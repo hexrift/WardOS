@@ -1,0 +1,89 @@
+# Credential Broker
+
+Status: Phase 0. Decision record: [ADR-0008](decisions/ADR-0008-credential-broker.md).
+
+## 1. Problem
+
+Agents need to push to GitHub, read issues, install packages from private registries and
+call their own model API. Today that is done by putting long-lived tokens in the agent's
+environment or home directory. In WardOS, Zone 3 is assumed compromised, so a long-lived
+secret in Zone 3 is a leaked secret.
+
+## 2. Model
+
+```text
+                     Zone 3                       Zone 0
+   agent ── needs GitHub ──▶ ward-request ──▶ ward-broker
+                                                   │  policy (Deny | Ask | Allow(scope))
+                                                   │  approval (Ward Shell / TUI)
+                                                   │  backend (vault) → mint / lease
+                                                   ▼
+                              ┌────────────────────┴────────────────────┐
+                              │ delivery A: proxy injection             │  preferred
+                              │  ward-proxy adds Authorization for       │
+                              │  (host, path-prefix, method) ∈ grant     │
+                              │  → token never enters Zone 3            │
+                              ├─────────────────────────────────────────┤
+                              │ delivery B: minted short-lived token     │  when a tool insists
+                              │  ≤ 10 min, scoped, session-bound, sent   │
+                              │  once over the control socket            │
+                              └─────────────────────────────────────────┘
+```
+
+## 3. Grant object
+
+```yaml
+grant:
+  id: grant_01J…
+  session: sess_01J…
+  service: github
+  subject: repo:hexrift/tamperward
+  permissions: [contents:read, issues:read]
+  delivery: proxy-injection
+  hosts: [api.github.com, github.com]
+  expires_in: 10m
+  approved_by: user:once       # policy:allow | user:once | user:session
+```
+
+Grants are events (`CredentialGranted`) minus the secret. Revocation on `ward stop`,
+on policy change, on explicit `ward revoke`, and on expiry.
+
+## 4. Service adapters (initial set)
+
+| Service | Backend secret (Zone 0) | Delivery | Scoping |
+| --- | --- | --- | --- |
+| GitHub | GitHub App private key or user OAuth token | A: proxy injection for `api.github.com` and HTTPS git; B: installation token for `gh` | Repository + permission set; tokens are GitHub App installation tokens (native expiry ≤ 1 h; broker requests ≤ 10 min where supported, otherwise revokes at expiry) |
+| Git over SSH | Host `~/.ssh` keys stay in Zone 0 | `ssh-agent` protocol proxy in the sandbox: signs only for approved `(host, user)`; every signature is an event | Per-host; `ask` by default |
+| npm / PyPI / crates.io (read) | Registry tokens | A | Read-only by default; publish is `deny` |
+| Agent model API (Anthropic / OpenAI / Google) | The user's API key or OAuth token | **A, via gateway mode**: sandbox gets `ANTHROPIC_BASE_URL=http://ward-proxy/anthropic` (and the equivalent for other agents); proxy injects auth | Per-agent; this keeps the user's long-lived model credential out of Zone 3 entirely **[experiment E-07]** |
+| Cloud (AWS/GCP/Azure) | Never for production; dev accounts via STS-style short leases | B (lease) | `deny` hard by default for anything tagged production |
+| Arbitrary env secret | Vault entry | A for HTTP; B otherwise | Explicit policy entry per secret |
+
+## 5. Backend
+
+Phase 2 backend: an encrypted file vault under `/var/lib/ward/vault/`, sealed with
+`systemd-creds` (TPM-backed where available, Phase 7) and unlocked at `wardd` start by
+the user's login session. The backend is a trait (`CredentialBackend { lease(...) }`) so
+that 1Password/Bitwarden/Vault/enterprise brokers are drop-ins later.
+
+## 6. What the agent sees
+
+```text
+$ ward creds
+SERVICE      STATE     SCOPE                              EXPIRES
+github       granted   repo:hexrift/tamperward ro          8m12s
+ssh:github   ask
+npm          granted   read                                session
+aws-prod     denied    production credentials unavailable
+anthropic    proxied   model API via gateway                session
+```
+
+No token values are ever printed, by type construction (`Secret<T>` has no `Display`).
+
+## 7. Failure behaviour
+
+* Broker unavailable → requests fail closed; the agent gets a clear error; event logged.
+* Approval times out (default 120 s) → `Deny(timeout)`; the agent can retry.
+* Proxy injection for a host that also appears unauthenticated in the same session: the
+  proxy injects only on `(host, path-prefix, method)` tuples of an active grant.
+* Injected requests are logged with method, host, path, status; never headers or bodies.
