@@ -1,0 +1,105 @@
+# TamperWard configuration for the WardOS repository.
+#
+# Principle: guard the judge, not the implementation.
+# Agents may freely modify ward-daemon, ward-agent, ward-verifier, the installer, etc.
+# What they must not quietly weaken are the tests, verification scripts, CI, trusted
+# fixtures, and TamperWard configuration that decide whether those changes are acceptable.
+#
+# Phase 0 note: this repository is in the "observe" stage of
+# docs/development-under-tamperward.md. The protected surfaces are declared now so
+# observations are meaningful; severities take effect at Phase 1 when code exists.
+# Validate this file against the TamperWard SPEC before enabling enforcement.
+
+version: 1
+
+protected:
+  # Things that judge WardOS behaviour.
+  tests:
+    - 'tests/**'
+    - 'security-tests/**'
+    - 'crates/**/tests/**'
+    - 'integration/**/tests/**'
+    - 'installer/tests/**'
+    - 'runtime/tests/**'
+
+  # Configuration that controls how verification is performed.
+  # Do NOT put ordinary WardOS implementation source here.
+  config:
+    - 'scripts/verify/**'
+    - 'scripts/security-check/**'
+    - 'clippy.toml'
+    - 'deny.toml'
+    - 'rust-toolchain.toml'
+    - '.cargo/config.toml'
+
+  # The merge authority.
+  ci:
+    - '.github/workflows/**'
+
+  # Expected outputs / security fixtures whose rewriting could manufacture a pass.
+  snapshots:
+    - 'tests/golden/**'
+    - 'security-tests/golden/**'
+    - 'security-tests/fixtures/expected/**'
+    - '**/*.golden'
+    - '**/*.golden.*'
+
+  # Control-plane wiring.
+  hooks:
+    - '.tamperward.yml'
+    - '.claude/settings.json'
+    - '.github/CODEOWNERS'
+    - '.pre-commit-config.yaml'
+
+rules:
+  # Hard failures.
+  test-deletion:
+    severity: block
+  test-content-removal:
+    severity: block
+  test-skip:
+    severity: block
+  coverage-lowering:
+    severity: block
+  ci-tampering:
+    severity: block
+  hook-tampering:
+    severity: block
+  no-verify:
+    severity: block
+
+  # Raised to block once the watcher is part of the supervised run envelope (Phase 3+).
+  transient-protected-mutation:
+    severity: block
+
+  # Intent-ambiguous signals stay non-blocking.
+  assertion-weakening:
+    severity: warn
+  guard-removal:
+    severity: warn
+  snapshot-rewrite:
+    severity: warn
+  snapshot-only-rewrite:
+    severity: warn
+
+# Keep this very small. An ignore needs the same scrutiny as adding a suppression.
+ignore: []
+
+signoff:
+  required_for:
+    - block
+  # Local use only. CI approvals remain out-of-band and SHA-bound.
+  ledger: .tamperward/ledger.jsonl
+
+verify:
+  command: bash scripts/verify/tamperward.sh
+  # WardOS verification may involve compilation and integration work.
+  budget: 1800
+  # Everything the command delegates to must be frozen/restored from the trusted base
+  # during pristine verification.
+  inputs:
+    - 'scripts/verify/**'
+    - 'scripts/security-check/**'
+    - 'security-tests/**'
+    - 'tests/**'
+    - 'integration/**/tests/**'
