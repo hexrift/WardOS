@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | ba
 
 This downloads the latest release tarball, verifies its SHA-256, installs the three
 binaries into `~/.local/bin`, and runs `ward doctor`. Use `--prefix /usr/local` for a
-system-wide install, `--version v0.1.1` to pin.
+system-wide install, `--version v0.2.0` to pin.
 
 No token is needed. For a private fork, export `GITHUB_TOKEN` (or `GH_TOKEN`) with
 read access first; the installer then fetches the script's release assets through the
