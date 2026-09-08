@@ -36,6 +36,9 @@ on:
         description: "ISO only: ask Anaconda for full-disk encryption"
         type: boolean
         default: false
+      draft_release:
+        description: "Optional draft-release tag to attach the disks to (fast, resumable download from the release CDN; draft fires no pipeline)"
+        default: ""
   release:
     types: [published]
 
@@ -77,6 +80,7 @@ jobs:
       RELEASE: ${{ github.event.inputs.release || github.event.release.tag_name || '' }}
       FIRST_USER: ${{ github.event.inputs.user || 'wardos' }}
       LUKS: ${{ github.event.inputs.luks || 'false' }}
+      DRAFT_RELEASE: ${{ github.event.inputs.draft_release || '' }}
       # The first user's password. Change it at first login (image/README.md).
       WARDOS_PASSWORD: wardos
     steps:
@@ -137,6 +141,27 @@ jobs:
           path: dist/
           compression-level: 6
           retention-days: 14
+      # A draft release is served from the fast release CDN (not the throttled
+      # Actions-artifact storage) and, being a draft, fires no `release:` event and
+      # cuts no version. Only the repository's own members can download its assets.
+      - name: "Attach to a draft release (fast, resumable download)"
+        if: env.DRAFT_RELEASE != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -q zstd
+          cd dist
+          for f in *.qcow2 *.raw *.iso; do [[ -f "$f" ]] && zstd -T0 -12 --rm "$f"; done
+          # GitHub caps a release asset at 2 GiB; anything larger is split into 1900 MiB
+          # parts (`cat name.zst.part* > name.zst`, then `zstd -d`).
+          for f in *.zst; do
+            if [[ $(stat -c %s "$f") -gt 1900000000 ]]; then split -b 1900M -d --suffix-length=1 "$f" "$f.part" && rm "$f"; fi
+          done
+          sha256sum ./* > "SHA256SUMS.${ARCH}"
+          ls -l
+          gh release view "$DRAFT_RELEASE" >/dev/null 2>&1 ||             gh release create "$DRAFT_RELEASE" --draft               --title "WardOS USB test image ($DRAFT_RELEASE)"               --notes "Draft build for testing the raw USB image. Not a release. cat the .part files back together, verify against SHA256SUMS, then zstd -d and dd to a USB."
+          gh release upload "$DRAFT_RELEASE" ./* --clobber
       # On a `release:` event, or when dispatched for a release tag (the release
       # workflow does that, since a release it creates cannot fire this trigger).
       - name: "Attach to the release (compressed: assets are capped at 2 GiB)"
