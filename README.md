@@ -129,9 +129,14 @@ Credentials never enter the sandbox: the model-API keys and, with `--grant githu
 GitHub token are injected by the proxy on repo-scoped routes. A per-session `wardd` is
 the single log writer behind a control socket (`ward watch`, `ward evidence append`,
 `ward session describe`, `ward snapshot …`), the building blocks TamperWard drives. A
-daemon-backed `ward run` warm-starts in 32 ms. Phase 0–2 are complete; the semantic
-TamperWard rules, the verifier image, the immutable host image and the desktop shell are
-later phases.
+daemon-backed `ward run` warm-starts in 32 ms. The desktop is built ([ADR-0016](docs/decisions/ADR-0016-desktop-feature-set.md),
+[`docs/desktop.md`](docs/desktop.md)): Hyprland with the full key set, the trust bar in
+Waybar, the command centre and every menu in fuzzel, approvals as notifications answered
+from the keyboard, fourteen themes rendered into every component, the `wardos-*` command
+family for capture, power, web apps, terminal apps, installs and setup, and a Fedora 44
+bootc image that CI builds on every merge. Phase 0–2 are complete; the semantic
+TamperWard rules, the verifier image, a boot on real hardware and the shell's own toolkit
+are later phases.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the phase plan and what remains for the
 Phase 2 gate, and [`docs/experiments.md`](docs/experiments.md) for the recorded results
