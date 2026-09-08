@@ -182,8 +182,15 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 if ! "$podman_bin" image exists "$image"; then
-  echo "disk.sh: image $image is not in root's container storage; run sudo image/build.sh first" >&2
-  exit 1
+  # A registry reference (ghcr.io/hexrift/wardos:latest, the image CI publishes on
+  # every merge) is pulled; a local name has to come from image/build.sh.
+  if [[ "$image" == */*.*/* || "$image" == ghcr.io/* ]]; then
+    echo "disk.sh: pulling $image"
+    "$podman_bin" pull "$image"
+  else
+    echo "disk.sh: image $image is not in root's container storage; run sudo image/build.sh first" >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "$output"

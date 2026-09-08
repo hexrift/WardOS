@@ -92,12 +92,14 @@ LABEL org.wardos.version="${WARDOS_VERSION}" \
 # Package versions follow the repositories at build time; the image digest, not
 # per-package pins, is what gets recorded in evidence (hadolint DL3041 is disabled in
 # .hadolint.yaml for this reason).
-COPY image/coprs.txt /tmp/coprs.txt
-COPY image/packages.txt /tmp/packages.txt
+COPY image/coprs.txt image/packages.txt /tmp/
+# install_weak_deps=False: only what the manifest names, none of the "recommended"
+# extras (a smaller image, and every package in it is one somebody wrote down).
 RUN dnf -y install dnf5-plugins \
     && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/coprs.txt \
        | while read -r copr; do echo "copr enable $copr"; dnf -y copr enable "$copr" || exit 1; done \
-    && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/packages.txt | xargs dnf -y install \
+    && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/packages.txt \
+       | xargs dnf -y --setopt=install_weak_deps=False install \
     && dnf clean all \
     && rm -f /tmp/packages.txt /tmp/coprs.txt
 
@@ -105,25 +107,22 @@ RUN dnf -y install dnf5-plugins \
 # wardos-theme-render (present from release v0.2 and in every checkout build). /usr is
 # the immutable, image-owned tree in bootc.
 COPY --from=binaries /out/ /usr/bin/
-RUN test -x /usr/bin/ward && test -x /usr/bin/wardd && test -x /usr/bin/ward-agent \
-    && ls -l /usr/bin/ward*
 
 # The desktop tree (docs/desktop.md §Layout): commands to /usr/bin, defaults to
 # /usr/share/wardos and /etc/xdg, user units and their preset, the tty1 autologin
 # drop-in for the `wardos` user. Placed by the same script desktop/install.sh uses on an
-# existing Fedora, so the two installs cannot drift apart.
-COPY image/install-desktop.sh /tmp/install-desktop.sh
-COPY desktop/ /tmp/desktop/
-RUN /tmp/install-desktop.sh /tmp/desktop / \
-    && rm -rf /tmp/desktop /tmp/install-desktop.sh
+# existing Fedora, so the two installs cannot drift apart. One COPY stages the script
+# beside the tree: every step here commits a multi-gigabyte layer, so steps are few.
+COPY image/install-desktop.sh desktop/ /tmp/stage/
+RUN test -x /usr/bin/ward && test -x /usr/bin/wardd && test -x /usr/bin/ward-agent \
+    && ls -l /usr/bin/ward* \
+    && /tmp/stage/install-desktop.sh /tmp/stage / \
+    && rm -rf /tmp/stage
 
-# Host configuration, all under /usr so it ships with the image and is not user state.
-COPY image/sysctl.d/50-wardos.conf /usr/lib/sysctl.d/50-wardos.conf
-COPY image/tmpfiles.d/wardos.conf /usr/lib/tmpfiles.d/wardos.conf
-COPY image/systemd/wardos-firstboot.service /usr/lib/systemd/system/wardos-firstboot.service
-COPY image/systemd/wardos-flathub.service /usr/lib/systemd/system/wardos-flathub.service
-COPY image/flathub.sh /usr/libexec/wardos-flathub
-COPY image/plymouth/wardos/ /usr/share/plymouth/themes/wardos/
+# Host configuration, laid out under image/rootfs exactly as it lands in the image
+# (sysctl, tmpfiles, the two first-boot units, the Flathub script, the Plymouth theme),
+# all under /usr so it ships with the image and is not user state.
+COPY image/rootfs/ /
 
 # Enable the first-boot units; pick the boot splash; sweep what package scriptlets left
 # in runtime-only places; let bootc check the layout (no /var content baked in, kernel

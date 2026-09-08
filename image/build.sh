@@ -58,7 +58,10 @@ if [[ ! -f image/Containerfile ]]; then
   exit 1
 fi
 
+# --format docker: the Containerfile's SHELL (pipefail) is honoured; the OCI format
+# ignores it, and bootc is happy with either.
 cmd=("$podman_bin" build
+  --format docker
   --tag "$tag"
   --file image/Containerfile
   --build-arg "WARDOS_VERSION=${version}")

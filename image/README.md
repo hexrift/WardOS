@@ -18,7 +18,7 @@ not.
 | `coprs.txt` | `/etc/yum.repos.d/_copr:*.repo` | The COPR repositories enabled before the install (Hyprland's ecosystem, lazygit); part of the trust set |
 | `check-packages.sh` | — | Proves every name in `packages.txt` exists in the pinned Fedora release plus `coprs.txt` (`dnf repoquery` in a `fedora:<release>` container); CI job "image packages" |
 | `install-desktop.sh` | — | Places `desktop/` into a root (`/` in the build, `/` from `desktop/install.sh`, a temp dir in tests) |
-| `flathub.sh` | `/usr/libexec/wardos-flathub` | Adds Flathub and installs `desktop/flatpaks.txt`, run once by `wardos-flathub.service` |
+| `rootfs/usr/libexec/wardos-flathub` | `/usr/libexec/wardos-flathub` | Adds Flathub and installs `desktop/flatpaks.txt`, run once by `wardos-flathub.service` |
 | `build.sh` | — | `podman build` wrapper; tags `localhost/wardos:<git describe>` and stamps the version label |
 | `disk.sh` | — | `bootc-image-builder` wrapper; qcow2 for QEMU, ISO for installation; `--user`, `--luks` |
 | `sysctl.d/50-wardos.conf` | `/usr/lib/sysctl.d/` | Unprivileged user namespaces for `wardd`'s sandboxes |
@@ -291,6 +291,30 @@ qemu-system-x86_64 -enable-kvm -m 4096 -cpu host \
 display; use `-device virtio-vga-gl -display gtk,gl=on` instead of `-nographic` to see
 the desktop.
 
+### The published image: skip the build
+
+Every merge to `main` that passes the image build pushes the result to
+`ghcr.io/hexrift/wardos` (`:latest` and `:<short sha>`). A machine that only wants a
+disk never builds anything:
+
+```sh
+sudo WARDOS_PASSWORD='choose-one' image/disk.sh --type qcow2 --user wardos \
+  --image ghcr.io/hexrift/wardos:latest
+```
+
+`disk.sh` pulls a registry reference it does not have and hands it to
+bootc-image-builder; five to ten minutes later the qcow2 is there. An installed WardOS
+follows the same reference: `bootc switch ghcr.io/hexrift/wardos:latest` once, then
+`wardos-update` (`bootc upgrade`) tracks every merge. Building locally is for changing
+the image, not for using it.
+
+Build time, when you do build: the Containerfile keeps its steps few because every step
+commits a multi-gigabyte layer (about fifteen seconds each even for a one-file copy);
+`dnf` installs with `install_weak_deps=False`, so the image holds only what
+`packages.txt` names; and `build.sh` passes `--format docker` so the Containerfile's
+`pipefail` shell is honoured under podman too. Compiling the tools is the slow part of a
+checkout build (five to ten minutes); `--source release` downloads them instead.
+
 ### Disk images from CI
 
 Nobody needs a Fedora box to get a WardOS disk. The `disk` workflow
@@ -361,7 +385,7 @@ CI runs, on every pull request and push (`verify.yml`):
 | --- | --- |
 | `image lint` | hadolint on `Containerfile`, shellcheck (`--severity=style`) on `image/*.sh`, the dry-runs of `build.sh`, `disk.sh` (plain and `--luks --user`), `check-packages.sh`, and `install-desktop.sh --help` |
 | `image packages` | `check-packages.sh`: every name in `packages.txt` exists in the pinned Fedora release (plus `coprs.txt`) |
-| `desktop scripts` | `desktop/tests/run.sh`, which includes `install.test.sh` (install-desktop, desktop/install.sh, flathub.sh, check-packages.sh, disk.sh) |
+| `desktop scripts` | `desktop/tests/run.sh`, which includes `install.test.sh` (install-desktop, desktop/install.sh, wardos-flathub, check-packages.sh, disk.sh) |
 
 and, in `image.yml` on `main` and on pull requests that touch `image/`, `desktop/`, the
 crates or `Cargo.lock`: `image build`, the real `docker build` with the checkout's
