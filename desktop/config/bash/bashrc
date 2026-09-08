@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# WardOS — interactive bash (docs/desktop.md §Parity: "bash, prompt, aliases").
+#
+# Sourced by /etc/profile.d/wardos.sh (config/bash/profile.d-wardos.sh) for every
+# interactive bash unless ~/.config/wardos/bash-override exists, and by the user's
+# ~/.bashrc when they want it. It is sourced, not run: no `set -e`, nothing that
+# changes the calling shell beyond aliases, functions, history and the prompt.
+# Each piece is its own file so `wardos-refresh bash` can replace one at a time.
+# $WARDOS_CONFIG is where they live (/usr/share/wardos/config, or the tree in a
+# checkout); the user's ~/.config/bash copies win when present.
+
+[[ $- == *i* ]] || return 0
+
+: "${WARDOS_CONFIG:=/usr/share/wardos/config}"
+wardos_bash_dir=$WARDOS_CONFIG/bash
+[[ -d ${XDG_CONFIG_HOME:-$HOME/.config}/bash ]] && wardos_bash_dir=${XDG_CONFIG_HOME:-$HOME/.config}/bash
+
+# History: large, shared between terminals, no duplicates, no leading-space lines.
+HISTSIZE=50000
+HISTFILESIZE=100000
+HISTCONTROL=ignoreboth:erasedups
+HISTTIMEFORMAT='%F %T  '
+shopt -s histappend checkwinsize cmdhist globstar autocd cdspell dirspell 2>/dev/null
+PROMPT_COMMAND="history -a${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+
+# shellcheck source=desktop/config/bash/envs
+[[ -r $wardos_bash_dir/envs ]] && source "$wardos_bash_dir/envs"
+# shellcheck source=desktop/config/bash/aliases
+[[ -r $wardos_bash_dir/aliases ]] && source "$wardos_bash_dir/aliases"
+# shellcheck source=desktop/config/bash/prompt
+[[ -r $wardos_bash_dir/prompt ]] && source "$wardos_bash_dir/prompt"
+
+# Tools that hook the shell, each only when installed.
+if command -v zoxide >/dev/null 2>&1; then
+  eval "$(zoxide init bash)"
+fi
+if [[ -r /usr/share/fzf/shell/key-bindings.bash ]]; then
+  # shellcheck source=/dev/null
+  source /usr/share/fzf/shell/key-bindings.bash
+fi
+if command -v fzf >/dev/null 2>&1 && command -v fd >/dev/null 2>&1; then
+  export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
+  export FZF_CTRL_T_COMMAND=$FZF_DEFAULT_COMMAND
+fi
+export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border=sharp --no-separator --no-scrollbar'
+if [[ -r /usr/share/bash-completion/bash_completion ]]; then
+  # shellcheck source=/dev/null
+  source /usr/share/bash-completion/bash_completion
+fi
+
+unset wardos_bash_dir

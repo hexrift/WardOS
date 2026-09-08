@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# WardOS — aliases. Sourced by config/bash/bashrc.
+#
+# Each alias that stands in for a program is only set when the replacement is
+# installed, so a shell on a trimmed image or a container still works.
+
+if command -v eza >/dev/null 2>&1; then
+  alias ls='eza --group-directories-first'
+  alias ll='eza -l --group-directories-first --git --time-style=long-iso'
+  alias la='eza -la --group-directories-first --git --time-style=long-iso'
+  alias lt='eza --tree --level=2 --group-directories-first'
+else
+  alias ls='ls --color=auto --group-directories-first'
+  alias ll='ls -l'
+  alias la='ls -la'
+fi
+
+if command -v bat >/dev/null 2>&1; then
+  alias cat='bat --paging=never --style=plain'
+fi
+
+command -v lazygit >/dev/null 2>&1 && alias lg='lazygit'
+command -v nvim >/dev/null 2>&1 && alias n='nvim' && alias vim='nvim'
+command -v rg >/dev/null 2>&1 && alias grep='rg'
+command -v fd >/dev/null 2>&1 && alias find='fd'
+
+alias g='git'
+alias gs='git status --short --branch'
+alias gd='git diff'
+alias gl='git log --oneline --graph --decorate -20'
+alias gp='git pull --ff-only'
+
+alias ..='cd ..'
+alias ...='cd ../..'
+alias mkdir='mkdir -p'
+alias cp='cp -i'
+alias mv='mv -i'
+alias df='df -h'
+alias du='du -h'
+alias free='free -h'
+
+# WardOS: the desktop family and the agent tools from the shell.
+alias keys='wardos-keys'
+alias theme='wardos-theme'
+alias menu='wardos-menu'
+alias about='wardos-about'
+alias verify='ward verify'
+alias watch-agent='ward watch'
