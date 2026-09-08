@@ -13,15 +13,15 @@ that back it. If a guarantee here has no test, it is a **goal**, labelled as suc
 
 | G | Guarantee | Threat-model rows | Tests | Status |
 | --- | --- | --- | --- | --- |
-| G1 | An agent session cannot read or write host paths outside its worktree, project environment, sandbox home and tmp | 1, 2, 3 | ST-001..003, 015 | Phase 1 target |
+| G1 | An agent session cannot read or write host paths outside its worktree, project environment, sandbox home and tmp | 1, 2, 3 | ST-001..003, 015 | Proven by `ward selftest` (ST-001..004, 013..015 DENIED on a real sandbox) |
 | G2 | An agent session never receives a long-lived credential; every credential it can use is scoped, short-lived, session-bound and logged | 11, 25 | ST-012, 024 | Model-API key: proven by `ward selftest` (canary key on the host never appears in Zone 3; the injected key cannot leave its route). Other services: Phase 3 |
-| G3 | An agent session can reach only the network destinations in its effective manifest, and never private/link-local/metadata ranges | 10, 21 | ST-011, 022 | Phase 1 target |
-| G4 | An agent session cannot observe, signal, trace, or share writable filesystem state with `wardd`, TamperWard, or any verifier | 5, 6 | ST-005, 006 | Phase 1 (wardd), Phase 4 (verifier) |
-| G5 | Entry, candidate and accepted snapshots are immutable and unreachable from the sandbox; their IDs are content-derived | 8, 16 | ST-008, 018 | Phase 2 target |
-| G6 | Evidence is append-only, hash-chained, unreachable from the sandbox, and agent-originated records are distinguishable from enforcement records | 9, 14 | ST-009, 010, 016 | Phase 2 target |
-| G7 | The effective capability manifest is fixed for the life of a session and repository policy can only narrow it | 7, 18 | ST-007 | Phase 1 target |
-| G8 | The host container engine is never exposed to an agent session | 4 | ST-004 | Phase 1 target |
-| G9 | Verification runs the trusted test set from Zone 1 against exactly the snapshot IDs in evidence, in an environment the agent cannot influence beyond repository content | 6, 16, 17 | ST-006, 018, 019 | Phase 4 target |
+| G3 | An agent session can reach only the network destinations in its effective manifest, and never private/link-local/metadata ranges | 10, 21 | ST-011, 022 | ST-011 proven by `ward selftest` and the proxy tests (private, link-local and metadata ranges 403 in every mode); ST-022 (TLS interception attempt) not yet a probe |
+| G4 | An agent session cannot observe, signal, trace, or share writable filesystem state with `wardd`, TamperWard, or any verifier | 5, 6 | ST-005, 006 | Proven by `ward selftest` for the namespace form: ST-005 (the supervisor cannot be signalled), ST-006 (the launch's host run directory, where verifier trees live, is invisible); the distinct verifier uid is Phase 4 |
+| G5 | Entry, candidate and accepted snapshots are immutable and unreachable from the sandbox; their IDs are content-derived | 8, 16 | ST-008, 018 | ST-008 proven by `ward selftest` (the CAS is unreachable) and by content addressing (`ward snapshot diff`); ST-018 (freeze before capture) is ahead |
+| G6 | Evidence is append-only, hash-chained, unreachable from the sandbox, and agent-originated records are distinguishable from enforcement records | 9, 14 | ST-009, 010, 016 | Proven: ST-009/010 and ST-017 by `ward selftest` (log, state root and control socket unreachable), ST-016 end to end (hook-socket input stays `Origin::Agent`), plus `ward replay --verify` on the chain |
+| G7 | The effective capability manifest is fixed for the life of a session and repository policy can only narrow it | 7, 18 | ST-007 | Proven: ST-007 end to end (a policy rewritten mid-session does not widen the network) and the merge property tests in `ward-policy` |
+| G8 | The host container engine is never exposed to an agent session | 4 | ST-004 | Proven by `ward selftest` (ST-004: no Docker socket) |
+| G9 | Verification runs the trusted test set from Zone 1 against exactly the snapshot IDs in evidence, in an environment the agent cannot influence beyond repository content | 6, 16, 17 | ST-006, 018, 019 | Partly proven: ST-006 by `ward selftest`, ST-019 end to end (a hostile verify command gets no network, no host path and no persistence); the trusted test set comes from the entry snapshot today, TamperWard's bundle and ST-018 are ahead |
 | G10 | Hard-denied capabilities are never presented with an override | 18 | UI test | Phase 5 target |
 | G11 | Data at rest is encrypted and unlockable only by the measured boot chain or the recovery key | 23 | RT-001 | Phase 7 target |
 | G12 | A failed update rolls back automatically or via `ward system rollback` | 24 | RT-002 | Phase 7 target |
