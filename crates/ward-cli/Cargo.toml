@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "WardOS: ward-cli"
+description = "WardOS: the `ward` command-line client"
+
+[[bin]]
+name = "ward"
+path = "src/main.rs"
 
 [dependencies]
+ward-daemon = { path = "../ward-daemon" }
+ward-events = { path = "../ward-events" }
+clap = { workspace = true }
 
 [lints]
 workspace = true

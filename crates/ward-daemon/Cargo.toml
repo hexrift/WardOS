@@ -5,9 +5,27 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "WardOS: ward-daemon"
+description = "WardOS: session supervisor — policy, snapshot, sandbox, event log"
+
+[lib]
+name = "ward_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wardd"
+path = "src/main.rs"
 
 [dependencies]
+ward-events = { path = "../ward-events" }
+ward-policy = { path = "../ward-policy" }
+ward-snapshot = { path = "../ward-snapshot" }
+ward-sandbox = { path = "../ward-sandbox" }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

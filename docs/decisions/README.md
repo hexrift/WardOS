@@ -21,3 +21,4 @@ Performance consequences · Why selected · How it will be validated
 | [0010](ADR-0010-snapshots-and-git.md) | Frozen state: content-addressed Ward Snapshots independent of `.git` | Accepted, pending E-02 |
 | [0011](ADR-0011-event-capture.md) | Event capture: eBPF exec + fanotify + proxy log; hooks are claims | Accepted, pending E-05 |
 | [0012](ADR-0012-observer.md) | Observer: TUI first, shared event API, Ward Shell panel later | Accepted |
+| [0013](ADR-0013-phase1-runtime.md) | Phase 1 runtime: in-process session, bubblewrap backend, bridged ids | Accepted |
