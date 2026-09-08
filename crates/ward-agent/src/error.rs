@@ -53,6 +53,17 @@ pub enum AgentError {
         /// Underlying I/O error.
         source: std::io::Error,
     },
+
+    /// An egress relay could not be started (bind or thread spawn).
+    #[error("relay {listen}: {context}: {source}")]
+    Relay {
+        /// The loopback address the relay was to listen on.
+        listen: std::net::SocketAddr,
+        /// What was being attempted.
+        context: &'static str,
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
 }
 
 impl From<seccompiler::BackendError> for AgentError {

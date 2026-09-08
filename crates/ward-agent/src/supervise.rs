@@ -21,14 +21,23 @@ pub fn signal_exit_code(signal: Signal) -> i32 {
     128 + signal as i32
 }
 
-/// Run `command` as the supervised child and return the exit code to relay.
-pub fn run(command: &mut Command) -> Result<i32> {
+/// Block the forwarded signals and `SIGCHLD` on the calling thread so that
+/// only [`run`]'s `sigwait` ever consumes them. Threads spawned afterwards
+/// inherit the mask, which keeps a process-directed signal from landing on one
+/// of them with its default (fatal) disposition; call this before spawning any.
+pub fn block_signals() -> Result<SigSet> {
     let mut mask = SigSet::empty();
     for signal in FORWARDED.into_iter().chain([Signal::SIGCHLD]) {
         mask.add(signal);
     }
     mask.thread_block()
         .map_err(AgentError::sys("block signals"))?;
+    Ok(mask)
+}
+
+/// Run `command` as the supervised child and return the exit code to relay.
+pub fn run(command: &mut Command) -> Result<i32> {
+    let mask = block_signals()?;
 
     let program = command.get_program().to_string_lossy().into_owned();
     let child = command
