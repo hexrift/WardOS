@@ -78,6 +78,43 @@ wardd → TamperWard   SessionClose { final_snapshot?, chain_head }
 TamperWard → wardd   countersignature (optional)
 ```
 
+### Implemented: evidence over the control socket
+
+The two lines of the protocol above that go through the session log — TamperWard's
+records in, the event stream out — exist today as `ward` commands over the session's
+control socket (`<state>/sessions/<id>/control.sock`, ADR-0015). Both need the session's
+daemon: with none listening they exit 1 with
+`ward: no daemon is serving this session (run ward up)` rather than opening the log
+themselves, because a second writer would fork the chain the daemon owns.
+
+```text
+ward evidence append [DIR] --json <RECORD>     # or --json - to read the record from stdin
+ward watch [DIR] [--from <SEQ>] [--all]
+```
+
+`evidence append` sends `Request::Evidence { event }`; the daemon appends the record with
+`origin = TamperWard` and answers `Response::Record`, and the command prints the observer
+row and `seq <n>`. `<RECORD>` is a `WardEvent` in its serde JSON shape, checked client-side
+with the daemon's own rule: only `PolicyDecision`, `PolicyDenied`, `TamperDetected` and
+`StateAccepted` are evidence kinds. `detail` may be given as a bare string; it is lifted
+to the `DetailText` object (`{"text": …, "truncated": false}`).
+
+```bash
+ward evidence append --json '{"PolicyDenied":{"subject":"ProtectedTests",
+    "rule":"protected-tests","detail":"tests/verify.rs"}}'
+# 01:07  DENIED protected tests · rule protected-tests · tests/verify.rs
+# seq 12
+ward evidence append --json '{"TamperDetected":{"subject":"VerifyConfig",
+    "detail":".tamperward/config.yml"}}'
+ward evidence append --json '{"StateAccepted":{"snapshot":"<64 hex>","by":"TamperWard"}}'
+```
+
+`watch` sends `Request::Subscribe { from_seq }` and prints one observer row per
+`Response::Record` line as it arrives: first the records already in the log with
+`seq >= from_seq`, then live ones. `--all` also prints the kinds the compact view hides
+(`event-model.md` §7), as a dim kind name. It exits 0 when the daemon closes the stream
+(the log is sealed) and 130 on Ctrl-C.
+
 ## 5. Policy split (do not create two contradictory policy systems)
 
 | File | Owner | Contents |

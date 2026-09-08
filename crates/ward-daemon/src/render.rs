@@ -353,12 +353,90 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
                 short_hex(&candidate.to_string())
             ),
         ),
+        WardEvent::PolicyDecision {
+            subject,
+            decision,
+            rule,
+            detail,
+        } => {
+            let (verb, color) = decision_verb(*decision);
+            (verb, color, evidence_text(subject, Some(rule), detail))
+        }
+        WardEvent::PolicyDenied {
+            subject,
+            rule,
+            detail,
+        } => ("DENIED", DENY, evidence_text(subject, Some(rule), detail)),
+        WardEvent::TamperDetected { subject, detail } => {
+            ("TAMPER", DENY, evidence_text(subject, None, detail))
+        }
+        WardEvent::StateAccepted { snapshot, .. } => (
+            "ACCEPT",
+            OK,
+            format!("snapshot {}", short_hex(&snapshot.to_string())),
+        ),
         WardEvent::SessionEnded { .. } => ("END", DIM, "session".to_string()),
         _ => return None,
     };
     Some(format!(
         "{ts}  {color}{verb:<5}{RESET} {INK}{subject}{RESET}"
     ))
+}
+
+/// The row for a record [`observer_row`] hides in the compact view: the same time
+/// column, then the event kind in dim (`ward watch --all`).
+#[must_use]
+pub fn kind_row(rec: &EventRecord) -> String {
+    let t = rec.ts_mono.as_secs();
+    format!(
+        "{DIM}{:02}:{:02}{RESET}  {DIM}{}{RESET}",
+        t / 60,
+        t % 60,
+        rec.event.kind()
+    )
+}
+
+/// `ALLOW` green, `ASK` amber, `DENIED` red.
+fn decision_verb(decision: ward_events::Decision) -> (&'static str, &'static str) {
+    use ward_events::Decision as D;
+    match decision {
+        D::Allow => ("ALLOW", OK),
+        D::Ask => ("ASK", WARN),
+        D::Deny => ("DENIED", DENY),
+    }
+}
+
+/// `protected tests · rule protected-tests · tests/verify.rs`.
+fn evidence_text(
+    subject: &ward_events::PolicySubject,
+    rule: Option<&ward_events::RuleRef>,
+    detail: &ward_events::DetailText,
+) -> String {
+    let mut parts = vec![policy_subject(subject)];
+    if let Some(rule) = rule {
+        parts.push(format!("rule {}", rule.as_str()));
+    }
+    if !detail.as_str().is_empty() {
+        parts.push(detail.as_str().to_string());
+    }
+    parts.join(" · ")
+}
+
+fn policy_subject(subject: &ward_events::PolicySubject) -> String {
+    use ward_events::PolicySubject as S;
+    match subject {
+        S::Session => "session".into(),
+        S::Manifest => "manifest".into(),
+        S::Policy => "policy".into(),
+        S::ProtectedTests => "protected tests".into(),
+        S::VerifyConfig => "verify config".into(),
+        S::Ci => "ci".into(),
+        S::Hooks => "hooks".into(),
+        S::Fixtures => "fixtures".into(),
+        S::Snapshot { id } => format!("snapshot {}", short_hex(&id.to_string())),
+        S::Path { path } => path.to_string(),
+        S::Other { detail } => detail.as_str().to_string(),
+    }
 }
 
 fn snapshot_role(role: ward_events::SnapshotRole) -> &'static str {
@@ -552,6 +630,81 @@ mod tests {
             plain(&snapshot_diff(&DiffReport::default())),
             "  identical\n"
         );
+    }
+
+    #[test]
+    fn evidence_kinds_have_observer_rows_and_hidden_kinds_a_dim_kind_row() {
+        use std::time::Duration;
+        use ward_events::{
+            Acceptor, AgentState, Blake3Hash, Chain, Decision, DetailText, Origin, PolicySubject,
+            RuleRef, SessionId, SnapshotId, Timestamp,
+        };
+        let rule = RuleRef::new("protected-tests").unwrap();
+        let events = [
+            WardEvent::PolicyDecision {
+                subject: PolicySubject::Session,
+                decision: Decision::Allow,
+                rule: rule.clone(),
+                detail: DetailText::new(""),
+            },
+            WardEvent::PolicyDecision {
+                subject: PolicySubject::Hooks,
+                decision: Decision::Deny,
+                rule: rule.clone(),
+                detail: DetailText::new(".claude/settings.json"),
+            },
+            WardEvent::PolicyDenied {
+                subject: PolicySubject::ProtectedTests,
+                rule,
+                detail: DetailText::new("tests/verify.rs"),
+            },
+            WardEvent::TamperDetected {
+                subject: PolicySubject::VerifyConfig,
+                detail: DetailText::new(".tamperward/config.yml"),
+            },
+            WardEvent::StateAccepted {
+                snapshot: SnapshotId::new(Blake3Hash::from_bytes([0xab; 32])),
+                by: Acceptor::TamperWard,
+            },
+            WardEvent::AgentStateChanged {
+                state: AgentState::Working,
+            },
+        ];
+        let mut chain = Chain::genesis(SessionId::from_u128(1), Blake3Hash::ZERO);
+        let records: Vec<EventRecord> = events
+            .into_iter()
+            .map(|e| {
+                chain
+                    .append(
+                        Origin::TamperWard,
+                        e,
+                        Timestamp::mono(Duration::from_secs(61)),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let rows: Vec<String> = records
+            .iter()
+            .take(5)
+            .map(|r| plain(&observer_row(r).unwrap()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "01:01  ALLOW session · rule protected-tests",
+                "01:01  DENIED hooks · rule protected-tests · .claude/settings.json",
+                "01:01  DENIED protected tests · rule protected-tests · tests/verify.rs",
+                "01:01  TAMPER verify config · .tamperward/config.yml",
+                "01:01  ACCEPT snapshot abababababab",
+            ]
+        );
+        assert!(observer_row(&records[0]).unwrap().contains(OK));
+        assert!(observer_row(&records[1]).unwrap().contains(DENY));
+        assert!(observer_row(&records[2]).unwrap().contains(DENY));
+        assert!(observer_row(&records[3]).unwrap().contains(DENY));
+        assert!(observer_row(&records[4]).unwrap().contains(OK));
+        assert_eq!(observer_row(&records[5]), None);
+        assert_eq!(plain(&kind_row(&records[5])), "01:01  agent_state_changed");
     }
 
     #[test]
