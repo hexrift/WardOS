@@ -94,7 +94,14 @@ the manifest's observer mode: `quiet`/`live` always allow; `step_through` answer
 the step-through UX rides on Claude Code's terminal, which is why this is best-effort
 (event-model §7). An unreachable socket or a malformed answer makes the client print
 nothing and exit 0: the outer layers are what hold. Codex has no hook layer; it gets
-intent only from exec and file capture (§6).
+intent only from exec and file capture (§6). To turn the holds on for a project:
+
+```yaml
+# .ward/policy.yaml
+observer: !step_through
+  pause_before_writes: true
+  pause_before_network: true
+```
 
 ## 5. Headless and interactive
 
