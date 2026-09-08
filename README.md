@@ -37,22 +37,27 @@ Observer        LIVE
 
 ## See it running
 
-The Phase 1 prototype runs today on any Linux host with `bubblewrap`. It loads the
+The Phase 1 prototype runs today on any Linux host with `bubblewrap`. It merges the
 project's policy into a capability manifest, freezes a content-addressed entry snapshot,
-runs commands inside an isolated sandbox, and records every action to an append-only,
-hash-chained event log.
+runs commands inside an isolated sandbox with live kernel-origin file events, and records
+every action to an append-only, hash-chained event log that persists across commands.
 
-![A WardOS session: the security panel, the live observer, and the isolation self-test](assets/ward-session.png)
+![A WardOS session: security panel, live observer, isolation self-test](assets/ward-session.png)
 
 ```bash
 cargo build --release
-ward status   examples/ward-demo    # the session security panel above
-ward run  --dir examples/ward-demo -- cargo test   # run a command in the sandbox
-ward selftest examples/ward-demo    # prove the isolation (5/5 blocked)
+ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
+ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live observer
+ward status   examples/ward-demo    # the security panel for the active session
+ward selftest examples/ward-demo    # prove the isolation (8/8 hostile probes blocked)
+ward stop     examples/ward-demo    # seal the log
+ward replay   <events.log>          # replay any sealed session
 ```
 
-The host home, SSH keys, cloud credentials, Docker socket, and private network are simply
-never mounted into the sandbox, so `ward selftest` shows them all denied by construction.
+The host home, SSH keys, cloud credentials, Docker socket, private network, and the
+namespace, cgroup and symlink escape routes are simply never reachable from the sandbox,
+so `ward selftest` shows every probe denied by construction, and CI reproduces the same
+result on every pull request.
 
 ## Design principle
 

@@ -11,7 +11,7 @@
 //! cannot see, it cannot reach.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ward_policy::NetworkCapability;
@@ -30,13 +30,46 @@ pub struct Outcome {
     pub duration: Duration,
 }
 
-/// Whether `bwrap` is available on this host.
+/// Whether the sandbox actually works on this host.
+///
+/// `bwrap --version` succeeding is not enough: on hardened hosts (e.g. Ubuntu with
+/// `apparmor_restrict_unprivileged_userns`) `bwrap` is installed but cannot create a
+/// user namespace, so every sandboxed command fails. This runs a minimal real
+/// sandbox and returns true only if it exits cleanly, so bwrap-guarded tests skip
+/// rather than fail where isolation is unavailable.
 pub fn available() -> bool {
-    Command::new("bwrap")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let mut cmd = Command::new("bwrap");
+    cmd.arg("--unshare-all")
+        .args(["--ro-bind", "/usr", "/usr"])
+        .args(["--ro-bind", "/bin", "/bin"])
+        .args(["--ro-bind", "/lib", "/lib"])
+        .args(["--ro-bind-try", "/lib64", "/lib64"])
+        .args(["--proc", "/proc"])
+        .args(["--dev", "/dev"])
+        .args(["--", "/bin/true"]);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    // Short timeout so a stuck `bwrap` cannot hang the caller; `/bin/true` returns
+    // near-instantly, so a probe that overruns is a broken sandbox, not a slow one.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 /// Run `argv` inside the sandbox for `worktree`, honouring the network capability.
@@ -106,4 +139,16 @@ pub fn run(worktree: &Path, network: &NetworkCapability, argv: &[String]) -> Res
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         duration: start.elapsed(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_probe_returns_a_bool_without_panicking() {
+        // The value depends on the host (bwrap present and userns permitted); we only
+        // assert the probe completes and yields a bool either way.
+        let _: bool = available();
+    }
 }
