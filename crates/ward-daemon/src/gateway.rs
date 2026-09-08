@@ -24,12 +24,16 @@ pub struct GatewaySpec {
     pub upstream: (&'static str, u16),
     /// Header carrying the injected credential.
     pub header: &'static str,
+    /// Text placed before the key in the header value (`Bearer ` for OAuth-style APIs).
+    pub value_prefix: &'static str,
     /// Client headers removed before injection, so the placeholder never leaves.
     pub strip: &'static [&'static str],
     /// Host variable (and vault file name) holding the real key.
     pub key_env: &'static str,
     /// Variable the agent reads its base URL from.
     pub base_url_env: &'static str,
+    /// Path appended to the prefix in that base URL (`/v1` when the agent expects it).
+    pub base_path: &'static str,
     /// Variable the agent reads its (placeholder) key from.
     pub placeholder_env: &'static str,
 }
@@ -62,7 +66,8 @@ impl Gateway {
     /// Build the gateway for `spec` around `key`.
     pub fn from_key(spec: &GatewaySpec, key: &str) -> Result<Self> {
         let (host, port) = spec.upstream;
-        let route = GatewayRoute::new(spec.prefix, host, port, spec.header, Secret::from(key))
+        let value = Secret::from(format!("{}{key}", spec.value_prefix));
+        let route = GatewayRoute::new(spec.prefix, host, port, spec.header, value)
             .map_err(|e| Error::Sandbox(format!("gateway {}: {e}", spec.service)))?
             .strip_headers(spec.strip);
         Ok(Self::new(spec, route))
@@ -77,7 +82,7 @@ impl Gateway {
             env: vec![
                 (
                     spec.base_url_env.to_owned(),
-                    format!("http://{RELAY_ADDR}{}", spec.prefix),
+                    format!("http://{RELAY_ADDR}{}{}", spec.prefix, spec.base_path),
                 ),
                 (spec.placeholder_env.to_owned(), PLACEHOLDER.to_owned()),
             ],
@@ -125,6 +130,24 @@ mod tests {
         );
         assert!(!format!("{:?}", g.route).contains("sk-ant-real"));
         assert_eq!(g.route.prefix(), "/anthropic");
+    }
+
+    #[test]
+    fn openai_gateway_uses_bearer_and_v1_base_path() {
+        let spec = crate::agents::profile("codex")
+            .and_then(|p| p.gateway)
+            .expect("codex has a gateway");
+        let g = Gateway::from_key(&spec, "sk-openai").unwrap();
+        assert_eq!(g.service, "openai");
+        assert!(g.env.contains(&(
+            "OPENAI_BASE_URL".into(),
+            format!("http://{RELAY_ADDR}/openai/v1")
+        )));
+        assert!(
+            g.env
+                .contains(&("OPENAI_API_KEY".into(), PLACEHOLDER.into()))
+        );
+        assert_eq!(spec.value_prefix, "Bearer ");
     }
 
     #[test]

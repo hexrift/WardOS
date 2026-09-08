@@ -54,6 +54,10 @@ model API. Points decided during implementation:
   `localhost_only` projects (the default for the demo) unable to use the model API at
   all, for no isolation gain. `offline` still refuses every gateway request and no
   grant is made, and the upstream is resolved and pinned like any other destination.
+* **One spec per service.** A gateway is `(service, prefix, upstream, header, value
+  prefix, headers to strip, key variable, base-URL variable and path)`: Anthropic is
+  `x-api-key` on `/anthropic`; OpenAI (Codex) is `Authorization: Bearer` on `/openai`
+  with the agent's base URL ending in `/v1`. Adding a provider is adding a spec.
 * **Key sources**, in order: the host variable named by the route (`ANTHROPIC_API_KEY`),
   then `$WARD_STATE_DIR/vault/<NAME>`. The encrypted vault of the decision text is
   still Phase 3; the file is the 0.1 stand-in.

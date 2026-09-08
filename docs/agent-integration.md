@@ -114,8 +114,12 @@ avoided in WardOS sessions because it skips hooks.
 
 Same shape: per-agent module in `ward-cli` supplying (a) required hosts, (b) config-dir
 and env conventions, (c) hook/adapter mapping if the agent has one, (d) headless flags.
-Codex and Gemini get their API hosts (`api.openai.com`, `generativelanguage.googleapis.com`)
-in `Development` mode; agents without hooks get intent only from exec/file capture.
+Codex gets the same gateway treatment as Claude Code: `OPENAI_API_KEY` stays on the host,
+the sandbox sees `OPENAI_BASE_URL=http://127.0.0.1:3128/openai/v1` and a placeholder key,
+and the proxy injects `Authorization: Bearer …` on the way to `api.openai.com` (client
+`authorization`, `openai-organization` and `openai-project` headers are stripped). Gemini
+gets its API host (`generativelanguage.googleapis.com`) in `Development` mode until it has
+a gateway spec. Agents without hooks get intent only from exec/file capture.
 
 ## 7. Acceptance (Phase 2 gate)
 
