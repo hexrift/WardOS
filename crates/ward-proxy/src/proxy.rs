@@ -10,6 +10,11 @@
 //! network namespace is handed, bind-mounted in. Both transports share one
 //! connection handler through the private [`Conn`] trait; upstream
 //! connections are always TCP to pinned addresses.
+//!
+//! A request that matches a [`GatewayRoute`] takes a third path: the head is
+//! rewritten with the credential injected, the body is forwarded by its
+//! framing, and the response is streamed back byte-for-byte as it arrives
+//! (so SSE from a model API is never buffered) — see [`serve_gateway`].
 
 use std::fmt;
 use std::fs;
@@ -26,7 +31,8 @@ use std::time::{Duration, Instant};
 use ward_policy::NetworkCapability;
 
 use crate::error::Error;
-use crate::http::{self, Method, Parsed};
+use crate::gateway::{GatewayRoute, Upstream};
+use crate::http::{self, ChunkTracker, Framing, Method, Parsed};
 use crate::observer::{Decision, Observer};
 use crate::policy::{Pinned, Policy};
 use crate::resolve::{Resolver, SystemResolver};
@@ -56,11 +62,13 @@ pub struct Config {
     connect_timeout: Duration,
     idle_timeout: Duration,
     allow_loopback: bool,
+    gateways: Vec<GatewayRoute>,
 }
 
 impl Config {
     /// Defaults: listen on `127.0.0.1:0`, system resolver, 64 connections,
-    /// 15 s to send a request head, 10 s to connect upstream, 5 min idle.
+    /// 15 s to send a request head, 10 s to connect upstream, 5 min idle,
+    /// no gateway routes.
     pub fn new(capability: NetworkCapability) -> Self {
         Self {
             listen: Listen::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
@@ -71,7 +79,17 @@ impl Config {
             connect_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(300),
             allow_loopback: false,
+            gateways: Vec::new(),
         }
+    }
+
+    /// Add a gateway route (repeatable). Routes are tried in the order added;
+    /// the first whose prefix matches a forward request's path wins. The
+    /// route's upstream still has to pass the session policy.
+    #[must_use]
+    pub fn gateway(mut self, route: GatewayRoute) -> Self {
+        self.gateways.push(route);
+        self
     }
 
     /// TCP address to listen on (the default transport). Port `0` picks a
@@ -155,6 +173,7 @@ impl fmt::Debug for Config {
             .field("connect_timeout", &self.connect_timeout)
             .field("idle_timeout", &self.idle_timeout)
             .field("allow_loopback", &self.allow_loopback)
+            .field("gateways", &self.gateways)
             .finish_non_exhaustive()
     }
 }
@@ -164,6 +183,7 @@ struct Shared {
     policy: Policy,
     resolver: Arc<dyn Resolver>,
     observer: Arc<dyn Observer>,
+    gateways: Vec<GatewayRoute>,
     max_connections: usize,
     request_timeout: Duration,
     connect_timeout: Duration,
@@ -192,6 +212,7 @@ impl Proxy {
             policy,
             resolver: config.resolver,
             observer,
+            gateways: config.gateways,
             max_connections: config.max_connections,
             request_timeout: config.request_timeout,
             connect_timeout: config.connect_timeout,
@@ -465,7 +486,23 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
         Ok(parsed) => parsed,
         Err(e) => return respond(&mut client, 400, "Bad Request", &e.to_string()),
     };
-    let req = &parsed.request;
+    // A gateway route replaces the destination; an origin-form request that
+    // matches none is not a proxy request at all.
+    let gateway = shared.gateways.iter().find(|g| g.matches(&parsed));
+    if gateway.is_none() && parsed.origin_form {
+        return respond(
+            &mut client,
+            400,
+            "Bad Request",
+            "proxy requires an absolute http:// URI",
+        );
+    }
+    let framing = match gateway.map(|_| http::body_framing(&parsed)) {
+        Some(Ok(framing)) => framing,
+        Some(Err(e)) => return respond(&mut client, 400, "Bad Request", &e.to_string()),
+        None => Framing::None,
+    };
+    let req = &gateway.map_or_else(|| parsed.request.clone(), |g| g.request(&parsed));
     let pinned = match shared
         .policy
         .evaluate(shared.resolver.as_ref(), &req.target)
@@ -483,11 +520,11 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
             );
         }
     };
-    shared.observer.decision(
-        req,
-        Decision::Allow,
-        &format!("pinned {}", pinned_list(&pinned)),
+    let reason = gateway.map_or_else(
+        || format!("pinned {}", pinned_list(&pinned)),
+        |g| format!("gateway {}", g.prefix()),
     );
+    shared.observer.decision(req, Decision::Allow, &reason);
     let Some(mut upstream) = connect_pinned(&pinned, shared.connect_timeout) else {
         return respond(
             &mut client,
@@ -497,6 +534,17 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
         );
     };
     let _ = upstream.set_nodelay(true);
+    if let Some(route) = gateway {
+        return serve_gateway(
+            client,
+            upstream,
+            route,
+            &parsed,
+            framing,
+            &head.remainder,
+            shared,
+        );
+    }
     let prelude = match &req.method {
         Method::Connect => {
             let ok = client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
@@ -517,6 +565,107 @@ fn forward_prelude(parsed: &Parsed, body: &[u8]) -> Vec<u8> {
     let mut prelude = http::origin_head(parsed);
     prelude.extend_from_slice(body);
     prelude
+}
+
+/// One gateway exchange: TLS to the pinned address, the rewritten head with
+/// the credential injected, the request body by its framing, then the
+/// response streamed back until the upstream closes. `first` is whatever the
+/// client sent after its head.
+fn serve_gateway<C: Conn>(
+    mut client: C,
+    tcp: TcpStream,
+    route: &GatewayRoute,
+    parsed: &Parsed,
+    framing: Framing,
+    first: &[u8],
+    shared: &Shared,
+) {
+    let Ok(mut upstream) = route.connect(tcp, shared.connect_timeout) else {
+        return respond(
+            &mut client,
+            502,
+            "Bad Gateway",
+            "upstream TLS handshake failed",
+        );
+    };
+    let head = match route.rewrite_head(parsed) {
+        Ok(head) => head,
+        Err(reason) => return respond(&mut client, 502, "Bad Gateway", reason),
+    };
+    let sent = upstream.write_all(&head).and_then(|()| upstream.flush());
+    drop(head);
+    if sent.is_err() {
+        return;
+    }
+    let expects_continue = parsed.headers.iter().any(|h| {
+        h.name.eq_ignore_ascii_case("expect") && h.value.eq_ignore_ascii_case("100-continue")
+    });
+    if expects_continue && client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").is_err() {
+        return;
+    }
+    let live = Liveness(Mutex::new(Instant::now()));
+    let _ = client.set_read_timeout(Some(POLL));
+    if send_body(&mut client, &mut upstream, framing, first, &live, shared).is_err() {
+        return;
+    }
+    let _ = upstream.socket().set_read_timeout(Some(POLL));
+    let _ = copy_stream(&mut upstream, &mut client, &live, shared);
+    let _ = client.shutdown(Shutdown::Write);
+}
+
+/// Forward the request body: `first` (already read) followed by the client
+/// stream, delimited by `framing`.
+fn send_body<C: Conn>(
+    client: &mut C,
+    upstream: &mut Upstream,
+    framing: Framing,
+    first: &[u8],
+    live: &Liveness,
+    shared: &Shared,
+) -> io::Result<()> {
+    let source = first.chain(client);
+    match framing {
+        Framing::None => Ok(()),
+        Framing::Length(n) => {
+            let mut limited = source.take(n as u64);
+            copy_stream(&mut limited, upstream, live, shared)?;
+            if limited.limit() == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from(ErrorKind::UnexpectedEof))
+            }
+        }
+        Framing::Chunked => {
+            let mut body = ChunkedBody {
+                inner: source,
+                tracker: ChunkTracker::new(),
+            };
+            copy_stream(&mut body, upstream, live, shared)
+        }
+    }
+}
+
+/// A reader that ends at the terminating chunk of a chunked body while
+/// passing the framing bytes through untouched.
+struct ChunkedBody<R> {
+    inner: R,
+    tracker: ChunkTracker,
+}
+
+impl<R: Read> Read for ChunkedBody<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.tracker.done() {
+            return Ok(0);
+        }
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            return Err(io::Error::from(ErrorKind::UnexpectedEof));
+        }
+        // Bytes past the end of the body (a pipelined request) are dropped.
+        self.tracker
+            .feed(&buf[..n])
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
+    }
 }
 
 fn pinned_list(pinned: &Pinned) -> String {
@@ -598,26 +747,39 @@ fn relay<C: Conn>(client: C, upstream: TcpStream, shared: &Arc<Shared>) {
 
 fn pump<S: Conn, D: Conn>(mut src: S, mut dst: D, live: &Liveness, shared: &Shared) {
     let _ = src.set_read_timeout(Some(POLL));
+    let _ = copy_stream(&mut src, &mut dst, live, shared);
+    let _ = dst.shutdown(Shutdown::Write);
+}
+
+/// Copy `src` to `dst` as bytes arrive until `src` reaches EOF. `src` must
+/// have a read timeout of [`POLL`]: each timeout is a chance to notice
+/// shutdown or an idle tunnel, both of which end the copy with `TimedOut`.
+fn copy_stream<S: Read + ?Sized, D: Write + ?Sized>(
+    src: &mut S,
+    dst: &mut D,
+    live: &Liveness,
+    shared: &Shared,
+) -> io::Result<()> {
     let mut buf = vec![0u8; RELAY_BUF];
     loop {
         match src.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => return Ok(()),
             Ok(n) => {
                 live.touch();
-                if dst.write_all(&buf[..n]).is_err() {
-                    break;
-                }
+                dst.write_all(&buf[..n])?;
+                dst.flush()?;
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 if shared.shutting_down() || live.idle() > shared.idle_timeout {
-                    break;
+                    return Err(io::Error::from(ErrorKind::TimedOut));
                 }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(_) => break,
+            // A TLS peer that closes without `close_notify` is still EOF.
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
         }
     }
-    let _ = dst.shutdown(Shutdown::Write);
 }
 
 /// Convenience for callers that only need `io::Error` semantics.
@@ -627,6 +789,7 @@ impl From<Error> for io::Error {
             Error::Bind { source, .. } | Error::BindUnix { source, .. } | Error::Spawn(source) => {
                 source
             }
+            Error::InvalidGateway { .. } => Self::new(ErrorKind::InvalidInput, e),
         }
     }
 }
