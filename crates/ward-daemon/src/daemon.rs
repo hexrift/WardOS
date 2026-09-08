@@ -28,10 +28,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ward_events::{EventRecord, LogReader};
+use ward_events::{EventRecord, LogReader, Origin, WardEvent};
 
+use crate::approvals::{self, Approval, Approvals, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
 use crate::error::{Error, Result};
 use crate::session::{SessionMeta, session_dir};
@@ -61,6 +62,34 @@ pub fn pid_path(state: &Path, session: &str) -> PathBuf {
 #[must_use]
 pub fn serving(state: &Path, session: &str) -> bool {
     RemoteSink::connect(&socket_path(state, session)).is_some()
+}
+
+/// The newest session under `state` whose daemon answers: the desktop's
+/// session when it is asked from somewhere that is not a project (the bar,
+/// the approval listener). Sessions whose record cannot be read are skipped.
+pub fn newest_live(state: &Path) -> Result<Option<SessionMeta>> {
+    let sessions = state.join("sessions");
+    let entries = match std::fs::read_dir(&sessions) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io(&sessions, e)),
+    };
+    let mut newest: Option<SessionMeta> = None;
+    for entry in entries.flatten() {
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let Ok(meta) = SessionMeta::load(state, &id) else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .is_some_and(|n| n.started_unix_ms >= meta.started_unix_ms)
+            || !serving(state, &id)
+        {
+            continue;
+        }
+        newest = Some(meta);
+    }
+    Ok(newest)
 }
 
 /// Serve `session`'s log on its control socket until a request seals it.
@@ -270,14 +299,15 @@ struct Subscription {
     live: Option<(Receiver<Delivery>, Sender<Delivery>)>,
 }
 
-/// The daemon's shared state: the log, the session facts, the subscribers, and
-/// the open connections.
+/// The daemon's shared state: the log, the session facts, the subscribers, the
+/// open connections, and the approvals it holds.
 struct Served {
     log: Option<LocalLog>,
     log_path: PathBuf,
     description: serde_json::Value,
     subscribers: Vec<Sender<Delivery>>,
     peers: Vec<(u64, UnixStream)>,
+    approvals: Arc<Approvals>,
 }
 
 impl Served {
@@ -288,6 +318,7 @@ impl Served {
             description,
             subscribers: Vec::new(),
             peers: Vec::new(),
+            approvals: Arc::new(Approvals::new()),
         }
     }
 
@@ -301,6 +332,17 @@ impl Served {
                 Response::Error("subscribe is served on its own connection".into()),
                 false,
             ),
+            Request::Hold { .. } => (
+                Response::Error("hold is served on its own connection".into()),
+                false,
+            ),
+            Request::Approve { id, decision } => (
+                self.approvals
+                    .answer(id, decision)
+                    .map_or_else(|e| Response::Error(refusal(e)), |()| Response::Ok),
+                false,
+            ),
+            Request::Pending => (Response::Pending(self.approvals.pending()), false),
             other => {
                 let subscribers = &mut self.subscribers;
                 let (response, done) = control::handle_with(&mut self.log, other, |record| {
@@ -311,10 +353,46 @@ impl Served {
                     for s in self.subscribers.drain(..) {
                         let _ = s.send(Delivery::End);
                     }
+                    // A question still open when the log seals is released as
+                    // denied; no record of it can follow the seal.
+                    self.approvals.close();
                 }
                 (response, done)
             }
         }
+    }
+
+    /// Append one `wardd`-origin record now, fanned out like any other.
+    fn append(&mut self, event: WardEvent) -> Result<EventRecord> {
+        let request = Request::Append {
+            origin: Origin::Wardd,
+            event,
+            at_unix_ms: control::unix_ms(SystemTime::now()),
+        };
+        match self.handle(request).0 {
+            Response::Record(record) => Ok(*record),
+            Response::Error(e) => Err(Error::Daemon(e)),
+            other => Err(Error::Daemon(format!("unexpected response {other:?}"))),
+        }
+    }
+
+    /// Register a question: the `CapabilityRequested` record is appended and
+    /// its seq becomes the approval's id, in one step under the mutex so a
+    /// subscriber that sees the record can already answer it. A standing
+    /// `allow-session` answers it at once.
+    fn hold(&mut self, tool: &str, summary: &str, reason: &str) -> Result<(u64, Option<Outcome>)> {
+        let record = self.append(approvals::requested_event(tool, summary, reason))?;
+        if self.approvals.remembered(tool, summary) {
+            return Ok((record.seq, Some(Outcome::Remembered)));
+        }
+        self.approvals.register(Approval {
+            id: record.seq,
+            tool: tool.to_owned(),
+            summary: summary.to_owned(),
+            reason: reason.to_owned(),
+            requested_at_unix_ms: control::unix_ms(SystemTime::now()),
+        })?;
+        Ok((record.seq, None))
     }
 
     /// Start a subscription from `from_seq`: everything in the log so far, and a
@@ -338,6 +416,15 @@ impl Served {
 
 fn lock(served: &Mutex<Served>) -> MutexGuard<'_, Served> {
     served.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The text of a refusal on the wire: the daemon's own errors without their
+/// `daemon: ` prefix, since the client adds it back when it reports them.
+fn refusal(e: Error) -> String {
+    match e {
+        Error::Daemon(message) => message,
+        other => other.to_string(),
+    }
 }
 
 fn write_line(writer: &mut UnixStream, response: &Response) -> std::io::Result<()> {
@@ -365,12 +452,48 @@ fn serve_stream(stream: UnixStream, served: &Arc<Mutex<Served>>) -> bool {
                 stream_subscription(reader, writer, served, from_seq);
                 return false;
             }
+            Ok(Request::Hold {
+                tool,
+                summary,
+                reason,
+                timeout_secs,
+            }) => (hold(served, &tool, &summary, &reason, timeout_secs), false),
             Ok(request) => lock(served).handle(request),
             Err(e) => (Response::Error(format!("bad request: {e}")), false),
         };
         if write_line(&mut writer, &response).is_err() || done {
             return done;
         }
+    }
+}
+
+/// Hold one `ask` (ADR-0016): record the request, wait for the user's answer
+/// or the timeout with the mutex released, record the decision, and answer.
+fn hold(
+    served: &Arc<Mutex<Served>>,
+    tool: &str,
+    summary: &str,
+    reason: &str,
+    timeout_secs: u64,
+) -> Response {
+    let (id, approvals, remembered) = {
+        let mut s = lock(served);
+        match s.hold(tool, summary, reason) {
+            Ok((id, remembered)) => (id, Arc::clone(&s.approvals), remembered),
+            Err(e) => return Response::Error(refusal(e)),
+        }
+    };
+    let outcome =
+        remembered.unwrap_or_else(|| approvals.wait(id, Duration::from_secs(timeout_secs)));
+    if let Some(event) = approvals::decided_event(tool, summary, outcome) {
+        // The log may have sealed meanwhile; the agent still gets its answer.
+        let _ = lock(served).append(event);
+    }
+    let response = outcome.response();
+    Response::Decision {
+        id,
+        decision: response.decision,
+        reason: response.reason,
     }
 }
 
@@ -425,7 +548,6 @@ fn stream_subscription(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use std::time::SystemTime;
     use ward_events::{
         AgentState, Blake3Hash, DetailText, EndReason, Origin, PolicySubject, RuleRef, SessionId,
         WardEvent,
@@ -528,6 +650,204 @@ mod tests {
             served.handle(Request::Ping),
             (Response::Error(_), true)
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_held_approval_is_recorded_listed_answered_and_recorded_again() {
+        use crate::approvals::ApprovalDecision;
+        use crate::hooks::HookDecision;
+        use ward_events::{CapabilityKind, Decision, DecisionSource, GrantScope};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let sub = lock(&served).subscribe(0).unwrap();
+        let (rx, _hangup) = sub.live.unwrap();
+
+        // Nothing pending, nothing to answer.
+        assert!(matches!(
+            lock(&served).handle(Request::Pending).0,
+            Response::Pending(p) if p.is_empty()
+        ));
+        assert!(matches!(
+            lock(&served).handle(Request::Approve { id: 0, decision: ApprovalDecision::Allow }).0,
+            Response::Error(e) if e == "approval 0: not pending"
+        ));
+
+        // A hold blocks its thread until the answer arrives.
+        let holding = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || {
+                hold(
+                    &served,
+                    "Write",
+                    "/work/src/lib.rs",
+                    "step-through: pause before writes",
+                    5,
+                )
+            })
+        };
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&served).approvals.pending().is_empty()
+        }));
+        let pending = match lock(&served).handle(Request::Pending).0 {
+            Response::Pending(p) => p,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, 0, "the seq of the request record");
+        assert_eq!(pending[0].tool, "Write");
+        let (live, _) = drain(&rx);
+        assert_eq!(seqs(&live), [0], "the subscriber saw the request");
+        assert!(matches!(
+            &live[0].event,
+            WardEvent::CapabilityRequested { cap, reason }
+                if cap.kind == CapabilityKind::FileWrite
+                    && cap.target.as_str() == "Write /work/src/lib.rs"
+                    && reason.as_ref().unwrap().as_str() == "step-through: pause before writes"
+        ));
+        assert!(!holding.is_finished());
+
+        assert!(matches!(
+            lock(&served)
+                .handle(Request::Approve {
+                    id: 0,
+                    decision: ApprovalDecision::AllowSession
+                })
+                .0,
+            Response::Ok
+        ));
+        assert!(matches!(
+            holding.join().unwrap(),
+            Response::Decision { id: 0, decision: HookDecision::Allow, reason }
+                if reason == "approval: allowed for the session"
+        ));
+        let (live, _) = drain(&rx);
+        assert_eq!(seqs(&live), [1]);
+        assert!(matches!(
+            &live[0].event,
+            WardEvent::CapabilityDecided {
+                decision: Decision::Allow,
+                by: DecisionSource::User,
+                grant: Some(GrantScope::Session),
+                ..
+            }
+        ));
+
+        // The same question again is answered from memory, and still recorded.
+        let response = hold(
+            &served,
+            "Write",
+            "/work/src/lib.rs",
+            "step-through: pause before writes",
+            5,
+        );
+        assert!(matches!(
+            response,
+            Response::Decision {
+                id: 2,
+                decision: HookDecision::Allow,
+                ..
+            }
+        ));
+        let (live, _) = drain(&rx);
+        assert_eq!(seqs(&live), [2, 3]);
+
+        // A short timeout denies, by the timeout.
+        let response = hold(&served, "WebFetch", "api.github.com", "network", 0);
+        assert!(matches!(
+            response,
+            Response::Decision { id: 4, decision: HookDecision::Deny, reason }
+                if reason == "approval: timed out"
+        ));
+        let (live, _) = drain(&rx);
+        assert!(matches!(
+            &live[1].event,
+            WardEvent::CapabilityDecided {
+                decision: Decision::Deny,
+                by: DecisionSource::Timeout,
+                grant: None,
+                ..
+            }
+        ));
+
+        // Sealing releases an open question as denied and records nothing more.
+        let holding = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || hold(&served, "Write", "/work/x.rs", "r", 5))
+        };
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&served).approvals.pending().is_empty()
+        }));
+        let (response, done) = lock(&served).handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        assert!(done, "{response:?}");
+        assert!(matches!(
+            holding.join().unwrap(),
+            Response::Decision { decision: HookDecision::Deny, reason, .. }
+                if reason == "approval: session ended"
+        ));
+        assert!(matches!(
+            hold(&served, "Write", "/work/y.rs", "r", 5),
+            Response::Error(e) if e == "log is sealed"
+        ));
+    }
+
+    #[test]
+    fn the_newest_served_session_is_the_desktops_session() {
+        let state = tempfile::tempdir().unwrap();
+        assert_eq!(newest_live(state.path()).unwrap(), None, "no sessions yet");
+        let meta = |id: &str, started: u64| SessionMeta {
+            id: id.to_owned(),
+            project: PathBuf::from("/tmp/demo"),
+            project_id: "proj_unit".to_owned(),
+            entry_snapshot: "blake3:abc".to_owned(),
+            manifest: merge(
+                &Policy::default(),
+                &Policy::default(),
+                &Policy::default(),
+                ward_policy::SessionId(id.to_owned()),
+                ward_policy::ProjectId("proj_unit".to_owned()),
+            ),
+            started_unix_ms: started,
+            agent: None,
+        };
+        for (id, started) in [("sess_old", 1), ("sess_new", 3), ("sess_mid", 2)] {
+            let dir = session_dir(state.path(), id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("session.json"),
+                serde_json::to_vec(&meta(id, started)).unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(session_dir(state.path(), "sess_broken")).unwrap();
+        std::fs::write(
+            session_dir(state.path(), "sess_broken").join("session.json"),
+            b"{",
+        )
+        .unwrap();
+        assert_eq!(
+            newest_live(state.path()).unwrap(),
+            None,
+            "sessions on disk, none served"
+        );
+        // Serve the middle one: it is the live one, whatever started later.
+        let mut log = Some(fresh_served(state.path()).log.take().unwrap());
+        let listener = bind_socket(&socket_path(state.path(), "sess_mid")).unwrap();
+        let server = std::thread::spawn(move || {
+            // Two pings: the probe in `newest_live`, and the caller's own connect.
+            for _ in 0..2 {
+                if let Ok((stream, _)) = listener.accept() {
+                    control::serve_connection(stream, &mut log);
+                }
+            }
+        });
+        let live = newest_live(state.path()).unwrap().unwrap();
+        assert_eq!(live.id, "sess_mid");
+        assert!(RemoteSink::connect(&socket_path(state.path(), "sess_mid")).is_some());
+        server.join().unwrap();
     }
 
     #[test]

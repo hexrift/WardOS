@@ -221,10 +221,11 @@ fn launcher_lines(dir: &Path, settle: Duration, query: &str) -> ward_daemon::Res
     Ok(())
 }
 
-/// The control socket of `dir`'s current session, or `None` when there is no
-/// session (the reason goes to stderr).
+/// The control socket of the session the shell shows: `dir`'s current one,
+/// else the newest one a daemon serves (the bar runs from home, not a
+/// project); `None` when there is neither (the reason goes to stderr).
 fn locate(dir: &Path) -> ward_daemon::Result<Option<PathBuf>> {
-    match client::socket_path(dir, &state_root()) {
+    match client::desktop_socket(dir, &state_root(), None) {
         Ok(socket) => Ok(Some(socket)),
         Err(ward_daemon::Error::Project(reason)) => {
             eprintln!("ward-shell: {reason}");
