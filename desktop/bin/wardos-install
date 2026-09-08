@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# wardos-install — add something to this machine (docs/desktop.md §Commands).
+#
+# Usage: wardos-install app [flatpak-id]          Flathub (`flatpak install -y flathub`)
+#        wardos-install package [rpm]             layered on the image with `sudo rpm-ostree
+#                                                 install`: needs a reboot, and the WardOS way
+#                                                 is a line in image/packages.txt instead
+#        wardos-install webapp <name> <url> [icon-url]   → wardos-webapp install
+#        wardos-install tui <name> <cmd…>         → wardos-tui install
+#        wardos-install theme <git-url>           → wardos-theme install
+#        wardos-install font <file-or-dir>        .ttf/.otf files into ~/.local/share/fonts
+#        wardos-install dev <lang>                `mise use -g <lang>@latest`
+#        wardos-install service <name>            tailscale (enable tailscaled when installed),
+#                                                 dropbox (Flathub), syncthing (user unit when
+#                                                 installed, else Flathub)
+#
+# Nothing is fetched with `curl | sh`; Fedora packages and Flathub only. A missing
+# argument is asked for in the picker.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+# ask VALUE PROMPT: VALUE, or the picker's answer when empty.
+ask() {
+  if [[ -n "$1" ]]; then printf '%s\n' "$1"; else wardos_menu "$2"; fi
+}
+
+install_font() {
+  local src=$1 dest="${XDG_DATA_HOME:-$HOME/.local/share}/fonts" n=0 f
+  [[ -e "$src" ]] || wardos_die "no such file or directory: $src"
+  mkdir -p "$dest"
+  while IFS= read -r -d '' f; do
+    cp -f "$f" "$dest/"
+    n=$((n + 1))
+  done < <(find "$src" -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.ttc' \) -print0)
+  [[ $n -gt 0 ]] || wardos_die "no .ttf/.otf files in $src"
+  fc-cache -f
+  echo "$n font file(s) installed to $dest; pick one with wardos-font set"
+}
+
+install_service() {
+  case "$1" in
+    tailscale)
+      if wardos_has tailscale; then
+        sudo systemctl enable --now tailscaled
+        echo "tailscaled enabled; run 'sudo tailscale up' to sign in"
+      else
+        wardos_die "tailscale is not in Fedora's repositories; it comes with the image (image/packages.txt) or from pkgs.tailscale.com, never from curl | sh"
+      fi
+      ;;
+    dropbox) flatpak install -y flathub com.dropbox.Client ;;
+    syncthing)
+      if wardos_has syncthing; then
+        systemctl --user enable --now syncthing
+      else
+        flatpak install -y flathub com.github.zocker_160.SyncThingy
+      fi
+      ;;
+    *) wardos_die "services: tailscale, dropbox, syncthing" ;;
+  esac
+}
+
+what=${1:-}
+[[ -n "$what" ]] || wardos_die "install what? (--help)"
+shift
+case "$what" in
+  app)
+    id=$(ask "${1:-}" "Flathub id") || exit 0
+    flatpak install -y flathub "$id"
+    wardos_notify "Installed" "$id"
+    ;;
+  package)
+    pkg=$(ask "${1:-}" "Package") || exit 0
+    cat >&2 <<EOF
+wardos-install: layering $pkg on the image with rpm-ostree. It takes effect after a
+reboot, and every image update carries the layer along. The WardOS way is a line in
+image/packages.txt so CI checks the name and the image ships it.
+EOF
+    sudo rpm-ostree install "$pkg"
+    wardos_notify "Package layered" "$pkg is there after a reboot"
+    ;;
+  webapp) exec wardos-webapp install "$@" ;;
+  tui) exec wardos-tui install "$@" ;;
+  theme)
+    wardos_has wardos-theme || wardos_die "wardos-theme is not installed"
+    exec wardos-theme install "$@"
+    ;;
+  font)
+    src=$(ask "${1:-}" "Font file or directory") || exit 0
+    install_font "$src"
+    ;;
+  dev)
+    lang=$(ask "${1:-}" "Language") || exit 0
+    wardos_has mise || wardos_die "mise is not installed; it ships with the image (image/packages.txt)"
+    mise use -g "$lang@latest"
+    ;;
+  service)
+    svc=$(ask "${1:-}" "Service") || exit 0
+    install_service "$svc"
+    ;;
+  *) wardos_die "app, package, webapp, tui, theme, font, dev or service? (--help)" ;;
+esac

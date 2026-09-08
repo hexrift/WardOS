@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# wardos-remove — the inverse of every wardos-install (docs/desktop.md §Commands).
+#
+# Usage: wardos-remove app [flatpak-id]      `flatpak uninstall -y`; asks from the installed list
+#        wardos-remove package [rpm]         `sudo rpm-ostree uninstall` (a layered package)
+#        wardos-remove webapp [name]         → wardos-webapp remove
+#        wardos-remove tui [name]            → wardos-tui remove
+#        wardos-remove theme <id>            → wardos-theme remove
+#        wardos-remove font <family>         its files under ~/.local/share/fonts (fc-list)
+#        wardos-remove dev <lang>            `mise unuse -g <lang>`
+#        wardos-remove service <name>        tailscale, dropbox, syncthing: disabled and gone
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+ask() {
+  if [[ -n "$1" ]]; then printf '%s\n' "$1"; else wardos_menu "$2"; fi
+}
+
+remove_font() {
+  local family=$1 dir="${XDG_DATA_HOME:-$HOME/.local/share}/fonts" n=0 f
+  # fc-list prints `path: Family:style=…`; only files under the user's directory go.
+  while IFS= read -r f; do
+    [[ $f == "$dir"/* && -f $f ]] || continue
+    rm -f "$f"
+    n=$((n + 1))
+  done < <(fc-list : file family | awk -F': ' -v fam="$family" '{ split($2, fs, ","); for (i in fs) if (fs[i] == fam) { print $1; break } }')
+  [[ $n -gt 0 ]] || wardos_die "no files of the family $family under $dir"
+  fc-cache -f
+  echo "$n file(s) of $family removed"
+}
+
+remove_service() {
+  case "$1" in
+    tailscale) sudo systemctl disable --now tailscaled ;;
+    dropbox) flatpak uninstall -y com.dropbox.Client ;;
+    syncthing)
+      systemctl --user disable --now syncthing 2>/dev/null || true
+      flatpak uninstall -y com.github.zocker_160.SyncThingy 2>/dev/null || true
+      ;;
+    *) wardos_die "services: tailscale, dropbox, syncthing" ;;
+  esac
+}
+
+what=${1:-}
+[[ -n "$what" ]] || wardos_die "remove what? (--help)"
+shift
+case "$what" in
+  app)
+    id=${1:-}
+    if [[ -z "$id" ]]; then
+      id=$(flatpak list --app --columns=application,name | wardos_menu "Remove app" | cut -f1) || exit 0
+    fi
+    flatpak uninstall -y "$id"
+    wardos_notify "Removed" "$id"
+    ;;
+  package)
+    pkg=$(ask "${1:-}" "Package") || exit 0
+    sudo rpm-ostree uninstall "$pkg"
+    ;;
+  webapp) exec wardos-webapp remove "$@" ;;
+  tui) exec wardos-tui remove "$@" ;;
+  theme)
+    wardos_has wardos-theme || wardos_die "wardos-theme is not installed"
+    exec wardos-theme remove "$@"
+    ;;
+  font)
+    family=$(ask "${1:-}" "Font family") || exit 0
+    remove_font "$family"
+    ;;
+  dev)
+    lang=$(ask "${1:-}" "Language") || exit 0
+    wardos_has mise || wardos_die "mise is not installed"
+    mise unuse -g "$lang"
+    ;;
+  service)
+    svc=$(ask "${1:-}" "Service") || exit 0
+    remove_service "$svc"
+    ;;
+  *) wardos_die "app, package, webapp, tui, theme, font, dev or service? (--help)" ;;
+esac
