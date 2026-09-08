@@ -162,9 +162,11 @@ contents.
 ## 5. Recorded results (Phase 1)
 
 * **E-01 (isolation baseline) — partial PASS.** The bubblewrap prototype blocks
-  ST-001, ST-002, ST-003, ST-004 and ST-011 with a hostile workload (`ward selftest`,
-  5/5). The full crun + seccomp + Landlock path and ST-013..015 remain to be run on a
-  non-nested host.
+  ST-001..004, ST-011 and ST-013..015 with a hostile workload (`ward selftest`, 8/8),
+  and CI reproduces this on every PR. `ward-agent` adds Landlock + seccomp inside the
+  sandbox (verified on the CI runner: empty capability sets, `Seccomp: 2`, denied
+  syscalls fail with EPERM, writes outside the rw set fail with EACCES). The full crun
+  path still needs a non-nested cgroups-v2 host.
 * **E-02 (snapshot performance) — measured.** On a 4 vCPU VM, ext4, kernel 6.18,
   200,000 files / 1 GiB (261,827 entries): cold capture 3.47 s, warm 1.46 s, cached
   incremental after touching 100 files 0.96 s. The warm ext4 hashing budget is met;
