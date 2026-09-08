@@ -16,7 +16,7 @@ not.
 | `Containerfile` | the image | Build or fetch the ward binaries; layer packages, binaries, desktop and configuration on `fedora-bootc` |
 | `packages.txt` | — | Every package the host installs, one per line with the reason; the Containerfile and `desktop/install.sh` read it |
 | `coprs.txt` | `/etc/yum.repos.d/_copr:*.repo` | The COPR repositories enabled before the install (Hyprland's ecosystem, lazygit); part of the trust set |
-| `check-packages.sh` | — | Proves every name in `packages.txt` exists in Fedora 42 plus `coprs.txt` (`dnf repoquery` in a `fedora:42` container); CI job "image packages" |
+| `check-packages.sh` | — | Proves every name in `packages.txt` exists in the pinned Fedora release plus `coprs.txt` (`dnf repoquery` in a `fedora:<release>` container); CI job "image packages" |
 | `install-desktop.sh` | — | Places `desktop/` into a root (`/` in the build, `/` from `desktop/install.sh`, a temp dir in tests) |
 | `flathub.sh` | `/usr/libexec/wardos-flathub` | Adds Flathub and installs `desktop/flatpaks.txt`, run once by `wardos-flathub.service` |
 | `build.sh` | — | `podman build` wrapper; tags `localhost/wardos:<git describe>` and stamps the version label |
@@ -38,7 +38,7 @@ hadolint rule, explained inside.
 
 Stage 1 provides the ward binaries, from a release tarball or a build of this checkout
 ([below](#where-the-binaries-come-from)). Stage 2 starts from
-`quay.io/fedora/fedora-bootc:42` and installs every package of
+`quay.io/fedora/fedora-bootc:44` and installs every package of
 [`packages.txt`](packages.txt): the runtime set (`bubblewrap git curl python3
 openssh-clients cargo rust podman`, reasons in the file and in the next paragraph), the
 Hyprland stack, the components that render the shell's surfaces until E-10 (Waybar,
@@ -73,109 +73,51 @@ boot, not at build time, so the image stays what `dnf` and this repository produ
 ### Packages
 
 `packages.txt` is the one list. Rules: one name per line, a `# why` after it, blank lines
-and comment lines ignored, exact Fedora 42 package names (not "provides": `fd-find`,
+and comment lines ignored, exact Fedora package names (not "provides": `fd-find`,
 `pipewire-pulseaudio`, not `fd` or `pipewire-pulse`). The Containerfile installs
 `sed -e 's/#.*//' packages.txt | xargs dnf -y install`; `desktop/install.sh` reads the
 same file for `dnf` or `rpm-ostree`.
 
 CI is the source of truth for the names: `check-packages.sh` enables the COPRs and runs
-`dnf repoquery` inside `quay.io/fedora/fedora:42` (docker on the runner, podman locally
-when docker is absent) and fails listing every name that did not resolve; a wrong name
+`dnf repoquery` inside `quay.io/fedora/fedora:<release>` (the release read from the
+Containerfile's `FROM` tag, so the check and the build cannot drift; docker on the
+runner, podman locally when docker is absent) and fails listing every name that did not
+resolve; a wrong name
 is a one-line fix there, and a name the check has not confirmed yet carries
 `# unverified` until it has. `check-packages.sh --dry-run` prints the command without a
 container runtime.
 
 ### COPRs
 
-Fedora 42 does not package the Hyprland ecosystem beyond the compositor itself
-(`hypridle`, `hyprlock`, `hyprpaper`, `hyprpicker`, `hyprpolkitagent`, `hyprsunset`,
-`uwsm`, `satty`, `cliphist`, `swayosd` are missing; the "image packages" job proved it)
-nor `lazygit`. They come from COPR repositories listed in [`coprs.txt`](coprs.txt), one
-`owner/project` per line with the reason: `solopasha/hyprland` and `dejan/lazygit`.
-Three things enable exactly that list the same way: the Containerfile (`dnf5-plugins`,
-then `dnf copr enable` for each, before the install), `check-packages.sh` (the same two
-commands in the check container, so the check sees what the build sees), and
-`desktop/install.sh` (`dnf copr enable` on Workstation; on rpm-ostree, which has no
+[`coprs.txt`](coprs.txt) lists COPR repositories, one `owner/project` per line with the
+reason, and three things enable exactly that list the same way: the Containerfile
+(`dnf5-plugins`, then `dnf copr enable` for each, before the install), `check-packages.sh`
+(the same two commands in the check container, so the check sees what the build sees),
+and `desktop/install.sh` (`dnf copr enable` on Workstation; on rpm-ostree, which has no
 `copr` verb, the `.repo` file COPR serves is fetched into `/etc/yum.repos.d`).
 
 A COPR is part of the image's trust set: its packages are built by the COPR's owner on
 Fedora's build system, not by Fedora, and its repository file stays in the image so
 `wardos-install package` layers from the same sources the image was built from. The
 list is therefore short, every entry justified, and an entry is removed the day Fedora
-packages the thing. `pulsemixer` is not packaged anywhere useful; the image ships
-`pavucontrol` and `wardos-setup audio` prefers pulsemixer when present.
-
-### The desktop in the image
-
-`install-desktop.sh SRC DESTDIR` places the [`desktop/`](../desktop) tree
-([`docs/desktop.md` §Layout](../docs/desktop.md#layout)). The same script runs in the
-image build (`SRC=/tmp/desktop`, `DESTDIR=/`) and from `desktop/install.sh` on an
-existing Fedora, so the two installs cannot drift apart. Every part is optional: what
-the tree does not contain yet is skipped.
-
-| `desktop/…` | Installed at | Notes |
-| --- | --- | --- |
-| `bin/wardos-*` | `/usr/bin/` | mode 0755 |
-| `lib/wardos.sh` | `/usr/lib/wardos/` | |
-| `hyprland/*.conf` | `/usr/share/wardos/hypr/`, `/etc/xdg/hypr` → that directory | The directory is linked, not the file: `hyprland.conf` sources `./keybindings.conf` relative to the path it was read from |
-| `config/<component>/` | `/usr/share/wardos/config/<component>/` | Copied to `~/.config` by `wardos-first-run`; re-applied by `wardos-refresh` |
-| `config/{waybar,foot,mako,fuzzel,btop,fastfetch}/` | also `/etc/xdg/<component>` → the above | These read `XDG_CONFIG_DIRS`, so they work before any first-run copy; an existing real `/etc/xdg/<component>` (a Fedora that ships one) is filled, not replaced |
-| `config/gtk/settings.ini` | also `/etc/xdg/gtk-3.0/settings.ini`, `/etc/xdg/gtk-4.0/settings.ini` | One file, two real directories (GTK reads `settings.ini` from `XDG_CONFIG_DIRS`; `gtk.css` only from the home directory, first-run's job) |
-| `config/bash/profile.d-wardos.sh` | `/etc/profile.d/wardos.sh` | Session environment; starts `uwsm` on tty1 |
-| `config/xcompose/XCompose` | `/usr/share/wardos/config/xcompose/` | Copied to `~/.XCompose` by first-run |
-| `themes/` | `/usr/share/wardos/themes/` | TOML token files and backgrounds |
-| `webapps/`, `tuis/`, `flatpaks.txt` | `/usr/share/wardos/` | Defaults for `wardos-webapp`, `wardos-tui`, `wardos-flathub` |
-| `systemd/user/*` | `/usr/lib/systemd/user/` + `/usr/lib/systemd/user-preset/90-wardos.preset` | The preset enables every unit that has an `[Install]` section (a timer's service has none and is pulled in by its timer) |
-| `systemd/system/getty@tty1.service.d/autologin.conf` | `/etc/systemd/system/getty@tty1.service.d/` | Autologin; `--no-autologin` skips it (what `desktop/install.sh` does unless told `--autologin`) |
-| `shell/`, `theme/`, `tests/`, `install.sh` | — | Sources and tests never land on the host; the two crates are built in stage 1 |
-
-`desktop/tests/install.test.sh` runs the script against a temp `DESTDIR` with a fake
-tree of every kind of file and asserts on every row above.
-
-### Autologin
-
-The image logs `wardos` in on tty1 without a password (the getty drop-in) and
-`/etc/profile.d/wardos.sh` starts Hyprland through `uwsm` there, so a machine boots
-into the desktop; hyprlock, not the login prompt, is the lock. The user is not in the
-image (bootc images carry no accounts): create it when making the disk,
-`disk.sh --user wardos …` ([below](#users-and-luks)), or with your own config. A
-different first user works too; then edit the drop-in's `--autologin` name in your
-`/etc`, which bootc keeps across upgrades.
-
-### Flathub and the default applications
-
-Applications that are not in Fedora come from Flathub (ADR-0016: no `curl | sh`, no
-AUR). `wardos-flathub.service` runs `/usr/libexec/wardos-flathub /usr/share/wardos/flatpaks.txt`
-once after the first boot that has a network (`After=network-online.target`): it adds
-the `flathub` remote and installs the ids in the list (`#` comments and blank lines
-allowed). It never blocks login; `wardos-install app` works as soon as the remote
-exists. Success writes `/var/lib/wardos/flathub.done`; a failed download leaves no
-marker, shows in `systemctl --failed`, and retries on the next boot. Delete the marker
-to re-run; `wardos-flathub /path/to/list` installs another list by hand.
-
-### Plymouth
-
-`plymouth/wardos/` is a Plymouth *script* theme: the Ward Dark ground (`#0E0F11`) fills
-the screen, `WARD` sits in the middle in the text colour, a 2 px line in the muted
-colour grows under it with boot progress, and the LUKS passphrase prompt is one line
-of text plus one bullet per character on the same surface. No logo, no animation
-([`design-language.md`](../docs/design-language.md) §2, §3). The build selects it with
-`plymouth-set-default-theme wardos` when the script engine (`plymouth-plugin-script`)
-is installed and falls back to `spinner` otherwise, then rebuilds the initramfs
-(`dracut --no-hostonly --add ostree`, the way other bootc desktops do) because Plymouth
-draws from the initramfs, not from the root filesystem. Both the package names and the
-dracut step are *unverified* until E-09; if the dracut line fails on a real build, drop
-it and the splash becomes the late, post-initramfs one.
+packages the thing; it must build for the pinned release (the `fedora-<NN>-x86_64`
+chroot), which the "image packages" job proves before the build runs. On Fedora 42 the
+Hyprland ecosystem beyond the compositor needed `solopasha/hyprland`, whose chroots
+moved on with the release's end of life; the list is empty on 44 until the check says
+otherwise. `pulsemixer` is not packaged anywhere useful; the image ships `pavucontrol`
+and `wardos-setup audio` prefers pulsemixer when present.
 
 ### Base image tag
 
-`fedora-bootc:42` pins the **current Fedora release**, not a digest. Two consequences:
+`fedora-bootc:44` pins the **current Fedora release**, not a digest. Two consequences:
 
-1. Rebuilding on a later day gives a newer Fedora 42 content set; the image *digest* is
+1. Rebuilding on a later day gives a newer Fedora 44 content set; the image *digest* is
    what identifies a build and what evidence records (ADR-0001). CI will move to pinned
    digests (`@sha256:…`) with a renovate-style bump once E-09 has a baseline to compare.
-2. A Fedora rebase (43, …) is an edit to `FROM` and a re-run of E-09, never an implicit
-   change. `bootc` on installed hosts follows whatever tag their `bootc status` names.
+2. A Fedora rebase (45, …) is an edit to `FROM` and a re-run of E-09, never an implicit
+   change; the first one, 42 → 44 in September 2026, is recorded in ADR-0001's addendum
+   (42 had reached end of life and the COPRs had dropped its chroot). `bootc` on
+   installed hosts follows whatever tag their `bootc status` names.
 
 ## Where the binaries come from
 
@@ -194,7 +136,7 @@ crates); the release stage copies the last two when the tarball has them, which
 release tarballs from **v0.2** do (`release.yml` packages five from now on)
 and v0.1.1 does not: an image built from v0.1.1 has the desktop's packages and
 configuration but no shell surfaces, and `ls -l /usr/bin/ward*` in the build log says
-which arrived. The Rust image is Debian-based; its glibc is older than Fedora 42's, so
+which arrived. The Rust image is Debian-based; its glibc is older than Fedora 44's, so
 the binaries run on the host without a rebuild.
 
 The tools and the image therefore have separate cadences: `vX.Y.Z` tags release the
@@ -303,7 +245,7 @@ Fedora way of Omarchy's snapper snapshots) are documented in
 
 ## The desktop on an existing Fedora
 
-[`desktop/install.sh`](../desktop/install.sh) applies the same desktop to a Fedora 42
+[`desktop/install.sh`](../desktop/install.sh) applies the same desktop to a Fedora 44
 that is already installed: Workstation (`dnf`), Silverblue and Kinoite (`rpm-ostree
 install`, layered, active after a reboot). See [`docs/install.md`](../docs/install.md),
 "Desktop".
@@ -315,7 +257,7 @@ CI runs, on every pull request and push (`verify.yml`):
 | Job | What |
 | --- | --- |
 | `image lint` | hadolint on `Containerfile`, shellcheck (`--severity=style`) on `image/*.sh`, the dry-runs of `build.sh`, `disk.sh` (plain and `--luks --user`), `check-packages.sh`, and `install-desktop.sh --help` |
-| `image packages` | `check-packages.sh`: every name in `packages.txt` exists in Fedora 42 |
+| `image packages` | `check-packages.sh`: every name in `packages.txt` exists in the pinned Fedora release (plus `coprs.txt`) |
 | `desktop scripts` | `desktop/tests/run.sh`, which includes `install.test.sh` (install-desktop, desktop/install.sh, flathub.sh, check-packages.sh, disk.sh) |
 
 and, in `image.yml` on `main` and on pull requests that touch `image/`, `desktop/`, the

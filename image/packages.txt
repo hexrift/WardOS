@@ -1,9 +1,9 @@
-# Every Fedora 42 package the WardOS host installs (docs/desktop.md §Packages).
+# Every Fedora package the WardOS host installs (the release image/Containerfile pins) (docs/desktop.md §Packages).
 # One name per line, `# why` after it; blank lines and comment lines are ignored.
 # The Containerfile installs from this file after enabling the COPRs of
 # image/coprs.txt; desktop/install.sh layers it onto an existing Fedora;
 # image/check-packages.sh (CI: "image packages") proves every name resolves in a
-# fedora:42 container with the same COPRs. `# unverified` marks a name that check has
+# fedora:<release> container with the same COPRs. `# unverified` marks a name that check has
 # not confirmed yet; the check, not this file, is the source of truth.
 
 # --- runtime (ADR-0001: no developer toolchain on the host, one explicit exception) ----
@@ -18,15 +18,15 @@ podman                # nested containers inside project environments (ADR-0005)
 
 # --- compositor and session ---------------------------------------------------------
 hyprland              # the compositor (ADR-0007)
-hyprlock              # lock screen (COPR solopasha/hyprland)                  # unverified
-hypridle              # idle management (lock, screen off, suspend) (COPR solopasha/hyprland) # unverified
-hyprpaper             # wallpaper daemon (image backgrounds; swaybg draws solid ones) (COPR solopasha/hyprland) # unverified
-hyprpicker            # colour picker (wardos-capture color) (COPR solopasha/hyprland) # unverified
-hyprsunset            # night light (wardos-toggle nightlight) (COPR solopasha/hyprland) # unverified
-hyprpolkitagent       # polkit prompts on the desktop (pkexec) (COPR solopasha/hyprland) # unverified
+hyprlock              # lock screen                  # unverified
+hypridle              # idle management (lock, screen off, suspend) # unverified
+hyprpaper             # wallpaper daemon (image backgrounds; swaybg draws solid ones) # unverified
+hyprpicker            # colour picker (wardos-capture color) # unverified
+hyprsunset            # night light (wardos-toggle nightlight) # unverified
+hyprpolkitagent       # polkit prompts on the desktop (pkexec) # unverified
 xdg-desktop-portal-hyprland # screen sharing, screenshots for portals
 xdg-desktop-portal-gtk # file chooser and settings portal
-uwsm                  # Universal Wayland Session Manager: starts Hyprland as a systemd session (COPR solopasha/hyprland) # unverified
+uwsm                  # Universal Wayland Session Manager: starts Hyprland as a systemd session # unverified
 xorg-x11-server-Xwayland # X11 applications
 qt6-qtwayland         # Qt 6 applications on Wayland
 qt5-qtwayland         # Qt 5 applications on Wayland
@@ -42,14 +42,14 @@ waybar                # the trust bar
 fuzzel                # command centre and every menu
 mako                  # notifications and approvals
 libnotify             # notify-send (wardos-notify)
-swayosd               # on-screen volume and brightness (COPR solopasha/hyprland) # unverified
+swayosd               # on-screen volume and brightness # unverified
 
 # --- capture and clipboard ------------------------------------------------------------
 grim                  # screenshot
 slurp                 # region selection
-satty                 # screenshot annotation (COPR solopasha/hyprland)        # unverified
+satty                 # screenshot annotation        # unverified
 wf-recorder           # screen recording
-cliphist              # clipboard history (Super+Ctrl+V) (COPR solopasha/hyprland) # unverified
+cliphist              # clipboard history (Super+Ctrl+V) # unverified
 wl-clipboard          # wl-copy, wl-paste
 swaybg                # solid-colour background (`solid:<hex>` themes)
 
@@ -90,7 +90,7 @@ fd-find               # fd
 bat                   # cat with syntax
 eza                   # ls with icons
 zoxide                # cd that learns
-lazygit               # git TUI (COPR dejan/lazygit)                            # unverified
+lazygit               # git TUI                            # unverified
 git-delta             # diffs
 tmux                  # terminal multiplexer
 pavucontrol           # wardos-setup audio (pulsemixer is not packaged; the command prefers it when present)

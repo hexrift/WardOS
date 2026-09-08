@@ -77,8 +77,9 @@ jobs:
           ./image/check-packages.sh --dry-run
           ./image/install-desktop.sh --help >/dev/null
 
-  # Every name in image/packages.txt must be a package in Fedora 42 (docs/desktop.md
-  # §Packages); dnf answers from a fedora:42 container on the runner's docker.
+  # Every name in image/packages.txt must be a package in the Fedora release the
+  # Containerfile pins (docs/desktop.md §Packages); dnf answers from a fedora:<release>
+  # container on the runner's docker.
   image-packages:
     name: image packages
     runs-on: ubuntu-latest

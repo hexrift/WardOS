@@ -22,7 +22,7 @@ usage() {
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 packages_file=$repo_root/image/packages.txt
-coprs_file=$repo_root/image/coprs.txt
+coprs_file=${WARDOS_COPRS_FILE:-$repo_root/image/coprs.txt}
 flatpaks_file=$repo_root/desktop/flatpaks.txt
 # The file that marks an rpm-ostree/bootc host; overridable for tests.
 ostree_marker=${WARDOS_OSTREE_MARKER:-/run/ostree-booted}
@@ -60,8 +60,9 @@ coprs=()
 if [[ -f "$coprs_file" ]]; then
   mapfile -t coprs < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$coprs_file")
 fi
-# The Fedora release the COPR repository files are for; 42 when not on Fedora (tests).
-fedora_release=42
+# The Fedora release the COPR repository files are for: the host's, or the one the
+# image pins (image/Containerfile FROM tag) when not on Fedora (tests).
+fedora_release=$(sed -n 's|^FROM quay.io/fedora/fedora-bootc:\([0-9][0-9]*\)$|\1|p' "$repo_root/image/Containerfile" | head -n 1)
 if grep -qs '^ID=fedora$' /etc/os-release; then
   fedora_release=$(sed -n 's/^VERSION_ID=//p' /etc/os-release)
 fi
@@ -87,7 +88,7 @@ elif command -v dnf >/dev/null 2>&1; then
   echo "install.sh: installing ${#packages[@]} packages with dnf"
   run sudo dnf install -y "${packages[@]}"
 else
-  echo "install.sh: neither dnf nor rpm-ostree found; the desktop targets Fedora 42 (Workstation, Silverblue, Kinoite)" >&2
+  echo "install.sh: neither dnf nor rpm-ostree found; the desktop targets Fedora ${fedora_release} (Workstation, Silverblue, Kinoite)" >&2
   exit 1
 fi
 

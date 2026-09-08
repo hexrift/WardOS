@@ -3,10 +3,11 @@
 # and `#` comments are ignored. Every COPR here is part of the image's trust set: its
 # packages are built by that COPR's owner, not by Fedora, and its repository file stays
 # in the image so `wardos-install package` can layer from it. Keep the list short and
-# each entry justified; when Fedora packages the thing, remove the entry.
+# each entry justified; when Fedora packages the thing, remove the entry. A COPR must
+# build for the release the Containerfile pins (its fedora-<NN>-x86_64 chroot), which
+# is what the "image packages" job proves.
 #
 # The Containerfile, image/check-packages.sh (CI: "image packages") and
 # desktop/install.sh enable exactly this list, the same way.
-
-solopasha/hyprland   # the Hyprland ecosystem Fedora does not carry: hypridle, hyprlock, hyprpaper, hyprpicker, hyprpolkitagent, hyprsunset, uwsm, satty, cliphist, swayosd
-dejan/lazygit        # lazygit (not in Fedora; atim/lazygit has no Fedora 42 chroot any more)
+#
+# Empty on purpose: Fedora 44 is expected to carry the whole manifest.

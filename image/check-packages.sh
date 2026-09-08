@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Check that every name in image/packages.txt is a package in Fedora 42 plus the COPRs
-# of image/coprs.txt.
+# Check that every name in image/packages.txt is a package in the Fedora release the
+# Containerfile pins (its FROM tag) plus the COPRs of image/coprs.txt.
 #
 #   image/check-packages.sh [--file FILE] [--coprs FILE] [--release N] [--dry-run]
 #
@@ -20,7 +20,9 @@ usage() {
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 file=$repo_root/image/packages.txt
 coprs_file=$repo_root/image/coprs.txt
-release=42
+# The release comes from the Containerfile's FROM line, so the check and the build
+# cannot drift apart; --release overrides for a trial against another one.
+release=$(sed -n 's|^FROM quay.io/fedora/fedora-bootc:\([0-9][0-9]*\)$|\1|p' "$repo_root/image/Containerfile" | head -n 1)
 dry_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,6 +40,14 @@ done
 
 strip() { sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$1"; }
 
+if [[ ! "$release" =~ ^[0-9]+$ ]]; then
+  echo "check-packages.sh: no fedora-bootc:<release> FROM line in image/Containerfile; pass --release" >&2
+  exit 1
+fi
+if [[ ! "$release" =~ ^[0-9]+$ ]]; then
+  echo "check-packages.sh: no fedora-bootc:<release> FROM line in image/Containerfile; pass --release" >&2
+  exit 1
+fi
 if [[ ! -f "$file" ]]; then
   echo "check-packages.sh: manifest not found: $file" >&2
   exit 1

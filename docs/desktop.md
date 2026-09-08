@@ -208,13 +208,13 @@ live in `~/.local/share/wardos/themes/`.
 ## Packages
 
 [`image/packages.txt`](../image/packages.txt) lists every package the desktop needs, one
-per line with a comment naming what it is for, exact Fedora 42 names (`fd-find`,
+per line with a comment naming what it is for, exact Fedora package names (`fd-find`,
 `pipewire-pulseaudio`). What Fedora does not carry (the Hyprland ecosystem beyond the
 compositor, lazygit) comes from the COPRs of [`image/coprs.txt`](../image/coprs.txt),
 part of the image's trust set (`image/README.md`, "COPRs"). The `Containerfile` enables
 the COPRs and installs from the manifest, and `desktop/install.sh` layers the same with
-`dnf` or `rpm-ostree`; CI checks every name exists in Fedora 42 plus those COPRs
-(`image/check-packages.sh`: `dnf repoquery` in a `fedora:42` container, job "image
+`dnf` or `rpm-ostree`; CI checks every name exists in the Fedora release the image pins
+(44; `image/check-packages.sh`: `dnf repoquery` in a `fedora:44` container, job "image
 packages" on every pull request) and builds the whole image with `docker build`
 (`image.yml`, job "image build", on `main` and on pull requests that touch `image/`,
 `desktop/` or the crates). Names the author could not see in Fedora carry

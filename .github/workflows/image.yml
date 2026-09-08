@@ -1,5 +1,5 @@
 # The whole host image, built for real (docs/desktop.md §Packages, ADR-0016): every
-# package of image/packages.txt installed on fedora-bootc:42, the ward binaries compiled
+# package of image/packages.txt installed on the pinned fedora-bootc release, the ward binaries compiled
 # from this checkout, the desktop tree placed, `bootc container lint` at the end. Kept
 # out of verify.yml so the merge authority stays fast: this runs on main and on pull
 # requests that touch what the image is made of.

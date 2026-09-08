@@ -68,9 +68,11 @@ FROM ${WARDOS_SOURCE} AS binaries
 
 # ---------------------------------------------------------------------------------------
 # Stage 2: the bootable host.
-# `42` pins the current Fedora release; a rebase is a deliberate edit of this line
-# (see image/README.md, "Base image tag").
-FROM quay.io/fedora/fedora-bootc:42
+# `44` pins the current Fedora release; a rebase is a deliberate edit of this line
+# (image/README.md "Base image tag"; ADR-0001 addendum 2026-09: 42 went end-of-life
+# and lost its COPR chroots). image/check-packages.sh and desktop/install.sh read the
+# release from this line, so keep the tag a plain number.
+FROM quay.io/fedora/fedora-bootc:44
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG WARDOS_VERSION=dev
@@ -84,7 +86,7 @@ LABEL org.wardos.version="${WARDOS_VERSION}" \
 # Every package, with the reason for each, is in image/packages.txt (docs/desktop.md
 # §Packages), and the COPRs the Hyprland pieces Fedora does not carry come from are in
 # image/coprs.txt (part of the image's trust set, image/README.md "COPRs"); CI checks
-# the names against Fedora 42 plus those COPRs before this line ever runs. `dnf copr`
+# the names against this Fedora release plus those COPRs before this line ever runs. `dnf copr`
 # is a dnf5 plugin, hence dnf5-plugins first; the repository files stay in the image so
 # `wardos-install package` can layer from the same sources.
 # Package versions follow the repositories at build time; the image digest, not

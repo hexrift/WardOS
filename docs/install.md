@@ -95,7 +95,7 @@ on tty1, `uwsm` starts Hyprland, `wardos-first-run` copies the configs and asks 
 theme, and Flathub plus `desktop/flatpaks.txt` arrive in the background. Updates:
 `wardos-update` (`bootc upgrade`; the previous deployment stays, `bootc rollback`).
 
-**On a Fedora you already have** (42: Workstation, Silverblue, Kinoite):
+**On a Fedora you already have** (44, the release the image pins: Workstation, Silverblue, Kinoite):
 
 ```bash
 git clone https://github.com/hexrift/WardOS && cd WardOS
