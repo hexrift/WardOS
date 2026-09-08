@@ -72,7 +72,7 @@ pub use gateway::{GatewayRoute, ScopeDenial};
 pub use http::{Header, Host, Method, ParseError, Parsed, Request, Target};
 pub use observer::{Decision, NullObserver, Observer};
 pub use policy::{Denial, Pinned, Policy};
-pub use proxy::{Config, Handle, Proxy};
+pub use proxy::{Config, Handle, PAUSED_BODY, Proxy};
 pub use resolve::{Resolver, StaticResolver, SystemResolver};
 pub use secret::Secret;
 pub use ward_policy::NetworkCapability;

@@ -67,6 +67,7 @@ window#waybar {
 .working   { color: @accent; }
 .waiting   { color: @restricted; }
 .blocked   { color: @denied; }
+.paused    { color: @denied; }
 .verifying { color: @accent; }
 .finished  { color: @text; }
 .verified  { color: @verified; }

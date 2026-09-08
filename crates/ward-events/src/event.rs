@@ -86,6 +86,9 @@ pub enum AgentState {
     Verifying,
     /// The agent has finished.
     Finished,
+    /// The host paused the session (ADR-0019 §3): every sandbox process is
+    /// frozen; the agent is neither working nor waiting.
+    Paused,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -318,6 +321,26 @@ pub enum SnapshotRole {
     Accepted,
     /// Taken at session end.
     Final,
+}
+
+/// How the host froze a session's processes (`SessionPaused`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PauseMethod {
+    /// `cgroup.freeze = 1` on a delegated cgroup v2 freezer holding the sandbox.
+    CgroupFreezer,
+    /// `SIGSTOP` to every process of the sandbox's tree, children first.
+    Sigstop,
+}
+
+impl PauseMethod {
+    /// The word the observer and the log text use.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CgroupFreezer => "cgroup-freezer",
+            Self::Sigstop => "sigstop",
+        }
+    }
 }
 
 /// How a snapshot was captured.
@@ -771,6 +794,31 @@ pub enum WardEvent {
         /// being sampled (`event-model.md` §5).
         degraded: bool,
     },
+
+    // -- intervention (origin: Wardd; ADR-0019 §3) --
+    /// The host paused the session as one operation: processes frozen, the proxy
+    /// closed to new traffic, credential injection suspended, approvals held.
+    SessionPaused {
+        /// How the processes were frozen.
+        method: PauseMethod,
+        /// Why, in the user's words (`ward pause --reason`), sanitised.
+        reason: ShortText,
+    },
+    /// The host resumed a paused session: everything `SessionPaused` held is released.
+    SessionResumed {
+        /// How long the session was paused.
+        paused_for: Duration,
+    },
+    /// The entry snapshot was materialised over the worktree (`ward stop --restore-entry`).
+    EntryRestored {
+        /// The snapshot written.
+        snapshot: SnapshotId,
+        /// Paths written or removed to match it.
+        files: u64,
+        /// Worktree-relative directory holding what the restore replaced (`.ward/restore-<ts>`),
+        /// empty when nothing differed.
+        backup: ShortText,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -807,11 +855,14 @@ pub enum EventKind {
     StateAccepted = 24,
     AgentClaim = 25,
     Anchor = 26,
+    SessionPaused = 27,
+    SessionResumed = 28,
+    EntryRestored = 29,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 27] = [
+    pub const ALL: [EventKind; 30] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -839,6 +890,9 @@ impl EventKind {
         EventKind::StateAccepted,
         EventKind::AgentClaim,
         EventKind::Anchor,
+        EventKind::SessionPaused,
+        EventKind::SessionResumed,
+        EventKind::EntryRestored,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
@@ -878,6 +932,9 @@ impl EventKind {
             EventKind::StateAccepted => "state_accepted",
             EventKind::AgentClaim => "agent_claim",
             EventKind::Anchor => "anchor",
+            EventKind::SessionPaused => "session_paused",
+            EventKind::SessionResumed => "session_resumed",
+            EventKind::EntryRestored => "entry_restored",
         }
     }
 
@@ -901,6 +958,9 @@ impl EventKind {
                 | EventKind::StateAccepted
                 | EventKind::TamperDetected
                 | EventKind::Anchor
+                | EventKind::SessionPaused
+                | EventKind::SessionResumed
+                | EventKind::EntryRestored
         )
     }
 }
@@ -1040,6 +1100,9 @@ impl WardEvent {
             WardEvent::StateAccepted { .. } => EventKind::StateAccepted,
             WardEvent::AgentClaim { .. } => EventKind::AgentClaim,
             WardEvent::Anchor { .. } => EventKind::Anchor,
+            WardEvent::SessionPaused { .. } => EventKind::SessionPaused,
+            WardEvent::SessionResumed { .. } => EventKind::SessionResumed,
+            WardEvent::EntryRestored { .. } => EventKind::EntryRestored,
         }
     }
 

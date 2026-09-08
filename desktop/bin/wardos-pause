@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# wardos-pause — pause or resume the agent session as one host operation
+# (ADR-0019 §3, docs/desktop.md §Commands, docs/security-model.md G13).
+#
+# Usage:
+#   wardos-pause            running: pause (processes frozen, network closed, credential
+#                           grants suspended, approvals held), then offer the exits;
+#                           already paused: offer the exits
+#   wardos-pause pause      pause and offer the exits
+#   wardos-pause resume     resume, no questions
+#   wardos-pause menu       the exits: Resume / Stop & preserve workspace /
+#                           Stop & restore entry state / Inspect activity
+#   wardos-pause --status   print paused, running or none (for the bar)
+#   wardos-pause --help
+#
+# The session is WARDOS_PROJECT's (default: the current directory). Everything goes
+# through `ward pause`, `ward resume`, `ward stop [--restore-entry]` and `ward watch`;
+# the menu is wardos-menu-select (WARDOS_MENU_BACKEND=fuzzel|stdin). A cancelled menu
+# changes nothing: a paused session stays paused until you say otherwise.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+project=${WARDOS_PROJECT:-$PWD}
+
+# paused, running or none: the daemon's marker, read by `ward pause --status`.
+status() { ward pause --status "$project" 2>/dev/null || echo none; }
+
+# The one notification of a pause (ADR-0019 §3), critical so it stays until read.
+do_pause() {
+  ward pause "$project"
+  wardos_notify "AGENTS PAUSED" \
+    "network closed · credential grants suspended · processes frozen · workspace retained" \
+    -u critical
+}
+
+do_resume() {
+  ward resume "$project"
+  wardos_notify "Agents resumed" "" -t 2000
+}
+
+# The exits of a pause. Cancelling is an answer too: everything stays held.
+menu() {
+  local choice
+  choice=$(wardos_menu "Paused" "Resume" "Stop & preserve workspace" \
+    "Stop & restore entry state" "Inspect activity") || return 0
+  case "$choice" in
+    Resume) do_resume ;;
+    "Stop & preserve workspace")
+      ward stop "$project"
+      wardos_notify "Session stopped" "workspace kept as it is" -t 3000
+      ;;
+    "Stop & restore entry state")
+      ward stop --restore-entry "$project"
+      wardos_notify "Session stopped" "entry state restored · what it replaced is in .ward/restore-*" -t 4000
+      ;;
+    "Inspect activity") wardos_terminal_exec ward-observer ward watch "$project" ;;
+  esac
+}
+
+case "${1:-}" in
+  --status) status ;;
+  pause)
+    do_pause
+    menu
+    ;;
+  resume) do_resume ;;
+  menu) menu ;;
+  "")
+    case "$(status)" in
+      running)
+        do_pause
+        menu
+        ;;
+      paused) menu ;;
+      *) wardos_die "no agent session for $project (ward up)" ;;
+    esac
+    ;;
+  *) wardos_die "pause, resume, menu or --status? (--help)" ;;
+esac

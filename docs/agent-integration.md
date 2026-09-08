@@ -155,6 +155,11 @@ agent ◄── {decision: allow|deny, reason} ◄── Response::Decision ◄�
    it and nothing to show it. `ward-agent hook` waits up to five minutes for the
    decision, which is what makes a held approval possible: its old five-second read
    timeout would have printed nothing and let the agent's default flow decide.
+5. A paused session (ADR-0019 §3, `ward pause`) holds the hold in turn: a question
+   that is open stays open with its timeout stopped, `Request::Approve` is refused
+   with `paused by ward` until `ward resume`, and a `Hold` that arrives while paused
+   waits like the rest. Nothing is denied by the pause itself; the clock simply does
+   not run.
 
 The approval record separates the agent's claim from Ward's authority (ADR-0019,
 decision 2). What the daemon holds, lists and prints:

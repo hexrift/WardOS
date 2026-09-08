@@ -30,6 +30,7 @@ use crate::gateway::Gateway;
 use crate::github;
 use crate::hooks::{DaemonHolder, Holder, Hooks};
 use crate::ids::{ev_capture, ev_hash, ev_role, ev_snapshot, new_session_id, project_id_for};
+use crate::pause;
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
 use crate::verify;
 use crate::watch::{CaptureMode, Captured, Watcher};
@@ -141,6 +142,18 @@ pub struct RunReport {
     pub stdout: String,
     /// Captured stderr.
     pub stderr: String,
+}
+
+/// What `ward stop --restore-entry` reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreReport {
+    /// The entry snapshot written over the worktree.
+    pub snapshot: String,
+    /// Paths written, removed or moved aside to match it.
+    pub files: usize,
+    /// Worktree-relative directory holding what the restore replaced, when
+    /// anything differed.
+    pub backup: Option<String>,
 }
 
 /// What `ward verify` reports.
@@ -559,8 +572,18 @@ impl Session {
         ))
     }
 
+    /// Whether the session is paused by the host (ADR-0019 §3): its daemon has
+    /// written the marker the proxies refuse on.
+    #[must_use]
+    pub fn paused(&self) -> bool {
+        pause::marker_path(&self.state, &self.session_str).exists()
+    }
+
     /// Run a command with explicit options; every run gets the session egress proxy.
+    /// Refused while the session is paused: a sandbox started then would run
+    /// unfrozen behind a closed proxy, which is neither state the user chose.
     pub fn launch(&mut self, argv: &[String], opts: &LaunchOpts) -> Result<RunReport> {
+        self.refuse_while_paused()?;
         self.emit(
             Origin::Wardd,
             WardEvent::AgentStateChanged {
@@ -599,11 +622,12 @@ impl Session {
             self.emit(Origin::Wardd, g.granted(GATEWAY_TTL)?)?;
         }
         let run_dir = run_dir(&self.session_str)?;
-        let egress = Egress::start(
+        let mut egress = Egress::start(
             &run_dir,
             &self.manifest.network,
             opts.gateways.iter().map(|g| g.route.clone()).collect(),
         )?;
+        egress.watch_marker(pause::marker_path(&self.state, &self.session_str));
         let hooks = Hooks::start_with(
             &run_dir,
             self.manifest.observer,
@@ -787,6 +811,90 @@ impl Session {
         })
     }
 
+    fn refuse_while_paused(&self) -> Result<()> {
+        if self.paused() {
+            return Err(Error::Sandbox(
+                "session is paused by ward; `ward resume` before running anything".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Materialise the entry snapshot over the worktree (`ward stop
+    /// --restore-entry`, ADR-0019 §3): every path that differs from the entry
+    /// is moved to `.ward/restore-<unix seconds>/` first, then the entry's
+    /// files, directories and symlinks are written and paths the entry does
+    /// not hold are gone. Paths the capture ignores (`.gitignore`) are not
+    /// looked at. Records `EntryRestored`.
+    pub fn restore_entry(&mut self) -> Result<RestoreReport> {
+        let store = SnapshotStore::open(self.state.join("cas"))
+            .map_err(|e| Error::Snapshot(e.to_string()))?;
+        let entry: ward_snapshot::SnapshotId = self
+            .entry_snapshot
+            .parse()
+            .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
+        let now = store
+            .store_snapshot(
+                &self.worktree,
+                SnapshotRole::Candidate,
+                CaptureOptions::default(),
+            )
+            .map_err(|e| Error::Snapshot(e.to_string()))?;
+        let mut diff = store
+            .diff(entry, now)
+            .map_err(|e| Error::Snapshot(e.to_string()))?;
+        let manifest = store
+            .manifest(entry)
+            .map_err(|e| Error::Snapshot(e.to_string()))?;
+        // An earlier restore's backup is not the agent's work: leave it where
+        // it is rather than nesting it in this one.
+        diff.added
+            .retain(|rel| !rel.starts_with(b".ward/restore-") && rel != b".ward");
+        let files = diff.added.len() + diff.removed.len() + diff.changed.len();
+        let backup_rel = format!(".ward/restore-{}", unix_ms(SystemTime::now()) / 1000);
+        let backup = self.worktree.join(&backup_rel);
+        // Move aside what the restore replaces (a moved parent takes its
+        // children with it; those then are simply not found).
+        for rel in diff.changed.iter().chain(&diff.added) {
+            let rel = restore_path(rel)?;
+            let from = self.worktree.join(&rel);
+            let to = backup.join(&rel);
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+            }
+            match std::fs::rename(&from, &to) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::io(&from, e)),
+            }
+        }
+        // Write the entry's own bytes for what changed or is missing.
+        for rel in diff.changed.iter().chain(&diff.removed) {
+            if let Some(item) = manifest.get(rel) {
+                let path = self.worktree.join(restore_path(rel)?);
+                write_entry_item(&store, entry, item, &path)?;
+            }
+        }
+        let backup_text = if files == 0 {
+            String::new()
+        } else {
+            backup_rel.clone()
+        };
+        self.emit(
+            Origin::Wardd,
+            WardEvent::EntryRestored {
+                snapshot: ev_snapshot(entry),
+                files: files as u64,
+                backup: ShortText::new(&backup_text),
+            },
+        )?;
+        Ok(RestoreReport {
+            snapshot: entry.to_string(),
+            files,
+            backup: (files > 0).then_some(backup_rel),
+        })
+    }
+
     /// End the session, seal the log, and clear the project's current pointer.
     ///
     /// The `SessionEnded` record and the seal are one [`Sink::stop`]: a running
@@ -867,6 +975,63 @@ impl Session {
     fn emit_at(&mut self, at: SystemTime, origin: Origin, event: WardEvent) -> Result<()> {
         self.sink.append(origin, event, at).map(drop)
     }
+}
+
+/// A snapshot path as a worktree-relative path, refusing anything that could
+/// leave the worktree (the CAS is trusted, the check costs nothing).
+fn restore_path(rel: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let rel = Path::new(std::ffi::OsStr::from_bytes(rel));
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(Error::Snapshot(format!(
+            "refusing snapshot path {}",
+            rel.display()
+        )));
+    }
+    Ok(rel.to_path_buf())
+}
+
+/// Write one entry of snapshot `id` at `path`: a directory, a file with its
+/// mode, or a symlink with the stored target; nodes the capture does not carry
+/// (devices, sockets) are skipped.
+fn write_entry_item(
+    store: &SnapshotStore,
+    id: ward_snapshot::SnapshotId,
+    item: &ward_snapshot::Entry,
+    path: &Path,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use ward_snapshot::EntryType;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    }
+    let content = || {
+        store
+            .cat(id, Path::new(std::ffi::OsStr::from_bytes(&item.path)))
+            .map_err(|e| Error::Snapshot(e.to_string()))
+    };
+    match item.kind {
+        EntryType::Dir | EntryType::SubmoduleWorktree => {
+            std::fs::create_dir_all(path).map_err(|e| Error::io(path, e))?;
+        }
+        EntryType::File => {
+            std::fs::write(path, content()?).map_err(|e| Error::io(path, e))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(item.mode))
+                .map_err(|e| Error::io(path, e))?;
+        }
+        EntryType::Symlink => {
+            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&content()?), path)
+                .map_err(|e| Error::io(path, e))?;
+        }
+        EntryType::Unsupported => {}
+    }
+    Ok(())
 }
 
 fn comm(argv: &[String]) -> Option<BoundedText<32>> {

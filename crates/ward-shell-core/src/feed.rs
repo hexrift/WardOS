@@ -116,7 +116,8 @@ pub enum TamperWard {
 /// The session state the trust bar shows, as the records so far describe it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionState {
-    /// The agent's last reported coarse state, once it has reported one.
+    /// The agent's last reported coarse state, once it has reported one; `Paused`
+    /// while the host holds the session (ADR-0019 §3).
     pub agent: Option<AgentState>,
     /// The verification phase.
     pub verification: Verification,
@@ -124,6 +125,8 @@ pub struct SessionState {
     pub tamperward: TamperWard,
     /// `restore …` steps of the verification in progress, for its verdict.
     restored: u32,
+    /// What the agent said last before the host paused it, restored on resume.
+    before_pause: Option<AgentState>,
 }
 
 impl SessionState {
@@ -131,6 +134,14 @@ impl SessionState {
     pub fn apply(&mut self, rec: &EventRecord) {
         match &rec.event {
             WardEvent::AgentStateChanged { state } => self.agent = Some(*state),
+            WardEvent::SessionPaused { .. } => {
+                self.before_pause = self.agent;
+                self.agent = Some(AgentState::Paused);
+            }
+            WardEvent::SessionResumed { .. } => {
+                self.agent = self.before_pause;
+                self.before_pause = None;
+            }
             WardEvent::VerificationRequested { candidate, .. }
             | WardEvent::VerificationStarted { candidate, .. } => {
                 self.verification = Verification::Running(*candidate);
@@ -401,6 +412,19 @@ pub(crate) mod fixtures {
 
     pub fn agent(state: AgentState) -> WardEvent {
         WardEvent::AgentStateChanged { state }
+    }
+
+    pub fn paused() -> WardEvent {
+        WardEvent::SessionPaused {
+            method: ward_events::PauseMethod::Sigstop,
+            reason: ward_events::ShortText::new("looks wrong"),
+        }
+    }
+
+    pub fn resumed() -> WardEvent {
+        WardEvent::SessionResumed {
+            paused_for: Duration::from_secs(12),
+        }
     }
 
     pub fn snapshot() -> SnapshotId {

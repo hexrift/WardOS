@@ -10,13 +10,15 @@
 //! with the question open.
 //!
 //! [`Approvals`] is the hold itself: the pending set, the answers, the
-//! `allow-session` memory, the credentials the launch granted, and the wait. It
-//! knows nothing about sockets or the log; the daemon appends the
-//! `CapabilityRequested` / `CapabilityDecided` records around it
-//! ([`requested_event`], [`decided_event`]), which is how the log, a subscriber
-//! and `ward replay` see the same question and the same answer. An approval's
-//! id is the sequence number of its request record, so the stream carries the
-//! id by construction.
+//! `allow-session` memory, the credentials the launch granted, and the wait.
+//! While the session is paused (ADR-0019 §3, [`Approvals::set_paused`]) the
+//! hold is held in turn: no timeout runs, no answer is taken, and a question
+//! that arrives waits like the rest. It knows nothing about sockets or the
+//! log; the daemon appends the `CapabilityRequested` / `CapabilityDecided`
+//! records around it ([`requested_event`], [`decided_event`]), which is how
+//! the log, a subscriber and `ward replay` see the same question and the same
+//! answer. An approval's id is the sequence number of its request record, so
+//! the stream carries the id by construction.
 //!
 //! An approval separates the agent's claim from Ward's authority (ADR-0019,
 //! decision 2). [`Approval::claim`] is what the agent asked for, verbatim;
@@ -685,6 +687,8 @@ struct State {
     /// The credentials the launches granted, one per service and scope.
     credentials: Vec<Credential>,
     closed: bool,
+    /// The session is paused: timeouts stand still and answers are refused.
+    paused: bool,
 }
 
 /// The daemon's hold: what is pending, what was answered, what is remembered,
@@ -761,7 +765,16 @@ impl Approvals {
             })
             .chain(state.remembered.values().cloned())
             .collect();
-        grants.sort_by_key(|g| g.granted_at_unix_ms);
+        // Order by when the grant was made; on a tie (the same millisecond, common
+        // in tests and fast paths) an allow-session answer comes before an injected
+        // credential, the order in which the two actually happen.
+        grants.sort_by_key(|g| {
+            let kind_rank = match g.kind {
+                GrantKind::Approval => 0,
+                GrantKind::Credential => 1,
+            };
+            (g.granted_at_unix_ms, kind_rank)
+        });
         grants
     }
 
@@ -781,9 +794,11 @@ impl Approvals {
     }
 
     /// Wait up to `timeout` for the answer to `id`, then forget the question.
-    /// The answer stays remembered when it was `allow-session`.
+    /// The answer stays remembered when it was `allow-session`. Time spent
+    /// paused does not count against the timeout.
     pub fn wait(&self, id: u64, timeout: Duration) -> Outcome {
-        let deadline = Instant::now() + timeout;
+        let mut remaining = timeout;
+        let mut last = Instant::now();
         let mut state = self.lock();
         loop {
             let Some(index) = state.held.iter().position(|h| h.approval.id == id) else {
@@ -803,14 +818,25 @@ impl Approvals {
                 state.held.remove(index);
                 return Outcome::Closed;
             }
+            if state.paused {
+                // Held in turn: wake on any change, and count none of this time.
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+                last = Instant::now();
+                continue;
+            }
             let now = Instant::now();
-            if now >= deadline {
+            remaining = remaining.saturating_sub(now - last);
+            last = now;
+            if remaining.is_zero() {
                 state.held.remove(index);
                 return Outcome::TimedOut;
             }
             state = self
                 .changed
-                .wait_timeout(state, deadline - now)
+                .wait_timeout(state, remaining)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
@@ -820,6 +846,11 @@ impl Approvals {
     /// a second answer to the same open question is too.
     pub fn answer(&self, id: u64, decision: ApprovalDecision) -> Result<()> {
         let mut state = self.lock();
+        if state.paused {
+            return Err(Error::Daemon(format!(
+                "approval {id}: paused by ward; resume the session to answer"
+            )));
+        }
         let held = state
             .held
             .iter_mut()
@@ -850,6 +881,20 @@ impl Approvals {
     pub fn close(&self) {
         self.lock().closed = true;
         self.changed.notify_all();
+    }
+
+    /// Pause or resume the hold (ADR-0019 §3): paused, pending questions stay
+    /// pending with their timeouts stopped, answers are refused, and new
+    /// questions wait like the rest.
+    pub fn set_paused(&self, paused: bool) {
+        self.lock().paused = paused;
+        self.changed.notify_all();
+    }
+
+    /// Whether the hold is paused.
+    #[must_use]
+    pub fn paused(&self) -> bool {
+        self.lock().paused
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -1263,6 +1308,44 @@ mod tests {
         assert!(approvals.pending().is_empty());
         let err = approvals.register(approval(2)).unwrap_err();
         assert_eq!(err.to_string(), "daemon: approval: session ended");
+    }
+
+    #[test]
+    fn a_paused_hold_stops_the_clock_refuses_answers_and_keeps_questions() {
+        let approvals = Arc::new(Approvals::new());
+        approvals.register(approval(1)).unwrap();
+        approvals.set_paused(true);
+        assert!(approvals.paused());
+        let waiter = {
+            let approvals = Arc::clone(&approvals);
+            std::thread::spawn(move || approvals.wait(1, Duration::from_millis(80)))
+        };
+        // Well past the timeout, the question is still pending: paused time
+        // does not count.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!waiter.is_finished());
+        assert_eq!(approvals.pending(), [approval(1)]);
+        let err = approvals.answer(1, ApprovalDecision::Allow).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "daemon: approval 1: paused by ward; resume the session to answer"
+        );
+        // A question that arrives while paused waits like the rest.
+        approvals.register(approval(2)).unwrap();
+        assert_eq!(approvals.pending().len(), 2);
+        approvals.set_paused(false);
+        approvals.answer(1, ApprovalDecision::Allow).unwrap();
+        assert_eq!(
+            waiter.join().unwrap(),
+            Outcome::Answered(ApprovalDecision::Allow)
+        );
+        // Resumed, the clock runs again from where it stood.
+        let started = Instant::now();
+        assert_eq!(
+            approvals.wait(2, Duration::from_millis(50)),
+            Outcome::TimedOut
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 
     #[test]

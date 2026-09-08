@@ -1010,3 +1010,246 @@ fn st019_hostile_verify_command_is_contained_and_disposable() {
     );
     session.stop(EndReason::UserStop).expect("stop");
 }
+
+/// ADR-0019 §3 end to end: a command running in the sandbox is paused through
+/// the daemon, every process of its tree is frozen, the proxy answers `503
+/// paused by ward` where it answered policy before, nothing new can be
+/// launched, and resume lets the command finish with its exit code. The log
+/// carries the pause and the resume before the command's end.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn pause_freezes_the_sandbox_closes_the_proxy_and_resume_lets_it_finish() {
+    if !sandbox::available() {
+        eprintln!("skipping: bubblewrap not available");
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let up = Session::start_in(project.path(), state.path()).expect("up");
+    let session_id = up.id().to_owned();
+    let log = up.log_path();
+    up.persist_current().expect("persist");
+    drop(up);
+    let (state_path, id) = (state.path().to_path_buf(), session_id.clone());
+    let served = std::thread::spawn(move || daemon::serve(&state_path, &id));
+    assert!(daemon::wait_until(daemon::STARTUP_TIMEOUT, || {
+        daemon::serving(state.path(), &session_id)
+    }));
+    let socket = daemon::socket_path(state.path(), &session_id);
+
+    // A command that runs for a few seconds, marked so its processes can be
+    // found from outside (the marker is in the command line of bwrap and of
+    // the shell it runs).
+    let marker = format!("ward-pause-e2e-{}", std::process::id());
+    let script =
+        format!("i=0; while [ $i -lt 30 ]; do sleep 0.1; i=$((i+1)); done; echo done # {marker}");
+    let runner = {
+        let (p, s) = (project.path().to_path_buf(), state.path().to_path_buf());
+        std::thread::spawn(move || {
+            let mut run = Session::open_current(&p, &s).unwrap().unwrap();
+            let report = run
+                .run(&["/bin/sh".into(), "-c".into(), script])
+                .expect("run");
+            run.sync().expect("sync");
+            report
+        })
+    };
+    let tagged = || -> Vec<u32> {
+        let mut pids = Vec::new();
+        for entry in fs::read_dir("/proc").unwrap().flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+            if String::from_utf8_lossy(&cmdline).contains(&marker) {
+                pids.push(pid);
+            }
+        }
+        pids
+    };
+    let comm = |pid: u32| {
+        fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    let state_of = |pid: u32| -> Option<char> {
+        fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()?
+            .lines()
+            .find_map(|l| l.strip_prefix("State:\t").and_then(|s| s.chars().next()))
+    };
+    let frozen_in_cgroup = |pid: u32| -> bool {
+        fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix("0::").map(str::to_owned))
+            })
+            .and_then(|rel| fs::read_to_string(format!("/sys/fs/cgroup{rel}/cgroup.events")).ok())
+            .is_some_and(|events| events.lines().any(|l| l == "frozen 1"))
+    };
+    assert!(
+        daemon::wait_until(std::time::Duration::from_secs(5), || tagged()
+            .iter()
+            .any(|p| comm(*p) == "sh")),
+        "the shell runs inside the sandbox"
+    );
+
+    // Before: the proxy answers policy (a private address is 403 under localhost_only).
+    let proxy_sock = ward_daemon::session::run_dir_path(&session_id).join("proxy.sock");
+    let probe = || -> String {
+        let mut s = UnixStream::connect(&proxy_sock).expect("proxy socket");
+        s.write_all(b"CONNECT 10.0.0.1:80 HTTP/1.1\r\nHost: 10.0.0.1:80\r\n\r\n")
+            .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    };
+    assert!(probe().starts_with("HTTP/1.1 403 "), "{}", probe());
+
+    // Pause: one request, one record.
+    let mut control = RemoteSink::connect(&socket).expect("control");
+    let paused = ward_daemon::client::pause(&mut control, "e2e: looks wrong").expect("pause");
+    let method = match &paused.event {
+        WardEvent::SessionPaused { method, reason } => {
+            assert_eq!(reason.as_str(), "e2e: looks wrong");
+            *method
+        }
+        other => panic!("{other:?}"),
+    };
+    let pids = tagged();
+    assert!(pids.len() >= 2, "bwrap and the shell: {pids:?}");
+    let frozen = |pid: u32| match method {
+        ward_events::PauseMethod::Sigstop => state_of(pid) == Some('T'),
+        ward_events::PauseMethod::CgroupFreezer => frozen_in_cgroup(pid),
+    };
+    assert!(
+        daemon::wait_until(std::time::Duration::from_secs(2), || pids
+            .iter()
+            .all(|p| frozen(*p))),
+        "every process of the tree is frozen ({method:?}): {:?}",
+        pids.iter()
+            .map(|p| (comm(*p), state_of(*p)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        daemon::wait_until(std::time::Duration::from_secs(2), || probe()
+            .starts_with("HTTP/1.1 503 ")),
+        "{}",
+        probe()
+    );
+    assert!(probe().ends_with("paused by ward\n"), "{}", probe());
+    // Nothing new starts while paused.
+    let mut other = Session::open_current(project.path(), state.path())
+        .unwrap()
+        .unwrap();
+    assert!(other.paused());
+    let refused = other.run(&["/bin/true".into()]).err().expect("refused");
+    assert!(refused.to_string().contains("paused by ward"), "{refused}");
+    drop(other);
+    // Still frozen after a while: the command makes no progress.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(pids.iter().all(|p| frozen(*p)));
+    assert!(!runner.is_finished());
+
+    // Resume: the proxy answers policy again and the command finishes.
+    let resumed = ward_daemon::client::resume(&mut control).expect("resume");
+    assert!(matches!(
+        resumed.event,
+        WardEvent::SessionResumed { paused_for } if paused_for >= std::time::Duration::from_millis(400)
+    ));
+    assert!(daemon::wait_until(
+        std::time::Duration::from_secs(2),
+        || probe().starts_with("HTTP/1.1 403 ")
+    ));
+    let report = runner.join().unwrap();
+    assert_eq!(report.code, Some(0), "{}", report.stderr);
+    assert!(report.stdout.contains("done"), "{}", report.stdout);
+
+    let stop = Session::open_current(project.path(), state.path())
+        .unwrap()
+        .unwrap();
+    stop.stop(EndReason::UserStop).expect("stop");
+    served.join().unwrap().expect("serve returns Ok");
+    let kinds: Vec<String> = LogReader::open(&log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|r| format!("{:?}", r.event.kind()))
+        .collect();
+    let at = |k: &str| {
+        kinds
+            .iter()
+            .position(|x| x == k)
+            .unwrap_or_else(|| panic!("{k} in {kinds:?}"))
+    };
+    assert!(at("CommandStarted") < at("SessionPaused"));
+    assert!(at("SessionPaused") < at("SessionResumed"));
+    assert!(at("SessionResumed") < at("CommandFinished"));
+}
+
+/// `ward stop --restore-entry` (ADR-0019 §3): the entry snapshot is written
+/// over the worktree, what it replaces is kept under `.ward/restore-<ts>/`,
+/// and the log records it. A second restore finds nothing to do and leaves the
+/// first backup alone.
+#[test]
+fn restore_entry_materialises_the_snapshot_and_keeps_what_it_replaced() {
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let w = project.path();
+    let mut session = Session::start_in(w, state.path()).expect("start");
+    let log = session.log_path();
+
+    // The agent's work: an edit, a new file in a new directory, a deletion.
+    fs::write(w.join("README.md"), "edited\n").unwrap();
+    fs::create_dir(w.join("src")).unwrap();
+    fs::write(w.join("src/lib.rs"), "fn main() {}\n").unwrap();
+    fs::remove_file(w.join(".ward/policy.yaml")).unwrap();
+
+    let report = session.restore_entry().expect("restore");
+    assert_eq!(report.snapshot, session.entry_snapshot());
+    assert!(report.files >= 3, "{report:?}");
+    let backup = w.join(report.backup.as_deref().expect("a backup"));
+    assert!(backup.starts_with(w.join(".ward")));
+    assert_eq!(fs::read_to_string(w.join("README.md")).unwrap(), "demo\n");
+    assert!(
+        fs::read_to_string(w.join(".ward/policy.yaml"))
+            .unwrap()
+            .contains("localhost_only"),
+        "the deleted file is back from the entry"
+    );
+    assert!(!w.join("src").exists(), "what the entry lacks is gone");
+    assert_eq!(
+        fs::read_to_string(backup.join("README.md")).unwrap(),
+        "edited\n"
+    );
+    assert_eq!(
+        fs::read_to_string(backup.join("src/lib.rs")).unwrap(),
+        "fn main() {}\n"
+    );
+
+    // Nothing differs now; the backup is not the agent's work and stays.
+    let again = session.restore_entry().expect("restore again");
+    assert_eq!(again.files, 0);
+    assert_eq!(again.backup, None);
+    assert!(backup.join("README.md").exists());
+
+    session.stop(EndReason::UserStop).expect("stop");
+    let restored: Vec<(u64, String)> = LogReader::open(&log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|r| match r.event {
+            WardEvent::EntryRestored { files, backup, .. } => {
+                Some((files, backup.as_str().to_owned()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(restored.len(), 2);
+    assert!(restored[0].0 >= 3 && restored[0].1.starts_with(".ward/restore-"));
+    assert_eq!(restored[1], (0, String::new()));
+}

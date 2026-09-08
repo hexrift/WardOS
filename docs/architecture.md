@@ -161,13 +161,32 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > **Implemented (Phase 3, ADR-0015).** `wardd serve --state <STATE> --session <ID>` is a
 > per-session process that owns the session's hash chain and log writer and serves the
 > control socket `<state>/sessions/<ID>/control.sock` (mode 0600, JSON lines:
-> `append`, `evidence`, `sync`, `seal`, `stop`, `describe`, `subscribe`, `ping`).
+> `append`, `evidence`, `sync`, `seal`, `stop`, `describe`, `subscribe`, `ping`, `hold`,
+> `approve`, `pending`, `pause`, `resume`).
 > `ward up` spawns it detached and `ward stop` sends `stop`; every other command adopts
 > the socket when a `ping` is answered and writes the log in-process otherwise. The
 > daemon runs as the session owner, not yet as a `ward` system user with the capability
 > set above; sandboxes, proxies and hook listeners still run in the `ward` process
 > (ADR-0013). `subscribe` is the live event stream of `event-model.md` §6 and
 > `evidence` the TamperWard evidence writer of `tamperward-integration.md` §2.
+
+> **Implemented (ADR-0019 §3): pause as a host primitive.** `pause` and `resume` on the
+> control socket are one operation each, applied under the daemon's mutex. Because the
+> sandboxes and proxies live in the `ward` processes that launched them, the daemon
+> reaches them from outside: it finds every `bwrap` of the session through `/proc` (its
+> command line binds the session's run directory) and freezes the whole tree, with a
+> cgroup v2 freezer when it can create a delegated cgroup next to its own and with
+> `SIGSTOP`, children first, otherwise; it then writes `sessions/<id>/paused`, which
+> every proxy of the session polls and refuses on (`503 paused by ward`, no credential
+> injected, established relays hold their bytes); it holds the approvals (timeouts stop,
+> answers are refused, new questions wait); and it appends `SessionPaused { method,
+> reason }`. `resume` reverses the order and appends `SessionResumed`. A launch while
+> paused is refused, a `stop` from paused ends the frozen tree and keeps the worktree,
+> and `ward stop --restore-entry` first writes the entry snapshot over the worktree,
+> keeping what it replaced under `.ward/restore-<ts>/` (`EntryRestored`). The desktop's
+> `wardos-pause` (`Super + Shift + P`) is that request plus the exits menu; the bar's
+> agent segment reads `PAUSED` in the denied tone while the marker stands. The
+> security model's G13 states what a pause holds and what it cannot recall.
 
 ### 3.2 `ward` CLI
 

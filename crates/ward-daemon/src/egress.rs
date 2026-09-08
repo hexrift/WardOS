@@ -1,9 +1,16 @@
 //! Session egress: the proxy on a Unix socket that is the sandbox's only way out
 //! (ADR-0014), plus a recorder that turns its decisions into log events.
+//!
+//! The proxy lives in the `ward` process that launched the sandbox, not in the
+//! daemon, so a pause (ADR-0019 §3) reaches it through a file: the egress
+//! watches the session's pause marker ([`Egress::watch_marker`]) and flips the
+//! proxy's paused flag as the marker comes and goes.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime};
 
 use ward_events::{DeniedDst, DenyReason, HostName, ProcessRef, RuleRef, WardEvent};
 use ward_policy::NetworkCapability;
@@ -57,11 +64,16 @@ impl Observer for Recorder {
     }
 }
 
+/// How often the marker is looked at. The sandbox is frozen before the marker
+/// is written, so this lag is not a window anything inside can use.
+const MARKER_POLL: Duration = Duration::from_millis(50);
+
 /// A running session proxy bound to a Unix socket.
 pub struct Egress {
-    handle: Handle,
+    handle: Arc<Handle>,
     socket: PathBuf,
     recorder: Arc<Recorder>,
+    watcher: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
 }
 
 impl Egress {
@@ -95,10 +107,37 @@ impl Egress {
         let handle = Proxy::spawn(config, observer)
             .map_err(|e| Error::Sandbox(format!("egress proxy: {e}")))?;
         Ok(Self {
-            handle,
+            handle: Arc::new(handle),
             socket,
             recorder,
+            watcher: None,
         })
+    }
+
+    /// Pause the proxy while `marker` exists and resume it when it is gone,
+    /// checked every [`MARKER_POLL`] until the egress stops. A marker already
+    /// there starts the proxy paused.
+    pub fn watch_marker(&mut self, marker: PathBuf) {
+        let handle = Arc::clone(&self.handle);
+        handle.set_paused(marker.exists());
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while !flag.load(Ordering::Acquire) {
+                std::thread::sleep(MARKER_POLL);
+                let paused = marker.exists();
+                if paused != handle.paused() {
+                    handle.set_paused(paused);
+                }
+            }
+        });
+        self.watcher = Some((stop, thread));
+    }
+
+    /// Whether the proxy is refusing traffic as paused.
+    #[must_use]
+    pub fn paused(&self) -> bool {
+        self.handle.paused()
     }
 
     /// Host path of the socket to bind into the sandbox.
@@ -125,6 +164,10 @@ impl Egress {
 
     /// Stop the proxy and remove the socket.
     pub fn stop(self) {
+        if let Some((stop, thread)) = self.watcher {
+            stop.store(true, Ordering::Release);
+            let _ = thread.join();
+        }
         self.handle.shutdown();
     }
 }
@@ -220,6 +263,25 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// The marker file drives the proxy's paused flag both ways.
+    #[test]
+    fn the_marker_pauses_and_resumes_the_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("paused");
+        let mut egress =
+            Egress::start(dir.path(), &NetworkCapability::Offline, Vec::new()).unwrap();
+        egress.watch_marker(marker.clone());
+        assert!(!egress.paused());
+        std::fs::write(&marker, "why\n").unwrap();
+        assert!(crate::daemon::wait_until(Duration::from_secs(2), || egress.paused()));
+        std::fs::remove_file(&marker).unwrap();
+        assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
+            !egress.paused()
+        }));
+        egress.stop();
+        assert!(!dir.path().join("proxy.sock").exists());
     }
 
     #[test]

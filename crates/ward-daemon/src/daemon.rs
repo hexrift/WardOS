@@ -14,6 +14,12 @@
 //! stops accepting, finishes in-flight responses, unlinks the socket and the pid
 //! file, and returns; the binary exits 0.
 //!
+//! [`Request::Pause`] and [`Request::Resume`] are the host's intervention
+//! (ADR-0019 §3, [`crate::pause`]): one operation under the mutex that freezes
+//! the sandboxes, writes the marker the proxies refuse on, holds the approvals
+//! and appends the record; a `Stop` from paused kills the frozen tree first, so
+//! nothing is left stopped forever, and the workspace is kept as it is.
+//!
 //! `ward up` starts the daemon with [`spawn`] and `ward status` asks [`serving`];
 //! every other command adopts the socket through
 //! [`Session::open_current`](crate::session::Session::open_current).
@@ -30,12 +36,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ward_events::{EventRecord, LogReader, Origin, WardEvent};
+use ward_events::{EventRecord, LogReader, Origin, ShortText, WardEvent};
 
 use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
 use crate::error::{Error, Result};
 use crate::github;
+use crate::pause::{self, Frozen};
 use crate::session::{SessionMeta, protected_paths, session_dir};
 
 /// File name of the daemon's pid file inside `sessions/<id>/`.
@@ -123,7 +130,14 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
     std::fs::write(&pid_file, format!("{}\n", std::process::id()))
         .map_err(|e| Error::io(&pid_file, e))?;
 
-    let served = Arc::new(Mutex::new(Served::new(log, log_path, description, deriver)));
+    let served = Arc::new(Mutex::new(Served::new(
+        log,
+        log_path,
+        description,
+        deriver,
+        state.to_path_buf(),
+        session.to_owned(),
+    )));
     let finished = Arc::new(AtomicBool::new(false));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
     let mut next_peer: u64 = 0;
@@ -308,9 +322,15 @@ struct Subscription {
     live: Option<(Receiver<Delivery>, Sender<Delivery>)>,
 }
 
+/// A pause in force: what was frozen and since when.
+struct Paused {
+    frozen: Frozen,
+    since: Instant,
+}
+
 /// The daemon's shared state: the log, the session facts, the subscribers, the
-/// open connections, the approvals it holds and what it derives their
-/// authority from.
+/// open connections, the approvals it holds, what it derives their authority
+/// from, and the pause in force.
 struct Served {
     log: Option<LocalLog>,
     log_path: PathBuf,
@@ -319,6 +339,9 @@ struct Served {
     peers: Vec<(u64, UnixStream)>,
     approvals: Arc<Approvals>,
     deriver: Deriver,
+    state: PathBuf,
+    session: String,
+    paused: Option<Paused>,
 }
 
 impl Served {
@@ -327,6 +350,8 @@ impl Served {
         log_path: PathBuf,
         description: serde_json::Value,
         deriver: Deriver,
+        state: PathBuf,
+        session: String,
     ) -> Self {
         Self {
             log: Some(log),
@@ -336,6 +361,9 @@ impl Served {
             peers: Vec::new(),
             approvals: Arc::new(Approvals::new()),
             deriver,
+            state,
+            session,
+            paused: None,
         }
     }
 
@@ -361,6 +389,25 @@ impl Served {
             ),
             Request::Pending => (Response::Pending(self.approvals.pending()), false),
             Request::Grants => (Response::Grants(self.approvals.grants()), false),
+            Request::Pause { reason } => (
+                self.pause(&reason)
+                    .map_or_else(|e| Response::Error(refusal(e)), Response::Record),
+                false,
+            ),
+            Request::Resume => (
+                self.resume()
+                    .map_or_else(|e| Response::Error(refusal(e)), Response::Record),
+                false,
+            ),
+            // Ending from paused: the frozen tree is killed rather than left
+            // stopped for ever; the worktree is not touched.
+            request @ (Request::Stop { .. } | Request::Seal) if self.paused.is_some() => {
+                if let Some(paused) = self.paused.take() {
+                    pause::kill_frozen(&paused.frozen);
+                    let _ = pause::clear_marker(&self.state, &self.session);
+                }
+                self.handle(request)
+            }
             other => {
                 // A credential the launch grants passes through here on its
                 // way to the log; once recorded it is temporary authority the
@@ -447,6 +494,63 @@ impl Served {
             control::unix_ms(SystemTime::now()),
         ))?;
         Ok((record.seq, None))
+    }
+
+    /// Pause the session (ADR-0019 §3), in this order: freeze the sandbox
+    /// processes, write the marker every proxy of the session refuses on (new
+    /// connections, new requests, credential injection), hold the approvals,
+    /// append `SessionPaused`. The processes are frozen first so nothing can
+    /// use the gap before the proxy notices the marker. Any failure undoes
+    /// what was done, so the session is either paused whole or not at all.
+    fn pause(&mut self, reason: &str) -> Result<Box<EventRecord>> {
+        if self.log.is_none() {
+            return Err(Error::Daemon("log is sealed".into()));
+        }
+        if self.paused.is_some() {
+            return Err(Error::Daemon("already paused".into()));
+        }
+        let reason = pause::reason_text(reason);
+        let frozen = pause::freeze(&self.session);
+        if let Err(e) = pause::write_marker(&self.state, &self.session, &reason) {
+            pause::thaw(&frozen);
+            return Err(e);
+        }
+        self.approvals.set_paused(true);
+        let event = WardEvent::SessionPaused {
+            method: frozen.method,
+            reason: ShortText::new(&reason),
+        };
+        match self.append(event) {
+            Ok(record) => {
+                self.paused = Some(Paused {
+                    frozen,
+                    since: Instant::now(),
+                });
+                Ok(Box::new(record))
+            }
+            Err(e) => {
+                self.approvals.set_paused(false);
+                let _ = pause::clear_marker(&self.state, &self.session);
+                pause::thaw(&frozen);
+                Err(e)
+            }
+        }
+    }
+
+    /// Reverse [`Self::pause`]: release the approvals, open the proxy, thaw
+    /// the processes, append `SessionResumed`.
+    fn resume(&mut self) -> Result<Box<EventRecord>> {
+        let Some(paused) = self.paused.take() else {
+            return Err(Error::Daemon("not paused".into()));
+        };
+        self.approvals.set_paused(false);
+        let cleared = pause::clear_marker(&self.state, &self.session);
+        pause::thaw(&paused.frozen);
+        cleared?;
+        let record = self.append(WardEvent::SessionResumed {
+            paused_for: paused.since.elapsed(),
+        })?;
+        Ok(Box::new(record))
     }
 
     /// Start a subscription from `from_seq`: everything in the log so far, and a
@@ -644,12 +748,131 @@ mod tests {
             Some("hexrift/WardOS".into()),
             vec!["tests/security_expiry.rs".into()],
         );
+        std::fs::create_dir_all(session_dir(dir, "sess_9")).unwrap();
         Served::new(
             log,
             log_path,
             serde_json::json!({"session": "sess_9"}),
             deriver,
+            dir.to_path_buf(),
+            "sess_9".to_owned(),
         )
+    }
+
+    /// ADR-0019 §3 in the daemon: a pause writes the marker, holds the
+    /// approvals and records itself; a second pause is refused; resume undoes
+    /// it and records; a stop from paused seals with the marker gone.
+    #[test]
+    fn pause_holds_approvals_writes_the_marker_and_records_until_resume_or_stop() {
+        use crate::approvals::ApprovalDecision;
+        use ward_events::PauseMethod;
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let marker = pause::marker_path(dir.path(), "sess_9");
+        let sub = lock(&served).subscribe(0).unwrap();
+        let (rx, _hangup) = sub.live.unwrap();
+
+        // A question is open when the pause lands.
+        let holding = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || hold(&served, "Write", "/work/a.rs", "r", 1))
+        };
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&served).approvals.pending().is_empty()
+        }));
+
+        let record = match lock(&served)
+            .handle(Request::Pause {
+                reason: " looks wrong ".into(),
+            })
+            .0
+        {
+            Response::Record(r) => *r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(record.origin, Origin::Wardd);
+        assert!(matches!(
+            &record.event,
+            WardEvent::SessionPaused { method, reason }
+                if matches!(method, PauseMethod::Sigstop | PauseMethod::CgroupFreezer)
+                    && reason.as_str() == "looks wrong"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "looks wrong\n",
+            "the proxies' marker"
+        );
+        assert!(lock(&served).approvals.paused());
+        assert!(matches!(
+            lock(&served).handle(Request::Pause { reason: String::new() }).0,
+            Response::Error(e) if e == "already paused"
+        ));
+        // The open question stays open past its own timeout, and cannot be
+        // answered while paused.
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(!holding.is_finished(), "held in turn");
+        assert!(matches!(
+            lock(&served).handle(Request::Approve { id: 0, decision: ApprovalDecision::Allow }).0,
+            Response::Error(e) if e.contains("paused by ward")
+        ));
+
+        let record = match lock(&served).handle(Request::Resume).0 {
+            Response::Record(r) => *r,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            &record.event,
+            WardEvent::SessionResumed { paused_for } if *paused_for >= Duration::from_millis(1000)
+        ));
+        assert!(!marker.exists(), "the marker is gone");
+        assert!(!lock(&served).approvals.paused());
+        assert!(matches!(
+            lock(&served).handle(Request::Resume).0,
+            Response::Error(e) if e == "not paused"
+        ));
+        // Resumed, the clock runs: the question times out on its own.
+        assert!(matches!(
+            holding.join().unwrap(),
+            Response::Decision { reason, .. } if reason == "approval: timed out"
+        ));
+
+        // Paused again, then stopped: the log seals, the marker is gone.
+        assert!(matches!(
+            lock(&served)
+                .handle(Request::Pause {
+                    reason: String::new()
+                })
+                .0,
+            Response::Record(_)
+        ));
+        assert!(marker.exists());
+        let (response, done) = lock(&served).handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        assert!(done, "{response:?}");
+        assert!(!marker.exists());
+        let (live, ended) = drain(&rx);
+        let kinds: Vec<_> = live
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "CapabilityRequested",
+                "SessionPaused",
+                "SessionResumed",
+                "CapabilityDecided",
+                "SessionPaused",
+                "SessionEnded"
+            ]
+        );
+        assert!(ended);
+        assert!(matches!(
+            lock(&served).handle(Request::Pause { reason: String::new() }).0,
+            Response::Error(e) if e == "log is sealed"
+        ));
     }
 
     fn seqs(records: &[EventRecord]) -> Vec<u64> {

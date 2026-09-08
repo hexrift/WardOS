@@ -366,7 +366,7 @@ impl Filter {
     }
 
     /// The Quiet observer mode: state changes, policy denials, capability requests and
-    /// decisions, verification outcomes, session end.
+    /// decisions, verification outcomes, the host's interventions, session end.
     #[must_use]
     pub const fn quiet() -> Self {
         Self {
@@ -379,6 +379,9 @@ impl Filter {
                 .with(EventKind::CapabilityDecided)
                 .with(EventKind::VerificationPassed)
                 .with(EventKind::VerificationFailed)
+                .with(EventKind::SessionPaused)
+                .with(EventKind::SessionResumed)
+                .with(EventKind::EntryRestored)
                 .with(EventKind::SessionEnded),
             exclude_agent_notes: true,
         }

@@ -429,6 +429,16 @@ fn summary(event: &WardEvent) -> String {
             format!("snapshot {}", short_snapshot(snapshot))
         }
         WardEvent::AgentClaim { kind, .. } => format!("{kind:?}"),
+        WardEvent::SessionPaused { method, reason } => format!("{} · {reason}", method.as_str()),
+        WardEvent::SessionResumed { paused_for } => format!("paused {}s", paused_for.as_secs()),
+        WardEvent::EntryRestored {
+            snapshot,
+            files,
+            backup,
+        } => format!(
+            "entry {} · {files} paths · backup {backup}",
+            short_snapshot(snapshot)
+        ),
         WardEvent::Anchor {
             chain_head,
             seq,
