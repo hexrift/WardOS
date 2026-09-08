@@ -4,9 +4,10 @@
 //! OCI runtime cannot: a [`landlock`] ruleset (rw under `/work`, `/env`, `/tmp`
 //! and `$HOME`; read+exec elsewhere), the [`seccomp`] filter derived from
 //! [`ward_sandbox::seccomp::Profile::baseline`], `PR_SET_NO_NEW_PRIVS` and an
-//! empty capability set ([`privs`]). It then execs the agent and performs PID 1
-//! duties ([`supervise`]): reaping orphans, forwarding termination signals and
-//! relaying the agent's exit status.
+//! empty capability set ([`privs`]). It then starts any egress [`relay`]s
+//! (ADR-0014: loopback ports forwarded to the proxy's bind-mounted Unix
+//! socket), execs the agent and performs PID 1 duties ([`supervise`]): reaping
+//! orphans, forwarding termination signals and relaying the agent's exit status.
 //!
 //! Every step is irreversible for the process tree and fails closed: the only
 //! opt-out is `--allow-no-landlock` for kernels without Landlock at all. The
@@ -22,9 +23,11 @@ pub mod cli;
 pub mod error;
 pub mod landlock;
 pub mod privs;
+pub mod relay;
 pub mod seccomp;
 pub mod supervise;
 
 pub use cli::Args;
 pub use error::{AgentError, Result};
 pub use landlock::PathSets;
+pub use relay::Relay;

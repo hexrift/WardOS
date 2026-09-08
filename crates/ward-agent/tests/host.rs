@@ -1,12 +1,16 @@
 //! Runs the built `ward-agent` binary on the host (no container needed) and
 //! checks that Landlock confines writes, that the seccomp/PID 1 path relays
-//! exit codes, and that termination signals reach the agent.
+//! exit codes, that termination signals reach the agent, and that `--relay`
+//! forwards loopback TCP into a Unix socket without outliving the agent.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::ffi::OsStr;
-use std::io::IoSliceMut;
+use std::io::{IoSliceMut, Read, Write};
+use std::net::{SocketAddr, TcpListener};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use nix::errno::Errno;
@@ -242,4 +246,184 @@ fn forwards_sigterm_to_the_agent() {
     .unwrap();
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(42));
+}
+
+/// Echo one stream's bytes back to it until EOF, reporting what was received.
+fn echo(mut stream: impl Read + Write, seen: &mpsc::Sender<Vec<u8>>) {
+    let mut buf = [0u8; 1024];
+    while let Ok(n) = stream.read(&mut buf) {
+        if n == 0 || stream.write_all(&buf[..n]).is_err() {
+            break;
+        }
+        let _ = seen.send(buf[..n].to_vec());
+    }
+}
+
+/// A port that was free a moment ago; the shim binds it before the agent runs.
+fn free_port() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+/// A shell one-liner that sends `ping` to `port` and prints the reply line,
+/// in the first runtime that works unsandboxed (bash's `/dev/tcp`, then
+/// python3). `None` when the host offers neither.
+fn tcp_client(port: u16) -> Option<[String; 3]> {
+    let candidates = [
+        [
+            "bash".to_string(),
+            "-c".to_string(),
+            format!("exec 3<>/dev/tcp/127.0.0.1/{port}; echo ping >&3; read -r r <&3; echo \"$r\""),
+        ],
+        [
+            "python3".to_string(),
+            "-c".to_string(),
+            format!(
+                "import socket; s = socket.create_connection(('127.0.0.1', {port})); \
+                 s.sendall(b'ping\\n'); print(s.makefile().readline().strip())"
+            ),
+        ],
+    ];
+    // Prove the candidate against a plain TCP echo before trusting it to test the relay.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let probe_port = listener.local_addr().unwrap().port();
+    let (seen, _) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            echo(stream, &seen);
+        }
+    });
+    candidates.into_iter().find(|[prog, flag, script]| {
+        let script = script.replace(&port.to_string(), &probe_port.to_string());
+        Command::new(prog)
+            .args([flag, &script])
+            .output()
+            .is_ok_and(|out| out.status.success() && out.stdout.trim_ascii() == b"ping")
+    })
+}
+
+/// `output()` with a deadline, so a shim that outlives its agent fails the
+/// test instead of hanging it.
+fn output_within(mut command: Command, timeout: Duration) -> Output {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || tx.send(command.output()));
+    rx.recv_timeout(timeout)
+        .expect("shim did not exit in time")
+        .unwrap()
+}
+
+#[test]
+fn relays_loopback_tcp_into_the_unix_socket() {
+    let listen = free_port();
+    let Some(client) = tcp_client(listen.port()) else {
+        eprintln!("skipping: neither bash /dev/tcp nor python3 can open a TCP connection here");
+        return;
+    };
+    let rw = tempfile::tempdir().unwrap();
+    let socket = rw.path().join("proxy.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (seen, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            echo(stream, &seen);
+        }
+    });
+
+    let mut command = shim(rw.path());
+    command
+        .arg("--relay")
+        .arg(format!("{listen}={}", socket.display()))
+        .arg("--")
+        .args(&client)
+        .stdout(Stdio::piped());
+    let out = output_within(command, Duration::from_secs(20));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "ping",
+        "{stderr}"
+    );
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(1)).unwrap(),
+        b"ping\n",
+        "the bytes did not pass through the Unix socket"
+    );
+}
+
+#[test]
+fn relay_threads_do_not_outlive_the_agent() {
+    let rw = tempfile::tempdir().unwrap();
+    let mut command = shim(rw.path());
+    command
+        .arg("--relay")
+        .arg(format!(
+            "{}={}",
+            free_port(),
+            rw.path().join("never.sock").display()
+        ))
+        .args(["--", "sh", "-c", "exit 7"]);
+    let out = output_within(command, Duration::from_secs(20));
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Relay threads inherit the supervisor's signal mask; without that a
+/// process-directed SIGTERM could be delivered to one of them and kill the
+/// shim outright instead of being forwarded.
+#[test]
+fn forwards_sigterm_to_the_agent_with_a_relay_running() {
+    let rw = tempfile::tempdir().unwrap();
+    let mut child = shim(rw.path())
+        .arg("--relay")
+        .arg(format!(
+            "{}={}",
+            free_port(),
+            rw.path().join("never.sock").display()
+        ))
+        .args([
+            "--",
+            "sh",
+            "-c",
+            "trap 'exit 42' TERM; while :; do sleep 0.05; done",
+        ])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    kill(
+        Pid::from_raw(i32::try_from(child.id()).unwrap()),
+        Signal::SIGTERM,
+    )
+    .unwrap();
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(42));
+}
+
+#[test]
+fn relay_bind_failure_is_a_shim_failure() {
+    let rw = tempfile::tempdir().unwrap();
+    // Hold the port so the shim cannot bind it.
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut command = shim(rw.path());
+    command
+        .arg("--relay")
+        .arg(format!(
+            "{}={}",
+            taken.local_addr().unwrap(),
+            rw.path().join("never.sock").display()
+        ))
+        .args(["--", "true"]);
+    let out = output_within(command, Duration::from_secs(20));
+    assert_eq!(out.status.code(), Some(125));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("relay") && stderr.contains("bind"),
+        "{stderr}"
+    );
 }
