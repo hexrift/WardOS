@@ -4,12 +4,14 @@
 //! and are judged host-side against what the host's own servers saw.
 
 mod egress;
+mod verifier_corpus;
 
 use std::path::Path;
 
 use ward_policy::NetworkCapability;
 
 pub use egress::selftest_egress;
+pub use verifier_corpus::{CORPUS as VERIFIER_CORPUS, selftest_verifier_corpus};
 
 use crate::error::Result;
 use crate::gateway::Gateway;

@@ -42,7 +42,7 @@ pub use describe::SessionDescription;
 pub use error::{Error, Result};
 pub use selftest::{
     ProbeResult, Verdict, selftest, selftest_credentials, selftest_egress, selftest_evidence,
-    selftest_verifier,
+    selftest_verifier, selftest_verifier_corpus,
 };
 pub use session::{RestoreReport, RunReport, Session, SessionMeta, VerifyReport};
 pub use ward_snapshot::SnapshotRole;

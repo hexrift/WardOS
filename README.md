@@ -98,7 +98,7 @@ ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stay
 ward claude   examples/ward-demo --grant github   # …and git/API calls to GitHub through the proxy
 ward status   examples/ward-demo    # the security panel for the active session
 ward verify   examples/ward-demo    # trusted verifier: protected tests from the entry snapshot
-ward selftest examples/ward-demo    # prove the isolation (29 hostile probes; none reaches its target)
+ward selftest examples/ward-demo    # prove the isolation (38 hostile probes; none reaches its target)
 ward pause    examples/ward-demo    # freeze the agents as one operation: processes, network, credentials, approvals (--reason, --status)
 ward resume   examples/ward-demo    # let them continue
 ward stop     examples/ward-demo    # seal the log (from paused: the frozen processes end, the workspace stays)
@@ -162,13 +162,14 @@ from the desktop at a glance. In progress:
   deny rates, decision time, and the rest) and E-14 (ten to twenty real tasks, bare
   agent against WardOS, ending with four comprehension questions); no targets until
   the data exists ([`docs/experiments.md`](docs/experiments.md)).
-* **The remaining security proofs before more desktop polish**: ST-029 a hostile
-  verifier corpus ([`docs/security-model.md`](docs/security-model.md) §6). Delivered:
+* **The security proofs behind ADR-0019 are all delivered** ([`docs/security-model.md`](docs/security-model.md) §6):
   ST-018 freeze before capture (the daemon freezes the sandbox for the length of a
   candidate/final capture so no agent write interleaves with it, an integration test
   reproduced by CI); ST-022 TLS interception, ST-026 raw TCP, SOCKS and UDP, ST-027
   loopback and control surfaces, ST-028 DNS rebinding and pinning, as the
-  `egress and surfaces` group of `ward selftest` (thirteen rows, §6.1).
+  `egress and surfaces` group of `ward selftest` (thirteen rows, §6.1); and ST-029 a
+  hostile verifier corpus, nine hostile repositories run through the real verifier as
+  the `verifier corpus` group (§6.2).
 * **One install path and one status.** The release tarball with its checksum is the
   primary install; signed releases wait for a signing-key decision
   ([`docs/roadmap.md`](docs/roadmap.md)).
@@ -188,9 +189,10 @@ rollback. What the image holds today:
   recorded operation (processes frozen, proxy closed, credentials suspended, approvals
   held), with `ward stop --restore-entry` to leave as you came; `ward verify`, a
   disposable offline verifier that takes the protected tests and its config from the
-  entry snapshot; 29 hostile probes in `ward selftest`, every one denied where the host
+  entry snapshot; 38 hostile probes in `ward selftest`, every one denied where the host
   can run it (a probe the host cannot run, such as the IPv6 path on a kernel without
-  IPv6, says `CANNOT-MEASURE-HERE` and never counts as a pass), reproduced by CI on every
+  IPv6 or a cgroup limit the bubblewrap backend does not apply, says
+  `CANNOT-MEASURE-HERE` and never counts as a pass), reproduced by CI on every
   pull request; a daemon-backed warm start of 32 ms.
 * **The agents.** Claude Code, OpenAI Codex and TamperWard at pinned versions with a
   lockfile, installed at build time, read-only in the sandbox; `ward init` makes any

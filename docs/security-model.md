@@ -22,7 +22,7 @@ that back it. If a guarantee here has no test, it is a **goal**, labelled as suc
 | G6 | Evidence is append-only, hash-chained, unreachable from the sandbox, and agent-originated records are distinguishable from enforcement records | 9, 14 | ST-009, 010, 016, 027 | Proven: ST-009/010 and ST-017 by `ward selftest` (log, state root and control socket unreachable), ST-027 `hook-socket-forgery` (a control-protocol `approve` on the hook socket is answered with nothing and recorded as nothing), ST-016 end to end (hook-socket input stays `Origin::Agent`), plus `ward replay --verify` on the chain |
 | G7 | The effective capability manifest is fixed for the life of a session and repository policy can only narrow it | 7, 18 | ST-007 | Proven: ST-007 end to end (a policy rewritten mid-session does not widen the network) and the merge property tests in `ward-policy` |
 | G8 | The host container engine is never exposed to an agent session | 4 | ST-004, 027 | Proven by `ward selftest` (ST-004: no Docker socket; ST-027 `host-run-sockets`: `/run/docker.sock`, `/run/podman/podman.sock` and `/run/user/*` are absent) |
-| G9 | Verification runs the trusted test set from Zone 1 against exactly the snapshot IDs in evidence, in an environment the agent cannot influence beyond repository content | 6, 16, 17 | ST-006, 018, 019, 029 | Partly proven: ST-006 by `ward selftest`, ST-019 end to end (a hostile verify command gets no network, no host path and no persistence); the trusted test set comes from the entry snapshot today, TamperWard's bundle; ST-018 is proven (the candidate is captured with the sandbox frozen, `candidate_capture_is_atomic_while_the_agent_writes`, see G5), ST-029 (hostile verifier corpus) is ahead (§6). Freshness (ADR-0019): a verdict is shown as `VERIFY ✓` only while the worktree digests to the candidate id the `VerificationPassed` record names, computed by the shell with the snapshot crate's digest-only walk, so a green mark never outlives the state it verified |
+| G9 | Verification runs the trusted test set from Zone 1 against exactly the snapshot IDs in evidence, in an environment the agent cannot influence beyond repository content | 6, 16, 17 | ST-006, 018, 019, 029 | Partly proven: ST-006 by `ward selftest`, ST-019 end to end (a hostile verify command gets no network, no host path and no persistence); the trusted test set comes from the entry snapshot today, TamperWard's bundle; ST-018 is proven (the candidate is captured with the sandbox frozen, `candidate_capture_is_atomic_while_the_agent_writes`, see G5), and ST-029 (hostile verifier corpus) is proven by the `verifier corpus` group of `ward selftest` (nine hostile repositories run through the real verifier, §6.2), reproduced by CI. Freshness (ADR-0019): a verdict is shown as `VERIFY ✓` only while the worktree digests to the candidate id the `VerificationPassed` record names, computed by the shell with the snapshot crate's digest-only walk, so a green mark never outlives the state it verified |
 | G10 | Hard-denied capabilities are never presented with an override | 18 | UI test | Phase 5 target |
 | G11 | Data at rest is encrypted and unlockable only by the measured boot chain or the recovery key | 23 | RT-001 | Phase 7 target |
 | G12 | A failed update rolls back automatically or via `ward system rollback` | 24 | RT-002 | Phase 7 target |
@@ -159,21 +159,24 @@ model is complete:
 
 ---
 
-## 6. Next security work: the proof backlog
+## 6. Security proofs: the backlog, now cleared
 
 [ADR-0019](decisions/ADR-0019-authority-freshness-intervention.md) decision 6: the
-remaining proofs come before more desktop polish. Each row below is a guarantee above
-that is stated but not yet backed by a probe, in the order the work is taken. A row
-leaves this list when it is a `ward selftest` row or an end-to-end test with a hostile
-workload, reproduced by CI on every pull request, and the guarantee's Status column
-says so. Numbering continues the threat model's §8 list; ST-023..025 are taken there.
+remaining proofs came before more desktop polish, and the list is now empty. Every
+guarantee above that was stated but not yet backed by a probe now is one — a
+`ward selftest` row or an end-to-end test with a hostile workload, reproduced by CI
+on every pull request, and named in the guarantee's Status column. The probes live as
+`ward selftest` groups or `security-tests/` workloads, not here; this section records
+what the last two showed. Numbering continues the threat model's §8 list; ST-023..025
+are taken there.
 
-| Test | Guarantee | What the probe does | Passes when |
-| --- | --- | --- | --- |
-| ST-029 `hostile-verifier-corpus` | G9 | Runs the verifier over a corpus of hostile repositories: build scripts that reach for the network, the host and the CAS; test harnesses that rewrite their own results; symlinks, submodules and hooks pointing out of the tree | Every repository gets a verdict; nothing touches the host, the network or the next run; the verdicts are what the trusted test set says, not what the repository says |
-
-The probes are implemented as `ward selftest` groups or `security-tests/` workloads,
-not here; this section is the contract for what they must show.
+ST-029 `hostile-verifier-corpus` (G9) left this list: it is proven by the `verifier
+corpus` group of `ward selftest` (§6.2), reproduced by CI on every pull request. It
+runs the verifier over nine hostile repositories — a build/test command that reaches
+for the network, the host and the CAS; a test overwritten in the worktree; output that
+forges a passing summary; a runaway workload; a symlink pointing out of the tree — and
+each is contained, its verdict what the trusted test set says rather than what the
+repository says.
 
 ST-018 `candidate-snapshot-toctou` (G5, G9) left this list: it is proven by the
 integration test `candidate_capture_is_atomic_while_the_agent_writes`
@@ -226,3 +229,35 @@ ranges and connected only to a checked address (`policy.rs`); the ST-028 rows an
 two proxy integration tests (`allowlisted_name_resolving_to_a_private_address_is_the_literal_403`,
 `an_established_tunnel_is_pinned_and_a_rebinding_answer_refuses_the_next`) state that
 as a contract rather than an implementation detail.
+
+### 6.2 Delivered: the `verifier corpus` group of `ward selftest`
+
+ST-029 left the backlog as nine rows of one `ward selftest` group, reproduced by CI on
+every pull request (`hostile_verifier_corpus_is_contained` in
+`crates/ward-daemon/tests/e2e.rs`; the group and its judges are
+`crates/ward-daemon/src/selftest/verifier_corpus.rs`). Each row is a hostile
+*verifier* repository — a `.tamperward/config.yml` whose `verify.command`, and any
+planted files, attempt one attack — built under a private temp base with its own
+content-addressed store, then run through the real verifier (`ward_daemon::verify`:
+snapshot the worktree as the candidate, overlay every protected path from the trusted
+entry snapshot, run the command in the disposable bubblewrap sandbox with *no egress
+socket* and the host toolchains bound read-only, kill it past its `budget_secs`). The
+command stands in for hostile repository content the trusted command happens to run (a
+build script, a test harness). Verdicts use the same vocabulary as every other group:
+`DENIED` when the sandbox contained the attack, `REACHED` when it escaped (none does),
+`CANNOT-MEASURE-HERE` when this host cannot enforce the guarantee, never a false pass.
+Where feasible a row also demonstrates the attack would succeed without the guard: the
+host canary is a real file the harness reads directly, and the overlay restores the
+strict test over the weakened one the fixture wrote.
+
+| Row | What the hostile repository does | Proof (`DENIED` when) |
+| --- | --- | --- |
+| ST-029 `network-egress` | Its command opens a raw TCP socket to `8.8.8.8:53` | The connect has no route: the verify sandbox is `--unshare-net` with loopback only and, unlike a session launch, is given no egress socket at all. No bash to open the socket is `CANNOT-MEASURE-HERE` |
+| ST-029 `read-host-path` | Reads the host canary file, the CAS, `/etc/shadow` and `$HOME` by absolute path | None is readable: they are never mounted into the sandbox. The harness reads the canary directly, so its absence inside is containment, not a bad target |
+| ST-029 `write-outside-scratch` | Writes to a read-only system bind (`/usr`) and to real host paths outside the scratch tree | The system bind rejects the write and no host path outside the disposable scratch is created (writes to the sandbox's own ephemeral tmpfs root vanish with it and do not count) |
+| ST-029 `no-persistence` | Writes `PWNED` and mutates a tracked file inside the run | The user's worktree and the immutable entry snapshot are byte-for-byte unchanged (the run is over a materialised copy), and a second verify's freshly materialised tree carries no trace of the first |
+| ST-029 `runaway-budget` | Runs an infinite loop under a one-second budget | The wall-clock budget kills it (`budget of 1s exceeded`) and the run fails: the host is not hung |
+| ST-029 `resource-cgroup` | Reads the memory and pid cgroup limits in force | A finite `memory.max`/`pids.max` would be `DENIED`; the 0.1 bubblewrap backend applies no cgroup limit (ADR-0002 selects `crun` for the production host, which does), so this host reports `CANNOT-MEASURE-HERE` with the observed values rather than running a destructive fork bomb |
+| ST-029 `protected-test-overlay` | Weakens a protected test in the worktree so it would pass, and runs it | The verifier overlaid the trusted bytes from the entry snapshot, so the strict test runs and still fails: the weakened test never granted a pass (the scratch copy is the strict bytes, not the weakened ones the fixture wrote) |
+| ST-029 `exit-code-authority` | Prints a fake `test result: ok. 999 passed` then exits non-zero | The verdict is the command's exit code, not text it printed: the summary parser reads the 999 yet the run fails. Only a non-zero exit or a timeout can fail, and no printed line can forge a pass |
+| ST-029 `symlink-host-escape` | Plants a worktree symlink at a host path and follows it | The snapshot captures it as a symlink and `materialize` writes it as a symlink (never following it or copying the target's content); inside the mount namespace the absolute target resolves to nothing, so the canary is unreachable and its secret never appears in the output |
