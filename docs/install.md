@@ -14,6 +14,19 @@ This downloads the latest release tarball, verifies its SHA-256, installs the th
 binaries into `~/.local/bin`, and runs `ward doctor`. Use `--prefix /usr/local` for a
 system-wide install, `--version v0.1.0` to pin.
 
+While the repository is private, the raw script URL and the release assets need a
+GitHub token with read access to the repository: export `GITHUB_TOKEN` (or `GH_TOKEN`)
+first and fetch the script with it, e.g.
+
+```bash
+export GITHUB_TOKEN=ghp_…
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+  https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | bash
+```
+
+The installer then downloads the assets through the GitHub API with the same token.
+Once the repository is public no token is needed.
+
 The same script ships inside every release tarball; run `./install.sh` from the
 unpacked directory to install from the files next to it.
 
