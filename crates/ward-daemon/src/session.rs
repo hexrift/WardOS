@@ -23,7 +23,8 @@ use ward_snapshot::{CaptureOptions, SnapshotRole, SnapshotStore};
 
 use crate::error::{Error, Result};
 use crate::ids::{ev_hash, ev_snapshot, new_session_id, project_id_for};
-use crate::sandbox;
+use crate::egress::Egress;
+use crate::sandbox::{Launch, StdioMode, find_shim, RELAY_ADDR};
 use crate::watch::{CaptureMode, Captured, Watcher};
 
 /// A live WardOS session over one project.
@@ -107,6 +108,15 @@ pub struct RunReport {
     pub stdout: String,
     /// Captured stderr.
     pub stderr: String,
+}
+
+/// Options for [`Session::launch`].
+#[derive(Clone, Debug, Default)]
+pub struct LaunchOpts {
+    /// Extra environment inside the sandbox.
+    pub env: Vec<(String, String)>,
+    /// Inherit the terminal instead of capturing output.
+    pub interactive: bool,
 }
 
 impl Session {
@@ -272,6 +282,28 @@ impl Session {
     /// to a before/after directory scan. Reads are captured only when the observer
     /// is Live or StepThrough.
     pub fn run(&mut self, argv: &[String]) -> Result<RunReport> {
+        self.launch(argv, &LaunchOpts::default())
+    }
+
+    /// Launch a known agent interactively (`docs/agent-integration.md`): its profile
+    /// env, the session egress proxy, and any explicitly passed-through host variables.
+    pub fn run_agent(&mut self, name: &str, args: &[String], pass_env: &[String]) -> Result<RunReport> {
+        let profile = crate::agents::profile(name)
+            .ok_or_else(|| Error::Project(format!("unknown agent `{name}`")))?;
+        let mut env: Vec<(String, String)> =
+            profile.env.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+        for key in pass_env {
+            if let Ok(v) = std::env::var(key) {
+                env.push((key.clone(), v));
+            }
+        }
+        let mut argv = vec![profile.binary.to_string()];
+        argv.extend(args.iter().cloned());
+        self.launch(&argv, &LaunchOpts { env, interactive: true })
+    }
+
+    /// Run a command with explicit options; every run gets the session egress proxy.
+    pub fn launch(&mut self, argv: &[String], opts: &LaunchOpts) -> Result<RunReport> {
         self.emit(
             Origin::Wardd,
             WardEvent::AgentStateChanged {
@@ -303,7 +335,24 @@ impl Session {
             None
         };
 
-        let outcome = sandbox::run(&self.worktree, &self.manifest.network, argv)?;
+        let session_dir = self.log_path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let egress = Egress::start(&session_dir, &self.manifest.network)?;
+        let mut launch = Launch::new(&self.worktree, argv.to_vec()).egress(egress.socket());
+        if let Some(shim) = find_shim() {
+            // With the shim present the relay exists, so proxy-aware tools get a proxy.
+            launch = launch
+                .shim(shim)
+                .env("HTTP_PROXY", format!("http://{RELAY_ADDR}"))
+                .env("HTTPS_PROXY", format!("http://{RELAY_ADDR}"))
+                .env("NO_PROXY", "localhost,127.0.0.1");
+        }
+        for (k, v) in &opts.env {
+            launch = launch.env(k.clone(), v.clone());
+        }
+        if opts.interactive {
+            launch = launch.stdio(StdioMode::Inherit);
+        }
+        let outcome = launch.run()?;
 
         let (captured, capture) = match (watcher, before) {
             (Some(w), _) => (w.finish(), CaptureMode::Inotify),
@@ -350,6 +399,12 @@ impl Session {
                 }
             }
         }
+
+        let by = ProcessRef { pid, comm: comm.clone() };
+        for event in egress.drain_events(&by) {
+            self.emit(Origin::Proxy, event)?;
+        }
+        egress.stop();
 
         self.emit(
             Origin::Kernel,

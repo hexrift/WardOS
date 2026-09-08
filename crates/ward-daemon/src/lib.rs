@@ -15,6 +15,8 @@
     clippy::struct_field_names
 )]
 
+pub mod agents;
+pub mod egress;
 pub mod error;
 pub mod ids;
 pub mod render;
