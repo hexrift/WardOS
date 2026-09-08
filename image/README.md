@@ -291,6 +291,36 @@ qemu-system-x86_64 -enable-kvm -m 4096 -cpu host \
 display; use `-device virtio-vga-gl -display gtk,gl=on` instead of `-nographic` to see
 the desktop.
 
+### Disk images from CI
+
+Nobody needs a Fedora box to get a WardOS disk. The `disk` workflow
+([`.github/workflows/disk.yml`](../.github/workflows/disk.yml)) runs `build.sh` and
+`disk.sh` on a GitHub runner, where bootc-image-builder has the privileged podman it
+needs, and publishes the result:
+
+* **By hand**: Actions → *disk* → *Run workflow*. Choose `qcow2`, `iso` or `both`, the
+  binaries (`checkout` compiles this commit, `release` takes the published tarball of
+  `--release`), the first user (`wardos`, which the autologin expects) and, for the ISO,
+  `luks`. The disks appear as the run's `wardos-disks` artifact for 14 days, with a
+  `SHA256SUMS`.
+* **On every published release**: both disks are built from that release's tarball and
+  attached to the release as `wardos-<version>-x86_64.qcow2.zst` and `.iso.zst`
+  (zstd-compressed to stay under GitHub's 2 GiB asset cap; `zstd -d` restores them).
+
+The first user's password in these disks is `wardos`. Change it at first login
+(`passwd`); the ISO with `luks` additionally asks for the disk passphrase during the
+install. The same job runs `check-packages.sh --arch aarch64 --discover` so the log says
+whether the COPRs the image depends on also build for aarch64, the prerequisite for an
+Apple-silicon image.
+
+**On a Mac.** Docker Desktop can build the container image
+(`docker build -f image/Containerfile --platform linux/amd64 -t wardos .`) and run it for
+a look around, but cannot make the disk: bootc-image-builder needs loop devices and a
+privileged Linux podman, which Docker Desktop's VM does not provide, and on Apple silicon
+it would build arm64 only. Download the qcow2 from CI instead and boot it in
+[UTM](https://mac.getutm.app) as an x86_64 machine (emulated on Apple silicon, so slow;
+native on an Intel Mac), or write the ISO to a USB stick for a PC.
+
 ## First boot: what to expect
 
 1. `systemd-tmpfiles` creates `/var/lib/wardos` (mode 0755, root).

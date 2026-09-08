@@ -3,7 +3,7 @@
 # Containerfile pins (its FROM tag) plus the COPRs of image/coprs.txt.
 #
 #   image/check-packages.sh [--file FILE] [--coprs FILE] [--release N] [--dry-run]
-#   image/check-packages.sh --discover NAME...
+#   image/check-packages.sh [--arch ARCH] --discover NAME...
 #
 # Strips comments from both manifests, then inside a quay.io/fedora/fedora:<release>
 # container (docker, or podman when docker is absent; CONTAINER_RUNTIME= overrides)
@@ -12,12 +12,13 @@
 # did not. Exact package names only: a name that dnf would accept as a "provides" still
 # fails here, so the manifest stays honest. --dry-run prints the command.
 # --discover asks the COPR API which projects mention each NAME and which of them build
-# for the pinned release (or the one before), plus a few known projects; it prints and
+# for the pinned release (or the one before) on ARCH (default x86_64; aarch64 answers
+# whether an Apple-silicon image is possible), plus a few known projects; it prints and
 # never fails the check. CI: verify.yml, job "image packages" (discovery first).
 set -euo pipefail
 
 usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,9 +29,12 @@ coprs_file=$repo_root/image/coprs.txt
 release=$(sed -n 's|^FROM quay.io/fedora/fedora-bootc:\([0-9][0-9]*\)$|\1|p' "$repo_root/image/Containerfile" | head -n 1)
 dry_run=0
 discover=()
+arch=x86_64
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --discover) shift; discover=("$@"); break ;;
+    --arch) arch=$2; shift 2 ;;
+    --arch=*) arch=${1#--arch=}; shift ;;
     --file) file=$2; shift 2 ;;
     --file=*) file=${1#--file=}; shift ;;
     --coprs) coprs_file=$2; shift 2 ;;
@@ -55,7 +59,7 @@ copr_api=${COPR_API:-https://copr.fedorainfracloud.org/api_3}
 # Known projects worth a direct look whatever the search says.
 known_projects=(solopasha/hyprland solopasha/hyprland-git erikreider/SwayNotificationCenter
   dejan/lazygit atim/lazygit yalter/niri)
-chroot_filter="fedora-(${release}|$((release - 1)))-x86_64"
+chroot_filter="fedora-(${release}|$((release - 1)))-${arch}"
 
 # describe_project JSON: one line "full_name: chroots matching the filter (or none)".
 describe_project() {
@@ -99,7 +103,7 @@ copr_api=${COPR_API:-https://copr.fedorainfracloud.org/api_3}
 # Known projects worth a direct look whatever the search says.
 known_projects=(solopasha/hyprland solopasha/hyprland-git erikreider/SwayNotificationCenter
   dejan/lazygit atim/lazygit yalter/niri)
-chroot_filter="fedora-(${release}|$((release - 1)))-x86_64"
+chroot_filter="fedora-(${release}|$((release - 1)))-${arch}"
 
 # describe_project JSON: one line "full_name: chroots matching the filter (or none)".
 describe_project() {

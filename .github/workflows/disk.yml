@@ -1,0 +1,114 @@
+# Bootable disks from the host image, built where bootc-image-builder can run: a Linux
+# runner with a privileged podman. Nobody needs a Fedora box to get a WardOS disk; a Mac
+# downloads the qcow2 and boots it in UTM, a PC writes the ISO to a stick
+# (image/README.md, "Disk images from CI"). By hand from the Actions tab, or on every
+# published release (then the disks are attached to it, compressed to fit the asset
+# limit).
+name: disk
+
+on:
+  workflow_dispatch:
+    inputs:
+      type:
+        description: "Disk to build"
+        type: choice
+        default: qcow2
+        options: [qcow2, iso, both]
+      source:
+        description: "Binaries: compile this checkout, or the published release tarball"
+        type: choice
+        default: checkout
+        options: [checkout, release]
+      release:
+        description: "Release tag for source=release (empty: the Containerfile default)"
+        default: ""
+      user:
+        description: "First user (the desktop's autologin expects wardos)"
+        default: wardos
+      luks:
+        description: "ISO only: ask Anaconda for full-disk encryption"
+        type: boolean
+        default: false
+  release:
+    types: [published]
+
+jobs:
+  disk:
+    name: disk image
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: write
+    env:
+      TYPE: ${{ github.event.inputs.type || 'both' }}
+      SOURCE: ${{ github.event.inputs.source || 'release' }}
+      RELEASE: ${{ github.event.inputs.release || github.event.release.tag_name || '' }}
+      FIRST_USER: ${{ github.event.inputs.user || 'wardos' }}
+      LUKS: ${{ github.event.inputs.luks || 'false' }}
+      # The first user's password. Change it at first login (image/README.md).
+      WARDOS_PASSWORD: wardos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup
+          df -h /
+      - name: Build the image into root's container storage
+        run: |
+          set -euo pipefail
+          args=(--source "$SOURCE" --tag localhost/wardos:ci)
+          if [[ -n "$RELEASE" ]]; then args+=(--release "$RELEASE"); fi
+          sudo -E ./image/build.sh "${args[@]}"
+      - name: qcow2
+        if: env.TYPE == 'qcow2' || env.TYPE == 'both'
+        run: sudo -E ./image/disk.sh --type qcow2 --image localhost/wardos:ci --user "$FIRST_USER" --output "$PWD/image/out"
+      - name: iso
+        if: env.TYPE == 'iso' || env.TYPE == 'both'
+        run: |
+          set -euo pipefail
+          args=(--type iso --image localhost/wardos:ci --user "$FIRST_USER" --output "$PWD/image/out")
+          if [[ "$LUKS" == "true" ]]; then args+=(--luks); fi
+          sudo -E ./image/disk.sh "${args[@]}"
+      - name: Name and checksum the disks
+        run: |
+          set -euo pipefail
+          version=$(git describe --tags --always)
+          mkdir -p dist
+          if [[ -f image/out/qcow2/disk.qcow2 ]]; then
+            sudo mv image/out/qcow2/disk.qcow2 "dist/wardos-${version}-x86_64.qcow2"
+          fi
+          if [[ -f image/out/bootiso/install.iso ]]; then
+            sudo mv image/out/bootiso/install.iso "dist/wardos-${version}-x86_64.iso"
+          fi
+          sudo chown -R "$(id -u):$(id -g)" dist
+          (cd dist && sha256sum ./* > SHA256SUMS)
+          ls -lh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wardos-disks
+          path: dist/
+          compression-level: 6
+          retention-days: 14
+      - name: "Attach to the release (compressed: assets are capped at 2 GiB)"
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -q zstd
+          cd dist
+          for f in *.qcow2 *.iso; do [[ -f "$f" ]] && zstd -T0 -12 --rm "$f"; done
+          sha256sum ./* > SHA256SUMS
+          gh release upload "${{ github.event.release.tag_name }}" ./* --clobber
+
+  # Whether the same desktop could be built for Apple silicon: do the COPRs the image
+  # depends on build for aarch64? Informational; the answer goes to image/README.md.
+  aarch64:
+    name: aarch64 chroots
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./image/check-packages.sh --arch aarch64 --discover hyprland swayosd lazygit
