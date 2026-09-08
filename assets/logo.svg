@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="WardOS">
+  <title>WardOS</title>
+  <!-- WardOS mark: a rounded host frame (the immutable boundary that stays outside the
+       agent's authority) encloses the Tamperward ward glyph (four strokes of change
+       stopped at the exact point). WardOS supplies the frame; Tamperward the core. -->
+  <style>
+    .ink { stroke: #16181b; }
+    @media (prefers-color-scheme: dark) { .ink { stroke: #d9d9d6; } }
+  </style>
+  <!-- host frame -->
+  <rect class="ink" x="8" y="8" width="84" height="84" rx="16" fill="none" stroke-width="5"/>
+  <!-- active-session tick, WardOS accent -->
+  <path d="M63 8 H76" stroke="#7fa1c3" stroke-width="5" stroke-linecap="round"/>
+  <!-- ward glyph, scaled 0.56 about centre (transform: 0.56*x + 22) -->
+  <g fill="none" stroke-linecap="round" stroke-width="9" transform="translate(22 22) scale(0.56)">
+    <g class="ink">
+      <path d="M15 13 42 40"/>
+      <path d="M15 87 42 60"/>
+      <path d="M85 13 58 40"/>
+      <path d="M85 87 58 60"/>
+    </g>
+    <g stroke="#2563eb">
+      <path d="M9 50 H42"/>
+      <path d="M58 50 H91"/>
+    </g>
+  </g>
+</svg>
