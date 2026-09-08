@@ -115,6 +115,69 @@ ecosystem, the successor of solopasha's), `erikreider/swayosd` (swayosd by its a
 and `atim/lazygit`. `pulsemixer` is not packaged anywhere useful; the image ships
 `pavucontrol` and `wardos-setup audio` prefers pulsemixer when present.
 
+### The desktop in the image
+
+`install-desktop.sh SRC DESTDIR` places the [`desktop/`](../desktop) tree
+([`docs/desktop.md` §Layout](../docs/desktop.md#layout)). The same script runs in the
+image build (`SRC=/tmp/desktop`, `DESTDIR=/`) and from `desktop/install.sh` on an
+existing Fedora, so the two installs cannot drift apart. Every part is optional: what
+the tree does not contain yet is skipped.
+
+| `desktop/…` | Installed at | Notes |
+| --- | --- | --- |
+| `bin/wardos-*` | `/usr/bin/` | mode 0755 |
+| `lib/wardos.sh` | `/usr/lib/wardos/` | |
+| `hyprland/*.conf` | `/usr/share/wardos/hypr/`, `/etc/xdg/hypr` → that directory | The directory is linked, not the file: `hyprland.conf` sources `./keybindings.conf` relative to the path it was read from |
+| `config/<component>/` | `/usr/share/wardos/config/<component>/` | Copied to `~/.config` by `wardos-first-run`; re-applied by `wardos-refresh` |
+| `config/{waybar,foot,mako,fuzzel,btop,fastfetch}/` | also `/etc/xdg/<component>` → the above | These read `XDG_CONFIG_DIRS`, so they work before any first-run copy; an existing real `/etc/xdg/<component>` (a Fedora that ships one) is filled, not replaced |
+| `config/gtk/settings.ini` | also `/etc/xdg/gtk-3.0/settings.ini`, `/etc/xdg/gtk-4.0/settings.ini` | One file, two real directories (GTK reads `settings.ini` from `XDG_CONFIG_DIRS`; `gtk.css` only from the home directory, first-run's job) |
+| `config/bash/profile.d-wardos.sh` | `/etc/profile.d/wardos.sh` | Session environment; starts `uwsm` on tty1 |
+| `config/xcompose/XCompose` | `/usr/share/wardos/config/xcompose/` | Copied to `~/.XCompose` by first-run |
+| `themes/` | `/usr/share/wardos/themes/` | TOML token files and backgrounds |
+| `webapps/`, `tuis/`, `flatpaks.txt` | `/usr/share/wardos/` | Defaults for `wardos-webapp`, `wardos-tui`, `wardos-flathub` |
+| `systemd/user/*` | `/usr/lib/systemd/user/` + `/usr/lib/systemd/user-preset/90-wardos.preset` | The preset enables every unit that has an `[Install]` section (a timer's service has none and is pulled in by its timer) |
+| `systemd/system/getty@tty1.service.d/autologin.conf` | `/etc/systemd/system/getty@tty1.service.d/` | Autologin; `--no-autologin` skips it (what `desktop/install.sh` does unless told `--autologin`) |
+| `shell/`, `theme/`, `tests/`, `install.sh` | — | Sources and tests never land on the host; the two crates are built in stage 1 |
+
+`desktop/tests/install.test.sh` runs the script against a temp `DESTDIR` with a fake
+tree of every kind of file and asserts on every row above.
+
+### Autologin
+
+The image logs `wardos` in on tty1 without a password (the getty drop-in) and
+`/etc/profile.d/wardos.sh` starts Hyprland through `uwsm` there, so a machine boots
+into the desktop; hyprlock, not the login prompt, is the lock. The user is not in the
+image (bootc images carry no accounts): create it when making the disk,
+`disk.sh --user wardos …` ([below](#users-and-luks)), or with your own config. A
+different first user works too; then edit the drop-in's `--autologin` name in your
+`/etc`, which bootc keeps across upgrades.
+
+### Flathub and the default applications
+
+Applications that are not in Fedora come from Flathub (ADR-0016: no `curl | sh`, no
+AUR). `wardos-flathub.service` runs `/usr/libexec/wardos-flathub /usr/share/wardos/flatpaks.txt`
+once after the first boot that has a network (`After=network-online.target`): it adds
+the `flathub` remote and installs the ids in the list (`#` comments and blank lines
+allowed). It never blocks login; `wardos-install app` works as soon as the remote
+exists. Success writes `/var/lib/wardos/flathub.done`; a failed download leaves no
+marker, shows in `systemctl --failed`, and retries on the next boot. Delete the marker
+to re-run; `wardos-flathub /path/to/list` installs another list by hand.
+
+### Plymouth
+
+`plymouth/wardos/` is a Plymouth *script* theme: the Ward Dark ground (`#0E0F11`) fills
+the screen, `WARD` sits in the middle in the text colour, a 2 px line in the muted
+colour grows under it with boot progress, and the LUKS passphrase prompt is one line
+of text plus one bullet per character on the same surface. No logo, no animation
+([`design-language.md`](../docs/design-language.md) §2, §3). The build selects it with
+`plymouth-set-default-theme wardos` when the script engine (`plymouth-plugin-script`)
+is installed and falls back to `spinner` otherwise, then rebuilds the initramfs
+(`dracut --no-hostonly --add ostree`, the way other bootc desktops do) because Plymouth
+draws from the initramfs, not from the root filesystem. The "image build" job proves
+the packages resolve, the theme is selected (`plymouth-set-default-theme` prints
+`wardos` in the build log) and the dracut step runs; how the splash looks at boot is
+E-09's to record.
+
 ### Base image tag
 
 `fedora-bootc:44` pins the **current Fedora release**, not a digest. Two consequences:
@@ -238,6 +301,8 @@ the desktop.
    applications in the background ([above](#flathub-and-the-default-applications)).
 4. tty1 logs `wardos` in and `uwsm` starts Hyprland; `wardos-first-run` copies the
    configs, asks for a theme, runs `ward doctor` and shows the keys.
+   `bootc container lint` ran clean at the end of the build (10 checks, no warnings
+   once the install-time caches and logs under `/var`, `/run` and `/tmp` are swept).
 5. `sysctl kernel.unprivileged_userns_clone` does not exist on Fedora kernels; the sysctl
    file marks it optional (`-`), so `systemd-sysctl` logs it and continues. Check with
    `sysctl user.max_user_namespaces` (non-zero) and `bwrap --unshare-all -- true`.

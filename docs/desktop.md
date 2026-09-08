@@ -270,7 +270,7 @@ command, key and test exist on `main`.
 | btop, fastfetch, lazygit, fzf, ripgrep, fd, bat, eza, zoxide | shipped, configured, themed | ✔ config: `config/btop`, `config/fastfetch`, aliases and fzf/zoxide hooks in `config/bash` |
 | Chromium default browser, theme colour | chromium, `chromium.json` fragment | ✔ config: `config/chromium/chromium-flags.conf`, `BROWSER=chromium` |
 | Nautilus | nautilus | |
-| Plymouth boot splash | WardOS Plymouth theme | ✔ `image/plymouth/wardos/` (WARD on the ground, 2 px progress, passphrase prompt), selected in the `Containerfile`; unverified until E-09 |
+| Plymouth boot splash | WardOS Plymouth theme | ✔ `image/plymouth/wardos/` (WARD on the ground, 2 px progress, passphrase prompt), selected in the `Containerfile` and in the initramfs (the image build proves it); its look at boot is E-09's |
 | Autologin into Hyprland | getty autologin + uwsm | ✔ `systemd/system/getty@tty1.service.d/autologin.conf`, `config/bash/profile.d-wardos.sh` (tested); placed by `image/install-desktop.sh` (`--no-autologin` for existing Fedoras), the user from `image/disk.sh --user wardos` (`install.test.sh`) |
 | Full-disk encryption at install | `image/disk.sh --luks` (Anaconda kickstart on the ISO; bootc-image-builder has no LUKS) | ✔ `image/disk.sh --type iso --luks`, `install.test.sh`; passphrase prompt unverified until E-09 |
 | omarchy-update, migrations | `wardos-update` (bootc upgrade, flatpak, refresh) | ✔ image side: `bootc upgrade`, `image/boot/README.md` |
