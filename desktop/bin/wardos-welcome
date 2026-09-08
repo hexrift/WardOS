@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# wardos-welcome — the first-login walkthrough (docs/onboarding.md, docs/desktop.md §Commands).
+#
+# Usage: wardos-welcome [--again] [STEP…]
+#   wardos-welcome            every step once: theme, keys, project, agent, done.
+#                             Nothing once ~/.config/wardos/welcome-done exists.
+#   wardos-welcome --again    every step again, marker or not
+#   wardos-welcome keys       one step, any time: theme | keys | project | agent | done
+#   wardos-welcome clone URL DIR   what the project step runs in a terminal: git clone, ward init
+#
+# Keyboard-first: every question is a wardos-menu-select menu, every step has a Skip
+# and a cancelled menu skips too. A key is typed in a terminal window running
+# `ward vault set NAME`, never in a menu. The chosen project is kept in
+# $XDG_STATE_HOME/wardos/welcome-project for the agent step; the marker is written by
+# the done step, so a single step never counts as the whole walkthrough.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+marker="$(wardos_config_dir)/welcome-done"
+project_file="$(wardos_state_dir)/welcome-project"
+skip="Skip"
+
+# ask PROMPT ITEM…: one answer, or "Skip" when the menu was cancelled.
+ask() {
+  local prompt=$1
+  shift
+  wardos_menu "$prompt" "$@" "$skip" || printf '%s\n' "$skip"
+}
+
+# typed PROMPT: free text (a menu with no items returns what was typed); empty = skipped.
+typed() {
+  printf '' | wardos-menu-select --prompt "$1" || true
+}
+
+# in_terminal APP-ID CMD…: a terminal window that shows the command's output and waits.
+in_terminal() { wardos-launch run "$@"; }
+
+step_theme() {
+  if ! wardos_has wardos-theme; then
+    echo "wardos-welcome: wardos-theme is not installed; theme step skipped" >&2
+    return 0
+  fi
+  local ids choice
+  ids=$(wardos-theme list 2>/dev/null || true)
+  [[ -n "$ids" ]] || return 0
+  # shellcheck disable=SC2086  # ids are one word each, one per line
+  choice=$(ask "Theme · pick the look (Super + Shift + T cycles later)" $ids)
+  [[ "$choice" == "$skip" ]] && return 0
+  wardos-theme set "$choice"
+}
+
+# key_state NAME: "set" or "not set", from `ward vault list` (never a value).
+key_state() {
+  wardos_has ward || { printf 'not set\n'; return; }
+  if ward vault list 2>/dev/null | grep -Eq "^ *$1 +set"; then printf 'set\n'; else printf 'not set\n'; fi
+}
+
+step_keys() {
+  if ! wardos_has ward; then
+    echo "wardos-welcome: ward is not installed; keys step skipped" >&2
+    return 0
+  fi
+  # Two rounds at most: one key, then the other; "Continue" ends it either way.
+  local round choice name
+  for round in 1 2; do
+    choice=$(ask "Keys · stored on the host, injected by the proxy, never seen by the agent" \
+      "Anthropic (Claude Code) · ANTHROPIC_API_KEY · $(key_state ANTHROPIC_API_KEY)" \
+      "OpenAI (Codex) · OPENAI_API_KEY · $(key_state OPENAI_API_KEY)" \
+      "Continue")
+    case "$choice" in
+      Anthropic*) name=ANTHROPIC_API_KEY ;;
+      OpenAI*) name=OPENAI_API_KEY ;;
+      *) return 0 ;;
+    esac
+    in_terminal wardos-vault ward vault set "$name"
+    [[ $round == 1 ]] || return 0
+  done
+}
+
+# pick_dir START: walk directories from START; prints the chosen one, fails on cancel.
+pick_dir() {
+  local dir=$1 choice sub rounds
+  for ((rounds = 0; rounds < 64; rounds++)); do
+    choice=$(
+      {
+        printf '%s\n' "· use this directory" "‹ up" "+ new directory…"
+        for sub in "$dir"/*/; do
+          # `if`, not `&&`: a directory with no subdirectories must not fail the pipeline.
+          if [[ -d "$sub" ]]; then printf '%s\n' "$(basename "$sub")/"; fi
+        done
+      } | wardos_menu "Project · $dir"
+    ) || return 1
+    case "$choice" in
+      "· use this directory")
+        printf '%s\n' "$dir"
+        return 0
+        ;;
+      "‹ up") dir=$(dirname "$dir") ;;
+      "+ new directory…")
+        sub=$(typed "Name of the new directory under $dir")
+        [[ -n "$sub" ]] || continue
+        printf '%s\n' "$dir/${sub%/}"
+        return 0
+        ;;
+      *)
+        sub=${choice%/}
+        sub=${sub/#\~/$HOME}
+        if [[ -d "$dir/$sub" ]]; then
+          dir="$dir/$sub"
+        elif [[ -d "$sub" ]]; then
+          dir=$sub
+        else
+          wardos_notify "No such directory" "$sub"
+        fi
+        ;;
+    esac
+  done
+  return 1
+}
+
+# clone URL DIR: the project step's terminal command.
+do_clone() {
+  local url=$1 dir=$2
+  git clone "$url" "$dir"
+  ward init "$dir"
+}
+
+step_project() {
+  local choice dir url
+  choice=$(ask "Project · a directory the agent works in" "Choose a directory" "Clone a repository")
+  case "$choice" in
+    "Choose a directory")
+      dir=$(pick_dir "$HOME") || return 0
+      in_terminal wardos-init ward init "$dir"
+      ;;
+    "Clone a repository")
+      url=$(typed "Repository URL (https://… or git@…)")
+      [[ -n "$url" ]] || return 0
+      dir="$HOME/$(basename "${url%.git}")"
+      if [[ -d "$dir" ]]; then
+        in_terminal wardos-init ward init "$dir"
+      else
+        in_terminal wardos-init wardos-welcome clone "$url" "$dir"
+      fi
+      ;;
+    *) return 0 ;;
+  esac
+  mkdir -p "$(dirname "$project_file")"
+  printf '%s\n' "$dir" >"$project_file"
+}
+
+step_agent() {
+  local project="" choice
+  [[ -f "$project_file" ]] && project=$(head -n1 "$project_file")
+  if [[ -z "$project" ]]; then
+    step_project
+    [[ -f "$project_file" ]] && project=$(head -n1 "$project_file")
+    [[ -n "$project" ]] || return 0
+  fi
+  choice=$(ask "Agent · start in $project" "Start Claude" "Start Codex")
+  case "$choice" in
+    "Start Claude") choice=claude ;;
+    "Start Codex") choice=codex ;;
+    *) return 0 ;;
+  esac
+  local bar="The trust bar, top of the screen: project, agent state, network, credentials, observer, TamperWard; green is verified, amber restricted, red denied."
+  printf '%s\n' "$bar"
+  wardos_notify "The trust bar" "$bar"
+  in_terminal wardos-agent ward "$choice" "$project"
+}
+
+step_done() {
+  wardos_menu "You are set" \
+    "Super + Space is everything: projects, agents, verify, apps" \
+    "Super + K lists the keys" \
+    "docs/onboarding.md is the five-minute path" \
+    "Done" >/dev/null || true
+  wardos_notify "Welcome to WardOS" "Super + Space is everything · Super + K lists the keys · docs/onboarding.md"
+  mkdir -p "$(dirname "$marker")"
+  date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
+}
+
+run_step() {
+  case "$1" in
+    theme | keys | project | agent | done) "step_$1" ;;
+    *) wardos_die "no step '$1' (theme, keys, project, agent, done)" ;;
+  esac
+}
+
+case "${1:-}" in
+  clone)
+    [[ $# -eq 3 ]] || wardos_die "clone <url> <dir>"
+    do_clone "$2" "$3"
+    exit
+    ;;
+  --again) shift ;;
+  "") if [[ -e "$marker" ]]; then exit 0; fi ;;
+esac
+steps=(theme keys project agent "done")
+[[ $# -gt 0 ]] && steps=("$@")
+for step in "${steps[@]}"; do run_step "$step"; done

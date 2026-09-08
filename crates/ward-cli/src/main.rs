@@ -20,8 +20,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod init;
 mod replay;
 mod tui;
+mod vault;
 use ward_daemon::approvals::ApprovalDecision;
 use ward_daemon::{Session, SessionMeta, SnapshotRole, client, daemon, render, selftest, snapshot};
 use ward_events::{EndReason, LogReader};
@@ -39,6 +41,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Make a directory a WardOS project: `.ward/policy.yaml`, the verifier config,
+    /// a `.gitignore` line and TamperWard's wiring. Idempotent; never overwrites
+    /// a file you wrote.
+    Init {
+        /// Project directory (default: current); created when missing.
+        dir: Option<PathBuf>,
+        /// The agent the closing "next" block names and whose key is looked for.
+        #[arg(long, value_enum, default_value_t = init::Agent::Claude)]
+        agent: init::Agent,
+        /// Leave TamperWard's wiring alone even when `tamperward` is installed.
+        #[arg(long)]
+        no_tamperward: bool,
+        /// Print what would be written and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// The keys the host keeps for the proxy (`$WARD_STATE_DIR/vault/<NAME>`, mode
+    /// 0600). A stored value is never printed back.
+    #[command(subcommand)]
+    Vault(VaultCmd),
     /// Start a session, record it as the project's current session, and print its
     /// security panel.
     Up {
@@ -199,6 +221,28 @@ Examples:
 ";
 
 #[derive(Subcommand)]
+enum VaultCmd {
+    /// Store a key: typed at the terminal without echo, or the first line of stdin.
+    Set {
+        /// The host variable the key stands for (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+        /// `GITHUB_TOKEN`); `[A-Z][A-Z0-9_]*`.
+        name: String,
+        /// Read the value from stdin even on a terminal.
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Every known key and whether it is set (vault, environment, neither); no values.
+    List,
+    /// Forget a key.
+    Rm {
+        /// The key's name.
+        name: String,
+    },
+    /// Print the vault directory.
+    Path,
+}
+
+#[derive(Subcommand)]
 enum SessionCmd {
     /// Print the immutable facts of the current session: ids, worktree, start time,
     /// agent, entry snapshot, policy hash, and the capability manifest.
@@ -302,6 +346,18 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
     match cli.command {
+        Command::Init {
+            dir,
+            agent,
+            no_tamperward,
+            dry_run,
+        } => cmd_init(
+            dir.unwrap_or_else(|| PathBuf::from(".")),
+            agent,
+            no_tamperward,
+            dry_run,
+        ),
+        Command::Vault(cmd) => cmd_vault(cmd),
         Command::Up { dir } => cmd_up(&dir.unwrap_or_else(cwd)),
         Command::Status { dir } => cmd_status(&dir.unwrap_or_else(cwd)),
         Command::Run { dir, argv } => cmd_run(&dir.unwrap_or_else(cwd), &argv),
@@ -375,6 +431,66 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             WatchMode::select(tui, plain, std::io::stdout().is_terminal()),
         ),
     }
+}
+
+/// `ward init`: everything the command reads from its environment is gathered here
+/// and handed to [`init::run`] as values.
+fn cmd_init(
+    dir: PathBuf,
+    agent: init::Agent,
+    no_tamperward: bool,
+    dry_run: bool,
+) -> ward_daemon::Result<ExitCode> {
+    let key_env = match agent {
+        init::Agent::Claude => "ANTHROPIC_API_KEY",
+        init::Agent::Codex => "OPENAI_API_KEY",
+    };
+    let opts = init::Options {
+        dir,
+        agent,
+        tamperward: init::find_tamperward(&std::env::var("PATH").unwrap_or_default()),
+        no_tamperward,
+        dry_run,
+        state: ward_daemon::session::state_root(),
+        key_in_env: std::env::var(key_env).is_ok_and(|v| !v.trim().is_empty()),
+    };
+    let report = init::run(&opts)?;
+    print!("{}", report.render());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward vault …`: the value of a key is read once, on `set`, and never shown.
+fn cmd_vault(cmd: VaultCmd) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    match cmd {
+        VaultCmd::Set { name, stdin } => {
+            vault::validate(&name)?;
+            let value = vault::read_value(&name, stdin)?;
+            let path = vault::set(&state, &name, &value)?;
+            println!(
+                "  {name} stored in {} (0600); the proxy injects it, the sandbox never sees it",
+                path.display()
+            );
+        }
+        VaultCmd::List => {
+            let rows = vault::list(&state, |name| {
+                std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
+            })?;
+            let width = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+            for (name, source) in rows {
+                println!("  {name:<width$}   {}", source.text());
+            }
+        }
+        VaultCmd::Rm { name } => {
+            if vault::remove(&state, &name)? {
+                println!("  {name} forgotten");
+            } else {
+                println!("  {name} was not set");
+            }
+        }
+        VaultCmd::Path => println!("{}", vault::dir(&state).display()),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `ward evidence append`: parse and check the record here, so a refused kind never

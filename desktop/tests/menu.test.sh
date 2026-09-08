@@ -84,6 +84,30 @@ grep -q "^PROJECTS" <<<"$top" && fail "no PROJECTS without ward-shell"
 wardos-menu security "Verify current project"
 assert_logged '^wardos-launch terminal ward verify$'
 
+# A fresh desktop: no live session, the walkthrough not done → "Start here" comes first.
+mock wardos-welcome
+marker="$XDG_CONFIG_HOME/wardos/welcome-done"
+top=$(wardos-menu --list)
+[[ "$(head -n1 <<<"$top")" =~ ^WELCOME\ +Start\ here$ ]] || fail "Start here is the first row; got: $top"
+wardos-menu welcome "Start here"
+assert_logged '^wardos-welcome $'
+export WARDOS_MENU_CHOICE="WELCOME    Start here"
+: >"$MOCK_LOG"
+wardos-menu
+assert_logged '^wardos-welcome $'
+# A session (the shell lists a PROJECTS row) hides it; so does the marker.
+mock ward-shell 'printf "AGENTS\tStart Claude\tward claude\n"'
+grep -q "^WELCOME" <<<"$(wardos-menu --list)" || fail "no PROJECTS row is no session: Start here stays"
+mock ward-shell 'printf "PROJECTS\tapp\tward open /p/app\nAGENTS\tStart Claude\tward claude\n"'
+grep -q "^WELCOME" <<<"$(wardos-menu --list)" && fail "a live session hides Start here"
+rm "$MOCK_DIR/ward-shell"
+mkdir -p "$(dirname "$marker")" && : >"$marker"
+grep -q "^WELCOME" <<<"$(wardos-menu --list)" && fail "the marker hides Start here"
+# Help keeps the walkthrough reachable afterwards.
+wardos-menu help welcome
+assert_logged '^wardos-welcome --again$'
+grep -qx Welcome <<<"$(wardos-menu --list help)" || fail "Help lists Welcome"
+
 # An unknown path fails.
 wardos-menu nowhere 2>/dev/null && fail "unknown path"
 exit 0

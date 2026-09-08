@@ -58,4 +58,49 @@ impl Policy {
         }
         Ok(serde_yaml::from_str(yaml)?)
     }
+
+    /// The commented project policy `ward init` writes (see [`TEMPLATE`]).
+    #[must_use]
+    pub const fn template() -> &'static str {
+        TEMPLATE
+    }
 }
+
+/// The project policy `ward init` writes: the secure defaults, spelled out with a
+/// comment per block so the file reads as a description of what the agent gets.
+/// Every value equals the image default, so the file narrows nothing until a line
+/// is edited; it exists so the choices are visible and reviewable in the repo.
+const TEMPLATE: &str = "\
+# .ward/policy.yaml — what an agent may reach in this project (written by `ward init`).
+#
+# WardOS merges this file with the host's defaults. A line here can only narrow what
+# the agent gets, never widen it; remove a line and the default applies again.
+# Reference: docs/security-model.md §3.
+
+# Where the agent may go on the network. `development` reaches package registries,
+# code hosts (github.com …) and the agent's own model API, nothing else. Narrower:
+# `registries`, `localhost_only`, `offline`; or an explicit host list under `!custom`.
+network: development
+
+# What the agent may read and write inside the sandbox (rw: read and write, ro: read
+# only, none: not mounted). Host paths outside these never appear in the sandbox.
+filesystem:
+  worktree: rw # this repository, mounted at /work
+  environment: rw # its caches and toolchains, at /env, kept between sessions
+  home: rw # a private home, empty at every start
+  tmp: rw # scratch space
+
+# Credentials the agent may ask for. Keys never enter the sandbox: the session proxy
+# injects them on the way out. `ask` means you approve each grant (a desktop
+# notification, or `ward claude --grant github`), limited to this repository and to
+# the permissions listed. `deny` refuses without asking.
+credentials:
+  github: !ask
+    repositories: [current_repository]
+    permissions: [contents:read, issues:read]
+
+# How closely the session is watched. `live` records every action as it happens, which
+# the trust bar and `ward watch` show. `!step_through {pause_before_writes: true}`
+# holds each file write (or `pause_before_network`, each request) for your approval.
+observer: live
+";

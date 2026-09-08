@@ -12,7 +12,9 @@
 # PROJECTS, AGENTS and SECURITY come from `ward-shell launcher --lines` (SECTION, label,
 # command, tab-separated) and run in a terminal; without ward-shell a static AGENTS and
 # SECURITY list of `ward` commands stands in. Leaves that need a terminal (installs,
-# updates, root) open one through `wardos-launch run`; the rest run in place.
+# updates, root) open one through `wardos-launch run`; the rest run in place. With no
+# live session and the walkthrough not yet done (~/.config/wardos/welcome-done), the
+# first row is WELCOME ▸ Start here, which runs wardos-welcome.
 set -euo pipefail
 # shellcheck source=desktop/lib/wardos.sh disable=SC1091
 source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
@@ -24,12 +26,23 @@ sub() { printf '%s\t>%s\n' "$1" "$2"; }
 # term ID CMD…: the leaf runs in a terminal window that stays open when the command ends.
 term() { printf 'wardos-launch run %s %s\n' "$1" "${*:2}"; }
 
+# What the shell says, asked once per run: empty without ward-shell or a daemon.
+shell_lines=""
+if wardos_has ward-shell; then
+  shell_lines=$(ward-shell launcher --lines 2>/dev/null || true)
+fi
+
+# The first row for a fresh desktop: no live session (the shell lists a PROJECTS row
+# only for one) and the walkthrough not done yet.
+welcome_items() {
+  if [[ -e "$(wardos_config_dir)/welcome-done" ]]; then return 0; fi
+  if printf '%s\n' "$shell_lines" | grep -q $'^PROJECTS\t'; then return 0; fi
+  printf 'WELCOME\tStart here\twardos-welcome\n'
+}
+
 # The upper sections: SECTION<TAB>label<TAB>command, from the shell or the static list.
 upper_items() {
-  local lines=""
-  if wardos_has ward-shell; then
-    lines=$(ward-shell launcher --lines 2>/dev/null || true)
-  fi
+  local lines=$shell_lines
   if [[ -z "$lines" ]]; then
     lines=$(printf '%s\n' \
       $'AGENTS\tStart Claude\tward claude' \
@@ -159,6 +172,7 @@ level() {
       done
       ;;
     help)
+      item "Welcome" "wardos-welcome --again"
       item "Keys" "wardos-keys"
       item "Manual" "wardos-launch browser https://github.com/hexrift/WardOS/blob/main/docs/desktop.md"
       item "Hyprland wiki" "wardos-launch browser https://wiki.hyprland.org"
@@ -203,6 +217,7 @@ run_level() {
 run_top() {
   local items sections section shown label
   items=$(
+    welcome_items
     upper_items
     system_items
   )

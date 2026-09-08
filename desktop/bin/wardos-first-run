@@ -6,8 +6,9 @@
 # Run by Hyprland's autostart. Once, unless --force (the marker is
 # ~/.config/wardos/first-run-done): copies every default configuration into ~/.config
 # (wardos-refresh --all), sets the Ward Dark theme, runs `ward doctor`, registers the
-# shipped web and terminal apps as .desktop entries, and shows the key bindings. Tools
-# that are not installed are skipped.
+# shipped web and terminal apps as .desktop entries, shows the key bindings, then hands
+# over to wardos-welcome (theme, keys, first project, first agent). Tools that are not
+# installed are skipped.
 set -euo pipefail
 # shellcheck source=desktop/lib/wardos.sh disable=SC1091
 source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
@@ -31,3 +32,5 @@ mkdir -p "$(dirname "$marker")"
 date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
 wardos_notify "Welcome to WardOS" "Super + Space opens the command centre; Super + K shows the keys"
 wardos-keys
+# The walkthrough keeps its own marker, so a login that skipped it can run it later.
+if wardos_has wardos-welcome; then wardos-welcome; fi

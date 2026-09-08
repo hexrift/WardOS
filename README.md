@@ -35,6 +35,27 @@ Evidence        protected
 Observer        LIVE
 ```
 
+## Get started
+
+On a machine of its own, boot the image ([`image/README.md`](image/README.md)): the
+agents, TamperWard and the desktop are in it, and the first login walks you through a
+theme, a key, a project and an agent. On a Linux you already have, install the tools:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | bash
+```
+
+Then, in any project, five commands and about five minutes
+([`docs/onboarding.md`](docs/onboarding.md)):
+
+```bash
+ward doctor                        # what this host can give a session, with a fix per gap
+ward vault set ANTHROPIC_API_KEY   # the model key, typed without echo, kept on the host
+ward init                          # policy, verifier config, TamperWard wiring; never overwrites yours
+ward claude                        # Claude Code in the sandbox; the proxy injects the key
+ward verify                        # the protected tests, from the entry snapshot, offline
+```
+
 ## See it running
 
 The prototype runs today on any Linux host with `bubblewrap`. It merges the project's
@@ -134,7 +155,13 @@ daemon-backed `ward run` warm-starts in 32 ms. The desktop is built ([ADR-0016](
 Waybar, the command centre and every menu in fuzzel, approvals as notifications answered
 from the keyboard, fourteen themes rendered into every component, the `wardos-*` command
 family for capture, power, web apps, terminal apps, installs and setup, and a Fedora 44
-bootc image that CI builds on every merge. Phase 0–2 are complete; the semantic
+bootc image that CI builds on every merge. Onboarding is one path
+([ADR-0017](docs/decisions/ADR-0017-agent-first-image.md), [`docs/onboarding.md`](docs/onboarding.md)):
+`ward init` makes any directory a project (policy, verifier config, TamperWard wiring,
+idempotent), `ward vault` keeps the keys on the host where the proxy injects them, and
+`wardos-welcome` walks a first login through theme, key, project and agent, with the
+command centre and the shell saying what to do next whenever there is no session.
+Phase 0–2 are complete; the semantic
 TamperWard rules, the verifier image, a boot on real hardware and the shell's own toolkit
 are later phases.
 
@@ -153,7 +180,8 @@ of the experiments that gate each phase.
 | [`docs/event-model.md`](docs/event-model.md) | The typed Ward event model, evidence chain, observer and replay |
 | [`docs/credential-broker.md`](docs/credential-broker.md) | How agents obtain scoped, short-lived credentials without seeing long-lived secrets |
 | [`docs/tamperward-integration.md`](docs/tamperward-integration.md) | The OS-level primitives WardOS exposes to TamperWard |
-| [`docs/install.md`](docs/install.md) | Install on an existing Linux host, requirements, first session |
+| [`docs/onboarding.md`](docs/onboarding.md) | Five minutes to a verified agent: boot, welcome, key, project, `ward claude`, `ward verify`, what the bar shows, what to do when something is denied |
+| [`docs/install.md`](docs/install.md) | Install on an existing Linux host, requirements, first project and session |
 | [`docs/agent-integration.md`](docs/agent-integration.md) | How `ward claude` / `ward codex` compose the sandbox, proxy, credentials and hooks |
 | [`docs/design-language.md`](docs/design-language.md) | Visual and interaction identity of the WardOS desktop |
 | [`docs/desktop.md`](docs/desktop.md) | The desktop: commands, keys, menu, themes, packages, parity with Omarchy |
