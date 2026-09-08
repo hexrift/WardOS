@@ -7,7 +7,10 @@ use std::time::SystemTime;
 
 use ward_events::{DeniedDst, DenyReason, HostName, ProcessRef, RuleRef, WardEvent};
 use ward_policy::NetworkCapability;
-use ward_proxy::{Config, Decision, GatewayRoute, Handle, Host, Observer, Proxy, Request};
+use ward_proxy::{
+    Config, Decision, GatewayRoute, Handle, Host, Observer, Proxy, Request, Resolver,
+    SystemResolver,
+};
 
 use crate::error::{Error, Result};
 
@@ -69,12 +72,25 @@ impl Egress {
         network: &NetworkCapability,
         routes: Vec<GatewayRoute>,
     ) -> Result<Self> {
+        Self::start_with(dir, network, routes, Arc::new(SystemResolver))
+    }
+
+    /// [`Egress::start`] with the resolver the proxy uses for every hostname.
+    /// Sessions resolve through the system; `ward selftest` injects answers to
+    /// stage DNS rebinding against the real proxy (ST-028).
+    pub fn start_with(
+        dir: &Path,
+        network: &NetworkCapability,
+        routes: Vec<GatewayRoute>,
+        resolver: Arc<dyn Resolver>,
+    ) -> Result<Self> {
         let socket = dir.join("proxy.sock");
         let recorder = Arc::new(Recorder::default());
         let observer: Arc<dyn Observer> = recorder.clone();
         let config = routes
             .into_iter()
             .fold(Config::new(network.clone()), Config::gateway)
+            .resolver(resolver)
             .listen_unix(&socket);
         let handle = Proxy::spawn(config, observer)
             .map_err(|e| Error::Sandbox(format!("egress proxy: {e}")))?;
@@ -88,6 +104,12 @@ impl Egress {
     /// Host path of the socket to bind into the sandbox.
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// Decisions made since the last drain, as recorded (the self-test reads
+    /// the proxy's own account of what it allowed and refused).
+    pub fn drain_decisions(&self) -> Vec<Recorded> {
+        self.recorder.drain()
     }
 
     /// Decisions made since the last drain, as log events with their decision time.

@@ -3,16 +3,17 @@
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use ward_proxy::{
     Config, Decision, GatewayRoute, Handle, Method, NetworkCapability, Observer, Proxy, Request,
-    Secret, StaticResolver,
+    Resolver, Secret, StaticResolver,
 };
 
 /// Records every decision the proxy reports.
@@ -779,4 +780,117 @@ fn unix_request_timeout_drops_a_silent_client() {
     assert!(recorder.0.lock().unwrap().is_empty());
     drop(proxy);
     assert!(!path.exists());
+}
+
+/// A resolver whose answer for one name changes on every call, counting the
+/// calls: the shape of a DNS-rebinding attack against the proxy (ST-028).
+struct FlipResolver {
+    name: &'static str,
+    answers: Vec<Vec<IpAddr>>,
+    calls: AtomicUsize,
+}
+
+impl Resolver for FlipResolver {
+    fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+        if host != self.name {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such host",
+            ));
+        }
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.answers[n.min(self.answers.len() - 1)].clone())
+    }
+}
+
+fn custom(hosts: &[&str]) -> Config {
+    let set: BTreeSet<String> = hosts.iter().map(|h| (*h).to_owned()).collect();
+    Config::new(NetworkCapability::Custom(set))
+}
+
+fn ip(s: &str) -> IpAddr {
+    s.parse().unwrap()
+}
+
+/// ST-028: an allowlisted name whose answer is a private, metadata, mapped or
+/// mixed address set gets byte-for-byte the same `403` as the private literal,
+/// and the observer sees the same address-class reason for both.
+#[test]
+fn allowlisted_name_resolving_to_a_private_address_is_the_literal_403() {
+    let resolver = StaticResolver::new()
+        .with("rebind.evil", [ip("10.0.0.5")])
+        .with("meta.evil", [ip("169.254.169.254")])
+        .with("mapped.evil", [ip("::ffff:192.168.1.1")])
+        .with("mixed.evil", [ip("93.184.216.34"), ip("10.0.0.5")]);
+    let config = custom(&["rebind.evil", "meta.evil", "mapped.evil", "mixed.evil"])
+        .resolver(Arc::new(resolver));
+    let (proxy, recorder) = start(config);
+    let send = |target: &str| {
+        let mut c = client(&proxy);
+        c.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .unwrap();
+        let response = read_all(&mut c);
+        let (_, decision, reason) = recorder.last();
+        (response, decision, reason)
+    };
+    // In an allowlist mode the literal is refused as a literal before its class
+    // is looked at; on the wire that is the same 403 the names get.
+    let (literal, decision, literal_reason) = send("10.0.0.5:443");
+    assert!(literal.starts_with("HTTP/1.1 403"), "{literal}");
+    assert_eq!(decision, Decision::Deny);
+    assert_eq!(literal_reason, "IP literal destinations are not permitted");
+    for (name, class) in [
+        ("rebind.evil:443", "private range"),
+        ("mixed.evil:443", "private range"),
+        ("meta.evil:80", "cloud metadata endpoint"),
+        ("mapped.evil:80", "private range"),
+    ] {
+        let (response, decision, reason) = send(name);
+        assert_eq!(response, literal, "{name} must get the literal's 403");
+        assert_eq!(decision, Decision::Deny, "{name}");
+        assert_eq!(reason, format!("destination is a {class}"), "{name}");
+        assert!(!response.contains("evil"), "leaks host: {response}");
+    }
+}
+
+/// ST-028: the proxy resolves once per request and connects only to what it
+/// checked. An answer that flips to a private address after the tunnel is up
+/// changes nothing for that tunnel, and the next request is refused.
+#[test]
+fn an_established_tunnel_is_pinned_and_a_rebinding_answer_refuses_the_next() {
+    let echo = spawn_echo();
+    let resolver = Arc::new(FlipResolver {
+        name: "pin.evil",
+        answers: vec![vec![echo.ip()], vec![ip("10.0.0.5")]],
+        calls: AtomicUsize::new(0),
+    });
+    let config = custom(&["pin.evil"])
+        .allow_loopback(true)
+        .resolver(resolver.clone());
+    let (proxy, recorder) = start(config);
+    let connect = format!(
+        "CONNECT pin.evil:{p} HTTP/1.1\r\nHost: pin.evil:{p}\r\n\r\n",
+        p = echo.port()
+    );
+
+    let mut first = client(&proxy);
+    first.write_all(connect.as_bytes()).unwrap();
+    assert!(read_head(&mut first).starts_with("HTTP/1.1 200"));
+    assert_eq!(recorder.last().2, format!("pinned {}", echo.ip()));
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+
+    let mut second = client(&proxy);
+    second.write_all(connect.as_bytes()).unwrap();
+    let response = read_all(&mut second);
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert_eq!(recorder.last().2, "destination is a private range");
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+
+    // The first tunnel still talks to the address it was pinned to; nothing
+    // re-resolved it on the data path.
+    first.write_all(b"still pinned").unwrap();
+    let mut echoed = [0u8; 12];
+    first.read_exact(&mut echoed).unwrap();
+    assert_eq!(&echoed, b"still pinned");
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
 }

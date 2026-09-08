@@ -12,6 +12,7 @@ use ward_policy::{
 };
 
 use crate::describe::SessionDescription;
+use crate::selftest::Verdict;
 use crate::snapshot::DiffReport;
 
 const RESET: &str = "\x1b[0m";
@@ -766,13 +767,19 @@ fn human_ago(d: std::time::Duration) -> String {
     }
 }
 
-/// Colour a self-test outcome line (`PASS`/`DENIED`).
+/// Colour a self-test outcome line: `DENIED` (the sandbox held), `REACHED`
+/// (it did not, with how), or `CANNOT-MEASURE-HERE` with the reason (E-06's
+/// convention: a probe this host cannot run is never shown as a pass).
 #[must_use]
-pub fn selftest_row(name: &str, blocked: bool) -> String {
-    if blocked {
-        format!("  {INK}{name:<36}{RESET}{OK}DENIED{RESET}")
-    } else {
-        format!("  {INK}{name:<36}{RESET}{DENY}REACHED{RESET}")
+pub fn selftest_row(name: &str, verdict: &Verdict) -> String {
+    match verdict {
+        Verdict::Denied => format!("  {INK}{name:<36}{RESET}{OK}DENIED{RESET}"),
+        Verdict::Reached(how) => {
+            format!("  {INK}{name:<36}{RESET}{DENY}REACHED{RESET}  {DIM}{how}{RESET}")
+        }
+        Verdict::CannotMeasure(why) => {
+            format!("  {INK}{name:<36}{RESET}{WARN}CANNOT-MEASURE-HERE{RESET}  {DIM}{why}{RESET}")
+        }
     }
 }
 
