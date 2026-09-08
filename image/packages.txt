@@ -3,8 +3,9 @@
 # The Containerfile installs from this file after enabling the COPRs of
 # image/coprs.txt; desktop/install.sh layers it onto an existing Fedora;
 # image/check-packages.sh (CI: "image packages") proves every name resolves in a
-# fedora:<release> container with the same COPRs. `# unverified` marks a name that check has
-# not confirmed yet; the check, not this file, is the source of truth.
+# fedora:<release> container with the same COPRs. The check, not this file, is the
+# source of truth: a name that has not passed it yet is marked `# unverified` until it has
+# (none today; every name here passed on Fedora 44 with the COPRs of coprs.txt).
 
 # --- runtime (ADR-0001: no developer toolchain on the host, one explicit exception) ----
 bubblewrap            # sandbox builder used by wardd (ADR-0002, ADR-0013)
@@ -17,16 +18,16 @@ rust                  # (image/README.md: the one, temporary, toolchain exceptio
 podman                # nested containers inside project environments (ADR-0005)
 
 # --- compositor and session ---------------------------------------------------------
-hyprland              # the compositor (ADR-0007) (COPR mineiro/hyprland)      # unverified
-hyprlock              # lock screen (COPR mineiro/hyprland)                    # unverified
-hypridle              # idle management (lock, screen off, suspend) (COPR mineiro/hyprland) # unverified
-hyprpaper             # wallpaper daemon (image backgrounds; swaybg draws solid ones) (COPR mineiro/hyprland) # unverified
-hyprpicker            # colour picker (wardos-capture color) (COPR mineiro/hyprland) # unverified
-hyprsunset            # night light (wardos-toggle nightlight) (COPR mineiro/hyprland) # unverified
-hyprpolkitagent       # polkit prompts on the desktop (pkexec) (COPR mineiro/hyprland) # unverified
-xdg-desktop-portal-hyprland # screen sharing, screenshots for portals (COPR mineiro/hyprland) # unverified
+hyprland              # the compositor (ADR-0007) (COPR mineiro/hyprland)
+hyprlock              # lock screen (COPR mineiro/hyprland)
+hypridle              # idle management (lock, screen off, suspend) (COPR mineiro/hyprland)
+hyprpaper             # wallpaper daemon (image backgrounds; swaybg draws solid ones) (COPR mineiro/hyprland)
+hyprpicker            # colour picker (wardos-capture color) (COPR mineiro/hyprland)
+hyprsunset            # night light (wardos-toggle nightlight) (COPR mineiro/hyprland)
+hyprpolkitagent       # polkit prompts on the desktop (pkexec) (COPR mineiro/hyprland)
+xdg-desktop-portal-hyprland # screen sharing, screenshots for portals (COPR mineiro/hyprland)
 xdg-desktop-portal-gtk # file chooser and settings portal
-uwsm                  # Universal Wayland Session Manager: starts Hyprland as a systemd session (COPR mineiro/hyprland) # unverified
+uwsm                  # Universal Wayland Session Manager: starts Hyprland as a systemd session (COPR mineiro/hyprland)
 xorg-x11-server-Xwayland # X11 applications
 qt6-qtwayland         # Qt 6 applications on Wayland
 qt5-qtwayland         # Qt 5 applications on Wayland
@@ -42,14 +43,14 @@ waybar                # the trust bar
 fuzzel                # command centre and every menu
 mako                  # notifications and approvals
 libnotify             # notify-send (wardos-notify)
-swayosd               # on-screen volume and brightness (COPR erikreider/swayosd) # unverified
+swayosd               # on-screen volume and brightness (COPR erikreider/swayosd)
 
 # --- capture and clipboard ------------------------------------------------------------
 grim                  # screenshot
 slurp                 # region selection
-satty                 # screenshot annotation (COPR mineiro/hyprland)          # unverified
+satty                 # screenshot annotation (COPR mineiro/hyprland)
 wf-recorder           # screen recording
-cliphist              # clipboard history (Super+Ctrl+V) # unverified
+cliphist              # clipboard history (Super+Ctrl+V)
 wl-clipboard          # wl-copy, wl-paste
 swaybg                # solid-colour background (`solid:<hex>` themes)
 
@@ -90,7 +91,7 @@ fd-find               # fd
 bat                   # cat with syntax
 eza                   # ls with icons
 zoxide                # cd that learns
-lazygit               # git TUI (COPR atim/lazygit)                            # unverified
+lazygit               # git TUI (COPR atim/lazygit)
 git-delta             # diffs
 tmux                  # terminal multiplexer
 pavucontrol           # wardos-setup audio (pulsemixer is not packaged; the command prefers it when present)

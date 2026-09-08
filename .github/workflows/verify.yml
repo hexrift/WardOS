@@ -85,11 +85,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # What COPR offers for the names Fedora may not carry, and for which releases;
-      # informational, so a COPR API hiccup never fails the check itself.
-      - name: COPR discovery
-        continue-on-error: true
-        run: ./image/check-packages.sh --discover hyprland hyprlock hypridle hyprpaper hyprpicker hyprpolkitagent hyprsunset xdg-desktop-portal-hyprland uwsm satty swayosd lazygit
+      # When a name goes missing, `./image/check-packages.sh --discover NAME` (locally or
+      # as a step here) lists the COPRs that carry it for the pinned release.
       - run: ./image/check-packages.sh
 
   # The desktop tree (docs/desktop.md): every script shellcheck-clean, every bash test green.

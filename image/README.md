@@ -82,10 +82,11 @@ CI is the source of truth for the names: `check-packages.sh` enables the COPRs a
 `dnf repoquery` inside `quay.io/fedora/fedora:<release>` (the release read from the
 Containerfile's `FROM` tag, so the check and the build cannot drift; docker on the
 runner, podman locally when docker is absent) and fails listing every name that did not
-resolve; a wrong name
-is a one-line fix there, and a name the check has not confirmed yet carries
-`# unverified` until it has. `check-packages.sh --dry-run` prints the command without a
-container runtime.
+resolve; a wrong name is a one-line fix there, and a name the check has not confirmed
+yet carries `# unverified` until it has (none today: every name passed on Fedora 44 with
+the three COPRs). `check-packages.sh --dry-run` prints the command without a container
+runtime; `check-packages.sh --discover NAME...` asks the COPR API which projects carry
+a name for the pinned release, which is how the COPRs below were chosen.
 
 ### COPRs
 

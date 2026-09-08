@@ -217,8 +217,8 @@ the COPRs and installs from the manifest, and `desktop/install.sh` layers the sa
 (44; `image/check-packages.sh`: `dnf repoquery` in a `fedora:44` container, job "image
 packages" on every pull request) and builds the whole image with `docker build`
 (`image.yml`, job "image build", on `main` and on pull requests that touch `image/`,
-`desktop/` or the crates). Names the author could not see in Fedora carry
-`# unverified`; the check, not the file, decides. Applications that are not in Fedora
+`desktop/` or the crates). A name the check has not confirmed yet carries
+`# unverified` until it has (none today); the check, not the file, decides. Applications that are not in Fedora
 come from Flathub via `wardos-install app` and the defaults in `desktop/flatpaks.txt`,
 installed once by `wardos-flathub.service` after the first boot with a network; nothing
 is downloaded by `curl | sh`. `mise` is not in Fedora and not in the image.
