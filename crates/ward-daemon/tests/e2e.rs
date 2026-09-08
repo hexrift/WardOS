@@ -446,6 +446,76 @@ fn verify_ignores_a_weakened_protected_test_and_passes_the_real_fix() {
     );
 }
 
+/// The `TamperWard` primitives (`docs/tamperward-integration.md` §2): a candidate
+/// snapshot after an edit, `diff` and `cat` answered from the CAS, and `describe`
+/// carrying the entry id and policy hash.
+#[test]
+fn snapshot_primitives_answer_from_the_cas_and_describe_carries_the_facts() {
+    if !sandbox::available() {
+        eprintln!("skipping: bubblewrap not available");
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let mut session = Session::start_in(project.path(), state.path()).expect("start");
+    let entry = ward_daemon::snapshot::parse_id(session.entry_snapshot()).expect("entry id");
+
+    fs::write(project.path().join("README.md"), "edited\n").unwrap();
+    let candidate = session
+        .snapshot(ward_daemon::SnapshotRole::Candidate)
+        .expect("candidate");
+    assert_ne!(candidate.id, entry);
+
+    let diff = ward_daemon::snapshot::diff(state.path(), entry, candidate.id).expect("diff");
+    assert_eq!(diff.changed, vec!["README.md".to_string()]);
+    assert!(diff.added.is_empty() && diff.removed.is_empty(), "{diff:?}");
+    assert!(
+        ward_daemon::snapshot::diff(state.path(), entry, entry)
+            .unwrap()
+            .is_empty()
+    );
+
+    let pristine =
+        ward_daemon::snapshot::cat(state.path(), entry, std::path::Path::new("README.md"))
+            .expect("cat");
+    assert_eq!(
+        pristine, b"demo\n",
+        "the entry bytes are untouched by the edit"
+    );
+    assert!(
+        ward_daemon::snapshot::cat(state.path(), entry, std::path::Path::new("missing.txt"))
+            .is_err()
+    );
+
+    let d = session.describe();
+    assert_eq!(d.session, session.id());
+    assert_eq!(d.entry_snapshot, entry.to_string());
+    assert_eq!(d.policy_hash, session.manifest().policy_hash.to_hex());
+    assert_eq!(d.manifest, *session.manifest());
+    assert_eq!(d.worktree, project.path().canonicalize().unwrap());
+    assert_eq!(d.agent.as_ref().map(|a| a.name.as_str()), Some("shell"));
+
+    // A reopened session describes the same facts, and the log records the capture.
+    session.persist_current().expect("persist");
+    let log = session.log_path();
+    drop(session);
+    let reopened = Session::open_current(project.path(), state.path())
+        .expect("open")
+        .expect("current");
+    assert_eq!(reopened.describe(), d);
+    reopened.stop(EndReason::UserStop).expect("stop");
+    let created = LogReader::open(&log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find_map(|r| match r.event {
+            WardEvent::SnapshotCreated { role, id, .. } => Some((role, id.to_string())),
+            _ => None,
+        })
+        .expect("a SnapshotCreated record");
+    assert_eq!(created.0, ward_events::SnapshotRole::Candidate);
+    assert_eq!(created.1, candidate.id.to_string());
+}
+
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for e in fs::read_dir(dir).unwrap().flatten() {

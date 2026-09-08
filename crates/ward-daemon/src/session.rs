@@ -20,13 +20,14 @@ use ward_events::{
     VerifySummary, WardEvent,
 };
 use ward_policy::{CapabilityManifest, NetworkCapability, ObserverMode, Policy, merge};
-use ward_snapshot::{CaptureOptions, SnapshotRole, SnapshotStore};
+use ward_snapshot::{CaptureOptions, SnapshotMeta, SnapshotRole, SnapshotStore};
 
+use crate::describe::SessionDescription;
 use crate::egress::Egress;
 use crate::error::{Error, Result};
 use crate::gateway::Gateway;
 use crate::hooks::Hooks;
-use crate::ids::{ev_hash, ev_snapshot, new_session_id, project_id_for};
+use crate::ids::{ev_capture, ev_hash, ev_role, ev_snapshot, new_session_id, project_id_for};
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
 use crate::verify;
 use crate::watch::{CaptureMode, Captured, Watcher};
@@ -39,6 +40,7 @@ pub struct Session {
     chain: Chain,
     log: LogWriter,
     started: SystemTime,
+    agent: AgentIdentity,
     next_pid: u32,
     root_pid: Pid,
     session_str: String,
@@ -62,6 +64,10 @@ pub struct SessionMeta {
     pub manifest: CapabilityManifest,
     /// Session start time, milliseconds since the Unix epoch.
     pub started_unix_ms: u64,
+    /// The agent identity recorded at start (absent in records written before it
+    /// was persisted).
+    #[serde(default)]
+    pub agent: Option<AgentIdentity>,
 }
 
 impl SessionMeta {
@@ -127,6 +133,17 @@ pub struct VerifyReport {
     pub restored: Vec<String>,
     /// The verifier's combined output.
     pub output: String,
+}
+
+/// What a session reopened from a record written before the identity was persisted
+/// reports as its agent.
+fn unknown_agent() -> AgentIdentity {
+    AgentIdentity {
+        kind: AgentKind::Other,
+        name: NameText::new("unknown"),
+        version: NameText::new("0"),
+        image: None,
+    }
 }
 
 /// Identity of the 0.1 verifier: a namespace sandbox on this host, not an image.
@@ -197,6 +214,12 @@ impl Session {
         let log = LogWriter::create(&log_path, chain.head(), FsyncPolicy::DEFAULT)
             .map_err(|e| Error::Events(e.to_string()))?;
 
+        let agent = AgentIdentity {
+            kind: AgentKind::Other,
+            name: NameText::new("shell"),
+            version: NameText::new(env!("CARGO_PKG_VERSION")),
+            image: None,
+        };
         let mut s = Self {
             manifest,
             worktree,
@@ -204,18 +227,13 @@ impl Session {
             chain,
             log,
             started: SystemTime::now(),
+            agent: agent.clone(),
             next_pid: 1,
             root_pid: Pid::new(1).map_err(|e| Error::Events(e.to_string()))?,
             session_str,
             project_id: project_id_str,
             state: state.to_path_buf(),
             log_path,
-        };
-        let agent = AgentIdentity {
-            kind: AgentKind::Other,
-            name: NameText::new("shell"),
-            version: NameText::new(env!("CARGO_PKG_VERSION")),
-            image: None,
         };
         s.emit(
             Origin::Wardd,
@@ -253,6 +271,7 @@ impl Session {
             chain,
             log,
             started,
+            agent: meta.agent.unwrap_or_else(unknown_agent),
             next_pid: 1,
             root_pid: Pid::new(1).map_err(|e| Error::Events(e.to_string()))?,
             session_str: meta.id,
@@ -272,6 +291,7 @@ impl Session {
             entry_snapshot: self.entry_snapshot.clone(),
             manifest: self.manifest.clone(),
             started_unix_ms: unix_ms(self.started),
+            agent: Some(self.agent.clone()),
         };
         let path = meta_path(&self.state, &self.session_str);
         let bytes = serde_json::to_vec_pretty(&meta)
@@ -283,6 +303,42 @@ impl Session {
     /// The effective capability manifest.
     pub fn manifest(&self) -> &CapabilityManifest {
         &self.manifest
+    }
+
+    /// The immutable facts of this session (`ward session describe`).
+    #[must_use]
+    pub fn describe(&self) -> SessionDescription {
+        SessionDescription {
+            session: self.session_str.clone(),
+            project: self.project_id.clone(),
+            worktree: self.worktree.clone(),
+            started_unix_ms: unix_ms(self.started),
+            agent: Some((&self.agent).into()),
+            entry_snapshot: self.entry_snapshot.clone(),
+            policy_hash: self.manifest.policy_hash.to_hex(),
+            manifest: self.manifest.clone(),
+        }
+    }
+
+    /// Capture the worktree into the session CAS under `role` and record it
+    /// (`ward snapshot create`). The 0.1 capture is a frozen copy without a cgroup
+    /// freeze, so the recorded stall is zero.
+    pub fn snapshot(&mut self, role: SnapshotRole) -> Result<SnapshotMeta> {
+        let meta = crate::snapshot::open_store(&self.state)?
+            .capture(&self.worktree, role, CaptureOptions::default())
+            .map_err(|e| Error::Snapshot(e.to_string()))?;
+        self.emit(
+            Origin::Wardd,
+            WardEvent::SnapshotCreated {
+                role: ev_role(role),
+                id: ev_snapshot(meta.id),
+                entries: meta.entries,
+                bytes: meta.bytes,
+                capture: ev_capture(meta.capture_mode),
+                stall: Duration::ZERO,
+            },
+        )?;
+        Ok(meta)
     }
 
     /// Paths `TamperWard` protects (`protected.tests` in `.tamperward/config.yml`),
@@ -898,6 +954,7 @@ mod tests {
             entry_snapshot: "blake3:abc".to_owned(),
             manifest,
             started_unix_ms: 1_700_000_000_000,
+            agent: None,
         }
     }
 

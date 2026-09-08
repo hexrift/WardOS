@@ -6,8 +6,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ward_events::{Blake3Hash as EvHash, ProjectId, SessionId, SnapshotId as EvSnapshotId};
-use ward_snapshot::SnapshotId as SnapSnapshotId;
+use ward_events::{
+    Blake3Hash as EvHash, CaptureMode as EvCaptureMode, ProjectId, SessionId,
+    SnapshotId as EvSnapshotId, SnapshotRole as EvSnapshotRole,
+};
+use ward_snapshot::{
+    CaptureMode as SnapCaptureMode, SnapshotId as SnapSnapshotId, SnapshotRole as SnapSnapshotRole,
+};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -29,6 +34,24 @@ pub fn ev_snapshot(id: SnapSnapshotId) -> EvSnapshotId {
     // Both render as `blake3:<hex>`; `from_hex` tolerates the prefix.
     let hash = EvHash::from_hex(&id.to_string()).unwrap_or_else(|_| EvHash::from_bytes([0u8; 32]));
     EvSnapshotId::new(hash)
+}
+
+/// Bridge a `ward-snapshot` role into the `ward-events` role used in the log.
+pub fn ev_role(role: SnapSnapshotRole) -> EvSnapshotRole {
+    match role {
+        SnapSnapshotRole::Entry => EvSnapshotRole::Entry,
+        SnapSnapshotRole::Candidate => EvSnapshotRole::Candidate,
+        SnapSnapshotRole::Accepted => EvSnapshotRole::Accepted,
+        SnapSnapshotRole::Final => EvSnapshotRole::Final,
+    }
+}
+
+/// Bridge a `ward-snapshot` capture mode into the `ward-events` one.
+pub fn ev_capture(mode: SnapCaptureMode) -> EvCaptureMode {
+    match mode {
+        SnapCaptureMode::BtrfsSnapshot => EvCaptureMode::BtrfsSnapshot,
+        SnapCaptureMode::FrozenCopy => EvCaptureMode::FrozenCopy,
+    }
 }
 
 /// Bridge raw manifest-hash bytes into the `ward-events` hash used as the chain genesis.
