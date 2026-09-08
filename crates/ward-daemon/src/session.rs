@@ -14,14 +14,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use ward_events::{
-    AgentIdentity, AgentKind, AgentState, BoundedArgv, BoundedText, Chain, EndReason, EventRecord,
-    ExitStatus, FileChangeKind, FsyncPolicy, ImageDigest, LogWriter, NameText, Origin, Pid,
-    ProcessRef, SandboxPath, SandboxRoot, ShortText, StepStatus, Timestamp, VerifyRequester,
-    VerifySummary, WardEvent,
+    AgentIdentity, AgentKind, AgentState, BoundedArgv, BoundedText, EndReason, ExitStatus,
+    FileChangeKind, ImageDigest, NameText, Origin, Pid, ProcessRef, SandboxPath, SandboxRoot,
+    ShortText, StepStatus, VerifyRequester, VerifySummary, WardEvent,
 };
 use ward_policy::{CapabilityManifest, NetworkCapability, ObserverMode, Policy, merge};
 use ward_snapshot::{CaptureOptions, SnapshotMeta, SnapshotRole, SnapshotStore};
 
+use crate::control::{LocalLog, RemoteSink, SOCKET_NAME, Sink, unix_ms};
 use crate::describe::SessionDescription;
 use crate::egress::Egress;
 use crate::error::{Error, Result};
@@ -37,8 +37,7 @@ pub struct Session {
     manifest: CapabilityManifest,
     worktree: PathBuf,
     entry_snapshot: String,
-    chain: Chain,
-    log: LogWriter,
+    sink: Box<dyn Sink>,
     started: SystemTime,
     agent: AgentIdentity,
     next_pid: u32,
@@ -210,9 +209,13 @@ impl Session {
         std::fs::create_dir_all(&session_dir).map_err(|e| Error::io(&session_dir, e))?;
         let log_path = session_dir.join("events.log");
         let manifest_hash = ev_hash(manifest.policy_hash.0);
-        let chain = Chain::genesis(session, manifest_hash);
-        let log = LogWriter::create(&log_path, chain.head(), FsyncPolicy::DEFAULT)
-            .map_err(|e| Error::Events(e.to_string()))?;
+        let started = SystemTime::now();
+        let sink = Box::new(LocalLog::create(
+            &log_path,
+            session,
+            manifest_hash,
+            started,
+        )?);
 
         let agent = AgentIdentity {
             kind: AgentKind::Other,
@@ -224,9 +227,8 @@ impl Session {
             manifest,
             worktree,
             entry_snapshot: entry.to_string(),
-            chain,
-            log,
-            started: SystemTime::now(),
+            sink,
+            started,
             agent: agent.clone(),
             next_pid: 1,
             root_pid: Pid::new(1).map_err(|e| Error::Events(e.to_string()))?,
@@ -259,17 +261,19 @@ impl Session {
             return Ok(None);
         };
         let worktree = meta.project.clone();
-        let log_path = session_dir(state, &meta.id).join("events.log");
-        let log = LogWriter::open(&log_path, FsyncPolicy::DEFAULT)
-            .map_err(|e| Error::Events(e.to_string()))?;
-        let chain = Chain::resume(log.head());
+        let dir = session_dir(state, &meta.id);
+        let log_path = dir.join("events.log");
         let started = UNIX_EPOCH + Duration::from_millis(meta.started_unix_ms);
+        // A running daemon (ADR-0015) is the writer; otherwise this process is.
+        let sink: Box<dyn Sink> = match RemoteSink::connect(&dir.join(SOCKET_NAME)) {
+            Some(remote) => Box::new(remote),
+            None => Box::new(LocalLog::open(&log_path, started)?),
+        };
         Ok(Some(Self {
             manifest: meta.manifest,
             worktree,
             entry_snapshot: meta.entry_snapshot,
-            chain,
-            log,
+            sink,
             started,
             agent: meta.agent.unwrap_or_else(unknown_agent),
             next_pid: 1,
@@ -386,7 +390,7 @@ impl Session {
     /// Force any buffered log records to disk. Call after [`run`](Self::run) on a
     /// session that stays active so nothing is lost if the process exits.
     pub fn sync(&mut self) -> Result<()> {
-        self.log.sync().map_err(|e| Error::Events(e.to_string()))
+        self.sink.sync()
     }
 
     /// Run one command inside the sandbox, recording its events.
@@ -693,7 +697,7 @@ impl Session {
                 final_snapshot: None,
             },
         )?;
-        self.log.seal().map_err(|e| Error::Events(e.to_string()))?;
+        self.sink.seal()?;
         clear_current(&self.state, &self.project_id, &self.session_str)?;
         Ok(())
     }
@@ -759,14 +763,7 @@ impl Session {
     /// claims, file events) are drained after the command exits but keep their
     /// own time, so the observer timeline is truthful.
     fn emit_at(&mut self, at: SystemTime, origin: Origin, event: WardEvent) -> Result<()> {
-        let record: EventRecord = self
-            .chain
-            .append(origin, event, ts_at(self.started, at))
-            .map_err(|e| Error::Events(e.to_string()))?;
-        self.log
-            .append(&record)
-            .map_err(|e| Error::Events(e.to_string()))?;
-        Ok(())
+        self.sink.append(origin, event, at).map(drop)
     }
 }
 
@@ -788,15 +785,6 @@ fn exit_status(code: Option<i32>) -> ExitStatus {
             core_dumped: false,
         },
     }
-}
-
-/// Monotonic session time of `at`; anything before the session started is 0.
-fn ts_at(started: SystemTime, at: SystemTime) -> Timestamp {
-    Timestamp::mono(at.duration_since(started).unwrap_or_default())
-}
-
-fn unix_ms(t: SystemTime) -> u64 {
-    u64::try_from(t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn load_project_policy(worktree: &Path) -> Result<Policy> {
@@ -1054,16 +1042,5 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded, meta);
-    }
-
-    #[test]
-    fn ts_at_keeps_capture_time_and_clamps_before_start() {
-        let started = SystemTime::now();
-        let later = started + Duration::from_secs(5);
-        assert_eq!(ts_at(started, later).mono, Duration::from_secs(5));
-        assert_eq!(
-            ts_at(started, started - Duration::from_secs(1)).mono,
-            Duration::ZERO
-        );
     }
 }
