@@ -328,8 +328,13 @@ needs, and publishes the result:
   `luks`. The disks appear as the run's `wardos-disks` artifact for 14 days, with a
   `SHA256SUMS`.
 * **On every published release**: both disks are built from that release's tarball and
-  attached to the release as `wardos-<version>-x86_64.qcow2.zst` and `.iso.zst`
-  (zstd-compressed to stay under GitHub's 2 GiB asset cap; `zstd -d` restores them).
+  attached to the release as `wardos-<tag>-x86_64.qcow2.zst` and `.iso.zst`. GitHub
+  caps a release asset at 2 GiB and bootc-image-builder's disks are already compressed
+  inside (zstd gains about 1 %), so a disk over the cap is attached in 1900 MiB parts:
+  `cat wardos-<tag>-x86_64.iso.zst.part* > wardos-<tag>-x86_64.iso.zst`, check it
+  against `SHA256SUMS`, then `zstd -d`. Decision: parts rather than an external host,
+  so a release stays one page with everything on it; the run's `wardos-disks` artifact
+  carries the same files unsplit for 14 days.
 
 The first user's password in these disks is `wardos`. Change it at first login
 (`passwd`); the ISO with `luks` additionally asks for the disk passphrase during the

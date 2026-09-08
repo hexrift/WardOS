@@ -74,7 +74,8 @@ jobs:
       - name: Name and checksum the disks
         run: |
           set -euo pipefail
-          version=$(git describe --tags --always)
+          # A release build carries the release's name; anything else its describe string.
+          if [[ "$SOURCE" == release && -n "$RELEASE" ]]; then version="$RELEASE"; else version=$(git describe --tags --always); fi
           mkdir -p dist
           if [[ -f image/out/qcow2/disk.qcow2 ]]; then
             sudo mv image/out/qcow2/disk.qcow2 "dist/wardos-${version}-x86_64.qcow2"
@@ -102,7 +103,14 @@ jobs:
           sudo apt-get install -y -q zstd
           cd dist
           for f in *.qcow2 *.iso; do [[ -f "$f" ]] && zstd -T0 -12 --rm "$f"; done
+          # bootc-image-builder's disks are already compressed inside, so zstd gains
+          # little and a disk is over GitHub's 2 GiB asset cap; anything that large is
+          # split into 1900 MiB parts (`cat name.zst.part* > name.zst`, then `zstd -d`).
+          for f in *.zst; do
+            if [[ $(stat -c %s "$f") -gt 1900000000 ]]; then split -b 1900M -d --suffix-length=1 "$f" "$f.part" && rm "$f"; fi
+          done
           sha256sum ./* > SHA256SUMS
+          ls -l
           gh release upload "$RELEASE" ./* --clobber
 
   # Whether the same desktop could be built for Apple silicon: do the COPRs the image
