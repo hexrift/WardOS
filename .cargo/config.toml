@@ -1,0 +1,6 @@
+# Protected by .tamperward.yml (config).
+[build]
+rustflags = ["-D", "warnings"]
+
+[alias]
+verify = "run --quiet --package ward-cli -- selftest"

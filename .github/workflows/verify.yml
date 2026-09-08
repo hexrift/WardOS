@@ -1,0 +1,20 @@
+# Protected by .tamperward.yml (ci). This is the merge authority.
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: pip install pyyaml
+      - run: bash scripts/verify/tamperward.sh
