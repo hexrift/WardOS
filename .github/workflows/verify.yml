@@ -6,8 +6,12 @@ on:
   push:
     branches: [main]
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   verify:
+    name: fmt · clippy · test · security-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,3 +22,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: pip install pyyaml
       - run: bash scripts/verify/tamperward.sh
+
+  deny:
+    name: cargo-deny (advisories · licenses · sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources bans
+
+  docs:
+    name: docs links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/security-check/doc-links.py
