@@ -570,6 +570,7 @@ fn cmd_selftest(dir: &Path) -> ward_daemon::Result<ExitCode> {
     };
     let credentials = ward_daemon::selftest_credentials(&mut session)?;
     let evidence = ward_daemon::selftest_evidence(&mut session)?;
+    let verifier = ward_daemon::selftest_verifier(&mut session)?;
     if throwaway {
         session.stop(EndReason::UserStop)?;
     } else {
@@ -579,6 +580,7 @@ fn cmd_selftest(dir: &Path) -> ward_daemon::Result<ExitCode> {
         ("isolation", &isolation),
         ("credentials", &credentials),
         ("evidence", &evidence),
+        ("verifier boundary", &verifier),
     ];
     for (name, results) in &groups {
         println!("WARD selftest · {name}\n");

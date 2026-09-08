@@ -142,8 +142,13 @@ repository; verifier has no network; verification startup < 500 ms.
 ### Phase 4 — delivered so far
 
 The verifier already has no network and a wall-clock budget (`verify.budget_secs`,
-ADR-0004 addendum) with a capped result document. Still ahead: the verifier image, a
-distinct uid range, the cgroup budget, and the hostile-repository probes.
+ADR-0004 addendum) with a capped result document. `ward selftest` has a verifier-boundary
+group: ST-005 (the supervisor cannot be signalled from the sandbox), ST-006 (the launch's
+host run directory, where verifier trees live, is unreachable) and ST-008 (the CAS is
+unreachable); ST-019 is an end-to-end test (a hostile verify command gets no network, no
+host path, no real worktree, and nothing it writes survives to the next run). Still
+ahead: the verifier image, a distinct uid range, the cgroup budget, ST-018 (freeze before
+capture), and the hostile-repository probes.
 
 ## Phase 5 — Observer
 
