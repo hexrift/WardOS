@@ -1,9 +1,11 @@
 # Bootable disks from the host image, built where bootc-image-builder can run: a Linux
-# runner with a privileged podman. Nobody needs a Fedora box to get a WardOS disk; a Mac
-# downloads the qcow2 and boots it in UTM, a PC writes the ISO to a stick
-# (image/README.md, "Disk images from CI"). By hand from the Actions tab, or on every
-# published release (then the disks are attached to it, compressed to fit the asset
-# limit).
+# runner with a privileged podman, of the disk's own architecture (x86_64 on
+# ubuntu-latest, aarch64 on ubuntu-24.04-arm; the builder's cross path is experimental
+# and cannot make an ISO). Nobody needs a Fedora box to get a WardOS disk; an
+# Apple-silicon Mac downloads the aarch64 qcow2 and boots it natively in UTM, an
+# Intel Mac the x86_64 one, a PC writes the ISO to a stick (image/README.md, "Disk
+# images from CI"). By hand from the Actions tab, or on every published release (then
+# the disks are attached to it, compressed to fit the asset limit).
 name: disk
 
 on:
@@ -14,6 +16,11 @@ on:
         type: choice
         default: qcow2
         options: [qcow2, iso, both]
+      arch:
+        description: "Architecture (both: one job per architecture, each on its own runner)"
+        type: choice
+        default: x86_64
+        options: [x86_64, aarch64, both]
       source:
         description: "Binaries: compile this checkout, or the published release tarball"
         type: choice
@@ -33,13 +40,38 @@ on:
     types: [published]
 
 jobs:
-  disk:
-    name: disk image
+  # Which architectures to build: the input, or both for a published release.
+  plan:
+    name: plan
     runs-on: ubuntu-latest
+    outputs:
+      arches: ${{ steps.plan.outputs.arches }}
+    steps:
+      - id: plan
+        env:
+          ARCH: ${{ github.event.inputs.arch || 'both' }}
+        run: |
+          set -euo pipefail
+          case "$ARCH" in
+            both) arches='["x86_64","aarch64"]' ;;
+            x86_64 | aarch64) arches="[\"$ARCH\"]" ;;
+            *) echo "unknown arch: $ARCH" >&2; exit 1 ;;
+          esac
+          echo "arches=$arches" >> "$GITHUB_OUTPUT"
+
+  disk:
+    name: disk image (${{ matrix.arch }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.plan.outputs.arches) }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     timeout-minutes: 150
     permissions:
       contents: write
     env:
+      ARCH: ${{ matrix.arch }}
       TYPE: ${{ github.event.inputs.type || 'both' }}
       SOURCE: ${{ github.event.inputs.source || 'release' }}
       RELEASE: ${{ github.event.inputs.release || github.event.release.tag_name || '' }}
@@ -55,20 +87,25 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup
           df -h /
+      - name: The runner is the disk's architecture
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$ARCH"
+          podman --version
       - name: Build the image into root's container storage
         run: |
           set -euo pipefail
-          args=(--source "$SOURCE" --tag localhost/wardos:ci)
+          args=(--source "$SOURCE" --arch "$ARCH" --tag localhost/wardos:ci)
           if [[ -n "$RELEASE" ]]; then args+=(--release "$RELEASE"); fi
           sudo -E ./image/build.sh "${args[@]}"
       - name: qcow2
         if: env.TYPE == 'qcow2' || env.TYPE == 'both'
-        run: sudo -E ./image/disk.sh --type qcow2 --image localhost/wardos:ci --user "$FIRST_USER" --output "$PWD/image/out"
+        run: sudo -E ./image/disk.sh --type qcow2 --arch "$ARCH" --image localhost/wardos:ci --user "$FIRST_USER" --output "$PWD/image/out"
       - name: iso
         if: env.TYPE == 'iso' || env.TYPE == 'both'
         run: |
           set -euo pipefail
-          args=(--type iso --image localhost/wardos:ci --user "$FIRST_USER" --output "$PWD/image/out")
+          args=(--type iso --arch "$ARCH" --image localhost/wardos:ci --user "$FIRST_USER" --output "$PWD/image/out")
           if [[ "$LUKS" == "true" ]]; then args+=(--luks); fi
           sudo -E ./image/disk.sh "${args[@]}"
       - name: Name and checksum the disks
@@ -78,17 +115,18 @@ jobs:
           if [[ "$SOURCE" == release && -n "$RELEASE" ]]; then version="$RELEASE"; else version=$(git describe --tags --always); fi
           mkdir -p dist
           if [[ -f image/out/qcow2/disk.qcow2 ]]; then
-            sudo mv image/out/qcow2/disk.qcow2 "dist/wardos-${version}-x86_64.qcow2"
+            sudo mv image/out/qcow2/disk.qcow2 "dist/wardos-${version}-${ARCH}.qcow2"
           fi
           if [[ -f image/out/bootiso/install.iso ]]; then
-            sudo mv image/out/bootiso/install.iso "dist/wardos-${version}-x86_64.iso"
+            sudo mv image/out/bootiso/install.iso "dist/wardos-${version}-${ARCH}.iso"
           fi
           sudo chown -R "$(id -u):$(id -g)" dist
-          (cd dist && sha256sum ./* > SHA256SUMS)
+          # One checksum file per architecture: both jobs attach to the same release.
+          (cd dist && sha256sum ./* > "SHA256SUMS.${ARCH}")
           ls -lh dist
       - uses: actions/upload-artifact@v4
         with:
-          name: wardos-disks
+          name: wardos-disks-${{ matrix.arch }}
           path: dist/
           compression-level: 6
           retention-days: 14
@@ -109,7 +147,8 @@ jobs:
           for f in *.zst; do
             if [[ $(stat -c %s "$f") -gt 1900000000 ]]; then split -b 1900M -d --suffix-length=1 "$f" "$f.part" && rm "$f"; fi
           done
-          sha256sum ./* > SHA256SUMS
+          # One checksum file per architecture: both jobs attach to the same release.
+          sha256sum ./* > "SHA256SUMS.${ARCH}"
           ls -l
           gh release upload "$RELEASE" ./* --clobber
 
