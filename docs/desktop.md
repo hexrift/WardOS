@@ -306,6 +306,18 @@ first on `PATH` (each mock appends its arguments to `$MOCK_LOG`), sets
 at a temp dir, and asserts on the log and the files written. Rust parts (the theme
 renderer, `ward-shell bar --waybar`) are tested with `cargo test`.
 
+## The README animation
+
+`assets/wardos-desktop.gif` is a storyboard rendered from the shipped material (theme
+tokens and wallpaper from `wardos-theme-render`, the Waybar layout, `ward-shell`'s
+launcher and bar lines, real `ward` output), screenshotted with Chromium and assembled
+by [`assets/storyboard/`](../assets/storyboard/README.md). It is not a compositor
+capture, and the README says so under it. Decision: the first five minutes are worth
+showing now, and every string in the storyboard is one the desktop prints, so nothing
+in it can drift from the product without the tests noticing first. The capture that
+replaces it runs Hyprland headless in CI, issue #84; when it lands, the storyboard
+directory goes.
+
 ## Parity
 
 Each Omarchy capability, and how WardOS delivers it. ✔ in the last column once the

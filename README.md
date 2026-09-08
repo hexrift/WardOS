@@ -11,7 +11,9 @@ coding agents (Claude Code, Codex, Gemini CLI, Aider, and whatever comes next) e
 they need to work effectively, while keeping the host, policy, credentials, verifier, and
 trusted state **outside the agent's authority**.
 
-![A WardOS session on the demo project: ward init, the security panel, a sandboxed command with two private-network probes denied, a failing protected test, a shortcut that edits the test and is undone by the verifier, the real fix VERIFIED](assets/ward-session.gif)
+![The WardOS desktop from boot to lock: the splash, autologin into Hyprland, the four steps of the first login (theme, a key kept on the host, a project, an agent), ward claude with the trust bar live, an approval answered from a notification, the command centre, a theme switch to Tokyo Night, the lock screen](assets/wardos-desktop.gif)
+
+<p align="center"><sub>Rendered from the shipped configs, theme tokens and real command output (<a href="assets/storyboard/">how</a>); a compositor capture is <a href="https://github.com/hexrift/WardOS/issues/84">#84</a>.</sub></p>
 
 ```bash
 ward init            # policy, verifier config and TamperWard wiring for this directory
@@ -41,6 +43,8 @@ ward verify                        # the protected tests, from the entry snapsho
 ```
 
 ## See it running
+
+![A WardOS session on the demo project: ward init, the security panel, a sandboxed command with two private-network probes denied, a failing protected test, a shortcut that edits the test and is undone by the verifier, the real fix VERIFIED](assets/ward-session.gif)
 
 The prototype runs today on any Linux host with `bubblewrap`. It merges the project's
 policy into a capability manifest, freezes a content-addressed entry snapshot, runs
