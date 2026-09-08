@@ -213,3 +213,35 @@ assert_logged '^podman run'
 # The real manifest parses and every name is a plain package name (no spaces, no versions).
 bash "$repo/image/check-packages.sh" --dry-run >"$TMP/out"
 ! sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo/image/packages.txt" | grep -Ev '^[A-Za-z0-9._+-]+$' || fail "packages.txt has a bad name"
+
+# --- image/disk.sh: --user and --luks write the bootc-image-builder config -----------
+setup_env
+out=$TMP/disk
+bash "$repo/image/disk.sh" --type qcow2 --user wardos --password 'p&ss/w.rd' --output "$out" --dry-run >"$TMP/out"
+assert_file "$out/config.toml"
+assert_contains "$out/config.toml" '[[customizations.user]]'
+assert_contains "$out/config.toml" 'name = "wardos"'
+assert_contains "$out/config.toml" 'password = "p&ss/w.rd"'
+assert_contains "$out/config.toml" 'groups = ["wheel"]'
+assert_eq "$(stat -c %a "$out/config.toml")" 600
+! grep -q 'p&ss/w.rd' "$TMP/out" || fail "dry-run output must not show the password"
+grep -q -- '--config /config.toml' "$TMP/out" || fail "generated config not passed to the builder"
+# --luks: the installer's kickstart, user inside it, no [[customizations.user]].
+echo 'ssh-ed25519 AAAATEST key@test' >"$TMP/key.pub"
+WARDOS_PASSWORD=secret bash "$repo/image/disk.sh" --type iso --luks --user wardos --ssh-key "$TMP/key.pub" --output "$out" --dry-run >"$TMP/out"
+assert_contains "$out/config.toml" '[customizations.installer.kickstart]'
+assert_contains "$out/config.toml" 'autopart --noswap --type=btrfs --encrypted'
+assert_contains "$out/config.toml" 'user --name=wardos --groups=wheel --password=secret --plaintext'
+assert_contains "$out/config.toml" 'sshkey --username=wardos "ssh-ed25519 AAAATEST key@test"'
+assert_contains "$out/config.toml" 'rootpw --lock'
+! grep -q 'customizations.user' "$out/config.toml" || fail "--luks must not also use customizations.user"
+! grep -q 'secret' "$TMP/out" || fail "dry-run output must not show WARDOS_PASSWORD"
+# Refusals: LUKS on qcow2, a user with no way in, --config together with --user.
+! bash "$repo/image/disk.sh" --type qcow2 --luks --output "$out" --dry-run 2>/dev/null || fail "--luks on qcow2 must fail"
+! bash "$repo/image/disk.sh" --type qcow2 --user wardos --output "$out" --dry-run 2>/dev/null || fail "--user without a password or key must fail"
+! bash "$repo/image/disk.sh" --type iso --user wardos --password x --config "$out/config.toml" --output "$out" --dry-run 2>/dev/null || fail "--config with --user must fail"
+# Without --user/--luks nothing is generated and no --config is passed.
+rm -rf "$out"
+bash "$repo/image/disk.sh" --type iso --output "$out" --dry-run >"$TMP/out"
+assert_missing "$out/config.toml"
+! grep -q -- '--config' "$TMP/out" || fail "no config expected"
