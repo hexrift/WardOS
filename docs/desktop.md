@@ -218,8 +218,10 @@ A theme is one TOML file (the existing token model). `wardos-theme render <id>` 
 ground), `waybar.css`, `mako.conf`, `fuzzel.ini`, `foot.ini`, `alacritty.toml`,
 `btop.theme`, `hyprlock.conf`, `swayosd.css`, `nvim.lua` (a colorscheme from the tokens),
 `chromium.json` (theme colour), `gtk.css` and `colors.env` (every token as `WARDOS_*`),
-plus `background` (a path, or `solid:<hex>` for swaybg `-c`) and `theme.toml` (the theme
-itself, for the shell). Every component's config `include`s its fragment; `wardos-theme
+plus `background.png` (the wallpaper drawn from the tokens, below), `background` (the
+path swaybg and hyprlock show; `solid:<hex>` is still understood for swaybg `-c` when a
+hand-written file says so) and `theme.toml` (the theme itself, for the shell). Every
+component's config `include`s its fragment; `wardos-theme
 set` re-renders and signals each running component (`hyprctl reload`, `pkill -SIGUSR2 -x
 waybar`, `pkill -SIGUSR1 -x nvim`, `makoctl reload`, swaybg restarted, `systemctl --user
 restart swayosd.service`, `gsettings … color-scheme prefer-dark|light`, the btop symlink
@@ -234,13 +236,36 @@ What the shipped configurations expect of each fragment: `hyprland.conf` sets
 (`looknfeel.conf` carries no colour); `waybar.css` and `gtk.css` `@define-color` the nine
 tokens by name (`ground`, `panel`, `separator`, `text`, `text_muted`, `accent`, `verified`,
 `restricted`, `denied`); `hyprlock.conf` defines the same nine as `$ground` … `$denied` in
-`rgb(RRGGBB)` plus `$font`; `mako.conf`, `fuzzel.ini`, `foot.ini` and `alacritty.toml` carry
-the colour keys and the font of their format; `nvim.lua` returns a table of highlight
+`rgb(RRGGBB)` plus `$veil` (the panel colour at 70 %, `rgba(RRGGBBAA)`), `$font`,
+`$radius` and `$wallpaper` (the path `background` names); `mako.conf`, `fuzzel.ini`,
+`foot.ini` and `alacritty.toml` carry the colour keys and the font of their format
+(fuzzel's `match` and `selection-match` are the accent and the text, so a match reads
+on the accent selection); `nvim.lua` returns a table of highlight
 groups for `nvim_set_hl` and `wardos-theme set` sends `SIGUSR1` to running editors;
 `colors.env` is sourced by the bash prompt on every prompt. btop only loads themes from
 its own directory, so `wardos-theme set` symlinks `~/.config/btop/themes/wardos.theme`
 to `theme/current/btop.theme` and `config/btop` names `color_theme = "wardos"`. swayosd
 takes its style on the command line, so `wardos-theme set` restarts `swayosd.service`.
+
+Wallpapers: every render writes `background.png`, a 1920×1200 wallpaper drawn from the
+tokens by the renderer's own rasteriser (rectangles on the 8 px grid, no vector library):
+the ground colour, one 1 px rule in the separator tone 64 px in from either edge, and
+the WARD mark set small (14 px, 5×7 bitmap glyphs of 2 px cells) in the lower left in
+`text_muted`. No gradient, no photo, three tones, so the file is a two-bit indexed PNG
+of about 6 KB and the render takes milliseconds; the composition is the same for every
+theme and only its tones change, which keeps the host layer identical under every
+palette (`design-language.md` §2). Precedence: when the theme ships
+`<id>/backgrounds/` (or an installed clone `backgrounds/`), its first file by name is
+the background and `background.png` is only written; otherwise `background` points at
+`background.png` (an absolute path, so swaybg and hyprlock read it from anywhere).
+`wardos-theme bg next` cycles the theme's own directory and rewrites the hyprlock
+fragment's `$wallpaper` line so the lock screen follows; a theme without a directory
+has nothing to cycle and says so. The lock screen (`config/hyprlock`) shows the same
+file under `$veil`, the ground alone when the file cannot be read. Tests:
+`cargo test -p wardos-theme` (`every_theme_draws_a_small_wallpaper_…`: dimensions, the
+corner pixel is the ground, the mark pixel is `text_muted`, three tones, < 200 KB, the
+time budget) and `desktop/tests/theme.test.sh` (swaybg is given the rendered file, `bg
+next` reaches hyprlock).
 
 Shipped: the four official variants, plus palette themes mapped onto the nine tokens
 (Tokyo Night, Catppuccin, Nord, Gruvbox, Everforest, Kanagawa, Rosé Pine, Matte Black,
@@ -289,14 +314,14 @@ command, key and test exist on `main`.
 | Walker launcher, clipboard history, emoji | fuzzel + cliphist, `wardos-menu-select` | ✔ config: `config/fuzzel` (+ `emoji.txt`), `Super + Ctrl + V` / `E` |
 | omarchy-menu tree | `wardos-menu` (SYSTEM section above) | ✔ `wardos-menu [path…]`, `wardos-menu-select` (fuzzel and stdin backends), `Super + Space` / `Super + Alt + Space`; `menu.test.sh`, `menu-select.test.sh` |
 | Keybindings viewer | `wardos-keys` | ✔ `wardos-keys [--list]`, `Super + K`; `keys.test.sh` |
-| Themes (set, next, install, remove, backgrounds) | `wardos-theme`, TOML tokens rendered per component | ✔ `wardos-theme list\|current\|set\|next\|install\|remove\|render\|reload\|bg next`, `wardos-theme-render` (crate `desktop/theme`, `cargo test -p wardos-theme`), 14 themes; `desktop/tests/theme.test.sh`. Keys `Super + Shift + T` / `B` belong to the keys slice |
+| Themes (set, next, install, remove, backgrounds) | `wardos-theme`, TOML tokens rendered per component | ✔ `wardos-theme list\|current\|set\|next\|install\|remove\|render\|reload\|bg next`, `wardos-theme-render` (crate `desktop/theme`, `cargo test -p wardos-theme`), 14 themes, each with a wallpaper drawn from its tokens (`background.png`); `desktop/tests/theme.test.sh`. Keys `Super + Shift + T` / `B` belong to the keys slice |
 | Font switching | `wardos-font` | ✔ `wardos-font list\|current\|set`; `desktop/tests/font.test.sh` |
 | Web apps in Chromium app mode | `wardos-webapp` | ✔ `wardos-webapp install\|remove\|list` (+ `install --defaults`), `wardos-launch webapp`, 13 defaults in `desktop/webapps/`; `webapp.test.sh`, `launch.test.sh` |
 | TUI apps as windows | `wardos-tui` | ✔ `wardos-tui install\|remove\|list` (+ `install --defaults`), `wardos-launch tui`, 7 defaults in `desktop/tuis/`, `Super + D` / `T`; `tui.test.sh`, `launch.test.sh` |
 | Screenshots (hyprshot + satty) | `wardos-capture screenshot` (grim, slurp, satty) | ✔ `wardos-capture screenshot region\|window\|output`, `Print` / `Shift + Print` / `Ctrl + Print`; `capture.test.sh` |
 | Screen recording | `wardos-capture record` (wf-recorder) | ✔ `wardos-capture record region\|output` (toggle, pid in `$XDG_STATE_HOME/wardos/record.pid`), `Alt + Print`; `capture.test.sh` |
 | Colour picker | `wardos-capture color` (hyprpicker) | ✔ `wardos-capture color`, `Super + Print`; `capture.test.sh` |
-| Lock screen, idle, suspend | hyprlock, hypridle, `wardos-power` | ✔ config: `config/hyprlock`, `config/hypridle`, `Super + Escape`; `wardos-power lock\|suspend`, `wardos-toggle idle` (`Super + Ctrl + I`); `power.test.sh`, `toggle.test.sh` |
+| Lock screen, idle, suspend | hyprlock, hypridle, `wardos-power` | ✔ config: `config/hyprlock` (the theme's wallpaper under a panel veil, the clock, the accent-bordered input, the WARD mark; `configs.test.sh`), `config/hypridle`, `Super + Escape`; `wardos-power lock\|suspend`, `wardos-toggle idle` (`Super + Ctrl + I`); `power.test.sh`, `toggle.test.sh` |
 | Night light | hyprsunset via `wardos-toggle nightlight` | ✔ config: `config/hyprsunset`, `Super + Ctrl + N`; `wardos-toggle nightlight [on\|off\|--status]`; `toggle.test.sh` |
 | On-screen volume/brightness | swayosd | ✔ config: `swayosd.service`, `XF86*` binds |
 | Notifications | mako | ✔ config: `config/mako` (approval and done categories, dnd mode); `wardos-notify [--done]`, `wardos-toggle notifications` (`Super + Ctrl + D`); `notify.test.sh`, `toggle.test.sh` |
