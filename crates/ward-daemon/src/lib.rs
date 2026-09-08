@@ -21,6 +21,7 @@ pub mod client;
 pub mod control;
 pub mod daemon;
 pub mod describe;
+pub mod doctor;
 pub mod egress;
 pub mod error;
 pub mod gateway;

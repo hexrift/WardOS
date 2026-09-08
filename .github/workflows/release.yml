@@ -1,0 +1,72 @@
+# Release: build the x86_64 Linux binaries, package them with the installer, and
+# attach the tarball and its checksum to a GitHub release. Runs on a v* tag push,
+# or by hand with a version (then the workflow creates the tag on the chosen ref).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to create, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p ward-cli -p ward-daemon -p ward-agent
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.version || github.ref_name }}"
+          case "$tag" in v[0-9]*) ;; *) echo "not a v* tag: $tag" >&2; exit 1 ;; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          name="wardos-${version}-x86_64-linux"
+          mkdir -p "dist/${name}"
+          cp target/release/ward target/release/wardd target/release/ward-agent "dist/${name}/"
+          cp install.sh README.md LICENSE "dist/${name}/"
+          cp -r docs "dist/${name}/docs"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          ls -la dist
+      - name: Smoke the packaged binaries
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          dir="dist/wardos-${version}-x86_64-linux"
+          "${dir}/ward" --version
+          "${dir}/wardd" --help >/dev/null
+          "${dir}/ward-agent" --help >/dev/null
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+          else
+            gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
+              --target "$GITHUB_SHA" --title "WardOS $TAG" --generate-notes
+          fi

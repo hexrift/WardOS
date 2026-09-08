@@ -614,6 +614,36 @@ fn change_verb(kind: ward_events::FileChangeKind) -> &'static str {
     }
 }
 
+/// The `ward doctor` panel: one row per check, colour by status.
+#[must_use]
+pub fn doctor_panel(checks: &[crate::doctor::Check]) -> String {
+    use crate::doctor::Status;
+    let mut s = format!("{ACCENT}WARD{RESET} {INK}doctor{RESET}  {DIM}host readiness{RESET}\n\n");
+    for c in checks {
+        let (color, word) = match c.status {
+            Status::Ok => (OK, "OK"),
+            Status::Warn => (WARN, "WARN"),
+            Status::Fail => (DENY, "FAIL"),
+        };
+        let _ = writeln!(
+            s,
+            "  {INK}{:<20}{RESET}{color}{word:<5}{RESET} {DIM}{}{RESET}",
+            c.name, c.detail
+        );
+    }
+    let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
+    let warns = checks.iter().filter(|c| c.status == Status::Warn).count();
+    let verdict = if fails > 0 {
+        format!("{DENY}{fails} blocking{RESET}")
+    } else if warns > 0 {
+        format!("{OK}ready{RESET} {DIM}· {warns} degraded{RESET}")
+    } else {
+        format!("{OK}ready{RESET}")
+    };
+    let _ = write!(s, "\n  {verdict}\n");
+    s
+}
+
 /// The `ward verify` summary block: what was restored, the verdict, and on failure
 /// the tail of the verifier's output.
 #[must_use]
