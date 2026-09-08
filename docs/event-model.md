@@ -166,3 +166,12 @@ sess_01J…   payments-api   Claude Code   2026-09-07 22:14 → 22:18   VERIFIED
 ```
 
 with `--json` for tooling and `--verify` to check the chain and anchors offline.
+
+Implemented (Phase 1): the observer rows and a one-line footer (`session · records ·
+entry · files changed · commands · network allowed / denied`); `--json` emits one
+object per record (`seq`, `ts_mono_ms`, `origin`, `kind`, `summary`; credential
+records summarise to service, subject and permissions, never a secret); `--verify`
+prints a verdict (`chain VERIFIED · N records · head …` and whether the sealed `HEAD`
+matches) and exits 1 on a broken chain, truncated tail, missing or mismatched `HEAD`,
+or an empty log. Every mode exits 1 when the chain is broken, so a tampered log never
+replays silently. The timeline strip and anchors are still to come.
