@@ -23,3 +23,4 @@ Performance consequences · Why selected · How it will be validated
 | [0012](ADR-0012-observer.md) | Observer: TUI first, shared event API, Ward Shell panel later | Accepted |
 | [0013](ADR-0013-phase1-runtime.md) | Phase 1 runtime: in-process session, bubblewrap backend, bridged ids | Accepted |
 | [0014](ADR-0014-sandbox-egress-relay.md) | Sandbox egress: proxy over a bind-mounted Unix socket with an in-sandbox relay | Accepted |
+| [0015](ADR-0015-single-writer-daemon.md) | `wardd` as the single log writer; `ward` commands as producers over the control socket | Accepted |
