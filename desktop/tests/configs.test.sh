@@ -39,7 +39,7 @@ text = "\n".join(p.read_text() for p in confs)
 variables = set(re.findall(r"^\$(\w+)\s*=", text, re.M))
 commands = set(re.findall(r"`(wardos-[a-z0-9-]+)", docs))
 dispatchers = {"exec", "workspace", "movetoworkspace", "killactive", "fullscreen", "togglefloating",
-               "pseudo", "togglesplit", "movefocus", "movewindow", "resizeactive", "resizewindow",
+               "pseudo", "togglesplit", "layoutmsg", "movefocus", "movewindow", "resizeactive", "resizewindow",
                "exit", "togglespecialworkspace", "movetoworkspacesilent", "centerwindow", "pin",
                "swapwindow", "cyclenext", "focusmonitor", "movecurrentworkspacetomonitor"}
 errors = []
