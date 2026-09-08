@@ -1,0 +1,58 @@
+# The whole host image, built for real (docs/desktop.md §Packages, ADR-0016): every
+# package of image/packages.txt installed on fedora-bootc:42, the ward binaries compiled
+# from this checkout, the desktop tree placed, `bootc container lint` at the end. Kept
+# out of verify.yml so the merge authority stays fast: this runs on main and on pull
+# requests that touch what the image is made of.
+name: image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "image/**"
+      - "desktop/**"
+      - "crates/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".containerignore"
+      - ".dockerignore"
+      - ".github/workflows/image.yml"
+  pull_request:
+    paths:
+      - "image/**"
+      - "desktop/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - ".containerignore"
+      - ".dockerignore"
+      - ".github/workflows/image.yml"
+
+jobs:
+  build:
+    name: image build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk (the Fedora layer plus a Rust build need it)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup
+          df -h /
+      - name: docker build (checkout binaries, not a release tarball)
+        run: |
+          set -euo pipefail
+          docker build -f image/Containerfile \
+            --build-arg WARDOS_SOURCE=builder \
+            --build-arg "WARDOS_VERSION=$(git describe --tags --always)" \
+            -t wardos:ci .
+      - name: What the image holds
+        run: |
+          set -euo pipefail
+          docker run --rm wardos:ci bash -c '
+            ls -l /usr/bin/ward*
+            ls /usr/share/wardos
+            cat /usr/lib/systemd/user-preset/90-wardos.preset 2>/dev/null || echo "no user preset (desktop/systemd/user not in the tree yet)"
+            readlink /etc/xdg/hypr
+            systemctl is-enabled wardos-firstboot.service wardos-flathub.service
+            plymouth-set-default-theme
+            bootc container lint'

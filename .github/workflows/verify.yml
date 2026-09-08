@@ -68,11 +68,23 @@ jobs:
           if [[ -f install.sh ]]; then files+=(install.sh); fi
           bash -n "${files[@]}"
           shellcheck --severity=style "${files[@]}"
-      - name: scripts explain themselves without podman
+      - name: scripts explain themselves without podman or docker
         run: |
           ./image/build.sh --dry-run
           ./image/disk.sh --type qcow2 --dry-run
           ./image/disk.sh --type iso --dry-run
+          ./image/disk.sh --type iso --luks --user wardos --password ci --output /tmp/disk-ci --dry-run
+          ./image/check-packages.sh --dry-run
+          ./image/install-desktop.sh --help >/dev/null
+
+  # Every name in image/packages.txt must be a package in Fedora 42 (docs/desktop.md
+  # §Packages); dnf answers from a fedora:42 container on the runner's docker.
+  image-packages:
+    name: image packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./image/check-packages.sh
 
   # The desktop tree (docs/desktop.md): every script shellcheck-clean, every bash test green.
   desktop:
