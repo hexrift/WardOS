@@ -17,6 +17,10 @@ cargo                 # the trusted verifier binds a host toolchain read-only in
 rust                  # (image/README.md: the one, temporary, toolchain exception)
 podman                # nested containers inside project environments (ADR-0005)
 
+# --- agents (ADR-0017: Claude Code, Codex and TamperWard ship in the image) ----------
+nodejs                # runtime for the three (image/agents; Claude Code needs Node >= 22, which the build checks)
+npm                   # `npm ci` from image/agents/package-lock.json at build time; nothing installs at run time
+
 # --- compositor and session ---------------------------------------------------------
 hyprland              # the compositor (ADR-0007) (COPR mineiro/hyprland)
 hyprlock              # lock screen (COPR mineiro/hyprland)

@@ -138,6 +138,34 @@ RUN test -x /usr/bin/ward && test -x /usr/bin/wardd && test -x /usr/bin/ward-age
     && /tmp/stage/install-desktop.sh /tmp/stage / \
     && rm -rf /tmp/stage
 
+# The agents (ADR-0017): Claude Code, Codex and TamperWard at the exact versions of
+# image/agents/package.json, installed by `npm ci` from its lockfile, so every tarball
+# is checked against the recorded integrity hash and nothing else is fetched (no
+# `curl | sh`, nothing at first boot). They live under /usr/lib/wardos/agents: image
+# content, read-only, replaced by every image update like the rest of /usr (on bootc
+# /opt is machine state or a read-only toplevel depending on the base, never
+# something an upgrade is sure to refresh; image/README.md "Agents and TamperWard in the
+# image"). Scripts are off for the install; the one postinstall the build needs, Claude
+# Code's install.cjs, is run by `npm rebuild` afterwards and hard-links the native
+# binary of this build's platform over bin/claude.exe (the lockfile carries the
+# packages of every platform, which is what an aarch64 build needs; the musl variant
+# is not for Fedora and goes). npm's cache and the agents' first-run files land in
+# /tmp under a throwaway HOME, never under /root (which is /var on bootc), and are
+# removed in the same step. Node must satisfy every `engines` floor (Claude Code: 22).
+COPY image/agents/package.json image/agents/package-lock.json /usr/lib/wardos/agents/
+RUN node --version && npm --version \
+    && node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' \
+    && export NODE_ENV=production HOME=/tmp/agents-home npm_config_cache=/tmp/npm-cache npm_config_update_notifier=false \
+    && npm --prefix /usr/lib/wardos/agents ci --omit=dev --ignore-scripts --no-fund --no-audit \
+    && npm --prefix /usr/lib/wardos/agents rebuild @anthropic-ai/claude-code \
+    && rm -rf /usr/lib/wardos/agents/node_modules/@anthropic-ai/claude-code-*-musl \
+    && for cmd in claude codex tamperward; do \
+         ln -s "/usr/lib/wardos/agents/node_modules/.bin/$cmd" "/usr/bin/$cmd"; \
+       done \
+    && /usr/bin/claude --version && /usr/bin/codex --version && /usr/bin/tamperward --help >/dev/null \
+    && rm -rf /tmp/agents-home /tmp/npm-cache \
+    && du -sh /usr/lib/wardos/agents/node_modules
+
 # Host configuration, laid out under image/rootfs exactly as it lands in the image
 # (sysctl, tmpfiles, the two first-boot units, the Flathub script, the Plymouth theme),
 # all under /usr so it ships with the image and is not user state.

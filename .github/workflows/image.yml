@@ -61,6 +61,11 @@ jobs:
             cat /usr/lib/systemd/user-preset/90-wardos.preset
             readlink /etc/xdg/hypr
             systemctl is-enabled wardos-firstboot.service wardos-flathub.service
+            ls -l /usr/bin/claude /usr/bin/codex /usr/bin/tamperward
+            node --version
+            HOME=/tmp claude --version
+            HOME=/tmp codex --version
+            grep "\"version\"" /usr/lib/wardos/agents/node_modules/tamperward/package.json
             plymouth-set-default-theme
             bootc container lint'
       # The image everyone else uses (image/README.md, "The published image"): a merge
