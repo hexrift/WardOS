@@ -144,9 +144,11 @@ source of truth, not the socket. Latency budget from kernel event to subscriber 
 
 Step-through is implemented in `wardd`, not in the UI: the sandbox request (or the
 agent hook, for actions the kernel cannot hold) blocks until a `CapabilityDecided` record
-exists. For file writes there is no kernel-level "hold" without a FUSE layer; Phase 5
-implements step-through for writes via the agent's hook layer (origin=Agent, best-effort)
-and documents this honestly. **[experiment E-11]** evaluates a FUSE or `fanotify`
+exists. For file writes there is no kernel-level "hold" without a FUSE layer; the
+agent's hook layer (origin=Agent, best-effort) is what holds today: under
+`step_through`, `wardd` answers the agent's `PreToolUse` hook with `ask` before writes
+and network tools, the agent's own permission prompt is the hold, and the exchange is
+recorded as an `AgentClaim` (`agent-integration.md` §4). Phase 5 hardens this. **[experiment E-11]** evaluates a FUSE or `fanotify`
 permission-event (`FAN_OPEN_PERM`) layer for hard holds.
 
 ## 8. Replay

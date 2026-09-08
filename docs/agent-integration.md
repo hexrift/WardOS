@@ -79,6 +79,30 @@ events from inotify/exec capture and the proxy remain the truth (event-model §2
 Hooks matter for UX (intent, holds) and for TamperWard's steering (`run` envelope),
 not for isolation.
 
+Implemented: `ward claude` seeds `/home/agent/.claude/settings.json` (read-only, from
+the daemon) so every hook above runs `/run/ward/ward-agent hook`. That client reads
+the hook payload on stdin, sends one JSON line `{hook, tool, summary}` to `wardd` over
+the session's hook socket (`/run/ward/hooks.sock`, bound like the egress socket), and
+relays the answer: `allow` prints nothing; `ask` or `deny` on `PreToolUse` prints the
+`hookSpecificOutput` decision so Claude Code holds for the user or refuses. `wardd`
+records each call as `AgentClaim{ToolUse}` (`TOOL` row: `PreToolUse Write
+/work/src/lib.rs → ask`) and the bookends as `AgentClaim{Note}`. The decision follows
+the manifest's observer mode: `quiet`/`live` always allow; `step_through` answers
+`ask` before writes (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`) when
+`pause_before_writes` is set and before `WebFetch`/`WebSearch` when
+`pause_before_network` is set. The hold itself is the agent's own permission prompt:
+the step-through UX rides on Claude Code's terminal, which is why this is best-effort
+(event-model §7). An unreachable socket or a malformed answer makes the client print
+nothing and exit 0: the outer layers are what hold. Codex has no hook layer; it gets
+intent only from exec and file capture (§6). To turn the holds on for a project:
+
+```yaml
+# .ward/policy.yaml
+observer: !step_through
+  pause_before_writes: true
+  pause_before_network: true
+```
+
 ## 5. Headless and interactive
 
 Interactive: `claude` with a TTY inside the sandbox (PID 1 forwards signals). Headless:
@@ -118,5 +142,8 @@ silently weakening. The model-API key stays on the host: `ward claude` configure
 `/anthropic` gateway route (§3) and the log records the grant; verified end to end in
 `crates/ward-daemon/tests/e2e.rs` (the sandboxed process holds only the placeholder,
 the upstream receives the real key). Other host credentials enter the sandbox only via
-an explicit, printed `--pass-env NAME`. Not yet: a live E-07 run of Claude Code against
-the real API through the gateway, the GitHub adapter, hook adapters, nested containers.
+an explicit, printed `--pass-env NAME`. Hook adapters (§4) are wired: the daemon
+seeds the settings file, answers `/run/ward/hooks.sock`, and records claims; verified
+end to end in `crates/ward-daemon/tests/e2e.rs` under a `step_through` policy. Not yet:
+a live E-07 run of Claude Code against the real API through the gateway, the GitHub
+adapter, nested containers.

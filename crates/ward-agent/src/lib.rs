@@ -9,6 +9,10 @@
 //! socket), execs the agent and performs PID 1 duties ([`supervise`]): reaping
 //! orphans, forwarding termination signals and relaying the agent's exit status.
 //!
+//! Invoked as `ward-agent hook`, the binary is instead the Claude Code hook
+//! client ([`hook`]): it forwards the hook payload to the daemon's socket and
+//! prints the decision.
+//!
 //! Every step is irreversible for the process tree and fails closed: the only
 //! opt-out is `--allow-no-landlock` for kernels without Landlock at all. The
 //! crate uses only the safe APIs of `landlock`, `seccompiler`, `nix` and `caps`.
@@ -21,6 +25,7 @@
 
 pub mod cli;
 pub mod error;
+pub mod hook;
 pub mod landlock;
 pub mod privs;
 pub mod relay;

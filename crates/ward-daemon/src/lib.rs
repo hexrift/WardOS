@@ -19,6 +19,7 @@ pub mod agents;
 pub mod egress;
 pub mod error;
 pub mod gateway;
+pub mod hooks;
 pub mod ids;
 pub mod render;
 pub mod sandbox;
