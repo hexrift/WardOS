@@ -24,3 +24,4 @@ Performance consequences · Why selected · How it will be validated
 | [0013](ADR-0013-phase1-runtime.md) | Phase 1 runtime: in-process session, bubblewrap backend, bridged ids | Accepted |
 | [0014](ADR-0014-sandbox-egress-relay.md) | Sandbox egress: proxy over a bind-mounted Unix socket with an in-sandbox relay | Accepted |
 | [0015](ADR-0015-single-writer-daemon.md) | `wardd` as the single log writer; `ward` commands as producers over the control socket | Accepted |
+| [0016](ADR-0016-desktop-feature-set.md) | Desktop: full Omarchy-equivalent feature set on Fedora, shell models rendered by Waybar/fuzzel/mako until E-10 | Accepted |

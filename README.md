@@ -151,6 +151,7 @@ of the experiments that gate each phase.
 | [`docs/install.md`](docs/install.md) | Install on an existing Linux host, requirements, first session |
 | [`docs/agent-integration.md`](docs/agent-integration.md) | How `ward claude` / `ward codex` compose the sandbox, proxy, credentials and hooks |
 | [`docs/design-language.md`](docs/design-language.md) | Visual and interaction identity of the WardOS desktop |
+| [`docs/desktop.md`](docs/desktop.md) | The desktop: commands, keys, menu, themes, packages, parity with Omarchy |
 | [`docs/performance.md`](docs/performance.md) | Latency budgets, benchmark methodology, CI regression gates |
 | [`docs/experiments.md`](docs/experiments.md) | Highest-risk assumptions and the experiments that must settle them |
 | [`docs/roadmap.md`](docs/roadmap.md) | Phases, first-prototype scope, acceptance criteria, implementation sequence |
