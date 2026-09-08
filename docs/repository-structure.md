@@ -82,6 +82,30 @@ wardos/
     └── ward-demo/                 # launch demo: failing tests + tempting shortcut
 ```
 
+## As built (Phase 1–3)
+
+The workspace today has eight crates; the planned `ward-observer`, `ward-credentials`,
+`ward-verifier` and `ward-bench` crates have not been split out yet because their
+current code is small enough to live where it is used. Where each planned
+responsibility lives now:
+
+| Crate | Modules | Planned home |
+| --- | --- | --- |
+| `ward-events` | `event`, `ids`, `text`, `origin`, `chain`, `wire`, `log` | as planned |
+| `ward-policy` | `policy`, `capability`, `merge`, `default`, `ids` | as planned (CODEOWNERS) |
+| `ward-snapshot` | `cas`, `manifest`, `capture`, `materialize`, `meta`, `ignore`, `backend` | as planned |
+| `ward-sandbox` | OCI spec generation and the typed seccomp profile | as planned |
+| `ward-proxy` | `proxy`, `policy`, `addr`, `hosts`, `http`, `resolve`, `gateway`, `secret`, `observer` | as planned; `gateway` is the credential injection of `ward-credentials` |
+| `ward-agent` | `cli`, `landlock`, `seccomp`, `privs`, `supervise`, `relay`, `hook` | as planned; `hook` is the hook adapter |
+| `ward-daemon` | `session`, `sandbox`, `egress`, `gateway`, `hooks`, `verify`, `selftest`, `watch`, `agents`, `render`, `ids` | `gateway` → `ward-credentials`; `verify` → `ward-verifier`; `render` → `ward-observer` |
+| `ward-cli` | `main`, `replay` | as planned; `replay` → `ward-observer` |
+
+`wardd` as a long-running daemon with a control socket (ADR-0009) is still ahead:
+`ward-daemon` is a library the `ward` binary drives in process (ADR-0013), with the
+per-launch sockets (`proxy.sock`, `hooks.sock`) living in a short-lived run directory.
+`unsafe_code` is forbidden workspace-wide; no crate has needed an exception so far, so
+there is no `UNSAFE.md` yet.
+
 ## Deviations from the brief and why
 
 | Change | Reason |
