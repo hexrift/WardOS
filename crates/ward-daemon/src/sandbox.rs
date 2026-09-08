@@ -76,6 +76,8 @@ pub fn available() -> bool {
 pub const PROXY_SOCKET: &str = "/run/ward/proxy.sock";
 /// Mount point of the `ward-agent` shim inside the sandbox.
 pub const AGENT_SHIM: &str = "/run/ward/ward-agent";
+/// Mount point of the session's hook socket inside the sandbox (`hooks.rs`).
+pub const HOOK_SOCKET: &str = "/run/ward/hooks.sock";
 /// Loopback address the in-sandbox relay listens on (ADR-0014).
 pub const RELAY_ADDR: &str = "127.0.0.1:3128";
 
@@ -94,6 +96,8 @@ pub struct Launch {
     argv: Vec<String>,
     env: Vec<(String, String)>,
     proxy_socket: Option<PathBuf>,
+    hook_socket: Option<PathBuf>,
+    seeds: Vec<(PathBuf, String)>,
     shim: Option<PathBuf>,
     shim_flags: Vec<String>,
     stdio: StdioMode,
@@ -107,6 +111,8 @@ impl Launch {
             argv,
             env: Vec::new(),
             proxy_socket: None,
+            hook_socket: None,
+            seeds: Vec::new(),
             shim: None,
             shim_flags: Vec::new(),
             stdio: StdioMode::Capture,
@@ -117,6 +123,21 @@ impl Launch {
     #[must_use]
     pub fn egress(mut self, socket: impl Into<PathBuf>) -> Self {
         self.proxy_socket = Some(socket.into());
+        self
+    }
+
+    /// Bind the session's hook socket into the sandbox; the shim's Landlock `io`
+    /// tier picks it up through `WARD_SOCKET`.
+    #[must_use]
+    pub fn hooks(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.hook_socket = Some(socket.into());
+        self
+    }
+
+    /// Bind a host file read-only at `path` inside the sandbox (agent settings).
+    #[must_use]
+    pub fn seed(mut self, host_file: impl Into<PathBuf>, path: impl Into<String>) -> Self {
+        self.seeds.push((host_file.into(), path.into()));
         self
     }
 
@@ -220,6 +241,13 @@ impl Launch {
         push(&mut a, &["--die-with-parent", "--new-session"]);
         if let Some(sock) = &self.proxy_socket {
             push(&mut a, &["--bind", &sock.to_string_lossy(), PROXY_SOCKET]);
+        }
+        if let Some(sock) = &self.hook_socket {
+            push(&mut a, &["--bind", &sock.to_string_lossy(), HOOK_SOCKET]);
+            push(&mut a, &["--setenv", "WARD_SOCKET", HOOK_SOCKET]);
+        }
+        for (file, path) in &self.seeds {
+            push(&mut a, &["--ro-bind", &file.to_string_lossy(), path]);
         }
         if let Some(shim) = &self.shim {
             push(&mut a, &["--ro-bind", &shim.to_string_lossy(), AGENT_SHIM]);
@@ -359,6 +387,18 @@ mod tests {
             a.contains("--dir /home/agent") && a.contains("--tmpfs /env"),
             "shim rw paths exist"
         );
+    }
+
+    #[test]
+    fn args_bind_hook_socket_and_seed_files() {
+        let a = Launch::new("/tmp", vec!["true".into()])
+            .hooks("/host/hooks.sock")
+            .seed("/host/settings.json", "/home/agent/.claude/settings.json")
+            .args(Path::new("/tmp"))
+            .join(" ");
+        assert!(a.contains("--bind /host/hooks.sock /run/ward/hooks.sock"));
+        assert!(a.contains("--setenv WARD_SOCKET /run/ward/hooks.sock"));
+        assert!(a.contains("--ro-bind /host/settings.json /home/agent/.claude/settings.json"));
     }
 
     #[test]
