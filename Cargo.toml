@@ -5,6 +5,7 @@ members = [
     "crates/ward-policy",
     "crates/ward-snapshot",
     "crates/ward-sandbox",
+    "crates/ward-proxy",
     "crates/ward-agent",
     "crates/ward-daemon",
     "crates/ward-cli",
