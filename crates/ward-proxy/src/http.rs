@@ -1,5 +1,7 @@
-//! Defensive HTTP/1.x request parsing for the two proxy forms the sandbox may
-//! use: `CONNECT host:port` and absolute-URI forwarding (`GET http://h/p`).
+//! Defensive HTTP/1.x request parsing for the three request forms the sandbox
+//! may use: `CONNECT host:port`, absolute-URI forwarding (`GET http://h/p`)
+//! and origin-form (`GET /p` with a `Host` header), the last of which only a
+//! gateway route ([`crate::GatewayRoute`]) can serve.
 //!
 //! The parser is deliberately strict: a bounded head, CRLF only, no
 //! obs-fold, token-validated names, and exactly one request per connection.
@@ -103,6 +105,10 @@ pub struct Parsed {
     pub version: String,
     /// All header fields, in order.
     pub headers: Vec<Header>,
+    /// `true` when the request line was origin-form (`GET /path`): the client
+    /// addressed the proxy itself, so `request.target` is the `Host` header
+    /// and only a gateway route can serve the request.
+    pub origin_form: bool,
 }
 
 /// Why a request head was rejected. Every variant maps to `400`.
@@ -187,19 +193,23 @@ pub fn parse(head: &[u8]) -> Result<Parsed, ParseError> {
     if version != "HTTP/1.1" && version != "HTTP/1.0" {
         return Err(ParseError::Malformed("unsupported HTTP version"));
     }
+    let headers = parse_headers(lines)?;
+    let origin_form = verb != "CONNECT" && target.starts_with('/');
     let request = if verb == "CONNECT" {
         Request {
             method: Method::Connect,
             target: parse_authority(target, None)?,
         }
+    } else if origin_form {
+        parse_origin_form(verb, target, &headers)?
     } else {
         parse_absolute_uri(verb, target)?
     };
-    let headers = parse_headers(lines)?;
     Ok(Parsed {
         request,
         version: version.to_owned(),
         headers,
+        origin_form,
     })
 }
 
@@ -237,6 +247,11 @@ fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
+/// Is `s` a non-empty RFC 9110 token (a valid header or method name)?
+pub(crate) fn is_token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(is_token_byte)
+}
+
 /// Parse `verb http://authority/path` into a forward request.
 fn parse_absolute_uri(verb: &str, uri: &str) -> Result<Request, ParseError> {
     let Some((scheme, rest)) = uri.split_once("://") else {
@@ -265,6 +280,22 @@ fn parse_absolute_uri(verb: &str, uri: &str) -> Result<Request, ParseError> {
             path,
         },
         target: parse_authority(authority, Some(80))?,
+    })
+}
+
+/// Parse `verb /path` plus the mandatory `Host` header into a forward request
+/// whose target is the proxy address the client used.
+fn parse_origin_form(verb: &str, path: &str, headers: &[Header]) -> Result<Request, ParseError> {
+    let host = headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("host"))
+        .ok_or(ParseError::Malformed("origin-form request without Host"))?;
+    Ok(Request {
+        method: Method::Forward {
+            verb: verb.to_owned(),
+            path: path.to_owned(),
+        },
+        target: parse_authority(&host.value, Some(80))?,
     })
 }
 
@@ -307,7 +338,7 @@ fn parse_authority(authority: &str, default_port: Option<u16>) -> Result<Target,
 /// A name whose last label is all digits is treated as an IPv4 literal and
 /// must parse strictly, so shorthand forms like `127.1` or `0x7f.1` that libc
 /// would happily turn into loopback are rejected instead of resolved.
-fn parse_host(host: &str) -> Result<Host, ParseError> {
+pub(crate) fn parse_host(host: &str) -> Result<Host, ParseError> {
     let host = host.strip_suffix('.').unwrap_or(host);
     if host.is_empty() || host.len() > MAX_HOST_LEN {
         return Err(ParseError::Malformed("invalid host"));
@@ -344,35 +375,192 @@ pub fn origin_head(parsed: &Parsed) -> Vec<u8> {
     let Method::Forward { verb, path } = &parsed.request.method else {
         return Vec::new();
     };
-    let mut hop_by_hop: Vec<String> = [
+    let host = parsed.request.target.to_string();
+    let mut out = build_head(parsed, verb, path, &host, &[]);
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out
+}
+
+/// Request line, `Host: {host}` and every surviving client header, without
+/// the terminating blank line so the caller can append more fields.
+///
+/// Dropped: the hop-by-hop set, anything named in `Connection`, every
+/// `Proxy-*` field, `Host`, and the lowercase names in `extra_drop`.
+pub(crate) fn build_head(
+    parsed: &Parsed,
+    verb: &str,
+    path: &str,
+    host: &str,
+    extra_drop: &[String],
+) -> Vec<u8> {
+    const HOP_BY_HOP: [&str; 6] = [
         "connection",
-        "proxy-connection",
-        "proxy-authorization",
-        "proxy-authenticate",
         "keep-alive",
         "te",
         "trailer",
         "upgrade",
         "host",
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .collect();
+    ];
+    let mut dropped: Vec<String> = extra_drop.to_vec();
     for h in &parsed.headers {
         if h.name.eq_ignore_ascii_case("connection") {
-            hop_by_hop.extend(h.value.split(',').map(|t| t.trim().to_ascii_lowercase()));
+            dropped.extend(h.value.split(',').map(|t| t.trim().to_ascii_lowercase()));
         }
     }
-    let mut out = format!("{verb} {path} {}\r\n", parsed.version).into_bytes();
-    out.extend_from_slice(format!("Host: {}\r\n", parsed.request.target).as_bytes());
+    let mut out = format!("{verb} {path} {}\r\nHost: {host}\r\n", parsed.version).into_bytes();
     for h in &parsed.headers {
         let lower = h.name.to_ascii_lowercase();
-        if !hop_by_hop.contains(&lower) {
-            out.extend_from_slice(format!("{}: {}\r\n", h.name, h.value).as_bytes());
+        if HOP_BY_HOP.contains(&lower.as_str())
+            || lower.starts_with("proxy-")
+            || dropped.contains(&lower)
+        {
+            continue;
+        }
+        out.extend_from_slice(format!("{}: {}\r\n", h.name, h.value).as_bytes());
+    }
+    out
+}
+
+/// How a request body is delimited (RFC 9112 §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    /// No body follows the head.
+    None,
+    /// Exactly this many bytes follow the head.
+    Length(usize),
+    /// `Transfer-Encoding: chunked`; see [`ChunkTracker`].
+    Chunked,
+}
+
+/// Determine the body framing of a parsed request. `Transfer-Encoding` takes
+/// precedence over `Content-Length`; any coding other than a single `chunked`,
+/// or conflicting lengths, is rejected.
+pub fn body_framing(parsed: &Parsed) -> Result<Framing, ParseError> {
+    let mut framing = Framing::None;
+    for h in &parsed.headers {
+        if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            if !h.value.eq_ignore_ascii_case("chunked") {
+                return Err(ParseError::Malformed("unsupported Transfer-Encoding"));
+            }
+            framing = Framing::Chunked;
         }
     }
-    out.extend_from_slice(b"Connection: close\r\n\r\n");
-    out
+    if framing == Framing::Chunked {
+        return Ok(framing);
+    }
+    for h in &parsed.headers {
+        if h.name.eq_ignore_ascii_case("content-length") {
+            let n = h
+                .value
+                .parse::<usize>()
+                .map_err(|_| ParseError::Malformed("invalid Content-Length"))?;
+            match framing {
+                Framing::Length(seen) if seen != n => {
+                    return Err(ParseError::Malformed("conflicting Content-Length"));
+                }
+                _ => framing = Framing::Length(n),
+            }
+        }
+    }
+    Ok(framing)
+}
+
+/// Longest accepted chunk-size or trailer line.
+const MAX_CHUNK_LINE: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkState {
+    /// Reading a `size[;ext]CRLF` line.
+    Size,
+    /// This many bytes of chunk data (plus its CRLF) remain.
+    Data(usize),
+    /// After the last chunk: trailer lines up to a blank line.
+    Trailer,
+    /// The body is complete.
+    Done,
+}
+
+/// Follows `Transfer-Encoding: chunked` framing over a pass-through byte
+/// stream, so the proxy knows where a request body ends without buffering or
+/// re-encoding it. Chunk data is never inspected.
+#[derive(Debug)]
+pub struct ChunkTracker {
+    state: ChunkState,
+    line: Vec<u8>,
+}
+
+impl Default for ChunkTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ChunkTracker {
+    /// A tracker positioned at the first chunk-size line.
+    pub fn new() -> Self {
+        Self {
+            state: ChunkState::Size,
+            line: Vec::new(),
+        }
+    }
+
+    /// Have the terminating chunk and its trailers been seen?
+    pub fn done(&self) -> bool {
+        self.state == ChunkState::Done
+    }
+
+    /// Account for `bytes` and return how many of them belong to the body;
+    /// anything beyond that count lies past the end of the message.
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<usize, ParseError> {
+        let mut i = 0;
+        while i < bytes.len() {
+            match self.state {
+                ChunkState::Done => break,
+                ChunkState::Data(ref mut remaining) => {
+                    let take = (*remaining).min(bytes.len() - i);
+                    *remaining -= take;
+                    i += take;
+                    if *remaining == 0 {
+                        self.state = ChunkState::Size;
+                    }
+                }
+                ChunkState::Size | ChunkState::Trailer => {
+                    if self.line.len() >= MAX_CHUNK_LINE {
+                        return Err(ParseError::Malformed("chunk line too long"));
+                    }
+                    let b = bytes[i];
+                    i += 1;
+                    self.line.push(b);
+                    if b == b'\n' {
+                        let line = std::mem::take(&mut self.line);
+                        self.end_of_line(&line)?;
+                    }
+                }
+            }
+        }
+        Ok(i)
+    }
+
+    fn end_of_line(&mut self, line: &[u8]) -> Result<(), ParseError> {
+        let text = std::str::from_utf8(line)
+            .map_err(|_| ParseError::Malformed("chunk line is not UTF-8"))?
+            .trim_end_matches(['\r', '\n']);
+        self.state = match self.state {
+            ChunkState::Size => {
+                let size = text.split(';').next().unwrap_or("").trim();
+                let n = usize::from_str_radix(size, 16)
+                    .map_err(|_| ParseError::Malformed("invalid chunk size"))?;
+                match n.checked_add(2) {
+                    _ if n == 0 => ChunkState::Trailer,
+                    Some(with_crlf) => ChunkState::Data(with_crlf),
+                    None => return Err(ParseError::Malformed("chunk size overflow")),
+                }
+            }
+            ChunkState::Trailer if text.is_empty() => ChunkState::Done,
+            other => other,
+        };
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -549,5 +737,75 @@ mod tests {
              Accept: */*\r\n\
              Connection: close\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn origin_form_targets_the_host_header() {
+        let p =
+            parse_str("POST /anthropic/v1/messages?x=1 HTTP/1.1\r\nHost: 127.0.0.1:3128").unwrap();
+        assert!(p.origin_form);
+        assert_eq!(
+            p.request.method,
+            Method::Forward {
+                verb: "POST".into(),
+                path: "/anthropic/v1/messages?x=1".into()
+            }
+        );
+        assert_eq!(p.request.target.to_string(), "127.0.0.1:3128");
+        assert!(!parse_str("GET http://a.com/ HTTP/1.1").unwrap().origin_form);
+        assert!(matches!(
+            parse_str("GET / HTTP/1.1"),
+            Err(ParseError::Malformed("origin-form request without Host"))
+        ));
+        assert!(parse_str("GET / HTTP/1.1\r\nHost: bad host").is_err());
+    }
+
+    #[test]
+    fn body_framing_from_headers() {
+        let f = |h: &str| {
+            body_framing(&parse_str(&format!("POST /p HTTP/1.1\r\nHost: h\r\n{h}")).unwrap())
+        };
+        assert_eq!(f("Accept: */*").unwrap(), Framing::None);
+        assert_eq!(f("Content-Length: 12").unwrap(), Framing::Length(12));
+        assert_eq!(
+            f("Content-Length: 5\r\nContent-Length: 5").unwrap(),
+            Framing::Length(5)
+        );
+        assert_eq!(
+            f("Transfer-Encoding: Chunked\r\nContent-Length: 5").unwrap(),
+            Framing::Chunked
+        );
+        assert!(f("Content-Length: -1").is_err());
+        assert!(f("Content-Length: 5\r\nContent-Length: 6").is_err());
+        assert!(f("Transfer-Encoding: gzip, chunked").is_err());
+    }
+
+    #[test]
+    fn chunk_tracker_finds_the_end_of_a_chunked_body() {
+        let body = b"4;ext=1\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Trailer: v\r\n\r\nGET /next";
+        let mut t = ChunkTracker::new();
+        // Byte at a time, so every state boundary is crossed mid-buffer.
+        let mut consumed = 0;
+        for b in body.iter().take(body.len() - 9) {
+            consumed += t.feed(std::slice::from_ref(b)).unwrap();
+        }
+        assert!(t.done());
+        assert_eq!(consumed, body.len() - 9);
+        assert_eq!(t.feed(b"GET /next").unwrap(), 0);
+
+        let mut whole = ChunkTracker::new();
+        assert_eq!(whole.feed(body).unwrap(), body.len() - 9);
+        assert!(whole.done());
+
+        let mut split = ChunkTracker::new();
+        assert_eq!(split.feed(b"3\r\nab").unwrap(), 5);
+        assert!(!split.done());
+        assert_eq!(split.feed(b"c\r\n0\r\n\r\n").unwrap(), 8);
+        assert!(split.done());
+
+        assert!(ChunkTracker::new().feed(b"zz\r\n").is_err());
+        assert!(ChunkTracker::new().feed(b"ffffffffffffffff\r\n").is_err());
+        let long = vec![b'1'; MAX_CHUNK_LINE + 1];
+        assert!(ChunkTracker::new().feed(&long).is_err());
     }
 }

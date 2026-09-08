@@ -16,6 +16,12 @@ test-loopback = []
 [dependencies]
 ward-policy = { path = "../ward-policy", version = "0.1.0" }
 thiserror = { workspace = true }
+# Gateway routes: TLS to the real upstream with the `ring` backend (no
+# aws-lc-rs), trust roots from the host's certificate store, and a
+# zeroize-on-drop wrapper for the injected credential.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+zeroize = "1"
 
 [dev-dependencies]
 # Self-dependency so the crate's own tests see the `test-loopback` feature.
