@@ -1,0 +1,20 @@
+# WardOS — the approval listener (docs/design-language.md §10, ADR-0016).
+#
+# `wardos-approve --watch` waits for pending `ask` decisions from wardd, shows each
+# as a mako notification in the ward-approval category and answers it from the
+# keyboard (y / s / n); deny is the default on timeout. It runs for the whole
+# graphical session and is restarted if it exits; without a session there is
+# nothing to show, so it is bound to graphical-session.target.
+[Unit]
+Description=WardOS approval listener
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wardos-approve --watch
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,15 @@
+# WardOS — runs wardos-battery-monitor.service every 2 minutes while the session is
+# up. Started by hyprland/autostart.conf and by graphical-session.target under uwsm.
+[Unit]
+Description=WardOS battery monitor timer
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Timer]
+OnActiveSec=30s
+OnUnitActiveSec=2min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+WantedBy=graphical-session.target

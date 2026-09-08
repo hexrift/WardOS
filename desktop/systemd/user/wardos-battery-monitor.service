@@ -1,0 +1,10 @@
+# WardOS — one run of the battery monitor (docs/desktop.md §Commands). Started by
+# wardos-battery-monitor.timer every 2 minutes; the command notifies at low levels and
+# remembers what it already said in ~/.local/state/wardos so a level is announced once.
+[Unit]
+Description=WardOS low-battery notifications
+ConditionPathExistsGlob=/sys/class/power_supply/BAT*
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/wardos-battery-monitor

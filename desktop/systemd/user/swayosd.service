@@ -1,0 +1,16 @@
+# WardOS — the on-screen display for volume and brightness. The style is the theme's
+# fragment (wardos-theme render writes swayosd.css); `wardos-theme set` restarts this
+# unit so the display follows a theme change. %h is the home directory.
+[Unit]
+Description=WardOS on-screen display (swayosd)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/swayosd-server --style %h/.config/wardos/theme/current/swayosd.css
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
