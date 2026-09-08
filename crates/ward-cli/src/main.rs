@@ -83,6 +83,11 @@ enum Command {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
     },
+    /// Verify the worktree in a disposable trusted verifier (`.tamperward/config.yml`).
+    Verify {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+    },
     /// Run the isolation self-tests against a real sandbox.
     Selftest {
         /// Project directory (default: current).
@@ -127,6 +132,7 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             args,
         } => cmd_agent(&dir.unwrap_or_else(cwd), "codex", &args, &pass_env),
         Command::Stop { dir } => cmd_stop(&dir.unwrap_or_else(cwd)),
+        Command::Verify { dir } => cmd_verify(&dir.unwrap_or_else(cwd)),
         Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
         Command::Replay { log, verify, json } => {
             let report = replay::replay(&log, replay::Options { verify, json })?;
@@ -251,6 +257,29 @@ fn cmd_stop(dir: &Path) -> ward_daemon::Result<ExitCode> {
         println!("{}", render::session_status_line(None));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_verify(dir: &Path) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let (mut session, throwaway) = match Session::open_current(dir, &state)? {
+        Some(session) => (session, false),
+        None => (Session::start(dir)?, true),
+    };
+    let log = session.log_path();
+    let report = session.verify()?;
+    if throwaway {
+        session.stop(EndReason::UserStop)?;
+    } else {
+        session.sync()?;
+    }
+    print!("{}", render::verify_report(&report));
+    println!();
+    render_log(&log);
+    Ok(if report.passed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn cmd_selftest(dir: &Path) -> ward_daemon::Result<ExitCode> {

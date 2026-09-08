@@ -135,6 +135,8 @@ pub struct Launch {
     proxy_socket: Option<PathBuf>,
     hook_socket: Option<PathBuf>,
     seeds: Vec<(PathBuf, String)>,
+    ro_binds: Vec<(PathBuf, String)>,
+    tmpfs: Vec<String>,
     shim: Option<PathBuf>,
     shim_flags: Vec<String>,
     stdio: StdioMode,
@@ -150,6 +152,8 @@ impl Launch {
             proxy_socket: None,
             hook_socket: None,
             seeds: Vec::new(),
+            ro_binds: Vec::new(),
+            tmpfs: Vec::new(),
             shim: None,
             shim_flags: Vec::new(),
             stdio: StdioMode::Capture,
@@ -175,6 +179,20 @@ impl Launch {
     #[must_use]
     pub fn seed(mut self, host_file: impl Into<PathBuf>, path: impl Into<String>) -> Self {
         self.seeds.push((host_file.into(), path.into()));
+        self
+    }
+
+    /// Bind a host directory read-only at `path` (verifier toolchains, ADR-0004).
+    #[must_use]
+    pub fn ro_bind(mut self, host_dir: impl Into<PathBuf>, path: impl Into<String>) -> Self {
+        self.ro_binds.push((host_dir.into(), path.into()));
+        self
+    }
+
+    /// Mount a private tmpfs at `path`, before any binds beneath it.
+    #[must_use]
+    pub fn tmpfs(mut self, path: impl Into<String>) -> Self {
+        self.tmpfs.push(path.into());
         self
     }
 
@@ -269,6 +287,12 @@ impl Launch {
         }
         for (file, path) in &self.seeds {
             push(&mut a, &["--ro-bind", &file.to_string_lossy(), path]);
+        }
+        for path in &self.tmpfs {
+            push(&mut a, &["--tmpfs", path]);
+        }
+        for (dir, path) in &self.ro_binds {
+            push(&mut a, &["--ro-bind", &dir.to_string_lossy(), path]);
         }
         if let Some(shim) = &self.shim {
             push(&mut a, &["--ro-bind", &shim.to_string_lossy(), AGENT_SHIM]);
@@ -383,6 +407,7 @@ pub fn find_shim() -> Option<Shim> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
     #[test]
@@ -431,6 +456,20 @@ mod tests {
         assert!(a.contains("--bind /host/hooks.sock /run/ward/hooks.sock"));
         assert!(a.contains("--setenv WARD_SOCKET /run/ward/hooks.sock"));
         assert!(a.contains("--ro-bind /host/settings.json /home/agent/.claude/settings.json"));
+    }
+
+    #[test]
+    fn args_mount_tmpfs_before_ro_binds_beneath_it() {
+        let a = Launch::new("/tmp", vec!["true".into()])
+            .tmpfs("/run/verifier/cargo")
+            .ro_bind("/root/.cargo/bin", "/run/verifier/cargo/bin")
+            .args(Path::new("/tmp"))
+            .join(" ");
+        let tmpfs = a.find("--tmpfs /run/verifier/cargo").unwrap();
+        let bind = a
+            .find("--ro-bind /root/.cargo/bin /run/verifier/cargo/bin")
+            .unwrap();
+        assert!(tmpfs < bind);
     }
 
     #[test]

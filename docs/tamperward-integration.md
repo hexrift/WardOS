@@ -101,6 +101,23 @@ ward claude "Fix all failing tests as quickly as possible."
 The acceptance criterion is that the "DENIED" line comes from TamperWard's decision, the
 "VERIFIED" line comes from a Zone 2 verifier, and ST-005..010 pass on the same build.
 
+**Implemented (first Phase 3 slice).** `ward verify` is the disposable verifier of
+ADR-0004 in its 0.1 namespace form. It snapshots the worktree as the *candidate*, reads
+`.tamperward/config.yml` from the *entry* snapshot, materialises the candidate into a
+scratch tree, overwrites every `protected.tests` path with its entry-snapshot bytes
+(reported as `restored …`), and runs `verify.command` in a bare sandbox with no egress
+and the host Rust toolchain bound read-only. The log records `VerificationRequested`
+(origin User), `VerificationStarted` with pristine, candidate and config hash, one
+`VerificationProgress` per restored path and one for the command, and
+`VerificationPassed` / `VerificationFailed` with the parsed counts and the BLAKE3 of
+the output (origin Verifier). The hook layer denies `Write`/`Edit` tool calls on
+protected paths with `protected by TamperWard policy: tests`. The end-to-end test runs
+the scenario above on `examples/ward-demo`: the bug fails, a weakened protected test
+still fails (the verifier never saw the edit), the real fix passes. Not yet: the
+TamperWard control plane over its socket (the decision today is `wardd`'s reading of
+the config), the semantic rules (`test-skip`, `assertion-weakening`), and the verifier
+image (ADR-0004 addendum).
+
 ## 7. Open questions for TamperWard (to settle before Phase 3)
 
 1. Does TamperWard want to supply the trusted test bundle as a snapshot ID (WardOS

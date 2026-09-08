@@ -53,12 +53,21 @@ the API's `401` is the proof that the request left through the gateway and nothi
 
 ![Claude Code headless inside a WardOS session: credential granted by proxy injection, network rows for every API call, the SessionStart hook recorded as a claim](assets/ward-claude.png)
 
+The verifier guards the judge, not the implementation. `ward verify` snapshots the
+worktree as a candidate, takes every protected test and the verify config from the
+*entry* snapshot, and runs the suite offline in a disposable sandbox. Below, the demo's
+bug fails; the shortcut of gutting the protected security test changes nothing, because
+the verifier restores the pristine copy; the real one-line fix passes.
+
+![ward verify on the demo: the bug fails, a weakened protected test is restored from the entry snapshot and still fails, the real fix is VERIFIED](assets/ward-verify.png)
+
 ```bash
 cargo build --release
 ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
 ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live observer
 ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stays on the host
 ward status   examples/ward-demo    # the security panel for the active session
+ward verify   examples/ward-demo    # trusted verifier: protected tests from the entry snapshot
 ward selftest examples/ward-demo    # prove the isolation (10/10 hostile probes blocked)
 ward stop     examples/ward-demo    # seal the log
 ward replay   <events.log>          # replay any sealed session (--verify, --json)
@@ -96,8 +105,10 @@ credential that never appears in the sandbox); a per-session
 policy proxy that is the sandbox's only way out; `ward claude` running real Claude Code
 with the model-API key held on the host and injected by the proxy; and Claude Code hooks
 reporting to `wardd`, with `step_through` policies holding before writes and network
-tools. Phase 0 and Phase 1 are complete; the immutable host image, TamperWard verifier
-and desktop shell are later phases.
+tools; and `ward verify`, a disposable offline verifier that takes protected tests and
+the verify config from the entry snapshot, so weakening the judge changes nothing.
+Phase 0 and Phase 1 are complete, Phase 2 and the first Phase 3 slice are in; the
+TamperWard control plane, immutable host image and desktop shell are later phases.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the phase plan and what remains for the
 Phase 2 gate, and [`docs/experiments.md`](docs/experiments.md) for the recorded results
