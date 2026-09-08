@@ -62,6 +62,23 @@ on policy change, on explicit `ward revoke`, and on expiry.
 | Cloud (AWS/GCP/Azure) | Never for production; dev accounts via STS-style short leases | B (lease) | `deny` hard by default for anything tagged production |
 | Arbitrary env secret | Vault entry | A for HTTP; B otherwise | Explicit policy entry per secret |
 
+**Route scope: where `CredentialScope` is enforced at the proxy.** A gateway route
+carries a scope (`GatewayRoute::scope(paths, write)`): the path prefixes, after the
+route prefix is stripped, that the injected credential may act on, and whether writes
+are granted. `wardd` derives it from the grant's `CredentialScope` — a GitHub grant for
+`hexrift/WardOS` with `contents:read` becomes a `/github` route scoped to
+`/hexrift/WardOS.git` (git over HTTPS) and `/repos/hexrift/WardOS` (the REST API) with
+`write = false`. Path prefixes match at segment boundaries only (`/hexrift/WardOS.gitx`
+is not under `/hexrift/WardOS.git`; the query string is ignored); an empty list means
+every path. A read-only route passes `GET`, `HEAD`, `OPTIONS` and a `POST` to
+`…/git-upload-pack` (a fetch) and refuses everything else, including `POST
+…/git-receive-pack` (a push), `PUT`, `PATCH` and `DELETE`. A refused request is answered
+`403 Forbidden` with the fixed body `request outside credential scope` and recorded as a
+`NetworkDenied` decision (`gateway /github: outside credential scope` or `gateway
+/github: write not granted`) before the upstream is resolved or connected, so the secret
+is never sent for a request the grant did not cover. The check is a pure function of the
+route and the request line; the upstream's own authorisation still applies on top.
+
 ## 5. Backend
 
 Phase 2 backend: an encrypted file vault under `/var/lib/ward/vault/`, sealed with
