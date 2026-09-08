@@ -17,7 +17,7 @@ thiserror = { workspace = true }
 clap = { workspace = true }
 landlock = "0.4"
 seccompiler = "0.5"
-nix = { version = "0.30", features = ["signal", "process"] }
+nix = { version = "0.30", features = ["signal", "process", "uio", "user"] }
 caps = "0.5"
 # Syscall name tables for every architecture the baseline profile declares.
 syscalls = { version = "0.8", default-features = false, features = ["std", "x86_64", "x86", "aarch64"] }

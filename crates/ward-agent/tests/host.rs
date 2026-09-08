@@ -3,11 +3,15 @@
 //! exit codes, and that termination signals reach the agent.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::ffi::OsStr;
+use std::io::IoSliceMut;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
+use nix::sys::uio::{RemoteIoVec, process_vm_readv};
 use nix::unistd::Pid;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ward-agent");
@@ -99,9 +103,6 @@ fn refuses_to_exec_without_landlock_unless_allowed() {
 
 #[test]
 fn relays_the_agent_exit_code() {
-    if !landlock_available() {
-        return;
-    }
     let rw = tempfile::tempdir().unwrap();
     let out = shim(rw.path())
         .args(["--", "sh", "-c", "exit 7"])
@@ -115,20 +116,101 @@ fn relays_the_agent_exit_code() {
     );
 }
 
+/// Re-exec hook: when `WARD_AGENT_PROBE=vm_readv` is set, this test binary
+/// issues `process_vm_readv` against its own memory — a syscall the baseline
+/// profile denies with EPERM but which an unprivileged process can otherwise
+/// make (self-access always passes the ptrace access check) — and exits with
+/// the errno (0 on success).
+///
+/// `ptrace(PTRACE_TRACEME)` is deliberately not used: libtest runs each test on
+/// a spawned thread, and a traced non-leader thread can only be reaped by its
+/// tracer with `__WALL`, which the parent's `Command::output` never does, so the
+/// unsandboxed control run would deadlock as a zombie.
+#[test]
+fn probe_vm_readv() {
+    if std::env::var_os(PROBE_ENV).as_deref() != Some(OsStr::new("vm_readv")) {
+        return;
+    }
+    let source = *b"ward-agent";
+    let mut sink = [0u8; 10];
+    let remote = [RemoteIoVec {
+        base: source.as_ptr() as usize,
+        len: source.len(),
+    }];
+    let result = process_vm_readv(
+        nix::unistd::getpid(),
+        &mut [IoSliceMut::new(&mut sink)],
+        &remote,
+    );
+    println!("process_vm_readv={result:?} copied={}", sink == source);
+    std::process::exit(match result {
+        Ok(n) if n == source.len() && sink == source => 0,
+        Ok(_) => 255,
+        Err(e) => e as i32,
+    });
+}
+
+const PROBE_ENV: &str = "WARD_AGENT_PROBE";
+
+/// Run [`probe_vm_readv`] in a fresh copy of this test binary, optionally under the shim.
+fn run_probe(under_shim: bool) -> std::process::Output {
+    let exe = std::env::current_exe().unwrap();
+    let rw = tempfile::tempdir().unwrap();
+    let mut command = if under_shim {
+        let mut command = shim(rw.path());
+        // `--ro` replaces the defaults, so restate them plus the test binary's directory.
+        for dir in ward_agent::landlock::DEFAULT_RO {
+            command.arg("--ro").arg(dir);
+        }
+        command.arg("--ro").arg(exe.parent().unwrap());
+        command.args(["--env", PROBE_ENV, "--"]);
+        command
+    } else {
+        Command::new("env")
+    };
+    command
+        .arg(&exe)
+        .args(["probe_vm_readv", "--exact", "--nocapture"])
+        .env(PROBE_ENV, "vm_readv")
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn denied_syscalls_fail_with_eperm() {
-    if !landlock_available() {
+    // Without the shim the probe succeeds, so EPERM below can only come from seccomp.
+    let plain = run_probe(false);
+    assert_eq!(
+        plain.status.code(),
+        Some(0),
+        "process_vm_readv should succeed unsandboxed: {}",
+        String::from_utf8_lossy(&plain.stdout)
+    );
+
+    let filtered = run_probe(true);
+    let stdout = String::from_utf8_lossy(&filtered.stdout);
+    assert_eq!(
+        filtered.status.code(),
+        Some(Errno::EPERM as i32),
+        "expected EPERM from process_vm_readv under the shim: {stdout} {}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    assert!(stdout.contains("EPERM"), "{stdout}");
+}
+
+#[test]
+fn mount_fails_with_eperm_as_root() {
+    if !nix::unistd::geteuid().is_root() {
+        eprintln!("skipping: mount(8) refuses to issue the syscall unless root");
         return;
     }
     let rw = tempfile::tempdir().unwrap();
-    // `mount` is EPERM in the baseline profile; without seccomp, root would succeed
-    // or fail with a different error (ENOENT/EINVAL) for this bogus request.
     let out = shim(rw.path())
         .args([
             "--",
             "sh",
             "-c",
-            "mount -t tmpfs none /nonexistent 2>&1; echo rc=$?",
+            "mount -t tmpfs none /mnt 2>&1; echo rc=$?",
         ])
         .stderr(Stdio::inherit())
         .output()
@@ -142,9 +224,6 @@ fn denied_syscalls_fail_with_eperm() {
 
 #[test]
 fn forwards_sigterm_to_the_agent() {
-    if !landlock_available() {
-        return;
-    }
     let rw = tempfile::tempdir().unwrap();
     let mut child = shim(rw.path())
         .args([
