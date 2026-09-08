@@ -4,8 +4,7 @@
 # image/coprs.txt; desktop/install.sh layers it onto an existing Fedora;
 # image/check-packages.sh (CI: "image packages") proves every name resolves in a
 # fedora:<release> container with the same COPRs. The check, not this file, is the
-# source of truth: a name that has not passed it yet is marked `# unverified` until it has
-# (linux-firmware and hyprland-qtutils are unverified pending this change's packages job).
+# source of truth: a name that has not passed it yet is marked `# unverified` until it has.
 # Size matters (a first pull is the whole image): one browser, no compiler, the fonts
 # the desktop renders, English locales; image/README.md "Size" says what each choice saves.
 
@@ -13,7 +12,7 @@
 bubblewrap            # sandbox builder used by wardd (ADR-0002, ADR-0013)
 git                   # snapshot/worktree plumbing (ADR-0010), `ward init` on repositories
 curl                  # transport for `ward` self-checks and the egress relay tests
-linux-firmware        # unverified # Wi-Fi/GPU/Bluetooth firmware; without it a laptop has no wireless (E-09: T480s had no Wi-Fi)
+linux-firmware        # Wi-Fi/GPU/Bluetooth firmware; without it a laptop has no wireless (E-09: T480s had no Wi-Fi)
 python3               # scripts/security-check and hook adapters
 openssh-clients       # agent-side git-over-ssh through the credential broker
 rustup                # rustup-init only, no toolchain: `wardos-install dev rust` puts one in ~/.rustup and ~/.cargo, which the verifier binds (image/README.md "Size")
@@ -31,7 +30,6 @@ firewalld             # host firewall, enabled, default zone `wardos` (nothing i
 
 # --- compositor and session ---------------------------------------------------------
 hyprland              # the compositor (ADR-0007) (COPR mineiro/hyprland)
-hyprland-qtutils      # unverified # Hyprland's Qt dialogs (hyprland-dialog etc.), a runtime dep some prompts need (COPR mineiro/hyprland)
 hyprlock              # lock screen (COPR mineiro/hyprland)
 hypridle              # idle management (lock, screen off, suspend) (COPR mineiro/hyprland)
 hyprpaper             # wallpaper daemon (image backgrounds; swaybg draws solid ones) (COPR mineiro/hyprland)

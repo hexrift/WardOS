@@ -16,7 +16,8 @@ case "${1:-}" in
   -h | --help) usage; exit 0 ;;
 esac
 list=${1:-/usr/share/wardos/flatpaks.txt}
-marker=/var/lib/wardos/flathub.done
+# The service points this at /var/lib/wardos; the tests override it into a writable temp dir.
+marker=${WARDOS_FLATHUB_MARKER:-/var/lib/wardos/flathub.done}
 
 # No usable network yet (first boot offline, Wi-Fi not connected)? Skip without failing
 # and without the marker, so the service simply retries on the next boot instead of

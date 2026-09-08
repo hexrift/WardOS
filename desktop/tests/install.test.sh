@@ -227,16 +227,32 @@ PATH="$MOCK_DIR:/usr/bin:/bin" bash "$repo/desktop/install.sh" --destdir "$TMP/r
 grep -q 'Fedora' "$TMP/out" || fail "must say it needs Fedora"
 
 # --- wardos-flathub: remote, then the default list ---------------------------------
+# curl gates on Flathub being reachable (mocked to succeed); the done-marker is redirected
+# into the temp dir so the test needs no /var/lib/wardos.
 setup_env
 mock flatpak
+mock curl
+export WARDOS_FLATHUB_MARKER=$TMP/flathub.done
 printf '# apps\norg.signal.Signal\n\ncom.spotify.Client # music\n' >"$TMP/flatpaks.txt"
 bash "$repo/image/rootfs/usr/libexec/wardos-flathub" "$TMP/flatpaks.txt"
 assert_logged '^flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo$'
 assert_logged '^flatpak install -y --noninteractive flathub org.signal.Signal com.spotify.Client$'
+assert_file "$WARDOS_FLATHUB_MARKER"
 : >"$MOCK_LOG"
+rm -f "$WARDOS_FLATHUB_MARKER"
 bash "$repo/image/rootfs/usr/libexec/wardos-flathub" "$TMP/no-such-list"
 assert_logged '^flatpak remote-add'
 assert_not_logged '^flatpak install'
+assert_file "$WARDOS_FLATHUB_MARKER"
+# Flathub unreachable: no remote, no marker, exit 0 so the service retries next boot.
+: >"$MOCK_LOG"
+rm -f "$WARDOS_FLATHUB_MARKER"
+mock curl 'exit 1'
+bash "$repo/image/rootfs/usr/libexec/wardos-flathub" "$TMP/flatpaks.txt"
+assert_not_logged '^flatpak remote-add'
+assert_missing "$WARDOS_FLATHUB_MARKER"
+mock curl
+unset WARDOS_FLATHUB_MARKER
 
 # --- image/check-packages.sh: exact names, diffed against what dnf resolved -----------
 setup_env
