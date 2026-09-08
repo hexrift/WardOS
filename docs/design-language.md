@@ -301,7 +301,8 @@ manifest's own invariant, one row per credential rule, `Containers`, `Observer`,
 `Advanced` group with the manifest hash). `desktop/shell` is the `ward-shell` binary:
 a client of the session daemon like `ward watch`, it asks for the description, catches
 up with the stream, and prints the surface asked for (`bar`, `session`, `launcher`,
-`observer`, `settings`) or `no session`; its `gui` feature is where the layer-shell
+`observer`, `settings`) or, with no session, one calm line saying what to do next
+(`Super + Space → Start Claude`, or `ward init` then `ward claude`); its `gui` feature is where the layer-shell
 toolkit lands after E-10 and today adds nothing but a notice. `desktop/hyprland` carries
 the bindings of `architecture.md` §11 plus `Super + S` (session panel), `Super + O`
 (observer toggle) and `Super + Shift + S` (permissions), the §5 geometry, and §12's
