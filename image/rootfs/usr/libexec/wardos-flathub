@@ -16,17 +16,30 @@ case "${1:-}" in
   -h | --help) usage; exit 0 ;;
 esac
 list=${1:-/usr/share/wardos/flatpaks.txt}
+# The service points this at /var/lib/wardos; the tests override it into a writable temp dir.
+marker=${WARDOS_FLATHUB_MARKER:-/var/lib/wardos/flathub.done}
+
+# No usable network yet (first boot offline, Wi-Fi not connected)? Skip without failing
+# and without the marker, so the service simply retries on the next boot instead of
+# showing up red in `systemctl --failed`.
+if ! curl -fsS --max-time 10 -o /dev/null https://dl.flathub.org/repo/flathub.flatpakrepo; then
+  echo "wardos-flathub: Flathub is not reachable yet; will retry on the next boot with a network"
+  exit 0
+fi
 
 flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
 if [[ ! -f "$list" ]]; then
   echo "wardos-flathub: no list at $list; Flathub added, nothing installed"
+  mkdir -p "$(dirname "$marker")" && touch "$marker"
   exit 0
 fi
 mapfile -t ids < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$list")
 if [[ ${#ids[@]} -eq 0 ]]; then
   echo "wardos-flathub: $list names no applications"
+  mkdir -p "$(dirname "$marker")" && touch "$marker"
   exit 0
 fi
 echo "wardos-flathub: installing ${#ids[@]} applications from $list"
 flatpak install -y --noninteractive flathub "${ids[@]}"
+mkdir -p "$(dirname "$marker")" && touch "$marker"

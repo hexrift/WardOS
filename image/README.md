@@ -73,7 +73,11 @@ desktop tree ([below](#the-desktop-in-the-image)); the agents are installed from
 configuration files under `/usr/lib` and `/etc/firewalld`, the Flathub script and the
 Plymouth theme are copied; the first-boot units, the firewall and the update timer are
 enabled, the firewall's default zone set, the splash theme selected and the initramfs
-rebuilt; and `bootc container lint` checks the result. Labels: `org.wardos.version`
+rebuilt; and `bootc container lint` checks the result. Two units are masked:
+`serial-getty@ttyS0` (a laptop has no serial port) and `NetworkManager-wait-online` (so a
+boot with no network — a laptop before Wi-Fi is set up — does not stall ~60s on
+`network-online.target`; nothing on the host must block boot on the network). Labels:
+`org.wardos.version`
 (from `--build-arg WARDOS_VERSION`, which `build.sh` sets to `git describe --tags
 --always`) and `containers.bootc=1`.
 
