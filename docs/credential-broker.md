@@ -58,7 +58,7 @@ on policy change, on explicit `ward revoke`, and on expiry.
 | GitHub | GitHub App private key or user OAuth token | A: proxy injection for `api.github.com` and HTTPS git; B: installation token for `gh` | Repository + permission set; tokens are GitHub App installation tokens (native expiry ≤ 1 h; broker requests ≤ 10 min where supported, otherwise revokes at expiry) |
 | Git over SSH | Host `~/.ssh` keys stay in Zone 0 | `ssh-agent` protocol proxy in the sandbox: signs only for approved `(host, user)`; every signature is an event | Per-host; `ask` by default |
 | npm / PyPI / crates.io (read) | Registry tokens | A | Read-only by default; publish is `deny` |
-| Agent model API (Anthropic / OpenAI / Google) | The user's API key or OAuth token | **A, via gateway mode**: sandbox gets `ANTHROPIC_BASE_URL=http://ward-proxy/anthropic` (and the equivalent for other agents); proxy injects auth | Per-agent; this keeps the user's long-lived model credential out of Zone 3 entirely **[experiment E-07]** |
+| Agent model API (Anthropic / OpenAI / Google) | The user's API key or OAuth token | **A, via gateway mode**: sandbox gets `ANTHROPIC_BASE_URL=http://127.0.0.1:3128/anthropic` or `OPENAI_BASE_URL=http://127.0.0.1:3128/openai/v1` and a placeholder key; proxy injects auth | Implemented for Anthropic and OpenAI; keeps the user's long-lived model credential out of Zone 3 entirely **[experiment E-07]** |
 | Cloud (AWS/GCP/Azure) | Never for production; dev accounts via STS-style short leases | B (lease) | `deny` hard by default for anything tagged production |
 | Arbitrary env secret | Vault entry | A for HTTP; B otherwise | Explicit policy entry per secret |
 
