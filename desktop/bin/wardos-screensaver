@@ -22,7 +22,8 @@ effects=(beams decrypt slide wipe expand print)
 child=""
 
 finish() {
-  [[ -n "$child" ]] && kill "$child" 2>/dev/null
+  # The effect may already be over: a failed kill must not turn the exit status.
+  [[ -z "$child" ]] || kill "$child" 2>/dev/null || true
   tput cnorm 2>/dev/null || true
   clear 2>/dev/null || true
 }

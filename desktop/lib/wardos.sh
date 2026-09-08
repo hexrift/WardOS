@@ -71,6 +71,15 @@ wardos_daemon() {
     trap - INT
     exec "${starter[@]}" "$@" >"$log" 2>&1
   ) &
+  # Return once the command itself runs (its name is in the process's cmdline), up to
+  # 2 s: whoever says "started" next must not say it before the exec.
+  local pid=$! name i
+  name=$(basename "$1")
+  for ((i = 0; i < 40; i++)); do
+    if tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q -- "$name"; then break; fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.05
+  done
 }
 
 wardos_browser() { printf '%s\n' "${BROWSER:-chromium}"; }

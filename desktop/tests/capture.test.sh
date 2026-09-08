@@ -51,7 +51,7 @@ assert_logged "^satty --filename - --output-filename $shots/.*\.png --copy-comma
 # record: the first call starts wf-recorder and keeps its pid, the second stops it.
 mock wf-recorder 'sleep 30'
 wardos-capture record region
-assert_logged "^wf-recorder -g 10,20 300x200 -f $HOME/Videos/Screencasts/[0-9-]+_[0-9-]+\.mp4$"
+wait_logged "^wf-recorder -g 10,20 300x200 -f $HOME/Videos/Screencasts/[0-9-]+_[0-9-]+\.mp4$"
 assert_file "$XDG_STATE_HOME/wardos/record.pid"
 pid=$(cat "$XDG_STATE_HOME/wardos/record.pid")
 # A stopped mock may linger as a zombie when nothing reaps it here; that counts as stopped.
@@ -64,14 +64,14 @@ sleep 0.2
 alive "$pid" && fail "the recorder was stopped"
 assert_logged '^notify-send -a WardOS .*stopped'
 wardos-capture record output
-assert_logged '^wf-recorder -o DP-1 -f '
+wait_logged '^wf-recorder -o DP-1 -f '
 wardos-capture record
 
 # A stale pid file (the recorder died) does not block a new recording.
 echo 999999 >"$XDG_STATE_HOME/wardos/record.pid"
 : >"$MOCK_LOG"
 wardos-capture record region
-assert_logged '^wf-recorder -g'
+wait_logged '^wf-recorder -g'
 wardos-capture record
 
 # color: hyprpicker -a copies, the notification shows the value.
