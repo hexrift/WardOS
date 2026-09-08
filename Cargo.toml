@@ -31,6 +31,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+crossterm = "0.29"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
