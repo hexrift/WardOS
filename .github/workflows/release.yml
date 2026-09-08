@@ -1,0 +1,53 @@
+# Release: on a v* tag, build the x86_64 Linux binaries, package them with the
+# installer, and attach the tarball and its checksum to a GitHub release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p ward-cli -p ward-daemon -p ward-agent
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="wardos-${version}-x86_64-linux"
+          mkdir -p "dist/${name}"
+          cp target/release/ward target/release/wardd target/release/ward-agent "dist/${name}/"
+          cp install.sh README.md LICENSE "dist/${name}/"
+          cp -r docs "dist/${name}/docs"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          ls -la dist
+      - name: Smoke the packaged binaries
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          dir="dist/wardos-${version}-x86_64-linux"
+          "${dir}/ward" --version
+          "${dir}/wardd" --help >/dev/null
+          "${dir}/ward-agent" --help >/dev/null
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          generate_release_notes: true
