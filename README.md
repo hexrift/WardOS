@@ -53,7 +53,7 @@ ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stay
 ward status   examples/ward-demo    # the security panel for the active session
 ward selftest examples/ward-demo    # prove the isolation (8/8 hostile probes blocked)
 ward stop     examples/ward-demo    # seal the log
-ward replay   <events.log>          # replay any sealed session
+ward replay   <events.log>          # replay any sealed session (--verify, --json)
 ```
 
 In the session above the sandbox's only way out is a Unix socket to the session proxy:
