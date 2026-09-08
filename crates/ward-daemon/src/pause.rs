@@ -85,6 +85,39 @@ pub fn freeze(session: &str) -> Frozen {
     }
 }
 
+/// Wait until a freeze has actually taken hold: every process is stopped
+/// (`State: T`/`t`) or already gone. The cgroup freezer is synchronous —
+/// [`freeze_cgroup`] already waited on `cgroup.events` — so only the signal
+/// path polls, because `SIGSTOP` is delivered asynchronously and a capture that
+/// began the instant [`freeze`] returned could still race a not-yet-stopped
+/// process. Bounded by [`FREEZE_SETTLE`]; returns whether every pid settled.
+#[must_use]
+pub fn wait_settled(frozen: &Frozen) -> bool {
+    if frozen.method == PauseMethod::CgroupFreezer {
+        return true;
+    }
+    let proc = Path::new("/proc");
+    crate::daemon::wait_until(FREEZE_SETTLE, || {
+        frozen.pids.iter().all(|&pid| stopped_or_gone(proc, pid))
+    })
+}
+
+/// Whether `pid` is stopped (`SIGSTOP` took hold) or no longer exists.
+fn stopped_or_gone(proc: &Path, pid: u32) -> bool {
+    match fs::read_to_string(proc.join(pid.to_string()).join("stat")) {
+        Ok(stat) => matches!(proc_state(&stat), Some('T' | 't')),
+        Err(_) => true,
+    }
+}
+
+/// The state character of a `/proc/<pid>/stat` line: the field after the
+/// parenthesised command name (which may itself hold spaces and parentheses,
+/// so the last `)` is the anchor, as in [`parent_of`]).
+fn proc_state(stat: &str) -> Option<char> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().next()?.chars().next()
+}
+
 /// Let a frozen tree run again.
 pub fn thaw(frozen: &Frozen) {
     match &frozen.cgroup {
@@ -115,6 +148,56 @@ pub fn kill_frozen(frozen: &Frozen) {
         let deadline = Instant::now() + FREEZE_SETTLE;
         while fs::remove_dir(dir).is_err() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// A freeze held only for the length of a snapshot capture (ST-018), released
+/// when dropped. This is the daemon's own hold, distinct from `ward pause`: it
+/// writes no marker, appends no record, and touches neither the proxy nor
+/// credential injection — it exists solely so the agent's process tree cannot
+/// write to the worktree while a capture walks and hashes it, which is what
+/// makes the capture atomic with respect to a running agent (the time-of-check/
+/// time-of-use race of `docs/security-model.md` G5/G9).
+///
+/// Acquiring waits for the freeze to actually take hold ([`wait_settled`]) so
+/// the capture that follows never races a not-yet-stopped process. A session
+/// already paused by the user is already frozen; the guard then holds nothing
+/// and thaws nothing, so a capture can never lift a user's pause — `ward resume`
+/// stays the only thaw. When no sandbox of the session is running the guard also
+/// holds nothing, so an idle `ward snapshot` costs nothing.
+#[derive(Debug)]
+#[must_use = "the freeze lasts only while the guard is held"]
+pub struct CaptureFreeze {
+    frozen: Option<Frozen>,
+}
+
+impl CaptureFreeze {
+    /// Freeze `session`'s sandbox for a capture, unless it is already paused by
+    /// the user (whose freeze must outlive the capture).
+    pub fn acquire(state: &Path, session: &str) -> Self {
+        if marker_path(state, session).exists() {
+            return Self { frozen: None };
+        }
+        let frozen = freeze(session);
+        let _ = wait_settled(&frozen);
+        Self {
+            frozen: Some(frozen),
+        }
+    }
+
+    /// How the sandbox was frozen, or `None` when the guard holds nothing (the
+    /// session was already paused, or nothing of it is running).
+    #[must_use]
+    pub fn method(&self) -> Option<PauseMethod> {
+        self.frozen.as_ref().map(|f| f.method)
+    }
+}
+
+impl Drop for CaptureFreeze {
+    fn drop(&mut self) {
+        if let Some(frozen) = &self.frozen {
+            thaw(frozen);
         }
     }
 }
@@ -481,5 +564,86 @@ mod tests {
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+    }
+
+    #[test]
+    fn proc_state_is_the_field_after_the_command_name() {
+        assert_eq!(proc_state("14 (sleep) T 13 14 10 0 -1"), Some('T'));
+        assert_eq!(proc_state("14 (a) b) S 7) t 13 1"), Some('t'));
+        assert_eq!(proc_state("14 (x) R 1"), Some('R'));
+        assert_eq!(proc_state("garbage"), None);
+    }
+
+    #[test]
+    fn wait_settled_is_immediate_for_the_cgroup_freezer_and_for_no_pids() {
+        // The cgroup freezer already waited on `cgroup.events`, so settling is
+        // trivially true; a signalled freeze of no pids has nothing to wait for.
+        assert!(wait_settled(&Frozen {
+            method: PauseMethod::CgroupFreezer,
+            pids: vec![],
+            cgroup: Some(PathBuf::from("/does/not/matter")),
+        }));
+        assert!(wait_settled(&Frozen {
+            method: PauseMethod::Sigstop,
+            pids: vec![],
+            cgroup: None,
+        }));
+    }
+
+    /// A session the user has already paused is already frozen; the capture
+    /// guard must hold nothing (and so thaw nothing on drop), leaving the user's
+    /// pause the only thing that can be lifted, by `ward resume`.
+    #[test]
+    fn capture_freeze_leaves_a_user_pause_alone() {
+        let state = tempfile::tempdir().unwrap();
+        let session = "sess_already_paused";
+        fs::create_dir_all(session_dir(state.path(), session)).unwrap();
+        write_marker(state.path(), session, "held by the user").unwrap();
+        let guard = CaptureFreeze::acquire(state.path(), session);
+        assert_eq!(guard.method(), None, "a paused session is frozen already");
+        drop(guard);
+        // The marker is untouched: the guard did not thaw the user's pause.
+        assert!(marker_path(state.path(), session).exists());
+    }
+
+    /// A freeze held around a capture stops a real writer and releases it on
+    /// drop — the property ST-018 relies on, exercised on a plain process tree.
+    #[test]
+    fn capture_freeze_stops_a_real_tree_and_releases_it_on_drop() {
+        use std::process::{Child, Command, Stdio};
+        struct Reap(Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let reap = Reap(
+            Command::new("sh")
+                .args(["-c", "while :; do :; done"])
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let root = reap.0.id();
+        let pids = tree(Path::new("/proc"), root);
+        let frozen = Frozen {
+            method: PauseMethod::Sigstop,
+            pids: pids.clone(),
+            cgroup: None,
+        };
+        freeze_signals(&pids);
+        assert!(wait_settled(&frozen), "the tree settles into `stopped`");
+        let state = |pid: u32| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| proc_state(&s))
+        };
+        assert_eq!(state(root), Some('T'), "stopped while the guard would hold");
+        thaw(&frozen);
+        assert!(
+            crate::daemon::wait_until(Duration::from_secs(2), || state(root) != Some('T')),
+            "running again after the guard releases it",
+        );
     }
 }

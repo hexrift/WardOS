@@ -239,7 +239,11 @@ contents.
   cold misses the < 3 s target by ~0.5 s and CAS ingest is disk-bound. Btrfs
   subvolume snapshot and reflink ingest could not be measured (no Btrfs on the host).
   Full data and the measuring implementation are on branch
-  `phase-1/ward-snapshot-full` (`experiments/E-02/RESULT.md`).
+  `phase-1/ward-snapshot-full` (`experiments/E-02/RESULT.md`). The TOCTOU half of the
+  pass criterion (ST-008/018) is now a standing regression: the candidate is captured
+  with the session's sandbox frozen (`pause::CaptureFreeze`), proven atomic against a
+  concurrently writing agent by `candidate_capture_is_atomic_while_the_agent_writes`
+  (see `docs/security-model.md` G5).
 * **E-08 (restricted egress) — partial PASS.** From inside the sandbox, via the shim
   relay and the session proxy: `development` mode reaches `registry.npmjs.org` over
   HTTPS (`200`) and denies `10.0.0.1` and `169.254.169.254` (`403`); `localhost_only`
