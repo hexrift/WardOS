@@ -38,3 +38,14 @@ noisy; LD_PRELOAD is trivially bypassed.
 
 ## How it will be validated
 E-05 against `strace -f` ground truth; ST-016.
+
+## Addendum (Phase 1): inotify for file events
+
+The Phase 1 runtime captures file activity with a recursive **inotify** watch of the
+worktree for the duration of each command (kernel-origin, no privilege needed), mapping
+create / close-write / delete / move / attrib to `FileChangeKind` and emitting
+`FileRead` only in Live/StepThrough. fanotify remains the target for mount-wide,
+permission-capable capture once `wardd` runs as the privileged `ward` user (it needs
+`CAP_SYS_ADMIN`); exec capture is still supervisor-emitted per command until the eBPF
+tracepoint path (E-05) lands. The origin semantics are unchanged: these are
+enforcement facts, hook records stay claims.
