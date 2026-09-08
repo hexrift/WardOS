@@ -12,8 +12,8 @@ name = "ward"
 path = "src/main.rs"
 
 [dependencies]
-ward-daemon = { path = "../ward-daemon" }
-ward-events = { path = "../ward-events" }
+ward-daemon = { path = "../ward-daemon", version = "0.1.0" }
+ward-events = { path = "../ward-events", version = "0.1.0" }
 clap = { workspace = true }
 
 [lints]

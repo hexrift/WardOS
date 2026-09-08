@@ -16,10 +16,10 @@ name = "wardd"
 path = "src/main.rs"
 
 [dependencies]
-ward-events = { path = "../ward-events" }
-ward-policy = { path = "../ward-policy" }
-ward-snapshot = { path = "../ward-snapshot" }
-ward-sandbox = { path = "../ward-sandbox" }
+ward-events = { path = "../ward-events", version = "0.1.0" }
+ward-policy = { path = "../ward-policy", version = "0.1.0" }
+ward-snapshot = { path = "../ward-snapshot", version = "0.1.0" }
+ward-sandbox = { path = "../ward-sandbox", version = "0.1.0" }
 blake3 = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
