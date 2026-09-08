@@ -226,7 +226,7 @@ versions; its lockfile records every tarball with an integrity hash; the image b
 runs `npm ci --omit=dev --ignore-scripts` on it under `/usr/lib/wardos/agents` (then
 `npm rebuild @anthropic-ai/claude-code`, the one postinstall that places the native
 binary) and links `/usr/bin/claude` and `/usr/bin/codex` to the two commands. Node.js
-comes from Fedora (`nodejs`, `npm` in `image/packages.txt`) and the build fails when it
+comes from Fedora (`nodejs24`, `nodejs24-npm` in `image/packages.txt`) and the build fails when it
 is older than the `engines` floor (22). Versions are bumped by editing `package.json`,
 regenerating the lockfile and opening a pull request; the image build's "What the image
 holds" step prints `claude --version` and `codex --version` as the proof

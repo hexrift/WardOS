@@ -207,7 +207,7 @@ agents `ward` exists to run and TamperWard, at pinned versions, installed at bui
 | Claude Code | `@anthropic-ai/claude-code` | `/usr/bin/claude` | `/usr/lib/wardos/agents/node_modules/@anthropic-ai/claude-code/` (the native binary of the build's platform, placed by the package's postinstall) |
 | Codex | `@openai/codex` | `/usr/bin/codex` | `/usr/lib/wardos/agents/node_modules/@openai/codex/` (+ the platform package) |
 | TamperWard | `tamperward` 2.10.3 | `/usr/bin/tamperward` | `/usr/lib/wardos/agents/node_modules/tamperward/` |
-| Node.js | Fedora `nodejs`, `npm` | `/usr/bin/node` | the distro runtime; the build fails when it is older than the `engines` floor (22) |
+| Node.js | Fedora `nodejs24`, `nodejs24-npm` | `/usr/bin/node` | the distro runtime (Fedora ships versioned streams, no plain `nodejs`); the build fails when it is older than the `engines` floor (22) |
 
 [`agents/package.json`](agents/package.json) pins the three exactly and
 `agents/package-lock.json` records every tarball they resolve to with its integrity
@@ -257,10 +257,9 @@ Three defaults of ADR-0017, each a file in this directory:
 * **Full-disk encryption by default.** `disk.sh --type iso` generates the LUKS
   kickstart unless told `--no-luks` ([below](#users-and-luks)); the qcow2 (a
   development disk for QEMU) is unchanged, because bootc-image-builder cannot encrypt
-  it and `disk.sh` refuses `--luks` for it. The `disk` workflow passes `--luks` only
-  when its `luks` input is `true`; with this default a plain `--type iso` from it is
-  encrypted too, and its `luks=false` needs `--no-luks` to mean what it says (a
-  one-line change in `disk.yml`, which this directory does not own).
+  it and `disk.sh` refuses `--luks` for it. The `disk` workflow passes `--luks` when
+  its `luks` input is `true` and `--no-luks` otherwise, so its input keeps meaning
+  what it says.
 * **A firewall that admits nothing inbound.** `firewalld` is in `packages.txt`,
   enabled by `90-wardos.preset` (and `systemctl enable` in the build), and its default
   zone is `wardos` (`rootfs/etc/firewalld/zones/wardos.xml`: `target="DROP"`, no

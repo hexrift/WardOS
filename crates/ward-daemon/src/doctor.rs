@@ -466,7 +466,7 @@ pub fn socket_path(state: &Path) -> Check {
 /// Node against [`NODE_FLOOR`], from `node --version` output (`None`: not on `PATH`).
 #[must_use]
 pub fn node(version: Option<&str>) -> Check {
-    let ships = "ships in the WardOS image; elsewhere install nodejs";
+    let ships = "ships in the WardOS image; elsewhere install nodejs (Fedora: nodejs24)";
     match version.and_then(version_in) {
         Some(v) => match v.split('.').next().and_then(|m| m.parse::<u64>().ok()) {
             Some(major) if major >= NODE_FLOOR => Check::new(
