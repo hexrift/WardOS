@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# wardos-approve — answer an approval the session daemon holds
+# (docs/design-language.md §10, ADR-0016, docs/agent-integration.md §4).
+#
+# Usage:
+#   wardos-approve                  pick a pending approval (one pending: it is picked)
+#                                   and answer it from the keyboard: y / s / n
+#   wardos-approve <id> [y|s|n]     answer approval <id>: y allow once, s allow for the
+#                                   session, n deny; without the answer, ask for it
+#   wardos-approve --watch [--once] follow the live session's approvals and show each as
+#                                   a notification with Allow once / Allow session / Deny;
+#                                   the chosen action is relayed to the daemon. Without
+#                                   --once the listener waits for the next session when
+#                                   one ends (this is what wardos-approve.service runs).
+#   wardos-approve --help
+#
+# The daemon is reached through `ward session pending` and `ward session approve`
+# for WARDOS_PROJECT (default: the current directory; from home that is the newest
+# live session). Menus go through wardos-menu-select (WARDOS_MENU_BACKEND=fuzzel|stdin,
+# WARDOS_MENU_CHOICE answers the stdin backend); when that command is absent the stdin
+# backend is built in. Deny is the daemon's default on timeout, so an unanswered
+# notification denies. Needs jq.
+set -euo pipefail
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
+
+project=${WARDOS_PROJECT:-$PWD}
+retry=${WARDOS_APPROVE_RETRY:-2}
+
+# One line per pending approval: id, session, agent, tool, summary, reason.
+fields='[.id, .session, .agent, .tool, .summary, .reason] | @tsv'
+
+# The words the design uses for the three answers.
+decision_of() {
+  case $1 in
+    y|allow) echo allow ;;
+    s|session|allow-session) echo allow-session ;;
+    n|deny) echo deny ;;
+    *) echo "wardos-approve: unknown answer '$1' (y, s or n)" >&2; return 1 ;;
+  esac
+}
+
+# Pick one line from stdin: wardos-menu-select when it exists, else the stdin
+# backend (the line whose first field, or whole text, is WARDOS_MENU_CHOICE).
+select_line() {
+  local prompt=$1
+  if command -v wardos-menu-select >/dev/null 2>&1; then
+    wardos-menu-select --prompt "$prompt"
+    return
+  fi
+  local choice=${WARDOS_MENU_CHOICE:-} line
+  [[ -n $choice ]] || return 1
+  while IFS= read -r line; do
+    if [[ $line == "$choice" || ${line%%$'\t'*} == "$choice" ]]; then
+      printf '%s\n' "$line"
+      return 0
+    fi
+  done
+  return 1
+}
+
+answer() {
+  local id=$1 session=$2 decision=$3
+  ward session approve --session "$session" "$id" "$decision"
+}
+
+# Ask for the answer with the menu: y / s / n.
+ask_decision() {
+  local chosen
+  chosen=$(printf 'y\tAllow once\ns\tAllow session\nn\tDeny\n' | select_line "Approve") || return 1
+  decision_of "${chosen%%$'\t'*}"
+}
+
+# The interactive path: list what is pending, pick one, answer it.
+interactive() {
+  local id=${1:-} given=${2:-} pending chosen session decision
+  pending=$(ward session pending "$project" | jq -r "$fields")
+  if [[ -z $pending ]]; then
+    echo "  no pending approvals"
+    return 0
+  fi
+  if [[ -n $id ]]; then
+    chosen=$(printf '%s\n' "$pending" | awk -F'\t' -v id="$id" '$1 == id') || true
+    [[ -n $chosen ]] || { echo "wardos-approve: approval $id is not pending" >&2; return 1; }
+  elif [[ $(printf '%s\n' "$pending" | wc -l) -eq 1 ]]; then
+    chosen=$pending
+  else
+    chosen=$(printf '%s\n' "$pending" \
+      | awk -F'\t' '{ printf "%s\t%s · %s %s · %s\n", $1, $3, $4, $5, $6 }' \
+      | select_line "Approval") || return 1
+    chosen=$(printf '%s\n' "$pending" | awk -F'\t' -v id="${chosen%%$'\t'*}" '$1 == id')
+  fi
+  id=${chosen%%$'\t'*}
+  session=$(printf '%s\n' "$chosen" | cut -f2)
+  if [[ -n $given ]]; then
+    decision=$(decision_of "$given")
+  else
+    decision=$(ask_decision) || return 1
+  fi
+  answer "$id" "$session" "$decision"
+}
+
+# One notification, waited on; the action chosen is the answer. Runs in the
+# background so a second approval is not queued behind the first.
+notify_one() {
+  local id=$1 session=$2 agent=$3 tool=$4 summary=$5 reason=$6 action decision
+  action=$(notify-send -a WardOS -c ward-approval -u critical --wait \
+    -A allow="Allow once" -A session="Allow session" -A deny="Deny" \
+    "${agent^} requests" "$summary"$'\n'"Reason  $reason"$'\n'"Scope   $tool") || action=
+  [[ -n $action ]] || return 0
+  decision=$(decision_of "$action") || return 0
+  answer "$id" "$session" "$decision" || true
+}
+
+follow_once() {
+  local id session agent tool summary reason
+  while IFS=$'\t' read -r id session agent tool summary reason; do
+    [[ -n $id ]] || continue
+    notify_one "$id" "$session" "$agent" "$tool" "$summary" "$reason" &
+  done < <(ward session pending --follow "$project" | jq --unbuffered -r "$fields")
+  wait
+}
+
+watch() {
+  local once=$1
+  while :; do
+    follow_once || true
+    [[ $once == 1 ]] && return 0
+    sleep "$retry"
+  done
+}
+
+case ${1:-} in
+  -h|--help) usage ;;
+  --watch)
+    once=0
+    [[ ${2:-} == --once ]] && once=1
+    watch "$once"
+    ;;
+  --*) echo "wardos-approve: unknown option $1" >&2; usage >&2; exit 2 ;;
+  *) interactive "${1:-}" "${2:-}" ;;
+esac
