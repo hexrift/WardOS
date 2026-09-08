@@ -1,6 +1,10 @@
-# WardOS
+<p align="center">
+  <img src="assets/logo.svg" alt="WardOS" width="112" height="112">
+</p>
 
-**A secure Linux workstation for software engineers working with autonomous coding agents.**
+<h1 align="center">WardOS</h1>
+
+<p align="center"><strong>A secure Linux workstation for software engineers working with autonomous coding agents.</strong></p>
 
 WardOS is a purpose-built Linux distribution for agentic software development. It gives
 coding agents (Claude Code, Codex, Gemini CLI, Aider, and whatever comes next) everything
@@ -93,6 +97,15 @@ WardOS 0.1 is not a general-purpose desktop, a server OS, a Kubernetes distribut
 gaming distro, a custom kernel project, a universal-hardware project, a promise of perfect
 sandbox security, or an enterprise management platform. See
 [`docs/roadmap.md`](docs/roadmap.md#non-goals).
+
+
+## Brand
+
+The WardOS mark places the [TamperWard](https://github.com/hexrift/tamperward) ward glyph —
+four strokes of change stopped at the exact point — inside a rounded host frame. That is the
+product relationship in one image: WardOS supplies the containing boundary, TamperWard the
+verification core. Assets live in [`assets/`](assets/) (`logo.svg`, `logo-dark.svg`,
+`favicon.svg`); the glyph is derived from TamperWard's own logo.
 
 ## License
 
