@@ -503,10 +503,11 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
         None => Framing::None,
     };
     let req = &gateway.map_or_else(|| parsed.request.clone(), |g| g.request(&parsed));
-    let pinned = match shared
-        .policy
-        .evaluate(shared.resolver.as_ref(), &req.target)
-    {
+    let resolver = shared.resolver.as_ref();
+    let pinned = match gateway.map_or_else(
+        || shared.policy.evaluate(resolver, &req.target),
+        |_| shared.policy.evaluate_gateway(resolver, &req.target),
+    ) {
         Ok(pinned) => pinned,
         Err(denial) => {
             shared

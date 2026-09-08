@@ -186,7 +186,14 @@ fn cmd_agent(
         );
     }
     let log = session.log_path();
-    let report = session.run_agent(agent, args, pass_env)?;
+    let (command, opts) = session.agent_launch(agent, args, pass_env)?;
+    for g in &opts.gateways {
+        eprintln!(
+            "ward: {} credential stays on the host; the proxy injects it",
+            g.service
+        );
+    }
+    let report = session.launch(&command, &opts)?;
     if throwaway {
         session.stop(EndReason::UserStop)?;
     } else {

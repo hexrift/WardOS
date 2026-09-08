@@ -1,6 +1,9 @@
 # Credential Broker
 
-Status: Phase 0. Decision record: [ADR-0008](decisions/ADR-0008-credential-broker.md).
+Status: Phase 2, model-API gateway implemented (`ward claude`, see
+[agent-integration.md](agent-integration.md) §3); GitHub, registry and SSH adapters and
+the vault are Phase 3. Decision record:
+[ADR-0008](decisions/ADR-0008-credential-broker.md).
 
 ## 1. Problem
 

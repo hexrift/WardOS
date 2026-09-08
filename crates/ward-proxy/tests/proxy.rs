@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use ward_proxy::{
     Config, Decision, GatewayRoute, Handle, Method, NetworkCapability, Observer, Proxy, Request,
-    Secret,
+    Secret, StaticResolver,
 };
 
 /// Records every decision the proxy reports.
@@ -512,34 +512,59 @@ fn gateway_forwards_chunked_bodies_and_absolute_form() {
 }
 
 #[test]
-fn gateway_upstream_is_subject_to_policy_and_prefix_is_exact() {
+fn gateway_upstream_is_host_chosen_and_prefix_is_exact() {
     let (upstream, seen) = spawn_gateway_upstream(Duration::ZERO);
-    // The upstream is allowlisted, but a second route points somewhere that
-    // is not: the same 403 as any other denied destination, secret unused.
-    let denied = GatewayRoute::new(
+    // The host configured the route, so the sandbox's allowlist does not
+    // apply to its upstream: `localhost_only` still reaches it. A route whose
+    // upstream does not resolve is the usual 403, secret unused.
+    let resolver = Arc::new(StaticResolver::new());
+    let unresolvable = GatewayRoute::new(
         "/openai",
-        "api.openai.com",
+        "api.openai.invalid",
         443,
         "Authorization",
         Secret::from(REAL_KEY),
     )
     .unwrap();
     let (proxy, recorder) = start(
-        custom_localhost()
+        Config::new(NetworkCapability::LocalhostOnly)
+            .resolver(resolver)
             .gateway(gateway_route(upstream))
-            .gateway(denied),
+            .gateway(unresolvable),
     );
 
-    let mut d = client(&proxy);
-    d.write_all(b"GET /openai/v1/models HTTP/1.1\r\nHost: 127.0.0.1:3128\r\n\r\n")
+    let mut denied = client(&proxy);
+    denied
+        .write_all(b"GET /openai/v1/models HTTP/1.1\r\nHost: 127.0.0.1:3128\r\n\r\n")
         .unwrap();
-    let response = read_all(&mut d);
+    let response = read_all(&mut denied);
     assert!(response.starts_with("HTTP/1.1 403"), "{response}");
     assert!(!response.contains(REAL_KEY));
     let (req, decision, reason) = recorder.last();
     assert_eq!(decision, Decision::Deny);
-    assert_eq!(reason, "host is not on the session allowlist");
-    assert_eq!(req.to_string(), "GET http://api.openai.com:443/v1/models");
+    assert_eq!(reason, "host did not resolve");
+    assert_eq!(
+        req.to_string(),
+        "GET http://api.openai.invalid:443/v1/models"
+    );
+
+    let mut allowed = client(&proxy);
+    allowed.write_all(
+        b"GET /anthropic/v1/models HTTP/1.1\r\nHost: 127.0.0.1:3128\r\nContent-Length: 0\r\n\r\n",
+    )
+    .unwrap();
+    assert!(read_head(&mut allowed).starts_with("HTTP/1.1 200"));
+    let _ = read_all(&mut allowed);
+    assert_eq!(recorder.last().2, "gateway /anthropic");
+
+    // Offline is still offline, gateway or not.
+    let (offline, recorder_off) =
+        start(Config::new(NetworkCapability::Offline).gateway(gateway_route(upstream)));
+    let mut off = client(&offline);
+    off.write_all(b"GET /anthropic/v1/models HTTP/1.1\r\nHost: 127.0.0.1:3128\r\n\r\n")
+        .unwrap();
+    assert!(read_all(&mut off).starts_with("HTTP/1.1 403"));
+    assert_eq!(recorder_off.last().2, "session network mode is offline");
 
     // `/anthropicx` is not under `/anthropic`; with no route it is not a
     // proxy request at all, and no decision is recorded for it.

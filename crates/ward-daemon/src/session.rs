@@ -18,11 +18,12 @@ use ward_events::{
     ExitStatus, FileChangeKind, FsyncPolicy, LogWriter, NameText, Origin, Pid, ProcessRef,
     SandboxPath, SandboxRoot, Timestamp, WardEvent,
 };
-use ward_policy::{CapabilityManifest, ObserverMode, Policy, merge};
+use ward_policy::{CapabilityManifest, NetworkCapability, ObserverMode, Policy, merge};
 use ward_snapshot::{CaptureOptions, SnapshotRole, SnapshotStore};
 
 use crate::egress::Egress;
 use crate::error::{Error, Result};
+use crate::gateway::Gateway;
 use crate::ids::{ev_hash, ev_snapshot, new_session_id, project_id_for};
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
 use crate::watch::{CaptureMode, Captured, Watcher};
@@ -117,7 +118,13 @@ pub struct LaunchOpts {
     pub env: Vec<(String, String)>,
     /// Inherit the terminal instead of capturing output.
     pub interactive: bool,
+    /// Credentials the proxy injects for this launch (`gateway.rs`).
+    pub gateways: Vec<Gateway>,
 }
+
+/// Nominal validity of a gateway grant. The route itself lives exactly as long
+/// as the launch; this is the bound recorded in the log.
+const GATEWAY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl Session {
     /// Open a session using the default state root (`$WARD_STATE_DIR` or
@@ -285,14 +292,28 @@ impl Session {
         self.launch(argv, &LaunchOpts::default())
     }
 
-    /// Launch a known agent interactively (`docs/agent-integration.md`): its profile
-    /// env, the session egress proxy, and any explicitly passed-through host variables.
+    /// Launch a known agent interactively (`docs/agent-integration.md`).
     pub fn run_agent(
         &mut self,
         name: &str,
         args: &[String],
         pass_env: &[String],
     ) -> Result<RunReport> {
+        let (command, opts) = self.agent_launch(name, args, pass_env)?;
+        self.launch(&command, &opts)
+    }
+
+    /// What [`run_agent`](Self::run_agent) would launch: the profile's command and
+    /// env, explicitly passed-through host variables, and the model-API gateway
+    /// when the host holds the key. Passing the key variable through with
+    /// `pass_env` hands the agent the real key instead, and no gateway is set up.
+    /// Nothing is granted when the session is offline.
+    pub fn agent_launch(
+        &self,
+        name: &str,
+        args: &[String],
+        pass_env: &[String],
+    ) -> Result<(Vec<String>, LaunchOpts)> {
         let profile = crate::agents::profile(name)
             .ok_or_else(|| Error::Project(format!("unknown agent `{name}`")))?;
         let mut env: Vec<(String, String)> = profile
@@ -305,15 +326,28 @@ impl Session {
                 env.push((key.clone(), v));
             }
         }
+        let online = !matches!(self.manifest.network, NetworkCapability::Offline);
+        let gateways = profile
+            .gateway
+            .filter(|g| online && !pass_env.iter().any(|k| k == g.key_env))
+            .map(|spec| Gateway::resolve(&spec, &self.state))
+            .transpose()?
+            .flatten()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for g in &gateways {
+            env.extend(g.env.iter().cloned());
+        }
         let mut command = vec![profile.binary.to_string()];
         command.extend(args.iter().cloned());
-        self.launch(
-            &command,
-            &LaunchOpts {
+        Ok((
+            command,
+            LaunchOpts {
                 env,
                 interactive: true,
+                gateways,
             },
-        )
+        ))
     }
 
     /// Run a command with explicit options; every run gets the session egress proxy.
@@ -351,8 +385,12 @@ impl Session {
 
         // Unix socket paths are capped at 108 bytes, so the proxy lives in a short,
         // private per-session run dir rather than under the (possibly deep) state root.
+        for g in &opts.gateways {
+            self.emit(Origin::Wardd, g.granted(GATEWAY_TTL)?)?;
+        }
+        let routes = opts.gateways.iter().map(|g| g.route.clone()).collect();
         let run_dir = run_dir(&self.session_str)?;
-        let egress = Egress::start(&run_dir, &self.manifest.network)?;
+        let egress = Egress::start(&run_dir, &self.manifest.network, routes)?;
         let mut launch = Launch::new(&self.worktree, argv.to_vec()).egress(egress.socket());
         // The shim is used only when it can relay to the egress socket; an older build
         // without `--relay` would reject the flag, so fall back to a direct exec (still

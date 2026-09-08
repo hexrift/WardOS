@@ -2,7 +2,11 @@
 //! End-to-end session test. Requires bubblewrap; skips cleanly without it.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 
+use ward_daemon::session::LaunchOpts;
 use ward_daemon::{Session, SessionMeta, sandbox, selftest};
 use ward_events::{EndReason, FileChangeKind, LogReader, WardEvent};
 
@@ -175,4 +179,98 @@ print(s.recv(200).split(b'\\r\\n')[0].decode())";
         .filter_map(Result::ok)
         .any(|r| matches!(r.event, ward_events::WardEvent::NetworkDenied { .. }));
     assert!(denied, "a NetworkDenied record must be in the sealed log");
+}
+
+/// A loopback "model API" that records the request head and answers 200.
+fn spawn_upstream() -> (u16, Arc<Mutex<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(String::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        if let Some(Ok(mut s)) = listener.incoming().next() {
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while s.read(&mut byte).unwrap_or(0) == 1 {
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            *log.lock().unwrap() = String::from_utf8_lossy(&buf).into_owned();
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+    (port, seen)
+}
+
+#[test]
+fn gateway_injects_the_host_key_and_the_sandbox_never_holds_it() {
+    if !sandbox::available() || !std::path::Path::new("/usr/bin/python3").exists() {
+        eprintln!("skipping: bubblewrap or python3 not available");
+        return;
+    }
+    let (port, seen) = spawn_upstream();
+    let spec = ward_daemon::agents::profile("claude")
+        .and_then(|p| p.gateway)
+        .unwrap();
+    let route = ward_proxy::GatewayRoute::new(
+        spec.prefix,
+        "127.0.0.1",
+        port,
+        spec.header,
+        ward_proxy::Secret::from("sk-ant-real"),
+    )
+    .unwrap()
+    .strip_headers(spec.strip)
+    .plain_upstream(true);
+    let gateway = ward_daemon::gateway::Gateway::new(&spec, route);
+
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let mut session = Session::start_in(project.path(), state.path()).expect("start");
+    let log = session.log_path();
+    // The agent's view: base URL and key from its environment, nothing else.
+    let script = "import os,socket\n\
+base=os.environ['ANTHROPIC_BASE_URL']\nkey=os.environ['ANTHROPIC_API_KEY']\n\
+s=socket.socket(socket.AF_UNIX)\ns.connect('/run/ward/proxy.sock')\n\
+path=base.split('3128',1)[1]+'/v1/messages'\n\
+s.sendall(('POST '+path+' HTTP/1.1\\r\\nHost: 127.0.0.1:3128\\r\\nx-api-key: '+key+'\\r\\n\
+Content-Length: 0\\r\\n\\r\\n').encode())\n\
+print(s.recv(200).split(b'\\r\\n')[0].decode()); print('key='+key)";
+    let opts = LaunchOpts {
+        env: gateway.env.clone(),
+        interactive: false,
+        gateways: vec![gateway],
+    };
+    let report = session
+        .launch(&["python3".into(), "-c".into(), script.into()], &opts)
+        .expect("launch");
+    assert!(
+        report.stdout.contains("200"),
+        "{}\n{}",
+        report.stdout,
+        report.stderr
+    );
+    assert!(
+        report.stdout.contains("key=ward-gateway"),
+        "{}",
+        report.stdout
+    );
+    session.stop(EndReason::UserStop).expect("stop");
+
+    let head = seen.lock().unwrap().clone();
+    assert!(head.starts_with("POST /v1/messages HTTP/1.1"), "{head}");
+    assert!(head.contains("x-api-key: sk-ant-real"), "{head}");
+    assert!(!head.contains("ward-gateway"), "{head}");
+
+    let granted = ward_events::LogReader::open(&log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|r| matches!(r.event, ward_events::WardEvent::CredentialGranted { .. }));
+    assert!(
+        granted,
+        "a CredentialGranted record must be in the sealed log"
+    );
 }

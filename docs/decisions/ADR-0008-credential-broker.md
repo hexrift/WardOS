@@ -42,3 +42,28 @@ a compromised Zone 3 gains nothing durable.
 
 ## How it will be validated
 ST-012 (persistence), ST-024 (scope overreach), E-07 (agent compatibility).
+
+## Addendum (Phase 2): gateway routes as implemented
+
+`ward-proxy` gateway routes and the `ward claude` wiring implement delivery (A) for the
+model API. Points decided during implementation:
+
+* **The gateway upstream is host-chosen, so the session allowlist does not apply to
+  it.** The sandbox cannot pick the destination of a `/anthropic` request; `wardd`
+  did, when it built the route. Subjecting it to the network capability would make
+  `localhost_only` projects (the default for the demo) unable to use the model API at
+  all, for no isolation gain. `offline` still refuses every gateway request and no
+  grant is made, and the upstream is resolved and pinned like any other destination.
+* **Key sources**, in order: the host variable named by the route (`ANTHROPIC_API_KEY`),
+  then `$WARD_STATE_DIR/vault/<NAME>`. The encrypted vault of the decision text is
+  still Phase 3; the file is the 0.1 stand-in.
+* **Placeholder, not empty.** The sandbox gets `ANTHROPIC_API_KEY=ward-gateway` so the
+  agent's own "is a key configured?" check passes; the proxy strips `x-api-key` and
+  `authorization` before injecting, so the placeholder never reaches the upstream.
+* **Explicit opt-out.** `--pass-env ANTHROPIC_API_KEY` hands the agent the real key and
+  disables the gateway; the CLI prints that it did.
+* **Grant record.** Each launch with a gateway emits `CredentialGranted { service,
+  scope: upstream host:port, expires: 24h, delivery: ProxyInjected }` before the
+  command starts; the route is torn down with the session proxy when the command
+  exits, so the recorded TTL is an upper bound.
+
