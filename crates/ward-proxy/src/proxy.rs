@@ -38,8 +38,9 @@ use crate::policy::{Pinned, Policy};
 use crate::resolve::{Resolver, SystemResolver};
 
 /// How often a relay loop wakes to check for shutdown or idleness.
-const POLL: Duration = Duration::from_millis(250);
 /// Relay buffer size.
+/// Read timeout on relayed sockets so a relay thread re-checks the shutdown flag.
+const POLL: Duration = Duration::from_millis(250);
 const RELAY_BUF: usize = 16 * 1024;
 
 /// Where clients are accepted from. Also records what was actually bound.
@@ -253,8 +254,8 @@ fn spawn_acceptor<L: Acceptor>(listener: L, shared: &Arc<Shared>) -> Result<Join
 }
 
 /// Create the Unix listening socket: replace a stale socket file, bind, and
-/// restrict the node to `0600`. The listener is left non-blocking so the
-/// accept loop can poll the shutdown flag instead of parking in `accept`.
+/// restrict the node to `0600`. The listener blocks in `accept`; shutdown wakes
+/// it with one connect, exactly like the TCP listener.
 fn bind_unix(path: &Path) -> Result<UnixListener, Error> {
     let err = |source| Error::BindUnix {
         path: path.to_path_buf(),
@@ -273,9 +274,7 @@ fn bind_unix(path: &Path) -> Result<UnixListener, Error> {
     }
     // A missing parent surfaces here as `NotFound`; nothing is created.
     let listener = UnixListener::bind(path).map_err(err)?;
-    let secured = fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .and_then(|()| listener.set_nonblocking(true));
-    if let Err(e) = secured {
+    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
         let _ = fs::remove_file(path);
         return Err(err(e));
     }
@@ -321,19 +320,17 @@ impl Handle {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         let Some(acceptor) = acceptor else { return };
-        // Wake the acceptor so it observes the flag now. The TCP listener
-        // blocks in `accept`, so this is required; the Unix listener is
-        // non-blocking and polls the flag anyway, so a failed connect (say
-        // the file was removed behind our back) still cannot hang the join.
-        match &self.bound {
-            Listen::Tcp(addr) => {
-                let _ = TcpStream::connect_timeout(addr, Duration::from_secs(1));
-            }
-            Listen::Unix(path) => {
-                let _ = UnixStream::connect(path);
-            }
+        // Wake the acceptor so it observes the flag now: both listeners block
+        // in `accept`. If the wake cannot reach it (the socket file was removed
+        // behind our back) the thread is left parked rather than joined; it
+        // holds nothing but the listener and ends with the process.
+        let woken = match &self.bound {
+            Listen::Tcp(addr) => TcpStream::connect_timeout(addr, Duration::from_secs(1)).is_ok(),
+            Listen::Unix(path) => UnixStream::connect(path).is_ok(),
+        };
+        if woken {
+            let _ = acceptor.join();
         }
-        let _ = acceptor.join();
         if let Listen::Unix(path) = &self.bound {
             let _ = fs::remove_file(path);
         }
@@ -437,9 +434,6 @@ impl Acceptor for UnixListener {
     type Conn = UnixStream;
     fn accept(&self) -> io::Result<UnixStream> {
         let (stream, _) = Self::accept(self)?;
-        // The listener is non-blocking; the connection must not be, or the
-        // per-connection read timeouts would never apply.
-        stream.set_nonblocking(false)?;
         Ok(stream)
     }
 }
@@ -449,13 +443,8 @@ fn accept_loop<L: Acceptor>(listener: &L, shared: &Arc<Shared>) {
         if shared.shutting_down() {
             break;
         }
-        let mut client = match listener.accept() {
-            Ok(client) => client,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(POLL);
-                continue;
-            }
-            Err(_) => continue,
+        let Ok(mut client) = listener.accept() else {
+            continue;
         };
         let Some(slot) = Slot::acquire(shared) else {
             respond(&mut client, 503, "Service Unavailable", "proxy at capacity");
