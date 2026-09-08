@@ -49,15 +49,17 @@ WORKDIR /src
 # The whole workspace, filtered by the repository's .containerignore (no target/, no .git).
 COPY . .
 # --locked refuses to touch Cargo.lock, so the image is built from exactly the dependency
-# set the repository reviewed. The theme renderer (desktop/theme, crate wardos-theme) is
-# built once that crate is in the tree; when it is, its binary must come out.
-RUN set -- --package ward-cli --package ward-daemon --package ward-agent --package ward-shell \
-    && if [ -f desktop/theme/Cargo.toml ]; then set -- "$@" --package wardos-theme; fi \
-    && echo "cargo build $*" \
-    && cargo build --release --locked "$@" \
+# set the repository reviewed. Five host binaries: the three of the secure-session
+# layer, the shell (desktop/shell) and the theme renderer (desktop/theme).
+RUN cargo build --release --locked \
+      --package ward-cli \
+      --package ward-daemon \
+      --package ward-agent \
+      --package ward-shell \
+      --package wardos-theme \
     && mkdir -p /out \
-    && cp target/release/ward target/release/wardd target/release/ward-agent target/release/ward-shell /out/ \
-    && if [ -f desktop/theme/Cargo.toml ]; then cp target/release/wardos-theme-render /out/; fi
+    && cp target/release/ward target/release/wardd target/release/ward-agent \
+          target/release/ward-shell target/release/wardos-theme-render /out/
 
 # The chosen source, under one name for the host stage (a stage name, not an image;
 # hadolint cannot tell, hence the ignore).
