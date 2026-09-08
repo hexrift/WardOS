@@ -416,12 +416,12 @@ impl Session {
             pid,
             comm: comm.clone(),
         };
-        for event in egress.drain_events(&by) {
-            self.emit(Origin::Proxy, event)?;
+        for (at, event) in egress.drain_events(&by) {
+            self.emit_at(at, Origin::Proxy, event)?;
         }
         egress.stop();
-        for event in hooks.drain_events() {
-            self.emit(Origin::Agent, event)?;
+        for (at, event) in hooks.drain_events() {
+            self.emit_at(at, Origin::Agent, event)?;
         }
         hooks.stop();
         let _ = std::fs::remove_dir_all(&run_dir);
@@ -525,10 +525,11 @@ impl Session {
         let mut changed_paths = BTreeSet::new();
         for item in captured {
             match item {
-                Captured::Modified { rel, kind } => {
+                Captured::Modified { at, rel, kind } => {
                     if let Ok(path) = SandboxPath::new(SandboxRoot::Work, rel) {
                         changed_paths.insert(rel.clone());
-                        self.emit(
+                        self.emit_at(
+                            *at,
                             Origin::Kernel,
                             WardEvent::FileModified {
                                 path,
@@ -541,9 +542,10 @@ impl Session {
                         )?;
                     }
                 }
-                Captured::Read { rel } => {
+                Captured::Read { at, rel } => {
                     if let Ok(path) = SandboxPath::new(SandboxRoot::Work, rel) {
-                        self.emit(
+                        self.emit_at(
+                            *at,
                             Origin::Kernel,
                             WardEvent::FileRead {
                                 path,
@@ -567,9 +569,16 @@ impl Session {
     }
 
     fn emit(&mut self, origin: Origin, event: WardEvent) -> Result<()> {
+        self.emit_at(SystemTime::now(), origin, event)
+    }
+
+    /// Append an event that happened at `at`: captured facts (proxy decisions, hook
+    /// claims, file events) are drained after the command exits but keep their
+    /// own time, so the observer timeline is truthful.
+    fn emit_at(&mut self, at: SystemTime, origin: Origin, event: WardEvent) -> Result<()> {
         let record: EventRecord = self
             .chain
-            .append(origin, event, now_ts(self.started))
+            .append(origin, event, ts_at(self.started, at))
             .map_err(|e| Error::Events(e.to_string()))?;
         self.log
             .append(&record)
@@ -598,11 +607,9 @@ fn exit_status(code: Option<i32>) -> ExitStatus {
     }
 }
 
-fn now_ts(started: SystemTime) -> Timestamp {
-    let mono = SystemTime::now()
-        .duration_since(started)
-        .unwrap_or_default();
-    Timestamp::mono(mono)
+/// Monotonic session time of `at`; anything before the session started is 0.
+fn ts_at(started: SystemTime, at: SystemTime) -> Timestamp {
+    Timestamp::mono(at.duration_since(started).unwrap_or_default())
 }
 
 fn unix_ms(t: SystemTime) -> u64 {
@@ -741,6 +748,7 @@ fn scan_changes(
     for (path, meta) in after {
         if before.get(path) != Some(meta) {
             changed.push(Captured::Modified {
+                at: SystemTime::now(),
                 rel: path.clone(),
                 kind: FileChangeKind::Write,
             });
@@ -797,7 +805,7 @@ mod tests {
         let mut changed: Vec<String> = scan_changes(&before, &after)
             .into_iter()
             .map(|c| match c {
-                Captured::Modified { rel, .. } | Captured::Read { rel } => rel,
+                Captured::Modified { rel, .. } | Captured::Read { rel, .. } => rel,
             })
             .collect();
         changed.sort();
@@ -862,5 +870,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded, meta);
+    }
+
+    #[test]
+    fn ts_at_keeps_capture_time_and_clamps_before_start() {
+        let started = SystemTime::now();
+        let later = started + Duration::from_secs(5);
+        assert_eq!(ts_at(started, later).mono, Duration::from_secs(5));
+        assert_eq!(
+            ts_at(started, started - Duration::from_secs(1)).mono,
+            Duration::ZERO
+        );
     }
 }

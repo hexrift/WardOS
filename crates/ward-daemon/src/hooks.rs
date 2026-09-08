@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use ward_events::{ClaimKind, PayloadText, WardEvent};
@@ -100,6 +100,8 @@ fn is_network_tool(tool: &str) -> bool {
 /// A request and the decision it received, kept until the session drains it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claim {
+    /// When the request arrived.
+    pub at: SystemTime,
     /// The request as received.
     pub request: HookRequest,
     /// The decision returned.
@@ -169,14 +171,15 @@ impl Hooks {
         &self.socket
     }
 
-    /// Claims recorded since the last drain, as log events, in arrival order.
-    pub fn drain_events(&self) -> Vec<WardEvent> {
+    /// Claims recorded since the last drain, as log events with their arrival
+    /// time, in arrival order.
+    pub fn drain_events(&self) -> Vec<(SystemTime, WardEvent)> {
         self.claims
             .lock()
             .map(|mut v| std::mem::take(&mut *v))
             .unwrap_or_default()
             .iter()
-            .map(to_event)
+            .map(|c| (c.at, to_event(c)))
             .collect()
     }
 
@@ -206,6 +209,7 @@ fn serve(mut stream: UnixStream, observer: ObserverMode, claims: &Mutex<Vec<Clai
     let response = decide(&observer, &req);
     if let Ok(mut v) = claims.lock() {
         v.push(Claim {
+            at: SystemTime::now(),
             request: req,
             decision: response.decision,
         });
@@ -354,6 +358,7 @@ mod tests {
 
     fn claim(r: HookRequest, decision: HookDecision) -> Claim {
         Claim {
+            at: SystemTime::now(),
             request: r,
             decision,
         }
@@ -445,12 +450,13 @@ mod tests {
 
         let events = hooks.drain_events();
         assert_eq!(events.len(), 2);
+        assert!(events[0].0 <= events[1].0, "arrival times are kept");
         assert_claim(
-            &events[0],
+            &events[0].1,
             ClaimKind::ToolUse,
             "PreToolUse Write /work/src/lib.rs → ask",
         );
-        assert_claim(&events[1], ClaimKind::Note, "Stop");
+        assert_claim(&events[1].1, ClaimKind::Note, "Stop");
         assert!(hooks.drain_events().is_empty());
 
         hooks.stop();

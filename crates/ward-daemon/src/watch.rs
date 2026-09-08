@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use nix::errno::Errno;
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify, WatchDescriptor};
@@ -49,6 +49,8 @@ impl CaptureMode {
 pub enum Captured {
     /// A modification (create, write, delete, rename, chmod).
     Modified {
+        /// When it was observed.
+        at: SystemTime,
         /// Path relative to the worktree root.
         rel: String,
         /// The kind of change.
@@ -56,9 +58,21 @@ pub enum Captured {
     },
     /// A read (open/access), captured only in Live/StepThrough observer modes.
     Read {
+        /// When it was observed.
+        at: SystemTime,
         /// Path relative to the worktree root.
         rel: String,
     },
+}
+
+impl Captured {
+    /// When the access was observed.
+    #[must_use]
+    pub fn at(&self) -> SystemTime {
+        match self {
+            Self::Modified { at, .. } | Self::Read { at, .. } => *at,
+        }
+    }
 }
 
 /// Directory names never descended into or reported.
@@ -159,6 +173,7 @@ fn drain(
         return false;
     }
     let now = started.elapsed();
+    let at = SystemTime::now();
     for ev in events {
         let Some(dir) = wds.get(&ev.wd).cloned() else {
             continue;
@@ -177,7 +192,7 @@ fn drain(
         let Some(rel) = relative(root, &full) else {
             continue;
         };
-        if let Some(captured) = translate(ev.mask, rel, debouncer, now) {
+        if let Some(captured) = translate(ev.mask, rel, debouncer, now, at) {
             out.push(captured);
         }
     }
@@ -190,17 +205,18 @@ fn translate(
     rel: String,
     debouncer: &mut Debouncer,
     now: Duration,
+    at: SystemTime,
 ) -> Option<Captured> {
     if let Some(kind) = change_kind(mask) {
         if debouncer.allow(&rel, Some(kind), now) {
-            return Some(Captured::Modified { rel, kind });
+            return Some(Captured::Modified { at, rel, kind });
         }
         return None;
     }
     if mask.intersects(AddWatchFlags::IN_ACCESS | AddWatchFlags::IN_OPEN)
         && debouncer.allow(&rel, None, now)
     {
-        return Some(Captured::Read { rel });
+        return Some(Captured::Read { at, rel });
     }
     None
 }
@@ -356,16 +372,18 @@ mod tests {
     fn translate_gates_reads_and_debounces() {
         let mut d = Debouncer::new(Duration::from_millis(300));
         let now = Duration::from_millis(0);
-        let read = translate(AddWatchFlags::IN_OPEN, "r.txt".into(), &mut d, now);
+        let at = SystemTime::now();
+        let read = translate(AddWatchFlags::IN_OPEN, "r.txt".into(), &mut d, now, at);
         assert_eq!(
             read,
             Some(Captured::Read {
+                at,
                 rel: "r.txt".into()
             })
         );
         // Repeat read inside window is dropped.
         assert_eq!(
-            translate(AddWatchFlags::IN_ACCESS, "r.txt".into(), &mut d, now),
+            translate(AddWatchFlags::IN_ACCESS, "r.txt".into(), &mut d, now, at),
             None
         );
     }
