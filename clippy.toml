@@ -1,0 +1,2 @@
+# Protected by .tamperward.yml (config). Loosening these needs review.
+avoid-breaking-exported-api = false
