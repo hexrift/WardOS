@@ -46,3 +46,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 scripts/security-check/doc-links.py
+
+  # The host image (image/) cannot be built or booted here; keep it lintable instead.
+  image-lint:
+    name: image lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: hadolint image/Containerfile
+        uses: hadolint/hadolint-action@v3
+        with:
+          dockerfile: image/Containerfile
+          config: .hadolint.yaml
+          failure-threshold: warning
+      - name: shellcheck image/*.sh (and install.sh when present)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q shellcheck
+          files=(image/*.sh)
+          if [[ -f install.sh ]]; then files+=(install.sh); fi
+          bash -n "${files[@]}"
+          shellcheck --severity=style "${files[@]}"
+      - name: scripts explain themselves without podman
+        run: |
+          ./image/build.sh --dry-run
+          ./image/disk.sh --type qcow2 --dry-run
+          ./image/disk.sh --type iso --dry-run

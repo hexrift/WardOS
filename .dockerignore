@@ -1,0 +1,14 @@
+# Build-context filter for image/Containerfile. podman reads .containerignore, docker
+# reads .dockerignore; the two files are kept identical. The context is only what
+# `cargo build --locked` needs plus the image/ inputs.
+.git
+.github
+.claude
+target
+**/target
+assets
+experiments
+examples
+docs
+*.md
+.tamperward
