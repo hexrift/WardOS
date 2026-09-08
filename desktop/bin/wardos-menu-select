@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# wardos-menu-select — the dmenu-style picker every menu uses (docs/desktop.md §Commands).
+#
+# Usage: wardos-menu-select [--prompt TEXT] [--lines N] < items
+#   Reads one item per line, prints the chosen line, exits 1 when cancelled.
+#
+# Backend: WARDOS_MENU_BACKEND=fuzzel (default) | stdin
+#   fuzzel  `fuzzel --dmenu`, themed by ~/.config/wardos/theme/current/fuzzel.ini when
+#           wardos-theme has rendered one.
+#   stdin   answers from WARDOS_MENU_CHOICE (tests, scripts): the item equal to it, else
+#           the first item it is a prefix of, else the text itself. Empty = cancelled.
+#           Several answers separated by newlines feed successive menus.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+prompt=""
+lines=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prompt)
+      prompt=$2
+      shift 2
+      ;;
+    --lines)
+      lines=$2
+      shift 2
+      ;;
+    *) wardos_die "unknown option $1" ;;
+  esac
+done
+
+# The stdin backend's answer list: a cursor file remembers how many answers this list has
+# already given, so a walk through the menu tree consumes one per menu.
+stdin_answer() {
+  local choices=${WARDOS_MENU_CHOICE:-} cursor_file idx=0 key n
+  cursor_file="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/wardos-menu-select.cursor"
+  key=$(printf '%s' "$choices" | cksum | cut -d' ' -f1)
+  if [[ -f "$cursor_file" ]] && [[ "$(head -n1 "$cursor_file")" == "$key" ]]; then
+    idx=$(($(tail -n1 "$cursor_file") + 1))
+  fi
+  printf '%s\n%s\n' "$key" "$idx" >"$cursor_file"
+  n=$(printf '%s\n' "$choices" | wc -l)
+  [[ $idx -ge $n ]] && idx=$((n - 1))
+  printf '%s\n' "$choices" | sed -n "$((idx + 1))p"
+}
+
+case "${WARDOS_MENU_BACKEND:-fuzzel}" in
+  stdin)
+    answer=$(stdin_answer)
+    [[ -n "$answer" ]] || exit 1
+    items=$(cat)
+    if match=$(printf '%s\n' "$items" | grep -Fx -m1 -- "$answer"); then
+      printf '%s\n' "$match"
+    elif match=$(printf '%s\n' "$items" | awk -v p="$answer" 'index($0, p) == 1 { print; exit }' | grep .); then
+      printf '%s\n' "$match"
+    else
+      printf '%s\n' "$answer"
+    fi
+    ;;
+  fuzzel)
+    args=(--dmenu --prompt "$prompt ")
+    ini="$(wardos_config_dir)/theme/current/fuzzel.ini"
+    [[ -f "$ini" ]] && args+=(--config "$ini")
+    [[ -n "$lines" ]] && args+=(--lines "$lines")
+    fuzzel "${args[@]}"
+    ;;
+  *) wardos_die "unknown WARDOS_MENU_BACKEND ${WARDOS_MENU_BACKEND}" ;;
+esac

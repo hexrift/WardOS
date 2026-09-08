@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# wardos-share — hand a file to another device on the LAN (docs/desktop.md §Commands).
+#
+# Usage: wardos-share [--port N] <file>
+#
+# Serves the file's directory with `python3 -m http.server` on a free port (or --port),
+# prints the file's URL with a QR code (qrencode, when installed) and runs until Ctrl-C.
+# The whole directory is reachable while it runs: share from a directory you mean to.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+port=""
+if [[ "${1:-}" == --port ]]; then
+  port=${2:-}
+  shift 2
+fi
+file=${1:-}
+[[ -n "$file" ]] || wardos_die "which file? (--help)"
+[[ -f "$file" ]] || wardos_die "no such file: $file"
+wardos_has python3 || wardos_die "python3 is not installed"
+
+dir=$(dirname "$(readlink -f "$file")")
+name=$(basename "$file")
+[[ -n "$port" ]] || port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("", 0)); print(s.getsockname()[1])')
+host=${WARDOS_SHARE_HOST:-$(hostname -I 2>/dev/null | awk '{ print $1 }')}
+[[ -n "$host" ]] || host=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ { for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1) }')
+host=${host:-127.0.0.1}
+
+# The URL's file name, percent-encoded for spaces and the like.
+encoded=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$name" 2>/dev/null || true)
+url="http://$host:$port/${encoded:-$name}"
+
+printf 'Sharing %s\n%s\n\n' "$name" "$url"
+wardos_has qrencode && qrencode -t ANSIUTF8 "$url"
+echo "Ctrl-C stops sharing."
+exec python3 -m http.server "$port" --bind 0.0.0.0 --directory "$dir"

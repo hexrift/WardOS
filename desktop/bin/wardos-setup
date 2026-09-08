@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# wardos-setup — set up a part of the machine (docs/desktop.md §Commands).
+#
+# Usage: wardos-setup <what> [choice]
+#   wifi          nmtui                  bluetooth   bluetui, else bluetoothctl
+#   audio         pulsemixer, else pavucontrol (a window)
+#   power         a power profile (powerprofilesctl)
+#   monitors      ~/.config/hypr/monitors.conf in the editor    input   …/input.conf
+#   keys          wardos-keys
+#   fingerprint   fprintd-enroll, then `sudo authselect enable-feature with-fingerprint`
+#   fido2         pamu2fcfg into ~/.config/Yubico/u2f_keys, then `sudo authselect
+#                 enable-feature with-pam-u2f`
+#   printers      system-config-printer, else CUPS at http://localhost:631
+#   dns           Cloudflare, Google, Quad9 or Automatic on the active connection (nmcli)
+#   timezone      one of `timedatectl list-timezones`
+#   config <component>   that component's configuration in the editor (a missing one is
+#                 copied from the defaults first: wardos-refresh)
+#
+# A TUI opens in a terminal window (class wardos-tui-<program>) unless this already runs
+# in one: the bar clicks call wardos-setup directly. Root is asked for with sudo, only by
+# fingerprint, fido2, dns and timezone, which therefore also open a terminal.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+in_terminal() { [[ -t 0 && -t 1 ]]; }
+
+# tui CMD…: run it here in a terminal, or in a new terminal window.
+tui() {
+  if in_terminal; then exec "$@"; fi
+  exec "$(wardos_terminal)" "$(wardos_terminal_class_flag)" "wardos-tui-$(basename "$1")" -e "$@"
+}
+
+# A step that needs sudo re-runs itself in a terminal window that stays open.
+need_terminal() { # called with the remaining arguments
+  in_terminal || exec wardos-launch run "wardos-tui-$what" "$0" "$what" "$@"
+}
+
+# The user's copy of a shipped Hyprland fragment, created from the default when missing.
+hypr_file() {
+  local file="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/$1"
+  if [[ ! -f "$file" ]]; then
+    mkdir -p "$(dirname "$file")"
+    if [[ -f "$(wardos_hypr_dir)/$1" ]]; then
+      cp "$(wardos_hypr_dir)/$1" "$file"
+    else
+      printf '# WardOS — %s (sourced by hyprland.conf)\n' "$1" >"$file"
+    fi
+  fi
+  printf '%s\n' "$file"
+}
+
+# The file to edit for a component (docs/desktop.md §Layout names the exceptions).
+config_file() {
+  local c="${XDG_CONFIG_HOME:-$HOME/.config}"
+  case "$1" in
+    hypr) echo "$c/hypr/hyprland.conf" ;;
+    hyprlock | hypridle | hyprsunset) echo "$c/hypr/$1.conf" ;;
+    waybar | fastfetch) echo "$c/$1/config.jsonc" ;;
+    mako) echo "$c/mako/config" ;;
+    fuzzel) echo "$c/fuzzel/fuzzel.ini" ;;
+    foot) echo "$c/foot/foot.ini" ;;
+    alacritty) echo "$c/alacritty/alacritty.toml" ;;
+    btop) echo "$c/btop/btop.conf" ;;
+    nvim) echo "$c/nvim/init.lua" ;;
+    swayosd) echo "$c/swayosd/config.toml" ;;
+    gtk) echo "$c/gtk-3.0/settings.ini" ;;
+    bash) echo "$c/bash/bashrc" ;;
+    xcompose) echo "$HOME/.XCompose" ;;
+    chromium) echo "$c/chromium-flags.conf" ;;
+    *) echo "$c/$1" ;;
+  esac
+}
+
+dns_servers() {
+  case "$1" in
+    Cloudflare) echo "1.1.1.1 1.0.0.1" ;;
+    Google) echo "8.8.8.8 8.8.4.4" ;;
+    Quad9) echo "9.9.9.9 149.112.112.112" ;;
+    Automatic) echo "" ;;
+    *) wardos_die "dns: Cloudflare, Google, Quad9 or Automatic" ;;
+  esac
+}
+
+what=${1:-}
+[[ -n "$what" ]] || wardos_die "set up what? (--help)"
+shift
+case "$what" in
+  wifi) tui nmtui ;;
+  bluetooth) if wardos_has bluetui; then tui bluetui; else tui bluetoothctl; fi ;;
+  audio) if wardos_has pulsemixer; then tui pulsemixer; else exec pavucontrol; fi ;;
+  power)
+    profile=${1:-}
+    if [[ -z "$profile" ]]; then
+      profile=$(powerprofilesctl list | awk '/^[ *]*[a-z-]+:/ { sub(/^[ *]*/, ""); sub(/:.*/, ""); print }' |
+        wardos_menu "Power profile") || exit 0
+    fi
+    powerprofilesctl set "$profile"
+    wardos_notify "Power profile" "$profile"
+    ;;
+  monitors) exec wardos-launch editor "$(hypr_file monitors.conf)" ;;
+  input) exec wardos-launch editor "$(hypr_file input.conf)" ;;
+  keys) exec wardos-keys ;;
+  fingerprint)
+    need_terminal "$@"
+    fprintd-enroll
+    echo "Enrolled. Turning the fingerprint PAM feature on (authselect, root)."
+    sudo authselect enable-feature with-fingerprint
+    wardos_notify "Fingerprint" "Enrolled; the lock screen and sudo accept it"
+    ;;
+  fido2)
+    need_terminal "$@"
+    keys="${XDG_CONFIG_HOME:-$HOME/.config}/Yubico/u2f_keys"
+    mkdir -p "$(dirname "$keys")"
+    echo "Touch the key when it blinks."
+    if [[ -f "$keys" ]]; then
+      wardos_backup "$keys"
+      pamu2fcfg -n >>"$keys"
+    else
+      pamu2fcfg >"$keys"
+    fi
+    echo "Key registered in $keys. Turning the pam-u2f feature on (authselect, root)."
+    sudo authselect enable-feature with-pam-u2f
+    wardos_notify "FIDO2" "Key registered"
+    ;;
+  printers)
+    if wardos_has system-config-printer; then exec system-config-printer; fi
+    exec wardos-launch browser http://localhost:631
+    ;;
+  dns)
+    need_terminal "$@"
+    provider=${1:-}
+    [[ -n "$provider" ]] || provider=$(wardos_menu DNS Cloudflare Google Quad9 Automatic) || exit 0
+    servers=$(dns_servers "$provider")
+    con=$(nmcli -t -f NAME,DEVICE connection show --active | head -n1 | cut -d: -f1)
+    [[ -n "$con" ]] || wardos_die "no active connection"
+    if [[ -n "$servers" ]]; then
+      sudo nmcli connection modify "$con" ipv4.dns "$servers" ipv4.ignore-auto-dns yes
+    else
+      sudo nmcli connection modify "$con" ipv4.dns "" ipv4.ignore-auto-dns no
+    fi
+    sudo nmcli connection up "$con"
+    wardos_notify "DNS" "$provider on $con"
+    ;;
+  timezone)
+    need_terminal "$@"
+    tz=${1:-}
+    [[ -n "$tz" ]] || tz=$(timedatectl list-timezones | wardos_menu Timezone) || exit 0
+    sudo timedatectl set-timezone "$tz"
+    wardos_notify "Timezone" "$tz"
+    ;;
+  config)
+    component=${1:-}
+    [[ -n "$component" ]] || wardos_die "config <component>"
+    file=$(config_file "$component")
+    [[ -e "$file" ]] || wardos-refresh "$component"
+    exec wardos-launch editor "$file"
+    ;;
+  *) wardos_die "unknown thing $what (--help)" ;;
+esac

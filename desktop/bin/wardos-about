@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# wardos-about — the About surface (docs/desktop.md §Commands).
+#
+# Usage: wardos-about
+#
+# fastfetch with the WardOS configuration (~/.config/fastfetch/config.jsonc: the logo,
+# the calm module set) when wardos-first-run has copied it, plain fastfetch otherwise,
+# and wardos-version when fastfetch is not installed.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+wardos_has fastfetch || exec wardos-version
+config="${XDG_CONFIG_HOME:-$HOME/.config}/fastfetch/config.jsonc"
+if [[ -f "$config" ]]; then exec fastfetch --config "$config"; fi
+exec fastfetch

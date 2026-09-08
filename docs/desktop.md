@@ -113,6 +113,33 @@ Rules: a command never edits a file it did not create without a backup next to i
 (`<file>.bak`); root is asked for with `pkexec` (desktop) or `sudo` (terminal) and only
 by `wardos-update`, `wardos-install package`, `wardos-setup fingerprint|fido2|dns|timezone`.
 
+How the family is built (`desktop/lib/wardos.sh` and the scripts): every script finds
+the library through `$WARDOS_LIB`, then `../lib/wardos.sh`, then
+`/usr/lib/wardos/wardos.sh`, so it runs from the checkout and from `/usr/bin`;
+`wardos_usage` prints the comment block under the shebang, which is the `--help` text.
+`wardos-menu-select`'s stdin backend takes several newline-separated answers in
+`WARDOS_MENU_CHOICE`, one per successive menu, so a walk through the tree is one test;
+an answer that matches nothing is returned as typed, which is how names and URLs are
+asked for. `wardos-menu` implies SYSTEM when the first word is not a section
+(`wardos-menu capture`), accepts `style` for Appearance, and runs leaves that need a
+terminal (installs, the system update, DNS, About) through `wardos-launch run
+<app-id> <cmd…>`, a terminal window that stays open when the command ends. Web and
+terminal app definitions are `name=`/`url=`/`icon=` and `name=`/`cmd=`/`icon=` files,
+the user's in `~/.config/wardos/webapps|tuis/` over the shipped ones in
+`/usr/share/wardos/`; `install <name>` alone installs a shipped default and
+`install --defaults` all of them (what `wardos-first-run` does). Toggles keep their
+state in `$XDG_STATE_HOME/wardos/<what>` and answer `--status` for the bar, except
+`idle` (pgrep hypridle) and `notifications` (`makoctl mode`), whose state something else
+may have changed. Detached processes (wf-recorder, hyprsunset, hypridle) start through
+`wardos_daemon`, which restores SIGINT (a script's background jobs ignore it) and gives
+them their own session. `wardos-refresh` copies `config/<component>` with the
+exceptions of §Layout and treats `hypr` as the Hyprland tree; `wardos-update` with no
+argument does system, flatpaks and themes, never configs, which replace the user's
+copies and are refreshed only on request. `wardos-install font` copies `.ttf`/`.otf`
+files into `~/.local/share/fonts` (choosing one is `wardos-font set`), `service
+tailscale` only enables an installed `tailscaled` because Tailscale is not in Fedora,
+and `package` says that a layered RPM belongs in `image/packages.txt`.
+
 ## Menu
 
 `Super + Space` is the command centre (`design-language.md` §13) and `Super + Alt + Space`
@@ -242,28 +269,28 @@ command, key and test exist on `main`.
 | Hyprland with tiling, gaps, keybindings | `desktop/hyprland/` | ✔ `hyprland.conf` + 7 sourced files, §Keys complete, `configs.test.sh` |
 | Waybar top bar | trust bar rendered by Waybar from `ward-shell bar --waybar` | ✔ config: `config/waybar`, `configs.test.sh` |
 | Walker launcher, clipboard history, emoji | fuzzel + cliphist, `wardos-menu-select` | ✔ config: `config/fuzzel` (+ `emoji.txt`), `Super + Ctrl + V` / `E` |
-| omarchy-menu tree | `wardos-menu` (SYSTEM section above) | |
-| Keybindings viewer | `wardos-keys` | |
+| omarchy-menu tree | `wardos-menu` (SYSTEM section above) | ✔ `wardos-menu [path…]`, `wardos-menu-select` (fuzzel and stdin backends), `Super + Space` / `Super + Alt + Space`; `menu.test.sh`, `menu-select.test.sh` |
+| Keybindings viewer | `wardos-keys` | ✔ `wardos-keys [--list]`, `Super + K`; `keys.test.sh` |
 | Themes (set, next, install, remove, backgrounds) | `wardos-theme`, TOML tokens rendered per component | ✔ `wardos-theme list\|current\|set\|next\|install\|remove\|render\|reload\|bg next`, `wardos-theme-render` (crate `desktop/theme`, `cargo test -p wardos-theme`), 14 themes; `desktop/tests/theme.test.sh`. Keys `Super + Shift + T` / `B` belong to the keys slice |
 | Font switching | `wardos-font` | ✔ `wardos-font list\|current\|set`; `desktop/tests/font.test.sh` |
-| Web apps in Chromium app mode | `wardos-webapp` | |
-| TUI apps as windows | `wardos-tui` | |
-| Screenshots (hyprshot + satty) | `wardos-capture screenshot` (grim, slurp, satty) | |
-| Screen recording | `wardos-capture record` (wf-recorder) | |
-| Colour picker | `wardos-capture color` (hyprpicker) | |
-| Lock screen, idle, suspend | hyprlock, hypridle, `wardos-power` | ✔ config: `config/hyprlock`, `config/hypridle`, `Super + Escape` |
-| Night light | hyprsunset via `wardos-toggle nightlight` | ✔ config: `config/hyprsunset`, `Super + Ctrl + N` |
+| Web apps in Chromium app mode | `wardos-webapp` | ✔ `wardos-webapp install\|remove\|list` (+ `install --defaults`), `wardos-launch webapp`, 13 defaults in `desktop/webapps/`; `webapp.test.sh`, `launch.test.sh` |
+| TUI apps as windows | `wardos-tui` | ✔ `wardos-tui install\|remove\|list` (+ `install --defaults`), `wardos-launch tui`, 7 defaults in `desktop/tuis/`, `Super + D` / `T`; `tui.test.sh`, `launch.test.sh` |
+| Screenshots (hyprshot + satty) | `wardos-capture screenshot` (grim, slurp, satty) | ✔ `wardos-capture screenshot region\|window\|output`, `Print` / `Shift + Print` / `Ctrl + Print`; `capture.test.sh` |
+| Screen recording | `wardos-capture record` (wf-recorder) | ✔ `wardos-capture record region\|output` (toggle, pid in `$XDG_STATE_HOME/wardos/record.pid`), `Alt + Print`; `capture.test.sh` |
+| Colour picker | `wardos-capture color` (hyprpicker) | ✔ `wardos-capture color`, `Super + Print`; `capture.test.sh` |
+| Lock screen, idle, suspend | hyprlock, hypridle, `wardos-power` | ✔ config: `config/hyprlock`, `config/hypridle`, `Super + Escape`; `wardos-power lock\|suspend`, `wardos-toggle idle` (`Super + Ctrl + I`); `power.test.sh`, `toggle.test.sh` |
+| Night light | hyprsunset via `wardos-toggle nightlight` | ✔ config: `config/hyprsunset`, `Super + Ctrl + N`; `wardos-toggle nightlight [on\|off\|--status]`; `toggle.test.sh` |
 | On-screen volume/brightness | swayosd | ✔ config: `swayosd.service`, `XF86*` binds |
-| Notifications | mako | ✔ config: `config/mako` (approval and done categories, dnd mode) |
-| Power menu | `wardos-power menu` | |
-| Screensaver | `wardos-screensaver` | |
-| Battery monitor | `wardos-battery-monitor` | ✔ units: `wardos-battery-monitor.service` + `.timer` (2 min) |
-| Wi-Fi, Bluetooth, audio TUIs | `wardos-setup wifi\|bluetooth\|audio` | |
-| Power profiles | `wardos-setup power` | |
-| Fingerprint, FIDO2 | `wardos-setup fingerprint\|fido2` | |
-| Printers, DNS, timezone | `wardos-setup printers\|dns\|timezone` | |
-| Install packages / AUR | `wardos-install app` (Flathub), `package` (bootc layer) | |
-| Dev environments (mise) | `wardos-install dev <lang>` | |
+| Notifications | mako | ✔ config: `config/mako` (approval and done categories, dnd mode); `wardos-notify [--done]`, `wardos-toggle notifications` (`Super + Ctrl + D`); `notify.test.sh`, `toggle.test.sh` |
+| Power menu | `wardos-power menu` | ✔ `wardos-power lock\|suspend\|relaunch\|restart\|shutdown\|menu`, `Super + Shift + Escape`; `power.test.sh` |
+| Screensaver | `wardos-screensaver` | ✔ `wardos-screensaver` (tte, tput fallback), `wardos-toggle screensaver` (`Super + Ctrl + S`), hypridle at 2.5 min; `screensaver.test.sh`, `toggle.test.sh` |
+| Battery monitor | `wardos-battery-monitor` | ✔ units: `wardos-battery-monitor.service` + `.timer` (2 min); `wardos-battery-monitor` (20/10/5 %, once each); `battery-monitor.test.sh` |
+| Wi-Fi, Bluetooth, audio TUIs | `wardos-setup wifi\|bluetooth\|audio` | ✔ nmtui, bluetui or bluetoothctl, pulsemixer or pavucontrol, in a `wardos-tui-*` window from the bar; `setup.test.sh` |
+| Power profiles | `wardos-setup power` | ✔ `wardos-setup power [profile]` (powerprofilesctl); `setup.test.sh` |
+| Fingerprint, FIDO2 | `wardos-setup fingerprint\|fido2` | ✔ fprintd-enroll / pamu2fcfg, then `sudo authselect enable-feature`; `setup.test.sh` |
+| Printers, DNS, timezone | `wardos-setup printers\|dns\|timezone` | ✔ system-config-printer or CUPS in the browser; nmcli on the active connection; timedatectl; `setup.test.sh` |
+| Install packages / AUR | `wardos-install app` (Flathub), `package` (bootc layer) | ✔ `wardos-install app\|package\|webapp\|tui\|theme\|font\|dev\|service`, `wardos-remove` the same; `install.test.sh`, `remove.test.sh` |
+| Dev environments (mise) | `wardos-install dev <lang>` | ✔ `mise use -g <lang>@latest`, a clear message without mise; `install.test.sh` |
 | Docker + lazydocker | podman, podman-compose, podman-tui | |
 | Terminal (Alacritty/Ghostty), bash, prompt, aliases | foot default, alacritty shipped, `config/bash` | ✔ `config/foot`, `config/alacritty`, `config/bash` (prompt tested in `configs.test.sh`) |
 | Neovim (LazyVim) | neovim with a WardOS config and per-theme colours | ✔ config: `config/nvim` (self-contained, `lua/plugins.lua` hook) |
@@ -273,10 +300,10 @@ command, key and test exist on `main`.
 | Plymouth boot splash | WardOS Plymouth theme | ✔ `image/plymouth/wardos/` (WARD on the ground, 2 px progress, passphrase prompt), selected in the `Containerfile` and in the initramfs (the image build proves it); its look at boot is E-09's |
 | Autologin into Hyprland | getty autologin + uwsm | ✔ `systemd/system/getty@tty1.service.d/autologin.conf`, `config/bash/profile.d-wardos.sh` (tested); placed by `image/install-desktop.sh` (`--no-autologin` for existing Fedoras), the user from `image/disk.sh --user wardos` (`install.test.sh`) |
 | Full-disk encryption at install | `image/disk.sh --luks` (Anaconda kickstart on the ISO; bootc-image-builder has no LUKS) | ✔ `image/disk.sh --type iso --luks`, `install.test.sh`; passphrase prompt unverified until E-09 |
-| omarchy-update, migrations | `wardos-update` (bootc upgrade, flatpak, refresh) | ✔ image side: `bootc upgrade`, `image/boot/README.md` |
+| omarchy-update, migrations | `wardos-update` (bootc upgrade, flatpak, refresh) | ✔ `wardos-update [system\|flatpaks\|themes\|configs\|--check]`, `wardos-refresh <component>\|--all`; `update.test.sh`, `refresh.test.sh`; image side: `bootc upgrade`, `image/boot/README.md` |
 | Snapshots and rollback (Limine + snapper) | bootc deployments, `bootc rollback` | ✔ every upgrade keeps the previous deployment; `bootc rollback` (`image/boot/README.md`) |
 | Install on an existing Arch | `desktop/install.sh` on an existing Fedora | ✔ `desktop/install.sh` (dnf or rpm-ostree, `--dry-run`), `install.test.sh` |
-| Share a file over LAN | `wardos-share` | |
+| Share a file over LAN | `wardos-share` | ✔ `wardos-share [--port N] <file>` (python3 http.server, qrencode); `share.test.sh` |
 | XCompose special characters | `config/xcompose` | ✔ `config/xcompose/XCompose`, compose on Right Alt |
 | Apple display brightness | `wardos-setup monitors` (ddcutil, asdcontrol when present) | |
 
@@ -286,6 +313,6 @@ Then some (WardOS only):
 | --- | --- |
 | Agent state, network, TamperWard and verification in the bar | `ward-shell bar --waybar` |
 | Approvals as notifications, answered from the keyboard | `wardos-approve`, daemon hold on `ask`; `wardos-approve.service` is the listener |
-| Verify, replay, evidence, snapshots, grants in the menu | `wardos-menu` SECURITY |
-| Sandboxed browser profile per project | `wardos-launch browser --project` |
+| Verify, replay, evidence, snapshots, grants in the menu | `wardos-menu` SECURITY (✔ from `ward-shell launcher --lines`, static `ward` list without it; `menu.test.sh`) |
+| Sandboxed browser profile per project | `wardos-launch browser --project` (✔ chromium profile under `~/.local/share/wardos/browser/<hash>`; `launch.test.sh`) |
 | Package names and the whole image checked by CI | `image/packages.txt`, image build job | ✔ `image/check-packages.sh` ("image packages"), `image.yml` ("image build") |

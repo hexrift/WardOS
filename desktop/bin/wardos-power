@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# wardos-power — lock, sleep, leave or turn off (docs/desktop.md §Commands).
+#
+# Usage: wardos-power lock | suspend | relaunch | restart | shutdown | menu
+#   lock        hyprlock
+#   suspend     systemctl suspend (hypridle locks first, see config/hypridle)
+#   relaunch    leave Hyprland (hyprctl dispatch exit); the autologin starts it again
+#   restart     systemctl reboot
+#   shutdown    systemctl poweroff
+#   menu        pick one of the five in the picker (Super + Shift + Escape)
+#
+# No confirmation: the menu is the confirmation, and every action is undone by logging
+# in again. systemd asks for authorisation itself when the session is not local.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+case "${1:-}" in
+  lock) exec hyprlock ;;
+  suspend) exec systemctl suspend ;;
+  relaunch) exec hyprctl dispatch exit ;;
+  restart) exec systemctl reboot ;;
+  shutdown) exec systemctl poweroff ;;
+  menu)
+    choice=$(wardos_menu Power Lock Suspend Relaunch Restart Shutdown) || exit 0
+    exec "$0" "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')"
+    ;;
+  *) wardos_die "lock, suspend, relaunch, restart, shutdown or menu? (--help)" ;;
+esac

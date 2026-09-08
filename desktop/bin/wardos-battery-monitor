@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# wardos-battery-monitor — low-battery notifications (docs/desktop.md §Commands).
+#
+# Usage: wardos-battery-monitor     one check; wardos-battery-monitor.timer runs it every 2 min
+#
+# Reads /sys/class/power_supply/BAT*/capacity and status ($WARDOS_POWER_SUPPLY_DIR in
+# tests). While discharging, 20 %, 10 % and 5 % are each announced once (5 % as
+# critical); charging clears the memory in $XDG_STATE_HOME/wardos/battery-notified.
+# Without a battery it does nothing.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+state="$(wardos_state_dir)/battery-notified"
+capacity=""
+status=""
+for bat in "${WARDOS_POWER_SUPPLY_DIR:-/sys/class/power_supply}"/BAT*; do
+  [[ -r "$bat/capacity" ]] || continue
+  capacity=$(cat "$bat/capacity")
+  status=$(cat "$bat/status" 2>/dev/null || echo Unknown)
+  break
+done
+[[ -n "$capacity" ]] || exit 0
+
+if [[ $status != Discharging ]]; then
+  rm -f "$state"
+  exit 0
+fi
+
+# The lowest level already announced in this discharge; each is said once.
+announced=$(cat "$state" 2>/dev/null || echo 100)
+for level in 20 10 5; do
+  [[ $capacity -le $level && $announced -gt $level ]] || continue
+  mkdir -p "$(dirname "$state")"
+  echo "$level" >"$state"
+  if [[ $level -eq 5 ]]; then
+    wardos_notify "Battery critical" "$capacity % left. Plug in or suspend" -u critical -i battery-caution
+  else
+    wardos_notify "Battery low" "$capacity % left" -i battery-low
+  fi
+  break
+done

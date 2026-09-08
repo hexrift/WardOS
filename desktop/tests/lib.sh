@@ -5,6 +5,7 @@
 #   mock NAME [BODY]   create a mock command that logs "$NAME $*" to $MOCK_LOG, then runs BODY
 #   assert_logged STR  fail unless $MOCK_LOG contains a line matching the regex STR
 #   assert_not_logged STR
+#   wait_logged STR    assert_logged after giving a detached mock up to 2 s
 #   assert_file PATH   fail unless PATH exists
 #   fail MSG
 set -euo pipefail
@@ -44,5 +45,14 @@ mock() {
 assert_logged() { grep -Eq -- "$1" "$MOCK_LOG" || fail "expected a call matching '$1'; log:
 $(cat "$MOCK_LOG")"; }
 assert_not_logged() { ! grep -Eq -- "$1" "$MOCK_LOG" || fail "unexpected call matching '$1'"; }
+# wait_logged STR: like assert_logged, but gives a detached mock up to 2 s to log.
+wait_logged() {
+  local i
+  for ((i = 0; i < 40; i++)); do
+    grep -Eq -- "$1" "$MOCK_LOG" && return 0
+    sleep 0.05
+  done
+  assert_logged "$1"
+}
 assert_file() { [[ -e "$1" ]] || fail "expected file $1"; }
 assert_eq() { [[ "$1" == "$2" ]] || fail "expected '$2', got '$1'"; }

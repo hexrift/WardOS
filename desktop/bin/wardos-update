@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# wardos-update — bring the machine up to date (docs/desktop.md §Commands).
+#
+# Usage: wardos-update              system, flatpaks and themes, then a done toast
+#        wardos-update system       `sudo bootc upgrade` (the next boot runs the new image)
+#        wardos-update flatpaks     `flatpak update -y`
+#        wardos-update themes       `git pull` every installed theme, re-render the current one
+#        wardos-update configs      `wardos-refresh --all` (backups kept; only on request,
+#                                   since it replaces the user's copies)
+#        wardos-update --check      one Waybar JSON line for the bar: text "update" and
+#                                   class "available" when `bootc upgrade --check` reports one
+#
+# Root is asked for with sudo, so the bar and the menu run this in a terminal window.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+json_string() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n'; }
+
+check() {
+  local report text="" class=""
+  if wardos_has bootc; then
+    report=$(bootc upgrade --check 2>&1 | head -n1) || true
+    if [[ $report == *"Update available"* ]]; then
+      text=update
+      class=available
+    fi
+  else
+    report="bootc is not installed"
+  fi
+  printf '{"text": "%s", "tooltip": "%s", "class": "%s"}\n' "$text" "$(json_string "$report")" "$class"
+}
+
+system() {
+  wardos_has bootc || wardos_die "bootc is not installed: not a WardOS image host"
+  echo "== System image (bootc upgrade, root)"
+  sudo bootc upgrade
+}
+
+flatpaks() {
+  wardos_has flatpak || return 0
+  echo "== Flatpaks"
+  flatpak update -y
+}
+
+themes() {
+  local d
+  for d in "$(wardos_data_dir)"/themes/*/; do
+    [[ -d "$d/.git" ]] || continue
+    echo "== Theme $(basename "$d")"
+    git -C "${d%/}" pull --ff-only || echo "wardos-update: could not pull $d" >&2
+  done
+  wardos_has wardos-theme && wardos-theme render
+  return 0
+}
+
+case "${1:-all}" in
+  --check) check ;;
+  system) system ;;
+  flatpaks | flatpak) flatpaks ;;
+  themes) themes ;;
+  configs) wardos-refresh --all ;;
+  all)
+    system
+    flatpaks
+    themes
+    wardos-notify --done "Update" "The new image runs after a reboot"
+    ;;
+  *) wardos_die "system, flatpaks, themes, configs or --check? (--help)" ;;
+esac

@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# wardos-menu — the full menu (docs/desktop.md §Menu), one tree, every leaf a wardos-* command.
+#
+# Usage: wardos-menu [path…]           walk the tree from that point (each word matches a
+#                                      label, case-insensitively, by prefix)
+#        wardos-menu --list [path…]    print a level instead of showing it
+#   wardos-menu                        the whole tree: PROJECTS, AGENTS, SECURITY, SYSTEM
+#   wardos-menu capture                the SYSTEM ▸ Capture level (SYSTEM is implied)
+#   wardos-menu power lock             runs the leaf directly: `wardos-power lock`
+#   wardos-menu style theme            Appearance ▸ Theme (`style` is an alias)
+#
+# PROJECTS, AGENTS and SECURITY come from `ward-shell launcher --lines` (SECTION, label,
+# command, tab-separated) and run in a terminal; without ward-shell a static AGENTS and
+# SECURITY list of `ward` commands stands in. Leaves that need a terminal (installs,
+# updates, root) open one through `wardos-launch run`; the rest run in place.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+item() { printf '%s\t%s\n' "$1" "$2"; }
+sub() { printf '%s\t>%s\n' "$1" "$2"; }
+# term ID CMD…: the leaf runs in a terminal window that stays open when the command ends.
+term() { printf 'wardos-launch run %s %s\n' "$1" "${*:2}"; }
+
+# The upper sections: SECTION<TAB>label<TAB>command, from the shell or the static list.
+upper_items() {
+  local lines=""
+  if wardos_has ward-shell; then
+    lines=$(ward-shell launcher --lines 2>/dev/null || true)
+  fi
+  if [[ -z "$lines" ]]; then
+    lines=$(printf '%s\n' \
+      $'AGENTS\tStart Claude\tward claude' \
+      $'AGENTS\tStart Codex\tward codex' \
+      $'AGENTS\tSessions\tward session list' \
+      $'SECURITY\tVerify current project\tward verify' \
+      $'SECURITY\tEvidence\tward evidence' \
+      $'SECURITY\tSnapshots\tward snapshot list' \
+      $'SECURITY\tStatus\tward status')
+  fi
+  printf '%s\n' "$lines" | awk -F'\t' 'NF >= 3 { print $1 "\t" $2 "\twardos-launch terminal " $3 }'
+}
+
+system_items() {
+  for label in Apps Capture Appearance Connect Install Remove Update Toggle Power Help; do
+    printf 'SYSTEM\t%s\t>%s\n' "$label" "$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]')"
+  done
+}
+
+# Every .desktop entry the session can launch, hidden ones excluded, user files first.
+apps_items() {
+  local data=${XDG_DATA_HOME:-$HOME/.local/share} dirs d f id name
+  dirs=("$data/applications" "$data/flatpak/exports/share/applications" /var/lib/flatpak/exports/share/applications)
+  IFS=: read -ra xdg <<<"${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+  for d in "${xdg[@]}"; do dirs+=("$d/applications"); done
+  declare -A seen
+  for d in "${dirs[@]}"; do
+    for f in "$d"/*.desktop; do
+      [[ -f "$f" ]] || continue
+      id=$(basename "$f" .desktop)
+      [[ -n "${seen[$id]:-}" ]] && continue
+      seen[$id]=1
+      name=$(awk -F= '/^\[/ { s = $1 }
+        s == "[Desktop Entry]" && ($1 == "NoDisplay" || $1 == "Hidden") && $2 == "true" { hidden = 1 }
+        s == "[Desktop Entry]" && $1 == "Name" && !n { n = $2 }
+        END { if (!hidden) print n }' "$f")
+      [[ -n "$name" ]] && item "$name" "gtk-launch $id"
+    done
+  done | sort -f
+}
+
+# Dynamic lists from the theme and font commands: one id (a font family may hold spaces) per line.
+list_of() {
+  local cmd=$1 verb=$2 set=$3 id
+  wardos_has "$cmd" || return 0
+  "$cmd" "$verb" 2>/dev/null | while read -r id; do
+    [[ -n "$id" ]] && item "$id" "$cmd $set $(printf '%q' "$id")"
+  done
+}
+
+level() {
+  case "$1" in
+    section) printf '%s\n' "$section_items" ;;
+    apps) apps_items ;;
+    capture)
+      item "Screenshot region" "wardos-capture screenshot region"
+      item "Screenshot window" "wardos-capture screenshot window"
+      item "Screenshot output" "wardos-capture screenshot output"
+      item "Record region" "wardos-capture record region"
+      item "Record output" "wardos-capture record output"
+      item "Colour" "wardos-capture color"
+      ;;
+    appearance)
+      sub "Theme" appearance/theme
+      item "Background" "wardos-theme bg next"
+      sub "Font" appearance/font
+      sub "Light or dark" appearance/light
+      ;;
+    appearance/theme) list_of wardos-theme list set ;;
+    appearance/font) list_of wardos-font list set ;;
+    appearance/light)
+      item "Light" "wardos-theme set ward-light"
+      item "Dark" "wardos-theme set ward-dark"
+      ;;
+    connect)
+      item "Wi-Fi" "wardos-setup wifi"
+      item "Bluetooth" "wardos-setup bluetooth"
+      item "Audio" "wardos-setup audio"
+      item "Monitors" "wardos-setup monitors"
+      item "Input" "wardos-setup input"
+      item "Printers" "wardos-setup printers"
+      item "DNS" "$(term wardos-setup wardos-setup dns)"
+      item "Power profile" "wardos-setup power"
+      ;;
+    install)
+      item "App (Flathub)" "$(term wardos-install wardos-install app)"
+      item "Package" "$(term wardos-install wardos-install package)"
+      item "Web app" "$(term wardos-install wardos-install webapp)"
+      item "Terminal app" "$(term wardos-install wardos-install tui)"
+      item "Theme" "$(term wardos-install wardos-install theme)"
+      item "Font" "$(term wardos-install wardos-install font)"
+      sub "Development" install/development
+      sub "Service" install/service
+      ;;
+    install/development)
+      for lang in ruby node bun go python rust java elixir php; do
+        item "$lang" "$(term wardos-install wardos-install dev "$lang")"
+      done
+      ;;
+    install/service)
+      for svc in tailscale dropbox syncthing; do
+        item "$svc" "$(term wardos-install wardos-install service "$svc")"
+      done
+      ;;
+    remove)
+      item "App" "$(term wardos-remove wardos-remove app)"
+      item "Web app" "wardos-remove webapp"
+      item "Terminal app" "wardos-remove tui"
+      item "Theme" "wardos-remove theme"
+      item "Font" "wardos-remove font"
+      ;;
+    update)
+      item "System" "$(term wardos-update wardos-update system)"
+      item "Configs" "wardos-update configs"
+      item "Themes" "wardos-update themes"
+      ;;
+    toggle)
+      item "Night light" "wardos-toggle nightlight"
+      item "Idle lock" "wardos-toggle idle"
+      item "Bar" "wardos-toggle bar"
+      item "Screensaver" "wardos-toggle screensaver"
+      item "Notifications" "wardos-toggle notifications"
+      ;;
+    power)
+      for what in Lock Suspend Relaunch Restart Shutdown; do
+        item "$what" "wardos-power $(printf '%s' "$what" | tr '[:upper:]' '[:lower:]')"
+      done
+      ;;
+    help)
+      item "Keys" "wardos-keys"
+      item "Manual" "wardos-launch browser https://github.com/hexrift/WardOS/blob/main/docs/desktop.md"
+      item "Hyprland wiki" "wardos-launch browser https://wiki.hyprland.org"
+      item "About" "$(term wardos-about wardos-about)"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# find_label ITEMS QUERY: the label equal to QUERY, else the first one it starts (case-insensitively).
+find_label() {
+  printf '%s\n' "$1" | awk -F'\t' -v q="$2" 'BEGIN { q = tolower(q) }
+    { l = tolower($1); if (l == q) { print $1; f = ""; exit } if (!f && index(l, q) == 1) f = $1 }
+    END { if (f != "") print f }'
+}
+
+run_level() {
+  local id=$1 title=$2 items choice action
+  shift 2
+  items=$(level "$id") || wardos_die "no such menu: $id"
+  [[ -n "$items" ]] || wardos_die "nothing to show in $title"
+  if [[ $list == 1 && $# -eq 0 ]]; then
+    printf '%s\n' "$items" | cut -f1
+    return
+  fi
+  if [[ $# -gt 0 ]]; then
+    choice=$(find_label "$items" "$1")
+    [[ -n "$choice" ]] || wardos_die "no entry '$1' in $title"
+    shift
+  else
+    choice=$(printf '%s\n' "$items" | cut -f1 | wardos_menu "$title") || exit 0
+  fi
+  action=$(printf '%s\n' "$items" | awk -F'\t' -v l="$choice" '$1 == l { print $2; exit }')
+  if [[ $action == '>'* ]]; then
+    run_level "${action#>}" "$choice" "$@"
+  else
+    eval "$action"
+  fi
+}
+
+# The top level: SECTION<TAB>label<TAB>action lines shown as "SECTION     label".
+run_top() {
+  local items sections section shown label
+  items=$(
+    upper_items
+    system_items
+  )
+  if [[ $# -eq 0 ]]; then
+    shown=$(printf '%s\n' "$items" | awk -F'\t' '{ printf "%-10s %s\n", $1, $2 }')
+    if [[ $list == 1 ]]; then
+      printf '%s\n' "$shown"
+      return
+    fi
+    label=$(printf '%s\n' "$shown" | wardos_menu WardOS) || exit 0
+    section=${label%% *}
+    label=${label#"$section"}
+    label=${label#"${label%%[! ]*}"}
+    run_top "$section" "$label"
+    return
+  fi
+  sections=$(printf '%s\n' "$items" | cut -f1 | sort -u)
+  section=$(find_label "$sections" "$1")
+  if [[ -n "$section" ]]; then shift; else section=SYSTEM; fi
+  if [[ $section == SYSTEM ]]; then
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+      style) set -- appearance "${@:2}" ;;
+      dev*) set -- install development "${@:2}" ;;
+    esac
+  fi
+  section_items=$(printf '%s\n' "$items" | awk -F'\t' -v s="$section" '$1 == s { print $2 "\t" $3 }')
+  run_level section "$section" "$@"
+}
+
+list=0
+if [[ "${1:-}" == --list ]]; then
+  list=1
+  shift
+fi
+run_top "$@"
