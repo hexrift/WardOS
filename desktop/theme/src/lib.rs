@@ -7,7 +7,8 @@
 //! `wardos-theme set` runs; this library is its whole implementation, so the
 //! renderers are tested without a display: [`Theme::parse`] reads the file,
 //! [`locate`] turns an id into a path, [`Fonts`] settles the two families,
-//! and [`render`] produces the fragments the component configs `include`.
+//! [`render`] produces the fragments the component configs `include`, and
+//! [`Wallpaper`] draws `background.png` from the tokens.
 
 #![allow(clippy::missing_errors_doc, clippy::doc_markdown)]
 
@@ -16,14 +17,16 @@ mod fonts;
 mod locate;
 mod render;
 mod theme;
+mod wallpaper;
 
 pub use color::Color;
 pub use fonts::{Fonts, Overrides};
 pub use locate::{Located, locate, search_dirs};
-pub use render::{Files, render, render_into};
+pub use render::{Files, WALLPAPER, render, render_into};
 pub use theme::{
     Geometry, Meta, Motion, Palette, Terminal, Theme, Token, Tones, Typography, Variant,
 };
+pub use wallpaper::{HEIGHT, Rect, WIDTH, Wallpaper};
 
 /// What can go wrong between a theme id and a rendered directory.
 #[derive(Debug, thiserror::Error)]

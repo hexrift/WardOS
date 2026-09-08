@@ -11,6 +11,7 @@
 #   wardos-theme render [id]         render only (default: the current id), no reload
 #   wardos-theme reload              signal the running components to re-read the render
 #   wardos-theme bg next             the next file of the theme's backgrounds/, via swaybg
+#                                    (and the lock screen, through the hyprlock fragment)
 #
 # Themes are searched in $WARDOS_THEMES (colon list), the user directory above,
 # /usr/share/wardos/themes and $WARDOS_ROOT/themes. The render is done by
@@ -83,7 +84,9 @@ read_env() {
   return 0
 }
 
-# swaybg has no reload: it is replaced. `background` is a path, or solid:<hex>.
+# swaybg has no reload: it is replaced. `background` is a path (the theme's own
+# file, else the background.png the render draws from the tokens), or solid:<hex>
+# when a hand-written file says so.
 start_swaybg() {
   local bg
   command -v swaybg >/dev/null 2>&1 || return 0
@@ -206,8 +209,18 @@ bg_next() {
   mkdir -p "$state_dir" "$current_dir"
   echo "$pick" >"$state"
   echo "$pick" >"$current_dir/background"
+  point_lock_at "$pick"
   read_env
   start_swaybg
+}
+
+# The lock screen shows the wallpaper through the fragment's $wallpaper line
+# (docs/desktop.md §Themes), so a cycled background reaches hyprlock too.
+point_lock_at() {
+  local pick=$1 esc
+  [[ -f $current_dir/hyprlock.conf ]] || return 0
+  esc=$(printf '%s' "$pick" | sed 's/[&|\\]/\\&/g')
+  sed -i "s|^\\\$wallpaper .*|\$wallpaper  = $esc|" "$current_dir/hyprlock.conf"
 }
 
 verb=${1:-}

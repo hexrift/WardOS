@@ -13,9 +13,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::{Color, Fonts, Theme, Variant};
+use crate::{Color, Fonts, Theme, Variant, Wallpaper};
 
 /// Font size for terminals and menus, in points.
 const SIZE: u32 = 11;
@@ -23,15 +23,26 @@ const SIZE: u32 = 11;
 /// The lightness step between a regular terminal cell and its bright twin.
 const BRIGHT_STEP: f64 = 0.08;
 
-/// The rendered fragments, keyed by file name.
+/// The lock screen's veil: the panel colour at this alpha (of 255, 70 %)
+/// over the wallpaper, so the wallpaper stays and the clock reads.
+const VEIL_ALPHA: u8 = 0xB3;
+
+/// The rendered text fragments, keyed by file name. The wallpaper
+/// (`background.png`) is the one binary output and comes from [`Wallpaper`].
 pub type Files = BTreeMap<&'static str, String>;
 
-/// Renders every fragment. `backgrounds` is the theme's backgrounds
+/// The wallpaper's file name inside the rendered directory.
+pub const WALLPAPER: &str = "background.png";
+
+/// Renders every text fragment. `backgrounds` is the theme's backgrounds
 /// directory (need not exist); its first file, by name, becomes
-/// `background`, else the ground colour does.
+/// `background`, else the wallpaper drawn from the tokens does, which
+/// [`render_into`] writes as `background.png` in `out`. `out` is only used
+/// for that path, made absolute so swaybg and hyprlock can read it whatever
+/// their working directory.
 #[must_use]
-pub fn render(theme: &Theme, backgrounds: Option<&Path>, fonts: &Fonts) -> Files {
-    let background = background_line(theme, backgrounds);
+pub fn render(theme: &Theme, backgrounds: Option<&Path>, fonts: &Fonts, out: &Path) -> Files {
+    let background = background_path(backgrounds, out);
     let mut files = Files::new();
     files.insert("hyprland.conf", hyprland(theme));
     files.insert("waybar.css", waybar(theme, fonts));
@@ -40,20 +51,21 @@ pub fn render(theme: &Theme, backgrounds: Option<&Path>, fonts: &Fonts) -> Files
     files.insert("foot.ini", foot(theme, fonts));
     files.insert("alacritty.toml", alacritty(theme, fonts));
     files.insert("btop.theme", btop(theme));
-    files.insert("hyprlock.conf", hyprlock(theme, fonts));
+    files.insert("hyprlock.conf", hyprlock(theme, fonts, &background));
     files.insert("swayosd.css", swayosd(theme, fonts));
     files.insert("nvim.lua", nvim(theme));
     files.insert("chromium.json", chromium(theme));
     files.insert("gtk.css", gtk(theme));
     files.insert("colors.env", colors_env(theme, fonts));
-    files.insert("background", format!("{background}\n"));
+    files.insert("background", format!("{}\n", background.to_string_lossy()));
     // A theme that fails to re-serialise is a bug in this crate, not in the
     // theme; the copy is a convenience for the shell, so the render goes on.
     files.insert("theme.toml", theme.to_toml().unwrap_or_default());
     files
 }
 
-/// Renders into `out` (created if needed), one file per fragment.
+/// Renders into `out` (created if needed): one file per fragment and the
+/// wallpaper as `background.png`.
 pub fn render_into(
     theme: &Theme,
     backgrounds: Option<&Path>,
@@ -61,9 +73,10 @@ pub fn render_into(
     out: &Path,
 ) -> io::Result<()> {
     fs::create_dir_all(out)?;
-    for (name, content) in render(theme, backgrounds, fonts) {
+    for (name, content) in render(theme, backgrounds, fonts, out) {
         fs::write(out.join(name), content)?;
     }
+    fs::write(out.join(WALLPAPER), Wallpaper::draw(theme).png()?)?;
     Ok(())
 }
 
@@ -74,7 +87,8 @@ fn header(theme: &Theme, open: &str, close: &str) -> String {
     )
 }
 
-fn background_line(theme: &Theme, backgrounds: Option<&Path>) -> String {
+/// The theme's first background file, by name, else the rendered wallpaper.
+fn background_path(backgrounds: Option<&Path>, out: &Path) -> PathBuf {
     let first = backgrounds
         .and_then(|dir| fs::read_dir(dir).ok())
         .map(|entries| {
@@ -87,10 +101,11 @@ fn background_line(theme: &Theme, backgrounds: Option<&Path>) -> String {
             files
         })
         .and_then(|files| files.into_iter().next());
-    match first {
-        Some(path) => path.to_string_lossy().into_owned(),
-        None => format!("solid:{}", theme.palette.ground.value.hex()),
-    }
+    first.unwrap_or_else(|| {
+        std::path::absolute(out)
+            .unwrap_or_else(|_| out.to_path_buf())
+            .join(WALLPAPER)
+    })
 }
 
 fn hyprland(theme: &Theme) -> String {
@@ -165,7 +180,7 @@ fn fuzzel(theme: &Theme, fonts: &Fonts) -> String {
         c(p.accent.value),
         c(p.ground.value),
         c(p.text.value),
-        c(p.accent.value),
+        c(p.text.value),
         theme.geometry.separator_px,
         theme.geometry.radius_px
     )
@@ -312,15 +327,23 @@ fn btop(theme: &Theme) -> String {
 }
 
 /// Variables only: the shipped `hyprlock.conf` sources this fragment and draws
-/// its own `background`, `input-field` and `label` blocks from `$ground` …
-/// `$denied` and `$font`, so a block here would be drawn twice.
-fn hyprlock(theme: &Theme, fonts: &Fonts) -> String {
+/// its own `background`, `shape`, `input-field` and `label` blocks from
+/// `$ground` … `$denied`, `$font`, `$radius`, `$wallpaper` (the file
+/// `background` names) and `$veil` (the panel colour at 70 %, laid over the
+/// wallpaper so the clock reads), so a block here would be drawn twice.
+fn hyprlock(theme: &Theme, fonts: &Fonts, wallpaper: &Path) -> String {
     let mut out = header(theme, "#", "");
     for (name, token) in theme.palette.tokens() {
         let _ = writeln!(out, "${name:<10} = rgb({})", token.value.bare());
     }
+    let _ = writeln!(
+        out,
+        "$veil       = rgba({}{VEIL_ALPHA:02X})",
+        theme.palette.panel.value.bare()
+    );
     let _ = writeln!(out, "$font       = {}", fonts.sans);
     let _ = writeln!(out, "$radius     = {}", theme.geometry.radius_px);
+    let _ = writeln!(out, "$wallpaper  = {}", wallpaper.to_string_lossy());
     out
 }
 

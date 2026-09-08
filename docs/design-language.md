@@ -340,3 +340,37 @@ the keyboard (`y` / `s` / `n`) through `wardos-approve`; the timeout is the daem
 The `Duration  Current session` row of §10 is not shown: the scope of an `allow` is
 chosen by the answer, not read from the request. Not yet built: a layer-shell
 surface of the shell's own for any of this, the verification display (§11), fonts (§4).
+
+## As built: wallpapers, lock screen, bar
+
+The wallpaper is drawn from the tokens, not chosen: `wardos-theme-render` writes a
+`background.png` for every theme, 1920×1200, in three tones and nothing else, the
+ground with one 1 px rule in the separator tone (64 px in from either edge, 88 px
+from the bottom) and the WARD mark set small in the lower left in `text_muted`
+(14 px tall: 5×7 bitmap glyphs of 2 px cells, rectangles on the 8 px grid, no
+anti-aliasing). No gradient, no photo, no second composition: the same drawing
+holds under every palette, so the host layer looks the same whichever theme is on
+(§2), and a theme that ships its own `backgrounds/` wins over it. The file is a
+two-bit indexed PNG of about 6 KB and takes milliseconds to render. The lock screen
+shows the same file under a veil of the panel colour at 70 % (the ground alone
+before the first render), the clock in the sans face at 96 px in the light weight,
+the date under it in `text_muted`, one 320×40 input on the grid whose 1 px border
+is the accent because it is the focused element (§3), the denied colour on that
+border after a failure without animation, and `WARD` at 12 px at 64, 64 in the lower
+left; no blur, nothing moves (§12). The bar is 32 px: every module a cell padded 8 px
+either side of its text with a 1 px separator, words and never icon-font glyphs in
+the system group (`VOL 40`, `WIFI 80`, `ETH`, `OFFLINE`, `BT`, `BAT 90`, `AC 90`,
+`CPU 12`, `MEM 40`), state colour on the trust segments' text only and otherwise on
+a 2 px marker at the foot of a cell (the active workspace's accent, a battery at
+warning or critical in restricted or denied, the number staying muted), tooltips as
+panels with 8 px of padding and the theme's radius. The command centre is fuzzel
+with `WARD` as its prompt, 28 rows of 24 px under it in a 640×720 surface, matches
+in the accent; the approval notification is a mako style for the `ward-approval`
+category, the §10 layout as far as a notification allows: the title, the body (the
+target on its own line, expected in the mono face through `<tt>` from
+`wardos-approve`, then the `Reason` and `Scope` rows) and the three actions with
+their keys as one dimmed row, because mako draws no buttons and `y` / `s` / `n`
+answer. Motion in the compositor is unchanged: the 120 ms workspace slide and the
+100 ms layer fade, gaps 4 and 8, 1 px borders, 6 px radius. Not yet built: the one
+shadow level (§5) for the command centre and approvals, which neither fuzzel nor
+mako draws.

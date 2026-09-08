@@ -8,8 +8,9 @@ current_dir="$XDG_CONFIG_HOME/wardos/theme/current"
 user_themes="$XDG_DATA_HOME/wardos/themes"
 
 # The renderer mock writes what the script reads back: colors.env (variant and
-# name from the theme file) and background (solid ground, as the real one does
-# when the theme has no backgrounds).
+# name from the theme file), background.png (the wallpaper drawn from the
+# tokens), background (its path, as the real one does when the theme has no
+# backgrounds/) and the hyprlock fragment's $wallpaper line.
 # shellcheck disable=SC2016  # the mock bodies expand when the mock runs
 mock wardos-theme-render '
 id=$1; out=$3
@@ -24,8 +25,10 @@ done
 name=$(sed -n "s/^name = \"\(.*\)\"/\1/p" "$toml")
 variant=$(sed -n "s/^variant = \"\(.*\)\"/\1/p" "$toml")
 printf "WARDOS_THEME_ID=\"%s\"\nWARDOS_THEME_NAME=\"%s\"\nWARDOS_VARIANT=\"%s\"\nWARDOS_GROUND=\"#0E0F11\"\n" "$id" "$name" "$variant" >"$out/colors.env"
-for f in hyprland.conf waybar.css mako.conf fuzzel.ini foot.ini alacritty.toml btop.theme hyprlock.conf swayosd.css nvim.lua chromium.json gtk.css theme.toml; do : >"$out/$f"; done
-echo "solid:#0E0F11" >"$out/background"'
+for f in hyprland.conf waybar.css mako.conf fuzzel.ini foot.ini alacritty.toml btop.theme swayosd.css nvim.lua chromium.json gtk.css theme.toml; do : >"$out/$f"; done
+printf "PNG" >"$out/background.png"
+echo "$out/background.png" >"$out/background"
+printf "\$ground     = rgb(0E0F11)\n\$wallpaper  = %s/background.png\n" "$out" >"$out/hyprlock.conf"'
 mock hyprctl
 mock pkill
 mock makoctl
@@ -76,7 +79,8 @@ assert_logged '^pkill -SIGUSR2 -x waybar$'
 assert_logged '^pkill -SIGUSR1 -x nvim$'
 assert_logged '^makoctl reload$'
 assert_logged '^pkill -x swaybg$'
-wait_logged '^swaybg -c #0E0F11$'
+# The wallpaper the render drew is what swaybg shows (docs/desktop.md §Themes).
+wait_logged "^swaybg -i $current_dir/background.png -m fill$"
 assert_logged '^systemctl --user restart swayosd.service$'
 assert_logged '^gsettings set org.gnome.desktop.interface color-scheme prefer-dark$'
 assert_logged '^notify-send .*Theme · Nord$'
@@ -117,6 +121,12 @@ assert_not_logged '^wardos-theme-render'
 assert_logged '^hyprctl reload$'
 assert_logged '^makoctl reload$'
 
+# A hand-written `solid:<hex>` background still means swaybg -c.
+echo "solid:#101010" >"$current_dir/background"
+: >"$MOCK_LOG"
+wardos-theme reload
+wait_logged '^swaybg -c #101010$'
+
 # install: a shallow clone under the user's themes, named after the URL, then set.
 : >"$MOCK_LOG"
 wardos-theme install https://example.invalid/someone/wardos-theme-ocean.git
@@ -147,9 +157,14 @@ wardos-theme set dune
 wardos-theme bg next
 wait_logged "^swaybg -i $user_themes/dune/backgrounds/a.png -m fill$"
 assert_eq "$(cat "$current_dir/background")" "$user_themes/dune/backgrounds/a.png"
+# The lock screen follows: the fragment's $wallpaper line is the pick, the rest stays.
+assert_eq "$(grep '^[$]wallpaper' "$current_dir/hyprlock.conf")" "\$wallpaper  = $user_themes/dune/backgrounds/a.png"
+assert_eq "$(grep -c '' "$current_dir/hyprlock.conf")" "2"
+grep -q '^[$]ground     = rgb(0E0F11)$' "$current_dir/hyprlock.conf" || fail "bg next must leave the other hyprlock variables alone"
 : >"$MOCK_LOG"
 wardos-theme bg next
 wait_logged "^swaybg -i $user_themes/dune/backgrounds/b.png -m fill$"
+assert_eq "$(grep '^[$]wallpaper' "$current_dir/hyprlock.conf")" "\$wallpaper  = $user_themes/dune/backgrounds/b.png"
 : >"$MOCK_LOG"
 wardos-theme bg next
 wait_logged "^swaybg -i $user_themes/dune/backgrounds/a.png -m fill$"

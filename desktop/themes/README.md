@@ -72,8 +72,18 @@ renderer makes, so a theme author knows what a token reaches:
   none).
 - `colors.env` carries every token as `WARDOS_<TOKEN>="#RRGGBB"` plus the id, name,
   variant, fonts and radius, double-quoted so scripts `source` it.
-- `background` is the first file, by name, of `<themes dir>/<id>/backgrounds/`, else
-  `solid:<ground>`; `wardos-theme bg next` cycles that directory.
+- `background.png` is a wallpaper drawn from the tokens for every theme (1920×1200:
+  the ground, one 1 px rule in the separator tone, the WARD mark small in the lower
+  left in text muted; a two-bit indexed PNG of a few kilobytes, no gradient, no
+  photo). `background` names the file swaybg and hyprlock show: the first file, by
+  name, of `<themes dir>/<id>/backgrounds/` when the theme ships one, else that
+  `background.png`; `wardos-theme bg next` cycles the directory. The hyprlock
+  fragment carries the same path as `$wallpaper` and the panel colour at 70 % as
+  `$veil`, the lock screen's dimming layer.
+- A theme's `backgrounds/` directory is optional and holds image files only (PNG or
+  JPEG, any size; sorted by name, the first is the default). It sits beside the
+  theme file as `<id>/backgrounds/` for a shipped theme and as `backgrounds/` inside
+  an installed clone. A theme without one still has a wallpaper: the rendered one.
 - Fonts are the theme's first candidates unless `~/.config/wardos/fonts.conf`
   (`sans=`, `mono=`, written by `wardos-font set`) or `WARDOS_FONT_SANS`/`WARDOS_FONT_MONO`
   override them.

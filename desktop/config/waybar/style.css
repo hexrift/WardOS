@@ -2,11 +2,13 @@
  *
  * Colours come from the theme fragment (wardos-theme render writes waybar.css with
  * @define-color ground, panel, separator, text, text_muted, accent, verified,
- * restricted, denied; a font-family for the sans and mono faces is set below).
- * 8 px grid, 1 px separators drawn as borders, no gradients, no shadows, no glow.
- * State colour sits on the ward segments only, through the class the ward-shell
- * JSON supplies (working, waiting, blocked, verifying, finished, verified,
- * restricted, denied); the system group at the right is muted text. */
+ * restricted, denied, and the sans and mono families). Everything here is geometry:
+ * a 32 px bar, every module a cell padded 8 px either side of its text on the 8 px
+ * grid, 1 px separators drawn as borders, no gradients, no shadows, no glow, no icon
+ * fonts. State colour sits on the ward segments' text, through the class the
+ * ward-shell JSON supplies (working, waiting, blocked, verifying, finished, verified,
+ * restricted, denied), and on a 2 px marker under a cell (the active workspace, a
+ * battery that needs attention); the system group at the right is muted text. */
 @import "../wardos/theme/current/waybar.css";
 
 * {
@@ -26,7 +28,8 @@ window#waybar {
   border-bottom: 1px solid @separator;
 }
 
-/* Every module is a cell on the 8 px grid, separated by a 1 px line. */
+/* Every module is a cell: 8 px either side of its text, a 1 px line after it, and a
+ * 2 px marker line at its foot that stays invisible until a state needs it. */
 #custom-ward-mark,
 #custom-ward-project,
 #custom-ward-agent,
@@ -41,8 +44,9 @@ window#waybar {
 #cpu,
 #memory,
 #clock {
-  padding: 0 16px;
+  padding: 0 8px;
   border-right: 1px solid @separator;
+  border-bottom: 2px solid transparent;
 }
 
 /* --- Host mark and trust segments (left) ------------------------------------- */
@@ -72,9 +76,9 @@ window#waybar {
 .sealed,
 .none { color: @text_muted; }
 
-/* --- Workspaces (centre) ------------------------------------------------------ */
+/* --- Workspaces (centre): the names, the active one marked ---------------------- */
 #workspaces button {
-  padding: 0 12px;
+  padding: 0 8px;
   color: @text_muted;
   border-bottom: 2px solid transparent;
 }
@@ -90,7 +94,7 @@ window#waybar {
   color: @text;
 }
 
-/* --- System group (right): demoted, muted, tabular -------------------------- */
+/* --- System group (right): words, muted, tabular ------------------------------ */
 #custom-ward-update,
 #pulseaudio,
 #network,
@@ -105,16 +109,17 @@ window#waybar {
   color: @text;
   border-right: none;
 }
-#battery.warning  { color: @restricted; }
-#battery.critical { color: @denied; }
-#pulseaudio.muted { color: @text_muted; }
-#network.disconnected { color: @text_muted; }
+/* A battery that needs attention is a 2 px marker under the cell, not a colour on
+ * the number (§3: state colour on the glyph or a 2 px marker, not on whole panels). */
+#battery.warning  { border-bottom: 2px solid @restricted; }
+#battery.critical { border-bottom: 2px solid @denied; }
 
+/* Tooltips are panels: 1 px line, the theme's radius, text on the grid. */
 tooltip {
   background: @panel;
   color: @text;
   border: 1px solid @separator;
-  border-radius: 4px;
+  border-radius: 6px;
 }
 tooltip label {
   padding: 8px;
