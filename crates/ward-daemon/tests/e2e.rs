@@ -246,6 +246,40 @@ fn egress_and_surface_probes_never_reach() {
     }
 }
 
+/// ST-029 (G9): a corpus of hostile verifier repositories, run through the real
+/// verifier, is contained. Every row must be `DENIED` or `CANNOT-MEASURE-HERE`
+/// (the resource cgroup row is the latter on the bubblewrap backend); nothing may
+/// be `REACHED`. The catalogue is fixed so a dropped or renamed row is caught.
+#[test]
+fn hostile_verifier_corpus_is_contained() {
+    if !sandbox::available() {
+        eprintln!("skipping: bubblewrap not available");
+        return;
+    }
+    let results = ward_daemon::selftest_verifier_corpus().expect("verifier corpus");
+    let names: Vec<&str> = results.iter().map(|r| r.name).collect();
+    assert_eq!(names, ward_daemon::selftest::VERIFIER_CORPUS.to_vec());
+    for r in &results {
+        assert!(
+            !r.reached(),
+            "{} reached its target: {:?}",
+            r.name,
+            r.verdict
+        );
+        if r.name == "ST-029 resource-cgroup" {
+            // bubblewrap manages no cgroup limit; production crun does. Never a pass.
+            assert!(
+                matches!(&r.verdict, ward_daemon::Verdict::CannotMeasure(w) if w.contains("cgroup")),
+                "{}: {:?}",
+                r.name,
+                r.verdict
+            );
+        } else {
+            assert!(r.blocked(), "{} must be DENIED: {:?}", r.name, r.verdict);
+        }
+    }
+}
+
 /// A sandboxed process can reach the session proxy only through the bind-mounted Unix
 /// socket, and a private destination is denied there and recorded (ADR-0014).
 #[test]

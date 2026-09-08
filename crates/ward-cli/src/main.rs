@@ -1011,12 +1011,14 @@ fn cmd_selftest(dir: &Path) -> ward_daemon::Result<ExitCode> {
         session.sync()?;
     }
     let egress = ward_daemon::selftest_egress(dir, Some(&control))?;
+    let corpus = ward_daemon::selftest_verifier_corpus()?;
     let groups = [
         ("isolation", &isolation),
         ("credentials", &credentials),
         ("evidence", &evidence),
         ("verifier boundary", &verifier),
         ("egress and surfaces", &egress),
+        ("verifier corpus", &corpus),
     ];
     for (name, results) in &groups {
         println!("WARD selftest · {name}\n");
