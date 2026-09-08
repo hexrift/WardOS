@@ -21,6 +21,14 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: pip install pyyaml
+      # Let the bubblewrap-guarded isolation tests actually run on the runner.
+      - name: Install bubblewrap and allow unprivileged user namespaces
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          bwrap --unshare-all --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind-try /lib64 /lib64 --proc /proc --dev /dev -- /bin/true && echo "bwrap userns: OK" || echo "bwrap userns: unavailable (guarded tests will skip)"
       - run: bash scripts/verify/tamperward.sh
 
   deny:

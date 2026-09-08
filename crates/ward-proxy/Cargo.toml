@@ -1,0 +1,25 @@
+[package]
+name = "ward-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WardOS: session egress proxy — the only way out of a sandbox"
+
+[features]
+# Lets a `Config` permit loopback destinations in modes other than
+# `LocalhostOnly`. Exists so integration tests can run a real upstream on
+# 127.0.0.1; never enable it in a shipped `wardd`.
+test-loopback = []
+
+[dependencies]
+ward-policy = { path = "../ward-policy", version = "0.1.0" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Self-dependency so the crate's own tests see the `test-loopback` feature.
+ward-proxy = { path = ".", features = ["test-loopback"] }
+
+[lints]
+workspace = true

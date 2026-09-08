@@ -90,6 +90,7 @@ a distribution.
 | [`docs/event-model.md`](docs/event-model.md) | The typed Ward event model, evidence chain, observer and replay |
 | [`docs/credential-broker.md`](docs/credential-broker.md) | How agents obtain scoped, short-lived credentials without seeing long-lived secrets |
 | [`docs/tamperward-integration.md`](docs/tamperward-integration.md) | The OS-level primitives WardOS exposes to TamperWard |
+| [`docs/agent-integration.md`](docs/agent-integration.md) | How `ward claude` / `ward codex` compose the sandbox, proxy, credentials and hooks |
 | [`docs/design-language.md`](docs/design-language.md) | Visual and interaction identity of the WardOS desktop |
 | [`docs/performance.md`](docs/performance.md) | Latency budgets, benchmark methodology, CI regression gates |
 | [`docs/experiments.md`](docs/experiments.md) | Highest-risk assumptions and the experiments that must settle them |

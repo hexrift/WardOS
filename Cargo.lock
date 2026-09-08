@@ -775,6 +775,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ward-proxy"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "ward-policy",
+ "ward-proxy",
+]
+
+[[package]]
 name = "ward-sandbox"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,11 @@
+# Human-review-only surfaces (docs/development-under-tamperward.md section 4.2).
+# TamperWard guards the judge; CODEOWNERS asks a human to review sensitive implementation.
+docs/threat-model.md        @hexrift
+docs/security-model.md      @hexrift
+SECURITY.md                 @hexrift
+image/secure-boot/**        @hexrift
+image/keys/**               @hexrift
+crates/ward-policy/**       @hexrift
+crates/ward-credentials/**  @hexrift
+crates/ward-verifier/**     @hexrift
+installer/crypto/**         @hexrift
