@@ -54,11 +54,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: hadolint image/Containerfile
-        uses: hadolint/hadolint-action@v3
-        with:
-          dockerfile: image/Containerfile
-          config: .hadolint.yaml
-          failure-threshold: warning
+        run: |
+          set -euo pipefail
+          curl -fsSL -o hadolint https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+          echo "56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010  hadolint" | sha256sum -c -
+          chmod +x hadolint
+          ./hadolint --config .hadolint.yaml image/Containerfile
       - name: shellcheck image/*.sh (and install.sh when present)
         run: |
           sudo apt-get update -q
