@@ -9,7 +9,8 @@ use ward_sandbox::seccomp::Profile;
 
 use crate::error::Result;
 use crate::landlock::{self, Outcome, PathSets};
-use crate::{privs, seccomp, supervise};
+use crate::relay::Relay;
+use crate::{privs, relay, seccomp, supervise};
 
 /// Environment variables forwarded to the agent when present.
 pub const ENV_PASSTHROUGH: &[&str] = &[
@@ -45,9 +46,15 @@ pub struct Args {
     pub ro: Vec<PathBuf>,
 
     /// Path the agent may read, write and ioctl but not create under
-    /// (repeatable; replaces the defaults /dev and $WARD_SOCKET).
+    /// (repeatable; replaces the defaults /dev and $WARD_SOCKET; relay
+    /// sockets are always included).
     #[arg(long = "io", value_name = "PATH")]
     pub io: Vec<PathBuf>,
+
+    /// Loopback address to forward into a Unix socket, e.g.
+    /// 127.0.0.1:3128=/run/ward/proxy.sock (repeatable; ADR-0014 egress).
+    #[arg(long = "relay", value_name = "LISTEN=SOCKET")]
+    pub relay: Vec<Relay>,
 
     /// Exec the agent even if the kernel has no Landlock (outer layers alone must hold).
     #[arg(long)]
@@ -63,7 +70,8 @@ pub struct Args {
 }
 
 impl Args {
-    /// The Landlock path sets: defaults unless the corresponding flag was given.
+    /// The Landlock path sets: defaults unless the corresponding flag was
+    /// given, plus every relay socket in the `io` tier.
     pub fn path_sets(&self) -> PathSets {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let socket = std::env::var_os("WARD_SOCKET").map(PathBuf::from);
@@ -75,10 +83,12 @@ impl Args {
                 given.to_vec()
             }
         };
+        let mut io = pick(&self.io, defaults.io);
+        io.extend(self.relay.iter().map(|r| r.socket.clone()));
         PathSets {
             rw: pick(&self.rw, defaults.rw),
             ro: pick(&self.ro, defaults.ro),
-            io: pick(&self.io, defaults.io),
+            io,
         }
     }
 
@@ -118,6 +128,17 @@ pub fn run(args: &Args) -> Result<i32> {
         compiled.programs.len(),
         compiled.unreachable
     ));
+    // Relays start only now: the Landlock domain and the seccomp filter are
+    // per-thread and inherited by threads created afterwards, so this is what
+    // makes the relay as confined as the agent. The supervisor's signal mask
+    // is inherited the same way and must already be in place, or a
+    // termination signal could be delivered to a relay thread and kill the
+    // shim instead of reaching `sigwait`.
+    supervise::block_signals()?;
+    for relay in &args.relay {
+        relay::start(relay)?;
+        note(&format!("relay {relay}"));
+    }
     supervise::run(&mut args.command())
 }
 
@@ -154,6 +175,54 @@ mod tests {
         let sets = args.path_sets();
         assert_eq!(sets.rw, vec![PathBuf::from("/only")]);
         assert_eq!(sets.ro, PathSets::defaults(None, None).ro);
+    }
+
+    #[test]
+    fn relay_is_repeatable_and_typed() {
+        let args = parse(&[
+            "--relay",
+            "127.0.0.1:3128=/run/ward/proxy.sock",
+            "--relay",
+            "[::1]:8080=/run/ward/other.sock",
+            "--",
+            "true",
+        ]);
+        assert_eq!(args.relay.len(), 2);
+        assert_eq!(args.relay[0].listen.port(), 3128);
+        assert_eq!(args.relay[1].socket, PathBuf::from("/run/ward/other.sock"));
+    }
+
+    #[test]
+    fn relay_rejects_non_loopback_and_malformed() {
+        for bad in ["0.0.0.0:3128=/s", "192.168.1.1:3128=/s", "3128=/s", "x"] {
+            let err = Args::try_parse_from(["ward-agent", "--relay", bad, "--", "true"])
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("--relay"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn relay_sockets_join_the_io_tier() {
+        let args = parse(&[
+            "--io",
+            "/dev/null",
+            "--relay",
+            "127.0.0.1:1=/x.sock",
+            "--",
+            "true",
+        ]);
+        assert_eq!(
+            args.path_sets().io,
+            vec![PathBuf::from("/dev/null"), PathBuf::from("/x.sock")]
+        );
+        let defaults = parse(&["--relay", "127.0.0.1:1=/x.sock", "--", "true"]);
+        assert!(
+            defaults
+                .path_sets()
+                .io
+                .ends_with(&[PathBuf::from("/x.sock")])
+        );
     }
 
     #[test]
