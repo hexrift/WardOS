@@ -1,0 +1,14 @@
+# Standalone crate: intentionally NOT a member of the WardOS workspace, so the
+# experiment stays out of the crate build/lint gates. The empty [workspace]
+# table detaches it from the parent workspace.
+[package]
+name = "e06-warm-start"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "e06-warm-start"
+path = "src/main.rs"
