@@ -16,6 +16,7 @@
 )]
 
 pub mod agents;
+pub mod client;
 pub mod control;
 pub mod describe;
 pub mod egress;

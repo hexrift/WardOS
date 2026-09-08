@@ -183,25 +183,49 @@ impl RemoteSink {
 
     /// Send one request and read its first response line.
     pub fn call(&mut self, request: &Request) -> Result<Response> {
+        self.send(request)?;
+        self.read_response()
+    }
+
+    /// Send one request without waiting for its response (a subscriber reads the
+    /// stream with [`Self::next_response`]).
+    pub fn send(&mut self, request: &Request) -> Result<()> {
         let mut line = serde_json::to_vec(request).map_err(|e| Error::Events(e.to_string()))?;
         line.push(b'\n');
         self.writer
             .write_all(&line)
-            .map_err(|e| Error::Sandbox(format!("control socket: {e}")))?;
-        self.read_response()
+            .map_err(|e| Error::Sandbox(format!("control socket: {e}")))
     }
 
     /// Read the next response line (a subscription yields many).
     pub fn read_response(&mut self) -> Result<Response> {
+        self.next_response()?
+            .ok_or_else(|| Error::Sandbox("control socket closed".into()))
+    }
+
+    /// Read the next response line, or `None` once the daemon has hung up (a
+    /// subscription ends this way when the log is sealed).
+    pub fn next_response(&mut self) -> Result<Option<Response>> {
         let mut line = String::new();
         let n = self
             .reader
             .read_line(&mut line)
             .map_err(|e| Error::Sandbox(format!("control socket: {e}")))?;
         if n == 0 {
-            return Err(Error::Sandbox("control socket closed".into()));
+            return Ok(None);
         }
-        serde_json::from_str(&line).map_err(|e| Error::Events(format!("control response: {e}")))
+        serde_json::from_str(&line)
+            .map(Some)
+            .map_err(|e| Error::Events(format!("control response: {e}")))
+    }
+
+    /// Change the read timeout (`None` waits forever; a subscriber uses this so a
+    /// quiet session does not look like a dead daemon).
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+        self.reader
+            .get_ref()
+            .set_read_timeout(timeout)
+            .map_err(|e| Error::Sandbox(format!("control socket: {e}")))
     }
 }
 
