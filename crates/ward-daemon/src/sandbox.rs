@@ -155,6 +155,7 @@ impl Launch {
         }
         let mut a: Vec<String> = Vec::new();
         // Read-only system directories the toolchain needs; host home is never bound.
+        // TLS trust roots are read-only system data the agent needs for HTTPS via CONNECT.
         for dir in [
             "/usr",
             "/bin",
@@ -162,6 +163,8 @@ impl Launch {
             "/lib",
             "/lib64",
             "/etc/alternatives",
+            "/etc/ssl",
+            "/etc/ca-certificates",
         ] {
             if Path::new(dir).exists() {
                 push(&mut a, &["--ro-bind", dir, dir]);
@@ -174,6 +177,9 @@ impl Launch {
             ],
         );
         push(&mut a, &["--tmpfs", "/run"]);
+        // The shim's read-write set is /work, /env, /tmp and $HOME; every one must exist
+        // (it fails closed otherwise), so create the sandbox-private ones here.
+        push(&mut a, &["--dir", "/home/agent", "--tmpfs", "/env"]);
         push(&mut a, &["--setenv", "HOME", "/home/agent"]);
         push(
             &mut a,
@@ -349,6 +355,10 @@ mod tests {
             "-- /run/ward/ward-agent --env FOO --relay 127.0.0.1:3128=/run/ward/proxy.sock -- true"
         ));
         assert!(!a.contains("/root"), "host home must never be bound");
+        assert!(
+            a.contains("--dir /home/agent") && a.contains("--tmpfs /env"),
+            "shim rw paths exist"
+        );
     }
 
     #[test]
