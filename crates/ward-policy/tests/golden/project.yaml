@@ -1,0 +1,17 @@
+# Golden fixture: project layer.
+agent:
+  filesystem:
+    repo: write
+  network:
+    mode: custom
+    allow: [api.github.com, api.example.com, evil.example]
+  secrets:
+    github: ask
+    cloud-dev: allow
+  containers:
+    allow: false
+  resources:
+    pids_max: 512
+observer:
+  default: step-through
+  step: ['tests/**']

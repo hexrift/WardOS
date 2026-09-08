@@ -1,0 +1,24 @@
+# Golden fixture: system layer. Protected path (.tamperward.yml: crates/**/tests/**).
+agent:
+  filesystem:
+    repo: write
+    host: deny
+  network:
+    mode: development
+    deny_private_networks: true
+  secrets:
+    github:
+      decision: ask
+      scope: [repo:current, contents:read, issues:read]
+    npm-publish: deny
+    'cloud-*': deny
+    ssh-signing: ask
+  containers:
+    allow: true
+  resources:
+    cpu_weight: 100
+    memory_max: 50%
+    pids_max: 4096
+    disk_quota: 20GiB
+observer:
+  default: live

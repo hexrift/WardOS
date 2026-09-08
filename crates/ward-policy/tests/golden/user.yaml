@@ -1,0 +1,14 @@
+# Golden fixture: user layer.
+agent:
+  network:
+    mode: custom
+    allow: [github.com, '*.github.com', registry.npmjs.org, '*.example.com']
+  secrets:
+    github:
+      decision: allow
+      scope: [repo:current, contents:read]
+  resources:
+    memory_max: 8GiB
+observer:
+  default: step-through
+  step: ['src/**']
