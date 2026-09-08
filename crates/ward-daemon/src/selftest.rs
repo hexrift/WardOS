@@ -145,3 +145,38 @@ fn canary_suffix() -> String {
         .unwrap_or_default();
     blake3::hash(&nanos.to_le_bytes()).to_hex()[..16].to_string()
 }
+
+/// ST-009: exit 0 only if the session log (`$1`) or the state root (`$2`) is visible.
+pub const ST_009: &str = "test -r \"$1\" && exit 0; test -d \"$2\" && exit 0; exit 1";
+/// ST-010: exit 0 only if the session log (`$1`) can be appended to or removed.
+pub const ST_010: &str = "test -e \"$1\" || exit 1; \
+     echo tamper >> \"$1\" 2>/dev/null && exit 0; rm -f \"$1\" 2>/dev/null && exit 0; exit 1";
+
+/// Run the evidence probes (ST-009, ST-010) inside `session`: the sandbox is
+/// handed the host paths of its own log and state root and tries to read, append
+/// to, or remove them. Blocked means the evidence is out of the agent's reach.
+pub fn selftest_evidence(session: &mut Session) -> Result<Vec<ProbeResult>> {
+    const PROBES: &[(&str, &str)] = &[
+        ("ST-009 read-evidence", ST_009),
+        ("ST-010 rewrite-evidence", ST_010),
+    ];
+    let log = session.log_path().to_string_lossy().into_owned();
+    let state = session.state_root().to_string_lossy().into_owned();
+    let mut out = Vec::with_capacity(PROBES.len());
+    for (name, script) in PROBES {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            (*script).to_string(),
+            "sh".to_string(),
+            log.clone(),
+            state.clone(),
+        ];
+        let report = session.launch(&argv, &LaunchOpts::default())?;
+        out.push(ProbeResult {
+            name,
+            blocked: report.code != Some(0),
+        });
+    }
+    Ok(out)
+}

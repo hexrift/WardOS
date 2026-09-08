@@ -188,6 +188,13 @@ contents.
   saw a key. The `SessionStart` hook reported through `ward-agent hook` and was logged
   as a claim. Eleven `NET api.anthropic.com:443` rows are Claude Code's own retries on
   the 401. A full task with a valid key, streaming and tool use, remains to be run.
+* **E-12 (TamperWard consumes snapshots and Zone 2 verification) — partial PASS.**
+  `ward verify` runs entirely on the primitives §2 of `tamperward-integration.md`
+  promises: candidate ids from the CAS, `cat` of pristine bytes for protected paths,
+  a disposable verifier whose result lands in the evidence log with the config hash.
+  No redesign of the snapshot or event model was needed. Open: the socket protocol
+  (§4) so that the decisions are TamperWard's rather than `wardd`'s reading of the
+  config, and the semantic rules.
 * **E-06 (sandbox warm start) — could not measure here.** `crun` cannot manage
   cgroups in the nested CI environment; the spike records `CANNOT-MEASURE-HERE` with
   the exact commands to run on a real cgroups-v2 host
