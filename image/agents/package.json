@@ -1,0 +1,12 @@
+{
+  "name": "wardos-agents",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The agents and TamperWard the WardOS image ships (ADR-0017): exact versions, installed at build time with npm ci",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.263",
+    "@openai/codex": "0.153.4",
+    "tamperward": "2.10.3"
+  }
+}

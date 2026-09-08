@@ -18,13 +18,17 @@ not.
 | `coprs.txt` | `/etc/yum.repos.d/_copr:*.repo` | The COPR repositories enabled before the install (Hyprland's ecosystem, lazygit); part of the trust set |
 | `check-packages.sh` | — | Proves every name in `packages.txt` exists in the pinned Fedora release plus `coprs.txt` (`dnf repoquery` in a `fedora:<release>` container); CI job "image packages" |
 | `install-desktop.sh` | — | Places `desktop/` into a root (`/` in the build, `/` from `desktop/install.sh`, a temp dir in tests) |
+| `agents/package.json`, `agents/package-lock.json` | `/usr/lib/wardos/agents/`, then `node_modules/` from `npm ci`; `/usr/bin/{claude,codex,tamperward}` | Claude Code, Codex and TamperWard at exact versions (ADR-0017; [`agents/README.md`](agents/README.md)) |
 | `rootfs/usr/libexec/wardos-flathub` | `/usr/libexec/wardos-flathub` | Adds Flathub and installs `desktop/flatpaks.txt`, run once by `wardos-flathub.service` |
 | `build.sh` | — | `podman build` wrapper; tags `localhost/wardos:<git describe>` and stamps the version label; `--arch x86_64|aarch64` |
-| `disk.sh` | — | `bootc-image-builder` wrapper; qcow2 for QEMU, ISO for installation; `--user`, `--luks`, `--arch` |
+| `disk.sh` | — | `bootc-image-builder` wrapper; qcow2 for QEMU, ISO for installation (encrypted unless `--no-luks`); `--user`, `--arch` |
 | `sysctl.d/50-wardos.conf` | `/usr/lib/sysctl.d/` | Unprivileged user namespaces for `wardd`'s sandboxes |
 | `tmpfiles.d/wardos.conf` | `/usr/lib/tmpfiles.d/` | Creates `/var/lib/wardos` at boot |
 | `systemd/wardos-firstboot.service` | `/usr/lib/systemd/system/` | Runs `ward doctor` once, keeps the report |
 | `systemd/wardos-flathub.service` | `/usr/lib/systemd/system/` | Flathub remote and default applications, once, after the first boot with a network |
+| `rootfs/usr/lib/systemd/system-preset/90-wardos.preset` | `/usr/lib/systemd/system-preset/` | The system units the image enables: the two above, `firewalld.service`, `bootc-fetch-apply-updates.timer` |
+| `rootfs/usr/lib/systemd/system/bootc-fetch-apply-updates.service.d/wardos.conf` | `/usr/lib/systemd/system/…/` | The update timer stages the next image and never reboots |
+| `rootfs/etc/firewalld/zones/wardos.xml` | `/etc/firewalld/zones/` | The default zone: nothing inbound |
 | `plymouth/wardos/` | `/usr/share/plymouth/themes/wardos/` | The boot splash: WARD on the ground colour |
 | `boot/` | (plan) | How the image boots, updates and rolls back; UKI/systemd-boot plan |
 | `secure-boot/` | (plan, CODEOWNERS) | Secure Boot chain and what signing would need |
@@ -58,17 +62,20 @@ on `PATH`, not a `~/.rustup`; `Toolchains::detect` finds no rustup home and fall
 through to `/usr/bin`.
 
 Then, in this order: the binaries go to `/usr/bin`; `install-desktop.sh` places the
-desktop tree ([below](#the-desktop-in-the-image)); the configuration files under
-`/usr/lib`, the Flathub script and the Plymouth theme are copied; the two first-boot
-units are enabled, the splash theme selected and the initramfs rebuilt; and `bootc
-container lint` checks the result. Labels: `org.wardos.version` (from `--build-arg
-WARDOS_VERSION`, which `build.sh` sets to `git describe --tags --always`) and
-`containers.bootc=1`.
+desktop tree ([below](#the-desktop-in-the-image)); the agents are installed from
+`agents/package-lock.json` ([below](#agents-and-tamperward-in-the-image)); the
+configuration files under `/usr/lib` and `/etc/firewalld`, the Flathub script and the
+Plymouth theme are copied; the first-boot units, the firewall and the update timer are
+enabled, the firewall's default zone set, the splash theme selected and the initramfs
+rebuilt; and `bootc container lint` checks the result. Labels: `org.wardos.version`
+(from `--build-arg WARDOS_VERSION`, which `build.sh` sets to `git describe --tags
+--always`) and `containers.bootc=1`.
 
-Not in the image, deliberately: the `tamperward` service and the system-service `wardd`
-of ADR-0009 (today `wardd` is per-session, spawned by `ward up`); `mise` (not in
-Fedora; `wardos-install dev` says so); the Flathub applications, which come at first
-boot, not at build time, so the image stays what `dnf` and this repository produced.
+Not in the image, deliberately: the TamperWard *service* and the system-service `wardd`
+of ADR-0009 (today `wardd` is per-session, spawned by `ward up`; the `tamperward` CLI
+does ship); `mise` (not in Fedora; `wardos-install dev` says so); the Flathub
+applications, which come at first boot, not at build time, so the image stays what
+`dnf`, npm's lockfile and this repository produced.
 
 ### Packages
 
@@ -190,6 +197,93 @@ E-09's to record.
    (42 had reached end of life and the COPRs had dropped its chroot). `bootc` on
    installed hosts follows whatever tag their `bootc status` names.
 
+### Agents and TamperWard in the image
+
+ADR-0017: a WardOS install is useful the minute it boots, so the image carries the
+agents `ward` exists to run and TamperWard, at pinned versions, installed at build time.
+
+| What | Package | Command | Where |
+| --- | --- | --- | --- |
+| Claude Code | `@anthropic-ai/claude-code` | `/usr/bin/claude` | `/usr/lib/wardos/agents/node_modules/@anthropic-ai/claude-code/` (the native binary of the build's platform, placed by the package's postinstall) |
+| Codex | `@openai/codex` | `/usr/bin/codex` | `/usr/lib/wardos/agents/node_modules/@openai/codex/` (+ the platform package) |
+| TamperWard | `tamperward` 2.10.3 | `/usr/bin/tamperward` | `/usr/lib/wardos/agents/node_modules/tamperward/` |
+| Node.js | Fedora `nodejs24`, `nodejs24-npm` | `/usr/bin/node` | the distro runtime (Fedora ships versioned streams, no plain `nodejs`); the build fails when it is older than the `engines` floor (22) |
+
+[`agents/package.json`](agents/package.json) pins the three exactly and
+`agents/package-lock.json` records every tarball they resolve to with its integrity
+hash ([`agents/README.md`](agents/README.md): what is pinned, why, how to bump). The
+Containerfile copies the two files to `/usr/lib/wardos/agents`, runs
+`npm ci --omit=dev --ignore-scripts` there (`NODE_ENV=production`; every tarball is
+checked against the lockfile or the build fails; nothing is fetched at first boot, no
+`curl | sh`), then `npm rebuild @anthropic-ai/claude-code` for the one postinstall the
+build needs (it hard-links the native binary of this platform over `bin/claude.exe`;
+the lockfile carries every platform's package, which is what an aarch64 build needs,
+and the musl variant is removed), links the three commands into `/usr/bin`, runs each
+once (`--version`, TamperWard's `--help`) with a throwaway `HOME`, and removes npm's
+cache. One `COPY`, one `RUN`; about 550 MB (Codex's platform package is 320 MB of it,
+Claude Code's 210 MB, TypeScript, a TamperWard runtime dependency, 23 MB).
+
+`/usr/lib/wardos/agents`, not `/opt`: on bootc, `/usr` is the image, replaced whole by
+every update and read-only at run time, which is exactly what a pinned version wants
+(a bump is a pull request and the next image carries it). `/opt` is either a symlink
+into `/var` (machine state, copied at install and never updated) or a read-only
+toplevel, depending on the base, and `bootc container lint` flags content under
+`/var`; the ADR's `/opt/wardos/agents` is therefore realised under `/usr/lib/wardos`,
+beside the desktop library. The security consequence the ADR names holds: the agents
+are root-owned image content, read-only in the sandbox, unalterable by the user and
+by an agent.
+
+How `ward claude` finds them: the session sandbox binds `/usr` (and `/opt`, `/bin`,
+`/lib`, `/lib64`) read-only (`crates/ward-daemon/src/sandbox.rs`, `SYSTEM_RO`) and
+builds its `PATH` from the host's entries under those roots plus `/usr/bin`, so
+`/usr/bin/claude` resolves inside the sandbox through
+`/usr/lib/wardos/agents/node_modules/.bin/claude` the same way it does on the host;
+nothing under `/home` is needed ([`docs/agent-integration.md`
+§9](../docs/agent-integration.md)). `ward init` runs `tamperward init` when the binary
+exists, and inside a session `tamperward run -- claude` is possible
+([`docs/tamperward-integration.md` §8](../docs/tamperward-integration.md)).
+
+Versions: `ward doctor` prints them (rows `agents`, `node`, `keys`), and the image
+build's "What the image holds" step prints `claude --version`, `codex --version`,
+TamperWard's `package.json` version and `node --version`, so the host, the build log
+and `agents/package.json` can be compared. To bump: edit `package.json`, regenerate
+the lockfile (`npm install --package-lock-only --ignore-scripts`), open a pull
+request; the image build is the proof.
+
+### Security posture
+
+Three defaults of ADR-0017, each a file in this directory:
+
+* **Full-disk encryption by default.** `disk.sh --type iso` generates the LUKS
+  kickstart unless told `--no-luks` ([below](#users-and-luks)); the qcow2 (a
+  development disk for QEMU) is unchanged, because bootc-image-builder cannot encrypt
+  it and `disk.sh` refuses `--luks` for it. The `disk` workflow passes `--luks` when
+  its `luks` input is `true` and `--no-luks` otherwise, so its input keeps meaning
+  what it says.
+* **A firewall that admits nothing inbound.** `firewalld` is in `packages.txt`,
+  enabled by `90-wardos.preset` (and `systemctl enable` in the build), and its default
+  zone is `wardos` (`rootfs/etc/firewalld/zones/wardos.xml`: `target="DROP"`, no
+  services; the build sets `DefaultZone=wardos` in `/etc/firewalld/firewalld.conf` and
+  checks the line). Outbound is unrestricted at this layer; the sandboxes carry their
+  own egress policy. A command that must be reached from the LAN opens its port in the
+  running configuration for as long as it runs (`firewall-cmd --add-port=PORT/tcp`,
+  never `--permanent`; `wardos-share` is the shipped example, `docs/desktop.md`
+  §Commands), and discovery protocols that expect unsolicited replies (mDNS for
+  printers) need `firewall-cmd --add-service=mdns` the same way. `ward doctor`'s
+  `firewall` row reports the service and the zone.
+* **Timed image updates, rollback kept.** `bootc-fetch-apply-updates.timer` (from the
+  `bootc` package: 1 h after boot, then every 8 h with a 2 h jitter) is enabled, so an
+  installed host follows the reference it was installed from or switched to
+  (`ghcr.io/hexrift/wardos:latest`, [below](#the-published-image-skip-the-build)).
+  bootc's service runs `bootc upgrade --apply --quiet`, which reboots into a fetched
+  update at once; the drop-in `bootc-fetch-apply-updates.service.d/wardos.conf` makes
+  it `bootc upgrade --quiet` instead: fetch and *stage*, never reboot, because a
+  desktop is not rebooted under a running agent session. The next boot runs the new
+  image; `bootc status` shows it as staged meanwhile. `wardos-update` (`bootc upgrade`)
+  is the manual path, `bootc rollback` boots the previous deployment, which every
+  upgrade keeps ([`boot/README.md`](boot/README.md) §4, §6). The build log's "What the
+  image holds" step prints `systemctl is-enabled` for the timer and the firewall.
+
 ## Where the binaries come from
 
 The host stage copies the binaries from one of two stages, chosen with
@@ -224,7 +318,7 @@ disk for the build layers (the desktop's packages are most of it) and the output
 git clone https://github.com/hexrift/WardOS && cd WardOS
 sudo ./image/build.sh                                        # -> localhost/wardos:<git describe>
 sudo ./image/disk.sh --type qcow2 --user wardos --password …  # -> image/out/qcow2/disk.qcow2
-sudo ./image/disk.sh --type iso --user wardos --luks          # -> image/out/bootiso/install.iso
+sudo ./image/disk.sh --type iso --user wardos                # -> image/out/bootiso/install.iso, LUKS
 ```
 
 Both scripts print the exact command they are about to run; `--dry-run` prints it and
@@ -256,11 +350,13 @@ password = "change-me-on-first-login"
 groups = ["wheel"]
 ```
 
-`disk.sh --type iso --luks` gives full-disk encryption. The blueprint that
-bootc-image-builder consumes knows `plain`, `lvm` and `btrfs` partitions and nothing
-encrypted (`osbuild/blueprint`, `disk_customizations.go`), so a qcow2 cannot be
-encrypted by the builder and `disk.sh` refuses `--luks` for it; the installer ISO can,
-through an Anaconda kickstart that `disk.sh` generates:
+`disk.sh --type iso` gives full-disk encryption **by default** (ADR-0017); `--no-luks`
+is the opt-out, `--luks` the explicit form, and the dry-run says which applies. The
+blueprint that bootc-image-builder consumes knows `plain`, `lvm` and `btrfs` partitions
+and nothing encrypted (`osbuild/blueprint`, `disk_customizations.go`), so a qcow2
+cannot be encrypted by the builder and `disk.sh` refuses `--luks` for it; the
+installer ISO can, through an Anaconda kickstart that `disk.sh` generates (a `--config`
+of your own carries its own partitioning, so no kickstart is generated next to it):
 
 ```text
 zerombr
@@ -275,8 +371,9 @@ reboot
 `autopart --encrypted` without `--passphrase` makes Anaconda ask for one during the
 installation, so no passphrase is ever written to a file (*unverified* until E-09; the
 generated file says so). bootc-image-builder refuses `[[customizations.user]]` next to a
-custom kickstart, which is why the user becomes a kickstart `user` line in this mode.
-At boot the passphrase is typed on the Plymouth surface.
+custom kickstart, which is why the user becomes a kickstart `user` line in this mode
+(`--no-luks --user` falls back to `[[customizations.user]]`). At boot the passphrase
+is typed on the Plymouth surface.
 
 ### Boot-testing in QEMU
 
@@ -450,8 +547,12 @@ image and its disks are for a VM or a PC, not for WSL2.
    `sysctl user.max_user_namespaces` (non-zero) and `bwrap --unshare-all -- true`.
 6. Verify the runtime: `ward selftest` should pass every group it passes on a Fedora
    development host; `ward doctor` (or `cat /var/lib/wardos/doctor.txt`) lists bubblewrap,
-   cgroups v2, user namespaces, `cargo` on `PATH`, `podman`.
+   cgroups v2, user namespaces, `cargo` on `PATH`, `podman`, and the ADR-0017 rows:
+   `node`, `agents` (the three versions), `keys` (a warning until `ward vault set
+   ANTHROPIC_API_KEY`), `firewall` (`firewalld active, default zone wardos`).
 7. `bootc status` shows the booted image and its digest. Record both in the E-09 result.
+   `systemctl list-timers bootc-fetch-apply-updates.timer` shows the next update check;
+   after one, a staged deployment appears in `bootc status` and the next boot runs it.
 
 Updates (`bootc upgrade`, which `wardos-update` wraps), switching between images, and
 rollback (`bootc rollback`: the previous deployment stays until the next upgrade, the
@@ -480,9 +581,11 @@ and, in `image.yml` on `main` and on pull requests that touch `image/`, `desktop
 crates or `Cargo.lock`: `image build` and `image build (aarch64)`, the real `docker
 build` with the checkout's binaries on a runner of each architecture, followed by a
 look inside (`/usr/bin/ward*`, `/usr/share/wardos`, the user preset, `/etc/xdg/hypr`,
-the enabled units, the Plymouth theme) and `bootc container lint`. It is the check that
-catches a package name that exists but conflicts (or exists for x86_64 only), a
-`dracut` flag that does not, or a desktop file the installer mishandles.
+the enabled units including the firewall and the update timer, the firewall's default
+zone, the three agent commands with their versions and `node --version`, the Plymouth
+theme) and `bootc container lint`. It is the check that catches a package name that
+exists but conflicts (or exists for x86_64 only), a `dracut` flag that does not, a
+lockfile that no longer installs, or a desktop file the installer mishandles.
 
 Locally:
 

@@ -3,23 +3,25 @@
 #
 #   image/disk.sh --type qcow2|iso [--image NAME] [--output DIR] [--rootfs FS]
 #                 [--arch x86_64|aarch64] [--user NAME [--password PW] [--ssh-key FILE]]
-#                 [--luks] [--config FILE] [--dry-run]
+#                 [--luks | --no-luks] [--config FILE] [--dry-run]
 #
 # Defaults: image localhost/wardos:<git describe --tags --always>, output ./image/out,
 # rootfs btrfs (ADR-0001), arch this machine's. --user writes a bootc-image-builder
 # config that creates the first user (wheel; the desktop's autologin expects `wardos`)
 # with --password (or WARDOS_PASSWORD in the environment, which keeps it out of `ps`)
-# and/or --ssh-key. --luks (iso only) asks Anaconda for full-disk encryption through a
-# kickstart, the passphrase typed at install time. --config passes your own TOML
-# instead. --arch names the disk's architecture (bootc-image-builder --target-arch; the
-# image must have been built for it): native on a matching host, which is how CI
-# builds the aarch64 disks, and experimental across (qcow2 only, needs qemu-user). Must
-# run as root: the builder is a privileged container that reads root's container
-# storage and writes the disk image. See image/README.md, "Users and LUKS".
+# and/or --ssh-key. The installer ISO encrypts the disk unless told --no-luks
+# (ADR-0017): a kickstart asks Anaconda for full-disk encryption, the passphrase typed
+# at install time. A qcow2 is never encrypted (the builder cannot; --luks on it is
+# refused). --config passes your own TOML instead. --arch names the disk's architecture
+# (bootc-image-builder --target-arch; the image must have been built for it): native on
+# a matching host, which is how CI builds the aarch64 disks, and experimental across
+# (qcow2 only, needs qemu-user). Must run as root: the builder is a privileged container
+# that reads root's container storage and writes the disk image. See image/README.md,
+# "Users and LUKS".
 set -euo pipefail
 
 usage() {
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -37,7 +39,8 @@ config=""
 user=""
 password=${WARDOS_PASSWORD:-}
 ssh_key=""
-luks=0
+# "" until the flags are read: the type's default (iso: on); 1 for --luks, 0 for --no-luks.
+luks=""
 dry_run=0
 
 while [[ $# -gt 0 ]]; do
@@ -61,6 +64,7 @@ while [[ $# -gt 0 ]]; do
     --ssh-key) ssh_key=$2; shift 2 ;;
     --ssh-key=*) ssh_key=${1#--ssh-key=}; shift ;;
     --luks) luks=1; shift ;;
+    --no-luks) luks=0; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) echo "disk.sh: unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -97,9 +101,14 @@ if [[ -n "$config" && ! -f "$config" ]]; then
   echo "disk.sh: config file not found: $config" >&2
   exit 1
 fi
-if [[ -n "$config" && ( -n "$user" || $luks -eq 1 ) ]]; then
+if [[ -n "$config" && ( -n "$user" || "$luks" == 1 ) ]]; then
   echo "disk.sh: --config carries its own users and partitioning; drop it or drop --user/--luks" >&2
   exit 2
+fi
+if [[ -z "$luks" ]]; then
+  # Encrypted by default where encryption is possible (ADR-0017): the installer ISO,
+  # unless a --config brings its own partitioning. --no-luks is the explicit opt-out.
+  if [[ "$type" == iso && -z "$config" ]]; then luks=1; else luks=0; fi
 fi
 if [[ -n "$ssh_key" && ! -f "$ssh_key" ]]; then
   echo "disk.sh: ssh key file not found: $ssh_key" >&2
@@ -183,6 +192,13 @@ if [[ -n "$config" ]]; then
 fi
 cmd+=("$image")
 
+if [[ "$type" == iso ]]; then
+  if [[ $luks -eq 1 ]]; then
+    echo "disk.sh: full-disk encryption on (the installer asks for the passphrase; --no-luks opts out)"
+  else
+    echo "disk.sh: full-disk encryption off"
+  fi
+fi
 printf 'disk.sh: would run (output in %s):\n  mkdir -p %q\n  ' "$output" "$output"
 printf '%q ' "${cmd[@]}"
 printf '\n'

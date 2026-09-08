@@ -17,6 +17,13 @@ cargo                 # the trusted verifier binds a host toolchain read-only in
 rust                  # (image/README.md: the one, temporary, toolchain exception)
 podman                # nested containers inside project environments (ADR-0005)
 
+# --- agents (ADR-0017: Claude Code, Codex and TamperWard ship in the image) ----------
+nodejs24              # runtime for the three (Fedora ships versioned streams, no plain `nodejs`; Claude Code needs Node >= 22, which the build checks)
+nodejs24-npm          # `npm ci` from image/agents/package-lock.json at build time; nothing installs at run time
+
+# --- security posture (ADR-0017) ----------------------------------------------------------
+firewalld             # host firewall, enabled, default zone `wardos` (nothing inbound); image/README.md "Security posture"
+
 # --- compositor and session ---------------------------------------------------------
 hyprland              # the compositor (ADR-0007) (COPR mineiro/hyprland)
 hyprlock              # lock screen (COPR mineiro/hyprland)

@@ -106,7 +106,8 @@ jobs:
         run: |
           set -euo pipefail
           args=(--type iso --arch "$ARCH" --image localhost/wardos:ci --user "$FIRST_USER" --output "$PWD/image/out")
-          if [[ "$LUKS" == "true" ]]; then args+=(--luks); fi
+          # disk.sh encrypts the ISO by default (ADR-0017); luks=false has to say so.
+          if [[ "$LUKS" == "true" ]]; then args+=(--luks); else args+=(--no-luks); fi
           sudo -E ./image/disk.sh "${args[@]}"
       - name: Name and checksum the disks
         run: |
