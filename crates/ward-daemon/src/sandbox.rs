@@ -28,6 +28,8 @@ pub struct Outcome {
     pub stderr: String,
     /// Wall-clock duration.
     pub duration: Duration,
+    /// The launch was killed because it outran its budget.
+    pub timed_out: bool,
 }
 
 /// Whether the sandbox actually works on this host.
@@ -140,6 +142,7 @@ pub struct Launch {
     shim: Option<PathBuf>,
     shim_flags: Vec<String>,
     stdio: StdioMode,
+    budget: Option<Duration>,
 }
 
 impl Launch {
@@ -157,6 +160,7 @@ impl Launch {
             shim: None,
             shim_flags: Vec::new(),
             stdio: StdioMode::Capture,
+            budget: None,
         }
     }
 
@@ -221,6 +225,13 @@ impl Launch {
     #[must_use]
     pub fn stdio(mut self, stdio: StdioMode) -> Self {
         self.stdio = stdio;
+        self
+    }
+
+    /// Kill the launch if it runs longer than this (verifier wall-clock budget).
+    #[must_use]
+    pub fn budget(mut self, budget: Duration) -> Self {
+        self.budget = Some(budget);
         self
     }
 
@@ -334,26 +345,58 @@ impl Launch {
                 Error::Sandbox(format!("failed to launch bwrap: {e}"))
             }
         };
-        let (code, stdout, stderr) = match self.stdio {
-            StdioMode::Capture => {
-                let out = cmd.output().map_err(launch_err)?;
-                (
-                    out.status.code(),
-                    String::from_utf8_lossy(&out.stdout).into_owned(),
-                    String::from_utf8_lossy(&out.stderr).into_owned(),
-                )
-            }
-            StdioMode::Inherit => {
-                let status = cmd.status().map_err(launch_err)?;
-                (status.code(), String::new(), String::new())
-            }
+        if self.stdio == StdioMode::Capture {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
+        let mut child = cmd.spawn().map_err(launch_err)?;
+        let stdout = child.stdout.take().map(drain);
+        let stderr = child.stderr.take().map(drain);
+        let (status, timed_out) = wait_within(&mut child, self.budget)?;
+        let collect = |h: Option<std::thread::JoinHandle<Vec<u8>>>| {
+            h.and_then(|h| h.join().ok())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
         };
         Ok(Outcome {
-            code,
-            stdout,
-            stderr,
+            code: status.and_then(|s| s.code()),
+            stdout: collect(stdout),
+            stderr: collect(stderr),
             duration: start.elapsed(),
+            timed_out,
         })
+    }
+}
+
+/// Read a child stream to the end on its own thread.
+fn drain<R: std::io::Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = r.read_to_end(&mut buf);
+        buf
+    })
+}
+
+/// Wait for `child`, killing it once `budget` elapses. Returns the exit status
+/// (`None` when killed) and whether the budget was exceeded.
+fn wait_within(
+    child: &mut std::process::Child,
+    budget: Option<Duration>,
+) -> Result<(Option<std::process::ExitStatus>, bool)> {
+    let wait_err = |e: std::io::Error| Error::Sandbox(format!("waiting for bwrap: {e}"));
+    let Some(budget) = budget else {
+        return Ok((Some(child.wait().map_err(wait_err)?), false));
+    };
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(status) = child.try_wait().map_err(wait_err)? {
+            return Ok((Some(status), false));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok((None, true));
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -470,6 +513,27 @@ mod tests {
             .find("--ro-bind /root/.cargo/bin /run/verifier/cargo/bin")
             .unwrap();
         assert!(tmpfs < bind);
+    }
+
+    #[test]
+    fn budget_kills_an_overrunning_launch() {
+        if !available() {
+            eprintln!("skipping: bubblewrap not available");
+            return;
+        }
+        let out = Launch::new("/tmp", vec!["sh".into(), "-c".into(), "sleep 5".into()])
+            .budget(Duration::from_millis(300))
+            .run()
+            .unwrap();
+        assert!(out.timed_out);
+        assert_eq!(out.code, None);
+        assert!(out.duration < Duration::from_secs(3), "{:?}", out.duration);
+        let ok = Launch::new("/tmp", vec!["sh".into(), "-c".into(), "echo fine".into()])
+            .budget(Duration::from_secs(5))
+            .run()
+            .unwrap();
+        assert!(!ok.timed_out);
+        assert_eq!(ok.stdout.trim(), "fine");
     }
 
     #[test]
