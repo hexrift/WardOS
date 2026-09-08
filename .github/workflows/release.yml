@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -75,3 +76,12 @@ jobs:
             gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
               --target "$GITHUB_SHA" --title "WardOS $TAG" --generate-notes
           fi
+      # The disks for this release. A release created with the workflow's own token
+      # does not fire other workflows' `release:` triggers (GitHub's rule for
+      # GITHUB_TOKEN events, workflow_dispatch excepted), so the disk workflow is
+      # dispatched here and attaches the qcow2 and ISO to the release itself.
+      - name: Build and attach the disks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh workflow run disk.yml --ref "$GITHUB_REF_NAME" -f type=both -f source=release -f "release=$TAG" -f user=wardos -f luks=false

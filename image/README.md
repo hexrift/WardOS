@@ -205,7 +205,7 @@ Five binaries: `ward`, `wardd`, `ward-agent` (required; the build fails without 
 The builder stage compiles all five (`desktop/shell`, `desktop/theme` are workspace
 crates); the release stage copies the last two when the tarball has them, which
 release tarballs from **v0.2** do (`release.yml` packages five from now on)
-and v0.1.1 does not: an image built from v0.1.1 has the desktop's packages and
+and earlier releases do not: an image built from one has the desktop's packages and
 configuration but no shell surfaces, and `ls -l /usr/bin/ward*` in the build log says
 which arrived. The Rust image is Debian-based; its glibc is older than Fedora 44's, so
 the binaries run on the host without a rebuild.

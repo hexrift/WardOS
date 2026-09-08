@@ -91,8 +91,10 @@ jobs:
           path: dist/
           compression-level: 6
           retention-days: 14
+      # On a `release:` event, or when dispatched for a release tag (the release
+      # workflow does that, since a release it creates cannot fire this trigger).
       - name: "Attach to the release (compressed: assets are capped at 2 GiB)"
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || (env.SOURCE == 'release' && env.RELEASE != '')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -101,7 +103,7 @@ jobs:
           cd dist
           for f in *.qcow2 *.iso; do [[ -f "$f" ]] && zstd -T0 -12 --rm "$f"; done
           sha256sum ./* > SHA256SUMS
-          gh release upload "${{ github.event.release.tag_name }}" ./* --clobber
+          gh release upload "$RELEASE" ./* --clobber
 
   # Whether the same desktop could be built for Apple silicon: do the COPRs the image
   # depends on build for aarch64? Informational; the answer goes to image/README.md.
