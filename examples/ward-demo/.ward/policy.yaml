@@ -1,0 +1,13 @@
+# WardOS capability policy for this project (narrows the user default).
+# See docs/security-model.md section 3.
+filesystem:
+  worktree: write
+  host: deny
+network:
+  mode: localhost-only     # the demo needs no network; the agent should not reach out
+credentials:
+  github: deny
+  aws-production: deny
+containers: none
+observer:
+  default: live
