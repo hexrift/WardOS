@@ -191,9 +191,10 @@ rollback. What the image holds today:
   `wardos-welcome` for the first login. CI parses the Hyprland tree with the compositor
   the image ships, so a renamed option fails a pull request instead of a boot.
 * **Security posture.** LUKS by default on the installer ISO, a firewall that admits
-  nothing inbound, timed image updates, every package name checked against Fedora 44
-  before the image is built, and nothing in the image is fetched by `curl | sh` at
-  build time.
+  nothing inbound, timed image updates, no compiler on the host (a Rust toolchain for
+  `ward verify` lives in the user's home, `wardos-install dev rust`), one browser,
+  every package name checked against Fedora 44 before the image is built, and nothing
+  in the image is fetched by `curl | sh` at build time.
 * **Agent-first onboarding** ([ADR-0017](docs/decisions/ADR-0017-agent-first-image.md)):
   `wardos-welcome` walks the first login through theme, key, project and agent;
   `ward init`, `ward vault` and `ward doctor` are the same path on any Linux; the

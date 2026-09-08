@@ -390,19 +390,36 @@ fn companions() -> Check {
 }
 
 fn toolchain() -> Check {
-    if verify::Toolchains::detect().has_rust() {
-        Check::new(
+    toolchain_check(
+        verify::Toolchains::detect().has_rust(),
+        which("rustup-init").as_deref(),
+    )
+}
+
+/// The verifier's toolchain row. The host image has no compiler (ADR-0001); a Rust
+/// toolchain is per user, installed by rustup into `~/.rustup` and `~/.cargo`, which
+/// the verifier binds read-only. `installer` is `rustup-init` on `PATH` (the image's
+/// `rustup` package), so the fix names what is there.
+fn toolchain_check(has_rust: bool, installer: Option<&Path>) -> Check {
+    if has_rust {
+        return Check::new(
             "verifier toolchain",
             Status::Ok,
             "Rust toolchain found (~/.rustup, ~/.cargo)",
-        )
-    } else {
-        Check::new(
-            "verifier toolchain",
-            Status::Warn,
-            "no Rust toolchain for the verifier; `ward verify` can run only commands from the base system",
-        )
+        );
     }
+    let rustup = installer.map_or_else(
+        || "not installed, the image's `rustup` package ships it".to_owned(),
+        |p| p.display().to_string(),
+    );
+    Check::new(
+        "verifier toolchain",
+        Status::Warn,
+        format!(
+            "toolchain: none (rustup: {rustup}); `wardos-install dev rust` (or `rustup-init -y --no-modify-path`) \
+             installs one into ~/.rustup and ~/.cargo for `ward verify`; until then it runs only commands from the base system"
+        ),
+    )
 }
 
 fn tool(name: &'static str, required: bool) -> Check {
@@ -606,6 +623,20 @@ mod tests {
         assert!(c.detail.contains("unprivileged_userns_clone=1"));
         assert_eq!(userns_policy(Some("0"), Some("1")).status, Status::Ok);
         assert_eq!(userns_policy(None, None).status, Status::Ok);
+    }
+
+    #[test]
+    fn toolchain_row_names_rustup_and_the_fix() {
+        let c = toolchain_check(false, Some(Path::new("/usr/bin/rustup-init")));
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.detail
+                .starts_with("toolchain: none (rustup: /usr/bin/rustup-init)")
+        );
+        assert!(c.detail.contains("wardos-install dev rust"));
+        let c = toolchain_check(false, None);
+        assert!(c.detail.contains("rustup: not installed"));
+        assert_eq!(toolchain_check(true, None).status, Status::Ok);
     }
 
     #[test]

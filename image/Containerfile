@@ -10,8 +10,9 @@
 #                             the Plymouth theme.
 #
 # Nothing here fetches code over the network at build time except dnf from the Fedora
-# repositories, cargo from crates.io (locked to Cargo.lock) and the release tarball
-# (checked against its recorded SHA-256). No secrets, no `curl | sh`.
+# repositories, cargo from crates.io (locked to Cargo.lock, in the builder stage only:
+# the host has no compiler, ADR-0001) and the release tarball (checked against its
+# recorded SHA-256). No secrets, no `curl | sh`.
 # Build with image/build.sh; turn into a disk with image/disk.sh; see image/README.md.
 
 # ---------------------------------------------------------------------------------------
@@ -119,17 +120,35 @@ LABEL org.wardos.version="${WARDOS_VERSION}" \
 COPY image/coprs.txt image/packages.txt /tmp/
 # install_weak_deps=False: only what the manifest names, none of the "recommended"
 # extras (a smaller image, and every package in it is one somebody wrote down).
-# The dnf cache is a cache mount too: downloaded RPMs and metadata are reused by the
-# next build and never enter the image, which is why there is no `dnf clean all`
-# (hadolint DL3040 asks for one; the mount makes it moot). `sharing=locked` serialises
-# concurrent builds on the same cache.
+# Locales (image/README.md "Size"): the rpm macro `_install_langs` is read by rpm as
+# each package is unpacked, so it is written before the install and stays in the image
+# (a later `rpm-ostree install` layers English-only too); it keeps a package's
+# `%lang`-tagged files for en_US and en (translations, Chromium's locale packs) and
+# drops the other languages'. glibc's own locales are separate packages:
+# glibc-langpack-en is in the manifest and glibc-all-langpacks, when the base image
+# carries it, goes (the 200 MB locale archive; C.UTF-8 is built into glibc). The build
+# then proves en_US.UTF-8 exists, so a macro that filtered too much fails here, not on
+# a booted machine; and that no compiler and no second browser slipped in as a
+# dependency. The dnf cache is a cache mount too: downloaded RPMs and metadata are
+# reused by the next build and never enter the image, which is why there is no `dnf
+# clean all` (hadolint DL3040 asks for one; the mount makes it moot). `sharing=locked`
+# serialises concurrent builds on the same cache.
 # hadolint ignore=DL3040
 RUN --mount=type=cache,target=/var/cache/libdnf5,sharing=locked \
-    dnf -y install dnf5-plugins \
+    echo '%_install_langs en_US:en' >/etc/rpm/macros.image-language-conf \
+    && dnf -y install dnf5-plugins \
     && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/coprs.txt \
        | while read -r copr; do echo "copr enable $copr"; dnf -y copr enable "$copr" || exit 1; done \
     && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/packages.txt \
        | xargs dnf -y --setopt=install_weak_deps=False --setopt=keepcache=True install \
+    && if rpm -q glibc-all-langpacks >/dev/null 2>&1; then \
+         dnf -y --setopt=clean_requirements_on_remove=False remove glibc-all-langpacks; \
+       fi \
+    && rpm -q glibc-langpack-en && locale -a | grep -i '^en_US.utf8$' \
+    && for absent in rust cargo gcc firefox glibc-all-langpacks; do \
+         if rpm -q "$absent" >/dev/null 2>&1; then echo "$absent is in the image (image/README.md \"Size\")" >&2; exit 1; fi; \
+       done \
+    && du -sh /usr/lib/locale /usr/share/locale /usr/share/fonts \
     && rm -f /tmp/packages.txt /tmp/coprs.txt
 
 # The host binaries: ward, wardd, ward-agent (required), ward-shell and

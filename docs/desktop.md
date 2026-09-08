@@ -143,7 +143,10 @@ argument does system, flatpaks and themes, never configs, which replace the user
 copies and are refreshed only on request. `wardos-install font` copies `.ttf`/`.otf`
 files into `~/.local/share/fonts` (choosing one is `wardos-font set`), `service
 tailscale` only enables an installed `tailscaled` because Tailscale is not in Fedora,
-and `package` says that a layered RPM belongs in `image/packages.txt`.
+`dev rust` installs a Rust toolchain into `~/.rustup` and `~/.cargo` with the image's
+`rustup-init` (the host has no compiler, ADR-0001; the verifier binds this one, and
+`ward doctor` names the command until it has run; repeating it only sets the default
+channel), and `package` says that a layered RPM belongs in `image/packages.txt`.
 
 ## Menu
 
@@ -290,10 +293,16 @@ the COPRs and installs from the manifest, and `desktop/install.sh` layers the sa
 packages" on every pull request) and builds the whole image with `docker build`
 (`image.yml`, job "image build", on `main` and on pull requests that touch `image/`,
 `desktop/` or the crates). A name the check has not confirmed yet carries
-`# unverified` until it has (none today); the check, not the file, decides. Applications that are not in Fedora
+`# unverified` until it has; the check, not the file, decides. Applications that are not in Fedora
 come from Flathub via `wardos-install app` and the defaults in `desktop/flatpaks.txt`,
 installed once by `wardos-flathub.service` after the first boot with a network; nothing
-is downloaded by `curl | sh`. `mise` is not in Fedora and not in the image.
+is downloaded by `curl | sh`. `mise` is not in Fedora and not in the image. The list is
+kept to what the desktop renders (`image/README.md` "Size"): one browser, Chromium,
+which is also the web-app engine (Firefox is `wardos-install app org.mozilla.firefox`
+and its window lands on the web workspace like Chromium's); no compiler (`rustup` ships
+the installer, `wardos-install dev rust` runs it); the fonts every component names,
+Inter and JetBrains Mono, with DejaVu, one CJK variable font and one colour emoji font
+as fallbacks; and the `en_US` locale.
 
 ## Tests
 
@@ -348,7 +357,7 @@ command, key and test exist on `main`.
 | Power profiles | `wardos-setup power` | ✔ `wardos-setup power [profile]` (powerprofilesctl); `setup.test.sh` |
 | Fingerprint, FIDO2 | `wardos-setup fingerprint\|fido2` | ✔ fprintd-enroll / pamu2fcfg, then `sudo authselect enable-feature`; `setup.test.sh` |
 | Printers, DNS, timezone | `wardos-setup printers\|dns\|timezone` | ✔ system-config-printer or CUPS in the browser; nmcli on the active connection; timedatectl; `setup.test.sh` |
-| Install packages / AUR | `wardos-install app` (Flathub), `package` (bootc layer) | ✔ `wardos-install app\|package\|webapp\|tui\|theme\|font\|dev\|service`, `wardos-remove` the same; `install.test.sh`, `remove.test.sh` |
+| Install packages / AUR | `wardos-install app` (Flathub), `package` (bootc layer) | ✔ `wardos-install app\|package\|webapp\|tui\|theme\|font\|dev\|service` (`dev rust` = rustup into the home, the verifier's toolchain), `wardos-remove` the same; `wardos-install.test.sh`, `remove.test.sh` |
 | Dev environments (mise) | `wardos-install dev <lang>` | ✔ `mise use -g <lang>@latest`, a clear message without mise; `install.test.sh` |
 | Docker + lazydocker | podman, podman-compose, podman-tui | |
 | Terminal (Alacritty/Ghostty), bash, prompt, aliases | foot default, alacritty shipped, `config/bash` | ✔ `config/foot`, `config/alacritty`, `config/bash` (prompt tested in `configs.test.sh`) |
