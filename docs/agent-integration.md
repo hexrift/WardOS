@@ -90,7 +90,11 @@ records each call as `AgentClaim{ToolUse}` (`TOOL` row: `PreToolUse Write
 the manifest's observer mode: `quiet`/`live` always allow; `step_through` answers
 `ask` before writes (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`) when
 `pause_before_writes` is set and before `WebFetch`/`WebSearch` when
-`pause_before_network` is set. The hold itself is the agent's own permission prompt:
+`pause_before_network` is set. Before any of that, a `Write`/`Edit` on a path listed
+under `protected.tests` in the entry snapshot's `.tamperward/config.yml` is answered
+`deny` with `protected by TamperWard policy: tests` (Bash is not inspected; the
+verifier's pristine overlay is the real guard). The hold itself is the agent's own
+permission prompt:
 the step-through UX rides on Claude Code's terminal, which is why this is best-effort
 (event-model §7). An unreachable socket or a malformed answer makes the client print
 nothing and exit 0: the outer layers are what hold. Codex has no hook layer; it gets

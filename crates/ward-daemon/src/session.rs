@@ -15,8 +15,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use ward_events::{
     AgentIdentity, AgentKind, AgentState, BoundedArgv, BoundedText, Chain, EndReason, EventRecord,
-    ExitStatus, FileChangeKind, FsyncPolicy, LogWriter, NameText, Origin, Pid, ProcessRef,
-    SandboxPath, SandboxRoot, Timestamp, WardEvent,
+    ExitStatus, FileChangeKind, FsyncPolicy, ImageDigest, LogWriter, NameText, Origin, Pid,
+    ProcessRef, SandboxPath, SandboxRoot, ShortText, StepStatus, Timestamp, VerifyRequester,
+    VerifySummary, WardEvent,
 };
 use ward_policy::{CapabilityManifest, NetworkCapability, ObserverMode, Policy, merge};
 use ward_snapshot::{CaptureOptions, SnapshotRole, SnapshotStore};
@@ -27,6 +28,7 @@ use crate::gateway::Gateway;
 use crate::hooks::Hooks;
 use crate::ids::{ev_hash, ev_snapshot, new_session_id, project_id_for};
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
+use crate::verify;
 use crate::watch::{CaptureMode, Captured, Watcher};
 
 /// A live WardOS session over one project.
@@ -110,6 +112,26 @@ pub struct RunReport {
     pub stdout: String,
     /// Captured stderr.
     pub stderr: String,
+}
+
+/// What `ward verify` reports.
+#[derive(Clone, Debug)]
+pub struct VerifyReport {
+    /// Candidate snapshot id.
+    pub candidate: String,
+    /// Whether the trusted verifier passed.
+    pub passed: bool,
+    /// Parsed counts.
+    pub summary: VerifySummary,
+    /// Protected paths the verifier took from the entry snapshot instead of the worktree.
+    pub restored: Vec<String>,
+    /// The verifier's combined output.
+    pub output: String,
+}
+
+/// Identity of the 0.1 verifier: a namespace sandbox on this host, not an image.
+fn verifier_image() -> ImageDigest {
+    ImageDigest::from_bytes(*blake3::hash(b"ward-verifier/namespace/0.1").as_bytes())
 }
 
 /// Options for [`Session::launch`].
@@ -263,6 +285,26 @@ impl Session {
         &self.manifest
     }
 
+    /// Paths `TamperWard` protects (`protected.tests` in `.tamperward/config.yml`),
+    /// read from the *entry* snapshot so a worktree edit cannot lift them; empty
+    /// when the file or key is absent.
+    #[must_use]
+    pub fn protected_paths(&self) -> Vec<String> {
+        let yaml = SnapshotStore::open(self.state.join("cas"))
+            .ok()
+            .zip(
+                self.entry_snapshot
+                    .parse::<ward_snapshot::SnapshotId>()
+                    .ok(),
+            )
+            .and_then(|(store, entry)| store.cat(entry, Path::new(verify::CONFIG_PATH)).ok());
+        yaml.and_then(|bytes| {
+            serde_yaml::from_str::<verify::Config>(&String::from_utf8_lossy(&bytes)).ok()
+        })
+        .map(|c| c.protected.tests)
+        .unwrap_or_default()
+    }
+
     /// The entry snapshot id (`blake3:…`).
     pub fn entry_snapshot(&self) -> &str {
         &self.entry_snapshot
@@ -396,7 +438,7 @@ impl Session {
             &self.manifest.network,
             opts.gateways.iter().map(|g| g.route.clone()).collect(),
         )?;
-        let hooks = Hooks::start(&run_dir, self.manifest.observer)?;
+        let hooks = Hooks::start(&run_dir, self.manifest.observer, self.protected_paths())?;
         let launch = self.prepare(argv, opts, &run_dir, &egress, &hooks)?;
         let outcome = launch.run()?;
 
@@ -493,6 +535,85 @@ impl Session {
             launch = launch.stdio(StdioMode::Inherit);
         }
         Ok(launch)
+    }
+
+    /// Verify the worktree in a disposable verifier (`verify.rs`) and record the run:
+    /// the candidate snapshot, the start with the pristine id and config hash, one
+    /// progress step per restored protected path and one for the command, then the
+    /// pass or fail with the parsed summary and the output hash.
+    pub fn verify(&mut self) -> Result<VerifyReport> {
+        let store = SnapshotStore::open(self.state.join("cas"))
+            .map_err(|e| Error::Snapshot(e.to_string()))?;
+        let entry: ward_snapshot::SnapshotId = self
+            .entry_snapshot
+            .parse()
+            .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
+        let scratch_root = run_dir(&self.session_str)?;
+        let prepared = verify::prepare(&store, &self.worktree, entry, &scratch_root)?;
+        let candidate = ev_snapshot(prepared.candidate);
+        self.emit(
+            Origin::User,
+            WardEvent::VerificationRequested {
+                candidate,
+                requested_by: VerifyRequester::User,
+            },
+        )?;
+        self.emit(
+            Origin::Verifier,
+            WardEvent::VerificationStarted {
+                candidate,
+                pristine: ev_snapshot(entry),
+                verifier_image: verifier_image(),
+                manifest_hash: ev_hash(prepared.manifest_hash),
+            },
+        )?;
+        for rel in &prepared.restored {
+            self.emit(
+                Origin::Verifier,
+                WardEvent::VerificationProgress {
+                    step: ShortText::new(&format!("restore {rel}")),
+                    status: StepStatus::Pass,
+                },
+            )?;
+        }
+        let outcome = verify::execute(&prepared);
+        let _ = std::fs::remove_dir_all(&prepared.scratch);
+        let _ = std::fs::remove_dir(&scratch_root);
+        let outcome = outcome?;
+        let status = if outcome.passed {
+            StepStatus::Pass
+        } else {
+            StepStatus::Fail
+        };
+        self.emit(
+            Origin::Verifier,
+            WardEvent::VerificationProgress {
+                step: ShortText::new(&prepared.config.verify.command),
+                status,
+            },
+        )?;
+        let result_hash = ev_hash(outcome.result_hash);
+        let event = if outcome.passed {
+            WardEvent::VerificationPassed {
+                candidate,
+                summary: outcome.summary,
+                result_hash,
+            }
+        } else {
+            WardEvent::VerificationFailed {
+                candidate,
+                summary: outcome.summary,
+                result_hash,
+            }
+        };
+        self.emit(Origin::Verifier, event)?;
+        Ok(VerifyReport {
+            candidate: candidate.to_string(),
+            passed: outcome.passed,
+            summary: outcome.summary,
+            restored: prepared.restored,
+            output: outcome.output,
+        })
     }
 
     /// End the session, seal the log, and clear the project's current pointer.

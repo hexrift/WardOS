@@ -25,9 +25,10 @@ pub mod render;
 pub mod sandbox;
 pub mod selftest;
 pub mod session;
+pub mod verify;
 pub mod watch;
 
 pub use error::{Error, Result};
 pub use selftest::{ProbeResult, selftest, selftest_credentials};
-pub use session::{RunReport, Session, SessionMeta};
+pub use session::{RunReport, Session, SessionMeta, VerifyReport};
 pub use watch::CaptureMode;

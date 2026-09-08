@@ -69,7 +69,7 @@ pub fn status_panel(
     row(
         &mut s,
         "Verifier",
-        &format!("{DIM}isolated (phase 4){RESET}"),
+        &format!("{DIM}disposable namespace · no network · protected tests from entry{RESET}"),
     );
     s
 }
@@ -155,6 +155,50 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
             format!("{service} → {} (proxy-injected)", scope.subject.as_str()),
         ),
         WardEvent::AgentClaim { kind, payload } => (claim_verb(*kind), DIM, payload.to_string()),
+        WardEvent::VerificationRequested { candidate, .. } => (
+            "VERIFY",
+            ACCENT,
+            format!("candidate {}", short_hex(&candidate.to_string())),
+        ),
+        WardEvent::VerificationStarted {
+            candidate,
+            pristine,
+            ..
+        } => (
+            "VERIFY",
+            ACCENT,
+            format!(
+                "trusted verifier started · pristine {} · candidate {}",
+                short_hex(&pristine.to_string()),
+                short_hex(&candidate.to_string())
+            ),
+        ),
+        WardEvent::VerificationProgress { step, status } => {
+            ("STEP", step_color(*status), step.to_string())
+        }
+        WardEvent::VerificationPassed {
+            candidate, summary, ..
+        } => (
+            "PASS",
+            OK,
+            format!(
+                "✓ VERIFIED · {} tests · candidate {}",
+                summary.tests_run,
+                short_hex(&candidate.to_string())
+            ),
+        ),
+        WardEvent::VerificationFailed {
+            candidate, summary, ..
+        } => (
+            "FAIL",
+            DENY,
+            format!(
+                "verification failed · {}/{} tests failed · candidate {}",
+                summary.tests_failed,
+                summary.tests_run,
+                short_hex(&candidate.to_string())
+            ),
+        ),
         WardEvent::SessionEnded { .. } => ("END", DIM, "session".to_string()),
         _ => return None,
     };
@@ -172,6 +216,51 @@ fn change_verb(kind: ward_events::FileChangeKind) -> &'static str {
         K::Rename => "MOVE",
         K::Chmod => "MODE",
         K::Symlink => "LINK",
+    }
+}
+
+/// The `ward verify` summary block: what was restored, the verdict, and on failure
+/// the tail of the verifier's output.
+#[must_use]
+pub fn verify_report(r: &crate::session::VerifyReport) -> String {
+    let mut s = format!(
+        "{ACCENT}WARD{RESET} {INK}verify{RESET}  {DIM}candidate {}{RESET}\n",
+        short_hex(&r.candidate)
+    );
+    for rel in &r.restored {
+        let _ = writeln!(
+            s,
+            "  {WARN}restored{RESET} {INK}{rel}{RESET} {DIM}(pristine copy; worktree edit ignored){RESET}"
+        );
+    }
+    if r.passed {
+        let _ = writeln!(
+            s,
+            "  {OK}✓ VERIFIED{RESET} {DIM}· {} tests · {:.1}s{RESET}",
+            r.summary.tests_run,
+            r.summary.duration.as_secs_f64()
+        );
+    } else {
+        let _ = writeln!(
+            s,
+            "  {DENY}✗ VERIFICATION FAILED{RESET} {DIM}· {}/{} tests failed · {:.1}s{RESET}",
+            r.summary.tests_failed,
+            r.summary.tests_run,
+            r.summary.duration.as_secs_f64()
+        );
+        let tail: Vec<&str> = r.output.lines().rev().take(12).collect();
+        for line in tail.iter().rev() {
+            let _ = writeln!(s, "    {DIM}{line}{RESET}");
+        }
+    }
+    s
+}
+
+fn step_color(status: ward_events::StepStatus) -> &'static str {
+    match status {
+        ward_events::StepStatus::Running => DIM,
+        ward_events::StepStatus::Pass => OK,
+        ward_events::StepStatus::Fail => DENY,
     }
 }
 
