@@ -22,3 +22,4 @@ Performance consequences · Why selected · How it will be validated
 | [0011](ADR-0011-event-capture.md) | Event capture: eBPF exec + fanotify + proxy log; hooks are claims | Accepted, pending E-05 |
 | [0012](ADR-0012-observer.md) | Observer: TUI first, shared event API, Ward Shell panel later | Accepted |
 | [0013](ADR-0013-phase1-runtime.md) | Phase 1 runtime: in-process session, bubblewrap backend, bridged ids | Accepted |
+| [0014](ADR-0014-sandbox-egress-relay.md) | Sandbox egress: proxy over a bind-mounted Unix socket with an in-sandbox relay | Accepted |
