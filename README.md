@@ -70,7 +70,8 @@ counters) or as plain rows on a pipe. Without a daemon, every command still work
 ![A daemon-backed session: ward up spawns wardd, a producer and a TamperWard evidence record write through the control socket, and ward watch streams every row live until the session ends](assets/ward-watch.png)
 
 ```bash
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | bash   # or: cargo build --release
+ward doctor                         # what this host can give a session, with a fix per gap
 ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
 ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live observer
 ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stays on the host
@@ -147,6 +148,7 @@ of the experiments that gate each phase.
 | [`docs/event-model.md`](docs/event-model.md) | The typed Ward event model, evidence chain, observer and replay |
 | [`docs/credential-broker.md`](docs/credential-broker.md) | How agents obtain scoped, short-lived credentials without seeing long-lived secrets |
 | [`docs/tamperward-integration.md`](docs/tamperward-integration.md) | The OS-level primitives WardOS exposes to TamperWard |
+| [`docs/install.md`](docs/install.md) | Install on an existing Linux host, requirements, first session |
 | [`docs/agent-integration.md`](docs/agent-integration.md) | How `ward claude` / `ward codex` compose the sandbox, proxy, credentials and hooks |
 | [`docs/design-language.md`](docs/design-language.md) | Visual and interaction identity of the WardOS desktop |
 | [`docs/performance.md`](docs/performance.md) | Latency budgets, benchmark methodology, CI regression gates |

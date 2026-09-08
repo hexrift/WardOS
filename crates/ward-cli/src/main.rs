@@ -97,6 +97,8 @@ enum Command {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
     },
+    /// Check what this host can give a session, with a fix for each gap.
+    Doctor,
     /// Run the isolation self-tests against a real sandbox.
     Selftest {
         /// Project directory (default: current).
@@ -287,6 +289,15 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         } => cmd_agent(&dir.unwrap_or_else(cwd), "codex", &args, &pass_env, &grant),
         Command::Stop { dir } => cmd_stop(&dir.unwrap_or_else(cwd)),
         Command::Verify { dir } => cmd_verify(&dir.unwrap_or_else(cwd)),
+        Command::Doctor => {
+            let checks = ward_daemon::doctor::run();
+            print!("{}", render::doctor_panel(&checks));
+            Ok(if ward_daemon::doctor::healthy(&checks) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
         Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
         Command::Replay { log, verify, json } => {
             let report = replay::replay(&log, replay::Options { verify, json })?;
