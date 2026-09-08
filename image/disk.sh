@@ -2,21 +2,24 @@
 # Turn a built WardOS image into a bootable disk with bootc-image-builder.
 #
 #   image/disk.sh --type qcow2|iso [--image NAME] [--output DIR] [--rootfs FS]
-#                 [--user NAME [--password PW] [--ssh-key FILE]] [--luks]
-#                 [--config FILE] [--dry-run]
+#                 [--arch x86_64|aarch64] [--user NAME [--password PW] [--ssh-key FILE]]
+#                 [--luks] [--config FILE] [--dry-run]
 #
 # Defaults: image localhost/wardos:<git describe --tags --always>, output ./image/out,
-# rootfs btrfs (ADR-0001). --user writes a bootc-image-builder config that creates the
-# first user (wheel; the desktop's autologin expects `wardos`) with --password (or
-# WARDOS_PASSWORD in the environment, which keeps it out of `ps`) and/or --ssh-key.
-# --luks (iso only) asks Anaconda for full-disk encryption through a kickstart, the
-# passphrase typed at install time. --config passes your own TOML instead. Must run as
-# root: the builder is a privileged container that reads root's container storage and
-# writes the disk image. See image/README.md, "Users and LUKS".
+# rootfs btrfs (ADR-0001), arch this machine's. --user writes a bootc-image-builder
+# config that creates the first user (wheel; the desktop's autologin expects `wardos`)
+# with --password (or WARDOS_PASSWORD in the environment, which keeps it out of `ps`)
+# and/or --ssh-key. --luks (iso only) asks Anaconda for full-disk encryption through a
+# kickstart, the passphrase typed at install time. --config passes your own TOML
+# instead. --arch names the disk's architecture (bootc-image-builder --target-arch; the
+# image must have been built for it): native on a matching host, which is how CI
+# builds the aarch64 disks, and experimental across (qcow2 only, needs qemu-user). Must
+# run as root: the builder is a privileged container that reads root's container
+# storage and writes the disk image. See image/README.md, "Users and LUKS".
 set -euo pipefail
 
 usage() {
-  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -29,6 +32,7 @@ type=""
 image=""
 output="$repo_root/image/out"
 rootfs="btrfs"
+arch=""
 config=""
 user=""
 password=${WARDOS_PASSWORD:-}
@@ -46,6 +50,8 @@ while [[ $# -gt 0 ]]; do
     --output=*) output=${1#--output=}; shift ;;
     --rootfs) rootfs=$2; shift 2 ;;
     --rootfs=*) rootfs=${1#--rootfs=}; shift ;;
+    --arch) arch=$2; shift 2 ;;
+    --arch=*) arch=${1#--arch=}; shift ;;
     --config) config=$2; shift 2 ;;
     --config=*) config=${1#--config=}; shift ;;
     --user) user=$2; shift 2 ;;
@@ -69,6 +75,22 @@ esac
 
 if [[ -z "$image" ]]; then
   image="localhost/wardos:$(git describe --tags --always 2>/dev/null || echo dev)"
+fi
+
+# The disk's architecture, in bootc-image-builder's spelling (amd64, arm64). On a host
+# of that architecture the flag changes nothing; on another it is the builder's
+# experimental cross path (qemu-user, no ISO: "cannot build iso for different target
+# arches yet"), so the ISO is refused here with the reason rather than deep in the run.
+target_arch=()
+case "$arch" in
+  "") ;;
+  x86_64) target_arch=(--target-arch amd64) ;;
+  aarch64) target_arch=(--target-arch arm64) ;;
+  *) echo "disk.sh: --arch must be x86_64 or aarch64 (got '$arch')" >&2; exit 2 ;;
+esac
+if [[ -n "$arch" && "$arch" != "$(uname -m)" && "$type" == iso ]]; then
+  echo "disk.sh: bootc-image-builder cannot build an ISO for another architecture; build the $arch ISO on an $arch host (CI's disk workflow does)" >&2
+  exit 2
 fi
 
 if [[ -n "$config" && ! -f "$config" ]]; then
@@ -154,7 +176,8 @@ if [[ -n "$config" ]]; then
 fi
 cmd+=("$builder"
   --type "$type"
-  --rootfs "$rootfs")
+  --rootfs "$rootfs"
+  "${target_arch[@]}")
 if [[ -n "$config" ]]; then
   cmd+=(--config /config.toml)
 fi

@@ -21,19 +21,38 @@
 # checkout instead (development images, the "image build" CI job).
 ARG WARDOS_SOURCE=release
 ARG WARDOS_RELEASE=v0.2.0
+# One checksum per architecture the release ships: WARDOS_SHA256 is the x86_64
+# tarball's, WARDOS_SHA256_AARCH64 the aarch64 one's (empty here: v0.2.0 has no aarch64
+# tarball; releases from v0.3 carry both, and build.sh fetches the one for --arch).
 ARG WARDOS_SHA256=d67a13e5d7523b007b4d4112a8bfb1335359421daedb29f40b475cda56f6433f
+ARG WARDOS_SHA256_AARCH64=
 
 # Stage 1a: a published release. The three host binaries are required; ward-shell and
 # wardos-theme-render are copied when the tarball has them (release tarballs from v0.2
 # carry both; earlier ones do not, and an image built from one has no shell surfaces).
-FROM docker.io/library/alpine:3.20 AS release
+# The tarball is the one for the platform being built (`--platform linux/arm64` gives
+# TARGETARCH=arm64, hence the aarch64 tarball); the stage itself runs on the build
+# host's platform, since it only downloads and checks, and nothing here needs emulating.
+FROM --platform=$BUILDPLATFORM docker.io/library/alpine:3.20 AS release
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 ARG WARDOS_RELEASE
 ARG WARDOS_SHA256
+ARG WARDOS_SHA256_AARCH64
+ARG TARGETARCH
 WORKDIR /out
-RUN name="wardos-${WARDOS_RELEASE#v}-x86_64-linux" \
+RUN case "${TARGETARCH:-$(uname -m)}" in \
+      amd64 | x86_64) arch=x86_64; sha="${WARDOS_SHA256}" ;; \
+      arm64 | aarch64) arch=aarch64; sha="${WARDOS_SHA256_AARCH64}" ;; \
+      *) echo "no WardOS release tarball for TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && if [ -z "$sha" ]; then \
+         echo "no checksum for the ${arch} tarball of ${WARDOS_RELEASE}: pass --build-arg" \
+              "WARDOS_SHA256_AARCH64 (image/build.sh --arch does) or build with WARDOS_SOURCE=builder" >&2; \
+         exit 1; \
+       fi \
+    && name="wardos-${WARDOS_RELEASE#v}-${arch}-linux" \
     && wget -q "https://github.com/hexrift/WardOS/releases/download/${WARDOS_RELEASE}/${name}.tar.gz" \
-    && echo "${WARDOS_SHA256}  ${name}.tar.gz" | sha256sum -c - \
+    && echo "${sha}  ${name}.tar.gz" | sha256sum -c - \
     && tar -xzf "${name}.tar.gz" \
     && mv "${name}/ward" "${name}/wardd" "${name}/ward-agent" /out/ \
     && for optional in ward-shell wardos-theme-render; do \
