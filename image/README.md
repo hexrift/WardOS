@@ -362,6 +362,58 @@ The tools and the image therefore have separate cadences: `vX.Y.Z` tags release 
 tools; images carry the release they embed in `org.wardos.version` plus the build's
 `git describe`, and are tagged by date when published (`wardos:2026.09`).
 
+## Three kinds of image: which one, and the one that erases a disk
+
+`image/disk.sh --type` produces three different things. They are not interchangeable,
+and one of them reformats a disk, so pick by what you want to do:
+
+| `--type` | What it is | What it touches | Use it to |
+| --- | --- | --- | --- |
+| `qcow2` | a virtual-machine disk | nothing on your real machine | try WardOS in QEMU (or UTM on a Mac), a window on top of your current OS |
+| `raw` | a whole-disk image you write to a **USB stick** | only the USB; boots the machine from the stick and leaves the internal disk alone | try WardOS on real hardware without installing it |
+| `iso` | an **installer** (Anaconda) | **erases and reformats the target machine's internal disk** | give a machine over to WardOS for good |
+
+**The `iso` installs. It is not a "try it" image.** Booting it and proceeding past the
+first screen wipes the internal disk. To try WardOS without risking anything, use
+`qcow2` (a VM) or `raw` (a USB stick you boot from). The `raw` image boots straight to
+the desktop with no installer at all.
+
+### Trying WardOS from a USB stick (no install)
+
+```sh
+sudo ./image/disk.sh --type raw --user wardos --image ghcr.io/hexrift/wardos:latest
+# -> image/out/raw/wardos.raw
+```
+
+Write it to a USB stick (this erases the **stick**, not the internal disk) and boot the
+machine from the stick (on a ThinkPad, tap **F12** at power-on and pick the USB; Secure
+Boot off, [`secure-boot/`](secure-boot/README.md)):
+
+```sh
+# Linux: the USB is the device whose TRAN is usb
+lsblk -o NAME,SIZE,MODEL,TRAN
+sudo dd if=image/out/raw/wardos.raw of=/dev/sdX bs=4M status=progress oflag=direct conv=fsync
+
+# macOS: find the disk, unmount it, write to the raw node (rdiskN is faster)
+diskutil list
+diskutil unmountDisk /dev/diskN
+sudo dd if=image/out/raw/wardos.raw of=/dev/rdiskN bs=4m
+```
+
+Because it boots from the stick, the machine's own disk is never written to just by
+running WardOS. As a second line of defence, `wardos-usb-guard` runs at boot: when
+WardOS is running from removable media it marks every *internal* disk read-only
+(`blockdev --setro`), so nothing on the stick — an accidental `dd`, a mistaken
+installer — can format or repartition the machine's own disk. It is a guard, not a
+wall (root can undo it with `blockdev --setrw`), and it is inert on an installed host.
+The `raw` image carries no Anaconda installer, so there is no path from booting it to
+reformatting a disk.
+
+If you do not have a Linux box to build on, the disk workflow builds a `raw` image in
+CI: run it (`disk.yml`, `type=raw`, `arch=x86_64`) and download the
+`wardos-disks-x86_64` artifact, or take `wardos-<tag>-x86_64.raw.zst` from a release and
+`zstd -d` it.
+
 ## Building on a Fedora host
 
 Requirements: a Fedora (or any bootc-capable) host with `podman` ≥ 4.9, `git`, and root,

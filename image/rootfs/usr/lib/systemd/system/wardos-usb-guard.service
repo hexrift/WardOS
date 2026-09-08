@@ -1,0 +1,21 @@
+# WardOS USB-boot disk guard (image/README.md, "Trying WardOS from a USB stick").
+# When WardOS runs from removable media it sets every internal disk read-only so
+# nothing on the stick can overwrite the machine's own disk. Inert on an installed
+# host (booted from a fixed disk). Runs before the login/desktop comes up.
+[Unit]
+Description=WardOS USB-boot disk guard (internal disks read-only when run from USB)
+Documentation=https://github.com/hexrift/WardOS/blob/main/image/README.md
+DefaultDependencies=no
+After=local-fs.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/wardos-usb-guard
+StandardOutput=journal+console
+
+[Install]
+WantedBy=sysinit.target

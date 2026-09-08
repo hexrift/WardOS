@@ -37,7 +37,10 @@ cp wardos-0.2.0-x86_64-linux/{ward,wardd,ward-agent} ~/.local/bin/
 
 On a machine of its own, boot the image ([`image/README.md`](image/README.md)): the
 agents, TamperWard and the desktop are in it, and the first login walks you through a
-theme, a key, a project and an agent. The convenient development installer,
+theme, a key, a project and an agent. To *try* it without giving up a machine, boot a
+`--type raw` image from a USB stick or a `--type qcow2` image in a VM; the `--type iso`
+is an installer that erases the target disk
+([which image to use](image/README.md#three-kinds-of-image-which-one-and-the-one-that-erases-a-disk)). The convenient development installer,
 `curl -fsSL https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | bash`,
 does the three steps above for you and runs `ward doctor`; it is a shell script fetched
 from `main`, so read it first ([`docs/install.md`](docs/install.md)).

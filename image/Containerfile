@@ -218,7 +218,31 @@ COPY image/rootfs/ /
 # lint reports as warnings, so they go. The build engine's own mounts under /run are left
 # alone: /run/systemd (docker's stub-resolv.conf) and /run/.containerenv and /run/secrets
 # (podman's); none of them is in the image layer.
-RUN systemctl enable wardos-firstboot.service wardos-flathub.service \
+# WardOS identity. The image inherits Fedora's /etc/os-release, so the Anaconda
+# installer, fastfetch, `ward doctor` and everything that reads os-release call the
+# system "Fedora". Rebrand to WardOS while keeping Fedora compatibility (ID_LIKE and
+# the inherited VERSION_ID), the way a bootc derivative does, so dnf/COPR/bootc tooling
+# is unaffected. /etc/os-release is a symlink to this file.
+RUN ver=$(sed -n 's/^VERSION_ID=//p' /usr/lib/os-release) \
+    && { \
+      echo 'NAME="WardOS"'; \
+      echo 'PRETTY_NAME="WardOS"'; \
+      echo 'ID=wardos'; \
+      echo 'ID_LIKE=fedora'; \
+      echo "VERSION=\"${ver}\""; \
+      echo "VERSION_ID=${ver}"; \
+      echo 'VARIANT="Agent Workstation"'; \
+      echo 'VARIANT_ID=wardos'; \
+      echo 'ANSI_COLOR="0;38;2;127;161;195"'; \
+      echo 'LOGO=wardos'; \
+      echo 'HOME_URL="https://github.com/hexrift/WardOS"'; \
+      echo 'DOCUMENTATION_URL="https://github.com/hexrift/WardOS/blob/main/README.md"'; \
+      echo 'BUG_REPORT_URL="https://github.com/hexrift/WardOS/issues"'; \
+    } > /usr/lib/os-release.wardos \
+    && mv /usr/lib/os-release.wardos /usr/lib/os-release \
+    && grep -q '^NAME="WardOS"$' /usr/lib/os-release
+
+RUN systemctl enable wardos-firstboot.service wardos-flathub.service wardos-usb-guard.service \
          firewalld.service bootc-fetch-apply-updates.timer \
     && sed -i 's/^DefaultZone=.*/DefaultZone=wardos/' /etc/firewalld/firewalld.conf \
     && grep -q '^DefaultZone=wardos$' /etc/firewalld/firewalld.conf \
