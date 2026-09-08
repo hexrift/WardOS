@@ -140,3 +140,39 @@ fn selftest_blocks_every_probe() {
         );
     }
 }
+
+/// A sandboxed process can reach the session proxy only through the bind-mounted Unix
+/// socket, and a private destination is denied there and recorded (ADR-0014).
+#[test]
+fn sandboxed_egress_goes_through_the_proxy_and_private_is_denied() {
+    if !sandbox::available()
+        || !std::path::Path::new("/usr/bin/python3").exists()
+            && !std::path::Path::new("/usr/local/bin/python3").exists()
+    {
+        eprintln!("skipping: bubblewrap or python3 not available");
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let mut session = Session::start_in(project.path(), state.path()).expect("start");
+    let log = session.log_path();
+    let script = "import socket\n\
+s=socket.socket(socket.AF_UNIX)\ns.connect('/run/ward/proxy.sock')\n\
+s.sendall(b'CONNECT 10.0.0.1:80 HTTP/1.1\\r\\nHost: 10.0.0.1:80\\r\\n\\r\\n')\n\
+print(s.recv(200).split(b'\\r\\n')[0].decode())";
+    let report = session
+        .run(&["python3".into(), "-c".into(), script.into()])
+        .expect("run");
+    assert!(
+        report.stdout.contains("403"),
+        "expected 403 from proxy, got: {}",
+        report.stdout
+    );
+    session.stop(EndReason::UserStop).expect("stop");
+
+    let denied = ward_events::LogReader::open(&log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|r| matches!(r.event, ward_events::WardEvent::NetworkDenied { .. }));
+    assert!(denied, "a NetworkDenied record must be in the sealed log");
+}

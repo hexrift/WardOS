@@ -54,6 +54,30 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         argv: Vec<String>,
     },
+    /// Launch Claude Code inside the session sandbox (interactive).
+    Claude {
+        /// Project directory (default: current).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Host environment variables to pass through (explicit, visible opt-in).
+        #[arg(long = "pass-env")]
+        pass_env: Vec<String>,
+        /// Extra arguments for the agent.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+    /// Launch OpenAI Codex inside the session sandbox (interactive).
+    Codex {
+        /// Project directory (default: current).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Host environment variables to pass through (explicit, visible opt-in).
+        #[arg(long = "pass-env")]
+        pass_env: Vec<String>,
+        /// Extra arguments for the agent.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// End the current session and seal its log.
     Stop {
         /// Project directory (default: current).
@@ -86,6 +110,16 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Up { dir } => cmd_up(&dir.unwrap_or_else(cwd)),
         Command::Status { dir } => cmd_status(&dir.unwrap_or_else(cwd)),
         Command::Run { dir, argv } => cmd_run(&dir.unwrap_or_else(cwd), &argv),
+        Command::Claude {
+            dir,
+            pass_env,
+            args,
+        } => cmd_agent(&dir.unwrap_or_else(cwd), "claude", &args, &pass_env),
+        Command::Codex {
+            dir,
+            pass_env,
+            args,
+        } => cmd_agent(&dir.unwrap_or_else(cwd), "codex", &args, &pass_env),
         Command::Stop { dir } => cmd_stop(&dir.unwrap_or_else(cwd)),
         Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
         Command::Replay { log } => {
@@ -134,6 +168,35 @@ fn cmd_status(dir: &Path) -> ward_daemon::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn cmd_agent(
+    dir: &Path,
+    agent: &str,
+    args: &[String],
+    pass_env: &[String],
+) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let (mut session, throwaway) = match Session::open_current(dir, &state)? {
+        Some(session) => (session, false),
+        None => (Session::start(dir)?, true),
+    };
+    if !pass_env.is_empty() {
+        eprintln!(
+            "ward: passing host environment through to the sandbox: {}",
+            pass_env.join(", ")
+        );
+    }
+    let log = session.log_path();
+    let report = session.run_agent(agent, args, pass_env)?;
+    if throwaway {
+        session.stop(EndReason::UserStop)?;
+    } else {
+        session.sync()?;
+    }
+    println!();
+    render_log(&log);
+    Ok(exit_code(report.code))
+}
+
 fn cmd_run(dir: &Path, argv: &[String]) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     // Append to the project's current session, or start a throwaway that seals its
@@ -153,6 +216,9 @@ fn cmd_run(dir: &Path, argv: &[String]) -> ward_daemon::Result<ExitCode> {
     render_log(&log);
     if !report.stdout.is_empty() {
         println!("\n{}", report.stdout.trim_end());
+    }
+    if code != Some(0) && !report.stderr.is_empty() {
+        eprintln!("\n{}", report.stderr.trim_end());
     }
     Ok(exit_code(code))
 }

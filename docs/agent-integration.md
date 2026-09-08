@@ -93,3 +93,17 @@ in `Development` mode; agents without hooks get intent only from exec/file captu
 * The only successful egress in the session log is to the allowlisted hosts; every
   other attempt is a `NetworkDenied` record.
 * A full session replays from its sealed log.
+
+## 8. Status (Phase 2, in progress)
+
+Implemented: `ward claude` / `ward codex` launch the agent interactively inside the
+session sandbox with the agent profile env (private config dir, non-essential traffic
+off); every run gets a per-session `ward-proxy` on a Unix socket bound into the
+isolated network namespace (ADR-0014), and each proxy decision becomes a
+`NetworkRequested` / `NetworkDenied` record shown as `NET` / `DENY` in the observer.
+When a `ward-agent` build that supports `--relay` is present, launches go through the
+shim with `HTTP(S)_PROXY` pointing at the in-sandbox relay; the daemon probes the shim
+and, on kernels without Landlock, passes `--allow-no-landlock` and records the
+degradation rather than silently weakening. Host credentials enter the sandbox only via
+an explicit, printed `--pass-env NAME` opt-in; gateway-mode injection (§3) is the next
+step and will remove even that.
