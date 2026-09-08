@@ -74,8 +74,14 @@ grant is a `CredentialGranted` record. Agent hook adapters are in: `ward claude`
 the hook settings, `ward-agent hook` reports every tool call to `wardd` over the hook
 socket, and `step_through` policies hold before writes and network tools through the
 agent's own prompt. `ward selftest` proves ST-012 and ST-024 for the model-API key with a
-canary held on the host. Remaining for the gate: a live E-07 run through the gateway, nested
-containers (E-04), and a full session replay of an agent run.
+canary held on the host. The GitHub adapter is in: `--grant github` routes git and API
+traffic through repo-scoped gateway routes under the `credentials.github` rule
+([`credential-broker.md`](credential-broker.md) §4). Warm start is measured at 32 ms
+median for a daemon-backed `ward run` (E-06, bubblewrap backend), inside the 150 ms
+budget. Claude Code has run inside the sandbox against the real API (E-07, partial: the
+401 for a deliberately invalid host key proves the path). Remaining for the gate: a
+full agent task with a valid key, nested containers (E-04), and a full session replay of
+that run.
 
 
 
@@ -114,8 +120,12 @@ records in the log, and the hook-layer deny for edits to protected paths
 `ward selftest` rows (the sandbox is handed its own log and state paths and cannot read,
 append to or remove them); ST-007 and ST-016 are end-to-end tests (a policy rewritten
 mid-session does not widen the network; whatever comes through the hook socket stays an
-`Origin::Agent` claim). Remaining: the TamperWard socket protocol (§4), semantic rules,
-E-12 in full.
+`Origin::Agent` claim). The control plane is in (ADR-0015): a per-session `wardd` is the
+single log writer behind `sessions/<id>/control.sock`; `ward session describe`,
+`ward snapshot create/diff/cat`, `ward evidence append` and `ward watch` are the §2
+primitives as CLI and socket requests, and evidence lands with `origin=tamperward`.
+Remaining: TamperWard's own turns of the §4 protocol (`SessionOpenAck`, `VerifyManifest`,
+`StateAccepted`) driven from the TamperWard side, the semantic rules, E-12 in full.
 
 Acceptance: demo passes end-to-end; DENIED originates from TamperWard; ST-007, 009, 010,
 016 pass; E-12 recorded.
@@ -128,6 +138,12 @@ snapshot, or evidence.
 
 Acceptance: ST-005, 006, 008, 018, 019 pass with a hostile agent *and* a hostile
 repository; verifier has no network; verification startup < 500 ms.
+
+### Phase 4 — delivered so far
+
+The verifier already has no network and a wall-clock budget (`verify.budget_secs`,
+ADR-0004 addendum) with a capped result document. Still ahead: the verifier image, a
+distinct uid range, the cgroup budget, and the hostile-repository probes.
 
 ## Phase 5 — Observer
 
