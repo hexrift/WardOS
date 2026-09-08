@@ -1,0 +1,23 @@
+# WardOS first-boot self-report.
+# Runs `ward doctor` once and keeps its report at /var/lib/wardos/doctor.txt so a fresh
+# install (or a `bootc switch` to a new image) leaves a record of what the host looked
+# like: user namespaces, cgroups v2, bubblewrap, toolchains, podman. The report is the
+# first thing to read when a session refuses to start.
+[Unit]
+Description=WardOS first-boot host check (ward doctor)
+Documentation=https://github.com/hexrift/WardOS/blob/main/image/README.md
+After=local-fs.target systemd-tmpfiles-setup.service
+Wants=systemd-tmpfiles-setup.service
+# Once per deployment: the report's presence is the marker. Delete it to re-run.
+ConditionPathExists=!/var/lib/wardos/doctor.txt
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ward doctor
+StandardOutput=truncate:/var/lib/wardos/doctor.txt
+StandardError=inherit
+# The report is informational: a non-zero exit from `ward doctor` still leaves the file,
+# and the unit shows in `systemctl --failed`, which is the intended signal.
+
+[Install]
+WantedBy=multi-user.target

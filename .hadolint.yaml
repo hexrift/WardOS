@@ -1,0 +1,10 @@
+# hadolint configuration for image/Containerfile (CI: verify.yml, job "image lint").
+#
+# DL3041 asks for `dnf install <package>-<version>`. WardOS deliberately does not pin
+# per-package versions: the base tag pins the Fedora release, dnf resolves against that
+# release's repositories at build time, and what gets recorded in evidence is the
+# resulting image digest (ADR-0001, "Security consequences"). Per-package pins would rot
+# on every Fedora update and give a false sense of reproducibility that only the digest
+# provides. Every other rule stays at its default severity.
+ignored:
+  - DL3041

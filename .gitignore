@@ -3,3 +3,5 @@
 .tamperward/ledger.jsonl
 experiments/**/results/*.raw
 /.claude/worktrees/
+# Disk images produced by image/disk.sh
+/image/out/

@@ -1,0 +1,81 @@
+# WardOS host image (ADR-0001: Fedora bootc, immutable, OCI-delivered).
+#
+# Two stages:
+#   1. `builder`  compiles `ward`, `wardd` and `ward-agent` from this checkout with the
+#                 toolchain pinned in rust-toolchain.toml (the image tag must match it).
+#   2. the host   Fedora bootc base plus the packages the runtime needs, the three
+#                 binaries, and the WardOS system configuration.
+#
+# Nothing here fetches code over the network at build time except dnf from the Fedora
+# repositories and cargo from crates.io (locked to Cargo.lock). No secrets, no `curl | sh`.
+# Build with image/build.sh; turn into a disk with image/disk.sh; see image/README.md.
+
+# ---------------------------------------------------------------------------------------
+# Stage 1: build the ward binaries.
+# The tag pins the same channel as rust-toolchain.toml (1.94.1); bump both together.
+FROM docker.io/library/rust:1.94.1 AS builder
+
+WORKDIR /src
+
+# The whole workspace, filtered by the repository's .containerignore (no target/, no .git).
+COPY . .
+
+# --locked refuses to touch Cargo.lock, so the image is built from exactly the dependency
+# set the repository reviewed. Only the three host binaries are built.
+RUN cargo build --release --locked \
+      --package ward-cli \
+      --package ward-daemon \
+      --package ward-agent
+
+# ---------------------------------------------------------------------------------------
+# Stage 2: the bootable host.
+# `42` pins the current Fedora release; a rebase is a deliberate edit of this line
+# (see image/README.md, "Base image tag").
+FROM quay.io/fedora/fedora-bootc:42
+
+ARG WARDOS_VERSION=dev
+
+LABEL org.wardos.version="${WARDOS_VERSION}" \
+      containers.bootc="1" \
+      org.opencontainers.image.title="WardOS host" \
+      org.opencontainers.image.source="https://github.com/hexrift/WardOS" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+# Runtime packages only (ADR-0001: no developer toolchain on the host, with one
+# deliberate exception, explained in image/README.md):
+#   bubblewrap        sandbox builder used by wardd (ADR-0002, ADR-0013)
+#   git               snapshot/worktree plumbing (ADR-0010) and `ward init` on repos
+#   curl              transport for `ward` self-checks and the egress relay tests
+#   python3           scripts/security-check and hook adapters
+#   openssh-clients   agent-side git-over-ssh through the credential broker
+#   cargo, rust       the trusted verifier (Phase 4) binds a host Rust toolchain
+#                     read-only into Zone 2; on the image that is the distro one
+#   podman            nested containers inside project environments (ADR-0005)
+# Package versions follow the Fedora 42 repositories at build time; the image digest,
+# not per-package pins, is what gets recorded in evidence (hadolint DL3041 is disabled
+# in .hadolint.yaml for this reason).
+RUN dnf -y install \
+      bubblewrap \
+      git \
+      curl \
+      python3 \
+      openssh-clients \
+      cargo \
+      rust \
+      podman \
+    && dnf clean all
+
+# The three host binaries. /usr is the immutable, image-owned tree in bootc.
+COPY --from=builder /src/target/release/ward /usr/bin/ward
+COPY --from=builder /src/target/release/wardd /usr/bin/wardd
+COPY --from=builder /src/target/release/ward-agent /usr/bin/ward-agent
+
+# Host configuration, all under /usr so it ships with the image and is not user state.
+COPY image/sysctl.d/50-wardos.conf /usr/lib/sysctl.d/50-wardos.conf
+COPY image/tmpfiles.d/wardos.conf /usr/lib/tmpfiles.d/wardos.conf
+COPY image/systemd/wardos-firstboot.service /usr/lib/systemd/system/wardos-firstboot.service
+
+# Enable the first-boot report and let bootc check the layout (no /var content baked in,
+# kernel present, nothing under /usr/local that should be in /usr, ...).
+RUN systemctl enable wardos-firstboot.service \
+    && bootc container lint

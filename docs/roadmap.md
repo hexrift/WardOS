@@ -167,6 +167,17 @@ defaults, four official themes, command centre. Built by CI with pinned digests.
 Acceptance: boots in QEMU and on the reference desktop; WardOS Security CI runs the ST
 suite on the image; performance CI subset green; idle RAM/CPU within budget.
 
+### Phase 6 — started
+
+[`image/`](../image/README.md) holds the first host image: a two-stage `Containerfile`
+(pinned Rust builder → `fedora-bootc:42` with the runtime packages, `ward`, `wardd`,
+`ward-agent`, the userns sysctl, a first-boot `ward doctor` report), `build.sh` and
+`disk.sh` around `podman build` and `bootc-image-builder`, and the boot, Secure Boot and
+key-handling plans in `image/boot/`, `image/secure-boot/`, `image/keys/`. CI lints it
+(hadolint, shellcheck); nothing has been built or booted yet. Not in the image: Hyprland,
+Ward Shell, themes, the command centre, pinned digests. Next: build and boot it in QEMU
+on a Fedora host, then E-09 on the reference hardware.
+
 ## Phase 7 — Security boot chain
 
 Secure Boot (Fedora shim → systemd-boot → UKI), TPM2-bound LUKS2 with recovery key,
