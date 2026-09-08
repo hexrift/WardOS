@@ -17,6 +17,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+
+mod replay;
 use ward_daemon::{Session, SessionMeta, render, selftest};
 use ward_events::{EndReason, LogReader};
 
@@ -92,6 +94,12 @@ enum Command {
     Replay {
         /// Path to an `events.log`.
         log: PathBuf,
+        /// Verify the hash chain and the sealed `HEAD`; print a verdict instead of rows.
+        #[arg(long)]
+        verify: bool,
+        /// Emit one JSON object per record.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -122,9 +130,14 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         } => cmd_agent(&dir.unwrap_or_else(cwd), "codex", &args, &pass_env),
         Command::Stop { dir } => cmd_stop(&dir.unwrap_or_else(cwd)),
         Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
-        Command::Replay { log } => {
-            render_log(&log);
-            Ok(ExitCode::SUCCESS)
+        Command::Replay { log, verify, json } => {
+            let report = replay::replay(&log, replay::Options { verify, json })?;
+            print!("{}", report.output);
+            Ok(if report.ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
         }
     }
 }
