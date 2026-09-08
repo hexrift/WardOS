@@ -136,9 +136,12 @@ mock sudo 'exec "$@"'
 root=$TMP/root
 bash "$repo/desktop/install.sh" --destdir "$root" >"$TMP/out" 2>&1 || fail "install.sh failed:
 $(cat "$TMP/out")"
+assert_logged '^sudo dnf -y install dnf5-plugins$'
+assert_logged '^sudo dnf -y copr enable solopasha/hyprland$'
 assert_logged '^sudo dnf install -y .*hyprland'
 assert_logged '^dnf install -y .*bubblewrap'
 assert_not_logged '^rpm-ostree'
+assert_not_logged '^curl'
 assert_logged '^sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo$'
 assert_logged '^systemctl --user daemon-reload$'
 # The real desktop tree of this checkout landed under --destdir.
@@ -166,11 +169,13 @@ setup_env
 mock rpm-ostree
 mock systemctl
 mock flatpak
+mock curl
 mock sudo 'exec "$@"'
 touch "$TMP/ostree-booted"
 WARDOS_OSTREE_MARKER=$TMP/ostree-booted bash "$repo/desktop/install.sh" --destdir "$TMP/root" >"$TMP/out" 2>&1 || fail "install.sh (ostree) failed:
 $(cat "$TMP/out")"
 assert_logged '^sudo rpm-ostree install --idempotent .*hyprland'
+assert_logged '^sudo curl -fsSL -o /etc/yum.repos.d/_copr_solopasha-hyprland.repo https://copr.fedorainfracloud.org/coprs/solopasha/hyprland/repo/fedora-42/solopasha-hyprland-fedora-42.repo$'
 assert_not_logged '^dnf'
 grep -qi 'reboot' "$TMP/out" || fail "ostree path must tell the user to reboot"
 
@@ -210,15 +215,18 @@ assert_not_logged '^flatpak install'
 setup_env
 printf '# manifest\nhyprland   # compositor\nfoot\n\nnope-not-a-package # unverified\n' >"$TMP/packages.txt"
 mock docker 'printf "%s\n" hyprland foot ""'
-bash "$repo/image/check-packages.sh" --file "$TMP/packages.txt" >"$TMP/out" 2>&1 && fail "a missing name must fail"
-assert_logged '^docker run --rm quay.io/fedora/fedora:42 bash -c .*repoquery.* -- foot hyprland nope-not-a-package$'
+bash "$repo/image/check-packages.sh" --file "$TMP/packages.txt" --coprs "$TMP/no-coprs" >"$TMP/out" 2>&1 && fail "a missing name must fail"
+assert_logged '^docker run --rm quay.io/fedora/fedora:42 bash -c .*repoquery.* -- 0 foot hyprland nope-not-a-package$'
 grep -q '^  nope-not-a-package$' "$TMP/out" || fail "missing name not listed:
 $(cat "$TMP/out")"
 ! grep -q '^  hyprland$' "$TMP/out" || fail "resolved name listed as missing"
 mock docker 'printf "%s\n" hyprland foot nope-not-a-package'
-bash "$repo/image/check-packages.sh" --file "$TMP/packages.txt" >"$TMP/out" 2>&1 || fail "all names resolve:
+printf '# coprs\nowner/project # why\n\n' >"$TMP/coprs.txt"
+bash "$repo/image/check-packages.sh" --file "$TMP/packages.txt" --coprs "$TMP/coprs.txt" >"$TMP/out" 2>&1 || fail "all names resolve:
 $(cat "$TMP/out")"
 grep -q 'all 3 names exist' "$TMP/out" || fail "success line missing"
+# The COPRs precede the names, counted, and are enabled with dnf5's copr plugin.
+assert_logged '^docker run --rm quay.io/fedora/fedora:42 bash -c .*dnf5-plugins.*copr enable.* -- 1 owner/project foot hyprland nope-not-a-package$'
 # --dry-run prints the command and runs nothing; --release changes the container tag.
 : >"$MOCK_LOG"
 bash "$repo/image/check-packages.sh" --file "$TMP/packages.txt" --release 43 --dry-run >"$TMP/out"
@@ -229,7 +237,10 @@ CONTAINER_RUNTIME=podman bash "$repo/image/check-packages.sh" --file "$TMP/packa
 assert_logged '^podman run'
 # The real manifest parses and every name is a plain package name (no spaces, no versions).
 bash "$repo/image/check-packages.sh" --dry-run >"$TMP/out"
+grep -q -- '-- 2 solopasha/hyprland atim/lazygit ' "$TMP/out" || fail "coprs.txt not passed:
+$(cat "$TMP/out")"
 ! sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo/image/packages.txt" | grep -Ev '^[A-Za-z0-9._+-]+$' || fail "packages.txt has a bad name"
+! sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo/image/coprs.txt" | grep -Ev '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' || fail "coprs.txt has a bad entry"
 
 # --- image/disk.sh: --user and --luks write the bootc-image-builder config -----------
 setup_env

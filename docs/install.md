@@ -103,7 +103,8 @@ git clone https://github.com/hexrift/WardOS && cd WardOS
 ./desktop/install.sh               # packages (dnf, or rpm-ostree + reboot), the tree, units, Flathub
 ```
 
-It installs `image/packages.txt`, places the tree with `image/install-desktop.sh` under
+It enables the COPRs of `image/coprs.txt` (the Hyprland ecosystem Fedora does not
+package, lazygit), installs `image/packages.txt`, places the tree with `image/install-desktop.sh` under
 `/usr/share/wardos` and `/etc/xdg` (sudo, per step), enables the user units, adds
 Flathub and the default applications, and prints how to log in: pick "Hyprland (uwsm)"
 at GDM or SDDM, or `uwsm start hyprland.desktop` from a console. It does not install

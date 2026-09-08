@@ -1,10 +1,10 @@
 # Every Fedora 42 package the WardOS host installs (docs/desktop.md §Packages).
 # One name per line, `# why` after it; blank lines and comment lines are ignored.
-# The Containerfile installs from this file; desktop/install.sh layers it onto an
-# existing Fedora; image/check-packages.sh (CI: "image packages") proves every name
-# resolves in a fedora:42 container. Names were written without repository access:
-# `# unverified` marks the ones not seen in Fedora 42 by the author, and the CI
-# check, not this file, is the source of truth for whether a name exists.
+# The Containerfile installs from this file after enabling the COPRs of
+# image/coprs.txt; desktop/install.sh layers it onto an existing Fedora;
+# image/check-packages.sh (CI: "image packages") proves every name resolves in a
+# fedora:42 container with the same COPRs. `# unverified` marks a name that check has
+# not confirmed yet; the check, not this file, is the source of truth.
 
 # --- runtime (ADR-0001: no developer toolchain on the host, one explicit exception) ----
 bubblewrap            # sandbox builder used by wardd (ADR-0002, ADR-0013)
@@ -18,15 +18,15 @@ podman                # nested containers inside project environments (ADR-0005)
 
 # --- compositor and session ---------------------------------------------------------
 hyprland              # the compositor (ADR-0007)
-hyprlock              # lock screen
-hypridle              # idle management (lock, screen off, suspend)
-hyprpaper             # wallpaper daemon (image backgrounds; swaybg draws solid ones)
-hyprpicker            # colour picker (wardos-capture color)
-hyprsunset            # night light (wardos-toggle nightlight)                  # unverified
-hyprpolkitagent       # polkit prompts on the desktop (pkexec)                  # unverified
+hyprlock              # lock screen (COPR solopasha/hyprland)                  # unverified
+hypridle              # idle management (lock, screen off, suspend) (COPR solopasha/hyprland) # unverified
+hyprpaper             # wallpaper daemon (image backgrounds; swaybg draws solid ones) (COPR solopasha/hyprland) # unverified
+hyprpicker            # colour picker (wardos-capture color) (COPR solopasha/hyprland) # unverified
+hyprsunset            # night light (wardos-toggle nightlight) (COPR solopasha/hyprland) # unverified
+hyprpolkitagent       # polkit prompts on the desktop (pkexec) (COPR solopasha/hyprland) # unverified
 xdg-desktop-portal-hyprland # screen sharing, screenshots for portals
 xdg-desktop-portal-gtk # file chooser and settings portal
-uwsm                  # Universal Wayland Session Manager: starts Hyprland as a systemd session # unverified
+uwsm                  # Universal Wayland Session Manager: starts Hyprland as a systemd session (COPR solopasha/hyprland) # unverified
 xorg-x11-server-Xwayland # X11 applications
 qt6-qtwayland         # Qt 6 applications on Wayland
 qt5-qtwayland         # Qt 5 applications on Wayland
@@ -42,21 +42,21 @@ waybar                # the trust bar
 fuzzel                # command centre and every menu
 mako                  # notifications and approvals
 libnotify             # notify-send (wardos-notify)
-swayosd               # on-screen volume and brightness                         # unverified
+swayosd               # on-screen volume and brightness (COPR solopasha/hyprland) # unverified
 
 # --- capture and clipboard ------------------------------------------------------------
 grim                  # screenshot
 slurp                 # region selection
-satty                 # screenshot annotation                                   # unverified
+satty                 # screenshot annotation (COPR solopasha/hyprland)        # unverified
 wf-recorder           # screen recording
-cliphist              # clipboard history (Super+Ctrl+V)                        # unverified
+cliphist              # clipboard history (Super+Ctrl+V) (COPR solopasha/hyprland) # unverified
 wl-clipboard          # wl-copy, wl-paste
 swaybg                # solid-colour background (`solid:<hex>` themes)
 
 # --- hardware and services --------------------------------------------------------------
 brightnessctl         # backlight
 playerctl             # media keys
-pamixer               # volume keys                                             # unverified
+pamixer               # volume keys
 pipewire              # audio
 wireplumber           # audio session manager
 pipewire-pulseaudio   # PulseAudio compatibility (the package is not named pipewire-pulse)
@@ -90,10 +90,10 @@ fd-find               # fd
 bat                   # cat with syntax
 eza                   # ls with icons
 zoxide                # cd that learns
-lazygit               # git TUI
+lazygit               # git TUI (COPR atim/lazygit)                            # unverified
 git-delta             # diffs
 tmux                  # terminal multiplexer
-pulsemixer            # wardos-setup audio                                      # unverified
+pavucontrol           # wardos-setup audio (pulsemixer is not packaged; the command prefers it when present)
 qrencode              # wardos-share QR codes
 jq                    # JSON in bar and menu scripts
 socat                 # Hyprland event socket in scripts
@@ -114,7 +114,7 @@ toolbox               # Fedora's own
 # --- fonts and themes ------------------------------------------------------------------------
 jetbrains-mono-fonts  # mono candidate (design-language.md §4)
 rsms-inter-fonts      # sans candidate
-cascadia-code-nf-fonts # mono with Nerd Font glyphs for the bar                # unverified
+cascadia-code-nf-fonts # mono with Nerd Font glyphs for the bar
 google-noto-sans-fonts # fallback sans
 google-noto-color-emoji-fonts # colour emoji
 google-noto-emoji-fonts # monochrome emoji
@@ -126,5 +126,5 @@ gnome-themes-extra    # Adwaita for GTK 2/3 applications that ask for it
 plymouth              # boot splash
 plymouth-system-theme # Fedora's default theme set
 plymouth-theme-spinner # the fallback theme
-plymouth-plugin-script # `script` theme engine for image/plymouth/wardos      # unverified
-plymouth-plugin-label # text rendering in script themes                        # unverified
+plymouth-plugin-script # `script` theme engine for image/plymouth/wardos
+plymouth-plugin-label # text rendering in script themes

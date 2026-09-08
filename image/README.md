@@ -15,7 +15,8 @@ not.
 | --- | --- | --- |
 | `Containerfile` | the image | Build or fetch the ward binaries; layer packages, binaries, desktop and configuration on `fedora-bootc` |
 | `packages.txt` | — | Every package the host installs, one per line with the reason; the Containerfile and `desktop/install.sh` read it |
-| `check-packages.sh` | — | Proves every name in `packages.txt` exists in Fedora 42 (`dnf repoquery` in a `fedora:42` container); CI job "image packages" |
+| `coprs.txt` | `/etc/yum.repos.d/_copr:*.repo` | The COPR repositories enabled before the install (Hyprland's ecosystem, lazygit); part of the trust set |
+| `check-packages.sh` | — | Proves every name in `packages.txt` exists in Fedora 42 plus `coprs.txt` (`dnf repoquery` in a `fedora:42` container); CI job "image packages" |
 | `install-desktop.sh` | — | Places `desktop/` into a root (`/` in the build, `/` from `desktop/install.sh`, a temp dir in tests) |
 | `flathub.sh` | `/usr/libexec/wardos-flathub` | Adds Flathub and installs `desktop/flatpaks.txt`, run once by `wardos-flathub.service` |
 | `build.sh` | — | `podman build` wrapper; tags `localhost/wardos:<git describe>` and stamps the version label |
@@ -77,12 +78,32 @@ and comment lines ignored, exact Fedora 42 package names (not "provides": `fd-fi
 `sed -e 's/#.*//' packages.txt | xargs dnf -y install`; `desktop/install.sh` reads the
 same file for `dnf` or `rpm-ostree`.
 
-The names were written without access to the Fedora repositories; the ones the author
-had not seen in Fedora 42 carry `# unverified`. CI is the source of truth:
-`check-packages.sh` runs `dnf repoquery` inside `quay.io/fedora/fedora:42` (docker on
-the runner, podman locally when docker is absent) and fails listing every name that did
-not resolve; a wrong name is a one-line fix there. `check-packages.sh --dry-run` prints
-the command without a container runtime.
+CI is the source of truth for the names: `check-packages.sh` enables the COPRs and runs
+`dnf repoquery` inside `quay.io/fedora/fedora:42` (docker on the runner, podman locally
+when docker is absent) and fails listing every name that did not resolve; a wrong name
+is a one-line fix there, and a name the check has not confirmed yet carries
+`# unverified` until it has. `check-packages.sh --dry-run` prints the command without a
+container runtime.
+
+### COPRs
+
+Fedora 42 does not package the Hyprland ecosystem beyond the compositor itself
+(`hypridle`, `hyprlock`, `hyprpaper`, `hyprpicker`, `hyprpolkitagent`, `hyprsunset`,
+`uwsm`, `satty`, `cliphist`, `swayosd` are missing; the "image packages" job proved it)
+nor `lazygit`. They come from COPR repositories listed in [`coprs.txt`](coprs.txt), one
+`owner/project` per line with the reason: `solopasha/hyprland` and `atim/lazygit`.
+Three things enable exactly that list the same way: the Containerfile (`dnf5-plugins`,
+then `dnf copr enable` for each, before the install), `check-packages.sh` (the same two
+commands in the check container, so the check sees what the build sees), and
+`desktop/install.sh` (`dnf copr enable` on Workstation; on rpm-ostree, which has no
+`copr` verb, the `.repo` file COPR serves is fetched into `/etc/yum.repos.d`).
+
+A COPR is part of the image's trust set: its packages are built by the COPR's owner on
+Fedora's build system, not by Fedora, and its repository file stays in the image so
+`wardos-install package` layers from the same sources the image was built from. The
+list is therefore short, every entry justified, and an entry is removed the day Fedora
+packages the thing. `pulsemixer` is not packaged anywhere useful; the image ships
+`pavucontrol` and `wardos-setup audio` prefers pulsemixer when present.
 
 ### The desktop in the image
 

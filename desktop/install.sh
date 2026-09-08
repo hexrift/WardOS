@@ -3,8 +3,10 @@
 #
 #   desktop/install.sh [--autologin] [--no-flatpaks] [--destdir DIR] [--dry-run]
 #
-# Steps, each printed before it runs: install image/packages.txt with dnf (Workstation)
-# or rpm-ostree (Silverblue, Kinoite, bootc: layered, takes effect after a reboot);
+# Steps, each printed before it runs: enable the COPRs of image/coprs.txt (dnf5-plugins
+# and `dnf copr enable`, or their .repo files into /etc/yum.repos.d on rpm-ostree) and
+# install image/packages.txt with dnf (Workstation) or rpm-ostree (Silverblue, Kinoite,
+# bootc: layered, takes effect after a reboot);
 # place the desktop tree with image/install-desktop.sh (sudo); enable the user units;
 # add Flathub and install desktop/flatpaks.txt (--no-flatpaks skips); then say how to
 # start Hyprland. --autologin also installs the tty1 autologin drop-in for the user
@@ -20,6 +22,7 @@ usage() {
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 packages_file=$repo_root/image/packages.txt
+coprs_file=$repo_root/image/coprs.txt
 flatpaks_file=$repo_root/desktop/flatpaks.txt
 # The file that marks an rpm-ostree/bootc host; overridable for tests.
 ostree_marker=${WARDOS_OSTREE_MARKER:-/run/ostree-booted}
@@ -53,13 +56,34 @@ if [[ ! -f "$packages_file" ]]; then
   exit 1
 fi
 mapfile -t packages < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$packages_file")
+coprs=()
+if [[ -f "$coprs_file" ]]; then
+  mapfile -t coprs < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$coprs_file")
+fi
+# The Fedora release the COPR repository files are for; 42 when not on Fedora (tests).
+fedora_release=42
+if grep -qs '^ID=fedora$' /etc/os-release; then
+  fedora_release=$(sed -n 's/^VERSION_ID=//p' /etc/os-release)
+fi
 
 if command -v rpm-ostree >/dev/null 2>&1 && [[ -e "$ostree_marker" ]]; then
   flavour=ostree
+  # rpm-ostree has no `copr` verb: the repository file is what `dnf copr enable` would
+  # write, fetched from COPR itself (a .repo file, not a script).
+  for c in "${coprs[@]}"; do
+    run sudo curl -fsSL -o "/etc/yum.repos.d/_copr_${c//\//-}.repo" \
+      "https://copr.fedorainfracloud.org/coprs/${c}/repo/fedora-${fedora_release}/${c//\//-}-fedora-${fedora_release}.repo"
+  done
   echo "install.sh: rpm-ostree host: layering ${#packages[@]} packages (a reboot applies them)"
   run sudo rpm-ostree install --idempotent "${packages[@]}"
 elif command -v dnf >/dev/null 2>&1; then
   flavour=dnf
+  if [[ ${#coprs[@]} -gt 0 ]]; then
+    run sudo dnf -y install dnf5-plugins
+    for c in "${coprs[@]}"; do
+      run sudo dnf -y copr enable "$c"
+    done
+  fi
   echo "install.sh: installing ${#packages[@]} packages with dnf"
   run sudo dnf install -y "${packages[@]}"
 else

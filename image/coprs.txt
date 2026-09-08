@@ -1,0 +1,12 @@
+# Fedora COPR repositories the host enables before installing image/packages.txt
+# (image/README.md, "COPRs"). One `owner/project` per line with the reason; blank lines
+# and `#` comments are ignored. Every COPR here is part of the image's trust set: its
+# packages are built by that COPR's owner, not by Fedora, and its repository file stays
+# in the image so `wardos-install package` can layer from it. Keep the list short and
+# each entry justified; when Fedora packages the thing, remove the entry.
+#
+# The Containerfile, image/check-packages.sh (CI: "image packages") and
+# desktop/install.sh enable exactly this list, the same way.
+
+solopasha/hyprland   # the Hyprland ecosystem Fedora does not carry: hypridle, hyprlock, hyprpaper, hyprpicker, hyprpolkitagent, hyprsunset, uwsm, satty, cliphist, swayosd
+atim/lazygit         # lazygit (not in Fedora)

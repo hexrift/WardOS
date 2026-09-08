@@ -80,14 +80,21 @@ LABEL org.wardos.version="${WARDOS_VERSION}" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 # Every package, with the reason for each, is in image/packages.txt (docs/desktop.md
-# §Packages); CI checks the names against Fedora 42 before this line ever runs.
-# Package versions follow the Fedora 42 repositories at build time; the image digest,
-# not per-package pins, is what gets recorded in evidence (hadolint DL3041 is disabled
-# in .hadolint.yaml for this reason).
+# §Packages), and the COPRs the Hyprland pieces Fedora does not carry come from are in
+# image/coprs.txt (part of the image's trust set, image/README.md "COPRs"); CI checks
+# the names against Fedora 42 plus those COPRs before this line ever runs. `dnf copr`
+# is a dnf5 plugin, hence dnf5-plugins first; the repository files stay in the image so
+# `wardos-install package` can layer from the same sources.
+# Package versions follow the repositories at build time; the image digest, not
+# per-package pins, is what gets recorded in evidence (hadolint DL3041 is disabled in
+# .hadolint.yaml for this reason).
+COPY image/coprs.txt /tmp/coprs.txt
 COPY image/packages.txt /tmp/packages.txt
-RUN sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/packages.txt | xargs dnf -y install \
+RUN dnf -y install dnf5-plugins \
+    && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/coprs.txt | xargs -r -n1 dnf -y copr enable \
+    && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/packages.txt | xargs dnf -y install \
     && dnf clean all \
-    && rm -f /tmp/packages.txt
+    && rm -f /tmp/packages.txt /tmp/coprs.txt
 
 # The host binaries: ward, wardd, ward-agent (required), ward-shell and
 # wardos-theme-render (present from release v0.2 and in every checkout build). /usr is

@@ -105,7 +105,9 @@ bar clicks call it directly); `wardos-update --check` prints one Waybar JSON lin
 (`text`, `tooltip`, `class` `available` or empty); `wardos-screensaver` returns at once
 when `wardos-toggle screensaver` has switched it off (hypridle calls it at 2.5 min);
 `wardos-approve --watch` is the long-running listener behind `wardos-approve.service`;
-`wardos-battery-monitor` runs once per call, from its timer every 2 min.
+`wardos-battery-monitor` runs once per call, from its timer every 2 min;
+`wardos-setup audio` opens `pulsemixer` when it is installed and `pavucontrol` otherwise
+(the image ships pavucontrol; pulsemixer is not packaged in Fedora).
 
 Rules: a command never edits a file it did not create without a backup next to it
 (`<file>.bak`); root is asked for with `pkexec` (desktop) or `sudo` (terminal) and only
@@ -207,8 +209,11 @@ live in `~/.local/share/wardos/themes/`.
 
 [`image/packages.txt`](../image/packages.txt) lists every package the desktop needs, one
 per line with a comment naming what it is for, exact Fedora 42 names (`fd-find`,
-`pipewire-pulseaudio`). The `Containerfile` installs from it and `desktop/install.sh`
-layers it with `dnf` or `rpm-ostree`; CI checks every name exists in Fedora 42
+`pipewire-pulseaudio`). What Fedora does not carry (the Hyprland ecosystem beyond the
+compositor, lazygit) comes from the COPRs of [`image/coprs.txt`](../image/coprs.txt),
+part of the image's trust set (`image/README.md`, "COPRs"). The `Containerfile` enables
+the COPRs and installs from the manifest, and `desktop/install.sh` layers the same with
+`dnf` or `rpm-ostree`; CI checks every name exists in Fedora 42 plus those COPRs
 (`image/check-packages.sh`: `dnf repoquery` in a `fedora:42` container, job "image
 packages" on every pull request) and builds the whole image with `docker build`
 (`image.yml`, job "image build", on `main` and on pull requests that touch `image/`,
