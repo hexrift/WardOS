@@ -43,13 +43,14 @@ inner='set -e
 dnf -y -q install dnf5-plugins >/dev/null
 for c in "$@"; do dnf -y -q copr enable "$c" >/dev/null; done
 dnf -y -q --setopt=install_weak_deps=False install hyprland >/dev/null
-export XDG_RUNTIME_DIR=/tmp/xdg && mkdir -m 700 -p "$XDG_RUNTIME_DIR"
-Hyprland --version | head -n 1
 mkdir -p /etc/xdg && ln -sfn /desktop/hyprland /etc/xdg/hypr
-mkdir -p "$HOME/.config/wardos/theme/current"
+# Hyprland refuses to run as root, so a plain user does the parsing.
+useradd -m check
+mkdir -p /home/check/.config/wardos/theme/current
 printf "general {\n  col.active_border = rgb(7FA1C3)\n  col.inactive_border = rgb(24272B)\n}\nmisc {\n  background_color = rgb(0E0F11)\n}\n" \
-  > "$HOME/.config/wardos/theme/current/hyprland.conf"
-Hyprland --verify-config -c /etc/xdg/hypr/hyprland.conf'
+  > /home/check/.config/wardos/theme/current/hyprland.conf
+chown -R check:check /home/check
+su check -c "export XDG_RUNTIME_DIR=/tmp/xdg-check HOME=/home/check; mkdir -m 700 -p \$XDG_RUNTIME_DIR; Hyprland --version | head -n 1; Hyprland --verify-config -c /etc/xdg/hypr/hyprland.conf"'
 cmd=("$runtime" run --rm
   --volume "$repo_root/desktop:/desktop:ro"
   --env HOME=/root
