@@ -70,9 +70,11 @@ session (that is Phase 2's `ward claude`).
 verified with real HTTPS to an allowlisted host and `403` for private and metadata
 destinations, all visible in the observer. Gateway-mode credential injection is in:
 `ward claude` keeps `ANTHROPIC_API_KEY` on the host, the proxy injects it, and the
-grant is a `CredentialGranted` record. Remaining for the gate: a live E-07 run through
-the gateway, agent hook adapters for step-through, nested containers (E-04), and a full
-session replay of an agent run.
+grant is a `CredentialGranted` record. Agent hook adapters are in: `ward claude` seeds
+the hook settings, `ward-agent hook` reports every tool call to `wardd` over the hook
+socket, and `step_through` policies hold before writes and network tools through the
+agent's own prompt. Remaining for the gate: a live E-07 run through the gateway, nested
+containers (E-04), and a full session replay of an agent run.
 
 
 
