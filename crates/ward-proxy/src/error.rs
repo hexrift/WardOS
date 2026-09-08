@@ -2,15 +2,27 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 /// Why the proxy could not start.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The listening socket could not be bound.
+    /// The TCP listening socket could not be bound.
     #[error("bind {addr}: {source}")]
     Bind {
         /// The requested address.
         addr: SocketAddr,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
+    /// The Unix-domain listening socket could not be created at `path`:
+    /// the parent directory is missing, a non-socket file is in the way, or
+    /// the bind or `chmod 0600` failed.
+    #[error("bind unix socket {}: {source}", path.display())]
+    BindUnix {
+        /// The requested socket path.
+        path: PathBuf,
         /// The underlying error.
         #[source]
         source: io::Error,
