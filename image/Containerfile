@@ -133,12 +133,14 @@ COPY image/plymouth/wardos/ /usr/share/plymouth/themes/wardos/
 # how the splash looks at boot is E-09's to record). /var and /run must be empty in a
 # bootc image (they are runtime state, created at boot by tmpfiles.d): dnf, cups and
 # the software catalogue leave caches and logs there during the install, which the
-# lint reports as warnings, so they go.
+# lint reports as warnings, so they go. /run/systemd is the build engine's own mount
+# (its stub-resolv.conf is busy during a docker build) and is left alone.
 RUN systemctl enable wardos-firstboot.service wardos-flathub.service \
     && if rpm -q plymouth-plugin-script >/dev/null 2>&1; then plymouth-set-default-theme wardos; \
        else plymouth-set-default-theme spinner; fi \
     && kver=$(basename /usr/lib/modules/*) \
     && dracut --force --no-hostonly --reproducible --zstd --add ostree \
          --kver "$kver" "/usr/lib/modules/$kver/initramfs.img" \
-    && rm -rf /var/log/* /var/cache/* /run/* /tmp/* \
+    && rm -rf /var/log/* /var/cache/* /tmp/* \
+    && find /run -mindepth 1 -maxdepth 1 ! -name systemd -exec rm -rf {} + \
     && bootc container lint
