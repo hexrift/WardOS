@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "ward-agent"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "caps",
  "clap",
@@ -2131,7 +2131,7 @@ dependencies = [
 
 [[package]]
 name = "ward-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "ward-daemon"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "clap",
@@ -2167,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "ward-events"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "postcard",
@@ -2179,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "ward-policy"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "proptest",
@@ -2191,7 +2191,7 @@ dependencies = [
 
 [[package]]
 name = "ward-proxy"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "rustls",
  "rustls-native-certs",
@@ -2203,7 +2203,7 @@ dependencies = [
 
 [[package]]
 name = "ward-sandbox"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "ward-shell"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "clap",
  "serde_json",
@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "ward-shell-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "ward-daemon",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "ward-snapshot"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2248,7 +2248,7 @@ dependencies = [
 
 [[package]]
 name = "wardos-theme"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "clap",
  "serde",
