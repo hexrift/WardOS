@@ -11,21 +11,46 @@
 # Build with image/build.sh; turn into a disk with image/disk.sh; see image/README.md.
 
 # ---------------------------------------------------------------------------------------
-# Stage 1: build the ward binaries.
+# Where the ward binaries come from. `release` (default) downloads a published release
+# tarball and checks its SHA-256, so the image is reproducible from a known version and
+# the tools and the image keep separate release cadences. `builder` compiles this
+# checkout instead (development images).
+ARG WARDOS_SOURCE=release
+ARG WARDOS_RELEASE=v0.1.1
+ARG WARDOS_SHA256=b5e77a2629edecd8fd47a2d320231fd6dfd8d489a4393e36c4a7519b934173fa
+
+# Stage 1a: a published release.
+FROM docker.io/library/alpine:3.20 AS release
+SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
+ARG WARDOS_RELEASE
+ARG WARDOS_SHA256
+WORKDIR /out
+RUN name="wardos-${WARDOS_RELEASE#v}-x86_64-linux" \
+    && wget -q "https://github.com/hexrift/WardOS/releases/download/${WARDOS_RELEASE}/${name}.tar.gz" \
+    && echo "${WARDOS_SHA256}  ${name}.tar.gz" | sha256sum -c - \
+    && tar -xzf "${name}.tar.gz" \
+    && mv "${name}/ward" "${name}/wardd" "${name}/ward-agent" /out/ \
+    && rm -rf "${name}" "${name}.tar.gz"
+
+# Stage 1b: build the ward binaries from this checkout.
 # The tag pins the same channel as rust-toolchain.toml (1.94.1); bump both together.
 FROM docker.io/library/rust:1.94.1 AS builder
-
 WORKDIR /src
-
 # The whole workspace, filtered by the repository's .containerignore (no target/, no .git).
 COPY . .
-
 # --locked refuses to touch Cargo.lock, so the image is built from exactly the dependency
 # set the repository reviewed. Only the three host binaries are built.
 RUN cargo build --release --locked \
       --package ward-cli \
       --package ward-daemon \
-      --package ward-agent
+      --package ward-agent \
+    && mkdir -p /out \
+    && cp target/release/ward target/release/wardd target/release/ward-agent /out/
+
+# The chosen source, under one name for the host stage (a stage name, not an image;
+# hadolint cannot tell, hence the ignore).
+# hadolint ignore=DL3006
+FROM ${WARDOS_SOURCE} AS binaries
 
 # ---------------------------------------------------------------------------------------
 # Stage 2: the bootable host.
@@ -66,9 +91,9 @@ RUN dnf -y install \
     && dnf clean all
 
 # The three host binaries. /usr is the immutable, image-owned tree in bootc.
-COPY --from=builder /src/target/release/ward /usr/bin/ward
-COPY --from=builder /src/target/release/wardd /usr/bin/wardd
-COPY --from=builder /src/target/release/ward-agent /usr/bin/ward-agent
+COPY --from=binaries /out/ward /usr/bin/ward
+COPY --from=binaries /out/wardd /usr/bin/wardd
+COPY --from=binaries /out/ward-agent /usr/bin/ward-agent
 
 # Host configuration, all under /usr so it ships with the image and is not user state.
 COPY image/sysctl.d/50-wardos.conf /usr/lib/sysctl.d/50-wardos.conf

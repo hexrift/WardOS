@@ -116,6 +116,23 @@ falls back to writing the log in-process when no daemon answers. The system-serv
 `unsafe_code` is forbidden workspace-wide; no crate has needed an exception so far, so
 there is no `UNSAFE.md` yet.
 
+## One repository, for now
+
+The session layer (`crates/`), the host image (`image/`) and the desktop (`desktop/`)
+stay in this repository. The layer is what users install today and what the image and
+the shell deliver; splitting it out now would mean cross-repository crate pins for
+`ward-shell-core` and `desktop/shell`, and a design record split across two places.
+Two rules keep the layer extractable:
+
+* Nothing under `crates/ward-*` may depend on `desktop/` or `image/`; the desktop
+  crates and the image consume the layer, never the reverse.
+* The image consumes released binaries (`image/README.md`, "Where the binaries come
+  from"), so the tools and the image keep separate release cadences.
+
+Revisit when the shell gains a GUI toolkit with its own native dependencies and CI, or
+when another product needs `ward-events`/`ward-proxy` as versioned crates; the
+extracted piece would be called `ward`, with WardOS remaining the distribution.
+
 ## Deviations from the brief and why
 
 | Change | Reason |
