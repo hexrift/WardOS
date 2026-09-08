@@ -1,0 +1,11 @@
+# WardOS system units (image/README.md "Security posture", "First boot"). The image
+# build enables exactly these with `systemctl enable`; this file is the same policy for
+# `systemctl preset` / `preset-all` on an installed host, so a reset lands on the same
+# state. Anything not named here follows Fedora's own presets.
+enable wardos-firstboot.service
+enable wardos-flathub.service
+# Host firewall, default zone `wardos` (/etc/firewalld/zones/wardos.xml): nothing inbound.
+enable firewalld.service
+# Timed image updates: fetch and stage the next ghcr.io/hexrift/wardos:latest (the
+# drop-in in bootc-fetch-apply-updates.service.d stages only; the next boot applies).
+enable bootc-fetch-apply-updates.timer

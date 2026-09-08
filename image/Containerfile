@@ -167,12 +167,19 @@ RUN node --version && npm --version \
     && du -sh /usr/lib/wardos/agents/node_modules
 
 # Host configuration, laid out under image/rootfs exactly as it lands in the image
-# (sysctl, tmpfiles, the two first-boot units, the Flathub script, the Plymouth theme),
-# all under /usr so it ships with the image and is not user state.
+# (sysctl, tmpfiles, the first-boot units, the Flathub script, the system preset that
+# enables the firewall and the update timer, the firewall zone, the Plymouth theme),
+# under /usr so it ships with the image and is not user state, except the firewall zone,
+# which firewalld reads from /etc (bootc merges /etc across upgrades).
 COPY image/rootfs/ /
 
-# Enable the first-boot units; pick the boot splash; sweep what package scriptlets left
-# in runtime-only places; let bootc check the layout (no /var content baked in, kernel
+# Enable the units the system preset names (the first-boot units, firewalld, the bootc
+# update timer; `systemctl enable` rather than `preset` so the build does not depend
+# on how the base image's own presets sort against ours, and the preset file stays the
+# policy a `systemctl preset-all` on the host would re-apply); make the `wardos` zone
+# the firewall's default (nothing inbound, ADR-0017; the sed is checked so a renamed
+# key fails the build); pick the boot splash; sweep what package scriptlets left in
+# runtime-only places; let bootc check the layout (no /var content baked in, kernel
 # present, nothing under /usr/local that should be in /usr, ...). Plymouth runs from the
 # initramfs, so the chosen theme has to be inside it: the initramfs is rebuilt with
 # dracut the way other bootc desktops do (the "image build" job proves the step runs;
@@ -183,6 +190,9 @@ COPY image/rootfs/ /
 # alone: /run/systemd (docker's stub-resolv.conf) and /run/.containerenv and /run/secrets
 # (podman's); none of them is in the image layer.
 RUN systemctl enable wardos-firstboot.service wardos-flathub.service \
+         firewalld.service bootc-fetch-apply-updates.timer \
+    && sed -i 's/^DefaultZone=.*/DefaultZone=wardos/' /etc/firewalld/firewalld.conf \
+    && grep -q '^DefaultZone=wardos$' /etc/firewalld/firewalld.conf \
     && if rpm -q plymouth-plugin-script >/dev/null 2>&1; then plymouth-set-default-theme wardos; \
        else plymouth-set-default-theme spinner; fi \
     && kver=$(basename /usr/lib/modules/*) \

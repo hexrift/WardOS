@@ -61,6 +61,8 @@ jobs:
             cat /usr/lib/systemd/user-preset/90-wardos.preset
             readlink /etc/xdg/hypr
             systemctl is-enabled wardos-firstboot.service wardos-flathub.service
+            systemctl is-enabled bootc-fetch-apply-updates.timer firewalld.service
+            grep ^DefaultZone /etc/firewalld/firewalld.conf
             ls -l /usr/bin/claude /usr/bin/codex /usr/bin/tamperward
             node --version
             HOME=/tmp claude --version

@@ -293,15 +293,48 @@ assert_contains "$out/config.toml" 'sshkey --username=wardos "ssh-ed25519 AAAATE
 assert_contains "$out/config.toml" 'rootpw --lock'
 ! grep -q 'customizations.user' "$out/config.toml" || fail "--luks must not also use customizations.user"
 ! grep -q 'secret' "$TMP/out" || fail "dry-run output must not show WARDOS_PASSWORD"
-# Refusals: LUKS on qcow2, a user with no way in, --config together with --user.
+# Refusals: LUKS on qcow2, a user with no way in, --config together with --user or --luks.
 ! bash "$repo/image/disk.sh" --type qcow2 --luks --output "$out" --dry-run 2>/dev/null || fail "--luks on qcow2 must fail"
 ! bash "$repo/image/disk.sh" --type qcow2 --user wardos --output "$out" --dry-run 2>/dev/null || fail "--user without a password or key must fail"
 ! bash "$repo/image/disk.sh" --type iso --user wardos --password x --config "$out/config.toml" --output "$out" --dry-run 2>/dev/null || fail "--config with --user must fail"
-# Without --user/--luks nothing is generated and no --config is passed.
+! bash "$repo/image/disk.sh" --type iso --luks --config "$out/config.toml" --output "$out" --dry-run 2>/dev/null || fail "--config with --luks must fail"
+# The ISO encrypts by default (ADR-0017): a bare --type iso gets the LUKS kickstart, the
+# user inside it when given, and says so; --no-luks is the opt-out.
 rm -rf "$out"
 bash "$repo/image/disk.sh" --type iso --output "$out" --dry-run >"$TMP/out"
+assert_contains "$out/config.toml" 'autopart --noswap --type=btrfs --encrypted'
+! grep -q 'user --name' "$out/config.toml" || fail "no user was asked for"
+assert_contains "$TMP/out" 'full-disk encryption on'
+assert_contains "$TMP/out" '--no-luks'
+grep -q -- '--config /config.toml' "$TMP/out" || fail "the default LUKS kickstart must reach the builder"
+rm -rf "$out"
+WARDOS_PASSWORD=secret bash "$repo/image/disk.sh" --type iso --user wardos --output "$out" --dry-run >"$TMP/out"
+assert_contains "$out/config.toml" 'autopart --noswap --type=btrfs --encrypted'
+assert_contains "$out/config.toml" 'user --name=wardos --groups=wheel --password=secret --plaintext'
+! grep -q 'customizations.user' "$out/config.toml" || fail "a default-LUKS iso must carry the user in the kickstart"
+rm -rf "$out"
+bash "$repo/image/disk.sh" --type iso --no-luks --output "$out" --dry-run >"$TMP/out"
+assert_missing "$out/config.toml"
+! grep -q -- '--config' "$TMP/out" || fail "no config expected with --no-luks"
+assert_contains "$TMP/out" 'full-disk encryption off'
+# --no-luks with a user falls back to the builder's own user customization.
+bash "$repo/image/disk.sh" --type iso --no-luks --user wardos --password x --output "$out" --dry-run >"$TMP/out"
+assert_contains "$out/config.toml" '[[customizations.user]]'
+! grep -q 'encrypted' "$out/config.toml" || fail "--no-luks must not encrypt"
+# A --config on the ISO carries its own partitioning: no default kickstart is generated.
+rm -rf "$out"
+mkdir -p "$out"
+echo '[[customizations.user]]' >"$TMP/own.toml"
+bash "$repo/image/disk.sh" --type iso --config "$TMP/own.toml" --output "$out" --dry-run >"$TMP/out"
+assert_missing "$out/config.toml"
+assert_contains "$TMP/out" 'full-disk encryption off'
+# A qcow2 is unchanged: nothing generated, nothing encrypted, no mention of LUKS.
+rm -rf "$out"
+bash "$repo/image/disk.sh" --type qcow2 --output "$out" --dry-run >"$TMP/out"
 assert_missing "$out/config.toml"
 ! grep -q -- '--config' "$TMP/out" || fail "no config expected"
+! grep -q 'encryption' "$TMP/out" || fail "a qcow2 says nothing about encryption"
+bash "$repo/image/disk.sh" --help | grep -q -- '--no-luks' || fail "--help must name --no-luks"
 
 # --- image/check-packages.sh --discover: COPR projects and their chroots, from the API ----
 setup_env

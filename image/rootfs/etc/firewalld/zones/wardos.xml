@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The WardOS default zone (ADR-0017: the host admits nothing inbound by default).
+     target DROP: every unsolicited inbound packet is dropped without an answer, on
+     every interface, the same as the built-in `drop` zone; nothing that a session, a
+     browser or an update needs is inbound. Outbound is unrestricted at this layer (the
+     sandboxes have their own egress policy). A command that must be reached from the
+     LAN opens its port for as long as it runs and no longer, in the running
+     configuration only: `firewall-cmd --add-port=PORT/tcp` (never `--permanent`);
+     wardos-share is the one shipped example. Discovery protocols that expect
+     unsolicited replies (mDNS for printers, for instance) need the same:
+     `firewall-cmd --add-service=mdns`. The image build sets DefaultZone=wardos in
+     /etc/firewalld/firewalld.conf. -->
+<zone target="DROP">
+  <short>WardOS</short>
+  <description>Nothing inbound. Ports are opened per command, for the run only.</description>
+</zone>
