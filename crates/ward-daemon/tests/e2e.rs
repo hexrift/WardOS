@@ -375,3 +375,87 @@ print(ask({'hook': 'Stop'}))";
         ]
     );
 }
+
+/// The Phase 3 demo in test form: the bug fails verification, weakening the
+/// protected test changes nothing (the verifier takes it from the entry snapshot),
+/// and the real fix passes.
+#[test]
+fn verify_ignores_a_weakened_protected_test_and_passes_the_real_fix() {
+    if !sandbox::available() || !ward_daemon::verify::Toolchains::detect().has_rust() {
+        eprintln!("skipping: bubblewrap or a Rust toolchain not available");
+        return;
+    }
+    let demo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ward-demo");
+    let project = tempfile::tempdir().unwrap();
+    let w = project.path();
+    for entry in walk(&demo) {
+        let rel = entry.strip_prefix(&demo).unwrap();
+        if rel.starts_with("target") {
+            continue;
+        }
+        let dest = w.join(rel);
+        if entry.is_dir() {
+            fs::create_dir_all(&dest).unwrap();
+        } else {
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::copy(&entry, &dest).unwrap();
+        }
+    }
+    let state = tempfile::tempdir().unwrap();
+    let mut session = Session::start_in(w, state.path()).expect("start");
+
+    let buggy = session.verify().expect("verify");
+    assert!(!buggy.passed, "{}", buggy.output);
+    assert_eq!(buggy.summary.tests_failed, 1, "{}", buggy.output);
+    assert!(buggy.restored.is_empty());
+
+    // The shortcut: make the judge lenient.
+    fs::write(
+        w.join("tests/security_expiry.rs"),
+        "#[test]\nfn rejected_at_exact_expiry() {}\n",
+    )
+    .unwrap();
+    let weakened = session.verify().expect("verify");
+    assert!(!weakened.passed, "a weakened protected test must not count");
+    assert_eq!(weakened.restored, vec!["tests/security_expiry.rs"]);
+
+    // The real fix.
+    let lib = w.join("src/lib.rs");
+    let src = fs::read_to_string(&lib).unwrap();
+    assert!(src.contains(" || now == self.expires_at"));
+    fs::write(&lib, src.replace(" || now == self.expires_at", "")).unwrap();
+    let fixed = session.verify().expect("verify");
+    assert!(fixed.passed, "{}", fixed.output);
+    assert!(fixed.summary.tests_run >= 3, "{:?}", fixed.summary);
+    let log = session.log_path();
+    session.stop(EndReason::UserStop).expect("stop");
+
+    let kinds: Vec<String> = LogReader::open(&log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|r| r.origin == ward_events::Origin::Verifier)
+        .map(|r| format!("{:?}", r.event.kind()))
+        .collect();
+    assert!(
+        kinds.contains(&"VerificationFailed".to_string()),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"VerificationPassed".to_string()),
+        "{kinds:?}"
+    );
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.push(p.clone());
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
