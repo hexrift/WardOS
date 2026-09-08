@@ -104,3 +104,15 @@ Only after the installer is correct and tested for FDE, Secure Boot and rollback
 
 Omarchy's fastest published installs are ~35 s on the fastest hardware and ~1–2 minutes
 typically; those are the reference points, with FDE and verification kept on.
+
+## Measured so far
+
+| Path | Median | Where |
+| --- | --- | --- |
+| `ward run -- true`, daemon-backed, bubblewrap backend, release build | 32 ms | 4 vCPU Xeon 2.8 GHz, `examples/ward-demo` (E-06 record in [`experiments.md`](experiments.md)) |
+| bare `bwrap … -- true` | 6 ms | same host |
+| `ward status` | 3 ms | same host |
+
+The warm-start budget is 150 ms; the remaining cost is the sandbox itself, the shim,
+the per-launch sockets and the entry checks, not any fixed wait.
+

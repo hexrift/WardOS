@@ -195,7 +195,16 @@ contents.
   No redesign of the snapshot or event model was needed. Open: the socket protocol
   (§4) so that the decisions are TamperWard's rather than `wardd`'s reading of the
   config, and the semantic rules.
-* **E-06 (sandbox warm start) — could not measure here.** `crun` cannot manage
+* **E-06 (sandbox warm start, bubblewrap backend) — PASS for the current backend.**
+  Release build, 4 vCPU Xeon 2.8 GHz, daemon-backed session on `examples/ward-demo`:
+  `ward run -- true` (entry checks, proxy and hook sockets, shim, inotify watcher,
+  events through the control socket) median **32 ms** (18–40 ms over 10 runs); bare
+  `bwrap … -- true` 6 ms; `ward status` 3 ms. Before this measurement the same command
+  took a constant 257 ms: the proxy's Unix acceptor polled its shutdown flag on a
+  250 ms sleep and the file watcher slept 40 ms between drains. Both now park in
+  `accept`/`poll(2)` and are woken explicitly. The `crun` backend of the original
+  E-06 plan is still unmeasured here (below).
+* **E-06 (sandbox warm start, crun) — could not measure here.** `crun` cannot manage
   cgroups in the nested CI environment; the spike records `CANNOT-MEASURE-HERE` with
   the exact commands to run on a real cgroups-v2 host
   (`experiments/E-06-warm-start/RESULT.md`).
