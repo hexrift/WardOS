@@ -95,6 +95,31 @@ pub(crate) fn capture(
     cache: &mut HashCache,
     stats: &mut CaptureStats,
 ) -> Result<Capture> {
+    walk(Some(cas), backend, source, opts, cache, stats)
+}
+
+/// The same walk as [`capture`] with nothing stored: every leaf is hashed in
+/// memory, so the manifest (and its id) is exactly what a capture would
+/// produce. This is what lets a shell compare a worktree against a verified
+/// candidate by content without owning a CAS (ADR-0019 decision 1).
+pub(crate) fn digest(
+    backend: &dyn Backend,
+    source: &Path,
+    opts: CaptureOptions,
+    cache: &mut HashCache,
+    stats: &mut CaptureStats,
+) -> Result<Capture> {
+    walk(None, backend, source, opts, cache, stats)
+}
+
+fn walk(
+    cas: Option<&Cas>,
+    backend: &dyn Backend,
+    source: &Path,
+    opts: CaptureOptions,
+    cache: &mut HashCache,
+    stats: &mut CaptureStats,
+) -> Result<Capture> {
     let frozen = backend.freeze(source)?;
     let root = frozen.root();
     let mut walker = Walker {
@@ -116,7 +141,8 @@ pub(crate) fn capture(
 }
 
 struct Walker<'a> {
-    cas: &'a Cas,
+    /// Where leaves go; `None` digests without storing.
+    cas: Option<&'a Cas>,
     opts: CaptureOptions,
     cache: &'a mut HashCache,
     stats: &'a mut CaptureStats,
@@ -171,7 +197,7 @@ impl Walker<'_> {
         if ft.is_symlink() {
             let target = fs::read_link(&abs).map_err(|e| SnapshotError::io(&abs, e))?;
             let bytes = target.as_os_str().as_bytes();
-            let digest = self.cas.put_blob(bytes)?;
+            let digest = self.store(bytes)?;
             self.push(
                 rel,
                 EntryType::Symlink,
@@ -212,21 +238,38 @@ impl Walker<'_> {
                 && mt == mtime
                 && sz == size
             {
+                // The cache may have been warmed by a digest-only walk, or by
+                // a capture into another CAS: a hit says what the bytes hash
+                // to, not that this store holds them.
+                if let Some(cas) = self.cas
+                    && !cas.has_blob(d)
+                {
+                    let bytes = fs::read(abs).map_err(|e| SnapshotError::io(abs, e))?;
+                    cas.put_blob(&bytes)?;
+                }
                 self.stats.files_cached += 1;
                 return Ok(d);
             }
             let bytes = fs::read(abs).map_err(|e| SnapshotError::io(abs, e))?;
-            let d = self.cas.put_blob(&bytes)?;
+            let d = self.store(&bytes)?;
             self.cache.map.insert(abs.to_path_buf(), (mtime, size, d));
             self.stats.files_hashed += 1;
             self.stats.bytes_hashed += bytes.len() as u64;
             Ok(d)
         } else {
             let bytes = fs::read(abs).map_err(|e| SnapshotError::io(abs, e))?;
-            let d = self.cas.put_blob(&bytes)?;
+            let d = self.store(&bytes)?;
             self.stats.files_hashed += 1;
             self.stats.bytes_hashed += bytes.len() as u64;
             Ok(d)
+        }
+    }
+
+    /// The digest of one leaf, stored when there is a CAS to store it in.
+    fn store(&self, bytes: &[u8]) -> Result<Digest> {
+        match self.cas {
+            Some(cas) => cas.put_blob(bytes),
+            None => Ok(Digest::of(bytes)),
         }
     }
 

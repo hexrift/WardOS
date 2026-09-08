@@ -5,12 +5,20 @@
 //! (`docs/event-model.md` §8), the follow/scroll state and the seal transition;
 //! [`SessionState`] is the part of it the trust bar reads (agent state,
 //! verification verdict, TamperWard's presence). Both are derived from records as
-//! they arrive, never from rendered rows, and never from the worktree.
+//! they arrive, never from rendered rows. The one input that is not a record is
+//! the worktree's digest ([`Model::observe_worktree`]), supplied by a viewer
+//! that can read the worktree so a verdict is shown only while it still
+//! describes the tree (ADR-0019).
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use ward_daemon::render::{self, ObserverCells};
-use ward_events::{AgentState, Decision, EventRecord, Origin, WardEvent};
+use ward_events::{
+    AgentState, Decision, EventRecord, Origin, SnapshotId, VerifySummary, WardEvent,
+};
+
+use crate::trust::VerifyState;
 
 /// The counters of the status line (`docs/event-model.md` §8), derived from
 /// records as they arrive, never from rendered rows.
@@ -37,18 +45,60 @@ pub fn counters_text(c: &Counters) -> String {
     )
 }
 
-/// Where the verification phase (`docs/design-language.md` §11) stands.
+/// Where the verification phase (`docs/design-language.md` §11) stands, as the
+/// stream says it: which candidate it concerns, and for a verdict what the
+/// verifier found. Whether that verdict still describes the worktree is the
+/// trust bar's question ([`VerifyState`](crate::trust::VerifyState)).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Verification {
     /// No verification has been requested in this session.
     #[default]
     NotRun,
-    /// Requested or started; the trusted verifier is running.
-    Running,
+    /// Requested or started; the trusted verifier is running on this candidate.
+    Running(SnapshotId),
     /// The last verification passed: `✓ VERIFIED`.
-    Passed,
+    Passed(Verdict),
     /// The last verification failed.
-    Failed,
+    Failed(Verdict),
+}
+
+impl Verification {
+    /// The candidate the phase concerns, once there is one.
+    #[must_use]
+    pub const fn candidate(&self) -> Option<SnapshotId> {
+        match self {
+            Self::NotRun => None,
+            Self::Running(c) => Some(*c),
+            Self::Passed(v) | Self::Failed(v) => Some(v.candidate),
+        }
+    }
+}
+
+/// What a verdict record said: the candidate it judged, when (session time),
+/// the test counts, and how many protected files the verifier restored from
+/// the entry snapshot because the worktree's copy differed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Verdict {
+    /// The candidate snapshot the verifier judged.
+    pub candidate: SnapshotId,
+    /// When the verdict was recorded, as time since the session started.
+    pub at: Duration,
+    /// The verifier's counts.
+    pub summary: VerifySummary,
+    /// Protected files taken from the entry snapshot instead of the worktree.
+    pub restored: u32,
+}
+
+/// The worktree as the shell last digested it (ADR-0019 decision 1): the one
+/// input to the trust bar that is not a record. Only the shell, which can read
+/// the worktree, supplies it; `ward watch` never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Worktree {
+    /// The id the worktree would get if captured now.
+    pub digest: SnapshotId,
+    /// Manifest entries that differ from the verified candidate, when the shell
+    /// could compare (a stored candidate manifest, and a digest that differs).
+    pub changes: Option<u64>,
 }
 
 /// What the stream says about TamperWard.
@@ -72,18 +122,31 @@ pub struct SessionState {
     pub verification: Verification,
     /// TamperWard's presence and verdict.
     pub tamperward: TamperWard,
+    /// `restore …` steps of the verification in progress, for its verdict.
+    restored: u32,
 }
 
 impl SessionState {
     /// Account for one record.
-    pub const fn apply(&mut self, rec: &EventRecord) {
+    pub fn apply(&mut self, rec: &EventRecord) {
         match &rec.event {
             WardEvent::AgentStateChanged { state } => self.agent = Some(*state),
-            WardEvent::VerificationRequested { .. } | WardEvent::VerificationStarted { .. } => {
-                self.verification = Verification::Running;
+            WardEvent::VerificationRequested { candidate, .. }
+            | WardEvent::VerificationStarted { candidate, .. } => {
+                self.verification = Verification::Running(*candidate);
+                self.restored = 0;
             }
-            WardEvent::VerificationPassed { .. } => self.verification = Verification::Passed,
-            WardEvent::VerificationFailed { .. } => self.verification = Verification::Failed,
+            WardEvent::VerificationProgress { step, .. } => {
+                if step.as_str().starts_with("restore ") {
+                    self.restored += 1;
+                }
+            }
+            WardEvent::VerificationPassed {
+                candidate, summary, ..
+            } => self.verification = Verification::Passed(self.verdict(rec, *candidate, *summary)),
+            WardEvent::VerificationFailed {
+                candidate, summary, ..
+            } => self.verification = Verification::Failed(self.verdict(rec, *candidate, *summary)),
             WardEvent::TamperDetected { .. } => self.tamperward = TamperWard::Tampered,
             _ => {}
         }
@@ -93,6 +156,20 @@ impl SessionState {
             && matches!(self.tamperward, TamperWard::Unknown)
         {
             self.tamperward = TamperWard::Clean;
+        }
+    }
+
+    const fn verdict(
+        &self,
+        rec: &EventRecord,
+        candidate: SnapshotId,
+        summary: VerifySummary,
+    ) -> Verdict {
+        Verdict {
+            candidate,
+            at: rec.ts_mono,
+            summary,
+            restored: self.restored,
         }
     }
 }
@@ -107,6 +184,8 @@ pub struct Model {
     pub counters: Counters,
     /// The session state the trust bar shows.
     pub state: SessionState,
+    /// The worktree as last digested, when the viewer can read it.
+    pub worktree: Option<Worktree>,
     /// The daemon closed the stream: the log is sealed.
     pub sealed: bool,
     /// The view tracks the newest row.
@@ -129,6 +208,7 @@ impl Model {
             records: Vec::new(),
             counters: Counters::default(),
             state: SessionState::default(),
+            worktree: None,
             sealed: false,
             follow: true,
             scroll: 0,
@@ -168,6 +248,24 @@ impl Model {
     /// The daemon ended the stream: the log is sealed. The rows stay.
     pub const fn seal(&mut self) {
         self.sealed = true;
+    }
+
+    /// The worktree digests to `digest` now, with `changes` manifest entries
+    /// differing from the verified candidate where that could be counted. The
+    /// trust bar compares this with the candidate the stream verified.
+    pub const fn observe_worktree(&mut self, digest: SnapshotId, changes: Option<u64>) {
+        self.worktree = Some(Worktree { digest, changes });
+    }
+
+    /// The verify segment's state: the stream's verdict held against the
+    /// observed worktree.
+    #[must_use]
+    pub const fn verify_state(&self) -> VerifyState {
+        let worktree = match self.worktree {
+            Some(w) => Some(w.digest),
+            None => None,
+        };
+        VerifyState::of(&self.state.verification, worktree)
     }
 
     /// Every row so far.
@@ -309,6 +407,18 @@ pub(crate) mod fixtures {
         SnapshotId::new(Blake3Hash::from_bytes([0xab; 32]))
     }
 
+    /// What a worktree digests to once it differs from [`snapshot`].
+    pub fn edited() -> SnapshotId {
+        SnapshotId::new(Blake3Hash::from_bytes([0xcd; 32]))
+    }
+
+    pub fn verify_progress(step: &str) -> WardEvent {
+        WardEvent::VerificationProgress {
+            step: ward_events::ShortText::new(step),
+            status: ward_events::StepStatus::Pass,
+        }
+    }
+
     pub fn verify_requested() -> WardEvent {
         WardEvent::VerificationRequested {
             candidate: snapshot(),
@@ -421,7 +531,7 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::panic)]
     use super::fixtures::*;
     use super::*;
     use ward_daemon::render::Tone;
@@ -514,17 +624,45 @@ mod tests {
             model.apply(rec);
         }
         assert_eq!(model.state.agent, Some(AgentState::Working));
-        assert_eq!(model.state.verification, Verification::Running);
+        assert_eq!(model.state.verification, Verification::Running(snapshot()));
+        assert_eq!(model.state.verification.candidate(), Some(snapshot()));
         assert_eq!(
             model.state.tamperward,
             TamperWard::Unknown,
             "wardd is not TamperWard"
         );
 
-        model.apply(wardd(&[verify_failed()]).remove(0));
-        assert_eq!(model.state.verification, Verification::Failed);
-        model.apply(wardd(&[verify_passed()]).remove(0));
-        assert_eq!(model.state.verification, Verification::Passed);
+        // Two protected files restored, then the verdict: the verdict carries
+        // the candidate the record names, the record's session time, the
+        // counts and the restore count.
+        for rec in wardd(&[
+            verify_progress("restore tests/security_expiry.rs"),
+            verify_progress("restore tests/other.rs"),
+            verify_progress("cargo test"),
+            verify_failed(),
+        ]) {
+            model.apply(rec);
+        }
+        let Verification::Failed(failed) = model.state.verification else {
+            panic!("{:?}", model.state.verification);
+        };
+        assert_eq!(failed.candidate, snapshot());
+        assert_eq!(failed.at, Duration::from_secs(3), "the record's time");
+        assert_eq!(failed.summary.tests_failed, 3);
+        assert_eq!(failed.restored, 2);
+
+        // The next run starts its own count.
+        for rec in wardd(&[verify_requested(), verify_passed()]) {
+            model.apply(rec);
+        }
+        let Verification::Passed(passed) = model.state.verification else {
+            panic!("{:?}", model.state.verification);
+        };
+        assert_eq!(passed.candidate, snapshot());
+        assert_eq!(passed.summary.tests_run, 184);
+        assert_eq!(passed.restored, 0);
+        assert_eq!(model.state.verification.candidate(), Some(snapshot()));
+        assert_eq!(Verification::NotRun.candidate(), None);
 
         // A denial from TamperWard is the system handling it: TW stays clean.
         model.apply(records(&[(Origin::TamperWard, denied())]).remove(0));

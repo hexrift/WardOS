@@ -141,7 +141,10 @@ ward verify
 The worktree is snapshotted as a candidate; every protected test and the verify config
 are taken from the *entry* snapshot, not the worktree; the command runs offline in a
 disposable sandbox; the verdict is recorded in the session log. The bar shows
-`VERIFYING`, then `VERIFY ✓` (green) or `VERIFY ✗` (red), and the command exits 0 or 1.
+`VERIFY ◐ 7c01a2b3`, then `VERIFY ✓ 7c01a2b3` (green) or `VERIFY ✗` (red), and the
+command exits 0 or 1. The green is bound to that candidate: edit anything afterwards and
+the segment reads `VERIFY ~ STALE` (amber) until the next `ward verify`; clicking it shows
+the verified candidate, the current digest and how many entries differ.
 An agent that weakened a protected test changed nothing the verifier reads, so a
 shortcut fails here even when the agent's own run passed.
 
@@ -154,10 +157,10 @@ checks the chain later, anywhere.
 | --- | --- |
 | booted, no session | the mark alone, dim; the shell's text surfaces say `No agent session. Super + Space → Start Claude, or ward init then ward claude in a terminal.` |
 | `ward vault set`, `ward init` | unchanged: nothing runs yet |
-| `ward claude` | `● WARD │ sess… │ app │ CLAUDE ● working │ NET restricted (dev) │ CRED 0 granted │ OBS live │ TW ✓ │ LIVE` |
+| `ward claude` | `● WARD │ sess… │ app │ CLAUDE ● working │ NET restricted (dev) │ CRED 0 granted │ OBS live │ TW ✓ │ VERIFY — │ LIVE` |
 | an approval pending | `CLAUDE ▲ waiting`, amber, and a notification |
 | `--grant github` | `CRED 1 granted` |
-| `ward verify` | `VERIFYING`, then `VERIFY ✓` green or `VERIFY ✗` red |
+| `ward verify` | `VERIFY ◐ 7c01a2b3`, then `VERIFY ✓ 7c01a2b3` green or `VERIFY ✗` red; `VERIFY ~ STALE` amber once the tree changes again (`VERIFY —` before the first run) |
 | `ward stop` | `■ WARD … SEALED`, dim |
 
 ## When something is denied

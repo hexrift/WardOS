@@ -169,6 +169,10 @@ for name in want[1:]:
     m = c[name]
     assert m["exec"] == f"ward-shell bar --waybar --segment {name.split('/ward-')[1]} --follow", m["exec"]
     assert m["return-type"] == "json" and m["restart-interval"] == 5
+    # Every segment opens a panel in a ward-session window: the verify segment its own
+    # (ADR-0019: the verified candidate against the worktree), the rest the session panel.
+    panel = "verify-panel" if name == "custom/ward-verify" else "session"
+    assert m["on-click"] == f"foot --app-id ward-session -e sh -c 'ward-shell {panel}; read -r _'", m["on-click"]
 assert c["custom/ward-update"]["interval"] >= 3600
 for m in ("cpu", "memory", "battery", "network", "pulseaudio", "bluetooth"):
     assert c[m].get("interval", 5) >= 5, m

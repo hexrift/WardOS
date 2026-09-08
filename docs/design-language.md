@@ -199,7 +199,39 @@ integrity pass
 ```
 
 `✓ VERIFIED` should become recognisable as a WardOS/TamperWard state. It is always
-rendered the same way, in the same place, in the verified colour.
+rendered the same way, in the same place, in the verified colour, and it is bound to
+the snapshot it judged (ADR-0019): the bar's `VERIFY` segment has five states and shows
+exactly one, decided by content, not by time or heuristics. The shell digests the
+worktree with the snapshot crate's incremental hash cache and compares the id with the
+candidate the last `VerificationPassed` record names; green disappears the moment the
+tree differs from that candidate.
+
+| State | Segment | Colour | Meaning |
+| --- | --- | --- | --- |
+| never | `VERIFY —` | muted | nothing has been verified in this session |
+| verifying | `VERIFY ◐ 7c01a2b3` | accent | the trusted verifier is running on candidate `7c01…` |
+| verified | `VERIFY ✓ 7c01a2b3` | verified green | candidate `7c01…` passed, and the worktree is `7c01…` byte for byte |
+| stale | `VERIFY ~ STALE` | restricted amber | `7c01…` passed, but the worktree has changed since; the verdict is history |
+| failed | `VERIFY ✗` | denied red | the candidate failed |
+
+A failed verdict stays red whatever the tree does next: only a new run changes it. A
+sealed log keeps its verdict; the tree can still make it stale. Clicking the segment
+opens the verify panel: the verified candidate, when it was verified, the worktree's
+digest now, how many manifest entries differ, TamperWard's evidence, the test counts,
+and integrity (how many protected files the verifier had to restore from the entry
+snapshot because the worktree's copy differed).
+
+```text
+Verify
+────────────────────────
+Verified candidate   7c01a2b3
+Verified time        at 12:04 · 3m 12s ago
+Current digest       9d3e5f10
+Changes              2 entries
+TamperWard           clean
+Tests                184/184
+Integrity            pass
+```
 
 ## 12. Motion
 
@@ -288,10 +320,13 @@ surface named here from two inputs only, the session's `SessionDescription` and 
 `EventRecord`s, with a colour role (`Tone`: dim, ink, accent, verified, restricted,
 denied) on each element and no graphics dependency: the trust bar (§6) as segments
 `session · project · agent · network · credentials · observer · TamperWard · verified ·
-daemon`, where the agent (`CLAUDE ● working`, §7 glyphs and words), `TW ✓`/`TW ■` and
-`VERIFYING`/`VERIFY ✓`/`VERIFY ✗` appear only once the stream has said so, and a sealed
-log dims the state marker, the network word, the daemon word and the agent but never a
-verdict; the session panel (§6) as `Session` and `TamperWard` rows; the observer feed
+daemon`, where the agent (`CLAUDE ● working`, §7 glyphs and words) and `TW ✓`/`TW ■`
+appear only once the stream has said so, the verify segment is the five-state machine of
+§11 (`VERIFY —` from the first frame, `◐`, `✓`, `~ STALE`, `✗`; `VerifyState` in
+`trust.rs`, fed by the stream's verdict and the worktree digest the shell observes
+through `Model::observe_worktree`), and a sealed log dims the state marker, the network
+word, the daemon word and the agent but never a verdict; the session panel (§6) as
+`Session` and `TamperWard` rows and the verify panel (§11) as `Verify` rows; the observer feed
 (§8), which is the `ward watch` TUI's `Model` moved here so the TUI and the shell share
 one implementation of the counters and the follow/scroll state (the TUI's bar is the
 same `TrustBar` with the three stream-derived segments omitted, unchanged to the byte);
@@ -323,13 +358,16 @@ custom module per segment (`project`, `agent`, `network`, `tamperward`, `verify`
 session's stream is a new JSON line and nothing polls. The shell decides the words
 and the colour roles; Waybar's stylesheet only maps the classes the JSON carries: the
 six roles of §3 by their names (`dim`, `ink`, `accent`, `verified`, `restricted`,
-`denied`), and on the agent module the §7 state word (`working`, `waiting`,
-`blocked`, `verifying`, `finished`, `idle`), so state colour sits on the segment's
+`denied`), on the agent module the §7 state word (`working`, `waiting`,
+`blocked`, `verifying`, `finished`, `idle`) and on the verify module the §11 state
+word (`never`, `verifying`, `stale`, `failed`), so state colour sits on the segment's
 text and nowhere else. A segment the stream has not established is the empty module,
 which Waybar hides, so the bar grows as the session says more (§2: the host layer
 looks the same with or without an agent) and the mark alone is a bar with no session
-(`WARD`, dim). The session panel (§6) is the whole-bar module's tooltip and opens on
-click in a terminal. The command centre (§13) is fuzzel in dmenu mode over
+(`WARD`, dim); the verify module is the exception, since `VERIFY —` is a state. The
+session panel (§6) is the whole-bar module's tooltip and opens on click in a terminal;
+the verify panel (§11) is the verify module's tooltip and opens on its click
+(`ward-shell verify-panel`). The command centre (§13) is fuzzel in dmenu mode over
 `ward-shell launcher --lines`: the four sections in order, the label with its state
 detail, and the command the shell chose (`ward claude` in a terminal in the worktree,
 `ward verify` in one that stays open); fuzzel matches what the user types, the shell

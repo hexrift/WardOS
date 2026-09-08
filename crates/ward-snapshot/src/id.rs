@@ -20,6 +20,16 @@ impl Digest {
         Self(*blake3::hash(bytes).as_bytes())
     }
 
+    /// Wrap raw digest bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw 32 bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Lowercase hex of the raw 32 bytes (no `blake3:` prefix).
     pub fn to_hex(self) -> String {
         let mut s = String::with_capacity(64);

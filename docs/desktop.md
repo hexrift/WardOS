@@ -189,6 +189,26 @@ claude in a terminal.` while `bar --waybar` stays the dim mark. Until
 `~/.config/wardos/welcome-done` exists, a command centre with no live session (no
 PROJECTS row) opens on `WELCOME  Start here`, which runs `wardos-welcome`.
 
+The bar's verify segment is bound to the snapshot it judged (ADR-0019 decision 1,
+`design-language.md` §11). Before rendering `bar` (text or `--waybar`, the whole bar or
+`--segment verify`) the shell digests the worktree with `ward-snapshot`'s digest-only
+walk and incremental hash cache, using the capture options `ward verify` captures a
+candidate with, and compares the id with the candidate the last `VerificationPassed`
+record names: `VERIFY —` never, `VERIFY ◐ 7c01a2b3` verifying, `VERIFY ✓ 7c01a2b3` the
+tree is that candidate, `VERIFY ~ STALE` it no longer is, `VERIFY ✗` it failed. In
+`--follow` mode the digest is repeated on every record and on every quiet tick
+(`--tick-ms`, 2000 by default), since an edit made outside the sandbox is a change the
+stream never reports. Cost on `examples/ward-demo` (9 files), measured by `ward-shell`'s
+`a_warm_digest_of_the_demo_is_within_the_bar_budget` (release build, 4-vCPU host): cold
+0.24 ms, warm 0.05 ms; on this repository's own checkout (364 files, `WARD_DIGEST_DIR`)
+cold 8.9 ms, warm 2.1 ms. The test fails above 50 ms warm. `ward-shell verify-panel` prints the segment's click panel (the
+verified candidate, its time, the current digest, the number of manifest entries that
+differ from the stored candidate, TamperWard's evidence, the test counts, and integrity
+as the number of protected files the verifier restored from the entry snapshot), and
+`custom/ward-verify`'s `on-click` opens it in a `ward-session` foot window like the
+session panel. The change count needs the session CAS (`~/.local/state/ward/cas`); the
+state itself needs only the digest, so it is decided even without one.
+
 ## Keys
 
 The existing set (`desktop/hyprland/keybindings.conf`) stays. Added, in one file per
@@ -313,7 +333,8 @@ and runs every `desktop/tests/*.test.sh`. A test puts a directory of mock comman
 first on `PATH` (each mock appends its arguments to `$MOCK_LOG`), sets
 `WARDOS_MENU_BACKEND=stdin` with `WARDOS_MENU_CHOICE=<answer>`, points `HOME` and `XDG_*`
 at a temp dir, and asserts on the log and the files written. Rust parts (the theme
-renderer, `ward-shell bar --waybar`) are tested with `cargo test`.
+renderer, `ward-shell bar --waybar`, the worktree digest behind the verify segment) are
+tested with `cargo test`.
 
 ## The README animation
 
@@ -379,7 +400,8 @@ Then some (WardOS only):
 
 | Feature | Delivers | Delivered |
 | --- | --- | --- |
-| Agent state, network, TamperWard and verification in the bar | `ward-shell bar --waybar [--segment mark\|session\|project\|agent\|network\|credentials\|observer\|tamperward\|verify\|daemon] [--follow]`, one JSON module per segment with the tone name and the agent state word as classes; `launcher --lines` for the command centre | ✔ `ward-shell-core` `waybar::tests::every_segment_is_a_module_in_the_{live,sealed}_state`, `every_segment_is_the_empty_module_with_no_session_except_the_mark`, `trust::tests::every_segment_is_addressable_by_name_live_and_sealed`, `launcher::tests::lines_are_section_label_and_shell_command_for_a_described_session`; `ward-shell` `waybar_flags_parse_and_need_waybar` |
+| Agent state, network, TamperWard and verification in the bar | `ward-shell bar --waybar [--segment mark\|session\|project\|agent\|network\|credentials\|observer\|tamperward\|verify\|daemon] [--follow [--tick-ms N]]`, one JSON module per segment with the tone name and the agent or verify state word as classes; `launcher --lines` for the command centre | ✔ `ward-shell-core` `waybar::tests::every_segment_is_a_module_in_the_{live,sealed}_state`, `every_segment_is_the_empty_module_with_no_session_except_the_mark`, `trust::tests::every_segment_is_addressable_by_name_live_and_sealed`, `launcher::tests::lines_are_section_label_and_shell_command_for_a_described_session`; `ward-shell` `waybar_flags_parse_and_need_waybar` |
+| Verification bound to the snapshot it judged (ADR-0019 decision 1) | the five-state `VERIFY` segment (`—` `◐` `✓` `~ STALE` `✗`) decided by digesting the worktree and comparing with the verified candidate; `ward-shell verify-panel` and the segment's click | ✔ `ward-snapshot` `digest_worktree`/`digest_manifest` (`tests/digest.rs`: `the_digest_is_the_id_a_capture_would_store_and_writes_nothing`, `the_hash_cache_makes_the_second_digest_cheap`); `ward-shell-core` `trust::tests::the_verify_segment_is_a_five_state_machine_over_the_stream_and_the_worktree`, `panel::tests::the_verify_panel_holds_the_verdict_against_the_worktree`, `waybar::tests::the_verify_module_goes_stale_with_the_worktree_and_says_how_far`; `ward-shell` `the_verify_segment_follows_the_worktree_by_content`, `a_warm_digest_of_the_demo_is_within_the_bar_budget`; `ward-daemon` `verify_ignores_a_weakened_protected_test_and_passes_the_real_fix` (the record's candidate is the worktree's digest); `configs.test.sh` (the click) |
 | Approvals as notifications, answered from the keyboard | `wardos-approve`, daemon hold on `ask` (`agent-integration.md` §4.1: `Request::Hold`/`Approve`/`Pending`, `ward session pending --follow`, `ward session approve`); `wardos-approve.service` is the listener | ✔ `ward-daemon` `approvals::tests::*`, `hooks::tests::a_held_ask_{waits_for_the_answer_and_relays_it,nobody_answers_is_denied_when_the_timeout_passes}`, `hooks::tests::allow_session_answers_the_same_question_without_asking_again`, `daemon::tests::a_held_approval_is_recorded_listed_answered_and_recorded_again`, `client::tests::{pending_and_approve_go_through_the_daemon,follow_pending_emits_what_is_pending_after_the_backlog_then_on_each_request}`; `desktop/tests/approve.test.sh` |
 | Verify, replay, evidence, snapshots, grants in the menu | `wardos-menu` SECURITY | ✔ from `ward-shell launcher --lines`, static `ward` list without it; `menu.test.sh` |
 | Sandboxed browser profile per project | `wardos-launch browser --project` | ✔ chromium profile under `~/.local/share/wardos/browser/<hash>`; `launch.test.sh` |

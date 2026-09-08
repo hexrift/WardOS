@@ -36,6 +36,13 @@ pub fn ev_snapshot(id: SnapSnapshotId) -> EvSnapshotId {
     EvSnapshotId::new(hash)
 }
 
+/// Bridge a `ward-events` id from the log back into the `ward-snapshot` id the
+/// CAS is keyed by: what a reader of a `VerificationPassed` record needs to
+/// look the candidate up, or to compare it with a digest of the worktree.
+pub fn snap_snapshot(id: EvSnapshotId) -> SnapSnapshotId {
+    SnapSnapshotId(ward_snapshot::Digest::from_bytes(*id.hash().as_bytes()))
+}
+
 /// Bridge a `ward-snapshot` role into the `ward-events` role used in the log.
 pub fn ev_role(role: SnapSnapshotRole) -> EvSnapshotRole {
     match role {

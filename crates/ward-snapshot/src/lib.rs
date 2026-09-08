@@ -25,6 +25,10 @@
 //! Only the portable **frozen-copy** capture path is implemented here; a Btrfs
 //! subvolume backend can be added behind [`backend::Backend`] with no change to
 //! capture, storage, or materialisation.
+//!
+//! [`digest_worktree`] is the same walk with nothing stored: the id a tree
+//! *would* get, for a reader that wants to compare a worktree with a snapshot
+//! by content (the shell's `VERIFY ~ STALE`, ADR-0019) without owning a CAS.
 
 // These pedantic lints would force `# Errors` sections and `#[must_use]` onto
 // nearly every item; we keep doc comments to one line instead.
@@ -51,6 +55,33 @@ pub use meta::{CaptureMode, GitContext, SnapshotMeta};
 
 use backend::{Backend, FrozenCopy};
 use cas::Cas;
+
+/// The id `root_dir` would get from [`SnapshotStore::store_snapshot`] with the
+/// same options, computed without writing a blob or a manifest anywhere. The
+/// walk, the ignore rules and the [`HashCache`] are those of a capture, so the
+/// ids agree byte for byte and a cache warmed here serves a capture later.
+pub fn digest_worktree(
+    root_dir: impl AsRef<Path>,
+    opts: CaptureOptions,
+    cache: &mut HashCache,
+) -> Result<SnapshotId> {
+    let mut stats = CaptureStats::default();
+    Ok(digest_manifest(root_dir, opts, cache, &mut stats)?.id())
+}
+
+/// The manifest behind [`digest_worktree`]: what `root_dir` would be stored
+/// as, entry for entry, reporting the work in `stats`. Diffing it against a
+/// stored manifest ([`ManifestDiff::between`]) counts what changed since a
+/// snapshot without capturing another.
+pub fn digest_manifest(
+    root_dir: impl AsRef<Path>,
+    opts: CaptureOptions,
+    cache: &mut HashCache,
+    stats: &mut CaptureStats,
+) -> Result<Manifest> {
+    let backend = FrozenCopy;
+    Ok(capture::digest(&backend, root_dir.as_ref(), opts, cache, stats)?.manifest)
+}
 
 /// A snapshot store: captures trees into, and serves them from, a CAS.
 #[derive(Clone, Debug)]

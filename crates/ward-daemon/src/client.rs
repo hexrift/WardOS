@@ -291,6 +291,33 @@ pub fn watch_records(
     }
 }
 
+/// [`watch_records`] with a clock: `emit` gets `Some(record)` as each arrives
+/// and `None` whenever `tick` passes with nothing from the daemon, until the
+/// stream ends. The shell's bar re-reads the worktree on both, since an edit
+/// made outside the sandbox is a change the stream never reports (ADR-0019).
+pub fn watch_records_ticking(
+    mut sink: RemoteSink,
+    from_seq: u64,
+    tick: Duration,
+    mut emit: impl FnMut(Option<EventRecord>),
+) -> Result<WatchEnd> {
+    sink.send(&Request::Subscribe { from_seq })?;
+    let mut records = 0;
+    loop {
+        let response = match sink.next_within(tick)? {
+            Next::Quiet => {
+                emit(None);
+                continue;
+            }
+            Next::Closed => None,
+            Next::Response(response) => Some(response),
+        };
+        if let Some(end) = step(response, &mut records, &mut |rec| emit(Some(rec)))? {
+            return Ok(end);
+        }
+    }
+}
+
 /// Subscribe from `from_seq` and hand `emit` the records the daemon has now:
 /// returns [`WatchEnd::Quiet`] once nothing more has arrived for `idle`, or the
 /// end of the stream if that comes first. A shell surface draws its first frame

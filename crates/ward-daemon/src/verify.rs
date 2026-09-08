@@ -95,6 +95,14 @@ pub struct Verification {
     pub scratch: PathBuf,
 }
 
+/// How the worktree is captured as a candidate. The shell digests the worktree
+/// with the same options (ADR-0019 decision 1), so the id it computes is the
+/// one a `VerificationPassed` record names and `VERIFY ✓` means "this tree".
+#[must_use]
+pub fn candidate_options() -> CaptureOptions {
+    CaptureOptions::default()
+}
+
 /// Snapshot the worktree as the candidate, then build the verifier tree under
 /// `scratch_root`: the candidate with every protected path taken from `entry`.
 pub fn prepare(
@@ -105,7 +113,7 @@ pub fn prepare(
 ) -> Result<Verification> {
     let snap = |e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string());
     let candidate = store
-        .store_snapshot(worktree, SnapshotRole::Candidate, CaptureOptions::default())
+        .store_snapshot(worktree, SnapshotRole::Candidate, candidate_options())
         .map_err(snap)?;
     let yaml = store
         .cat(entry, Path::new(CONFIG_PATH))

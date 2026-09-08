@@ -47,6 +47,11 @@ impl Cas {
         Ok(d)
     }
 
+    /// Whether a blob with digest `d` is stored.
+    pub fn has_blob(&self, d: Digest) -> bool {
+        self.blob_path(d).exists()
+    }
+
     /// Read a blob by digest.
     pub fn get_blob(&self, d: Digest) -> Result<Vec<u8>> {
         let path = self.blob_path(d);

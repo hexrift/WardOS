@@ -2294,7 +2294,10 @@ dependencies = [
  "serde_json",
  "tempfile",
  "ward-daemon",
+ "ward-events",
+ "ward-policy",
  "ward-shell-core",
+ "ward-snapshot",
 ]
 
 [[package]]
