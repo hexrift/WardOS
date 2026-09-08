@@ -827,7 +827,10 @@ fn run_dir(session_id: &str) -> Result<PathBuf> {
     }
 }
 
-fn session_dir(state: &Path, id: &str) -> PathBuf {
+/// `<state>/sessions/<id>`: where a session keeps its log, metadata and control
+/// socket.
+#[must_use]
+pub fn session_dir(state: &Path, id: &str) -> PathBuf {
     state.join("sessions").join(id)
 }
 

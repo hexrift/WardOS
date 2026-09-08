@@ -11,7 +11,7 @@
     clippy::struct_field_names
 )]
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -20,7 +20,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod replay;
-use ward_daemon::{Session, SessionMeta, SnapshotRole, render, selftest, snapshot};
+use ward_daemon::{Session, SessionMeta, SnapshotRole, client, render, selftest, snapshot};
 use ward_events::{EndReason, LogReader};
 
 #[derive(Parser)]
@@ -111,7 +111,52 @@ enum Command {
     /// Snapshot primitives for TamperWard, answered from the session CAS.
     #[command(subcommand)]
     Snapshot(SnapshotCmd),
+    /// Evidence records for TamperWard, appended by the session daemon.
+    #[command(subcommand)]
+    Evidence(EvidenceCmd),
+    /// Follow the current session's log live: one observer row per record, from
+    /// the daemon, until the log is sealed (exit 0) or Ctrl-C (exit 130).
+    Watch {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+        /// First sequence number to show; earlier records are skipped.
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        /// Also show the kinds the compact view hides, as a dim kind name.
+        #[arg(long)]
+        all: bool,
+    },
 }
+
+#[derive(Subcommand)]
+enum EvidenceCmd {
+    /// Append one `TamperWard`-origin record to the current session's log through
+    /// its daemon, and print the record's `seq` and observer row.
+    #[command(after_help = EVIDENCE_EXAMPLES)]
+    Append {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+        /// The record as `WardEvent` JSON, or `-` to read it from stdin.
+        #[arg(long, value_name = "RECORD")]
+        json: String,
+    },
+}
+
+const EVIDENCE_EXAMPLES: &str = "\
+The record is a `WardEvent` in its serde JSON shape and must be an evidence kind:
+PolicyDecision, PolicyDenied, TamperDetected or StateAccepted. `detail` may be a bare
+string. Subjects: Session, Manifest, Policy, ProtectedTests, VerifyConfig, Ci, Hooks,
+Fixtures, {\"Snapshot\":{\"id\":\"<hex>\"}}, {\"Path\":{\"path\":…}}, {\"Other\":{\"detail\":…}}.
+
+Examples:
+  ward evidence append --json '{\"PolicyDenied\":{\"subject\":\"ProtectedTests\",
+      \"rule\":\"protected-tests\",\"detail\":\"tests/verify.rs\"}}'
+  ward evidence append --json '{\"TamperDetected\":{\"subject\":\"VerifyConfig\",
+      \"detail\":\".tamperward/config.yml\"}}'
+  ward evidence append --json '{\"StateAccepted\":{\"snapshot\":\"<64 hex>\",
+      \"by\":\"TamperWard\"}}'
+  ward evidence append --json - < record.json
+";
 
 #[derive(Subcommand)]
 enum SessionCmd {
@@ -221,7 +266,56 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         }
         Command::Snapshot(SnapshotCmd::Diff { a, b, json }) => cmd_snapshot_diff(&a, &b, json),
         Command::Snapshot(SnapshotCmd::Cat { id, path }) => cmd_snapshot_cat(&id, &path),
+        Command::Evidence(EvidenceCmd::Append { dir, json }) => {
+            cmd_evidence_append(&dir.unwrap_or_else(cwd), &json)
+        }
+        Command::Watch { dir, from, all } => cmd_watch(
+            &dir.unwrap_or_else(cwd),
+            client::WatchOptions {
+                from_seq: from,
+                all,
+            },
+        ),
     }
+}
+
+/// `ward evidence append`: parse and check the record here, so a refused kind never
+/// reaches the socket; then the daemon appends it with `origin = TamperWard`.
+fn cmd_evidence_append(dir: &Path, json: &str) -> ward_daemon::Result<ExitCode> {
+    let text = if json == "-" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| ward_daemon::Error::Io {
+                path: PathBuf::from("<stdin>"),
+                source: e,
+            })?;
+        text
+    } else {
+        json.to_owned()
+    };
+    let event = client::parse_evidence(&text)?;
+    let state = ward_daemon::session::state_root();
+    let mut sink = client::connect(&client::socket_path(dir, &state)?)?;
+    let record = client::append_evidence(&mut sink, event)?;
+    if let Some(row) = render::observer_row(&record) {
+        println!("{row}");
+    }
+    println!("seq {}", record.seq);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward watch`: a line-at-a-time reader over the daemon's subscription. Ctrl-C is
+/// left to SIGINT's default disposition, which ends the process with status 130.
+fn cmd_watch(dir: &Path, opts: client::WatchOptions) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let sink = client::connect(&client::socket_path(dir, &state)?)?;
+    let mut out = std::io::stdout();
+    client::watch(sink, opts, |row| {
+        // A closed pipe (`ward watch | head`) is the reader's choice, not an error.
+        let _ = writeln!(out, "{row}").and_then(|()| out.flush());
+    })?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_describe(dir: &Path, json: bool) -> ward_daemon::Result<ExitCode> {
