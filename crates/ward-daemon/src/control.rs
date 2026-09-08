@@ -177,6 +177,21 @@ fn session_ended(reason: EndReason) -> WardEvent {
     }
 }
 
+/// What a bounded read ([`RemoteSink::next_within`]) yields.
+#[derive(Debug)]
+pub enum Next {
+    /// A response line.
+    Response(Response),
+    /// The daemon hung up.
+    Closed,
+    /// Nothing arrived within the wait.
+    Quiet,
+}
+
+fn parse_response(line: &str) -> Result<Response> {
+    serde_json::from_str(line).map_err(|e| Error::Events(format!("control response: {e}")))
+}
+
 /// A client of a running daemon: one connection, one request at a time.
 pub struct RemoteSink {
     reader: BufReader<UnixStream>,
@@ -229,9 +244,30 @@ impl RemoteSink {
         if n == 0 {
             return Ok(None);
         }
-        serde_json::from_str(&line)
-            .map(Some)
-            .map_err(|e| Error::Events(format!("control response: {e}")))
+        parse_response(&line).map(Some)
+    }
+
+    /// Read the next response line, waiting at most `wait` for it: [`Next::Quiet`]
+    /// when the daemon is up but has nothing to say yet, [`Next::Closed`] once it
+    /// has hung up. Leaves the read timeout at `wait`. The daemon writes each
+    /// response as one `write` of a short line, so a wait that ends mid-line is not
+    /// expected; if it did, that line would be lost.
+    pub fn next_within(&mut self, wait: Duration) -> Result<Next> {
+        self.set_read_timeout(Some(wait))?;
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => Ok(Next::Closed),
+            Ok(_) => parse_response(&line).map(Next::Response),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(Next::Quiet)
+            }
+            Err(e) => Err(Error::Sandbox(format!("control socket: {e}"))),
+        }
     }
 
     /// Change the read timeout (`None` waits forever; a subscriber uses this so a

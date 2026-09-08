@@ -40,11 +40,12 @@ wardos/
 │   ├── ward-snapshot/             # CAS, manifest, capture (btrfs / frozen-copy), materialise
 │   ├── ward-proxy/                # egress proxy: allowlist, private-range deny, injection
 │   ├── ward-sandbox/              # OCI spec generation, crun driver, cgroup/netns plumbing
+│   ├── ward-shell-core/           # Ward Shell view model (trust bar, feed, launcher, settings), no toolkit
 │   └── ward-bench/                # `ward benchmark`
 │
 ├── desktop/                       # Ward Shell (Rust, layer-shell), Hyprland config, themes
-│   ├── shell/
-│   ├── hyprland/
+│   ├── shell/                     # `ward-shell` binary (workspace member)
+│   ├── hyprland/                  # hyprland.conf, keybindings.conf
 │   └── themes/                    # ward-dark, ward-light, ward-graphite, ward-high-contrast
 │
 ├── image/                         # bootc Containerfile, build manifests
@@ -82,11 +83,12 @@ wardos/
     └── ward-demo/                 # launch demo: failing tests + tempting shortcut
 ```
 
-## As built (Phase 1–3)
+## As built (Phase 1–5)
 
-The workspace today has eight crates; the planned `ward-observer`, `ward-credentials`,
+The workspace today has ten crates; the planned `ward-observer`, `ward-credentials`,
 `ward-verifier` and `ward-bench` crates have not been split out yet because their
-current code is small enough to live where it is used. Where each planned
+current code is small enough to live where it is used (`ward-shell-core` now holds the
+shared view models `ward-observer` was planned for). Where each planned
 responsibility lives now:
 
 | Crate | Modules | Planned home |
@@ -98,7 +100,10 @@ responsibility lives now:
 | `ward-proxy` | `proxy`, `policy`, `addr`, `hosts`, `http`, `resolve`, `gateway`, `secret`, `observer` | as planned; `gateway` is the credential injection of `ward-credentials` |
 | `ward-agent` | `cli`, `landlock`, `seccomp`, `privs`, `supervise`, `relay`, `hook` | as planned; `hook` is the hook adapter |
 | `ward-daemon` | `session`, `control`, `daemon`, `sandbox`, `egress`, `gateway`, `hooks`, `verify`, `selftest`, `watch`, `agents`, `render`, `describe`, `snapshot`, `ids` | `gateway` → `ward-credentials`; `verify` → `ward-verifier`; `render` → `ward-observer` |
-| `ward-cli` | `main`, `replay` | as planned; `replay` → `ward-observer` |
+| `ward-cli` | `main`, `replay`, `tui` | as planned; `replay` → `ward-observer`; `tui` draws the models of `ward-shell-core` |
+| `ward-shell-core` | `trust`, `feed`, `panel`, `launcher`, `settings` | the shared view models of `ward-observer`; no GUI dependency, derived from `SessionDescription` + `EventRecord`s only |
+| `ward-shell` (`desktop/shell`) | `main` | as planned; prints each surface from a running session via `ward_daemon::client`, `gui` feature reserved for the toolkit E-10 selects |
+| `desktop/hyprland`, `desktop/themes` | `hyprland.conf`, `keybindings.conf`; four theme TOMLs + README | as planned; configuration and tokens only, installed by the Phase 6 image |
 | `image/` (not a crate) | `Containerfile`, `build.sh`, `disk.sh`, `sysctl.d/`, `tmpfiles.d/`, `systemd/`, `boot/`, `secure-boot/`, `keys/` | as planned; `boot/`, `secure-boot/`, `keys/` hold plans and public material only (CODEOWNERS); lint-checked in CI, not yet built (Phase 6 started) |
 
 `wardd` is a per-session daemon (ADR-0015): `ward up` spawns `wardd serve`, which owns

@@ -4,16 +4,20 @@
 //! [`append_evidence`] is `ward evidence append`: a `TamperWard`-origin record
 //! appended on TamperWard's behalf (`tamperward-integration.md` §2). [`watch`] is
 //! `ward watch`: [`Request::Subscribe`] and one observer row per record until the
-//! daemon closes the stream, which it does when the log is sealed. Neither touches
-//! the log: with no daemon they fail with [`NO_DAEMON`] instead of falling back to
-//! a local writer, because a producer that opened the log itself would fork the
-//! chain the daemon owns.
+//! daemon closes the stream, which it does when the log is sealed. [`describe`]
+//! is `ward session describe` over the socket, and [`catch_up`] the bounded
+//! subscription a shell surface uses to draw its first frame. None of them
+//! touches the log: with no daemon they fail with [`NO_DAEMON`] instead of
+//! falling back to a local writer, because a producer that opened the log itself
+//! would fork the chain the daemon owns.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ward_events::{EventKind, EventRecord, WardEvent};
 
-use crate::control::{RemoteSink, Request, Response, SOCKET_NAME, is_evidence};
+use crate::control::{Next, RemoteSink, Request, Response, SOCKET_NAME, is_evidence};
+use crate::describe::SessionDescription;
 use crate::error::{Error, Result};
 use crate::render;
 use crate::session::{SessionMeta, session_dir};
@@ -100,6 +104,17 @@ pub fn append_evidence(sink: &mut RemoteSink, event: WardEvent) -> Result<EventR
     }
 }
 
+/// The session's immutable facts from the daemon (`ward session describe` over
+/// the socket): the same [`SessionDescription`] the daemon answers TamperWard.
+pub fn describe(sink: &mut RemoteSink) -> Result<SessionDescription> {
+    match sink.call(&Request::Describe)? {
+        Response::Description(value) => serde_json::from_value(value)
+            .map_err(|e| Error::Events(format!("session description: {e}"))),
+        Response::Error(e) => Err(Error::Events(format!("daemon refused describe: {e}"))),
+        other => Err(Error::Events(format!("unexpected response {other:?}"))),
+    }
+}
+
 /// What `ward watch` prints.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WatchOptions {
@@ -122,6 +137,12 @@ pub enum WatchEnd {
         /// Records received.
         records: u64,
     },
+    /// The stream is still open but nothing more arrived within [`catch_up`]'s
+    /// wait: the log is caught up with, the session is live.
+    Quiet {
+        /// Records received.
+        records: u64,
+    },
 }
 
 impl WatchEnd {
@@ -129,7 +150,9 @@ impl WatchEnd {
     #[must_use]
     pub const fn records(&self) -> u64 {
         match self {
-            Self::Closed { records } | Self::Sealed { records } => *records,
+            Self::Closed { records } | Self::Sealed { records } | Self::Quiet { records } => {
+                *records
+            }
         }
     }
 }
@@ -168,19 +191,54 @@ pub fn watch_records(
     sink.send(&Request::Subscribe { from_seq })?;
     let mut records = 0;
     loop {
-        match sink.next_response()? {
-            Some(Response::Record(rec)) => {
-                records += 1;
-                emit(*rec);
-            }
-            Some(Response::Ok) => {}
-            Some(Response::Sealed { .. }) => return Ok(WatchEnd::Sealed { records }),
-            Some(Response::Error(e)) => {
-                return Err(Error::Events(format!("daemon refused subscribe: {e}")));
-            }
-            Some(other) => return Err(Error::Events(format!("unexpected response {other:?}"))),
-            None => return Ok(WatchEnd::Closed { records }),
+        if let Some(end) = step(sink.next_response()?, &mut records, &mut emit)? {
+            return Ok(end);
         }
+    }
+}
+
+/// Subscribe from `from_seq` and hand `emit` the records the daemon has now:
+/// returns [`WatchEnd::Quiet`] once nothing more has arrived for `idle`, or the
+/// end of the stream if that comes first. A shell surface draws its first frame
+/// from this and then follows with [`watch_records`] on a fresh connection.
+pub fn catch_up(
+    mut sink: RemoteSink,
+    from_seq: u64,
+    idle: Duration,
+    mut emit: impl FnMut(EventRecord),
+) -> Result<WatchEnd> {
+    sink.send(&Request::Subscribe { from_seq })?;
+    let mut records = 0;
+    loop {
+        let response = match sink.next_within(idle)? {
+            Next::Quiet => return Ok(WatchEnd::Quiet { records }),
+            Next::Closed => None,
+            Next::Response(response) => Some(response),
+        };
+        if let Some(end) = step(response, &mut records, &mut emit)? {
+            return Ok(end);
+        }
+    }
+}
+
+/// One step of a subscription: count and emit a record, or report how the
+/// stream ended (`None` is the daemon hanging up).
+fn step(
+    response: Option<Response>,
+    records: &mut u64,
+    emit: &mut impl FnMut(EventRecord),
+) -> Result<Option<WatchEnd>> {
+    match response {
+        Some(Response::Record(rec)) => {
+            *records += 1;
+            emit(*rec);
+            Ok(None)
+        }
+        Some(Response::Ok) => Ok(None),
+        Some(Response::Sealed { .. }) => Ok(Some(WatchEnd::Sealed { records: *records })),
+        Some(Response::Error(e)) => Err(Error::Events(format!("daemon refused subscribe: {e}"))),
+        Some(other) => Err(Error::Events(format!("unexpected response {other:?}"))),
+        None => Ok(Some(WatchEnd::Closed { records: *records })),
     }
 }
 
@@ -272,9 +330,21 @@ mod tests {
     /// `log` from `from_seq` and closes; `Evidence` appends to `chain` and answers
     /// `Record` (or `refuse`). Returns the requests it saw.
     fn fake_daemon(
+        chain: Chain,
+        log: Vec<EventRecord>,
+        refuse: Option<&'static str>,
+    ) -> (TempDir, PathBuf, JoinHandle<Vec<Request>>) {
+        fake_daemon_holding(chain, log, refuse, None)
+    }
+
+    /// [`fake_daemon`], but after streaming a subscription it keeps the
+    /// connection open for `hold` (a live session with nothing new to say)
+    /// before closing. `Describe` answers [`description`] as JSON.
+    fn fake_daemon_holding(
         mut chain: Chain,
         log: Vec<EventRecord>,
         refuse: Option<&'static str>,
+        hold: Option<Duration>,
     ) -> (TempDir, PathBuf, JoinHandle<Vec<Request>>) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join(SOCKET_NAME);
@@ -296,12 +366,19 @@ mod tests {
                 seen.push(request.clone());
                 match request {
                     Request::Ping => reply(&mut writer, &Response::Ok),
+                    Request::Describe => reply(
+                        &mut writer,
+                        &Response::Description(serde_json::to_value(description()).unwrap()),
+                    ),
                     Request::Subscribe { from_seq } => {
                         if let Some(e) = refuse {
                             reply(&mut writer, &Response::Error(e.into()));
                         }
                         for rec in log.iter().filter(|r| r.seq >= from_seq) {
                             reply(&mut writer, &Response::Record(Box::new(rec.clone())));
+                        }
+                        if let Some(hold) = hold {
+                            std::thread::sleep(hold);
                         }
                         break;
                     }
@@ -326,6 +403,75 @@ mod tests {
             seen
         });
         (dir, socket, server)
+    }
+
+    /// The description the fake daemon answers.
+    fn description() -> SessionDescription {
+        let manifest = ward_policy::merge(
+            &ward_policy::Policy::default(),
+            &ward_policy::Policy::default(),
+            &ward_policy::Policy::default(),
+            ward_policy::SessionId("sess_fake".to_owned()),
+            ward_policy::ProjectId("proj_fake".to_owned()),
+        );
+        SessionDescription {
+            session: "sess_fake".to_owned(),
+            project: "proj_fake".to_owned(),
+            worktree: PathBuf::from("/home/dev/payments-api"),
+            started_unix_ms: 1_700_000_000_000,
+            agent: None,
+            entry_snapshot: format!("blake3:{}", "ab".repeat(32)),
+            policy_hash: manifest.policy_hash.to_hex(),
+            manifest,
+        }
+    }
+
+    #[test]
+    fn describe_returns_the_daemons_description() {
+        let (chain, log) = records(&[]);
+        let (_dir, socket, server) = fake_daemon(chain, log, None);
+        let mut sink = connect(&socket).unwrap();
+        let d = describe(&mut sink).unwrap();
+        assert_eq!(d, description());
+        assert_eq!(d.worktree, PathBuf::from("/home/dev/payments-api"));
+        drop(sink);
+        assert_eq!(
+            server.join().unwrap(),
+            vec![Request::Ping, Request::Describe]
+        );
+    }
+
+    #[test]
+    fn catch_up_returns_quiet_on_a_live_session_and_closed_on_a_sealed_one() {
+        let events = [(Origin::TamperWard, denied()), (Origin::Wardd, working())];
+        // Live: the daemon streams the backlog and then says nothing for a while.
+        let (chain, log) = records(&events);
+        let (_dir, socket, _) =
+            fake_daemon_holding(chain, log, None, Some(Duration::from_millis(400)));
+        let sink = connect(&socket).unwrap();
+        let mut seen = Vec::new();
+        let end = catch_up(sink, 0, Duration::from_millis(50), |rec| seen.push(rec)).unwrap();
+        assert_eq!(end, WatchEnd::Quiet { records: 2 });
+        assert_eq!(end.records(), 2);
+        assert_eq!(seen[0].event, denied());
+        assert_eq!(seen[1].event, working());
+
+        // Sealed: the daemon hangs up right after the backlog.
+        let (chain, log) = records(&events);
+        let (_dir, socket, _) = fake_daemon(chain, log, None);
+        let sink = connect(&socket).unwrap();
+        let end = catch_up(sink, 1, Duration::from_secs(5), |_| {}).unwrap();
+        assert_eq!(end, WatchEnd::Closed { records: 1 });
+
+        // A refusal is the same error as for a watch.
+        let (chain, log) = records(&[]);
+        let (_dir, socket, _) = fake_daemon(chain, log, Some("log is sealed"));
+        let sink = connect(&socket).unwrap();
+        let err = catch_up(sink, 0, Duration::from_secs(5), |_| {}).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "events: daemon refused subscribe: log is sealed"
+        );
     }
 
     #[test]

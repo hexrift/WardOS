@@ -2,17 +2,17 @@
 //!
 //! The layout follows `docs/design-language.md`: a trust bar on top whose colour
 //! carries the session's state, the agent activity stream as the main pane with
-//! the same columns as line mode ([`render::observer_cells`]), and a status line
+//! the same columns as line mode ([`ward_daemon::render::observer_cells`]), and a status line
 //! with the counters of `docs/event-model.md` §8 and the key hints.
 //!
 //! The module is split so that everything but the terminal is testable without
 //! one: [`Model`] holds the records, counters, follow/scroll state and the seal
-//! transition; [`Header`] holds the session facts the trust bar shows; [`Action`]
-//! maps keys; [`draw`] renders a frame onto any ratatui backend, including the
-//! `TestBackend`. [`run`] owns the terminal, the background reader thread and
-//! the 50 ms tick loop.
+//! transition and [`Header`] the session facts the trust bar shows, both shared
+//! with the Ward Shell through `ward-shell-core` so there is one implementation
+//! of the observer's state; [`Action`] maps keys; [`draw`] renders a frame onto
+//! any ratatui backend, including the `TestBackend`. [`run`] owns the terminal,
+//! the background reader thread and the 50 ms tick loop.
 
-use std::collections::BTreeSet;
 use std::io::{self, Stdout, Write as _};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -31,199 +31,18 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use ward_daemon::SessionMeta;
 use ward_daemon::client::{self, WatchEnd, WatchOptions};
 use ward_daemon::control::RemoteSink;
-use ward_daemon::render::{self, ObserverCells, Tone};
-use ward_daemon::{SessionMeta, render::network_tone};
-use ward_events::{Decision, EventRecord, WardEvent};
-use ward_policy::NetworkCapability;
+use ward_daemon::render::{ObserverCells, Tone};
+use ward_events::EventRecord;
+use ward_shell_core::{Header, Model, Segment, counters_text, trust_bar_segments};
 
 /// How often the UI loop wakes to drain the channel and redraw.
 pub const TICK: Duration = Duration::from_millis(50);
 
 /// Rows a page key moves by, when the pane height is unknown.
 const PAGE_FALLBACK: usize = 10;
-
-/// The session facts the trust bar shows. Fixed for the session's lifetime; the
-/// daemon state ([`Model::sealed`]) is the one thing on the bar that changes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Header {
-    /// Session id (`sess_…`), shown in short form.
-    pub session: String,
-    /// Project name (the worktree's last path component).
-    pub project: String,
-    /// Network mode; its tone is the bar's state colour.
-    pub network: NetworkCapability,
-    /// Credential rules that grant outright.
-    pub credentials_granted: usize,
-    /// Observer mode as the panels name it.
-    pub observer: &'static str,
-}
-
-impl Header {
-    /// The trust bar facts of a session, from its persisted metadata.
-    #[must_use]
-    pub fn from_meta(meta: &SessionMeta) -> Self {
-        let project = meta.project.file_name().map_or_else(
-            || meta.project.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        Self {
-            session: meta.id.clone(),
-            project,
-            network: meta.manifest.network.clone(),
-            credentials_granted: render::credentials_granted(&meta.manifest),
-            observer: render::observer_text(meta.manifest.observer),
-        }
-    }
-}
-
-/// The counters of the status line (`docs/event-model.md` §8), derived from
-/// records as they arrive, never from rendered rows.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Counters {
-    /// Distinct paths with a `FileModified` record.
-    pub files_changed: u64,
-    /// `CommandStarted` records.
-    pub commands: u64,
-    /// `NetworkRequested` records decided `Allow`.
-    pub net_allowed: u64,
-    /// `NetworkRequested` records decided `Deny`, plus `NetworkDenied` records.
-    pub net_denied: u64,
-    /// `AgentClaim` records: what the agent says about itself, never enforcement.
-    pub claims: u64,
-}
-
-/// The observer's state: what has arrived, what it adds up to, and where the
-/// viewer is looking.
-#[derive(Clone, Debug)]
-pub struct Model {
-    /// Every record received, in sequence order.
-    pub records: Vec<EventRecord>,
-    /// The status-line counters.
-    pub counters: Counters,
-    /// The daemon closed the stream: the log is sealed.
-    pub sealed: bool,
-    /// The view tracks the newest row.
-    pub follow: bool,
-    /// Index of the first visible row while not following.
-    pub scroll: usize,
-    /// Show the kinds the compact view hides, as a dim kind name (`--all`).
-    all: bool,
-    /// The rendered rows, one per record that has one.
-    rows: Vec<ObserverCells>,
-    /// Paths already counted in `counters.files_changed`.
-    paths: BTreeSet<String>,
-}
-
-impl Model {
-    /// An empty, following model. `all` mirrors `ward watch --all`.
-    #[must_use]
-    pub fn new(all: bool) -> Self {
-        Self {
-            records: Vec::new(),
-            counters: Counters::default(),
-            sealed: false,
-            follow: true,
-            scroll: 0,
-            all,
-            rows: Vec::new(),
-            paths: BTreeSet::new(),
-        }
-    }
-
-    /// Account for one record: its counters, and its row if it has one.
-    pub fn apply(&mut self, rec: EventRecord) {
-        match &rec.event {
-            WardEvent::FileModified { path, .. } => {
-                if self.paths.insert(path.to_string()) {
-                    self.counters.files_changed += 1;
-                }
-            }
-            WardEvent::CommandStarted { .. } => self.counters.commands += 1,
-            WardEvent::NetworkRequested { decision, .. } => match decision {
-                Decision::Allow => self.counters.net_allowed += 1,
-                Decision::Deny => self.counters.net_denied += 1,
-                Decision::Ask => {}
-            },
-            WardEvent::NetworkDenied { .. } => self.counters.net_denied += 1,
-            WardEvent::AgentClaim { .. } => self.counters.claims += 1,
-            _ => {}
-        }
-        let cells =
-            render::observer_cells(&rec).or_else(|| self.all.then(|| render::kind_cells(&rec)));
-        if let Some(cells) = cells {
-            self.rows.push(cells);
-        }
-        self.records.push(rec);
-    }
-
-    /// The daemon ended the stream: the log is sealed. The rows stay.
-    pub const fn seal(&mut self) {
-        self.sealed = true;
-    }
-
-    /// Every row so far.
-    #[cfg(test)]
-    pub fn rows(&self) -> &[ObserverCells] {
-        &self.rows
-    }
-
-    /// The largest first-row index at which a pane of `height` rows is full.
-    fn max_top(&self, height: usize) -> usize {
-        self.rows.len().saturating_sub(height)
-    }
-
-    /// The first visible row for a pane of `height` rows.
-    #[must_use]
-    pub fn top(&self, height: usize) -> usize {
-        if self.follow {
-            self.max_top(height)
-        } else {
-            self.scroll.min(self.max_top(height))
-        }
-    }
-
-    /// The rows a pane of `height` rows shows: the newest ones while following,
-    /// otherwise the window at [`Model::scroll`], clamped to the rows that exist.
-    #[must_use]
-    pub fn visible_rows(&self, height: usize) -> &[ObserverCells] {
-        let top = self.top(height);
-        let end = (top + height).min(self.rows.len());
-        &self.rows[top..end]
-    }
-
-    /// Scroll `n` rows towards the oldest; the view stops following.
-    pub fn scroll_up(&mut self, n: usize, height: usize) {
-        self.scroll = self.top(height).saturating_sub(n);
-        self.follow = false;
-    }
-
-    /// Scroll `n` rows towards the newest; reaching the newest row resumes
-    /// following.
-    pub fn scroll_down(&mut self, n: usize, height: usize) {
-        let max = self.max_top(height);
-        let next = self.top(height).saturating_add(n);
-        if next >= max {
-            self.follow_end();
-        } else {
-            self.scroll = next;
-            self.follow = false;
-        }
-    }
-
-    /// Jump to the oldest row.
-    pub const fn scroll_top(&mut self) {
-        self.scroll = 0;
-        self.follow = false;
-    }
-
-    /// Track the newest row again.
-    pub const fn follow_end(&mut self) {
-        self.follow = true;
-        self.scroll = 0;
-    }
-}
 
 /// What a key asks the observer to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,118 +101,6 @@ pub fn dispatch(model: &mut Model, action: Action, height: usize) -> bool {
         Action::Follow => model.follow_end(),
     }
     false
-}
-
-/// The colour that carries the trust bar's state: dim neutral once the log is
-/// sealed, otherwise the network mode's tone (verified green for offline,
-/// restricted amber for every limited mode, red for open).
-#[must_use]
-pub fn trust_tone(network: &NetworkCapability, sealed: bool) -> Tone {
-    if sealed {
-        Tone::Dim
-    } else {
-        network_tone(network)
-    }
-}
-
-/// `sess_01J…`: the session id cut to twelve characters plus an ellipsis.
-#[must_use]
-pub fn short_id(id: &str) -> String {
-    const KEEP: usize = 12;
-    if id.chars().count() <= KEEP + 1 {
-        id.to_owned()
-    } else {
-        let mut s: String = id.chars().take(KEEP).collect();
-        s.push('…');
-        s
-    }
-}
-
-/// One piece of the trust bar: its text, its colour role, and whether it is
-/// emphasised.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Segment {
-    /// The text.
-    pub text: String,
-    /// The colour role.
-    pub tone: Tone,
-    /// Rendered bold.
-    pub bold: bool,
-}
-
-impl Segment {
-    fn new(text: impl Into<String>, tone: Tone) -> Self {
-        Self {
-            text: text.into(),
-            tone,
-            bold: false,
-        }
-    }
-
-    fn bold(text: impl Into<String>, tone: Tone) -> Self {
-        Self {
-            bold: true,
-            ..Self::new(text, tone)
-        }
-    }
-}
-
-/// The trust bar, left to right: state marker, host mark, session id (short
-/// form), project, network mode, credentials granted, observer mode, daemon
-/// state. State colour goes on the marker and the state words, never on the
-/// whole bar (`docs/design-language.md` §3).
-#[must_use]
-pub fn trust_bar_segments(header: &Header, sealed: bool) -> Vec<Segment> {
-    let tone = trust_tone(&header.network, sealed);
-    let sep = || Segment::new(" │ ", Tone::Dim);
-    let (marker, state) = if sealed {
-        ("■ ", "SEALED")
-    } else {
-        ("● ", "LIVE")
-    };
-    let cred_tone = if header.credentials_granted == 0 {
-        Tone::Ink
-    } else {
-        Tone::Warn
-    };
-    vec![
-        Segment::new(marker, tone),
-        Segment::bold("WARD", Tone::Accent),
-        sep(),
-        Segment::new(short_id(&header.session), Tone::Dim),
-        sep(),
-        Segment::new(header.project.clone(), Tone::Ink),
-        sep(),
-        Segment::new("NET ", Tone::Ink),
-        Segment::new(render::network_text(&header.network), tone),
-        sep(),
-        Segment::new(
-            format!("CRED {} granted", header.credentials_granted),
-            cred_tone,
-        ),
-        sep(),
-        Segment::new(format!("OBS {}", header.observer), Tone::Ink),
-        sep(),
-        Segment::bold(state, tone),
-    ]
-}
-
-/// Text of the trust bar, uncoloured: the segments joined.
-#[cfg(test)]
-pub fn trust_bar_text(header: &Header, sealed: bool) -> String {
-    trust_bar_segments(header, sealed)
-        .iter()
-        .map(|s| s.text.as_str())
-        .collect()
-}
-
-/// Text of the status line's counters, uncoloured.
-#[must_use]
-pub fn counters_text(c: &Counters) -> String {
-    format!(
-        "files changed {} · commands {} · network {} allowed / {} denied · claims {}",
-        c.files_changed, c.commands, c.net_allowed, c.net_denied, c.claims
-    )
 }
 
 /// The key hints on the status line, in full.
@@ -654,11 +361,12 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ward_events::{
-        AgentState, Blake3Hash, Chain, ClaimKind, DeniedDst, DenyReason, EndReason, FileChangeKind,
-        HostName, Origin, PayloadText, Pid, ProcessRef, RuleRef, SandboxPath, SandboxRoot,
-        SessionId, Timestamp,
+        AgentState, Blake3Hash, Chain, ClaimKind, Decision, DeniedDst, DenyReason, EndReason,
+        FileChangeKind, HostName, Origin, PayloadText, Pid, ProcessRef, RuleRef, SandboxPath,
+        SandboxRoot, SessionId, Timestamp, WardEvent,
     };
-    use ward_policy::{Policy, merge};
+    use ward_policy::{NetworkCapability, Policy, merge};
+    use ward_shell_core::{Counters, short_id, trust_bar_text, trust_tone};
 
     fn by() -> ProcessRef {
         ProcessRef {
@@ -775,6 +483,7 @@ mod tests {
         Header {
             session: "sess_01J8ZK3Q9X7VY2".to_owned(),
             project: "payments-api".to_owned(),
+            agent: None,
             network,
             credentials_granted: 0,
             observer: "live",

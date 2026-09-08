@@ -1,0 +1,68 @@
+# Ward Dark — the default theme (docs/design-language.md §3).
+#
+# Every token is named; `source` says where its value comes from: the design
+# language section that fixes it, or `derived` where the design gives a rule
+# but no value. Colours are sRGB hex. Terminal cells are the xterm-256 indices
+# the observer already prints (design-language "As built: ward watch").
+
+[meta]
+name = "Ward Dark"
+id = "ward-dark"
+variant = "dark"
+contrast = "standard"
+source = "design-language.md §3"
+
+[palette]
+# Host layer.
+ground = { value = "#0E0F11", role = "Host layer", source = "design-language.md §3" }
+# Surfaces.
+panel = { value = "#16181B", role = "Surfaces", source = "design-language.md §3" }
+# Thin, 1 px.
+separator = { value = "#24272B", role = "Separator", source = "design-language.md §3" }
+# Primary text.
+text = { value = "#D9D9D6", role = "Primary text", source = "design-language.md §3" }
+# Secondary text.
+text_muted = { value = "#8A8D91", role = "Secondary text", source = "design-language.md §3" }
+# The one hue: active agent, focus, selection.
+accent = { value = "#7FA1C3", role = "Active agent, focus, selection", source = "design-language.md §3" }
+# ✓ VERIFIED, pass.
+verified = { value = "#6FAE8A", role = "Verified, pass", source = "design-language.md §3" }
+# Limited network, ask pending.
+restricted = { value = "#C9A24A", role = "Restricted, ask pending", source = "design-language.md §3" }
+# Used sparingly, never animated.
+denied = { value = "#C25A5A", role = "Denied, failed", source = "design-language.md §3" }
+
+# Tones the shell maps onto the palette (crate ward-shell-core, `Tone`).
+[tones]
+dim = "text_muted"
+ink = "text"
+accent = "accent"
+ok = "verified"
+warn = "restricted"
+deny = "denied"
+
+# xterm-256 indices for terminal renderers (`ward watch`).
+[terminal]
+dim = 245
+ink = 252
+accent = 110
+ok = 108
+warn = 179
+deny = 167
+
+[geometry]
+radius_px = 6          # 4–8 px (§5)
+separator_px = 1       # §5
+grid_px = 8            # §5
+shadow_levels = 1      # command centre and approvals only (§5)
+
+[motion]
+transition_ms = 120    # 100–150 ms (§12)
+easing = "ease-out"    # linear or gentle ease-out; no springs, no bounces
+animated = ["agent-start", "workspace-change", "verification-begin", "approval-appear", "agent-finish"]
+
+[typography]
+# Decided by rendering tests in Phase 5 (§4); these are the candidate classes.
+sans = ["Inter", "Geist", "sans-serif"]
+mono = ["JetBrains Mono", "Commit Mono", "monospace"]
+tabular_numerals = true

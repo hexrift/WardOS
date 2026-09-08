@@ -9,6 +9,8 @@ members = [
     "crates/ward-agent",
     "crates/ward-daemon",
     "crates/ward-cli",
+    "crates/ward-shell-core",
+    "desktop/shell",
 ]
 
 [workspace.package]

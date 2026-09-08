@@ -2094,6 +2094,7 @@ dependencies = [
  "ward-daemon",
  "ward-events",
  "ward-policy",
+ "ward-shell-core",
 ]
 
 [[package]]
@@ -2161,6 +2162,25 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "ward-shell"
+version = "0.1.1"
+dependencies = [
+ "clap",
+ "tempfile",
+ "ward-daemon",
+ "ward-shell-core",
+]
+
+[[package]]
+name = "ward-shell-core"
+version = "0.1.1"
+dependencies = [
+ "ward-daemon",
+ "ward-events",
+ "ward-policy",
 ]
 
 [[package]]

@@ -1,0 +1,57 @@
+# Ward Graphite — lower-contrast dark (docs/design-language.md §3).
+#
+# The design names the variant ("lower contrast dark") and gives no values, so
+# every token is derived: Ward Dark lifted off black and its text softened, with
+# the four state colours kept exactly so `✓ VERIFIED` is the same colour in
+# every theme (§11).
+
+[meta]
+name = "Ward Graphite"
+id = "ward-graphite"
+variant = "dark"
+contrast = "low"
+source = "design-language.md §3 (named only; values derived)"
+
+[palette]
+ground = { value = "#1A1C1F", role = "Host layer", source = "derived: Ward Dark ground, lifted" }
+panel = { value = "#212428", role = "Surfaces", source = "derived: Ward Dark panel, lifted" }
+separator = { value = "#2D3136", role = "Separator", source = "derived: Ward Dark separator, lifted" }
+text = { value = "#C4C6C8", role = "Primary text", source = "derived: Ward Dark text, softened" }
+text_muted = { value = "#7E8286", role = "Secondary text", source = "derived: Ward Dark muted, softened" }
+accent = { value = "#7FA1C3", role = "Active agent, focus, selection", source = "design-language.md §3 (unchanged)" }
+verified = { value = "#6FAE8A", role = "Verified, pass", source = "design-language.md §3 (unchanged)" }
+restricted = { value = "#C9A24A", role = "Restricted, ask pending", source = "design-language.md §3 (unchanged)" }
+denied = { value = "#C25A5A", role = "Denied, failed", source = "design-language.md §3 (unchanged)" }
+
+[tones]
+dim = "text_muted"
+ink = "text"
+accent = "accent"
+ok = "verified"
+warn = "restricted"
+deny = "denied"
+
+# Same state cells as Ward Dark; text one step softer (derived).
+[terminal]
+dim = 243
+ink = 251
+accent = 110
+ok = 108
+warn = 179
+deny = 167
+
+[geometry]
+radius_px = 6
+separator_px = 1
+grid_px = 8
+shadow_levels = 1
+
+[motion]
+transition_ms = 120
+easing = "ease-out"
+animated = ["agent-start", "workspace-change", "verification-begin", "approval-appear", "agent-finish"]
+
+[typography]
+sans = ["Inter", "Geist", "sans-serif"]
+mono = ["JetBrains Mono", "Commit Mono", "monospace"]
+tabular_numerals = true
