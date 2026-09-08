@@ -6,16 +6,20 @@
 # fedora:<release> container with the same COPRs. The check, not this file, is the
 # source of truth: a name that has not passed it yet is marked `# unverified` until it has
 # (none today; every name here passed on Fedora 44 with the COPRs of coprs.txt).
+# Size matters (a first pull is the whole image): one browser, no compiler, the fonts
+# the desktop renders, English locales; image/README.md "Size" says what each choice saves.
 
-# --- runtime (ADR-0001: no developer toolchain on the host, one explicit exception) ----
+# --- runtime (ADR-0001: no developer toolchain on the host) -------------------------------
 bubblewrap            # sandbox builder used by wardd (ADR-0002, ADR-0013)
 git                   # snapshot/worktree plumbing (ADR-0010), `ward init` on repositories
 curl                  # transport for `ward` self-checks and the egress relay tests
 python3               # scripts/security-check and hook adapters
 openssh-clients       # agent-side git-over-ssh through the credential broker
-cargo                 # the trusted verifier binds a host toolchain read-only into Zone 2
-rust                  # (image/README.md: the one, temporary, toolchain exception)
+rustup                # rustup-init only, no toolchain: `wardos-install dev rust` puts one in ~/.rustup and ~/.cargo, which the verifier binds (image/README.md "Size")
 podman                # nested containers inside project environments (ADR-0005)
+
+# --- locales (image/README.md "Size": en_US and C.UTF-8; the rest are not installed) -------
+glibc-langpack-en     # en_US.UTF-8 (the base image's glibc-all-langpacks, if present, is removed in the build)
 
 # --- agents (ADR-0017: Claude Code, Codex and TamperWard ship in the image) ----------
 nodejs24              # runtime for the three (Fedora ships versioned streams, no plain `nodejs`; Claude Code needs Node >= 22, which the build checks)
@@ -109,8 +113,7 @@ bash-completion       # completions for the wardos-* family
 
 # --- desktop applications ------------------------------------------------------------------
 nautilus              # files (Super+E)
-chromium              # default browser, web apps (--app)
-firefox               # second browser
+chromium              # the browser: default, web apps (--app); Firefox is a Flatpak away (wardos-install app org.mozilla.firefox)
 flatpak               # Flathub applications (wardos-install app)
 
 # --- containers ---------------------------------------------------------------------------------
@@ -119,13 +122,13 @@ podman-tui            # containers TUI (Super+D)
 distrobox             # mutable development containers
 toolbox               # Fedora's own
 
-# --- fonts and themes ------------------------------------------------------------------------
-jetbrains-mono-fonts  # mono candidate (design-language.md §4)
-rsms-inter-fonts      # sans candidate
-cascadia-code-nf-fonts # mono with Nerd Font glyphs for the bar
-google-noto-sans-fonts # fallback sans
-google-noto-color-emoji-fonts # colour emoji
-google-noto-emoji-fonts # monochrome emoji
+# --- fonts and themes (the faces the desktop renders, image/README.md "Size") ---------------
+jetbrains-mono-fonts  # the mono face (design-language.md §4; every theme's first mono)
+rsms-inter-fonts      # the sans face (every theme's first sans; waybar, hyprlock)
+dejavu-sans-fonts     # fontconfig's default sans and the Latin/Greek/Cyrillic fallback
+dejavu-sans-mono-fonts # the same for mono
+google-noto-sans-cjk-vf-fonts # one CJK fallback (variable font, one file for the five scripts)
+google-noto-color-emoji-fonts # colour emoji (wardos-menu-select emoji, notifications, the browser)
 papirus-icon-theme    # icons
 adw-gtk3-theme        # GTK 3 in the libadwaita look
 

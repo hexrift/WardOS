@@ -44,22 +44,28 @@ Stage 1 provides the ward binaries, from a release tarball or a build of this ch
 ([below](#where-the-binaries-come-from)). Stage 2 starts from
 `quay.io/fedora/fedora-bootc:44` and installs every package of
 [`packages.txt`](packages.txt): the runtime set (`bubblewrap git curl python3
-openssh-clients cargo rust podman`, reasons in the file and in the next paragraph), the
-Hyprland stack, the components that render the shell's surfaces until E-10 (Waybar,
-fuzzel, mako, swayosd), capture tools, audio, Bluetooth, Wi-Fi, power, fingerprint and
-FIDO2, printing, terminals and TUIs, Chromium, Firefox, Nautilus, Flatpak, podman and
-friends, fonts, icon and GTK themes, and Plymouth.
+openssh-clients rustup podman`, reasons in the file and in the next paragraph), the
+English locale, the Hyprland stack, the components that render the shell's surfaces
+until E-10 (Waybar, fuzzel, mako, swayosd), capture tools, audio, Bluetooth, Wi-Fi,
+power, fingerprint and FIDO2, printing, terminals and TUIs, Chromium, Nautilus,
+Flatpak, podman and friends, the fonts the desktop renders, icon and GTK themes, and
+Plymouth. What is *not* there, and why, is the [Size](#size) section: one browser
+(Firefox is `wardos-install app org.mozilla.firefox`), no compiler, no other locales.
 
 On the runtime set: `bubblewrap` is the sandbox builder (ADR-0002, ADR-0013); `git` and
 `openssh-clients` serve worktrees, snapshots (ADR-0010) and git over ssh through the
 broker; `curl` and `python3` the self-checks, `scripts/security-check` and hook
-adapters; `podman` nested containers inside project environments (ADR-0005). `cargo`
-and `rust` are the one, explicit, temporary exception to ADR-0001's "no toolchain on the
-host": the trusted verifier ([`verify.rs`](../crates/ward-daemon/src/verify.rs)) binds a
-host Rust toolchain read-only into Zone 2 for the 0.1 stand-in of a verifier image, and
-they go away when that image (Phase 4, "still ahead") lands. It is the distro toolchain
-on `PATH`, not a `~/.rustup`; `Toolchains::detect` finds no rustup home and falls
-through to `/usr/bin`.
+adapters; `podman` nested containers inside project environments (ADR-0005). `rustup`
+is Fedora's package of the installer only (`rustup-init`), not a toolchain: ADR-0001
+keeps compilers off the host, and the trusted verifier
+([`verify.rs`](../crates/ward-daemon/src/verify.rs)) binds a Rust toolchain read-only
+into Zone 2 from the *user's* `~/.rustup` and `~/.cargo`, which is where
+`Toolchains::detect` looks first and where `wardos-install dev rust` (`rustup-init -y
+--no-modify-path`) puts one. Until that has run, `ward doctor`'s `verifier toolchain`
+row warns `toolchain: none (rustup: /usr/bin/rustup-init)` with that command as the
+fix, and `ward verify` runs only commands from the base system (the 0.1 stand-in for a
+verifier image; Phase 4, "still ahead", replaces the bind with an image). The build
+refuses an image that has `rust`, `cargo` or `gcc` in it.
 
 Then, in this order: the binaries go to `/usr/bin`; `install-desktop.sh` places the
 desktop tree ([below](#the-desktop-in-the-image)); the agents are installed from
@@ -283,6 +289,54 @@ Three defaults of ADR-0017, each a file in this directory:
   is the manual path, `bootc rollback` boots the previous deployment, which every
   upgrade keeps ([`boot/README.md`](boot/README.md) §4, §6). The build log's "What the
   image holds" step prints `systemctl is-enabled` for the timer and the firewall.
+
+## Size
+
+A first pull of `ghcr.io/hexrift/wardos:latest` is the whole host, and it took over ten
+minutes: on 2026-09-08, before the work below, the registry's manifest for
+`latest-x86_64` summed to **2,849,473,784 bytes compressed** (2.65 GiB, 74 layers: the
+`dnf` layer 1.23 GB, the last layer with the rebuilt initramfs 277 MB, the agents
+233 MB, the binaries 145 MB), the `disk` workflow's qcow2 was 2.94 GiB
+(`wardos-v0.2.0-x86_64.qcow2` of run 4; 2.91 GiB as `.zst`, because
+bootc-image-builder compresses the filesystem inside) and the ISO 3.44 GiB (3.37 GiB
+`.zst`). Every pull, every `bootc upgrade` and every disk pays for what the manifest
+names, so the manifest is kept to what the desktop renders and what a session needs;
+the rest is a Flatpak, a rustup toolchain in the user's home, or absent.
+
+**Baseline: `install_weak_deps=False` (#66, #70).** Run 2 of the `disk` workflow
+(34216758319, the last build before #66) uploaded a qcow2-only artifact of
+3,377,829,214 bytes (3.15 GiB; the artifact zip of a qcow2 that is compressed inside
+is the qcow2's size within a percent). Run 4 (34224721518, the first after it, with
+nothing else in the manifest changed in between) has the same qcow2 at 2.94 GiB: about
+210 MiB less for the "recommended" extras alone. Nothing the desktop needs was a weak
+dependency that anyone has found; the names to look at first when E-09 finds a gap are
+the recommendations of the installed set, listed offline with `podman run --rm
+quay.io/fedora/fedora:44 dnf -q repoquery --recommends $(sed -e 's/#.*//' packages.txt)`
+after enabling the COPRs the way `check-packages.sh` does. Known candidates:
+`gnome-keyring-pam` (the keyring is unlocked at login without it only because the
+image has no password prompt), `fwupd-plugin-uefi-capsule-data` (dbx updates),
+`pipewire-gstreamer` (media in GTK applications), `mesa-va-drivers` (video decoding in
+Chromium); each is one line in `packages.txt` if a boot test wants it, never a return
+to weak dependencies.
+
+**What went, and the expected saving** (installed sizes from the Fedora 44 packages;
+the measured number is the line `docker image inspect --format '{{.Size}}'` prints
+after every "image build" job in `image.yml`, and the pull size is the manifest sum
+above, recomputed with the same command against the next `latest-x86_64`):
+
+| Removed | Why | Expected saving |
+| --- | --- | --- |
+| `firefox` (#67) | One browser. Chromium is the default browser, the web-app engine (`wardos-webapp`, `--app`, one profile per app and per project) and what the theme's `chromium.json` colours; nothing in `desktop/` names Firefox except the window rule that puts the Flatpak on the web workspace. Firefox is `wardos-install app org.mozilla.firefox`, one command, Flathub's build, sandboxed. | ~290 MB |
+| `rust`, `cargo` (#68) | ADR-0001: no toolchain on the host. They were the "one temporary exception" for the verifier; the verifier reads `~/.rustup` and `~/.cargo` instead, filled by `wardos-install dev rust`. With them go what only they pulled in: `rust-std-static`, `gcc`, `binutils`, `glibc-devel`, `kernel-headers` (`llvm-libs` stays: Mesa needs it). Neither `gcc` nor `make` is in the manifest because nothing in it needs a compiler at run time: `python3` is used for plain scripts, the agents' native pieces are prebuilt binaries from the lockfile (`npm ci --ignore-scripts`), bootc kernels ship their modules and there is no DKMS. The build refuses the image if `rust`, `cargo` or `gcc` is in it. Added: `rustup` (the installer, ~10 MB). | ~500 MB |
+| `cascadia-code-nf-fonts` (#69) | No component names it: the bar is words in Inter and JetBrains Mono (`config/waybar/style.css`), the menus and terminals take the theme's `mono` list, and no shipped file uses a Nerd Font glyph. | ~30 MB |
+| `google-noto-sans-fonts`, `google-noto-emoji-fonts` (#69) | Inter is the sans everywhere (every theme's first `sans`, hyprlock, the bar); the fallback for Latin, Greek and Cyrillic is DejaVu (fontconfig's own default, now named in the manifest so it cannot vanish); one emoji font, the colour one (`wardos-menu-select` emoji, notifications, the browser). Added: `dejavu-sans-fonts`, `dejavu-sans-mono-fonts` (~3 MB, usually already present) and `google-noto-sans-cjk-vf-fonts` as the one CJK fallback (a variable font, one file for the five scripts, ~35 MB; the static family it replaces in the usual desktop set is over 100 MB), so a page or a file name in Japanese or Chinese renders instead of boxes. | ~15 MB net |
+| Locales other than `en_US` and `C.UTF-8` (#69) | `glibc-langpack-en` is in the manifest and `glibc-all-langpacks` (the 220 MB locale archive) is removed when the base image carries it; the rpm macro `%_install_langs en_US:en` (`/etc/rpm/macros.image-language-conf`, written before the install, kept in the image so later layering matches) drops every other language's translations and Chromium's other locale packs as the packages unpack. The kickstart and the desktop are `en_US.UTF-8`; the build asserts `locale -a` lists it, so a filter that took too much fails the build rather than a boot. Not done: `tsflags=nodocs`, which would also drop the manual pages, and the desktop keeps those. | ~220 MB if the base carried the archive, ~100 MB of translations |
+
+Together, roughly a gigabyte installed, about a third of the pull; the table is the
+expectation and the CI line is the fact. What stays big and why: the agents
+(`agents/`, 550 MB, ADR-0017: useful the minute it boots), Chromium (~300 MB, the
+browser and the web-app engine), the kernel with its modules and the initramfs, Mesa
+and LLVM (the compositor), Node (the agents' runtime).
 
 ## Where the binaries come from
 
@@ -551,7 +605,8 @@ image and its disks are for a VM or a PC, not for WSL2.
    `sysctl user.max_user_namespaces` (non-zero) and `bwrap --unshare-all -- true`.
 6. Verify the runtime: `ward selftest` should pass every group it passes on a Fedora
    development host; `ward doctor` (or `cat /var/lib/wardos/doctor.txt`) lists bubblewrap,
-   cgroups v2, user namespaces, `cargo` on `PATH`, `podman`, and the ADR-0017 rows:
+   cgroups v2, user namespaces, the verifier toolchain (a warning naming
+   `wardos-install dev rust` until a user has run it), `podman`, and the ADR-0017 rows:
    `node`, `agents` (the three versions), `keys` (a warning until `ward vault set
    ANTHROPIC_API_KEY`), `firewall` (`firewalld active, default zone wardos`).
 7. `bootc status` shows the booted image and its digest. Record both in the E-09 result.
@@ -583,8 +638,10 @@ CI runs, on every pull request and push (`verify.yml`):
 
 and, in `image.yml` on `main` and on pull requests that touch `image/`, `desktop/`, the
 crates or `Cargo.lock`: `image build` and `image build (aarch64)`, the real `docker
-build` with the checkout's binaries on a runner of each architecture, followed by a
-look inside (`/usr/bin/ward*`, `/usr/share/wardos`, the user preset, `/etc/xdg/hypr`,
+build` with the checkout's binaries on a runner of each architecture, the image's size
+printed right after it (`docker image inspect --format '{{.Size}}'`, the number the
+[Size](#size) section tracks), followed by a look inside (`/usr/bin/ward*`,
+`/usr/share/wardos`, the user preset, `/etc/xdg/hypr`,
 the enabled units including the firewall and the update timer, the firewall's default
 zone, the three agent commands with their versions and `node --version`, the Plymouth
 theme) and `bootc container lint`. It is the check that catches a package name that

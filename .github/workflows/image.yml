@@ -51,6 +51,8 @@ jobs:
             --build-arg WARDOS_SOURCE=builder \
             --build-arg "WARDOS_VERSION=$(git describe --tags --always)" \
             -t wardos:ci .
+          # The size a first pull pays for (image/README.md "Size"): bytes, then human.
+          docker image inspect --format '{{.Size}}' wardos:ci | tee /dev/stderr | numfmt --to=iec-i --suffix=B
       - name: What the image holds
         run: |
           set -euo pipefail
@@ -114,6 +116,8 @@ jobs:
             --build-arg WARDOS_SOURCE=builder \
             --build-arg "WARDOS_VERSION=$(git describe --tags --always)" \
             -t wardos:ci .
+          # The size a first pull pays for (image/README.md "Size"): bytes, then human.
+          docker image inspect --format '{{.Size}}' wardos:ci | tee /dev/stderr | numfmt --to=iec-i --suffix=B
       - name: What the image holds
         run: |
           set -euo pipefail

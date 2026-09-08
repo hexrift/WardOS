@@ -52,7 +52,7 @@ API with it.
 | unprivileged user namespaces | bwrap without setuid | Ubuntu 24.04+: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`; some distros: `kernel.unprivileged_userns_clone=1` |
 | Landlock (kernel ≥ 5.13) | inner file rules in the shim | recommended; without it the shim runs with seccomp only and records the degradation |
 | `git` | repository probes, GitHub adapter | usually present |
-| a Rust toolchain in `~/.rustup` + `~/.cargo` | `ward verify` on Rust projects | `rustup` (optional) |
+| a Rust toolchain in `~/.rustup` + `~/.cargo` | `ward verify` on Rust projects | `rustup` (optional): `rustup-init -y --no-modify-path`, or on WardOS `wardos-install dev rust`; the image ships the installer, never a toolchain (ADR-0001), and `ward doctor` says `toolchain: none (rustup: …)` with that fix until one is there |
 | cgroup v2 | nested containers, later | most modern distros (optional today) |
 
 `ward doctor` prints each of these with a fix when it is missing.
@@ -145,6 +145,9 @@ on tty1, `uwsm` starts Hyprland, `wardos-first-run` copies the configs and hands
 to `wardos-welcome` (theme, key, first project, first agent; [`onboarding.md`](onboarding.md)),
 and Flathub plus `desktop/flatpaks.txt` arrive in the background. Updates:
 `wardos-update` (`bootc upgrade`; the previous deployment stays, `bootc rollback`).
+The image has one browser (Chromium; Firefox is `wardos-install app
+org.mozilla.firefox`), no compiler (`wardos-install dev rust` puts a toolchain in your
+home for `ward verify`) and English locales; `image/README.md` "Size" says why.
 
 **On a Fedora you already have** (44, the release the image pins: Workstation, Silverblue, Kinoite):
 

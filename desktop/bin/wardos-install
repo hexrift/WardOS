@@ -9,7 +9,10 @@
 #        wardos-install tui <name> <cmd…>         → wardos-tui install
 #        wardos-install theme <git-url>           → wardos-theme install
 #        wardos-install font <file-or-dir>        .ttf/.otf files into ~/.local/share/fonts
-#        wardos-install dev <lang>                `mise use -g <lang>@latest`
+#        wardos-install dev <lang>                `mise use -g <lang>@latest`; `dev rust` is
+#                                                 rustup-init into ~/.rustup and ~/.cargo (the
+#                                                 host has no toolchain, ADR-0001; the verifier
+#                                                 binds this one)
 #        wardos-install service <name>            tailscale (enable tailscaled when installed),
 #                                                 dropbox (Flathub), syncthing (user unit when
 #                                                 installed, else Flathub)
@@ -38,6 +41,22 @@ install_font() {
   [[ $n -gt 0 ]] || wardos_die "no .ttf/.otf files in $src"
   fc-cache -f
   echo "$n font file(s) installed to $dest; pick one with wardos-font set"
+}
+
+# A Rust toolchain lives in the user's home, never in the image (ADR-0001): Fedora's
+# `rustup` package ships only the installer, rustup-init, which downloads the toolchain
+# from static.rust-lang.org into ~/.rustup and ~/.cargo; that is where the verifier
+# (`ward verify`) and `ward doctor` look. An existing toolchain only gets its default
+# channel set, so the command is safe to repeat and never re-downloads.
+install_rust() {
+  local cargo_home=${CARGO_HOME:-$HOME/.cargo}
+  if [[ -x "$cargo_home/bin/rustup" ]]; then
+    "$cargo_home/bin/rustup" default stable
+  else
+    wardos_has rustup-init || wardos_die "rustup-init is not installed; it ships with the image as the rustup package (image/packages.txt)"
+    rustup-init -y --no-modify-path --profile minimal --default-toolchain stable
+  fi
+  echo "Rust toolchain in $cargo_home (rustup); \`ward doctor\` shows the verifier's toolchain row"
 }
 
 install_service() {
@@ -93,8 +112,12 @@ EOF
     ;;
   dev)
     lang=$(ask "${1:-}" "Language") || exit 0
-    wardos_has mise || wardos_die "mise is not installed; it ships with the image (image/packages.txt)"
-    mise use -g "$lang@latest"
+    if [[ $lang == rust ]]; then
+      install_rust
+    else
+      wardos_has mise || wardos_die "mise is not installed; it ships with the image (image/packages.txt)"
+      mise use -g "$lang@latest"
+    fi
     ;;
   service)
     svc=$(ask "${1:-}" "Service") || exit 0

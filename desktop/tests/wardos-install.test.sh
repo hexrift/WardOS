@@ -49,6 +49,22 @@ rm "$MOCK_DIR/mise"
 wardos-install dev node 2>"$TMP/err" && fail "no mise, no install"
 grep -q mise "$TMP/err" || fail "the message names mise"
 
+# dev rust: no toolchain on the host (ADR-0001); rustup-init from Fedora's rustup
+# package installs one into ~/.rustup and ~/.cargo, which the verifier binds. Without
+# the package the message says so; with a toolchain already there, only the default
+# channel is set (no download).
+wardos-install dev rust 2>"$TMP/err" && fail "no rustup-init, no toolchain"
+grep -q 'rustup' "$TMP/err" || fail "the message names rustup"
+mock rustup-init
+wardos-install dev rust
+assert_logged '^rustup-init -y --no-modify-path --profile minimal --default-toolchain stable$'
+mkdir -p "$HOME/.cargo/bin" "$HOME/.rustup"
+mock rustup
+cp "$MOCK_DIR/rustup" "$HOME/.cargo/bin/rustup"
+wardos-install dev rust
+assert_logged '^rustup default stable$'
+[[ $(grep -c '^rustup-init' "$MOCK_LOG") -eq 1 ]] || fail "an existing toolchain is not reinstalled"
+
 # service: dropbox from Flathub; syncthing as a user unit when installed, else Flathub;
 # tailscale enabled when installed, else a message.
 wardos-install service dropbox
