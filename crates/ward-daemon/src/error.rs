@@ -28,6 +28,9 @@ pub enum Error {
     /// The sandbox runtime (bubblewrap) failed to launch.
     #[error("sandbox: {0}")]
     Sandbox(String),
+    /// The session daemon (`wardd`) could not be started, bound, or reached.
+    #[error("daemon: {0}")]
+    Daemon(String),
 }
 
 /// Daemon result alias.

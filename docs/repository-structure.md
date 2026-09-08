@@ -97,12 +97,16 @@ responsibility lives now:
 | `ward-sandbox` | OCI spec generation and the typed seccomp profile | as planned |
 | `ward-proxy` | `proxy`, `policy`, `addr`, `hosts`, `http`, `resolve`, `gateway`, `secret`, `observer` | as planned; `gateway` is the credential injection of `ward-credentials` |
 | `ward-agent` | `cli`, `landlock`, `seccomp`, `privs`, `supervise`, `relay`, `hook` | as planned; `hook` is the hook adapter |
-| `ward-daemon` | `session`, `sandbox`, `egress`, `gateway`, `hooks`, `verify`, `selftest`, `watch`, `agents`, `render`, `ids` | `gateway` → `ward-credentials`; `verify` → `ward-verifier`; `render` → `ward-observer` |
+| `ward-daemon` | `session`, `control`, `daemon`, `sandbox`, `egress`, `gateway`, `hooks`, `verify`, `selftest`, `watch`, `agents`, `render`, `describe`, `snapshot`, `ids` | `gateway` → `ward-credentials`; `verify` → `ward-verifier`; `render` → `ward-observer` |
 | `ward-cli` | `main`, `replay` | as planned; `replay` → `ward-observer` |
 
-`wardd` as a long-running daemon with a control socket (ADR-0009) is still ahead:
-`ward-daemon` is a library the `ward` binary drives in process (ADR-0013), with the
-per-launch sockets (`proxy.sock`, `hooks.sock`) living in a short-lived run directory.
+`wardd` is a per-session daemon (ADR-0015): `ward up` spawns `wardd serve`, which owns
+the session log and serves `sessions/<id>/control.sock` (`control` is the protocol and
+the two sinks, `daemon` the server); `ward stop` ends it. Sandboxes, proxies and hook
+listeners still run in the `ward` process (ADR-0013), with the per-launch sockets
+(`proxy.sock`, `hooks.sock`) living in a short-lived run directory, and every command
+falls back to writing the log in-process when no daemon answers. The system-service
+`wardd` of ADR-0009 (one supervisor for all sessions, its own uid) is still ahead.
 `unsafe_code` is forbidden workspace-wide; no crate has needed an exception so far, so
 there is no `UNSAFE.md` yet.
 

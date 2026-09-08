@@ -1,14 +1,16 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! End-to-end session test. Requires bubblewrap; skips cleanly without it.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
+use ward_daemon::control::{RemoteSink, Request, Response};
 use ward_daemon::session::LaunchOpts;
-use ward_daemon::{Session, SessionMeta, sandbox, selftest};
-use ward_events::{EndReason, FileChangeKind, LogReader, WardEvent};
+use ward_daemon::{Session, SessionMeta, daemon, sandbox, selftest};
+use ward_events::{EndReason, EventRecord, FileChangeKind, LogReader, Origin, WardEvent};
 
 fn scratch_project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -609,5 +611,172 @@ for req in ({'hook': 'PostToolUse', 'tool': 'Read', 'summary': 'FORGED kernel re
             .filter(|r| r.origin != ward_events::Origin::Agent)
             .all(|r| !matches!(r.event, WardEvent::AgentClaim { .. })),
         "no claim carries an enforcement origin"
+    );
+}
+
+/// ADR-0015 end to end: a live `wardd` owns the log. A reopened session appends
+/// through it, a second client adds `TamperWard` evidence, a subscriber from seq 0
+/// sees the run's records and the evidence in order with no gap across the
+/// replay/live boundary, and `stop` seals a log that verifies.
+#[test]
+fn daemon_owns_the_log_streams_to_a_subscriber_and_seals_on_stop() {
+    if !sandbox::available() {
+        eprintln!("skipping: bubblewrap not available");
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+
+    // `ward up`: start, persist, hand the log over to the daemon.
+    let up = Session::start_in(project.path(), state.path()).expect("up");
+    let session_id = up.id().to_owned();
+    let log = up.log_path();
+    up.persist_current().expect("persist");
+    drop(up);
+    let (state_path, id) = (state.path().to_path_buf(), session_id.clone());
+    let served = std::thread::spawn(move || daemon::serve(&state_path, &id));
+    assert!(
+        daemon::wait_until(daemon::STARTUP_TIMEOUT, || daemon::serving(
+            state.path(),
+            &session_id
+        )),
+        "the daemon answers a Ping"
+    );
+    let socket = daemon::socket_path(state.path(), &session_id);
+    assert!(daemon::pid_path(state.path(), &session_id).exists());
+
+    let collector = subscribe_from_zero(&socket);
+
+    // `ward run`: the reopened session writes through the socket.
+    let mut run = Session::open_current(project.path(), state.path())
+        .expect("open current")
+        .expect("a current session exists");
+    let report = run
+        .run(&[
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo hi > created.txt".into(),
+        ])
+        .expect("run");
+    assert_eq!(report.code, Some(0));
+    run.sync().expect("sync through the daemon");
+
+    // TamperWard: evidence from a second connection, and the session facts.
+    let mut tamperward = RemoteSink::connect(&socket).expect("second client");
+    let evidence = WardEvent::PolicyDenied {
+        subject: ward_events::PolicySubject::ProtectedTests,
+        rule: ward_events::RuleRef::new("tests").unwrap(),
+        detail: ward_events::DetailText::new("tests/security_expiry.rs"),
+    };
+    let appended = match tamperward
+        .call(&Request::Evidence { event: evidence })
+        .expect("evidence")
+    {
+        Response::Record(r) => *r,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(appended.origin, Origin::TamperWard);
+    match tamperward.call(&Request::Describe).expect("describe") {
+        Response::Description(v) => {
+            assert_eq!(v, serde_json::to_value(run.describe()).unwrap());
+        }
+        other => panic!("{other:?}"),
+    }
+    let forged = tamperward
+        .call(&Request::Append {
+            origin: Origin::TamperWard,
+            event: WardEvent::AgentStateChanged {
+                state: ward_events::AgentState::Working,
+            },
+            at_unix_ms: 0,
+        })
+        .expect("answered");
+    assert!(matches!(forged, Response::Error(_)), "{forged:?}");
+
+    // `ward stop`: a `Request::Stop` through the sink; the daemon seals and exits.
+    run.stop(EndReason::UserStop).expect("stop");
+    served
+        .join()
+        .unwrap()
+        .expect("serve returns Ok once the log is sealed");
+    assert!(!socket.exists(), "the socket is unlinked on exit");
+    assert!(
+        !daemon::pid_path(state.path(), &session_id).exists(),
+        "the pid file is removed on exit"
+    );
+    assert!(
+        SessionMeta::current(project.path(), state.path())
+            .unwrap()
+            .is_none(),
+        "the current pointer is cleared"
+    );
+    assert!(
+        RemoteSink::connect(&socket).is_none(),
+        "nothing answers after the seal"
+    );
+
+    // The subscriber saw exactly the sealed log, in order, with no gap or repeat.
+    let seen = collector.join().unwrap();
+    assert_stream_matches_sealed_log(&seen, &log);
+}
+
+/// A subscriber from seq 0 on its own thread, collecting until the daemon closes
+/// the stream. A raw stream: the replay is instant but live records arrive
+/// whenever the sandboxed command produces them, so no client read timeout applies.
+fn subscribe_from_zero(socket: &std::path::Path) -> std::thread::JoinHandle<Vec<EventRecord>> {
+    let stream = UnixStream::connect(socket).expect("subscriber connects");
+    std::thread::spawn(move || {
+        let mut writer = stream.try_clone().unwrap();
+        let mut line = serde_json::to_vec(&Request::Subscribe { from_seq: 0 }).unwrap();
+        line.push(b'\n');
+        writer.write_all(&line).unwrap();
+        let mut seen: Vec<EventRecord> = Vec::new();
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            match serde_json::from_str::<Response>(&line).expect("a response line") {
+                Response::Record(r) => seen.push(*r),
+                other => panic!("unexpected on a subscription: {other:?}"),
+            }
+        }
+        seen
+    })
+}
+
+/// `seen` (what a subscriber from seq 0 received) is the sealed log at `log`,
+/// record for record, and carries the run's records and the evidence in seq order.
+fn assert_stream_matches_sealed_log(seen: &[EventRecord], log: &std::path::Path) {
+    let head = LogReader::open(log)
+        .unwrap()
+        .verify_all()
+        .expect("sealed log verifies");
+    let on_disk: Vec<EventRecord> = LogReader::open(log)
+        .unwrap()
+        .map(|r| r.expect("record"))
+        .collect();
+    assert_eq!(seen, on_disk);
+    let seqs: Vec<u64> = seen.iter().map(|r| r.seq).collect();
+    assert_eq!(seqs, (0..head.next_seq).collect::<Vec<_>>());
+    let position =
+        |pred: &dyn Fn(&EventRecord) -> bool| seen.iter().position(pred).expect("record present");
+    let started = position(&|r| matches!(r.event, WardEvent::CommandStarted { .. }));
+    let created = position(&|r| {
+        matches!(&r.event, WardEvent::FileModified { path, kind, .. }
+            if *kind == FileChangeKind::Create && path.to_string().contains("created.txt"))
+    });
+    let finished = position(&|r| matches!(r.event, WardEvent::CommandFinished { .. }));
+    let evidence = position(&|r| r.origin == Origin::TamperWard);
+    assert!(
+        started < created && created < finished && finished < evidence,
+        "{seqs:?}"
+    );
+    assert!(matches!(
+        seen.last().map(|r| &r.event),
+        Some(WardEvent::SessionEnded { .. })
+    ));
+    assert_eq!(
+        seen.iter()
+            .filter(|r| r.origin == Origin::TamperWard)
+            .count(),
+        1,
+        "the forged append never reached the log"
     );
 }
