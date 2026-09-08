@@ -148,6 +148,11 @@ fn selftest_blocks_every_probe() {
     let state = tempfile::tempdir().unwrap();
     let mut session = Session::start_in(project.path(), state.path()).expect("start");
     let creds = ward_daemon::selftest_credentials(&mut session).expect("credential probes");
+    let evidence = ward_daemon::selftest_evidence(&mut session).expect("evidence probes");
+    assert_eq!(evidence.len(), 2);
+    for r in &evidence {
+        assert!(r.blocked, "{} must be denied in the sandbox", r.name);
+    }
     session.stop(EndReason::UserStop).expect("stop");
     let names: Vec<&str> = creds.iter().map(|r| r.name).collect();
     assert_eq!(names.len(), 2, "{names:?}");
@@ -458,4 +463,81 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+/// ST-007: a project policy rewritten mid-session changes nothing; the manifest was
+/// computed at `ward up` and the proxy enforces that one.
+#[test]
+fn st007_policy_rewrite_mid_session_does_not_widen_the_network() {
+    if !sandbox::available() || !std::path::Path::new("/usr/bin/python3").exists() {
+        eprintln!("skipping: bubblewrap or python3 not available");
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let mut session = Session::start_in(project.path(), state.path()).expect("start");
+    fs::write(
+        project.path().join(".ward/policy.yaml"),
+        "network: unrestricted\ncontainers: none\n",
+    )
+    .unwrap();
+    // A public IP literal is allowed under `unrestricted` and refused under
+    // `localhost_only`, so a 403 proves the session still runs the entry policy.
+    let script = "import socket\n\
+s=socket.socket(socket.AF_UNIX)\ns.connect('/run/ward/proxy.sock')\n\
+s.sendall(b'CONNECT 93.184.216.34:80 HTTP/1.1\\r\\nHost: 93.184.216.34:80\\r\\n\\r\\n')\n\
+print(s.recv(200).split(b'\\r\\n')[0].decode())";
+    let report = session
+        .run(&["python3".into(), "-c".into(), script.into()])
+        .expect("run");
+    assert!(report.stdout.contains("403"), "{}", report.stdout);
+    let reopened = Session::open_current(project.path(), state.path()).unwrap();
+    assert!(
+        reopened.is_none(),
+        "throwaway sessions never become current"
+    );
+    session.stop(EndReason::UserStop).expect("stop");
+}
+
+/// ST-016: whatever the agent sends through the hook socket lands as an
+/// `Origin::Agent` claim, never as a kernel, proxy or daemon fact.
+#[test]
+fn st016_forged_semantic_events_stay_agent_origin_claims() {
+    if !sandbox::available() || !std::path::Path::new("/usr/bin/python3").exists() {
+        eprintln!("skipping: bubblewrap or python3 not available");
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let mut session = Session::start_in(project.path(), state.path()).expect("start");
+    let log = session.log_path();
+    let script = r"import json, os, socket
+for req in ({'hook': 'PostToolUse', 'tool': 'Read', 'summary': 'FORGED kernel read'},
+            {'hook': 'SessionStart', 'origin': 'kernel', 'seq': 0}):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(os.environ['WARD_SOCKET'])
+    s.sendall((json.dumps(req) + '\n').encode())
+    s.makefile().readline()";
+    session
+        .run(&["python3".into(), "-c".into(), script.into()])
+        .expect("run");
+    session.stop(EndReason::UserStop).expect("stop");
+    let records: Vec<_> = LogReader::open(&log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    // The command line itself carries the string too; only claims count here.
+    let forged: Vec<_> = records
+        .iter()
+        .filter(|r| matches!(&r.event, WardEvent::AgentClaim { payload, .. } if payload.to_string().contains("FORGED")))
+        .collect();
+    assert_eq!(forged.len(), 1, "the forged claim is recorded once");
+    assert_eq!(forged[0].origin, ward_events::Origin::Agent);
+    assert!(
+        records
+            .iter()
+            .filter(|r| r.origin != ward_events::Origin::Agent)
+            .all(|r| !matches!(r.event, WardEvent::AgentClaim { .. })),
+        "no claim carries an enforcement origin"
+    );
 }
