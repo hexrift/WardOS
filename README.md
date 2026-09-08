@@ -71,6 +71,10 @@ ward verify   examples/ward-demo    # trusted verifier: protected tests from the
 ward selftest examples/ward-demo    # prove the isolation (12/12 hostile probes blocked)
 ward stop     examples/ward-demo    # seal the log
 ward replay   <events.log>          # replay any sealed session (--verify, --json)
+ward session describe examples/ward-demo   # the session's immutable facts for TamperWard (--json)
+ward snapshot create  examples/ward-demo   # capture the worktree into the CAS (--role candidate|final)
+ward snapshot diff    <a> <b>              # manifest-level diff from the CAS, not the worktree (--json)
+ward snapshot cat     <id> <path>          # pristine bytes of a path in a snapshot
 ```
 
 In the session above the sandbox's only way out is a Unix socket to the session proxy:

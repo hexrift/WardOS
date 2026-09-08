@@ -11,15 +11,16 @@
     clippy::struct_field_names
 )]
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 mod replay;
-use ward_daemon::{Session, SessionMeta, render, selftest};
+use ward_daemon::{Session, SessionMeta, SnapshotRole, render, selftest, snapshot};
 use ward_events::{EndReason, LogReader};
 
 #[derive(Parser)]
@@ -104,6 +105,75 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Session facts for TamperWard (`docs/tamperward-integration.md` §2).
+    #[command(subcommand)]
+    Session(SessionCmd),
+    /// Snapshot primitives for TamperWard, answered from the session CAS.
+    #[command(subcommand)]
+    Snapshot(SnapshotCmd),
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// Print the immutable facts of the current session: ids, worktree, start time,
+    /// agent, entry snapshot, policy hash, and the capability manifest.
+    Describe {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+        /// Emit the `SessionDescription` as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Capture the worktree into the session CAS and print the snapshot id; the
+    /// current session records it (a throwaway session is used when none is active).
+    Create {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+        /// Lifecycle role to record for the snapshot.
+        #[arg(long, value_enum, default_value_t = Role::Candidate)]
+        role: Role,
+    },
+    /// Manifest-level diff of two stored snapshots (never reads the worktree).
+    /// Ids are `blake3:<hex>` or bare hex, in full: the store has no prefix lookup.
+    Diff {
+        /// The earlier snapshot.
+        a: String,
+        /// The later snapshot.
+        b: String,
+        /// Emit `{added, removed, changed}` as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write the pristine bytes of a path within a snapshot to stdout, undecorated.
+    /// The id is `blake3:<hex>` or bare hex, in full.
+    Cat {
+        /// The snapshot.
+        id: String,
+        /// Worktree-relative path.
+        path: PathBuf,
+    },
+}
+
+/// The roles a snapshot may be created with from the command line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Role {
+    /// A state offered for verification.
+    Candidate,
+    /// The state at session end.
+    Final,
+}
+
+impl From<Role> for SnapshotRole {
+    fn from(r: Role) -> Self {
+        match r {
+            Role::Candidate => Self::Candidate,
+            Role::Final => Self::Final,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -143,7 +213,78 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
                 ExitCode::FAILURE
             })
         }
+        Command::Session(SessionCmd::Describe { dir, json }) => {
+            cmd_describe(&dir.unwrap_or_else(cwd), json)
+        }
+        Command::Snapshot(SnapshotCmd::Create { dir, role }) => {
+            cmd_snapshot_create(&dir.unwrap_or_else(cwd), role.into())
+        }
+        Command::Snapshot(SnapshotCmd::Diff { a, b, json }) => cmd_snapshot_diff(&a, &b, json),
+        Command::Snapshot(SnapshotCmd::Cat { id, path }) => cmd_snapshot_cat(&id, &path),
     }
+}
+
+fn cmd_describe(dir: &Path, json: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let session = Session::open_current(dir, &state)?.ok_or_else(|| {
+        ward_daemon::Error::Project(format!(
+            "no session for {}; run `ward up {0}` to start one",
+            dir.display()
+        ))
+    })?;
+    let description = session.describe();
+    if json {
+        println!("{}", to_json(&description)?);
+    } else {
+        print!("{}", render::describe_panel(&description));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_snapshot_create(dir: &Path, role: SnapshotRole) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let (mut session, throwaway) = match Session::open_current(dir, &state)? {
+        Some(session) => (session, false),
+        None => (Session::start(dir)?, true),
+    };
+    let meta = session.snapshot(role)?;
+    if throwaway {
+        session.stop(EndReason::UserStop)?;
+    } else {
+        session.sync()?;
+    }
+    println!("{}", meta.id);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The CAS is shared by every project under one state root, so `diff` and `cat`
+/// take no project directory.
+fn cmd_snapshot_diff(a: &str, b: &str, json: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let report = snapshot::diff(&state, snapshot::parse_id(a)?, snapshot::parse_id(b)?)?;
+    if json {
+        println!("{}", to_json(&report)?);
+    } else {
+        print!("{}", render::snapshot_diff(&report));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_snapshot_cat(id: &str, path: &Path) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let bytes = snapshot::cat(&state, snapshot::parse_id(id)?, path)?;
+    let mut out = std::io::stdout().lock();
+    out.write_all(&bytes)
+        .and_then(|()| out.flush())
+        .map_err(|e| ward_daemon::Error::Io {
+            path: PathBuf::from("<stdout>"),
+            source: e,
+        })?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn to_json<T: serde::Serialize>(value: &T) -> ward_daemon::Result<String> {
+    serde_json::to_string_pretty(value).map_err(|e| ward_daemon::Error::Project(e.to_string()))
 }
 
 fn cmd_up(dir: &Path) -> ward_daemon::Result<ExitCode> {

@@ -40,6 +40,14 @@ All available over the TamperWard-only Unix socket `/run/ward/tamperward.sock`
 | `ward capability check <cap>` | Ask what the manifest says about a capability (pure read) | `Decision` |
 | `ward events subscribe` | Live typed stream (§ event-model) | stream |
 
+**Implemented as CLI.** `ward session describe [DIR] [--json]` (the `SessionDescription`
+above; image digests are the manifest's placeholders until 0.1 pins images),
+`ward snapshot create [DIR] --role candidate|final` (recorded in the session log as
+`SnapshotCreated`), `ward snapshot diff <a> <b> [--json]` and `ward snapshot cat <id> <path>`
+exist today and answer from the session CAS, never from the worktree. Ids are given in full
+(`blake3:<hex>` or bare hex); the store has no prefix lookup. The socket form, `attest`, the
+verifier and evidence primitives, and `capability check` are still to come.
+
 ## 3. What TamperWard obtains that it could not before
 
 | Need | Without WardOS | With WardOS |
