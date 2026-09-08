@@ -240,6 +240,26 @@ grep -q '^\s*blur_passes = 0' "$lock" || fail "hyprlock: no blur"
 grep -E '^\s*(size|position) = ' "$lock" | tr -d ' ' | cut -d= -f2 | tr ',' '\n' | awk '$1 % 8 != 0 { exit 1 }' \
   || fail "hyprlock: sizes and positions on the 8 px grid"
 
+# --- looknfeel: geometry (§5) and motion (§12) ------------------------------------
+lnf=$root/hyprland/looknfeel.conf
+for want in 'gaps_in = 4' 'gaps_out = 8' 'border_size = 1' 'rounding = 6' \
+  'animation = workspaces, 1, 1.2, wardOut, slide' 'animation = layers, 1, 1.0, wardOut, fade'; do
+  grep -q "^\s*$want$" "$lnf" || fail "looknfeel.conf lacks '$want'"
+done
+grep -E '^\s*animation = ' "$lnf" | grep -Ev '^\s*animation = (workspaces|layers), 1' | grep -Evq ', 0$' && fail "looknfeel.conf: only the workspace slide and the layer fade animate (§12)"
+grep -Eq '^\s*(pseudotile|vfr|workspace_swipe)' "$lnf" && fail "looknfeel.conf: an option Hyprland 0.56 no longer has"
+
+# --- window rules for the welcome terminal and the session panel ----------------
+# Hyprland 0.56's legacy parser: `windowrule = match:class <regex>, <effect> <value>`;
+# the v2 form is gone.
+win=$root/hyprland/windows.conf
+for want in 'match:class ^(wardos-welcome)$, float on' 'match:class ^(wardos-welcome)$, size 720 560' \
+  'match:class ^(wardos-welcome)$, center on' 'match:class ^(ward-session)$, float on' \
+  'match:class ^(ward-session)$, size 480 400'; do
+  grep -qF "windowrule = $want" "$win" || fail "windows.conf lacks '$want'"
+done
+grep -Eq '^(windowrulev2|layerrule = [^m])' "$win" && fail "windows.conf: a rule in the form Hyprland 0.56 rejects"
+
 # --- emoji list: `<emoji> <name>` per line, a few hundred lines -----------------
 [[ $(wc -l <"$root/config/fuzzel/emoji.txt") -ge 250 ]] || fail "emoji.txt is too short"
 grep -Evq '^[^ ]+ [a-z0-9 ,-]+$' "$root/config/fuzzel/emoji.txt" && fail "emoji.txt: every line is '<emoji> <name>'"
