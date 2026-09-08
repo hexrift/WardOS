@@ -2,7 +2,7 @@
 //! keeps the model-API key and `ward-proxy` injects it on the way out. The
 //! sandbox sees a base URL on the relay and a placeholder token, never the key.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ward_events::{CredentialDelivery, NameText, Scope, ServiceId, ShortText, WardEvent};
 use ward_proxy::{GatewayRoute, Secret};
@@ -12,6 +12,20 @@ use crate::sandbox::RELAY_ADDR;
 
 /// Placeholder the agent presents; the proxy strips it before injection.
 pub const PLACEHOLDER: &str = "ward-gateway";
+
+/// The vault under `state`: one file per key, named by the host variable, written
+/// by `ward vault set` and read by [`Gateway::resolve`]. Both go through here so the
+/// two can never name different paths.
+#[must_use]
+pub fn vault_dir(state: &Path) -> PathBuf {
+    state.join("vault")
+}
+
+/// `vault/<key_env>`, the file holding one key.
+#[must_use]
+pub fn vault_file(state: &Path, key_env: &str) -> PathBuf {
+    vault_dir(state).join(key_env)
+}
 
 /// How one service is fronted by the proxy.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,7 +93,7 @@ impl Gateway {
     /// Resolve `spec` with a key from the host environment (`key_env`), else from
     /// `vault/<key_env>` under `state`. `None` when neither holds a key.
     pub fn resolve(spec: &GatewaySpec, state: &Path) -> Result<Option<Self>> {
-        let vault = state.join("vault").join(spec.key_env);
+        let vault = vault_file(state, spec.key_env);
         let key = std::env::var(spec.key_env)
             .ok()
             .or_else(|| std::fs::read_to_string(vault).ok())
@@ -214,11 +228,16 @@ mod tests {
         };
         let state = tempfile::tempdir().unwrap();
         assert!(Gateway::resolve(&spec, state.path()).unwrap().is_none());
-        let vault = state.path().join("vault");
-        std::fs::create_dir_all(&vault).unwrap();
-        std::fs::write(vault.join(spec.key_env), "  \n").unwrap();
+        // The file `ward vault set WARD_TEST_NO_SUCH_KEY` would write.
+        let file = vault_file(state.path(), spec.key_env);
+        assert_eq!(
+            file,
+            state.path().join("vault").join("WARD_TEST_NO_SUCH_KEY")
+        );
+        std::fs::create_dir_all(vault_dir(state.path())).unwrap();
+        std::fs::write(&file, "  \n").unwrap();
         assert!(Gateway::resolve(&spec, state.path()).unwrap().is_none());
-        std::fs::write(vault.join(spec.key_env), "sk-vault\n").unwrap();
+        std::fs::write(&file, "sk-vault\n").unwrap();
         let g = Gateway::resolve(&spec, state.path()).unwrap().expect("key");
         assert_eq!(g.service, "anthropic");
     }

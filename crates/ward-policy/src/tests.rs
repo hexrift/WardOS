@@ -495,6 +495,42 @@ observer: live
     assert_eq!(parsed, reparsed);
 }
 
+// --- The `ward init` template ---------------------------------------------
+
+#[test]
+fn the_template_parses_to_the_documented_defaults() {
+    let p = Policy::from_yaml(Policy::template()).expect("the template is valid policy");
+    assert_eq!(p.network, Some(NetworkCapability::Development));
+    let fs = p.filesystem.expect("filesystem block");
+    assert_eq!(fs.worktree, AccessMode::ReadWrite);
+    assert_eq!(fs.environment, AccessMode::ReadWrite);
+    let creds = p.credentials.expect("credentials block");
+    assert!(matches!(
+        creds.get(&ServiceId("github".into())),
+        Some(CredentialRule::Ask(scope))
+            if scope.repositories.contains(&RepoSelector::CurrentRepository)
+    ));
+    assert_eq!(p.observer, Some(ObserverMode::Live));
+    assert!(p.containers.is_none() && p.devices.is_none() && p.resources.is_none());
+}
+
+#[test]
+fn the_template_narrows_nothing_against_the_defaults() {
+    let p = Policy::from_yaml(Policy::template()).expect("valid");
+    let base = default_manifest();
+    let merged = merge(
+        &Policy::default(),
+        &Policy::default(),
+        &p,
+        SessionId("s".into()),
+        ProjectId("p".into()),
+    );
+    assert_eq!(merged.network, base.network);
+    assert_eq!(merged.filesystem, base.filesystem);
+    assert_eq!(merged.credentials, base.credentials);
+    assert_eq!(merged.observer, base.observer);
+}
+
 #[test]
 fn empty_yaml_is_fully_inheriting() {
     let p = Policy::from_yaml("").expect("empty policy");
