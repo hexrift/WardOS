@@ -151,7 +151,8 @@ ADR-0004 in its 0.1 namespace form. It snapshots the worktree as the *candidate*
 `.tamperward/config.yml` from the *entry* snapshot, materialises the candidate into a
 scratch tree, overwrites every `protected.tests` path with its entry-snapshot bytes
 (reported as `restored …`), and runs `verify.command` in a bare sandbox with no egress
-and the host Rust toolchain bound read-only. The log records `VerificationRequested`
+and the host Rust toolchain bound read-only, killed past `verify.budget_secs` (default
+600). The log records `VerificationRequested`
 (origin User), `VerificationStarted` with pristine, candidate and config hash, one
 `VerificationProgress` per restored path and one for the command, and
 `VerificationPassed` / `VerificationFailed` with the parsed counts and the BLAKE3 of

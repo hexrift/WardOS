@@ -55,6 +55,8 @@ a private `/tmp`, and the host toolchains bound read-only under `/run/verifier`
 (`~/.rustup`, and `~/.cargo/{bin,registry}` beneath a private tmpfs `CARGO_HOME` so cargo
 can take its locks). The verifier image of the decision text is therefore a digest of the
 string `ward-verifier/namespace/0.1` for now; a real image, a distinct uid range and the
-cgroup budget follow in Phase 4. Results reach `wardd` as the captured output of the one
-command; the summary is parsed from `test result:` lines and the output's BLAKE3 is the
+cgroup budget follow in Phase 4. The wall-clock budget is in: `verify.budget_secs`
+(default 600) kills the verifier past the limit and the run fails with the reason in
+its output; the output kept in the result document is capped at 1 MiB. Results reach
+`wardd` as the captured output of the one command; the summary is parsed from `test result:` lines and the output's BLAKE3 is the
 `result_hash` in the log.
