@@ -2217,6 +2217,7 @@ name = "ward-shell"
 version = "0.1.1"
 dependencies = [
  "clap",
+ "serde_json",
  "tempfile",
  "ward-daemon",
  "ward-shell-core",
@@ -2226,6 +2227,7 @@ dependencies = [
 name = "ward-shell-core"
 version = "0.1.1"
 dependencies = [
+ "serde",
  "ward-daemon",
  "ward-events",
  "ward-policy",

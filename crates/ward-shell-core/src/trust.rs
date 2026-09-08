@@ -178,6 +178,99 @@ impl Segment {
     }
 }
 
+/// The name of a Waybar class for a colour role: the six roles of §3 by the
+/// words the design uses for them.
+#[must_use]
+pub const fn tone_name(tone: Tone) -> &'static str {
+    match tone {
+        Tone::Dim => "dim",
+        Tone::Ink => "ink",
+        Tone::Accent => "accent",
+        Tone::Ok => "verified",
+        Tone::Warn => "restricted",
+        Tone::Deny => "denied",
+    }
+}
+
+/// One segment of the trust bar by name, as `ward-shell bar --waybar --segment`
+/// addresses it: the §6 order, with the host mark first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SegmentName {
+    /// `WARD`, the host mark.
+    Mark,
+    /// The session id, short form.
+    Session,
+    /// The project name.
+    Project,
+    /// `CLAUDE ● working`.
+    Agent,
+    /// `NET restricted (dev)`.
+    Network,
+    /// `CRED n granted`.
+    Credentials,
+    /// `OBS live`.
+    Observer,
+    /// `TW ✓` / `TW ■`.
+    Tamperward,
+    /// `VERIFYING` / `VERIFY ✓` / `VERIFY ✗`.
+    Verify,
+    /// `LIVE` / `SEALED`.
+    Daemon,
+}
+
+impl SegmentName {
+    /// Every segment, in bar order.
+    pub const ALL: [Self; 10] = [
+        Self::Mark,
+        Self::Session,
+        Self::Project,
+        Self::Agent,
+        Self::Network,
+        Self::Credentials,
+        Self::Observer,
+        Self::Tamperward,
+        Self::Verify,
+        Self::Daemon,
+    ];
+
+    /// The name on the command line and in Waybar's module names.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mark => "mark",
+            Self::Session => "session",
+            Self::Project => "project",
+            Self::Agent => "agent",
+            Self::Network => "network",
+            Self::Credentials => "credentials",
+            Self::Observer => "observer",
+            Self::Tamperward => "tamperward",
+            Self::Verify => "verify",
+            Self::Daemon => "daemon",
+        }
+    }
+}
+
+impl std::str::FromStr for SegmentName {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|n| n.as_str() == s)
+            .ok_or_else(|| {
+                let names: Vec<&str> = Self::ALL.iter().map(|n| n.as_str()).collect();
+                format!("unknown segment `{s}` (one of {})", names.join(", "))
+            })
+    }
+}
+
+impl std::fmt::Display for SegmentName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The trust bar's segments, left to right as §6 orders them. The three the
 /// session daemon cannot know at start (`agent`, `tamperward`, `verified`) are
 /// `None` until the stream reports them, and are then omitted from the row.
@@ -252,6 +345,37 @@ impl TrustBar {
             Verification::Failed => Some(Segment::new("VERIFY ✗", Tone::Deny)),
         };
         bar
+    }
+
+    /// The host mark as a module of its own: `WARD`, accent while the session
+    /// is live, dim once the log is sealed. In the row it is always accent (the
+    /// host layer never changes); alone on a bar whose other modules are
+    /// hidden it is the one place the session's state still shows.
+    #[must_use]
+    pub fn mark(&self) -> Segment {
+        let tone = if self.sealed { Tone::Dim } else { Tone::Accent };
+        Segment::bold("WARD", tone)
+    }
+
+    /// One segment by name: `None` for a stream-derived segment the stream has
+    /// not established yet. The network segment carries its `NET ` prefix, as
+    /// the row shows it.
+    #[must_use]
+    pub fn segment(&self, name: SegmentName) -> Option<Segment> {
+        Some(match name {
+            SegmentName::Mark => self.mark(),
+            SegmentName::Session => self.session.clone(),
+            SegmentName::Project => self.project.clone(),
+            SegmentName::Agent => self.agent.clone()?,
+            SegmentName::Network => {
+                Segment::new(format!("NET {}", self.network.text), self.network.tone)
+            }
+            SegmentName::Credentials => self.credentials.clone(),
+            SegmentName::Observer => self.observer.clone(),
+            SegmentName::Tamperward => self.tamperward.clone()?,
+            SegmentName::Verify => self.verified.clone()?,
+            SegmentName::Daemon => self.daemon.clone(),
+        })
     }
 
     /// The tone that carries the bar's state (the marker, the network mode and
@@ -573,6 +697,118 @@ mod tests {
         assert_eq!(
             TrustBar::new(&anon, &model).agent.unwrap().text,
             "AGENT ● working"
+        );
+    }
+
+    #[test]
+    fn segment_names_round_trip_and_reject_strangers() {
+        for name in SegmentName::ALL {
+            assert_eq!(name.as_str().parse::<SegmentName>(), Ok(name));
+            assert_eq!(name.to_string(), name.as_str());
+        }
+        let err = "clock".parse::<SegmentName>().unwrap_err();
+        assert!(
+            err.starts_with("unknown segment `clock` (one of mark, session"),
+            "{err}"
+        );
+        assert!(err.ends_with("verify, daemon)"), "{err}");
+    }
+
+    #[test]
+    fn tone_names_are_the_six_words_of_the_design() {
+        let names: Vec<&str> = [
+            Tone::Dim,
+            Tone::Ink,
+            Tone::Accent,
+            Tone::Ok,
+            Tone::Warn,
+            Tone::Deny,
+        ]
+        .into_iter()
+        .map(tone_name)
+        .collect();
+        assert_eq!(
+            names,
+            ["dim", "ink", "accent", "verified", "restricted", "denied"]
+        );
+    }
+
+    #[test]
+    fn every_segment_is_addressable_by_name_live_and_sealed() {
+        let h = header(NetworkCapability::Development);
+        let watch = TrustBar::from_header(&h, false);
+        let seg = |bar: &TrustBar, name| bar.segment(name).unwrap();
+        assert_eq!(
+            watch.segment(SegmentName::Mark),
+            Some(Segment::bold("WARD", Tone::Accent))
+        );
+        assert_eq!(seg(&watch, SegmentName::Session).text, "sess_01J8ZK3…");
+        assert_eq!(seg(&watch, SegmentName::Project).text, "payments-api");
+        assert_eq!(watch.segment(SegmentName::Agent), None, "not said yet");
+        assert_eq!(
+            watch.segment(SegmentName::Network),
+            Some(Segment::new("NET restricted (dev)", Tone::Warn)),
+            "the prefix travels with the mode"
+        );
+        assert_eq!(seg(&watch, SegmentName::Credentials).text, "CRED 0 granted");
+        assert_eq!(seg(&watch, SegmentName::Observer).text, "OBS live");
+        assert_eq!(watch.segment(SegmentName::Tamperward), None);
+        assert_eq!(watch.segment(SegmentName::Verify), None);
+        assert_eq!(
+            watch.segment(SegmentName::Daemon),
+            Some(Segment::bold("LIVE", Tone::Warn))
+        );
+
+        let mut model = model_with(&sequence(), false);
+        for rec in wardd(&[verify_passed()]) {
+            model.apply(rec);
+        }
+        model.apply(records(&[(Origin::TamperWard, denied())]).remove(0));
+        let live = TrustBar::new(&h, &model);
+        assert_eq!(
+            live.segment(SegmentName::Agent),
+            Some(Segment::new("CLAUDE ● working", Tone::Accent))
+        );
+        assert_eq!(
+            live.segment(SegmentName::Tamperward),
+            Some(Segment::new("TW ✓", Tone::Ok))
+        );
+        assert_eq!(
+            live.segment(SegmentName::Verify),
+            Some(Segment::new("VERIFY ✓", Tone::Ok))
+        );
+        // Every name answers, and the answers are the row's segments.
+        for name in SegmentName::ALL {
+            let segment = seg(&live, name);
+            if name == SegmentName::Network {
+                assert!(live.text().contains(&segment.text), "{name}");
+            } else if name != SegmentName::Mark {
+                assert!(live.row().contains(&segment), "{name}");
+            }
+        }
+
+        model.seal();
+        let sealed = TrustBar::new(&h, &model);
+        assert_eq!(
+            sealed.segment(SegmentName::Mark),
+            Some(Segment::bold("WARD", Tone::Dim))
+        );
+        assert_eq!(seg(&sealed, SegmentName::Agent).tone, Tone::Dim);
+        assert_eq!(seg(&sealed, SegmentName::Network).tone, Tone::Dim);
+        assert_eq!(
+            sealed.segment(SegmentName::Daemon),
+            Some(Segment::bold("SEALED", Tone::Dim))
+        );
+        assert_eq!(
+            seg(&sealed, SegmentName::Verify).tone,
+            Tone::Ok,
+            "verdicts keep their colour"
+        );
+        assert_eq!(seg(&sealed, SegmentName::Project).tone, Tone::Ink);
+        assert_eq!(
+            sealed.row()[1],
+            Segment::bold("WARD", Tone::Accent),
+            "in the row the host mark never changes"
         );
     }
 

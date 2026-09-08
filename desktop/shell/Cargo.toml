@@ -24,6 +24,7 @@ gui = []
 ward-shell-core = { path = "../../crates/ward-shell-core", version = "0.1.0" }
 ward-daemon = { path = "../../crates/ward-daemon", version = "0.1.0" }
 clap = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
