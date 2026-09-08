@@ -146,10 +146,27 @@ Step-through is implemented in `wardd`, not in the UI: the sandbox request (or t
 agent hook, for actions the kernel cannot hold) blocks until a `CapabilityDecided` record
 exists. For file writes there is no kernel-level "hold" without a FUSE layer; the
 agent's hook layer (origin=Agent, best-effort) is what holds today: under
-`step_through`, `wardd` answers the agent's `PreToolUse` hook with `ask` before writes
-and network tools, the agent's own permission prompt is the hold, and the exchange is
-recorded as an `AgentClaim` (`agent-integration.md` §4). Phase 5 hardens this. **[experiment E-11]** evaluates a FUSE or `fanotify`
+`step_through`, the hook adapter answers the agent's `PreToolUse` hook with `ask`
+before writes and network tools, and the exchange is recorded as an `AgentClaim`
+(`agent-integration.md` §4). **[experiment E-11]** evaluates a FUSE or `fanotify`
 permission-event (`FAN_OPEN_PERM`) layer for hard holds.
+
+Implemented (ADR-0016, `agent-integration.md` §4.1): with a `wardd` serving the
+session the `ask` is held by the daemon and recorded with the two capability records
+the catalogue already has, so no new kind was needed and `ward replay` shows the
+question and the answer as it shows every other decision:
+
+| Record | Origin | Fields |
+| --- | --- | --- |
+| `CapabilityRequested` | `Wardd` | `cap.kind` from the tool (`FileWrite` for `Write`/`Edit`/`MultiEdit`/`NotebookEdit`, `Network` for `WebFetch`/`WebSearch`, `Exec` for `Bash`, `FileRead` for `Read`/`Grep`/`Glob`, else `Other`); `cap.target` = `<tool> <summary>`; `reason` = the hook's reason (`step-through: pause before writes`) |
+| `CapabilityDecided` | `Wardd` | the same `cap`; `decision` `Allow`/`Deny`; `by` `User` for an answer (grant `Once` for `allow`, `Session` for `allow-session` and for a request a standing `allow-session` covered) or `Timeout` (deny, no grant) |
+
+The approval's id is the `seq` of its `CapabilityRequested` record: a subscriber
+that sees the record can answer it (`Request::Approve { id, decision }`) without a
+second lookup, and `Request::Pending` lists what is still open. A question the
+session's end releases is denied to the agent but has no `CapabilityDecided`: the log
+is sealed by then, and the seal itself is the record of why. Without a daemon the
+agent's own permission prompt remains the hold, and only the `AgentClaim` is written.
 
 ## 8. Replay
 

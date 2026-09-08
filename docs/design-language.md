@@ -312,3 +312,31 @@ named and its source recorded; where this document names a variant without value
 (Graphite, High Contrast, Light's state colours) the value is derived and marked so.
 Not yet built: the approval surface (§10), the verification display (§11), fonts (§4),
 and any pixel.
+
+## As built: Waybar rendering and approvals (ADR-0016)
+
+Until E-10, Waybar draws the trust bar (§6) from `ward-shell bar --waybar`: one
+custom module per segment (`project`, `agent`, `network`, `tamperward`, `verify`; the
+`WARD` mark is static), each fed by `--segment <name> --follow` so a change in the
+session's stream is a new JSON line and nothing polls. The shell decides the words
+and the colour roles; Waybar's stylesheet only maps the classes the JSON carries: the
+six roles of §3 by their names (`dim`, `ink`, `accent`, `verified`, `restricted`,
+`denied`), and on the agent module the §7 state word (`working`, `waiting`,
+`blocked`, `verifying`, `finished`, `idle`), so state colour sits on the segment's
+text and nowhere else. A segment the stream has not established is the empty module,
+which Waybar hides, so the bar grows as the session says more (§2: the host layer
+looks the same with or without an agent) and the mark alone is a bar with no session
+(`WARD`, dim). The session panel (§6) is the whole-bar module's tooltip and opens on
+click in a terminal. The command centre (§13) is fuzzel in dmenu mode over
+`ward-shell launcher --lines`: the four sections in order, the label with its state
+detail, and the command the shell chose (`ward claude` in a terminal in the worktree,
+`ward verify` in one that stays open); fuzzel matches what the user types, the shell
+never sees it. Approvals (§10) are real: an `ask` is held by the session daemon
+(`agent-integration.md` §4.1) and shown by mako as a notification in the
+`ward-approval` category, `<Agent> requests` over the target, `Reason` and `Scope`
+rows, and the three actions `Allow once` / `Allow session` / `Deny`, answered from
+the keyboard (`y` / `s` / `n`) through `wardos-approve`; the timeout is the daemon's
+(60 s, deny), and the notification shows it as mako's progress line, not a number.
+The `Duration  Current session` row of §10 is not shown: the scope of an `allow` is
+chosen by the answer, not read from the request. Not yet built: a layer-shell
+surface of the shell's own for any of this, the verification display (§11), fonts (§4).

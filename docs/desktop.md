@@ -166,6 +166,17 @@ SYSTEM     Apps · Capture · Appearance · Connect · Install · Remove · Upda
   Help        Keys · Manual · Hyprland wiki · About
 ```
 
+The command centre's PROJECTS, AGENTS and SECURITY rows come from the shell:
+`ward-shell launcher --lines [--query q]` prints one `SECTION<TAB>label<TAB>command`
+line per entry of `design-language.md` §13, in section order, with the session's state
+in the label (`payments-api   ● working`, `Resume session   payments-api · ● working`)
+and the command the shell chose for it (`foot -D <worktree> -- ward claude`, `ward
+watch`, `ward verify` and `ward-shell settings` in a terminal that stays open, `ward
+replay <events.log>`, `foot`, `chromium`, `wardos-menu system`; paths are shell-quoted).
+`wardos-menu` shows the first two columns through fuzzel `--dmenu` and runs the third;
+fuzzel does the matching, so `--query` is for scripts and tests. Without a session the
+fixed rows remain and the given directory is the project.
+
 ## Keys
 
 The existing set (`desktop/hyprland/keybindings.conf`) stays. Added, in one file per
@@ -309,10 +320,10 @@ command, key and test exist on `main`.
 
 Then some (WardOS only):
 
-| Feature | Delivers |
-| --- | --- |
-| Agent state, network, TamperWard and verification in the bar | `ward-shell bar --waybar` |
-| Approvals as notifications, answered from the keyboard | `wardos-approve`, daemon hold on `ask`; `wardos-approve.service` is the listener |
-| Verify, replay, evidence, snapshots, grants in the menu | `wardos-menu` SECURITY (✔ from `ward-shell launcher --lines`, static `ward` list without it; `menu.test.sh`) |
-| Sandboxed browser profile per project | `wardos-launch browser --project` (✔ chromium profile under `~/.local/share/wardos/browser/<hash>`; `launch.test.sh`) |
+| Feature | Delivers | Delivered |
+| --- | --- | --- |
+| Agent state, network, TamperWard and verification in the bar | `ward-shell bar --waybar [--segment mark\|session\|project\|agent\|network\|credentials\|observer\|tamperward\|verify\|daemon] [--follow]`, one JSON module per segment with the tone name and the agent state word as classes; `launcher --lines` for the command centre | ✔ `ward-shell-core` `waybar::tests::every_segment_is_a_module_in_the_{live,sealed}_state`, `every_segment_is_the_empty_module_with_no_session_except_the_mark`, `trust::tests::every_segment_is_addressable_by_name_live_and_sealed`, `launcher::tests::lines_are_section_label_and_shell_command_for_a_described_session`; `ward-shell` `waybar_flags_parse_and_need_waybar` |
+| Approvals as notifications, answered from the keyboard | `wardos-approve`, daemon hold on `ask` (`agent-integration.md` §4.1: `Request::Hold`/`Approve`/`Pending`, `ward session pending --follow`, `ward session approve`); `wardos-approve.service` is the listener | ✔ `ward-daemon` `approvals::tests::*`, `hooks::tests::a_held_ask_{waits_for_the_answer_and_relays_it,nobody_answers_is_denied_when_the_timeout_passes}`, `hooks::tests::allow_session_answers_the_same_question_without_asking_again`, `daemon::tests::a_held_approval_is_recorded_listed_answered_and_recorded_again`, `client::tests::{pending_and_approve_go_through_the_daemon,follow_pending_emits_what_is_pending_after_the_backlog_then_on_each_request}`; `desktop/tests/approve.test.sh` |
+| Verify, replay, evidence, snapshots, grants in the menu | `wardos-menu` SECURITY | ✔ from `ward-shell launcher --lines`, static `ward` list without it; `menu.test.sh` |
+| Sandboxed browser profile per project | `wardos-launch browser --project` | ✔ chromium profile under `~/.local/share/wardos/browser/<hash>`; `launch.test.sh` |
 | Package names and the whole image checked by CI | `image/packages.txt`, image build job | ✔ `image/check-packages.sh` ("image packages"), `image.yml` ("image build") |
