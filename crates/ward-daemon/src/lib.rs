@@ -16,6 +16,7 @@
 )]
 
 pub mod agents;
+pub mod describe;
 pub mod egress;
 pub mod error;
 pub mod gateway;
@@ -25,10 +26,13 @@ pub mod render;
 pub mod sandbox;
 pub mod selftest;
 pub mod session;
+pub mod snapshot;
 pub mod verify;
 pub mod watch;
 
+pub use describe::SessionDescription;
 pub use error::{Error, Result};
 pub use selftest::{ProbeResult, selftest, selftest_credentials, selftest_evidence};
 pub use session::{RunReport, Session, SessionMeta, VerifyReport};
+pub use ward_snapshot::SnapshotRole;
 pub use watch::CaptureMode;
