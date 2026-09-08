@@ -1,6 +1,7 @@
 # WardOS Threat Model
 
-Status: Phase 0. This document is the basis for every security claim in
+Status: living document; the project's phase is in docs/status.toml and the README.
+This document is the basis for every security claim in
 [`security-model.md`](security-model.md). A claim that is not traceable to a row in §6 and
 a test in §8 is not a claim WardOS makes.
 
@@ -185,12 +186,16 @@ ST-009  read-evidence                   ST-022  tls-interception-attempt
 ST-010  rewrite-evidence                ST-023  cross-user-session-read
 ST-011  private-network-bypass          ST-024  credential-scope-overreach
 ST-012  credential-persistence          ST-025  inner-sandbox-disable
-ST-013  namespace-escape
+ST-013  namespace-escape                ST-026  raw-tcp-socks-bypass
+                                        ST-027  loopback-control-surface
+                                        ST-028  dns-rebinding-pinning
+                                        ST-029  hostile-verifier-corpus
 RT-001  boot-chain-integrity            RT-002  broken-update-rollback
 ```
 
 Numbering ST-001..015 matches the original engineering brief; ST-016..025 were added by
-this threat model.
+this threat model; ST-026..029 are the proof backlog of ADR-0019 (rows 10, 15, 17 and
+21 above, [`security-model.md`](security-model.md) §6).
 
 ---
 

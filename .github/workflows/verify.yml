@@ -46,6 +46,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: python3 scripts/security-check/doc-links.py
+      # One status source (ADR-0019): docs/status.toml and the README agree, and no other
+      # document states a phase of its own.
+      - run: python3 scripts/security-check/doc-status.py
 
   # The host image (image/) cannot be built or booted here; keep it lintable instead.
   image-lint:

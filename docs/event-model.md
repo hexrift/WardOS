@@ -1,6 +1,7 @@
 # Ward Event Model
 
-Status: Phase 0. Decision records: [ADR-0011](decisions/ADR-0011-event-capture.md),
+Status: living document; the project's phase is in docs/status.toml and the README.
+Decision records: [ADR-0011](decisions/ADR-0011-event-capture.md),
 [ADR-0012](decisions/ADR-0012-observer.md).
 
 ## 1. Purpose

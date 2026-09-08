@@ -23,13 +23,24 @@ ward verify          # the protected tests, in a disposable verifier, from the e
 
 ## Get started
 
-On a machine of its own, boot the image ([`image/README.md`](image/README.md)): the
-agents, TamperWard and the desktop are in it, and the first login walks you through a
-theme, a key, a project and an agent. On a Linux you already have, install the tools:
+On a Linux you already have, install the release binaries: the tarball for your
+architecture and its checksum from the
+[latest release](https://github.com/hexrift/WardOS/releases/latest)
+(`wardos-<version>-<arch>-linux.tar.gz` and `.sha256`; `<arch>` is `uname -m`, x86_64
+or aarch64), checked before anything is unpacked:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | bash
+sha256sum -c wardos-0.2.0-x86_64-linux.tar.gz.sha256      # the checksum from the same release
+tar -xzf wardos-0.2.0-x86_64-linux.tar.gz
+cp wardos-0.2.0-x86_64-linux/{ward,wardd,ward-agent} ~/.local/bin/
 ```
+
+On a machine of its own, boot the image ([`image/README.md`](image/README.md)): the
+agents, TamperWard and the desktop are in it, and the first login walks you through a
+theme, a key, a project and an agent. The convenient development installer,
+`curl -fsSL https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | bash`,
+does the three steps above for you and runs `ward doctor`; it is a shell script fetched
+from `main`, so read it first ([`docs/install.md`](docs/install.md)).
 
 Then, in any project, five commands and about five minutes
 ([`docs/onboarding.md`](docs/onboarding.md)):
@@ -79,7 +90,7 @@ counters) or as plain rows on a pipe. Without a daemon, every command still work
 ![A daemon-backed session: ward up spawns wardd, a producer and a TamperWard evidence record write through the control socket, and ward watch streams every row live until the session ends](assets/ward-watch.png)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | bash   # or: cargo build --release
+# the binaries: the release tarball (Get started), install.sh, or cargo build --release
 ward doctor                         # what this host can give a session, with a fix per gap
 ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
 ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live observer
@@ -123,10 +134,39 @@ TamperWard policy  = allowed behaviour and verification (what the agent MAY do, 
 
 ## Status
 
-**Phase 6 — the agent-first image, in progress.** The v0.2.0 release ships the five
-host binaries with the bootable disks attached; `ghcr.io/hexrift/wardos:latest` is
-rebuilt, linted and published on every merge, for x86_64 and aarch64, and an installed
-host follows it on a timer with rollback. What the image holds today:
+**Phase 7 — authority, freshness, intervention.** The phase is declared once, in
+[`docs/status.toml`](docs/status.toml), and CI fails any document that claims one of
+its own. The contract is [ADR-0019](docs/decisions/ADR-0019-authority-freshness-intervention.md):
+the architecture and the visual language stay, what changes is what a human can read
+from the desktop at a glance. In progress:
+
+* **Verification bound to a snapshot, with its freshness shown.** `VERIFY` has five
+  states (`—`, `◐`, `✓ 7c01…`, `~ STALE`, `✗`); green disappears the moment the
+  worktree differs from the verified candidate, decided by content, not heuristics.
+* **Approvals that separate the agent's claim from Ward's authority.** The destination,
+  *requested by agent* (verbatim, labelled as the agent's words) and *Ward will allow*
+  (what the policy and credential rules actually grant) as three blocks.
+* **Pause as a host primitive.** `ward pause` and one key freeze the session, close the
+  proxy, suspend credential injection and hold approvals as one recorded operation;
+  the exits are resume, stop keeping the workspace, stop restoring the entry state.
+* **Temporary authority visible while it exists.** A session-scoped grant changes the
+  bar (`NET restricted · github+`, `GRANTS 1`) until the session ends.
+* **Approval load as a security metric.** E-13 (approvals per agent-hour, approve and
+  deny rates, decision time, and the rest) and E-14 (ten to twenty real tasks, bare
+  agent against WardOS, ending with four comprehension questions); no targets until
+  the data exists ([`docs/experiments.md`](docs/experiments.md)).
+* **The remaining security proofs before more desktop polish**: ST-018 freeze before
+  capture, ST-022 TLS interception, ST-026 raw TCP and SOCKS, ST-027 loopback and
+  control socket, ST-028 DNS rebinding and pinning, ST-029 a hostile verifier corpus
+  ([`docs/security-model.md`](docs/security-model.md) §6).
+* **One install path and one status.** The release tarball with its checksum is the
+  primary install; signed releases wait for a signing-key decision
+  ([`docs/roadmap.md`](docs/roadmap.md)).
+
+Delivered. The v0.2.0 release ships the five host binaries with the bootable disks
+attached; `ghcr.io/hexrift/wardos:latest` is rebuilt, linted and published on every
+merge, for x86_64 and aarch64, and an installed host follows it on a timer with
+rollback. What the image holds today:
 
 * **The secure-session layer.** `ward up` / `run` / `claude` / `codex` / `stop` /
   `verify` / `replay --verify` on a capability manifest, content-addressed entry
@@ -152,13 +192,17 @@ host follows it on a timer with rollback. What the image holds today:
   the image ships, so a renamed option fails a pull request instead of a boot.
 * **Security posture.** LUKS by default on the installer ISO, a firewall that admits
   nothing inbound, timed image updates, every package name checked against Fedora 44
-  before the image is built, nothing fetched by `curl | sh`.
+  before the image is built, and nothing in the image is fetched by `curl | sh` at
+  build time.
+* **Agent-first onboarding** ([ADR-0017](docs/decisions/ADR-0017-agent-first-image.md)):
+  `wardos-welcome` walks the first login through theme, key, project and agent;
+  `ward init`, `ward vault` and `ward doctor` are the same path on any Linux; the
+  image boots to the desktop in QEMU on a Fedora laptop (E-09, first boot; the
+  Hyprland config errors it showed are fixed and now caught by CI).
 
-Verified so far: the image boots to the desktop in QEMU on a Fedora laptop (E-09, first
-boot; the Hyprland config errors it showed are fixed and now caught by CI). Still ahead:
-the onboarding walk on real hardware with the time from boot to `✓ VERIFIED`, the
-semantic TamperWard rules, the verifier image, the shell's own toolkit (E-10), and the
-Secure Boot chain of Phase 7.
+Still ahead, behind the list above: the onboarding walk on real hardware with the time
+from boot to `✓ VERIFIED`, the semantic TamperWard rules, the verifier image, the
+shell's own toolkit (E-10), and the Secure Boot chain.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the phase plan and
 [`docs/experiments.md`](docs/experiments.md) for the recorded results of the experiments

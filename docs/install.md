@@ -4,22 +4,45 @@ WardOS today is the secure-session layer: three binaries (`ward`, `wardd`,
 `ward-agent`) that run on any x86_64 Linux with `bubblewrap`. The immutable host
 image (`image/`) is the next step and is documented there.
 
-## 1. One-line install (release binaries)
+## 1. Install the release binaries
+
+Every release attaches one tarball per architecture and its checksum:
+`wardos-<version>-<arch>-linux.tar.gz` and `wardos-<version>-<arch>-linux.tar.gz.sha256`,
+where `<arch>` is what `uname -m` prints (`x86_64`; `aarch64` from v0.3). Download both
+from the [latest release](https://github.com/hexrift/WardOS/releases/latest), check
+the tarball before unpacking it, and copy the binaries into your path:
+
+```bash
+sha256sum -c wardos-0.2.0-x86_64-linux.tar.gz.sha256       # "OK", or stop here
+tar -xzf wardos-0.2.0-x86_64-linux.tar.gz
+cp wardos-0.2.0-x86_64-linux/{ward,wardd,ward-agent} ~/.local/bin/
+ward doctor
+```
+
+The tarball also carries `ward-shell` and `wardos-theme-render` (the desktop's
+binaries, only useful with the desktop of §6) and a copy of `install.sh`. The checksum
+proves the tarball is the one CI attached to the release; releases are not yet signed,
+which is a signing-key decision recorded in [`roadmap.md`](roadmap.md).
+
+**The OS image** is the other way in: on a machine of its own, boot it and the tools,
+the agents, TamperWard and the desktop are already there (§6, [`image/README.md`](../image/README.md)).
+
+**The convenient development installer.** The same three steps, done by a script:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | bash
 ```
 
-This downloads the latest release tarball, verifies its SHA-256, installs the three
+It resolves the latest release, downloads the tarball for this machine's architecture,
+verifies its SHA-256 against the `.sha256` from the same release, installs the three
 binaries into `~/.local/bin`, and runs `ward doctor`. Use `--prefix /usr/local` for a
-system-wide install, `--version v0.2.0` to pin.
+system-wide install, `--version v0.2.0` to pin. It is a script fetched from `main` and
+run unread, which is why it is not the headline: read it, or run `./install.sh` from
+an unpacked tarball, where it installs the files next to it and fetches nothing.
 
 No token is needed. For a private fork, export `GITHUB_TOKEN` (or `GH_TOKEN`) with
-read access first; the installer then fetches the script's release assets through the
-GitHub API with it.
-
-The same script ships inside every release tarball; run `./install.sh` from the
-unpacked directory to install from the files next to it.
+read access first; the installer then fetches the release assets through the GitHub
+API with it.
 
 ## 2. Host requirements
 
@@ -164,8 +187,8 @@ and UTM's QEMU backend (the Apple Virtualization backend on Intel boots it too);
 runs natively. An aarch64 disk on an Intel Mac, or an x86_64 one on Apple silicon, is
 emulated: it boots, slowly; use the disk of your own architecture.
 
-**Windows.** The tools only, in WSL2: an Ubuntu 24.04 distribution runs the one-line
-install from §1 (bubblewrap and unprivileged user namespaces work in WSL2's kernel;
+**Windows.** The tools only, in WSL2: an Ubuntu 24.04 distribution installs the release
+binaries as in §1 (bubblewrap and unprivileged user namespaces work in WSL2's kernel;
 `ward doctor` says so), and `ward` sandboxes agents there. The desktop and the OS image
 do not run under WSL2; a Hyper-V machine could boot the x86_64 disk (`qemu-img convert
 -O vhdx` the qcow2, Generation 2, Secure Boot off) but that path is untested.

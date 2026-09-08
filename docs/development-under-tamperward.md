@@ -1,6 +1,7 @@
 # Developing WardOS under TamperWard
 
-Status: Phase 0. This describes how the WardOS repository itself is protected while
+Status: living document; the project's phase is in docs/status.toml and the README.
+This describes how the WardOS repository itself is protected while
 agents help build it. It is deliberately separate from
 [`tamperward-integration.md`](tamperward-integration.md), which is about WardOS *at
 runtime* giving TamperWard primitives. Here the relationship is inverted: TamperWard keeps

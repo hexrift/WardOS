@@ -1,6 +1,7 @@
 # Credential Broker
 
-Status: Phase 3. Implemented: the model-API gateways (Anthropic, OpenAI; see
+Status: living document; the project's phase is in docs/status.toml and the README.
+Implemented: the model-API gateways (Anthropic, OpenAI; see
 [agent-integration.md](agent-integration.md) §3) and the GitHub adapter in gateway
 mode (§4). Registry and SSH adapters, minted tokens and the encrypted vault are ahead. Decision record:
 [ADR-0008](decisions/ADR-0008-credential-broker.md).
