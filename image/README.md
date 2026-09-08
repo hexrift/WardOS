@@ -385,6 +385,7 @@ CI runs, on every pull request and push (`verify.yml`):
 | --- | --- |
 | `image lint` | hadolint on `Containerfile`, shellcheck (`--severity=style`) on `image/*.sh`, the dry-runs of `build.sh`, `disk.sh` (plain and `--luks --user`), `check-packages.sh`, and `install-desktop.sh --help` |
 | `image packages` | `check-packages.sh`: every name in `packages.txt` exists in the pinned Fedora release (plus `coprs.txt`) |
+| `hyprland config` | `image/check-hyprland.sh`: `Hyprland --verify-config` on `desktop/hyprland/` inside a `fedora:<release>` container with the COPRs, so the tree matches the compositor the image ships |
 | `desktop scripts` | `desktop/tests/run.sh`, which includes `install.test.sh` (install-desktop, desktop/install.sh, wardos-flathub, check-packages.sh, disk.sh) |
 
 and, in `image.yml` on `main` and on pull requests that touch `image/`, `desktop/`, the

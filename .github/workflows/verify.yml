@@ -99,3 +99,12 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q shellcheck
       - run: bash desktop/tests/run.sh
+
+  # The Hyprland the image ships parses the shipped Hyprland tree (image/check-hyprland.sh):
+  # a removed or renamed option shows up here, not in the booted desktop's error bar.
+  hyprland-config:
+    name: hyprland config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./image/check-hyprland.sh

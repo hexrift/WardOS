@@ -207,20 +207,29 @@ fn foot(theme: &Theme, fonts: &Fonts) -> String {
     let p = &theme.palette;
     let [regular, bright] = ansi(theme);
     let mut out = format!(
-        "{}{ANSI_NOTE}[main]\nfont={}:size={SIZE}\n\n[colors]\nforeground={}\nbackground={}\n\
-         selection-foreground={}\nselection-background={}\n",
+        "{}{ANSI_NOTE}[main]\nfont={}:size={SIZE}\n",
         header(theme, "#", ""),
         fonts.mono,
-        p.text.value.lower(),
-        p.ground.value.lower(),
-        p.ground.value.lower(),
-        p.accent.value.lower(),
     );
-    for (i, c) in regular.iter().enumerate() {
-        let _ = writeln!(out, "regular{i}={}", c.lower());
-    }
-    for (i, c) in bright.iter().enumerate() {
-        let _ = writeln!(out, "bright{i}={}", c.lower());
+    // foot 1.25 deprecated [colors] for [colors-dark] and [colors-light], picked by the
+    // desktop's colour-scheme preference; the theme is the theme whichever is asked
+    // for, so both sections carry it.
+    for section in ["colors-dark", "colors-light"] {
+        let _ = write!(
+            out,
+            "\n[{section}]\nforeground={}\nbackground={}\nselection-foreground={}\n\
+             selection-background={}\n",
+            p.text.value.lower(),
+            p.ground.value.lower(),
+            p.ground.value.lower(),
+            p.accent.value.lower(),
+        );
+        for (i, c) in regular.iter().enumerate() {
+            let _ = writeln!(out, "regular{i}={}", c.lower());
+        }
+        for (i, c) in bright.iter().enumerate() {
+            let _ = writeln!(out, "bright{i}={}", c.lower());
+        }
     }
     out
 }

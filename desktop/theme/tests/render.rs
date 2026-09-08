@@ -287,7 +287,29 @@ fn ward_dark_foot_fragment_is_pinned() {
 [main]
 font=JetBrains Mono:size=11
 
-[colors]
+[colors-dark]
+foreground=d9d9d6
+background=0e0f11
+selection-foreground=0e0f11
+selection-background=7fa1c3
+regular0=0e0f11
+regular1=c25a5a
+regular2=6fae8a
+regular3=c9a24a
+regular4=7fa1c3
+regular5=c37fc3
+regular6=7fc3c3
+regular7=8a8d91
+bright0=24272b
+bright1=cd7878
+bright2=89bd9f
+bright3=d2b269
+bright4=9bb5d0
+bright5=d09bd0
+bright6=9bd0d0
+bright7=d9d9d6
+
+[colors-light]
 foreground=d9d9d6
 background=0e0f11
 selection-foreground=0e0f11

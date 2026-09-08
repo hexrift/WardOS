@@ -263,7 +263,9 @@ is downloaded by `curl | sh`. `mise` is not in Fedora and not in the image.
 
 ## Tests
 
-`desktop/tests/run.sh` shellchecks `desktop/bin/*`, `desktop/lib/*`, `desktop/install.sh`
+`image/check-hyprland.sh` (CI job `hyprland config`) parses `desktop/hyprland/` with the
+Hyprland the image ships, so a removed or renamed option fails a pull request instead of
+showing in a booted desktop's error bar. `desktop/tests/run.sh` shellchecks `desktop/bin/*`, `desktop/lib/*`, `desktop/install.sh`
 and runs every `desktop/tests/*.test.sh`. A test puts a directory of mock commands
 first on `PATH` (each mock appends its arguments to `$MOCK_LOG`), sets
 `WARDOS_MENU_BACKEND=stdin` with `WARDOS_MENU_CHOICE=<answer>`, points `HOME` and `XDG_*`
