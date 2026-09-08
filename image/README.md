@@ -40,22 +40,23 @@ Stage 1 provides the ward binaries, from a release tarball or a build of this ch
 ([below](#where-the-binaries-come-from)). Stage 2 starts from
 `quay.io/fedora/fedora-bootc:44` and installs every package of
 [`packages.txt`](packages.txt): the runtime set (`bubblewrap git curl python3
-openssh-clients cargo rust podman`, reasons in the file and in the next paragraph), the
+openssh-clients rustup podman`, reasons in the file and in the next paragraph), the
 Hyprland stack, the components that render the shell's surfaces until E-10 (Waybar,
 fuzzel, mako, swayosd), capture tools, audio, Bluetooth, Wi-Fi, power, fingerprint and
-FIDO2, printing, terminals and TUIs, Chromium, Firefox, Nautilus, Flatpak, podman and
+FIDO2, printing, terminals and TUIs, Chromium, Nautilus, Flatpak, podman and
 friends, fonts, icon and GTK themes, and Plymouth.
 
 On the runtime set: `bubblewrap` is the sandbox builder (ADR-0002, ADR-0013); `git` and
 `openssh-clients` serve worktrees, snapshots (ADR-0010) and git over ssh through the
 broker; `curl` and `python3` the self-checks, `scripts/security-check` and hook
-adapters; `podman` nested containers inside project environments (ADR-0005). `cargo`
-and `rust` are the one, explicit, temporary exception to ADR-0001's "no toolchain on the
-host": the trusted verifier ([`verify.rs`](../crates/ward-daemon/src/verify.rs)) binds a
-host Rust toolchain read-only into Zone 2 for the 0.1 stand-in of a verifier image, and
-they go away when that image (Phase 4, "still ahead") lands. It is the distro toolchain
-on `PATH`, not a `~/.rustup`; `Toolchains::detect` finds no rustup home and falls
-through to `/usr/bin`.
+adapters; `podman` nested containers inside project environments (ADR-0005). No
+toolchain is on the host (ADR-0001): `rustup` is the only Rust piece in the image, and
+a toolchain it installs lives in the user's home (`~/.rustup`, `~/.cargo`), which is
+exactly what the trusted verifier ([`verify.rs`](../crates/ward-daemon/src/verify.rs))
+binds read-only into Zone 2 (`Toolchains::detect` looks there first). `wardos-install
+dev rust` runs `rustup default stable`; other languages come through `mise` when it is
+installed, or a Flatpak SDK, or a toolbox. One browser ships, Chromium (web apps, the
+theme colour); Firefox is a `wardos-install app org.mozilla.firefox` away.
 
 Then, in this order: the binaries go to `/usr/bin`; `install-desktop.sh` places the
 desktop tree ([below](#the-desktop-in-the-image)); the configuration files under
@@ -362,7 +363,7 @@ native on an Intel Mac), or write the ISO to a USB stick for a PC.
    `sysctl user.max_user_namespaces` (non-zero) and `bwrap --unshare-all -- true`.
 6. Verify the runtime: `ward selftest` should pass every group it passes on a Fedora
    development host; `ward doctor` (or `cat /var/lib/wardos/doctor.txt`) lists bubblewrap,
-   cgroups v2, user namespaces, `cargo` on `PATH`, `podman`.
+   cgroups v2, user namespaces, no toolchain on `PATH` (a warning until `rustup default stable` has run), `podman`.
 7. `bootc status` shows the booted image and its digest. Record both in the E-09 result.
 
 Updates (`bootc upgrade`, which `wardos-update` wraps), switching between images, and

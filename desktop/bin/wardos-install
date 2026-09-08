@@ -93,8 +93,14 @@ EOF
     ;;
   dev)
     lang=$(ask "${1:-}" "Language") || exit 0
-    wardos_has mise || wardos_die "mise is not installed; it ships with the image (image/packages.txt)"
-    mise use -g "$lang@latest"
+    # Rust comes from rustup into ~/.rustup, which the verifier binds; the image ships
+    # rustup and no toolchain (image/README.md). Everything else goes through mise.
+    if [[ "$lang" == rust ]] && wardos_has rustup; then
+      rustup default stable
+    else
+      wardos_has mise || wardos_die "mise is not installed; install it or use a toolbox (image/README.md)"
+      mise use -g "$lang@latest"
+    fi
     ;;
   service)
     svc=$(ask "${1:-}" "Service") || exit 0

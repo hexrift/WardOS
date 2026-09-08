@@ -13,8 +13,7 @@ git                   # snapshot/worktree plumbing (ADR-0010), `ward init` on re
 curl                  # transport for `ward` self-checks and the egress relay tests
 python3               # scripts/security-check and hook adapters
 openssh-clients       # agent-side git-over-ssh through the credential broker
-cargo                 # the trusted verifier binds a host toolchain read-only into Zone 2
-rust                  # (image/README.md: the one, temporary, toolchain exception)
+rustup                # toolchains live in the user's home (~/.rustup, which the verifier binds), never on the host (ADR-0001)
 podman                # nested containers inside project environments (ADR-0005)
 
 # --- compositor and session ---------------------------------------------------------
@@ -103,7 +102,6 @@ bash-completion       # completions for the wardos-* family
 # --- desktop applications ------------------------------------------------------------------
 nautilus              # files (Super+E)
 chromium              # default browser, web apps (--app)
-firefox               # second browser
 flatpak               # Flathub applications (wardos-install app)
 
 # --- containers ---------------------------------------------------------------------------------

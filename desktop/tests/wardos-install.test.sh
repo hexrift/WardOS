@@ -42,7 +42,10 @@ assert_logged '^fc-cache -f$'
 wardos-install font "$TMP/fonts/Mono-Regular.ttf"
 assert_file "$XDG_DATA_HOME/fonts/Mono-Regular.ttf"
 
-# dev: mise, or a clear message without it.
+# dev: rust through rustup when present; mise for the rest, or a clear message without it.
+mock rustup
+wardos-install dev rust
+assert_logged '^rustup default stable$'
 wardos-install dev ruby
 assert_logged '^mise use -g ruby@latest$'
 rm "$MOCK_DIR/mise"
