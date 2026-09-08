@@ -5,9 +5,25 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "WardOS: ward-agent"
+description = "WardOS: in-sandbox PID 1 shim that applies inner hardening (Landlock, seccomp) before exec"
+
+[[bin]]
+name = "ward-agent"
+path = "src/main.rs"
 
 [dependencies]
+ward-sandbox = { path = "../ward-sandbox", version = "0.1.0" }
+thiserror = { workspace = true }
+clap = { workspace = true }
+landlock = "0.4"
+seccompiler = "0.5"
+nix = { version = "0.30", features = ["signal", "process"] }
+caps = "0.5"
+# Syscall name tables for every architecture the baseline profile declares.
+syscalls = { version = "0.8", default-features = false, features = ["std", "x86_64", "x86", "aarch64"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
