@@ -161,16 +161,22 @@ grep -q 'wardos/theme/current/swayosd.css' "$root/systemd/user/swayosd.service" 
 python3 - "$root/config/waybar/config.jsonc" <<'PY' || fail "waybar config is not the trust bar"
 import json, sys
 c = json.load(open(sys.argv[1]))
-want = ["custom/ward-mark", "custom/ward-project", "custom/ward-agent", "custom/ward-network", "custom/ward-tamperward", "custom/ward-verify"]
+want = ["custom/ward-mark", "custom/ward-project", "custom/ward-agent", "custom/ward-network", "custom/ward-grants", "custom/ward-tamperward", "custom/ward-verify"]
 assert c["modules-left"] == want, c["modules-left"]
+# The network and grants segments open the authority panel (ADR-0019).
+for name in ("custom/ward-network", "custom/ward-grants"):
+    assert c[name]["on-click"] == "foot --app-id ward-authority -e sh -c 'ward-shell authority-panel; read -r _'", c[name]["on-click"]
 assert c["modules-center"] == ["hyprland/workspaces"]
 assert c["modules-right"][0] == "custom/ward-update" and c["modules-right"][-1] == "clock"
 for name in want[1:]:
     m = c[name]
     assert m["exec"] == f"ward-shell bar --waybar --segment {name.split('/ward-')[1]} --follow", m["exec"]
     assert m["return-type"] == "json" and m["restart-interval"] == 5
-    # Every segment opens a panel in a ward-session window: the verify segment its own
-    # (ADR-0019: the verified candidate against the worktree), the rest the session panel.
+    # network and grants open the authority panel (asserted above); the verify segment
+    # opens its own (ADR-0019: the verified candidate against the worktree); every other
+    # left segment opens the session panel.
+    if name in ("custom/ward-network", "custom/ward-grants"):
+        continue
     panel = "verify-panel" if name == "custom/ward-verify" else "session"
     assert m["on-click"] == f"foot --app-id ward-session -e sh -c 'ward-shell {panel}; read -r _'", m["on-click"]
 assert c["custom/ward-update"]["interval"] >= 3600

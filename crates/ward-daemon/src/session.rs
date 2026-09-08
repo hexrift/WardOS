@@ -169,6 +169,22 @@ fn unknown_agent() -> AgentIdentity {
     }
 }
 
+/// Paths `TamperWard` protects (`protected.tests` in `.tamperward/config.yml`),
+/// read from the *entry* snapshot `entry_snapshot` under `state` so a worktree
+/// edit cannot lift them; empty when the file or key is absent.
+#[must_use]
+pub fn protected_paths(state: &Path, entry_snapshot: &str) -> Vec<String> {
+    let yaml = SnapshotStore::open(state.join("cas"))
+        .ok()
+        .zip(entry_snapshot.parse::<ward_snapshot::SnapshotId>().ok())
+        .and_then(|(store, entry)| store.cat(entry, Path::new(verify::CONFIG_PATH)).ok());
+    yaml.and_then(|bytes| {
+        serde_yaml::from_str::<verify::Config>(&String::from_utf8_lossy(&bytes)).ok()
+    })
+    .map(|c| c.protected.tests)
+    .unwrap_or_default()
+}
+
 /// A refused GitHub grant, as recorded before the command starts.
 fn github_refusal(reason: DenyReason) -> WardEvent {
     WardEvent::CredentialDenied {
@@ -387,19 +403,7 @@ impl Session {
     /// when the file or key is absent.
     #[must_use]
     pub fn protected_paths(&self) -> Vec<String> {
-        let yaml = SnapshotStore::open(self.state.join("cas"))
-            .ok()
-            .zip(
-                self.entry_snapshot
-                    .parse::<ward_snapshot::SnapshotId>()
-                    .ok(),
-            )
-            .and_then(|(store, entry)| store.cat(entry, Path::new(verify::CONFIG_PATH)).ok());
-        yaml.and_then(|bytes| {
-            serde_yaml::from_str::<verify::Config>(&String::from_utf8_lossy(&bytes)).ok()
-        })
-        .map(|c| c.protected.tests)
-        .unwrap_or_default()
+        protected_paths(&self.state, &self.entry_snapshot)
     }
 
     /// The state root holding this session's CAS and log.

@@ -156,15 +156,57 @@ agent ◄── {decision: allow|deny, reason} ◄── Response::Decision ◄�
    decision, which is what makes a held approval possible: its old five-second read
    timeout would have printed nothing and let the agent's default flow decide.
 
+The approval record separates the agent's claim from Ward's authority (ADR-0019,
+decision 2). What the daemon holds, lists and prints:
+
+```text
+Approval {
+  id, tool, summary,           the request as the hook sent it (summary: the URL, path or command)
+  claim,                       "<tool> <summary>": the agent's words, verbatim, shown labelled as such
+  authority: {                 derived by the daemon; never populated from the agent's text
+    rule,                      why Ward asks: "step-through: pause before network"
+    destination,               sanitised: the URL's host, the path under /work, the command's program
+    network,                   the proxy's own verdict: "reachable · restricted (dev)",
+                               "refused · host is not on the session allowlist", or "none"
+    method,                    "GET" | "read" | "write" | "exec"; "write · refused (protected by
+                               TamperWard policy: tests)" or "… refused (/work is read-only)"
+    credential,                "GitHub · contents:read, issues:read" once the launch granted it;
+                               "… · not granted (--grant github)" for an ask rule; "none"
+    repository,                the rule's repositories, current_repository resolved from origin
+    lifetime,                  null while open (the answer chooses); once | session in the grant
+  },
+  requested_at_unix_ms
+}
+```
+
+`Deriver` (`approvals.rs`) is built once per daemon from the session's manifest, the
+worktree's GitHub remote and the entry snapshot's protected paths; `network` is
+`ward_proxy::Policy::check_host` on the destination, exactly what the proxy will do,
+and `credential` is read from the `CredentialGranted` records the daemon itself
+appends (a `--grant github` launch), else from the manifest's rule. A denied write
+or an unreachable host is still asked when step-through says so, but the block says
+`refused`, so a `y` grants the tool and nothing more.
+
+Temporary authority stays visible while it exists (decision 4): `Request::Grants` /
+`ward session grants [--json]` lists every `allow-session` answer (`kind: approval`,
+`label: "WebFetch api.github.com"`, `scope`, `lifetime: session`) and every credential
+the proxy injects (`kind: credential`, `label: "GitHub"`, `scope: "contents:read,
+issues:read · github.com, api.github.com"`, `lifetime: launch`), oldest first; the
+shell derives the same list from the stream (`ward-shell-core` `authority.rs`) for
+the bar's `NET restricted · github+` and `GRANTS n` and the authority panel.
+
 The desktop side is `wardos-approve` (`desktop.md` §Commands): `--watch` follows
-`ward session pending --follow` (one JSON object per line: `id`, `tool`, `summary`,
-`reason`, `requested_at_unix_ms`, `agent`, `session`) and shows each approval as a
-mako notification with `Allow once` / `Allow session` / `Deny` actions, relaying the
-chosen one as `ward session approve --session <id> <n> <decision>`; without arguments
-it lists what is pending and takes `y` / `s` / `n` from the keyboard. From home, where
-the listener and the bar run, `ward session pending` and `ward-shell` mean the newest
-session a daemon serves (`client::desktop_socket`); a project directory still means
-its own session, and `--session` names one outright.
+`ward session pending --json --follow` (one JSON object per line: the record above
+plus `agent` and `session`) and shows each approval as a mako notification with the
+three blocks (`DESTINATION` in the mono face, `REQUESTED BY AGENT` escaped, `WARD WILL
+ALLOW` as `Network`, `Method`, `Credential`, `Repository`, `Lifetime` rows) and the
+`Allow once` / `Allow session` / `Deny` actions with their keys, relaying the chosen
+one as `ward session approve --session <id> <n> <decision>`; without arguments it
+lists what is pending, shows the blocks, and takes `y` / `s` / `n` from the keyboard.
+`ward session pending` without `--json` prints the same three blocks per approval.
+From home, where the listener and the bar run, `ward session pending` and
+`ward-shell` mean the newest session a daemon serves (`client::desktop_socket`); a
+project directory still means its own session, and `--session` names one outright.
 
 ## 5. Headless and interactive
 

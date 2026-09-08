@@ -18,7 +18,7 @@ use ward_events::{
     WardEvent,
 };
 
-use crate::approvals::{Approval, ApprovalDecision};
+use crate::approvals::{Approval, ApprovalDecision, Grant};
 use crate::error::{Error, Result};
 use crate::hooks::HookDecision;
 
@@ -85,6 +85,9 @@ pub enum Request {
     },
     /// The approvals waiting for an answer.
     Pending,
+    /// The temporary authority the session holds (ADR-0019): every
+    /// `allow-session` answer and every credential the proxy injects.
+    Grants,
 }
 
 /// What the daemon answers.
@@ -115,6 +118,8 @@ pub enum Response {
     },
     /// The open approvals, oldest first.
     Pending(Vec<Approval>),
+    /// The session's temporary grants, oldest first.
+    Grants(Vec<Grant>),
 }
 
 /// Where a session's events go.
@@ -435,7 +440,8 @@ pub fn handle_with(
         | Request::Subscribe { .. }
         | Request::Hold { .. }
         | Request::Approve { .. }
-        | Request::Pending => (
+        | Request::Pending
+        | Request::Grants => (
             Response::Error("not served on this connection".into()),
             false,
         ),
@@ -589,20 +595,45 @@ mod tests {
             r#"{"resp":"decision","body":{"id":7,"decision":"deny","reason":"approval: timed out"}}"#
         );
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), decision);
-        let pending = Response::Pending(vec![Approval {
-            id: 7,
-            tool: "Write".into(),
-            summary: "/work/src/lib.rs".into(),
-            reason: "r".into(),
-            requested_at_unix_ms: 5,
-        }]);
+        let pending = Response::Pending(vec![Approval::new(
+            7,
+            "Write",
+            "/work/src/lib.rs",
+            crate::approvals::Authority::none("r", "/work/src/lib.rs"),
+            5,
+        )]);
         let json = serde_json::to_string(&pending).unwrap();
         assert!(json.contains(r#""requested_at_unix_ms":5"#), "{json}");
+        assert!(
+            json.contains(r#""claim":"Write /work/src/lib.rs""#),
+            "the agent's words travel as the claim: {json}"
+        );
+        assert!(
+            json.contains(r#""authority":{"rule":"r","destination":"/work/src/lib.rs","network":"none","method":"none","credential":"none","repository":null,"lifetime":null}"#),
+            "{json}"
+        );
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), pending);
-        // A plain log connection does not hold or answer approvals.
+        assert_eq!(
+            serde_json::to_string(&Request::Grants).unwrap(),
+            r#"{"req":"grants"}"#
+        );
+        let grants = Response::Grants(vec![Grant {
+            kind: crate::approvals::GrantKind::Credential,
+            label: "GitHub".into(),
+            scope: "contents:read · github.com".into(),
+            lifetime: crate::approvals::Lifetime::Launch,
+            granted_at_unix_ms: 9,
+        }]);
+        let json = serde_json::to_string(&grants).unwrap();
+        assert_eq!(
+            json,
+            r#"{"resp":"grants","body":[{"kind":"credential","label":"GitHub","scope":"contents:read · github.com","lifetime":"launch","granted_at_unix_ms":9}]}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), grants);
+        // A plain log connection does not hold or answer approvals, nor list grants.
         let dir = tempfile::tempdir().unwrap();
         let mut log = Some(fresh(dir.path()));
-        for request in [hold, approve, Request::Pending] {
+        for request in [hold, approve, Request::Pending, Request::Grants] {
             assert!(matches!(
                 handle(&mut log, request).0,
                 Response::Error(e) if e == "not served on this connection"

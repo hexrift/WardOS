@@ -163,20 +163,51 @@ Hard denials show no override control.
 
 ## 10. Approvals
 
+An approval separates what the agent claims from what Ward will allow (ADR-0019,
+decision 2). Three blocks, in this order, and nothing the agent wrote ever looks like
+something Ward derived:
+
 ```text
 Claude requests
 
+DESTINATION
 api.github.com
 
-Reason      Read GitHub issue #381
-Scope       Network only
-Duration    Current session
+REQUESTED BY AGENT
+WebFetch https://api.github.com/repos/hexrift/WardOS/issues/381
 
-[Allow once]   [Allow session]   [Deny]
+WARD WILL ALLOW
+Network      reachable · restricted (dev)
+Method       GET
+Credential   GitHub · contents:read, issues:read
+Repository   hexrift/WardOS
+Lifetime     once (y) · session (s)
+
+Allow once  y      Allow session  s      Deny  n
 ```
 
-Rendered by the shell as a layer-shell surface with a single shadow level; keyboard-first
-(`y` / `s` / `n`). Timeout is shown as a thin progress line, not a countdown number.
+*Destination* is the target as the daemon sanitised it: the host of a URL, the path as
+the sandbox sees it, the program of a command; in the mono face (§4). *Requested by
+agent* is the agent's request verbatim, labelled as the agent's words and never more
+prominent than the block under it; its markup is escaped, so it cannot dress itself up
+as a row. *Ward will allow* is what the policy and the credential rules grant if the
+user says yes, derived by the daemon from the session's manifest and never from the
+agent's text: the proxy's own verdict on the destination (`reachable · restricted
+(dev)`, `refused · host is not on the session allowlist`), the method (`GET`, `read`,
+`write`, `exec`; a write to a TamperWard-protected path or a read-only worktree says
+`refused` here, whatever the answer), the credential the proxy injects with its scope
+(or `none`, or the rule and why nothing is granted: `not granted (--grant github)`),
+the repository the rule scopes it to, and the lifetime, which the answer chooses. The
+three actions carry their keys. Rendered by the shell as a layer-shell surface with a
+single shadow level; keyboard-first (`y` / `s` / `n`). Timeout is shown as a thin
+progress line, not a countdown number.
+
+Authority that outlives an answer stays visible while it exists (decision 4): an
+`allow-session` and a `--grant` credential put `GRANTS n` on the bar and turn the
+network segment into `NET restricted · github+` until the session ends; the panel
+behind both lists the current agent authority — filesystem, network, every temporary
+grant with its scope and lifetime, and the standing denials (host files, private
+network, cloud and publish credentials).
 
 ## 11. Verification: a distinct phase with its own language
 
@@ -353,8 +384,8 @@ and any pixel.
 ## As built: Waybar rendering and approvals (ADR-0016)
 
 Until E-10, Waybar draws the trust bar (§6) from `ward-shell bar --waybar`: one
-custom module per segment (`project`, `agent`, `network`, `tamperward`, `verify`; the
-`WARD` mark is static), each fed by `--segment <name> --follow` so a change in the
+custom module per segment (`project`, `agent`, `network`, `grants`, `tamperward`,
+`verify`; the `WARD` mark is static), each fed by `--segment <name> --follow` so a change in the
 session's stream is a new JSON line and nothing polls. The shell decides the words
 and the colour roles; Waybar's stylesheet only maps the classes the JSON carries: the
 six roles of §3 by their names (`dim`, `ink`, `accent`, `verified`, `restricted`,
@@ -372,14 +403,21 @@ the verify panel (§11) is the verify module's tooltip and opens on its click
 detail, and the command the shell chose (`ward claude` in a terminal in the worktree,
 `ward verify` in one that stays open); fuzzel matches what the user types, the shell
 never sees it. Approvals (§10) are real: an `ask` is held by the session daemon
-(`agent-integration.md` §4.1) and shown by mako as a notification in the
-`ward-approval` category, `<Agent> requests` over the target, `Reason` and `Scope`
-rows, and the three actions `Allow once` / `Allow session` / `Deny`, answered from
-the keyboard (`y` / `s` / `n`) through `wardos-approve`; the timeout is the daemon's
-(60 s, deny), and the notification shows it as mako's progress line, not a number.
-The `Duration  Current session` row of §10 is not shown: the scope of an `allow` is
-chosen by the answer, not read from the request. Not yet built: a layer-shell
-surface of the shell's own for any of this, the verification display (§11), fonts (§4).
+(`agent-integration.md` §4.1), which derives the `WARD WILL ALLOW` block from the
+manifest, the credential rules, the credentials it has granted and the protected
+paths, and mako shows it as a notification in the `ward-approval` category:
+`<Agent> requests`, then the three blocks as §10 draws them (`DESTINATION` in `<tt>`,
+`REQUESTED BY AGENT` with the agent's words escaped, `WARD WILL ALLOW` with its five
+rows), then the three actions with their keys, answered from the keyboard (`y` / `s`
+/ `n`) through `wardos-approve`; the timeout is the daemon's (60 s, deny), and the
+notification shows it as mako's progress line, not a number. The `Lifetime` row reads
+`once (y) · session (s)` while the question is open, since the answer chooses it; the
+daemon fills it in the grant. Temporary authority stays visible (§10, last
+paragraph): the `network` module reads `NET restricted · github+` and a `grants`
+module `GRANTS n` while an `allow-session` or a `--grant` credential is live, both
+open the authority panel (`ward-shell authority-panel`) on click, and `ward session
+grants` is the same list in a terminal. Not yet built: a layer-shell surface of the
+shell's own for any of this, the verification display (§11), fonts (§4).
 
 ## As built: wallpapers, lock screen, bar
 

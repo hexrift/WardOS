@@ -32,10 +32,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ward_events::{EventRecord, LogReader, Origin, WardEvent};
 
-use crate::approvals::{self, Approval, Approvals, Outcome};
+use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
 use crate::error::{Error, Result};
-use crate::session::{SessionMeta, session_dir};
+use crate::github;
+use crate::session::{SessionMeta, protected_paths, session_dir};
 
 /// File name of the daemon's pid file inside `sessions/<id>/`.
 pub const PID_NAME: &str = "wardd.pid";
@@ -106,6 +107,14 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
     let log = LocalLog::open(&log_path, started)?;
     let description = serde_json::to_value(meta.describe())
         .map_err(|e| Error::Daemon(format!("describe {session}: {e}")))?;
+    // What an approval's authority is derived from: the manifest, the
+    // repository a `current_repository` credential scope means, and the paths
+    // TamperWard protects, all fixed at the session's start.
+    let deriver = Deriver::new(
+        meta.manifest.clone(),
+        github::origin_repo(&meta.project),
+        protected_paths(state, &meta.entry_snapshot),
+    );
 
     let socket = dir.join(SOCKET_NAME);
     let listener = bind_socket(&socket)?;
@@ -114,7 +123,7 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
     std::fs::write(&pid_file, format!("{}\n", std::process::id()))
         .map_err(|e| Error::io(&pid_file, e))?;
 
-    let served = Arc::new(Mutex::new(Served::new(log, log_path, description)));
+    let served = Arc::new(Mutex::new(Served::new(log, log_path, description, deriver)));
     let finished = Arc::new(AtomicBool::new(false));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
     let mut next_peer: u64 = 0;
@@ -300,7 +309,8 @@ struct Subscription {
 }
 
 /// The daemon's shared state: the log, the session facts, the subscribers, the
-/// open connections, and the approvals it holds.
+/// open connections, the approvals it holds and what it derives their
+/// authority from.
 struct Served {
     log: Option<LocalLog>,
     log_path: PathBuf,
@@ -308,10 +318,16 @@ struct Served {
     subscribers: Vec<Sender<Delivery>>,
     peers: Vec<(u64, UnixStream)>,
     approvals: Arc<Approvals>,
+    deriver: Deriver,
 }
 
 impl Served {
-    fn new(log: LocalLog, log_path: PathBuf, description: serde_json::Value) -> Self {
+    fn new(
+        log: LocalLog,
+        log_path: PathBuf,
+        description: serde_json::Value,
+        deriver: Deriver,
+    ) -> Self {
         Self {
             log: Some(log),
             log_path,
@@ -319,6 +335,7 @@ impl Served {
             subscribers: Vec::new(),
             peers: Vec::new(),
             approvals: Arc::new(Approvals::new()),
+            deriver,
         }
     }
 
@@ -343,12 +360,45 @@ impl Served {
                 false,
             ),
             Request::Pending => (Response::Pending(self.approvals.pending()), false),
+            Request::Grants => (Response::Grants(self.approvals.grants()), false),
             other => {
+                // A credential the launch grants passes through here on its
+                // way to the log; once recorded it is temporary authority the
+                // session holds, and what an approval's authority reports.
+                let credential = match &other {
+                    Request::Append {
+                        event: WardEvent::CredentialGranted { service, scope, .. },
+                        ..
+                    } => Some((
+                        service.as_str().to_owned(),
+                        scope.subject.as_str().to_owned(),
+                        scope
+                            .permissions
+                            .iter()
+                            .map(|p| p.as_str().to_owned())
+                            .collect::<Vec<_>>(),
+                    )),
+                    _ => None,
+                };
                 let subscribers = &mut self.subscribers;
                 let (response, done) = control::handle_with(&mut self.log, other, |record| {
                     subscribers
                         .retain(|s| s.send(Delivery::Record(Box::new(record.clone()))).is_ok());
                 });
+                if let (Some((service, subject, permissions)), Response::Record(_)) =
+                    (credential, &response)
+                {
+                    // The subject is the route's upstream, `host:port`.
+                    let host = subject
+                        .rsplit_once(':')
+                        .map_or(subject.as_str(), |(h, _)| h);
+                    self.approvals.record_credential(
+                        &service,
+                        host,
+                        permissions,
+                        control::unix_ms(SystemTime::now()),
+                    );
+                }
                 if done {
                     for s in self.subscribers.drain(..) {
                         let _ = s.send(Delivery::End);
@@ -379,19 +429,23 @@ impl Served {
     /// Register a question: the `CapabilityRequested` record is appended and
     /// its seq becomes the approval's id, in one step under the mutex so a
     /// subscriber that sees the record can already answer it. A standing
-    /// `allow-session` answers it at once.
+    /// `allow-session` answers it at once. The approval's authority is derived
+    /// here, from the manifest and the credentials granted so far.
     fn hold(&mut self, tool: &str, summary: &str, reason: &str) -> Result<(u64, Option<Outcome>)> {
         let record = self.append(approvals::requested_event(tool, summary, reason))?;
         if self.approvals.remembered(tool, summary) {
             return Ok((record.seq, Some(Outcome::Remembered)));
         }
-        self.approvals.register(Approval {
-            id: record.seq,
-            tool: tool.to_owned(),
-            summary: summary.to_owned(),
-            reason: reason.to_owned(),
-            requested_at_unix_ms: control::unix_ms(SystemTime::now()),
-        })?;
+        let authority = self
+            .deriver
+            .derive(tool, summary, reason, &self.approvals.credentials());
+        self.approvals.register(Approval::new(
+            record.seq,
+            tool,
+            summary,
+            authority,
+            control::unix_ms(SystemTime::now()),
+        ))?;
         Ok((record.seq, None))
     }
 
@@ -585,7 +639,17 @@ mod tests {
             SystemTime::now(),
         )
         .unwrap();
-        Served::new(log, log_path, serde_json::json!({"session": "sess_9"}))
+        let deriver = Deriver::new(
+            ward_policy::default_manifest(),
+            Some("hexrift/WardOS".into()),
+            vec!["tests/security_expiry.rs".into()],
+        );
+        Served::new(
+            log,
+            log_path,
+            serde_json::json!({"session": "sess_9"}),
+            deriver,
+        )
     }
 
     fn seqs(records: &[EventRecord]) -> Vec<u64> {
@@ -697,6 +761,16 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, 0, "the seq of the request record");
         assert_eq!(pending[0].tool, "Write");
+        assert_eq!(
+            pending[0].claim, "Write /work/src/lib.rs",
+            "the agent's words"
+        );
+        assert_eq!(pending[0].authority.destination, "/work/src/lib.rs");
+        assert_eq!(pending[0].authority.method, "write");
+        assert_eq!(
+            pending[0].authority.rule,
+            "step-through: pause before writes"
+        );
         let (live, _) = drain(&rx);
         assert_eq!(seqs(&live), [0], "the subscriber saw the request");
         assert!(matches!(
@@ -792,6 +866,129 @@ mod tests {
             hold(&served, "Write", "/work/y.rs", "r", 5),
             Response::Error(e) if e == "log is sealed"
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_granted_credential_is_temporary_authority_the_daemon_lists_and_derives_from() {
+        use crate::approvals::{GrantKind, Lifetime};
+        use crate::hooks::HookDecision;
+        use ward_events::{CredentialDelivery, NameText, Scope, ServiceId, ShortText};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        assert!(matches!(
+            lock(&served).handle(Request::Grants).0,
+            Response::Grants(g) if g.is_empty()
+        ));
+        // Before any grant, a fetch to GitHub shows the rule and that nothing
+        // was granted.
+        let holding = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || {
+                hold(
+                    &served,
+                    "WebFetch",
+                    "https://api.github.com/repos/hexrift/WardOS/issues/1",
+                    "step-through: pause before network",
+                    5,
+                )
+            })
+        };
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&served).approvals.pending().is_empty()
+        }));
+        let pending = lock(&served).approvals.pending();
+        assert_eq!(
+            pending[0].authority.credential,
+            "GitHub · contents:read, issues:read · not granted (--grant github)"
+        );
+        assert_eq!(pending[0].authority.network, "reachable · restricted (dev)");
+        lock(&served).handle(Request::Approve {
+            id: 0,
+            decision: crate::approvals::ApprovalDecision::AllowSession,
+        });
+        assert!(matches!(
+            holding.join().unwrap(),
+            Response::Decision {
+                decision: HookDecision::Allow,
+                ..
+            }
+        ));
+
+        // The launch grants GitHub: two routes, one credential.
+        for host in ["github.com", "api.github.com"] {
+            let granted = WardEvent::CredentialGranted {
+                service: ServiceId::new("github").unwrap(),
+                scope: Scope {
+                    subject: ShortText::new(&format!("{host}:443")),
+                    permissions: vec![NameText::new("contents:read"), NameText::new("issues:read")],
+                },
+                expires: Duration::from_secs(60),
+                delivery: CredentialDelivery::ProxyInjected,
+            };
+            assert!(matches!(
+                lock(&served).append(granted),
+                Ok(record) if record.seq >= 2
+            ));
+        }
+        let grants = match lock(&served).handle(Request::Grants).0 {
+            Response::Grants(g) => g,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(grants.len(), 2, "{grants:?}");
+        assert_eq!(grants[0].kind, GrantKind::Approval);
+        assert_eq!(grants[0].label, "WebFetch api.github.com");
+        assert_eq!(grants[0].lifetime, Lifetime::Session);
+        assert_eq!(grants[1].kind, GrantKind::Credential);
+        assert_eq!(grants[1].label, "GitHub");
+        assert_eq!(
+            grants[1].scope,
+            "contents:read, issues:read · github.com, api.github.com"
+        );
+        assert_eq!(grants[1].lifetime, Lifetime::Launch);
+
+        // A fresh question to the same service now shows the injected credential.
+        let holding = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || {
+                hold(
+                    &served,
+                    "WebFetch",
+                    "https://github.com/hexrift/WardOS",
+                    "r",
+                    5,
+                )
+            })
+        };
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&served).approvals.pending().is_empty()
+        }));
+        let pending = lock(&served).approvals.pending();
+        assert_eq!(
+            pending[0].authority.credential,
+            "GitHub · contents:read, issues:read"
+        );
+        assert_eq!(
+            pending[0].authority.repository.as_deref(),
+            Some("hexrift/WardOS")
+        );
+        lock(&served).handle(Request::Approve {
+            id: pending[0].id,
+            decision: crate::approvals::ApprovalDecision::Deny,
+        });
+        assert!(matches!(
+            holding.join().unwrap(),
+            Response::Decision {
+                decision: HookDecision::Deny,
+                ..
+            }
+        ));
+        assert_eq!(
+            lock(&served).approvals.grants().len(),
+            2,
+            "a denial grants nothing"
+        );
     }
 
     #[test]

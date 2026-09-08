@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use ward_events::{EventKind, EventRecord, WardEvent};
 
-use crate::approvals::{Approval, ApprovalDecision};
+use crate::approvals::{Approval, ApprovalDecision, Grant};
 use crate::control::{Next, RemoteSink, Request, Response, SOCKET_NAME, is_evidence};
 use crate::describe::SessionDescription;
 use crate::error::{Error, Result};
@@ -142,6 +142,16 @@ pub fn pending(sink: &mut RemoteSink) -> Result<Vec<Approval>> {
     match sink.call(&Request::Pending)? {
         Response::Pending(approvals) => Ok(approvals),
         Response::Error(e) => Err(Error::Daemon(format!("daemon refused pending: {e}"))),
+        other => Err(Error::Events(format!("unexpected response {other:?}"))),
+    }
+}
+
+/// The temporary grants the session holds (`ward session grants`), oldest
+/// first: `allow-session` answers and the credentials the proxy injects.
+pub fn grants(sink: &mut RemoteSink) -> Result<Vec<Grant>> {
+    match sink.call(&Request::Grants)? {
+        Response::Grants(grants) => Ok(grants),
+        Response::Error(e) => Err(Error::Daemon(format!("daemon refused grants: {e}"))),
         other => Err(Error::Events(format!("unexpected response {other:?}"))),
     }
 }
@@ -507,12 +517,22 @@ mod tests {
                     }
                     Request::Pending => reply(
                         &mut writer,
-                        &Response::Pending(vec![Approval {
-                            id: 4,
-                            tool: "Write".into(),
-                            summary: "/work/a.rs".into(),
-                            reason: "r".into(),
-                            requested_at_unix_ms: 0,
+                        &Response::Pending(vec![Approval::new(
+                            4,
+                            "Write",
+                            "/work/a.rs",
+                            crate::approvals::Authority::none("r", "/work/a.rs"),
+                            0,
+                        )]),
+                    ),
+                    Request::Grants => reply(
+                        &mut writer,
+                        &Response::Grants(vec![Grant {
+                            kind: crate::approvals::GrantKind::Approval,
+                            label: "Write /work/a.rs".into(),
+                            scope: "write".into(),
+                            lifetime: crate::approvals::Lifetime::Session,
+                            granted_at_unix_ms: 1,
                         }]),
                     ),
                     Request::Approve { id, .. } => reply(
@@ -716,6 +736,10 @@ mod tests {
         approve(&mut sink, 4, ApprovalDecision::Allow).unwrap();
         let err = approve(&mut sink, 5, ApprovalDecision::Deny).unwrap_err();
         assert_eq!(err.to_string(), "daemon: approval 5: not pending");
+        let held = grants(&mut sink).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].label, "Write /work/a.rs");
+        assert_eq!(held[0].lifetime, crate::approvals::Lifetime::Session);
         drop(sink);
         let seen = server.join().unwrap();
         assert_eq!(seen[1], Request::Pending);
@@ -726,6 +750,7 @@ mod tests {
                 decision: ApprovalDecision::Allow
             }
         );
+        assert_eq!(seen[4], Request::Grants);
     }
 
     #[test]
@@ -760,13 +785,13 @@ mod tests {
                             pending_calls += 1;
                             reply(
                                 &mut writer,
-                                &Response::Pending(vec![Approval {
-                                    id: 1,
-                                    tool: "Write".into(),
-                                    summary: "/work/a.rs".into(),
-                                    reason: "r".into(),
-                                    requested_at_unix_ms: 0,
-                                }]),
+                                &Response::Pending(vec![Approval::new(
+                                    1,
+                                    "Write",
+                                    "/work/a.rs",
+                                    crate::approvals::Authority::none("r", "/work/a.rs"),
+                                    0,
+                                )]),
                             );
                         }
                         Request::Subscribe { .. } => {

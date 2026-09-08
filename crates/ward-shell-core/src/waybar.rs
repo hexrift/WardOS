@@ -17,6 +17,7 @@ use serde::Serialize;
 
 use ward_daemon::describe::SessionDescription;
 
+use crate::authority::{Authority, authority_panel};
 use crate::feed::Model;
 use crate::panel::{Group, panel_text, session_panel, verify_panel};
 use crate::settings::{Row, rows_text};
@@ -136,7 +137,20 @@ fn explanation(
             let word = model.state.agent.map_or("unknown", agent_word);
             vec![row("Agent"), Row::new("State", word, Tone::Ink)]
         }
-        SegmentName::Network => vec![row("Network")],
+        // The network and grants modules explain themselves with the
+        // authority panel (ADR-0019), which their click opens in full.
+        SegmentName::Network => {
+            let authority = authority_panel(d, &Authority::from_records(&model.records));
+            vec![
+                panel_row(&authority, "Network"),
+                panel_row(&authority, "Temporary grants"),
+            ]
+        }
+        SegmentName::Grants => {
+            authority_panel(d, &Authority::from_records(&model.records))
+                .swap_remove(1)
+                .rows
+        }
         SegmentName::Credentials => vec![row("Secrets")],
         SegmentName::Observer => vec![row("Observer")],
         SegmentName::Tamperward => vec![row("Policy"), row("Evidence")],
@@ -165,7 +179,7 @@ mod tests {
         agent, denied, edited, ended, model_with, records, sequence, snapshot, verify_passed, wardd,
     };
     use crate::trust::fixtures::description;
-    use ward_events::{AgentState, Origin};
+    use ward_events::{AgentState, Origin, WardEvent};
     use ward_policy::NetworkCapability;
 
     fn live() -> (SessionDescription, Header, Model) {
@@ -244,7 +258,7 @@ mod tests {
                 SegmentName::Network,
                 "NET restricted (dev)",
                 vec!["restricted"],
-                "Network   restricted (dev)",
+                "Network            restricted (dev)",
             ),
             (
                 SegmentName::Credentials,
@@ -389,6 +403,51 @@ mod tests {
             }
         }
         assert_eq!(Module::none(None).class, ["none"], "the whole bar");
+    }
+
+    #[test]
+    fn a_live_grant_changes_the_network_module_and_shows_the_grants_module() {
+        use std::time::Duration;
+        use ward_events::{CredentialDelivery, NameText, Scope, ShortText};
+        let (d, header, mut model) = live();
+        let none = Module::segment(&d, &header, &model, SegmentName::Grants, now(&d));
+        assert_eq!(none, Module::none(Some(SegmentName::Grants)));
+        let network = Module::segment(&d, &header, &model, SegmentName::Network, now(&d));
+        assert_eq!(
+            network.tooltip,
+            "Network            restricted (dev)\nTemporary grants   0"
+        );
+        model.apply(
+            wardd(&[WardEvent::CredentialGranted {
+                service: ward_events::ServiceId::new("github").unwrap(),
+                scope: Scope {
+                    subject: ShortText::new("api.github.com:443"),
+                    permissions: vec![NameText::new("contents:read")],
+                },
+                expires: Duration::from_secs(60),
+                delivery: CredentialDelivery::ProxyInjected,
+            }])
+            .remove(0),
+        );
+        let network = Module::segment(&d, &header, &model, SegmentName::Network, now(&d));
+        assert_eq!(network.text, "NET restricted · github+");
+        assert_eq!(network.class, ["restricted"]);
+        assert_eq!(
+            network.tooltip,
+            "Network            restricted · github+\nTemporary grants   1"
+        );
+        let grants = Module::segment(&d, &header, &model, SegmentName::Grants, now(&d));
+        assert_eq!(grants.text, "GRANTS 1");
+        assert_eq!(grants.class, ["restricted"]);
+        assert_eq!(
+            grants.tooltip,
+            "GitHub   contents:read · api.github.com · launch"
+        );
+        assert!(
+            Module::bar(&d, &header, &model, now(&d))
+                .text
+                .contains("│ NET restricted · github+ │ GRANTS 1 │ CRED 0 granted │")
+        );
     }
 
     #[test]

@@ -32,8 +32,9 @@ use ward_daemon::ids::{ev_snapshot, snap_snapshot};
 use ward_daemon::session::state_root;
 use ward_daemon::verify::candidate_options;
 use ward_shell_core::{
-    Header, Launcher, LineContext, Model, Module, SegmentName, SessionCard, SessionDescription,
-    Settings, TrustBar, counters_text, panel_text, session_panel, verify_panel,
+    Authority, Header, Launcher, LineContext, Model, Module, SegmentName, SessionCard,
+    SessionDescription, Settings, TrustBar, authority_panel, counters_text, panel_text,
+    session_panel, verify_panel,
 };
 use ward_snapshot::{
     CaptureOptions, CaptureStats, HashCache, Manifest, ManifestDiff, SnapshotStore,
@@ -92,6 +93,10 @@ enum Surface {
     /// verified candidate, when, the worktree's digest now, what changed, and
     /// what the verifier found.
     VerifyPanel,
+    /// The current agent authority (ADR-0019) behind the network and grants
+    /// segments: filesystem, network, every temporary grant with its scope
+    /// and lifetime, and the standing denials.
+    AuthorityPanel,
     /// The command centre, optionally filtered as if `query` had been typed.
     Launcher {
         /// Typed text.
@@ -392,6 +397,13 @@ fn render(s: &Snapshot, surface: Surface) -> String {
             let panel = verify_panel(&s.description, &s.model, now_unix_ms());
             format!("{bar}\n\n{}", panel_text(&panel))
         }
+        Surface::AuthorityPanel => {
+            let authority = Authority::from_records(&s.model.records);
+            format!(
+                "{bar}\n\n{}",
+                panel_text(&authority_panel(&s.description, &authority))
+            )
+        }
         Surface::Launcher { query, .. } => {
             let card = SessionCard::new(&s.description, &s.model);
             let mut launcher = Launcher::new(&[card]);
@@ -509,6 +521,7 @@ mod tests {
             },
             Surface::Session,
             Surface::VerifyPanel,
+            Surface::AuthorityPanel,
             Surface::Observer { rows: 3 },
             Surface::Settings,
         ] {

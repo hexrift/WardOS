@@ -769,13 +769,13 @@ mod tests {
                 .next_id
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.approvals
-                .register(Approval {
+                .register(Approval::new(
                     id,
-                    tool: tool.into(),
-                    summary: summary.into(),
-                    reason: reason.into(),
-                    requested_at_unix_ms: 0,
-                })
+                    tool,
+                    summary,
+                    crate::approvals::Authority::none(reason, summary),
+                    0,
+                ))
                 .ok()?;
             Some(self.approvals.wait(id, self.timeout).response())
         }
@@ -814,7 +814,11 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].tool, "Write");
         assert_eq!(pending[0].summary, "/work/src/lib.rs");
-        assert_eq!(pending[0].reason, "step-through: pause before writes");
+        assert_eq!(
+            pending[0].authority.rule,
+            "step-through: pause before writes"
+        );
+        assert_eq!(pending[0].claim, "Write /work/src/lib.rs");
         assert!(!asking.is_finished(), "the hook is held");
 
         approvals
