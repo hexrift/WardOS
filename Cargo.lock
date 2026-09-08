@@ -507,6 +507,15 @@ dependencies = [
 [[package]]
 name = "ward-snapshot"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "wasip2"
