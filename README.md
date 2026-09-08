@@ -59,7 +59,7 @@ ward up       examples/ward-demo    # start a session: policy → manifest, entr
 ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live observer
 ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stays on the host
 ward status   examples/ward-demo    # the security panel for the active session
-ward selftest examples/ward-demo    # prove the isolation (8/8 hostile probes blocked)
+ward selftest examples/ward-demo    # prove the isolation (10/10 hostile probes blocked)
 ward stop     examples/ward-demo    # seal the log
 ward replay   <events.log>          # replay any sealed session (--verify, --json)
 ```
@@ -88,13 +88,20 @@ TamperWard policy  = allowed behaviour and verification (what the agent MAY do, 
 
 ## Status
 
-**Phase 0 — Architecture.** No implementation exists yet. This repository currently holds
-the architecture, threat model, technology decisions, experiment plan, and roadmap that
-must be agreed and (where marked) experimentally validated before code is written.
+**Phase 2 — Agent support, in progress.** The Rust workspace builds a working prototype on
+any Linux host with `bubblewrap`: sessions with a capability manifest, content-addressed
+entry snapshots and a hash-chained log (`ward up` / `status` / `run` / `stop` /
+`replay --verify`); the self-test (10/10 hostile probes blocked, including a canary
+credential that never appears in the sandbox); a per-session
+policy proxy that is the sandbox's only way out; `ward claude` running real Claude Code
+with the model-API key held on the host and injected by the proxy; and Claude Code hooks
+reporting to `wardd`, with `step_through` policies holding before writes and network
+tools. Phase 0 and Phase 1 are complete; the immutable host image, TamperWard verifier
+and desktop shell are later phases.
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the phase plan and
-[`docs/experiments.md`](docs/experiments.md) for what must be proven before WardOS becomes
-a distribution.
+See [`docs/roadmap.md`](docs/roadmap.md) for the phase plan and what remains for the
+Phase 2 gate, and [`docs/experiments.md`](docs/experiments.md) for the recorded results
+of the experiments that gate each phase.
 
 ## Documentation
 

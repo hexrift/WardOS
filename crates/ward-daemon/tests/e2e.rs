@@ -143,6 +143,37 @@ fn selftest_blocks_every_probe() {
             "{id} must be denied in the sandbox"
         );
     }
+
+    // Credential probes run inside a session with a canary key on the host.
+    let state = tempfile::tempdir().unwrap();
+    let mut session = Session::start_in(project.path(), state.path()).expect("start");
+    let creds = ward_daemon::selftest_credentials(&mut session).expect("credential probes");
+    session.stop(EndReason::UserStop).expect("stop");
+    let names: Vec<&str> = creds.iter().map(|r| r.name).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    for r in &creds {
+        assert!(r.blocked, "{} must be denied in the sandbox", r.name);
+    }
+
+    // The probe itself must be able to fail: a key leaked into the environment REACHES.
+    let mut session = Session::start_in(project.path(), state.path()).expect("start");
+    let leaked = LaunchOpts {
+        env: vec![("ANTHROPIC_API_KEY".into(), "canary-xyz".into())],
+        ..LaunchOpts::default()
+    };
+    let argv: Vec<String> = [
+        "/bin/sh",
+        "-c",
+        ward_daemon::selftest::ST_012,
+        "sh",
+        "canary-xyz",
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    let report = session.launch(&argv, &leaked).expect("launch");
+    session.stop(EndReason::UserStop).expect("stop");
+    assert_eq!(report.code, Some(0), "ST-012 must detect a leaked key");
 }
 
 /// A sandboxed process can reach the session proxy only through the bind-mounted Unix
