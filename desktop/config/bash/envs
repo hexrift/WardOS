@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# WardOS — environment for the shell. Sourced by config/bash/bashrc.
+#
+# The defaults every wardos-* command assumes (docs/desktop.md §Commands): neovim
+# edits, foot is the terminal, chromium the browser. ~/.local/bin is first on PATH
+# for the user's own tools; mise (wardos-install dev <lang>) activates when present.
+
+export EDITOR=nvim
+export VISUAL=nvim
+export TERMINAL=foot
+export BROWSER=chromium
+export PAGER=less
+export LESS='-R --mouse --wheel-lines=3'
+export MANPAGER='nvim +Man!'
+
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+
+if command -v mise >/dev/null 2>&1; then
+  eval "$(mise activate bash)"
+fi
+
+# Wayland-native toolkits; the same values hyprland/envs.conf sets for the session,
+# repeated here for shells started outside it (ssh, a tty).
+export MOZ_ENABLE_WAYLAND=1
+export ELECTRON_OZONE_PLATFORM_HINT=auto

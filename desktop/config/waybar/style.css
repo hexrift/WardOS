@@ -1,0 +1,121 @@
+/* WardOS trust bar (docs/design-language.md §3, §5, §6).
+ *
+ * Colours come from the theme fragment (wardos-theme render writes waybar.css with
+ * @define-color ground, panel, separator, text, text_muted, accent, verified,
+ * restricted, denied; a font-family for the sans and mono faces is set below).
+ * 8 px grid, 1 px separators drawn as borders, no gradients, no shadows, no glow.
+ * State colour sits on the ward segments only, through the class the ward-shell
+ * JSON supplies (working, waiting, blocked, verifying, finished, verified,
+ * restricted, denied); the system group at the right is muted text. */
+@import "../wardos/theme/current/waybar.css";
+
+* {
+  font-family: "Inter", "Geist", sans-serif;
+  font-size: 13px;
+  font-feature-settings: "tnum";
+  min-height: 0;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  margin: 0;
+}
+
+window#waybar {
+  background: @ground;
+  color: @text;
+  border-bottom: 1px solid @separator;
+}
+
+/* Every module is a cell on the 8 px grid, separated by a 1 px line. */
+#custom-ward-mark,
+#custom-ward-project,
+#custom-ward-agent,
+#custom-ward-network,
+#custom-ward-tamperward,
+#custom-ward-verify,
+#custom-ward-update,
+#pulseaudio,
+#network,
+#bluetooth,
+#battery,
+#cpu,
+#memory,
+#clock {
+  padding: 0 16px;
+  border-right: 1px solid @separator;
+}
+
+/* --- Host mark and trust segments (left) ------------------------------------- */
+#custom-ward-mark {
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+#custom-ward-project {
+  font-family: "JetBrains Mono", "Commit Mono", monospace;
+}
+#custom-ward-agent,
+#custom-ward-network,
+#custom-ward-tamperward,
+#custom-ward-verify {
+  color: @text;
+}
+/* State colour on the segment's text (the shell puts it on the glyph), never a fill. */
+.working   { color: @accent; }
+.waiting   { color: @restricted; }
+.blocked   { color: @denied; }
+.verifying { color: @accent; }
+.finished  { color: @text; }
+.verified  { color: @verified; }
+.restricted { color: @restricted; }
+.denied    { color: @denied; }
+.idle,
+.sealed,
+.none { color: @text_muted; }
+
+/* --- Workspaces (centre) ------------------------------------------------------ */
+#workspaces button {
+  padding: 0 12px;
+  color: @text_muted;
+  border-bottom: 2px solid transparent;
+}
+#workspaces button.active {
+  color: @text;
+  border-bottom: 2px solid @accent;
+}
+#workspaces button.urgent {
+  color: @restricted;
+}
+#workspaces button:hover {
+  background: @panel;
+  color: @text;
+}
+
+/* --- System group (right): demoted, muted, tabular -------------------------- */
+#custom-ward-update,
+#pulseaudio,
+#network,
+#bluetooth,
+#battery,
+#cpu,
+#memory {
+  color: @text_muted;
+}
+#custom-ward-update.available { color: @accent; }
+#clock {
+  color: @text;
+  border-right: none;
+}
+#battery.warning  { color: @restricted; }
+#battery.critical { color: @denied; }
+#pulseaudio.muted { color: @text_muted; }
+#network.disconnected { color: @text_muted; }
+
+tooltip {
+  background: @panel;
+  color: @text;
+  border: 1px solid @separator;
+  border-radius: 4px;
+}
+tooltip label {
+  padding: 8px;
+}

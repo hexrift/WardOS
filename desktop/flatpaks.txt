@@ -1,0 +1,16 @@
+# WardOS — default Flathub applications (docs/desktop.md §Packages).
+# One id per line with what it is for; `wardos-install app <id>` installs one,
+# wardos-first-run offers this list. Nothing here is required by the desktop:
+# the keys that open them (Super + M, G, /) say so when the app is missing.
+org.signal.Signal                        # messages (Super + G)
+md.obsidian.Obsidian                     # notes
+com.spotify.Client                       # music (Super + M)
+com.onepassword.OnePassword              # passwords (Super + /)
+org.localsend.localsend_app              # send files to nearby devices
+org.gnome.gitlab.somas.Apostrophe        # markdown editor
+com.github.tchx84.Flatseal               # flatpak permissions
+org.libreoffice.LibreOffice              # office documents
+org.videolan.VLC                         # video and audio player
+com.obsproject.Studio                    # screen recording and streaming
+org.kde.kdenlive                         # video editing
+com.github.PintaProject.Pinta            # image editing

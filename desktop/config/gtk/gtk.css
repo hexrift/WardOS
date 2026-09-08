@@ -1,0 +1,22 @@
+/* WardOS — GTK 3 and GTK 4 overrides. Installed as ~/.config/gtk-3.0/gtk.css and
+ * ~/.config/gtk-4.0/gtk.css. The colours are the theme's: the fragment defines
+ * @define-color for the nine tokens and the libadwaita names it maps them onto
+ * (window_bg_color, view_bg_color, accent_color, …). Only geometry lives here:
+ * no shadows, no rounded window corners beyond 6 px, no gradients. */
+@import url("../wardos/theme/current/gtk.css");
+
+window.csd,
+window.csd decoration {
+  box-shadow: none;
+  border-radius: 6px;
+}
+
+headerbar {
+  min-height: 40px;
+  box-shadow: none;
+}
+
+button,
+entry {
+  border-radius: 4px;
+}

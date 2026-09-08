@@ -1,0 +1,52 @@
+# WardOS — notifications and approvals (docs/design-language.md §9, §10).
+#
+# Calm, top-right, under the bar, on the 8 px grid, 1 px border, 4 px radius, no
+# icons by default. Colours and fonts come from the theme fragment included at the
+# end (background-color, text-color, border-color, progress-color, font). Approvals
+# from wardos-approve use the `ward-approval` category: they stay until answered and
+# their timeout is a thin progress line, not a number (§10). Denials (§9) are short
+# and never urgent-red on the whole surface.
+
+max-visible=4
+sort=-time
+layer=overlay
+anchor=top-right
+output=
+margin=8,8,0,0
+padding=8,12
+width=360
+height=160
+border-size=1
+border-radius=4
+icons=0
+markup=1
+actions=1
+default-timeout=6000
+ignore-timeout=0
+group-by=app-name
+format=<b>%s</b>\n%b
+
+[urgency=low]
+default-timeout=4000
+
+[urgency=critical]
+default-timeout=0
+
+# Approvals wait for a keyboard answer (y / s / n) from wardos-approve.
+[category=ward-approval]
+default-timeout=0
+ignore-timeout=1
+layer=overlay
+anchor=center
+width=520
+height=300
+
+# Toasts for finished work (wardos-notify --done).
+[category=ward-done]
+default-timeout=3000
+
+# Do-not-disturb mode set by `wardos-toggle notifications` (makoctl mode -s dnd).
+[mode=dnd]
+invisible=1
+
+include=~/.config/wardos/theme/current/mako.conf

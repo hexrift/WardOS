@@ -1,0 +1,47 @@
+# WardOS — alacritty, the second terminal (foot is the default; alacritty is shipped
+# for GPU-heavy TUIs and for people who bring their own alacritty habits).
+#
+# Colours and the font come from the theme fragment imported first; the rest is
+# geometry on the 8 px grid, no bell, no blink, no decorations (Hyprland draws the
+# 1 px border).
+
+[general]
+import = ["~/.config/wardos/theme/current/alacritty.toml"]
+live_config_reload = true
+
+[env]
+TERM = "xterm-256color"
+
+[window]
+padding = { x = 8, y = 8 }
+dynamic_padding = true
+decorations = "None"
+opacity = 1.0
+dynamic_title = true
+
+[scrolling]
+history = 10000
+multiplier = 3
+
+[cursor]
+style = { shape = "Beam", blinking = "Never" }
+thickness = 0.15
+
+[bell]
+duration = 0
+
+[mouse]
+hide_when_typing = true
+
+[terminal]
+osc52 = "CopyPaste"
+
+[keyboard]
+bindings = [
+  { key = "C", mods = "Control|Shift", action = "Copy" },
+  { key = "V", mods = "Control|Shift", action = "Paste" },
+  { key = "Plus", mods = "Control", action = "IncreaseFontSize" },
+  { key = "Equals", mods = "Control", action = "IncreaseFontSize" },
+  { key = "Minus", mods = "Control", action = "DecreaseFontSize" },
+  { key = "Key0", mods = "Control", action = "ResetFontSize" },
+]

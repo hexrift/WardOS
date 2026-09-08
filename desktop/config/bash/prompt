@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# WardOS — the prompt. Sourced by config/bash/bashrc.
+#
+# Two calm lines: the directory and the git branch (dirty marked with `*`) in muted
+# text, then `$ ` (`# ` as root). No emoji, no glyph fonts, no timing. The colours
+# are the theme's: colors.env (WARDOS_ACCENT, WARDOS_TEXT_MUTED, hex) rendered by
+# wardos-theme, read on every prompt so a theme change reaches open terminals; when
+# it is missing the prompt is the terminal's default colours.
+
+wardos_prompt_rgb() {
+  # "#RRGGBB" -> "38;2;R;G;B"
+  local hex=${1#\#}
+  printf '38;2;%d;%d;%d' "0x${hex:0:2}" "0x${hex:2:2}" "0x${hex:4:2}"
+}
+
+wardos_prompt_branch() {
+  local branch
+  branch=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null) || return 0
+  [[ -n $branch ]] || return 0
+  if [[ -n $(git status --porcelain 2>/dev/null | head -1) ]]; then
+    printf ' %s*' "$branch"
+  else
+    printf ' %s' "$branch"
+  fi
+}
+
+wardos_prompt() {
+  local colors=${XDG_CONFIG_HOME:-$HOME/.config}/wardos/theme/current/colors.env
+  local accent='' muted='' reset='\[\e[0m\]'
+  if [[ -r $colors ]]; then
+    local WARDOS_ACCENT='' WARDOS_TEXT_MUTED=''
+    # shellcheck source=/dev/null
+    source "$colors"
+    [[ -n $WARDOS_ACCENT ]] && accent="\[\e[$(wardos_prompt_rgb "$WARDOS_ACCENT")m\]"
+    [[ -n $WARDOS_TEXT_MUTED ]] && muted="\[\e[$(wardos_prompt_rgb "$WARDOS_TEXT_MUTED")m\]"
+  fi
+  local sigil='$'
+  [[ ${EUID:-$(id -u)} -eq 0 ]] && sigil='#'
+  PS1="\n${accent}\w${reset}${muted}$(wardos_prompt_branch)${reset}\n${sigil} "
+}
+
+PROMPT_COMMAND="wardos_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+PS2='  '
