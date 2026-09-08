@@ -314,7 +314,12 @@ commits a multi-gigabyte layer (about fifteen seconds each even for a one-file c
 `dnf` installs with `install_weak_deps=False`, so the image holds only what
 `packages.txt` names; and `build.sh` passes `--format docker` so the Containerfile's
 `pipefail` shell is honoured under podman too. Compiling the tools is the slow part of a
-checkout build (five to ten minutes); `--source release` downloads them instead.
+checkout build (five to ten minutes); `--source release` downloads them instead. Both
+`dnf` and `cargo` run behind cache mounts (`RUN --mount=type=cache`, honoured by docker
+and by podman/buildah): the second build on a machine reuses the downloaded RPMs and the
+compiled dependencies, so a rebuild after a small change takes a minute or two instead
+of ten. Nothing from a cache lands in the image. Decision: caches over a smaller
+manifest, because the manifest is the product and the cache is free.
 
 ### Disk images from CI
 

@@ -70,7 +70,12 @@ COPY . .
 # --locked refuses to touch Cargo.lock, so the image is built from exactly the dependency
 # set the repository reviewed. Five host binaries: the three of the secure-session
 # layer, the shell (desktop/shell) and the theme renderer (desktop/theme).
-RUN cargo build --release --locked \
+# Cache mounts (BuildKit and buildah alike): the cargo registry and the target
+# directory survive between builds, so a rebuild recompiles only what changed. Nothing
+# from a cache mount lands in the image; the binaries are copied out within the step.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked \
       --package ward-cli \
       --package ward-daemon \
       --package ward-agent \
@@ -114,12 +119,17 @@ LABEL org.wardos.version="${WARDOS_VERSION}" \
 COPY image/coprs.txt image/packages.txt /tmp/
 # install_weak_deps=False: only what the manifest names, none of the "recommended"
 # extras (a smaller image, and every package in it is one somebody wrote down).
-RUN dnf -y install dnf5-plugins \
+# The dnf cache is a cache mount too: downloaded RPMs and metadata are reused by the
+# next build and never enter the image, which is why there is no `dnf clean all`
+# (hadolint DL3040 asks for one; the mount makes it moot). `sharing=locked` serialises
+# concurrent builds on the same cache.
+# hadolint ignore=DL3040
+RUN --mount=type=cache,target=/var/cache/libdnf5,sharing=locked \
+    dnf -y install dnf5-plugins \
     && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/coprs.txt \
        | while read -r copr; do echo "copr enable $copr"; dnf -y copr enable "$copr" || exit 1; done \
     && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/packages.txt \
-       | xargs dnf -y --setopt=install_weak_deps=False install \
-    && dnf clean all \
+       | xargs dnf -y --setopt=install_weak_deps=False --setopt=keepcache=True install \
     && rm -f /tmp/packages.txt /tmp/coprs.txt
 
 # The host binaries: ward, wardd, ward-agent (required), ward-shell and
