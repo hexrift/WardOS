@@ -858,6 +858,8 @@ dependencies = [
  "landlock",
  "nix",
  "seccompiler",
+ "serde",
+ "serde_json",
  "syscalls",
  "tempfile",
  "thiserror",

@@ -32,6 +32,9 @@ const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 pub const SHIM_FAILURE: u8 = 125;
 
 /// In-sandbox PID 1: apply Landlock, seccomp and `no_new_privs`, then run the agent.
+///
+/// `ward-agent hook` reads a Claude Code hook payload on stdin, asks wardd over
+/// $WARD_HOOK_SOCKET (default /run/ward/hooks.sock) and prints the decision.
 #[derive(Debug, Parser)]
 #[command(name = "ward-agent", version, about)]
 pub struct Args {
@@ -142,7 +145,8 @@ pub fn run(args: &Args) -> Result<i32> {
     supervise::run(&mut args.command())
 }
 
-fn note(message: &str) {
+/// Diagnostic on stderr unless `WARD_AGENT_QUIET` is set.
+pub(crate) fn note(message: &str) {
     if std::env::var_os("WARD_AGENT_QUIET").is_none() {
         eprintln!("ward-agent: {message}");
     }
