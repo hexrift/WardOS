@@ -1,14 +1,26 @@
-//! Every shipped theme renders into every component's format, and the two
+//! Every shipped theme renders into every component's format, the two
 //! fragments the compositor and the default terminal read are pinned to the
-//! byte for Ward Dark.
+//! byte for Ward Dark, and the wallpaper drawn from the tokens is a small PNG
+//! with the ground in its corners and the mark in `text_muted`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use wardos_theme::{Color, Fonts, Overrides, Theme, Variant, locate, render, render_into};
+use wardos_theme::{
+    Color, Fonts, HEIGHT, Overrides, Theme, Variant, WALLPAPER, WIDTH, Wallpaper, locate, render,
+    render_into,
+};
+
+/// Where `wardos-theme` renders to; the fragments name the wallpaper there.
+const OUT: &str = "/home/wardos/.config/wardos/theme/current";
+
+fn out() -> &'static Path {
+    Path::new(OUT)
+}
 
 const TOKENS: [&str; 9] = [
     "ground",
@@ -154,7 +166,7 @@ fn the_official_cells_are_the_design_languages_own() {
 #[test]
 fn every_theme_renders_every_file_with_its_tokens_in_place() {
     for (stem, theme) in shipped() {
-        let files = render(&theme, None, &Fonts::from_theme(&theme));
+        let files = render(&theme, None, &Fonts::from_theme(&theme), out());
         let names: BTreeSet<&str> = files.keys().copied().collect();
         assert_eq!(names, FILES.into_iter().collect::<BTreeSet<_>>(), "{stem}");
         let p = &theme.palette;
@@ -199,6 +211,9 @@ fn every_theme_renders_every_file_with_its_tokens_in_place() {
         assert!(lock.contains(&format!("$accent     = rgb({})", p.accent.value.bare())));
         assert!(lock.contains(&format!("$text_muted = rgb({})", p.text_muted.value.bare())));
         assert!(lock.contains(&format!("$font       = {}", theme.typography.sans[0])));
+        assert!(lock.contains(&format!("$radius     = {}", theme.geometry.radius_px)));
+        assert!(lock.contains(&format!("$veil       = rgba({}B3)", p.panel.value.bare())));
+        assert!(lock.contains(&format!("$wallpaper  = {OUT}/{WALLPAPER}\n")));
         assert!(
             !lock.contains("input-field"),
             "{stem}: hyprlock draws its own blocks"
@@ -241,18 +256,72 @@ fn every_theme_renders_every_file_with_its_tokens_in_place() {
             "WARDOS_FONT_MONO=\"{}\"",
             theme.typography.mono[0]
         )));
-        assert_eq!(
-            files["background"].trim(),
-            format!("solid:{}", p.ground.value.hex())
-        );
+        assert_eq!(files["background"].trim(), format!("{OUT}/{WALLPAPER}"));
         assert!(files["theme.toml"].contains(&format!("id = \"{}\"", theme.meta.id)));
+    }
+}
+
+/// Decodes a PNG to 8-bit RGB: `(width, height, pixels)`.
+fn decode(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    assert_eq!(info.color_type, png::ColorType::Rgb);
+    buf.truncate(info.buffer_size());
+    (info.width, info.height, buf)
+}
+
+fn pixel(image: &(u32, u32, Vec<u8>), x: u32, y: u32) -> Color {
+    let i = ((y * image.0 + x) * 3) as usize;
+    Color {
+        r: image.2[i],
+        g: image.2[i + 1],
+        b: image.2[i + 2],
+    }
+}
+
+#[test]
+fn every_theme_draws_a_small_wallpaper_with_the_ground_in_the_corners_and_the_mark_in_text_muted() {
+    for (stem, theme) in shipped() {
+        let started = Instant::now();
+        let png = Wallpaper::draw(&theme).png().unwrap();
+        let took = started.elapsed();
+        // The budget is 200 ms; an unoptimised test build gets five times that.
+        let budget = if cfg!(debug_assertions) { 1000 } else { 200 };
+        assert!(took.as_millis() < budget, "{stem}: {took:?}");
+        assert!(png.len() < 200 * 1024, "{stem}: {} bytes", png.len());
+        let image = decode(&png);
+        assert_eq!((image.0, image.1), (WIDTH, HEIGHT), "{stem}");
+        assert_eq!((image.0, image.1), (1920, 1200));
+        let p = &theme.palette;
+        for (x, y) in [
+            (0, 0),
+            (WIDTH - 1, 0),
+            (0, HEIGHT - 1),
+            (WIDTH - 1, HEIGHT - 1),
+        ] {
+            assert_eq!(pixel(&image, x, y), p.ground.value, "{stem} corner {x},{y}");
+        }
+        let mark = Wallpaper::MARK;
+        assert_eq!(pixel(&image, mark.x, mark.y), p.text_muted.value, "{stem}");
+        let rule = Wallpaper::RULE;
+        assert_eq!(pixel(&image, rule.x, rule.y), p.separator.value, "{stem}");
+        // Three tones and nothing else: no gradient, no anti-aliasing.
+        let tones: BTreeSet<[u8; 3]> = image.2.chunks(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let want: BTreeSet<[u8; 3]> = [p.ground.value, p.separator.value, p.text_muted.value]
+            .into_iter()
+            .map(|c| [c.r, c.g, c.b])
+            .collect();
+        assert!(tones.is_subset(&want), "{stem}: {tones:?}");
     }
 }
 
 #[test]
 fn ward_dark_hyprland_fragment_is_pinned() {
     let theme = load("ward-dark");
-    let files = render(&theme, None, &Fonts::from_theme(&theme));
+    let files = render(&theme, None, &Fonts::from_theme(&theme), out());
     assert_eq!(
         files["hyprland.conf"],
         "\
@@ -274,7 +343,7 @@ misc {
 #[test]
 fn ward_dark_foot_fragment_is_pinned() {
     let theme = load("ward-dark");
-    let files = render(&theme, None, &Fonts::from_theme(&theme));
+    let files = render(&theme, None, &Fonts::from_theme(&theme), out());
     assert_eq!(
         files["foot.ini"],
         "\
@@ -338,7 +407,7 @@ bright7=d9d9d6
 fn light_variants_flip_the_terminal_brightness_and_the_colour_scheme() {
     let theme = load("ward-light");
     assert_eq!(theme.meta.variant, Variant::Light);
-    let files = render(&theme, None, &Fonts::from_theme(&theme));
+    let files = render(&theme, None, &Fonts::from_theme(&theme), out());
     assert!(files["nvim.lua"].contains("vim.o.background = \"light\""));
     assert!(files["colors.env"].contains("WARDOS_VARIANT=\"light\""));
     // Bright red is darker than red on a light ground.
@@ -378,7 +447,7 @@ fn fonts_come_from_the_theme_unless_overridden() {
     assert_eq!(fonts.sans, "Geist");
     assert_eq!(fonts.mono, "Iosevka");
 
-    let files = render(&theme, None, &fonts);
+    let files = render(&theme, None, &fonts, out());
     assert!(files["foot.ini"].contains("font=Iosevka:size=11"));
     assert!(files["waybar.css"].contains("font-family: \"Geist\", sans-serif;"));
     assert!(files["colors.env"].contains("WARDOS_FONT_SANS=\"Geist\""));
@@ -389,26 +458,42 @@ fn fonts_come_from_the_theme_unless_overridden() {
 }
 
 #[test]
-fn background_is_the_first_file_of_the_backgrounds_dir_or_solid_ground() {
+fn background_is_the_first_file_of_the_backgrounds_dir_or_the_rendered_wallpaper() {
     let theme = load("ward-dark");
     let dir = tempfile::tempdir().unwrap();
     let bg = dir.path().join("backgrounds");
     fs::create_dir(&bg).unwrap();
     fs::write(bg.join("b-second.png"), "").unwrap();
     fs::write(bg.join("a-first.jpg"), "").unwrap();
-    let files = render(&theme, Some(&bg), &Fonts::from_theme(&theme));
+    let files = render(&theme, Some(&bg), &Fonts::from_theme(&theme), out());
     assert_eq!(
         files["background"].trim(),
         bg.join("a-first.jpg").to_string_lossy()
     );
+    // The lock screen shows the same file.
+    assert!(files["hyprlock.conf"].contains(&format!(
+        "$wallpaper  = {}\n",
+        bg.join("a-first.jpg").to_string_lossy()
+    )));
 
     let empty = dir.path().join("none");
-    let files = render(&theme, Some(&empty), &Fonts::from_theme(&theme));
-    assert_eq!(files["background"].trim(), "solid:#0E0F11");
+    let files = render(&theme, Some(&empty), &Fonts::from_theme(&theme), out());
+    assert_eq!(files["background"].trim(), format!("{OUT}/{WALLPAPER}"));
+
+    // A relative output directory still yields an absolute path.
+    let files = render(
+        &theme,
+        None,
+        &Fonts::from_theme(&theme),
+        Path::new("current"),
+    );
+    let named = PathBuf::from(files["background"].trim());
+    assert!(named.is_absolute(), "{}", named.display());
+    assert!(named.ends_with(format!("current/{WALLPAPER}")));
 }
 
 #[test]
-fn render_into_writes_every_file() {
+fn render_into_writes_every_file_and_the_wallpaper() {
     let theme = load("nord");
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("current");
@@ -416,6 +501,21 @@ fn render_into_writes_every_file() {
     for f in FILES {
         assert!(out.join(f).is_file(), "{f}");
     }
+    let png = fs::read(out.join(WALLPAPER)).unwrap();
+    let image = decode(&png);
+    assert_eq!((image.0, image.1), (WIDTH, HEIGHT));
+    assert_eq!(pixel(&image, 0, 0), theme.palette.ground.value);
+    // The fragments name the file that was written.
+    let named = out.join(WALLPAPER).to_string_lossy().into_owned();
+    assert_eq!(
+        fs::read_to_string(out.join("background")).unwrap().trim(),
+        named
+    );
+    assert!(
+        fs::read_to_string(out.join("hyprlock.conf"))
+            .unwrap()
+            .contains(&format!("$wallpaper  = {named}\n"))
+    );
 }
 
 #[test]
