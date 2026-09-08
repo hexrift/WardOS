@@ -205,6 +205,19 @@ applies the same desktop to an existing Fedora. Still ahead: boot it in QEMU and
 reference hardware (E-09), pinned digests, the `tamperward` service, and the shell's own
 toolkit (E-10).
 
+### Phase 6 — agent-first onboarding ([ADR-0017](decisions/ADR-0017-agent-first-image.md))
+
+The measure of the image is the time from first boot to a verified agent run. The image
+ships Claude Code, Codex, TamperWard and Node.js at pinned versions; `ward init` makes a
+directory a project (policy, TamperWard wiring, first snapshot); `ward vault` keeps keys
+on the host; `wardos-welcome` walks the first login through theme, keys, project and
+agent; `ward doctor` reports all of it. The installer ISO encrypts by default, the
+firewall admits nothing inbound, and the host follows the published image on a timer.
+Look and feel: a wallpaper per theme drawn from its tokens, a lock screen with the mark
+and the clock, the bar and menus on one grid. Portability: aarch64 binaries, image and
+disks, so Apple-silicon Macs boot WardOS natively in a VM. Acceptance: under five
+minutes from boot to `✓ VERIFIED` on the reference laptop, recorded as E-09.
+
 ## Phase 7 — Security boot chain
 
 Secure Boot (Fedora shim → systemd-boot → UKI), TPM2-bound LUKS2 with recovery key,
