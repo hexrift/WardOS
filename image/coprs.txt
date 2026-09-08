@@ -10,4 +10,11 @@
 # The Containerfile, image/check-packages.sh (CI: "image packages") and
 # desktop/install.sh enable exactly this list, the same way.
 #
-# Empty on purpose: Fedora 44 is expected to carry the whole manifest.
+# Chosen 2026-09 from `check-packages.sh --discover` (the "image packages" log lists
+# every project with a fedora-44 chroot): the smallest set that covers what Fedora 44
+# lacks, preferring the upstream author, then the one repository that carries the
+# whole ecosystem.
+
+mineiro/hyprland      # Hyprland and its ecosystem, retired from Fedora after 42: hyprland, hypridle, hyprlock, hyprpaper, hyprpicker, hyprpolkitagent, hyprsunset, xdg-desktop-portal-hyprland, uwsm, satty (successor of solopasha/hyprland, which builds rawhide only)
+erikreider/swayosd    # swayosd, packaged by its author
+atim/lazygit          # lazygit (not in Fedora)

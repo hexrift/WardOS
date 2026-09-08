@@ -139,10 +139,9 @@ mock sudo 'exec "$@"'
 root=$TMP/root
 bash "$repo/desktop/install.sh" --destdir "$root" >"$TMP/out" 2>&1 || fail "install.sh failed:
 $(cat "$TMP/out")"
-# coprs.txt is empty today: no plugin install, no copr enable (the paths are exercised
-# below with a list of their own).
-assert_not_logged 'dnf5-plugins'
-assert_not_logged 'copr enable'
+assert_logged '^sudo dnf -y install dnf5-plugins$'
+assert_logged '^sudo dnf -y copr enable mineiro/hyprland$'
+assert_logged '^sudo dnf -y copr enable atim/lazygit$'
 assert_logged '^sudo dnf install -y .*hyprland'
 assert_logged '^dnf install -y .*bubblewrap'
 assert_not_logged '^rpm-ostree'
@@ -180,8 +179,8 @@ touch "$TMP/ostree-booted"
 WARDOS_OSTREE_MARKER=$TMP/ostree-booted bash "$repo/desktop/install.sh" --destdir "$TMP/root" >"$TMP/out" 2>&1 || fail "install.sh (ostree) failed:
 $(cat "$TMP/out")"
 assert_logged '^sudo rpm-ostree install --idempotent .*hyprland'
+assert_logged '^sudo curl -fsSL -o /etc/yum.repos.d/_copr_mineiro-hyprland.repo https://copr.fedorainfracloud.org/coprs/mineiro/hyprland/repo/fedora-'"$rel"'/mineiro-hyprland-fedora-'"$rel"'.repo$'
 assert_not_logged '^dnf'
-assert_not_logged '^curl'
 grep -qi 'reboot' "$TMP/out" || fail "ostree path must tell the user to reboot"
 
 # --- desktop/install.sh with a COPR list: dnf's copr plugin, or the .repo file on ostree
@@ -266,6 +265,8 @@ assert_logged '^podman run'
 # The real manifest parses and every name is a plain package name (no spaces, no versions).
 bash "$repo/image/check-packages.sh" --dry-run >"$TMP/out"
 grep -q "fedora:$rel " "$TMP/out" || fail "release not derived from the Containerfile:
+$(cat "$TMP/out")"
+grep -q -- '-- 3 mineiro/hyprland erikreider/swayosd atim/lazygit ' "$TMP/out" || fail "coprs.txt not passed:
 $(cat "$TMP/out")"
 ! sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo/image/packages.txt" | grep -Ev '^[A-Za-z0-9._+-]+$' || fail "packages.txt has a bad name"
 ! sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo/image/coprs.txt" | grep -Ev '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' || fail "coprs.txt has a bad entry"

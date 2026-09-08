@@ -101,11 +101,18 @@ Fedora's build system, not by Fedora, and its repository file stays in the image
 `wardos-install package` layers from the same sources the image was built from. The
 list is therefore short, every entry justified, and an entry is removed the day Fedora
 packages the thing; it must build for the pinned release (the `fedora-<NN>-x86_64`
-chroot), which the "image packages" job proves before the build runs. On Fedora 42 the
-Hyprland ecosystem beyond the compositor needed `solopasha/hyprland`, whose chroots
-moved on with the release's end of life; the list is empty on 44 until the check says
-otherwise. `pulsemixer` is not packaged anywhere useful; the image ships `pavucontrol`
-and `wardos-setup audio` prefers pulsemixer when present.
+chroot), which the "image packages" job proves before the build runs.
+
+Fedora retired Hyprland itself after 42 (on 44 without COPRs the check reports
+`hyprland`, `hypridle`, `hyprlock`, `hyprpaper`, `hyprpicker`, `hyprpolkitagent`,
+`hyprsunset`, `xdg-desktop-portal-hyprland`, `uwsm`, `satty`, `swayosd` and `lazygit`
+missing), and `solopasha/hyprland`, the COPR everyone used, builds rawhide only now.
+`check-packages.sh --discover NAME...` asks the COPR API which projects mention a name
+and which of them build for the pinned release; the September 2026 run chose the
+smallest trust set: `mineiro/hyprland` (the one repository that carries the whole
+ecosystem, the successor of solopasha's), `erikreider/swayosd` (swayosd by its author)
+and `atim/lazygit`. `pulsemixer` is not packaged anywhere useful; the image ships
+`pavucontrol` and `wardos-setup audio` prefers pulsemixer when present.
 
 ### Base image tag
 

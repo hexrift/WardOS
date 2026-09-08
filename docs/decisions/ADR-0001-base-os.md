@@ -72,7 +72,13 @@ rebase is a deliberate edit of `FROM` and never an implicit change, the edit is 
 here, once, to the current release, 44: `image/Containerfile` pins `fedora-bootc:44`,
 `image/check-packages.sh`, `desktop/install.sh` and the tests read the release from
 that `FROM` line so nothing else has to be kept in step, and `image/coprs.txt` starts
-empty again because a current Fedora packages far more of the ecosystem than 42 did;
-the check adds a COPR back only for what the release still lacks. E-09 runs against 44.
+empty again in the first attempt; the check then showed that Fedora had retired
+Hyprland itself after 42, so three COPRs came back for exactly what 44 lacks
+(`mineiro/hyprland` for the ecosystem, `erikreider/swayosd` from swayosd's author,
+`atim/lazygit`), chosen by `check-packages.sh --discover` from the projects that build
+for 44. Each COPR is part of the image's trust set: its builds are the owner's, not
+Fedora's, and the repository file stays in the image; the list is kept short, every
+entry justified in `image/coprs.txt`, and an entry leaves the day Fedora packages the
+thing. E-09 runs against 44.
 Lesson recorded: a pinned release needs a calendar; the next rebase is due before 44's
 end of life, and the "image packages" job is the alarm if it is missed.
