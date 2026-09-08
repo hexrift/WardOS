@@ -110,8 +110,12 @@ At this phase the verifier may still be a Zone 2 *namespace* environment on the 
 `ward verify`: candidate snapshot, config and protected tests taken from the entry
 snapshot, an offline namespace verifier with read-only host toolchains, verification
 records in the log, and the hook-layer deny for edits to protected paths
-([`tamperward-integration.md`](tamperward-integration.md) §6). Remaining: the TamperWard
-socket protocol (§4), semantic rules, ST-007/009/010/016, E-12.
+([`tamperward-integration.md`](tamperward-integration.md) §6). ST-009 and ST-010 are
+`ward selftest` rows (the sandbox is handed its own log and state paths and cannot read,
+append to or remove them); ST-007 and ST-016 are end-to-end tests (a policy rewritten
+mid-session does not widen the network; whatever comes through the hook socket stays an
+`Origin::Agent` claim). Remaining: the TamperWard socket protocol (§4), semantic rules,
+E-12 in full.
 
 Acceptance: demo passes end-to-end; DENIED originates from TamperWard; ST-007, 009, 010,
 016 pass; E-12 recorded.

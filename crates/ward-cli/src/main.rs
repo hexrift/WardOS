@@ -290,26 +290,30 @@ fn cmd_selftest(dir: &Path) -> ward_daemon::Result<ExitCode> {
         None => (Session::start(dir)?, true),
     };
     let credentials = ward_daemon::selftest_credentials(&mut session)?;
+    let evidence = ward_daemon::selftest_evidence(&mut session)?;
     if throwaway {
         session.stop(EndReason::UserStop)?;
     } else {
         session.sync()?;
     }
-    println!("WARD selftest · isolation\n");
-    for r in &isolation {
-        println!("{}", render::selftest_row(r.name, r.blocked));
+    let groups = [
+        ("isolation", &isolation),
+        ("credentials", &credentials),
+        ("evidence", &evidence),
+    ];
+    for (name, results) in &groups {
+        println!("WARD selftest · {name}\n");
+        for r in *results {
+            println!("{}", render::selftest_row(r.name, r.blocked));
+        }
+        println!();
     }
-    println!("\nWARD selftest · credentials\n");
-    for r in &credentials {
-        println!("{}", render::selftest_row(r.name, r.blocked));
-    }
-    let total = isolation.len() + credentials.len();
-    let passed = isolation
+    let total: usize = groups.iter().map(|(_, r)| r.len()).sum();
+    let passed: usize = groups
         .iter()
-        .chain(&credentials)
-        .filter(|r| r.blocked)
-        .count();
-    println!("\n  {passed}/{total} PASS");
+        .map(|(_, r)| r.iter().filter(|p| p.blocked).count())
+        .sum();
+    println!("  {passed}/{total} PASS");
     Ok(if passed == total {
         ExitCode::SUCCESS
     } else {
