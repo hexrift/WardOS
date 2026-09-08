@@ -174,6 +174,11 @@ contents.
   subvolume snapshot and reflink ingest could not be measured (no Btrfs on the host).
   Full data and the measuring implementation are on branch
   `phase-1/ward-snapshot-full` (`experiments/E-02/RESULT.md`).
+* **E-08 (restricted egress) — partial PASS.** From inside the sandbox, via the shim
+  relay and the session proxy: `development` mode reaches `registry.npmjs.org` over
+  HTTPS (`200`) and denies `10.0.0.1` and `169.254.169.254` (`403`); `localhost_only`
+  denies `api.github.com`. Agent-specific host lists (Claude Code OAuth/API hosts) are
+  allowlisted in `Development` and remain to be exercised with the real agents (E-07).
 * **E-06 (sandbox warm start) — could not measure here.** `crun` cannot manage
   cgroups in the nested CI environment; the spike records `CANNOT-MEASURE-HERE` with
   the exact commands to run on a real cgroups-v2 host

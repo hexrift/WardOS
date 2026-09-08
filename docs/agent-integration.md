@@ -96,14 +96,17 @@ in `Development` mode; agents without hooks get intent only from exec/file captu
 
 ## 8. Status (Phase 2, in progress)
 
-Implemented: `ward claude` / `ward codex` launch the agent interactively inside the
-session sandbox with the agent profile env (private config dir, non-essential traffic
-off); every run gets a per-session `ward-proxy` on a Unix socket bound into the
-isolated network namespace (ADR-0014), and each proxy decision becomes a
-`NetworkRequested` / `NetworkDenied` record shown as `NET` / `DENY` in the observer.
-When a `ward-agent` build that supports `--relay` is present, launches go through the
-shim with `HTTP(S)_PROXY` pointing at the in-sandbox relay; the daemon probes the shim
-and, on kernels without Landlock, passes `--allow-no-landlock` and records the
-degradation rather than silently weakening. Host credentials enter the sandbox only via
-an explicit, printed `--pass-env NAME` opt-in; gateway-mode injection (§3) is the next
-step and will remove even that.
+Implemented and verified end to end: `ward claude` / `ward codex` launch the agent
+interactively inside the session sandbox with the agent profile env (private config
+dir, non-essential traffic off). Every run gets a per-session `ward-proxy` on a Unix
+socket bound into the isolated network namespace, `ward-agent` relays the sandbox's
+loopback `127.0.0.1:3128` to it, and both cases of `http_proxy`/`https_proxy` point
+there (ADR-0014). Each proxy decision is a `NetworkRequested` / `NetworkDenied` record
+rendered as `NET` / `DENY`. Measured on the demo: under `development`, an HTTPS request
+to `registry.npmjs.org` succeeds (`200`, TLS verified against the read-only CA roots
+bound into the sandbox) while `10.0.0.1` and `169.254.169.254` get `403`; under
+`localhost_only`, `api.github.com` gets `403`. The daemon probes the shim for
+`--relay` support and Landlock availability and records degradation rather than
+silently weakening. Host credentials enter the sandbox only via an explicit, printed
+`--pass-env NAME`; gateway-mode injection (§3) is being implemented in `ward-proxy` so
+that even this becomes unnecessary for the model API key.

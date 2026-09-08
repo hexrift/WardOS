@@ -358,12 +358,14 @@ impl Session {
         // without `--relay` would reject the flag, so fall back to a direct exec (still
         // isolated by bwrap; the socket is bound for socket-aware tools).
         if let Some(shim) = find_shim().filter(|s| s.relay) {
-            launch = launch
-                .shim_flags(shim.flags())
-                .shim(shim.path)
-                .env("HTTP_PROXY", format!("http://{RELAY_ADDR}"))
-                .env("HTTPS_PROXY", format!("http://{RELAY_ADDR}"))
-                .env("NO_PROXY", "localhost,127.0.0.1");
+            // Both cases: curl and friends honour only lowercase `http_proxy`.
+            launch = launch.shim_flags(shim.flags()).shim(shim.path);
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                launch = launch.env(key, format!("http://{RELAY_ADDR}"));
+            }
+            for key in ["NO_PROXY", "no_proxy"] {
+                launch = launch.env(key, "localhost,127.0.0.1");
+            }
         }
         for (k, v) in &opts.env {
             launch = launch.env(k.clone(), v.clone());

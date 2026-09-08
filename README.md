@@ -37,27 +37,31 @@ Observer        LIVE
 
 ## See it running
 
-The Phase 1 prototype runs today on any Linux host with `bubblewrap`. It merges the
-project's policy into a capability manifest, freezes a content-addressed entry snapshot,
-runs commands inside an isolated sandbox with live kernel-origin file events, and records
-every action to an append-only, hash-chained event log that persists across commands.
+The prototype runs today on any Linux host with `bubblewrap`. It merges the project's
+policy into a capability manifest, freezes a content-addressed entry snapshot, runs
+commands inside an isolated sandbox with live kernel-origin file events, routes every
+network request through a per-session policy proxy, and records everything to an
+append-only, hash-chained event log that persists across commands.
 
-![A WardOS session: security panel, live observer, isolation self-test](assets/ward-session.png)
+![A WardOS session: security panel, live observer with network decisions, isolation self-test](assets/ward-session.png)
 
 ```bash
 cargo build --release
 ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
 ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live observer
+ward claude   examples/ward-demo    # launch Claude Code in the sandbox (Phase 2, in progress)
 ward status   examples/ward-demo    # the security panel for the active session
 ward selftest examples/ward-demo    # prove the isolation (8/8 hostile probes blocked)
 ward stop     examples/ward-demo    # seal the log
 ward replay   <events.log>          # replay any sealed session
 ```
 
-The host home, SSH keys, cloud credentials, Docker socket, private network, and the
-namespace, cgroup and symlink escape routes are simply never reachable from the sandbox,
-so `ward selftest` shows every probe denied by construction, and CI reproduces the same
-result on every pull request.
+In the session above the sandbox's only way out is a Unix socket to the session proxy:
+an allowlisted registry is reached over real HTTPS (`NET`, `http 200`), while a private
+address and the cloud metadata endpoint are refused host-side (`DENY`, `403`). The host
+home, SSH keys, cloud credentials, Docker socket, and the namespace, cgroup and symlink
+escape routes are never reachable, so `ward selftest` shows every probe denied by
+construction, and CI reproduces the same result on every pull request.
 
 ## Design principle
 
