@@ -144,6 +144,9 @@ silently weakening. The model-API key stays on the host: `ward claude` configure
 the upstream receives the real key). Other host credentials enter the sandbox only via
 an explicit, printed `--pass-env NAME`. Hook adapters (§4) are wired: the daemon
 seeds the settings file, answers `/run/ward/hooks.sock`, and records claims; verified
-end to end in `crates/ward-daemon/tests/e2e.rs` under a `step_through` policy. Not yet:
-a live E-07 run of Claude Code against the real API through the gateway, the GitHub
-adapter, nested containers.
+end to end in `crates/ward-daemon/tests/e2e.rs` under a `step_through` policy. Live
+run (E-07, `experiments.md` §5): Claude Code 2.1.263 started headless inside the
+sandbox from the read-only `/opt` bind, reached `api.anthropic.com` only through the
+gateway (the API's `401` for a deliberately invalid host key proves the path), and its
+`SessionStart` hook was logged as a claim. Not yet: a full task with a valid key, the
+GitHub adapter, nested containers.

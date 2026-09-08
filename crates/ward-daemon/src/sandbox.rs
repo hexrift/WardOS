@@ -76,10 +76,47 @@ pub fn available() -> bool {
 pub const PROXY_SOCKET: &str = "/run/ward/proxy.sock";
 /// Mount point of the `ward-agent` shim inside the sandbox.
 pub const AGENT_SHIM: &str = "/run/ward/ward-agent";
+/// Read-only system directories bound into the sandbox: the toolchains the agent
+/// needs (`/opt` carries vendor installs such as Node and Claude Code). The host
+/// home, `/etc` beyond trust roots, and everything else are never bound.
+const SYSTEM_RO: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/etc/alternatives",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+];
+/// `PATH` inside the sandbox when the host offers nothing under a bound directory.
+const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
 /// Mount point of the session's hook socket inside the sandbox (`hooks.rs`).
 pub const HOOK_SOCKET: &str = "/run/ward/hooks.sock";
 /// Loopback address the in-sandbox relay listens on (ADR-0014).
 pub const RELAY_ADDR: &str = "127.0.0.1:3128";
+
+fn host_path() -> String {
+    std::env::var("PATH").unwrap_or_default()
+}
+
+/// The sandbox `PATH`: the host's entries that live under a bound system directory,
+/// in host order, then the defaults. Nothing under the host home or elsewhere leaks in.
+fn sandbox_path(host: &str) -> String {
+    let bound = |dir: &&str| {
+        SYSTEM_RO
+            .iter()
+            .any(|root| Path::new(dir).starts_with(root))
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for dir in host.split(':').filter(bound).chain(DEFAULT_PATH.split(':')) {
+        if !out.contains(&dir) {
+            out.push(dir);
+        }
+    }
+    out.join(":")
+}
 
 /// How the command's stdio is handled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,16 +214,7 @@ impl Launch {
         let mut a: Vec<String> = Vec::new();
         // Read-only system directories the toolchain needs; host home is never bound.
         // TLS trust roots are read-only system data the agent needs for HTTPS via CONNECT.
-        for dir in [
-            "/usr",
-            "/bin",
-            "/sbin",
-            "/lib",
-            "/lib64",
-            "/etc/alternatives",
-            "/etc/ssl",
-            "/etc/ca-certificates",
-        ] {
+        for dir in SYSTEM_RO {
             if Path::new(dir).exists() {
                 push(&mut a, &["--ro-bind", dir, dir]);
             }
@@ -202,14 +230,7 @@ impl Launch {
         // (it fails closed otherwise), so create the sandbox-private ones here.
         push(&mut a, &["--dir", "/home/agent", "--tmpfs", "/env"]);
         push(&mut a, &["--setenv", "HOME", "/home/agent"]);
-        push(
-            &mut a,
-            &[
-                "--setenv",
-                "PATH",
-                "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
-            ],
-        );
+        push(&mut a, &["--setenv", "PATH", &sandbox_path(&host_path())]);
         push(&mut a, &["--setenv", "TERM", "xterm"]);
         for (k, v) in &self.env {
             push(&mut a, &["--setenv", k, v]);
@@ -387,6 +408,17 @@ mod tests {
             a.contains("--dir /home/agent") && a.contains("--tmpfs /env"),
             "shim rw paths exist"
         );
+    }
+
+    #[test]
+    fn sandbox_path_keeps_only_bound_host_entries_then_defaults() {
+        let host = "/root/.cargo/bin:/opt/node22/bin:/usr/local/bin:/home/u/bin:/usr/bin";
+        assert_eq!(
+            sandbox_path(host),
+            "/opt/node22/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+        );
+        assert_eq!(sandbox_path(""), DEFAULT_PATH);
+        assert!(!sandbox_path("/optical/bin").contains("optical"));
     }
 
     #[test]
