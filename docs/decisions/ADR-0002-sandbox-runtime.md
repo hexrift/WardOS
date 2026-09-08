@@ -53,3 +53,18 @@ Direct syscalls remain a Phase 2+ optimisation if E-06 shows crun on the critica
 ## How it will be validated
 E-01 (hostile workload, ST-001..004/011/013/014/015), E-06 (start latency). youki is
 benchmarked alongside crun as a Rust alternative; selection by measurement.
+
+## Addendum (Phase 1): bubblewrap dev/nested backend
+
+`crun` cannot manage cgroups inside a nested/CI environment with hybrid (v1+v2)
+cgroups, where it exits with `cgroups in hybrid mode not supported`. The Phase 1
+prototype therefore also carries a **bubblewrap** backend (`ward-daemon::sandbox`)
+that provides the same *filesystem and network* isolation the Phase 1 guarantees
+depend on: the worktree is the only writable host path, host home and secrets are
+never mounted, and egress is an isolated network namespace (loopback only) unless
+policy widens it. `crun` with the generated OCI spec remains the production-host
+backend (ADR unchanged); bubblewrap is the portable/nested path and is what
+`ward selftest` and the README screenshot run on. This is defence-by-construction
+(what is not mounted cannot be reached), not the full seccomp/Landlock defence in
+depth the OCI path adds; the two are complementary and both are validated by the
+ST-* suite.

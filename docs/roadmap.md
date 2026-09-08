@@ -45,6 +45,19 @@ Acceptance:
 | Policy merge | Repo policy cannot widen; unit + integration tests |
 | Docs | `docs/` updated with measured numbers and any ADR revisions |
 
+
+### Phase 1 — delivered so far
+
+The workspace, CI, and all four foundation crates are merged, and a runnable
+prototype exists: `ward status`, `ward run`, `ward selftest`, and `ward replay`
+drive an in-process session ([ADR-0013](decisions/ADR-0013-phase1-runtime.md)) that
+merges policy into a manifest, freezes a content-addressed entry snapshot, runs
+commands in a bubblewrap sandbox, and writes the append-only event log. `ward
+selftest` blocks ST-001, ST-002, ST-003, ST-004 and ST-011 on a real sandbox (5/5).
+Still open for the Phase 1 gate: the `wardd` control socket, eBPF/fanotify event
+capture (events are currently emitted by the supervisor around each command), and
+the remaining ST probes (ST-013..015).
+
 ## Phase 2 — Agent support
 
 ```text
