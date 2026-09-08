@@ -11,28 +11,12 @@ coding agents (Claude Code, Codex, Gemini CLI, Aider, and whatever comes next) e
 they need to work effectively, while keeping the host, policy, credentials, verifier, and
 trusted state **outside the agent's authority**.
 
+![A WardOS session on the demo project: ward init, the security panel, a sandboxed command with two private-network probes denied, a failing protected test, a shortcut that edits the test and is undone by the verifier, the real fix VERIFIED](assets/ward-session.gif)
+
 ```bash
-git clone project
-cd project
-ward claude
-```
-
-```text
-WARD SESSION
-
-Project         project
-Agent           Claude Code
-Runtime         isolated
-Network         restricted
-Credentials     none
-
-TamperWard
-Policy          protected
-Entry state     frozen
-Verifier        isolated
-Evidence        protected
-
-Observer        LIVE
+ward init            # policy, verifier config and TamperWard wiring for this directory
+ward claude          # Claude Code in the sandbox; keys stay on the host
+ward verify          # the protected tests, in a disposable verifier, from the entry snapshot
 ```
 
 ## Get started
@@ -219,14 +203,11 @@ sandbox security, or an enterprise management platform. See
 [`docs/roadmap.md`](docs/roadmap.md#non-goals).
 
 
-## Brand
+## Contributing
 
-The WardOS mark places the [TamperWard](https://github.com/hexrift/tamperward) ward glyph —
-four strokes of change stopped at the exact point — inside a rounded host frame. That is the
-product relationship in one image: WardOS supplies the containing boundary, TamperWard the
-verification core. Assets live in [`assets/`](assets/) (`logo.svg`, `logo-dark.svg`,
-`favicon.svg`); the glyph is derived from TamperWard's own logo.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to build, verify and propose a change,
+and [`SECURITY.md`](SECURITY.md) for how to report a vulnerability.
 
 ## License
 
-To be decided before the first code commit (Phase 1). Candidate: Apache-2.0 for all crates.
+[Apache-2.0](LICENSE).

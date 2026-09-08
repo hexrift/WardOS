@@ -233,4 +233,10 @@ if ! "$podman_bin" image exists "$image"; then
 fi
 
 mkdir -p "$output"
-exec "${cmd[@]}"
+"${cmd[@]}"
+
+# bootc-image-builder writes as root. Hand the disks back to whoever ran sudo, so the
+# QEMU command in the README works without a second sudo or a chown by hand.
+if [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
+  chown -R "$SUDO_UID:$SUDO_GID" "$output"
+fi

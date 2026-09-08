@@ -26,3 +26,4 @@ Performance consequences · Why selected · How it will be validated
 | [0015](ADR-0015-single-writer-daemon.md) | `wardd` as the single log writer; `ward` commands as producers over the control socket | Accepted |
 | [0016](ADR-0016-desktop-feature-set.md) | Desktop: full Omarchy-equivalent feature set on Fedora, shell models rendered by Waybar/fuzzel/mako until E-10 | Accepted |
 | [0017](ADR-0017-agent-first-image.md) | Agent-first: Claude Code, Codex, TamperWard and Node ship in the image; `ward init`, `ward vault`, `wardos-welcome`; LUKS, firewall and timed updates by default | Accepted |
+| [0018](ADR-0018-public-repository.md) | Public repository: README, CONTRIBUTING and SECURITY written for readers who did not build it; maintainer-only material stays out of the tree | Accepted |

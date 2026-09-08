@@ -19,6 +19,3 @@
 <!-- Does this touch a protected surface (.tamperward.yml) or a human-review-only path
      (CODEOWNERS)? Does it change any guarantee or non-guarantee in
      docs/security-model.md? If so, say which and why. "None" is an acceptable answer. -->
-
----
-Built using Claude on behalf of Hexrift

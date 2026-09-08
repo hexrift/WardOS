@@ -194,9 +194,17 @@ pub fn is_protected(protected: &[String], summary: &str) -> bool {
     while let Some(rest) = path.strip_prefix("./") {
         path = rest;
     }
-    protected.iter().any(|entry| match entry.strip_suffix('/') {
-        Some(dir) => !dir.is_empty() && (path == dir || path.starts_with(entry.as_str())),
-        None => path == entry,
+    // `dir/`, `dir/**` and `dir/*` all mean the directory, as they do for the verifier.
+    protected.iter().any(|entry| {
+        let dir = entry
+            .strip_suffix("/**")
+            .or_else(|| entry.strip_suffix("/*"))
+            .or_else(|| entry.strip_suffix('/'))
+            .map(|d| d.trim_end_matches('/'));
+        match dir {
+            Some(dir) => !dir.is_empty() && (path == dir || path.starts_with(&format!("{dir}/"))),
+            None => path == entry,
+        }
     })
 }
 
@@ -515,6 +523,11 @@ mod tests {
 
     #[test]
     fn is_protected_directory_entry_covers_everything_under_it() {
+        for spelling in ["tests/", "tests/**", "tests/*"] {
+            let p = vec![spelling.to_owned()];
+            assert!(is_protected(&p, "tests/deep/nested.rs"), "{spelling}");
+            assert!(!is_protected(&p, "tests_helpers/x.rs"), "{spelling}");
+        }
         let p = vec!["tests/".to_owned()];
         for summary in [
             "tests/security_expiry.rs",

@@ -150,7 +150,9 @@ The acceptance criterion is that the "DENIED" line comes from TamperWard's decis
 ADR-0004 in its 0.1 namespace form. It snapshots the worktree as the *candidate*, reads
 `.tamperward/config.yml` from the *entry* snapshot, materialises the candidate into a
 scratch tree, overwrites every `protected.tests` path with its entry-snapshot bytes
-(reported as `restored …`), and runs `verify.command` in a bare sandbox with no egress
+(reported as `restored …`; a `tests/` entry, as `ward init` writes it, means every file
+under that directory in either snapshot, so an edited, deleted or newly planted test is
+undone alike), and runs `verify.command` in a bare sandbox with no egress
 and the host Rust toolchain bound read-only, killed past `verify.budget_secs` (default
 600). The log records `VerificationRequested`
 (origin User), `VerificationStarted` with pristine, candidate and config hash, one

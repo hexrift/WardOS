@@ -212,7 +212,7 @@ contents.
 ## 6. Recorded results (Phase 6)
 
 * **E-09 (base OS chain on reference hardware) — first boot, partial.** 2026-09-08,
-  Lenovo laptop running Fedora, QEMU/KVM with OVMF and virtio-gpu, the image built on
+  a Fedora laptop, QEMU/KVM with OVMF and virtio-gpu, the image built on
   the laptop with `image/build.sh` (podman) from commit 762d193 and written with
   `image/disk.sh --type qcow2 --user wardos`. The disk boots through UEFI to the
   desktop: tty1 autologin into Hyprland 0.56.2 (from the `mineiro/hyprland` COPR on
