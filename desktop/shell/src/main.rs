@@ -5,13 +5,18 @@
 //!
 //! Each subcommand is one surface of `docs/design-language.md`: the trust bar
 //! (§6), the session panel (§6), the command centre (§13), the observer (§8)
-//! and the semantic settings (§14). The shell is a client of the session daemon
-//! like `ward watch` (ADR-0015): it asks for the session's description and
-//! catches up with its event stream over the control socket, derives every
-//! surface in [`ward_shell_core`], and prints it. It has no privileged access
-//! and reads nothing from the worktree. With no session, or no daemon serving
-//! it, the text surfaces print [`NO_SESSION`], one line saying what to do next,
-//! and `bar --waybar` the empty module (the mark alone, dim).
+//! and the semantic settings (§14), plus the verify panel of ADR-0019. The
+//! shell is a client of the session daemon like `ward watch` (ADR-0015): it
+//! asks for the session's description and catches up with its event stream
+//! over the control socket, derives every surface in [`ward_shell_core`], and
+//! prints it. It has no privileged access. The one thing it reads besides the
+//! stream is the worktree, which it digests with the snapshot crate's
+//! incremental hash cache (never capturing) so the verify segment can compare
+//! the tree with the candidate the last verdict named: `VERIFY ✓` only while
+//! they are the same bytes, `VERIFY ~ STALE` as soon as they are not. With no
+//! session, or no daemon serving it, the text surfaces print [`NO_SESSION`],
+//! one line saying what to do next, and `bar --waybar` the empty module (the
+//! mark alone, dim).
 
 #![allow(clippy::missing_errors_doc, clippy::doc_markdown)]
 
@@ -23,15 +28,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use ward_daemon::client::{self, WatchEnd};
+use ward_daemon::ids::{ev_snapshot, snap_snapshot};
 use ward_daemon::session::state_root;
+use ward_daemon::verify::candidate_options;
 use ward_shell_core::{
     Header, Launcher, LineContext, Model, Module, SegmentName, SessionCard, SessionDescription,
-    Settings, TrustBar, counters_text, panel_text, session_panel,
+    Settings, TrustBar, counters_text, panel_text, session_panel, verify_panel,
+};
+use ward_snapshot::{
+    CaptureOptions, CaptureStats, HashCache, Manifest, ManifestDiff, SnapshotStore,
 };
 
 /// How long the catch-up waits for one more record before calling the log
 /// caught up with.
 const SETTLE_MS: u64 = 250;
+
+/// How often `bar --follow` re-reads the worktree when the stream is quiet:
+/// an edit made outside the sandbox (the user's editor) is a change no record
+/// reports, and it must turn `VERIFY ✓` into `VERIFY ~ STALE` all the same.
+const TICK_MS: u64 = 2000;
 
 /// What the text surfaces say with no session: calm, and the two ways to get
 /// one (the command centre, or `ward init` then `ward claude` in a terminal),
@@ -66,9 +81,17 @@ enum Surface {
         /// JSON changes; exit 0 when the daemon closes the stream.
         #[arg(long, requires = "waybar")]
         follow: bool,
+        /// Milliseconds between re-reads of the worktree while following and
+        /// the stream is quiet.
+        #[arg(long, requires = "follow", default_value_t = TICK_MS)]
+        tick_ms: u64,
     },
     /// The trust bar and the session panel behind its agent segment.
     Session,
+    /// The trust bar and the verify panel behind its verify segment: the
+    /// verified candidate, when, the worktree's digest now, what changed, and
+    /// what the verifier found.
+    VerifyPanel,
     /// The command centre, optionally filtered as if `query` had been typed.
     Launcher {
         /// Typed text.
@@ -95,6 +118,57 @@ struct Snapshot {
     model: Model,
 }
 
+/// The worktree reader behind the verify segment (ADR-0019 decision 1): a
+/// hash cache that stays warm across re-reads, and the session CAS the change
+/// count is diffed against. It never writes: the digest is the id the tree
+/// *would* get, computed the way `ward verify` captures a candidate.
+struct Digester {
+    cache: HashCache,
+    store: Option<SnapshotStore>,
+}
+
+impl Digester {
+    fn new() -> Self {
+        Self {
+            cache: HashCache::new(),
+            store: SnapshotStore::open(state_root().join("cas")).ok(),
+        }
+    }
+
+    /// Digest `s`'s worktree and tell the model. A tree that cannot be read
+    /// leaves the model as it was and says why once on stderr.
+    fn observe(&mut self, s: &mut Snapshot) {
+        let opts = CaptureOptions {
+            incremental: true,
+            ..candidate_options()
+        };
+        let mut stats = CaptureStats::default();
+        let worktree = &s.description.worktree;
+        match ward_snapshot::digest_manifest(worktree, opts, &mut self.cache, &mut stats) {
+            Ok(manifest) => {
+                let changes = self.changes(s, &manifest);
+                s.model
+                    .observe_worktree(ev_snapshot(manifest.id()), changes);
+            }
+            Err(e) => eprintln!("ward-shell: {}: {e}", worktree.display()),
+        }
+    }
+
+    /// Manifest entries that differ between the verified candidate and the
+    /// tree now: `0` when the ids agree, the diff against the stored candidate
+    /// manifest otherwise, `None` when nothing was verified or the CAS does
+    /// not hold the candidate.
+    fn changes(&self, s: &Snapshot, current: &Manifest) -> Option<u64> {
+        let candidate = snap_snapshot(s.model.state.verification.candidate()?);
+        if candidate == current.id() {
+            return Some(0);
+        }
+        let stored = self.store.as_ref()?.manifest(candidate).ok()?;
+        let diff = ManifestDiff::between(&stored, current);
+        Some((diff.added.len() + diff.removed.len() + diff.changed.len()) as u64)
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     #[cfg(feature = "gui")]
@@ -105,13 +179,21 @@ fn main() -> ExitCode {
         waybar: false,
         segment: None,
         follow: false,
+        tick_ms: TICK_MS,
     });
     let result = match surface {
         Surface::Bar {
             waybar: true,
             segment,
             follow,
-        } => waybar(&dir, settle, segment, follow),
+            tick_ms,
+        } => waybar(
+            &dir,
+            settle,
+            segment,
+            follow,
+            Duration::from_millis(tick_ms),
+        ),
         Surface::Launcher { query, lines: true } => launcher_lines(&dir, settle, &query),
         surface => text(&dir, settle, surface),
     };
@@ -124,9 +206,20 @@ fn main() -> ExitCode {
     }
 }
 
-/// Print one text surface, or [`NO_SESSION`].
+/// Print one text surface, or [`NO_SESSION`]. The surfaces that show the
+/// verify segment read the worktree first; the launcher, the observer and the
+/// settings do not show it and stay within their latency budget on any tree.
 fn text(dir: &Path, settle: Duration, surface: Surface) -> ward_daemon::Result<()> {
-    print!("{}", surface_text(load(dir, settle)?.as_ref(), surface));
+    let mut snapshot = load(dir, settle)?;
+    if let Some(s) = snapshot.as_mut()
+        && matches!(
+            surface,
+            Surface::Bar { .. } | Surface::Session | Surface::VerifyPanel
+        )
+    {
+        Digester::new().observe(s);
+    }
+    print!("{}", surface_text(snapshot.as_ref(), surface));
     Ok(())
 }
 
@@ -138,12 +231,15 @@ fn surface_text(snapshot: Option<&Snapshot>, surface: Surface) -> String {
     }
 }
 
-/// `bar --waybar`: the module's JSON, once or on every change.
+/// `bar --waybar`: the module's JSON, once or on every change. The worktree is
+/// digested before the first line and, while following, on every record and
+/// on every quiet `tick`, so the verify segment answers for the tree as it is.
 fn waybar(
     dir: &Path,
     settle: Duration,
     segment: Option<SegmentName>,
     follow: bool,
+    tick: Duration,
 ) -> ward_daemon::Result<()> {
     let Some(socket) = locate(dir)? else {
         return emit(&Module::none(segment));
@@ -151,6 +247,8 @@ fn waybar(
     let Some(mut snapshot) = load_from(&socket, settle)? else {
         return emit(&Module::none(segment));
     };
+    let mut digester = Digester::new();
+    digester.observe(&mut snapshot);
     let mut last = module(&snapshot, segment);
     emit(&last)?;
     if !follow || snapshot.model.sealed {
@@ -162,8 +260,11 @@ fn waybar(
     let from_seq = snapshot.model.records.last().map_or(0, |r| r.seq + 1);
     let subscriber = client::connect(&socket)?;
     let mut failed = None;
-    client::watch_records(subscriber, from_seq, |rec| {
-        snapshot.model.apply(rec);
+    client::watch_records_ticking(subscriber, from_seq, tick, |rec| {
+        if let Some(rec) = rec {
+            snapshot.model.apply(rec);
+        }
+        digester.observe(&mut snapshot);
         let now = module(&snapshot, segment);
         if now != last {
             if let Err(e) = emit(&now) {
@@ -287,6 +388,10 @@ fn render(s: &Snapshot, surface: Surface) -> String {
             let panel = session_panel(&s.description, &s.model, now_unix_ms());
             format!("{bar}\n\n{}", panel_text(&panel))
         }
+        Surface::VerifyPanel => {
+            let panel = verify_panel(&s.description, &s.model, now_unix_ms());
+            format!("{bar}\n\n{}", panel_text(&panel))
+        }
         Surface::Launcher { query, .. } => {
             let card = SessionCard::new(&s.description, &s.model);
             let mut launcher = Launcher::new(&[card]);
@@ -352,11 +457,32 @@ mod tests {
             Some(Surface::Bar {
                 waybar: true,
                 segment: Some(SegmentName::Agent),
-                follow: true
+                follow: true,
+                tick_ms: TICK_MS,
             })
         ));
         assert!(Cli::try_parse_from(["ward-shell", "bar", "--segment", "agent"]).is_err());
         assert!(Cli::try_parse_from(["ward-shell", "bar", "--follow"]).is_err());
+        let cli = Cli::parse_from([
+            "ward-shell",
+            "bar",
+            "--waybar",
+            "--follow",
+            "--tick-ms",
+            "500",
+        ]);
+        assert!(matches!(
+            cli.surface,
+            Some(Surface::Bar { tick_ms: 500, .. })
+        ));
+        assert!(
+            Cli::try_parse_from(["ward-shell", "bar", "--waybar", "--tick-ms", "500"]).is_err(),
+            "a tick is a follow's"
+        );
+        assert!(matches!(
+            Cli::parse_from(["ward-shell", "verify-panel"]).surface,
+            Some(Surface::VerifyPanel)
+        ));
         let err = Cli::try_parse_from(["ward-shell", "bar", "--waybar", "--segment", "clock"])
             .err()
             .map(|e| e.to_string())
@@ -379,8 +505,10 @@ mod tests {
                 waybar: false,
                 segment: None,
                 follow: false,
+                tick_ms: TICK_MS,
             },
             Surface::Session,
+            Surface::VerifyPanel,
             Surface::Observer { rows: 3 },
             Surface::Settings,
         ] {
@@ -391,6 +519,178 @@ mod tests {
             );
             assert!(!text.contains("no session"));
         }
+    }
+
+    /// A described session on a worktree, with its stream so far.
+    #[allow(clippy::unwrap_used)]
+    fn snapshot_on(worktree: &Path, events: &[ward_events::WardEvent]) -> Snapshot {
+        use ward_events::{Chain, Origin, SessionId, Timestamp};
+        use ward_policy::{Policy, merge};
+        let manifest = merge(
+            &Policy::default(),
+            &Policy::default(),
+            &Policy::default(),
+            ward_policy::SessionId("sess_01J8ZK3Q9X7VY2".to_owned()),
+            ward_policy::ProjectId("proj_x".to_owned()),
+        );
+        let description = SessionDescription {
+            session: "sess_01J8ZK3Q9X7VY2".to_owned(),
+            project: "proj_x".to_owned(),
+            worktree: worktree.to_path_buf(),
+            started_unix_ms: 0,
+            agent: None,
+            entry_snapshot: format!("blake3:{}", "ab".repeat(32)),
+            policy_hash: manifest.policy_hash.to_hex(),
+            manifest,
+        };
+        let mut model = Model::new(false);
+        let mut chain = Chain::genesis(
+            SessionId::from_u128(7),
+            ward_events::Blake3Hash::from_bytes([1; 32]),
+        );
+        for (i, event) in events.iter().enumerate() {
+            let rec = chain
+                .append(
+                    Origin::Verifier,
+                    event.clone(),
+                    Timestamp::mono(Duration::from_secs(i as u64)),
+                )
+                .unwrap();
+            model.apply(rec);
+        }
+        Snapshot {
+            header: Header::from_description(&description),
+            description,
+            model,
+        }
+    }
+
+    fn passed(candidate: ward_snapshot::SnapshotId) -> ward_events::WardEvent {
+        ward_events::WardEvent::VerificationPassed {
+            candidate: ev_snapshot(candidate),
+            summary: ward_events::VerifySummary {
+                steps_total: 1,
+                steps_passed: 1,
+                steps_failed: 0,
+                tests_run: 3,
+                tests_failed: 0,
+                duration: Duration::from_secs(1),
+            },
+            result_hash: ward_events::Blake3Hash::from_bytes([2; 32]),
+        }
+    }
+
+    #[test]
+    fn the_verify_segment_follows_the_worktree_by_content() {
+        #![allow(clippy::unwrap_used)]
+        // A worktree with a candidate stored in a CAS, as `ward verify` leaves it.
+        let work = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("lib.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(work.path().join("README.md"), "# x\n").unwrap();
+        let store = SnapshotStore::open(state.path().join("cas")).unwrap();
+        let candidate = store
+            .store_snapshot(
+                work.path(),
+                ward_snapshot::SnapshotRole::Candidate,
+                candidate_options(),
+            )
+            .unwrap();
+        let mut digester = Digester {
+            cache: HashCache::new(),
+            store: Some(store),
+        };
+
+        // Verified, and the tree is the candidate: green, and the panel says 0 changes.
+        let mut s = snapshot_on(work.path(), &[passed(candidate)]);
+        digester.observe(&mut s);
+        let bar = TrustBar::new(&s.header, &s.model);
+        let verify = bar.segment(SegmentName::Verify).unwrap();
+        assert_eq!(
+            verify.text,
+            format!("VERIFY ✓ {}", &candidate.digest().to_hex()[..8])
+        );
+        assert_eq!(verify.tone, ward_shell_core::Tone::Ok);
+        let text = render(&s, Surface::VerifyPanel);
+        assert!(text.contains("Changes              0\n"), "{text}");
+        assert!(text.contains("Tests                3/3\n"), "{text}");
+
+        // One edit and one new file: stale, and the panel counts two entries.
+        std::fs::write(work.path().join("lib.rs"), "fn f() { g() }\n").unwrap();
+        std::fs::write(work.path().join("new.rs"), "").unwrap();
+        digester.observe(&mut s);
+        let bar = TrustBar::new(&s.header, &s.model);
+        let verify = bar.segment(SegmentName::Verify).unwrap();
+        assert_eq!(verify.text, "VERIFY ~ STALE");
+        assert_eq!(verify.tone, ward_shell_core::Tone::Warn);
+        let text = render(&s, Surface::VerifyPanel);
+        assert!(text.contains("Changes              2 entries\n"), "{text}");
+        assert!(
+            text.starts_with(&format!("{}\n\nVerify\n", bar.text())),
+            "{text}"
+        );
+
+        // Undo both: the bytes are the candidate's again, so it is verified again.
+        std::fs::write(work.path().join("lib.rs"), "fn f() {}\n").unwrap();
+        std::fs::remove_file(work.path().join("new.rs")).unwrap();
+        digester.observe(&mut s);
+        assert!(
+            TrustBar::new(&s.header, &s.model)
+                .segment(SegmentName::Verify)
+                .unwrap()
+                .text
+                .starts_with("VERIFY ✓ ")
+        );
+
+        // Without the CAS the state is still decided (by digest), only the
+        // count is unknown; a worktree that cannot be read changes nothing.
+        digester.store = None;
+        std::fs::write(work.path().join("lib.rs"), "fn f() { g() }\n").unwrap();
+        digester.observe(&mut s);
+        let text = render(&s, Surface::VerifyPanel);
+        assert!(text.contains("VERIFY ~ STALE"), "{text}");
+        assert!(text.contains("Changes              unknown\n"), "{text}");
+        let before = s.model.worktree;
+        s.description.worktree = work.path().join("gone");
+        digester.observe(&mut s);
+        assert_eq!(s.model.worktree, before);
+    }
+
+    /// The number `docs/desktop.md` states. `WARD_DIGEST_DIR=<tree>` measures
+    /// another worktree instead (`cargo test -p ward-shell a_warm_digest --
+    /// --nocapture`).
+    #[test]
+    fn a_warm_digest_of_the_demo_is_within_the_bar_budget() {
+        #![allow(clippy::unwrap_used)]
+        let demo = std::env::var_os("WARD_DIGEST_DIR").map_or_else(
+            || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ward-demo"),
+            PathBuf::from,
+        );
+        let opts = CaptureOptions {
+            incremental: true,
+            ..candidate_options()
+        };
+        let mut cache = HashCache::new();
+        let mut stats = CaptureStats::default();
+        let cold = std::time::Instant::now();
+        let first = ward_snapshot::digest_manifest(&demo, opts, &mut cache, &mut stats).unwrap();
+        let cold = cold.elapsed();
+        let warm = std::time::Instant::now();
+        let second = ward_snapshot::digest_manifest(&demo, opts, &mut cache, &mut stats).unwrap();
+        let warm = warm.elapsed();
+        assert_eq!(first, second);
+        eprintln!(
+            "{} digest: cold {} µs, warm {} µs ({} files, {} cached)",
+            demo.display(),
+            cold.as_micros(),
+            warm.as_micros(),
+            stats.files_total / 2,
+            stats.files_cached
+        );
+        assert!(
+            warm < Duration::from_millis(50),
+            "warm digest took {warm:?}"
+        );
     }
 
     #[test]

@@ -6,17 +6,19 @@
 //! Waybar is the pixel renderer. A module's `class` carries the colour role by
 //! its §3 name (`dim`, `ink`, `accent`, `verified`, `restricted`, `denied`) so
 //! the theme's `waybar.css` colours the glyph and the word and nothing else,
-//! plus the agent's state word on the agent module and `live`/`sealed` on the
-//! whole-bar module. A segment the stream has not established, and every
-//! segment but the host mark when there is no session, is the empty module
-//! (`text: ""`, class `none`), which Waybar hides.
+//! plus the agent's state word on the agent module, the verify state's word
+//! (`never`, `verifying`, `stale`, `failed`) on the verify module and
+//! `live`/`sealed` on the whole-bar module. A segment the stream has not
+//! established, and every segment but the host mark when there is no session,
+//! is the empty module (`text: ""`, class `none`), which Waybar hides; the
+//! verify module is never empty with a session, since `VERIFY —` is a state.
 
 use serde::Serialize;
 
 use ward_daemon::describe::SessionDescription;
 
 use crate::feed::Model;
-use crate::panel::{Group, panel_text, session_panel};
+use crate::panel::{Group, panel_text, session_panel, verify_panel};
 use crate::settings::{Row, rows_text};
 use crate::trust::{Header, SegmentName, TrustBar, agent_word, tone_name};
 use ward_daemon::render::Tone;
@@ -82,8 +84,20 @@ impl Module {
             return Self::none(Some(name));
         };
         let mut class = vec![tone_name(segment.tone).to_owned()];
-        if let (SegmentName::Agent, Some(state)) = (name, model.state.agent) {
-            class.push(agent_word(state).to_owned());
+        match name {
+            SegmentName::Agent => {
+                if let Some(state) = model.state.agent {
+                    class.push(agent_word(state).to_owned());
+                }
+            }
+            SegmentName::Verify => {
+                // `verified` is both the state word and the tone's name.
+                let word = model.verify_state().word();
+                if class[0] != word {
+                    class.push(word.to_owned());
+                }
+            }
+            _ => {}
         }
         Self {
             text: segment.text,
@@ -126,7 +140,7 @@ fn explanation(
         SegmentName::Credentials => vec![row("Secrets")],
         SegmentName::Observer => vec![row("Observer")],
         SegmentName::Tamperward => vec![row("Policy"), row("Evidence")],
-        SegmentName::Verify => vec![row("Last verify")],
+        SegmentName::Verify => verify_panel(d, model, now_unix_ms).remove(0).rows,
         SegmentName::Daemon => vec![Row::new("Log", state, Tone::Ink), row("Duration")],
     };
     rows_text(&rows).trim_end().to_owned()
@@ -148,7 +162,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::feed::fixtures::{
-        agent, denied, ended, model_with, records, sequence, verify_passed, wardd,
+        agent, denied, edited, ended, model_with, records, sequence, snapshot, verify_passed, wardd,
     };
     use crate::trust::fixtures::description;
     use ward_events::{AgentState, Origin};
@@ -180,7 +194,7 @@ mod tests {
         let module = Module::bar(&d, &header, &model, now(&d));
         assert_eq!(
             module.text,
-            "● WARD │ sess_01J8ZK3… │ payments-api │ CLAUDE ● working │ NET restricted (dev) │ CRED 0 granted │ OBS live │ TW ✓ │ VERIFY ✓ │ LIVE"
+            "● WARD │ sess_01J8ZK3… │ payments-api │ CLAUDE ● working │ NET restricted (dev) │ CRED 0 granted │ OBS live │ TW ✓ │ VERIFY ✓ abababab │ LIVE"
         );
         assert_eq!(module.class, ["live", "restricted"]);
         assert!(
@@ -252,9 +266,9 @@ mod tests {
             ),
             (
                 SegmentName::Verify,
-                "VERIFY ✓",
+                "VERIFY ✓ abababab",
                 vec!["verified"],
-                "Last verify   pass",
+                "Verified candidate   abababab",
             ),
             (
                 SegmentName::Daemon,
@@ -282,6 +296,46 @@ mod tests {
             2,
             "policy and evidence"
         );
+        assert_eq!(
+            module(SegmentName::Verify).tooltip,
+            "Verified candidate   abababab\n\
+             Verified time        at 00:00 · 12m 43s ago\n\
+             Current digest       not digested\n\
+             Changes              unknown\n\
+             TamperWard           clean\n\
+             Tests                184/184\n\
+             Integrity            pass",
+            "the verify panel is the segment's explanation"
+        );
+    }
+
+    #[test]
+    fn the_verify_module_goes_stale_with_the_worktree_and_says_how_far() {
+        let (d, header, mut model) = live();
+        let module = |m: &Model| Module::segment(&d, &header, m, SegmentName::Verify, now(&d));
+        model.observe_worktree(snapshot(), Some(0));
+        let fresh = module(&model);
+        assert_eq!(fresh.text, "VERIFY ✓ abababab");
+        assert_eq!(fresh.class, ["verified"], "the word is the tone's name");
+        assert!(fresh.tooltip.contains("Current digest       abababab\n"));
+        assert!(fresh.tooltip.contains("Changes              0\n"));
+
+        model.observe_worktree(edited(), Some(3));
+        let stale = module(&model);
+        assert_eq!(stale.text, "VERIFY ~ STALE");
+        assert_eq!(stale.class, ["restricted", "stale"]);
+        assert!(stale.tooltip.contains("Verified candidate   abababab\n"));
+        assert!(stale.tooltip.contains("Current digest       cdcdcdcd\n"));
+        assert!(stale.tooltip.contains("Changes              3 entries\n"));
+
+        let mut never = Model::new(false);
+        never.observe_worktree(edited(), None);
+        let m = module(&never);
+        assert_eq!(m.text, "VERIFY —");
+        assert_eq!(m.class, ["dim", "never"]);
+        assert!(m.tooltip.contains("Verified candidate   none\n"));
+        assert!(m.tooltip.contains("Current digest       cdcdcdcd\n"));
+        assert!(m.tooltip.contains("Changes              —\n"));
     }
 
     #[test]
@@ -301,7 +355,7 @@ mod tests {
             (SegmentName::Credentials, "CRED 0 granted", vec!["ink"]),
             (SegmentName::Observer, "OBS live", vec!["ink"]),
             (SegmentName::Tamperward, "TW ✓", vec!["verified"]),
-            (SegmentName::Verify, "VERIFY ✓", vec!["verified"]),
+            (SegmentName::Verify, "VERIFY ✓ abababab", vec!["verified"]),
             (SegmentName::Daemon, "SEALED", vec!["dim"]),
         ];
         for (name, text, class) in cases {
@@ -342,14 +396,14 @@ mod tests {
         let d = description(NetworkCapability::Offline);
         let header = Header::from_description(&d);
         let model = Model::new(false);
-        for name in [
-            SegmentName::Agent,
-            SegmentName::Tamperward,
-            SegmentName::Verify,
-        ] {
+        for name in [SegmentName::Agent, SegmentName::Tamperward] {
             let m = Module::segment(&d, &header, &model, name, now(&d));
             assert_eq!(m, Module::none(Some(name)), "{name}");
         }
+        // Not verified is a state of its own, not silence (ADR-0019).
+        let verify = Module::segment(&d, &header, &model, SegmentName::Verify, now(&d));
+        assert_eq!(verify.text, "VERIFY —");
+        assert_eq!(verify.class, ["dim", "never"]);
         let mut model = model;
         model.apply(wardd(&[agent(AgentState::Blocked)]).remove(0));
         let m = Module::segment(&d, &header, &model, SegmentName::Agent, now(&d));

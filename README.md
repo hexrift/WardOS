@@ -143,6 +143,8 @@ from the desktop at a glance. In progress:
 * **Verification bound to a snapshot, with its freshness shown.** `VERIFY` has five
   states (`—`, `◐`, `✓ 7c01…`, `~ STALE`, `✗`); green disappears the moment the
   worktree differs from the verified candidate, decided by content, not heuristics.
+  Built: the shell digests the worktree before every bar frame and `ward-shell
+  verify-panel` (the segment's click) shows the candidate, the digest and what differs.
 * **Approvals that separate the agent's claim from Ward's authority.** The destination,
   *requested by agent* (verbatim, labelled as the agent's words) and *Ward will allow*
   (what the policy and credential rules actually grant) as three blocks.
@@ -184,7 +186,8 @@ rollback. What the image holds today:
   kernel features with a fix for each gap.
 * **The desktop** ([ADR-0016](docs/decisions/ADR-0016-desktop-feature-set.md),
   [`docs/desktop.md`](docs/desktop.md)): Hyprland 0.56 with the full key set, the trust
-  bar in Waybar, the command centre and every menu in fuzzel, approvals as
+  bar in Waybar (its `VERIFY ✓` turns `~ STALE` the moment the worktree differs from
+  the verified candidate), the command centre and every menu in fuzzel, approvals as
   notifications answered with `y`/`s`/`n`, fourteen themes rendered into every component
   with a wallpaper drawn from each theme's tokens, a lock screen, the `wardos-*` command
   family for capture, power, web apps, terminal apps, installs and setup, and

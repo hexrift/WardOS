@@ -7,15 +7,17 @@
 //! The bar the `ward watch` TUI draws
 //! is [`TrustBar::from_header`]: the stream-independent segments only, exactly
 //! as `docs/design-language.md` "As built: `ward watch`" describes it. The shell
-//! adds the agent, TamperWard and verification segments as the stream reports
-//! them ([`TrustBar::new`]).
+//! adds the agent and TamperWard segments as the stream reports them, and the
+//! verify segment from the first frame ([`TrustBar::new`]): a [`VerifyState`]
+//! that holds the stream's verdict against the worktree's digest (ADR-0019),
+//! so `VERIFY ✓` names a tree, not a moment.
 
 use std::path::Path;
 
 use ward_daemon::SessionMeta;
 use ward_daemon::describe::SessionDescription;
 use ward_daemon::render::{self, Tone, network_tone};
-use ward_events::AgentState;
+use ward_events::{AgentState, SnapshotId};
 use ward_policy::{CapabilityManifest, NetworkCapability};
 
 use crate::feed::{Model, TamperWard, Verification};
@@ -147,6 +149,113 @@ pub const fn agent_tone(state: AgentState) -> Tone {
     }
 }
 
+/// The verify segment's five states (ADR-0019 decision 1): what the stream has
+/// said about verification, held against what the worktree digests to now.
+/// The bar shows exactly one, and green appears only while the tree is the
+/// verified candidate, byte for byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyState {
+    /// `VERIFY —`: nothing has been verified in this session.
+    Never,
+    /// `VERIFY ◐ 7c01a2b3`: the trusted verifier is running on this candidate.
+    Verifying(SnapshotId),
+    /// `VERIFY ✓ 7c01a2b3`: the candidate passed, and the worktree still is it
+    /// (or has not been digested, as in `ward watch`).
+    Verified(SnapshotId),
+    /// `VERIFY ~ STALE`: the candidate passed, but the worktree has changed
+    /// since. The verdict is history, not a description of the tree.
+    Stale {
+        /// The candidate that passed.
+        candidate: SnapshotId,
+        /// What the worktree digests to now.
+        worktree: SnapshotId,
+    },
+    /// `VERIFY ✗`: the candidate failed.
+    Failed(SnapshotId),
+}
+
+impl VerifyState {
+    /// The state from what the stream said and, when a viewer has digested
+    /// the worktree, what it digests to. Without a digest a verdict stands as
+    /// recorded; with one it stands only for the tree it judged.
+    #[must_use]
+    pub const fn of(verification: &Verification, worktree: Option<SnapshotId>) -> Self {
+        match (*verification, worktree) {
+            (Verification::NotRun, _) => Self::Never,
+            (Verification::Running(candidate), _) => Self::Verifying(candidate),
+            (Verification::Failed(v), _) => Self::Failed(v.candidate),
+            (Verification::Passed(v), Some(worktree)) if !same_id(&v.candidate, &worktree) => {
+                Self::Stale {
+                    candidate: v.candidate,
+                    worktree,
+                }
+            }
+            (Verification::Passed(v), _) => Self::Verified(v.candidate),
+        }
+    }
+
+    /// The colour role: green only for a verdict that describes the tree,
+    /// amber once the tree has moved on, red for a failure, accent while the
+    /// verifier runs, dim before anything was verified.
+    #[must_use]
+    pub const fn tone(self) -> Tone {
+        match self {
+            Self::Never => Tone::Dim,
+            Self::Verifying(_) => Tone::Accent,
+            Self::Verified(_) => Tone::Ok,
+            Self::Stale { .. } => Tone::Warn,
+            Self::Failed(_) => Tone::Deny,
+        }
+    }
+
+    /// One word for the state, as a Waybar class and in the panels.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Verifying(_) => "verifying",
+            Self::Verified(_) => "verified",
+            Self::Stale { .. } => "stale",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    /// The segment: `VERIFY` and the state's mark, with the first eight hex
+    /// digits of the candidate where one is named.
+    #[must_use]
+    pub fn segment(self) -> Segment {
+        let text = match self {
+            Self::Never => "VERIFY —".to_owned(),
+            Self::Verifying(c) => format!("VERIFY ◐ {}", short_hex(c)),
+            Self::Verified(c) => format!("VERIFY ✓ {}", short_hex(c)),
+            Self::Stale { .. } => "VERIFY ~ STALE".to_owned(),
+            Self::Failed(_) => "VERIFY ✗".to_owned(),
+        };
+        Segment::new(text, self.tone())
+    }
+}
+
+/// Two snapshot ids are the same digest (`const`, for [`VerifyState::of`]).
+const fn same_id(a: &SnapshotId, b: &SnapshotId) -> bool {
+    let (a, b) = (a.hash(), b.hash());
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `7c01a2b3`: the first eight hex digits of a snapshot id, the form the bar
+/// and the panels name a candidate by.
+#[must_use]
+pub fn short_hex(id: SnapshotId) -> String {
+    id.hash().to_hex().chars().take(8).collect()
+}
+
 /// One piece of the trust bar: its text, its colour role, and whether it is
 /// emphasised.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,7 +321,8 @@ pub enum SegmentName {
     Observer,
     /// `TW ✓` / `TW ■`.
     Tamperward,
-    /// `VERIFYING` / `VERIFY ✓` / `VERIFY ✗`.
+    /// `VERIFY —` / `VERIFY ◐ 7c01a2b3` / `VERIFY ✓ 7c01a2b3` / `VERIFY ~ STALE`
+    /// / `VERIFY ✗` ([`VerifyState`]).
     Verify,
     /// `LIVE` / `SEALED`.
     Daemon,
@@ -273,7 +383,9 @@ impl std::fmt::Display for SegmentName {
 
 /// The trust bar's segments, left to right as §6 orders them. The three the
 /// session daemon cannot know at start (`agent`, `tamperward`, `verified`) are
-/// `None` until the stream reports them, and are then omitted from the row.
+/// `None` on the `ward watch` bar until the stream reports them, and are then
+/// omitted from the row; the shell's bar always carries the verify segment,
+/// `VERIFY —` before anything was verified (ADR-0019).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustBar {
     /// Session id, short form, dim.
@@ -290,7 +402,8 @@ pub struct TrustBar {
     pub observer: Segment,
     /// `TW ✓` green, or `TW ■` red once tampering was detected.
     pub tamperward: Option<Segment>,
-    /// `VERIFYING` accent, `VERIFY ✓` green, `VERIFY ✗` red.
+    /// The [`VerifyState`]'s segment: `VERIFY —` dim, `VERIFY ◐ 7c01a2b3`
+    /// accent, `VERIFY ✓ 7c01a2b3` green, `VERIFY ~ STALE` amber, `VERIFY ✗` red.
     pub verified: Option<Segment>,
     /// `LIVE` or `SEALED`, bold, in the state tone.
     pub daemon: Segment,
@@ -338,12 +451,7 @@ impl TrustBar {
             TamperWard::Clean => Some(Segment::new("TW ✓", Tone::Ok)),
             TamperWard::Tampered => Some(Segment::new("TW ■", Tone::Deny)),
         };
-        bar.verified = match state.verification {
-            Verification::NotRun => None,
-            Verification::Running => Some(Segment::new("VERIFYING", Tone::Accent)),
-            Verification::Passed => Some(Segment::new("VERIFY ✓", Tone::Ok)),
-            Verification::Failed => Some(Segment::new("VERIFY ✗", Tone::Deny)),
-        };
+        bar.verified = Some(model.verify_state().segment());
         bar
     }
 
@@ -497,11 +605,14 @@ mod tests {
     use super::fixtures::description;
     use super::*;
     use crate::feed::fixtures::{
-        agent, denied, ended, model_with, records, sequence, tamper, verify_failed, verify_passed,
-        verify_requested, wardd,
+        agent, denied, edited, ended, model_with, records, sequence, snapshot, tamper,
+        verify_failed, verify_passed, verify_requested, wardd,
     };
-    use ward_events::Origin;
+    use ward_events::{Origin, WardEvent};
     use ward_policy::merge;
+
+    const VERIFY_NEVER: &str = "VERIFY —";
+    const VERIFY_OK: &str = "VERIFY ✓ abababab";
 
     fn header(network: NetworkCapability) -> Header {
         Header::from_description(&description(network))
@@ -616,8 +727,118 @@ mod tests {
         assert!(bar.row()[1].bold, "WARD");
         assert_eq!(bar.row()[1].tone, Tone::Accent);
         assert!(bar.daemon.bold);
-        // A model with nothing in it changes nothing.
-        assert_eq!(TrustBar::new(&h, &Model::new(false)), bar);
+        // The shell's bar from an empty model adds one thing: the verify
+        // segment in its never-verified state (ADR-0019), dim.
+        let shell = TrustBar::new(&h, &Model::new(false));
+        assert_eq!(shell.verified, Some(Segment::new(VERIFY_NEVER, Tone::Dim)));
+        assert_eq!(
+            TrustBar {
+                verified: None,
+                ..shell
+            },
+            bar
+        );
+    }
+
+    #[test]
+    fn the_verify_segment_is_a_five_state_machine_over_the_stream_and_the_worktree() {
+        use VerifyState as V;
+        let h = header(NetworkCapability::Development);
+        let mut model = Model::new(false);
+        let state = |m: &Model| m.verify_state();
+        let seg = |m: &Model| TrustBar::new(&h, m).verified.unwrap();
+
+        // — : nothing verified, with or without a digest.
+        assert_eq!(state(&model), V::Never);
+        assert_eq!(seg(&model), Segment::new(VERIFY_NEVER, Tone::Dim));
+        model.observe_worktree(edited(), None);
+        assert_eq!(state(&model), V::Never);
+
+        // ◐ : verifying the candidate, named by its first eight hex digits.
+        model.apply(wardd(&[verify_requested()]).remove(0));
+        assert_eq!(state(&model), V::Verifying(snapshot()));
+        assert_eq!(seg(&model), Segment::new("VERIFY ◐ abababab", Tone::Accent));
+
+        // ✗ : the candidate failed; the worktree's digest does not change that.
+        model.apply(wardd(&[verify_failed()]).remove(0));
+        assert_eq!(state(&model), V::Failed(snapshot()));
+        assert_eq!(seg(&model), Segment::new("VERIFY ✗", Tone::Deny));
+        model.observe_worktree(snapshot(), Some(0));
+        assert_eq!(state(&model), V::Failed(snapshot()));
+
+        // ✓ : passed, and the worktree is the candidate.
+        for rec in wardd(&[verify_requested(), verify_passed()]) {
+            model.apply(rec);
+        }
+        assert_eq!(state(&model), V::Verified(snapshot()));
+        assert_eq!(seg(&model), Segment::new(VERIFY_OK, Tone::Ok));
+
+        // passed → edit → STALE: green disappears the moment the tree differs.
+        model.observe_worktree(edited(), Some(1));
+        assert_eq!(
+            state(&model),
+            V::Stale {
+                candidate: snapshot(),
+                worktree: edited()
+            }
+        );
+        assert_eq!(seg(&model), Segment::new("VERIFY ~ STALE", Tone::Warn));
+
+        // STALE → verify again → ◐ → ✓ on the new candidate.
+        let again = |event: &WardEvent| match event {
+            WardEvent::VerificationRequested { requested_by, .. } => {
+                WardEvent::VerificationRequested {
+                    candidate: edited(),
+                    requested_by: *requested_by,
+                }
+            }
+            WardEvent::VerificationPassed {
+                summary,
+                result_hash,
+                ..
+            } => WardEvent::VerificationPassed {
+                candidate: edited(),
+                summary: *summary,
+                result_hash: *result_hash,
+            },
+            other => other.clone(),
+        };
+        model.apply(wardd(&[again(&verify_requested())]).remove(0));
+        assert_eq!(state(&model), V::Verifying(edited()));
+        assert_eq!(seg(&model).tone, Tone::Accent);
+        model.apply(wardd(&[again(&verify_passed())]).remove(0));
+        assert_eq!(state(&model), V::Verified(edited()));
+        assert_eq!(seg(&model), Segment::new("VERIFY ✓ cdcdcdcd", Tone::Ok));
+
+        // Reverting the edit brings the tree back to the old candidate: that
+        // is not the verified one any more, so it is stale too.
+        model.observe_worktree(snapshot(), Some(1));
+        assert_eq!(seg(&model).text, "VERIFY ~ STALE");
+        model.observe_worktree(edited(), Some(0));
+        assert_eq!(seg(&model).text, "VERIFY ✓ cdcdcdcd");
+
+        // Every state has its tone and word.
+        let cases = [
+            (V::Never, Tone::Dim, "never"),
+            (V::Verifying(snapshot()), Tone::Accent, "verifying"),
+            (V::Verified(snapshot()), Tone::Ok, "verified"),
+            (
+                V::Stale {
+                    candidate: snapshot(),
+                    worktree: edited(),
+                },
+                Tone::Warn,
+                "stale",
+            ),
+            (V::Failed(snapshot()), Tone::Deny, "failed"),
+        ];
+        for (state, tone, word) in cases {
+            assert_eq!(state.tone(), tone, "{word}");
+            assert_eq!(state.word(), word);
+            assert_eq!(state.segment().tone, tone, "{word}");
+            assert!(state.segment().text.starts_with("VERIFY "), "{word}");
+        }
+        assert_eq!(short_hex(snapshot()), "abababab");
     }
 
     #[test]
@@ -631,14 +852,17 @@ mod tests {
         );
         assert_eq!(
             bar.text(),
-            "● WARD │ sess_01J8ZK3… │ payments-api │ CLAUDE ● working │ NET restricted (dev) │ CRED 0 granted │ OBS live │ LIVE"
+            "● WARD │ sess_01J8ZK3… │ payments-api │ CLAUDE ● working │ NET restricted (dev) │ CRED 0 granted │ OBS live │ VERIFY — │ LIVE"
         );
 
         for rec in wardd(&[verify_requested()]) {
             model.apply(rec);
         }
         let bar = TrustBar::new(&h, &model);
-        assert_eq!(bar.verified, Some(Segment::new("VERIFYING", Tone::Accent)));
+        assert_eq!(
+            bar.verified,
+            Some(Segment::new("VERIFY ◐ abababab", Tone::Accent))
+        );
         model.apply(wardd(&[verify_failed()]).remove(0));
         assert_eq!(
             TrustBar::new(&h, &model).verified,
@@ -646,7 +870,7 @@ mod tests {
         );
         model.apply(wardd(&[verify_passed()]).remove(0));
         let bar = TrustBar::new(&h, &model);
-        assert_eq!(bar.verified, Some(Segment::new("VERIFY ✓", Tone::Ok)));
+        assert_eq!(bar.verified, Some(Segment::new(VERIFY_OK, Tone::Ok)));
         assert_eq!(
             bar.tamperward, None,
             "wardd has said nothing for TamperWard"
@@ -656,7 +880,8 @@ mod tests {
         let bar = TrustBar::new(&h, &model);
         assert_eq!(bar.tamperward, Some(Segment::new("TW ✓", Tone::Ok)));
         assert!(
-            bar.text().ends_with("│ OBS live │ TW ✓ │ VERIFY ✓ │ LIVE"),
+            bar.text()
+                .ends_with("│ OBS live │ TW ✓ │ VERIFY ✓ abababab │ LIVE"),
             "{}",
             bar.text()
         );
@@ -753,7 +978,12 @@ mod tests {
         assert_eq!(seg(&watch, SegmentName::Credentials).text, "CRED 0 granted");
         assert_eq!(seg(&watch, SegmentName::Observer).text, "OBS live");
         assert_eq!(watch.segment(SegmentName::Tamperward), None);
-        assert_eq!(watch.segment(SegmentName::Verify), None);
+        assert_eq!(watch.segment(SegmentName::Verify), None, "ward watch's bar");
+        assert_eq!(
+            TrustBar::new(&h, &Model::new(false)).segment(SegmentName::Verify),
+            Some(Segment::new(VERIFY_NEVER, Tone::Dim)),
+            "the shell's bar"
+        );
         assert_eq!(
             watch.segment(SegmentName::Daemon),
             Some(Segment::bold("LIVE", Tone::Warn))
@@ -775,7 +1005,7 @@ mod tests {
         );
         assert_eq!(
             live.segment(SegmentName::Verify),
-            Some(Segment::new("VERIFY ✓", Tone::Ok))
+            Some(Segment::new(VERIFY_OK, Tone::Ok))
         );
         // Every name answers, and the answers are the row's segments.
         for name in SegmentName::ALL {
@@ -835,9 +1065,18 @@ mod tests {
         assert_eq!(
             bar.verified.as_ref().unwrap().tone,
             Tone::Ok,
-            "a verdict does not expire"
+            "a verdict does not expire with the session"
         );
         assert_eq!(bar.tamperward.as_ref().unwrap().tone, Tone::Ok);
-        assert!(bar.text().ends_with("│ TW ✓ │ VERIFY ✓ │ SEALED"));
+        assert!(bar.text().ends_with("│ TW ✓ │ VERIFY ✓ abababab │ SEALED"));
+
+        // It does expire with the tree: a sealed log and a changed worktree
+        // is a stale verdict, whatever the seal says.
+        model.observe_worktree(edited(), Some(2));
+        let bar = TrustBar::new(&h, &model);
+        assert_eq!(
+            bar.verified,
+            Some(Segment::new("VERIFY ~ STALE", Tone::Warn))
+        );
     }
 }

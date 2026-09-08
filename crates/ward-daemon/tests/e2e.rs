@@ -441,13 +441,40 @@ fn verify_ignores_a_weakened_protected_test_and_passes_the_real_fix() {
     let fixed = session.verify().expect("verify");
     assert!(fixed.passed, "{}", fixed.output);
     assert!(fixed.summary.tests_run >= 3, "{:?}", fixed.summary);
+    // The candidate the verdict names is what the worktree digests to with the
+    // verifier's capture options: the shell's `VERIFY ✓` compares exactly this
+    // (ADR-0019 decision 1), and one more edit makes it stale.
+    let mut cache = ward_snapshot::HashCache::new();
+    let digest = |cache: &mut ward_snapshot::HashCache| {
+        ward_snapshot::digest_worktree(w, ward_daemon::verify::candidate_options(), cache)
+            .expect("digest")
+            .to_string()
+    };
+    assert_eq!(digest(&mut cache), fixed.candidate);
+    fs::write(w.join("README.md"), "edited after the verdict\n").unwrap();
+    assert_ne!(digest(&mut cache), fixed.candidate);
     let log = session.log_path();
     session.stop(EndReason::UserStop).expect("stop");
 
-    let kinds: Vec<String> = LogReader::open(&log)
+    let verifier: Vec<EventRecord> = LogReader::open(&log)
         .unwrap()
         .filter_map(Result::ok)
         .filter(|r| r.origin == ward_events::Origin::Verifier)
+        .collect();
+    let passed_candidates: Vec<String> = verifier
+        .iter()
+        .filter_map(|r| match &r.event {
+            WardEvent::VerificationPassed { candidate, .. } => Some(candidate.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        passed_candidates,
+        vec![fixed.candidate.clone()],
+        "the record names the candidate the shell compares against"
+    );
+    let kinds: Vec<String> = verifier
+        .iter()
         .map(|r| format!("{:?}", r.event.kind()))
         .collect();
     assert!(

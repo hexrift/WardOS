@@ -63,7 +63,7 @@
     "return-type": "json",
     "restart-interval": 5,
     "format": "{}",
-    "on-click": "foot --app-id ward-session -e sh -c 'ward-shell session; read -r _'"
+    "on-click": "foot --app-id ward-session -e sh -c 'ward-shell verify-panel; read -r _'"
   },
 
   "hyprland/workspaces": {
