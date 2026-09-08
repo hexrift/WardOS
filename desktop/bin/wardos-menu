@@ -71,12 +71,12 @@ apps_items() {
   done | sort -f
 }
 
-# Dynamic lists from the theme and font commands: the first word of each line is the id.
+# Dynamic lists from the theme and font commands: one id (a font family may hold spaces) per line.
 list_of() {
   local cmd=$1 verb=$2 set=$3 id
   wardos_has "$cmd" || return 0
-  "$cmd" "$verb" 2>/dev/null | awk '{ print $1 }' | while read -r id; do
-    [[ -n "$id" ]] && item "$id" "$cmd $set $id"
+  "$cmd" "$verb" 2>/dev/null | while read -r id; do
+    [[ -n "$id" ]] && item "$id" "$cmd $set $(printf '%q' "$id")"
   done
 }
 

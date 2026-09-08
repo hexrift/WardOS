@@ -46,6 +46,14 @@ wardos-menu help "Hyprland wiki"
 assert_logged '^wardos-launch browser https://wiki.hyprland.org'
 wardos-menu style "Light or dark" "Light"
 assert_logged '^wardos-theme set ward-light$'
+# Theme and font lists come from their commands; a family name with spaces stays one argument.
+mock wardos-theme "case \"\$1\" in list) printf 'ward-dark\nnord\n' ;; esac"
+mock wardos-font "case \"\$1\" in list) printf 'JetBrains Mono\nNoto Sans\n' ;; esac"
+grep -qx nord <<<"$(wardos-menu --list appearance theme)" || fail "themes are listed"
+wardos-menu appearance theme nord
+assert_logged '^wardos-theme set nord$'
+wardos-menu appearance font "Noto Sans"
+assert_logged '^wardos-font set Noto Sans$'
 # A leaf of ward-shell runs the command it named.
 wardos-menu agents "Start Claude"
 assert_logged '^wardos-launch terminal ward claude$'

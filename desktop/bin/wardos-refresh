@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# wardos-refresh — put a component's default configuration back (docs/desktop.md).
+#
+# Usage: wardos-refresh <component>   copy /usr/share/wardos/config/<component> (or the
+#                                     $WARDOS_ROOT checkout's) into ~/.config, the previous
+#                                     copy kept next to it as <component>.bak
+#        wardos-refresh --all         every component that ships
+#        wardos-refresh --list        their names
+#
+# The exceptions of docs/desktop.md §Layout: hyprlock, hypridle and hyprsunset go to
+# ~/.config/hypr/ (a file each, <file>.bak beside it); gtk to gtk-3.0 and gtk-4.0;
+# xcompose to ~/.XCompose; chromium to ~/.config/chromium-flags.conf; bash copies its
+# pieces but never profile.d-wardos.sh (the image's /etc/profile.d file); hypr is the
+# Hyprland tree itself (desktop/hyprland → ~/.config/hypr, backed up whole).
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+share=$(wardos_share_dir)
+config=${XDG_CONFIG_HOME:-$HOME/.config}
+
+components() {
+  local d
+  for d in "$share"/config/*/; do
+    [[ -d "$d" ]] && basename "$d"
+  done
+  [[ -d "$(wardos_hypr_dir)" ]] && echo hypr
+}
+
+# copy_file SRC DEST: backup, then copy one file.
+copy_file() {
+  mkdir -p "$(dirname "$2")"
+  wardos_backup "$2"
+  cp -f "$1" "$2"
+}
+
+# copy_dir SRC DEST [EXCLUDE]: backup DEST whole, then copy the directory's files over it.
+copy_dir() {
+  local src=$1 dest=$2 exclude=${3:-} f
+  wardos_backup "$dest"
+  mkdir -p "$dest"
+  for f in "$src"/* "$src"/.[!.]*; do
+    [[ -e "$f" ]] || continue
+    [[ -n "$exclude" && "$(basename "$f")" == "$exclude" ]] && continue
+    cp -rf "$f" "$dest/"
+  done
+}
+
+refresh() {
+  local c=$1 src="$share/config/$1"
+  case "$c" in
+    hypr) copy_dir "$(wardos_hypr_dir)" "$config/hypr" ;;
+    hyprlock | hypridle | hyprsunset) copy_file "$src/$c.conf" "$config/hypr/$c.conf" ;;
+    gtk)
+      copy_dir "$src" "$config/gtk-3.0"
+      copy_dir "$src" "$config/gtk-4.0"
+      ;;
+    xcompose) copy_file "$src/XCompose" "$HOME/.XCompose" ;;
+    chromium) copy_file "$src/chromium-flags.conf" "$config/chromium-flags.conf" ;;
+    bash) copy_dir "$src" "$config/bash" profile.d-wardos.sh ;;
+    *)
+      [[ -d "$src" ]] || wardos_die "no component named $c ships (--list)"
+      copy_dir "$src" "$config/$c"
+      ;;
+  esac
+  echo "$c refreshed"
+}
+
+case "${1:-}" in
+  "") wardos_die "which component? (--list, --all)" ;;
+  --list) components ;;
+  --all)
+    for c in $(components); do refresh "$c"; done
+    ;;
+  *)
+    for c in "$@"; do
+      [[ $c == hypr ]] || [[ -d "$share/config/$c" ]] || wardos_die "no component named $c ships (--list)"
+      refresh "$c"
+    done
+    ;;
+esac

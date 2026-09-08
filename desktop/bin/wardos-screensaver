@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# wardos-screensaver — the wordmark in terminal text effects while idle (docs/desktop.md).
+#
+# Usage: wardos-screensaver      runs until any key (or the end of input); hypridle starts
+#                                it after 2.5 min in a terminal window
+#
+# `tte` (terminaltexteffects) plays one calm effect after another on the WARDOS wordmark
+# and the identity line of design-language.md §1; without tte, tput moves the wordmark
+# around the screen. Returns at once when `wardos-toggle screensaver` has switched it
+# off ($XDG_STATE_HOME/wardos/screensaver says off), so hypridle can keep calling it.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+[[ "$(cat "$(wardos_state_dir)/screensaver" 2>/dev/null || echo on)" != off ]] || exit 0
+
+text=$'WARDOS\n\nThe operating system where autonomous agents are visible, constrained, and verifiable.'
+# §12: gentle motion only; no bounces, no rain.
+effects=(beams decrypt slide wipe expand print)
+child=""
+
+finish() {
+  [[ -n "$child" ]] && kill "$child" 2>/dev/null
+  tput cnorm 2>/dev/null || true
+  clear 2>/dev/null || true
+}
+trap finish EXIT
+
+# key_pressed SECONDS: true on a key or the end of input; false on a plain timeout.
+key_pressed() {
+  local rc=0
+  read -rsn1 -t "$1" _ || rc=$?
+  [[ $rc -lt 128 ]]
+}
+
+alive() { [[ "$(ps -o stat= -p "$1" 2>/dev/null)" =~ ^[^Z] ]]; }
+
+tput civis 2>/dev/null || true
+if wardos_has tte; then
+  while :; do
+    effect=${effects[RANDOM % ${#effects[@]}]}
+    tte --frame-rate 60 --canvas-width 0 --canvas-height 0 --anchor-canvas c --anchor-text c "$effect" <<<"$text" &
+    child=$!
+    while alive "$child"; do
+      key_pressed 0.2 && exit 0
+    done
+    wait "$child" 2>/dev/null || true
+    child=""
+    key_pressed 2 && exit 0
+  done
+else
+  cols=$(tput cols 2>/dev/null || echo 80)
+  lines=$(tput lines 2>/dev/null || echo 24)
+  while :; do
+    clear 2>/dev/null || true
+    tput cup $((RANDOM % (lines > 1 ? lines - 1 : 1))) $((RANDOM % (cols > 6 ? cols - 6 : 1))) 2>/dev/null || true
+    printf 'WARDOS\n'
+    key_pressed 3 && exit 0
+  done
+fi

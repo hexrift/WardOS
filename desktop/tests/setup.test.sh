@@ -21,6 +21,10 @@ wardos-setup bluetooth
 assert_logged '^foot --app-id wardos-tui-bluetui -e bluetui$'
 wardos-setup audio
 assert_logged '^foot --app-id wardos-tui-pulsemixer -e pulsemixer$'
+rm "$MOCK_DIR/pulsemixer"
+mock pavucontrol
+wardos-setup audio
+assert_logged '^pavucontrol $'
 
 # power: pick a profile from powerprofilesctl's list.
 mock powerprofilesctl 'case "$1" in list) printf "  performance:\n* balanced:\n  power-saver:\n" ;; esac'

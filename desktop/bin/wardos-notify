@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# wardos-notify — a notification the WardOS way (docs/desktop.md §Commands).
+#
+# Usage: wardos-notify [-u low|normal|critical] [-i icon] [-t ms] <title> [body]
+#        wardos-notify --done <title> [body]     a short "finished" toast: `✓ <title>`,
+#                                               body "Finished" unless given
+#
+# notify-send with `-a WardOS` so mako groups and styles them as the desktop's own.
+# design-language.md §9 and §11: calm words, the ✓ glyph for a finished state, and no
+# exclamation marks, which are stripped whoever wrote them. Without notify-send (a plain
+# terminal session) nothing is sent and nothing fails.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+opts=()
+done_toast=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u | -i | -t)
+      opts+=("$1" "$2")
+      shift 2
+      ;;
+    --done)
+      done_toast=1
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*) wardos_die "unknown option $1 (--help)" ;;
+    *) break ;;
+  esac
+done
+[[ -n "${1:-}" ]] || wardos_die "a title is required (--help)"
+
+title=${1//!/}
+body=${2:-}
+body=${body//!/}
+if [[ $done_toast == 1 ]]; then
+  title="✓ $title"
+  body=${body:-Finished}
+  opts+=(-t 3000)
+fi
+wardos_notify "$title" "$body" "${opts[@]}"

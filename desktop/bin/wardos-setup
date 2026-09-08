@@ -3,7 +3,8 @@
 #
 # Usage: wardos-setup <what> [choice]
 #   wifi          nmtui                  bluetooth   bluetui, else bluetoothctl
-#   audio         pulsemixer             power       a power profile (powerprofilesctl)
+#   audio         pulsemixer, else pavucontrol (a window)
+#   power         a power profile (powerprofilesctl)
 #   monitors      ~/.config/hypr/monitors.conf in the editor    input   …/input.conf
 #   keys          wardos-keys
 #   fingerprint   fprintd-enroll, then `sudo authselect enable-feature with-fingerprint`
@@ -89,7 +90,7 @@ shift
 case "$what" in
   wifi) tui nmtui ;;
   bluetooth) if wardos_has bluetui; then tui bluetui; else tui bluetoothctl; fi ;;
-  audio) tui pulsemixer ;;
+  audio) if wardos_has pulsemixer; then tui pulsemixer; else exec pavucontrol; fi ;;
   power)
     profile=${1:-}
     if [[ -z "$profile" ]]; then

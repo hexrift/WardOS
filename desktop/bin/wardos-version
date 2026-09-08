@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# wardos-version — what runs here (docs/desktop.md §Commands).
+#
+# Usage: wardos-version
+#
+# The booted image and its version from `bootc status --json` (and a staged update when
+# one waits for a reboot), `ward --version`, and Hyprland's version line.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+row() { printf '%-10s %s\n' "$1" "$2"; }
+
+# bootc's JSON has the same keys under staged, booted and rollback; python3 picks the
+# right branch (jq is not part of the image's promise, python3 is).
+image_rows() {
+  wardos_has bootc || {
+    row Image "not a bootc host"
+    return
+  }
+  local json
+  json=$(bootc status --json 2>/dev/null) || {
+    row Image "bootc status failed"
+    return
+  }
+  python3 - "$json" <<'PY' 2>/dev/null || row Image "unreadable bootc status"
+import json, sys
+status = json.loads(sys.argv[1]).get("status", {})
+booted = (status.get("booted") or {}).get("image") or {}
+print("%-10s %s" % ("Image", booted.get("image", {}).get("image", "?")))
+print("%-10s %s" % ("Version", booted.get("version", "?")))
+staged = (status.get("staged") or {}).get("image") or {}
+if staged:
+    print("%-10s %s" % ("Staged", staged.get("version", "?")))
+PY
+}
+
+image_rows
+if wardos_has ward; then
+  v=$(ward --version 2>/dev/null | head -n1)
+  row ward "${v#ward }"
+else
+  row ward "not installed"
+fi
+if wardos_has Hyprland; then
+  v=$(Hyprland --version 2>/dev/null | head -n1)
+  row Hyprland "${v#Hyprland }"
+elif wardos_has hyprland; then
+  v=$(hyprland --version 2>/dev/null | head -n1)
+  row Hyprland "${v#Hyprland }"
+else
+  row Hyprland "not installed"
+fi

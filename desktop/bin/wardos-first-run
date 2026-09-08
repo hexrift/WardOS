@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# wardos-first-run — the first login (docs/desktop.md §Commands).
+#
+# Usage: wardos-first-run [--force]
+#
+# Run by Hyprland's autostart. Once, unless --force (the marker is
+# ~/.config/wardos/first-run-done): copies every default configuration into ~/.config
+# (wardos-refresh --all), sets the Ward Dark theme, runs `ward doctor`, registers the
+# shipped web and terminal apps as .desktop entries, and shows the key bindings. Tools
+# that are not installed are skipped.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+marker="$(wardos_config_dir)/first-run-done"
+if [[ -e "$marker" && "${1:-}" != --force ]]; then exit 0; fi
+
+wardos-refresh --all
+if wardos_has wardos-theme && ! wardos-theme set ward-dark; then
+  wardos_notify "Theme not applied" "Run 'wardos-theme set ward-dark' in a terminal"
+fi
+if wardos_has ward && ! ward doctor; then
+  wardos_notify "ward doctor found problems" "Run 'ward doctor' in a terminal"
+fi
+wardos-webapp install --defaults
+wardos-tui install --defaults
+
+mkdir -p "$(dirname "$marker")"
+date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
+wardos_notify "Welcome to WardOS" "Super + Space opens the command centre; Super + K shows the keys"
+wardos-keys
