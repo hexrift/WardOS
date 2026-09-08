@@ -1,0 +1,130 @@
+# Every Fedora 42 package the WardOS host installs (docs/desktop.md §Packages).
+# One name per line, `# why` after it; blank lines and comment lines are ignored.
+# The Containerfile installs from this file; desktop/install.sh layers it onto an
+# existing Fedora; image/check-packages.sh (CI: "image packages") proves every name
+# resolves in a fedora:42 container. Names were written without repository access:
+# `# unverified` marks the ones not seen in Fedora 42 by the author, and the CI
+# check, not this file, is the source of truth for whether a name exists.
+
+# --- runtime (ADR-0001: no developer toolchain on the host, one explicit exception) ----
+bubblewrap            # sandbox builder used by wardd (ADR-0002, ADR-0013)
+git                   # snapshot/worktree plumbing (ADR-0010), `ward init` on repositories
+curl                  # transport for `ward` self-checks and the egress relay tests
+python3               # scripts/security-check and hook adapters
+openssh-clients       # agent-side git-over-ssh through the credential broker
+cargo                 # the trusted verifier binds a host toolchain read-only into Zone 2
+rust                  # (image/README.md: the one, temporary, toolchain exception)
+podman                # nested containers inside project environments (ADR-0005)
+
+# --- compositor and session ---------------------------------------------------------
+hyprland              # the compositor (ADR-0007)
+hyprlock              # lock screen
+hypridle              # idle management (lock, screen off, suspend)
+hyprpaper             # wallpaper daemon (image backgrounds; swaybg draws solid ones)
+hyprpicker            # colour picker (wardos-capture color)
+hyprsunset            # night light (wardos-toggle nightlight)                  # unverified
+hyprpolkitagent       # polkit prompts on the desktop (pkexec)                  # unverified
+xdg-desktop-portal-hyprland # screen sharing, screenshots for portals
+xdg-desktop-portal-gtk # file chooser and settings portal
+uwsm                  # Universal Wayland Session Manager: starts Hyprland as a systemd session # unverified
+xorg-x11-server-Xwayland # X11 applications
+qt6-qtwayland         # Qt 6 applications on Wayland
+qt5-qtwayland         # Qt 5 applications on Wayland
+polkit                # privilege prompts
+gvfs                  # trash, MTP, network shares for nautilus
+xdg-user-dirs         # ~/Documents, ~/Downloads, ...
+xdg-utils             # xdg-open, xdg-mime, default applications
+mesa-dri-drivers      # OpenGL for the compositor
+mesa-vulkan-drivers   # Vulkan (Hyprland's renderer can use it; browsers do)
+
+# --- shell surfaces until E-10 (rendered from ward-shell's models) --------------------
+waybar                # the trust bar
+fuzzel                # command centre and every menu
+mako                  # notifications and approvals
+libnotify             # notify-send (wardos-notify)
+swayosd               # on-screen volume and brightness                         # unverified
+
+# --- capture and clipboard ------------------------------------------------------------
+grim                  # screenshot
+slurp                 # region selection
+satty                 # screenshot annotation                                   # unverified
+wf-recorder           # screen recording
+cliphist              # clipboard history (Super+Ctrl+V)                        # unverified
+wl-clipboard          # wl-copy, wl-paste
+swaybg                # solid-colour background (`solid:<hex>` themes)
+
+# --- hardware and services --------------------------------------------------------------
+brightnessctl         # backlight
+playerctl             # media keys
+pamixer               # volume keys                                             # unverified
+pipewire              # audio
+wireplumber           # audio session manager
+pipewire-pulseaudio   # PulseAudio compatibility (the package is not named pipewire-pulse)
+pipewire-alsa         # ALSA compatibility
+bluez                 # Bluetooth
+bluez-tools           # bt-device and friends for wardos-setup bluetooth
+NetworkManager-wifi   # Wi-Fi
+NetworkManager-tui    # nmtui (wardos-setup wifi)
+power-profiles-daemon # wardos-setup power
+upower                # battery state for the bar and wardos-battery-monitor
+fprintd               # fingerprint enrolment
+fprintd-pam           # fingerprint login
+pam-u2f               # FIDO2 login
+pamu2fcfg             # FIDO2 enrolment
+cups                  # printing
+system-config-printer # printer setup (wardos-setup printers)
+avahi                 # printer and host discovery
+fwupd                 # firmware updates
+gnome-keyring         # secrets for chromium and friends
+ddcutil               # external display brightness (wardos-setup monitors)
+
+# --- terminals and tools ------------------------------------------------------------------
+foot                  # default terminal
+alacritty             # second terminal, shipped configured
+neovim                # editor
+btop                  # activity (Super+T)
+fastfetch             # wardos-about
+fzf                   # fuzzy finder for the shell
+ripgrep               # rg
+fd-find               # fd
+bat                   # cat with syntax
+eza                   # ls with icons
+zoxide                # cd that learns
+lazygit               # git TUI
+git-delta             # diffs
+tmux                  # terminal multiplexer
+pulsemixer            # wardos-setup audio                                      # unverified
+qrencode              # wardos-share QR codes
+jq                    # JSON in bar and menu scripts
+socat                 # Hyprland event socket in scripts
+bash-completion       # completions for the wardos-* family
+
+# --- desktop applications ------------------------------------------------------------------
+nautilus              # files (Super+E)
+chromium              # default browser, web apps (--app)
+firefox               # second browser
+flatpak               # Flathub applications (wardos-install app)
+
+# --- containers ---------------------------------------------------------------------------------
+podman-compose        # compose files
+podman-tui            # containers TUI (Super+D)
+distrobox             # mutable development containers
+toolbox               # Fedora's own
+
+# --- fonts and themes ------------------------------------------------------------------------
+jetbrains-mono-fonts  # mono candidate (design-language.md §4)
+rsms-inter-fonts      # sans candidate
+cascadia-code-nf-fonts # mono with Nerd Font glyphs for the bar                # unverified
+google-noto-sans-fonts # fallback sans
+google-noto-color-emoji-fonts # colour emoji
+google-noto-emoji-fonts # monochrome emoji
+papirus-icon-theme    # icons
+adw-gtk3-theme        # GTK 3 in the libadwaita look
+gnome-themes-extra    # Adwaita for GTK 2/3 applications that ask for it
+
+# --- boot ----------------------------------------------------------------------------------------
+plymouth              # boot splash
+plymouth-system-theme # Fedora's default theme set
+plymouth-theme-spinner # the fallback theme
+plymouth-plugin-script # `script` theme engine for image/plymouth/wardos      # unverified
+plymouth-plugin-label # text rendering in script themes                        # unverified
