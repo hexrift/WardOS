@@ -113,5 +113,15 @@ that is `wardos-first-run`'s job, with a backup next to anything it replaces.
 
 ## 7. macOS, ARM, Windows
 
-Linux x86_64 only. On a Mac, run WardOS inside a Linux VM (any distro with bubblewrap).
-ARM builds from source but has no release binaries yet.
+The tools are Linux x86_64 only: the sandbox (bubblewrap, namespaces, Landlock,
+seccomp) has no macOS or Windows equivalent. ARM builds from source but has no release
+binaries yet.
+
+On a Mac, run the whole OS in a VM. Do not try to build the disk there: download it from
+CI instead (the `disk` workflow's artifact, or the `.qcow2.zst` attached to a release;
+see [`image/README.md`](../image/README.md), "Disk images from CI"), then boot it in UTM
+as an x86_64 machine. On Apple silicon that is emulated and slow but works; an Intel Mac
+runs it natively. Docker Desktop can build and inspect the container image
+(`--platform linux/amd64`) but cannot produce a bootable disk. A native Apple-silicon
+image needs aarch64 builds of the Hyprland COPRs; the `disk` workflow's `aarch64
+chroots` job reports whether they exist.

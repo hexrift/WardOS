@@ -141,7 +141,10 @@ if [[ -n "$user" || $luks -eq 1 ]]; then
   config=$generated
 fi
 
-cmd=("$podman_bin" run --rm -it
+# A terminal only when there is one: CI has no tty, and podman refuses -t without it.
+tty_flag=()
+if [[ -t 0 ]]; then tty_flag=(-t); fi
+cmd=("$podman_bin" run --rm -i "${tty_flag[@]}"
   --privileged
   --security-opt label=type:unconfined_t
   --volume "${output}:/output"
