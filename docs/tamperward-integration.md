@@ -1,10 +1,11 @@
 # TamperWard Integration Points
 
-Status: Phase 0. This is the contract WardOS offers TamperWard. TamperWard's own semantics
+Status: living document; the project's phase is in docs/status.toml and the README.
+This is the contract WardOS offers TamperWard. TamperWard's own semantics
 (protected paths, detectors, sign-off, pristine verification, run envelope) are defined in
 TamperWard's specification and are not restated here. Where WardOS makes an assumption
 about TamperWard it is marked **[assumption]** and must be confirmed against the
-TamperWard spec before Phase 3.
+TamperWard spec before the §4 protocol is built.
 
 ## 1. Principle
 

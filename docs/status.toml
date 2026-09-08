@@ -1,0 +1,7 @@
+# The one source of truth for the project's phase (ADR-0019, decision 7).
+# The README's Status section restates it; scripts/security-check/doc-status.py fails
+# CI when the two differ or when any other document claims a phase of its own.
+phase = 7
+name = "authority, freshness, intervention"
+since = 2026-09-08
+summary = "Snapshot-bound verification with visible freshness, approvals that separate the agent's claim from Ward's authority, pause as a host primitive, visible temporary grants, approval load measured (E-13, E-14), and the remaining security proofs before more desktop polish."

@@ -1,6 +1,7 @@
 # Agent Integration (`ward claude`, `ward codex`)
 
-Status: Phase 2 design. Builds on the Phase 1 runtime (ADR-0013), `ward-agent`
+Status: living document; the project's phase is in docs/status.toml and the README.
+Builds on the runtime of ADR-0013, `ward-agent`
 (ADR-0003) and `ward-proxy` (ADR-0006). Facts about Claude Code below come from its
 public documentation and are the inputs to experiments E-07 and E-08.
 
@@ -191,7 +192,7 @@ a gateway spec. Agents without hooks get intent only from exec/file capture.
   other attempt is a `NetworkDenied` record.
 * A full session replays from its sealed log.
 
-## 8. Status (Phase 2, in progress)
+## 8. Status
 
 Implemented and verified end to end: `ward claude` / `ward codex` launch the agent
 interactively inside the session sandbox with the agent profile env (private config

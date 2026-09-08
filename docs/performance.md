@@ -1,6 +1,7 @@
 # Performance
 
-Status: Phase 0. Performance is a release criterion. Every number below is a *budget* to
+Status: living document; the project's phase is in docs/status.toml and the README.
+Performance is a release criterion. Every number below is a *budget* to
 be confirmed or revised by measurement; no number is published without the
 reproducibility record in §4.
 

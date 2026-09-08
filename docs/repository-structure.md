@@ -1,6 +1,7 @@
 # Repository Structure
 
-Status: Phase 0 proposal. Directories are created when their first real content lands;
+Status: living document; the project's phase is in docs/status.toml and the README.
+Directories are created when their first real content lands;
 this document is the plan, not a promise of empty folders.
 
 ```text
@@ -104,7 +105,7 @@ responsibility lives now:
 | `ward-shell-core` | `trust`, `feed`, `panel`, `launcher`, `settings` | the shared view models of `ward-observer`; no GUI dependency, derived from `SessionDescription` + `EventRecord`s only |
 | `ward-shell` (`desktop/shell`) | `main` | as planned; prints each surface from a running session via `ward_daemon::client`, `gui` feature reserved for the toolkit E-10 selects |
 | `desktop/hyprland`, `desktop/themes` | `hyprland.conf`, `keybindings.conf`; four theme TOMLs + README | as planned; configuration and tokens only, installed by the Phase 6 image |
-| `image/` (not a crate) | `Containerfile`, `build.sh`, `disk.sh`, `sysctl.d/`, `tmpfiles.d/`, `systemd/`, `boot/`, `secure-boot/`, `keys/` | as planned; `boot/`, `secure-boot/`, `keys/` hold plans and public material only (CODEOWNERS); lint-checked in CI, not yet built (Phase 6 started) |
+| `image/` (not a crate) | `Containerfile`, `build.sh`, `disk.sh`, `sysctl.d/`, `tmpfiles.d/`, `systemd/`, `boot/`, `secure-boot/`, `keys/` | as planned; `boot/`, `secure-boot/`, `keys/` hold plans and public material only (CODEOWNERS); lint-checked and built in CI (`image lint`, `image build`) |
 
 `wardd` is a per-session daemon (ADR-0015): `ward up` spawns `wardd serve`, which owns
 the session log and serves `sessions/<id>/control.sock` (`control` is the protocol and

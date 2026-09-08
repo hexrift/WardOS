@@ -1,6 +1,7 @@
 # WardOS Architecture
 
-Status: Phase 0 draft. Decisions referenced as `ADR-NNNN` live in
+Status: living document; the project's phase is in docs/status.toml and the README.
+Decisions referenced as `ADR-NNNN` live in
 [`decisions/`](decisions/). Anything marked **[experiment]** is an assumption that must be
 validated per [`experiments.md`](experiments.md) before it is relied upon.
 

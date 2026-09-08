@@ -1,6 +1,7 @@
 # Roadmap
 
-Status: Phase 0 in progress. Phases are sequential in their *gates*; work inside a phase
+Status: living document; the project's phase is in [`status.toml`](status.toml) and the
+README's Status section, which this plan never restates. Phases are sequential in their *gates*; work inside a phase
 may overlap with experiments from the next.
 
 ## Phase 0 — Architecture (this repository, now)
@@ -172,8 +173,7 @@ it, so there is one implementation of the observer's counters and state.
 compositor configuration (architecture §11 bindings, §5 geometry, §12 motion) and
 `desktop/themes` the four official themes as token files, both destined for the Phase 6
 image. Still ahead in Phase 5: E-10 and the first layer-shell surfaces (bar, session
-panel, approvals), step-through holds; Phase 6 and 7 have not started beyond these
-files.
+panel, approvals), step-through holds.
 
 ## Phase 6 — Immutable image
 
@@ -226,6 +226,36 @@ images (E-09).
 
 Acceptance: RT-001, RT-002 pass on two reference devices; a deliberately broken update
 rolls back without user action; Secure Boot stays *on* throughout installation.
+
+### Phase 7 — authority, freshness, intervention ([ADR-0019](decisions/ADR-0019-authority-freshness-intervention.md))
+
+The phase that follows the image is about legibility, not decoration: the architecture
+and the visual language stay, and what a human can read from the desktop at a glance
+changes, in the order ADR-0019 gives. Snapshot-bound verification with five `VERIFY`
+states and a content-decided `~ STALE`; approvals that show the destination, the
+agent's words as the agent's words, and what Ward will actually allow; `ward pause` as
+one host operation with three exits; temporary grants visible in the bar until the
+session ends; approval load measured before any target is set (E-13, E-14 in
+[`experiments.md`](experiments.md)); one status source ([`status.toml`](status.toml))
+checked in CI; the release tarball with its checksum as the primary install path.
+
+**The proof backlog comes before more desktop polish.** These are the next security
+work, in this order, each a `ward selftest` row or an end-to-end test with a hostile
+workload ([`security-model.md`](security-model.md) §6):
+
+| Test | Proves | Built on |
+| --- | --- | --- |
+| ST-018 `candidate-snapshot-toctou` | the session is frozen before a candidate is captured, nested containers included | the pause primitive |
+| ST-022 `tls-interception-attempt` | a sandbox-side CA or a proxy trick cannot make the gateway terminate TLS for a host it does not inject | the proxy |
+| ST-026 `raw-tcp-socks-bypass` | a raw TCP connect, a SOCKS request or a non-HTTP protocol on the relay port leaves the sandbox only as a `NetworkDenied` record | the relay and the proxy |
+| ST-027 `loopback-control-surface` | the sandbox's loopback reaches nothing on the host: no control socket, no hook socket beyond its own, no host service on `127.0.0.1` | the network namespace |
+| ST-028 `dns-rebinding-pinning` | a host whose answer changes between resolution and connect, or resolves to a private range, is refused; the proxy connects to the address it resolved | the proxy's resolver |
+| ST-029 `hostile-verifier-corpus` | a corpus of hostile repositories (build scripts, test harness tricks, symlinks, submodules, hooks) gets a verdict from the verifier without touching the host, the network or the next run | the verifier |
+
+Signed releases are part of this phase's install story and wait on one decision: which
+key signs (a project key held by the maintainer, Sigstore keyless from the release
+workflow, or both), where its public half lives and how it rotates. Until that is
+recorded as a decision, releases carry a checksum only and the README says so.
 
 ## Phase 8 — Installer optimisation
 

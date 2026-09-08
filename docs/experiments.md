@@ -1,6 +1,7 @@
 # Highest-Risk Assumptions and Required Experiments
 
-Status: Phase 0. Nothing in this list is "decided" until its experiment has a recorded
+Status: living document; the project's phase is in docs/status.toml and the README.
+Nothing in this list is "decided" until its experiment has a recorded
 result under `experiments/<id>/RESULT.md`. Experiments are throwaway code; they live in
 `experiments/`, not in `crates/`.
 
@@ -21,6 +22,8 @@ Ranked by (probability the assumption is wrong) × (cost if wrong).
 | 9 | A Rust layer-shell UI (iced/GTK4-rs) can hit < 16 ms launcher and < 0.5 % idle | Shell toolkit change | E-10 |
 | 10 | Step-through "hard hold" on file writes is possible without unacceptable overhead | Step-through for writes stays best-effort via hooks | E-11 |
 | 11 | TamperWard can consume snapshot IDs and Zone 2 verification without redesign | Integration duplicates TamperWard's pristine mechanism | E-12 |
+| 12 | The default policy asks a human rarely enough, and about the right things, that approvals stay decisions rather than reflexes | Habituation: the user approves everything, the approval surface is a formality and the sandbox is the only real control | E-13 |
+| 13 | A real task under WardOS costs the developer little over the bare agent and leaves them able to say what the agent could reach, used and changed | Users run agents outside `ward`, or inside it without reading what it shows; the product's legibility claim is unfounded | E-14 |
 
 ## 2. Experiments
 
@@ -137,6 +140,68 @@ scenario in `examples/ward-demo`.
 **Pass.** Demo scenario passes end-to-end with the DENIED line originating from
 TamperWard and VERIFIED from Zone 2.
 
+### E-13 Human approval load
+**Hypothesis.** None yet: this experiment produces the numbers a hypothesis would need
+([ADR-0019](decisions/ADR-0019-authority-freshness-intervention.md) decision 5).
+Approval load is a security metric because a prompt the user answers without reading
+is not a control, and the published evidence says that is where prompts go: Anthropic
+reports that sandboxing cut Claude Code's permission prompts by 84 % and that users
+approve about 93 % of what they are asked; usable-security research finds repeated
+warnings habituate.
+**Metrics.** From the session logs, per session and aggregated over the corpus:
+* approvals per agent-hour;
+* approve rate and deny rate;
+* decision time, from `CapabilityRequested` to `CapabilityDecided`;
+* allow-once followed by the same request (the same destination, credential or path
+  asked again within the session);
+* allow-session rate;
+* requests contained by the sandbox (denied by the manifest, never shown to a human);
+* requests caused by missing policy (an `ask` that a policy line would have settled);
+* switches to unrestricted network;
+* launches outside `ward` (the agent run on the same host without a session, from the
+  host's shell history and the agents' own logs, where the user provides them).
+**Method.** Every `CapabilityRequested` and `CapabilityDecided` record in the log,
+with the `NetworkDenied` and `CredentialGranted` records around them, over a corpus of
+real sessions: the maintainers' own development sessions first, then volunteered logs.
+The corpus is read with `ward replay --json` over each sealed log and the metrics are
+derived from the records, never from the observer's counters. The intended tool is
+`ward replay --stats`, which would print this list for one log or a directory of logs;
+it is not implemented, and the experiment does not wait for it (a script over
+`--json` is enough for the first corpus).
+**Pass.** No target until the data exists.
+**What the result changes.** The profiles of decision `deferred` in ADR-0019 (which
+task-shaped network profiles exist, and what each asks); the step-through defaults
+(which tools hold by default and which are silent); the approval layout (what the
+three blocks show first, and whether allow-once is offered at all for a request the
+data says is always followed by the same one).
+
+### E-14 Agent workstation usability
+**Hypothesis.** None yet, for the same reason as E-13. The four comprehension
+questions at the end are the product's real acceptance test.
+**Metrics.** Per task, bare agent against the WardOS default policy:
+* task completion;
+* time to completion;
+* interruptions (every time the developer had to act for the agent to continue);
+* prompts shown;
+* legitimate work blocked (a denial the developer judged wrong);
+* retries by the agent after a denial or a hold;
+* time to `✓ VERIFIED`;
+* after the task, whether the developer can say, without looking again: what the agent
+  could reach, which credentials it used, what it changed, and whether the current
+  state is verified.
+**Method.** Ten to twenty real tasks from the maintainers' backlog and from
+`examples/`, each run twice by the same developer in counterbalanced order: once with
+the agent bare on the host, once inside `ward` with the default policy and the desktop
+approval surface. Everything is taken from the session log and a stopwatch, except the
+four questions, which are asked aloud after each task and scored against the log.
+**Pass.** No target until the data exists.
+**What the result changes.** The same three things as E-13, from the other side: the
+profiles of decision `deferred` (whether a task-shaped profile removes the
+interruptions a task showed), the step-through defaults (whether a hold the developer
+never needed should be off), and the approval layout (which block the developer read,
+by what they could answer afterwards). A task where the bare agent finishes and the
+WardOS one does not is a bug report before it is a data point.
+
 ## 3. What must be proven before building the distro
 
 Before any Phase 6 (image) work starts, these must have recorded PASS results:
@@ -153,7 +218,8 @@ contents.
 | Can entry state remain trustworthy even if the agent controls the repository and `.git`? | E-02, ST-008/018, [`snapshots-and-git.md`](snapshots-and-git.md) |
 | Can useful temporary credentials be provided without leaking long-lived secrets? | E-07, ST-012/024 |
 | Can agents run development containers without host-root-equivalent Docker authority? | E-04, ST-004 |
-| Can all this isolation remain nearly invisible to developers? | E-06, E-08, Phase 2 usability review |
+| Can all this isolation remain nearly invisible to developers? | E-06, E-08, E-14 |
+| Does the default policy ask a human rarely enough, and about the right things, that an approval stays a decision? | E-13, E-14 |
 | Can project and agent environments start fast enough that users do not bypass them? | E-06, performance CI |
 | Can the OS always roll back after a broken upgrade? | E-09, RT-002 |
 | Can the project realistically support a sufficiently useful laptop set? | Phase 9 matrix; E-09 on two devices first |

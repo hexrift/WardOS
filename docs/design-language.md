@@ -1,6 +1,7 @@
 # WardOS Design Language
 
-Status: Phase 0. Decision record: [ADR-0007](decisions/ADR-0007-desktop-and-shell.md).
+Status: living document; the project's phase is in docs/status.toml and the README.
+Decision record: [ADR-0007](decisions/ADR-0007-desktop-and-shell.md).
 
 ## 1. Identity
 

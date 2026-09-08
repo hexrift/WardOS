@@ -1,6 +1,7 @@
 # Snapshots and Git
 
-Status: Phase 0. Decision record: [ADR-0010](decisions/ADR-0010-snapshots-and-git.md).
+Status: living document; the project's phase is in docs/status.toml and the README.
+Decision record: [ADR-0010](decisions/ADR-0010-snapshots-and-git.md).
 
 ## 1. Why `.git` is not trusted
 
