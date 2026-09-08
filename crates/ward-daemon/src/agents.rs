@@ -51,10 +51,26 @@ const ANTHROPIC: GatewaySpec = GatewaySpec {
     prefix: "/anthropic",
     upstream: ("api.anthropic.com", 443),
     header: "x-api-key",
+    value_prefix: "",
     strip: &["x-api-key", "authorization"],
     key_env: "ANTHROPIC_API_KEY",
     base_url_env: "ANTHROPIC_BASE_URL",
+    base_path: "",
     placeholder_env: "ANTHROPIC_API_KEY",
+};
+
+/// OpenAI's API behind `/openai` on the relay; Codex expects the base URL to end in `/v1`.
+const OPENAI: GatewaySpec = GatewaySpec {
+    service: "openai",
+    prefix: "/openai",
+    upstream: ("api.openai.com", 443),
+    header: "authorization",
+    value_prefix: "Bearer ",
+    strip: &["authorization", "openai-organization", "openai-project"],
+    key_env: "OPENAI_API_KEY",
+    base_url_env: "OPENAI_BASE_URL",
+    base_path: "/v1",
+    placeholder_env: "OPENAI_API_KEY",
 };
 
 /// Profile for a known agent name, if any.
@@ -79,7 +95,7 @@ pub fn profile(name: &str) -> Option<AgentProfile> {
         "codex" => Some(AgentProfile {
             binary: "codex",
             env: &[("CODEX_HOME", "/home/agent/.codex")],
-            gateway: None,
+            gateway: Some(OPENAI),
             settings: None,
         }),
         _ => None,
@@ -104,7 +120,10 @@ mod tests {
                 .contains(&("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"))
         );
         assert_eq!(p.gateway.map(|g| g.service), Some("anthropic"));
-        assert!(profile("codex").unwrap().gateway.is_none());
+        assert_eq!(
+            profile("codex").unwrap().gateway.map(|g| g.service),
+            Some("openai")
+        );
         assert!(profile("nope").is_none());
     }
 
