@@ -13,6 +13,9 @@
 //! back to a before/after directory scan.
 
 use std::collections::HashMap;
+use std::io::Write as _;
+use std::os::fd::AsFd as _;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +23,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify, WatchDescriptor};
 
 use ward_events::FileChangeKind;
@@ -77,14 +81,15 @@ impl Captured {
 
 /// Directory names never descended into or reported.
 const SKIP: [&str; 3] = [".git", "target", "node_modules"];
-/// How often the watcher thread wakes to drain the queue.
-const POLL: Duration = Duration::from_millis(40);
+/// Upper bound on one park in `poll(2)`; the wake pipe ends it early.
+const POLL_CAP_MS: u16 = 500;
 /// Debounce window: repeats of the same (path, kind) within it are dropped.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// A running inotify watch over one worktree.
 pub struct Watcher {
     stop: Arc<AtomicBool>,
+    wake: UnixStream,
     handle: JoinHandle<Vec<Captured>>,
 }
 
@@ -116,26 +121,33 @@ impl Watcher {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
-        let handle =
-            std::thread::spawn(move || watch_loop(&inotify, flags, &root, &mut wds, &stop_thread));
-        Ok(Self { stop, handle })
+        let (wake, wake_rx) =
+            UnixStream::pair().map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(0)))?;
+        let handle = std::thread::spawn(move || {
+            watch_loop(&inotify, flags, &root, &mut wds, &stop_thread, &wake_rx)
+        });
+        Ok(Self { stop, wake, handle })
     }
 
     /// Stop watching and return the captured events in observed order.
     #[must_use]
-    pub fn finish(self) -> Vec<Captured> {
+    pub fn finish(mut self) -> Vec<Captured> {
         self.stop.store(true, Ordering::Relaxed);
+        let _ = self.wake.write_all(&[1]);
         self.handle.join().unwrap_or_default()
     }
 }
 
 /// The watcher thread body: drain until told to stop, then drain any tail.
+/// Between drains it parks in `poll(2)` on the inotify descriptor and the wake
+/// pipe, so events and the stop request are both seen at once.
 fn watch_loop(
     inotify: &Inotify,
     flags: AddWatchFlags,
     root: &Path,
     wds: &mut HashMap<WatchDescriptor, PathBuf>,
     stop: &AtomicBool,
+    wake: &UnixStream,
 ) -> Vec<Captured> {
     let started = Instant::now();
     let mut debouncer = Debouncer::new(DEBOUNCE);
@@ -148,7 +160,13 @@ fn watch_loop(
                 break;
             }
         } else if !drained {
-            std::thread::sleep(POLL);
+            let mut fds = [
+                PollFd::new(inotify.as_fd(), PollFlags::POLLIN),
+                PollFd::new(wake.as_fd(), PollFlags::POLLIN),
+            ];
+            if poll(&mut fds, PollTimeout::from(POLL_CAP_MS)).is_err() {
+                std::thread::sleep(Duration::from_millis(u64::from(POLL_CAP_MS)));
+            }
         }
     }
     out

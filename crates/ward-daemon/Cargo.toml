@@ -28,7 +28,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-nix = { version = "0.30", features = ["inotify"] }
+nix = { version = "0.30", features = ["inotify", "poll"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
