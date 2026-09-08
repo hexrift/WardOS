@@ -1,0 +1,150 @@
+{
+  "layer": "top",
+  "position": "top",
+  "height": 32,
+  "spacing": 0,
+  "reload_style_on_change": true,
+
+  "modules-left": [
+    "custom/ward-mark",
+    "custom/ward-project",
+    "custom/ward-agent",
+    "custom/ward-network",
+    "custom/ward-tamperward",
+    "custom/ward-verify"
+  ],
+  "modules-center": ["hyprland/workspaces"],
+  "modules-right": [
+    "custom/ward-update",
+    "pulseaudio",
+    "network",
+    "bluetooth",
+    "battery",
+    "cpu",
+    "memory",
+    "clock"
+  ],
+
+  "custom/ward-mark": {
+    "format": "WARD",
+    "tooltip-format": "WardOS. Click for the session panel.",
+    "on-click": "foot --app-id ward-session -e sh -c 'ward-shell session; read -r _'"
+  },
+  "custom/ward-project": {
+    "exec": "ward-shell bar --waybar --segment project --follow",
+    "return-type": "json",
+    "restart-interval": 5,
+    "format": "{}",
+    "on-click": "foot --app-id ward-session -e sh -c 'ward-shell session; read -r _'"
+  },
+  "custom/ward-agent": {
+    "exec": "ward-shell bar --waybar --segment agent --follow",
+    "return-type": "json",
+    "restart-interval": 5,
+    "format": "{}",
+    "on-click": "foot --app-id ward-session -e sh -c 'ward-shell session; read -r _'"
+  },
+  "custom/ward-network": {
+    "exec": "ward-shell bar --waybar --segment network --follow",
+    "return-type": "json",
+    "restart-interval": 5,
+    "format": "{}",
+    "on-click": "foot --app-id ward-session -e sh -c 'ward-shell session; read -r _'"
+  },
+  "custom/ward-tamperward": {
+    "exec": "ward-shell bar --waybar --segment tamperward --follow",
+    "return-type": "json",
+    "restart-interval": 5,
+    "format": "{}",
+    "on-click": "foot --app-id ward-session -e sh -c 'ward-shell session; read -r _'"
+  },
+  "custom/ward-verify": {
+    "exec": "ward-shell bar --waybar --segment verify --follow",
+    "return-type": "json",
+    "restart-interval": 5,
+    "format": "{}",
+    "on-click": "foot --app-id ward-session -e sh -c 'ward-shell session; read -r _'"
+  },
+
+  "hyprland/workspaces": {
+    "format": "{name}",
+    "on-click": "activate",
+    "on-scroll-up": "hyprctl dispatch workspace e-1",
+    "on-scroll-down": "hyprctl dispatch workspace e+1",
+    "all-outputs": true,
+    "sort-by-number": true,
+    "persistent-workspaces": { "1": [], "2": [], "3": [] }
+  },
+
+  "custom/ward-update": {
+    "exec": "wardos-update --check",
+    "return-type": "json",
+    "interval": 3600,
+    "format": "{}",
+    "on-click": "foot --app-id wardos-tui-update -e wardos-update"
+  },
+  "pulseaudio": {
+    "interval": 5,
+    "format": "VOL {volume}",
+    "format-muted": "VOL off",
+    "format-bluetooth": "VOL {volume} BT",
+    "tooltip-format": "{desc}",
+    "scroll-step": 5,
+    "on-click": "wardos-setup audio",
+    "on-click-right": "swayosd-client --output-volume mute-toggle"
+  },
+  "network": {
+    "interval": 5,
+    "format-wifi": "WIFI {signalStrength}",
+    "format-ethernet": "ETH",
+    "format-disconnected": "NET off",
+    "tooltip-format-wifi": "{essid}  {ipaddr}  {frequency} GHz",
+    "tooltip-format-ethernet": "{ifname}  {ipaddr}",
+    "tooltip-format-disconnected": "no connection",
+    "on-click": "wardos-setup wifi"
+  },
+  "bluetooth": {
+    "interval": 30,
+    "format": "BT",
+    "format-disabled": "",
+    "format-off": "",
+    "format-connected": "BT {device_alias}",
+    "tooltip-format-connected": "{device_enumerate}",
+    "on-click": "wardos-setup bluetooth"
+  },
+  "battery": {
+    "interval": 30,
+    "states": { "warning": 20, "critical": 10 },
+    "format": "BAT {capacity}",
+    "format-charging": "BAT {capacity}+",
+    "format-plugged": "AC",
+    "format-full": "AC",
+    "tooltip-format": "{timeTo}",
+    "on-click": "wardos-setup power"
+  },
+  "cpu": {
+    "interval": 5,
+    "format": "CPU {usage}",
+    "on-click": "wardos-launch tui btop"
+  },
+  "memory": {
+    "interval": 5,
+    "format": "MEM {percentage}",
+    "tooltip-format": "{used:0.1f} of {total:0.1f} GiB",
+    "on-click": "wardos-launch tui btop"
+  },
+  "clock": {
+    "interval": 60,
+    "format": "{:%H:%M}",
+    "tooltip-format": "<tt>{calendar}</tt>",
+    "calendar": {
+      "mode": "month",
+      "weeks-pos": "",
+      "on-scroll": 1,
+      "format": {
+        "today": "<b>{}</b>"
+      }
+    },
+    "on-click": "wardos-setup timezone"
+  }
+}
