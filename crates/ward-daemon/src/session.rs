@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use ward_events::{
@@ -391,12 +391,19 @@ impl Session {
     }
 
     /// Capture the worktree into the session CAS under `role` and record it
-    /// (`ward snapshot create`). The 0.1 capture is a frozen copy without a cgroup
-    /// freeze, so the recorded stall is zero.
+    /// (`ward snapshot create`). The sandbox is frozen for the length of the
+    /// walk ([`freeze_for_capture`](Self::freeze_for_capture), ST-018) so no
+    /// agent write can interleave with it; the recorded stall is how long the
+    /// capture held the tree still.
     pub fn snapshot(&mut self, role: SnapshotRole) -> Result<SnapshotMeta> {
-        let meta = crate::snapshot::open_store(&self.state)?
+        let store = crate::snapshot::open_store(&self.state)?;
+        let guard = self.freeze_for_capture();
+        let started = Instant::now();
+        let meta = store
             .capture(&self.worktree, role, CaptureOptions::default())
             .map_err(|e| Error::Snapshot(e.to_string()))?;
+        let stall = started.elapsed();
+        drop(guard);
         self.emit(
             Origin::Wardd,
             WardEvent::SnapshotCreated {
@@ -405,10 +412,18 @@ impl Session {
                 entries: meta.entries,
                 bytes: meta.bytes,
                 capture: ev_capture(meta.capture_mode),
-                stall: Duration::ZERO,
+                stall,
             },
         )?;
         Ok(meta)
+    }
+
+    /// Freeze the session's sandbox for the length of a capture so no agent
+    /// write interleaves with the walk (ST-018, `docs/security-model.md` G5/G9):
+    /// the returned guard holds the freeze and thaws when it drops. A no-op when
+    /// no sandbox of the session is running, and it leaves a user pause in place.
+    fn freeze_for_capture(&self) -> pause::CaptureFreeze {
+        pause::CaptureFreeze::acquire(&self.state, &self.session_str)
     }
 
     /// Paths `TamperWard` protects (`protected.tests` in `.tamperward/config.yml`),
@@ -744,7 +759,12 @@ impl Session {
             .parse()
             .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
         let scratch_root = run_dir(&self.session_str)?;
-        let prepared = verify::prepare(&store, &self.worktree, entry, &scratch_root)?;
+        // Freeze the agent only for the candidate capture inside `prepare`; the
+        // verifier itself runs from the CAS, not the worktree (ST-018, G5/G9).
+        let prepared = {
+            let _freeze = self.freeze_for_capture();
+            verify::prepare(&store, &self.worktree, entry, &scratch_root)?
+        };
         let candidate = ev_snapshot(prepared.candidate);
         self.emit(
             Origin::User,
@@ -833,6 +853,10 @@ impl Session {
             .entry_snapshot
             .parse()
             .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
+        // Freeze the agent across the whole restore: the candidate capture must
+        // be atomic (ST-018, G5/G9) and the worktree must not change under the
+        // rewrite that follows it.
+        let _freeze = self.freeze_for_capture();
         let now = store
             .store_snapshot(
                 &self.worktree,

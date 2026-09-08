@@ -162,12 +162,13 @@ from the desktop at a glance. In progress:
   deny rates, decision time, and the rest) and E-14 (ten to twenty real tasks, bare
   agent against WardOS, ending with four comprehension questions); no targets until
   the data exists ([`docs/experiments.md`](docs/experiments.md)).
-* **The remaining security proofs before more desktop polish**: ST-018 freeze before
-  capture and ST-029 a hostile verifier corpus
-  ([`docs/security-model.md`](docs/security-model.md) §6). Delivered: ST-022 TLS
-  interception, ST-026 raw TCP, SOCKS and UDP, ST-027 loopback and control surfaces,
-  ST-028 DNS rebinding and pinning, as the `egress and surfaces` group of
-  `ward selftest` (thirteen rows, §6.1).
+* **The remaining security proofs before more desktop polish**: ST-029 a hostile
+  verifier corpus ([`docs/security-model.md`](docs/security-model.md) §6). Delivered:
+  ST-018 freeze before capture (the daemon freezes the sandbox for the length of a
+  candidate/final capture so no agent write interleaves with it, an integration test
+  reproduced by CI); ST-022 TLS interception, ST-026 raw TCP, SOCKS and UDP, ST-027
+  loopback and control surfaces, ST-028 DNS rebinding and pinning, as the
+  `egress and surfaces` group of `ward selftest` (thirteen rows, §6.1).
 * **One install path and one status.** The release tarball with its checksum is the
   primary install; signed releases wait for a signing-key decision
   ([`docs/roadmap.md`](docs/roadmap.md)).
