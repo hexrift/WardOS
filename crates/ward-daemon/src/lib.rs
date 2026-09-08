@@ -20,9 +20,11 @@ pub mod ids;
 pub mod render;
 pub mod sandbox;
 pub mod session;
+pub mod watch;
 
 pub use error::{Error, Result};
-pub use session::{RunReport, Session};
+pub use session::{RunReport, Session, SessionMeta};
+pub use watch::CaptureMode;
 
 use std::path::Path;
 use ward_policy::NetworkCapability;
@@ -56,6 +58,34 @@ pub fn selftest(worktree: &Path) -> Result<Vec<ProbeResult>> {
         (
             "ST-011 private-network",
             "timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53'",
+        ),
+        // ST-013: exit 0 only if a namespace trick reads a host-only file. The host's
+        // /etc/hostname is never bound into the sandbox, so reaching it means escape.
+        (
+            "ST-013 namespace-escape",
+            "r=1; \
+             nsenter -t 1 -m -p -- cat /etc/hostname 2>/dev/null && r=0; \
+             unshare -m mount -t proc proc /proc 2>/dev/null; \
+             cat /etc/hostname 2>/dev/null && r=0; \
+             exit $r",
+        ),
+        // ST-014: exit 0 only if our pid can be written into a host cgroup. The host
+        // cgroupfs is not mounted writable in the sandbox, so both writes must fail.
+        (
+            "ST-014 cgroup-escape",
+            "r=1; \
+             echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null && r=0; \
+             echo $$ > /sys/fs/cgroup/../cgroup.procs 2>/dev/null && r=0; \
+             exit $r",
+        ),
+        // ST-015: inside /work, a symlink to /root or a ../../.. traversal must not
+        // resolve outside the bind mount. exit 0 only if a host file is read through one.
+        (
+            "ST-015 symlink-boundary-escape",
+            "cd /work || exit 1; rm -f evil up; r=1; \
+             ln -s /root evil 2>/dev/null && cat evil/.bashrc 2>/dev/null && r=0; \
+             ln -s ../../../.. up 2>/dev/null && cat up/etc/passwd 2>/dev/null && r=0; \
+             rm -f evil up; exit $r",
         ),
     ];
     let mut out = Vec::with_capacity(PROBES.len());

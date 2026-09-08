@@ -179,6 +179,32 @@ fn exit_text(exit: ward_events::ExitStatus) -> String {
     }
 }
 
+/// One-line session state for the status panel: `session ACTIVE · started Ns ago`
+/// when a session is running, or `no session` otherwise.
+#[must_use]
+pub fn session_status_line(active: Option<std::time::Duration>) -> String {
+    match active {
+        Some(ago) => {
+            format!(
+                "  {OK}session ACTIVE{RESET} {DIM}· started {} ago{RESET}",
+                human_ago(ago)
+            )
+        }
+        None => format!("  {DIM}no session{RESET}"),
+    }
+}
+
+fn human_ago(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
 /// Colour a self-test outcome line (`PASS`/`DENIED`).
 #[must_use]
 pub fn selftest_row(name: &str, blocked: bool) -> String {
