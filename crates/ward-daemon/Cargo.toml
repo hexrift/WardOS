@@ -23,6 +23,8 @@ ward-sandbox = { path = "../ward-sandbox", version = "0.1.0" }
 blake3 = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+nix = { version = "0.30", features = ["inotify"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

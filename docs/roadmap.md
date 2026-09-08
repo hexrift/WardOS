@@ -48,15 +48,18 @@ Acceptance:
 
 ### Phase 1 — delivered so far
 
-The workspace, CI, and all four foundation crates are merged, and a runnable
-prototype exists: `ward status`, `ward run`, `ward selftest`, and `ward replay`
-drive an in-process session ([ADR-0013](decisions/ADR-0013-phase1-runtime.md)) that
-merges policy into a manifest, freezes a content-addressed entry snapshot, runs
-commands in a bubblewrap sandbox, and writes the append-only event log. `ward
-selftest` blocks ST-001, ST-002, ST-003, ST-004 and ST-011 on a real sandbox (5/5).
-Still open for the Phase 1 gate: the `wardd` control socket, eBPF/fanotify event
-capture (events are currently emitted by the supervisor around each command), and
-the remaining ST probes (ST-013..015).
+The workspace, CI, and all foundation crates are merged, and a runnable prototype
+exists: `ward up`, `ward status`, `ward run`, `ward selftest`, `ward stop` and
+`ward replay` drive a session that persists across invocations
+([ADR-0013](decisions/ADR-0013-phase1-runtime.md)), merges policy into a manifest,
+freezes a content-addressed entry snapshot, runs commands in a bubblewrap sandbox with
+live inotify file events, and writes the append-only event log. `ward selftest` blocks
+ST-001..004, ST-011 and ST-013..015 on a real sandbox (8/8), and CI runs those probes
+on every PR. `ward-agent` (Landlock + seccomp PID 1 shim) and `ward-proxy` (egress
+allowlist with DNS pinning) are implemented as crates. Still open for the Phase 1
+gate: the `wardd` control socket, eBPF exec capture (commands are currently emitted by
+the supervisor around each run), and wiring `ward-agent`/`ward-proxy` into the
+session (that is Phase 2's `ward claude`).
 
 ## Phase 2 — Agent support
 
