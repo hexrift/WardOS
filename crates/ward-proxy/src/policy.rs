@@ -138,15 +138,34 @@ impl Policy {
     /// of `[public, private]` is refused rather than "just using the public one".
     pub fn evaluate(&self, resolver: &dyn Resolver, target: &Target) -> Result<Pinned, Denial> {
         self.check_host(target)?;
+        let pinned = Self::pin(resolver, target)?;
+        for ip in &pinned.addrs {
+            self.check_addr(*ip)?;
+        }
+        Ok(pinned)
+    }
+
+    /// Evaluation for a gateway upstream: the host, not the sandbox, chose the
+    /// destination when it configured the route, so the allowlist and address
+    /// classes do not apply. `offline` still means offline.
+    pub fn evaluate_gateway(
+        &self,
+        resolver: &dyn Resolver,
+        target: &Target,
+    ) -> Result<Pinned, Denial> {
+        if matches!(self.capability, NetworkCapability::Offline) {
+            return Err(Denial::Offline);
+        }
+        Self::pin(resolver, target)
+    }
+
+    fn pin(resolver: &dyn Resolver, target: &Target) -> Result<Pinned, Denial> {
         let addrs = match &target.host {
             Host::Ip(ip) => vec![*ip],
             Host::Name(name) => resolver.resolve(name).unwrap_or_default(),
         };
         if addrs.is_empty() {
             return Err(Denial::Unresolvable);
-        }
-        for ip in &addrs {
-            self.check_addr(*ip)?;
         }
         Ok(Pinned {
             addrs,
@@ -392,5 +411,25 @@ mod tests {
             let msg = d.to_string();
             assert!(!msg.contains("github") && !msg.contains('.'), "{msg}");
         }
+    }
+
+    #[test]
+    fn gateway_upstream_ignores_allowlist_but_not_offline() {
+        let localhost = Policy::new(NetworkCapability::LocalhostOnly);
+        let target = name("api.anthropic.com", 443);
+        assert_eq!(
+            localhost.evaluate(&resolver(), &target),
+            Err(Denial::NotAllowlisted)
+        );
+        let pinned = localhost.evaluate_gateway(&resolver(), &target).unwrap();
+        assert_eq!(pinned.addrs, vec![ip(PUBLIC)]);
+        assert_eq!(
+            Policy::new(NetworkCapability::Offline).evaluate_gateway(&resolver(), &target),
+            Err(Denial::Offline)
+        );
+        assert_eq!(
+            localhost.evaluate_gateway(&resolver(), &name("nx.invalid", 443)),
+            Err(Denial::Unresolvable)
+        );
     }
 }

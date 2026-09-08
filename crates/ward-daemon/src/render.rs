@@ -149,6 +149,11 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
         WardEvent::FileRead { path, .. } => ("READ", DIM, path.to_string()),
         WardEvent::NetworkRequested { host, port, .. } => ("NET", WARN, format!("{host}:{port}")),
         WardEvent::NetworkDenied { dst, .. } => ("DENY", DENY, denied_dst(dst)),
+        WardEvent::CredentialGranted { service, scope, .. } => (
+            "CRED",
+            ACCENT,
+            format!("{service} → {} (proxy-injected)", scope.subject.as_str()),
+        ),
         WardEvent::SessionEnded { .. } => ("END", DIM, "session".to_string()),
         _ => return None,
     };
