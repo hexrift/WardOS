@@ -120,7 +120,6 @@ google-noto-color-emoji-fonts # colour emoji
 google-noto-emoji-fonts # monochrome emoji
 papirus-icon-theme    # icons
 adw-gtk3-theme        # GTK 3 in the libadwaita look
-gnome-themes-extra    # Adwaita for GTK 2/3 applications that ask for it
 
 # --- boot ----------------------------------------------------------------------------------------
 plymouth              # boot splash

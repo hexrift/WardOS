@@ -301,3 +301,20 @@ rm -rf "$out"
 bash "$repo/image/disk.sh" --type iso --output "$out" --dry-run >"$TMP/out"
 assert_missing "$out/config.toml"
 ! grep -q -- '--config' "$TMP/out" || fail "no config expected"
+
+# --- image/check-packages.sh --discover: COPR projects and their chroots, from the API ----
+setup_env
+mock curl 'case "$*" in
+  *"project/search?query=hyprland"*) printf %s "{\"items\":[{\"full_name\":\"someone/hyprland\",\"chroot_repos\":{\"fedora-rawhide-x86_64\":\"u\",\"fedora-'"$rel"'-x86_64\":\"u\"}},{\"full_name\":\"other/hypr\",\"chroot_repos\":{\"fedora-rawhide-x86_64\":\"u\"}}]}" ;;
+  *"project/search"*) printf %s "{\"items\":[]}" ;;
+  *"ownername=solopasha&projectname=hyprland"*) printf %s "{\"full_name\":\"solopasha/hyprland\",\"chroot_repos\":{\"fedora-rawhide-x86_64\":\"u\"}}" ;;
+  *) exit 22 ;;
+esac'
+bash "$repo/image/check-packages.sh" --discover hyprland nothing >"$TMP/out" 2>&1 || fail "--discover must not fail:
+$(cat "$TMP/out")"
+assert_contains "$TMP/out" "  someone/hyprland: fedora-$rel-x86_64"
+assert_contains "$TMP/out" "  other/hypr: no fedora-"
+assert_contains "$TMP/out" "  no project mentions nothing"
+assert_contains "$TMP/out" "  solopasha/hyprland: no fedora-"
+assert_contains "$TMP/out" "  dejan/lazygit: not found"
+assert_logged '^curl -fsSL https://copr.fedorainfracloud.org/api_3/project/search\?query=hyprland$'
