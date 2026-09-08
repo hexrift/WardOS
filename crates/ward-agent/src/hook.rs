@@ -23,6 +23,11 @@ pub const SOCKET_ENV: &str = "WARD_HOOK_SOCKET";
 pub const SUMMARY_MAX: usize = 256;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for the decision: the daemon holds an `ask` for the user
+/// (ADR-0016, up to `approval.timeout_secs`, 60 s by default) and always
+/// answers by then, so a reply that takes minutes is a held approval, not a
+/// dead daemon. Beyond this the client gives up and prints nothing.
+const DECISION_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_RESPONSE: u64 = 4096;
 
 /// One request line to the daemon, derived from the Claude Code hook input.
@@ -130,7 +135,7 @@ pub fn output(hook: &str, response: &Response) -> Option<String> {
 /// One connection, one line each way; any failure or timeout is `None`.
 pub fn exchange(socket: &Path, request: &Request) -> Option<Response> {
     let mut stream = UnixStream::connect(socket).ok()?;
-    stream.set_read_timeout(Some(TIMEOUT)).ok()?;
+    stream.set_read_timeout(Some(DECISION_TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(TIMEOUT)).ok()?;
     let mut line = serde_json::to_string(request).ok()?;
     line.push('\n');

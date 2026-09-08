@@ -18,7 +18,9 @@ use ward_events::{
     WardEvent,
 };
 
+use crate::approvals::{Approval, ApprovalDecision};
 use crate::error::{Error, Result};
+use crate::hooks::HookDecision;
 
 /// File name of the control socket inside `sessions/<id>/`.
 pub const SOCKET_NAME: &str = "control.sock";
@@ -61,6 +63,28 @@ pub enum Request {
     },
     /// Liveness.
     Ping,
+    /// Hold an `ask` from the hook adapter until the user answers it or
+    /// `timeout_secs` pass (ADR-0016): the daemon records the request, lists it
+    /// as pending, and answers this connection once with the decision.
+    Hold {
+        /// The tool the agent wants to use.
+        tool: String,
+        /// Its target, sanitised.
+        summary: String,
+        /// Why the hook asks.
+        reason: String,
+        /// How long to wait before denying.
+        timeout_secs: u64,
+    },
+    /// Answer a pending approval.
+    Approve {
+        /// The approval's id: the seq of its `CapabilityRequested` record.
+        id: u64,
+        /// `allow`, `allow-session` or `deny`.
+        decision: ApprovalDecision,
+    },
+    /// The approvals waiting for an answer.
+    Pending,
 }
 
 /// What the daemon answers.
@@ -80,6 +104,17 @@ pub enum Response {
     Description(serde_json::Value),
     /// The request failed; the log is unchanged.
     Error(String),
+    /// A held approval was released: what the hook tells the agent.
+    Decision {
+        /// The approval's id.
+        id: u64,
+        /// Allow or deny.
+        decision: HookDecision,
+        /// Why (`approval: timed out`).
+        reason: String,
+    },
+    /// The open approvals, oldest first.
+    Pending(Vec<Approval>),
 }
 
 /// Where a session's events go.
@@ -396,7 +431,11 @@ pub fn handle_with(
                 Err(e) => (Response::Error(e.to_string()), false),
             }
         }
-        Request::Describe | Request::Subscribe { .. } => (
+        Request::Describe
+        | Request::Subscribe { .. }
+        | Request::Hold { .. }
+        | Request::Approve { .. }
+        | Request::Pending => (
             Response::Error("not served on this connection".into()),
             false,
         ),
@@ -509,6 +548,66 @@ mod tests {
             serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(),
             resp
         );
+    }
+
+    #[test]
+    fn approval_requests_and_responses_round_trip_with_their_words() {
+        let hold = Request::Hold {
+            tool: "Write".into(),
+            summary: "/work/src/lib.rs".into(),
+            reason: "step-through: pause before writes".into(),
+            timeout_secs: 60,
+        };
+        let json = serde_json::to_string(&hold).unwrap();
+        assert!(
+            json.starts_with(r#"{"req":"hold","tool":"Write""#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), hold);
+        let approve = Request::Approve {
+            id: 7,
+            decision: ApprovalDecision::AllowSession,
+        };
+        let json = serde_json::to_string(&approve).unwrap();
+        assert_eq!(
+            json,
+            r#"{"req":"approve","id":7,"decision":"allow-session"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), approve);
+        assert_eq!(
+            serde_json::to_string(&Request::Pending).unwrap(),
+            r#"{"req":"pending"}"#
+        );
+        let decision = Response::Decision {
+            id: 7,
+            decision: HookDecision::Deny,
+            reason: "approval: timed out".into(),
+        };
+        let json = serde_json::to_string(&decision).unwrap();
+        assert_eq!(
+            json,
+            r#"{"resp":"decision","body":{"id":7,"decision":"deny","reason":"approval: timed out"}}"#
+        );
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), decision);
+        let pending = Response::Pending(vec![Approval {
+            id: 7,
+            tool: "Write".into(),
+            summary: "/work/src/lib.rs".into(),
+            reason: "r".into(),
+            requested_at_unix_ms: 5,
+        }]);
+        let json = serde_json::to_string(&pending).unwrap();
+        assert!(json.contains(r#""requested_at_unix_ms":5"#), "{json}");
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), pending);
+        // A plain log connection does not hold or answer approvals.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Some(fresh(dir.path()));
+        for request in [hold, approve, Request::Pending] {
+            assert!(matches!(
+                handle(&mut log, request).0,
+                Response::Error(e) if e == "not served on this connection"
+            ));
+        }
     }
 
     #[test]

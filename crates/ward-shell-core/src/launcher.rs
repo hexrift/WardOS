@@ -7,7 +7,7 @@
 //! that stand for sessions carry the agent states §7 names, so a project row
 //! reads `payments-api   ● working`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ward_daemon::describe::SessionDescription;
 use ward_daemon::render::Tone;
@@ -63,6 +63,8 @@ pub enum Command {
     ResumeSession {
         /// Session id.
         session: String,
+        /// Its worktree.
+        worktree: PathBuf,
     },
     /// `ward verify` on the current project.
     VerifyProject,
@@ -79,6 +81,76 @@ pub enum Command {
     Browser,
     /// System settings.
     Settings,
+}
+
+/// What a command line needs besides the [`Command`]: the project the
+/// command centre was opened for, and where session logs live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineContext<'a> {
+    /// The current project's worktree.
+    pub worktree: &'a Path,
+    /// The state root holding `sessions/<id>/events.log`.
+    pub state: &'a Path,
+}
+
+impl Command {
+    /// The shell command line that carries the command out, for a launcher
+    /// that runs lines (fuzzel `--dmenu` through `wardos-menu`, ADR-0016).
+    /// Interactive commands open a terminal in the worktree (`foot -D`); ones
+    /// that print and exit keep it open (`--hold`) so the result can be read.
+    #[must_use]
+    pub fn shell(&self, ctx: &LineContext<'_>) -> String {
+        let terminal = |dir: &Path, hold: bool, cmd: &str| {
+            let hold = if hold { " --hold" } else { "" };
+            format!("foot{hold} -D {} -- {cmd}", quote(&path_text(dir)))
+        };
+        match self {
+            Self::OpenProject { worktree } => format!("foot -D {}", quote(&path_text(worktree))),
+            Self::StartAgent { kind } => {
+                let agent = match kind {
+                    AgentKind::ClaudeCode => "claude",
+                    AgentKind::Codex => "codex",
+                    // WardOS has no launcher for another agent: a terminal in
+                    // the project is the honest answer.
+                    AgentKind::Other => {
+                        return format!("foot -D {}", quote(&path_text(ctx.worktree)));
+                    }
+                };
+                terminal(ctx.worktree, false, &format!("ward {agent}"))
+            }
+            Self::ResumeSession { worktree, .. } => terminal(worktree, false, "ward watch"),
+            Self::VerifyProject => terminal(ctx.worktree, true, "ward verify"),
+            Self::ReviewPermissions => terminal(ctx.worktree, true, "ward-shell settings"),
+            Self::ReplaySession { session } => {
+                let log = ctx.state.join("sessions").join(session).join("events.log");
+                terminal(
+                    ctx.worktree,
+                    true,
+                    &format!("ward replay {}", quote(&path_text(&log))),
+                )
+            }
+            Self::Terminal => "foot".to_owned(),
+            Self::Browser => "chromium".to_owned(),
+            Self::Settings => "wardos-menu system".to_owned(),
+        }
+    }
+}
+
+fn path_text(path: &Path) -> String {
+    path.display().to_string()
+}
+
+/// `s` as one shell word: unchanged when it is plain, single-quoted otherwise.
+#[must_use]
+pub fn quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%=,".contains(c));
+    if plain {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 /// One row of the command centre.
@@ -228,6 +300,7 @@ impl Launcher {
                 tone,
                 command: Command::ResumeSession {
                     session: card.session.clone(),
+                    worktree: card.worktree.clone(),
                 },
             });
         }
@@ -315,6 +388,24 @@ impl Launcher {
                     .filter(|e| e.section == section)
                     .collect();
                 (!rows.is_empty()).then_some((section, rows))
+            })
+            .collect()
+    }
+
+    /// The matching entries as dmenu lines, `SECTION<TAB>label<TAB>command`,
+    /// in section order: what `ward-shell launcher --lines` prints for fuzzel.
+    /// The label carries the detail after three spaces, as [`Launcher::text`]
+    /// shows it; the command is [`Command::shell`].
+    #[must_use]
+    pub fn lines(&self, ctx: &LineContext<'_>) -> Vec<String> {
+        self.matches()
+            .into_iter()
+            .map(|e| {
+                let label = match &e.detail {
+                    Some(detail) => format!("{}   {detail}", e.label),
+                    None => e.label.clone(),
+                };
+                format!("{}\t{label}\t{}", e.section.title(), e.command.shell(ctx))
             })
             .collect()
     }
@@ -426,7 +517,8 @@ mod tests {
         assert_eq!(
             sections[1].1[2].command,
             Command::ResumeSession {
-                session: "sess_live".to_owned()
+                session: "sess_live".to_owned(),
+                worktree: PathBuf::from("/home/dev/payments-api"),
             }
         );
         assert_eq!(
@@ -458,6 +550,70 @@ mod tests {
             launcher
                 .text()
                 .starts_with("WARD\n\nSearch anything…\n\nPROJECTS\npayments-api   ● working\n")
+        );
+    }
+
+    #[test]
+    fn lines_are_section_label_and_shell_command_for_a_described_session() {
+        let d = description(NetworkCapability::Development);
+        let mut model = Model::new(false);
+        model.apply(wardd(&[agent(AgentState::Working)]).remove(0));
+        let live = SessionCard::new(&d, &model);
+        let old = card("tamperward", "sess_old", Some(AgentState::Finished), true);
+        let launcher = Launcher::new(&[live, old]);
+        let ctx = LineContext {
+            worktree: Path::new("/home/dev/payments-api"),
+            state: Path::new("/home/dev/.local/state/ward"),
+        };
+        assert_eq!(
+            launcher.lines(&ctx),
+            [
+                "PROJECTS\tpayments-api   ● working\tfoot -D /home/dev/payments-api",
+                "PROJECTS\ttamperward   sealed\tfoot -D /home/dev/tamperward",
+                "AGENTS\tStart Claude\tfoot -D /home/dev/payments-api -- ward claude",
+                "AGENTS\tStart Codex\tfoot -D /home/dev/payments-api -- ward codex",
+                "AGENTS\tResume session   payments-api · ● working\tfoot -D /home/dev/payments-api -- ward watch",
+                "SECURITY\tVerify current project\tfoot --hold -D /home/dev/payments-api -- ward verify",
+                "SECURITY\tReview permissions\tfoot --hold -D /home/dev/payments-api -- ward-shell settings",
+                "SECURITY\tReplay last session   tamperward\tfoot --hold -D /home/dev/payments-api -- ward replay /home/dev/.local/state/ward/sessions/sess_old/events.log",
+                "SYSTEM\tTerminal\tfoot",
+                "SYSTEM\tBrowser\tchromium",
+                "SYSTEM\tSettings\twardos-menu system",
+            ]
+        );
+        let mut filtered = launcher;
+        filtered.set_query("verify");
+        assert_eq!(
+            filtered.lines(&ctx),
+            [
+                "SECURITY\tVerify current project\tfoot --hold -D /home/dev/payments-api -- ward verify"
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_words_are_quoted_only_when_they_need_it() {
+        assert_eq!(quote("/home/dev/payments-api"), "/home/dev/payments-api");
+        assert_eq!(quote("a-b_c.d+e:f@g%h=i,j"), "a-b_c.d+e:f@g%h=i,j");
+        assert_eq!(quote("/home/dev/my project"), "'/home/dev/my project'");
+        assert_eq!(quote("it's"), "'it'\\''s'");
+        assert_eq!(quote(""), "''");
+        assert_eq!(quote("$HOME"), "'$HOME'");
+        let ctx = LineContext {
+            worktree: Path::new("/home/dev/my project"),
+            state: Path::new("/s"),
+        };
+        assert_eq!(
+            Command::VerifyProject.shell(&ctx),
+            "foot --hold -D '/home/dev/my project' -- ward verify"
+        );
+        assert_eq!(
+            Command::StartAgent {
+                kind: AgentKind::Other
+            }
+            .shell(&ctx),
+            "foot -D '/home/dev/my project'",
+            "no launcher for another agent: a terminal in the project"
         );
     }
 

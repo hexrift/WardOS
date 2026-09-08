@@ -22,6 +22,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod replay;
 mod tui;
+use ward_daemon::approvals::ApprovalDecision;
 use ward_daemon::{Session, SessionMeta, SnapshotRole, client, daemon, render, selftest, snapshot};
 use ward_events::{EndReason, LogReader};
 
@@ -208,6 +209,35 @@ enum SessionCmd {
         #[arg(long)]
         json: bool,
     },
+    /// The approvals the session daemon holds (ADR-0016), one JSON object per
+    /// line: `{id, tool, summary, reason, requested_at_unix_ms, agent, session}`.
+    /// The session is the project's current one, else (the desktop asks from
+    /// home, not a project) the newest one a daemon serves.
+    Pending {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+        /// The session id, instead of looking one up.
+        #[arg(long)]
+        session: Option<String>,
+        /// Keep printing each approval as it becomes pending, until the daemon
+        /// closes the stream (exit 0).
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Answer a held approval: `allow` (once), `allow-session` (the same tool on
+    /// the same target for the rest of the session) or `deny`.
+    Approve {
+        /// The approval's id, as `ward session pending` lists it.
+        id: u64,
+        /// The answer.
+        decision: ApprovalDecision,
+        /// Project directory (default: current).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The session id, as `ward session pending` lists it.
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -311,6 +341,17 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Session(SessionCmd::Describe { dir, json }) => {
             cmd_describe(&dir.unwrap_or_else(cwd), json)
         }
+        Command::Session(SessionCmd::Pending {
+            dir,
+            session,
+            follow,
+        }) => cmd_pending(&dir.unwrap_or_else(cwd), session.as_deref(), follow),
+        Command::Session(SessionCmd::Approve {
+            id,
+            decision,
+            dir,
+            session,
+        }) => cmd_approve(&dir.unwrap_or_else(cwd), session.as_deref(), id, decision),
         Command::Snapshot(SnapshotCmd::Create { dir, role }) => {
             cmd_snapshot_create(&dir.unwrap_or_else(cwd), role.into())
         }
@@ -390,6 +431,69 @@ fn cmd_watch(
             })?;
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One line of `ward session pending`: the approval plus who asks and where.
+#[derive(serde::Serialize)]
+struct PendingLine<'a> {
+    #[serde(flatten)]
+    approval: &'a ward_daemon::approvals::Approval,
+    /// The agent's product name, for the notification's title.
+    agent: &'a str,
+    /// The session id.
+    session: &'a str,
+}
+
+/// `ward session pending [--follow]`: what the daemon holds, as JSON lines the
+/// desktop's `wardos-approve` reads. A quiet stream is not a dead daemon; the
+/// stream ending is the log sealed, and the command exits 0.
+fn cmd_pending(dir: &Path, session: Option<&str>, follow: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let socket = client::desktop_socket(dir, &state, session)?;
+    let mut sink = client::connect(&socket)?;
+    let description = client::describe(&mut sink)?;
+    let agent = description
+        .agent
+        .as_ref()
+        .map_or("agent", |a| a.name.as_str());
+    let mut out = std::io::stdout();
+    let mut print = |approval: &ward_daemon::approvals::Approval| {
+        let line = PendingLine {
+            approval,
+            agent,
+            session: &description.session,
+        };
+        if let Ok(json) = serde_json::to_string(&line) {
+            // A closed pipe is the reader's choice, not an error.
+            let _ = writeln!(out, "{json}").and_then(|()| out.flush());
+        }
+    };
+    if follow {
+        client::follow_pending(&socket, FOLLOW_SETTLE, |approval| print(&approval))?;
+    } else {
+        for approval in client::pending(&mut sink)? {
+            print(&approval);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// How long `ward session pending --follow` lets the stream go quiet before
+/// it counts the backlog as read.
+const FOLLOW_SETTLE: Duration = Duration::from_millis(250);
+
+/// `ward session approve <id> <decision>`.
+fn cmd_approve(
+    dir: &Path,
+    session: Option<&str>,
+    id: u64,
+    decision: ApprovalDecision,
+) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
+    client::approve(&mut sink, id, decision)?;
+    println!("  approval {id} {decision}");
     Ok(ExitCode::SUCCESS)
 }
 

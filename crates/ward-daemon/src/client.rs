@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use ward_events::{EventKind, EventRecord, WardEvent};
 
+use crate::approvals::{Approval, ApprovalDecision};
 use crate::control::{Next, RemoteSink, Request, Response, SOCKET_NAME, is_evidence};
 use crate::describe::SessionDescription;
 use crate::error::{Error, Result};
@@ -43,6 +44,27 @@ pub fn socket_path(project_dir: &Path, state: &Path) -> Result<PathBuf> {
         ))
     })?;
     Ok(session_dir(state, &meta.id).join(SOCKET_NAME))
+}
+
+/// The control socket the desktop means (ADR-0016): `session`'s when one is
+/// named; else `project_dir`'s current session when it has one; else the
+/// newest session a daemon serves, since the bar and the approval listener run
+/// from the home directory, not a project. [`Error::Project`] when there is
+/// none of those.
+pub fn desktop_socket(project_dir: &Path, state: &Path, session: Option<&str>) -> Result<PathBuf> {
+    if let Some(id) = session {
+        return Ok(session_dir(state, id).join(SOCKET_NAME));
+    }
+    if let Some(meta) = SessionMeta::current(project_dir, state).ok().flatten() {
+        return Ok(session_dir(state, &meta.id).join(SOCKET_NAME));
+    }
+    match crate::daemon::newest_live(state)? {
+        Some(meta) => Ok(session_dir(state, &meta.id).join(SOCKET_NAME)),
+        None => Err(Error::Project(format!(
+            "no session for {} and no live session anywhere; run `ward up` to start one",
+            project_dir.display()
+        ))),
+    }
 }
 
 /// Connect to the daemon on `socket`; [`NO_DAEMON`] when nothing answers there.
@@ -112,6 +134,78 @@ pub fn describe(sink: &mut RemoteSink) -> Result<SessionDescription> {
             .map_err(|e| Error::Events(format!("session description: {e}"))),
         Response::Error(e) => Err(Error::Events(format!("daemon refused describe: {e}"))),
         other => Err(Error::Events(format!("unexpected response {other:?}"))),
+    }
+}
+
+/// The approvals the daemon holds (`ward session pending`), oldest first.
+pub fn pending(sink: &mut RemoteSink) -> Result<Vec<Approval>> {
+    match sink.call(&Request::Pending)? {
+        Response::Pending(approvals) => Ok(approvals),
+        Response::Error(e) => Err(Error::Daemon(format!("daemon refused pending: {e}"))),
+        other => Err(Error::Events(format!("unexpected response {other:?}"))),
+    }
+}
+
+/// Answer a held approval (`ward session approve <id> <decision>`).
+pub fn approve(sink: &mut RemoteSink, id: u64, decision: ApprovalDecision) -> Result<()> {
+    match sink.call(&Request::Approve { id, decision })? {
+        Response::Ok => Ok(()),
+        Response::Error(e) => Err(Error::Daemon(e)),
+        other => Err(Error::Events(format!("unexpected response {other:?}"))),
+    }
+}
+
+/// `ward session pending --follow`: hand `emit` every approval as it becomes
+/// pending, until the daemon closes the stream. The backlog is skipped with
+/// [`catch_up`]'s rule (`idle` of silence), then what is pending now is
+/// emitted, then each live `CapabilityRequested` record prompts a fresh
+/// listing so an approval is emitted once, with its id and reason, and an
+/// approval already answered by then is not emitted at all.
+pub fn follow_pending(
+    socket: &Path,
+    idle: Duration,
+    mut emit: impl FnMut(Approval),
+) -> Result<WatchEnd> {
+    let mut subscriber = connect(socket)?;
+    subscriber.send(&Request::Subscribe { from_seq: 0 })?;
+    let mut records = 0;
+    let mut emitted = Vec::new();
+    let list = |emitted: &mut Vec<u64>, emit: &mut dyn FnMut(Approval)| -> Result<()> {
+        let mut sink = connect(socket)?;
+        for approval in pending(&mut sink)? {
+            if !emitted.contains(&approval.id) {
+                emitted.push(approval.id);
+                emit(approval);
+            }
+        }
+        Ok(())
+    };
+    // The backlog: read until the stream goes quiet, or ends.
+    loop {
+        match subscriber.next_within(idle)? {
+            Next::Quiet => break,
+            Next::Closed => return Ok(WatchEnd::Closed { records }),
+            Next::Response(response) => {
+                if let Some(end) = step(Some(response), &mut records, &mut |_| {})? {
+                    return Ok(end);
+                }
+            }
+        }
+    }
+    list(&mut emitted, &mut emit)?;
+    subscriber.set_read_timeout(None)?;
+    loop {
+        let response = subscriber.next_response()?;
+        let asked = matches!(
+            &response,
+            Some(Response::Record(rec)) if matches!(rec.event, WardEvent::CapabilityRequested { .. })
+        );
+        if let Some(end) = step(response, &mut records, &mut |_| {})? {
+            return Ok(end);
+        }
+        if asked {
+            list(&mut emitted, &mut emit)?;
+        }
     }
 }
 
@@ -365,7 +459,9 @@ mod tests {
                 let request: Request = serde_json::from_str(&line).unwrap();
                 seen.push(request.clone());
                 match request {
-                    Request::Ping => reply(&mut writer, &Response::Ok),
+                    Request::Ping | Request::Approve { id: 4, .. } => {
+                        reply(&mut writer, &Response::Ok);
+                    }
                     Request::Describe => reply(
                         &mut writer,
                         &Response::Description(serde_json::to_value(description()).unwrap()),
@@ -382,6 +478,20 @@ mod tests {
                         }
                         break;
                     }
+                    Request::Pending => reply(
+                        &mut writer,
+                        &Response::Pending(vec![Approval {
+                            id: 4,
+                            tool: "Write".into(),
+                            summary: "/work/a.rs".into(),
+                            reason: "r".into(),
+                            requested_at_unix_ms: 0,
+                        }]),
+                    ),
+                    Request::Approve { id, .. } => reply(
+                        &mut writer,
+                        &Response::Error(format!("approval {id}: not pending")),
+                    ),
                     Request::Evidence { event } => {
                         let response = match refuse {
                             Some(e) => Response::Error(e.into()),
@@ -554,6 +664,111 @@ mod tests {
         let state = dir.path().join("state");
         let err = socket_path(dir.path(), &state).unwrap_err().to_string();
         assert!(err.starts_with("no session for "), "{err}");
+        // The desktop's socket: a named session needs no lookup; otherwise a
+        // project without a session falls back to a live one, and says so when
+        // there is none.
+        assert_eq!(
+            desktop_socket(dir.path(), &state, Some("sess_x")).unwrap(),
+            state.join("sessions/sess_x").join(SOCKET_NAME)
+        );
+        let err = desktop_socket(dir.path(), &state, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no live session anywhere"), "{err}");
+    }
+
+    #[test]
+    fn pending_and_approve_go_through_the_daemon() {
+        let (chain, log) = records(&[]);
+        let (_dir, socket, server) = fake_daemon(chain, log, None);
+        let mut sink = connect(&socket).unwrap();
+        let listed = pending(&mut sink).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, 4);
+        assert_eq!(listed[0].tool, "Write");
+        approve(&mut sink, 4, ApprovalDecision::Allow).unwrap();
+        let err = approve(&mut sink, 5, ApprovalDecision::Deny).unwrap_err();
+        assert_eq!(err.to_string(), "daemon: approval 5: not pending");
+        drop(sink);
+        let seen = server.join().unwrap();
+        assert_eq!(seen[1], Request::Pending);
+        assert_eq!(
+            seen[2],
+            Request::Approve {
+                id: 4,
+                decision: ApprovalDecision::Allow
+            }
+        );
+    }
+
+    #[test]
+    fn follow_pending_emits_what_is_pending_after_the_backlog_then_on_each_request() {
+        // A daemon whose subscription streams a backlog, goes quiet, then sends
+        // a `CapabilityRequested` record; `Pending` answers one approval, the
+        // same one each time, so it is emitted once.
+        let asked = crate::approvals::requested_event("Write", "/work/a.rs", "r");
+        let (_, backlog) = records(&[(Origin::Wardd, working()), (Origin::Wardd, asked.clone())]);
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut pending_calls = 0;
+            // The subscription has been streamed and closed; the listings that
+            // follow are what the test counts.
+            let mut done = false;
+            // Connections: the subscriber, then one per `Pending` listing.
+            for stream in listener.incoming().flatten() {
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let reply = |writer: &mut std::os::unix::net::UnixStream, r: &Response| {
+                    let mut b = serde_json::to_vec(r).unwrap();
+                    b.push(b'\n');
+                    writer.write_all(&b).unwrap();
+                };
+                while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                    match serde_json::from_str::<Request>(&line).unwrap() {
+                        Request::Ping => reply(&mut writer, &Response::Ok),
+                        Request::Pending => {
+                            pending_calls += 1;
+                            reply(
+                                &mut writer,
+                                &Response::Pending(vec![Approval {
+                                    id: 1,
+                                    tool: "Write".into(),
+                                    summary: "/work/a.rs".into(),
+                                    reason: "r".into(),
+                                    requested_at_unix_ms: 0,
+                                }]),
+                            );
+                        }
+                        Request::Subscribe { .. } => {
+                            for rec in &backlog {
+                                reply(&mut writer, &Response::Record(Box::new(rec.clone())));
+                            }
+                            std::thread::sleep(Duration::from_millis(300));
+                            let (_, fresh) = records(&[(Origin::Wardd, asked.clone())]);
+                            reply(&mut writer, &Response::Record(Box::new(fresh[0].clone())));
+                            std::thread::sleep(Duration::from_millis(100));
+                            done = true;
+                            break;
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                    line.clear();
+                }
+                if done && pending_calls >= 2 {
+                    break;
+                }
+            }
+            pending_calls
+        });
+        let mut seen = Vec::new();
+        let end = follow_pending(&socket, Duration::from_millis(50), |a| seen.push(a)).unwrap();
+        assert_eq!(end, WatchEnd::Closed { records: 3 });
+        assert_eq!(seen.len(), 1, "listed twice, emitted once");
+        assert_eq!(seen[0].id, 1);
+        assert_eq!(server.join().unwrap(), 2);
     }
 
     #[test]

@@ -110,6 +110,61 @@ observer: !step_through
   pause_before_network: true
 ```
 
+### 4.1 Approvals held by the daemon (ADR-0016)
+
+With a `wardd` serving the session, an `ask` is no longer handed to the agent's own
+prompt. The flow, in the order it happens:
+
+```text
+agent hook ──► ward-agent hook ──► hooks.sock ──► ward (Hooks) ──► control.sock ──► wardd
+  PreToolUse                        {hook,tool,summary}      decide() = ask     Request::Hold
+                                                                                    │ appends CapabilityRequested (seq N)
+                                                                                    │ pending += {id: N, tool, summary, reason}
+      desktop ◄── ward session pending --follow ◄── Subscribe ◄─────────────────────┤
+  wardos-approve shows the notification; y / s / n                                  │
+      desktop ──► ward session approve N allow|allow-session|deny ──► Request::Approve
+                                                                                    │ appends CapabilityDecided
+agent ◄── {decision: allow|deny, reason} ◄── Response::Decision ◄───────────────────┘
+```
+
+1. `ward` (the process running the sandbox) starts its hook listener with a
+   `DaemonHolder` when the session's control socket answers. When `decide` says `ask`,
+   the listener sends `Request::Hold { tool, summary, reason, timeout_secs }` over a
+   connection of its own and waits for the one answer that connection gets. Each hook
+   connection is served on its own thread, so a held write does not stall the agent's
+   other hooks.
+2. The daemon appends a `CapabilityRequested` record (`event-model.md` §7) and registers
+   the approval under that record's sequence number as its id, in one step under the
+   log's mutex, so a subscriber that sees the record can already answer it.
+   `Request::Pending` lists what is open; `Request::Approve { id, decision }` answers
+   it with `allow`, `allow-session` or `deny`. `allow-session` is remembered for the
+   same tool on the same target for the rest of the session: the next such `Hold` is
+   answered at once, and still recorded as a request and a session-scoped decision.
+3. When the answer arrives, or `timeout_secs` pass (`approval.timeout_secs`, the
+   session's `WARD_APPROVAL_TIMEOUT_SECS`, default 60), the daemon appends
+   `CapabilityDecided` and answers `Response::Decision { id, decision, reason }`. The
+   hook relays `allow` or `deny` with the reason (`approval: allowed once`, `approval:
+   allowed for the session`, `approval: denied`, `approval: timed out`) and records the
+   claim with the decision the agent actually heard (`PreToolUse Write /work/src/lib.rs
+   → deny`). A session that ends with a question open releases it as `approval:
+   session ended`, denied, and no record follows the seal.
+4. Deny is the default: on timeout, on a daemon lost mid-hold (`approval: lost the
+   daemon`), and on a sealed log. Only when there is no daemon at all does `ask` pass
+   through to the agent's own prompt as before (§4), because there is nothing to hold
+   it and nothing to show it. `ward-agent hook` waits up to five minutes for the
+   decision, which is what makes a held approval possible: its old five-second read
+   timeout would have printed nothing and let the agent's default flow decide.
+
+The desktop side is `wardos-approve` (`desktop.md` §Commands): `--watch` follows
+`ward session pending --follow` (one JSON object per line: `id`, `tool`, `summary`,
+`reason`, `requested_at_unix_ms`, `agent`, `session`) and shows each approval as a
+mako notification with `Allow once` / `Allow session` / `Deny` actions, relaying the
+chosen one as `ward session approve --session <id> <n> <decision>`; without arguments
+it lists what is pending and takes `y` / `s` / `n` from the keyboard. From home, where
+the listener and the bar run, `ward session pending` and `ward-shell` mean the newest
+session a daemon serves (`client::desktop_socket`); a project directory still means
+its own session, and `--session` names one outright.
+
 ## 5. Headless and interactive
 
 Interactive: `claude` with a TTY inside the sandbox (PID 1 forwards signals). Headless:

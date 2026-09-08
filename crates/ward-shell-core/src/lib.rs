@@ -26,14 +26,16 @@ pub mod launcher;
 pub mod panel;
 pub mod settings;
 pub mod trust;
+pub mod waybar;
 
 pub use feed::{Counters, Model, SessionState, TamperWard, Verification, counters_text};
-pub use launcher::{Command, Entry, Launcher, Section, SessionCard};
+pub use launcher::{Command, Entry, Launcher, LineContext, Section, SessionCard, quote};
 pub use panel::{Group, duration_text, panel_text, session_panel};
 pub use settings::{Row, Settings, rows_text};
 pub use trust::{
-    Header, Segment, TrustBar, agent_glyph, agent_tone, agent_word, short_id, trust_bar_segments,
-    trust_bar_text, trust_tone,
+    Header, Segment, SegmentName, TrustBar, agent_glyph, agent_tone, agent_word, short_id,
+    tone_name, trust_bar_segments, trust_bar_text, trust_tone,
 };
 pub use ward_daemon::describe::SessionDescription;
 pub use ward_daemon::render::Tone;
+pub use waybar::Module;

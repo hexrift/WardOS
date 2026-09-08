@@ -28,7 +28,7 @@ use crate::egress::Egress;
 use crate::error::{Error, Result};
 use crate::gateway::Gateway;
 use crate::github;
-use crate::hooks::Hooks;
+use crate::hooks::{DaemonHolder, Holder, Hooks};
 use crate::ids::{ev_capture, ev_hash, ev_role, ev_snapshot, new_session_id, project_id_for};
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
 use crate::verify;
@@ -408,6 +408,18 @@ impl Session {
         &self.state
     }
 
+    /// Where an `ask` waits for the user (ADR-0016): the session daemon, when
+    /// one serves this session; otherwise nothing, and the ask passes through
+    /// to the agent's own prompt as before.
+    fn holder(&self) -> Option<std::sync::Arc<dyn Holder>> {
+        let socket = session_dir(&self.state, &self.session_str).join(SOCKET_NAME);
+        RemoteSink::connect(&socket)?;
+        Some(std::sync::Arc::new(DaemonHolder::new(
+            socket,
+            approval_timeout(),
+        )))
+    }
+
     /// The entry snapshot id (`blake3:…`).
     pub fn entry_snapshot(&self) -> &str {
         &self.entry_snapshot
@@ -588,7 +600,12 @@ impl Session {
             &self.manifest.network,
             opts.gateways.iter().map(|g| g.route.clone()).collect(),
         )?;
-        let hooks = Hooks::start(&run_dir, self.manifest.observer, self.protected_paths())?;
+        let hooks = Hooks::start_with(
+            &run_dir,
+            self.manifest.observer,
+            self.protected_paths(),
+            self.holder(),
+        )?;
         let launch = self.prepare(argv, opts, &run_dir, &egress, &hooks)?;
         let outcome = launch.run()?;
 
@@ -877,6 +894,19 @@ fn load_project_policy(worktree: &Path) -> Result<Policy> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Policy::default()),
         Err(e) => Err(Error::io(&path, e)),
     }
+}
+
+/// How long the daemon holds an unanswered approval before denying it
+/// (`approval.timeout_secs`): `$WARD_APPROVAL_TIMEOUT_SECS`, else
+/// [`crate::approvals::DEFAULT_TIMEOUT_SECS`]. The policy schema has no
+/// `approval` key yet, so the session's environment is where the knob lives.
+#[must_use]
+pub fn approval_timeout() -> Duration {
+    let secs = std::env::var("WARD_APPROVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(crate::approvals::DEFAULT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
 
 /// The default state root: `$WARD_STATE_DIR`, else `~/.local/state/ward`.

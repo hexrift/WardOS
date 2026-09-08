@@ -5,6 +5,12 @@
 //! TamperWard protects (`docs/tamperward-integration.md` §6). That refusal is
 //! best-effort steering at the hook layer: only `Write`/`Edit`-style tools are
 //! inspected, never `Bash`, and the trusted verifier remains the real guard.
+//!
+//! An `ask` is held rather than handed to the agent's own prompt when a
+//! [`Holder`] is attached (ADR-0016): the session daemon keeps the question,
+//! the desktop shows it, and the answer (or the timeout, which denies) is what
+//! the agent hears. With no daemon serving the session there is nothing to
+//! hold it, and `ask` passes through as before.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -18,10 +24,66 @@ use serde::{Deserialize, Serialize};
 use ward_events::{ClaimKind, PayloadText, WardEvent};
 use ward_policy::ObserverMode;
 
+use crate::control::{RemoteSink, Request, Response};
 use crate::error::{Error, Result};
 
 /// Longest a client may take to send its request line.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How much longer than its own timeout a hold waits for the daemon's answer
+/// before treating the daemon as gone.
+const HOLD_GRACE: Duration = Duration::from_secs(5);
+
+/// Where an `ask` goes to wait for the user.
+pub trait Holder: Send + Sync {
+    /// Hold `tool` on `summary` for the reason given until it is answered or
+    /// times out; `None` when nothing can hold it (the `ask` then passes
+    /// through to the agent's own prompt).
+    fn hold(&self, tool: &str, summary: &str, reason: &str) -> Option<HookResponse>;
+}
+
+/// The session daemon as the holder: one `Request::Hold` per question over
+/// its control socket, answered when the user has.
+pub struct DaemonHolder {
+    socket: PathBuf,
+    timeout: Duration,
+}
+
+impl DaemonHolder {
+    /// Hold through the daemon on `socket`, denying after `timeout`.
+    #[must_use]
+    pub fn new(socket: PathBuf, timeout: Duration) -> Self {
+        Self { socket, timeout }
+    }
+}
+
+impl Holder for DaemonHolder {
+    fn hold(&self, tool: &str, summary: &str, reason: &str) -> Option<HookResponse> {
+        let mut sink = RemoteSink::connect(&self.socket)?;
+        sink.set_read_timeout(Some(self.timeout + HOLD_GRACE))
+            .ok()?;
+        let request = Request::Hold {
+            tool: tool.to_owned(),
+            summary: summary.to_owned(),
+            reason: reason.to_owned(),
+            timeout_secs: self.timeout.as_secs(),
+        };
+        // Once the question is with the daemon the answer is final: a lost
+        // daemon denies, it never lets the ask through.
+        Some(match sink.call(&request) {
+            Ok(Response::Decision {
+                decision, reason, ..
+            }) => HookResponse { decision, reason },
+            Ok(Response::Error(e)) => HookResponse {
+                decision: HookDecision::Deny,
+                reason: format!("approval: {e}"),
+            },
+            Ok(_) | Err(_) => HookResponse {
+                decision: HookDecision::Deny,
+                reason: "approval: lost the daemon".to_owned(),
+            },
+        })
+    }
+}
 
 /// One hook request from the sandbox (`hook-protocol.md`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,8 +249,21 @@ pub struct Hooks {
 
 impl Hooks {
     /// Start answering hook requests under `observer`, denying writes to
-    /// `protected` paths, listening at `dir/hooks.sock`.
+    /// `protected` paths, listening at `dir/hooks.sock`; an `ask` passes
+    /// through to the agent's own prompt.
     pub fn start(dir: &Path, observer: ObserverMode, protected: Vec<String>) -> Result<Self> {
+        Self::start_with(dir, observer, protected, None)
+    }
+
+    /// [`Hooks::start`] with every `ask` held by `holder` until the user
+    /// answers it. Each held question is answered on its own thread so one
+    /// pending approval does not stall the agent's other hooks.
+    pub fn start_with(
+        dir: &Path,
+        observer: ObserverMode,
+        protected: Vec<String>,
+        holder: Option<Arc<dyn Holder>>,
+    ) -> Result<Self> {
         let socket = dir.join("hooks.sock");
         let listener = UnixListener::bind(&socket)
             .map_err(|e| Error::Sandbox(format!("hook socket {}: {e}", socket.display())))?;
@@ -197,11 +272,21 @@ impl Hooks {
         let thread = {
             let (claims, shutdown) = (claims.clone(), shutdown.clone());
             std::thread::spawn(move || {
+                let protected = Arc::new(protected);
+                let mut held: Vec<JoinHandle<()>> = Vec::new();
                 for stream in listener.incoming().flatten() {
                     if shutdown.load(Ordering::SeqCst) {
                         break;
                     }
-                    serve(stream, observer, &protected, &claims);
+                    held.retain(|h| !h.is_finished());
+                    let (protected, claims, holder) =
+                        (Arc::clone(&protected), Arc::clone(&claims), holder.clone());
+                    held.push(std::thread::spawn(move || {
+                        serve(stream, observer, &protected, &claims, holder.as_deref());
+                    }));
+                }
+                for h in held {
+                    let _ = h.join();
                 }
             })
         };
@@ -242,13 +327,14 @@ impl Hooks {
     }
 }
 
-/// Handle one connection: read a line, decide, record, reply. Malformed input
-/// closes the connection silently.
+/// Handle one connection: read a line, decide, hold an `ask` when there is a
+/// holder, record, reply. Malformed input closes the connection silently.
 fn serve(
     mut stream: UnixStream,
     observer: ObserverMode,
     protected: &[String],
     claims: &Mutex<Vec<Claim>>,
+    holder: Option<&dyn Holder>,
 ) {
     drop(stream.set_read_timeout(Some(READ_TIMEOUT)));
     let mut line = String::new();
@@ -258,7 +344,14 @@ fn serve(
     else {
         return;
     };
-    let response = decide(&observer, protected, &req);
+    let mut response = decide(&observer, protected, &req);
+    if let (HookDecision::Ask, Some(holder)) = (response.decision, holder) {
+        let tool = req.tool.as_deref().unwrap_or_default();
+        let summary = req.summary.as_deref().unwrap_or_default();
+        if let Some(held) = holder.hold(tool, summary, &response.reason) {
+            response = held;
+        }
+    }
     if let Ok(mut v) = claims.lock() {
         v.push(Claim {
             at: SystemTime::now(),
@@ -276,6 +369,7 @@ fn serve(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use crate::approvals::{Approval, ApprovalDecision, Approvals, Outcome};
     use ward_policy::StepPolicy;
 
     fn req(hook: &str, tool: Option<&str>, summary: Option<&str>) -> HookRequest {
@@ -643,5 +737,236 @@ mod tests {
 
         hooks.stop();
         assert!(!socket.exists());
+    }
+
+    /// A holder over an in-process [`Approvals`], ids counted up: the daemon's
+    /// hold without the daemon.
+    struct LocalHolder {
+        approvals: Arc<Approvals>,
+        next_id: std::sync::atomic::AtomicU64,
+        timeout: Duration,
+    }
+
+    impl Holder for LocalHolder {
+        fn hold(&self, tool: &str, summary: &str, reason: &str) -> Option<HookResponse> {
+            if self.approvals.remembered(tool, summary) {
+                return Some(Outcome::Remembered.response());
+            }
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.approvals
+                .register(Approval {
+                    id,
+                    tool: tool.into(),
+                    summary: summary.into(),
+                    reason: reason.into(),
+                    requested_at_unix_ms: 0,
+                })
+                .ok()?;
+            Some(self.approvals.wait(id, self.timeout).response())
+        }
+    }
+
+    fn held_hooks(dir: &Path, timeout: Duration) -> (Hooks, Arc<Approvals>) {
+        let approvals = Arc::new(Approvals::new());
+        let holder = LocalHolder {
+            approvals: Arc::clone(&approvals),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+            timeout,
+        };
+        let hooks =
+            Hooks::start_with(dir, step(true, true), protected(), Some(Arc::new(holder))).unwrap();
+        (hooks, approvals)
+    }
+
+    const WRITE: &str =
+        "{\"hook\":\"PreToolUse\",\"tool\":\"Write\",\"summary\":\"/work/src/lib.rs\"}\n";
+
+    fn ask_in_background(socket: &Path, line: &'static str) -> std::thread::JoinHandle<String> {
+        let socket = socket.to_path_buf();
+        std::thread::spawn(move || roundtrip(&socket, line))
+    }
+
+    #[test]
+    fn a_held_ask_waits_for_the_answer_and_relays_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hooks, approvals) = held_hooks(dir.path(), Duration::from_secs(5));
+        let asking = ask_in_background(hooks.socket(), WRITE);
+        assert!(
+            crate::daemon::wait_until(Duration::from_secs(2), || !approvals.pending().is_empty()),
+            "the question is pending while the agent waits"
+        );
+        let pending = approvals.pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tool, "Write");
+        assert_eq!(pending[0].summary, "/work/src/lib.rs");
+        assert_eq!(pending[0].reason, "step-through: pause before writes");
+        assert!(!asking.is_finished(), "the hook is held");
+
+        approvals
+            .answer(pending[0].id, ApprovalDecision::Allow)
+            .unwrap();
+        let resp: HookResponse = serde_json::from_str(&asking.join().unwrap()).unwrap();
+        assert_eq!(resp.decision, HookDecision::Allow);
+        assert_eq!(resp.reason, "approval: allowed once");
+
+        // A denial relays as deny; the claim records what the agent heard.
+        let asking = ask_in_background(hooks.socket(), WRITE);
+        assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
+            !approvals.pending().is_empty()
+        }));
+        approvals
+            .answer(approvals.pending()[0].id, ApprovalDecision::Deny)
+            .unwrap();
+        let resp: HookResponse = serde_json::from_str(&asking.join().unwrap()).unwrap();
+        assert_eq!(resp.decision, HookDecision::Deny);
+        assert_eq!(resp.reason, "approval: denied");
+        let events = hooks.drain_events();
+        assert_claim(
+            &events[0].1,
+            ClaimKind::ToolUse,
+            "PreToolUse Write /work/src/lib.rs → allow",
+        );
+        assert_claim(
+            &events[1].1,
+            ClaimKind::ToolUse,
+            "PreToolUse Write /work/src/lib.rs → deny",
+        );
+        hooks.stop();
+    }
+
+    #[test]
+    fn a_held_ask_nobody_answers_is_denied_when_the_timeout_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hooks, approvals) = held_hooks(dir.path(), Duration::from_millis(80));
+        let started = std::time::Instant::now();
+        let reply = roundtrip(hooks.socket(), WRITE);
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        let resp: HookResponse = serde_json::from_str(&reply).unwrap();
+        assert_eq!(resp.decision, HookDecision::Deny);
+        assert_eq!(resp.reason, "approval: timed out");
+        assert!(approvals.pending().is_empty());
+        // Other hooks are not held at all.
+        let reply = roundtrip(
+            hooks.socket(),
+            "{\"hook\":\"PreToolUse\",\"tool\":\"Read\",\"summary\":\"/work/src/lib.rs\"}\n",
+        );
+        let resp: HookResponse = serde_json::from_str(&reply).unwrap();
+        assert_eq!(resp.decision, HookDecision::Allow);
+        hooks.stop();
+    }
+
+    #[test]
+    fn allow_session_answers_the_same_question_without_asking_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hooks, approvals) = held_hooks(dir.path(), Duration::from_secs(5));
+        let asking = ask_in_background(hooks.socket(), WRITE);
+        assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
+            !approvals.pending().is_empty()
+        }));
+        approvals
+            .answer(approvals.pending()[0].id, ApprovalDecision::AllowSession)
+            .unwrap();
+        let resp: HookResponse = serde_json::from_str(&asking.join().unwrap()).unwrap();
+        assert_eq!(resp.decision, HookDecision::Allow);
+        assert_eq!(resp.reason, "approval: allowed for the session");
+
+        // The same tool on the same path: allowed at once, nothing pending.
+        let started = std::time::Instant::now();
+        let resp: HookResponse = serde_json::from_str(&roundtrip(hooks.socket(), WRITE)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(resp.decision, HookDecision::Allow);
+        assert_eq!(resp.reason, "approval: allowed for the session");
+        assert!(approvals.pending().is_empty());
+        // Another path is a new question.
+        let asking = ask_in_background(
+            hooks.socket(),
+            "{\"hook\":\"PreToolUse\",\"tool\":\"Write\",\"summary\":\"/work/src/main.rs\"}\n",
+        );
+        assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
+            !approvals.pending().is_empty()
+        }));
+        approvals.close();
+        let resp: HookResponse = serde_json::from_str(&asking.join().unwrap()).unwrap();
+        assert_eq!(resp.decision, HookDecision::Deny);
+        assert_eq!(resp.reason, "approval: session ended");
+        hooks.stop();
+    }
+
+    #[test]
+    fn without_a_daemon_to_hold_it_the_ask_passes_through() {
+        let dir = tempfile::tempdir().unwrap();
+        // A socket path nothing listens on: the holder cannot connect.
+        let holder: Arc<dyn Holder> = Arc::new(DaemonHolder::new(
+            dir.path().join("control.sock"),
+            Duration::from_secs(1),
+        ));
+        let hooks =
+            Hooks::start_with(dir.path(), step(true, false), protected(), Some(holder)).unwrap();
+        let resp: HookResponse = serde_json::from_str(&roundtrip(hooks.socket(), WRITE)).unwrap();
+        assert_eq!(resp.decision, HookDecision::Ask);
+        assert_eq!(resp.reason, "step-through: pause before writes");
+        hooks.stop();
+    }
+
+    /// A daemon stand-in answering `Ping` and one `Hold`.
+    fn fake_daemon(dir: &Path, answer: Option<Response>) -> PathBuf {
+        let socket = dir.join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                    let request: Request = serde_json::from_str(&line).unwrap();
+                    let response = match request {
+                        Request::Ping => Some(Response::Ok),
+                        Request::Hold { .. } => answer.clone(),
+                        other => panic!("{other:?}"),
+                    };
+                    let Some(response) = response else {
+                        return;
+                    };
+                    let mut bytes = serde_json::to_vec(&response).unwrap();
+                    bytes.push(b'\n');
+                    writer.write_all(&bytes).unwrap();
+                    line.clear();
+                }
+            }
+        });
+        socket
+    }
+
+    #[test]
+    fn the_daemon_holder_relays_the_decision_and_denies_a_lost_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = fake_daemon(
+            dir.path(),
+            Some(Response::Decision {
+                id: 4,
+                decision: HookDecision::Allow,
+                reason: "approval: allowed once".into(),
+            }),
+        );
+        let holder = DaemonHolder::new(socket, Duration::from_secs(1));
+        let resp = holder.hold("Write", "/work/a.rs", "r").unwrap();
+        assert_eq!(resp.decision, HookDecision::Allow);
+        assert_eq!(resp.reason, "approval: allowed once");
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = fake_daemon(dir.path(), None);
+        let holder = DaemonHolder::new(socket, Duration::from_secs(1));
+        let resp = holder.hold("Write", "/work/a.rs", "r").unwrap();
+        assert_eq!(resp.decision, HookDecision::Deny);
+        assert_eq!(resp.reason, "approval: lost the daemon");
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = fake_daemon(dir.path(), Some(Response::Error("session ended".into())));
+        let holder = DaemonHolder::new(socket, Duration::from_secs(1));
+        let resp = holder.hold("Write", "/work/a.rs", "r").unwrap();
+        assert_eq!(resp.decision, HookDecision::Deny);
+        assert_eq!(resp.reason, "approval: session ended");
     }
 }
