@@ -1,0 +1,72 @@
+# WardOS boot splash (Plymouth "script" theme; image/README.md, "Plymouth").
+#
+# The host layer never shouts (design-language.md §2, §3): the Ward Dark ground
+# (#0E0F11) fills the screen, WARD sits in the middle in the text colour (#D9D9D6),
+# and boot progress is a 2 px line in the muted text colour (#8A8D91) that grows
+# under it. No logo, no animation, no gradient. The LUKS passphrase prompt uses the
+# same two colours and shows one bullet per typed character, so an encrypted disk
+# (image/disk.sh --luks) is unlocked on this surface, not on a text fallback.
+# line.png is one muted pixel; script themes have no rectangle primitive, so the
+# progress line is that pixel scaled.
+
+ground_r = 0.055; ground_g = 0.059; ground_b = 0.067;   # #0E0F11
+text_r   = 0.851; text_g   = 0.851; text_b   = 0.839;   # #D9D9D6
+muted_r  = 0.541; muted_g  = 0.553; muted_b  = 0.569;   # #8A8D91
+
+Window.SetBackgroundTopColor(ground_r, ground_g, ground_b);
+Window.SetBackgroundBottomColor(ground_r, ground_g, ground_b);
+
+screen_w = Window.GetWidth();
+screen_h = Window.GetHeight();
+centre_x = Window.GetX() + screen_w / 2;
+centre_y = Window.GetY() + screen_h / 2;
+
+# The word.
+mark = Image.Text("WARD", text_r, text_g, text_b, 1, "Sans 28");
+mark_sprite = Sprite(mark);
+mark_sprite.SetPosition(centre_x - mark.GetWidth() / 2, centre_y - mark.GetHeight() / 2, 1);
+
+# Progress: a 2 px line, at most as wide as the word, growing left to right.
+line = Image("line.png");
+bar_w = mark.GetWidth();
+bar_x = centre_x - bar_w / 2;
+bar_y = centre_y + mark.GetHeight() / 2 + 12;
+bar_sprite = Sprite();
+bar_sprite.SetPosition(bar_x, bar_y, 1);
+
+fun progress_callback(duration, progress) {
+  width = Math.Int(bar_w * progress);
+  if (width < 1) width = 1;
+  bar_sprite.SetImage(line.Scale(width, 2));
+}
+Plymouth.SetBootProgressFunction(progress_callback);
+
+# Passphrase (LUKS) and questions: the prompt, then one bullet per character.
+prompt_sprite = Sprite();
+prompt_sprite.SetPosition(bar_x, bar_y + 24, 1);
+bullets_sprite = Sprite();
+
+fun display_password_callback(prompt, bullets) {
+  if (prompt == "") prompt = "Passphrase";
+  text = Image.Text(prompt + ":", text_r, text_g, text_b, 1, "Sans 12");
+  prompt_sprite.SetImage(text);
+  dots = "";
+  for (i = 0; i < bullets; i++) dots += "•";
+  bullets_sprite.SetImage(Image.Text(dots, muted_r, muted_g, muted_b, 1, "Sans 12"));
+  bullets_sprite.SetPosition(bar_x + text.GetWidth() + 8, bar_y + 24, 1);
+}
+Plymouth.SetDisplayPasswordFunction(display_password_callback);
+
+fun display_normal_callback() {
+  prompt_sprite.SetImage(Image.Text("", 0, 0, 0));
+  bullets_sprite.SetImage(Image.Text("", 0, 0, 0));
+}
+Plymouth.SetDisplayNormalFunction(display_normal_callback);
+
+# Messages (fsck, "Press Escape for details"): one line of muted text, no dialogue.
+message_sprite = Sprite();
+message_sprite.SetPosition(bar_x, bar_y + 48, 1);
+fun message_callback(text) {
+  message_sprite.SetImage(Image.Text(text, muted_r, muted_g, muted_b, 1, "Sans 10"));
+}
+Plymouth.SetMessageFunction(message_callback);

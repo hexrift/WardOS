@@ -1,6 +1,8 @@
 # Build-context filter for image/Containerfile. podman reads .containerignore, docker
-# reads .dockerignore; the two files are kept identical. The context is only what
-# `cargo build --locked` needs plus the image/ inputs.
+# reads .dockerignore; the two files are kept identical. The context is what
+# `cargo build --locked` needs (the workspace, desktop/shell and desktop/theme included),
+# image/ and the desktop tree that image/install-desktop.sh places (desktop/ stays in;
+# its tests do not). *.md is excluded, so desktop/**/README.md never ships either.
 .git
 .github
 .claude
@@ -10,5 +12,6 @@ assets
 experiments
 examples
 docs
+desktop/tests
 *.md
 .tamperward
