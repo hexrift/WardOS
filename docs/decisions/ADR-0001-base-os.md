@@ -60,3 +60,25 @@ atomic + signed + rollback + Secure-Boot-on + OCI delivery today.
 E-09: build, install with FDE on the reference desktop and one laptop with Secure Boot
 enabled, break an update, confirm automatic rollback (RT-001/002), record boot and resume
 times, and test the sealed backend in parallel. Re-open this ADR if E-09 fails.
+
+## Addendum 2026-09: base rebased from Fedora 42 to Fedora 44
+
+The image pinned `quay.io/fedora/fedora-bootc:42` from its first draft. By September
+2026 Fedora 42 had reached end of life (May 2026) and the COPR repositories the Hyprland
+ecosystem came from had dropped their `fedora-42-x86_64` chroot, which the new "image
+packages" CI job reported the first time it ran for real (`dnf copr enable`: "Chroot
+not found in the given Copr project (fedora-42-x86_64)"). Per this ADR's rule that a
+rebase is a deliberate edit of `FROM` and never an implicit change, the edit is made
+here, once, to the current release, 44: `image/Containerfile` pins `fedora-bootc:44`,
+`image/check-packages.sh`, `desktop/install.sh` and the tests read the release from
+that `FROM` line so nothing else has to be kept in step, and `image/coprs.txt` starts
+empty again in the first attempt; the check then showed that Fedora had retired
+Hyprland itself after 42, so three COPRs came back for exactly what 44 lacks
+(`mineiro/hyprland` for the ecosystem, `erikreider/swayosd` from swayosd's author,
+`atim/lazygit`), chosen by `check-packages.sh --discover` from the projects that build
+for 44. Each COPR is part of the image's trust set: its builds are the owner's, not
+Fedora's, and the repository file stays in the image; the list is kept short, every
+entry justified in `image/coprs.txt`, and an entry leaves the day Fedora packages the
+thing. E-09 runs against 44.
+Lesson recorded: a pinned release needs a calendar; the next rebase is due before 44's
+end of life, and the "image packages" job is the alarm if it is missed.

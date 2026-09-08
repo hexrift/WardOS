@@ -1,25 +1,31 @@
-# WardOS host image (ADR-0001: Fedora bootc, immutable, OCI-delivered).
+# WardOS host image (ADR-0001: Fedora bootc, immutable, OCI-delivered; ADR-0016: the
+# desktop is in the image).
 #
-# Two stages:
-#   1. `builder`  compiles `ward`, `wardd` and `ward-agent` from this checkout with the
-#                 toolchain pinned in rust-toolchain.toml (the image tag must match it).
-#   2. the host   Fedora bootc base plus the packages the runtime needs, the three
-#                 binaries, and the WardOS system configuration.
+# Stages:
+#   1. `release` / `builder`  the ward binaries, from a checksum-verified release tarball
+#                             or compiled from this checkout (--build-arg WARDOS_SOURCE).
+#   2. the host               Fedora bootc base, every package of image/packages.txt,
+#                             the binaries, the desktop tree (desktop/ placed by
+#                             image/install-desktop.sh), the WardOS system configuration,
+#                             the Plymouth theme.
 #
 # Nothing here fetches code over the network at build time except dnf from the Fedora
-# repositories and cargo from crates.io (locked to Cargo.lock). No secrets, no `curl | sh`.
+# repositories, cargo from crates.io (locked to Cargo.lock) and the release tarball
+# (checked against its recorded SHA-256). No secrets, no `curl | sh`.
 # Build with image/build.sh; turn into a disk with image/disk.sh; see image/README.md.
 
 # ---------------------------------------------------------------------------------------
 # Where the ward binaries come from. `release` (default) downloads a published release
 # tarball and checks its SHA-256, so the image is reproducible from a known version and
 # the tools and the image keep separate release cadences. `builder` compiles this
-# checkout instead (development images).
+# checkout instead (development images, the "image build" CI job).
 ARG WARDOS_SOURCE=release
 ARG WARDOS_RELEASE=v0.1.1
 ARG WARDOS_SHA256=b5e77a2629edecd8fd47a2d320231fd6dfd8d489a4393e36c4a7519b934173fa
 
-# Stage 1a: a published release.
+# Stage 1a: a published release. The three host binaries are required; ward-shell and
+# wardos-theme-render are copied when the tarball has them (release tarballs from v0.2
+# carry both; v0.1.1 does not, and an image built from it has no shell surfaces).
 FROM docker.io/library/alpine:3.20 AS release
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 ARG WARDOS_RELEASE
@@ -30,22 +36,30 @@ RUN name="wardos-${WARDOS_RELEASE#v}-x86_64-linux" \
     && echo "${WARDOS_SHA256}  ${name}.tar.gz" | sha256sum -c - \
     && tar -xzf "${name}.tar.gz" \
     && mv "${name}/ward" "${name}/wardd" "${name}/ward-agent" /out/ \
+    && for optional in ward-shell wardos-theme-render; do \
+         if [ -f "${name}/${optional}" ]; then mv "${name}/${optional}" /out/; \
+         else echo "release ${WARDOS_RELEASE} has no ${optional} (expected from v0.2)"; fi; \
+       done \
     && rm -rf "${name}" "${name}.tar.gz"
 
-# Stage 1b: build the ward binaries from this checkout.
+# Stage 1b: build the binaries from this checkout.
 # The tag pins the same channel as rust-toolchain.toml (1.94.1); bump both together.
 FROM docker.io/library/rust:1.94.1 AS builder
 WORKDIR /src
 # The whole workspace, filtered by the repository's .containerignore (no target/, no .git).
 COPY . .
 # --locked refuses to touch Cargo.lock, so the image is built from exactly the dependency
-# set the repository reviewed. Only the three host binaries are built.
+# set the repository reviewed. Five host binaries: the three of the secure-session
+# layer, the shell (desktop/shell) and the theme renderer (desktop/theme).
 RUN cargo build --release --locked \
       --package ward-cli \
       --package ward-daemon \
       --package ward-agent \
+      --package ward-shell \
+      --package wardos-theme \
     && mkdir -p /out \
-    && cp target/release/ward target/release/wardd target/release/ward-agent /out/
+    && cp target/release/ward target/release/wardd target/release/ward-agent \
+          target/release/ward-shell target/release/wardos-theme-render /out/
 
 # The chosen source, under one name for the host stage (a stage name, not an image;
 # hadolint cannot tell, hence the ignore).
@@ -54,9 +68,12 @@ FROM ${WARDOS_SOURCE} AS binaries
 
 # ---------------------------------------------------------------------------------------
 # Stage 2: the bootable host.
-# `42` pins the current Fedora release; a rebase is a deliberate edit of this line
-# (see image/README.md, "Base image tag").
-FROM quay.io/fedora/fedora-bootc:42
+# `44` pins the current Fedora release; a rebase is a deliberate edit of this line
+# (image/README.md "Base image tag"; ADR-0001 addendum 2026-09: 42 went end-of-life
+# and lost its COPR chroots). image/check-packages.sh and desktop/install.sh read the
+# release from this line, so keep the tag a plain number.
+FROM quay.io/fedora/fedora-bootc:44
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG WARDOS_VERSION=dev
 
@@ -66,41 +83,64 @@ LABEL org.wardos.version="${WARDOS_VERSION}" \
       org.opencontainers.image.source="https://github.com/hexrift/WardOS" \
       org.opencontainers.image.licenses="Apache-2.0"
 
-# Runtime packages only (ADR-0001: no developer toolchain on the host, with one
-# deliberate exception, explained in image/README.md):
-#   bubblewrap        sandbox builder used by wardd (ADR-0002, ADR-0013)
-#   git               snapshot/worktree plumbing (ADR-0010) and `ward init` on repos
-#   curl              transport for `ward` self-checks and the egress relay tests
-#   python3           scripts/security-check and hook adapters
-#   openssh-clients   agent-side git-over-ssh through the credential broker
-#   cargo, rust       the trusted verifier (Phase 4) binds a host Rust toolchain
-#                     read-only into Zone 2; on the image that is the distro one
-#   podman            nested containers inside project environments (ADR-0005)
-# Package versions follow the Fedora 42 repositories at build time; the image digest,
-# not per-package pins, is what gets recorded in evidence (hadolint DL3041 is disabled
-# in .hadolint.yaml for this reason).
-RUN dnf -y install \
-      bubblewrap \
-      git \
-      curl \
-      python3 \
-      openssh-clients \
-      cargo \
-      rust \
-      podman \
-    && dnf clean all
+# Every package, with the reason for each, is in image/packages.txt (docs/desktop.md
+# §Packages), and the COPRs the Hyprland pieces Fedora does not carry come from are in
+# image/coprs.txt (part of the image's trust set, image/README.md "COPRs"); CI checks
+# the names against this Fedora release plus those COPRs before this line ever runs. `dnf copr`
+# is a dnf5 plugin, hence dnf5-plugins first; the repository files stay in the image so
+# `wardos-install package` can layer from the same sources.
+# Package versions follow the repositories at build time; the image digest, not
+# per-package pins, is what gets recorded in evidence (hadolint DL3041 is disabled in
+# .hadolint.yaml for this reason).
+COPY image/coprs.txt /tmp/coprs.txt
+COPY image/packages.txt /tmp/packages.txt
+RUN dnf -y install dnf5-plugins \
+    && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/coprs.txt \
+       | while read -r copr; do echo "copr enable $copr"; dnf -y copr enable "$copr" || exit 1; done \
+    && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/packages.txt | xargs dnf -y install \
+    && dnf clean all \
+    && rm -f /tmp/packages.txt /tmp/coprs.txt
 
-# The three host binaries. /usr is the immutable, image-owned tree in bootc.
-COPY --from=binaries /out/ward /usr/bin/ward
-COPY --from=binaries /out/wardd /usr/bin/wardd
-COPY --from=binaries /out/ward-agent /usr/bin/ward-agent
+# The host binaries: ward, wardd, ward-agent (required), ward-shell and
+# wardos-theme-render (present from release v0.2 and in every checkout build). /usr is
+# the immutable, image-owned tree in bootc.
+COPY --from=binaries /out/ /usr/bin/
+RUN test -x /usr/bin/ward && test -x /usr/bin/wardd && test -x /usr/bin/ward-agent \
+    && ls -l /usr/bin/ward*
+
+# The desktop tree (docs/desktop.md §Layout): commands to /usr/bin, defaults to
+# /usr/share/wardos and /etc/xdg, user units and their preset, the tty1 autologin
+# drop-in for the `wardos` user. Placed by the same script desktop/install.sh uses on an
+# existing Fedora, so the two installs cannot drift apart.
+COPY image/install-desktop.sh /tmp/install-desktop.sh
+COPY desktop/ /tmp/desktop/
+RUN /tmp/install-desktop.sh /tmp/desktop / \
+    && rm -rf /tmp/desktop /tmp/install-desktop.sh
 
 # Host configuration, all under /usr so it ships with the image and is not user state.
 COPY image/sysctl.d/50-wardos.conf /usr/lib/sysctl.d/50-wardos.conf
 COPY image/tmpfiles.d/wardos.conf /usr/lib/tmpfiles.d/wardos.conf
 COPY image/systemd/wardos-firstboot.service /usr/lib/systemd/system/wardos-firstboot.service
+COPY image/systemd/wardos-flathub.service /usr/lib/systemd/system/wardos-flathub.service
+COPY image/flathub.sh /usr/libexec/wardos-flathub
+COPY image/plymouth/wardos/ /usr/share/plymouth/themes/wardos/
 
-# Enable the first-boot report and let bootc check the layout (no /var content baked in,
-# kernel present, nothing under /usr/local that should be in /usr, ...).
-RUN systemctl enable wardos-firstboot.service \
+# Enable the first-boot units; pick the boot splash; sweep what package scriptlets left
+# in runtime-only places; let bootc check the layout (no /var content baked in, kernel
+# present, nothing under /usr/local that should be in /usr, ...). Plymouth runs from the
+# initramfs, so the chosen theme has to be inside it: the initramfs is rebuilt with
+# dracut the way other bootc desktops do (the "image build" job proves the step runs;
+# how the splash looks at boot is E-09's to record). /var and /run must be empty in a
+# bootc image (they are runtime state, created at boot by tmpfiles.d): dnf, cups and
+# the software catalogue leave caches and logs there during the install, which the
+# lint reports as warnings, so they go. /run/systemd is the build engine's own mount
+# (its stub-resolv.conf is busy during a docker build) and is left alone.
+RUN systemctl enable wardos-firstboot.service wardos-flathub.service \
+    && if rpm -q plymouth-plugin-script >/dev/null 2>&1; then plymouth-set-default-theme wardos; \
+       else plymouth-set-default-theme spinner; fi \
+    && kver=$(basename /usr/lib/modules/*) \
+    && dracut --force --no-hostonly --reproducible --zstd --add ostree \
+         --kver "$kver" "/usr/lib/modules/$kver/initramfs.img" \
+    && rm -rf /var/log/* /var/cache/* /tmp/* \
+    && find /run -mindepth 1 -maxdepth 1 ! -name systemd -exec rm -rf {} + \
     && bootc container lint

@@ -29,7 +29,7 @@ jobs:
           toolchain: 1.94.1
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release --locked -p ward-cli -p ward-daemon -p ward-agent
+        run: cargo build --release --locked -p ward-cli -p ward-daemon -p ward-agent -p ward-shell -p wardos-theme
       - name: Resolve version
         id: version
         run: |
@@ -44,7 +44,10 @@ jobs:
           version="${{ steps.version.outputs.version }}"
           name="wardos-${version}-x86_64-linux"
           mkdir -p "dist/${name}"
-          cp target/release/ward target/release/wardd target/release/ward-agent "dist/${name}/"
+          # The image's release stage expects these five (image/Containerfile); tarballs
+          # before v0.2 carried only the first three.
+          cp target/release/ward target/release/wardd target/release/ward-agent \
+             target/release/ward-shell target/release/wardos-theme-render "dist/${name}/"
           cp install.sh README.md LICENSE "dist/${name}/"
           cp -r docs "dist/${name}/docs"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
@@ -58,6 +61,8 @@ jobs:
           "${dir}/ward" --version
           "${dir}/wardd" --help >/dev/null
           "${dir}/ward-agent" --help >/dev/null
+          "${dir}/ward-shell" --help >/dev/null
+          "${dir}/wardos-theme-render" --help >/dev/null
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -43,6 +43,21 @@ them; `~/.config/wardos/bash-override` opts out entirely). `hyprland/hyprland.co
 sources: `envs`, `monitors`, `input`, `looknfeel`, `windows`, `autostart`, `bindings`, then
 the theme fragment last so the theme's colours win.
 
+On the image, and on an existing Fedora through `desktop/install.sh`, the tree is placed
+by [`image/install-desktop.sh`](../image/install-desktop.sh) (table in
+[`image/README.md`](../image/README.md#the-desktop-in-the-image)): `bin/` → `/usr/bin`,
+`lib/` → `/usr/lib/wardos`, `hyprland/` → `/usr/share/wardos/hypr` with `/etc/xdg/hypr`
+a link to that directory (so `source = ./envs.conf` resolves), `config/` →
+`/usr/share/wardos/config` with `/etc/xdg/<component>` links for the ones that read
+`XDG_CONFIG_DIRS` (waybar, foot, mako, fuzzel, btop, fastfetch) and
+`gtk/settings.ini` copied to `/etc/xdg/gtk-3.0` and `gtk-4.0`, `bash/profile.d-wardos.sh`
+→ `/etc/profile.d/wardos.sh`, `themes/`, `webapps/`, `tuis/`, `flatpaks.txt` →
+`/usr/share/wardos/`, `systemd/user/` → `/usr/lib/systemd/user` with
+`/usr/lib/systemd/user-preset/90-wardos.preset` enabling every unit that has `[Install]`,
+the getty drop-in → `/etc/systemd/system/getty@tty1.service.d/` (the image; an existing
+Fedora only with `install.sh --autologin`). `shell/`, `theme/` and `tests/` never land on
+the host. Every row is asserted by `desktop/tests/install.test.sh` against a temp root.
+
 User state: `~/.config/wardos/` (theme choice, rendered theme in `theme/current/`, user
 overrides), `~/.local/share/wardos/` (web app profiles, installed themes, fonts),
 `~/.local/state/wardos/` (toggles, last screenshot, record pid). Image-owned defaults
@@ -90,7 +105,9 @@ bar clicks call it directly); `wardos-update --check` prints one Waybar JSON lin
 (`text`, `tooltip`, `class` `available` or empty); `wardos-screensaver` returns at once
 when `wardos-toggle screensaver` has switched it off (hypridle calls it at 2.5 min);
 `wardos-approve --watch` is the long-running listener behind `wardos-approve.service`;
-`wardos-battery-monitor` runs once per call, from its timer every 2 min.
+`wardos-battery-monitor` runs once per call, from its timer every 2 min;
+`wardos-setup audio` opens `pulsemixer` when it is installed and `pavucontrol` otherwise
+(the image ships pavucontrol; pulsemixer is not packaged in Fedora).
 
 Rules: a command never edits a file it did not create without a backup next to it
 (`<file>.bak`); root is asked for with `pkexec` (desktop) or `sudo` (terminal) and only
@@ -190,12 +207,21 @@ live in `~/.local/share/wardos/themes/`.
 
 ## Packages
 
-`image/packages.txt` lists every package the desktop needs, one per line with a comment
-naming what it is for. The `Containerfile` installs from it; CI checks every name exists
-in Fedora 42 (`dnf repoquery` in a `fedora:42` container) and builds the whole image
-with `docker build` on `main`. Applications that are not in Fedora come from Flathub via
-`wardos-install app` and the defaults in `desktop/flatpaks.txt`; nothing is downloaded
-by `curl | sh`.
+[`image/packages.txt`](../image/packages.txt) lists every package the desktop needs, one
+per line with a comment naming what it is for, exact Fedora package names (`fd-find`,
+`pipewire-pulseaudio`). What Fedora does not carry (the Hyprland ecosystem beyond the
+compositor, lazygit) comes from the COPRs of [`image/coprs.txt`](../image/coprs.txt),
+part of the image's trust set (`image/README.md`, "COPRs"). The `Containerfile` enables
+the COPRs and installs from the manifest, and `desktop/install.sh` layers the same with
+`dnf` or `rpm-ostree`; CI checks every name exists in the Fedora release the image pins
+(44; `image/check-packages.sh`: `dnf repoquery` in a `fedora:44` container, job "image
+packages" on every pull request) and builds the whole image with `docker build`
+(`image.yml`, job "image build", on `main` and on pull requests that touch `image/`,
+`desktop/` or the crates). A name the check has not confirmed yet carries
+`# unverified` until it has (none today); the check, not the file, decides. Applications that are not in Fedora
+come from Flathub via `wardos-install app` and the defaults in `desktop/flatpaks.txt`,
+installed once by `wardos-flathub.service` after the first boot with a network; nothing
+is downloaded by `curl | sh`. `mise` is not in Fedora and not in the image.
 
 ## Tests
 
@@ -244,12 +270,12 @@ command, key and test exist on `main`.
 | btop, fastfetch, lazygit, fzf, ripgrep, fd, bat, eza, zoxide | shipped, configured, themed | ✔ config: `config/btop`, `config/fastfetch`, aliases and fzf/zoxide hooks in `config/bash` |
 | Chromium default browser, theme colour | chromium, `chromium.json` fragment | ✔ config: `config/chromium/chromium-flags.conf`, `BROWSER=chromium` |
 | Nautilus | nautilus | |
-| Plymouth boot splash | WardOS Plymouth theme | |
-| Autologin into Hyprland | getty autologin + uwsm | ✔ `systemd/system/getty@tty1.service.d/autologin.conf`, `config/bash/profile.d-wardos.sh` (tested) |
-| Full-disk encryption at install | `image/disk.sh --luks` (bootc-image-builder) | |
-| omarchy-update, migrations | `wardos-update` (bootc upgrade, flatpak, refresh) | |
-| Snapshots and rollback (Limine + snapper) | bootc deployments, `bootc rollback` | |
-| Install on an existing Arch | `desktop/install.sh` on an existing Fedora | |
+| Plymouth boot splash | WardOS Plymouth theme | ✔ `image/plymouth/wardos/` (WARD on the ground, 2 px progress, passphrase prompt), selected in the `Containerfile` and in the initramfs (the image build proves it); its look at boot is E-09's |
+| Autologin into Hyprland | getty autologin + uwsm | ✔ `systemd/system/getty@tty1.service.d/autologin.conf`, `config/bash/profile.d-wardos.sh` (tested); placed by `image/install-desktop.sh` (`--no-autologin` for existing Fedoras), the user from `image/disk.sh --user wardos` (`install.test.sh`) |
+| Full-disk encryption at install | `image/disk.sh --luks` (Anaconda kickstart on the ISO; bootc-image-builder has no LUKS) | ✔ `image/disk.sh --type iso --luks`, `install.test.sh`; passphrase prompt unverified until E-09 |
+| omarchy-update, migrations | `wardos-update` (bootc upgrade, flatpak, refresh) | ✔ image side: `bootc upgrade`, `image/boot/README.md` |
+| Snapshots and rollback (Limine + snapper) | bootc deployments, `bootc rollback` | ✔ every upgrade keeps the previous deployment; `bootc rollback` (`image/boot/README.md`) |
+| Install on an existing Arch | `desktop/install.sh` on an existing Fedora | ✔ `desktop/install.sh` (dnf or rpm-ostree, `--dry-run`), `install.test.sh` |
 | Share a file over LAN | `wardos-share` | |
 | XCompose special characters | `config/xcompose` | ✔ `config/xcompose/XCompose`, compose on Right Alt |
 | Apple display brightness | `wardos-setup monitors` (ddcutil, asdcontrol when present) | |
@@ -262,4 +288,4 @@ Then some (WardOS only):
 | Approvals as notifications, answered from the keyboard | `wardos-approve`, daemon hold on `ask`; `wardos-approve.service` is the listener |
 | Verify, replay, evidence, snapshots, grants in the menu | `wardos-menu` SECURITY |
 | Sandboxed browser profile per project | `wardos-launch browser --project` |
-| Package names and the whole image checked by CI | `image/packages.txt`, image build job |
+| Package names and the whole image checked by CI | `image/packages.txt`, image build job | ✔ `image/check-packages.sh` ("image packages"), `image.yml` ("image build") |

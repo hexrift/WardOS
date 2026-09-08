@@ -1,0 +1,20 @@
+# Fedora COPR repositories the host enables before installing image/packages.txt
+# (image/README.md, "COPRs"). One `owner/project` per line with the reason; blank lines
+# and `#` comments are ignored. Every COPR here is part of the image's trust set: its
+# packages are built by that COPR's owner, not by Fedora, and its repository file stays
+# in the image so `wardos-install package` can layer from it. Keep the list short and
+# each entry justified; when Fedora packages the thing, remove the entry. A COPR must
+# build for the release the Containerfile pins (its fedora-<NN>-x86_64 chroot), which
+# is what the "image packages" job proves.
+#
+# The Containerfile, image/check-packages.sh (CI: "image packages") and
+# desktop/install.sh enable exactly this list, the same way.
+#
+# Chosen 2026-09 from `check-packages.sh --discover` (the "image packages" log lists
+# every project with a fedora-44 chroot): the smallest set that covers what Fedora 44
+# lacks, preferring the upstream author, then the one repository that carries the
+# whole ecosystem.
+
+mineiro/hyprland      # Hyprland and its ecosystem, retired from Fedora after 42: hyprland, hypridle, hyprlock, hyprpaper, hyprpicker, hyprpolkitagent, hyprsunset, xdg-desktop-portal-hyprland, uwsm, satty (successor of solopasha/hyprland, which builds rawhide only)
+erikreider/swayosd    # swayosd, packaged by its author
+atim/lazygit          # lazygit (not in Fedora)

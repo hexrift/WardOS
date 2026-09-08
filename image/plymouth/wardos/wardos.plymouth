@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=WardOS
+Description=WARD on the ground colour, a 2 px progress line, a plain passphrase prompt (docs/design-language.md)
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/wardos
+ScriptFile=/usr/share/plymouth/themes/wardos/wardos.script
