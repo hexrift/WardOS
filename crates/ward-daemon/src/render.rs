@@ -245,8 +245,8 @@ fn human_ago(d: std::time::Duration) -> String {
 #[must_use]
 pub fn selftest_row(name: &str, blocked: bool) -> String {
     if blocked {
-        format!("  {INK}{name:<32}{RESET}{OK}DENIED{RESET}")
+        format!("  {INK}{name:<36}{RESET}{OK}DENIED{RESET}")
     } else {
-        format!("  {INK}{name:<32}{RESET}{DENY}REACHED{RESET}")
+        format!("  {INK}{name:<36}{RESET}{DENY}REACHED{RESET}")
     }
 }

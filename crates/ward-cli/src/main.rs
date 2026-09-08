@@ -254,14 +254,34 @@ fn cmd_stop(dir: &Path) -> ward_daemon::Result<ExitCode> {
 }
 
 fn cmd_selftest(dir: &Path) -> ward_daemon::Result<ExitCode> {
-    let results = selftest(dir)?;
-    let passed = results.iter().filter(|r| r.blocked).count();
+    let isolation = selftest(dir)?;
+    let state = ward_daemon::session::state_root();
+    let (mut session, throwaway) = match Session::open_current(dir, &state)? {
+        Some(session) => (session, false),
+        None => (Session::start(dir)?, true),
+    };
+    let credentials = ward_daemon::selftest_credentials(&mut session)?;
+    if throwaway {
+        session.stop(EndReason::UserStop)?;
+    } else {
+        session.sync()?;
+    }
     println!("WARD selftest · isolation\n");
-    for r in &results {
+    for r in &isolation {
         println!("{}", render::selftest_row(r.name, r.blocked));
     }
-    println!("\n  {passed}/{} PASS", results.len());
-    Ok(if passed == results.len() {
+    println!("\nWARD selftest · credentials\n");
+    for r in &credentials {
+        println!("{}", render::selftest_row(r.name, r.blocked));
+    }
+    let total = isolation.len() + credentials.len();
+    let passed = isolation
+        .iter()
+        .chain(&credentials)
+        .filter(|r| r.blocked)
+        .count();
+    println!("\n  {passed}/{total} PASS");
+    Ok(if passed == total {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
