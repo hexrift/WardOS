@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # image/install-desktop.sh places a desktop tree into a DESTDIR; desktop/install.sh
 # applies it to an existing Fedora with mocked dnf / rpm-ostree / sudo / systemctl /
-# flatpak; image/flathub.sh adds Flathub and installs the default list.
+# flatpak; image/rootfs/usr/libexec/wardos-flathub adds Flathub and installs the default list.
 # shellcheck source=desktop/tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 
@@ -226,15 +226,15 @@ mock sudo 'exec "$@"'
 PATH="$MOCK_DIR:/usr/bin:/bin" bash "$repo/desktop/install.sh" --destdir "$TMP/root" >"$TMP/out" 2>&1 && fail "must fail without dnf or rpm-ostree"
 grep -q 'Fedora' "$TMP/out" || fail "must say it needs Fedora"
 
-# --- image/flathub.sh: remote, then the default list ---------------------------------
+# --- wardos-flathub: remote, then the default list ---------------------------------
 setup_env
 mock flatpak
 printf '# apps\norg.signal.Signal\n\ncom.spotify.Client # music\n' >"$TMP/flatpaks.txt"
-bash "$repo/image/flathub.sh" "$TMP/flatpaks.txt"
+bash "$repo/image/rootfs/usr/libexec/wardos-flathub" "$TMP/flatpaks.txt"
 assert_logged '^flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo$'
 assert_logged '^flatpak install -y --noninteractive flathub org.signal.Signal com.spotify.Client$'
 : >"$MOCK_LOG"
-bash "$repo/image/flathub.sh" "$TMP/no-such-list"
+bash "$repo/image/rootfs/usr/libexec/wardos-flathub" "$TMP/no-such-list"
 assert_logged '^flatpak remote-add'
 assert_not_logged '^flatpak install'
 

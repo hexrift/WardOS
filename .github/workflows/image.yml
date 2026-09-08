@@ -32,6 +32,9 @@ jobs:
     name: image build
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - name: Free runner disk (the Fedora layer plus a Rust build need it)
@@ -56,3 +59,17 @@ jobs:
             systemctl is-enabled wardos-firstboot.service wardos-flathub.service
             plymouth-set-default-theme
             bootc container lint'
+      # The image everyone else uses (image/README.md, "The published image"): a merge
+      # to main that built and linted is what gets published, never a pull request.
+      - name: Publish to ghcr.io (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker tag wardos:ci "$repo:latest"
+          docker tag wardos:ci "$repo:${GITHUB_SHA::7}"
+          docker push "$repo:latest"
+          docker push "$repo:${GITHUB_SHA::7}"
