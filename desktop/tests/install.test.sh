@@ -226,7 +226,7 @@ bash "$repo/image/check-packages.sh" --file "$TMP/packages.txt" --coprs "$TMP/co
 $(cat "$TMP/out")"
 grep -q 'all 3 names exist' "$TMP/out" || fail "success line missing"
 # The COPRs precede the names, counted, and are enabled with dnf5's copr plugin.
-assert_logged '^docker run --rm quay.io/fedora/fedora:42 bash -c .*dnf5-plugins.*copr enable.* -- 1 owner/project foot hyprland nope-not-a-package$'
+assert_logged '^docker run --rm quay.io/fedora/fedora:42 bash -c .*dnf5-plugins.*echo .copr enable .*dnf -y -q copr enable.* -- 1 owner/project foot hyprland nope-not-a-package$'
 # --dry-run prints the command and runs nothing; --release changes the container tag.
 : >"$MOCK_LOG"
 bash "$repo/image/check-packages.sh" --file "$TMP/packages.txt" --release 43 --dry-run >"$TMP/out"
@@ -237,7 +237,7 @@ CONTAINER_RUNTIME=podman bash "$repo/image/check-packages.sh" --file "$TMP/packa
 assert_logged '^podman run'
 # The real manifest parses and every name is a plain package name (no spaces, no versions).
 bash "$repo/image/check-packages.sh" --dry-run >"$TMP/out"
-grep -q -- '-- 2 solopasha/hyprland atim/lazygit ' "$TMP/out" || fail "coprs.txt not passed:
+grep -q -- '-- 2 solopasha/hyprland dejan/lazygit ' "$TMP/out" || fail "coprs.txt not passed:
 $(cat "$TMP/out")"
 ! sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo/image/packages.txt" | grep -Ev '^[A-Za-z0-9._+-]+$' || fail "packages.txt has a bad name"
 ! sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo/image/coprs.txt" | grep -Ev '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' || fail "coprs.txt has a bad entry"

@@ -68,7 +68,7 @@ fi
 # exactly the resolved names. `%{name}\n` is what dnf5 (Fedora 41+) wants; dnf4 adds
 # its own newline, hence the blank-line filter below.
 # shellcheck disable=SC2016  # the $1/$@ are for the inner bash, expanded in the container
-inner='set -e; n=$1; shift; if [ "$n" -gt 0 ]; then dnf -y -q install dnf5-plugins >&2; fi; while [ "$n" -gt 0 ]; do dnf -y -q copr enable "$1" >&2; shift; n=$((n - 1)); done; dnf -q repoquery --qf "%{name}\n" "$@"'
+inner='set -e; n=$1; shift; if [ "$n" -gt 0 ]; then dnf -y -q install dnf5-plugins >&2; fi; while [ "$n" -gt 0 ]; do echo "copr enable $1" >&2; dnf -y -q copr enable "$1" >&2; shift; n=$((n - 1)); done; dnf -q repoquery --qf "%{name}\n" "$@"'
 cmd=("$runtime" run --rm "quay.io/fedora/fedora:${release}"
   bash -c "$inner" -- "${#coprs[@]}")
 if [[ ${#coprs[@]} -gt 0 ]]; then cmd+=("${coprs[@]}"); fi

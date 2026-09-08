@@ -9,4 +9,4 @@
 # desktop/install.sh enable exactly this list, the same way.
 
 solopasha/hyprland   # the Hyprland ecosystem Fedora does not carry: hypridle, hyprlock, hyprpaper, hyprpicker, hyprpolkitagent, hyprsunset, uwsm, satty, cliphist, swayosd
-atim/lazygit         # lazygit (not in Fedora)
+dejan/lazygit        # lazygit (not in Fedora; atim/lazygit has no Fedora 42 chroot any more)

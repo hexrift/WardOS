@@ -90,7 +90,7 @@ fd-find               # fd
 bat                   # cat with syntax
 eza                   # ls with icons
 zoxide                # cd that learns
-lazygit               # git TUI (COPR atim/lazygit)                            # unverified
+lazygit               # git TUI (COPR dejan/lazygit)                            # unverified
 git-delta             # diffs
 tmux                  # terminal multiplexer
 pavucontrol           # wardos-setup audio (pulsemixer is not packaged; the command prefers it when present)

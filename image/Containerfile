@@ -93,7 +93,8 @@ LABEL org.wardos.version="${WARDOS_VERSION}" \
 COPY image/coprs.txt /tmp/coprs.txt
 COPY image/packages.txt /tmp/packages.txt
 RUN dnf -y install dnf5-plugins \
-    && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/coprs.txt | xargs -r -n1 dnf -y copr enable \
+    && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/coprs.txt \
+       | while read -r copr; do echo "copr enable $copr"; dnf -y copr enable "$copr" || exit 1; done \
     && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/packages.txt | xargs dnf -y install \
     && dnf clean all \
     && rm -f /tmp/packages.txt /tmp/coprs.txt

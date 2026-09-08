@@ -91,7 +91,7 @@ Fedora 42 does not package the Hyprland ecosystem beyond the compositor itself
 (`hypridle`, `hyprlock`, `hyprpaper`, `hyprpicker`, `hyprpolkitagent`, `hyprsunset`,
 `uwsm`, `satty`, `cliphist`, `swayosd` are missing; the "image packages" job proved it)
 nor `lazygit`. They come from COPR repositories listed in [`coprs.txt`](coprs.txt), one
-`owner/project` per line with the reason: `solopasha/hyprland` and `atim/lazygit`.
+`owner/project` per line with the reason: `solopasha/hyprland` and `dejan/lazygit`.
 Three things enable exactly that list the same way: the Containerfile (`dnf5-plugins`,
 then `dnf copr enable` for each, before the install), `check-packages.sh` (the same two
 commands in the check container, so the check sees what the build sees), and
