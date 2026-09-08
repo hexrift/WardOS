@@ -99,6 +99,7 @@ responsibility lives now:
 | `ward-agent` | `cli`, `landlock`, `seccomp`, `privs`, `supervise`, `relay`, `hook` | as planned; `hook` is the hook adapter |
 | `ward-daemon` | `session`, `control`, `daemon`, `sandbox`, `egress`, `gateway`, `hooks`, `verify`, `selftest`, `watch`, `agents`, `render`, `describe`, `snapshot`, `ids` | `gateway` → `ward-credentials`; `verify` → `ward-verifier`; `render` → `ward-observer` |
 | `ward-cli` | `main`, `replay` | as planned; `replay` → `ward-observer` |
+| `image/` (not a crate) | `Containerfile`, `build.sh`, `disk.sh`, `sysctl.d/`, `tmpfiles.d/`, `systemd/`, `boot/`, `secure-boot/`, `keys/` | as planned; `boot/`, `secure-boot/`, `keys/` hold plans and public material only (CODEOWNERS); lint-checked in CI, not yet built (Phase 6 started) |
 
 `wardd` is a per-session daemon (ADR-0015): `ward up` spawns `wardd serve`, which owns
 the session log and serves `sessions/<id>/control.sock` (`control` is the protocol and
