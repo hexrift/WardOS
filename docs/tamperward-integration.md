@@ -175,3 +175,33 @@ image (ADR-0004 addendum).
 3. Does TamperWard want raw kernel-origin file events, or a debounced "files changed
    since last decision" view? The event bus can offer both.
 4. Countersigning anchors: key management on TamperWard's side.
+
+## 8. Shipped in the image (ADR-0017)
+
+The WardOS image installs the `tamperward` npm package (2.10.3, pinned in
+[`image/agents/package.json`](../image/agents/package.json) with its lockfile, `npm ci`
+at build time, [`image/agents/README.md`](../image/agents/README.md)) and links the
+binary at `/usr/bin/tamperward` (→ `/usr/lib/wardos/agents/node_modules/.bin/tamperward`).
+It is image content: root-owned, read-only in the sandbox, replaced by the next image
+update and never fetched at run time. `ward doctor` lists it with its version in the
+`agents` row (the CLI has no `--version`; the version is read from the package's
+`package.json`), and warns with the `npm install -g tamperward` fix on hosts that are
+not the image.
+
+What uses it:
+
+* **`ward init`** (the onboarding path) runs `tamperward init --cwd <dir>` when the
+  binary exists, so a new project gets its `.tamperward/` policy and hook wiring in the
+  same command that writes `.ward/policy.yaml`; the split of §5 is unchanged.
+* **Inside a session**, the agent's `PATH` has it, so `tamperward run -- claude` (the
+  outer envelope of TamperWard's own model, inside the WardOS sandbox) and
+  `tamperward check --worktree` are possible from a session shell, and Claude Code's
+  `hook claude` adapter can be wired by `tamperward init`. Everything it decides there
+  is Zone 3 output: a claim, recorded like any hook decision (§4 of
+  [`agent-integration.md`](agent-integration.md)), never enforcement.
+* **`ward verify`** stays the trusted verification of §6: it restores the protected
+  paths from the entry snapshot and runs the verify command in Zone 2, with no
+  network, from the daemon's reading of `.tamperward/config.yml`. `tamperward verify`
+  inside the session judges the same tree from inside; agreement between the two is
+  the acceptance ("`ward verify` and `tamperward verify` agree on what is protected"),
+  and where they differ the Zone 2 result is the one in evidence.

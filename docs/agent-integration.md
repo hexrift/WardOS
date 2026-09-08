@@ -216,3 +216,30 @@ sandbox from the read-only `/opt` bind, reached `api.anthropic.com` only through
 gateway (the API's `401` for a deliberately invalid host key proves the path), and its
 `SessionStart` hook was logged as a claim. Not yet: a full task with a valid key, the
 GitHub adapter, nested containers.
+
+## 9. Shipped in the image (ADR-0017)
+
+The WardOS image carries both agents, so `ward claude` and `ward codex` work on a fresh
+install without installing anything. [`image/agents/package.json`](../image/agents/package.json)
+pins `@anthropic-ai/claude-code` and `@openai/codex` (and `tamperward`) at exact
+versions; its lockfile records every tarball with an integrity hash; the image build
+runs `npm ci --omit=dev --ignore-scripts` on it under `/usr/lib/wardos/agents` (then
+`npm rebuild @anthropic-ai/claude-code`, the one postinstall that places the native
+binary) and links `/usr/bin/claude` and `/usr/bin/codex` to the two commands. Node.js
+comes from Fedora (`nodejs`, `npm` in `image/packages.txt`) and the build fails when it
+is older than the `engines` floor (22). Versions are bumped by editing `package.json`,
+regenerating the lockfile and opening a pull request; the image build's "What the image
+holds" step prints `claude --version` and `codex --version` as the proof
+([`image/agents/README.md`](../image/agents/README.md)).
+
+How `ward claude` finds them: the sandbox binds `/usr` (and `/opt`) read-only
+(`sandbox.rs`, `SYSTEM_RO`) and builds its `PATH` from the host's entries under those
+roots plus `/usr/bin`, so `/usr/bin/claude` resolves inside the sandbox through
+`/usr/lib/wardos/agents/node_modules/...` the same way it does on the host, root-owned
+and unwritable by the agent. Nothing in `~/.local` or `/home` is needed, which is the
+point: the agent runs from image content only. `ward doctor` reports the three commands
+with their versions (`agents` row), the Node version against the floor (`node`), and
+whether `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are on the host, in the environment or in
+`$WARD_STATE_DIR/vault/` (`keys`; presence only, never a value, with `ward vault set
+ANTHROPIC_API_KEY` as the fix). On a host that is not the image, the rows say so and
+name the `npm install -g` command.

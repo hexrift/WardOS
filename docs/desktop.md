@@ -108,7 +108,11 @@ when `wardos-toggle screensaver` has switched it off (hypridle calls it at 2.5 m
 `wardos-approve --watch` is the long-running listener behind `wardos-approve.service`;
 `wardos-battery-monitor` runs once per call, from its timer every 2 min;
 `wardos-setup audio` opens `pulsemixer` when it is installed and `pavucontrol` otherwise
-(the image ships pavucontrol; pulsemixer is not packaged in Fedora).
+(the image ships pavucontrol; pulsemixer is not packaged in Fedora). The image's firewall
+admits nothing inbound (`image/README.md` "Security posture"), so `wardos-share` is
+expected to open its port for the duration of the run and no longer, with
+`firewall-cmd --add-port=<port>/tcp` (never `--permanent`) before serving and
+`--remove-port` on exit.
 
 Rules: a command never edits a file it did not create without a backup next to it
 (`<file>.bak`); root is asked for with `pkexec` (desktop) or `sudo` (terminal) and only
@@ -317,7 +321,7 @@ command, key and test exist on `main`.
 | Nautilus | nautilus | |
 | Plymouth boot splash | WardOS Plymouth theme | ✔ `image/rootfs/usr/share/plymouth/themes/wardos/` (WARD on the ground, 2 px progress, passphrase prompt), selected in the `Containerfile` and in the initramfs (the image build proves it); its look at boot is E-09's |
 | Autologin into Hyprland | getty autologin + uwsm | ✔ `systemd/system/getty@tty1.service.d/autologin.conf`, `config/bash/profile.d-wardos.sh` (tested); placed by `image/install-desktop.sh` (`--no-autologin` for existing Fedoras), the user from `image/disk.sh --user wardos` (`install.test.sh`) |
-| Full-disk encryption at install | `image/disk.sh --luks` (Anaconda kickstart on the ISO; bootc-image-builder has no LUKS) | ✔ `image/disk.sh --type iso --luks`, `install.test.sh`; passphrase prompt unverified until E-09 |
+| Full-disk encryption at install | `image/disk.sh` (Anaconda kickstart on the ISO, on by default; bootc-image-builder has no LUKS) | ✔ `image/disk.sh --type iso` encrypts unless `--no-luks` (ADR-0017), `install.test.sh`; passphrase prompt unverified until E-09 |
 | omarchy-update, migrations | `wardos-update` (bootc upgrade, flatpak, refresh) | ✔ `wardos-update [system\|flatpaks\|themes\|configs\|--check]`, `wardos-refresh <component>\|--all`; `update.test.sh`, `refresh.test.sh`; image side: `bootc upgrade`, `image/boot/README.md` |
 | Snapshots and rollback (Limine + snapper) | bootc deployments, `bootc rollback` | ✔ every upgrade keeps the previous deployment; `bootc rollback` (`image/boot/README.md`) |
 | Install on an existing Arch | `desktop/install.sh` on an existing Fedora | ✔ `desktop/install.sh` (dnf or rpm-ostree, `--dry-run`), `install.test.sh` |
@@ -335,3 +339,6 @@ Then some (WardOS only):
 | Sandboxed browser profile per project | `wardos-launch browser --project` | ✔ chromium profile under `~/.local/share/wardos/browser/<hash>`; `launch.test.sh` |
 | The first five minutes (ADR-0017) | `wardos-welcome` from `wardos-first-run`, Help ▸ Welcome and the command centre's `Start here` row; `ward init` (policy template, verifier config, `.gitignore`, TamperWard wiring), `ward vault set\|list\|rm\|path`; the shell's no-session line | ✔ `wardos-welcome [--again] [theme\|keys\|project\|agent\|done]`; `welcome.test.sh`, `first-run.test.sh`, `menu.test.sh`; `ward-cli` `init::tests::*`, `vault::tests::*`, `ward-policy` `tests::the_template_*`, `ward-daemon` `gateway::tests::key_comes_from_the_vault_when_the_host_env_is_unset`, `ward-shell` `a_project_without_a_session_gets_the_next_step_not_an_error`; [`onboarding.md`](onboarding.md) |
 | Package names and the whole image checked by CI | `image/packages.txt`, image build job | ✔ `image/check-packages.sh` ("image packages"), `image.yml` ("image build") |
+| Claude Code, Codex and TamperWard in the image (ADR-0017) | `image/agents/package.json` + lockfile, `npm ci` at build time, `/usr/bin/{claude,codex,tamperward}` | ✔ `image/agents/`, Containerfile agents step, "What the image holds" prints the three versions; `ward doctor` rows `agents`, `node`, `keys` (`ward-daemon` `doctor::tests::{agents_lists_versions_and_names_what_is_missing_with_its_package,node_is_checked_against_the_agents_floor,keys_reports_where_a_key_is_and_never_its_value}`) |
+| Host firewall, nothing inbound | firewalld enabled, default zone `wardos` (`image/rootfs/etc/firewalld/zones/wardos.xml`) | ✔ `image/rootfs/usr/lib/systemd/system-preset/90-wardos.preset`, Containerfile; `ward doctor` row `firewall` (`doctor::tests::firewall_wants_firewalld_running_with_a_closed_default_zone`) |
+| Timed image updates, rollback kept | `bootc-fetch-apply-updates.timer` (stage only; the next boot applies), `bootc rollback` | ✔ preset + drop-in `bootc-fetch-apply-updates.service.d/wardos.conf`; "What the image holds" checks `is-enabled`; `wardos-update` stays the manual path |
