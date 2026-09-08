@@ -183,16 +183,27 @@ defaults, four official themes, command centre. Built by CI with pinned digests.
 Acceptance: boots in QEMU and on the reference desktop; WardOS Security CI runs the ST
 suite on the image; performance CI subset green; idle RAM/CPU within budget.
 
-### Phase 6 — started
+### Phase 6 — the desktop, built by CI
 
-[`image/`](../image/README.md) holds the first host image: a two-stage `Containerfile`
-(pinned Rust builder → `fedora-bootc:42` with the runtime packages, `ward`, `wardd`,
-`ward-agent`, the userns sysctl, a first-boot `ward doctor` report), `build.sh` and
-`disk.sh` around `podman build` and `bootc-image-builder`, and the boot, Secure Boot and
-key-handling plans in `image/boot/`, `image/secure-boot/`, `image/keys/`. CI lints it
-(hadolint, shellcheck); nothing has been built or booted yet. Not in the image: Hyprland,
-Ward Shell, themes, the command centre, pinned digests. Next: build and boot it in QEMU
-on a Fedora host, then E-09 on the reference hardware.
+The image now carries the whole desktop ([ADR-0016](decisions/ADR-0016-desktop-feature-set.md),
+[`desktop.md`](desktop.md)): every Omarchy capability on Fedora, rendered by Waybar, fuzzel
+and mako from the Ward Shell's models until E-10 picks the toolkit, and the agent layer
+on top (session state in the bar, approvals held by `wardd` and answered from a
+notification, verification and grants in the command centre). `desktop/` holds the
+`wardos-*` command family (23 commands, one bash test each), the Hyprland tree with the
+full key set, every component configuration, the theme renderer (`wardos-theme`, four
+official variants plus ten palette themes rendered into fifteen per-component
+fragments), the user units and the autologin drop-in. [`image/`](../image/README.md)
+installs it: the base moved to `fedora-bootc:44` (Fedora 42 reached end of life and
+Fedora retired Hyprland after it), the packages come from a checked manifest
+(`packages.txt`) and three named COPRs (`coprs.txt`), the initramfs carries the WardOS
+Plymouth theme, first boot adds Flathub and the default applications, and
+`disk.sh --user … --luks` builds the installable ISO. CI proves the names exist (`image
+packages`) and builds the whole image with `bootc container lint` at the end (`image
+build`), so a merge to `main` is a bootable image by construction. `desktop/install.sh`
+applies the same desktop to an existing Fedora. Still ahead: boot it in QEMU and on the
+reference hardware (E-09), pinned digests, the `tamperward` service, and the shell's own
+toolkit (E-10).
 
 ## Phase 7 — Security boot chain
 
