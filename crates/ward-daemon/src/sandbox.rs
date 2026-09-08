@@ -10,7 +10,7 @@
 //! This backend is defence-by-construction, not defence-in-depth: what the agent
 //! cannot see, it cannot reach.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -72,72 +72,253 @@ pub fn available() -> bool {
     }
 }
 
-/// Run `argv` inside the sandbox for `worktree`, honouring the network capability.
-pub fn run(worktree: &Path, network: &NetworkCapability, argv: &[String]) -> Result<Outcome> {
-    if argv.is_empty() {
-        return Err(Error::Sandbox("empty command".into()));
-    }
-    let worktree = worktree
-        .canonicalize()
-        .map_err(|e| Error::io(worktree, e))?;
+/// Mount point of the egress socket inside the sandbox.
+pub const PROXY_SOCKET: &str = "/run/ward/proxy.sock";
+/// Mount point of the `ward-agent` shim inside the sandbox.
+pub const AGENT_SHIM: &str = "/run/ward/ward-agent";
+/// Loopback address the in-sandbox relay listens on (ADR-0014).
+pub const RELAY_ADDR: &str = "127.0.0.1:3128";
 
-    let mut cmd = Command::new("bwrap");
-    // Read-only system directories the toolchain needs; host home is never bound.
-    for dir in [
-        "/usr",
-        "/bin",
-        "/sbin",
-        "/lib",
-        "/lib64",
-        "/etc/alternatives",
-    ] {
-        if Path::new(dir).exists() {
-            cmd.args(["--ro-bind", dir, dir]);
+/// How the command's stdio is handled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdioMode {
+    /// Capture stdout/stderr (batch commands).
+    Capture,
+    /// Inherit the terminal (interactive agents).
+    Inherit,
+}
+
+/// One sandboxed launch, built up then executed.
+pub struct Launch {
+    worktree: PathBuf,
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    proxy_socket: Option<PathBuf>,
+    shim: Option<PathBuf>,
+    shim_flags: Vec<String>,
+    stdio: StdioMode,
+}
+
+impl Launch {
+    /// A launch of `argv` over `worktree` with the default isolation.
+    pub fn new(worktree: impl Into<PathBuf>, argv: Vec<String>) -> Self {
+        Self {
+            worktree: worktree.into(),
+            argv,
+            env: Vec::new(),
+            proxy_socket: None,
+            shim: None,
+            shim_flags: Vec::new(),
+            stdio: StdioMode::Capture,
         }
     }
-    cmd.args(["--proc", "/proc"])
-        .args(["--dev", "/dev"])
-        .args(["--tmpfs", "/tmp"])
-        .args(["--tmpfs", "/home"])
-        .args(["--setenv", "HOME", "/home/agent"])
-        .args([
-            "--setenv",
-            "PATH",
-            "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
-        ])
-        .args(["--setenv", "TERM", "xterm"])
-        .args(["--bind", &worktree.to_string_lossy(), "/work"])
-        .args(["--chdir", "/work"])
-        .args(["--hostname", "ward-sandbox"])
-        .arg("--unshare-user")
-        .arg("--unshare-pid")
-        .arg("--unshare-ipc")
-        .arg("--unshare-uts")
-        .arg("--unshare-cgroup-try")
-        .arg("--die-with-parent")
-        .arg("--new-session");
-    // Offline and localhost-only get an isolated netns (loopback only). Wider modes
-    // still route through a proxy that Phase 1 does not ship, so they too run isolated
-    // for now; the observer records the effective restriction.
-    if !matches!(network, NetworkCapability::Unrestricted) {
-        cmd.arg("--unshare-net");
-    }
-    cmd.arg("--");
-    cmd.args(argv);
 
-    let start = Instant::now();
-    let out = cmd.output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            Error::Sandbox("bubblewrap (bwrap) is not installed".into())
+    /// Bind the session's egress socket into the sandbox (ADR-0014).
+    #[must_use]
+    pub fn egress(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.proxy_socket = Some(socket.into());
+        self
+    }
+
+    /// Run through the `ward-agent` shim at this host path (Landlock, seccomp, relay).
+    #[must_use]
+    pub fn shim(mut self, path: impl Into<PathBuf>) -> Self {
+        self.shim = Some(path.into());
+        self
+    }
+
+    /// Extra flags for the shim (e.g. `--allow-no-landlock` on kernels without Landlock).
+    #[must_use]
+    pub fn shim_flags(mut self, flags: Vec<String>) -> Self {
+        self.shim_flags = flags;
+        self
+    }
+
+    /// Add an environment variable inside the sandbox.
+    #[must_use]
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Inherit or capture stdio.
+    #[must_use]
+    pub fn stdio(mut self, stdio: StdioMode) -> Self {
+        self.stdio = stdio;
+        self
+    }
+
+    /// The `bwrap` argument vector (without the program name). Pure, for tests.
+    pub fn args(&self, worktree: &Path) -> Vec<String> {
+        fn push(a: &mut Vec<String>, xs: &[&str]) {
+            a.extend(xs.iter().map(|x| (*x).to_string()));
+        }
+        let mut a: Vec<String> = Vec::new();
+        // Read-only system directories the toolchain needs; host home is never bound.
+        for dir in [
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/etc/alternatives",
+        ] {
+            if Path::new(dir).exists() {
+                push(&mut a, &["--ro-bind", dir, dir]);
+            }
+        }
+        push(
+            &mut a,
+            &[
+                "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/home",
+            ],
+        );
+        push(&mut a, &["--tmpfs", "/run"]);
+        push(&mut a, &["--setenv", "HOME", "/home/agent"]);
+        push(
+            &mut a,
+            &[
+                "--setenv",
+                "PATH",
+                "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+            ],
+        );
+        push(&mut a, &["--setenv", "TERM", "xterm"]);
+        for (k, v) in &self.env {
+            push(&mut a, &["--setenv", k, v]);
+        }
+        push(
+            &mut a,
+            &[
+                "--bind",
+                &worktree.to_string_lossy(),
+                "/work",
+                "--chdir",
+                "/work",
+            ],
+        );
+        push(&mut a, &["--hostname", "ward-sandbox"]);
+        // The network namespace is always isolated: the only way out is the egress
+        // socket, and only when the session provides one (ADR-0014).
+        push(
+            &mut a,
+            &[
+                "--unshare-user",
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--unshare-cgroup-try",
+                "--unshare-net",
+            ],
+        );
+        push(&mut a, &["--die-with-parent", "--new-session"]);
+        if let Some(sock) = &self.proxy_socket {
+            push(&mut a, &["--bind", &sock.to_string_lossy(), PROXY_SOCKET]);
+        }
+        if let Some(shim) = &self.shim {
+            push(&mut a, &["--ro-bind", &shim.to_string_lossy(), AGENT_SHIM]);
+        }
+        push(&mut a, &["--"]);
+        if self.shim.is_some() {
+            push(&mut a, &[AGENT_SHIM]);
+            a.extend(self.shim_flags.iter().cloned());
+            if self.proxy_socket.is_some() {
+                a.push("--relay".into());
+                a.push(format!("{RELAY_ADDR}={PROXY_SOCKET}"));
+            }
+            push(&mut a, &["--"]);
+        }
+        a.extend(self.argv.iter().cloned());
+        a
+    }
+
+    /// Execute the launch.
+    pub fn run(&self) -> Result<Outcome> {
+        if self.argv.is_empty() {
+            return Err(Error::Sandbox("empty command".into()));
+        }
+        let worktree = self
+            .worktree
+            .canonicalize()
+            .map_err(|e| Error::io(&self.worktree, e))?;
+        let mut cmd = Command::new("bwrap");
+        cmd.args(self.args(&worktree));
+        let start = Instant::now();
+        let launch_err = |e: std::io::Error| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::Sandbox("bubblewrap (bwrap) is not installed".into())
+            } else {
+                Error::Sandbox(format!("failed to launch bwrap: {e}"))
+            }
+        };
+        let (code, stdout, stderr) = match self.stdio {
+            StdioMode::Capture => {
+                let out = cmd.output().map_err(launch_err)?;
+                (
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout).into_owned(),
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                )
+            }
+            StdioMode::Inherit => {
+                let status = cmd.status().map_err(launch_err)?;
+                (status.code(), String::new(), String::new())
+            }
+        };
+        Ok(Outcome {
+            code,
+            stdout,
+            stderr,
+            duration: start.elapsed(),
+        })
+    }
+}
+
+/// Run `argv` inside the sandbox for `worktree` with no egress (used by selftest).
+pub fn run(worktree: &Path, _network: &NetworkCapability, argv: &[String]) -> Result<Outcome> {
+    Launch::new(worktree, argv.to_vec()).run()
+}
+
+/// What the located `ward-agent` shim supports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shim {
+    /// Host path of the binary (bound read-only into the sandbox).
+    pub path: PathBuf,
+    /// Whether this build accepts `--relay` (ADR-0014).
+    pub relay: bool,
+    /// Whether the running kernel enforces Landlock; if not the shim is told to
+    /// continue with seccomp only, and the session records the degradation.
+    pub landlock: bool,
+}
+
+impl Shim {
+    /// Flags the daemon passes to this shim.
+    #[must_use]
+    pub fn flags(&self) -> Vec<String> {
+        if self.landlock {
+            Vec::new()
         } else {
-            Error::Sandbox(format!("failed to launch bwrap: {e}"))
+            vec!["--allow-no-landlock".into()]
         }
-    })?;
-    Ok(Outcome {
-        code: out.status.code(),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        duration: start.elapsed(),
+    }
+}
+
+/// Locate and probe the `ward-agent` shim: `$WARD_AGENT_BIN`, else a sibling of this
+/// executable. Returns `None` when no usable shim exists.
+pub fn find_shim() -> Option<Shim> {
+    let path = match std::env::var("WARD_AGENT_BIN") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => std::env::current_exe().ok()?.parent()?.join("ward-agent"),
+    };
+    if !path.is_file() {
+        return None;
+    }
+    let help = Command::new(&path).arg("--help").output().ok()?;
+    let text = String::from_utf8_lossy(&help.stdout);
+    Some(Shim {
+        path,
+        relay: text.contains("--relay"),
+        landlock: ward_agent::landlock::is_available(),
     })
 }
 
@@ -146,9 +327,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn available_probe_returns_a_bool_without_panicking() {
-        // The value depends on the host (bwrap present and userns permitted); we only
-        // assert the probe completes and yields a bool either way.
-        let _: bool = available();
+    fn args_isolate_net_and_bind_egress_and_shim() {
+        let l = Launch::new("/tmp", vec!["true".into()])
+            .egress("/host/proxy.sock")
+            .shim("/host/ward-agent")
+            .env("FOO", "bar");
+        let a = l.args(Path::new("/tmp")).join(" ");
+        assert!(a.contains("--unshare-net"));
+        assert!(a.contains("--bind /host/proxy.sock /run/ward/proxy.sock"));
+        assert!(a.contains("--ro-bind /host/ward-agent /run/ward/ward-agent"));
+        assert!(a.contains("--setenv FOO bar"));
+        assert!(a.ends_with(
+            "-- /run/ward/ward-agent --relay 127.0.0.1:3128=/run/ward/proxy.sock -- true"
+        ));
+        assert!(!a.contains("/root"), "host home must never be bound");
+    }
+
+    #[test]
+    fn args_without_shim_exec_argv_directly() {
+        let a = Launch::new("/tmp", vec!["sh".into(), "-c".into(), "id".into()])
+            .args(Path::new("/tmp"));
+        assert_eq!(&a[a.len() - 4..], &["--", "sh", "-c", "id"]);
     }
 }
