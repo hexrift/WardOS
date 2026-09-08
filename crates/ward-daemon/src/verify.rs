@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use ward_events::VerifySummary;
-use ward_snapshot::{CaptureOptions, SnapshotId, SnapshotRole, SnapshotStore};
+use ward_snapshot::{CaptureOptions, EntryType, SnapshotId, SnapshotRole, SnapshotStore};
 
 use crate::error::{Error, Result};
 use crate::sandbox::{Launch, StdioMode};
@@ -116,7 +116,8 @@ pub fn prepare(
     let scratch = scratch_root.join(format!("verify-{}", &candidate.digest().to_hex()[..12]));
     store.materialize(candidate, &scratch).map_err(snap)?;
     let mut restored = Vec::new();
-    for rel in &config.protected.tests {
+    for rel in protected_files(store, entry, candidate, &config.protected.tests)? {
+        let rel = &rel;
         let pristine = store.cat(entry, Path::new(rel)).ok();
         let target = scratch.join(rel);
         let current = std::fs::read(&target).ok();
@@ -141,6 +142,66 @@ pub fn prepare(
         restored,
         scratch,
     })
+}
+
+/// Expand `protected.tests` into the files the verifier restores, in manifest order
+/// with no duplicates. A `dir/`, `dir/**` or `dir/*` entry, or one naming a directory
+/// in either snapshot, means every file under it: those in the entry snapshot (restored
+/// to their pristine bytes) and those only in the candidate (removed, so a test added
+/// beside the protected ones cannot stand in for them). Anything else is one file.
+fn protected_files(
+    store: &SnapshotStore,
+    entry: SnapshotId,
+    candidate: SnapshotId,
+    patterns: &[String],
+) -> Result<Vec<String>> {
+    let snap = |e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string());
+    let manifests = [
+        store.manifest(entry).map_err(snap)?,
+        store.manifest(candidate).map_err(snap)?,
+    ];
+    let files: Vec<&str> = manifests
+        .iter()
+        .flat_map(ward_snapshot::Manifest::entries)
+        .filter(|e| e.kind == EntryType::File)
+        .filter_map(|e| std::str::from_utf8(&e.path).ok())
+        .collect();
+    let dirs: Vec<&str> = manifests
+        .iter()
+        .flat_map(ward_snapshot::Manifest::entries)
+        .filter(|e| e.kind == EntryType::Dir)
+        .filter_map(|e| std::str::from_utf8(&e.path).ok())
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for pattern in patterns {
+        let stem = pattern
+            .strip_suffix("/**")
+            .or_else(|| pattern.strip_suffix("/*"))
+            .or_else(|| pattern.strip_suffix('/'))
+            .map(|s| s.trim_end_matches('/'));
+        let dir = match stem {
+            Some(d) => Some(d),
+            None if dirs.contains(&pattern.as_str()) => Some(pattern.as_str()),
+            None => None,
+        };
+        let matched: Vec<&str> = match dir {
+            Some(d) => {
+                let prefix = format!("{d}/");
+                files
+                    .iter()
+                    .copied()
+                    .filter(|f| f.starts_with(&prefix))
+                    .collect()
+            }
+            None => vec![pattern.as_str()],
+        };
+        for f in matched {
+            if !out.iter().any(|o| o == f) {
+                out.push(f.to_owned());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// What the verifier produced.
@@ -389,6 +450,84 @@ mod tests {
         assert!(path.1.starts_with("/run/verifier/cargo/bin:"));
         assert!(!path.1.contains("/root"));
         assert_eq!(Toolchains::default().env().len(), 2, "HOME and PATH only");
+    }
+
+    #[test]
+    fn prepare_restores_every_file_under_a_protected_directory() {
+        // `ward init` writes `tests/` as the protected entry. Editing one test, deleting
+        // another and adding a third must all be undone in the verifier tree.
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        std::fs::create_dir_all(w.join(".tamperward")).unwrap();
+        std::fs::create_dir_all(w.join("tests/nested")).unwrap();
+        std::fs::write(
+            w.join(CONFIG_PATH),
+            "protected:\n  tests:\n    - tests/\nverify:\n  command: true\n",
+        )
+        .unwrap();
+        std::fs::write(w.join("tests/a.rs"), "strict a").unwrap();
+        std::fs::write(w.join("tests/nested/b.rs"), "strict b").unwrap();
+        std::fs::write(w.join("src.rs"), "v1").unwrap();
+        let store = SnapshotStore::open(state.path().join("cas")).unwrap();
+        let entry = store
+            .store_snapshot(w, SnapshotRole::Entry, CaptureOptions::default())
+            .unwrap();
+
+        std::fs::write(w.join("tests/a.rs"), "lenient").unwrap();
+        std::fs::remove_file(w.join("tests/nested/b.rs")).unwrap();
+        std::fs::write(w.join("tests/c.rs"), "planted").unwrap();
+        std::fs::write(w.join("src.rs"), "v2").unwrap();
+        let v = prepare(&store, w, entry, state.path()).unwrap();
+        assert_eq!(
+            v.restored,
+            vec!["tests/a.rs", "tests/nested/b.rs", "tests/c.rs"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(v.scratch.join("tests/a.rs")).unwrap(),
+            "strict a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(v.scratch.join("tests/nested/b.rs")).unwrap(),
+            "strict b"
+        );
+        assert!(!v.scratch.join("tests/c.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(v.scratch.join("src.rs")).unwrap(),
+            "v2"
+        );
+    }
+
+    #[test]
+    fn protected_directory_spellings_all_mean_every_file_under_it() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        std::fs::create_dir_all(w.join("tests")).unwrap();
+        std::fs::write(w.join("tests/a.rs"), "a").unwrap();
+        std::fs::write(w.join("tests.rs"), "not under tests/").unwrap();
+        let store = SnapshotStore::open(state.path().join("cas")).unwrap();
+        let id = store
+            .store_snapshot(w, SnapshotRole::Entry, CaptureOptions::default())
+            .unwrap();
+        for spelling in ["tests", "tests/", "tests/*", "tests/**"] {
+            let files = protected_files(&store, id, id, &[spelling.to_owned()]).unwrap();
+            assert_eq!(files, vec!["tests/a.rs"], "{spelling}");
+        }
+        // A plain file, listed twice, is one file; an absent one is kept so the
+        // verifier can remove a planted copy.
+        let files = protected_files(
+            &store,
+            id,
+            id,
+            &[
+                "tests.rs".to_owned(),
+                "tests.rs".to_owned(),
+                "gone.rs".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(files, vec!["tests.rs", "gone.rs"]);
     }
 
     #[test]

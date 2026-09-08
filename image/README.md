@@ -380,13 +380,17 @@ is typed on the Plymouth surface.
 ```sh
 qemu-system-x86_64 -enable-kvm -m 4096 -cpu host \
   -drive file=image/out/qcow2/disk.qcow2,if=virtio,format=qcow2 \
-  -bios /usr/share/edk2/ovmf/OVMF_CODE.fd -nographic
+  -bios /usr/share/edk2/ovmf/OVMF_CODE.fd \
+  -device virtio-vga-gl -display gtk,gl=on
 ```
 
-(UEFI firmware from the `edk2-ovmf` package; Secure Boot off in this configuration, see
-[`secure-boot/`](secure-boot/README.md) for the variant with it on.) Hyprland needs a
-display; use `-device virtio-vga-gl -display gtk,gl=on` instead of `-nographic` to see
-the desktop.
+The last line is the display: Hyprland needs a GPU and a window to draw in, so a
+`-nographic` boot stops at the text login on the serial console and never reaches the
+desktop. Without GTK in your QEMU build, `-device virtio-vga -display sdl` works too.
+`disk.sh` hands `image/out/` back to the user who ran `sudo`, so QEMU can open the disk
+without root. UEFI firmware comes from the `edk2-ovmf` package; Secure Boot is off in
+this configuration, see [`secure-boot/`](secure-boot/README.md) for the variant with it
+on.
 
 ### The published image: skip the build
 
