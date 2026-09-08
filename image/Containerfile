@@ -242,7 +242,11 @@ RUN ver=$(sed -n 's/^VERSION_ID=//p' /usr/lib/os-release) \
     && mv /usr/lib/os-release.wardos /usr/lib/os-release \
     && grep -q '^NAME="WardOS"$' /usr/lib/os-release
 
-RUN systemctl mask serial-getty@ttyS0.service \
+# Masking NetworkManager-wait-online keeps a boot with no network (a laptop before Wi-Fi
+# is set up, E-09) from stalling ~60s on network-online.target: nothing here must block
+# boot on the network. wardos-flathub still orders after network-online (reached at once
+# now) and gates on its own reachability check, so Flathub setup is unaffected.
+RUN systemctl mask serial-getty@ttyS0.service NetworkManager-wait-online.service \
     && systemctl enable wardos-firstboot.service wardos-flathub.service wardos-usb-guard.service \
          firewalld.service bootc-fetch-apply-updates.timer \
     && sed -i 's/^DefaultZone=.*/DefaultZone=wardos/' /etc/firewalld/firewalld.conf \
