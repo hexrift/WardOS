@@ -177,6 +177,53 @@ for cls in working waiting blocked verifying finished verified restricted denied
   grep -q "\.$cls\b" "$root/config/waybar/style.css" || fail "waybar/style.css has no .$cls rule"
 done
 grep -Eq 'gradient\(|box-shadow:[^;]*[0-9]' "$root/config/waybar/style.css" && fail "waybar/style.css: no gradients, no shadows (§3, §5)"
+# The bar is 32 px tall, its cells are padded on the 8 px grid, the system group is
+# words (no icon-font glyphs anywhere in a format), and battery state is a 2 px marker
+# under the cell, never a colour on the text (§3, §5, §6).
+python3 - "$root/config/waybar/config.jsonc" "$root/config/waybar/style.css" <<'PY' || fail "waybar polish (height, words, marker, grid)"
+import json, re, sys
+c = json.load(open(sys.argv[1])); css = open(sys.argv[2]).read()
+assert c["height"] == 32, c["height"]
+for name, m in c.items():
+    if not isinstance(m, dict): continue
+    for k, v in m.items():
+        if k.startswith("format") and isinstance(v, str):
+            assert all(ord(ch) < 0x2000 or ch in "·…" for ch in v), f"{name}.{k}: icon glyph in {v!r}"
+rule = lambda sel: re.search(re.escape(sel) + r"\s*\{([^}]*)\}", css)
+for sel in ("#battery.warning", "#battery.critical"):
+    body = rule(sel).group(1)
+    assert "border-bottom: 2px solid" in body, sel
+    assert "color:" not in body.replace("border-bottom: 2px solid", ""), sel + " colours the text"
+assert "padding: 0 8px" in rule("#clock").group(1) or "padding: 0 8px" in css, "cells are 8 px padded"
+for m in re.finditer(r"padding:\s*([^;]+);", css):
+    for px in re.findall(r"(\d+)px", m.group(1)):
+        assert int(px) % 8 == 0, f"padding {m.group(1)} is off the 8 px grid"
+assert "8px" in rule("tooltip label").group(1), "tooltip text sits on the grid"
+PY
+
+# --- mako: the approval layout of design-language §10 as a style ---------------
+approval=$(sed -n '/^\[category=ward-approval\]/,/^\[/p' "$root/config/mako/config")
+grep -q '^format=<b>%s</b>' <<<"$approval" || fail "mako ward-approval: the title is the summary, bold"
+grep -q '%b' <<<"$approval" || fail "mako ward-approval: the body (target, Reason, Scope) is shown"
+for action in 'Allow once' 'Allow session' 'Deny'; do
+  grep -q "$action" <<<"$approval" || fail "mako ward-approval: the action '$action' is not in the layout"
+done
+grep -q '^anchor=center' <<<"$approval" || fail "mako ward-approval: centred"
+grep -Eq '^padding=(8|16|24|32)(,(8|16|24|32))*$' <<<"$approval" || fail "mako ward-approval: padding on the 8 px grid"
+grep -Eq '^(default-timeout=0|ignore-timeout=1)' <<<"$approval" || fail "mako ward-approval: waits for the answer"
+grep -Eq '^(padding|margin)=' "$root/config/mako/config" | grep -Evq '^(padding|margin)=(0|8|16|24|32)(,(0|8|16|24|32))*$' && fail "mako: padding and margin on the 8 px grid"
+
+# --- fuzzel: the command centre (§13) -------------------------------------------
+fuzzel=$root/config/fuzzel/fuzzel.ini
+grep -q '^prompt="WARD  "' "$fuzzel" || fail "fuzzel: the prompt is the WARD mark"
+grep -q '^placeholder=Search anything' "$fuzzel" || fail "fuzzel: placeholder"
+{ grep -q '^lines=28$' "$fuzzel" && grep -q '^line-height=24$' "$fuzzel"; } || fail "fuzzel: 28 lines of 24 px make the 720 px command centre"
+grep -q '^width=42$' "$fuzzel" || fail "fuzzel: width 42 (about 640 px at 11 pt)"
+for k in horizontal-pad vertical-pad inner-pad; do
+  v=$(sed -n "s/^$k=//p" "$fuzzel")
+  [[ -n $v && $((v % 8)) -eq 0 ]] || fail "fuzzel: $k=$v is off the 8 px grid"
+done
+grep -Eq '^(match|selection-match)=' "$fuzzel" && fail "fuzzel: match colours come from the theme fragment"
 
 # --- hyprlock: the wallpaper under a veil, the clock, the mark -------------------
 lock=$root/config/hyprlock/hyprlock.conf

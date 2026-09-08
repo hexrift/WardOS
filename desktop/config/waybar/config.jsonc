@@ -97,7 +97,7 @@
     "interval": 5,
     "format-wifi": "WIFI {signalStrength}",
     "format-ethernet": "ETH",
-    "format-disconnected": "NET off",
+    "format-disconnected": "OFFLINE",
     "tooltip-format-wifi": "{essid}  {ipaddr}  {frequency} GHz",
     "tooltip-format-ethernet": "{ifname}  {ipaddr}",
     "tooltip-format-disconnected": "no connection",
@@ -116,15 +116,16 @@
     "interval": 30,
     "states": { "warning": 20, "critical": 10 },
     "format": "BAT {capacity}",
-    "format-charging": "BAT {capacity}+",
+    "format-charging": "AC {capacity}",
     "format-plugged": "AC",
     "format-full": "AC",
-    "tooltip-format": "{timeTo}",
+    "tooltip-format": "{capacity}%  {timeTo}",
     "on-click": "wardos-setup power"
   },
   "cpu": {
     "interval": 5,
     "format": "CPU {usage}",
+    "tooltip-format": "{load} load",
     "on-click": "wardos-launch tui btop"
   },
   "memory": {
