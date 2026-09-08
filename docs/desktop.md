@@ -92,7 +92,8 @@ menu path is scriptable and testable.
 | `wardos-battery-monitor` | low-battery notifications (timer unit) |
 | `wardos-screensaver` | terminal text effects on idle, any key exits |
 | `wardos-share <file>` | serve a file on the LAN with a QR code (python http.server + qrencode) |
-| `wardos-first-run` | first login: copy configs, pick a theme, `ward doctor`, show the keys |
+| `wardos-first-run` | first login: copy configs, the default theme, `ward doctor`, the default apps, show the keys, then `wardos-welcome` |
+| `wardos-welcome [--again] [step…]` | the first-login walkthrough ([`onboarding.md`](onboarding.md) §1): `theme` (from `wardos-theme list`), `keys` (a terminal running `ward vault set NAME`, never a menu), `project` (a directory picker over `~` or a URL to clone, then `ward init`), `agent` (`ward claude` there, the trust bar in one line), `done` (the card; writes `~/.config/wardos/welcome-done`); one step by name any time, `--again` the whole; `clone URL DIR` is the project step's terminal command |
 | `wardos-version` | image and tool versions (`bootc status`, `ward --version`) |
 | `wardos-about` | the About surface (fastfetch with the WardOS logo) |
 
@@ -163,7 +164,7 @@ SYSTEM     Apps · Capture · Appearance · Connect · Install · Remove · Upda
   Update      System · Configs · Themes
   Toggle      Night light · Idle lock · Bar · Screensaver · Notifications
   Power       Lock · Suspend · Relaunch · Restart · Shutdown
-  Help        Keys · Manual · Hyprland wiki · About
+  Help        Welcome · Keys · Manual · Hyprland wiki · About
 ```
 
 The command centre's PROJECTS, AGENTS and SECURITY rows come from the shell:
@@ -175,7 +176,11 @@ watch`, `ward verify` and `ward-shell settings` in a terminal that stays open, `
 replay <events.log>`, `foot`, `chromium`, `wardos-menu system`; paths are shell-quoted).
 `wardos-menu` shows the first two columns through fuzzel `--dmenu` and runs the third;
 fuzzel does the matching, so `--query` is for scripts and tests. Without a session the
-fixed rows remain and the given directory is the project.
+fixed rows remain and the given directory is the project; the shell's text surfaces
+then say `No agent session. Super + Space → Start Claude, or ward init then ward
+claude in a terminal.` while `bar --waybar` stays the dim mark. Until
+`~/.config/wardos/welcome-done` exists, a command centre with no live session (no
+PROJECTS row) opens on `WELCOME  Start here`, which runs `wardos-welcome`.
 
 ## Keys
 
@@ -326,4 +331,5 @@ Then some (WardOS only):
 | Approvals as notifications, answered from the keyboard | `wardos-approve`, daemon hold on `ask` (`agent-integration.md` §4.1: `Request::Hold`/`Approve`/`Pending`, `ward session pending --follow`, `ward session approve`); `wardos-approve.service` is the listener | ✔ `ward-daemon` `approvals::tests::*`, `hooks::tests::a_held_ask_{waits_for_the_answer_and_relays_it,nobody_answers_is_denied_when_the_timeout_passes}`, `hooks::tests::allow_session_answers_the_same_question_without_asking_again`, `daemon::tests::a_held_approval_is_recorded_listed_answered_and_recorded_again`, `client::tests::{pending_and_approve_go_through_the_daemon,follow_pending_emits_what_is_pending_after_the_backlog_then_on_each_request}`; `desktop/tests/approve.test.sh` |
 | Verify, replay, evidence, snapshots, grants in the menu | `wardos-menu` SECURITY | ✔ from `ward-shell launcher --lines`, static `ward` list without it; `menu.test.sh` |
 | Sandboxed browser profile per project | `wardos-launch browser --project` | ✔ chromium profile under `~/.local/share/wardos/browser/<hash>`; `launch.test.sh` |
+| The first five minutes (ADR-0017) | `wardos-welcome` from `wardos-first-run`, Help ▸ Welcome and the command centre's `Start here` row; `ward init` (policy template, verifier config, `.gitignore`, TamperWard wiring), `ward vault set\|list\|rm\|path`; the shell's no-session line | ✔ `wardos-welcome [--again] [theme\|keys\|project\|agent\|done]`; `welcome.test.sh`, `first-run.test.sh`, `menu.test.sh`; `ward-cli` `init::tests::*`, `vault::tests::*`, `ward-policy` `tests::the_template_*`, `ward-daemon` `gateway::tests::key_comes_from_the_vault_when_the_host_env_is_unset`, `ward-shell` `a_project_without_a_session_gets_the_next_step_not_an_error`; [`onboarding.md`](onboarding.md) |
 | Package names and the whole image checked by CI | `image/packages.txt`, image build job | ✔ `image/check-packages.sh` ("image packages"), `image.yml` ("image build") |

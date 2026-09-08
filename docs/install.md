@@ -46,24 +46,49 @@ ward doctor
 
 The toolchain is pinned in `rust-toolchain.toml`; `rustup` picks it up.
 
-## 4. First session
+## 4. First project, first session
+
+Three commands from a fresh install to an agent inside the sandbox, and one more to a
+verdict ([`onboarding.md`](onboarding.md) is the same path with the desktop):
 
 ```bash
+ward vault set ANTHROPIC_API_KEY   # typed without echo; stored 0600 on the host, never printed back
 cd your-project
+ward init                          # .ward/policy.yaml, .tamperward/config.yml, .gitignore, TamperWard
+ward claude                        # Claude Code inside the sandbox; the proxy injects the key
+ward verify                        # the protected tests, from the entry snapshot, offline
+```
+
+`ward init [DIR]` makes a directory a project and is safe to repeat: it writes only what
+is absent, never a file you wrote, and reports each item (`written`, `already there,
+left as is`). The policy it writes is the secure default with a comment per block, so
+the file reads as a description of what the agent gets; the verifier config names the
+protected tests (`tests/`) and a command guessed from `Cargo.toml`, `package.json` or
+`pyproject.toml`; when `tamperward` is installed, `tamperward init --cwd DIR` wires
+its policy, the Claude Code hooks, a pre-commit hook and a CI workflow (`--no-tamperward`
+leaves that alone), and without it a minimal `.tamperward.yml` is written and the
+report says how to get the rest. `--agent codex` names Codex and its key in the closing
+"next" block; `--dry-run` prints the plan and touches nothing.
+
+Keys live in `$WARD_STATE_DIR/vault/<NAME>` (`ward vault set|list|rm|path`; names are
+host variables, `[A-Z][A-Z0-9_]*`) or in the host environment, which wins. Inside the
+sandbox the agent sees a placeholder and a base URL on the session proxy. For GitHub,
+`ward vault set GITHUB_TOKEN` and launch with `--grant github`: the token is injected on
+repository-scoped routes.
+
+The longer form, one step at a time:
+
+```bash
 ward up                    # policy → manifest, entry snapshot, daemon, log
 ward status                # the security panel
 ward run -- cargo test     # any command, sandboxed, observed
-ward claude                # Claude Code inside the sandbox; key stays on the host
 ward watch --tui           # live observer (second terminal)
-ward verify                # trusted verifier (needs .tamperward/config.yml)
 ward selftest              # 16 hostile probes against your host
 ward stop                  # seal the log
 ```
 
-Put the model-API key in the host environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`)
-or in `$WARD_STATE_DIR/vault/<NAME>` (mode 0600). For GitHub, set `GITHUB_TOKEN` the same
-way and launch with `--grant github`. A project opts into policy with `.ward/policy.yaml`
-and into protected tests with `.tamperward/config.yml`; see `examples/ward-demo`.
+`examples/ward-demo` is a project with a protected test and a tempting shortcut, for
+seeing `ward verify` refuse one.
 
 ## 5. Where things live
 
@@ -71,6 +96,8 @@ and into protected tests with `.tamperward/config.yml`; see `examples/ward-demo`
 | --- | --- |
 | `~/.local/state/ward` (or `$WARD_STATE_DIR`) | snapshot CAS, session logs, vault |
 | `~/.local/state/ward/sessions/<id>/` | `events.log`, `HEAD`, `session.json`, `control.sock` |
+| `~/.local/state/ward/vault/<NAME>` | one key per file, 0600 in a 0700 directory (`ward vault`) |
+| `<project>/.ward/policy.yaml`, `.tamperward/config.yml`, `.tamperward.yml` | the project's policy, verifier config and TamperWard policy (`ward init`) |
 | `/tmp/ward-<id tail>/` | per-launch sockets, gone when the command exits |
 
 Keep `WARD_STATE_DIR` short: the control socket path must fit in 107 bytes; `ward
@@ -91,8 +118,9 @@ sudo ./image/disk.sh --type qcow2 --user wardos --password …     # or a VM dis
 
 `--user wardos` creates the first user (wheel), which the tty1 autologin expects; with
 `--luks` Anaconda asks for the passphrase during the installation. First boot logs in
-on tty1, `uwsm` starts Hyprland, `wardos-first-run` copies the configs and asks for a
-theme, and Flathub plus `desktop/flatpaks.txt` arrive in the background. Updates:
+on tty1, `uwsm` starts Hyprland, `wardos-first-run` copies the configs and hands over
+to `wardos-welcome` (theme, key, first project, first agent; [`onboarding.md`](onboarding.md)),
+and Flathub plus `desktop/flatpaks.txt` arrive in the background. Updates:
 `wardos-update` (`bootc upgrade`; the previous deployment stays, `bootc rollback`).
 
 **On a Fedora you already have** (44, the release the image pins: Workstation, Silverblue, Kinoite):
