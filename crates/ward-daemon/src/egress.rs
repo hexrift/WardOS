@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use ward_events::{DeniedDst, DenyReason, HostName, ProcessRef, RuleRef, WardEvent};
 use ward_policy::NetworkCapability;
-use ward_proxy::{Config, Decision, Handle, Host, Observer, Proxy, Request};
+use ward_proxy::{Config, Decision, GatewayRoute, Handle, Host, Observer, Proxy, Request};
 
 use crate::error::{Error, Result};
 
@@ -58,12 +58,21 @@ pub struct Egress {
 }
 
 impl Egress {
-    /// Start the proxy for `network`, listening at `dir/proxy.sock`.
-    pub fn start(dir: &Path, network: &NetworkCapability) -> Result<Self> {
+    /// Start the proxy for `network` with the given gateway routes, listening at
+    /// `dir/proxy.sock`.
+    pub fn start(
+        dir: &Path,
+        network: &NetworkCapability,
+        routes: Vec<GatewayRoute>,
+    ) -> Result<Self> {
         let socket = dir.join("proxy.sock");
         let recorder = Arc::new(Recorder::default());
         let observer: Arc<dyn Observer> = recorder.clone();
-        let handle = Proxy::spawn(Config::new(network.clone()).listen_unix(&socket), observer)
+        let config = routes
+            .into_iter()
+            .fold(Config::new(network.clone()), Config::gateway)
+            .listen_unix(&socket);
+        let handle = Proxy::spawn(config, observer)
             .map_err(|e| Error::Sandbox(format!("egress proxy: {e}")))?;
         Ok(Self {
             handle,

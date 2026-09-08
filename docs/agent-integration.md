@@ -49,12 +49,19 @@ Disabled inside the sandbox by default (denied by the proxy, and switched off so
 agent does not retry): telemetry/error reporting (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`),
 auto-update hosts, artifact hosts (`CLAUDE_CODE_DISABLE_ARTIFACT=1`), changelog fetch.
 
-Credential delivery (ADR-0008) prefers **gateway mode**: the sandbox gets
-`ANTHROPIC_BASE_URL=http://<proxy>/anthropic` and a placeholder
-`ANTHROPIC_AUTH_TOKEN`; `ward-proxy` injects the user's real key on the way out. The
-long-lived key never enters Zone 3. If gateway mode proves incompatible with a
-provider's OAuth refresh (E-07), the fallback is a per-session short-lived token minted
-by the broker into the private config dir.
+Credential delivery (ADR-0008) is **gateway mode**, implemented: when the host holds
+`ANTHROPIC_API_KEY` (environment, else `$WARD_STATE_DIR/vault/ANTHROPIC_API_KEY`), the
+sandbox gets `ANTHROPIC_BASE_URL=http://127.0.0.1:3128/anthropic` and the placeholder
+`ANTHROPIC_API_KEY=ward-gateway`. `ward-proxy` strips the placeholder (`x-api-key`,
+`authorization`) and injects the real key over TLS to `api.anthropic.com`. The
+long-lived key never enters Zone 3; the grant is a `CredentialGranted` record (`CRED`
+row) with `delivery: proxy-injected`. The gateway upstream is the host's choice, so the
+session allowlist does not apply to it (`localhost_only` still reaches the model API);
+`offline` still means offline and no grant is made. `--pass-env ANTHROPIC_API_KEY`
+opts out: the real key is handed to the agent, printed as such, and no gateway is set
+up. If gateway mode proves incompatible with a provider's OAuth refresh (E-07), the
+fallback is a per-session short-lived token minted by the broker into the private
+config dir.
 
 ## 4. Hooks: step-through and semantic events
 
@@ -107,6 +114,9 @@ to `registry.npmjs.org` succeeds (`200`, TLS verified against the read-only CA r
 bound into the sandbox) while `10.0.0.1` and `169.254.169.254` get `403`; under
 `localhost_only`, `api.github.com` gets `403`. The daemon probes the shim for
 `--relay` support and Landlock availability and records degradation rather than
-silently weakening. Host credentials enter the sandbox only via an explicit, printed
-`--pass-env NAME`; gateway-mode injection (§3) is being implemented in `ward-proxy` so
-that even this becomes unnecessary for the model API key.
+silently weakening. The model-API key stays on the host: `ward claude` configures the
+`/anthropic` gateway route (§3) and the log records the grant; verified end to end in
+`crates/ward-daemon/tests/e2e.rs` (the sandboxed process holds only the placeholder,
+the upstream receives the real key). Other host credentials enter the sandbox only via
+an explicit, printed `--pass-env NAME`. Not yet: a live E-07 run of Claude Code against
+the real API through the gateway, the GitHub adapter, hook adapters, nested containers.
