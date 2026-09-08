@@ -1,0 +1,23 @@
+# WardOS Flathub setup, once, after the first boot with a network.
+# Adds the Flathub remote and installs the desktop's default applications from
+# /usr/share/wardos/flatpaks.txt (desktop/flatpaks.txt in the checkout) through
+# /usr/libexec/wardos-flathub (image/flathub.sh). It does not block login: nothing waits
+# for it, and `wardos-install app` works as soon as the remote exists. The marker file is
+# written only when the whole run succeeded, so a failed download retries on the next
+# boot and shows in `systemctl --failed` meanwhile.
+[Unit]
+Description=WardOS Flathub remote and default applications
+Documentation=https://github.com/hexrift/WardOS/blob/main/image/README.md
+After=network-online.target systemd-tmpfiles-setup.service
+Wants=network-online.target
+ConditionPathExists=!/var/lib/wardos/flathub.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/wardos-flathub /usr/share/wardos/flatpaks.txt
+ExecStartPost=/usr/bin/touch /var/lib/wardos/flathub.done
+# Downloads can take a while on first boot; a stuck one must not hang the unit forever.
+TimeoutStartSec=1h
+
+[Install]
+WantedBy=multi-user.target
