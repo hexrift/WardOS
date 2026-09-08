@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# wardos-keys — the key bindings viewer (docs/desktop.md §Commands, §Keys).
+#
+# Usage: wardos-keys            show every binding in the picker, print the chosen line
+#        wardos-keys --list     print them: `Super + Shift + S    Review permissions`
+#
+# Reads `bind`, `bindm`, `bindel` (any bind* line) from the shipped Hyprland files
+# (desktop/hyprland or /usr/share/wardos/hypr) and then ~/.config/hypr/*.conf, so a user
+# file wins for the same key. `$mod`-style variables are expanded. A binding's
+# description is the `#` comment on the line above it, or a trailing `# comment`; with
+# neither, the dispatcher and its argument stand in. Separator comments (`# ----`) and
+# blank lines end a description.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+files=()
+for f in "$(wardos_hypr_dir)"/*.conf "${XDG_CONFIG_HOME:-$HOME/.config}"/hypr/*.conf; do
+  [[ -f "$f" ]] && files+=("$f")
+done
+[[ ${#files[@]} -gt 0 ]] || wardos_die "no Hyprland configuration found"
+
+# One pass: variables, descriptions, bind lines; the last definition of a key wins and
+# keys keep the order of their first appearance.
+bindings=$(awk '
+  function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+  function word(s) { return toupper(substr(s, 1, 1)) tolower(substr(s, 2)) }
+  function keyname(k) {
+    if (length(k) == 1) return toupper(k)
+    if (k ~ /^[A-Z]+$/) return word(k)
+    return k
+  }
+  # $name → its value, whole names only ($mod does not touch $modifier).
+  function expand(line,   v, p, s, out, after) {
+    for (v in vars) {
+      out = ""; s = line
+      while ((p = index(s, "$" v)) > 0) {
+        after = substr(s, p + length(v) + 1, 1)
+        if (after ~ /[A-Za-z0-9_]/) out = out substr(s, 1, p + length(v))
+        else out = out substr(s, 1, p - 1) vars[v]
+        s = substr(s, p + length(v) + 1)
+      }
+      line = out s
+    }
+    return line
+  }
+  /^\$[A-Za-z_]+[ \t]*=/ {
+    name = $1; sub(/^\$/, "", name)
+    val = $0; sub(/^[^=]*=[ \t]*/, "", val)
+    vars[name] = val; prev = ""; next
+  }
+  /^#[ \t]*-{3,}/ { prev = ""; next }
+  /^#/ { prev = $0; sub(/^#[ \t]*/, "", prev); next }
+  /^[ \t]*$/ { prev = ""; next }
+  /^bind[a-z]*[ \t]*=/ {
+    line = $0; desc = ""
+    if (match(line, /[ \t]#[^#]*$/)) {
+      desc = trim(substr(line, RSTART + 2)); line = substr(line, 1, RSTART - 1)
+    } else desc = prev
+    sub(/^bind[a-z]*[ \t]*=[ \t]*/, "", line)
+    line = expand(line)
+    n = split(line, f, /,/)
+    mods = trim(f[1]); key = trim(f[2]); rest = trim(f[3])
+    for (i = 4; i <= n; i++) rest = rest " " trim(f[i])
+    if (desc == "") desc = rest
+    combo = ""
+    m = split(mods, ms, /[ \t]+/)
+    for (i = 1; i <= m; i++) if (ms[i] != "") combo = combo word(ms[i]) " + "
+    combo = combo keyname(key)
+    if (!(combo in seen)) { seen[combo] = 1; order[++count] = combo }
+    text[combo] = desc; prev = ""; next
+  }
+  { prev = "" }
+  END { for (i = 1; i <= count; i++) printf "%-28s %s\n", order[i], text[order[i]] }
+' "${files[@]}")
+
+if [[ "${1:-}" == --list ]]; then
+  printf '%s\n' "$bindings"
+else
+  printf '%s\n' "$bindings" | wardos_menu Keys || exit 0
+fi
