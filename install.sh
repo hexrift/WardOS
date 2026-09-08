@@ -56,17 +56,35 @@ if [ -x "${here}/ward" ] && [ -x "${here}/wardd" ] && [ -x "${here}/ward-agent" 
   install_from "$here"
 else
   command -v curl >/dev/null || { echo "install.sh: curl is required to download a release" >&2; exit 1; }
+  # A private repository needs a token (GITHUB_TOKEN or GH_TOKEN) with contents:read;
+  # with one, assets are fetched through the API, which works for public repos too.
+  token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  auth=()
+  [ -n "$token" ] && auth=(-H "Authorization: Bearer ${token}")
+  api="https://api.github.com/repos/${REPO}/releases"
   if [ "$VERSION" = "latest" ]; then
-    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
-    [ -n "$VERSION" ] || { echo "install.sh: could not resolve the latest release" >&2; exit 1; }
+    release="$(curl -fsSL "${auth[@]}" "${api}/latest")"
+  else
+    release="$(curl -fsSL "${auth[@]}" "${api}/tags/${VERSION}")"
   fi
+  VERSION="$(printf '%s' "$release" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+  [ -n "$VERSION" ] || { echo "install.sh: could not resolve release ${VERSION:-latest} (private repository? set GITHUB_TOKEN)" >&2; exit 1; }
   name="wardos-${VERSION#v}-x86_64-linux"
-  url="https://github.com/${REPO}/releases/download/${VERSION}/${name}.tar.gz"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
-  echo "downloading ${url}"
-  curl -fsSL -o "${tmp}/${name}.tar.gz" "$url"
-  curl -fsSL -o "${tmp}/${name}.tar.gz.sha256" "${url}.sha256"
+  fetch_asset() {
+    # $1 asset file name, $2 destination; by API id so private assets download too.
+    local id
+    id="$(printf '%s' "$release" | tr -d '\n' | sed -n "s/.*\"url\": *\"[^\"]*\/releases\/assets\/\([0-9]*\)\",[^}]*\"name\": *\"$1\".*/\1/p" | head -1)"
+    if [ -n "$id" ]; then
+      curl -fsSL "${auth[@]}" -H "Accept: application/octet-stream" -o "$2" "${api}/assets/${id}"
+    else
+      curl -fsSL "${auth[@]}" -o "$2" "https://github.com/${REPO}/releases/download/${VERSION}/$1"
+    fi
+  }
+  echo "downloading ${name}.tar.gz from release ${VERSION}"
+  fetch_asset "${name}.tar.gz" "${tmp}/${name}.tar.gz"
+  fetch_asset "${name}.tar.gz.sha256" "${tmp}/${name}.tar.gz.sha256"
   (cd "$tmp" && sha256sum -c "${name}.tar.gz.sha256" >/dev/null) || { echo "install.sh: checksum mismatch" >&2; exit 1; }
   tar -C "$tmp" -xzf "${tmp}/${name}.tar.gz"
   install_from "${tmp}/${name}"
