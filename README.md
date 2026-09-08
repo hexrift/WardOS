@@ -64,7 +64,8 @@ the verifier restores the pristine copy; the real one-line fix passes.
 Each session's log has one writer. `ward up` starts a per-session `wardd` that owns the
 hash chain behind a control socket; every `ward` command writes through it, TamperWard
 appends its decisions as `origin=tamperward` evidence, and `ward watch` follows the log
-live from another terminal. Without a daemon, every command still works in-process.
+live from another terminal, as a full-screen observer (trust bar, activity stream,
+counters) or as plain rows on a pipe. Without a daemon, every command still works in-process.
 
 ![A daemon-backed session: ward up spawns wardd, a producer and a TamperWard evidence record write through the control socket, and ward watch streams every row live until the session ends](assets/ward-watch.png)
 
@@ -83,7 +84,7 @@ ward session describe examples/ward-demo   # the session's immutable facts for T
 ward snapshot create  examples/ward-demo   # capture the worktree into the CAS (--role candidate|final)
 ward snapshot diff    <a> <b>              # manifest-level diff from the CAS, not the worktree (--json)
 ward snapshot cat     <id> <path>          # pristine bytes of a path in a snapshot
-ward watch            examples/ward-demo   # follow the session log live from its daemon (--from <seq>, --all)
+ward watch            examples/ward-demo   # full-screen observer on a terminal (--tui; q quits), one row per line on a pipe or with --plain (--from <seq>, --all)
 ward evidence append  examples/ward-demo --json '{"TamperDetected":{"subject":"VerifyConfig","detail":".tamperward/config.yml"}}'
                                            # append a TamperWard-origin record through the daemon (--json - reads stdin)
 ```

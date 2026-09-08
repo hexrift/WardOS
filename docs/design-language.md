@@ -261,3 +261,21 @@ From any existing distribution, Omarchy included: exact bar layout, menu structu
 typography choices, theme set, launcher layout, keybinding cheat-sheet presentation,
 branding mood. Good *principles* (speed, polish, keyboard-first, strong defaults) are
 adopted; the visual language, interaction model and product identity are WardOS's own.
+
+## As built: `ward watch` (Phase 3)
+
+The first observer is a terminal UI (`ward watch`, ADR-0012), so it follows §3, §6
+and §8 within what a terminal can do. Colour: the six roles (dim, ink, accent,
+verified, restricted, denied) are the xterm-256 indices line mode already prints
+(245, 252, 110, 108, 179, 167), the nearest cells to the Ward Dark palette; a real
+theme comes with the shell. The trust bar is one row, `WARD │ session │ project │
+NET mode │ CRED n granted │ OBS mode │ LIVE`, with a 1-cell separator below (§5), and
+the state colour sits on the leading marker (`●` live, `■` sealed) and the state
+words, never on the whole bar (§3). It carries the observer's facts rather than §6's
+exact groups: no agent glyph yet (the agent's state is not in the stream today) and no
+clock or TamperWard state, because the session daemon does not know them; they arrive
+with the shell. Typography: §4 wants the verb column in sans and the subject in mono;
+a terminal has one face, so the verb column is distinguished by its fixed width and
+colour instead. Motion: none; the view redraws on a 50 ms tick, well inside §12's
+budget, and nothing animates, not even the seal. The status line's counters are
+§8-of-`event-model.md`'s footer, not a §6 element.

@@ -144,23 +144,34 @@ pub fn row(rec: &EventRecord, all: bool) -> Option<String> {
 /// Subscribe from `opts.from_seq` and hand `emit` one row per record as it
 /// arrives, until the daemon ends the stream.
 pub fn watch(
-    mut sink: RemoteSink,
+    sink: RemoteSink,
     opts: WatchOptions,
     mut emit: impl FnMut(String),
 ) -> Result<WatchEnd> {
+    watch_records(sink, opts.from_seq, |rec| {
+        if let Some(line) = row(&rec, opts.all) {
+            emit(line);
+        }
+    })
+}
+
+/// Subscribe from `from_seq` and hand `emit` every record as it arrives, until
+/// the daemon ends the stream. The TUI consumes records, not rows: its counters
+/// and its `--all` filter are derived from the record itself.
+pub fn watch_records(
+    mut sink: RemoteSink,
+    from_seq: u64,
+    mut emit: impl FnMut(EventRecord),
+) -> Result<WatchEnd> {
     // A quiet session is not a dead daemon: wait as long as the stream is open.
     sink.set_read_timeout(None)?;
-    sink.send(&Request::Subscribe {
-        from_seq: opts.from_seq,
-    })?;
+    sink.send(&Request::Subscribe { from_seq })?;
     let mut records = 0;
     loop {
         match sink.next_response()? {
             Some(Response::Record(rec)) => {
                 records += 1;
-                if let Some(line) = row(&rec, opts.all) {
-                    emit(line);
-                }
+                emit(*rec);
             }
             Some(Response::Ok) => {}
             Some(Response::Sealed { .. }) => return Ok(WatchEnd::Sealed { records }),
@@ -463,6 +474,24 @@ mod tests {
                 "00:02  ACCEPT snapshot abababababab"
             ]
         );
+    }
+
+    #[test]
+    fn watch_records_delivers_every_record_including_hidden_kinds() {
+        let (chain, log) = records(&[
+            (Origin::TamperWard, denied()),
+            (Origin::Wardd, working()),
+            (Origin::TamperWard, accepted()),
+        ]);
+        let (_dir, socket, _) = fake_daemon(chain, log, None);
+        let sink = connect(&socket).unwrap();
+        let mut seen = Vec::new();
+        let end = watch_records(sink, 1, |rec| seen.push(rec)).unwrap();
+        assert_eq!(end, WatchEnd::Closed { records: 2 });
+        assert_eq!(seen.len(), 2, "records, not rows: the hidden kind arrives");
+        assert_eq!(seen[0].seq, 1);
+        assert_eq!(seen[0].event, working());
+        assert_eq!(seen[1].event, accepted());
     }
 
     #[test]

@@ -12,7 +12,7 @@
     clippy::struct_field_names
 )]
 
-use std::io::{Read as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -21,6 +21,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod replay;
+mod tui;
 use ward_daemon::{Session, SessionMeta, SnapshotRole, client, daemon, render, selftest, snapshot};
 use ward_events::{EndReason, LogReader};
 
@@ -121,8 +122,10 @@ enum Command {
     /// Evidence records for TamperWard, appended by the session daemon.
     #[command(subcommand)]
     Evidence(EvidenceCmd),
-    /// Follow the current session's log live: one observer row per record, from
-    /// the daemon, until the log is sealed (exit 0) or Ctrl-C (exit 130).
+    /// Follow the current session's log live from its daemon. On a terminal this
+    /// is a full-screen observer (trust bar, activity stream, counters; `q` quits);
+    /// on a pipe, or with `--plain`, one observer row per record until the log is
+    /// sealed (exit 0) or Ctrl-C (exit 130).
     Watch {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
@@ -132,7 +135,34 @@ enum Command {
         /// Also show the kinds the compact view hides, as a dim kind name.
         #[arg(long)]
         all: bool,
+        /// The full-screen observer, even when stdout is not a terminal.
+        #[arg(long, conflicts_with = "plain")]
+        tui: bool,
+        /// One row per line on stdout, even on a terminal.
+        #[arg(long, conflicts_with = "tui")]
+        plain: bool,
     },
+}
+
+/// How `ward watch` shows the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchMode {
+    /// The full-screen observer.
+    Tui,
+    /// One row per line.
+    Plain,
+}
+
+impl WatchMode {
+    /// `--tui` and `--plain` decide; otherwise a terminal gets the TUI and a
+    /// pipe gets lines.
+    fn select(tui: bool, plain: bool, stdout_is_terminal: bool) -> Self {
+        if tui || (stdout_is_terminal && !plain) {
+            Self::Tui
+        } else {
+            Self::Plain
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -278,12 +308,19 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Evidence(EvidenceCmd::Append { dir, json }) => {
             cmd_evidence_append(&dir.unwrap_or_else(cwd), &json)
         }
-        Command::Watch { dir, from, all } => cmd_watch(
+        Command::Watch {
+            dir,
+            from,
+            all,
+            tui,
+            plain,
+        } => cmd_watch(
             &dir.unwrap_or_else(cwd),
             client::WatchOptions {
                 from_seq: from,
                 all,
             },
+            WatchMode::select(tui, plain, std::io::stdout().is_terminal()),
         ),
     }
 }
@@ -314,16 +351,34 @@ fn cmd_evidence_append(dir: &Path, json: &str) -> ward_daemon::Result<ExitCode> 
     Ok(ExitCode::SUCCESS)
 }
 
-/// `ward watch`: a line-at-a-time reader over the daemon's subscription. Ctrl-C is
-/// left to SIGINT's default disposition, which ends the process with status 130.
-fn cmd_watch(dir: &Path, opts: client::WatchOptions) -> ward_daemon::Result<ExitCode> {
+/// `ward watch`: the daemon's subscription, as the full-screen observer or as a
+/// line-at-a-time reader. The daemon is contacted first, on a plain terminal, so
+/// a missing one is reported as `NO_DAEMON` (exit 1) before raw mode. In line
+/// mode Ctrl-C is left to SIGINT's default disposition, which ends the process
+/// with status 130; in the TUI it is a key that quits like `q`.
+fn cmd_watch(
+    dir: &Path,
+    opts: client::WatchOptions,
+    mode: WatchMode,
+) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
-    let sink = client::connect(&client::socket_path(dir, &state)?)?;
-    let mut out = std::io::stdout();
-    client::watch(sink, opts, |row| {
-        // A closed pipe (`ward watch | head`) is the reader's choice, not an error.
-        let _ = writeln!(out, "{row}").and_then(|()| out.flush());
+    let meta = SessionMeta::current(dir, &state)?.ok_or_else(|| {
+        ward_daemon::Error::Project(format!(
+            "no session for {}; run `ward up {0}` to start one",
+            dir.display()
+        ))
     })?;
+    let sink = client::connect(&client::socket_path(dir, &state)?)?;
+    match mode {
+        WatchMode::Tui => tui::run(sink, &meta, opts)?,
+        WatchMode::Plain => {
+            let mut out = std::io::stdout();
+            client::watch(sink, opts, |row| {
+                // A closed pipe (`ward watch | head`) is the reader's choice, not an error.
+                let _ = writeln!(out, "{row}").and_then(|()| out.flush());
+            })?;
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -632,4 +687,17 @@ fn exit_code(code: Option<i32>) -> ExitCode {
 
 fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WatchMode;
+
+    #[test]
+    fn watch_mode_prefers_the_tui_on_a_terminal_unless_plain() {
+        assert_eq!(WatchMode::select(false, false, true), WatchMode::Tui);
+        assert_eq!(WatchMode::select(false, false, false), WatchMode::Plain);
+        assert_eq!(WatchMode::select(false, true, true), WatchMode::Plain);
+        assert_eq!(WatchMode::select(true, false, false), WatchMode::Tui);
+    }
 }
