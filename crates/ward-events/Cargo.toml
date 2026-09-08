@@ -5,17 +5,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "WardOS: ward-events"
+description = "WardOS: typed events, envelope, hash chain, wire format, append-only log"
 
 [dependencies]
 blake3 = { workspace = true }
-serde = { workspace = true }
 postcard = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-postcard = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -533,6 +533,7 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
+ "tempfile",
  "thiserror",
 ]
 
