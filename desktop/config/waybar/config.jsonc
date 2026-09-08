@@ -10,6 +10,7 @@
     "custom/ward-project",
     "custom/ward-agent",
     "custom/ward-network",
+    "custom/ward-grants",
     "custom/ward-tamperward",
     "custom/ward-verify"
   ],
@@ -49,7 +50,14 @@
     "return-type": "json",
     "restart-interval": 5,
     "format": "{}",
-    "on-click": "foot --app-id ward-session -e sh -c 'ward-shell session; read -r _'"
+    "on-click": "foot --app-id ward-authority -e sh -c 'ward-shell authority-panel; read -r _'"
+  },
+  "custom/ward-grants": {
+    "exec": "ward-shell bar --waybar --segment grants --follow",
+    "return-type": "json",
+    "restart-interval": 5,
+    "format": "{}",
+    "on-click": "foot --app-id ward-authority -e sh -c 'ward-shell authority-panel; read -r _'"
   },
   "custom/ward-tamperward": {
     "exec": "ward-shell bar --waybar --segment tamperward --follow",

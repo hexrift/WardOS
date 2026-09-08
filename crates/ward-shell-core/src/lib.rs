@@ -21,6 +21,7 @@
     clippy::module_name_repetitions
 )]
 
+pub mod authority;
 pub mod feed;
 pub mod launcher;
 pub mod panel;
@@ -28,6 +29,7 @@ pub mod settings;
 pub mod trust;
 pub mod waybar;
 
+pub use authority::{Authority, authority_panel, grants_segment, network_segment_text};
 pub use feed::{
     Counters, Model, SessionState, TamperWard, Verdict, Verification, Worktree, counters_text,
 };

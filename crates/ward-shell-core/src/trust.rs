@@ -20,6 +20,7 @@ use ward_daemon::render::{self, Tone, network_tone};
 use ward_events::{AgentState, SnapshotId};
 use ward_policy::{CapabilityManifest, NetworkCapability};
 
+use crate::authority::{Authority, grants_segment, network_segment_text};
 use crate::feed::{Model, TamperWard, Verification};
 
 /// The session facts the trust bar shows. Fixed for the session's lifetime; the
@@ -313,8 +314,10 @@ pub enum SegmentName {
     Project,
     /// `CLAUDE ● working`.
     Agent,
-    /// `NET restricted (dev)`.
+    /// `NET restricted (dev)`, `NET restricted · github+` while a grant is live.
     Network,
+    /// `GRANTS n` while temporary authority exists (ADR-0019).
+    Grants,
     /// `CRED n granted`.
     Credentials,
     /// `OBS live`.
@@ -330,12 +333,13 @@ pub enum SegmentName {
 
 impl SegmentName {
     /// Every segment, in bar order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Mark,
         Self::Session,
         Self::Project,
         Self::Agent,
         Self::Network,
+        Self::Grants,
         Self::Credentials,
         Self::Observer,
         Self::Tamperward,
@@ -352,6 +356,7 @@ impl SegmentName {
             Self::Project => "project",
             Self::Agent => "agent",
             Self::Network => "network",
+            Self::Grants => "grants",
             Self::Credentials => "credentials",
             Self::Observer => "observer",
             Self::Tamperward => "tamperward",
@@ -394,8 +399,11 @@ pub struct TrustBar {
     pub project: Segment,
     /// `CLAUDE ● working`: name, glyph and state word in the state's tone.
     pub agent: Option<Segment>,
-    /// The network mode, in the bar's state tone.
+    /// The network mode, in the bar's state tone; `restricted · github+`
+    /// while a grant widens it ([`crate::authority`]).
     pub network: Segment,
+    /// `GRANTS n`, amber, while temporary authority exists; `None` with none.
+    pub grants: Option<Segment>,
     /// `CRED n granted`: amber once anything is granted outright.
     pub credentials: Segment,
     /// `OBS live`, ink.
@@ -427,6 +435,7 @@ impl TrustBar {
             project: Segment::new(header.project.clone(), Tone::Ink),
             agent: None,
             network: Segment::new(render::network_text(&header.network), tone),
+            grants: None,
             credentials: Segment::new(
                 format!("CRED {} granted", header.credentials_granted),
                 cred_tone,
@@ -446,6 +455,11 @@ impl TrustBar {
         let state = &model.state;
         let mut bar = Self::from_header(header, model.sealed);
         bar.agent = state.agent.map(|s| agent_segment(header, s, model.sealed));
+        // Temporary authority shows while it exists (ADR-0019): on the network
+        // segment's text and as a segment of its own.
+        let authority = Authority::from_records(&model.records);
+        bar.network.text = network_segment_text(&header.network, &authority);
+        bar.grants = grants_segment(&authority, model.sealed);
         bar.tamperward = match state.tamperward {
             TamperWard::Unknown => None,
             TamperWard::Clean => Some(Segment::new("TW ✓", Tone::Ok)),
@@ -478,6 +492,7 @@ impl TrustBar {
             SegmentName::Network => {
                 Segment::new(format!("NET {}", self.network.text), self.network.tone)
             }
+            SegmentName::Grants => self.grants.clone()?,
             SegmentName::Credentials => self.credentials.clone(),
             SegmentName::Observer => self.observer.clone(),
             SegmentName::Tamperward => self.tamperward.clone()?,
@@ -511,10 +526,12 @@ impl TrustBar {
             row.push(sep());
             row.push(agent.clone());
         }
+        row.extend([sep(), Segment::new("NET ", Tone::Ink), self.network.clone()]);
+        if let Some(grants) = &self.grants {
+            row.push(sep());
+            row.push(grants.clone());
+        }
         row.extend([
-            sep(),
-            Segment::new("NET ", Tone::Ink),
-            self.network.clone(),
             sep(),
             self.credentials.clone(),
             sep(),
@@ -1007,9 +1024,14 @@ mod tests {
             live.segment(SegmentName::Verify),
             Some(Segment::new(VERIFY_OK, Tone::Ok))
         );
-        // Every name answers, and the answers are the row's segments.
+        // Every name answers, and the answers are the row's segments; the
+        // grants segment only once something is granted.
+        assert_eq!(live.segment(SegmentName::Grants), None, "nothing granted");
         for name in SegmentName::ALL {
-            let segment = seg(&live, name);
+            let Some(segment) = live.segment(name) else {
+                assert_eq!(name, SegmentName::Grants);
+                continue;
+            };
             if name == SegmentName::Network {
                 assert!(live.text().contains(&segment.text), "{name}");
             } else if name != SegmentName::Mark {

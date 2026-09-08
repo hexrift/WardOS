@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
 # wardos-approve — answer an approval the session daemon holds
-# (docs/design-language.md §10, ADR-0016, docs/agent-integration.md §4).
+# (docs/design-language.md §10, ADR-0016, ADR-0019, docs/agent-integration.md §4.1).
 #
 # Usage:
-#   wardos-approve                  pick a pending approval (one pending: it is picked)
-#                                   and answer it from the keyboard: y / s / n
+#   wardos-approve                  pick a pending approval (one pending: it is picked),
+#                                   show its three blocks, and answer from the keyboard:
+#                                   y / s / n
 #   wardos-approve <id> [y|s|n]     answer approval <id>: y allow once, s allow for the
 #                                   session, n deny; without the answer, ask for it
 #   wardos-approve --watch [--once] follow the live session's approvals and show each as
-#                                   a notification with Allow once / Allow session / Deny;
-#                                   the chosen action is relayed to the daemon. Without
-#                                   --once the listener waits for the next session when
-#                                   one ends (this is what wardos-approve.service runs).
+#                                   a notification: DESTINATION (sanitised by the daemon),
+#                                   REQUESTED BY AGENT (the agent's words, labelled as
+#                                   such), WARD WILL ALLOW (network, method, credential,
+#                                   repository, lifetime), then Allow once / Allow session
+#                                   / Deny with their keys; the chosen action is relayed
+#                                   to the daemon. Without --once the listener waits for
+#                                   the next session when one ends (this is what
+#                                   wardos-approve.service runs).
 #   wardos-approve --help
 #
-# The daemon is reached through `ward session pending` and `ward session approve`
+# The daemon is reached through `ward session pending --json` and `ward session approve`
 # for WARDOS_PROJECT (default: the current directory; from home that is the newest
 # live session). Menus go through wardos-menu-select (WARDOS_MENU_BACKEND=fuzzel|stdin,
 # WARDOS_MENU_CHOICE answers the stdin backend); when that command is absent the stdin
 # backend is built in. Deny is the daemon's default on timeout, so an unanswered
-# notification denies. Needs jq.
+# notification denies. The notification body is Pango markup: every value is escaped,
+# so nothing the agent wrote can dress itself up as a row Ward derived, and the
+# destination is in the mono face (<tt>, design-language §4). Needs jq.
 set -euo pipefail
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
@@ -27,8 +34,13 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 project=${WARDOS_PROJECT:-$PWD}
 retry=${WARDOS_APPROVE_RETRY:-2}
 
-# One line per pending approval: id, session, agent, tool, summary, reason.
-fields='[.id, .session, .agent, .tool, .summary, .reason] | @tsv'
+# One line per pending approval: id, session, agent, tool, the agent's claim, then
+# what Ward derived: destination, network, method, credential, repository, lifetime.
+# The lifetime is unset while the question is open: the answer chooses it.
+fields='[.id, .session, .agent, .tool, .claim,
+         .authority.destination, .authority.network, .authority.method,
+         .authority.credential, (.authority.repository // "none"),
+         (.authority.lifetime // "once (y) · session (s)")] | @tsv'
 
 # The words the design uses for the three answers.
 decision_of() {
@@ -64,6 +76,37 @@ answer() {
   ward session approve --session "$session" "$id" "$decision"
 }
 
+# Escape Pango markup, so text cannot pose as markup of its own.
+esc() {
+  local s=$1
+  s=${s//&/\&amp;}
+  s=${s//</\&lt;}
+  s=${s//>/\&gt;}
+  printf '%s' "$s"
+}
+
+# The three blocks of §10 from the fields of one approval. Markup (1) is the
+# notification: dim headers, the destination in <tt>, everything escaped. Plain (0)
+# is the terminal: the same blocks, indented.
+blocks() {
+  local markup=$1 claim=$2 destination=$3 network=$4 method=$5 credential=$6 repository=$7 lifetime=$8
+  local h1=DESTINATION h2='REQUESTED BY AGENT' h3='WARD WILL ALLOW' pad='  ' target
+  if [[ $markup == 1 ]]; then
+    h1="<span alpha=\"39322\">$h1</span>"
+    h2="<span alpha=\"39322\">$h2</span>"
+    h3="<span alpha=\"39322\">$h3</span>"
+    pad=''
+    target="<tt>$(esc "$destination")</tt>"
+    claim=$(esc "$claim") network=$(esc "$network") method=$(esc "$method")
+    credential=$(esc "$credential") repository=$(esc "$repository") lifetime=$(esc "$lifetime")
+  else
+    target=$destination
+  fi
+  printf '%s\n%s%s\n\n%s\n%s%s\n\n%s\n' "$h1" "$pad" "$target" "$h2" "$pad" "$claim" "$h3"
+  printf "${pad}%-12s %s\n" Network "$network" Method "$method" Credential "$credential" \
+    Repository "$repository" Lifetime "$lifetime"
+}
+
 # Ask for the answer with the menu: y / s / n.
 ask_decision() {
   local chosen
@@ -71,10 +114,10 @@ ask_decision() {
   decision_of "${chosen%%$'\t'*}"
 }
 
-# The interactive path: list what is pending, pick one, answer it.
+# The interactive path: list what is pending, pick one, show it, answer it.
 interactive() {
   local id=${1:-} given=${2:-} pending chosen session decision
-  pending=$(ward session pending "$project" | jq -r "$fields")
+  pending=$(ward session pending --json "$project" | jq -r "$fields")
   if [[ -z $pending ]]; then
     echo "  no pending approvals"
     return 0
@@ -86,7 +129,7 @@ interactive() {
     chosen=$pending
   else
     chosen=$(printf '%s\n' "$pending" \
-      | awk -F'\t' '{ printf "%s\t%s · %s %s · %s\n", $1, $3, $4, $5, $6 }' \
+      | awk -F'\t' '{ printf "%s\t%s · %s %s\n", $1, $3, $4, $6 }' \
       | select_line "Approval") || return 1
     chosen=$(printf '%s\n' "$pending" | awk -F'\t' -v id="${chosen%%$'\t'*}" '$1 == id')
   fi
@@ -95,6 +138,11 @@ interactive() {
   if [[ -n $given ]]; then
     decision=$(decision_of "$given")
   else
+    local agent tool claim destination network method credential repository lifetime
+    IFS=$'\t' read -r _ _ agent tool claim destination network method credential repository lifetime \
+      <<<"$chosen"
+    printf '%s requests · %s\n' "${agent^}" "$tool"
+    blocks 0 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime"
     decision=$(ask_decision) || return 1
   fi
   answer "$id" "$session" "$decision"
@@ -103,21 +151,22 @@ interactive() {
 # One notification, waited on; the action chosen is the answer. Runs in the
 # background so a second approval is not queued behind the first.
 notify_one() {
-  local id=$1 session=$2 agent=$3 tool=$4 summary=$5 reason=$6 action decision
+  local id=$1 session=$2 agent=$3 body=$4 action decision
   action=$(notify-send -a WardOS -c ward-approval -u critical --wait \
     -A allow="Allow once" -A session="Allow session" -A deny="Deny" \
-    "${agent^} requests" "$summary"$'\n'"Reason  $reason"$'\n'"Scope   $tool") || action=
+    "${agent^} requests" "$body") || action=
   [[ -n $action ]] || return 0
   decision=$(decision_of "$action") || return 0
   answer "$id" "$session" "$decision" || true
 }
 
 follow_once() {
-  local id session agent tool summary reason
-  while IFS=$'\t' read -r id session agent tool summary reason; do
+  local id session agent tool claim destination network method credential repository lifetime body
+  while IFS=$'\t' read -r id session agent tool claim destination network method credential repository lifetime; do
     [[ -n $id ]] || continue
-    notify_one "$id" "$session" "$agent" "$tool" "$summary" "$reason" &
-  done < <(ward session pending --follow "$project" | jq --unbuffered -r "$fields")
+    body=$(blocks 1 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime")
+    notify_one "$id" "$session" "$agent" "$body" &
+  done < <(ward session pending --json --follow "$project" | jq --unbuffered -r "$fields")
   wait
 }
 

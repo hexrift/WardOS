@@ -253,10 +253,11 @@ enum SessionCmd {
         #[arg(long)]
         json: bool,
     },
-    /// The approvals the session daemon holds (ADR-0016), one JSON object per
-    /// line: `{id, tool, summary, reason, requested_at_unix_ms, agent, session}`.
-    /// The session is the project's current one, else (the desktop asks from
-    /// home, not a project) the newest one a daemon serves.
+    /// The approvals the session daemon holds (ADR-0016): for each, the
+    /// destination, what the agent asked for in its own words, and what Ward
+    /// will allow (ADR-0019). The session is the project's current one, else
+    /// (the desktop asks from home, not a project) the newest one a daemon
+    /// serves.
     Pending {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
@@ -267,6 +268,25 @@ enum SessionCmd {
         /// closes the stream (exit 0).
         #[arg(long)]
         follow: bool,
+        /// One JSON object per approval: `{id, tool, summary, claim, authority:
+        /// {rule, destination, network, method, credential, repository,
+        /// lifetime}, requested_at_unix_ms, agent, session}`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The temporary authority the session holds (ADR-0019): every
+    /// `allow-session` answer and every credential the proxy injects, with its
+    /// scope and lifetime.
+    Grants {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+        /// The session id, instead of looking one up.
+        #[arg(long)]
+        session: Option<String>,
+        /// One JSON object per grant: `{kind, label, scope, lifetime,
+        /// granted_at_unix_ms}`.
+        #[arg(long)]
+        json: bool,
     },
     /// Answer a held approval: `allow` (once), `allow-session` (the same tool on
     /// the same target for the rest of the session) or `deny`.
@@ -401,7 +421,11 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             dir,
             session,
             follow,
-        }) => cmd_pending(&dir.unwrap_or_else(cwd), session.as_deref(), follow),
+            json,
+        }) => cmd_pending(&dir.unwrap_or_else(cwd), session.as_deref(), follow, json),
+        Command::Session(SessionCmd::Grants { dir, session, json }) => {
+            cmd_grants(&dir.unwrap_or_else(cwd), session.as_deref(), json)
+        }
         Command::Session(SessionCmd::Approve {
             id,
             decision,
@@ -561,10 +585,16 @@ struct PendingLine<'a> {
     session: &'a str,
 }
 
-/// `ward session pending [--follow]`: what the daemon holds, as JSON lines the
+/// `ward session pending [--follow] [--json]`: what the daemon holds, each as
+/// the three blocks of `docs/design-language.md` §10, or as the JSON lines the
 /// desktop's `wardos-approve` reads. A quiet stream is not a dead daemon; the
 /// stream ending is the log sealed, and the command exits 0.
-fn cmd_pending(dir: &Path, session: Option<&str>, follow: bool) -> ward_daemon::Result<ExitCode> {
+fn cmd_pending(
+    dir: &Path,
+    session: Option<&str>,
+    follow: bool,
+    json: bool,
+) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     let socket = client::desktop_socket(dir, &state, session)?;
     let mut sink = client::connect(&socket)?;
@@ -575,22 +605,59 @@ fn cmd_pending(dir: &Path, session: Option<&str>, follow: bool) -> ward_daemon::
         .map_or("agent", |a| a.name.as_str());
     let mut out = std::io::stdout();
     let mut print = |approval: &ward_daemon::approvals::Approval| {
-        let line = PendingLine {
-            approval,
-            agent,
-            session: &description.session,
+        let text = if json {
+            let line = PendingLine {
+                approval,
+                agent,
+                session: &description.session,
+            };
+            serde_json::to_string(&line).map_or_else(|_| String::new(), |j| format!("{j}\n"))
+        } else {
+            pending_text(approval, agent)
         };
-        if let Ok(json) = serde_json::to_string(&line) {
-            // A closed pipe is the reader's choice, not an error.
-            let _ = writeln!(out, "{json}").and_then(|()| out.flush());
-        }
+        // A closed pipe is the reader's choice, not an error.
+        let _ = write!(out, "{text}").and_then(|()| out.flush());
     };
     if follow {
         client::follow_pending(&socket, FOLLOW_SETTLE, |approval| print(&approval))?;
     } else {
-        for approval in client::pending(&mut sink)? {
+        let pending = client::pending(&mut sink)?;
+        if pending.is_empty() && !json {
+            println!("  no pending approvals");
+        }
+        for approval in pending {
             print(&approval);
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One approval as text: who asks, the three blocks, and how to answer.
+fn pending_text(approval: &ward_daemon::approvals::Approval, agent: &str) -> String {
+    format!(
+        "Approval {id} · {agent} · {tool}\n{blocks}\nward session approve {id} allow | allow-session | deny\n\n",
+        id = approval.id,
+        tool = approval.tool,
+        blocks = approval.blocks(),
+    )
+}
+
+/// `ward session grants [--json]`: the temporary authority the session holds.
+fn cmd_grants(dir: &Path, session: Option<&str>, json: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
+    let grants = client::grants(&mut sink)?;
+    let mut out = std::io::stdout();
+    if grants.is_empty() && !json {
+        println!("  no temporary grants");
+    }
+    for grant in &grants {
+        let line = if json {
+            serde_json::to_string(grant).unwrap_or_default()
+        } else {
+            grant.line()
+        };
+        let _ = writeln!(out, "{line}").and_then(|()| out.flush());
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -922,7 +989,47 @@ fn cwd() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::WatchMode;
+    use super::{Cli, Command, SessionCmd, WatchMode, pending_text};
+    use clap::Parser as _;
+
+    #[test]
+    fn session_pending_and_grants_take_json_and_print_the_three_blocks() {
+        let cli = Cli::parse_from(["ward", "session", "pending", "--json", "--follow", "/p"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCmd::Pending {
+                json: true,
+                follow: true,
+                ..
+            })
+        ));
+        let cli = Cli::parse_from(["ward", "session", "grants", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCmd::Grants { json: true, .. })
+        ));
+        let approval = ward_daemon::approvals::Approval::new(
+            12,
+            "Write",
+            "/work/src/lib.rs",
+            ward_daemon::approvals::Authority::none(
+                "step-through: pause before writes",
+                "/work/src/lib.rs",
+            ),
+            0,
+        );
+        let text = pending_text(&approval, "claude");
+        assert!(
+            text.starts_with(
+                "Approval 12 · claude · Write\nDESTINATION\n  /work/src/lib.rs\n\nREQUESTED BY AGENT\n  Write /work/src/lib.rs\n\nWARD WILL ALLOW\n  Network      none\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("\nward session approve 12 allow | allow-session | deny\n\n"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn watch_mode_prefers_the_tui_on_a_terminal_unless_plain() {

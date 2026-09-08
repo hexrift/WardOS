@@ -102,6 +102,8 @@ ward selftest examples/ward-demo    # prove the isolation (16/16 hostile probes 
 ward stop     examples/ward-demo    # seal the log
 ward replay   <events.log>          # replay any sealed session (--verify, --json)
 ward session describe examples/ward-demo   # the session's immutable facts for TamperWard (--json)
+ward session pending  examples/ward-demo   # held approvals: destination · requested by agent · Ward will allow (--json)
+ward session grants   examples/ward-demo   # the temporary authority the agent holds: allow-session answers, --grant credentials (--json)
 ward snapshot create  examples/ward-demo   # capture the worktree into the CAS (--role candidate|final)
 ward snapshot diff    <a> <b>              # manifest-level diff from the CAS, not the worktree (--json)
 ward snapshot cat     <id> <path>          # pristine bytes of a path in a snapshot
@@ -188,7 +190,9 @@ rollback. What the image holds today:
   [`docs/desktop.md`](docs/desktop.md)): Hyprland 0.56 with the full key set, the trust
   bar in Waybar (its `VERIFY ✓` turns `~ STALE` the moment the worktree differs from
   the verified candidate), the command centre and every menu in fuzzel, approvals as
-  notifications answered with `y`/`s`/`n`, fourteen themes rendered into every component
+  notifications that show the destination, the agent's claim labelled as its own and
+  what Ward will allow (ADR-0019), answered with `y`/`s`/`n`, every temporary grant on
+  the bar while it lasts, fourteen themes rendered into every component
   with a wallpaper drawn from each theme's tokens, a lock screen, the `wardos-*` command
   family for capture, power, web apps, terminal apps, installs and setup, and
   `wardos-welcome` for the first login. CI parses the Hyprland tree with the compositor
