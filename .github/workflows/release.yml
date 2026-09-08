@@ -56,7 +56,7 @@ jobs:
       VERSION: ${{ needs.version.outputs.version }}
       ARCH: ${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -92,7 +92,7 @@ jobs:
           "${dir}/ward-agent" --help >/dev/null
           "${dir}/ward-shell" --help >/dev/null
           "${dir}/wardos-theme-render" --help >/dev/null
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wardos-${{ matrix.arch }}
           path: |
@@ -114,8 +114,8 @@ jobs:
       TAG: ${{ needs.version.outputs.tag }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: wardos-*
           path: dist

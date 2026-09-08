@@ -80,7 +80,7 @@ jobs:
       # The first user's password. Change it at first login (image/README.md).
       WARDOS_PASSWORD: wardos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Free runner disk
@@ -125,7 +125,7 @@ jobs:
           # One checksum file per architecture: both jobs attach to the same release.
           (cd dist && sha256sum ./* > "SHA256SUMS.${ARCH}")
           ls -lh dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wardos-disks-${{ matrix.arch }}
           path: dist/
@@ -160,5 +160,5 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: ./image/check-packages.sh --arch aarch64 --discover hyprland swayosd lazygit
