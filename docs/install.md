@@ -113,15 +113,31 @@ that is `wardos-first-run`'s job, with a backup next to anything it replaces.
 
 ## 7. macOS, ARM, Windows
 
-The tools are Linux x86_64 only: the sandbox (bubblewrap, namespaces, Landlock,
-seccomp) has no macOS or Windows equivalent. ARM builds from source but has no release
-binaries yet.
+The tools are Linux only: the sandbox (bubblewrap, namespaces, Landlock, seccomp) has
+no macOS or Windows equivalent. They come for two architectures, x86_64 and, from
+v0.3, aarch64; `install.sh` picks the tarball by `uname -m`, and the image and its
+disks exist for both ([`image/README.md`](../image/README.md), "aarch64 and Apple
+silicon").
 
-On a Mac, run the whole OS in a VM. Do not try to build the disk there: download it from
-CI instead (the `disk` workflow's artifact, or the `.qcow2.zst` attached to a release;
-see [`image/README.md`](../image/README.md), "Disk images from CI"), then boot it in UTM
-as an x86_64 machine. On Apple silicon that is emulated and slow but works; an Intel Mac
-runs it natively. Docker Desktop can build and inspect the container image
-(`--platform linux/amd64`) but cannot produce a bootable disk. A native Apple-silicon
-image needs aarch64 builds of the Hyprland COPRs; the `disk` workflow's `aarch64
-chroots` job reports whether they exist.
+**Apple-silicon Mac (M1 and later).** Run the whole OS in a VM, natively: download the
+aarch64 qcow2 (the `disk` workflow's `wardos-disks-aarch64` artifact, or the
+`wardos-<version>-aarch64.qcow2.zst` attached to a release; `zstd -d` restores it) and
+boot it in [UTM](https://mac.getutm.app) as a Linux virtual machine with the Apple
+Virtualization backend: "Use Apple Virtualization", UEFI boot, 4 GB of memory, 4 cores,
+the qcow2 attached as a virtio disk, the display on virtio-gpu. The UTM settings and
+the caveats (no Secure Boot, screen scaling) are in the README section above. Do not
+try to build the disk on the Mac: bootc-image-builder needs a privileged Linux podman
+with loop devices, which Docker Desktop's VM does not provide; CI builds it on an
+arm64 runner. Docker Desktop can build and inspect the *container* image
+(`docker build --platform linux/arm64 …`) for a look around.
+
+**Intel Mac.** The same, with the x86_64 qcow2 (`wardos-<version>-x86_64.qcow2.zst`)
+and UTM's QEMU backend (the Apple Virtualization backend on Intel boots it too); it
+runs natively. An aarch64 disk on an Intel Mac, or an x86_64 one on Apple silicon, is
+emulated: it boots, slowly; use the disk of your own architecture.
+
+**Windows.** The tools only, in WSL2: an Ubuntu 24.04 distribution runs the one-line
+install from §1 (bubblewrap and unprivileged user namespaces work in WSL2's kernel;
+`ward doctor` says so), and `ward` sandboxes agents there. The desktop and the OS image
+do not run under WSL2; a Hyper-V machine could boot the x86_64 disk (`qemu-img convert
+-O vhdx` the qcow2, Generation 2, Secure Boot off) but that path is untested.
