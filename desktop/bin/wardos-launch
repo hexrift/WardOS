@@ -11,11 +11,11 @@
 #        wardos-launch editor [file]            $VISUAL/$EDITOR (nvim), in a terminal when it
 #                                               is a terminal editor
 #        wardos-launch files [dir]              nautilus (or $FILE_MANAGER)
-#        wardos-launch tui <name>               a terminal app from wardos-tui, class wardos-<name>
+#        wardos-launch tui <name>               a terminal app from wardos-tui, class wardos-tui-<name>
 #        wardos-launch webapp <name>            a web app from wardos-webapp: chromium --app,
-#                                               one profile per app, class wardos-<name>
+#                                               one profile per app, class wardos-webapp-<name>
 #        wardos-launch or-focus <class> <cmd…>  focus the window with that class if it is
-#                                               open (hyprctl), else run cmd
+#                                               open (hyprctl, case-insensitive), else run cmd
 set -euo pipefail
 # shellcheck source=desktop/lib/wardos.sh disable=SC1091
 source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
@@ -73,7 +73,7 @@ case "$what" in
     cmd=$(wardos_conf_get "$(conf_file tuis "$1")" cmd)
     [[ -n "$cmd" ]] || wardos_die "$1 has no cmd"
     read -ra words <<<"$cmd"
-    exec "$(wardos_terminal)" "$(wardos_terminal_class_flag)" "wardos-$1" -e "${words[@]}"
+    exec "$(wardos_terminal)" "$(wardos_terminal_class_flag)" "wardos-tui-$1" -e "${words[@]}"
     ;;
   webapp)
     [[ -n "${1:-}" ]] || wardos_die "webapp <name>"
@@ -81,13 +81,13 @@ case "$what" in
     [[ -n "$url" ]] || wardos_die "$1 has no url"
     profile="$(wardos_data_dir)/webapps/$1"
     mkdir -p "$profile"
-    exec chromium "--app=$url" "--user-data-dir=$profile" "--class=wardos-$1"
+    exec chromium "--app=$url" "--user-data-dir=$profile" "--class=wardos-webapp-$1"
     ;;
   or-focus)
     [[ $# -ge 2 ]] || wardos_die "or-focus <class> <cmd…>"
     class=$1
     shift
-    if hyprctl clients -j 2>/dev/null | grep -Eq "\"class\": *\"$class\""; then
+    if hyprctl clients -j 2>/dev/null | grep -Eiq "\"class\": *\"$class\""; then
       exec hyprctl dispatch focuswindow "class:$class"
     fi
     exec "$@"

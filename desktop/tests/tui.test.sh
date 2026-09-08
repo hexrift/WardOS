@@ -11,7 +11,7 @@ wardos-tui install "Disk usage" "ncdu /" >/dev/null
 assert_file "$apps/wardos-disk-usage.desktop"
 grep -q '^Exec=wardos-launch tui disk-usage$' "$apps/wardos-disk-usage.desktop" || fail "Exec"
 grep -q '^Name=Disk usage$' "$apps/wardos-disk-usage.desktop" || fail "Name"
-grep -q '^StartupWMClass=wardos-disk-usage$' "$apps/wardos-disk-usage.desktop" || fail "WMClass"
+grep -q '^StartupWMClass=wardos-tui-disk-usage$' "$apps/wardos-disk-usage.desktop" || fail "WMClass"
 grep -q '^Terminal=false$' "$apps/wardos-disk-usage.desktop" || fail "the terminal is ours, not the launcher's"
 grep -q '^cmd=ncdu /$' "$XDG_CONFIG_HOME/wardos/tuis/disk-usage.conf" || fail "conf cmd"
 grep -q '^icon=utilities-terminal$' "$XDG_CONFIG_HOME/wardos/tuis/disk-usage.conf" || fail "default icon"

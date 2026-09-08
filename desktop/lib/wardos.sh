@@ -58,6 +58,21 @@ wardos_terminal_exec() {
   "$(wardos_terminal)" "$(wardos_terminal_class_flag)" "$app_id" -e "$@"
 }
 
+# wardos_daemon CMD…: start CMD detached (its own session, output in the state directory)
+# and leave its pid in $!. A script's background jobs have SIGINT ignored, which would
+# stop wf-recorder and friends from ever answering a stop; the subshell restores it.
+wardos_daemon() {
+  local log
+  log="$(wardos_state_dir)/$(basename "$1").log"
+  mkdir -p "$(dirname "$log")"
+  local starter=()
+  wardos_has setsid && starter=(setsid)
+  (
+    trap - INT
+    exec "${starter[@]}" "$@" >"$log" 2>&1
+  ) &
+}
+
 wardos_browser() { printf '%s\n' "${BROWSER:-chromium}"; }
 wardos_editor() { printf '%s\n' "${VISUAL:-${EDITOR:-nvim}}"; }
 

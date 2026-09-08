@@ -39,7 +39,7 @@ install_one() {
   mkdir -p "$confs"
   printf 'name=%s\nurl=%s\nicon=%s\n' "$name" "$url" "$icon_url" >"$confs/$slug.conf"
   wardos_desktop_write "$apps/wardos-$slug.desktop" "$name" "wardos-launch webapp $slug" \
-    "$icon" "wardos-$slug" "Network;" "$name (web app)"
+    "$icon" "wardos-webapp-$slug" "Network;" "$name (web app)"
   echo "$name installed: $apps/wardos-$slug.desktop"
 }
 

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# wardos-capture — screenshots, screen recording and the colour picker (docs/desktop.md).
+#
+# Usage: wardos-capture screenshot [region|window|output]   grim (+ slurp for a region, the
+#                                  active window's geometry from hyprctl, the focused output);
+#                                  annotated in satty when installed, else saved to
+#                                  ~/Pictures/Screenshots/<timestamp>.png and copied (wl-copy)
+#        wardos-capture record [region|output]   toggle: starts wf-recorder into
+#                                  ~/Videos/Screencasts/<timestamp>.mp4, or stops the one
+#                                  whose pid is in $XDG_STATE_HOME/wardos/record.pid
+#        wardos-capture color      hyprpicker -a: the colour goes to the clipboard and a toast
+#
+# The last screenshot's path is kept in $XDG_STATE_HOME/wardos/last-screenshot.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+state=$(wardos_state_dir)
+mkdir -p "$state"
+stamp=$(date +%Y-%m-%d_%H-%M-%S)
+
+user_dir() {
+  local kind=$1 fallback=$2 dir
+  dir=$(xdg-user-dir "$kind" 2>/dev/null || true)
+  printf '%s\n' "${dir:-$HOME/$fallback}"
+}
+
+# The active window as "x,y wxh", from hyprctl's JSON (no jq needed for two fields).
+window_geometry() {
+  local json
+  json=$(hyprctl activewindow -j | tr -d '\n ')
+  [[ $json =~ \"at\":\[(-?[0-9]+),(-?[0-9]+)\] ]] || wardos_die "no active window"
+  local x=${BASH_REMATCH[1]} y=${BASH_REMATCH[2]}
+  [[ $json =~ \"size\":\[([0-9]+),([0-9]+)\] ]] || wardos_die "no active window"
+  printf '%s,%s %sx%s\n' "$x" "$y" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+focused_output() {
+  local json
+  json=$(hyprctl activeworkspace -j | tr -d '\n')
+  [[ $json =~ \"monitor\":\ *\"([^\"]+)\" ]] || wardos_die "no focused output"
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# grim_args WHAT: the target option(s) for grim and wf-recorder (they share the syntax).
+grim_args() {
+  case "$1" in
+    region) printf -- '-g\n%s\n' "$(slurp)" ;;
+    window) printf -- '-g\n%s\n' "$(window_geometry)" ;;
+    output) printf -- '-o\n%s\n' "$(focused_output)" ;;
+    *) wardos_die "region, window or output? (--help)" ;;
+  esac
+}
+
+screenshot() {
+  local what=${1:-region} dir file
+  dir=$(user_dir PICTURES Pictures)/Screenshots
+  mkdir -p "$dir"
+  file="$dir/$stamp.png"
+  mapfile -t target < <(grim_args "$what")
+  if wardos_has satty; then
+    grim "${target[@]}" - | satty --filename - --output-filename "$file" --copy-command wl-copy
+  else
+    grim "${target[@]}" "$file"
+    wl-copy <"$file"
+    wardos_notify "Screenshot saved" "$file"
+  fi
+  printf '%s\n' "$file" >"$state/last-screenshot"
+  echo "$file"
+}
+
+record() {
+  local what=${1:-region} pidfile="$state/record.pid" pid dir file
+  if [[ -f "$pidfile" ]]; then
+    pid=$(cat "$pidfile")
+    rm -f "$pidfile"
+    if kill -0 "$pid" 2>/dev/null; then
+      # SIGINT to the recorder's group: wf-recorder finalises the file on it.
+      kill -INT -- "-$pid" 2>/dev/null || kill -INT "$pid"
+      wardos_notify "Recording stopped" "$(cat "$state/record.file" 2>/dev/null || true)"
+      return
+    fi
+  fi
+  dir=$(user_dir VIDEOS Videos)/Screencasts
+  mkdir -p "$dir"
+  file="$dir/$stamp.mp4"
+  mapfile -t target < <(grim_args "$what")
+  wardos_daemon wf-recorder "${target[@]}" -f "$file"
+  echo $! >"$pidfile"
+  printf '%s\n' "$file" >"$state/record.file"
+  wardos_notify "Recording started" "$file"
+}
+
+color() {
+  local value
+  value=$(hyprpicker -a)
+  wardos_notify "Colour copied" "$value"
+  echo "$value"
+}
+
+case "${1:-}" in
+  screenshot) screenshot "${2:-region}" ;;
+  record) record "${2:-region}" ;;
+  color | colour) color ;;
+  *) wardos_die "screenshot, record or color? (--help)" ;;
+esac

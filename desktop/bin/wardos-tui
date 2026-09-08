@@ -2,7 +2,7 @@
 # wardos-tui — terminal apps as windows (docs/desktop.md §Commands).
 #
 # Usage: wardos-tui install <name> <cmd…>   a .desktop entry (Exec=wardos-launch tui <name>)
-#                                          and the definition; the window's class is wardos-<name>
+#                                          and the definition; the window's class is wardos-tui-<name>
 #        wardos-tui install <name>         a shipped default (desktop/tuis)
 #        wardos-tui install --defaults     every shipped default not installed yet
 #        wardos-tui remove [name]          entry and definition
@@ -30,7 +30,7 @@ install_one() {
   mkdir -p "$confs"
   printf 'name=%s\ncmd=%s\nicon=%s\n' "$name" "$cmd" "$icon" >"$confs/$slug.conf"
   wardos_desktop_write "$apps/wardos-$slug.desktop" "$name" "wardos-launch tui $slug" \
-    "$icon" "wardos-$slug" "System;" "$name (terminal app)"
+    "$icon" "wardos-tui-$slug" "System;" "$name (terminal app)"
   echo "$name installed: $apps/wardos-$slug.desktop"
 }
 

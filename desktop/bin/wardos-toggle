@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# wardos-toggle — switch a desktop feature on or off (docs/desktop.md §Commands).
+#
+# Usage: wardos-toggle <what> [on|off|--status]
+#   nightlight      hyprsunset at $WARDOS_NIGHTLIGHT_TEMP kelvin (4000); off kills it
+#   idle            hypridle (the idle lock): running means on
+#   bar             waybar, shown or hidden with SIGUSR1
+#   screensaver     whether wardos-screensaver runs on idle (it reads the state file)
+#   notifications   mako's do-not-disturb mode, inverted: on means notifications show
+#
+# No argument toggles; on/off sets; --status prints on or off (for the bar). State lives
+# in $XDG_STATE_HOME/wardos/<what>; idle asks pgrep and notifications ask makoctl instead,
+# since something else may have started or stopped them.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+state=$(wardos_state_dir)
+mkdir -p "$state"
+what=${1:-}
+mode=${2:-toggle}
+
+# current WHAT: on or off. Files default to on except nightlight, which starts off.
+current() {
+  case "$1" in
+    idle) if pgrep -x hypridle >/dev/null 2>&1; then echo on; else echo off; fi ;;
+    notifications) if makoctl mode 2>/dev/null | grep -q do-not-disturb; then echo off; else echo on; fi ;;
+    nightlight) cat "$state/$1" 2>/dev/null || echo off ;;
+    *) cat "$state/$1" 2>/dev/null || echo on ;;
+  esac
+}
+
+# apply WHAT on|off
+apply() {
+  case "$1:$2" in
+    nightlight:on) wardos_daemon hyprsunset --temperature "${WARDOS_NIGHTLIGHT_TEMP:-4000}" ;;
+    nightlight:off) pkill -x hyprsunset || true ;;
+    idle:on) wardos_daemon hypridle ;;
+    idle:off) pkill -x hypridle || true ;;
+    bar:*) pkill -SIGUSR1 waybar || true ;;
+    screensaver:*) ;;
+    notifications:*)
+      makoctl mode -t do-not-disturb >/dev/null
+      # Trust mako's word over ours: the toggle may have gone the other way.
+      [[ $(current notifications) == "$2" ]] || echo "wardos-toggle: mako reports $(current notifications)" >&2
+      ;;
+  esac
+  case "$1" in
+    idle | notifications) current "$1" >"$state/$1" ;;
+    *) printf '%s\n' "$2" >"$state/$1" ;;
+  esac
+}
+
+label() {
+  case "$1" in
+    nightlight) echo "Night light" ;;
+    idle) echo "Idle lock" ;;
+    bar) echo "Bar" ;;
+    screensaver) echo "Screensaver" ;;
+    notifications) echo "Notifications" ;;
+  esac
+}
+
+case "$what" in
+  nightlight | idle | bar | screensaver | notifications) ;;
+  *) wardos_die "nightlight, idle, bar, screensaver or notifications? (--help)" ;;
+esac
+
+now=$(current "$what")
+case "$mode" in
+  --status)
+    echo "$now"
+    exit 0
+    ;;
+  toggle) if [[ $now == on ]]; then want=off; else want=on; fi ;;
+  on | off) want=$mode ;;
+  *) wardos_die "on, off or --status? (--help)" ;;
+esac
+
+if [[ $want == "$now" && $what != bar && $what != notifications ]]; then
+  # Already there: nothing to start twice (bar and notifications have no state of their own).
+  printf '%s\n' "$now" >"$state/$what"
+  exit 0
+fi
+apply "$what" "$want"
+[[ $what == notifications && $want == off ]] || wardos_notify "$(label "$what") $want" "" -t 2000
+echo "$want"

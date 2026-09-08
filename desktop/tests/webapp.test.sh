@@ -5,7 +5,7 @@
 source "$(dirname "$0")/lib.sh"
 setup_env
 # shellcheck disable=SC2016  # the mock's body is expanded when the mock runs
-mock curl 'for a; do case "$a" in -o) shift; : >"$1" ;; esac; done'
+mock curl 'while [[ $# -gt 0 ]]; do [[ $1 == -o ]] && : >"$2"; shift; done'
 mock notify-send
 apps="$XDG_DATA_HOME/applications"
 exec >/dev/null # the commands' own output; failures go to stderr
@@ -18,7 +18,7 @@ assert_logged '^curl .*https://my.example/icon.png'
 assert_file "$apps/wardos-my-app.desktop"
 grep -q '^Exec=wardos-launch webapp my-app$' "$apps/wardos-my-app.desktop" || fail "Exec"
 grep -q '^Name=My App$' "$apps/wardos-my-app.desktop" || fail "Name"
-grep -q '^StartupWMClass=wardos-my-app$' "$apps/wardos-my-app.desktop" || fail "WMClass"
+grep -q '^StartupWMClass=wardos-webapp-my-app$' "$apps/wardos-my-app.desktop" || fail "WMClass"
 grep -q "^Icon=$XDG_DATA_HOME/wardos/webapps/icons/my-app.png$" "$apps/wardos-my-app.desktop" || fail "Icon path"
 assert_file "$XDG_CONFIG_HOME/wardos/webapps/my-app.conf"
 grep -q '^url=https://my.example$' "$XDG_CONFIG_HOME/wardos/webapps/my-app.conf" || fail "conf url"
