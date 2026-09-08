@@ -890,8 +890,10 @@ pub fn state_root() -> PathBuf {
 }
 
 /// A short, 0700 per-session directory for the egress socket (see `launch`).
-fn run_dir(session_id: &str) -> Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
+/// Where a launch of `session_id` keeps its sockets on the host (never bound into
+/// the sandbox).
+#[must_use]
+pub fn run_dir_path(session_id: &str) -> PathBuf {
     let tail: String = session_id
         .chars()
         .rev()
@@ -900,7 +902,12 @@ fn run_dir(session_id: &str) -> Result<PathBuf> {
         .into_iter()
         .rev()
         .collect();
-    let dir = std::env::temp_dir().join(format!("ward-{tail}"));
+    std::env::temp_dir().join(format!("ward-{tail}"))
+}
+
+fn run_dir(session_id: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = run_dir_path(session_id);
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => Ok(dir),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(dir),
