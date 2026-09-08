@@ -178,6 +178,21 @@ for cls in working waiting blocked verifying finished verified restricted denied
 done
 grep -Eq 'gradient\(|box-shadow:[^;]*[0-9]' "$root/config/waybar/style.css" && fail "waybar/style.css: no gradients, no shadows (§3, §5)"
 
+# --- hyprlock: the wallpaper under a veil, the clock, the mark -------------------
+lock=$root/config/hyprlock/hyprlock.conf
+for v in ground panel separator text text_muted accent verified restricted denied veil font radius wallpaper; do
+  grep -q "^\\\$$v *= " "$lock" || fail "hyprlock: no fallback for \$$v before the first render"
+done
+grep -q '^\s*path = [$]wallpaper' "$lock" || fail "hyprlock: the background is the theme's wallpaper"
+grep -q '^\s*color = [$]veil' "$lock" || fail "hyprlock: the wallpaper is veiled by the panel colour"
+grep -q '^\s*color = [$]ground' "$lock" || fail "hyprlock: the ground shows when there is no wallpaper"
+grep -q '^\s*outer_color = [$]accent' "$lock" || fail "hyprlock: the input's border is the accent (focus)"
+grep -q '^\s*rounding = [$]radius' "$lock" || fail "hyprlock: the input's radius is the theme's"
+grep -q 'WARD' "$lock" || fail "hyprlock: the WARD mark"
+grep -q '^\s*blur_passes = 0' "$lock" || fail "hyprlock: no blur"
+grep -E '^\s*(size|position) = ' "$lock" | tr -d ' ' | cut -d= -f2 | tr ',' '\n' | awk '$1 % 8 != 0 { exit 1 }' \
+  || fail "hyprlock: sizes and positions on the 8 px grid"
+
 # --- emoji list: `<emoji> <name>` per line, a few hundred lines -----------------
 [[ $(wc -l <"$root/config/fuzzel/emoji.txt") -ge 250 ]] || fail "emoji.txt is too short"
 grep -Evq '^[^ ]+ [a-z0-9 ,-]+$' "$root/config/fuzzel/emoji.txt" && fail "emoji.txt: every line is '<emoji> <name>'"
