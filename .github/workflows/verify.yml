@@ -73,3 +73,14 @@ jobs:
           ./image/build.sh --dry-run
           ./image/disk.sh --type qcow2 --dry-run
           ./image/disk.sh --type iso --dry-run
+
+  # The desktop tree (docs/desktop.md): every script shellcheck-clean, every bash test green.
+  desktop:
+    name: desktop scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q shellcheck
+      - run: bash desktop/tests/run.sh
