@@ -179,6 +179,15 @@ contents.
   HTTPS (`200`) and denies `10.0.0.1` and `169.254.169.254` (`403`); `localhost_only`
   denies `api.github.com`. Agent-specific host lists (Claude Code OAuth/API hosts) are
   allowlisted in `Development` and remain to be exercised with the real agents (E-07).
+* **E-07 (model-API credential brokering) — partial PASS.** Claude Code 2.1.263 ran
+  headless inside the session sandbox (`ward claude --dir examples/ward-demo -- -p …`)
+  with `ANTHROPIC_API_KEY` held on the host and a placeholder in Zone 3. Its requests
+  went placeholder → relay → session proxy → `/anthropic` gateway → TLS to
+  `api.anthropic.com`, and the API answered `401 API key is invalid` for the
+  deliberately invalid host key: the credential path is complete and the sandbox never
+  saw a key. The `SessionStart` hook reported through `ward-agent hook` and was logged
+  as a claim. Eleven `NET api.anthropic.com:443` rows are Claude Code's own retries on
+  the 401. A full task with a valid key, streaming and tool use, remains to be run.
 * **E-06 (sandbox warm start) — could not measure here.** `crun` cannot manage
   cgroups in the nested CI environment; the spike records `CANNOT-MEASURE-HERE` with
   the exact commands to run on a real cgroups-v2 host

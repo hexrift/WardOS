@@ -45,6 +45,14 @@ append-only, hash-chained event log that persists across commands.
 
 ![A WardOS session: security panel, live observer with network decisions, isolation self-test](assets/ward-session.png)
 
+Claude Code runs inside that sandbox unmodified. The model-API key stays on the host:
+the agent gets a placeholder and a base URL on the session proxy, which injects the real
+key on the way out (`CRED`). Its hooks report to `wardd` (`NOTE`, `TOOL`), and every
+request to `api.anthropic.com` is a `NET` row. Below, a deliberately invalid host key:
+the API's `401` is the proof that the request left through the gateway and nothing else.
+
+![Claude Code headless inside a WardOS session: credential granted by proxy injection, network rows for every API call, the SessionStart hook recorded as a claim](assets/ward-claude.png)
+
 ```bash
 cargo build --release
 ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
