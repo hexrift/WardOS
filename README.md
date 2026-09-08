@@ -53,6 +53,14 @@ the API's `401` is the proof that the request left through the gateway and nothi
 
 ![Claude Code headless inside a WardOS session: credential granted by proxy injection, network rows for every API call, the SessionStart hook recorded as a claim](assets/ward-claude.png)
 
+The verifier guards the judge, not the implementation. `ward verify` snapshots the
+worktree as a candidate, takes every protected test and the verify config from the
+*entry* snapshot, and runs the suite offline in a disposable sandbox. Below, the demo's
+bug fails; the shortcut of gutting the protected security test changes nothing, because
+the verifier restores the pristine copy; the real one-line fix passes.
+
+![ward verify on the demo: the bug fails, a weakened protected test is restored from the entry snapshot and still fails, the real fix is VERIFIED](assets/ward-verify.png)
+
 ```bash
 cargo build --release
 ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
