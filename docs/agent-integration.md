@@ -59,7 +59,10 @@ row) with `delivery: proxy-injected`. The gateway upstream is the host's choice,
 session allowlist does not apply to it (`localhost_only` still reaches the model API);
 `offline` still means offline and no grant is made. `--pass-env ANTHROPIC_API_KEY`
 opts out: the real key is handed to the agent, printed as such, and no gateway is set
-up. If gateway mode proves incompatible with a provider's OAuth refresh (E-07), the
+up. GitHub works the same way (`credential-broker.md` §4): with `--grant github` (or an
+`allow` rule) the agent's `git push`/`fetch` to `github.com` and its `GITHUB_API_URL`
+calls leave through `/github` and `/github-api` routes, scoped to the policy's
+repositories and permissions, with the host's `GITHUB_TOKEN` injected by the proxy. If gateway mode proves incompatible with a provider's OAuth refresh (E-07), the
 fallback is a per-session short-lived token minted by the broker into the private
 config dir.
 

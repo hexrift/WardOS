@@ -26,16 +26,39 @@ pub struct GatewaySpec {
     pub header: &'static str,
     /// Text placed before the key in the header value (`Bearer ` for OAuth-style APIs).
     pub value_prefix: &'static str,
+    /// When set, the header carries `Basic base64(user:key)` instead (git over HTTPS).
+    pub basic_user: Option<&'static str>,
     /// Client headers removed before injection, so the placeholder never leaves.
     pub strip: &'static [&'static str],
     /// Host variable (and vault file name) holding the real key.
     pub key_env: &'static str,
-    /// Variable the agent reads its base URL from.
+    /// Variable the agent reads its base URL from (empty: none).
     pub base_url_env: &'static str,
     /// Path appended to the prefix in that base URL (`/v1` when the agent expects it).
     pub base_path: &'static str,
-    /// Variable the agent reads its (placeholder) key from.
+    /// Variable the agent reads its (placeholder) key from (empty: none).
     pub placeholder_env: &'static str,
+}
+
+/// Standard base64 without a dependency: only credentials pass through here.
+#[must_use]
+pub fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(TABLE[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// A resolved gateway: the route for the proxy and the sandbox's view of it.
@@ -47,6 +70,8 @@ pub struct Gateway {
     pub route: GatewayRoute,
     /// Environment set inside the sandbox.
     pub env: Vec<(String, String)>,
+    /// Permissions recorded in the grant.
+    pub permissions: Vec<String>,
     subject: String,
 }
 
@@ -66,7 +91,10 @@ impl Gateway {
     /// Build the gateway for `spec` around `key`.
     pub fn from_key(spec: &GatewaySpec, key: &str) -> Result<Self> {
         let (host, port) = spec.upstream;
-        let value = Secret::from(format!("{}{key}", spec.value_prefix));
+        let value = Secret::from(match spec.basic_user {
+            Some(user) => format!("Basic {}", base64(format!("{user}:{key}").as_bytes())),
+            None => format!("{}{key}", spec.value_prefix),
+        });
         let route = GatewayRoute::new(spec.prefix, host, port, spec.header, value)
             .map_err(|e| Error::Sandbox(format!("gateway {}: {e}", spec.service)))?
             .strip_headers(spec.strip);
@@ -76,18 +104,37 @@ impl Gateway {
     /// Pair `spec` with an already built route.
     #[must_use]
     pub fn new(spec: &GatewaySpec, route: GatewayRoute) -> Self {
+        let mut env = Vec::new();
+        if !spec.base_url_env.is_empty() {
+            env.push((
+                spec.base_url_env.to_owned(),
+                format!("http://{RELAY_ADDR}{}{}", spec.prefix, spec.base_path),
+            ));
+        }
+        if !spec.placeholder_env.is_empty() {
+            env.push((spec.placeholder_env.to_owned(), PLACEHOLDER.to_owned()));
+        }
         Self {
             service: spec.service.to_owned(),
             route,
-            env: vec![
-                (
-                    spec.base_url_env.to_owned(),
-                    format!("http://{RELAY_ADDR}{}{}", spec.prefix, spec.base_path),
-                ),
-                (spec.placeholder_env.to_owned(), PLACEHOLDER.to_owned()),
-            ],
+            env,
+            permissions: vec!["proxy-injected".to_owned()],
             subject: format!("{}:{}", spec.upstream.0, spec.upstream.1),
         }
+    }
+
+    /// Transform the route (scope it, for instance).
+    #[must_use]
+    pub fn map_route(mut self, f: impl FnOnce(GatewayRoute) -> GatewayRoute) -> Self {
+        self.route = f(self.route);
+        self
+    }
+
+    /// Record these permissions in the grant instead of the default.
+    #[must_use]
+    pub fn with_permissions(mut self, permissions: Vec<String>) -> Self {
+        self.permissions = permissions;
+        self
     }
 
     /// The grant as recorded in the log. Its validity is the launch: the route is
@@ -97,7 +144,7 @@ impl Gateway {
             service: ServiceId::new(&self.service).map_err(|e| Error::Events(e.to_string()))?,
             scope: Scope {
                 subject: ShortText::new(&self.subject),
-                permissions: vec![NameText::new("proxy-injected")],
+                permissions: self.permissions.iter().map(|p| NameText::new(p)).collect(),
             },
             expires,
             delivery: CredentialDelivery::ProxyInjected,
@@ -148,6 +195,15 @@ mod tests {
                 .contains(&("OPENAI_API_KEY".into(), PLACEHOLDER.into()))
         );
         assert_eq!(spec.value_prefix, "Bearer ");
+    }
+
+    #[test]
+    fn base64_matches_the_standard_alphabet_and_padding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"x-access-token:tok"), "eC1hY2Nlc3MtdG9rZW46dG9r");
     }
 
     #[test]

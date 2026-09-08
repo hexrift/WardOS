@@ -73,6 +73,7 @@ cargo build --release
 ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
 ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live observer
 ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stays on the host
+ward claude   examples/ward-demo --grant github   # …and git/API calls to GitHub through the proxy
 ward status   examples/ward-demo    # the security panel for the active session
 ward verify   examples/ward-demo    # trusted verifier: protected tests from the entry snapshot
 ward selftest examples/ward-demo    # prove the isolation (12/12 hostile probes blocked)

@@ -503,6 +503,21 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
         None => Framing::None,
     };
     let req = &gateway.map_or_else(|| parsed.request.clone(), |g| g.request(&parsed));
+    // The route's credential scope is checked before anything is resolved or
+    // connected: a refused request never reaches the upstream and the secret
+    // is never read for it.
+    if let (Some(route), Method::Forward { verb, path }) = (gateway, &req.method)
+        && let Err(denial) = route.permits(verb, path)
+    {
+        let reason = format!("gateway {}: {denial}", route.prefix());
+        shared.observer.decision(req, Decision::Deny, &reason);
+        return respond(
+            &mut client,
+            403,
+            "Forbidden",
+            "request outside credential scope",
+        );
+    }
     let resolver = shared.resolver.as_ref();
     let pinned = match gateway.map_or_else(
         || shared.policy.evaluate(resolver, &req.target),

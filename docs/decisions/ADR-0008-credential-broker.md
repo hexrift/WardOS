@@ -58,6 +58,12 @@ model API. Points decided during implementation:
   prefix, headers to strip, key variable, base-URL variable and path)`: Anthropic is
   `x-api-key` on `/anthropic`; OpenAI (Codex) is `Authorization: Bearer` on `/openai`
   with the agent's base URL ending in `/v1`. Adding a provider is adding a spec.
+* **GitHub in gateway mode.** Git over HTTPS is plain HTTP to the relay inside the
+  sandbox (a seeded `insteadOf` rewrite), so the proxy can inject
+  `Authorization: Basic x-access-token:<token>` on the way to `github.com`; the API
+  goes to `api.github.com` with a `Bearer` header. The `credentials.github` rule and
+  its scope decide the grant, and the route is restricted to the scope's repositories
+  and to read-only methods unless `contents:write` is granted.
 * **Key sources**, in order: the host variable named by the route (`ANTHROPIC_API_KEY`),
   then `$WARD_STATE_DIR/vault/<NAME>`. The encrypted vault of the decision text is
   still Phase 3; the file is the 0.1 stand-in.
