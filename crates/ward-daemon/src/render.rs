@@ -464,6 +464,40 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
             Tone::Ok,
             format!("snapshot {}", short_hex(&snapshot.to_string())),
         ),
+        WardEvent::SessionPaused { method, reason } => (
+            "PAUSE",
+            Tone::Deny,
+            format!(
+                "agents paused · network closed · grants suspended · processes frozen ({}) · {}",
+                method.as_str(),
+                reason.as_str()
+            ),
+        ),
+        WardEvent::SessionResumed { paused_for } => (
+            "RESUME",
+            Tone::Accent,
+            format!("agents resumed · paused {}", duration_text(*paused_for)),
+        ),
+        WardEvent::EntryRestored {
+            snapshot,
+            files,
+            backup,
+        } => (
+            "RESTORE",
+            Tone::Accent,
+            if backup.as_str().is_empty() {
+                format!(
+                    "entry {} · worktree already matched",
+                    short_hex(&snapshot.to_string())
+                )
+            } else {
+                format!(
+                    "entry {} · {files} paths · replaced files in {}",
+                    short_hex(&snapshot.to_string()),
+                    backup.as_str()
+                )
+            },
+        ),
         WardEvent::SessionEnded { .. } => ("END", Tone::Dim, "session".to_string()),
         _ => return None,
     };
@@ -473,6 +507,17 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
         tone,
         subject,
     })
+}
+
+/// A duration as the observer says it: `12s`, `3m 05s`, `1h 02m`.
+#[must_use]
+pub fn duration_text(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    match (secs / 3600, (secs % 3600) / 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s:02}s"),
+        (h, m, _) => format!("{h}h {m:02}m"),
+    }
 }
 
 /// The verification phase's rows (`docs/design-language.md` §11): `VERIFY` in

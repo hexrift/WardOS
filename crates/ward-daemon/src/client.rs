@@ -72,6 +72,28 @@ pub fn connect(socket: &Path) -> Result<RemoteSink> {
     RemoteSink::connect(socket).ok_or_else(|| Error::Project(NO_DAEMON.to_owned()))
 }
 
+/// `ward pause`: the daemon pauses the session as one operation (ADR-0019 §3)
+/// and answers with the `SessionPaused` record.
+pub fn pause(sink: &mut RemoteSink, reason: &str) -> Result<EventRecord> {
+    expect_record(sink.call(&Request::Pause {
+        reason: reason.to_owned(),
+    })?)
+}
+
+/// `ward resume`: the daemon reverses the pause and answers with the
+/// `SessionResumed` record.
+pub fn resume(sink: &mut RemoteSink) -> Result<EventRecord> {
+    expect_record(sink.call(&Request::Resume)?)
+}
+
+fn expect_record(response: Response) -> Result<EventRecord> {
+    match response {
+        Response::Record(record) => Ok(*record),
+        Response::Error(e) => Err(Error::Project(e)),
+        other => Err(Error::Project(format!("unexpected response {other:?}"))),
+    }
+}
+
 /// Parse one `WardEvent` from its serde JSON and check it is an evidence kind,
 /// with the same rule the daemon applies ([`is_evidence`]), so a refused record
 /// never reaches the socket.

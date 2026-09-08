@@ -12,9 +12,9 @@ use ward_events::chain::{Chain, Timestamp, verify};
 use ward_events::event::{
     Acceptor, AgentIdentity, AgentKind, AgentState, CapabilityKind, CapabilityRequest, CaptureMode,
     ClaimKind, CredentialDelivery, Decision, DecisionSource, DeniedDst, DenyReason, EndReason,
-    EventKind, ExitStatus, FileChangeKind, GrantScope, PolicySubject, ProcessRef, RevokeReason,
-    Scope, SignatureBytes, SnapshotRole, StepStatus, TamperWardSig, VerifyRequester, VerifySummary,
-    WardEvent,
+    EventKind, ExitStatus, FileChangeKind, GrantScope, PauseMethod, PolicySubject, ProcessRef,
+    RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus, TamperWardSig, VerifyRequester,
+    VerifySummary, WardEvent,
 };
 use ward_events::ids::{
     Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
@@ -248,7 +248,8 @@ fn any_event() -> impl Strategy<Value = WardEvent> {
             AgentState::Idle,
             AgentState::Working,
             AgentState::Blocked,
-            AgentState::Finished
+            AgentState::Finished,
+            AgentState::Paused
         ])
         .prop_map(|state| WardEvent::AgentStateChanged { state }),
         nasty_bytes().prop_map(|b| WardEvent::AgentClaim {
@@ -586,6 +587,27 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Wardd,
+            WardEvent::SessionPaused {
+                method: PauseMethod::Sigstop,
+                reason: text("ward pause"),
+            },
+        ),
+        (
+            Origin::Wardd,
+            WardEvent::SessionResumed {
+                paused_for: Duration::from_secs(12),
+            },
+        ),
+        (
+            Origin::Wardd,
+            WardEvent::EntryRestored {
+                snapshot: snap(b"entry"),
+                files: 3,
+                backup: text(".ward/restore-1700000000"),
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -674,7 +696,8 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
         .iter()
         .filter(|r| Filter::quiet().matches(r))
         .count();
-    assert_eq!(quiet, 9);
+    // The nine of Quiet mode plus the three host interventions (ADR-0019 §3).
+    assert_eq!(quiet, 12);
 }
 
 #[test]

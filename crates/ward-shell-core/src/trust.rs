@@ -119,6 +119,7 @@ pub const fn agent_glyph(state: AgentState) -> &'static str {
         AgentState::Blocked => "■",
         AgentState::Verifying => "◐",
         AgentState::Finished => "✓",
+        AgentState::Paused => "‖",
     }
 }
 
@@ -133,19 +134,20 @@ pub const fn agent_word(state: AgentState) -> &'static str {
         AgentState::Blocked => "blocked",
         AgentState::Verifying => "verifying",
         AgentState::Finished => "finished",
+        AgentState::Paused => "paused",
     }
 }
 
 /// The agent's colour role: accent while it moves (working, verifying), amber
-/// while it waits on someone, red while blocked, green when finished, dim when
-/// idle.
+/// while it waits on someone, red while blocked or paused by the host, green
+/// when finished, dim when idle.
 #[must_use]
 pub const fn agent_tone(state: AgentState) -> Tone {
     match state {
         AgentState::Idle => Tone::Dim,
         AgentState::Working | AgentState::Verifying => Tone::Accent,
         AgentState::Waiting => Tone::Warn,
-        AgentState::Blocked => Tone::Deny,
+        AgentState::Blocked | AgentState::Paused => Tone::Deny,
         AgentState::Finished => Tone::Ok,
     }
 }
@@ -555,16 +557,19 @@ impl TrustBar {
 
 /// `CLAUDE ● working`: the agent's name in capitals, its glyph and its state
 /// word. Dim once the log is sealed: the agent is gone, whatever it last said.
+/// Paused by the host (ADR-0019 §3) the word is `PAUSED`, in capitals like the
+/// bar's other host-owned states, in the denied tone.
 fn agent_segment(header: &Header, state: AgentState, sealed: bool) -> Segment {
     let name = header
         .agent
         .as_deref()
         .map_or_else(|| "AGENT".to_owned(), str::to_uppercase);
     let tone = if sealed { Tone::Dim } else { agent_tone(state) };
-    Segment::new(
-        format!("{name} {} {}", agent_glyph(state), agent_word(state)),
-        tone,
-    )
+    let word = match state {
+        AgentState::Paused => "PAUSED",
+        other => agent_word(other),
+    };
+    Segment::new(format!("{name} {} {word}", agent_glyph(state)), tone)
 }
 
 /// The trust bar of `ward watch`, as segments: [`TrustBar::from_header`]'s row.
@@ -622,8 +627,8 @@ mod tests {
     use super::fixtures::description;
     use super::*;
     use crate::feed::fixtures::{
-        agent, denied, edited, ended, model_with, records, sequence, snapshot, tamper,
-        verify_failed, verify_passed, verify_requested, wardd,
+        agent, denied, edited, ended, model_with, paused, records, resumed, sequence, snapshot,
+        tamper, verify_failed, verify_passed, verify_requested, wardd,
     };
     use ward_events::{Origin, WardEvent};
     use ward_policy::merge;
@@ -931,6 +936,23 @@ mod tests {
             assert_eq!(segment.text, format!("CLAUDE {glyph} {word}"));
             assert_eq!(segment.tone, tone);
         }
+        // Paused by the host: `PAUSED` in the denied tone, whatever the agent
+        // said last; resumed, that last word is back.
+        let mut model = Model::new(false);
+        model.apply(wardd(&[agent(S::Working)]).remove(0));
+        model.apply(wardd(&[paused()]).remove(0));
+        assert_eq!(model.state.agent, Some(S::Paused));
+        assert_eq!(agent_glyph(S::Paused), "‖");
+        assert_eq!(agent_word(S::Paused), "paused");
+        assert_eq!(agent_tone(S::Paused), Tone::Deny);
+        let segment = TrustBar::new(&h, &model).agent.unwrap();
+        assert_eq!(segment.text, "CLAUDE ‖ PAUSED");
+        assert_eq!(segment.tone, Tone::Deny);
+        model.apply(wardd(&[resumed()]).remove(0));
+        assert_eq!(
+            TrustBar::new(&h, &model).agent.unwrap().text,
+            "CLAUDE ● working"
+        );
         // No recorded agent: a neutral name, never an invented one.
         let mut anon = h.clone();
         anon.agent = None;

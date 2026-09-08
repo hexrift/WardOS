@@ -29,6 +29,7 @@ pub mod gateway;
 pub mod github;
 pub mod hooks;
 pub mod ids;
+pub mod pause;
 pub mod render;
 pub mod sandbox;
 pub mod selftest;
@@ -43,6 +44,6 @@ pub use selftest::{
     ProbeResult, Verdict, selftest, selftest_credentials, selftest_egress, selftest_evidence,
     selftest_verifier,
 };
-pub use session::{RunReport, Session, SessionMeta, VerifyReport};
+pub use session::{RestoreReport, RunReport, Session, SessionMeta, VerifyReport};
 pub use ward_snapshot::SnapshotRole;
 pub use watch::CaptureMode;

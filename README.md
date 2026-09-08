@@ -99,7 +99,10 @@ ward claude   examples/ward-demo --grant github   # …and git/API calls to GitH
 ward status   examples/ward-demo    # the security panel for the active session
 ward verify   examples/ward-demo    # trusted verifier: protected tests from the entry snapshot
 ward selftest examples/ward-demo    # prove the isolation (29 hostile probes; none reaches its target)
-ward stop     examples/ward-demo    # seal the log
+ward pause    examples/ward-demo    # freeze the agents as one operation: processes, network, credentials, approvals (--reason, --status)
+ward resume   examples/ward-demo    # let them continue
+ward stop     examples/ward-demo    # seal the log (from paused: the frozen processes end, the workspace stays)
+ward stop     examples/ward-demo --restore-entry   # …after writing the entry snapshot back over the worktree (.ward/restore-<ts>/ keeps what it replaced)
 ward replay   <events.log>          # replay any sealed session (--verify, --json)
 ward session describe examples/ward-demo   # the session's immutable facts for TamperWard (--json)
 ward session pending  examples/ward-demo   # held approvals: destination · requested by agent · Ward will allow (--json)
@@ -180,11 +183,14 @@ rollback. What the image holds today:
   per-session policy proxy that is the sandbox's only way out, injecting the model-API
   and GitHub credentials on repo-scoped routes so no key ever enters the sandbox; Claude
   Code hooks reporting to `wardd`, `ask` decisions held by the daemon until the desktop
-  answers; `ward verify`, a disposable offline verifier that takes the protected tests
-  and its config from the entry snapshot; 29 hostile probes in `ward selftest`, every
-  one denied where the host can run it (a probe the host cannot run, such as the IPv6
-  path on a kernel without IPv6, says `CANNOT-MEASURE-HERE` and never counts as a
-  pass), reproduced by CI on every pull request; a daemon-backed warm start of 32 ms.
+  answers; `ward pause` / `ward resume`, the host's own hold on a session as one
+  recorded operation (processes frozen, proxy closed, credentials suspended, approvals
+  held), with `ward stop --restore-entry` to leave as you came; `ward verify`, a
+  disposable offline verifier that takes the protected tests and its config from the
+  entry snapshot; 29 hostile probes in `ward selftest`, every one denied where the host
+  can run it (a probe the host cannot run, such as the IPv6 path on a kernel without
+  IPv6, says `CANNOT-MEASURE-HERE` and never counts as a pass), reproduced by CI on every
+  pull request; a daemon-backed warm start of 32 ms.
 * **The agents.** Claude Code, OpenAI Codex and TamperWard at pinned versions with a
   lockfile, installed at build time, read-only in the sandbox; `ward init` makes any
   directory a project (policy, verifier config, TamperWard wiring, idempotent);
@@ -195,8 +201,9 @@ rollback. What the image holds today:
   bar in Waybar (its `VERIFY ✓` turns `~ STALE` the moment the worktree differs from
   the verified candidate), the command centre and every menu in fuzzel, approvals as
   notifications that show the destination, the agent's claim labelled as its own and
-  what Ward will allow (ADR-0019), answered with `y`/`s`/`n`, every temporary grant on
-  the bar while it lasts, fourteen themes rendered into every component
+  what Ward will allow (ADR-0019), answered with `y`/`s`/`n`, `Super + Shift + P` to
+  pause the agents with the exits in a menu, every temporary grant on the bar while it
+  lasts, fourteen themes rendered into every component
   with a wallpaper drawn from each theme's tokens, a lock screen, the `wardos-*` command
   family for capture, power, web apps, terminal apps, installs and setup, and
   `wardos-welcome` for the first login. CI parses the Hyprland tree with the compositor

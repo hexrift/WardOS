@@ -15,6 +15,13 @@
 //! rewritten with the credential injected, the body is forwarded by its
 //! framing, and the response is streamed back byte-for-byte as it arrives
 //! (so SSE from a model API is never buffered) — see [`serve_gateway`].
+//!
+//! A proxy can be **paused** ([`Handle::set_paused`], ADR-0019 §3): a new
+//! connection is answered `503 paused by ward` before any of it is read, a
+//! request already read is refused the same way before it is resolved or its
+//! credential is injected, and the relays of established tunnels stop moving
+//! bytes until the proxy is resumed. Bytes already handed to a socket are not
+//! recalled; that is the boundary the security model states.
 
 use std::fmt;
 use std::fs;
@@ -42,6 +49,8 @@ use crate::resolve::{Resolver, SystemResolver};
 /// Read timeout on relayed sockets so a relay thread re-checks the shutdown flag.
 const POLL: Duration = Duration::from_millis(250);
 const RELAY_BUF: usize = 16 * 1024;
+/// The body of every refusal while the proxy is paused.
+pub const PAUSED_BODY: &str = "paused by ward";
 
 /// Where clients are accepted from. Also records what was actually bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,12 +200,22 @@ struct Shared {
     idle_timeout: Duration,
     active: AtomicUsize,
     shutdown: AtomicBool,
+    paused: AtomicBool,
 }
 
 impl Shared {
     fn shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
+
+    fn paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+}
+
+/// `503 paused by ward`: the one answer a paused proxy gives.
+fn refuse_paused<C: Conn>(client: &mut C) {
+    respond(client, 503, "Service Unavailable", PAUSED_BODY);
 }
 
 /// The proxy entry point.
@@ -220,6 +239,7 @@ impl Proxy {
             idle_timeout: config.idle_timeout,
             active: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
         });
         let (bound, acceptor) = match config.listen {
             Listen::Tcp(addr) => {
@@ -308,6 +328,18 @@ impl Handle {
     /// Connections currently being served.
     pub fn active_connections(&self) -> usize {
         self.shared.active.load(Ordering::Acquire)
+    }
+
+    /// Pause or resume the proxy (ADR-0019 §3). Paused, every new connection
+    /// and every request not yet resolved is answered `503 paused by ward`, no
+    /// credential is injected, and established relays hold their bytes.
+    pub fn set_paused(&self, paused: bool) {
+        self.shared.paused.store(paused, Ordering::Release);
+    }
+
+    /// Whether the proxy is paused.
+    pub fn paused(&self) -> bool {
+        self.shared.paused()
     }
 
     /// Stop accepting, ask every relay to wind down, join the acceptor and
@@ -446,6 +478,10 @@ fn accept_loop<L: Acceptor>(listener: &L, shared: &Arc<Shared>) {
         let Ok(mut client) = listener.accept() else {
             continue;
         };
+        if shared.paused() {
+            refuse_paused(&mut client);
+            continue;
+        }
         let Some(slot) = Slot::acquire(shared) else {
             respond(&mut client, 503, "Service Unavailable", "proxy at capacity");
             continue;
@@ -475,6 +511,11 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
         Ok(parsed) => parsed,
         Err(e) => return respond(&mut client, 400, "Bad Request", &e.to_string()),
     };
+    // A pause that landed while the head was in flight: nothing is resolved,
+    // connected or injected for it.
+    if shared.paused() {
+        return refuse_paused(&mut client);
+    }
     // A gateway route replaces the destination; an origin-form request that
     // matches none is not a proxy request at all.
     let gateway = shared.gateways.iter().find(|g| g.matches(&parsed));
@@ -593,6 +634,10 @@ fn serve_gateway<C: Conn>(
             "upstream TLS handshake failed",
         );
     };
+    // The last check before the credential leaves the host.
+    if shared.paused() {
+        return refuse_paused(&mut client);
+    }
     let head = match route.rewrite_head(parsed) {
         Ok(head) => head,
         Err(reason) => return respond(&mut client, 502, "Bad Gateway", reason),
@@ -767,6 +812,15 @@ fn copy_stream<S: Read + ?Sized, D: Write + ?Sized>(
 ) -> io::Result<()> {
     let mut buf = vec![0u8; RELAY_BUF];
     loop {
+        // Paused: hold the bytes where they are (the kernel's buffers fill and
+        // TCP flow control does the rest) until resume or shutdown.
+        if shared.paused() {
+            if shared.shutting_down() {
+                return Err(io::Error::from(ErrorKind::TimedOut));
+            }
+            thread::sleep(POLL);
+            continue;
+        }
         match src.read(&mut buf) {
             Ok(0) => return Ok(()),
             Ok(n) => {
@@ -859,6 +913,36 @@ mod tests {
         assert!(matches!(err, Error::BindUnix { .. }), "{err}");
         assert_eq!(fs::read(&path).unwrap(), b"not a socket");
         fs::remove_file(&path).unwrap();
+    }
+
+    /// ADR-0019 §3: while paused the proxy answers every new connection with
+    /// `503 paused by ward` before reading a byte of it, and takes requests
+    /// again the moment it is resumed.
+    #[test]
+    fn a_paused_proxy_refuses_new_requests_and_resumes_cleanly() {
+        let path = socket_path("paused");
+        let handle = spawn_unix(&path).unwrap();
+        assert!(!handle.paused());
+        let ask = |path: &Path| {
+            let mut s = UnixStream::connect(path).unwrap();
+            s.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+                .unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).unwrap();
+            out
+        };
+        handle.set_paused(true);
+        assert!(handle.paused());
+        let out = ask(&path);
+        assert!(
+            out.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{out}"
+        );
+        assert!(out.ends_with("\r\n\r\npaused by ward\n"), "{out}");
+        handle.set_paused(false);
+        let out = ask(&path);
+        assert!(out.starts_with("HTTP/1.1 403 "), "offline denies: {out}");
+        handle.shutdown();
     }
 
     #[test]

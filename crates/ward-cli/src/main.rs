@@ -110,8 +110,32 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
-    /// End the current session and seal its log.
+    /// End the current session and seal its log. A paused session's frozen
+    /// processes are ended; the workspace is kept as it is.
     Stop {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+        /// First write the entry snapshot over the worktree; what it replaces is
+        /// kept under `.ward/restore-<ts>/` and the restore is recorded.
+        #[arg(long)]
+        restore_entry: bool,
+    },
+    /// Pause the current session as one host operation (ADR-0019 §3): freeze its
+    /// sandbox processes, close the proxy to new traffic, suspend credential
+    /// injection, hold the approvals, and record it. Exits are `ward resume`,
+    /// `ward stop`, and `ward stop --restore-entry`.
+    Pause {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+        /// Why, in your words; recorded with the pause.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Print `paused` or `running` for the current session and change nothing.
+        #[arg(long)]
+        status: bool,
+    },
+    /// Resume a paused session and record it.
+    Resume {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
     },
@@ -393,7 +417,13 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             grant,
             args,
         } => cmd_agent(&dir.unwrap_or_else(cwd), "codex", &args, &pass_env, &grant),
-        Command::Stop { dir } => cmd_stop(&dir.unwrap_or_else(cwd)),
+        Command::Stop { dir, restore_entry } => cmd_stop(&dir.unwrap_or_else(cwd), restore_entry),
+        Command::Pause {
+            dir,
+            reason,
+            status,
+        } => cmd_pause(&dir.unwrap_or_else(cwd), reason.as_deref(), status),
+        Command::Resume { dir } => cmd_resume(&dir.unwrap_or_else(cwd)),
         Command::Verify { dir } => cmd_verify(&dir.unwrap_or_else(cwd)),
         Command::Doctor => {
             let checks = ward_daemon::doctor::run();
@@ -873,10 +903,59 @@ fn cmd_run(dir: &Path, argv: &[String]) -> ward_daemon::Result<ExitCode> {
     Ok(exit_code(code))
 }
 
-fn cmd_stop(dir: &Path) -> ward_daemon::Result<ExitCode> {
+/// `ward pause`: one request to the daemon, which does the whole operation;
+/// the row it answers with is the record of it. `--status` reads the marker the
+/// daemon leaves for the proxies, so it needs no daemon.
+fn cmd_pause(dir: &Path, reason: Option<&str>, status: bool) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
-    if let Some(session) = Session::open_current(dir, &state)? {
+    if status {
+        let word = match SessionMeta::current(dir, &state)? {
+            Some(meta) if ward_daemon::pause::marker_path(&state, &meta.id).exists() => "paused",
+            Some(_) => "running",
+            None => "none",
+        };
+        println!("{word}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut sink = client::connect(&client::socket_path(dir, &state)?)?;
+    let record = client::pause(&mut sink, reason.unwrap_or_default())?;
+    if let Some(row) = render::observer_row(&record) {
+        println!("{row}");
+    }
+    println!(
+        "  `ward resume` continues; `ward stop` keeps the workspace; `ward stop --restore-entry` restores the entry state"
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward resume`: the daemon reverses the pause and answers with its record.
+fn cmd_resume(dir: &Path) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let mut sink = client::connect(&client::socket_path(dir, &state)?)?;
+    let record = client::resume(&mut sink)?;
+    if let Some(row) = render::observer_row(&record) {
+        println!("{row}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_stop(dir: &Path, restore_entry: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    if let Some(mut session) = Session::open_current(dir, &state)? {
         let id = session.id().to_owned();
+        if restore_entry {
+            let report = session.restore_entry()?;
+            match &report.backup {
+                Some(backup) => println!(
+                    "  entry {} restored · {} paths · what it replaced is in {backup}/",
+                    report.snapshot, report.files
+                ),
+                None => println!(
+                    "  entry {} · the worktree already matched it",
+                    report.snapshot
+                ),
+            }
+        }
         // With a daemon serving, `stop` is a `Request::Stop`: the daemon writes
         // `SessionEnded`, seals, and exits; otherwise this process seals the log.
         let served = daemon::serving(&state, &id);
@@ -998,6 +1077,7 @@ fn cwd() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::{Cli, Command, SessionCmd, WatchMode, pending_text};
     use clap::Parser as _;
 
@@ -1038,6 +1118,27 @@ mod tests {
             text.ends_with("\nward session approve 12 allow | allow-session | deny\n\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn pause_resume_and_restore_entry_parse() {
+        let cli = Cli::try_parse_from(["ward", "pause", "--reason", "looks wrong"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pause { dir: None, reason: Some(r), status: false } if r == "looks wrong"
+        ));
+        let cli = Cli::try_parse_from(["ward", "pause", "/p", "--status"]).unwrap();
+        assert!(matches!(cli.command, Command::Pause { status: true, .. }));
+        let cli = Cli::try_parse_from(["ward", "resume"]).unwrap();
+        assert!(matches!(cli.command, Command::Resume { dir: None }));
+        let cli = Cli::try_parse_from(["ward", "stop", "--restore-entry"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Stop {
+                restore_entry: true,
+                ..
+            }
+        ));
     }
 
     #[test]

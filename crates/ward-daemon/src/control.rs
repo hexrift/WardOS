@@ -88,6 +88,15 @@ pub enum Request {
     /// The temporary authority the session holds (ADR-0019): every
     /// `allow-session` answer and every credential the proxy injects.
     Grants,
+    /// Pause the session as one operation (ADR-0019 §3): freeze its sandbox
+    /// processes, close the proxy to new traffic, suspend credential
+    /// injection, hold the approvals, and record `SessionPaused`.
+    Pause {
+        /// Why, in the user's words (may be empty).
+        reason: String,
+    },
+    /// Reverse a `Pause` and record `SessionResumed`.
+    Resume,
 }
 
 /// What the daemon answers.
@@ -441,7 +450,9 @@ pub fn handle_with(
         | Request::Hold { .. }
         | Request::Approve { .. }
         | Request::Pending
-        | Request::Grants => (
+        | Request::Grants
+        | Request::Pause { .. }
+        | Request::Resume => (
             Response::Error("not served on this connection".into()),
             false,
         ),
@@ -630,10 +641,29 @@ mod tests {
             r#"{"resp":"grants","body":[{"kind":"credential","label":"GitHub","scope":"contents:read · github.com","lifetime":"launch","granted_at_unix_ms":9}]}"#
         );
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), grants);
-        // A plain log connection does not hold or answer approvals, nor list grants.
+        // Pause and resume are the daemon's; they round-trip as their words.
+        let pause = Request::Pause {
+            reason: "looks wrong".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&pause).unwrap(),
+            r#"{"req":"pause","reason":"looks wrong"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Resume).unwrap(),
+            r#"{"req":"resume"}"#
+        );
+        // A plain log connection does not hold or answer approvals, list grants, or pause.
         let dir = tempfile::tempdir().unwrap();
         let mut log = Some(fresh(dir.path()));
-        for request in [hold, approve, Request::Pending, Request::Grants] {
+        for request in [
+            hold,
+            approve,
+            Request::Pending,
+            Request::Grants,
+            pause,
+            Request::Resume,
+        ] {
             assert!(matches!(
                 handle(&mut log, request).0,
                 Response::Error(e) if e == "not served on this connection"
