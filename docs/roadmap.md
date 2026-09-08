@@ -63,6 +63,17 @@ session (that is Phase 2's `ward claude`).
 
 ## Phase 2 — Agent support
 
+### Phase 2 — delivered so far
+
+`ward claude` and `ward codex` launch inside the sandbox; the ADR-0014 egress path
+(`ward-proxy` on a Unix socket, `ward-agent` loopback relay) is implemented and
+verified with real HTTPS to an allowlisted host and `403` for private and metadata
+destinations, all visible in the observer. Remaining for the gate: gateway-mode
+credential injection so no model-API key enters the sandbox, agent hook adapters for
+step-through, nested containers (E-04), and a full session replay of an agent run.
+
+
+
 ```text
 ward claude
 ward codex
