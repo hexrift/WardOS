@@ -924,31 +924,40 @@ fn cmd_selftest(dir: &Path) -> ward_daemon::Result<ExitCode> {
     let credentials = ward_daemon::selftest_credentials(&mut session)?;
     let evidence = ward_daemon::selftest_evidence(&mut session)?;
     let verifier = ward_daemon::selftest_verifier(&mut session)?;
+    let control = ward_daemon::session::session_dir(session.state_root(), session.id())
+        .join(ward_daemon::control::SOCKET_NAME);
     if throwaway {
         session.stop(EndReason::UserStop)?;
     } else {
         session.sync()?;
     }
+    let egress = ward_daemon::selftest_egress(dir, Some(&control))?;
     let groups = [
         ("isolation", &isolation),
         ("credentials", &credentials),
         ("evidence", &evidence),
         ("verifier boundary", &verifier),
+        ("egress and surfaces", &egress),
     ];
     for (name, results) in &groups {
         println!("WARD selftest · {name}\n");
         for r in *results {
-            println!("{}", render::selftest_row(r.name, r.blocked));
+            println!("{}", render::selftest_row(r.name, &r.verdict));
         }
         println!();
     }
-    let total: usize = groups.iter().map(|(_, r)| r.len()).sum();
-    let passed: usize = groups
-        .iter()
-        .map(|(_, r)| r.iter().filter(|p| p.blocked).count())
-        .sum();
-    println!("  {passed}/{total} PASS");
-    Ok(if passed == total {
+    let all = groups.iter().flat_map(|(_, r)| r.iter());
+    let total = all.clone().count();
+    let passed = all.clone().filter(|p| p.blocked()).count();
+    let reached = all.clone().filter(|p| p.reached()).count();
+    // A probe this host cannot run is reported, never counted as a pass.
+    let unmeasured = total - passed - reached;
+    if unmeasured == 0 {
+        println!("  {passed}/{total} PASS");
+    } else {
+        println!("  {passed}/{total} PASS · {unmeasured} CANNOT-MEASURE-HERE");
+    }
+    Ok(if reached == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

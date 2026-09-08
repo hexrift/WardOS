@@ -1,21 +1,64 @@
 //! `ward selftest`: hostile probes run inside a real sandbox. Each probe exits 0
 //! only if it REACHED its target, so a passing probe is one the sandbox blocked.
+//! The egress and surface probes ([`egress`]) report structured facts instead
+//! and are judged host-side against what the host's own servers saw.
+
+mod egress;
 
 use std::path::Path;
 
 use ward_policy::NetworkCapability;
+
+pub use egress::selftest_egress;
 
 use crate::error::Result;
 use crate::gateway::Gateway;
 use crate::session::{LaunchOpts, Session};
 use crate::{agents, sandbox};
 
-/// One hostile self-test probe and whether the sandbox blocked it.
+/// What a probe found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// The sandbox prevented the probe from reaching its target.
+    Denied,
+    /// The probe reached its target — an isolation failure — and this is how.
+    Reached(String),
+    /// The probe cannot run on this host, for this reason (E-06's
+    /// `CANNOT-MEASURE-HERE`). Never counted as a pass.
+    CannotMeasure(String),
+}
+
+/// One hostile self-test probe and what it found.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProbeResult {
     /// Stable probe name (matches the ST-* catalogue in the threat model).
     pub name: &'static str,
+    /// The finding.
+    pub verdict: Verdict,
+}
+
+impl ProbeResult {
+    /// The exit-code convention: a probe that exits 0 reached its target.
+    fn from_exit(name: &'static str, code: Option<i32>) -> Self {
+        let verdict = if code == Some(0) {
+            Verdict::Reached("the probe exited 0".into())
+        } else {
+            Verdict::Denied
+        };
+        Self { name, verdict }
+    }
+
     /// True if the sandbox prevented the probe from reaching its target.
-    pub blocked: bool,
+    #[must_use]
+    pub fn blocked(&self) -> bool {
+        self.verdict == Verdict::Denied
+    }
+
+    /// True if the probe reached its target: the finding that fails a self-test.
+    #[must_use]
+    pub fn reached(&self) -> bool {
+        matches!(self.verdict, Verdict::Reached(_))
+    }
 }
 
 /// Run the isolation probes (ST-001..015) against a bare sandbox over `worktree`.
@@ -77,10 +120,7 @@ pub fn selftest(worktree: &Path) -> Result<Vec<ProbeResult>> {
             (*script).to_string(),
         ];
         let outcome = sandbox::run(worktree, &NetworkCapability::LocalhostOnly, &argv)?;
-        out.push(ProbeResult {
-            name,
-            blocked: outcome.code != Some(0),
-        });
+        out.push(ProbeResult::from_exit(name, outcome.code));
     }
     Ok(out)
 }
@@ -129,10 +169,7 @@ pub fn selftest_credentials(session: &mut Session) -> Result<Vec<ProbeResult>> {
             canary.clone(),
         ];
         let report = session.launch(&argv, &opts)?;
-        out.push(ProbeResult {
-            name,
-            blocked: report.code != Some(0),
-        });
+        out.push(ProbeResult::from_exit(name, report.code));
     }
     Ok(out)
 }
@@ -188,10 +225,7 @@ pub fn selftest_evidence(session: &mut Session) -> Result<Vec<ProbeResult>> {
             state.clone(),
         ];
         let report = session.launch(&argv, &LaunchOpts::default())?;
-        out.push(ProbeResult {
-            name,
-            blocked: report.code != Some(0),
-        });
+        out.push(ProbeResult::from_exit(name, report.code));
     }
     Ok(out)
 }
@@ -239,10 +273,7 @@ pub fn selftest_verifier(session: &mut Session) -> Result<Vec<ProbeResult>> {
             arg,
         ];
         let report = session.launch(&argv, &LaunchOpts::default())?;
-        out.push(ProbeResult {
-            name,
-            blocked: report.code != Some(0),
-        });
+        out.push(ProbeResult::from_exit(name, report.code));
     }
     Ok(out)
 }

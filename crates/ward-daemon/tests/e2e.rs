@@ -133,7 +133,7 @@ fn selftest_blocks_every_probe() {
     let project = scratch_project();
     let results = selftest(project.path()).expect("selftest");
     assert!(
-        results.iter().all(|r| r.blocked),
+        results.iter().all(ward_daemon::ProbeResult::blocked),
         "all probes must be blocked"
     );
     // The escape probes added for this work must be present and denied.
@@ -141,7 +141,7 @@ fn selftest_blocks_every_probe() {
         let probe = results.iter().find(|r| r.name.starts_with(id));
         assert!(probe.is_some(), "{id} probe must exist");
         assert!(
-            probe.is_some_and(|p| p.blocked),
+            probe.is_some_and(ward_daemon::ProbeResult::blocked),
             "{id} must be denied in the sandbox"
         );
     }
@@ -153,18 +153,18 @@ fn selftest_blocks_every_probe() {
     let evidence = ward_daemon::selftest_evidence(&mut session).expect("evidence probes");
     assert_eq!(evidence.len(), 3);
     for r in &evidence {
-        assert!(r.blocked, "{} must be denied in the sandbox", r.name);
+        assert!(r.blocked(), "{} must be denied in the sandbox", r.name);
     }
     let verifier = ward_daemon::selftest_verifier(&mut session).expect("verifier probes");
     assert_eq!(verifier.len(), 3);
     for r in &verifier {
-        assert!(r.blocked, "{} must be denied in the sandbox", r.name);
+        assert!(r.blocked(), "{} must be denied in the sandbox", r.name);
     }
     session.stop(EndReason::UserStop).expect("stop");
     let names: Vec<&str> = creds.iter().map(|r| r.name).collect();
     assert_eq!(names.len(), 2, "{names:?}");
     for r in &creds {
-        assert!(r.blocked, "{} must be denied in the sandbox", r.name);
+        assert!(r.blocked(), "{} must be denied in the sandbox", r.name);
     }
 
     // The probe itself must be able to fail: a key leaked into the environment REACHES.
@@ -186,6 +186,64 @@ fn selftest_blocks_every_probe() {
     let report = session.launch(&argv, &leaked).expect("launch");
     session.stop(EndReason::UserStop).expect("stop");
     assert_eq!(report.code, Some(0), "ST-012 must detect a leaked key");
+}
+
+/// ADR-0019 decision 6: the egress and surface probes (ST-022, ST-026, ST-027,
+/// ST-028) never reach their targets from a real sandbox. Each row that this CI
+/// can measure must be `Denied`; the IPv6 path may be `CANNOT-MEASURE-HERE` on a
+/// runner without IPv6, and nothing may be `Reached`.
+#[test]
+fn egress_and_surface_probes_never_reach() {
+    if !sandbox::available()
+        || !std::path::Path::new("/usr/bin/python3").exists()
+            && !std::path::Path::new("/usr/local/bin/python3").exists()
+    {
+        eprintln!("skipping: bubblewrap or python3 not available");
+        return;
+    }
+    let project = scratch_project();
+    let control = std::path::PathBuf::from("/nonexistent/control.sock");
+    let results =
+        ward_daemon::selftest_egress(project.path(), Some(&control)).expect("egress probes");
+    let names: Vec<&str> = results.iter().map(|r| r.name).collect();
+    assert_eq!(
+        names,
+        [
+            "ST-022 tunnel-host-switch",
+            "ST-022 tls-end-to-end",
+            "ST-022 proxy-inside-tunnel",
+            "ST-026 raw-tcp-ipv4",
+            "ST-026 raw-tcp-ipv6",
+            "ST-026 socks5-on-proxy",
+            "ST-026 udp-egress",
+            "ST-027 host-run-sockets",
+            "ST-027 host-loopback",
+            "ST-027 host-abstract-socket",
+            "ST-027 hook-socket-forgery",
+            "ST-028 rebind-to-private",
+            "ST-028 pinned-tunnel",
+        ]
+    );
+    for r in &results {
+        assert!(
+            !r.reached(),
+            "{} reached its target: {:?}",
+            r.name,
+            r.verdict
+        );
+        if r.name == "ST-026 raw-tcp-ipv6" {
+            // A runner without IPv6 cannot measure this path; it must say so.
+            assert!(
+                r.blocked()
+                    || matches!(&r.verdict, ward_daemon::Verdict::CannotMeasure(w) if w.contains("IPv6")),
+                "{}: {:?}",
+                r.name,
+                r.verdict
+            );
+        } else {
+            assert!(r.blocked(), "{} must be denied: {:?}", r.name, r.verdict);
+        }
+    }
 }
 
 /// A sandboxed process can reach the session proxy only through the bind-mounted Unix
