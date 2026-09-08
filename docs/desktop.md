@@ -63,8 +63,8 @@ menu path is scriptable and testable.
 | `wardos-capture <what>` | `screenshot [region\|window\|output]` (grim+slurp, satty to annotate), `record [region\|output]` toggle (wf-recorder), `color` (hyprpicker) |
 | `wardos-toggle <what>` | `nightlight` (hyprsunset), `idle` (hypridle), `bar` (waybar), `screensaver`, `notifications` (mako dnd) |
 | `wardos-power <what>` | `lock`, `suspend`, `relaunch` (Hyprland), `restart`, `shutdown`, `menu` |
-| `wardos-theme <verb>` | `list`, `current`, `set <id>`, `next`, `install <git-url>`, `remove <id>`, `render [id]`, `bg next` |
-| `wardos-font <verb>` | `list`, `current`, `set <name>` (mono for terminals, sans for UI) |
+| `wardos-theme <verb>` | `list`, `current`, `set <id>`, `next`, `install <git-url>`, `remove <id>`, `render [id]`, `reload`, `bg next` |
+| `wardos-font <verb>` | `list`, `current`, `set [mono\|sans] <name>` (mono for terminals, sans for UI; a sans candidate sets sans, anything else mono) |
 | `wardos-webapp <verb>` | `install <name> <url> [icon-url]`, `remove <name>`, `list`; chromium `--app`, one profile each |
 | `wardos-tui <verb>` | `install <name> <cmd>`, `remove <name>`, `list`; a `.desktop` that opens the terminal with a class |
 | `wardos-install <what>` | `app <flatpak-id>`, `package <rpm>` (bootc layering, says so), `webapp`, `tui`, `theme`, `font`, `dev <lang>` (mise), `service <name>` |
@@ -158,9 +158,16 @@ A theme is one TOML file (the existing token model). `wardos-theme render <id>` 
 ground), `waybar.css`, `mako.conf`, `fuzzel.ini`, `foot.ini`, `alacritty.toml`,
 `btop.theme`, `hyprlock.conf`, `swayosd.css`, `nvim.lua` (a colorscheme from the tokens),
 `chromium.json` (theme colour), `gtk.css` and `colors.env` (every token as `WARDOS_*`),
-plus `background` (a path, or `solid:<hex>` for swaybg `-c`). Every component's config
-`include`s its fragment; `wardos-theme set` re-renders and signals each running
-component (hyprctl reload, `killall -SIGUSR2 waybar`, `makoctl reload`, ...).
+plus `background` (a path, or `solid:<hex>` for swaybg `-c`) and `theme.toml` (the theme
+itself, for the shell). Every component's config `include`s its fragment; `wardos-theme
+set` re-renders and signals each running component (`hyprctl reload`, `pkill -SIGUSR2 -x
+waybar`, `pkill -SIGUSR1 -x nvim`, `makoctl reload`, swaybg restarted, `systemctl --user
+restart swayosd.service`, `gsettings … color-scheme prefer-dark|light`, the btop symlink
+below), then notifies `Theme · <name>`. `wardos-theme reload` is that signalling alone,
+which `wardos-font set` uses after writing `~/.config/wardos/fonts.conf` and re-rendering.
+The renderer is the Rust crate `desktop/theme` (`wardos-theme-render <id-or-path> --out
+<dir>`); what each fragment carries and how the terminal cells are derived is in
+`desktop/themes/README.md`.
 
 What the shipped configurations expect of each fragment: `hyprland.conf` sets
 `general:col.active_border`, `general:col.inactive_border` and `misc:background_color`
@@ -211,8 +218,8 @@ command, key and test exist on `main`.
 | Walker launcher, clipboard history, emoji | fuzzel + cliphist, `wardos-menu-select` | ✔ config: `config/fuzzel` (+ `emoji.txt`), `Super + Ctrl + V` / `E` |
 | omarchy-menu tree | `wardos-menu` (SYSTEM section above) | |
 | Keybindings viewer | `wardos-keys` | |
-| Themes (set, next, install, remove, backgrounds) | `wardos-theme`, TOML tokens rendered per component | |
-| Font switching | `wardos-font` | |
+| Themes (set, next, install, remove, backgrounds) | `wardos-theme`, TOML tokens rendered per component | ✔ `wardos-theme list\|current\|set\|next\|install\|remove\|render\|reload\|bg next`, `wardos-theme-render` (crate `desktop/theme`, `cargo test -p wardos-theme`), 14 themes; `desktop/tests/theme.test.sh`. Keys `Super + Shift + T` / `B` belong to the keys slice |
+| Font switching | `wardos-font` | ✔ `wardos-font list\|current\|set`; `desktop/tests/font.test.sh` |
 | Web apps in Chromium app mode | `wardos-webapp` | |
 | TUI apps as windows | `wardos-tui` | |
 | Screenshots (hyprshot + satty) | `wardos-capture screenshot` (grim, slurp, satty) | |

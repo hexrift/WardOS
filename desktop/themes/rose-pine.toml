@@ -1,0 +1,57 @@
+# Rosé Pine — the Rosé Pine palette on the nine Ward tokens (ADR-0016,
+# desktop/themes/README.md). Mapping: base, surface, overlay; text and subtle; iris
+# (the lavender) is the accent, foam marks additions, gold warnings, love errors, as
+# the palette's own role guide has them. Everything but the palette and the terminal
+# cells is Ward Dark's.
+
+[meta]
+name = "Rosé Pine"
+id = "rose-pine"
+variant = "dark"
+contrast = "standard"
+source = "palette, mapped onto design-language.md §3"
+origin = "Rosé Pine, the main variant"
+
+[palette]
+ground = { value = "#191724", role = "Host layer", source = "palette" }
+panel = { value = "#1F1D2E", role = "Surfaces", source = "palette" }
+separator = { value = "#26233A", role = "Separator", source = "palette" }
+text = { value = "#E0DEF4", role = "Primary text", source = "palette" }
+text_muted = { value = "#908CAA", role = "Secondary text", source = "palette" }
+accent = { value = "#C4A7E7", role = "Active agent, focus, selection", source = "palette" }
+verified = { value = "#9CCFD8", role = "Verified, pass", source = "palette" }
+restricted = { value = "#F6C177", role = "Restricted, ask pending", source = "palette" }
+denied = { value = "#EB6F92", role = "Denied, failed", source = "palette" }
+
+[tones]
+dim = "text_muted"
+ink = "text"
+accent = "accent"
+ok = "verified"
+warn = "restricted"
+deny = "denied"
+
+# Nearest xterm-256 cells to the palette (Color::nearest_xterm256 in desktop/theme).
+[terminal]
+dim = 103
+ink = 189
+accent = 182
+ok = 152
+warn = 216
+deny = 168
+
+[geometry]
+radius_px = 6
+separator_px = 1
+grid_px = 8
+shadow_levels = 1
+
+[motion]
+transition_ms = 120
+easing = "ease-out"
+animated = ["agent-start", "workspace-change", "verification-begin", "approval-appear", "agent-finish"]
+
+[typography]
+sans = ["Inter", "Geist", "sans-serif"]
+mono = ["JetBrains Mono", "Commit Mono", "monospace"]
+tabular_numerals = true

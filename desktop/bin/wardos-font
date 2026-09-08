@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# wardos-font — the two families every component uses (docs/desktop.md §Commands).
+#
+# Usage:
+#   wardos-font list                  installed monospace families, then the sans candidates
+#   wardos-font current               sans=<family> and mono=<family> in use
+#   wardos-font set [mono|sans] <family>
+#                                     record the choice in ~/.config/wardos/fonts.conf,
+#                                     re-render the current theme and reload; without a
+#                                     class, a sans candidate sets sans, anything else mono
+#
+# The theme lists candidate families (design-language.md §4); fonts.conf overrides
+# them, and wardos-theme-render honours it on every render.
+set -euo pipefail
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/wardos"
+fonts_conf="$config_dir/fonts.conf"
+current_env="$config_dir/theme/current/colors.env"
+
+# The grotesk sans candidates of §4 and the common installed ones; listed
+# whether or not they are installed so the choice is visible before a font is.
+sans_candidates=("Inter" "Geist" "Noto Sans" "Cantarell" "IBM Plex Sans" "Roboto" "Source Sans 3")
+
+die() { echo "wardos-font: $*" >&2; exit 1; }
+
+mono_installed() {
+  command -v fc-list >/dev/null 2>&1 || return 0
+  # One name per family: fc-list prints "Family,Family Alias"; keep the first.
+  fc-list :spacing=mono family | cut -d, -f1 | sort -u
+}
+
+list() {
+  mono_installed
+  printf '%s\n' "${sans_candidates[@]}"
+}
+
+# The family in use: fonts.conf, else the last render, else the theme's first candidate.
+value() {
+  local key=$1 fallback=$2 v=""
+  [[ -f $fonts_conf ]] && v=$(sed -n "s/^$key *= *//p" "$fonts_conf" | tail -1)
+  if [[ -z $v && -f $current_env ]]; then
+    v=$(sed -n "s/^WARDOS_FONT_${key^^}=\"\(.*\)\"/\1/p" "$current_env")
+  fi
+  echo "${v:-$fallback}"
+}
+
+current() {
+  echo "sans=$(value sans Inter)"
+  echo "mono=$(value mono 'JetBrains Mono')"
+}
+
+is_sans_candidate() {
+  local c
+  for c in "${sans_candidates[@]}"; do [[ $c == "$1" ]] && return 0; done
+  return 1
+}
+
+set_font() {
+  local class=$1 family=$2 sans mono
+  sans=$(value sans Inter)
+  mono=$(value mono 'JetBrains Mono')
+  case $class in
+    sans) sans=$family ;;
+    mono) mono=$family ;;
+  esac
+  mkdir -p "$config_dir"
+  printf '# Written by wardos-font; these override the theme'"'"'s candidates on every render.\nsans=%s\nmono=%s\n' "$sans" "$mono" >"$fonts_conf"
+  wardos-theme render
+  wardos-theme reload
+  command -v notify-send >/dev/null 2>&1 && notify-send -a WardOS "Font · $family"
+  return 0
+}
+
+verb=${1:-}
+case $verb in
+  list) list ;;
+  current) current ;;
+  set)
+    case ${2:-} in
+      mono | sans) [[ -n ${3:-} ]] || die "set $2 needs a family"; set_font "$2" "$3" ;;
+      "") die "set needs a family" ;;
+      *) if is_sans_candidate "$2"; then set_font sans "$2"; else set_font mono "$2"; fi ;;
+    esac
+    ;;
+  -h | --help | help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac

@@ -1,0 +1,56 @@
+# Matte Black — the Matte Black palette on the nine Ward tokens (ADR-0016,
+# desktop/themes/README.md). Mapping: true blacks for the surfaces, warm greys for
+# text, a matte steel blue as the one hue, the state colours desaturated to match.
+# Everything but the palette and the terminal cells is Ward Dark's.
+
+[meta]
+name = "Matte Black"
+id = "matte-black"
+variant = "dark"
+contrast = "standard"
+source = "palette, mapped onto design-language.md §3"
+origin = "Matte Black, in WardOS's own rendition (a near-monochrome dark palette; the values are chosen here, not copied)"
+
+[palette]
+ground = { value = "#0B0B0B", role = "Host layer", source = "palette" }
+panel = { value = "#141414", role = "Surfaces", source = "palette" }
+separator = { value = "#232323", role = "Separator", source = "palette" }
+text = { value = "#C8C8C8", role = "Primary text", source = "palette" }
+text_muted = { value = "#7A7A7A", role = "Secondary text", source = "palette" }
+accent = { value = "#8C9AA8", role = "Active agent, focus, selection", source = "palette" }
+verified = { value = "#7FB07F", role = "Verified, pass", source = "palette" }
+restricted = { value = "#D2A24C", role = "Restricted, ask pending", source = "palette" }
+denied = { value = "#C75450", role = "Denied, failed", source = "palette" }
+
+[tones]
+dim = "text_muted"
+ink = "text"
+accent = "accent"
+ok = "verified"
+warn = "restricted"
+deny = "denied"
+
+# Nearest xterm-256 cells to the palette (Color::nearest_xterm256 in desktop/theme).
+[terminal]
+dim = 243
+ink = 251
+accent = 103
+ok = 108
+warn = 179
+deny = 167
+
+[geometry]
+radius_px = 6
+separator_px = 1
+grid_px = 8
+shadow_levels = 1
+
+[motion]
+transition_ms = 120
+easing = "ease-out"
+animated = ["agent-start", "workspace-change", "verification-begin", "approval-appear", "agent-finish"]
+
+[typography]
+sans = ["Inter", "Geist", "sans-serif"]
+mono = ["JetBrains Mono", "Commit Mono", "monospace"]
+tabular_numerals = true

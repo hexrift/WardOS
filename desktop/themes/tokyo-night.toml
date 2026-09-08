@@ -1,0 +1,56 @@
+# Tokyo Night — the Tokyo Night palette on the nine Ward tokens (ADR-0016,
+# desktop/themes/README.md). Mapping: bg_dark, bg, bg_highlight; fg and dark5 for the
+# text pair; blue is the accent. Everything but the palette and the terminal cells is
+# Ward Dark's.
+
+[meta]
+name = "Tokyo Night"
+id = "tokyo-night"
+variant = "dark"
+contrast = "standard"
+source = "palette, mapped onto design-language.md §3"
+origin = "Tokyo Night (folke), the night variant"
+
+[palette]
+ground = { value = "#16161E", role = "Host layer", source = "palette" }
+panel = { value = "#1A1B26", role = "Surfaces", source = "palette" }
+separator = { value = "#292E42", role = "Separator", source = "palette" }
+text = { value = "#C0CAF5", role = "Primary text", source = "palette" }
+text_muted = { value = "#737AA2", role = "Secondary text", source = "palette" }
+accent = { value = "#7AA2F7", role = "Active agent, focus, selection", source = "palette" }
+verified = { value = "#9ECE6A", role = "Verified, pass", source = "palette" }
+restricted = { value = "#E0AF68", role = "Restricted, ask pending", source = "palette" }
+denied = { value = "#F7768E", role = "Denied, failed", source = "palette" }
+
+[tones]
+dim = "text_muted"
+ink = "text"
+accent = "accent"
+ok = "verified"
+warn = "restricted"
+deny = "denied"
+
+# Nearest xterm-256 cells to the palette (Color::nearest_xterm256 in desktop/theme).
+[terminal]
+dim = 67
+ink = 153
+accent = 111
+ok = 149
+warn = 179
+deny = 210
+
+[geometry]
+radius_px = 6
+separator_px = 1
+grid_px = 8
+shadow_levels = 1
+
+[motion]
+transition_ms = 120
+easing = "ease-out"
+animated = ["agent-start", "workspace-change", "verification-begin", "approval-appear", "agent-finish"]
+
+[typography]
+sans = ["Inter", "Geist", "sans-serif"]
+mono = ["JetBrains Mono", "Commit Mono", "monospace"]
+tabular_numerals = true

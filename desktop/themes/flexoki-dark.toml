@@ -1,0 +1,56 @@
+# Flexoki Dark — the Flexoki palette on the nine Ward tokens (ADR-0016,
+# desktop/themes/README.md). Mapping: black, base-950, base-900; base-200 and
+# base-500; the 400 series for blue, green, yellow, red. Everything but the palette
+# and the terminal cells is Ward Dark's.
+
+[meta]
+name = "Flexoki Dark"
+id = "flexoki-dark"
+variant = "dark"
+contrast = "standard"
+source = "palette, mapped onto design-language.md §3"
+origin = "Flexoki (Steph Ango), dark"
+
+[palette]
+ground = { value = "#100F0F", role = "Host layer", source = "palette" }
+panel = { value = "#1C1B1A", role = "Surfaces", source = "palette" }
+separator = { value = "#282726", role = "Separator", source = "palette" }
+text = { value = "#CECDC3", role = "Primary text", source = "palette" }
+text_muted = { value = "#878580", role = "Secondary text", source = "palette" }
+accent = { value = "#4385BE", role = "Active agent, focus, selection", source = "palette" }
+verified = { value = "#879A39", role = "Verified, pass", source = "palette" }
+restricted = { value = "#D0A215", role = "Restricted, ask pending", source = "palette" }
+denied = { value = "#D14D41", role = "Denied, failed", source = "palette" }
+
+[tones]
+dim = "text_muted"
+ink = "text"
+accent = "accent"
+ok = "verified"
+warn = "restricted"
+deny = "denied"
+
+# Nearest xterm-256 cells to the palette (Color::nearest_xterm256 in desktop/theme).
+[terminal]
+dim = 102
+ink = 251
+accent = 67
+ok = 101
+warn = 178
+deny = 167
+
+[geometry]
+radius_px = 6
+separator_px = 1
+grid_px = 8
+shadow_levels = 1
+
+[motion]
+transition_ms = 120
+easing = "ease-out"
+animated = ["agent-start", "workspace-change", "verification-begin", "approval-appear", "agent-finish"]
+
+[typography]
+sans = ["Inter", "Geist", "sans-serif"]
+mono = ["JetBrains Mono", "Commit Mono", "monospace"]
+tabular_numerals = true
