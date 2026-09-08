@@ -4,8 +4,9 @@
 //! and merges policy into a capability manifest ([`ward_policy`]), freezes an entry
 //! snapshot ([`ward_snapshot`]), runs commands in an isolated sandbox
 //! ([`sandbox`]), and records everything to the append-only event log
-//! ([`ward_events`]). The daemon/control-socket split (ADR-0009) lands in Phase 2;
-//! the module boundaries here are drawn so that split is mechanical.
+//! ([`ward_events`]). Since ADR-0015 a per-session `wardd` ([`daemon`]) is the one
+//! writer of that log, serving the control socket protocol ([`control`]); a
+//! command with no daemon to talk to writes the log itself, as before.
 
 #![allow(
     clippy::missing_errors_doc,
@@ -18,6 +19,7 @@
 pub mod agents;
 pub mod client;
 pub mod control;
+pub mod daemon;
 pub mod describe;
 pub mod egress;
 pub mod error;

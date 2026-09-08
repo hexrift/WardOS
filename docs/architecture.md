@@ -157,6 +157,17 @@ Sub-modules are internal to the crate structure (`ward-daemon` depends on `ward-
 `ward-snapshot`, `ward-credentials`, `ward-verifier`, `ward-events`); they are not
 separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 
+> **Implemented (Phase 3, ADR-0015).** `wardd serve --state <STATE> --session <ID>` is a
+> per-session process that owns the session's hash chain and log writer and serves the
+> control socket `<state>/sessions/<ID>/control.sock` (mode 0600, JSON lines:
+> `append`, `evidence`, `sync`, `seal`, `stop`, `describe`, `subscribe`, `ping`).
+> `ward up` spawns it detached and `ward stop` sends `stop`; every other command adopts
+> the socket when a `ping` is answered and writes the log in-process otherwise. The
+> daemon runs as the session owner, not yet as a `ward` system user with the capability
+> set above; sandboxes, proxies and hook listeners still run in the `ward` process
+> (ADR-0013). `subscribe` is the live event stream of `event-model.md` §6 and
+> `evidence` the TamperWard evidence writer of `tamperward-integration.md` §2.
+
 ### 3.2 `ward` CLI
 
 Thin, fast Rust client for the `wardd` control socket. Target: `ward status` renders in

@@ -1,7 +1,8 @@
 //! `ward` — the WardOS command-line client.
 //!
-//! Phase 1 drives the session in-process via [`ward_daemon`]; the daemon/socket
-//! split (ADR-0009) lands in Phase 2.
+//! Sandboxes, proxies and hook listeners run in this process (ADR-0013); the
+//! session log is written by the per-session `wardd` that `ward up` starts
+//! (ADR-0015), or by this process when none is serving.
 
 #![allow(
     clippy::missing_errors_doc,
@@ -20,7 +21,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod replay;
-use ward_daemon::{Session, SessionMeta, SnapshotRole, client, render, selftest, snapshot};
+use ward_daemon::{Session, SessionMeta, SnapshotRole, client, daemon, render, selftest, snapshot};
 use ward_events::{EndReason, LogReader};
 
 #[derive(Parser)]
@@ -382,21 +383,44 @@ fn to_json<T: serde::Serialize>(value: &T) -> ward_daemon::Result<String> {
 }
 
 fn cmd_up(dir: &Path) -> ward_daemon::Result<ExitCode> {
-    let session = Session::start(dir)?;
+    let state = ward_daemon::session::state_root();
+    let mut session = Session::start_in(dir, &state)?;
     session.persist_current()?;
+    session.sync()?;
+    let id = session.id().to_owned();
+    let log = session.log_path();
     print!(
         "{}",
         render::status_panel(
-            session.id(),
+            &id,
             &dir.display().to_string(),
             session.entry_snapshot(),
             session.manifest(),
         )
     );
+    // Hand the log over: from here on the daemon is its writer (ADR-0015).
+    drop(session);
+    let control = match daemon::spawn(&state, &id) {
+        Ok(Some(_)) => Some(control_name(&id)),
+        Ok(None) => {
+            eprintln!("ward: wardd not found beside `ward` or on PATH; staying in-process");
+            None
+        }
+        Err(e) => {
+            eprintln!("ward: {e}; staying in-process");
+            None
+        }
+    };
     println!();
     println!("{}", render::session_status_line(Some(Duration::ZERO)));
-    println!("  session ready · log {}", session.log_path().display());
+    println!("{}", render::daemon_status_line(control.as_deref()));
+    println!("  session ready · log {}", log.display());
     Ok(ExitCode::SUCCESS)
+}
+
+/// The control socket relative to the state root, as the panel names it.
+fn control_name(id: &str) -> String {
+    format!("sessions/{id}/{}", ward_daemon::control::SOCKET_NAME)
 }
 
 fn cmd_status(dir: &Path) -> ward_daemon::Result<ExitCode> {
@@ -413,6 +437,8 @@ fn cmd_status(dir: &Path) -> ward_daemon::Result<ExitCode> {
         );
         println!();
         println!("{}", render::session_status_line(Some(meta.started_ago())));
+        let control = daemon::serving(&state, &meta.id).then(|| control_name(&meta.id));
+        println!("{}", render::daemon_status_line(control.as_deref()));
     } else {
         println!("{}", render::session_status_line(None));
         println!("  run `ward up {}` to start one", dir.display());
@@ -486,7 +512,13 @@ fn cmd_stop(dir: &Path) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     if let Some(session) = Session::open_current(dir, &state)? {
         let id = session.id().to_owned();
+        // With a daemon serving, `stop` is a `Request::Stop`: the daemon writes
+        // `SessionEnded`, seals, and exits; otherwise this process seals the log.
+        let served = daemon::serving(&state, &id);
         session.stop(EndReason::UserStop)?;
+        if served && !daemon::wait_stopped(&state, &id, daemon::STARTUP_TIMEOUT) {
+            eprintln!("ward: wardd has not released {}", control_name(&id));
+        }
         println!("  session {id} stopped");
     } else {
         println!("{}", render::session_status_line(None));
