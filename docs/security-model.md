@@ -16,12 +16,12 @@ that back it. If a guarantee here has no test, it is a **goal**, labelled as suc
 | --- | --- | --- | --- | --- |
 | G1 | An agent session cannot read or write host paths outside its worktree, project environment, sandbox home and tmp | 1, 2, 3 | ST-001..003, 015 | Proven by `ward selftest` (ST-001..004, 013..015 DENIED on a real sandbox) |
 | G2 | An agent session never receives a long-lived credential; every credential it can use is scoped, short-lived, session-bound and logged | 11, 25 | ST-012, 024 | Model-API key: proven by `ward selftest` (canary key on the host never appears in Zone 3; the injected key cannot leave its route). Other services: Phase 3 |
-| G3 | An agent session can reach only the network destinations in its effective manifest, and never private/link-local/metadata ranges | 10, 21 | ST-011, 022, 026, 028 | ST-011 proven by `ward selftest` and the proxy tests (private, link-local and metadata ranges 403 in every mode); ST-022 (TLS interception), ST-026 (raw TCP and SOCKS) and ST-028 (DNS rebinding and pinning) are the backlog of §6 |
-| G4 | An agent session cannot observe, signal, trace, or share writable filesystem state with `wardd`, TamperWard, or any verifier | 5, 6 | ST-005, 006, 027 | Proven by `ward selftest` for the namespace form: ST-005 (the supervisor cannot be signalled), ST-006 (the launch's host run directory, where verifier trees live, is invisible); the distinct verifier uid and ST-027 (loopback and control-socket surfaces, §6) are ahead |
+| G3 | An agent session can reach only the network destinations in its effective manifest, and never private/link-local/metadata ranges | 10, 21 | ST-011, 022, 026, 028 | Proven by `ward selftest` and the proxy tests: ST-011 (private, link-local and metadata ranges 403 in every mode), ST-022 (a tunnel is opaque and pinned to its `CONNECT` target; the agent's TLS ends at the destination even with a sandbox-writable CA), ST-026 (raw TCP, IPv6, SOCKS5 and UDP have no path out), ST-028 (an allowlisted name that resolves to a private address gets the private literal's 403; a tunnel keeps the address it was pinned to). Rows and proofs in §6.1 |
+| G4 | An agent session cannot observe, signal, trace, or share writable filesystem state with `wardd`, TamperWard, or any verifier | 5, 6 | ST-005, 006, 027 | Proven by `ward selftest` for the namespace form: ST-005 (the supervisor cannot be signalled), ST-006 (the launch's host run directory, where verifier trees live, is invisible), ST-027 (the host's loopback, abstract sockets and run-directory sockets are in another namespace; a control-protocol request on the hook socket gets nothing); the distinct verifier uid is ahead |
 | G5 | Entry, candidate and accepted snapshots are immutable and unreachable from the sandbox; their IDs are content-derived | 8, 16 | ST-008, 018 | ST-008 proven by `ward selftest` (the CAS is unreachable) and by content addressing (`ward snapshot diff`); ST-018 (freeze before capture) is ahead |
-| G6 | Evidence is append-only, hash-chained, unreachable from the sandbox, and agent-originated records are distinguishable from enforcement records | 9, 14 | ST-009, 010, 016 | Proven: ST-009/010 and ST-017 by `ward selftest` (log, state root and control socket unreachable), ST-016 end to end (hook-socket input stays `Origin::Agent`), plus `ward replay --verify` on the chain |
+| G6 | Evidence is append-only, hash-chained, unreachable from the sandbox, and agent-originated records are distinguishable from enforcement records | 9, 14 | ST-009, 010, 016, 027 | Proven: ST-009/010 and ST-017 by `ward selftest` (log, state root and control socket unreachable), ST-027 `hook-socket-forgery` (a control-protocol `approve` on the hook socket is answered with nothing and recorded as nothing), ST-016 end to end (hook-socket input stays `Origin::Agent`), plus `ward replay --verify` on the chain |
 | G7 | The effective capability manifest is fixed for the life of a session and repository policy can only narrow it | 7, 18 | ST-007 | Proven: ST-007 end to end (a policy rewritten mid-session does not widen the network) and the merge property tests in `ward-policy` |
-| G8 | The host container engine is never exposed to an agent session | 4 | ST-004 | Proven by `ward selftest` (ST-004: no Docker socket) |
+| G8 | The host container engine is never exposed to an agent session | 4 | ST-004, 027 | Proven by `ward selftest` (ST-004: no Docker socket; ST-027 `host-run-sockets`: `/run/docker.sock`, `/run/podman/podman.sock` and `/run/user/*` are absent) |
 | G9 | Verification runs the trusted test set from Zone 1 against exactly the snapshot IDs in evidence, in an environment the agent cannot influence beyond repository content | 6, 16, 17 | ST-006, 018, 019, 029 | Partly proven: ST-006 by `ward selftest`, ST-019 end to end (a hostile verify command gets no network, no host path and no persistence); the trusted test set comes from the entry snapshot today, TamperWard's bundle, ST-018 and ST-029 (hostile verifier corpus) are ahead (§6). Freshness (ADR-0019): a verdict is shown as `VERIFY ✓` only while the worktree digests to the candidate id the `VerificationPassed` record names, computed by the shell with the snapshot crate's digest-only walk, so a green mark never outlives the state it verified |
 | G10 | Hard-denied capabilities are never presented with an override | 18 | UI test | Phase 5 target |
 | G11 | Data at rest is encrypted and unlockable only by the measured boot chain or the recovery key | 23 | RT-001 | Phase 7 target |
@@ -170,11 +170,45 @@ says so. Numbering continues the threat model's §8 list; ST-023..025 are taken 
 | Test | Guarantee | What the probe does | Passes when |
 | --- | --- | --- | --- |
 | ST-018 `candidate-snapshot-toctou` | G5, G9 | Writes to the worktree from a background process and from a nested container while a candidate is being captured | The candidate's manifest is what the freeze saw; the writes land after it or are recorded as the session being paused (built on the pause primitive of ADR-0019) |
-| ST-022 `tls-interception-attempt` | G3 | Installs a CA into the sandbox's trust store, points the agent's proxy variables at a sandbox-side listener, and asks for an injected host through it | The gateway terminates TLS only for the hosts it injects, with system trust; the sandbox listener sees a CONNECT it cannot complete, and the log shows the attempt |
-| ST-026 `raw-tcp-socks-bypass` | G3 | Opens a raw TCP connection, a SOCKS4/5 handshake and a non-HTTP protocol on the relay port and on every other address the sandbox can name | Nothing leaves except through the proxy's HTTP grammar; each attempt is a `NetworkDenied` record with the reason |
-| ST-027 `loopback-control-surface` | G4, G6 | Scans the sandbox's loopback and abstract Unix namespace for the control socket, the hook socket of another session, and any host service | Only the session's own relay and hook socket answer; the control socket is unreachable (ST-017 already proves it cannot be abused when found) |
-| ST-028 `dns-rebinding-pinning` | G3 | Serves an allowlisted name whose answer flips to a private address between resolution and connect, and a name with mixed public and private answers | The proxy connects to the address it resolved and refused the private one; the flip is a `NetworkDenied` record, not a connection |
 | ST-029 `hostile-verifier-corpus` | G9 | Runs the verifier over a corpus of hostile repositories: build scripts that reach for the network, the host and the CAS; test harnesses that rewrite their own results; symlinks, submodules and hooks pointing out of the tree | Every repository gets a verdict; nothing touches the host, the network or the next run; the verdicts are what the trusted test set says, not what the repository says |
 
 The probes are implemented as `ward selftest` groups or `security-tests/` workloads,
 not here; this section is the contract for what they must show.
+
+### 6.1 Delivered: the `egress and surfaces` group of `ward selftest`
+
+ST-022, ST-026, ST-027 and ST-028 left the backlog as thirteen rows of one
+`ward selftest` group, reproduced by CI on every pull request
+(`egress_and_surface_probes_never_reach` in `crates/ward-daemon/tests/e2e.rs`). The
+probes run inside the real bubblewrap sandbox, handed a proxy socket and a hook socket
+exactly as a session launch is; the proxy is the real `ward-proxy` in `localhost_only`
+mode with a resolver the self-test stages, so an allowlisted `*.localhost` name can be
+made to answer with a private address or to change its answer between two requests,
+and the self-test's own loopback servers (two plain HTTP servers that sign their
+answers, one TLS server with a certificate made for the run) stand in for allowed
+destinations. Each probe prints facts; the verdict is reached on the host by comparing
+them with what those servers, the resolver and the proxy's decision record saw. A row
+this host cannot measure says `CANNOT-MEASURE-HERE` with the reason and is never
+counted as a pass (E-06's convention); the summary line counts them separately.
+
+| Row | What the sandbox does | Proof (`DENIED` when) |
+| --- | --- | --- |
+| ST-022 `tunnel-host-switch` | `CONNECT`s to allowed server A, then sends a request with `Host:` server B inside the tunnel | The answer carries A's signature and B saw no request: a tunnel is bytes to its `CONNECT` target, nothing re-reads the `Host` |
+| ST-022 `tls-end-to-end` | Writes its own CA file under `/tmp`, names it in `SSL_CERT_FILE`, `SSL_CERT_DIR` and `NODE_EXTRA_CA_CERTS`, then speaks TLS through a `CONNECT` to the TLS server | The peer certificate is byte for byte the server's and the response is byte for byte what the server wrote: the proxy never terminated TLS, so it could not read the plaintext or inject a header. A verify failure or a differing certificate is `REACHED` |
+| ST-022 `proxy-inside-tunnel` | Inside a `CONNECT` to A, sends `GET http://denied.example:B/` (what `curl --proxy` sends to a proxy) for a name outside the allowlist that resolves to loopback | Server A answers with its signature and B saw nothing: a tunnel is not a second proxy |
+| ST-026 `raw-tcp-ipv4` | `connect(2)` to `8.8.8.8:53` and `10.0.0.1:80` | `ENETUNREACH`, `ECONNREFUSED` or `EHOSTUNREACH` (or `EPERM` from a filter): the namespace has loopback only |
+| ST-026 `raw-tcp-ipv6` | `connect(2)` to `[2001:4860:4860::8888]:53` | The same, or `CANNOT-MEASURE-HERE` on a kernel without IPv6 sockets (`EAFNOSUPPORT`) |
+| ST-026 `socks5-on-proxy` | A SOCKS5 greeting (`05 01 00`) on the proxy socket | An HTTP `400` or a closed connection, never a `05` reply: the relay speaks HTTP `CONNECT` and forwarding only |
+| ST-026 `udp-egress` | A DNS query over UDP to `1.1.1.1:53` | `sendto` fails with no route; a datagram that leaves but is not answered is `CANNOT-MEASURE-HERE`, a reply is `REACHED` |
+| ST-027 `host-run-sockets` | Looks for `/run/user/*`, `/run/docker.sock`, `/var/run/docker.sock`, `/run/podman/podman.sock` and the session's control socket path | None exists: `/run` is a private tmpfs holding only the two sockets the session binds |
+| ST-027 `host-loopback` | Connects to a port the host is listening on, binds that same port, binds a port the host verified free and asks the proxy to `CONNECT` to it | The host's port is refused inside and free to bind inside (separate port space), and the proxy's connect from the host side is a `502`: a port bound inside is invisible to the host |
+| ST-027 `host-abstract-socket` | Connects to an abstract Unix socket the host bound for the run (`@ward-selftest-<nonce>`) and to `@/tmp/.X11-unix/X0` | `ECONNREFUSED`: abstract sockets are per network namespace |
+| ST-027 `hook-socket-forgery` | Sends a control-protocol `{"req":"approve",…}` line on the hook socket | The hook listener answers with nothing and records nothing; the hook socket has no path to the control protocol, and the control socket itself is absent (ST-017), so there is no daemon secret to steal because no request from the sandbox can reach a `wardd` decision |
+| ST-028 `rebind-to-private` | `CONNECT`s to allowlisted names staged to resolve to `10.0.0.1`, `169.254.169.254`, `::ffff:192.168.0.1` and `[127.0.0.1, 10.0.0.1]`, and to the literal `10.0.0.1` | Every name gets byte for byte the literal's `403` and the proxy's record says `private range` or `cloud metadata endpoint`; a `200` or `502` (an attempted connect) is `REACHED` |
+| ST-028 `pinned-tunnel` | `CONNECT`s to `pin.localhost`, whose answer is loopback once and `10.0.0.1` ever after; sends a request inside the first tunnel; `CONNECT`s again | The first tunnel reaches server A, the proxy resolved the name exactly once per request (twice in all: a third resolution would mean the data path re-resolves), and the second `CONNECT` is a `403` recorded as `private range` |
+
+`ward-proxy` already checked every resolved address against the structural deny
+ranges and connected only to a checked address (`policy.rs`); the ST-028 rows and the
+two proxy integration tests (`allowlisted_name_resolving_to_a_private_address_is_the_literal_403`,
+`an_established_tunnel_is_pinned_and_a_rebinding_answer_refuses_the_next`) state that
+as a contract rather than an implementation detail.

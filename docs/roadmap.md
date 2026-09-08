@@ -246,11 +246,16 @@ workload ([`security-model.md`](security-model.md) §6):
 | Test | Proves | Built on |
 | --- | --- | --- |
 | ST-018 `candidate-snapshot-toctou` | the session is frozen before a candidate is captured, nested containers included | the pause primitive |
-| ST-022 `tls-interception-attempt` | a sandbox-side CA or a proxy trick cannot make the gateway terminate TLS for a host it does not inject | the proxy |
-| ST-026 `raw-tcp-socks-bypass` | a raw TCP connect, a SOCKS request or a non-HTTP protocol on the relay port leaves the sandbox only as a `NetworkDenied` record | the relay and the proxy |
-| ST-027 `loopback-control-surface` | the sandbox's loopback reaches nothing on the host: no control socket, no hook socket beyond its own, no host service on `127.0.0.1` | the network namespace |
-| ST-028 `dns-rebinding-pinning` | a host whose answer changes between resolution and connect, or resolves to a private range, is refused; the proxy connects to the address it resolved | the proxy's resolver |
+| ST-022 `tls-interception-attempt` ✔ | a sandbox-side CA or a proxy trick cannot make the gateway terminate TLS for a host it does not inject | the proxy |
+| ST-026 `raw-tcp-socks-bypass` ✔ | a raw TCP connect, a SOCKS request or a non-HTTP protocol on the relay port leaves the sandbox only as a `NetworkDenied` record | the relay and the proxy |
+| ST-027 `loopback-control-surface` ✔ | the sandbox's loopback reaches nothing on the host: no control socket, no hook socket beyond its own, no host service on `127.0.0.1` | the network namespace |
+| ST-028 `dns-rebinding-pinning` ✔ | a host whose answer changes between resolution and connect, or resolves to a private range, is refused; the proxy connects to the address it resolved | the proxy's resolver |
 | ST-029 `hostile-verifier-corpus` | a corpus of hostile repositories (build scripts, test harness tricks, symlinks, submodules, hooks) gets a verdict from the verifier without touching the host, the network or the next run | the verifier |
+
+✔ delivered: ST-022, ST-026, ST-027 and ST-028 are the `egress and surfaces` group of
+`ward selftest`, thirteen rows judged host-side against the self-test's own servers,
+resolver and proxy record ([`security-model.md`](security-model.md) §6.1), reproduced
+by CI on every pull request. ST-018 waits on the pause primitive; ST-029 is ahead.
 
 Signed releases are part of this phase's install story and wait on one decision: which
 key signs (a project key held by the maintainer, Sigstore keyless from the release

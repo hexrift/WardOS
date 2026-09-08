@@ -106,7 +106,7 @@ ward up                    # policy → manifest, entry snapshot, daemon, log
 ward status                # the security panel
 ward run -- cargo test     # any command, sandboxed, observed
 ward watch --tui           # live observer (second terminal)
-ward selftest              # 16 hostile probes against your host
+ward selftest              # 29 hostile probes against your host
 ward stop                  # seal the log
 ```
 

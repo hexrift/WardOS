@@ -98,7 +98,7 @@ ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stay
 ward claude   examples/ward-demo --grant github   # …and git/API calls to GitHub through the proxy
 ward status   examples/ward-demo    # the security panel for the active session
 ward verify   examples/ward-demo    # trusted verifier: protected tests from the entry snapshot
-ward selftest examples/ward-demo    # prove the isolation (16/16 hostile probes blocked)
+ward selftest examples/ward-demo    # prove the isolation (29 hostile probes; none reaches its target)
 ward stop     examples/ward-demo    # seal the log
 ward replay   <events.log>          # replay any sealed session (--verify, --json)
 ward session describe examples/ward-demo   # the session's immutable facts for TamperWard (--json)
@@ -158,9 +158,11 @@ from the desktop at a glance. In progress:
   agent against WardOS, ending with four comprehension questions); no targets until
   the data exists ([`docs/experiments.md`](docs/experiments.md)).
 * **The remaining security proofs before more desktop polish**: ST-018 freeze before
-  capture, ST-022 TLS interception, ST-026 raw TCP and SOCKS, ST-027 loopback and
-  control socket, ST-028 DNS rebinding and pinning, ST-029 a hostile verifier corpus
-  ([`docs/security-model.md`](docs/security-model.md) §6).
+  capture and ST-029 a hostile verifier corpus
+  ([`docs/security-model.md`](docs/security-model.md) §6). Delivered: ST-022 TLS
+  interception, ST-026 raw TCP, SOCKS and UDP, ST-027 loopback and control surfaces,
+  ST-028 DNS rebinding and pinning, as the `egress and surfaces` group of
+  `ward selftest` (thirteen rows, §6.1).
 * **One install path and one status.** The release tarball with its checksum is the
   primary install; signed releases wait for a signing-key decision
   ([`docs/roadmap.md`](docs/roadmap.md)).
@@ -177,8 +179,10 @@ rollback. What the image holds today:
   and GitHub credentials on repo-scoped routes so no key ever enters the sandbox; Claude
   Code hooks reporting to `wardd`, `ask` decisions held by the daemon until the desktop
   answers; `ward verify`, a disposable offline verifier that takes the protected tests
-  and its config from the entry snapshot; 16/16 hostile probes blocked in `ward selftest`
-  and reproduced by CI on every pull request; a daemon-backed warm start of 32 ms.
+  and its config from the entry snapshot; 29 hostile probes in `ward selftest`, every
+  one denied where the host can run it (a probe the host cannot run, such as the IPv6
+  path on a kernel without IPv6, says `CANNOT-MEASURE-HERE` and never counts as a
+  pass), reproduced by CI on every pull request; a daemon-backed warm start of 32 ms.
 * **The agents.** Claude Code, OpenAI Codex and TamperWard at pinned versions with a
   lockfile, installed at build time, read-only in the sandbox; `ward init` makes any
   directory a project (policy, verifier config, TamperWard wiring, idempotent);
