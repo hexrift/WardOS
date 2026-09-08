@@ -1,12 +1,21 @@
-//! Errors surfaced by [`crate::Proxy::spawn`].
+//! Errors surfaced by [`crate::Proxy::spawn`] and [`crate::GatewayRoute::new`].
 
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-/// Why the proxy could not start.
+/// Why the proxy could not start, or a gateway route could not be built.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A [`crate::GatewayRoute`] was misconfigured. The reason names the
+    /// field, never its value.
+    #[error("gateway route {prefix}: {reason}")]
+    InvalidGateway {
+        /// The route's path prefix as given.
+        prefix: String,
+        /// What was wrong with it.
+        reason: &'static str,
+    },
     /// The TCP listening socket could not be bound.
     #[error("bind {addr}: {source}")]
     Bind {

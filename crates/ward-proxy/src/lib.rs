@@ -20,6 +20,12 @@
 //! `NetworkRequested` / `NetworkDenied` events. Denials answer `403` with a
 //! fixed body that never reveals the allowlist.
 //!
+//! **Gateway routes** ([`GatewayRoute`], ADR-0008 delivery A) let the sandbox
+//! call its model API through `http://127.0.0.1:3128/anthropic` with a
+//! placeholder token: the proxy rewrites the request to the real HTTPS
+//! upstream (policy-checked and pinned like any other destination) and
+//! injects the real credential, a [`Secret`] that is unprintable by type.
+//!
 //! # Layout
 //!
 //! | Module | Contents |
@@ -28,12 +34,15 @@
 //! | [`hosts`] | Built-in allowlists and case-insensitive / wildcard host matching |
 //! | [`policy`] | `Policy`: mode + structural denies, two-stage evaluation, pinning |
 //! | [`resolve`] | `Resolver` trait, `SystemResolver`, `StaticResolver` |
-//! | [`http`] | Bounded, strict request parsing; origin-form rewrite |
+//! | [`http`] | Bounded, strict request parsing; origin-form rewrite; body framing |
+//! | [`secret`] | `Secret`: no `Display`, redacted `Debug`, zeroed on drop |
+//! | [`gateway`] | `GatewayRoute`: prefix match, rewrite + injection, TLS upstream |
 //! | [`observer`] | `Observer`, `Decision`, `NullObserver` |
 //! | [`proxy`] | `Config`, `Proxy::spawn`, `Handle`, the thread-per-connection relay |
 //!
 //! The crate uses only the standard library's blocking I/O: one thread per
-//! connection, bounded by `Config::max_connections`.
+//! connection, bounded by `Config::max_connections`. TLS for gateway
+//! upstreams is `rustls` with the `ring` backend and the host trust store.
 
 #![forbid(unsafe_code)]
 #![allow(
@@ -45,18 +54,22 @@
 
 pub mod addr;
 pub mod error;
+pub mod gateway;
 pub mod hosts;
 pub mod http;
 pub mod observer;
 pub mod policy;
 pub mod proxy;
 pub mod resolve;
+pub mod secret;
 
 pub use addr::AddrClass;
 pub use error::Error;
+pub use gateway::GatewayRoute;
 pub use http::{Header, Host, Method, ParseError, Parsed, Request, Target};
 pub use observer::{Decision, NullObserver, Observer};
 pub use policy::{Denial, Pinned, Policy};
 pub use proxy::{Config, Handle, Proxy};
 pub use resolve::{Resolver, StaticResolver, SystemResolver};
+pub use secret::Secret;
 pub use ward_policy::NetworkCapability;
