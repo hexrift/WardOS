@@ -24,6 +24,7 @@ use ward_snapshot::{CaptureOptions, SnapshotRole, SnapshotStore};
 use crate::egress::Egress;
 use crate::error::{Error, Result};
 use crate::gateway::Gateway;
+use crate::hooks::Hooks;
 use crate::ids::{ev_hash, ev_snapshot, new_session_id, project_id_for};
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
 use crate::watch::{CaptureMode, Captured, Watcher};
@@ -120,6 +121,8 @@ pub struct LaunchOpts {
     pub interactive: bool,
     /// Credentials the proxy injects for this launch (`gateway.rs`).
     pub gateways: Vec<Gateway>,
+    /// A settings file seeded read-only into the sandbox: `(path, content)`.
+    pub settings: Option<(String, String)>,
 }
 
 /// Nominal validity of a gateway grant. The route itself lives exactly as long
@@ -346,6 +349,7 @@ impl Session {
                 env,
                 interactive: true,
                 gateways,
+                settings: profile.settings.map(|s| (s.path.to_owned(), (s.content)())),
             },
         ))
     }
@@ -383,34 +387,17 @@ impl Session {
             None
         };
 
-        // Unix socket paths are capped at 108 bytes, so the proxy lives in a short,
-        // private per-session run dir rather than under the (possibly deep) state root.
         for g in &opts.gateways {
             self.emit(Origin::Wardd, g.granted(GATEWAY_TTL)?)?;
         }
-        let routes = opts.gateways.iter().map(|g| g.route.clone()).collect();
         let run_dir = run_dir(&self.session_str)?;
-        let egress = Egress::start(&run_dir, &self.manifest.network, routes)?;
-        let mut launch = Launch::new(&self.worktree, argv.to_vec()).egress(egress.socket());
-        // The shim is used only when it can relay to the egress socket; an older build
-        // without `--relay` would reject the flag, so fall back to a direct exec (still
-        // isolated by bwrap; the socket is bound for socket-aware tools).
-        if let Some(shim) = find_shim().filter(|s| s.relay) {
-            // Both cases: curl and friends honour only lowercase `http_proxy`.
-            launch = launch.shim_flags(shim.flags()).shim(shim.path);
-            for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-                launch = launch.env(key, format!("http://{RELAY_ADDR}"));
-            }
-            for key in ["NO_PROXY", "no_proxy"] {
-                launch = launch.env(key, "localhost,127.0.0.1");
-            }
-        }
-        for (k, v) in &opts.env {
-            launch = launch.env(k.clone(), v.clone());
-        }
-        if opts.interactive {
-            launch = launch.stdio(StdioMode::Inherit);
-        }
+        let egress = Egress::start(
+            &run_dir,
+            &self.manifest.network,
+            opts.gateways.iter().map(|g| g.route.clone()).collect(),
+        )?;
+        let hooks = Hooks::start(&run_dir, self.manifest.observer)?;
+        let launch = self.prepare(argv, opts, &run_dir, &egress, &hooks)?;
         let outcome = launch.run()?;
 
         let (captured, capture) = match (watcher, before) {
@@ -433,7 +420,11 @@ impl Session {
             self.emit(Origin::Proxy, event)?;
         }
         egress.stop();
-        let _ = std::fs::remove_dir(&run_dir);
+        for event in hooks.drain_events() {
+            self.emit(Origin::Agent, event)?;
+        }
+        hooks.stop();
+        let _ = std::fs::remove_dir_all(&run_dir);
 
         self.emit(
             Origin::Kernel,
@@ -459,6 +450,49 @@ impl Session {
             stdout: outcome.stdout,
             stderr: outcome.stderr,
         })
+    }
+
+    /// The sandboxed launch: egress and hook sockets bound, settings seeded, the
+    /// shim when it can relay, proxy env, and the caller's env and stdio.
+    ///
+    /// Unix socket paths are capped at 108 bytes, so both sockets live in the short,
+    /// private per-session `run_dir` rather than under the (possibly deep) state root.
+    fn prepare(
+        &self,
+        argv: &[String],
+        opts: &LaunchOpts,
+        run_dir: &Path,
+        egress: &Egress,
+        hooks: &Hooks,
+    ) -> Result<Launch> {
+        let mut launch = Launch::new(&self.worktree, argv.to_vec())
+            .egress(egress.socket())
+            .hooks(hooks.socket());
+        if let Some((path, content)) = &opts.settings {
+            let file = run_dir.join("settings.json");
+            std::fs::write(&file, content).map_err(|e| Error::io(&file, e))?;
+            launch = launch.seed(file, path.clone());
+        }
+        // The shim is used only when it can relay to the egress socket; an older build
+        // without `--relay` would reject the flag, so fall back to a direct exec (still
+        // isolated by bwrap; the socket is bound for socket-aware tools).
+        if let Some(shim) = find_shim().filter(|s| s.relay) {
+            // Both cases: curl and friends honour only lowercase `http_proxy`.
+            launch = launch.shim_flags(shim.flags()).shim(shim.path);
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                launch = launch.env(key, format!("http://{RELAY_ADDR}"));
+            }
+            for key in ["NO_PROXY", "no_proxy"] {
+                launch = launch.env(key, "localhost,127.0.0.1");
+            }
+        }
+        for (k, v) in &opts.env {
+            launch = launch.env(k.clone(), v.clone());
+        }
+        if opts.interactive {
+            launch = launch.stdio(StdioMode::Inherit);
+        }
+        Ok(launch)
     }
 
     /// End the session, seal the log, and clear the project's current pointer.
