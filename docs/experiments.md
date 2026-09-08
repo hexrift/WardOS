@@ -209,6 +209,26 @@ contents.
   the exact commands to run on a real cgroups-v2 host
   (`experiments/E-06-warm-start/RESULT.md`).
 
+## 6. Recorded results (Phase 6)
+
+* **E-09 (base OS chain on reference hardware) — first boot, partial.** 2026-09-08,
+  Lenovo laptop running Fedora, QEMU/KVM with OVMF and virtio-gpu, the image built on
+  the laptop with `image/build.sh` (podman) from commit 762d193 and written with
+  `image/disk.sh --type qcow2 --user wardos`. The disk boots through UEFI to the
+  desktop: tty1 autologin into Hyprland 0.56.2 (from the `mineiro/hyprland` COPR on
+  Fedora 44), Waybar with the trust bar, foot as the terminal. Findings: Hyprland's
+  error bar listed three options removed since the config was written
+  (`gestures:workspace_swipe`, `dwindle:pseudotile`, `misc:vfr`), and a parse with the
+  real binary then found the rest (`windowrulev2` and the old layer-rule form gone,
+  `togglesplit` now a layout message); foot 1.25 deprecated `[colors]`. All fixed in
+  #73, and `image/check-hyprland.sh` now parses the tree with the shipped Hyprland on
+  every pull request. Also found on the way: a podman build mounts `/run/.containerenv`
+  and `/run/secrets` where docker mounts `/run/systemd` (#65). Not yet recorded: the
+  Plymouth splash's look, suspend and brightness keys, Wi-Fi on the laptop's own
+  hardware, and the time from boot to `✓ VERIFIED` through `wardos-welcome`; those come
+  with the next boot of `ghcr.io/hexrift/wardos:latest` and a bare-metal install from
+  the v0.2.0 ISO.
+
 ### Parallel alternative implementations
 
 Some Phase 1 crates were built twice by parallel agents. The merged versions are

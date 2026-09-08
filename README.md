@@ -135,39 +135,46 @@ TamperWard policy  = allowed behaviour and verification (what the agent MAY do, 
 
 ## Status
 
-**Phase 3 — TamperWard integration, in progress.** The Rust workspace builds a working prototype on
-any Linux host with `bubblewrap`: sessions with a capability manifest, content-addressed
-entry snapshots and a hash-chained log (`ward up` / `status` / `run` / `stop` /
-`replay --verify`); the self-test (16/16 hostile probes blocked, including a canary
-credential that never appears in the sandbox and evidence the agent cannot touch); a
-per-session
-policy proxy that is the sandbox's only way out; `ward claude` running real Claude Code
-with the model-API key held on the host and injected by the proxy; and Claude Code hooks
-reporting to `wardd`, with `step_through` policies holding before writes and network
-tools; and `ward verify`, a disposable offline verifier that takes protected tests and
-the verify config from the entry snapshot, so weakening the judge changes nothing.
-Credentials never enter the sandbox: the model-API keys and, with `--grant github`, the
-GitHub token are injected by the proxy on repo-scoped routes. A per-session `wardd` is
-the single log writer behind a control socket (`ward watch`, `ward evidence append`,
-`ward session describe`, `ward snapshot …`), the building blocks TamperWard drives. A
-daemon-backed `ward run` warm-starts in 32 ms. The desktop is built ([ADR-0016](docs/decisions/ADR-0016-desktop-feature-set.md),
-[`docs/desktop.md`](docs/desktop.md)): Hyprland with the full key set, the trust bar in
-Waybar, the command centre and every menu in fuzzel, approvals as notifications answered
-from the keyboard, fourteen themes rendered into every component, the `wardos-*` command
-family for capture, power, web apps, terminal apps, installs and setup, and a Fedora 44
-bootc image that CI builds on every merge. Onboarding is one path
-([ADR-0017](docs/decisions/ADR-0017-agent-first-image.md), [`docs/onboarding.md`](docs/onboarding.md)):
-`ward init` makes any directory a project (policy, verifier config, TamperWard wiring,
-idempotent), `ward vault` keeps the keys on the host where the proxy injects them, and
-`wardos-welcome` walks a first login through theme, key, project and agent, with the
-command centre and the shell saying what to do next whenever there is no session.
-Phase 0–2 are complete; the semantic
-TamperWard rules, the verifier image, a boot on real hardware and the shell's own toolkit
-are later phases.
+**Phase 6 — the agent-first image, in progress.** The v0.2.0 release ships the five
+host binaries with the bootable disks attached; `ghcr.io/hexrift/wardos:latest` is
+rebuilt, linted and published on every merge, for x86_64 and aarch64, and an installed
+host follows it on a timer with rollback. What the image holds today:
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the phase plan and what remains for the
-Phase 2 gate, and [`docs/experiments.md`](docs/experiments.md) for the recorded results
-of the experiments that gate each phase.
+* **The secure-session layer.** `ward up` / `run` / `claude` / `codex` / `stop` /
+  `verify` / `replay --verify` on a capability manifest, content-addressed entry
+  snapshots and a hash-chained log; a per-session `wardd` as the single log writer; a
+  per-session policy proxy that is the sandbox's only way out, injecting the model-API
+  and GitHub credentials on repo-scoped routes so no key ever enters the sandbox; Claude
+  Code hooks reporting to `wardd`, `ask` decisions held by the daemon until the desktop
+  answers; `ward verify`, a disposable offline verifier that takes the protected tests
+  and its config from the entry snapshot; 16/16 hostile probes blocked in `ward selftest`
+  and reproduced by CI on every pull request; a daemon-backed warm start of 32 ms.
+* **The agents.** Claude Code, OpenAI Codex and TamperWard at pinned versions with a
+  lockfile, installed at build time, read-only in the sandbox; `ward init` makes any
+  directory a project (policy, verifier config, TamperWard wiring, idempotent);
+  `ward vault` keeps keys on the host; `ward doctor` reports agents, keys, firewall and
+  kernel features with a fix for each gap.
+* **The desktop** ([ADR-0016](docs/decisions/ADR-0016-desktop-feature-set.md),
+  [`docs/desktop.md`](docs/desktop.md)): Hyprland 0.56 with the full key set, the trust
+  bar in Waybar, the command centre and every menu in fuzzel, approvals as
+  notifications answered with `y`/`s`/`n`, fourteen themes rendered into every component
+  with a wallpaper drawn from each theme's tokens, a lock screen, the `wardos-*` command
+  family for capture, power, web apps, terminal apps, installs and setup, and
+  `wardos-welcome` for the first login. CI parses the Hyprland tree with the compositor
+  the image ships, so a renamed option fails a pull request instead of a boot.
+* **Security posture.** LUKS by default on the installer ISO, a firewall that admits
+  nothing inbound, timed image updates, every package name checked against Fedora 44
+  before the image is built, nothing fetched by `curl | sh`.
+
+Verified so far: the image boots to the desktop in QEMU on a Fedora laptop (E-09, first
+boot; the Hyprland config errors it showed are fixed and now caught by CI). Still ahead:
+the onboarding walk on real hardware with the time from boot to `✓ VERIFIED`, the
+semantic TamperWard rules, the verifier image, the shell's own toolkit (E-10), and the
+Secure Boot chain of Phase 7.
+
+See [`docs/roadmap.md`](docs/roadmap.md) for the phase plan and
+[`docs/experiments.md`](docs/experiments.md) for the recorded results of the experiments
+that gate each phase.
 
 ## Documentation
 
