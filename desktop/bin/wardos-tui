@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# wardos-tui — terminal apps as windows (docs/desktop.md §Commands).
+#
+# Usage: wardos-tui install <name> <cmd…>   a .desktop entry (Exec=wardos-launch tui <name>)
+#                                          and the definition; the window's class is wardos-<name>
+#        wardos-tui install <name>         a shipped default (desktop/tuis)
+#        wardos-tui install --defaults     every shipped default not installed yet
+#        wardos-tui remove [name]          entry and definition
+#        wardos-tui list                   name, display name, command, installed|default
+#
+# Definitions are `name=`, `cmd=`, `icon=` (a theme icon name) files: the user's in
+# ~/.config/wardos/tuis/, the shipped ones in /usr/share/wardos/tuis/. The entry says
+# Terminal=false because wardos-launch opens the terminal itself, with the app id that
+# window rules and or-focus key on.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+confs="$(wardos_config_dir)/tuis"
+defaults="$(wardos_share_dir)/tuis"
+apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+
+installed() { [[ -f "$apps/wardos-$1.desktop" ]]; }
+
+# install_one SLUG NAME CMD [ICON]
+install_one() {
+  local slug=$1 name=$2 cmd=$3 icon=${4:-utilities-terminal}
+  mkdir -p "$confs"
+  printf 'name=%s\ncmd=%s\nicon=%s\n' "$name" "$cmd" "$icon" >"$confs/$slug.conf"
+  wardos_desktop_write "$apps/wardos-$slug.desktop" "$name" "wardos-launch tui $slug" \
+    "$icon" "wardos-$slug" "System;" "$name (terminal app)"
+  echo "$name installed: $apps/wardos-$slug.desktop"
+}
+
+install_default() {
+  local slug=$1 f="$defaults/$1.conf"
+  [[ -f "$f" ]] || wardos_die "no terminal app named $1 ships; give a command: install <name> <cmd…>"
+  install_one "$slug" "$(wardos_conf_get "$f" name)" "$(wardos_conf_get "$f" cmd)" "$(wardos_conf_get "$f" icon)"
+}
+
+verb=${1:-}
+[[ -n "$verb" ]] || wardos_die "install, remove or list? (--help)"
+shift
+case "$verb" in
+  install)
+    if [[ "${1:-}" == --defaults ]]; then
+      for f in "$defaults"/*.conf; do
+        [[ -f "$f" ]] || continue
+        slug=$(basename "$f" .conf)
+        installed "$slug" || install_default "$slug"
+      done
+      exit 0
+    fi
+    name=${1:-$(wardos_menu "Terminal app name")} || exit 0
+    if [[ $# -ge 2 ]]; then
+      install_one "$(wardos_slug "$name")" "$name" "${*:2}"
+    else
+      install_default "$(wardos_slug "$name")"
+    fi
+    ;;
+  remove)
+    slug=${1:-}
+    if [[ -z "$slug" ]]; then
+      slug=$(for f in "$apps"/wardos-*.desktop; do
+        [[ -f "$f" ]] || continue
+        s=$(basename "$f" .desktop)
+        s=${s#wardos-}
+        [[ -f "$confs/$s.conf" ]] && printf '%s\t%s\n' "$s" "$(wardos_conf_get "$confs/$s.conf" name)"
+      done | wardos_menu "Remove terminal app" | cut -f1) || exit 0
+    fi
+    installed "$slug" || wardos_die "no terminal app named $slug is installed"
+    rm -f "$apps/wardos-$slug.desktop" "$confs/$slug.conf"
+    echo "$slug removed"
+    ;;
+  list)
+    {
+      for f in "$confs"/*.conf "$defaults"/*.conf; do
+        [[ -f "$f" ]] || continue
+        slug=$(basename "$f" .conf)
+        state=default
+        installed "$slug" && state=installed
+        printf '%s\t%s\t%s\t%s\n' "$slug" "$(wardos_conf_get "$f" name)" "$(wardos_conf_get "$f" cmd)" "$state"
+      done
+    } | sort -s -u -t$'\t' -k1,1 # stable: the user's definition (listed first) wins
+    ;;
+  *) wardos_die "unknown verb $verb (--help)" ;;
+esac

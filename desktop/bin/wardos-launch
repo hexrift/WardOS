@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# wardos-launch — open the desktop's programs the WardOS way (docs/desktop.md §Commands).
+#
+# Usage: wardos-launch terminal [cmd…]          $TERMINAL (foot), running cmd when given
+#        wardos-launch run <app-id> <cmd…>      a terminal window with that app id that
+#                                               stays open when cmd ends (installs, updates)
+#        wardos-launch browser [url]            $BROWSER (chromium)
+#        wardos-launch browser --project <dir> [url]
+#                                               chromium with a profile of its own per project,
+#                                               under ~/.local/share/wardos/browser/<hash>
+#        wardos-launch editor [file]            $VISUAL/$EDITOR (nvim), in a terminal when it
+#                                               is a terminal editor
+#        wardos-launch files [dir]              nautilus (or $FILE_MANAGER)
+#        wardos-launch tui <name>               a terminal app from wardos-tui, class wardos-<name>
+#        wardos-launch webapp <name>            a web app from wardos-webapp: chromium --app,
+#                                               one profile per app, class wardos-<name>
+#        wardos-launch or-focus <class> <cmd…>  focus the window with that class if it is
+#                                               open (hyprctl), else run cmd
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+# conf_file KIND NAME: the user's definition, else the shipped default.
+conf_file() {
+  local kind=$1 name=$2 f
+  for f in "$(wardos_config_dir)/$kind/$name.conf" "$(wardos_share_dir)/$kind/$name.conf"; do
+    if [[ -f "$f" ]]; then
+      printf '%s\n' "$f"
+      return
+    fi
+  done
+  wardos_die "no $kind named $name (wardos-${kind%s} list)"
+}
+
+what=${1:-}
+[[ -n "$what" ]] || wardos_die "what to launch? (--help)"
+shift
+case "$what" in
+  terminal)
+    if [[ $# -gt 0 ]]; then exec "$(wardos_terminal)" -e "$@"; fi
+    exec "$(wardos_terminal)"
+    ;;
+  run)
+    [[ $# -ge 2 ]] || wardos_die "run <app-id> <cmd…>"
+    app_id=$1
+    shift
+    # The command runs through sh so the window shows its output and waits for Enter.
+    exec "$(wardos_terminal)" "$(wardos_terminal_class_flag)" "$app_id" -e sh -c \
+      '"$@"; printf "\n[done]  press Enter to close\n"; read -r _' sh "$@"
+    ;;
+  browser)
+    if [[ "${1:-}" == --project ]]; then
+      [[ -n "${2:-}" ]] || wardos_die "browser --project <dir> [url]"
+      hash=$(printf '%s' "$(readlink -f "$2")" | sha256sum | cut -c1-12)
+      shift 2
+      profile="$(wardos_data_dir)/browser/$hash"
+      mkdir -p "$profile"
+      exec chromium "--user-data-dir=$profile" "--class=wardos-browser-$hash" "$@"
+    fi
+    exec "$(wardos_browser)" "$@"
+    ;;
+  editor)
+    if wardos_editor_is_terminal; then
+      exec "$(wardos_terminal)" "$(wardos_terminal_class_flag)" wardos-editor -e "$(wardos_editor)" "$@"
+    fi
+    exec "$(wardos_editor)" "$@"
+    ;;
+  files) exec "${FILE_MANAGER:-nautilus}" "$@" ;;
+  tui)
+    [[ -n "${1:-}" ]] || wardos_die "tui <name>"
+    cmd=$(wardos_conf_get "$(conf_file tuis "$1")" cmd)
+    [[ -n "$cmd" ]] || wardos_die "$1 has no cmd"
+    read -ra words <<<"$cmd"
+    exec "$(wardos_terminal)" "$(wardos_terminal_class_flag)" "wardos-$1" -e "${words[@]}"
+    ;;
+  webapp)
+    [[ -n "${1:-}" ]] || wardos_die "webapp <name>"
+    url=$(wardos_conf_get "$(conf_file webapps "$1")" url)
+    [[ -n "$url" ]] || wardos_die "$1 has no url"
+    profile="$(wardos_data_dir)/webapps/$1"
+    mkdir -p "$profile"
+    exec chromium "--app=$url" "--user-data-dir=$profile" "--class=wardos-$1"
+    ;;
+  or-focus)
+    [[ $# -ge 2 ]] || wardos_die "or-focus <class> <cmd…>"
+    class=$1
+    shift
+    if hyprctl clients -j 2>/dev/null | grep -Eq "\"class\": *\"$class\""; then
+      exec hyprctl dispatch focuswindow "class:$class"
+    fi
+    exec "$@"
+    ;;
+  *) wardos_die "unknown target $what (--help)" ;;
+esac

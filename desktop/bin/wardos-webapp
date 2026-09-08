@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# wardos-webapp — web apps as windows: chromium --app, one profile each (docs/desktop.md).
+#
+# Usage: wardos-webapp install <name> <url> [icon-url]   a .desktop entry (Exec=wardos-launch
+#                                                        webapp <name>) and the definition
+#        wardos-webapp install <name>                    a shipped default (desktop/webapps)
+#        wardos-webapp install --defaults                every shipped default not installed yet
+#        wardos-webapp remove [name]                     entry, definition, icon and profile
+#        wardos-webapp list                              name, display name, url, installed|default
+#
+# Definitions are `name=`, `url=`, `icon=` files: the user's in ~/.config/wardos/webapps/,
+# the shipped ones in /usr/share/wardos/webapps/. The icon is downloaded with curl only
+# when an icon url is given; a shipped default names its own. The profile lives in
+# ~/.local/share/wardos/webapps/<name>, apart from the main browser profile.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+confs="$(wardos_config_dir)/webapps"
+defaults="$(wardos_share_dir)/webapps"
+apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+data="$(wardos_data_dir)/webapps"
+
+installed() { [[ -f "$apps/wardos-$1.desktop" ]]; }
+
+# install_one SLUG NAME URL [ICON-URL]
+install_one() {
+  local slug=$1 name=$2 url=$3 icon_url=${4:-} icon=web-browser
+  if [[ -n "$icon_url" ]]; then
+    mkdir -p "$data/icons"
+    icon="$data/icons/$slug.png"
+    curl -fsSL -o "$icon" "$icon_url" || {
+      echo "wardos-webapp: could not fetch $icon_url; using a theme icon" >&2
+      icon=web-browser
+    }
+  fi
+  mkdir -p "$confs"
+  printf 'name=%s\nurl=%s\nicon=%s\n' "$name" "$url" "$icon_url" >"$confs/$slug.conf"
+  wardos_desktop_write "$apps/wardos-$slug.desktop" "$name" "wardos-launch webapp $slug" \
+    "$icon" "wardos-$slug" "Network;" "$name (web app)"
+  echo "$name installed: $apps/wardos-$slug.desktop"
+}
+
+install_default() {
+  local slug=$1 f="$defaults/$1.conf"
+  [[ -f "$f" ]] || wardos_die "no web app named $1 ships; give a url: install <name> <url> [icon-url]"
+  install_one "$slug" "$(wardos_conf_get "$f" name)" "$(wardos_conf_get "$f" url)" "$(wardos_conf_get "$f" icon)"
+}
+
+verb=${1:-}
+[[ -n "$verb" ]] || wardos_die "install, remove or list? (--help)"
+shift
+case "$verb" in
+  install)
+    if [[ "${1:-}" == --defaults ]]; then
+      for f in "$defaults"/*.conf; do
+        [[ -f "$f" ]] || continue
+        slug=$(basename "$f" .conf)
+        installed "$slug" || install_default "$slug"
+      done
+      exit 0
+    fi
+    name=${1:-$(wardos_menu "Web app name")} || exit 0
+    if [[ $# -ge 2 ]]; then
+      install_one "$(wardos_slug "$name")" "$name" "$2" "${3:-}"
+    else
+      install_default "$(wardos_slug "$name")"
+    fi
+    ;;
+  remove)
+    slug=${1:-}
+    if [[ -z "$slug" ]]; then
+      slug=$(for f in "$apps"/wardos-*.desktop; do
+        [[ -f "$f" ]] || continue
+        s=$(basename "$f" .desktop)
+        s=${s#wardos-}
+        [[ -f "$confs/$s.conf" ]] && printf '%s\t%s\n' "$s" "$(wardos_conf_get "$confs/$s.conf" name)"
+      done | wardos_menu "Remove web app" | cut -f1) || exit 0
+    fi
+    installed "$slug" || wardos_die "no web app named $slug is installed"
+    rm -f "$apps/wardos-$slug.desktop" "$confs/$slug.conf" "$data/icons/$slug.png"
+    rm -rf "${data:?}/$slug"
+    echo "$slug removed"
+    ;;
+  list)
+    {
+      for f in "$confs"/*.conf "$defaults"/*.conf; do
+        [[ -f "$f" ]] || continue
+        slug=$(basename "$f" .conf)
+        state=default
+        installed "$slug" && state=installed
+        printf '%s\t%s\t%s\t%s\n' "$slug" "$(wardos_conf_get "$f" name)" "$(wardos_conf_get "$f" url)" "$state"
+      done
+    } | sort -s -u -t$'\t' -k1,1 # stable: the user's definition (listed first) wins
+    ;;
+  *) wardos_die "unknown verb $verb (--help)" ;;
+esac
