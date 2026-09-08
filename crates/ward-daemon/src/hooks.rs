@@ -1,7 +1,10 @@
 //! Agent hook adapter: a Unix socket the sandbox's `ward-agent hook` shim talks to,
 //! answering one JSON request per connection and recording each as an agent claim
 //! (`docs/agent-integration.md` §4, `docs/event-model.md` §2). Claims are never
-//! enforcement; the decision only feeds step-through UX.
+//! enforcement; the decision feeds step-through UX and refuses edits to paths
+//! TamperWard protects (`docs/tamperward-integration.md` §6). That refusal is
+//! best-effort steering at the hook layer: only `Write`/`Edit`-style tools are
+//! inspected, never `Bash`, and the trusted verifier remains the real guard.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -48,7 +51,7 @@ pub struct HookResponse {
 pub enum HookDecision {
     /// Let the action proceed.
     Allow,
-    /// Refuse the action (reserved; never emitted today).
+    /// Refuse the action (a write to a TamperWard-protected path).
     Deny,
     /// Pause and ask the operator.
     Ask,
@@ -64,10 +67,23 @@ impl HookDecision {
     }
 }
 
-/// Apply the observer mode's decision rule to a request.
+/// Reason returned when a write targets a TamperWard-protected path.
+pub const PROTECTED_REASON: &str = "protected by TamperWard policy: tests";
+
+/// Apply the decision rules to a request: a write to a path in `protected` is
+/// denied first; otherwise the observer mode decides.
 // The by-reference signature is the module's contract with the session code.
 #[allow(clippy::trivially_copy_pass_by_ref)]
-pub fn decide(observer: &ObserverMode, req: &HookRequest) -> HookResponse {
+pub fn decide(observer: &ObserverMode, protected: &[String], req: &HookRequest) -> HookResponse {
+    let permission_hook = matches!(req.hook.as_str(), "PreToolUse" | "PermissionRequest");
+    let write = req.tool.as_deref().is_some_and(is_write_tool);
+    let target = req.summary.as_deref().unwrap_or_default();
+    if permission_hook && write && is_protected(protected, target) {
+        return HookResponse {
+            decision: HookDecision::Deny,
+            reason: PROTECTED_REASON.to_owned(),
+        };
+    }
     let (decision, reason) = match observer {
         ObserverMode::Live => (HookDecision::Allow, "observer: live"),
         ObserverMode::Quiet => (HookDecision::Allow, "observer: quiet"),
@@ -91,6 +107,57 @@ pub fn decide(observer: &ObserverMode, req: &HookRequest) -> HookResponse {
 
 fn is_write_tool(tool: &str) -> bool {
     matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit")
+}
+
+/// Whether the tool summary (the agent's `file_path`) names a protected path.
+///
+/// Entries are worktree-relative: a plain path protects that file, and an entry
+/// ending in `/` protects everything under that directory. The summary may be
+/// absolute under `/work/` or relative with a `./` prefix; both are stripped.
+/// A summary with any `..` segment is treated as protected whenever the set is
+/// non-empty, so no traversal spelling bypasses the check.
+#[must_use]
+pub fn is_protected(protected: &[String], summary: &str) -> bool {
+    if protected.is_empty() {
+        return false;
+    }
+    if summary == ".."
+        || summary.starts_with("../")
+        || summary.ends_with("/..")
+        || summary.contains("/../")
+    {
+        return true;
+    }
+    let mut path = summary.strip_prefix("/work/").unwrap_or(summary);
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest;
+    }
+    protected.iter().any(|entry| match entry.strip_suffix('/') {
+        Some(dir) => !dir.is_empty() && (path == dir || path.starts_with(entry.as_str())),
+        None => path == entry,
+    })
+}
+
+/// The subset of a TamperWard `config.yml` this module reads.
+#[derive(Debug, Default, Deserialize)]
+struct TamperwardConfig {
+    #[serde(default)]
+    protected: Protected,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Protected {
+    #[serde(default)]
+    tests: Vec<String>,
+}
+
+/// Collect `protected.tests` from a TamperWard config; anything missing or
+/// unparsable yields an empty set.
+#[must_use]
+pub fn protected_from_yaml(yaml: &str) -> Vec<String> {
+    serde_yaml::from_str::<TamperwardConfig>(yaml)
+        .map(|c| c.protected.tests)
+        .unwrap_or_default()
 }
 
 fn is_network_tool(tool: &str) -> bool {
@@ -140,8 +207,9 @@ pub struct Hooks {
 }
 
 impl Hooks {
-    /// Start answering hook requests under `observer`, listening at `dir/hooks.sock`.
-    pub fn start(dir: &Path, observer: ObserverMode) -> Result<Self> {
+    /// Start answering hook requests under `observer`, denying writes to
+    /// `protected` paths, listening at `dir/hooks.sock`.
+    pub fn start(dir: &Path, observer: ObserverMode, protected: Vec<String>) -> Result<Self> {
         let socket = dir.join("hooks.sock");
         let listener = UnixListener::bind(&socket)
             .map_err(|e| Error::Sandbox(format!("hook socket {}: {e}", socket.display())))?;
@@ -154,7 +222,7 @@ impl Hooks {
                     if shutdown.load(Ordering::SeqCst) {
                         break;
                     }
-                    serve(stream, observer, &claims);
+                    serve(stream, observer, &protected, &claims);
                 }
             })
         };
@@ -197,7 +265,12 @@ impl Hooks {
 
 /// Handle one connection: read a line, decide, record, reply. Malformed input
 /// closes the connection silently.
-fn serve(mut stream: UnixStream, observer: ObserverMode, claims: &Mutex<Vec<Claim>>) {
+fn serve(
+    mut stream: UnixStream,
+    observer: ObserverMode,
+    protected: &[String],
+    claims: &Mutex<Vec<Claim>>,
+) {
     drop(stream.set_read_timeout(Some(READ_TIMEOUT)));
     let mut line = String::new();
     let Ok(Some(req)) = BufReader::new(&stream)
@@ -206,7 +279,7 @@ fn serve(mut stream: UnixStream, observer: ObserverMode, claims: &Mutex<Vec<Clai
     else {
         return;
     };
-    let response = decide(&observer, &req);
+    let response = decide(&observer, protected, &req);
     if let Ok(mut v) = claims.lock() {
         v.push(Claim {
             at: SystemTime::now(),
@@ -250,7 +323,7 @@ mod tests {
     }
 
     fn assert_decision(observer: ObserverMode, r: &HookRequest, d: HookDecision, reason: &str) {
-        let resp = decide(&observer, r);
+        let resp = decide(&observer, &[], r);
         assert_eq!(resp.decision, d, "{r:?} under {observer:?}");
         assert_eq!(resp.reason, reason, "{r:?} under {observer:?}");
     }
@@ -337,6 +410,150 @@ mod tests {
             HookDecision::Allow,
             "step-through",
         );
+    }
+
+    fn protected() -> Vec<String> {
+        vec!["tests/security_expiry.rs".into()]
+    }
+
+    #[test]
+    fn is_protected_matches_exact_and_prefixed_spellings() {
+        let p = protected();
+        for summary in [
+            "tests/security_expiry.rs",
+            "/work/tests/security_expiry.rs",
+            "./tests/security_expiry.rs",
+            "/work/./tests/security_expiry.rs",
+        ] {
+            assert!(is_protected(&p, summary), "{summary}");
+        }
+        for summary in [
+            "tests/other.rs",
+            "/work/tests/other.rs",
+            "tests/security_expiry.rs.bak",
+            "src/tests/security_expiry.rs",
+            "/tests/security_expiry.rs",
+            "",
+        ] {
+            assert!(!is_protected(&p, summary), "{summary}");
+        }
+        assert!(!is_protected(&[], "tests/security_expiry.rs"));
+    }
+
+    #[test]
+    fn is_protected_directory_entry_covers_everything_under_it() {
+        let p = vec!["tests/".to_owned()];
+        for summary in [
+            "tests/security_expiry.rs",
+            "tests/deep/nested.rs",
+            "/work/tests/x.rs",
+            "./tests/x.rs",
+            "tests",
+            "tests/",
+        ] {
+            assert!(is_protected(&p, summary), "{summary}");
+        }
+        for summary in ["src/tests/x.rs", "tests_helpers/x.rs", "src/lib.rs"] {
+            assert!(!is_protected(&p, summary), "{summary}");
+        }
+    }
+
+    #[test]
+    fn is_protected_refuses_any_dot_dot_when_set_is_non_empty() {
+        let p = protected();
+        for summary in [
+            "/work/tests/../tests/security_expiry.rs",
+            "/work/src/../tests/security_expiry.rs",
+            "../tests/security_expiry.rs",
+            "src/../src/lib.rs",
+            "tests/..",
+            "..",
+        ] {
+            assert!(is_protected(&p, summary), "{summary}");
+            assert!(
+                !is_protected(&[], summary),
+                "{summary} with nothing protected"
+            );
+        }
+        assert!(
+            !is_protected(&p, "src/a..b.rs"),
+            "dots inside a name are not traversal"
+        );
+    }
+
+    #[test]
+    fn protected_from_yaml_reads_protected_tests_only() {
+        let yaml = "\
+version: 1
+protected:
+  tests:
+    - 'tests/security_expiry.rs'
+    - tests/auth/
+rules:
+  test-skip: block
+verify:
+  command: cargo test --all-targets
+";
+        assert_eq!(
+            protected_from_yaml(yaml),
+            vec![
+                "tests/security_expiry.rs".to_owned(),
+                "tests/auth/".to_owned()
+            ]
+        );
+        assert!(protected_from_yaml("").is_empty());
+        assert!(protected_from_yaml("version: 1\n").is_empty());
+        assert!(protected_from_yaml("protected: {}\n").is_empty());
+        assert!(protected_from_yaml("protected:\n  tests: 3\n").is_empty());
+        assert!(protected_from_yaml(": not yaml [").is_empty());
+    }
+
+    #[test]
+    fn writes_to_protected_paths_are_denied_in_every_mode() {
+        let p = protected();
+        let target = Some("/work/tests/security_expiry.rs");
+        for observer in [
+            ObserverMode::Quiet,
+            ObserverMode::Live,
+            step(false, false),
+            step(true, true),
+        ] {
+            for hook in ["PreToolUse", "PermissionRequest"] {
+                for tool in ["Write", "Edit", "MultiEdit", "NotebookEdit"] {
+                    let resp = decide(&observer, &p, &req(hook, Some(tool), target));
+                    assert_eq!(
+                        resp.decision,
+                        HookDecision::Deny,
+                        "{hook} {tool} {observer:?}"
+                    );
+                    assert_eq!(resp.reason, PROTECTED_REASON);
+                }
+            }
+        }
+        // Reads, Bash and PostToolUse are not inspected.
+        for (hook, tool) in [
+            ("PreToolUse", "Read"),
+            ("PreToolUse", "Bash"),
+            ("PostToolUse", "Write"),
+        ] {
+            let resp = decide(&ObserverMode::Quiet, &p, &req(hook, Some(tool), target));
+            assert_eq!(resp.decision, HookDecision::Allow, "{hook} {tool}");
+        }
+    }
+
+    #[test]
+    fn unprotected_writes_still_follow_step_through() {
+        let p = protected();
+        let r = req("PreToolUse", Some("Write"), Some("/work/src/lib.rs"));
+        let resp = decide(&step(true, false), &p, &r);
+        assert_eq!(resp.decision, HookDecision::Ask);
+        assert_eq!(resp.reason, "step-through: pause before writes");
+        let resp = decide(&step(false, false), &p, &r);
+        assert_eq!(resp.decision, HookDecision::Allow);
+        assert_eq!(resp.reason, "step-through");
+        let resp = decide(&ObserverMode::Live, &p, &r);
+        assert_eq!(resp.decision, HookDecision::Allow);
+        assert_eq!(resp.reason, "observer: live");
     }
 
     #[test]
@@ -430,9 +647,17 @@ mod tests {
     #[test]
     fn listener_answers_records_and_stops() {
         let dir = tempfile::tempdir().unwrap();
-        let hooks = Hooks::start(dir.path(), step(true, false)).unwrap();
+        let hooks = Hooks::start(dir.path(), step(true, false), protected()).unwrap();
         let socket = hooks.socket().to_path_buf();
         assert_eq!(socket, dir.path().join("hooks.sock"));
+
+        let reply = roundtrip(
+            &socket,
+            "{\"hook\":\"PreToolUse\",\"tool\":\"Write\",\"summary\":\"/work/tests/security_expiry.rs\"}\n",
+        );
+        let resp: HookResponse = serde_json::from_str(&reply).unwrap();
+        assert_eq!(resp.decision, HookDecision::Deny);
+        assert_eq!(resp.reason, PROTECTED_REASON);
 
         let reply = roundtrip(
             &socket,
@@ -449,14 +674,19 @@ mod tests {
         assert_eq!(resp.decision, HookDecision::Allow);
 
         let events = hooks.drain_events();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert!(events[0].0 <= events[1].0, "arrival times are kept");
         assert_claim(
             &events[0].1,
             ClaimKind::ToolUse,
+            "PreToolUse Write /work/tests/security_expiry.rs → deny",
+        );
+        assert_claim(
+            &events[1].1,
+            ClaimKind::ToolUse,
             "PreToolUse Write /work/src/lib.rs → ask",
         );
-        assert_claim(&events[1].1, ClaimKind::Note, "Stop");
+        assert_claim(&events[2].1, ClaimKind::Note, "Stop");
         assert!(hooks.drain_events().is_empty());
 
         hooks.stop();

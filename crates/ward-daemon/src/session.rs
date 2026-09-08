@@ -24,7 +24,7 @@ use ward_snapshot::{CaptureOptions, SnapshotRole, SnapshotStore};
 use crate::egress::Egress;
 use crate::error::{Error, Result};
 use crate::gateway::Gateway;
-use crate::hooks::Hooks;
+use crate::hooks::{Hooks, protected_from_yaml};
 use crate::ids::{ev_hash, ev_snapshot, new_session_id, project_id_for};
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
 use crate::watch::{CaptureMode, Captured, Watcher};
@@ -263,6 +263,16 @@ impl Session {
         &self.manifest
     }
 
+    /// Paths TamperWard protects (`protected.tests` in
+    /// `<worktree>/.tamperward/config.yml`); empty when the file or key is absent.
+    #[must_use]
+    pub fn protected_paths(&self) -> Vec<String> {
+        let path = self.worktree.join(".tamperward").join("config.yml");
+        std::fs::read_to_string(path)
+            .map(|yaml| protected_from_yaml(&yaml))
+            .unwrap_or_default()
+    }
+
     /// The entry snapshot id (`blake3:…`).
     pub fn entry_snapshot(&self) -> &str {
         &self.entry_snapshot
@@ -396,7 +406,7 @@ impl Session {
             &self.manifest.network,
             opts.gateways.iter().map(|g| g.route.clone()).collect(),
         )?;
-        let hooks = Hooks::start(&run_dir, self.manifest.observer)?;
+        let hooks = Hooks::start(&run_dir, self.manifest.observer, self.protected_paths())?;
         let launch = self.prepare(argv, opts, &run_dir, &egress, &hooks)?;
         let outcome = launch.run()?;
 
