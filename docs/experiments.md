@@ -144,6 +144,7 @@ Before any Phase 6 (image) work starts, these must have recorded PASS results:
 recorded results (pass or documented fallback), because their outcomes shape the image
 contents.
 
+
 ## 4. Critical questions and where they are answered
 
 | Question | Answered by |
@@ -157,3 +158,35 @@ contents.
 | Can the OS always roll back after a broken upgrade? | E-09, RT-002 |
 | Can the project realistically support a sufficiently useful laptop set? | Phase 9 matrix; E-09 on two devices first |
 | Does OS integration simplify and strengthen TamperWard rather than duplicate it? | E-12, TamperWard open questions in [`tamperward-integration.md`](tamperward-integration.md) |
+
+## 5. Recorded results (Phase 1)
+
+* **E-01 (isolation baseline) — partial PASS.** The bubblewrap prototype blocks
+  ST-001, ST-002, ST-003, ST-004 and ST-011 with a hostile workload (`ward selftest`,
+  5/5). The full crun + seccomp + Landlock path and ST-013..015 remain to be run on a
+  non-nested host.
+* **E-02 (snapshot performance) — measured.** On a 4 vCPU VM, ext4, kernel 6.18,
+  200,000 files / 1 GiB (261,827 entries): cold capture 3.47 s, warm 1.46 s, cached
+  incremental after touching 100 files 0.96 s. The warm ext4 hashing budget is met;
+  cold misses the < 3 s target by ~0.5 s and CAS ingest is disk-bound. Btrfs
+  subvolume snapshot and reflink ingest could not be measured (no Btrfs on the host).
+  Full data and the measuring implementation are on branch
+  `phase-1/ward-snapshot-full` (`experiments/E-02/RESULT.md`).
+* **E-06 (sandbox warm start) — could not measure here.** `crun` cannot manage
+  cgroups in the nested CI environment; the spike records `CANNOT-MEASURE-HERE` with
+  the exact commands to run on a real cgroups-v2 host
+  (`experiments/E-06-warm-start/RESULT.md`).
+
+### Parallel alternative implementations
+
+Some Phase 1 crates were built twice by parallel agents. The merged versions are
+canonical; two more thorough alternatives are kept on branches for a later,
+deliberate upgrade rather than mid-stream churn:
+
+* `phase-1/ward-snapshot-full` — adds a real cgroup-v2 freezer, reflink ingest,
+  ctime-based cache anti-forgery, and the E-02 measurements above (94 tests).
+* `phase-1/ward-policy-alt` — adds custom-allowlist intersection, explicit
+  unrestricted opt-in, and golden hash fixtures (102 tests).
+
+These also carry documentation corrections (Decision-order and network-spelling
+consistency in the policy docs) to fold in with the upgrade.
