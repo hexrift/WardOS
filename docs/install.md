@@ -76,7 +76,41 @@ and into protected tests with `.tamperward/config.yml`; see `examples/ward-demo`
 Keep `WARD_STATE_DIR` short: the control socket path must fit in 107 bytes; `ward
 doctor` checks this.
 
-## 6. macOS, ARM, Windows
+## 6. Desktop
+
+The WardOS desktop ([`desktop.md`](desktop.md), ADR-0016) comes two ways.
+
+**The OS image.** A Fedora bootc image with everything in it: build it and make a disk
+on a Fedora host with podman ([`image/README.md`](../image/README.md)):
+
+```bash
+sudo ./image/build.sh                                            # the image
+sudo ./image/disk.sh --type iso --user wardos --luks             # installer ISO, encrypted disk
+sudo ./image/disk.sh --type qcow2 --user wardos --password …     # or a VM disk
+```
+
+`--user wardos` creates the first user (wheel), which the tty1 autologin expects; with
+`--luks` Anaconda asks for the passphrase during the installation. First boot logs in
+on tty1, `uwsm` starts Hyprland, `wardos-first-run` copies the configs and asks for a
+theme, and Flathub plus `desktop/flatpaks.txt` arrive in the background. Updates:
+`wardos-update` (`bootc upgrade`; the previous deployment stays, `bootc rollback`).
+
+**On a Fedora you already have** (42: Workstation, Silverblue, Kinoite):
+
+```bash
+git clone https://github.com/hexrift/WardOS && cd WardOS
+./desktop/install.sh --dry-run     # every command it would run
+./desktop/install.sh               # packages (dnf, or rpm-ostree + reboot), the tree, units, Flathub
+```
+
+It installs `image/packages.txt`, places the tree with `image/install-desktop.sh` under
+`/usr/share/wardos` and `/etc/xdg` (sudo, per step), enables the user units, adds
+Flathub and the default applications, and prints how to log in: pick "Hyprland (uwsm)"
+at GDM or SDDM, or `uwsm start hyprland.desktop` from a console. It does not install
+the tty1 autologin unless told `--autologin`, and never touches your `~/.config`:
+that is `wardos-first-run`'s job, with a backup next to anything it replaces.
+
+## 7. macOS, ARM, Windows
 
 Linux x86_64 only. On a Mac, run WardOS inside a Linux VM (any distro with bubblewrap).
 ARM builds from source but has no release binaries yet.
