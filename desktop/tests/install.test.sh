@@ -14,7 +14,7 @@ $(cat "$1")"; }
 # --- a fake desktop tree with every kind of file the layout names --------------------
 make_tree() {
   local t=$1
-  mkdir -p "$t"/{bin,lib,hyprland,config/{waybar,foot,mako,fuzzel,btop,fastfetch,hyprlock,nvim,gtk/gtk-3.0,gtk/gtk-4.0,bash,xcompose},themes/ward-dark/backgrounds,systemd/user,systemd/system/getty@tty1.service.d,webapps,tuis,shell/src,theme/src,tests}
+  mkdir -p "$t"/{bin,lib,hyprland,config/{waybar,foot,mako,fuzzel,btop,fastfetch,hyprlock,nvim,gtk,chromium,bash,xcompose},themes/ward-dark/backgrounds,systemd/user,systemd/system/getty@tty1.service.d,webapps,tuis,shell/src,theme/src,tests}
   printf '#!/usr/bin/env bash\necho hi\n' >"$t/bin/wardos-hello"
   chmod 0644 "$t/bin/wardos-hello" # the installer must make it executable
   echo 'wardos_lib=1' >"$t/lib/wardos.sh"
@@ -28,8 +28,9 @@ make_tree() {
   echo 'x' >"$t/config/fastfetch/config.jsonc"
   echo 'x' >"$t/config/hyprlock/hyprlock.conf"
   echo 'x' >"$t/config/nvim/init.lua"
-  echo '[Settings]' >"$t/config/gtk/gtk-3.0/settings.ini"
-  echo '[Settings]' >"$t/config/gtk/gtk-4.0/settings.ini"
+  echo '[Settings]' >"$t/config/gtk/settings.ini"
+  echo '* {}' >"$t/config/gtk/gtk.css"
+  echo '--ozone-platform=wayland' >"$t/config/chromium/chromium-flags.conf"
   echo 'export WARDOS=1' >"$t/config/bash/profile.d-wardos.sh"
   echo 'include "%L"' >"$t/config/xcompose/XCompose"
   echo '[meta]' >"$t/themes/ward-dark.toml"
@@ -66,12 +67,16 @@ assert_file "$dest/usr/share/wardos/config/nvim/init.lua"
 for c in waybar foot mako fuzzel btop fastfetch; do
   assert_link "$dest/etc/xdg/$c" "/usr/share/wardos/config/$c"
 done
-assert_link "$dest/etc/xdg/gtk-3.0" /usr/share/wardos/config/gtk/gtk-3.0
-assert_link "$dest/etc/xdg/gtk-4.0" /usr/share/wardos/config/gtk/gtk-4.0
-# Only the XDG_CONFIG_DIRS components get a /etc/xdg entry; the rest are copied to
-# ~/.config by wardos-first-run.
+assert_file "$dest/etc/xdg/gtk-3.0/settings.ini"
+assert_file "$dest/etc/xdg/gtk-4.0/settings.ini"
+assert_missing "$dest/etc/xdg/gtk-3.0/gtk.css"
+assert_file "$dest/usr/share/wardos/config/gtk/gtk.css"
+# Only the XDG_CONFIG_DIRS components get a /etc/xdg entry; the rest (hypr*, nvim,
+# chromium-flags.conf, XCompose) are copied to the home directory by wardos-first-run.
 assert_missing "$dest/etc/xdg/hyprlock"
 assert_missing "$dest/etc/xdg/nvim"
+assert_missing "$dest/etc/xdg/chromium"
+assert_file "$dest/usr/share/wardos/config/chromium/chromium-flags.conf"
 assert_file "$dest/etc/profile.d/wardos.sh"
 assert_file "$dest/usr/share/wardos/config/xcompose/XCompose"
 assert_file "$dest/usr/share/wardos/themes/ward-dark.toml"
@@ -138,7 +143,19 @@ assert_logged '^sudo flatpak remote-add --if-not-exists flathub https://dl.flath
 assert_logged '^systemctl --user daemon-reload$'
 # The real desktop tree of this checkout landed under --destdir.
 assert_file "$root/usr/share/wardos/hypr/hyprland.conf"
+assert_file "$root/usr/share/wardos/hypr/bindings.conf"
+assert_link "$root/etc/xdg/hypr" /usr/share/wardos/hypr
 assert_file "$root/usr/share/wardos/themes/ward-dark.toml"
+assert_file "$root/usr/share/wardos/config/bash/bashrc"
+assert_file "$root/etc/profile.d/wardos.sh"
+assert_file "$root/etc/xdg/gtk-3.0/settings.ini"
+assert_file "$root/usr/share/wardos/flatpaks.txt"
+assert_link "$root/etc/xdg/waybar" /usr/share/wardos/config/waybar
+assert_file "$root/usr/lib/systemd/user/wardos-approve.service"
+for u in swayosd.service wardos-approve.service wardos-battery-monitor.timer; do
+  assert_contains "$root/usr/lib/systemd/user-preset/90-wardos.preset" "enable $u"
+  assert_logged "^systemctl --user preset .*$u"
+done
 # Existing Fedora: no tty1 autologin unless asked for.
 assert_missing "$root/etc/systemd/system/getty@tty1.service.d/autologin.conf"
 grep -q 'uwsm start hyprland.desktop' "$TMP/out" || fail "login instructions missing:

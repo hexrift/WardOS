@@ -51,7 +51,7 @@ jobs:
           docker run --rm wardos:ci bash -c '
             ls -l /usr/bin/ward*
             ls /usr/share/wardos
-            cat /usr/lib/systemd/user-preset/90-wardos.preset 2>/dev/null || echo "no user preset (desktop/systemd/user not in the tree yet)"
+            cat /usr/lib/systemd/user-preset/90-wardos.preset
             readlink /etc/xdg/hypr
             systemctl is-enabled wardos-firstboot.service wardos-flathub.service
             plymouth-set-default-theme

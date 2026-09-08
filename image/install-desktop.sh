@@ -94,9 +94,15 @@ if [[ -d "$src/config" ]]; then
   for c in "${xdg_components[@]}"; do
     [[ -d "$src/config/$c" ]] && link_or_fill "$c" "$share/config/$c"
   done
-  for v in gtk-3.0 gtk-4.0; do
-    [[ -d "$src/config/gtk/$v" ]] && link_or_fill "$v" "$share/config/gtk/$v"
-  done
+  # GTK reads settings.ini from XDG_CONFIG_DIRS/gtk-3.0 and gtk-4.0 (gtk.css only from
+  # the user's own directory, which wardos-first-run fills): one file, two real
+  # directories, because the source directory serves both versions.
+  if [[ -f "$src/config/gtk/settings.ini" ]]; then
+    for v in gtk-3.0 gtk-4.0; do
+      install -D -m 0644 "$src/config/gtk/settings.ini" "$dest/etc/xdg/$v/settings.ini"
+    done
+    say "config/gtk/settings.ini → /etc/xdg/gtk-3.0/, /etc/xdg/gtk-4.0/"
+  fi
   if [[ -f "$src/config/bash/profile.d-wardos.sh" ]]; then
     install -D -m 0644 "$src/config/bash/profile.d-wardos.sh" "$dest/etc/profile.d/wardos.sh"
     say "config/bash/profile.d-wardos.sh → /etc/profile.d/wardos.sh"
