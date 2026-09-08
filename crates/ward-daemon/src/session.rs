@@ -25,7 +25,7 @@ use ward_snapshot::{CaptureOptions, SnapshotRole, SnapshotStore};
 use crate::egress::Egress;
 use crate::error::{Error, Result};
 use crate::gateway::Gateway;
-use crate::hooks::{Hooks, protected_from_yaml};
+use crate::hooks::Hooks;
 use crate::ids::{ev_hash, ev_snapshot, new_session_id, project_id_for};
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
 use crate::verify;
@@ -285,14 +285,24 @@ impl Session {
         &self.manifest
     }
 
-    /// Paths TamperWard protects (`protected.tests` in
-    /// `<worktree>/.tamperward/config.yml`); empty when the file or key is absent.
+    /// Paths `TamperWard` protects (`protected.tests` in `.tamperward/config.yml`),
+    /// read from the *entry* snapshot so a worktree edit cannot lift them; empty
+    /// when the file or key is absent.
     #[must_use]
     pub fn protected_paths(&self) -> Vec<String> {
-        let path = self.worktree.join(".tamperward").join("config.yml");
-        std::fs::read_to_string(path)
-            .map(|yaml| protected_from_yaml(&yaml))
-            .unwrap_or_default()
+        let yaml = SnapshotStore::open(self.state.join("cas"))
+            .ok()
+            .zip(
+                self.entry_snapshot
+                    .parse::<ward_snapshot::SnapshotId>()
+                    .ok(),
+            )
+            .and_then(|(store, entry)| store.cat(entry, Path::new(verify::CONFIG_PATH)).ok());
+        yaml.and_then(|bytes| {
+            serde_yaml::from_str::<verify::Config>(&String::from_utf8_lossy(&bytes)).ok()
+        })
+        .map(|c| c.protected.tests)
+        .unwrap_or_default()
     }
 
     /// The entry snapshot id (`blake3:…`).

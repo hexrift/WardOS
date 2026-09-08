@@ -105,6 +105,14 @@ trusted verifier independently passes
 
 At this phase the verifier may still be a Zone 2 *namespace* environment on the same host.
 
+### Phase 3 — delivered so far
+
+`ward verify`: candidate snapshot, config and protected tests taken from the entry
+snapshot, an offline namespace verifier with read-only host toolchains, verification
+records in the log, and the hook-layer deny for edits to protected paths
+([`tamperward-integration.md`](tamperward-integration.md) §6). Remaining: the TamperWard
+socket protocol (§4), semantic rules, ST-007/009/010/016, E-12.
+
 Acceptance: demo passes end-to-end; DENIED originates from TamperWard; ST-007, 009, 010,
 016 pass; E-12 recorded.
 

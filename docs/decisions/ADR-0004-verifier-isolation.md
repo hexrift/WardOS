@@ -44,3 +44,17 @@ poison. Remote verification is an enterprise extension, not a 0.1 requirement.
 
 ## How it will be validated
 ST-005, 006, 018, 019 with hostile agent and hostile repository; E-03 latency.
+
+## Addendum (Phase 3): the 0.1 namespace verifier as implemented
+
+`ward verify` builds the verifier tree from the CAS, never from the worktree: the
+candidate is materialised, then every protected path is replaced by its entry-snapshot
+bytes, and the verification config itself is read from the entry snapshot. The tree runs
+under bubblewrap with every namespace unshared, no egress socket (so no network at all),
+a private `/tmp`, and the host toolchains bound read-only under `/run/verifier`
+(`~/.rustup`, and `~/.cargo/{bin,registry}` beneath a private tmpfs `CARGO_HOME` so cargo
+can take its locks). The verifier image of the decision text is therefore a digest of the
+string `ward-verifier/namespace/0.1` for now; a real image, a distinct uid range and the
+cgroup budget follow in Phase 4. Results reach `wardd` as the captured output of the one
+command; the summary is parsed from `test result:` lines and the output's BLAKE3 is the
+`result_hash` in the log.

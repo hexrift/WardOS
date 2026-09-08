@@ -139,27 +139,6 @@ pub fn is_protected(protected: &[String], summary: &str) -> bool {
 }
 
 /// The subset of a TamperWard `config.yml` this module reads.
-#[derive(Debug, Default, Deserialize)]
-struct TamperwardConfig {
-    #[serde(default)]
-    protected: Protected,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct Protected {
-    #[serde(default)]
-    tests: Vec<String>,
-}
-
-/// Collect `protected.tests` from a TamperWard config; anything missing or
-/// unparsable yields an empty set.
-#[must_use]
-pub fn protected_from_yaml(yaml: &str) -> Vec<String> {
-    serde_yaml::from_str::<TamperwardConfig>(yaml)
-        .map(|c| c.protected.tests)
-        .unwrap_or_default()
-}
-
 fn is_network_tool(tool: &str) -> bool {
     matches!(tool, "WebFetch" | "WebSearch")
 }
@@ -479,33 +458,6 @@ mod tests {
             !is_protected(&p, "src/a..b.rs"),
             "dots inside a name are not traversal"
         );
-    }
-
-    #[test]
-    fn protected_from_yaml_reads_protected_tests_only() {
-        let yaml = "\
-version: 1
-protected:
-  tests:
-    - 'tests/security_expiry.rs'
-    - tests/auth/
-rules:
-  test-skip: block
-verify:
-  command: cargo test --all-targets
-";
-        assert_eq!(
-            protected_from_yaml(yaml),
-            vec![
-                "tests/security_expiry.rs".to_owned(),
-                "tests/auth/".to_owned()
-            ]
-        );
-        assert!(protected_from_yaml("").is_empty());
-        assert!(protected_from_yaml("version: 1\n").is_empty());
-        assert!(protected_from_yaml("protected: {}\n").is_empty());
-        assert!(protected_from_yaml("protected:\n  tests: 3\n").is_empty());
-        assert!(protected_from_yaml(": not yaml [").is_empty());
     }
 
     #[test]
