@@ -5,7 +5,8 @@
 #                  [--version V] [--dry-run] [-- extra podman build args]
 #
 # Defaults: --source release (the published tarball of --release, default the newest
-# tag reachable from HEAD, checksum fetched from the release and verified in the build);
+# tag reachable from HEAD, else the Containerfile default; checksum fetched from the
+# release and verified in the build);
 # --source checkout compiles this working tree instead. Tag localhost/wardos:<git
 # describe --tags --always>, version = the same describe string, passed in as
 # --build-arg WARDOS_VERSION for the org.wardos.version label. Run it as root (sudo)
@@ -14,7 +15,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -67,7 +68,12 @@ case "$source" in
       release=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
     fi
     if [[ -z "$release" ]]; then
-      echo "build.sh: no v* tag reachable; pass --release vX.Y.Z or --source checkout" >&2
+      # No tag reachable (shallow clone, fork without tags): fall back to the
+      # Containerfile's own default, which is the release the image was last verified with.
+      release=$(sed -n 's/^ARG WARDOS_RELEASE=\(v[0-9][^ ]*\)$/\1/p' image/Containerfile | head -n 1)
+    fi
+    if [[ -z "$release" ]]; then
+      echo "build.sh: no release known; pass --release vX.Y.Z or --source checkout" >&2
       exit 1
     fi
     asset="wardos-${release#v}-x86_64-linux.tar.gz.sha256"
