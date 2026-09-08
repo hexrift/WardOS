@@ -71,6 +71,20 @@ The tag could not be verified from the authoring environment (no registry access
 does not resolve on the build host, `podman build` fails on the `FROM` line and nothing
 else has run.
 
+## Where the binaries come from
+
+The host stage copies `ward`, `wardd` and `ward-agent` from one of two stages, chosen
+with `--build-arg WARDOS_SOURCE` (`image/build.sh --source`):
+
+| Source | What happens | Use |
+| --- | --- | --- |
+| `release` (default) | downloads `wardos-<ver>-x86_64-linux.tar.gz` for `WARDOS_RELEASE` from the GitHub release and refuses to continue unless its SHA-256 matches `WARDOS_SHA256` (`build.sh` fetches the published checksum) | every image that leaves your machine: reproducible from a known, tested release |
+| `builder` (`--source checkout`) | compiles this working tree with the pinned toolchain, `--locked` | development images of unreleased changes |
+
+The tools and the image therefore have separate cadences: `vX.Y.Z` tags release the
+tools; images carry the release they embed in `org.wardos.version` plus the build's
+`git describe`, and are tagged by date when published (`wardos:2026.09`).
+
 ## Building on a Fedora host
 
 Requirements: a Fedora (or any bootc-capable) host with `podman` ≥ 4.9, `git`, and root,
