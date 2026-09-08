@@ -43,6 +43,7 @@ inner='set -e
 dnf -y -q install dnf5-plugins >/dev/null
 for c in "$@"; do dnf -y -q copr enable "$c" >/dev/null; done
 dnf -y -q --setopt=install_weak_deps=False install hyprland >/dev/null
+export XDG_RUNTIME_DIR=/tmp/xdg && mkdir -m 700 -p "$XDG_RUNTIME_DIR"
 Hyprland --version | head -n 1
 mkdir -p /etc/xdg && ln -sfn /desktop/hyprland /etc/xdg/hypr
 mkdir -p "$HOME/.config/wardos/theme/current"
