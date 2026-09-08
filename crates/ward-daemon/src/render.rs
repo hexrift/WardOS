@@ -145,7 +145,7 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
         WardEvent::SessionStarted { .. } => ("START", ACCENT, "session".to_string()),
         WardEvent::CommandStarted { argv, .. } => ("RUN", INK, argv_text(argv)),
         WardEvent::CommandFinished { exit, .. } => ("EXIT", exit_color(*exit), exit_text(*exit)),
-        WardEvent::FileModified { path, .. } => ("EDIT", INK, path.to_string()),
+        WardEvent::FileModified { path, kind, .. } => (change_verb(*kind), INK, path.to_string()),
         WardEvent::FileRead { path, .. } => ("READ", DIM, path.to_string()),
         WardEvent::NetworkDenied { .. } => ("DENY", DENY, "network".to_string()),
         WardEvent::SessionEnded { .. } => ("END", DIM, "session".to_string()),
@@ -154,6 +154,18 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
     Some(format!(
         "{ts}  {color}{verb:<5}{RESET} {INK}{subject}{RESET}"
     ))
+}
+
+fn change_verb(kind: ward_events::FileChangeKind) -> &'static str {
+    use ward_events::FileChangeKind as K;
+    match kind {
+        K::Create => "NEW",
+        K::Write => "EDIT",
+        K::Delete => "DEL",
+        K::Rename => "MOVE",
+        K::Chmod => "MODE",
+        K::Symlink => "LINK",
+    }
 }
 
 fn argv_text(argv: &ward_events::BoundedArgv) -> String {
@@ -209,8 +221,8 @@ fn human_ago(d: std::time::Duration) -> String {
 #[must_use]
 pub fn selftest_row(name: &str, blocked: bool) -> String {
     if blocked {
-        format!("  {INK}{name:<28}{RESET}{OK}DENIED{RESET}")
+        format!("  {INK}{name:<32}{RESET}{OK}DENIED{RESET}")
     } else {
-        format!("  {INK}{name:<28}{RESET}{DENY}REACHED{RESET}")
+        format!("  {INK}{name:<32}{RESET}{DENY}REACHED{RESET}")
     }
 }
