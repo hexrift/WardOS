@@ -1,0 +1,11 @@
+# TamperWard semantic policy for the demo. Guards the security test that judges the fix.
+version: 1
+protected:
+  tests:
+    - 'tests/security_expiry.rs'
+rules:
+  test-skip: block
+  test-content-removal: block
+  assertion-weakening: block
+verify:
+  command: cargo test --all-targets
