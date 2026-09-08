@@ -147,7 +147,8 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
         WardEvent::CommandFinished { exit, .. } => ("EXIT", exit_color(*exit), exit_text(*exit)),
         WardEvent::FileModified { path, kind, .. } => (change_verb(*kind), INK, path.to_string()),
         WardEvent::FileRead { path, .. } => ("READ", DIM, path.to_string()),
-        WardEvent::NetworkDenied { .. } => ("DENY", DENY, "network".to_string()),
+        WardEvent::NetworkRequested { host, port, .. } => ("NET", WARN, format!("{host}:{port}")),
+        WardEvent::NetworkDenied { dst, .. } => ("DENY", DENY, denied_dst(dst)),
         WardEvent::SessionEnded { .. } => ("END", DIM, "session".to_string()),
         _ => return None,
     };
@@ -165,6 +166,15 @@ fn change_verb(kind: ward_events::FileChangeKind) -> &'static str {
         K::Rename => "MOVE",
         K::Chmod => "MODE",
         K::Symlink => "LINK",
+    }
+}
+
+fn denied_dst(dst: &ward_events::DeniedDst) -> String {
+    use ward_events::DeniedDst as D;
+    match dst {
+        D::Host { host, port } => format!("{host}:{port}"),
+        D::Ip { addr, port } => format!("{addr}:{port}"),
+        D::Raw { .. } => "raw destination".to_string(),
     }
 }
 

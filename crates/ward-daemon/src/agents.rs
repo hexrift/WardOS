@@ -33,14 +33,21 @@ pub fn profile(name: &str) -> Option<AgentProfile> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
     #[test]
     fn claude_profile_uses_private_config_and_no_telemetry() {
         let p = profile("claude").expect("claude");
         assert_eq!(p.binary, "claude");
-        assert!(p.env.contains(&("CLAUDE_CONFIG_DIR", "/home/agent/.claude")));
-        assert!(p.env.contains(&("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")));
+        assert!(
+            p.env
+                .contains(&("CLAUDE_CONFIG_DIR", "/home/agent/.claude"))
+        );
+        assert!(
+            p.env
+                .contains(&("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"))
+        );
         assert!(profile("nope").is_none());
     }
 }

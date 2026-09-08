@@ -21,10 +21,10 @@ use ward_events::{
 use ward_policy::{CapabilityManifest, ObserverMode, Policy, merge};
 use ward_snapshot::{CaptureOptions, SnapshotRole, SnapshotStore};
 
+use crate::egress::Egress;
 use crate::error::{Error, Result};
 use crate::ids::{ev_hash, ev_snapshot, new_session_id, project_id_for};
-use crate::egress::Egress;
-use crate::sandbox::{Launch, StdioMode, find_shim, RELAY_ADDR};
+use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
 use crate::watch::{CaptureMode, Captured, Watcher};
 
 /// A live WardOS session over one project.
@@ -287,19 +287,33 @@ impl Session {
 
     /// Launch a known agent interactively (`docs/agent-integration.md`): its profile
     /// env, the session egress proxy, and any explicitly passed-through host variables.
-    pub fn run_agent(&mut self, name: &str, args: &[String], pass_env: &[String]) -> Result<RunReport> {
+    pub fn run_agent(
+        &mut self,
+        name: &str,
+        args: &[String],
+        pass_env: &[String],
+    ) -> Result<RunReport> {
         let profile = crate::agents::profile(name)
             .ok_or_else(|| Error::Project(format!("unknown agent `{name}`")))?;
-        let mut env: Vec<(String, String)> =
-            profile.env.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+        let mut env: Vec<(String, String)> = profile
+            .env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
         for key in pass_env {
             if let Ok(v) = std::env::var(key) {
                 env.push((key.clone(), v));
             }
         }
-        let mut argv = vec![profile.binary.to_string()];
-        argv.extend(args.iter().cloned());
-        self.launch(&argv, &LaunchOpts { env, interactive: true })
+        let mut command = vec![profile.binary.to_string()];
+        command.extend(args.iter().cloned());
+        self.launch(
+            &command,
+            &LaunchOpts {
+                env,
+                interactive: true,
+            },
+        )
     }
 
     /// Run a command with explicit options; every run gets the session egress proxy.
@@ -335,8 +349,10 @@ impl Session {
             None
         };
 
-        let session_dir = self.log_path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let egress = Egress::start(&session_dir, &self.manifest.network)?;
+        // Unix socket paths are capped at 108 bytes, so the proxy lives in a short,
+        // private per-session run dir rather than under the (possibly deep) state root.
+        let run_dir = run_dir(&self.session_str)?;
+        let egress = Egress::start(&run_dir, &self.manifest.network)?;
         let mut launch = Launch::new(&self.worktree, argv.to_vec()).egress(egress.socket());
         if let Some(shim) = find_shim() {
             // With the shim present the relay exists, so proxy-aware tools get a proxy.
@@ -364,47 +380,17 @@ impl Session {
         };
 
         let comm = comm(argv);
-        let mut changed_paths = BTreeSet::new();
-        for item in &captured {
-            match item {
-                Captured::Modified { rel, kind } => {
-                    if let Ok(path) = SandboxPath::new(SandboxRoot::Work, rel) {
-                        changed_paths.insert(rel.clone());
-                        self.emit(
-                            Origin::Kernel,
-                            WardEvent::FileModified {
-                                path,
-                                by: ProcessRef {
-                                    pid,
-                                    comm: comm.clone(),
-                                },
-                                kind: *kind,
-                            },
-                        )?;
-                    }
-                }
-                Captured::Read { rel } => {
-                    if let Ok(path) = SandboxPath::new(SandboxRoot::Work, rel) {
-                        self.emit(
-                            Origin::Kernel,
-                            WardEvent::FileRead {
-                                path,
-                                by: ProcessRef {
-                                    pid,
-                                    comm: comm.clone(),
-                                },
-                            },
-                        )?;
-                    }
-                }
-            }
-        }
+        let changed_paths = self.emit_captured(&captured, pid, comm.as_ref())?;
 
-        let by = ProcessRef { pid, comm: comm.clone() };
+        let by = ProcessRef {
+            pid,
+            comm: comm.clone(),
+        };
         for event in egress.drain_events(&by) {
             self.emit(Origin::Proxy, event)?;
         }
         egress.stop();
+        let _ = std::fs::remove_dir(&run_dir);
 
         self.emit(
             Origin::Kernel,
@@ -450,6 +436,52 @@ impl Session {
         self.log.seal().map_err(|e| Error::Events(e.to_string()))?;
         clear_current(&self.state, &self.project_id, &self.session_str)?;
         Ok(())
+    }
+
+    /// Emit kernel-origin file events for one command and return the changed paths.
+    fn emit_captured(
+        &mut self,
+        captured: &[Captured],
+        pid: Pid,
+        comm: Option<&BoundedText<32>>,
+    ) -> Result<BTreeSet<String>> {
+        let mut changed_paths = BTreeSet::new();
+        for item in captured {
+            match item {
+                Captured::Modified { rel, kind } => {
+                    if let Ok(path) = SandboxPath::new(SandboxRoot::Work, rel) {
+                        changed_paths.insert(rel.clone());
+                        self.emit(
+                            Origin::Kernel,
+                            WardEvent::FileModified {
+                                path,
+                                by: ProcessRef {
+                                    pid,
+                                    comm: comm.cloned(),
+                                },
+                                kind: *kind,
+                            },
+                        )?;
+                    }
+                }
+                Captured::Read { rel } => {
+                    if let Ok(path) = SandboxPath::new(SandboxRoot::Work, rel) {
+                        self.emit(
+                            Origin::Kernel,
+                            WardEvent::FileRead {
+                                path,
+                                by: ProcessRef {
+                                    pid,
+                                    comm: comm.cloned(),
+                                },
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+
+        Ok(changed_paths)
     }
 
     fn alloc_pid(&mut self) -> Pid {
@@ -519,6 +551,25 @@ pub fn state_root() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".local/state/ward")
+}
+
+/// A short, 0700 per-session directory for the egress socket (see `launch`).
+fn run_dir(session_id: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let tail: String = session_id
+        .chars()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let dir = std::env::temp_dir().join(format!("ward-{tail}"));
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => Ok(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(dir),
+        Err(e) => Err(Error::io(&dir, e)),
+    }
 }
 
 fn session_dir(state: &Path, id: &str) -> PathBuf {

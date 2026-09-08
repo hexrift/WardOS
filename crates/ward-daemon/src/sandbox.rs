@@ -101,7 +101,14 @@ pub struct Launch {
 impl Launch {
     /// A launch of `argv` over `worktree` with the default isolation.
     pub fn new(worktree: impl Into<PathBuf>, argv: Vec<String>) -> Self {
-        Self { worktree: worktree.into(), argv, env: Vec::new(), proxy_socket: None, shim: None, stdio: StdioMode::Capture }
+        Self {
+            worktree: worktree.into(),
+            argv,
+            env: Vec::new(),
+            proxy_socket: None,
+            shim: None,
+            stdio: StdioMode::Capture,
+        }
     }
 
     /// Bind the session's egress socket into the sandbox (ADR-0014).
@@ -134,29 +141,67 @@ impl Launch {
 
     /// The `bwrap` argument vector (without the program name). Pure, for tests.
     pub fn args(&self, worktree: &Path) -> Vec<String> {
-        let mut a: Vec<String> = Vec::new();
         fn push(a: &mut Vec<String>, xs: &[&str]) {
             a.extend(xs.iter().map(|x| (*x).to_string()));
         }
+        let mut a: Vec<String> = Vec::new();
         // Read-only system directories the toolchain needs; host home is never bound.
-        for dir in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/alternatives"] {
+        for dir in [
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/etc/alternatives",
+        ] {
             if Path::new(dir).exists() {
                 push(&mut a, &["--ro-bind", dir, dir]);
             }
         }
-        push(&mut a, &["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/home"]);
+        push(
+            &mut a,
+            &[
+                "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/home",
+            ],
+        );
         push(&mut a, &["--tmpfs", "/run"]);
         push(&mut a, &["--setenv", "HOME", "/home/agent"]);
-        push(&mut a, &["--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"]);
+        push(
+            &mut a,
+            &[
+                "--setenv",
+                "PATH",
+                "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+            ],
+        );
         push(&mut a, &["--setenv", "TERM", "xterm"]);
         for (k, v) in &self.env {
             push(&mut a, &["--setenv", k, v]);
         }
-        push(&mut a, &["--bind", &worktree.to_string_lossy(), "/work", "--chdir", "/work"]);
+        push(
+            &mut a,
+            &[
+                "--bind",
+                &worktree.to_string_lossy(),
+                "/work",
+                "--chdir",
+                "/work",
+            ],
+        );
         push(&mut a, &["--hostname", "ward-sandbox"]);
         // The network namespace is always isolated: the only way out is the egress
         // socket, and only when the session provides one (ADR-0014).
-        push(&mut a, &["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try", "--unshare-net"]);
+        push(
+            &mut a,
+            &[
+                "--unshare-user",
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--unshare-cgroup-try",
+                "--unshare-net",
+            ],
+        );
         push(&mut a, &["--die-with-parent", "--new-session"]);
         if let Some(sock) = &self.proxy_socket {
             push(&mut a, &["--bind", &sock.to_string_lossy(), PROXY_SOCKET]);
@@ -182,7 +227,10 @@ impl Launch {
         if self.argv.is_empty() {
             return Err(Error::Sandbox("empty command".into()));
         }
-        let worktree = self.worktree.canonicalize().map_err(|e| Error::io(&self.worktree, e))?;
+        let worktree = self
+            .worktree
+            .canonicalize()
+            .map_err(|e| Error::io(&self.worktree, e))?;
         let mut cmd = Command::new("bwrap");
         cmd.args(self.args(&worktree));
         let start = Instant::now();
@@ -207,7 +255,12 @@ impl Launch {
                 (status.code(), String::new(), String::new())
             }
         };
-        Ok(Outcome { code, stdout, stderr, duration: start.elapsed() })
+        Ok(Outcome {
+            code,
+            stdout,
+            stderr,
+            duration: start.elapsed(),
+        })
     }
 }
 
@@ -242,13 +295,16 @@ mod tests {
         assert!(a.contains("--bind /host/proxy.sock /run/ward/proxy.sock"));
         assert!(a.contains("--ro-bind /host/ward-agent /run/ward/ward-agent"));
         assert!(a.contains("--setenv FOO bar"));
-        assert!(a.ends_with("-- /run/ward/ward-agent --relay 127.0.0.1:3128=/run/ward/proxy.sock -- true"));
+        assert!(a.ends_with(
+            "-- /run/ward/ward-agent --relay 127.0.0.1:3128=/run/ward/proxy.sock -- true"
+        ));
         assert!(!a.contains("/root"), "host home must never be bound");
     }
 
     #[test]
     fn args_without_shim_exec_argv_directly() {
-        let a = Launch::new("/tmp", vec!["sh".into(), "-c".into(), "id".into()]).args(Path::new("/tmp"));
+        let a = Launch::new("/tmp", vec!["sh".into(), "-c".into(), "id".into()])
+            .args(Path::new("/tmp"));
         assert_eq!(&a[a.len() - 4..], &["--", "sh", "-c", "id"]);
     }
 }

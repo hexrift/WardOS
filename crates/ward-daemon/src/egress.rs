@@ -30,7 +30,10 @@ pub struct Recorder(Mutex<Vec<Recorded>>);
 impl Recorder {
     /// Take everything recorded so far.
     pub fn drain(&self) -> Vec<Recorded> {
-        self.0.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+        self.0
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default()
     }
 }
 
@@ -62,7 +65,11 @@ impl Egress {
         let observer: Arc<dyn Observer> = recorder.clone();
         let handle = Proxy::spawn(Config::new(network.clone()).listen_unix(&socket), observer)
             .map_err(|e| Error::Sandbox(format!("egress proxy: {e}")))?;
-        Ok(Self { handle, socket, recorder })
+        Ok(Self {
+            handle,
+            socket,
+            recorder,
+        })
     }
 
     /// Host path of the socket to bind into the sandbox.
@@ -73,7 +80,11 @@ impl Egress {
     /// Decisions made since the last drain, as log events. Entries whose host or
     /// reason cannot be represented are skipped (the proxy already validated them).
     pub fn drain_events(&self, by: &ProcessRef) -> Vec<WardEvent> {
-        self.recorder.drain().iter().filter_map(|r| to_event(r, by)).collect()
+        self.recorder
+            .drain()
+            .iter()
+            .filter_map(|r| to_event(r, by))
+            .collect()
     }
 
     /// Stop the proxy and remove the socket.
@@ -88,15 +99,23 @@ fn to_event(r: &Recorded, by: &ProcessRef) -> Option<WardEvent> {
             host: HostName::new(name).ok()?,
             port: r.port,
             decision: ward_events::Decision::Allow,
-            rule: RuleRef::new(&r.reason).or_else(|_| RuleRef::new("proxy")).ok()?,
+            rule: RuleRef::new(&r.reason)
+                .or_else(|_| RuleRef::new("proxy"))
+                .ok()?,
             by: by.clone(),
         },
         (Host::Name(name), false) => WardEvent::NetworkDenied {
-            dst: DeniedDst::Host { host: HostName::new(name).ok()?, port: r.port },
+            dst: DeniedDst::Host {
+                host: HostName::new(name).ok()?,
+                port: r.port,
+            },
             reason: deny_reason(&r.reason),
         },
         (Host::Ip(addr), _) => WardEvent::NetworkDenied {
-            dst: DeniedDst::Ip { addr: *addr, port: r.port },
+            dst: DeniedDst::Ip {
+                addr: *addr,
+                port: r.port,
+            },
             reason: deny_reason(&r.reason),
         },
     };
@@ -114,10 +133,9 @@ fn deny_reason(reason: &str) -> DenyReason {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use std::net::IpAddr;
     use ward_events::Pid;
@@ -127,20 +145,39 @@ mod tests {
     }
 
     fn by() -> ProcessRef {
-        ProcessRef { pid: Pid::new(7).unwrap(), comm: None }
+        ProcessRef {
+            pid: Pid::new(7).unwrap(),
+            comm: None,
+        }
     }
 
     #[test]
     fn allowed_name_becomes_network_requested() {
-        let r = Recorded { host: Host::Name("api.github.com".into()), port: 443, allowed: true, reason: "allowlisted".into() };
-        assert!(matches!(to_event(&r, &by()), Some(WardEvent::NetworkRequested { port: 443, .. })));
+        let r = Recorded {
+            host: Host::Name("api.github.com".into()),
+            port: 443,
+            allowed: true,
+            reason: "allowlisted".into(),
+        };
+        assert!(matches!(
+            to_event(&r, &by()),
+            Some(WardEvent::NetworkRequested { port: 443, .. })
+        ));
     }
 
     #[test]
     fn denied_private_ip_maps_to_private_range() {
-        let r = Recorded { host: Host::Ip(ip("10.0.0.1")), port: 80, allowed: false, reason: "private range".into() };
+        let r = Recorded {
+            host: Host::Ip(ip("10.0.0.1")),
+            port: 80,
+            allowed: false,
+            reason: "private range".into(),
+        };
         match to_event(&r, &by()) {
-            Some(WardEvent::NetworkDenied { dst: DeniedDst::Ip { port: 80, .. }, reason }) => {
+            Some(WardEvent::NetworkDenied {
+                dst: DeniedDst::Ip { port: 80, .. },
+                reason,
+            }) => {
                 assert_eq!(reason, DenyReason::PrivateRange);
             }
             other => panic!("unexpected {other:?}"),
@@ -150,7 +187,13 @@ mod tests {
     #[test]
     fn recorder_drains_once() {
         let rec = Recorder::default();
-        let req = Request { method: ward_proxy::Method::Connect, target: ward_proxy::Target { host: Host::Name("x.io".into()), port: 1 } };
+        let req = Request {
+            method: ward_proxy::Method::Connect,
+            target: ward_proxy::Target {
+                host: Host::Name("x.io".into()),
+                port: 1,
+            },
+        };
         rec.decision(&req, Decision::Deny, "offline");
         assert_eq!(rec.drain().len(), 1);
         assert!(rec.drain().is_empty());
