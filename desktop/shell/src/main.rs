@@ -10,7 +10,8 @@
 //! catches up with its event stream over the control socket, derives every
 //! surface in [`ward_shell_core`], and prints it. It has no privileged access
 //! and reads nothing from the worktree. With no session, or no daemon serving
-//! it, it prints `no session` (or the empty Waybar module).
+//! it, the text surfaces print [`NO_SESSION`], one line saying what to do next,
+//! and `bar --waybar` the empty module (the mark alone, dim).
 
 #![allow(clippy::missing_errors_doc, clippy::doc_markdown)]
 
@@ -31,6 +32,11 @@ use ward_shell_core::{
 /// How long the catch-up waits for one more record before calling the log
 /// caught up with.
 const SETTLE_MS: u64 = 250;
+
+/// What the text surfaces say with no session: calm, and the two ways to get
+/// one (the command centre, or `ward init` then `ward claude` in a terminal),
+/// rather than a bare `no session`.
+const NO_SESSION: &str = "No agent session. Super + Space → Start Claude, or `ward init` then `ward claude` in a terminal.";
 
 #[derive(Parser)]
 #[command(name = "ward-shell", version, about = "The Ward Shell, printed")]
@@ -118,13 +124,18 @@ fn main() -> ExitCode {
     }
 }
 
-/// Print one text surface, or `no session`.
+/// Print one text surface, or [`NO_SESSION`].
 fn text(dir: &Path, settle: Duration, surface: Surface) -> ward_daemon::Result<()> {
-    match load(dir, settle)? {
-        Some(snapshot) => print!("{}", render(&snapshot, surface)),
-        None => println!("no session"),
-    }
+    print!("{}", surface_text(load(dir, settle)?.as_ref(), surface));
     Ok(())
+}
+
+/// The text of a surface for a session, or the no-session line without one.
+fn surface_text(snapshot: Option<&Snapshot>, surface: Surface) -> String {
+    match snapshot {
+        Some(snapshot) => render(snapshot, surface),
+        None => format!("{NO_SESSION}\n"),
+    }
 }
 
 /// `bar --waybar`: the module's JSON, once or on every change.
@@ -354,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn a_project_without_a_session_is_no_session_not_an_error() {
+    fn a_project_without_a_session_gets_the_next_step_not_an_error() {
         #![allow(clippy::unwrap_used)]
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
@@ -362,6 +373,24 @@ mod tests {
             Ok(None)
         ));
         assert!(matches!(locate(dir.path()), Ok(None)));
+        // Every text surface says the same calm thing, and what to do about it.
+        for surface in [
+            Surface::Bar {
+                waybar: false,
+                segment: None,
+                follow: false,
+            },
+            Surface::Session,
+            Surface::Observer { rows: 3 },
+            Surface::Settings,
+        ] {
+            let text = surface_text(None, surface);
+            assert_eq!(
+                text,
+                "No agent session. Super + Space → Start Claude, or `ward init` then `ward claude` in a terminal.\n"
+            );
+            assert!(!text.contains("no session"));
+        }
     }
 
     #[test]
