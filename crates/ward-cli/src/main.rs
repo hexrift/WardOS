@@ -14,8 +14,10 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use std::time::Duration;
+
 use clap::{Parser, Subcommand};
-use ward_daemon::{Session, render, selftest};
+use ward_daemon::{Session, SessionMeta, render, selftest};
 use ward_events::{EndReason, LogReader};
 
 #[derive(Parser)]
@@ -31,17 +33,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start a session and print its security panel.
+    /// Start a session, record it as the project's current session, and print its
+    /// security panel.
     Up {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
     },
-    /// Print the session security panel (alias of `up`).
+    /// Print the current session's security panel without starting one.
     Status {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
     },
-    /// Run a command inside the sandbox and show the observer view.
+    /// Run a command in the current session's sandbox (starting a throwaway session
+    /// if none is active), and show the observer view.
     Run {
         /// Project directory (default: current).
         #[arg(long)]
@@ -49,6 +53,11 @@ enum Command {
         /// Command and arguments to run.
         #[arg(trailing_var_arg = true, required = true)]
         argv: Vec<String>,
+    },
+    /// End the current session and seal its log.
+    Stop {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
     },
     /// Run the isolation self-tests against a real sandbox.
     Selftest {
@@ -74,56 +83,105 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
     match cli.command {
-        Command::Up { dir } | Command::Status { dir } => {
-            let dir = dir.unwrap_or_else(cwd);
-            let session = Session::start(&dir)?;
-            print!(
-                "{}",
-                render::status_panel(
-                    session.id(),
-                    &dir.display().to_string(),
-                    session.entry_snapshot(),
-                    session.manifest(),
-                )
-            );
-            println!();
-            println!("  session ready · log {}", session.log_path().display());
-            session.stop(EndReason::UserStop)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Run { dir, argv } => {
-            let dir = dir.unwrap_or_else(cwd);
-            let mut session = Session::start(&dir)?;
-            let log = session.log_path();
-            let report = session.run(&argv)?;
-            let code = report.code;
-            session.stop(EndReason::UserStop)?;
-            render_log(&log);
-            if !report.stdout.is_empty() {
-                println!("\n{}", report.stdout.trim_end());
-            }
-            Ok(exit_code(code))
-        }
-        Command::Selftest { dir } => {
-            let dir = dir.unwrap_or_else(cwd);
-            let results = selftest(&dir)?;
-            let passed = results.iter().filter(|r| r.blocked).count();
-            println!("WARD selftest · isolation\n");
-            for r in &results {
-                println!("{}", render::selftest_row(r.name, r.blocked));
-            }
-            println!("\n  {passed}/{} PASS", results.len());
-            Ok(if passed == results.len() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
-        }
+        Command::Up { dir } => cmd_up(&dir.unwrap_or_else(cwd)),
+        Command::Status { dir } => cmd_status(&dir.unwrap_or_else(cwd)),
+        Command::Run { dir, argv } => cmd_run(&dir.unwrap_or_else(cwd), &argv),
+        Command::Stop { dir } => cmd_stop(&dir.unwrap_or_else(cwd)),
+        Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
         Command::Replay { log } => {
             render_log(&log);
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn cmd_up(dir: &Path) -> ward_daemon::Result<ExitCode> {
+    let session = Session::start(dir)?;
+    session.persist_current()?;
+    print!(
+        "{}",
+        render::status_panel(
+            session.id(),
+            &dir.display().to_string(),
+            session.entry_snapshot(),
+            session.manifest(),
+        )
+    );
+    println!();
+    println!("{}", render::session_status_line(Some(Duration::ZERO)));
+    println!("  session ready · log {}", session.log_path().display());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_status(dir: &Path) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    if let Some(meta) = SessionMeta::current(dir, &state)? {
+        print!(
+            "{}",
+            render::status_panel(
+                &meta.id,
+                &dir.display().to_string(),
+                &meta.entry_snapshot,
+                &meta.manifest,
+            )
+        );
+        println!();
+        println!("{}", render::session_status_line(Some(meta.started_ago())));
+    } else {
+        println!("{}", render::session_status_line(None));
+        println!("  run `ward up {}` to start one", dir.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_run(dir: &Path, argv: &[String]) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    // Append to the project's current session, or start a throwaway that seals its
+    // own log when none is active.
+    let (mut session, throwaway) = match Session::open_current(dir, &state)? {
+        Some(session) => (session, false),
+        None => (Session::start(dir)?, true),
+    };
+    let log = session.log_path();
+    let report = session.run(argv)?;
+    let code = report.code;
+    if throwaway {
+        session.stop(EndReason::UserStop)?;
+    } else {
+        session.sync()?;
+    }
+    render_log(&log);
+    if !report.stdout.is_empty() {
+        println!("\n{}", report.stdout.trim_end());
+    }
+    Ok(exit_code(code))
+}
+
+fn cmd_stop(dir: &Path) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    if let Some(session) = Session::open_current(dir, &state)? {
+        let id = session.id().to_owned();
+        session.stop(EndReason::UserStop)?;
+        println!("  session {id} stopped");
+    } else {
+        println!("{}", render::session_status_line(None));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_selftest(dir: &Path) -> ward_daemon::Result<ExitCode> {
+    let results = selftest(dir)?;
+    let passed = results.iter().filter(|r| r.blocked).count();
+    println!("WARD selftest · isolation\n");
+    for r in &results {
+        println!("{}", render::selftest_row(r.name, r.blocked));
+    }
+    println!("\n  {passed}/{} PASS", results.len());
+    Ok(if passed == results.len() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn render_log(path: &Path) {
