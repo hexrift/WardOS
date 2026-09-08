@@ -11,6 +11,10 @@ mock wl-copy
 mock notify-send
 mock wf-recorder
 mock hyprpicker 'echo "#7fa1c3"'
+# A runner without user-dirs.dirs: xdg-user-dir answers $HOME, which must not be used.
+# shellcheck disable=SC2016
+mock xdg-user-dir 'echo "$HOME"'
+unset XDG_PICTURES_DIR XDG_VIDEOS_DIR
 mock hyprctl "case \"\$*\" in 'activewindow -j') printf '{\"at\": [100, 50], \"size\": [640, 480], \"class\": \"foot\"}\n' ;; 'activeworkspace -j') printf '{\"monitor\": \"DP-1\"}\n' ;; esac"
 shots="$HOME/Pictures/Screenshots"
 
@@ -33,6 +37,9 @@ assert_logged "^grim -o DP-1 $shots/"
 : >"$MOCK_LOG"
 wardos-capture screenshot
 assert_logged '^grim -g 10,20 300x200'
+# XDG_PICTURES_DIR wins over xdg-user-dir.
+XDG_PICTURES_DIR="$TMP/pics" wardos-capture screenshot
+assert_logged "^grim -g 10,20 300x200 $TMP/pics/Screenshots/"
 
 # With satty: grim to stdout, satty annotates and saves.
 mock satty 'cat >/dev/null'

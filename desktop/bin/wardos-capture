@@ -21,10 +21,14 @@ state=$(wardos_state_dir)
 mkdir -p "$state"
 stamp=$(date +%Y-%m-%d_%H-%M-%S)
 
+# user_dir KIND FALLBACK: $XDG_<KIND>_DIR, else xdg-user-dir's answer, else ~/FALLBACK.
+# xdg-user-dir answers $HOME itself when user-dirs.dirs has no entry; that is no answer.
 user_dir() {
-  local kind=$1 fallback=$2 dir
-  dir=$(xdg-user-dir "$kind" 2>/dev/null || true)
-  printf '%s\n' "${dir:-$HOME/$fallback}"
+  local kind=$1 fallback=$2 dir var="XDG_${1}_DIR"
+  dir=${!var:-}
+  [[ -n "$dir" ]] || dir=$(xdg-user-dir "$kind" 2>/dev/null || true)
+  [[ -n "$dir" && "$dir" != "$HOME" ]] || dir="$HOME/$fallback"
+  printf '%s\n' "$dir"
 }
 
 # The active window as "x,y wxh", from hyprctl's JSON (no jq needed for two fields).
