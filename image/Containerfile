@@ -242,7 +242,8 @@ RUN ver=$(sed -n 's/^VERSION_ID=//p' /usr/lib/os-release) \
     && mv /usr/lib/os-release.wardos /usr/lib/os-release \
     && grep -q '^NAME="WardOS"$' /usr/lib/os-release
 
-RUN systemctl enable wardos-firstboot.service wardos-flathub.service wardos-usb-guard.service \
+RUN systemctl mask serial-getty@ttyS0.service \
+    && systemctl enable wardos-firstboot.service wardos-flathub.service wardos-usb-guard.service \
          firewalld.service bootc-fetch-apply-updates.timer \
     && sed -i 's/^DefaultZone=.*/DefaultZone=wardos/' /etc/firewalld/firewalld.conf \
     && grep -q '^DefaultZone=wardos$' /etc/firewalld/firewalld.conf \

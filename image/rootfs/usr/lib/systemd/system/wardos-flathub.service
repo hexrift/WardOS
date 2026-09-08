@@ -15,7 +15,6 @@ ConditionPathExists=!/var/lib/wardos/flathub.done
 [Service]
 Type=oneshot
 ExecStart=/usr/libexec/wardos-flathub /usr/share/wardos/flatpaks.txt
-ExecStartPost=/usr/bin/touch /var/lib/wardos/flathub.done
 # Downloads can take a while on first boot; a stuck one must not hang the unit forever.
 TimeoutStartSec=1h
 

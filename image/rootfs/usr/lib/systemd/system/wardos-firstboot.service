@@ -16,6 +16,9 @@ Type=oneshot
 ExecStart=/usr/bin/ward doctor
 StandardOutput=truncate:/var/lib/wardos/doctor.txt
 StandardError=inherit
+# ward doctor caps each probe at 5s; bound the whole run so a wedged probe can never
+# stall the boot (it showed "no limit" on the first hardware boot).
+TimeoutStartSec=60s
 # The report is informational: a non-zero exit from `ward doctor` still leaves the file,
 # and the unit shows in `systemctl --failed`, which is the intended signal.
 

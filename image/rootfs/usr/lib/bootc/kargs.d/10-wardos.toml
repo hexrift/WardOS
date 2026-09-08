@@ -1,0 +1,5 @@
+# Boot quietly. The first hardware boot (E-09) drowned the console in kernel audit and
+# SELinux messages, hiding the desktop handoff. `quiet` plus a low console log level
+# keeps the console to warnings and errors; audit still goes to auditd. bootc applies
+# these kargs when it installs the image to a disk (bootc-image-builder included).
+kargs = ["quiet", "loglevel=4", "rd.udev.log_level=3"]
