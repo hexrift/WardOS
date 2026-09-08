@@ -4,7 +4,7 @@
 # shellcheck source=desktop/tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 setup_env
-for c in wardos-refresh wardos-theme ward wardos-keys wardos-webapp wardos-tui notify-send; do mock "$c"; done
+for c in wardos-refresh wardos-theme ward wardos-keys wardos-webapp wardos-tui notify-send wardos-welcome; do mock "$c"; done
 marker="$XDG_CONFIG_HOME/wardos/first-run-done"
 
 wardos-first-run --help | grep -q '^Usage' || fail "--help prints the usage block"
@@ -18,6 +18,9 @@ assert_logged '^wardos-tui install --defaults$'
 assert_logged '^wardos-keys $'
 assert_logged '^notify-send -a WardOS .*Welcome'
 assert_file "$marker"
+# The walkthrough comes last, after the keys, once the marker is written.
+assert_logged '^wardos-welcome $'
+[[ "$(tail -n1 "$MOCK_LOG")" == "wardos-welcome " ]] || fail "wardos-welcome is the last step; log: $(cat "$MOCK_LOG")"
 
 # Done once: the second login does nothing.
 : >"$MOCK_LOG"
