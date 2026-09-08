@@ -73,7 +73,8 @@ destinations, all visible in the observer. Gateway-mode credential injection is 
 grant is a `CredentialGranted` record. Agent hook adapters are in: `ward claude` seeds
 the hook settings, `ward-agent hook` reports every tool call to `wardd` over the hook
 socket, and `step_through` policies hold before writes and network tools through the
-agent's own prompt. Remaining for the gate: a live E-07 run through the gateway, nested
+agent's own prompt. `ward selftest` proves ST-012 and ST-024 for the model-API key with a
+canary held on the host. Remaining for the gate: a live E-07 run through the gateway, nested
 containers (E-04), and a full session replay of an agent run.
 
 
