@@ -222,6 +222,10 @@ impl Launch {
         if self.shim.is_some() {
             push(&mut a, &[AGENT_SHIM]);
             a.extend(self.shim_flags.iter().cloned());
+            // The shim only forwards whitelisted env to the agent; name ours explicitly.
+            for (k, _) in &self.env {
+                push(&mut a, &["--env", k]);
+            }
             if self.proxy_socket.is_some() {
                 a.push("--relay".into());
                 a.push(format!("{RELAY_ADDR}={PROXY_SOCKET}"));
@@ -337,8 +341,12 @@ mod tests {
         assert!(a.contains("--bind /host/proxy.sock /run/ward/proxy.sock"));
         assert!(a.contains("--ro-bind /host/ward-agent /run/ward/ward-agent"));
         assert!(a.contains("--setenv FOO bar"));
+        assert!(
+            a.contains("--env FOO"),
+            "shim must be told to pass FOO through"
+        );
         assert!(a.ends_with(
-            "-- /run/ward/ward-agent --relay 127.0.0.1:3128=/run/ward/proxy.sock -- true"
+            "-- /run/ward/ward-agent --env FOO --relay 127.0.0.1:3128=/run/ward/proxy.sock -- true"
         ));
         assert!(!a.contains("/root"), "host home must never be bound");
     }
