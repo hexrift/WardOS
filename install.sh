@@ -7,12 +7,16 @@
 #
 # Installs ward, wardd and ward-agent, checks for bubblewrap, and runs
 # `ward doctor`. Nothing is written outside the prefix and ~/.local/state/ward.
+# The release tarball is the one for this machine's architecture (`uname -m`):
+# x86_64, or aarch64 from v0.3.
 set -euo pipefail
 
 REPO="hexrift/WardOS"
 PREFIX="${HOME}/.local"
 VERSION="latest"
 ARCH="$(uname -m)"
+# Some kernels report arm64 for aarch64; the tarballs use the Fedora and rustc name.
+[ "$ARCH" != "arm64" ] || ARCH="aarch64"
 
 usage() {
   cat <<USAGE
@@ -35,10 +39,10 @@ if [ "$(uname -s)" != "Linux" ]; then
   echo "install.sh: WardOS runs on Linux only (macOS: use a Linux VM)" >&2
   exit 1
 fi
-if [ "$ARCH" != "x86_64" ]; then
-  echo "install.sh: no release binaries for $ARCH yet; build from source with cargo" >&2
-  exit 1
-fi
+case "$ARCH" in
+  x86_64 | aarch64) ;;
+  *) echo "install.sh: no release binaries for $ARCH (x86_64 and aarch64 only); build from source with cargo" >&2; exit 1 ;;
+esac
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 bindir="${PREFIX}/bin"
@@ -69,7 +73,11 @@ else
   fi
   VERSION="$(printf '%s' "$release" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
   [ -n "$VERSION" ] || { echo "install.sh: could not resolve release ${VERSION:-latest} (private repository? set GITHUB_TOKEN)" >&2; exit 1; }
-  name="wardos-${VERSION#v}-x86_64-linux"
+  name="wardos-${VERSION#v}-${ARCH}-linux"
+  if ! printf '%s' "$release" | grep -q "\"name\": *\"${name}.tar.gz\""; then
+    echo "install.sh: release ${VERSION} has no ${ARCH} tarball (aarch64 ships from v0.3); build from source with cargo" >&2
+    exit 1
+  fi
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   fetch_asset() {

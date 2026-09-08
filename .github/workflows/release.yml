@@ -1,6 +1,7 @@
-# Release: build the x86_64 Linux binaries, package them with the installer, and
-# attach the tarball and its checksum to a GitHub release. Runs on a v* tag push,
-# or by hand with a version (then the workflow creates the tag on the chosen ref).
+# Release: build the Linux binaries for x86_64 and aarch64, each natively on a runner
+# of that architecture (no cross toolchain), package them with the installer, and
+# attach both tarballs and their checksums to one GitHub release. Runs on a v* tag
+# push, or by hand with a version (then the workflow creates the tag on the chosen ref).
 name: release
 
 on:
@@ -20,17 +21,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: x86_64-unknown-linux-gnu
+  version:
+    name: version
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.94.1
-      - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --release --locked -p ward-cli -p ward-daemon -p ward-agent -p ward-shell -p wardos-theme
       - name: Resolve version
         id: version
         run: |
@@ -39,11 +36,43 @@ jobs:
           case "$tag" in v[0-9]*) ;; *) echo "not a v* tag: $tag" >&2; exit 1 ;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  # One job per architecture, on a runner of that architecture: the binaries are built
+  # and smoke-tested natively, and the tarball name carries `uname -m` of the machine
+  # they run on (install.sh and the image's release stage pick the tarball by it).
+  build:
+    name: ${{ matrix.arch }}-unknown-linux-gnu
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+      - name: The runner is the architecture it claims
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$ARCH"
+      - name: Build
+        run: cargo build --release --locked -p ward-cli -p ward-daemon -p ward-agent -p ward-shell -p wardos-theme
       - name: Package
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          name="wardos-${version}-x86_64-linux"
+          name="wardos-${VERSION}-${ARCH}-linux"
           mkdir -p "dist/${name}"
           # The image's release stage expects these five (image/Containerfile); tarballs
           # before v0.2 carried only the first three.
@@ -57,17 +86,52 @@ jobs:
       - name: Smoke the packaged binaries
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          dir="dist/wardos-${version}-x86_64-linux"
+          dir="dist/wardos-${VERSION}-${ARCH}-linux"
           "${dir}/ward" --version
           "${dir}/wardd" --help >/dev/null
           "${dir}/ward-agent" --help >/dev/null
           "${dir}/ward-shell" --help >/dev/null
           "${dir}/wardos-theme-render" --help >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wardos-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # One job creates the release and attaches every tarball, so the two builds never
+  # race on `gh release create`. It runs as long as the version resolved and nothing
+  # was cancelled: an aarch64 build that fails must not lose the x86_64 release (the
+  # red matrix job says what is missing), but a missing x86_64 tarball is fatal.
+  release:
+    name: release
+    needs: [version, build]
+    if: ${{ !cancelled() && needs.version.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wardos-*
+          path: dist
+          merge-multiple: true
+      - name: What was built
+        id: built
+        run: |
+          set -euo pipefail
+          ls -la dist
+          test -f "dist/wardos-${VERSION}-x86_64-linux.tar.gz"
+          arch=x86_64
+          if [[ -f "dist/wardos-${VERSION}-aarch64-linux.tar.gz" ]]; then arch=both; fi
+          echo "disk_arch=$arch" >> "$GITHUB_OUTPUT"
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -76,12 +140,13 @@ jobs:
             gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
               --target "$GITHUB_SHA" --title "WardOS $TAG" --generate-notes
           fi
-      # The disks for this release. A release created with the workflow's own token
-      # does not fire other workflows' `release:` triggers (GitHub's rule for
-      # GITHUB_TOKEN events, workflow_dispatch excepted), so the disk workflow is
-      # dispatched here and attaches the qcow2 and ISO to the release itself.
+      # The disks for this release, for every architecture that has a tarball. A
+      # release created with the workflow's own token does not fire other workflows'
+      # `release:` triggers (GitHub's rule for GITHUB_TOKEN events, workflow_dispatch
+      # excepted), so the disk workflow is dispatched here, once, and attaches the
+      # qcow2 and ISO of each architecture to the release itself.
       - name: Build and attach the disks
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-        run: gh workflow run disk.yml --ref "$GITHUB_REF_NAME" -f type=both -f source=release -f "release=$TAG" -f user=wardos -f luks=false
+          DISK_ARCH: ${{ steps.built.outputs.disk_arch }}
+        run: gh workflow run disk.yml --ref "$GITHUB_REF_NAME" -f type=both -f source=release -f "release=$TAG" -f "arch=$DISK_ARCH" -f user=wardos -f luks=false

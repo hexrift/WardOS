@@ -2,7 +2,9 @@
 # package of image/packages.txt installed on the pinned fedora-bootc release, the ward binaries compiled
 # from this checkout, the desktop tree placed, `bootc container lint` at the end. Kept
 # out of verify.yml so the merge authority stays fast: this runs on main and on pull
-# requests that touch what the image is made of.
+# requests that touch what the image is made of. Built twice, natively: x86_64 on
+# ubuntu-latest and aarch64 on ubuntu-24.04-arm (image/README.md, "aarch64 and Apple
+# silicon"); on main both are published per architecture and joined under `latest`.
 name: image
 
 on:
@@ -45,6 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           docker build -f image/Containerfile \
+            --platform linux/amd64 \
             --build-arg WARDOS_SOURCE=builder \
             --build-arg "WARDOS_VERSION=$(git describe --tags --always)" \
             -t wardos:ci .
@@ -52,6 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run --rm wardos:ci bash -c '
+            uname -m
             ls -l /usr/bin/ward*
             ls /usr/share/wardos
             cat /usr/lib/systemd/user-preset/90-wardos.preset
@@ -61,6 +65,9 @@ jobs:
             bootc container lint'
       # The image everyone else uses (image/README.md, "The published image"): a merge
       # to main that built and linted is what gets published, never a pull request.
+      # `latest` and `<sha>` are pushed from here as x86_64 images, so they exist even
+      # when the aarch64 build fails; the manifest job below turns them into
+      # two-architecture lists once both builds are in.
       - name: Publish to ghcr.io (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
@@ -69,7 +76,84 @@ jobs:
           set -euo pipefail
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
-          docker tag wardos:ci "$repo:latest"
-          docker tag wardos:ci "$repo:${GITHUB_SHA::7}"
-          docker push "$repo:latest"
-          docker push "$repo:${GITHUB_SHA::7}"
+          for tag in latest "${GITHUB_SHA::7}" latest-x86_64 "${GITHUB_SHA::7}-x86_64"; do
+            docker tag wardos:ci "$repo:$tag"
+            docker push "$repo:$tag"
+          done
+
+  # The same image for aarch64, built natively on an arm64 runner (no emulation: the
+  # Rust build and dnf would take hours under qemu). Published as `latest-aarch64` and
+  # `<sha>-aarch64`; an Apple-silicon Mac or an arm64 server pulls those, or `latest`
+  # once the manifest job has joined the two.
+  build-aarch64:
+    name: image build (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup
+          df -h /
+      - name: docker build --platform linux/arm64 (checkout binaries)
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          docker build -f image/Containerfile \
+            --platform linux/arm64 \
+            --build-arg WARDOS_SOURCE=builder \
+            --build-arg "WARDOS_VERSION=$(git describe --tags --always)" \
+            -t wardos:ci .
+      - name: What the image holds
+        run: |
+          set -euo pipefail
+          docker run --rm wardos:ci bash -c '
+            uname -m
+            ls -l /usr/bin/ward*
+            ls /usr/share/wardos
+            cat /usr/lib/systemd/user-preset/90-wardos.preset
+            readlink /etc/xdg/hypr
+            systemctl is-enabled wardos-firstboot.service wardos-flathub.service
+            plymouth-set-default-theme
+            bootc container lint'
+      - name: Publish to ghcr.io (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          for tag in latest-aarch64 "${GITHUB_SHA::7}-aarch64"; do
+            docker tag wardos:ci "$repo:$tag"
+            docker push "$repo:$tag"
+          done
+
+  # One `latest` (and one `<sha>`) for both: a manifest list that points at the two
+  # per-architecture images, so `bootc switch ghcr.io/hexrift/wardos:latest` and
+  # `podman pull` resolve to the right one on either machine. `docker buildx imagetools
+  # create` only writes manifests to the registry (no image data moves), which the
+  # workflow token's packages:write allows. Runs only when both builds succeeded;
+  # otherwise `latest` stays the x86_64 image the first job pushed.
+  manifest:
+    name: multi-arch manifest
+    needs: [build, build-aarch64]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Join latest-x86_64 and latest-aarch64 under latest
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha="${GITHUB_SHA::7}"
+          docker buildx imagetools create -t "$repo:latest" -t "$repo:$sha" \
+            "$repo:$sha-x86_64" "$repo:$sha-aarch64"
+          docker buildx imagetools inspect "$repo:latest"

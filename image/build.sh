@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 # Build the WardOS host image (image/Containerfile) with podman.
 #
-#   image/build.sh [--source release|checkout] [--release vX.Y.Z] [--tag NAME]
-#                  [--version V] [--dry-run] [-- extra podman build args]
+#   image/build.sh [--source release|checkout] [--release vX.Y.Z] [--arch x86_64|aarch64]
+#                  [--tag NAME] [--version V] [--dry-run] [-- extra podman build args]
 #
 # Defaults: --source release (the published tarball of --release, default the newest
 # tag reachable from HEAD, else the Containerfile default; checksum fetched from the
 # release and verified in the build);
-# --source checkout compiles this working tree instead. Tag localhost/wardos:<git
-# describe --tags --always>, version = the same describe string, passed in as
-# --build-arg WARDOS_VERSION for the org.wardos.version label. Run it as root (sudo)
-# when the image is going to feed image/disk.sh, because bootc-image-builder reads
-# root's container storage. See image/README.md.
+# --source checkout compiles this working tree instead. --arch builds for another
+# architecture (podman --platform, and the release tarball and checksum of that
+# architecture; aarch64 tarballs exist from v0.3), the default being this machine's.
+# Tag localhost/wardos:<git describe --tags --always>, version = the same describe
+# string, passed in as --build-arg WARDOS_VERSION for the org.wardos.version label.
+# Run it as root (sudo) when the image is going to feed image/disk.sh, because
+# bootc-image-builder reads root's container storage. See image/README.md.
 set -euo pipefail
 
 usage() {
-  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -26,6 +28,7 @@ tag=""
 version=""
 source="release"
 release=""
+arch=""
 dry_run=0
 extra=()
 
@@ -39,6 +42,8 @@ while [[ $# -gt 0 ]]; do
     --source=*) source=${1#--source=}; shift ;;
     --release) release=$2; shift 2 ;;
     --release=*) release=${1#--release=}; shift ;;
+    --arch) arch=$2; shift 2 ;;
+    --arch=*) arch=${1#--arch=}; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h | --help) usage; exit 0 ;;
     --) shift; extra=("$@"); break ;;
@@ -58,10 +63,25 @@ if [[ ! -f image/Containerfile ]]; then
   exit 1
 fi
 
+# The architecture decides the platform podman builds for and which release tarball
+# (and checksum build arg) the Containerfile's release stage takes. Without --arch the
+# build is native and no --platform is passed: podman uses this machine's, and the
+# Containerfile picks the tarball from TARGETARCH.
+platform=()
+case "$arch" in
+  "") arch=$(uname -m) ;;
+  x86_64) platform=(--platform linux/amd64) ;;
+  aarch64) platform=(--platform linux/arm64) ;;
+  *) echo "build.sh: --arch must be x86_64 or aarch64 (got '$arch')" >&2; exit 2 ;;
+esac
+sha_arg="WARDOS_SHA256"
+if [[ "$arch" == aarch64 ]]; then sha_arg="WARDOS_SHA256_AARCH64"; fi
+
 # --format docker: the Containerfile's SHELL (pipefail) is honoured; the OCI format
 # ignores it, and bootc is happy with either.
 cmd=("$podman_bin" build
   --format docker
+  "${platform[@]}"
   --tag "$tag"
   --file image/Containerfile
   --build-arg "WARDOS_VERSION=${version}")
@@ -79,15 +99,18 @@ case "$source" in
       echo "build.sh: no release known; pass --release vX.Y.Z or --source checkout" >&2
       exit 1
     fi
-    asset="wardos-${release#v}-x86_64-linux.tar.gz.sha256"
+    asset="wardos-${release#v}-${arch}-linux.tar.gz.sha256"
     sha=$(curl -fsSL "https://github.com/hexrift/WardOS/releases/download/${release}/${asset}" | awk '{print $1}') || true
     if [[ ! "$sha" =~ ^[0-9a-f]{64}$ ]]; then
-      echo "build.sh: could not fetch the checksum for release ${release}" >&2
+      echo "build.sh: could not fetch the checksum for release ${release} (${asset})" >&2
+      if [[ "$arch" == aarch64 ]]; then
+        echo "build.sh: aarch64 tarballs ship from v0.3; for an older release use --source checkout" >&2
+      fi
       exit 1
     fi
     cmd+=(--build-arg "WARDOS_SOURCE=release"
       --build-arg "WARDOS_RELEASE=${release}"
-      --build-arg "WARDOS_SHA256=${sha}")
+      --build-arg "${sha_arg}=${sha}")
     ;;
   checkout)
     cmd+=(--build-arg "WARDOS_SOURCE=builder")

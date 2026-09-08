@@ -19,8 +19,8 @@ not.
 | `check-packages.sh` | — | Proves every name in `packages.txt` exists in the pinned Fedora release plus `coprs.txt` (`dnf repoquery` in a `fedora:<release>` container); CI job "image packages" |
 | `install-desktop.sh` | — | Places `desktop/` into a root (`/` in the build, `/` from `desktop/install.sh`, a temp dir in tests) |
 | `rootfs/usr/libexec/wardos-flathub` | `/usr/libexec/wardos-flathub` | Adds Flathub and installs `desktop/flatpaks.txt`, run once by `wardos-flathub.service` |
-| `build.sh` | — | `podman build` wrapper; tags `localhost/wardos:<git describe>` and stamps the version label |
-| `disk.sh` | — | `bootc-image-builder` wrapper; qcow2 for QEMU, ISO for installation; `--user`, `--luks` |
+| `build.sh` | — | `podman build` wrapper; tags `localhost/wardos:<git describe>` and stamps the version label; `--arch x86_64|aarch64` |
+| `disk.sh` | — | `bootc-image-builder` wrapper; qcow2 for QEMU, ISO for installation; `--user`, `--luks`, `--arch` |
 | `sysctl.d/50-wardos.conf` | `/usr/lib/sysctl.d/` | Unprivileged user namespaces for `wardd`'s sandboxes |
 | `tmpfiles.d/wardos.conf` | `/usr/lib/tmpfiles.d/` | Creates `/var/lib/wardos` at boot |
 | `systemd/wardos-firstboot.service` | `/usr/lib/systemd/system/` | Runs `ward doctor` once, keeps the report |
@@ -197,7 +197,7 @@ The host stage copies the binaries from one of two stages, chosen with
 
 | Source | What happens | Use |
 | --- | --- | --- |
-| `release` (default) | downloads `wardos-<ver>-x86_64-linux.tar.gz` for `WARDOS_RELEASE` from the GitHub release and refuses to continue unless its SHA-256 matches `WARDOS_SHA256` (`build.sh` fetches the published checksum) | every image that leaves your machine: reproducible from a known, tested release |
+| `release` (default) | downloads `wardos-<ver>-<arch>-linux.tar.gz` for `WARDOS_RELEASE` from the GitHub release (`<arch>` from the platform being built: `TARGETARCH` amd64 → `x86_64`, arm64 → `aarch64`) and refuses to continue unless its SHA-256 matches `WARDOS_SHA256` (x86_64) or `WARDOS_SHA256_AARCH64` (`build.sh` fetches the published checksum for `--arch`) | every image that leaves your machine: reproducible from a known, tested release |
 | `builder` (`--source checkout`) | compiles this working tree with `docker.io/library/rust:1.94.1` (the channel of `rust-toolchain.toml`; bump both together), `--locked` | development images of unreleased changes; the "image build" CI job |
 
 Five binaries: `ward`, `wardd`, `ward-agent` (required; the build fails without them),
@@ -294,8 +294,9 @@ the desktop.
 ### The published image: skip the build
 
 Every merge to `main` that passes the image build pushes the result to
-`ghcr.io/hexrift/wardos` (`:latest` and `:<short sha>`). A machine that only wants a
-disk never builds anything:
+`ghcr.io/hexrift/wardos` (`:latest` and `:<short sha>`, for x86_64 and aarch64 both;
+`:latest-<arch>` names one architecture, [below](#aarch64-and-apple-silicon)). A
+machine that only wants a disk never builds anything:
 
 ```sh
 sudo WARDOS_PASSWORD='choose-one' image/disk.sh --type qcow2 --user wardos \
@@ -323,32 +324,109 @@ Nobody needs a Fedora box to get a WardOS disk. The `disk` workflow
 needs, and publishes the result:
 
 * **By hand**: Actions → *disk* → *Run workflow*. Choose `qcow2`, `iso` or `both`, the
-  binaries (`checkout` compiles this commit, `release` takes the published tarball of
-  `--release`), the first user (`wardos`, which the autologin expects) and, for the ISO,
-  `luks`. The disks appear as the run's `wardos-disks` artifact for 14 days, with a
-  `SHA256SUMS`.
-* **On every published release**: both disks are built from that release's tarball and
-  attached to the release as `wardos-<tag>-x86_64.qcow2.zst` and `.iso.zst`. GitHub
-  caps a release asset at 2 GiB and bootc-image-builder's disks are already compressed
-  inside (zstd gains about 1 %), so a disk over the cap is attached in 1900 MiB parts:
-  `cat wardos-<tag>-x86_64.iso.zst.part* > wardos-<tag>-x86_64.iso.zst`, check it
-  against `SHA256SUMS`, then `zstd -d`. Decision: parts rather than an external host,
-  so a release stays one page with everything on it; the run's `wardos-disks` artifact
+  architecture (`x86_64`, `aarch64`, or `both` for one job per architecture, each on a
+  runner of that architecture), the binaries (`checkout` compiles this commit,
+  `release` takes the published tarball of `--release`), the first user (`wardos`,
+  which the autologin expects) and, for the ISO, `luks`. The disks appear as the run's
+  `wardos-disks-<arch>` artifact for 14 days, with a `SHA256SUMS.<arch>`.
+* **On every published release**: both disks of both architectures are built from that
+  release's tarballs and attached to the release as `wardos-<tag>-<arch>.qcow2.zst` and
+  `.iso.zst`. GitHub caps a release asset at 2 GiB and bootc-image-builder's disks are
+  already compressed inside (zstd gains about 1 %), so a disk over the cap is attached
+  in 1900 MiB parts: `cat wardos-<tag>-<arch>.iso.zst.part* > wardos-<tag>-<arch>.iso.zst`,
+  check it against `SHA256SUMS.<arch>`, then `zstd -d`. Decision: parts rather than an
+  external host, so a release stays one page with everything on it; the run's artifact
   carries the same files unsplit for 14 days.
 
 The first user's password in these disks is `wardos`. Change it at first login
 (`passwd`); the ISO with `luks` additionally asks for the disk passphrase during the
-install. The same job runs `check-packages.sh --arch aarch64 --discover` so the log says
-whether the COPRs the image depends on also build for aarch64, the prerequisite for an
-Apple-silicon image.
+install. The same workflow runs `check-packages.sh --arch aarch64 --discover` so the
+log says whether the COPRs the image depends on still build for aarch64.
 
 **On a Mac.** Docker Desktop can build the container image
-(`docker build -f image/Containerfile --platform linux/amd64 -t wardos .`) and run it for
-a look around, but cannot make the disk: bootc-image-builder needs loop devices and a
-privileged Linux podman, which Docker Desktop's VM does not provide, and on Apple silicon
-it would build arm64 only. Download the qcow2 from CI instead and boot it in
-[UTM](https://mac.getutm.app) as an x86_64 machine (emulated on Apple silicon, so slow;
-native on an Intel Mac), or write the ISO to a USB stick for a PC.
+(`docker build -f image/Containerfile --platform linux/arm64 -t wardos .` on Apple
+silicon, `linux/amd64` on Intel) and run it for a look around, but cannot make the
+disk: bootc-image-builder needs loop devices and a privileged Linux podman, which
+Docker Desktop's VM does not provide. Download the qcow2 of the Mac's own architecture
+from CI instead and boot it natively in [UTM](https://mac.getutm.app)
+([below](#aarch64-and-apple-silicon)), or write the ISO to a USB stick for a PC.
+
+### aarch64 and Apple silicon
+
+Everything the x86_64 host gets exists for aarch64 too, built natively on GitHub's
+`ubuntu-24.04-arm` runners (free for public repositories), never cross-compiled or
+emulated:
+
+| What | Built by | Name |
+| --- | --- | --- |
+| The five binaries, from release **v0.3** | `release.yml`, one matrix job per architecture, the tarballs attached to one release | `wardos-<ver>-aarch64-linux.tar.gz` + `.sha256`; `install.sh` picks the tarball by `uname -m` |
+| The image, on every merge to `main` | `image.yml`, job `image build (aarch64)`: the same `docker build --platform linux/arm64 --build-arg WARDOS_SOURCE=builder`, the same look inside, `bootc container lint` | `ghcr.io/hexrift/wardos:latest-aarch64`, `:<sha>-aarch64`; the x86_64 image is also `:latest-x86_64`, `:<sha>-x86_64`; `:latest` and `:<sha>` are manifest lists pointing at both once both builds passed (`podman pull` and `bootc switch` resolve the machine's own), and stay the x86_64 image when the aarch64 build failed |
+| The disks | `disk.yml` with `arch=aarch64` (or `both`), on an arm64 runner: `build.sh --arch aarch64` and `disk.sh --arch aarch64`, bootc-image-builder running natively | `wardos-<ver>-aarch64.qcow2`, `.iso`; artifact `wardos-disks-aarch64`; on a release `.zst` beside the x86_64 ones |
+
+What makes it possible: `quay.io/fedora/fedora-bootc:44` is multi-arch, the three COPRs
+of `coprs.txt` have `fedora-44-aarch64` chroots (the `aarch64 chroots` job checks on
+every dispatch), every name in `packages.txt` is noarch or built for aarch64 (the
+`image build (aarch64)` job is the proof, on every merge), and bootc-image-builder is
+published for arm64. Nothing in the desktop tree is architecture-specific. The
+Containerfile's release stage reads `TARGETARCH` (which docker and podman set from
+`--platform`) to fetch the tarball of the platform being built and checks it against
+`WARDOS_SHA256_AARCH64`; the builder stage compiles for that platform by itself.
+
+Locally, `build.sh --arch aarch64` passes `--platform linux/arm64` and the aarch64
+checksum. On an arm64 host (an Asahi or Fedora-on-Mac box, a Graviton VM) that is a
+native build; on an x86_64 host podman runs the Rust build and `dnf` under
+`qemu-user-static`, which works and takes hours, so prefer the published image or CI.
+`disk.sh --arch aarch64` passes `--target-arch arm64` to bootc-image-builder: a no-op on
+an arm64 host, and the builder's *experimental* cross path (needs `qemu-user`, qcow2
+only: it refuses an ISO for another architecture, and so does `disk.sh`) elsewhere. CI
+never crosses: the arm64 runner builds the aarch64 image and disk. Before v0.3 there is
+no aarch64 tarball, so `build.sh --arch aarch64 --source release` says so and stops;
+`--source checkout` works for any commit.
+
+**Getting the aarch64 disk.** Actions → *disk* → *Run workflow* with `arch=aarch64`,
+`type=qcow2` (the artifact `wardos-disks-aarch64`), or take
+`wardos-<ver>-aarch64.qcow2.zst` from a release and `zstd -d` it. The first user is
+`wardos`, password `wardos`; change it at first login.
+
+**UTM on an Apple-silicon Mac** (M1 and later; UTM 4.x from [mac.getutm.app](https://mac.getutm.app)
+or the App Store):
+
+1. *Create a New Virtual Machine* → *Virtualize* → *Linux*. Tick **Use Apple
+   Virtualization** (the macOS hypervisor: native speed, virtio devices, a virtio-gpu
+   display); leave *Boot from kernel image* off and skip the ISO: the qcow2 already has
+   a bootable system.
+2. Hardware: **4096 MB** of memory and **4 CPU cores** (the desktop is comfortable with
+   that; more helps compiles). Storage: any size, it is replaced next.
+3. Save, then open the machine's settings: remove the empty drive UTM created and
+   **Import** the qcow2 as a **virtio** drive. Apple's framework wants raw disks; UTM
+   converts on import, or do it yourself first with `qemu-img convert -O raw
+   wardos-<ver>-aarch64.qcow2 wardos.img` (`brew install qemu`). Disk size grows with
+   use; the qcow2 ships small.
+4. Boot is **UEFI** (the only firmware Apple Virtualization offers for Linux, and what
+   the image expects: bootc installs to the EFI system partition). Start the machine:
+   Plymouth, the tty1 autologin, Hyprland.
+
+Caveats, all *unverified* on real Apple hardware until someone records them the way
+E-09 does for the reference laptop:
+
+* **No Secure Boot.** Apple Virtualization boots Linux without a Secure Boot chain, so
+  the plan in [`secure-boot/`](secure-boot/README.md) does not apply inside the VM;
+  `bootc status` still verifies the image digest.
+* **Screen scaling.** The virtio-gpu display appears to Hyprland at the Retina pixel
+  size; text is tiny at scale 1. Set the scale (`wardos-setup monitors`, or
+  `monitor=,preferred,auto,2` in `~/.config/hypr/monitors.conf`) or lower UTM's display
+  resolution; UTM's own *Retina* option doubles the pixels the guest sees.
+* **Devices.** No fingerprint reader, FIDO2 key or Bluetooth reaches the guest
+  (`fprintd`, `pam-u2f`, `bluez` idle); USB passthrough needs the QEMU backend. The
+  clipboard is not shared (the SPICE agent belongs to QEMU). Nested virtualization for
+  `podman` inside the VM exists from the M3 with macOS 15; earlier chips run containers
+  without it, which is what podman does anyway.
+* **The x86_64 disk on Apple silicon** boots under UTM's QEMU backend as an emulated
+  machine (choose *Emulate*, x86_64, UEFI) and is slow; it is the wrong disk for that
+  Mac. An Intel Mac takes the x86_64 qcow2 the same way as above, natively.
+
+Windows: the tools install in WSL2 ([`docs/install.md`](../docs/install.md) §7); the
+image and its disks are for a VM or a PC, not for WSL2.
 
 ## First boot: what to expect
 
@@ -394,10 +472,11 @@ CI runs, on every pull request and push (`verify.yml`):
 | `desktop scripts` | `desktop/tests/run.sh`, which includes `install.test.sh` (install-desktop, desktop/install.sh, wardos-flathub, check-packages.sh, disk.sh) |
 
 and, in `image.yml` on `main` and on pull requests that touch `image/`, `desktop/`, the
-crates or `Cargo.lock`: `image build`, the real `docker build` with the checkout's
-binaries, followed by a look inside (`/usr/bin/ward*`, `/usr/share/wardos`, the user
-preset, `/etc/xdg/hypr`, the enabled units, the Plymouth theme) and `bootc container
-lint`. It is the check that catches a package name that exists but conflicts, a
+crates or `Cargo.lock`: `image build` and `image build (aarch64)`, the real `docker
+build` with the checkout's binaries on a runner of each architecture, followed by a
+look inside (`/usr/bin/ward*`, `/usr/share/wardos`, the user preset, `/etc/xdg/hypr`,
+the enabled units, the Plymouth theme) and `bootc container lint`. It is the check that
+catches a package name that exists but conflicts (or exists for x86_64 only), a
 `dracut` flag that does not, or a desktop file the installer mishandles.
 
 Locally:
