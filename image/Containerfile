@@ -20,12 +20,12 @@
 # the tools and the image keep separate release cadences. `builder` compiles this
 # checkout instead (development images, the "image build" CI job).
 ARG WARDOS_SOURCE=release
-ARG WARDOS_RELEASE=v0.1.1
-ARG WARDOS_SHA256=b5e77a2629edecd8fd47a2d320231fd6dfd8d489a4393e36c4a7519b934173fa
+ARG WARDOS_RELEASE=v0.2.0
+ARG WARDOS_SHA256=d67a13e5d7523b007b4d4112a8bfb1335359421daedb29f40b475cda56f6433f
 
 # Stage 1a: a published release. The three host binaries are required; ward-shell and
 # wardos-theme-render are copied when the tarball has them (release tarballs from v0.2
-# carry both; v0.1.1 does not, and an image built from it has no shell surfaces).
+# carry both; earlier ones do not, and an image built from one has no shell surfaces).
 FROM docker.io/library/alpine:3.20 AS release
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 ARG WARDOS_RELEASE
