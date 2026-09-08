@@ -7,6 +7,7 @@
 //! read-only, and the parsed result is what the session records.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use ward_events::VerifySummary;
@@ -40,12 +41,31 @@ pub struct Protected {
 }
 
 /// The verification command.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct VerifyCommand {
     /// Shell command run at the root of the candidate tree.
     #[serde(default)]
     pub command: String,
+    /// Wall-clock budget in seconds; the verifier is killed past it.
+    #[serde(default = "default_budget_secs")]
+    pub budget_secs: u64,
 }
+
+impl Default for VerifyCommand {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            budget_secs: default_budget_secs(),
+        }
+    }
+}
+
+const fn default_budget_secs() -> u64 {
+    600
+}
+
+/// Captured output kept in the result document; the rest is dropped with a marker.
+pub const MAX_OUTPUT_BYTES: usize = 1 << 20;
 
 impl Config {
     /// Parse the config; an empty command is a configuration error.
@@ -143,17 +163,27 @@ pub fn execute(v: &Verification) -> Result<Outcome> {
         "-c".to_string(),
         v.config.verify.command.clone(),
     ];
-    let mut launch = Launch::new(&v.scratch, argv).stdio(StdioMode::Capture);
+    let mut launch = Launch::new(&v.scratch, argv)
+        .stdio(StdioMode::Capture)
+        .budget(Duration::from_secs(v.config.verify.budget_secs));
     for (k, val) in Toolchains::detect().env() {
         launch = launch.env(k, val);
     }
     launch = Toolchains::detect().mount(launch);
     let out = launch.run()?;
-    let output = format!("{}{}", out.stdout, out.stderr);
+    let mut output = cap(format!("{}{}", out.stdout, out.stderr));
+    if out.timed_out {
+        use std::fmt::Write as _;
+        let _ = write!(
+            output,
+            "\nverifier budget of {}s exceeded; killed\n",
+            v.config.verify.budget_secs
+        );
+    }
     let mut summary = parse_summary(&output);
     summary.steps_total = 1;
     summary.duration = out.duration;
-    let passed = out.code == Some(0);
+    let passed = out.code == Some(0) && !out.timed_out;
     if passed {
         summary.steps_passed = 1;
     } else {
@@ -165,6 +195,19 @@ pub fn execute(v: &Verification) -> Result<Outcome> {
         result_hash: *blake3::hash(output.as_bytes()).as_bytes(),
         output,
     })
+}
+
+/// Keep the first [`MAX_OUTPUT_BYTES`] of `output` (on a char boundary) with a marker.
+fn cap(mut output: String) -> String {
+    if output.len() > MAX_OUTPUT_BYTES {
+        let mut end = MAX_OUTPUT_BYTES;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.truncate(end);
+        output.push_str("\n[verifier output truncated]\n");
+    }
+    output
 }
 
 /// Per-test counts from `cargo test` style result lines
@@ -276,6 +319,9 @@ mod tests {
         .unwrap();
         assert_eq!(c.protected.tests, vec!["tests/security_expiry.rs"]);
         assert_eq!(c.verify.command, "cargo test --all-targets");
+        assert_eq!(c.verify.budget_secs, 600, "default budget");
+        let b = Config::parse("verify:\n  command: true\n  budget_secs: 7\n").unwrap();
+        assert_eq!(b.verify.budget_secs, 7);
         assert!(Config::parse("version: 1\n").is_err());
         assert!(Config::parse("verify:\n  command: '  '\n").is_err());
     }
@@ -289,6 +335,45 @@ mod tests {
         let s = parse_summary(out);
         assert_eq!((s.tests_run, s.tests_failed), (3, 1));
         assert_eq!(parse_summary("no runner output").tests_run, 0);
+    }
+
+    #[test]
+    fn output_is_capped_on_a_char_boundary_with_a_marker() {
+        let long = "é".repeat(MAX_OUTPUT_BYTES);
+        let capped = cap(long);
+        assert!(capped.ends_with("[verifier output truncated]\n"));
+        assert!(capped.len() <= MAX_OUTPUT_BYTES + 40);
+        assert_eq!(cap("short".into()), "short");
+    }
+
+    #[test]
+    fn budget_fails_a_verifier_that_outruns_it() {
+        if !crate::sandbox::available() {
+            eprintln!("skipping: bubblewrap not available");
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        std::fs::create_dir_all(w.join(".tamperward")).unwrap();
+        std::fs::write(
+            w.join(CONFIG_PATH),
+            "verify:\n  command: sleep 5\n  budget_secs: 1\n",
+        )
+        .unwrap();
+        let store = SnapshotStore::open(state.path().join("cas")).unwrap();
+        let entry = store
+            .store_snapshot(w, SnapshotRole::Entry, CaptureOptions::default())
+            .unwrap();
+        let v = prepare(&store, w, entry, state.path()).unwrap();
+        let out = execute(&v).unwrap();
+        assert!(!out.passed);
+        assert!(
+            out.output.contains("budget of 1s exceeded"),
+            "{}",
+            out.output
+        );
+        assert!(out.summary.duration < std::time::Duration::from_secs(4));
     }
 
     #[test]
