@@ -59,7 +59,6 @@ enum Command {
     /// Launch Claude Code inside the session sandbox (interactive).
     Claude {
         /// Project directory (default: current).
-        #[arg(long)]
         dir: Option<PathBuf>,
         /// Host environment variables to pass through (explicit, visible opt-in).
         #[arg(long = "pass-env")]
@@ -71,7 +70,6 @@ enum Command {
     /// Launch OpenAI Codex inside the session sandbox (interactive).
     Codex {
         /// Project directory (default: current).
-        #[arg(long)]
         dir: Option<PathBuf>,
         /// Host environment variables to pass through (explicit, visible opt-in).
         #[arg(long = "pass-env")]
