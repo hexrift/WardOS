@@ -112,7 +112,7 @@ TamperWard policy  = allowed behaviour and verification (what the agent MAY do, 
 
 ## Status
 
-**Phase 2 — Agent support, in progress.** The Rust workspace builds a working prototype on
+**Phase 3 — TamperWard integration, in progress.** The Rust workspace builds a working prototype on
 any Linux host with `bubblewrap`: sessions with a capability manifest, content-addressed
 entry snapshots and a hash-chained log (`ward up` / `status` / `run` / `stop` /
 `replay --verify`); the self-test (12/12 hostile probes blocked, including a canary
@@ -123,10 +123,13 @@ with the model-API key held on the host and injected by the proxy; and Claude Co
 reporting to `wardd`, with `step_through` policies holding before writes and network
 tools; and `ward verify`, a disposable offline verifier that takes protected tests and
 the verify config from the entry snapshot, so weakening the judge changes nothing.
-Phase 3 so far: a per-session `wardd` as the single log writer with a control socket
-(`ward watch`, `ward evidence append`, `ward session describe`, `ward snapshot …`), the
-building blocks TamperWard drives. Phase 0 and Phase 1 are complete; the semantic
-TamperWard rules, immutable host image and desktop shell are later phases.
+Credentials never enter the sandbox: the model-API keys and, with `--grant github`, the
+GitHub token are injected by the proxy on repo-scoped routes. A per-session `wardd` is
+the single log writer behind a control socket (`ward watch`, `ward evidence append`,
+`ward session describe`, `ward snapshot …`), the building blocks TamperWard drives. A
+daemon-backed `ward run` warm-starts in 32 ms. Phase 0–2 are complete; the semantic
+TamperWard rules, the verifier image, the immutable host image and the desktop shell are
+later phases.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the phase plan and what remains for the
 Phase 2 gate, and [`docs/experiments.md`](docs/experiments.md) for the recorded results
