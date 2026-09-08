@@ -135,9 +135,16 @@ on a Fedora host with podman ([`image/README.md`](../image/README.md)):
 
 ```bash
 sudo ./image/build.sh                                            # the image
-sudo ./image/disk.sh --type iso --user wardos --luks             # installer ISO, encrypted disk
-sudo ./image/disk.sh --type qcow2 --user wardos --password …     # or a VM disk
+sudo ./image/disk.sh --type qcow2 --user wardos --password …     # a VM disk (QEMU/UTM), touches nothing
+sudo ./image/disk.sh --type raw  --user wardos                   # a USB image: boot it, no install, no disk touched
+sudo ./image/disk.sh --type iso  --user wardos                   # the INSTALLER: erases the target machine's disk
 ```
+
+The three `--type`s are not interchangeable: `qcow2` runs in a VM, `raw` boots a
+machine from a USB stick without touching its internal disk, and `iso` is an installer
+that **erases and reformats the target disk**. To try WardOS, use `qcow2` or `raw`; see
+[which image to use](../image/README.md#three-kinds-of-image-which-one-and-the-one-that-erases-a-disk)
+and [trying it from a USB stick](../image/README.md#trying-wardos-from-a-usb-stick-no-install).
 
 `--user wardos` creates the first user (wheel), which the tty1 autologin expects; with
 `--luks` Anaconda asks for the passphrase during the installation. First boot logs in

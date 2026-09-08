@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Turn a built WardOS image into a bootable disk with bootc-image-builder.
 #
-#   image/disk.sh --type qcow2|iso [--image NAME] [--output DIR] [--rootfs FS]
+#   image/disk.sh --type qcow2|raw|iso [--image NAME] [--output DIR] [--rootfs FS]
 #                 [--arch x86_64|aarch64] [--user NAME [--password PW] [--ssh-key FILE]]
 #                 [--luks | --no-luks] [--config FILE] [--dry-run]
 #
@@ -11,7 +11,11 @@
 # with --password (or WARDOS_PASSWORD in the environment, which keeps it out of `ps`)
 # and/or --ssh-key. The installer ISO encrypts the disk unless told --no-luks
 # (ADR-0017): a kickstart asks Anaconda for full-disk encryption, the passphrase typed
-# at install time. A qcow2 is never encrypted (the builder cannot; --luks on it is
+# at install time. A `raw` image is a whole-disk image you write to a USB stick and
+# boot a machine from: it runs WardOS entirely off the stick and never touches the
+# machine's own disk, which is the way to try WardOS on real hardware without an
+# install (see image/README.md). A qcow2 and a raw image are never encrypted (the
+# builder cannot; --luks on either is
 # refused). --config passes your own TOML instead. --arch names the disk's architecture
 # (bootc-image-builder --target-arch; the image must have been built for it): native on
 # a matching host, which is how CI builds the aarch64 disks, and experimental across
@@ -72,9 +76,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$type" in
-  qcow2 | iso) ;;
-  "") echo "disk.sh: --type qcow2|iso is required" >&2; exit 2 ;;
-  *) echo "disk.sh: unsupported --type '$type' (qcow2 or iso)" >&2; exit 2 ;;
+  qcow2 | raw | iso) ;;
+  "") echo "disk.sh: --type qcow2|raw|iso is required" >&2; exit 2 ;;
+  *) echo "disk.sh: unsupported --type '$type' (qcow2, raw or iso)" >&2; exit 2 ;;
 esac
 
 if [[ -z "$image" ]]; then
@@ -240,3 +244,35 @@ mkdir -p "$output"
 if [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
   chown -R "$SUDO_UID:$SUDO_GID" "$output"
 fi
+
+# Say where the disk landed and, for a raw image, that flashing it to a USB and
+# booting that USB never touches the machine's own disk (unlike the installer ISO).
+case "$type" in
+  qcow2) echo "disk.sh: $output/qcow2/disk.qcow2 (boot in QEMU; see image/README.md)" ;;
+  raw)
+    # bootc-image-builder writes raw to <output>/image/disk.raw; give it a clear name.
+    if [[ -f "$output/image/disk.raw" ]]; then
+      mkdir -p "$output/raw"
+      mv -f "$output/image/disk.raw" "$output/raw/wardos.raw"
+      rmdir "$output/image" 2>/dev/null || true
+      [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]] && chown -R "$SUDO_UID:$SUDO_GID" "$output/raw"
+    fi
+    echo "disk.sh: $output/raw/wardos.raw"
+    echo "disk.sh: a whole-disk image. Write it to a USB stick and boot the machine"
+    echo "disk.sh: from that USB: WardOS runs off the stick and boots straight to the"
+    echo "disk.sh: desktop, with no installer. Booted from USB it marks every internal"
+    echo "disk.sh: disk read-only (wardos-usb-guard), so nothing on the stick can"
+    echo "disk.sh: format or repartition the machine's own disk. To flash (this ERASES"
+    echo "disk.sh: the USB, not the internal disk):"
+    echo "disk.sh:   lsblk -o NAME,SIZE,MODEL,TRAN            # Linux: the USB is TRAN=usb"
+    echo "disk.sh:   sudo dd if=$output/raw/wardos.raw of=/dev/sdX bs=4M status=progress oflag=direct conv=fsync"
+    echo "disk.sh:   # macOS: diskutil list; diskutil unmountDisk /dev/diskN;"
+    echo "disk.sh:   #        sudo dd if=$output/raw/wardos.raw of=/dev/rdiskN bs=4m"
+    ;;
+  iso)
+    echo "disk.sh: $output/bootiso/install.iso"
+    echo "disk.sh: THIS IS AN INSTALLER. Booting it and proceeding ERASES the target"
+    echo "disk.sh: machine's internal disk. To try WardOS without installing, build a"
+    echo "disk.sh: --type raw image and boot it from USB, or a --type qcow2 image in QEMU."
+    ;;
+esac

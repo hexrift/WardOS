@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# wardos-usb-guard — when WardOS is booted from removable media (a USB stick written
+# from a `--type raw` image), mark every *internal* disk read-only, so nothing running
+# off the stick can format, repartition or overwrite the machine's own disk. It is a
+# guard, not a wall: root can undo it (`blockdev --setrw`), and it only reduces the
+# blast radius of an accident (a stray `dd`, a mis-aimed installer). Booted from a
+# fixed disk (an installed WardOS host) it does nothing.
+#
+# It refuses to act unless it can name the boot disk with confidence, because setting
+# the wrong device read-only would break the running system; when unsure it protects
+# nothing and says so.
+set -euo pipefail
+
+log() { printf 'wardos-usb-guard: %s\n' "$*"; }
+
+# The whole disk that backs `/` (e.g. sda from /dev/sda3, or the disk under a
+# device-mapper root). Empty if it cannot be determined.
+boot_disk() {
+  local src pk
+  src=$(findmnt -no SOURCE / 2>/dev/null) || return 0
+  # Resolve device-mapper / partitions to the parent kernel disk name.
+  pk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -n1 || true)
+  if [[ -z "$pk" ]]; then
+    # `src` may itself be a whole disk, or lsblk could not walk it.
+    pk=$(lsblk -dno KNAME "$src" 2>/dev/null | head -n1 || true)
+  fi
+  # Walk up one more level for dm/luks stacks (PKNAME of a dm is another dm/part).
+  while [[ -n "$pk" && -e "/sys/block/$pk/partition" ]]; do
+    pk=$(lsblk -no PKNAME "/dev/$pk" 2>/dev/null | head -n1 || true)
+  done
+  printf '%s\n' "$pk"
+}
+
+# 1 if the named whole disk is removable or on the USB transport, else 0.
+is_removable() {
+  local disk=$1 rm tran
+  rm=$(cat "/sys/block/$disk/removable" 2>/dev/null || echo 0)
+  tran=$(lsblk -dno TRAN "/dev/$disk" 2>/dev/null | head -n1 || true)
+  [[ "$rm" == "1" || "$tran" == "usb" ]] && echo 1 || echo 0
+}
+
+main() {
+  local boot
+  boot=$(boot_disk)
+  if [[ -z "$boot" || ! -e "/sys/block/$boot" ]]; then
+    log "could not identify the boot disk; protecting nothing (fail safe)"
+    return 0
+  fi
+  if [[ "$(is_removable "$boot")" != "1" ]]; then
+    log "booted from a fixed disk ($boot); this is an installed host, doing nothing"
+    return 0
+  fi
+  log "booted from removable media ($boot); internal disks will be read-only"
+  local locked=0 disk
+  for path in /sys/block/*; do
+    disk=$(basename "$path")
+    # Only real whole disks; skip the boot stick, partitions, and virtual devices.
+    case "$disk" in
+      "$boot") continue ;;
+      loop*|ram*|zram*|dm-*|sr*|md*|fd*) continue ;;
+    esac
+    [[ -e "/sys/block/$disk/device" ]] || continue          # backed by real hardware
+    [[ "$(is_removable "$disk")" == "1" ]] && continue        # leave other USB/SD alone
+    if blockdev --setro "/dev/$disk" 2>/dev/null; then
+      log "read-only: /dev/$disk ($(cat "/sys/block/$disk/device/model" 2>/dev/null | tr -d '\n' || echo unknown))"
+      locked=$((locked + 1))
+    else
+      log "could not set /dev/$disk read-only"
+    fi
+  done
+  log "$locked internal disk(s) protected; undo with: sudo blockdev --setrw /dev/<disk>"
+}
+
+main "$@"

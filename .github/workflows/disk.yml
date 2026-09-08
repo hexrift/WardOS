@@ -15,7 +15,7 @@ on:
         description: "Disk to build"
         type: choice
         default: qcow2
-        options: [qcow2, iso, both]
+        options: [qcow2, raw, iso, both]
       arch:
         description: "Architecture (both: one job per architecture, each on its own runner)"
         type: choice
@@ -101,6 +101,9 @@ jobs:
       - name: qcow2
         if: env.TYPE == 'qcow2' || env.TYPE == 'both'
         run: sudo -E ./image/disk.sh --type qcow2 --arch "$ARCH" --image localhost/wardos:ci --user "$FIRST_USER" --output "$PWD/image/out"
+      - name: raw
+        if: env.TYPE == 'raw'
+        run: sudo -E ./image/disk.sh --type raw --arch "$ARCH" --image localhost/wardos:ci --user "$FIRST_USER" --output "$PWD/image/out"
       - name: iso
         if: env.TYPE == 'iso' || env.TYPE == 'both'
         run: |
@@ -120,6 +123,9 @@ jobs:
           fi
           if [[ -f image/out/bootiso/install.iso ]]; then
             sudo mv image/out/bootiso/install.iso "dist/wardos-${version}-${ARCH}.iso"
+          fi
+          if [[ -f image/out/raw/wardos.raw ]]; then
+            sudo mv image/out/raw/wardos.raw "dist/wardos-${version}-${ARCH}.raw"
           fi
           sudo chown -R "$(id -u):$(id -g)" dist
           # One checksum file per architecture: both jobs attach to the same release.
@@ -141,7 +147,7 @@ jobs:
           set -euo pipefail
           sudo apt-get install -y -q zstd
           cd dist
-          for f in *.qcow2 *.iso; do [[ -f "$f" ]] && zstd -T0 -12 --rm "$f"; done
+          for f in *.qcow2 *.raw *.iso; do [[ -f "$f" ]] && zstd -T0 -12 --rm "$f"; done
           # bootc-image-builder's disks are already compressed inside, so zstd gains
           # little and a disk is over GitHub's 2 GiB asset cap; anything that large is
           # split into 1900 MiB parts (`cat name.zst.part* > name.zst`, then `zstd -d`).
