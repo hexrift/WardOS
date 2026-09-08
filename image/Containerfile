@@ -21,6 +21,7 @@ ARG WARDOS_SHA256=b5e77a2629edecd8fd47a2d320231fd6dfd8d489a4393e36c4a7519b934173
 
 # Stage 1a: a published release.
 FROM docker.io/library/alpine:3.20 AS release
+SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 ARG WARDOS_RELEASE
 ARG WARDOS_SHA256
 WORKDIR /out
@@ -46,7 +47,9 @@ RUN cargo build --release --locked \
     && mkdir -p /out \
     && cp target/release/ward target/release/wardd target/release/ward-agent /out/
 
-# The chosen source, under one name for the host stage.
+# The chosen source, under one name for the host stage (a stage name, not an image;
+# hadolint cannot tell, hence the ignore).
+# hadolint ignore=DL3006
 FROM ${WARDOS_SOURCE} AS binaries
 
 # ---------------------------------------------------------------------------------------
