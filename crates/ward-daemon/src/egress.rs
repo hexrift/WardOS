@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use ward_events::{DeniedDst, DenyReason, HostName, ProcessRef, RuleRef, WardEvent};
 use ward_policy::NetworkCapability;
@@ -13,6 +14,8 @@ use crate::error::{Error, Result};
 /// A recorded proxy decision, kept until the session drains it into the log.
 #[derive(Clone, Debug)]
 pub struct Recorded {
+    /// When the proxy decided.
+    pub at: SystemTime,
     /// Destination host or literal.
     pub host: Host,
     /// Destination port.
@@ -41,6 +44,7 @@ impl Observer for Recorder {
     fn decision(&self, req: &Request, decision: Decision, reason: &str) {
         if let Ok(mut v) = self.0.lock() {
             v.push(Recorded {
+                at: SystemTime::now(),
                 host: req.target.host.clone(),
                 port: req.target.port,
                 allowed: matches!(decision, Decision::Allow),
@@ -86,13 +90,14 @@ impl Egress {
         &self.socket
     }
 
-    /// Decisions made since the last drain, as log events. Entries whose host or
-    /// reason cannot be represented are skipped (the proxy already validated them).
-    pub fn drain_events(&self, by: &ProcessRef) -> Vec<WardEvent> {
+    /// Decisions made since the last drain, as log events with their decision time.
+    /// Entries whose host or reason cannot be represented are skipped (the proxy
+    /// already validated them).
+    pub fn drain_events(&self, by: &ProcessRef) -> Vec<(SystemTime, WardEvent)> {
         self.recorder
             .drain()
             .iter()
-            .filter_map(|r| to_event(r, by))
+            .filter_map(|r| Some((r.at, to_event(r, by)?)))
             .collect()
     }
 
@@ -163,6 +168,7 @@ mod tests {
     #[test]
     fn allowed_name_becomes_network_requested() {
         let r = Recorded {
+            at: SystemTime::now(),
             host: Host::Name("api.github.com".into()),
             port: 443,
             allowed: true,
@@ -177,6 +183,7 @@ mod tests {
     #[test]
     fn denied_private_ip_maps_to_private_range() {
         let r = Recorded {
+            at: SystemTime::now(),
             host: Host::Ip(ip("10.0.0.1")),
             port: 80,
             allowed: false,
@@ -203,8 +210,14 @@ mod tests {
                 port: 1,
             },
         };
+        let before = SystemTime::now();
         rec.decision(&req, Decision::Deny, "offline");
-        assert_eq!(rec.drain().len(), 1);
+        let drained = rec.drain();
+        assert_eq!(drained.len(), 1);
+        assert!(
+            drained[0].at >= before,
+            "decision time is captured, not drained"
+        );
         assert!(rec.drain().is_empty());
     }
 }

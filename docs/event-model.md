@@ -22,7 +22,7 @@ One typed event stream serves four consumers with different trust needs:
 pub struct EventRecord {
     pub session: SessionId,
     pub seq: u64,                 // dense, per session, assigned by wardd
-    pub ts_mono: Duration,        // monotonic since session genesis
+    pub ts_mono: Duration,        // monotonic since session genesis, taken when the fact was captured
     pub ts_wall: Option<SystemTime>, // informational
     pub origin: Origin,           // Kernel | Proxy | Wardd | Verifier | TamperWard | Agent | User
     pub prev: Blake3Hash,         // hash of previous record (genesis: hash of manifest)
