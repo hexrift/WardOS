@@ -23,6 +23,135 @@ const WARN: &str = "\x1b[38;5;179m";
 const DENY: &str = "\x1b[38;5;167m";
 const BOLD: &str = "\x1b[1m";
 
+/// The colour roles of `docs/design-language.md` §3, as the observer uses them.
+/// Every renderer (line mode, the TUI) maps a role to its own colour space, so a
+/// verb is the same colour everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tone {
+    /// Muted text: timestamps, hidden kinds, reads, ended.
+    Dim,
+    /// Primary text.
+    Ink,
+    /// The active agent: session start, credentials, snapshots, verification.
+    Accent,
+    /// Verified: passes, accepts, exit 0, offline network.
+    Ok,
+    /// Restricted: network requests, `ask`, limited network.
+    Warn,
+    /// Denied or failed; used sparingly.
+    Deny,
+}
+
+impl Tone {
+    /// The 256-colour SGR sequence line mode prints for this role.
+    #[must_use]
+    pub const fn sgr(self) -> &'static str {
+        match self {
+            Self::Dim => DIM,
+            Self::Ink => INK,
+            Self::Accent => ACCENT,
+            Self::Ok => OK,
+            Self::Warn => WARN,
+            Self::Deny => DENY,
+        }
+    }
+
+    /// The xterm-256 palette index behind [`Tone::sgr`], for renderers that set
+    /// colours by index rather than by escape sequence.
+    #[must_use]
+    pub const fn palette_index(self) -> u8 {
+        match self {
+            Self::Dim => 245,
+            Self::Ink => 252,
+            Self::Accent => 110,
+            Self::Ok => 108,
+            Self::Warn => 179,
+            Self::Deny => 167,
+        }
+    }
+}
+
+/// The colour role of a network mode in the trust state: `offline` is verified
+/// green, every limited mode is restricted amber, `open` is red; the same rule
+/// the status panel's `Network` row follows.
+#[must_use]
+pub const fn network_tone(n: &NetworkCapability) -> Tone {
+    match n {
+        NetworkCapability::Offline => Tone::Ok,
+        NetworkCapability::LocalhostOnly
+        | NetworkCapability::Registries
+        | NetworkCapability::Development
+        | NetworkCapability::Custom(_) => Tone::Warn,
+        NetworkCapability::Unrestricted => Tone::Deny,
+    }
+}
+
+/// The network mode as the panels name it, uncoloured.
+#[must_use]
+pub fn network_text(n: &NetworkCapability) -> String {
+    match n {
+        NetworkCapability::Offline => "offline".to_owned(),
+        NetworkCapability::LocalhostOnly => "localhost only".to_owned(),
+        NetworkCapability::Registries => "package registries".to_owned(),
+        NetworkCapability::Development => "restricted (dev)".to_owned(),
+        NetworkCapability::Custom(hosts) => format!("allowlist ({} hosts)", hosts.len()),
+        NetworkCapability::Unrestricted => "open".to_owned(),
+    }
+}
+
+/// The observer mode as the panels name it.
+#[must_use]
+pub const fn observer_text(o: ObserverMode) -> &'static str {
+    match o {
+        ObserverMode::Quiet => "quiet",
+        ObserverMode::Live => "live",
+        ObserverMode::StepThrough(_) => "step-through",
+    }
+}
+
+/// How many credential rules grant outright.
+#[must_use]
+pub fn credentials_granted(m: &CapabilityManifest) -> usize {
+    m.credentials
+        .values()
+        .filter(|r| matches!(r, CredentialRule::Allow(_)))
+        .count()
+}
+
+/// One observer row before it is coloured: the columns of the agent activity
+/// panel (`docs/design-language.md` §8), so the TUI and line mode agree on
+/// text and colour by construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObserverCells {
+    /// `MM:SS` since session genesis.
+    pub time: String,
+    /// The fixed verb column (`READ EDIT RUN DENY NET …`).
+    pub verb: &'static str,
+    /// The verb's colour role.
+    pub tone: Tone,
+    /// The subject: a path, a command, a host, a summary.
+    pub subject: String,
+}
+
+impl ObserverCells {
+    /// The line-mode rendering: dim time, coloured verb padded to the column,
+    /// subject in ink.
+    #[must_use]
+    pub fn to_ansi(&self) -> String {
+        let color = self.tone.sgr();
+        format!(
+            "{DIM}{}{RESET}  {color}{:<5}{RESET} {INK}{}{RESET}",
+            self.time, self.verb, self.subject
+        )
+    }
+}
+
+/// `MM:SS` since session genesis.
+fn mono_time(rec: &EventRecord) -> String {
+    let t = rec.ts_mono.as_secs();
+    format!("{:02}:{:02}", t / 60, t % 60)
+}
+
 /// Render the session status panel (the design-language session view).
 #[must_use]
 pub fn status_panel(
@@ -90,24 +219,11 @@ fn access(mode: AccessMode) -> &'static str {
 }
 
 fn network(n: &NetworkCapability) -> String {
-    match n {
-        NetworkCapability::Offline => format!("{OK}offline{RESET}"),
-        NetworkCapability::LocalhostOnly => format!("{WARN}localhost only{RESET}"),
-        NetworkCapability::Registries => format!("{WARN}package registries{RESET}"),
-        NetworkCapability::Development => format!("{WARN}restricted (dev){RESET}"),
-        NetworkCapability::Custom(hosts) => {
-            format!("{WARN}allowlist ({} hosts){RESET}", hosts.len())
-        }
-        NetworkCapability::Unrestricted => format!("{DENY}open{RESET}"),
-    }
+    format!("{}{}{RESET}", network_tone(n).sgr(), network_text(n))
 }
 
 fn credentials(m: &CapabilityManifest) -> String {
-    let granted = m
-        .credentials
-        .values()
-        .filter(|r| matches!(r, CredentialRule::Allow(_)))
-        .count();
+    let granted = credentials_granted(m);
     if granted == 0 {
         format!(
             "{OK}none{RESET} {DIM}(brokered, {} services){RESET}",
@@ -126,11 +242,7 @@ fn containers(c: ContainerCapability) -> &'static str {
 }
 
 fn observer(o: ObserverMode) -> &'static str {
-    match o {
-        ObserverMode::Quiet => "quiet",
-        ObserverMode::Live => "live",
-        ObserverMode::StepThrough(_) => "step-through",
-    }
+    observer_text(o)
 }
 
 fn short_hex(s: &str) -> String {
@@ -288,30 +400,87 @@ pub fn snapshot_diff(d: &DiffReport) -> String {
 /// row in the compact view.
 #[must_use]
 pub fn observer_row(rec: &EventRecord) -> Option<String> {
-    let t = rec.ts_mono.as_secs();
-    let ts = format!("{DIM}{:02}:{:02}{RESET}", t / 60, t % 60);
-    let (verb, color, subject) = match &rec.event {
-        WardEvent::SessionStarted { .. } => ("START", ACCENT, "session".to_string()),
-        WardEvent::CommandStarted { argv, .. } => ("RUN", INK, argv_text(argv)),
+    observer_cells(rec).map(|cells| cells.to_ansi())
+}
+
+/// The columns of one observer row for a log record, uncoloured. Returns `None`
+/// for records with no row in the compact view.
+#[must_use]
+pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
+    let (verb, tone, subject) = match &rec.event {
+        WardEvent::SessionStarted { .. } => ("START", Tone::Accent, "session".to_string()),
+        WardEvent::CommandStarted { argv, .. } => ("RUN", Tone::Ink, argv_text(argv)),
         WardEvent::CommandFinished { exit, .. } => ("EXIT", exit_color(*exit), exit_text(*exit)),
-        WardEvent::FileModified { path, kind, .. } => (change_verb(*kind), INK, path.to_string()),
-        WardEvent::FileRead { path, .. } => ("READ", DIM, path.to_string()),
-        WardEvent::NetworkRequested { host, port, .. } => ("NET", WARN, format!("{host}:{port}")),
-        WardEvent::NetworkDenied { dst, .. } => ("DENY", DENY, denied_dst(dst)),
+        WardEvent::FileModified { path, kind, .. } => {
+            (change_verb(*kind), Tone::Ink, path.to_string())
+        }
+        WardEvent::FileRead { path, .. } => ("READ", Tone::Dim, path.to_string()),
+        WardEvent::NetworkRequested { host, port, .. } => {
+            ("NET", Tone::Warn, format!("{host}:{port}"))
+        }
+        WardEvent::NetworkDenied { dst, .. } => ("DENY", Tone::Deny, denied_dst(dst)),
         WardEvent::CredentialGranted { service, scope, .. } => (
             "CRED",
-            ACCENT,
+            Tone::Accent,
             format!("{service} → {} (proxy-injected)", scope.subject.as_str()),
         ),
-        WardEvent::AgentClaim { kind, payload } => (claim_verb(*kind), DIM, payload.to_string()),
+        WardEvent::AgentClaim { kind, payload } => {
+            (claim_verb(*kind), Tone::Dim, payload.to_string())
+        }
         WardEvent::SnapshotCreated { role, id, .. } => (
             "SNAP",
-            ACCENT,
+            Tone::Accent,
             format!("{} {}", snapshot_role(*role), short_hex(&id.to_string())),
         ),
+        WardEvent::VerificationRequested { .. }
+        | WardEvent::VerificationStarted { .. }
+        | WardEvent::VerificationProgress { .. }
+        | WardEvent::VerificationPassed { .. }
+        | WardEvent::VerificationFailed { .. } => verification_cells(&rec.event)?,
+        WardEvent::PolicyDecision {
+            subject,
+            decision,
+            rule,
+            detail,
+        } => {
+            let (verb, tone) = decision_verb(*decision);
+            (verb, tone, evidence_text(subject, Some(rule), detail))
+        }
+        WardEvent::PolicyDenied {
+            subject,
+            rule,
+            detail,
+        } => (
+            "DENIED",
+            Tone::Deny,
+            evidence_text(subject, Some(rule), detail),
+        ),
+        WardEvent::TamperDetected { subject, detail } => {
+            ("TAMPER", Tone::Deny, evidence_text(subject, None, detail))
+        }
+        WardEvent::StateAccepted { snapshot, .. } => (
+            "ACCEPT",
+            Tone::Ok,
+            format!("snapshot {}", short_hex(&snapshot.to_string())),
+        ),
+        WardEvent::SessionEnded { .. } => ("END", Tone::Dim, "session".to_string()),
+        _ => return None,
+    };
+    Some(ObserverCells {
+        time: mono_time(rec),
+        verb,
+        tone,
+        subject,
+    })
+}
+
+/// The verification phase's rows (`docs/design-language.md` §11): `VERIFY` in
+/// accent while it runs, `PASS` green, `FAIL` red.
+fn verification_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)> {
+    Some(match event {
         WardEvent::VerificationRequested { candidate, .. } => (
             "VERIFY",
-            ACCENT,
+            Tone::Accent,
             format!("candidate {}", short_hex(&candidate.to_string())),
         ),
         WardEvent::VerificationStarted {
@@ -320,7 +489,7 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
             ..
         } => (
             "VERIFY",
-            ACCENT,
+            Tone::Accent,
             format!(
                 "trusted verifier started · pristine {} · candidate {}",
                 short_hex(&pristine.to_string()),
@@ -334,7 +503,7 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
             candidate, summary, ..
         } => (
             "PASS",
-            OK,
+            Tone::Ok,
             format!(
                 "✓ VERIFIED · {} tests · candidate {}",
                 summary.tests_run,
@@ -345,7 +514,7 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
             candidate, summary, ..
         } => (
             "FAIL",
-            DENY,
+            Tone::Deny,
             format!(
                 "verification failed · {}/{} tests failed · candidate {}",
                 summary.tests_failed,
@@ -353,56 +522,40 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
                 short_hex(&candidate.to_string())
             ),
         ),
-        WardEvent::PolicyDecision {
-            subject,
-            decision,
-            rule,
-            detail,
-        } => {
-            let (verb, color) = decision_verb(*decision);
-            (verb, color, evidence_text(subject, Some(rule), detail))
-        }
-        WardEvent::PolicyDenied {
-            subject,
-            rule,
-            detail,
-        } => ("DENIED", DENY, evidence_text(subject, Some(rule), detail)),
-        WardEvent::TamperDetected { subject, detail } => {
-            ("TAMPER", DENY, evidence_text(subject, None, detail))
-        }
-        WardEvent::StateAccepted { snapshot, .. } => (
-            "ACCEPT",
-            OK,
-            format!("snapshot {}", short_hex(&snapshot.to_string())),
-        ),
-        WardEvent::SessionEnded { .. } => ("END", DIM, "session".to_string()),
         _ => return None,
-    };
-    Some(format!(
-        "{ts}  {color}{verb:<5}{RESET} {INK}{subject}{RESET}"
-    ))
+    })
 }
 
 /// The row for a record [`observer_row`] hides in the compact view: the same time
 /// column, then the event kind in dim (`ward watch --all`).
 #[must_use]
 pub fn kind_row(rec: &EventRecord) -> String {
-    let t = rec.ts_mono.as_secs();
     format!(
-        "{DIM}{:02}:{:02}{RESET}  {DIM}{}{RESET}",
-        t / 60,
-        t % 60,
+        "{DIM}{}{RESET}  {DIM}{}{RESET}",
+        mono_time(rec),
         rec.event.kind()
     )
 }
 
+/// The uncoloured columns of [`kind_row`]: the kind name stands in the verb
+/// column, dim, with an empty subject.
+#[must_use]
+pub fn kind_cells(rec: &EventRecord) -> ObserverCells {
+    ObserverCells {
+        time: mono_time(rec),
+        verb: rec.event.kind().name(),
+        tone: Tone::Dim,
+        subject: String::new(),
+    }
+}
+
 /// `ALLOW` green, `ASK` amber, `DENIED` red.
-fn decision_verb(decision: ward_events::Decision) -> (&'static str, &'static str) {
+fn decision_verb(decision: ward_events::Decision) -> (&'static str, Tone) {
     use ward_events::Decision as D;
     match decision {
-        D::Allow => ("ALLOW", OK),
-        D::Ask => ("ASK", WARN),
-        D::Deny => ("DENIED", DENY),
+        D::Allow => ("ALLOW", Tone::Ok),
+        D::Ask => ("ASK", Tone::Warn),
+        D::Deny => ("DENIED", Tone::Deny),
     }
 }
 
@@ -498,11 +651,11 @@ pub fn verify_report(r: &crate::session::VerifyReport) -> String {
     s
 }
 
-fn step_color(status: ward_events::StepStatus) -> &'static str {
+fn step_color(status: ward_events::StepStatus) -> Tone {
     match status {
-        ward_events::StepStatus::Running => DIM,
-        ward_events::StepStatus::Pass => OK,
-        ward_events::StepStatus::Fail => DENY,
+        ward_events::StepStatus::Running => Tone::Dim,
+        ward_events::StepStatus::Pass => Tone::Ok,
+        ward_events::StepStatus::Fail => Tone::Deny,
     }
 }
 
@@ -531,10 +684,10 @@ fn argv_text(argv: &ward_events::BoundedArgv) -> String {
         .join(" ")
 }
 
-fn exit_color(exit: ward_events::ExitStatus) -> &'static str {
+fn exit_color(exit: ward_events::ExitStatus) -> Tone {
     match exit {
-        ward_events::ExitStatus::Exited { code: 0 } => OK,
-        _ => DENY,
+        ward_events::ExitStatus::Exited { code: 0 } => Tone::Ok,
+        _ => Tone::Deny,
     }
 }
 
