@@ -1,8 +1,8 @@
 # Credential Broker
 
-Status: Phase 2, model-API gateway implemented (`ward claude`, see
-[agent-integration.md](agent-integration.md) §3); GitHub, registry and SSH adapters and
-the vault are Phase 3. Decision record:
+Status: Phase 3. Implemented: the model-API gateways (Anthropic, OpenAI; see
+[agent-integration.md](agent-integration.md) §3) and the GitHub adapter in gateway
+mode (§4). Registry and SSH adapters, minted tokens and the encrypted vault are ahead. Decision record:
 [ADR-0008](decisions/ADR-0008-credential-broker.md).
 
 ## 1. Problem
@@ -55,7 +55,7 @@ on policy change, on explicit `ward revoke`, and on expiry.
 
 | Service | Backend secret (Zone 0) | Delivery | Scoping |
 | --- | --- | --- | --- |
-| GitHub | GitHub App private key or user OAuth token | A: proxy injection for `api.github.com` and HTTPS git; B: installation token for `gh` | Repository + permission set; tokens are GitHub App installation tokens (native expiry ≤ 1 h; broker requests ≤ 10 min where supported, otherwise revokes at expiry) |
+| GitHub | GitHub App private key or user OAuth token | A: proxy injection for `api.github.com` and HTTPS git; B: installation token for `gh` | Repository + permission set; tokens are GitHub App installation tokens (native expiry ≤ 1 h; broker requests ≤ 10 min where supported, otherwise revokes at expiry). **Implemented (A, 0.1):** `ward claude --grant github` routes `https://github.com/` and `git@github.com:` remotes to `/github` on the relay (a seeded `~/.gitconfig` `insteadOf`) and `GITHUB_API_URL` to `/github-api`; the proxy injects `Authorization: Basic x-access-token:<token>` / `Bearer <token>` from the host's `GITHUB_TOKEN` (or the vault). The manifest's `credentials.github` rule gates it: `deny` refuses and records `CredentialDenied`, `ask` needs the explicit `--grant`, `allow` is automatic; the scope's repositories (`current` resolves from the worktree's origin remote) and permissions are recorded in `CredentialGranted` and enforced at the route. |
 | Git over SSH | Host `~/.ssh` keys stay in Zone 0 | `ssh-agent` protocol proxy in the sandbox: signs only for approved `(host, user)`; every signature is an event | Per-host; `ask` by default |
 | npm / PyPI / crates.io (read) | Registry tokens | A | Read-only by default; publish is `deny` |
 | Agent model API (Anthropic / OpenAI / Google) | The user's API key or OAuth token | **A, via gateway mode**: sandbox gets `ANTHROPIC_BASE_URL=http://127.0.0.1:3128/anthropic` or `OPENAI_BASE_URL=http://127.0.0.1:3128/openai/v1` and a placeholder key; proxy injects auth | Implemented for Anthropic and OpenAI; keeps the user's long-lived model credential out of Zone 3 entirely **[experiment E-07]** |

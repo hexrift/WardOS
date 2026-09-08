@@ -65,6 +65,9 @@ enum Command {
         /// Host environment variables to pass through (explicit, visible opt-in).
         #[arg(long = "pass-env")]
         pass_env: Vec<String>,
+        /// Grant a brokered credential the policy marks `ask` (e.g. `github`).
+        #[arg(long = "grant")]
+        grant: Vec<String>,
         /// Extra arguments for the agent.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -76,6 +79,9 @@ enum Command {
         /// Host environment variables to pass through (explicit, visible opt-in).
         #[arg(long = "pass-env")]
         pass_env: Vec<String>,
+        /// Grant a brokered credential the policy marks `ask` (e.g. `github`).
+        #[arg(long = "grant")]
+        grant: Vec<String>,
         /// Extra arguments for the agent.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -240,13 +246,15 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Claude {
             dir,
             pass_env,
+            grant,
             args,
-        } => cmd_agent(&dir.unwrap_or_else(cwd), "claude", &args, &pass_env),
+        } => cmd_agent(&dir.unwrap_or_else(cwd), "claude", &args, &pass_env, &grant),
         Command::Codex {
             dir,
             pass_env,
+            grant,
             args,
-        } => cmd_agent(&dir.unwrap_or_else(cwd), "codex", &args, &pass_env),
+        } => cmd_agent(&dir.unwrap_or_else(cwd), "codex", &args, &pass_env, &grant),
         Command::Stop { dir } => cmd_stop(&dir.unwrap_or_else(cwd)),
         Command::Verify { dir } => cmd_verify(&dir.unwrap_or_else(cwd)),
         Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
@@ -451,6 +459,7 @@ fn cmd_agent(
     agent: &str,
     args: &[String],
     pass_env: &[String],
+    grants: &[String],
 ) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     let (mut session, throwaway) = match Session::open_current(dir, &state)? {
@@ -464,12 +473,15 @@ fn cmd_agent(
         );
     }
     let log = session.log_path();
-    let (command, opts) = session.agent_launch(agent, args, pass_env)?;
-    for g in &opts.gateways {
+    let (command, opts) = session.agent_launch(agent, args, pass_env, grants)?;
+    for g in opts.gateways.iter().filter(|g| g.service != "github") {
         eprintln!(
             "ward: {} credential stays on the host; the proxy injects it",
             g.service
         );
+    }
+    for note in &opts.notes {
+        eprintln!("ward: {note}");
     }
     let report = session.launch(&command, &opts)?;
     if throwaway {

@@ -339,11 +339,13 @@ def ask(req):
 print(ask({'hook': 'PreToolUse', 'tool': 'Write', 'summary': '/work/a.rs'}))
 print(ask({'hook': 'PreToolUse', 'tool': 'Read', 'summary': '/work/a.rs'}))
 print(ask({'hook': 'Stop'}))";
-    let settings = ward_daemon::agents::profile("claude")
+    let seeds = ward_daemon::agents::profile("claude")
         .and_then(|p| p.settings)
-        .map(|s| (s.path.to_owned(), (s.content)()));
+        .map(|s| (s.path.to_owned(), (s.content)()))
+        .into_iter()
+        .collect();
     let opts = LaunchOpts {
-        settings,
+        seeds,
         ..LaunchOpts::default()
     };
     let report = session
@@ -779,4 +781,98 @@ fn assert_stream_matches_sealed_log(seen: &[EventRecord], log: &std::path::Path)
         1,
         "the forged append never reached the log"
     );
+}
+
+/// The GitHub adapter: a `github.com` remote inside the sandbox is rewritten to the
+/// relay, the gateway injects `Authorization: Basic x-access-token:<token>`, and
+/// the sandbox never holds the token.
+#[test]
+fn github_remote_goes_through_the_gateway_with_the_host_token() {
+    if !sandbox::available() {
+        eprintln!("skipping: bubblewrap not available");
+        return;
+    }
+    let (port, seen) = spawn_upstream();
+    let route = ward_proxy::GatewayRoute::new(
+        ward_daemon::github::GIT.prefix,
+        "127.0.0.1",
+        port,
+        ward_daemon::github::GIT.header,
+        ward_proxy::Secret::from(format!(
+            "Basic {}",
+            ward_daemon::gateway::base64(b"x-access-token:ghp_secret")
+        )),
+    )
+    .unwrap()
+    .strip_headers(ward_daemon::github::GIT.strip)
+    .plain_upstream(true);
+    let gateway = ward_daemon::gateway::Gateway::new(&ward_daemon::github::GIT, route)
+        .with_permissions(vec!["contents:read".into()]);
+
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let mut session = Session::start_in(project.path(), state.path()).expect("start");
+    let log = session.log_path();
+    let opts = LaunchOpts {
+        gateways: vec![gateway],
+        seeds: vec![(
+            ward_daemon::github::GITCONFIG_PATH.to_owned(),
+            ward_daemon::github::gitconfig(),
+        )],
+        ..LaunchOpts::default()
+    };
+    // Real git, the real remote spelling; the fake upstream answers nonsense, so
+    // git fails, but the request it made is what matters.
+    // The e2e sandbox has no shim relay, so a Python stand-in bridges the loopback
+    // port to the egress socket the way `ward-agent --relay` does.
+    let relay = r"import socket, threading
+def pump(a, b):
+    while True:
+        d = a.recv(65536)
+        if not d:
+            break
+        b.sendall(d)
+    b.shutdown(socket.SHUT_WR)
+srv = socket.socket(); srv.bind(('127.0.0.1', 3128)); srv.listen(8)
+while True:
+    c, _ = srv.accept()
+    u = socket.socket(socket.AF_UNIX); u.connect('/run/ward/proxy.sock')
+    threading.Thread(target=pump, args=(c, u), daemon=True).start()
+    threading.Thread(target=pump, args=(u, c), daemon=True).start()";
+    let script = format!(
+        "python3 -c \"{relay}\" & sleep 0.5; \
+         git ls-remote https://github.com/hexrift/WardOS.git 2>&1 | head -2; \
+         env | grep -c ghp_ || true"
+    );
+    let argv: Vec<String> = ["sh", "-c", &script]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let report = session.launch(&argv, &opts).expect("launch");
+    session.stop(EndReason::UserStop).expect("stop");
+    assert!(
+        report.stdout.trim().ends_with('0'),
+        "the token must not be in the sandbox environment: {}",
+        report.stdout
+    );
+
+    let head = seen.lock().unwrap().clone();
+    assert!(
+        head.starts_with("GET /hexrift/WardOS.git/info/refs?service=git-upload-pack HTTP/1.1"),
+        "{head}"
+    );
+    assert!(
+        head.contains("authorization: Basic eC1hY2Nlc3MtdG9rZW46Z2hwX3NlY3JldA=="),
+        "{head}"
+    );
+    assert!(!head.contains("ward-gateway"), "{head}");
+
+    let granted = LogReader::open(&log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|r| {
+            matches!(r.event, WardEvent::CredentialGranted { ref scope, .. }
+            if scope.permissions.iter().any(|p| p.as_str() == "contents:read"))
+        });
+    assert!(granted, "the grant records the policy scope");
 }
