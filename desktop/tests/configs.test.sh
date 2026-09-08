@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# The component configurations (docs/desktop.md §Layout `config/`, §Keys, the Hyprland
+# tree, the units). Static checks, no component is started:
+#   - every *.jsonc under desktop/config parses as strict JSON (waybar and fastfetch
+#     accept comments, but strict JSON keeps the files machine-checkable);
+#   - every Hyprland bind line parses, its dispatcher is known, and an exec target's
+#     first word is a $variable defined in the tree, a wardos-* command named in
+#     docs/desktop.md, or a program in the allowlist below;
+#   - every key of docs/desktop.md §Keys has a bind, and no two binds share MODS+KEY;
+#   - every `source =` names a file in the tree (the theme fragment excepted);
+#   - every desktop/config/<dir> is named in docs/desktop.md §Layout;
+#   - bash configs pass `bash -n`, the profile.d script passes shellcheck;
+#   - systemd units carry the keys they need (`systemd-analyze verify` needs a running
+#     manager and a bus, so the check is structural);
+#   - the waybar bar lists the six trust segments of design-language §6 in order and
+#     its stylesheet knows every state class the ward-shell JSON supplies.
+# shellcheck source=desktop/tests/lib.sh
+source "$(dirname "$0")/lib.sh"
+setup_env
+
+root=$WARDOS_ROOT
+docs=$root/../docs/desktop.md
+
+# Programs a bind or exec-once may start directly. Everything else goes through a
+# wardos-* command so it has a menu entry and a test (docs/desktop.md §Commands).
+exec_allowlist="waybar mako hypridle systemctl wl-paste swayosd-client playerctl cliphist pkill ward hyprctl loginctl wl-copy"
+
+# --- JSON ---------------------------------------------------------------------
+while IFS= read -r f; do
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$f" || fail "$f is not strict JSON"
+done < <(find "$root/config" -name '*.jsonc' -o -name '*.json' | sort)
+
+# --- Hyprland: binds, keys, sources -------------------------------------------
+python3 - "$root/hyprland" "$docs" "$exec_allowlist" <<'PY' || fail "hyprland checks failed"
+import re, sys, pathlib
+tree, docs, allow = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).read_text(), set(sys.argv[3].split())
+confs = sorted(tree.glob("*.conf"))
+text = "\n".join(p.read_text() for p in confs)
+variables = set(re.findall(r"^\$(\w+)\s*=", text, re.M))
+commands = set(re.findall(r"`(wardos-[a-z0-9-]+)", docs))
+dispatchers = {"exec", "workspace", "movetoworkspace", "killactive", "fullscreen", "togglefloating",
+               "pseudo", "togglesplit", "movefocus", "movewindow", "resizeactive", "resizewindow",
+               "exit", "togglespecialworkspace", "movetoworkspacesilent", "centerwindow", "pin",
+               "swapwindow", "cyclenext", "focusmonitor", "movecurrentworkspacetomonitor"}
+errors = []
+
+def norm_mods(s):
+    mods = set()
+    for m in s.replace("$mod", "SUPER").split():
+        mods.add({"SUPER": "super", "ALT": "alt", "CTRL": "ctrl", "CONTROL": "ctrl", "SHIFT": "shift"}.get(m.upper(), m.lower()))
+    return frozenset(mods)
+
+def check_first_word(cmd, where):
+    first = cmd.strip().split()[0]
+    if first.startswith("$"):
+        if first[1:] not in variables:
+            errors.append(f"{where}: undefined variable {first}")
+    elif first.startswith("wardos-"):
+        if first not in commands:
+            errors.append(f"{where}: {first} is not a command in docs/desktop.md")
+    elif first not in allow:
+        errors.append(f"{where}: {first} is not a wardos-* command, a $variable or allowlisted")
+
+seen = {}
+bind_re = re.compile(r"^(bind[a-z]*)\s*=\s*([^,]*),\s*([^,]+),\s*([a-z]+)\s*(?:,\s*(.*))?$")
+for path in confs:
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        where = f"{path.name}:{n}"
+        s = line.strip()
+        if s.startswith("bind"):
+            m = bind_re.match(s)
+            if not m:
+                errors.append(f"{where}: unparsable bind: {s}"); continue
+            flags, mods, key, dispatcher, args = m.groups()
+            if dispatcher not in dispatchers:
+                errors.append(f"{where}: unknown dispatcher {dispatcher}"); continue
+            if dispatcher == "exec":
+                if not args: errors.append(f"{where}: exec without a command"); continue
+                check_first_word(args, where)
+            combo = (norm_mods(mods), key.strip().lower())
+            if combo in seen:
+                errors.append(f"{where}: {mods.strip()} + {key.strip()} already bound at {seen[combo]}")
+            seen[combo] = where
+        elif s.startswith("exec"):
+            check_first_word(s.split("=", 1)[1], where)
+        elif s.startswith("source"):
+            target = s.split("=", 1)[1].strip()
+            if "wardos/theme/current" in target: continue
+            rel = target.replace("~/.config/hypr/", "").replace("./", "")
+            if not (tree / rel).exists():
+                errors.append(f"{where}: sourced file {target} is not in the tree")
+
+# Every key of docs/desktop.md §Keys: backticked spans of the first column. A span
+# without `+` inherits the modifiers of the span before it (`Super + Ctrl + N` / `I`).
+keys = docs.split("## Keys", 1)[1].split("\n## ", 1)[0]
+keynames = {"/": "slash", "[": "bracketleft", "]": "bracketright", "return": "return", "scroll": "scroll"}
+wanted, mods = [], frozenset()
+for row in keys.splitlines():
+    if not row.startswith("| `"): continue
+    for span in re.findall(r"`([^`]+)`", row.split("|")[1]):
+        if span.startswith("XF86"):
+            wanted += [(frozenset(), k) for k in ("xf86audioraisevolume", "xf86audiolowervolume", "xf86audiomute",
+                       "xf86audiomicmute", "xf86monbrightnessup", "xf86monbrightnessdown",
+                       "xf86audioplay", "xf86audionext", "xf86audioprev")]
+            continue
+        parts = [p.strip() for p in span.split("+")]
+        if len(parts) > 1:
+            mods = norm_mods(" ".join(parts[:-1]))
+        key = parts[-1].lower()
+        key = keynames.get(key, key)
+        if key == "scroll":
+            wanted += [(mods, "mouse_down"), (mods, "mouse_up")]
+        elif key == "arrows":
+            wanted += [(mods, k) for k in ("left", "down", "up", "right")]
+        else:
+            wanted.append((mods, key))
+for combo in wanted:
+    if combo not in seen:
+        errors.append(f"docs/desktop.md §Keys: no bind for {'+'.join(sorted(combo[0])) or 'none'} + {combo[1]}")
+
+# Every bind that runs something has a description line above it for wardos-keys.
+for path in confs:
+    lines = path.read_text().splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("bind") and (i == 0 or not lines[i - 1].startswith("#")):
+            errors.append(f"{path.name}:{i + 1}: bind without a '# description' line above it")
+
+print("\n".join(errors), file=sys.stderr)
+sys.exit(1 if errors else 0)
+PY
+
+# hyprland.conf sources every sibling and the theme fragment last.
+for f in envs monitors input looknfeel windows autostart bindings; do
+  grep -q "^source = ./$f.conf" "$root/hyprland/hyprland.conf" || fail "hyprland.conf does not source $f.conf"
+done
+[[ $(grep '^source' "$root/hyprland/hyprland.conf" | tail -1) == *wardos/theme/current/hyprland.conf* ]] \
+  || fail "the theme fragment must be sourced last"
+grep -q 'rgb(' "$root/hyprland/looknfeel.conf" && fail "looknfeel.conf carries colour literals; they come from the theme"
+
+# --- config directories are documented ----------------------------------------
+layout=$(sed -n '/^## Layout/,/^## /p' "$docs")
+for d in "$root"/config/*/; do
+  name=$(basename "$d")
+  grep -qw "$name" <<<"$layout" || fail "desktop/config/$name is not named in docs/desktop.md §Layout"
+done
+
+# --- every component includes its theme fragment ------------------------------
+assert_fragment() { grep -q "$2" "$root/config/$1" || fail "config/$1 does not include its theme fragment ($2)"; }
+assert_fragment waybar/style.css '@import "../wardos/theme/current/waybar.css"'
+assert_fragment mako/config 'include=~/.config/wardos/theme/current/mako.conf'
+assert_fragment fuzzel/fuzzel.ini 'include=~/.config/wardos/theme/current/fuzzel.ini'
+assert_fragment foot/foot.ini 'include=~/.config/wardos/theme/current/foot.ini'
+assert_fragment alacritty/alacritty.toml 'import = \["~/.config/wardos/theme/current/alacritty.toml"\]'
+assert_fragment btop/btop.conf 'color_theme = "wardos"'
+assert_fragment hyprlock/hyprlock.conf 'source = ~/.config/wardos/theme/current/hyprlock.conf'
+assert_fragment nvim/init.lua 'wardos/theme/current/nvim.lua'
+assert_fragment gtk/gtk.css '@import url("../wardos/theme/current/gtk.css")'
+grep -q 'wardos/theme/current/swayosd.css' "$root/systemd/user/swayosd.service" || fail "swayosd.service does not use the theme style"
+
+# --- waybar: the trust bar ----------------------------------------------------
+python3 - "$root/config/waybar/config.jsonc" <<'PY' || fail "waybar config is not the trust bar"
+import json, sys
+c = json.load(open(sys.argv[1]))
+want = ["custom/ward-mark", "custom/ward-project", "custom/ward-agent", "custom/ward-network", "custom/ward-tamperward", "custom/ward-verify"]
+assert c["modules-left"] == want, c["modules-left"]
+assert c["modules-center"] == ["hyprland/workspaces"]
+assert c["modules-right"][0] == "custom/ward-update" and c["modules-right"][-1] == "clock"
+for name in want[1:]:
+    m = c[name]
+    assert m["exec"] == f"ward-shell bar --waybar --segment {name.split('/ward-')[1]} --follow", m["exec"]
+    assert m["return-type"] == "json" and m["restart-interval"] == 5
+assert c["custom/ward-update"]["interval"] >= 3600
+for m in ("cpu", "memory", "battery", "network", "pulseaudio", "bluetooth"):
+    assert c[m].get("interval", 5) >= 5, m
+PY
+for cls in working waiting blocked verifying finished verified restricted denied; do
+  grep -q "\.$cls\b" "$root/config/waybar/style.css" || fail "waybar/style.css has no .$cls rule"
+done
+grep -Eq 'gradient\(|box-shadow:[^;]*[0-9]' "$root/config/waybar/style.css" && fail "waybar/style.css: no gradients, no shadows (§3, §5)"
+
+# --- emoji list: `<emoji> <name>` per line, a few hundred lines -----------------
+[[ $(wc -l <"$root/config/fuzzel/emoji.txt") -ge 250 ]] || fail "emoji.txt is too short"
+grep -Evq '^[^ ]+ [a-z0-9 ,-]+$' "$root/config/fuzzel/emoji.txt" && fail "emoji.txt: every line is '<emoji> <name>'"
+
+# --- bash ---------------------------------------------------------------------
+for f in bashrc aliases prompt envs profile.d-wardos.sh; do
+  bash -n "$root/config/bash/$f" || fail "config/bash/$f: syntax"
+done
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck --severity=style --shell=bash "$root/config/bash/profile.d-wardos.sh" "$root/config/bash/bashrc" \
+    "$root/config/bash/aliases" "$root/config/bash/prompt" "$root/config/bash/envs" || fail "shellcheck on config/bash"
+fi
+# The prompt renders without colors.env and with it.
+mock git 'echo main'
+out=$(bash -c "source '$root/config/bash/prompt'; wardos_prompt; printf '%s' \"\$PS1\"")
+[[ $out == *' main'*'\n$ ' || $out == *' main'*'\n# ' ]] || fail "prompt without colors.env: $out"
+[[ $out != *'38;2;'* ]] || fail "prompt without colors.env must not colour: $out"
+mkdir -p "$XDG_CONFIG_HOME/wardos/theme/current"
+printf 'WARDOS_ACCENT=#7FA1C3\nWARDOS_TEXT_MUTED=#8A8D91\n' >"$XDG_CONFIG_HOME/wardos/theme/current/colors.env"
+out=$(bash -c "source '$root/config/bash/prompt'; wardos_prompt; printf '%s' \"\$PS1\"")
+[[ $out == *'38;2;127;161;195'* ]] || fail "prompt does not use the accent from colors.env: $out"
+# profile.d: no override marker -> sources the shipped bashrc; the marker stops it.
+mock uwsm
+mock tty 'echo /dev/pts/3'
+out=$(bash -ic "WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; type wardos_prompt >/dev/null && echo loaded" 2>/dev/null)
+[[ $out == loaded ]] || fail "profile.d did not load the shipped bashrc"
+touch "$XDG_CONFIG_HOME/wardos/bash-override"
+out=$(bash -ic "WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; type wardos_prompt >/dev/null 2>&1 && echo loaded || echo skipped" 2>/dev/null)
+[[ $out == skipped ]] || fail "profile.d ignored the override marker"
+rm "$XDG_CONFIG_HOME/wardos/bash-override"
+# profile.d on tty1 without a Wayland display: exec uwsm start hyprland.desktop.
+mock tty 'echo /dev/tty1'
+bash -ic "unset WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE; WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'" 2>/dev/null
+assert_logged '^uwsm start hyprland.desktop$'
+assert_logged '^tty $'
+
+# --- systemd units ------------------------------------------------------------
+unit_has() { grep -q "^$2" "$1" || fail "$(basename "$1") lacks $2"; }
+for u in "$root"/systemd/user/*.service; do
+  unit_has "$u" '\[Unit\]'; unit_has "$u" 'Description='; unit_has "$u" '\[Service\]'; unit_has "$u" 'ExecStart='
+done
+for t in "$root"/systemd/user/*.timer; do
+  unit_has "$t" '\[Timer\]'; unit_has "$t" 'OnUnitActiveSec='; unit_has "$t" 'WantedBy=timers.target'
+  assert_file "${t%.timer}.service"
+done
+unit_has "$root/systemd/user/wardos-approve.service" 'ExecStart=.*wardos-approve --watch'
+unit_has "$root/systemd/user/wardos-approve.service" 'WantedBy=graphical-session.target'
+unit_has "$root/systemd/user/swayosd.service" 'ExecStart=.*swayosd-server --style %h/.config/wardos/theme/current/swayosd.css'
+unit_has "$root/systemd/user/wardos-battery-monitor.timer" 'OnUnitActiveSec=2min'
+unit_has "$root/systemd/system/getty@tty1.service.d/autologin.conf" 'ExecStart=-/usr/sbin/agetty .*--autologin wardos'
+
+# --- flatpaks: one id per line with a purpose ---------------------------------
+grep -Ev '^#|^$' "$root/flatpaks.txt" | grep -Evq '^[a-z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_-]+)+ +# .+$' \
+  && fail "flatpaks.txt: '<id>  # purpose' per line"
+for id in org.signal.Signal com.spotify.Client com.onepassword.OnePassword; do
+  grep -q "^$id " "$root/flatpaks.txt" || fail "flatpaks.txt lacks $id, which a key opens"
+done
