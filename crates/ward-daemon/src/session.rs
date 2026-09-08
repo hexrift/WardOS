@@ -361,6 +361,12 @@ impl Session {
         .unwrap_or_default()
     }
 
+    /// The state root holding this session's CAS and log.
+    #[must_use]
+    pub fn state_root(&self) -> &Path {
+        &self.state
+    }
+
     /// The entry snapshot id (`blake3:…`).
     pub fn entry_snapshot(&self) -> &str {
         &self.entry_snapshot

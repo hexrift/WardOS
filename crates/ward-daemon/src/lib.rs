@@ -32,7 +32,7 @@ pub mod watch;
 
 pub use describe::SessionDescription;
 pub use error::{Error, Result};
-pub use selftest::{ProbeResult, selftest, selftest_credentials};
+pub use selftest::{ProbeResult, selftest, selftest_credentials, selftest_evidence};
 pub use session::{RunReport, Session, SessionMeta, VerifyReport};
 pub use ward_snapshot::SnapshotRole;
 pub use watch::CaptureMode;

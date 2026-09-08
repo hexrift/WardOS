@@ -68,7 +68,7 @@ ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live
 ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stays on the host
 ward status   examples/ward-demo    # the security panel for the active session
 ward verify   examples/ward-demo    # trusted verifier: protected tests from the entry snapshot
-ward selftest examples/ward-demo    # prove the isolation (10/10 hostile probes blocked)
+ward selftest examples/ward-demo    # prove the isolation (12/12 hostile probes blocked)
 ward stop     examples/ward-demo    # seal the log
 ward replay   <events.log>          # replay any sealed session (--verify, --json)
 ward session describe examples/ward-demo   # the session's immutable facts for TamperWard (--json)
@@ -104,8 +104,9 @@ TamperWard policy  = allowed behaviour and verification (what the agent MAY do, 
 **Phase 2 — Agent support, in progress.** The Rust workspace builds a working prototype on
 any Linux host with `bubblewrap`: sessions with a capability manifest, content-addressed
 entry snapshots and a hash-chained log (`ward up` / `status` / `run` / `stop` /
-`replay --verify`); the self-test (10/10 hostile probes blocked, including a canary
-credential that never appears in the sandbox); a per-session
+`replay --verify`); the self-test (12/12 hostile probes blocked, including a canary
+credential that never appears in the sandbox and evidence the agent cannot touch); a
+per-session
 policy proxy that is the sandbox's only way out; `ward claude` running real Claude Code
 with the model-API key held on the host and injected by the proxy; and Claude Code hooks
 reporting to `wardd`, with `step_through` policies holding before writes and network
