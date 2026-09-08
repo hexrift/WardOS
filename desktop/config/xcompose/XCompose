@@ -1,0 +1,61 @@
+# WardOS — compose sequences. Installed as ~/.XCompose by wardos-first-run.
+#
+# The compose key is Right Alt (hyprland/input.conf: compose:ralt). GTK reads this
+# file through its built-in simple input method, so GTK_IM_MODULE must stay unset;
+# Chromium reads it with --gtk-version=4 (config/chromium). Foot and other Wayland
+# clients get it from libxkbcommon. Sequences: the locale's table first, then the
+# typographic characters engineers reach for.
+
+include "%L"
+
+# Dashes and dots
+<Multi_key> <minus> <minus> <minus>   : "—"   U2014  # em dash
+<Multi_key> <minus> <minus> <period>  : "–"   U2013  # en dash
+<Multi_key> <period> <period> <period>: "…"   U2026  # ellipsis
+<Multi_key> <period> <minus>          : "·"   U00B7  # middle dot
+<Multi_key> <asterisk> <asterisk>     : "•"   U2022  # bullet
+<Multi_key> <o> <o>                   : "°"   U00B0  # degree
+
+# Quotes
+<Multi_key> <less> <quotedbl>         : "“"   U201C  # left double quote
+<Multi_key> <greater> <quotedbl>      : "”"   U201D  # right double quote
+<Multi_key> <less> <apostrophe>       : "‘"   U2018  # left single quote
+<Multi_key> <greater> <apostrophe>    : "’"   U2019  # right single quote
+<Multi_key> <less> <less>             : "«"   U00AB  # left guillemet
+<Multi_key> <greater> <greater>       : "»"   U00BB  # right guillemet
+
+# Arrows
+<Multi_key> <minus> <greater>         : "→"   U2192  # right arrow
+<Multi_key> <less> <minus>            : "←"   U2190  # left arrow
+<Multi_key> <asciicircum> <bar>       : "↑"   U2191  # up arrow
+<Multi_key> <v> <bar>                 : "↓"   U2193  # down arrow
+<Multi_key> <equal> <greater>         : "⇒"   U21D2  # double right arrow
+<Multi_key> <less> <equal> <greater>  : "⇔"   U21D4  # double both arrow
+<Multi_key> <less> <minus> <greater>  : "↔"   U2194  # left right arrow
+
+# Mathematics and units
+<Multi_key> <x> <x>                   : "×"   U00D7  # multiplication
+<Multi_key> <colon> <minus>           : "÷"   U00F7  # division
+<Multi_key> <plus> <minus>            : "±"   U00B1  # plus minus
+<Multi_key> <slash> <equal>           : "≠"   U2260  # not equal
+<Multi_key> <less> <equal>            : "≤"   U2264  # less or equal
+<Multi_key> <greater> <equal>         : "≥"   U2265  # greater or equal
+<Multi_key> <asciitilde> <equal>      : "≈"   U2248  # almost equal
+<Multi_key> <o> <c>                   : "©"   U00A9  # copyright
+<Multi_key> <o> <r>                   : "®"   U00AE  # registered
+<Multi_key> <t> <m>                   : "™"   U2122  # trade mark
+<Multi_key> <m> <u>                   : "µ"   U00B5  # micro
+<Multi_key> <s> <s>                   : "§"   U00A7  # section
+<Multi_key> <p> <p>                   : "¶"   U00B6  # pilcrow
+<Multi_key> <E> <equal>               : "€"   U20AC  # euro
+<Multi_key> <L> <minus>               : "£"   U00A3  # pound
+<Multi_key> <Y> <equal>               : "¥"   U00A5  # yen
+
+# Marks the Ward Shell uses (design-language.md §7, §11)
+<Multi_key> <v> <v>                   : "✓"   U2713  # check mark
+<Multi_key> <x> <v>                   : "✗"   U2717  # ballot x
+<Multi_key> <o> <period>              : "●"   U25CF  # black circle
+<Multi_key> <o> <o> <o>               : "◌"   U25CC  # dotted circle
+<Multi_key> <asciicircum> <asciicircum>: "▲"  U25B2  # black up triangle
+<Multi_key> <bracketleft> <bracketright>: "■" U25A0  # black square
+<Multi_key> <bar> <bar>               : "│"   U2502  # box vertical
