@@ -151,7 +151,7 @@ fn selftest_blocks_every_probe() {
     let mut session = Session::start_in(project.path(), state.path()).expect("start");
     let creds = ward_daemon::selftest_credentials(&mut session).expect("credential probes");
     let evidence = ward_daemon::selftest_evidence(&mut session).expect("evidence probes");
-    assert_eq!(evidence.len(), 2);
+    assert_eq!(evidence.len(), 3);
     for r in &evidence {
         assert!(r.blocked, "{} must be denied in the sandbox", r.name);
     }
