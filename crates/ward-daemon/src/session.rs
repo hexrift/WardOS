@@ -1,21 +1,30 @@
 //! Session lifecycle: policy → manifest → entry snapshot → sandboxed execution,
 //! all recorded to the append-only event log.
+//!
+//! Phase 1 keeps session state on disk so it survives across `ward` invocations:
+//! `ward up` records a [`SessionMeta`] under `<state>/sessions/<id>/session.json`
+//! and points `<state>/projects/<project-id>/current` at it; `ward run` reopens
+//! that session's log and resumes its hash chain; `ward stop` seals the log and
+//! clears the pointer. The daemon/socket split (ADR-0009) replaces the on-disk
+//! pointer with a live supervisor in Phase 2.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use ward_events::{
     AgentIdentity, AgentKind, AgentState, BoundedArgv, BoundedText, Chain, EndReason, EventRecord,
     ExitStatus, FileChangeKind, FsyncPolicy, LogWriter, NameText, Origin, Pid, ProcessRef,
     SandboxPath, SandboxRoot, Timestamp, WardEvent,
 };
-use ward_policy::{CapabilityManifest, Policy, merge};
+use ward_policy::{CapabilityManifest, ObserverMode, Policy, merge};
 use ward_snapshot::{CaptureOptions, SnapshotRole, SnapshotStore};
 
 use crate::error::{Error, Result};
 use crate::ids::{ev_hash, ev_snapshot, new_session_id, project_id_for};
 use crate::sandbox;
+use crate::watch::{CaptureMode, Captured, Watcher};
 
 /// A live WardOS session over one project.
 pub struct Session {
@@ -28,7 +37,58 @@ pub struct Session {
     next_pid: u32,
     root_pid: Pid,
     session_str: String,
+    project_id: String,
+    state: PathBuf,
     log_path: PathBuf,
+}
+
+/// The on-disk record of a session, written to `sessions/<id>/session.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMeta {
+    /// Session id (`sess_…`).
+    pub id: String,
+    /// Canonical project worktree path.
+    pub project: PathBuf,
+    /// Stable project id (`proj_…`).
+    pub project_id: String,
+    /// Entry snapshot id (`blake3:…`).
+    pub entry_snapshot: String,
+    /// The effective capability manifest.
+    pub manifest: CapabilityManifest,
+    /// Session start time, milliseconds since the Unix epoch.
+    pub started_unix_ms: u64,
+}
+
+impl SessionMeta {
+    /// How long ago the session started (saturating at zero).
+    #[must_use]
+    pub fn started_ago(&self) -> Duration {
+        let start = UNIX_EPOCH + Duration::from_millis(self.started_unix_ms);
+        SystemTime::now().duration_since(start).unwrap_or_default()
+    }
+
+    /// Load the current session's metadata for `project_dir`, if one is active.
+    ///
+    /// Does not start a session or touch the event log.
+    pub fn current(project_dir: &Path, state: &Path) -> Result<Option<Self>> {
+        let worktree = project_dir
+            .canonicalize()
+            .map_err(|e| Error::io(project_dir, e))?;
+        let project_id = project_id_for(&worktree).to_string();
+        let Some(id) = read_current(state, &project_id)? else {
+            return Ok(None);
+        };
+        let path = meta_path(state, &id);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let meta = serde_json::from_slice(&bytes)
+                    .map_err(|e| Error::Project(format!("{}: {e}", path.display())))?;
+                Ok(Some(meta))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::io(&path, e)),
+        }
+    }
 }
 
 /// A single command run and the events it produced, for immediate rendering.
@@ -41,6 +101,8 @@ pub struct RunReport {
     pub files_changed: usize,
     /// Wall-clock duration.
     pub duration: Duration,
+    /// Which capture source produced the file events.
+    pub capture: CaptureMode,
     /// Captured stdout.
     pub stdout: String,
     /// Captured stderr.
@@ -57,12 +119,14 @@ impl Session {
     /// Open a session, storing the snapshot CAS and event log under `state`.
     ///
     /// Resolves the project, merges policy into a manifest, freezes an entry
-    /// snapshot, and opens the event log.
+    /// snapshot, and opens a fresh event log. Does not itself become the project's
+    /// current session; call [`persist_current`](Self::persist_current) for that.
     pub fn start_in(project_dir: &Path, state: &Path) -> Result<Self> {
         let worktree = project_dir
             .canonicalize()
             .map_err(|e| Error::io(project_dir, e))?;
         let project_id = project_id_for(&worktree);
+        let project_id_str = project_id.to_string();
         let session = new_session_id();
         let session_str = session.to_string();
 
@@ -74,7 +138,7 @@ impl Session {
             &Policy::default(),
             &project_policy,
             ward_policy::SessionId(session_str.clone()),
-            ward_policy::ProjectId(project_id.to_string()),
+            ward_policy::ProjectId(project_id_str.clone()),
         );
 
         let store =
@@ -83,7 +147,7 @@ impl Session {
             .store_snapshot(&worktree, SnapshotRole::Entry, CaptureOptions::default())
             .map_err(|e| Error::Snapshot(e.to_string()))?;
 
-        let session_dir = state.join("sessions").join(&session_str);
+        let session_dir = session_dir(state, &session_str);
         std::fs::create_dir_all(&session_dir).map_err(|e| Error::io(&session_dir, e))?;
         let log_path = session_dir.join("events.log");
         let manifest_hash = ev_hash(manifest.policy_hash.0);
@@ -101,6 +165,8 @@ impl Session {
             next_pid: 1,
             root_pid: Pid::new(1).map_err(|e| Error::Events(e.to_string()))?,
             session_str,
+            project_id: project_id_str,
+            state: state.to_path_buf(),
             log_path,
         };
         let agent = AgentIdentity {
@@ -121,6 +187,55 @@ impl Session {
             },
         )?;
         Ok(s)
+    }
+
+    /// Reopen the project's current session (set by [`persist_current`]) for more
+    /// commands, resuming its hash chain from the log head. Returns `None` when the
+    /// project has no active session.
+    ///
+    /// [`persist_current`]: Self::persist_current
+    pub fn open_current(project_dir: &Path, state: &Path) -> Result<Option<Self>> {
+        let Some(meta) = SessionMeta::current(project_dir, state)? else {
+            return Ok(None);
+        };
+        let worktree = meta.project.clone();
+        let log_path = session_dir(state, &meta.id).join("events.log");
+        let log = LogWriter::open(&log_path, FsyncPolicy::DEFAULT)
+            .map_err(|e| Error::Events(e.to_string()))?;
+        let chain = Chain::resume(log.head());
+        let started = UNIX_EPOCH + Duration::from_millis(meta.started_unix_ms);
+        Ok(Some(Self {
+            manifest: meta.manifest,
+            worktree,
+            entry_snapshot: meta.entry_snapshot,
+            chain,
+            log,
+            started,
+            next_pid: 1,
+            root_pid: Pid::new(1).map_err(|e| Error::Events(e.to_string()))?,
+            session_str: meta.id,
+            project_id: meta.project_id,
+            state: state.to_path_buf(),
+            log_path,
+        }))
+    }
+
+    /// Record this session as the project's current session: write its
+    /// `session.json` and point `projects/<project-id>/current` at it.
+    pub fn persist_current(&self) -> Result<()> {
+        let meta = SessionMeta {
+            id: self.session_str.clone(),
+            project: self.worktree.clone(),
+            project_id: self.project_id.clone(),
+            entry_snapshot: self.entry_snapshot.clone(),
+            manifest: self.manifest.clone(),
+            started_unix_ms: unix_ms(self.started),
+        };
+        let path = meta_path(&self.state, &self.session_str);
+        let bytes = serde_json::to_vec_pretty(&meta)
+            .map_err(|e| Error::Project(format!("serialize session.json: {e}")))?;
+        std::fs::write(&path, bytes).map_err(|e| Error::io(&path, e))?;
+        write_current(&self.state, &self.project_id, &self.session_str)
     }
 
     /// The effective capability manifest.
@@ -144,7 +259,18 @@ impl Session {
         self.log_path.clone()
     }
 
+    /// Force any buffered log records to disk. Call after [`run`](Self::run) on a
+    /// session that stays active so nothing is lost if the process exits.
+    pub fn sync(&mut self) -> Result<()> {
+        self.log.sync().map_err(|e| Error::Events(e.to_string()))
+    }
+
     /// Run one command inside the sandbox, recording its events.
+    ///
+    /// File changes are captured live over the worktree with inotify for the
+    /// duration of the command; if inotify cannot be initialised the run falls back
+    /// to a before/after directory scan. Reads are captured only when the observer
+    /// is Live or StepThrough.
     pub fn run(&mut self, argv: &[String]) -> Result<RunReport> {
         self.emit(
             Origin::Wardd,
@@ -166,26 +292,65 @@ impl Session {
             },
         )?;
 
-        let before = scan(&self.worktree);
-        let outcome = sandbox::run(&self.worktree, &self.manifest.network, argv)?;
-        let after = scan(&self.worktree);
-        let changed = diff_paths(&before, &after);
+        let watch_reads = matches!(
+            self.manifest.observer,
+            ObserverMode::Live | ObserverMode::StepThrough(_)
+        );
+        let watcher = Watcher::start(&self.worktree, watch_reads).ok();
+        let before = if watcher.is_none() {
+            Some(scan(&self.worktree))
+        } else {
+            None
+        };
 
-        for rel in &changed {
-            if let Ok(path) = SandboxPath::new(SandboxRoot::Work, rel) {
-                self.emit(
-                    Origin::Kernel,
-                    WardEvent::FileModified {
-                        path,
-                        by: ProcessRef {
-                            pid,
-                            comm: comm(argv),
-                        },
-                        kind: FileChangeKind::Write,
-                    },
-                )?;
+        let outcome = sandbox::run(&self.worktree, &self.manifest.network, argv)?;
+
+        let (captured, capture) = match (watcher, before) {
+            (Some(w), _) => (w.finish(), CaptureMode::Inotify),
+            (None, Some(before)) => {
+                let after = scan(&self.worktree);
+                (scan_changes(&before, &after), CaptureMode::Scan)
+            }
+            (None, None) => (Vec::new(), CaptureMode::Scan),
+        };
+
+        let comm = comm(argv);
+        let mut changed_paths = BTreeSet::new();
+        for item in &captured {
+            match item {
+                Captured::Modified { rel, kind } => {
+                    if let Ok(path) = SandboxPath::new(SandboxRoot::Work, rel) {
+                        changed_paths.insert(rel.clone());
+                        self.emit(
+                            Origin::Kernel,
+                            WardEvent::FileModified {
+                                path,
+                                by: ProcessRef {
+                                    pid,
+                                    comm: comm.clone(),
+                                },
+                                kind: *kind,
+                            },
+                        )?;
+                    }
+                }
+                Captured::Read { rel } => {
+                    if let Ok(path) = SandboxPath::new(SandboxRoot::Work, rel) {
+                        self.emit(
+                            Origin::Kernel,
+                            WardEvent::FileRead {
+                                path,
+                                by: ProcessRef {
+                                    pid,
+                                    comm: comm.clone(),
+                                },
+                            },
+                        )?;
+                    }
+                }
             }
         }
+
         self.emit(
             Origin::Kernel,
             WardEvent::CommandFinished {
@@ -204,14 +369,15 @@ impl Session {
         Ok(RunReport {
             argv: argv.to_vec(),
             code: outcome.code,
-            files_changed: changed.len(),
+            files_changed: changed_paths.len(),
             duration: outcome.duration,
+            capture,
             stdout: outcome.stdout,
             stderr: outcome.stderr,
         })
     }
 
-    /// End the session and seal the log.
+    /// End the session, seal the log, and clear the project's current pointer.
     pub fn stop(mut self, reason: EndReason) -> Result<()> {
         self.emit(
             Origin::Wardd,
@@ -227,6 +393,7 @@ impl Session {
             },
         )?;
         self.log.seal().map_err(|e| Error::Events(e.to_string()))?;
+        clear_current(&self.state, &self.project_id, &self.session_str)?;
         Ok(())
     }
 
@@ -274,6 +441,10 @@ fn now_ts(started: SystemTime) -> Timestamp {
     Timestamp::mono(mono)
 }
 
+fn unix_ms(t: SystemTime) -> u64 {
+    u64::try_from(t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn load_project_policy(worktree: &Path) -> Result<Policy> {
     let path = worktree.join(".ward").join("policy.yaml");
     match std::fs::read_to_string(&path) {
@@ -285,12 +456,60 @@ fn load_project_policy(worktree: &Path) -> Result<Policy> {
     }
 }
 
-fn state_root() -> PathBuf {
+/// The default state root: `$WARD_STATE_DIR`, else `~/.local/state/ward`.
+#[must_use]
+pub fn state_root() -> PathBuf {
     if let Ok(dir) = std::env::var("WARD_STATE_DIR") {
         return PathBuf::from(dir);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".local/state/ward")
+}
+
+fn session_dir(state: &Path, id: &str) -> PathBuf {
+    state.join("sessions").join(id)
+}
+
+fn meta_path(state: &Path, id: &str) -> PathBuf {
+    session_dir(state, id).join("session.json")
+}
+
+fn current_pointer(state: &Path, project_id: &str) -> PathBuf {
+    state.join("projects").join(project_id).join("current")
+}
+
+fn read_current(state: &Path, project_id: &str) -> Result<Option<String>> {
+    let path = current_pointer(state, project_id);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let id = s.trim().to_owned();
+            Ok(if id.is_empty() { None } else { Some(id) })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::io(&path, e)),
+    }
+}
+
+fn write_current(state: &Path, project_id: &str, id: &str) -> Result<()> {
+    let path = current_pointer(state, project_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    }
+    std::fs::write(&path, id).map_err(|e| Error::io(&path, e))
+}
+
+/// Clear the current pointer, but only if it still names `id` (do not clobber a
+/// newer session that replaced this one).
+fn clear_current(state: &Path, project_id: &str, id: &str) -> Result<()> {
+    if read_current(state, project_id)?.as_deref() == Some(id) {
+        let path = current_pointer(state, project_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io(&path, e)),
+        }
+    }
+    Ok(())
 }
 
 /// Map relative worktree paths to (mtime, size), skipping `.git` and `target`.
@@ -329,14 +548,19 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, (u128, u64)>) {
     }
 }
 
-fn diff_paths(
+/// Diff two scans into `Write` modifications (the scan fallback cannot tell
+/// creates from writes, so it reports both as `Write`).
+fn scan_changes(
     before: &BTreeMap<String, (u128, u64)>,
     after: &BTreeMap<String, (u128, u64)>,
-) -> Vec<String> {
+) -> Vec<Captured> {
     let mut changed = Vec::new();
     for (path, meta) in after {
         if before.get(path) != Some(meta) {
-            changed.push(path.clone());
+            changed.push(Captured::Modified {
+                rel: path.clone(),
+                kind: FileChangeKind::Write,
+            });
         }
     }
     changed
@@ -346,6 +570,24 @@ fn diff_paths(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    fn sample_meta(id: &str) -> SessionMeta {
+        let manifest = merge(
+            &Policy::default(),
+            &Policy::default(),
+            &Policy::default(),
+            ward_policy::SessionId(id.to_owned()),
+            ward_policy::ProjectId("proj_test".to_owned()),
+        );
+        SessionMeta {
+            id: id.to_owned(),
+            project: PathBuf::from("/tmp/demo"),
+            project_id: "proj_test".to_owned(),
+            entry_snapshot: "blake3:abc".to_owned(),
+            manifest,
+            started_unix_ms: 1_700_000_000_000,
+        }
+    }
 
     #[test]
     fn exit_status_maps_code_and_signal() {
@@ -362,14 +604,19 @@ mod tests {
     }
 
     #[test]
-    fn diff_reports_only_changed_paths() {
+    fn scan_diff_reports_only_changed_paths() {
         let mut before = BTreeMap::new();
         before.insert("a".to_string(), (1u128, 10u64));
         before.insert("b".to_string(), (1, 10));
         let mut after = before.clone();
         after.insert("b".to_string(), (2, 12)); // modified
         after.insert("c".to_string(), (1, 1)); // created
-        let mut changed = diff_paths(&before, &after);
+        let mut changed: Vec<String> = scan_changes(&before, &after)
+            .into_iter()
+            .map(|c| match c {
+                Captured::Modified { rel, .. } | Captured::Read { rel } => rel,
+            })
+            .collect();
         changed.sort();
         assert_eq!(changed, vec!["b".to_string(), "c".to_string()]);
     }
@@ -379,5 +626,58 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let policy = load_project_policy(dir.path()).unwrap();
         assert_eq!(policy, Policy::default());
+    }
+
+    #[test]
+    fn session_meta_round_trips_through_json() {
+        let meta = sample_meta("sess_round");
+        let bytes = serde_json::to_vec_pretty(&meta).unwrap();
+        let back: SessionMeta = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(meta, back);
+    }
+
+    #[test]
+    fn current_pointer_set_and_clear() {
+        let state = tempfile::tempdir().unwrap();
+        let pid = "proj_test";
+        assert_eq!(read_current(state.path(), pid).unwrap(), None);
+        write_current(state.path(), pid, "sess_a").unwrap();
+        assert_eq!(
+            read_current(state.path(), pid).unwrap().as_deref(),
+            Some("sess_a")
+        );
+        // A stale clear (different id) must not remove a newer pointer.
+        clear_current(state.path(), pid, "sess_old").unwrap();
+        assert_eq!(
+            read_current(state.path(), pid).unwrap().as_deref(),
+            Some("sess_a")
+        );
+        // Clearing the matching id removes it.
+        clear_current(state.path(), pid, "sess_a").unwrap();
+        assert_eq!(read_current(state.path(), pid).unwrap(), None);
+    }
+
+    #[test]
+    fn current_meta_reads_back_what_was_written() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let worktree = project.path().canonicalize().unwrap();
+        let project_id = project_id_for(&worktree).to_string();
+        let id = "sess_persist";
+        let mut meta = sample_meta(id);
+        meta.project = worktree.clone();
+        meta.project_id = project_id.clone();
+        std::fs::create_dir_all(session_dir(state.path(), id)).unwrap();
+        std::fs::write(
+            meta_path(state.path(), id),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        write_current(state.path(), &project_id, id).unwrap();
+
+        let loaded = SessionMeta::current(project.path(), state.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, meta);
     }
 }
