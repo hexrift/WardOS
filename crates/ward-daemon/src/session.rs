@@ -14,9 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use ward_events::{
-    AgentIdentity, AgentKind, AgentState, BoundedArgv, BoundedText, EndReason, ExitStatus,
-    FileChangeKind, ImageDigest, NameText, Origin, Pid, ProcessRef, SandboxPath, SandboxRoot,
-    ShortText, StepStatus, VerifyRequester, VerifySummary, WardEvent,
+    AgentIdentity, AgentKind, AgentState, BoundedArgv, BoundedText, DenyReason, EndReason,
+    ExitStatus, FileChangeKind, ImageDigest, NameText, Origin, Pid, ProcessRef, RuleRef,
+    SandboxPath, SandboxRoot, Scope, ServiceId, ShortText, StepStatus, VerifyRequester,
+    VerifySummary, WardEvent,
 };
 use ward_policy::{CapabilityManifest, NetworkCapability, ObserverMode, Policy, merge};
 use ward_snapshot::{CaptureOptions, SnapshotMeta, SnapshotRole, SnapshotStore};
@@ -26,6 +27,7 @@ use crate::describe::SessionDescription;
 use crate::egress::Egress;
 use crate::error::{Error, Result};
 use crate::gateway::Gateway;
+use crate::github;
 use crate::hooks::Hooks;
 use crate::ids::{ev_capture, ev_hash, ev_role, ev_snapshot, new_session_id, project_id_for};
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
@@ -167,6 +169,15 @@ fn unknown_agent() -> AgentIdentity {
     }
 }
 
+/// A refused GitHub grant, as recorded before the command starts.
+fn github_refusal(reason: DenyReason) -> WardEvent {
+    WardEvent::CredentialDenied {
+        service: ServiceId::new(github::SERVICE).unwrap_or_else(|_| unreachable!("static id")),
+        scope: Scope::default(),
+        reason,
+    }
+}
+
 /// Identity of the 0.1 verifier: a namespace sandbox on this host, not an image.
 fn verifier_image() -> ImageDigest {
     ImageDigest::from_bytes(*blake3::hash(b"ward-verifier/namespace/0.1").as_bytes())
@@ -181,8 +192,12 @@ pub struct LaunchOpts {
     pub interactive: bool,
     /// Credentials the proxy injects for this launch (`gateway.rs`).
     pub gateways: Vec<Gateway>,
-    /// A settings file seeded read-only into the sandbox: `(path, content)`.
-    pub settings: Option<(String, String)>,
+    /// Files seeded read-only into the sandbox: `(path, content)`.
+    pub seeds: Vec<(String, String)>,
+    /// Credential refusals to record before the command starts.
+    pub refusals: Vec<WardEvent>,
+    /// Lines for the user about credential decisions.
+    pub notes: Vec<String>,
 }
 
 /// Nominal validity of a gateway grant. The route itself lives exactly as long
@@ -432,7 +447,7 @@ impl Session {
         args: &[String],
         pass_env: &[String],
     ) -> Result<RunReport> {
-        let (command, opts) = self.agent_launch(name, args, pass_env)?;
+        let (command, opts) = self.agent_launch(name, args, pass_env, &[])?;
         self.launch(&command, &opts)
     }
 
@@ -446,6 +461,7 @@ impl Session {
         name: &str,
         args: &[String],
         pass_env: &[String],
+        grants: &[String],
     ) -> Result<(Vec<String>, LaunchOpts)> {
         let profile = crate::agents::profile(name)
             .ok_or_else(|| Error::Project(format!("unknown agent `{name}`")))?;
@@ -460,7 +476,7 @@ impl Session {
             }
         }
         let online = !matches!(self.manifest.network, NetworkCapability::Offline);
-        let gateways = profile
+        let mut gateways = profile
             .gateway
             .filter(|g| online && !pass_env.iter().any(|k| k == g.key_env))
             .map(|spec| Gateway::resolve(&spec, &self.state))
@@ -468,6 +484,47 @@ impl Session {
             .flatten()
             .into_iter()
             .collect::<Vec<_>>();
+        let mut seeds: Vec<(String, String)> = profile
+            .settings
+            .map(|s| (s.path.to_owned(), (s.content)()))
+            .into_iter()
+            .collect();
+        let mut refusals = Vec::new();
+        let mut notes = Vec::new();
+        let requested = grants.iter().any(|g| g == github::SERVICE);
+        match github::grant(&self.manifest, &self.worktree, &self.state, requested)? {
+            github::Grant::Granted {
+                gateways: routes,
+                repos,
+                write,
+            } => {
+                notes.push(format!(
+                    "github: token stays on the host; the proxy injects it for {} ({})",
+                    repos.join(", "),
+                    if write { "read & write" } else { "read-only" }
+                ));
+                gateways.extend(routes);
+                seeds.push((github::GITCONFIG_PATH.to_owned(), github::gitconfig()));
+            }
+            github::Grant::Ask => notes.push(
+                "github: policy says ask; pass --grant github to route git and API calls through the proxy"
+                    .to_owned(),
+            ),
+            github::Grant::Denied if requested => {
+                refusals.push(github_refusal(DenyReason::PolicyDeny {
+                    rule: RuleRef::new("credentials.github").map_err(|e| Error::Events(e.to_string()))?,
+                }));
+                notes.push("github: denied by policy".to_owned());
+            }
+            github::Grant::NoKey if requested => {
+                notes.push(format!("github: no {} on the host or in the vault", github::KEY_ENV));
+            }
+            github::Grant::NoRemote if requested => {
+                notes.push("github: the worktree has no GitHub origin remote to scope the grant to".to_owned());
+            }
+            github::Grant::Offline if requested => notes.push("github: session is offline".to_owned()),
+            _ => {}
+        }
         for g in &gateways {
             env.extend(g.env.iter().cloned());
         }
@@ -479,7 +536,9 @@ impl Session {
                 env,
                 interactive: true,
                 gateways,
-                settings: profile.settings.map(|s| (s.path.to_owned(), (s.content)())),
+                seeds,
+                refusals,
+                notes,
             },
         ))
     }
@@ -517,6 +576,9 @@ impl Session {
             None
         };
 
+        for refusal in &opts.refusals {
+            self.emit(Origin::Wardd, refusal.clone())?;
+        }
         for g in &opts.gateways {
             self.emit(Origin::Wardd, g.granted(GATEWAY_TTL)?)?;
         }
@@ -598,8 +660,8 @@ impl Session {
         let mut launch = Launch::new(&self.worktree, argv.to_vec())
             .egress(egress.socket())
             .hooks(hooks.socket());
-        if let Some((path, content)) = &opts.settings {
-            let file = run_dir.join("settings.json");
+        for (n, (path, content)) in opts.seeds.iter().enumerate() {
+            let file = run_dir.join(format!("seed-{n}"));
             std::fs::write(&file, content).map_err(|e| Error::io(&file, e))?;
             launch = launch.seed(file, path.clone());
         }

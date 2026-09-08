@@ -24,6 +24,7 @@ pub mod describe;
 pub mod egress;
 pub mod error;
 pub mod gateway;
+pub mod github;
 pub mod hooks;
 pub mod ids;
 pub mod render;

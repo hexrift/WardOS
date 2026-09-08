@@ -591,6 +591,160 @@ fn gateway_upstream_is_host_chosen_and_prefix_is_exact() {
     assert!(!tunnelled.contains(REAL_KEY));
 }
 
+/// A `/github` route granting one repository (git over HTTPS and the REST
+/// API), read-only or read-write.
+fn github_route(upstream: SocketAddr, write: bool) -> GatewayRoute {
+    GatewayRoute::new(
+        "/github",
+        "127.0.0.1",
+        upstream.port(),
+        "Authorization",
+        Secret::from(format!("Bearer {REAL_KEY}")),
+    )
+    .unwrap()
+    .strip_headers(["authorization"])
+    .scope(["/hexrift/WardOS.git", "/repos/hexrift/WardOS"], write)
+    .plain_upstream(true)
+}
+
+fn send(proxy: &Handle, head: &str) -> String {
+    let mut c = client(proxy);
+    c.write_all(head.as_bytes()).unwrap();
+    read_all(&mut c)
+}
+
+const REFUSED: &str = "request outside credential scope";
+
+#[test]
+fn gateway_scope_admits_an_in_scope_read_with_the_credential() {
+    let (upstream, seen) = spawn_gateway_upstream(Duration::ZERO);
+    let (proxy, recorder) = start(custom_localhost().gateway(github_route(upstream, false)));
+    let response = send(
+        &proxy,
+        "GET /github/hexrift/WardOS.git/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+         Host: 127.0.0.1:3128\r\n\
+         Authorization: Basic placeholder\r\n\
+         Git-Protocol: version=2\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.ends_with("data: part1\n\ndata: part2\n\n"));
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let upstream_req = String::from_utf8(seen[0].clone()).unwrap();
+    let lines: Vec<&str> = upstream_req.lines().collect();
+    assert_eq!(
+        lines[0],
+        "GET /hexrift/WardOS.git/info/refs?service=git-upload-pack HTTP/1.1"
+    );
+    assert!(
+        lines.contains(&format!("Authorization: Bearer {REAL_KEY}").as_str()),
+        "{upstream_req}"
+    );
+    assert!(lines.contains(&"Git-Protocol: version=2"), "{upstream_req}");
+    assert!(!upstream_req.contains("placeholder"), "{upstream_req}");
+    let (req, decision, reason) = recorder.last();
+    assert_eq!(decision, Decision::Allow);
+    assert_eq!(reason, "gateway /github");
+    assert!(
+        matches!(req.method, Method::Forward { ref verb, ref path } if verb == "GET" && path == "/hexrift/WardOS.git/info/refs?service=git-upload-pack")
+    );
+}
+
+#[test]
+fn gateway_scope_refuses_another_repository_before_any_upstream_contact() {
+    let (upstream, seen) = spawn_gateway_upstream(Duration::ZERO);
+    let (proxy, recorder) = start(custom_localhost().gateway(github_route(upstream, true)));
+    for path in [
+        "/github/hexrift/other.git/info/refs?service=git-upload-pack",
+        "/github/hexrift/WardOS.gitx/info/refs",
+        "/github/repos/hexrift/other/pulls",
+        "/github/user",
+        "/github",
+    ] {
+        let response = send(
+            &proxy,
+            &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:3128\r\n\r\n"),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.ends_with(&format!("\r\n\r\n{REFUSED}\n")),
+            "{response}"
+        );
+        assert!(!response.contains(REAL_KEY), "{response}");
+        let (req, decision, reason) = recorder.last();
+        assert_eq!(decision, Decision::Deny, "{path}");
+        assert_eq!(reason, "gateway /github: outside credential scope");
+        assert!(!req.to_string().contains(REAL_KEY));
+    }
+    // The upstream never heard from the proxy: no connection, no secret.
+    thread::sleep(Duration::from_millis(100));
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn gateway_scope_read_only_refuses_a_push_that_a_write_route_forwards() {
+    let (upstream, seen) = spawn_gateway_upstream(Duration::ZERO);
+    let push = "POST /github/hexrift/WardOS.git/git-receive-pack HTTP/1.1\r\n\
+                Host: 127.0.0.1:3128\r\n\
+                Content-Type: application/x-git-receive-pack-request\r\n\
+                Content-Length: 4\r\n\r\npack";
+    let (read_only, recorder) = start(custom_localhost().gateway(github_route(upstream, false)));
+    for head in [
+        push,
+        "DELETE /github/repos/hexrift/WardOS HTTP/1.1\r\nHost: 127.0.0.1:3128\r\n\r\n",
+        "PATCH /github/repos/hexrift/WardOS HTTP/1.1\r\nHost: 127.0.0.1:3128\r\nContent-Length: 0\r\n\r\n",
+    ] {
+        let response = send(&read_only, head);
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.ends_with(&format!("\r\n\r\n{REFUSED}\n")),
+            "{response}"
+        );
+        let (_, decision, reason) = recorder.last();
+        assert_eq!(decision, Decision::Deny);
+        assert_eq!(reason, "gateway /github: write not granted");
+    }
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "read-only route reached upstream"
+    );
+
+    // A fetch is a POST too, and is a read.
+    let fetch = "POST /github/hexrift/WardOS.git/git-upload-pack HTTP/1.1\r\n\
+                 Host: 127.0.0.1:3128\r\n\
+                 Content-Length: 4\r\n\r\nwant";
+    let response = send(&read_only, fetch);
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert_eq!(recorder.last().2, "gateway /github");
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let text = String::from_utf8(seen[0].clone()).unwrap();
+        assert!(text.starts_with("POST /hexrift/WardOS.git/git-upload-pack HTTP/1.1\r\n"));
+        assert!(text.ends_with("\r\n\r\nwant"));
+    }
+
+    // The same push on a write route reaches the upstream with the credential.
+    let (write, recorder_w) = start(custom_localhost().gateway(github_route(upstream, true)));
+    let response = send(&write, push);
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert_eq!(recorder_w.last().1, Decision::Allow);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let text = String::from_utf8(seen[1].clone()).unwrap();
+    assert!(text.starts_with("POST /hexrift/WardOS.git/git-receive-pack HTTP/1.1\r\n"));
+    assert!(text.contains(&format!("Authorization: Bearer {REAL_KEY}\r\n")));
+    assert!(text.ends_with("\r\n\r\npack"));
+}
+
 #[test]
 fn config_debug_never_reveals_the_secret() {
     let config = Config::new(NetworkCapability::Development).gateway(

@@ -9,6 +9,13 @@
 //! `CONNECT` is never a gateway: a tunnel is opaque and cannot be injected
 //! into. The upstream host goes through the same policy check and DNS
 //! pinning as any other destination.
+//!
+//! A route may carry a **scope** ([`GatewayRoute::scope`]): the path prefixes
+//! the credential may act on and whether writes are granted. This is where a
+//! `CredentialScope` (repository + permission set, credential-broker §3) is
+//! enforced: a request outside it is refused with `403` before the upstream
+//! is contacted, so the secret is never sent on the agent's behalf for
+//! anything the grant did not cover.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -35,8 +42,34 @@ pub struct GatewayRoute {
     header: String,
     value: Secret,
     strip: Vec<String>,
+    /// Path prefixes (after the route prefix is stripped) the credential may
+    /// act on; empty means every path.
+    paths: Vec<String>,
+    /// Whether requests that are not read-only are permitted.
+    write: bool,
     #[cfg(feature = "test-loopback")]
     plain_upstream: bool,
+}
+
+/// Why a request was refused by a route's [`scope`](GatewayRoute::scope).
+///
+/// The `Display` text is the tail of the observer reason; it names neither
+/// the path nor the credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScopeDenial {
+    /// The stripped path is under none of the scope's path prefixes.
+    OutsideScope,
+    /// The route is read-only and the request would write.
+    WriteNotGranted,
+}
+
+impl fmt::Display for ScopeDenial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::OutsideScope => "outside credential scope",
+            Self::WriteNotGranted => "write not granted",
+        })
+    }
 }
 
 impl GatewayRoute {
@@ -88,9 +121,77 @@ impl GatewayRoute {
             header,
             value,
             strip: Vec::new(),
+            paths: Vec::new(),
+            write: true,
             #[cfg(feature = "test-loopback")]
             plain_upstream: false,
         })
+    }
+
+    /// Restrict what the injected credential may be used for.
+    ///
+    /// `paths` are path prefixes **after the route prefix is stripped** — for
+    /// a `/github` route granting one repository, `/hexrift/WardOS.git` (git
+    /// over HTTPS) and `/repos/hexrift/WardOS` (the REST API). A request whose
+    /// stripped path is not under one of them is refused; the boundary rule is
+    /// that of [`Self::matches_path`] (exact, or followed by `/` or `?`), so
+    /// `/hexrift/WardOS.gitx` is not under `/hexrift/WardOS.git`. An empty
+    /// list means every path. A trailing `/` on a prefix is ignored, a
+    /// missing leading `/` is supplied, and a bare `/` covers everything.
+    ///
+    /// With `write == false` only read-only requests pass: `GET`, `HEAD`,
+    /// `OPTIONS`, and a `POST` whose stripped path ends with
+    /// `/git-upload-pack` (a git fetch). Everything else — `POST
+    /// …/git-receive-pack` (a push), `PUT`, `PATCH`, `DELETE` — is refused.
+    ///
+    /// A refused request never reaches the upstream: see [`Self::permits`].
+    /// Calling `scope` again replaces the previous scope.
+    #[must_use]
+    pub fn scope(
+        mut self,
+        paths: impl IntoIterator<Item = impl Into<String>>,
+        write: bool,
+    ) -> Self {
+        self.paths = paths
+            .into_iter()
+            .map(|p| {
+                let p = p.into();
+                let trimmed = p.trim_end_matches('/');
+                if trimmed.is_empty() || trimmed.starts_with('/') {
+                    trimmed.to_owned()
+                } else {
+                    format!("/{trimmed}")
+                }
+            })
+            .collect();
+        self.write = write;
+        self
+    }
+
+    /// Is a `verb` request for `stripped_path` (the path after
+    /// [`Self::strip_prefix`], query included) within this route's scope?
+    ///
+    /// Pure: the verdict depends only on the route and the two arguments.
+    /// The path is checked before the method, so a push to a repository
+    /// outside the scope is reported as outside the scope.
+    pub fn permits(&self, verb: &str, stripped_path: &str) -> Result<(), ScopeDenial> {
+        if !self.paths.is_empty() && !self.paths.iter().any(|p| under_prefix(stripped_path, p)) {
+            return Err(ScopeDenial::OutsideScope);
+        }
+        if self.write {
+            return Ok(());
+        }
+        let path_only = stripped_path.split('?').next().unwrap_or_default();
+        let read_only = match verb {
+            "GET" | "HEAD" | "OPTIONS" => true,
+            "POST" => path_only.ends_with("/git-upload-pack"),
+            _ => false,
+        };
+        if read_only {
+            Ok(())
+        } else {
+            Err(ScopeDenial::WriteNotGranted)
+        }
     }
 
     /// Header names (matched case-insensitively) to remove from the client's
@@ -130,8 +231,7 @@ impl GatewayRoute {
     /// Does `path` fall under this route's prefix? `/anthropic` matches
     /// `/anthropic`, `/anthropic/v1` and `/anthropic?x`, never `/anthropicx`.
     pub fn matches_path(&self, path: &str) -> bool {
-        path.strip_prefix(self.prefix.as_str())
-            .is_some_and(|rest| matches!(rest.as_bytes().first(), None | Some(b'/' | b'?')))
+        under_prefix(path, &self.prefix)
     }
 
     /// Does this route serve `parsed`? Only forward requests can match.
@@ -236,6 +336,13 @@ impl GatewayRoute {
     }
 }
 
+/// Is `path` exactly `prefix`, or `prefix` followed by `/` or `?`? The one
+/// boundary rule for route prefixes and scope paths alike.
+fn under_prefix(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| matches!(rest.as_bytes().first(), None | Some(b'/' | b'?')))
+}
+
 impl fmt::Debug for GatewayRoute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GatewayRoute")
@@ -244,6 +351,8 @@ impl fmt::Debug for GatewayRoute {
             .field("header", &self.header)
             .field("value", &self.value)
             .field("strip", &self.strip)
+            .field("paths", &self.paths)
+            .field("write", &self.write)
             .finish_non_exhaustive()
     }
 }
@@ -440,6 +549,12 @@ mod tests {
         let debug = format!("{r:?}");
         assert!(debug.contains("/anthropic") && debug.contains("Secret(<redacted>)"));
         assert!(!debug.contains(SECRET), "{debug}");
+        let debug = format!("{:?}", scoped(false));
+        assert!(
+            debug.contains(REPO) && debug.contains("write: false"),
+            "{debug}"
+        );
+        assert!(!debug.contains(SECRET), "{debug}");
 
         let bad = GatewayRoute::new(
             "/g",
@@ -493,5 +608,145 @@ mod tests {
         let ip = GatewayRoute::new("/a", "127.0.0.1", 8080, "x", secret()).unwrap();
         assert_eq!(ip.target().to_string(), "127.0.0.1:8080");
         assert_eq!(ip.prefix(), "/a");
+    }
+    const REPO: &str = "/hexrift/WardOS.git";
+    const API: &str = "/repos/hexrift/WardOS";
+
+    fn scoped(write: bool) -> GatewayRoute {
+        GatewayRoute::new(
+            "/github",
+            "github.com",
+            443,
+            "Authorization",
+            Secret::from(SECRET),
+        )
+        .unwrap()
+        .scope([REPO, API], write)
+    }
+
+    #[test]
+    fn permits_checks_scope_paths_at_segment_boundaries() {
+        let r = scoped(true);
+        for p in [
+            REPO,
+            "/hexrift/WardOS.git/",
+            "/hexrift/WardOS.git/info/refs?service=git-upload-pack",
+            "/hexrift/WardOS.git?x=1",
+            API,
+            "/repos/hexrift/WardOS/pulls?state=open",
+        ] {
+            assert_eq!(r.permits("GET", p), Ok(()), "{p}");
+        }
+        for p in [
+            "/hexrift/WardOS.gitx",
+            "/hexrift/WardOS.gi",
+            "/hexrift/WardOS",
+            "/hexrift/other.git/info/refs",
+            "/other/WardOS.git",
+            "/repos/hexrift/WardOSx",
+            "/repos/hexrift",
+            "/",
+            "/?path=/hexrift/WardOS.git",
+            "hexrift/WardOS.git",
+        ] {
+            assert_eq!(r.permits("GET", p), Err(ScopeDenial::OutsideScope), "{p}");
+        }
+        // Path before method: a push to another repository is "outside
+        // scope", not "write not granted".
+        assert_eq!(
+            scoped(false).permits("POST", "/hexrift/other.git/git-receive-pack"),
+            Err(ScopeDenial::OutsideScope)
+        );
+    }
+
+    #[test]
+    fn permits_read_only_method_matrix() {
+        let ro = scoped(false);
+        let refs = "/hexrift/WardOS.git/info/refs?service=git-upload-pack";
+        for verb in ["GET", "HEAD", "OPTIONS"] {
+            assert_eq!(ro.permits(verb, refs), Ok(()), "{verb}");
+            assert_eq!(ro.permits(verb, API), Ok(()), "{verb}");
+        }
+        // A fetch is a POST and still a read; the query does not matter.
+        assert_eq!(
+            ro.permits("POST", "/hexrift/WardOS.git/git-upload-pack"),
+            Ok(())
+        );
+        assert_eq!(
+            ro.permits("POST", "/hexrift/WardOS.git/git-upload-pack?x=1"),
+            Ok(())
+        );
+        for (verb, path) in [
+            ("POST", "/hexrift/WardOS.git/git-receive-pack"),
+            ("POST", "/hexrift/WardOS.git/git-upload-packx"),
+            ("POST", "/hexrift/WardOS.git/git-upload-pack/x"),
+            ("POST", "/hexrift/WardOS.git?git-upload-pack"),
+            ("POST", "/repos/hexrift/WardOS/issues"),
+            ("PUT", "/repos/hexrift/WardOS/contents/x"),
+            ("PATCH", "/repos/hexrift/WardOS"),
+            ("DELETE", "/repos/hexrift/WardOS"),
+            ("get", REPO),
+            ("PROPFIND", REPO),
+        ] {
+            assert_eq!(
+                ro.permits(verb, path),
+                Err(ScopeDenial::WriteNotGranted),
+                "{verb} {path}"
+            );
+        }
+        let rw = scoped(true);
+        for (verb, path) in [
+            ("POST", "/hexrift/WardOS.git/git-receive-pack"),
+            ("PUT", "/repos/hexrift/WardOS/contents/x"),
+            ("DELETE", "/repos/hexrift/WardOS"),
+        ] {
+            assert_eq!(rw.permits(verb, path), Ok(()), "{verb} {path}");
+        }
+        assert_eq!(
+            ScopeDenial::OutsideScope.to_string(),
+            "outside credential scope"
+        );
+        assert_eq!(
+            ScopeDenial::WriteNotGranted.to_string(),
+            "write not granted"
+        );
+    }
+
+    #[test]
+    fn empty_scope_permits_every_path_and_an_unscoped_route_everything() {
+        // No `scope` call: the model-API routes keep working unchanged.
+        let open = route();
+        for (verb, path) in [("POST", "/v1/messages"), ("DELETE", "/anything?x")] {
+            assert_eq!(open.permits(verb, path), Ok(()), "{verb} {path}");
+        }
+        // Empty list: every path, but the write flag still applies.
+        let ro = route().scope(Vec::<String>::new(), false);
+        assert_eq!(ro.permits("GET", "/v1/models"), Ok(()));
+        assert_eq!(
+            ro.permits("POST", "/v1/messages"),
+            Err(ScopeDenial::WriteNotGranted)
+        );
+        // A bare `/` covers everything; a trailing slash is not a stricter
+        // prefix; a missing leading slash is supplied.
+        assert_eq!(route().scope(["/"], true).permits("GET", "/x"), Ok(()));
+        let trailing = route().scope(["/hexrift/WardOS.git/"], true);
+        assert_eq!(trailing.permits("GET", REPO), Ok(()));
+        assert_eq!(
+            trailing.permits("GET", "/hexrift/WardOS.git/info/refs"),
+            Ok(())
+        );
+        assert_eq!(
+            trailing.permits("GET", "/hexrift/WardOS.gitx"),
+            Err(ScopeDenial::OutsideScope)
+        );
+        let bare = route().scope(["hexrift/WardOS.git"], true);
+        assert_eq!(bare.permits("GET", REPO), Ok(()));
+        // A second call replaces the first.
+        let replaced = route().scope([REPO], false).scope([API], true);
+        assert_eq!(replaced.permits("DELETE", API), Ok(()));
+        assert_eq!(
+            replaced.permits("GET", REPO),
+            Err(ScopeDenial::OutsideScope)
+        );
     }
 }

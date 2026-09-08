@@ -24,7 +24,10 @@
 //! call its model API through `http://127.0.0.1:3128/anthropic` with a
 //! placeholder token: the proxy rewrites the request to the real HTTPS
 //! upstream (policy-checked and pinned like any other destination) and
-//! injects the real credential, a [`Secret`] that is unprintable by type.
+//! injects the real credential, a [`Secret`] that is unprintable by type. A
+//! route's [`scope`](GatewayRoute::scope) (path prefixes, read or write) is
+//! where a `CredentialScope` is enforced: an out-of-scope request is `403`
+//! before any upstream connection.
 //!
 //! # Layout
 //!
@@ -36,7 +39,7 @@
 //! | [`resolve`] | `Resolver` trait, `SystemResolver`, `StaticResolver` |
 //! | [`http`] | Bounded, strict request parsing; origin-form rewrite; body framing |
 //! | [`secret`] | `Secret`: no `Display`, redacted `Debug`, zeroed on drop |
-//! | [`gateway`] | `GatewayRoute`: prefix match, rewrite + injection, TLS upstream |
+//! | [`gateway`] | `GatewayRoute`: prefix match, credential scope, rewrite + injection, TLS upstream |
 //! | [`observer`] | `Observer`, `Decision`, `NullObserver` |
 //! | [`proxy`] | `Config`, `Proxy::spawn`, `Handle`, the thread-per-connection relay |
 //!
@@ -65,7 +68,7 @@ pub mod secret;
 
 pub use addr::AddrClass;
 pub use error::Error;
-pub use gateway::GatewayRoute;
+pub use gateway::{GatewayRoute, ScopeDenial};
 pub use http::{Header, Host, Method, ParseError, Parsed, Request, Target};
 pub use observer::{Decision, NullObserver, Observer};
 pub use policy::{Denial, Pinned, Policy};
