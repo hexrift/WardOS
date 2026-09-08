@@ -4,6 +4,8 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -89,13 +91,13 @@ fn start(config: Config) -> (Handle, Arc<Recorder>) {
 }
 
 fn client(handle: &Handle) -> TcpStream {
-    let s = TcpStream::connect(handle.local_addr()).unwrap();
+    let s = TcpStream::connect(handle.local_addr().expect("tcp listener")).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     s
 }
 
 /// Read until the blank line that ends a response head.
-fn read_head(stream: &mut TcpStream) -> String {
+fn read_head(stream: &mut impl Read) -> String {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     while !buf.ends_with(b"\r\n\r\n") {
@@ -106,7 +108,7 @@ fn read_head(stream: &mut TcpStream) -> String {
 }
 
 /// Read a whole `Connection: close` response.
-fn read_all(stream: &mut TcpStream) -> String {
+fn read_all(stream: &mut impl Read) -> String {
     let mut out = String::new();
     stream.read_to_string(&mut out).unwrap();
     out
@@ -265,7 +267,7 @@ fn capacity_is_bounded_with_503() {
 fn shutdown_stops_the_listener_and_open_tunnels() {
     let echo = spawn_echo();
     let (proxy, _) = start(custom_localhost());
-    let addr = proxy.local_addr();
+    let addr = proxy.local_addr().unwrap();
     let mut c = client(&proxy);
     c.write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", echo.port()).as_bytes())
         .unwrap();
@@ -278,4 +280,89 @@ fn shutdown_stops_the_listener_and_open_tunnels() {
     // Nothing accepts any more.
     let refused = TcpStream::connect_timeout(&addr, Duration::from_secs(1));
     assert!(refused.is_err() || read_all(&mut refused.unwrap()).is_empty());
+}
+
+/// A short, unique socket path under the system temp dir (`sun_path` is small).
+fn socket_path(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("wp-{tag}-{}.sock", std::process::id()))
+}
+
+#[test]
+fn unix_listener_tunnels_exactly_like_tcp() {
+    let echo = spawn_echo();
+    let path = socket_path("tunnel");
+    let (proxy, recorder) = start(custom_localhost().listen_unix(&path));
+    assert_eq!(proxy.local_addr(), None);
+    assert_eq!(proxy.unix_path(), Some(path.as_path()));
+
+    let mut c = UnixStream::connect(&path).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let target = format!("127.0.0.1:{}", echo.port());
+    c.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+        .unwrap();
+    let head = read_head(&mut c);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let payload = b"over a unix socket \x16\x03\x01";
+    c.write_all(payload).unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    c.read_exact(&mut echoed).unwrap();
+    assert_eq!(echoed, payload);
+
+    let (req, decision, reason) = recorder.last();
+    assert_eq!(decision, Decision::Allow);
+    assert_eq!(req.method, Method::Connect);
+    assert_eq!(req.target.port, echo.port());
+    assert!(reason.starts_with("pinned "), "{reason}");
+
+    c.shutdown(Shutdown::Write).unwrap();
+    let mut rest = Vec::new();
+    c.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty());
+
+    // Policy is the same policy: a denial over Unix is the same 403.
+    let mut d = UnixStream::connect(&path).unwrap();
+    d.write_all(b"CONNECT 10.0.0.1:80 HTTP/1.1\r\n\r\n")
+        .unwrap();
+    assert!(read_all(&mut d).starts_with("HTTP/1.1 403"));
+    assert_eq!(recorder.last().1, Decision::Deny);
+}
+
+#[test]
+fn unix_shutdown_unlinks_the_socket_and_closes_tunnels() {
+    let echo = spawn_echo();
+    let path = socket_path("shutdown");
+    let (proxy, _) = start(custom_localhost().listen_unix(&path));
+    let mut c = UnixStream::connect(&path).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", echo.port()).as_bytes())
+        .unwrap();
+    assert!(read_head(&mut c).starts_with("HTTP/1.1 200"));
+
+    proxy.shutdown();
+    let mut rest = Vec::new();
+    c.read_to_end(&mut rest).unwrap();
+    assert!(!path.exists(), "socket file left behind");
+    assert!(UnixStream::connect(&path).is_err());
+    // Idempotent: a second shutdown (and the eventual drop) is a no-op.
+    proxy.shutdown();
+}
+
+#[test]
+fn unix_request_timeout_drops_a_silent_client() {
+    let path = socket_path("timeout");
+    let (proxy, recorder) = start(
+        custom_localhost()
+            .listen_unix(&path)
+            .request_timeout(Duration::from_millis(300)),
+    );
+    let mut c = UnixStream::connect(&path).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let started = std::time::Instant::now();
+    // Never send a head: the proxy must hang up, not wait forever.
+    assert!(read_all(&mut c).is_empty());
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(recorder.0.lock().unwrap().is_empty());
+    drop(proxy);
+    assert!(!path.exists());
 }

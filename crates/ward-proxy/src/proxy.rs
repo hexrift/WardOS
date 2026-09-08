@@ -4,10 +4,20 @@
 //! [`Config::max_connections`]; a tunnel uses a second thread for the return
 //! direction. Everything is blocking std I/O with timeouts, so shutdown is a
 //! flag the relay loops poll rather than a cancellation token.
+//!
+//! Clients arrive over TCP or over a Unix-domain socket
+//! ([`Config::listen_unix`]) — the latter is what a sandbox with its own
+//! network namespace is handed, bind-mounted in. Both transports share one
+//! connection handler through the private [`Conn`] trait; upstream
+//! connections are always TCP to pinned addresses.
 
 use std::fmt;
+use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -26,10 +36,19 @@ const POLL: Duration = Duration::from_millis(250);
 /// Relay buffer size.
 const RELAY_BUF: usize = 16 * 1024;
 
+/// Where clients are accepted from. Also records what was actually bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Listen {
+    /// A TCP listener; port `0` requests a free port.
+    Tcp(SocketAddr),
+    /// A Unix-domain socket at this path, mode `0600`, unlinked on shutdown.
+    Unix(PathBuf),
+}
+
 /// Proxy configuration. Build with [`Config::new`] and the setters.
 #[derive(Clone)]
 pub struct Config {
-    listen: SocketAddr,
+    listen: Listen,
     capability: NetworkCapability,
     resolver: Arc<dyn Resolver>,
     max_connections: usize,
@@ -44,7 +63,7 @@ impl Config {
     /// 15 s to send a request head, 10 s to connect upstream, 5 min idle.
     pub fn new(capability: NetworkCapability) -> Self {
         Self {
-            listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            listen: Listen::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
             capability,
             resolver: Arc::new(SystemResolver),
             max_connections: 64,
@@ -55,10 +74,22 @@ impl Config {
         }
     }
 
-    /// Address to listen on. Port `0` picks a free port; see [`Handle::local_addr`].
+    /// TCP address to listen on (the default transport). Port `0` picks a
+    /// free port; see [`Handle::local_addr`]. Replaces any [`Self::listen_unix`].
     #[must_use]
     pub fn listen(mut self, addr: SocketAddr) -> Self {
-        self.listen = addr;
+        self.listen = Listen::Tcp(addr);
+        self
+    }
+
+    /// Listen on a Unix-domain socket at `path` instead of TCP, so the daemon
+    /// can bind-mount the socket into a sandbox whose network namespace cannot
+    /// reach the host loopback. The parent directory must exist; a stale
+    /// socket file there is replaced, any other file is an error. The socket
+    /// is created mode `0600` and unlinked by [`Handle::shutdown`].
+    #[must_use]
+    pub fn listen_unix(mut self, path: impl Into<PathBuf>) -> Self {
+        self.listen = Listen::Unix(path.into());
         self
     }
 
@@ -153,16 +184,9 @@ pub struct Proxy;
 
 impl Proxy {
     /// Bind the listener and start accepting. Returns once the socket is
-    /// bound, so [`Handle::local_addr`] is immediately usable.
+    /// bound, so [`Handle::local_addr`] / [`Handle::unix_path`] are
+    /// immediately usable.
     pub fn spawn(config: Config, observer: Arc<dyn Observer>) -> Result<Handle, Error> {
-        let listener = TcpListener::bind(config.listen).map_err(|source| Error::Bind {
-            addr: config.listen,
-            source,
-        })?;
-        let local_addr = listener.local_addr().map_err(|source| Error::Bind {
-            addr: config.listen,
-            source,
-        })?;
         let policy = config.policy();
         let shared = Arc::new(Shared {
             policy,
@@ -175,32 +199,90 @@ impl Proxy {
             active: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
         });
-        let acceptor = {
-            let shared = Arc::clone(&shared);
-            thread::Builder::new()
-                .name("ward-proxy-accept".into())
-                .spawn(move || accept_loop(&listener, &shared))
-                .map_err(Error::Spawn)?
+        let (bound, acceptor) = match config.listen {
+            Listen::Tcp(addr) => {
+                let bind_err = |source| Error::Bind { addr, source };
+                let listener = TcpListener::bind(addr).map_err(bind_err)?;
+                let local = listener.local_addr().map_err(bind_err)?;
+                (Listen::Tcp(local), spawn_acceptor(listener, &shared)?)
+            }
+            Listen::Unix(path) => {
+                let listener = bind_unix(&path)?;
+                let acceptor = spawn_acceptor(listener, &shared);
+                if acceptor.is_err() {
+                    let _ = fs::remove_file(&path);
+                }
+                (Listen::Unix(path), acceptor?)
+            }
         };
         Ok(Handle {
-            local_addr,
+            bound,
             shared,
             acceptor: Mutex::new(Some(acceptor)),
         })
     }
 }
 
+fn spawn_acceptor<L: Acceptor>(listener: L, shared: &Arc<Shared>) -> Result<JoinHandle<()>, Error> {
+    let shared = Arc::clone(shared);
+    thread::Builder::new()
+        .name("ward-proxy-accept".into())
+        .spawn(move || accept_loop(&listener, &shared))
+        .map_err(Error::Spawn)
+}
+
+/// Create the Unix listening socket: replace a stale socket file, bind, and
+/// restrict the node to `0600`. The listener is left non-blocking so the
+/// accept loop can poll the shutdown flag instead of parking in `accept`.
+fn bind_unix(path: &Path) -> Result<UnixListener, Error> {
+    let err = |source| Error::BindUnix {
+        path: path.to_path_buf(),
+        source,
+    };
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => fs::remove_file(path).map_err(err)?,
+        Ok(_) => {
+            return Err(err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                "path exists and is not a socket",
+            )));
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(err(e)),
+    }
+    // A missing parent surfaces here as `NotFound`; nothing is created.
+    let listener = UnixListener::bind(path).map_err(err)?;
+    let secured = fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .and_then(|()| listener.set_nonblocking(true));
+    if let Err(e) = secured {
+        let _ = fs::remove_file(path);
+        return Err(err(e));
+    }
+    Ok(listener)
+}
+
 /// A running proxy. Dropping it shuts the listener down.
 pub struct Handle {
-    local_addr: SocketAddr,
+    bound: Listen,
     shared: Arc<Shared>,
     acceptor: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Handle {
-    /// The bound listening address.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+    /// The bound TCP listening address; `None` for a Unix-socket listener.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        match &self.bound {
+            Listen::Tcp(addr) => Some(*addr),
+            Listen::Unix(_) => None,
+        }
+    }
+
+    /// The Unix-socket path being listened on; `None` for a TCP listener.
+    pub fn unix_path(&self) -> Option<&Path> {
+        match &self.bound {
+            Listen::Unix(path) => Some(path),
+            Listen::Tcp(_) => None,
+        }
     }
 
     /// Connections currently being served.
@@ -208,8 +290,8 @@ impl Handle {
         self.shared.active.load(Ordering::Acquire)
     }
 
-    /// Stop accepting, ask every relay to wind down, and join the acceptor.
-    /// Idempotent.
+    /// Stop accepting, ask every relay to wind down, join the acceptor and
+    /// (for a Unix listener) unlink the socket file. Idempotent.
     pub fn shutdown(&self) {
         self.shared.shutdown.store(true, Ordering::Release);
         let acceptor = self
@@ -217,10 +299,22 @@ impl Handle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(acceptor) = acceptor {
-            // Wake the blocking `accept` so it observes the flag.
-            let _ = TcpStream::connect_timeout(&self.local_addr, Duration::from_secs(1));
-            let _ = acceptor.join();
+        let Some(acceptor) = acceptor else { return };
+        // Wake the acceptor so it observes the flag now. The TCP listener
+        // blocks in `accept`, so this is required; the Unix listener is
+        // non-blocking and polls the flag anyway, so a failed connect (say
+        // the file was removed behind our back) still cannot hang the join.
+        match &self.bound {
+            Listen::Tcp(addr) => {
+                let _ = TcpStream::connect_timeout(addr, Duration::from_secs(1));
+            }
+            Listen::Unix(path) => {
+                let _ = UnixStream::connect(path);
+            }
+        }
+        let _ = acceptor.join();
+        if let Listen::Unix(path) = &self.bound {
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -234,7 +328,7 @@ impl Drop for Handle {
 impl fmt::Debug for Handle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Handle")
-            .field("local_addr", &self.local_addr)
+            .field("listen", &self.bound)
             .field("active", &self.active_connections())
             .finish_non_exhaustive()
     }
@@ -269,12 +363,79 @@ impl Drop for Slot {
     }
 }
 
-fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
-    for incoming in listener.incoming() {
+/// A client-side transport. What [`serve`] needs from a stream beyond
+/// `Read + Write`, implemented for both `TcpStream` and `UnixStream` so the
+/// two share one parsing, policy, relay and timeout path.
+trait Conn: Read + Write + Send + Sized + 'static {
+    fn try_clone(&self) -> io::Result<Self>;
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+}
+
+impl Conn for TcpStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        Self::try_clone(self)
+    }
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        Self::set_read_timeout(self, timeout)
+    }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        Self::shutdown(self, how)
+    }
+}
+
+impl Conn for UnixStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        Self::try_clone(self)
+    }
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        Self::set_read_timeout(self, timeout)
+    }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        Self::shutdown(self, how)
+    }
+}
+
+/// A listening socket yielding [`Conn`]s. `WouldBlock` from `accept` means
+/// "nothing yet" and makes [`accept_loop`] poll the shutdown flag.
+trait Acceptor: Send + 'static {
+    type Conn: Conn;
+    fn accept(&self) -> io::Result<Self::Conn>;
+}
+
+impl Acceptor for TcpListener {
+    type Conn = TcpStream;
+    fn accept(&self) -> io::Result<TcpStream> {
+        let (stream, _) = Self::accept(self)?;
+        let _ = stream.set_nodelay(true);
+        Ok(stream)
+    }
+}
+
+impl Acceptor for UnixListener {
+    type Conn = UnixStream;
+    fn accept(&self) -> io::Result<UnixStream> {
+        let (stream, _) = Self::accept(self)?;
+        // The listener is non-blocking; the connection must not be, or the
+        // per-connection read timeouts would never apply.
+        stream.set_nonblocking(false)?;
+        Ok(stream)
+    }
+}
+
+fn accept_loop<L: Acceptor>(listener: &L, shared: &Arc<Shared>) {
+    loop {
         if shared.shutting_down() {
             break;
         }
-        let Ok(mut client) = incoming else { continue };
+        let mut client = match listener.accept() {
+            Ok(client) => client,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(POLL);
+                continue;
+            }
+            Err(_) => continue,
+        };
         let Some(slot) = Slot::acquire(shared) else {
             respond(&mut client, 503, "Service Unavailable", "proxy at capacity");
             continue;
@@ -293,9 +454,8 @@ fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
 }
 
 /// Serve exactly one request on `client`.
-fn serve(mut client: TcpStream, shared: &Arc<Shared>) {
+fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
     let _ = client.set_read_timeout(Some(shared.request_timeout));
-    let _ = client.set_nodelay(true);
     let head = match http::read_head(&mut client) {
         Ok(Ok(head)) => head,
         Ok(Err(e)) => return respond(&mut client, 400, "Bad Request", &e.to_string()),
@@ -379,7 +539,7 @@ fn connect_pinned(pinned: &Pinned, timeout: Duration) -> Option<TcpStream> {
 
 /// Write a short plain-text response, then let the client finish before closing
 /// so it can read the status instead of a reset.
-fn respond(client: &mut TcpStream, status: u16, reason: &str, body: &str) {
+fn respond<C: Conn>(client: &mut C, status: u16, reason: &str, body: &str) {
     let body = format!("{body}\n");
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
@@ -419,7 +579,7 @@ impl Liveness {
 
 /// Copy bytes both ways until either side closes, the tunnel idles out, or
 /// the proxy shuts down.
-fn relay(client: TcpStream, upstream: TcpStream, shared: &Arc<Shared>) {
+fn relay<C: Conn>(client: C, upstream: TcpStream, shared: &Arc<Shared>) {
     let (Ok(client_rx), Ok(upstream_rx)) = (client.try_clone(), upstream.try_clone()) else {
         return;
     };
@@ -436,7 +596,7 @@ fn relay(client: TcpStream, upstream: TcpStream, shared: &Arc<Shared>) {
     }
 }
 
-fn pump(mut src: TcpStream, mut dst: TcpStream, live: &Liveness, shared: &Shared) {
+fn pump<S: Conn, D: Conn>(mut src: S, mut dst: D, live: &Liveness, shared: &Shared) {
     let _ = src.set_read_timeout(Some(POLL));
     let mut buf = vec![0u8; RELAY_BUF];
     loop {
@@ -464,7 +624,80 @@ fn pump(mut src: TcpStream, mut dst: TcpStream, live: &Liveness, shared: &Shared
 impl From<Error> for io::Error {
     fn from(e: Error) -> Self {
         match e {
-            Error::Bind { source, .. } | Error::Spawn(source) => source,
+            Error::Bind { source, .. } | Error::BindUnix { source, .. } | Error::Spawn(source) => {
+                source
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::observer::NullObserver;
+
+    fn socket_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("wp-unit-{tag}-{}.sock", std::process::id()))
+    }
+
+    fn spawn_unix(path: &Path) -> Result<Handle, Error> {
+        let config = Config::new(NetworkCapability::Offline).listen_unix(path);
+        Proxy::spawn(config, Arc::new(NullObserver))
+    }
+
+    #[test]
+    fn listen_defaults_to_tcp_and_the_setters_switch_transport() {
+        let config = Config::new(NetworkCapability::Offline);
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        assert_eq!(config.listen, Listen::Tcp(loopback));
+        let config = config.listen_unix("/run/ward/proxy.sock");
+        assert_eq!(
+            config.listen,
+            Listen::Unix(PathBuf::from("/run/ward/proxy.sock"))
+        );
+        assert!(format!("{config:?}").contains("proxy.sock"));
+        let tcp: SocketAddr = "127.0.0.1:3128".parse().unwrap();
+        assert_eq!(config.listen(tcp).listen, Listen::Tcp(tcp));
+    }
+
+    #[test]
+    fn unix_socket_is_private_and_unlinked_on_shutdown() {
+        let path = socket_path("mode");
+        let handle = spawn_unix(&path).unwrap();
+        assert_eq!(handle.local_addr(), None);
+        assert_eq!(handle.unix_path(), Some(path.as_path()));
+        let meta = fs::metadata(&path).unwrap();
+        assert!(meta.file_type().is_socket());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert!(format!("{handle:?}").contains("Unix"));
+        handle.shutdown();
+        assert!(!path.exists());
+        handle.shutdown();
+    }
+
+    #[test]
+    fn stale_socket_is_replaced_but_other_files_are_not() {
+        let path = socket_path("stale");
+        // Dropping a listener leaves its socket node behind.
+        drop(UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+        drop(spawn_unix(&path).unwrap());
+        assert!(!path.exists());
+
+        fs::write(&path, b"not a socket").unwrap();
+        let err = spawn_unix(&path).unwrap_err();
+        assert!(matches!(err, Error::BindUnix { .. }), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), b"not a socket");
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn missing_parent_directory_is_refused() {
+        let path = socket_path("missing").join("nested").join("proxy.sock");
+        let err = spawn_unix(&path).unwrap_err();
+        assert!(matches!(err, Error::BindUnix { ref path, .. } if path.ends_with("proxy.sock")));
+        assert_eq!(io::Error::from(err).kind(), ErrorKind::NotFound);
     }
 }
