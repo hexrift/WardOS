@@ -88,15 +88,37 @@ impl SessionMeta {
         let Some(id) = read_current(state, &project_id)? else {
             return Ok(None);
         };
-        let path = meta_path(state, &id);
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                let meta = serde_json::from_slice(&bytes)
-                    .map_err(|e| Error::Project(format!("{}: {e}", path.display())))?;
-                Ok(Some(meta))
+        match Self::load(state, &id) {
+            Ok(meta) => Ok(Some(meta)),
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::io(&path, e)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Load the record of session `id` from `sessions/<id>/session.json`.
+    pub fn load(state: &Path, id: &str) -> Result<Self> {
+        let path = meta_path(state, id);
+        let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Project(format!("{}: {e}", path.display())))
+    }
+
+    /// The immutable facts of the session, as [`Session::describe`] reports them
+    /// for a reopened session.
+    #[must_use]
+    pub fn describe(&self) -> SessionDescription {
+        let agent = self.agent.clone().unwrap_or_else(unknown_agent);
+        SessionDescription {
+            session: self.id.clone(),
+            project: self.project_id.clone(),
+            worktree: self.project.clone(),
+            started_unix_ms: self.started_unix_ms,
+            agent: Some((&agent).into()),
+            entry_snapshot: self.entry_snapshot.clone(),
+            policy_hash: self.manifest.policy_hash.to_hex(),
+            manifest: self.manifest.clone(),
         }
     }
 }
@@ -683,6 +705,10 @@ impl Session {
     }
 
     /// End the session, seal the log, and clear the project's current pointer.
+    ///
+    /// The `SessionEnded` record and the seal are one [`Sink::stop`]: a running
+    /// daemon (ADR-0015) writes them on a [`Request::Stop`](crate::control::Request::Stop)
+    /// and exits; without one this process seals the log itself.
     pub fn stop(mut self, reason: EndReason) -> Result<()> {
         self.emit(
             Origin::Wardd,
@@ -690,14 +716,7 @@ impl Session {
                 state: AgentState::Finished,
             },
         )?;
-        self.emit(
-            Origin::Wardd,
-            WardEvent::SessionEnded {
-                reason,
-                final_snapshot: None,
-            },
-        )?;
-        self.sink.seal()?;
+        self.sink.stop(reason)?;
         clear_current(&self.state, &self.project_id, &self.session_str)?;
         Ok(())
     }

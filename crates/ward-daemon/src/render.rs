@@ -561,6 +561,17 @@ pub fn session_status_line(active: Option<std::time::Duration>) -> String {
     }
 }
 
+/// One-line daemon state for the status panel: `daemon wardd · control <socket>`
+/// when a `wardd` answers on the session's control socket, or a note that
+/// commands write the log in-process otherwise.
+#[must_use]
+pub fn daemon_status_line(control: Option<&str>) -> String {
+    match control {
+        Some(socket) => format!("  {INK}daemon wardd{RESET} {DIM}· control {socket}{RESET}"),
+        None => format!("  {DIM}daemon none · commands write the log in-process{RESET}"),
+    }
+}
+
 fn human_ago(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -705,6 +716,19 @@ mod tests {
         assert!(observer_row(&records[4]).unwrap().contains(OK));
         assert_eq!(observer_row(&records[5]), None);
         assert_eq!(plain(&kind_row(&records[5])), "01:01  agent_state_changed");
+    }
+
+    #[test]
+    fn daemon_line_names_the_socket_or_the_fallback() {
+        let served = plain(&daemon_status_line(Some("sessions/sess_x/control.sock")));
+        assert_eq!(
+            served,
+            "  daemon wardd · control sessions/sess_x/control.sock"
+        );
+        assert_eq!(
+            plain(&daemon_status_line(None)),
+            "  daemon none · commands write the log in-process"
+        );
     }
 
     #[test]

@@ -90,6 +90,8 @@ pub trait Sink: Send {
     fn sync(&mut self) -> Result<()>;
     /// Seal the log.
     fn seal(self: Box<Self>) -> Result<()>;
+    /// End the session: append `SessionEnded { reason }` and seal.
+    fn stop(self: Box<Self>, reason: EndReason) -> Result<()>;
 }
 
 /// The chain and log in this process (no daemon).
@@ -159,6 +161,19 @@ impl Sink for LocalLog {
 
     fn seal(self: Box<Self>) -> Result<()> {
         self.seal_head().map(drop)
+    }
+
+    fn stop(mut self: Box<Self>, reason: EndReason) -> Result<()> {
+        self.append(Origin::Wardd, session_ended(reason), SystemTime::now())?;
+        self.seal()
+    }
+}
+
+/// The record every stop path appends before sealing.
+fn session_ended(reason: EndReason) -> WardEvent {
+    WardEvent::SessionEnded {
+        reason,
+        final_snapshot: None,
     }
 }
 
@@ -247,11 +262,19 @@ impl Sink for RemoteSink {
     }
 
     fn seal(mut self: Box<Self>) -> Result<()> {
-        match self.call(&Request::Seal)? {
-            Response::Sealed { .. } => Ok(()),
-            Response::Error(e) => Err(Error::Events(format!("daemon refused seal: {e}"))),
-            other => Err(Error::Events(format!("unexpected response {other:?}"))),
-        }
+        expect_sealed(self.call(&Request::Seal)?)
+    }
+
+    fn stop(mut self: Box<Self>, reason: EndReason) -> Result<()> {
+        expect_sealed(self.call(&Request::Stop { reason })?)
+    }
+}
+
+fn expect_sealed(response: Response) -> Result<()> {
+    match response {
+        Response::Sealed { .. } => Ok(()),
+        Response::Error(e) => Err(Error::Events(format!("daemon refused seal: {e}"))),
+        other => Err(Error::Events(format!("unexpected response {other:?}"))),
     }
 }
 
@@ -278,10 +301,26 @@ pub fn is_evidence(event: &WardEvent) -> bool {
 /// Handle one request against `log`. Returns the response to write, and whether
 /// the log was sealed (the caller stops serving afterwards).
 pub fn handle(log: &mut Option<LocalLog>, request: Request) -> (Response, bool) {
+    handle_with(log, request, |_| {})
+}
+
+/// [`handle`] with `appended` called for every record the request appends to the
+/// log, including the `SessionEnded` a [`Request::Stop`] writes before sealing;
+/// the daemon fans those out to subscribers.
+pub fn handle_with(
+    log: &mut Option<LocalLog>,
+    request: Request,
+    mut appended: impl FnMut(&EventRecord),
+) -> (Response, bool) {
     let Some(local) = log.as_mut() else {
         return (Response::Error("log is sealed".into()), true);
     };
-    let appended = |r: Result<EventRecord>| match r {
+    let mut append = |origin: Origin, event: WardEvent, at: SystemTime| {
+        let record = local.append(origin, event, at)?;
+        appended(&record);
+        Ok(record)
+    };
+    let as_response = |r: Result<EventRecord>| match r {
         Ok(record) => Response::Record(Box::new(record)),
         Err(e) => Response::Error(e.to_string()),
     };
@@ -292,7 +331,7 @@ pub fn handle(log: &mut Option<LocalLog>, request: Request) -> (Response, bool) 
             event,
             at_unix_ms,
         } if origin != Origin::TamperWard => (
-            appended(local.append(
+            as_response(append(
                 origin,
                 event,
                 UNIX_EPOCH + Duration::from_millis(at_unix_ms),
@@ -304,7 +343,7 @@ pub fn handle(log: &mut Option<LocalLog>, request: Request) -> (Response, bool) 
             false,
         ),
         Request::Evidence { event } if is_evidence(&event) => (
-            appended(local.append(Origin::TamperWard, event, SystemTime::now())),
+            as_response(append(Origin::TamperWard, event, SystemTime::now())),
             false,
         ),
         Request::Evidence { .. } => (Response::Error("not an evidence kind".into()), false),
@@ -316,15 +355,7 @@ pub fn handle(log: &mut Option<LocalLog>, request: Request) -> (Response, bool) 
         ),
         Request::Seal => seal(log),
         Request::Stop { reason } => {
-            let ended = local.append(
-                Origin::Wardd,
-                WardEvent::SessionEnded {
-                    reason,
-                    final_snapshot: None,
-                },
-                SystemTime::now(),
-            );
-            match ended {
+            match append(Origin::Wardd, session_ended(reason), SystemTime::now()) {
                 Ok(_) => seal(log),
                 Err(e) => (Response::Error(e.to_string()), false),
             }
