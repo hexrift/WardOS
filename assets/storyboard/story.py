@@ -45,7 +45,8 @@ def bar(t, session=None, agent=None, tw=None, verify=None, ws=1):
         if agent: left += cell(agent, A)
         left += cell("NET restricted (dev)", R)
         if tw: left += cell("TW ✓", V)
-        if verify: left += cell("VERIFY ✓", V)
+        if verify == "ok": left += cell("VERIFY ✓ 7c01…", V)
+        elif verify == "stale": left += cell("VERIFY ~ STALE", R)
     wsd = "".join(f'<div class="ws" style="color:{T if i==ws else M};border-bottom-color:{A if i==ws else "transparent"}">{i}</div>' for i in (1,2,3))
     right = "".join(cell(x, M) for x in ["vol 60%", "wlp3s0", "bt", "82%", "cpu 3%", "mem 2.1G"]) + cell("23:41", T, last=True)
     return f'<div class="bar"><div class="l">{left}</div><div class="c">{wsd}</div><div class="r">{right}</div></div>'
@@ -108,6 +109,11 @@ def observer(extra=""):
     out = "\n".join(f'{col(t,"WARDOS_TEXT_MUTED",ts)}  {col(t,k,kind.ljust(5))} {E(msg)}' for ts,kind,msg,k in rows)
     return win(1148, 56, 748, 1000, "● WARD │ sess_01M20HZ… │ ward-demo │ CLAUDE ● working │ LIVE", out + extra)
 add(t, bar(t, "ward-demo", "CLAUDE ● working", tw=True) + win(24, 56, 1100, 1000, None, term) + observer(), "working · the agent edits code; the protected test is refused; ward watch shows every row", 2800)
+# 8b. Verify freshness: a pass, then an edit turns it STALE
+verify_term = term.replace('%s ' % col(t,"WARDOS_ACCENT","›") + '<span class="cursor"></span>', col(t,"WARDOS_ACCENT","$") + ' ward verify\n  ' + col(t,"WARDOS_VERIFIED","✓ VERIFIED") + ' ' + col(t,"WARDOS_TEXT_MUTED","· candidate 7c01f9a · 3 tests · 0.3s") + '\n\n' + col(t,"WARDOS_ACCENT","›") + ' <span class="cursor"></span>')
+add(t, bar(t, "ward-demo", "CLAUDE ● working", tw=True, verify="ok") + win(24, 56, 1100, 1000, None, verify_term) + observer(f'\n{col(t,"WARDOS_TEXT_MUTED","00:22")}  {col(t,"WARDOS_VERIFIED","VERIFY")} candidate 7c01f9a · 3 tests'), "ward verify · VERIFY ✓ names the candidate the green mark is bound to", 2400)
+stale_term = verify_term.replace(col(t,"WARDOS_ACCENT","›") + ' <span class="cursor"></span>', col(t,"WARDOS_ACCENT","›") + ' edit one line of src/lib.rs\n\n' + col(t,"WARDOS_TEXT_MUTED","● Edit src/lib.rs") + '\n\n' + col(t,"WARDOS_ACCENT","›") + ' <span class="cursor"></span>')
+add(t, bar(t, "ward-demo", "CLAUDE ● working", tw=True, verify="stale") + win(24, 56, 1100, 1000, None, stale_term) + observer(f'\n{col(t,"WARDOS_TEXT_MUTED","00:22")}  {col(t,"WARDOS_VERIFIED","VERIFY")} candidate 7c01f9a · 3 tests\n{col(t,"WARDOS_TEXT_MUTED","00:29")}  {col(t,"WARDOS_TEXT_MUTED","EDIT ")} src/lib.rs') + notif("Verification is stale", "The worktree no longer digests to 7c01f9a; the green mark is gone until ward verify runs again."), "the moment the tree changes, VERIFY ~ STALE · green never outlives the state it judged", 2600)
 # 9. Approval
 appr = notif("Claude requests", f'<tt>api.github.com</tt><br>Reason  Read GitHub issue #381<br>Scope   WebFetch<br><span style="color:{t["WARDOS_TEXT_MUTED"]}">y allow once · s allow for the session · n deny</span>', appr=True, prog=62)
 add(t, bar(t, "ward-demo", "CLAUDE ● waiting", tw=True) + win(24, 56, 1100, 1000, None, term) + observer(f'\n{col(t,"WARDOS_TEXT_MUTED","00:24")}  {col(t,"WARDOS_RESTRICTED","ASK  ")} WebFetch api.github.com') + appr, "an approval · held by the daemon, answered with y, s or n", 2200)
