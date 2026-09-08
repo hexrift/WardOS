@@ -354,10 +354,13 @@ impl Session {
         let run_dir = run_dir(&self.session_str)?;
         let egress = Egress::start(&run_dir, &self.manifest.network)?;
         let mut launch = Launch::new(&self.worktree, argv.to_vec()).egress(egress.socket());
-        if let Some(shim) = find_shim() {
-            // With the shim present the relay exists, so proxy-aware tools get a proxy.
+        // The shim is used only when it can relay to the egress socket; an older build
+        // without `--relay` would reject the flag, so fall back to a direct exec (still
+        // isolated by bwrap; the socket is bound for socket-aware tools).
+        if let Some(shim) = find_shim().filter(|s| s.relay) {
             launch = launch
-                .shim(shim)
+                .shim_flags(shim.flags())
+                .shim(shim.path)
                 .env("HTTP_PROXY", format!("http://{RELAY_ADDR}"))
                 .env("HTTPS_PROXY", format!("http://{RELAY_ADDR}"))
                 .env("NO_PROXY", "localhost,127.0.0.1");

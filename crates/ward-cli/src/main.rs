@@ -217,6 +217,9 @@ fn cmd_run(dir: &Path, argv: &[String]) -> ward_daemon::Result<ExitCode> {
     if !report.stdout.is_empty() {
         println!("\n{}", report.stdout.trim_end());
     }
+    if code != Some(0) && !report.stderr.is_empty() {
+        eprintln!("\n{}", report.stderr.trim_end());
+    }
     Ok(exit_code(code))
 }
 

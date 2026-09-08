@@ -95,6 +95,7 @@ pub struct Launch {
     env: Vec<(String, String)>,
     proxy_socket: Option<PathBuf>,
     shim: Option<PathBuf>,
+    shim_flags: Vec<String>,
     stdio: StdioMode,
 }
 
@@ -107,6 +108,7 @@ impl Launch {
             env: Vec::new(),
             proxy_socket: None,
             shim: None,
+            shim_flags: Vec::new(),
             stdio: StdioMode::Capture,
         }
     }
@@ -122,6 +124,13 @@ impl Launch {
     #[must_use]
     pub fn shim(mut self, path: impl Into<PathBuf>) -> Self {
         self.shim = Some(path.into());
+        self
+    }
+
+    /// Extra flags for the shim (e.g. `--allow-no-landlock` on kernels without Landlock).
+    #[must_use]
+    pub fn shim_flags(mut self, flags: Vec<String>) -> Self {
+        self.shim_flags = flags;
         self
     }
 
@@ -212,6 +221,7 @@ impl Launch {
         push(&mut a, &["--"]);
         if self.shim.is_some() {
             push(&mut a, &[AGENT_SHIM]);
+            a.extend(self.shim_flags.iter().cloned());
             if self.proxy_socket.is_some() {
                 a.push("--relay".into());
                 a.push(format!("{RELAY_ADDR}={PROXY_SOCKET}"));
@@ -269,15 +279,47 @@ pub fn run(worktree: &Path, _network: &NetworkCapability, argv: &[String]) -> Re
     Launch::new(worktree, argv.to_vec()).run()
 }
 
-/// Locate the `ward-agent` shim: `$WARD_AGENT_BIN`, else a sibling of this executable.
-pub fn find_shim() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("WARD_AGENT_BIN") {
-        let p = PathBuf::from(p);
-        return p.is_file().then_some(p);
+/// What the located `ward-agent` shim supports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shim {
+    /// Host path of the binary (bound read-only into the sandbox).
+    pub path: PathBuf,
+    /// Whether this build accepts `--relay` (ADR-0014).
+    pub relay: bool,
+    /// Whether the running kernel enforces Landlock; if not the shim is told to
+    /// continue with seccomp only, and the session records the degradation.
+    pub landlock: bool,
+}
+
+impl Shim {
+    /// Flags the daemon passes to this shim.
+    #[must_use]
+    pub fn flags(&self) -> Vec<String> {
+        if self.landlock {
+            Vec::new()
+        } else {
+            vec!["--allow-no-landlock".into()]
+        }
     }
-    let exe = std::env::current_exe().ok()?;
-    let sibling = exe.parent()?.join("ward-agent");
-    sibling.is_file().then_some(sibling)
+}
+
+/// Locate and probe the `ward-agent` shim: `$WARD_AGENT_BIN`, else a sibling of this
+/// executable. Returns `None` when no usable shim exists.
+pub fn find_shim() -> Option<Shim> {
+    let path = match std::env::var("WARD_AGENT_BIN") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => std::env::current_exe().ok()?.parent()?.join("ward-agent"),
+    };
+    if !path.is_file() {
+        return None;
+    }
+    let help = Command::new(&path).arg("--help").output().ok()?;
+    let text = String::from_utf8_lossy(&help.stdout);
+    Some(Shim {
+        path,
+        relay: text.contains("--relay"),
+        landlock: ward_agent::landlock::is_available(),
+    })
 }
 
 #[cfg(test)]

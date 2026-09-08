@@ -746,6 +746,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "ward-agent",
  "ward-events",
  "ward-policy",
  "ward-proxy",
