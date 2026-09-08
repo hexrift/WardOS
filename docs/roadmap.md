@@ -159,6 +159,22 @@ first Ward Shell components (bar + session panel + approvals) on Hyprland per
 Acceptance: observer latency < 25 ms p99; step-through holds commands and network
 requests; write holds either hard (E-11) or documented as best-effort; ST-020 passes.
 
+### Phase 5–7 — started
+
+The desktop layer has begun without a graphics stack, so that what the shell shows is
+decided and tested before E-10 decides how it is drawn. `crates/ward-shell-core` is the
+Ward Shell view model per [`design-language.md`](design-language.md) (trust bar,
+session panel, observer feed, command centre, semantic settings), derived from
+`SessionDescription` and the event stream alone; the `ward watch` TUI now draws from
+it, so there is one implementation of the observer's counters and state.
+`desktop/shell` is the `ward-shell` binary, a daemon client that prints each surface
+(`gui` feature reserved for the toolkit after E-10). `desktop/hyprland` is the
+compositor configuration (architecture §11 bindings, §5 geometry, §12 motion) and
+`desktop/themes` the four official themes as token files, both destined for the Phase 6
+image. Still ahead in Phase 5: E-10 and the first layer-shell surfaces (bar, session
+panel, approvals), step-through holds; Phase 6 and 7 have not started beyond these
+files.
+
 ## Phase 6 — Immutable image
 
 Fedora bootc image: Hyprland, Ward Shell, `ward*`, container tooling, development

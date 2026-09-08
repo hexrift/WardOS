@@ -1,0 +1,20 @@
+[package]
+name = "ward-shell-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WardOS: the Ward Shell view model (trust bar, observer feed, launcher, settings), toolkit-free"
+
+[lib]
+name = "ward_shell_core"
+path = "src/lib.rs"
+
+[dependencies]
+ward-daemon = { path = "../ward-daemon", version = "0.1.0" }
+ward-events = { path = "../ward-events", version = "0.1.0" }
+ward-policy = { path = "../ward-policy", version = "0.1.0" }
+
+[lints]
+workspace = true

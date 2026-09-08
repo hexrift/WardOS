@@ -1,0 +1,56 @@
+# Ward Light (docs/design-language.md §3).
+#
+# The neutral values are fixed by the design language; the state colours are
+# "same, darker" than Ward Dark's, so each is Ward Dark's hue darkened until
+# it reads on the off-white ground at ≥ 4.5:1 (derived).
+
+[meta]
+name = "Ward Light"
+id = "ward-light"
+variant = "light"
+contrast = "standard"
+source = "design-language.md §3"
+
+[palette]
+ground = { value = "#F4F4F2", role = "Host layer", source = "design-language.md §3" }
+panel = { value = "#EAEAE7", role = "Surfaces", source = "design-language.md §3" }
+separator = { value = "#D6D6D2", role = "Separator", source = "design-language.md §3" }
+text = { value = "#1A1B1E", role = "Primary text", source = "design-language.md §3" }
+text_muted = { value = "#6B6E73", role = "Secondary text", source = "design-language.md §3" }
+accent = { value = "#4F7398", role = "Active agent, focus, selection", source = "derived: Ward Dark accent, darker" }
+verified = { value = "#3F7F5B", role = "Verified, pass", source = "derived: Ward Dark verified, darker" }
+restricted = { value = "#8A6A1F", role = "Restricted, ask pending", source = "derived: Ward Dark restricted, darker" }
+denied = { value = "#A33E3E", role = "Denied, failed", source = "derived: Ward Dark denied, darker" }
+
+[tones]
+dim = "text_muted"
+ink = "text"
+accent = "accent"
+ok = "verified"
+warn = "restricted"
+deny = "denied"
+
+# Nearest xterm-256 cells to the light palette (derived).
+[terminal]
+dim = 243
+ink = 234
+accent = 67
+ok = 65
+warn = 136
+deny = 131
+
+[geometry]
+radius_px = 6
+separator_px = 1
+grid_px = 8
+shadow_levels = 1
+
+[motion]
+transition_ms = 120
+easing = "ease-out"
+animated = ["agent-start", "workspace-change", "verification-begin", "approval-appear", "agent-finish"]
+
+[typography]
+sans = ["Inter", "Geist", "sans-serif"]
+mono = ["JetBrains Mono", "Commit Mono", "monospace"]
+tabular_numerals = true

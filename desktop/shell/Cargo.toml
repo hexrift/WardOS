@@ -1,0 +1,32 @@
+[package]
+name = "ward-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WardOS: the Ward Shell (bar, command centre, session panel, observer, settings) on Hyprland"
+
+[[bin]]
+name = "ward-shell"
+path = "src/main.rs"
+
+[features]
+default = []
+# The layer-shell toolkit lands behind this feature once E-10 has chosen it
+# (ADR-0007: iced + iced_layershell, or GTK4-rs + gtk4-layer-shell). Until then
+# the feature adds no dependency and the binary says so at start; every surface
+# is still the text dump. It must keep building under `--all-features`, which the
+# protected verify script uses.
+gui = []
+
+[dependencies]
+ward-shell-core = { path = "../../crates/ward-shell-core", version = "0.1.0" }
+ward-daemon = { path = "../../crates/ward-daemon", version = "0.1.0" }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

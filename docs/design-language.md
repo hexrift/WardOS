@@ -279,3 +279,36 @@ a terminal has one face, so the verb column is distinguished by its fixed width 
 colour instead. Motion: none; the view redraws on a 50 ms tick, well inside §12's
 budget, and nothing animates, not even the seal. The status line's counters are
 §8-of-`event-model.md`'s footer, not a §6 element.
+
+## As built: shell scaffold (Phase 5 start)
+
+The shell's view model exists before its toolkit. `crates/ward-shell-core` derives every
+surface named here from two inputs only, the session's `SessionDescription` and its
+`EventRecord`s, with a colour role (`Tone`: dim, ink, accent, verified, restricted,
+denied) on each element and no graphics dependency: the trust bar (§6) as segments
+`session · project · agent · network · credentials · observer · TamperWard · verified ·
+daemon`, where the agent (`CLAUDE ● working`, §7 glyphs and words), `TW ✓`/`TW ■` and
+`VERIFYING`/`VERIFY ✓`/`VERIFY ✗` appear only once the stream has said so, and a sealed
+log dims the state marker, the network word, the daemon word and the agent but never a
+verdict; the session panel (§6) as `Session` and `TamperWard` rows; the observer feed
+(§8), which is the `ward watch` TUI's `Model` moved here so the TUI and the shell share
+one implementation of the counters and the follow/scroll state (the TUI's bar is the
+same `TrustBar` with the three stream-derived segments omitted, unchanged to the byte);
+the command centre (§13) with its four sections, session rows carrying §7 states, and
+filtering by typed text; and the semantic settings (§14) as read-only rows (`Repository
+Read & Write`, `Internet Restricted`, `Private network Denied` derived from the
+manifest's own invariant, one row per credential rule, `Containers`, `Observer`, and an
+`Advanced` group with the manifest hash). `desktop/shell` is the `ward-shell` binary:
+a client of the session daemon like `ward watch`, it asks for the description, catches
+up with the stream, and prints the surface asked for (`bar`, `session`, `launcher`,
+`observer`, `settings`) or `no session`; its `gui` feature is where the layer-shell
+toolkit lands after E-10 and today adds nothing but a notice. `desktop/hyprland` carries
+the bindings of `architecture.md` §11 plus `Super + S` (session panel), `Super + O`
+(observer toggle) and `Super + Shift + S` (permissions), the §5 geometry, and §12's
+motion rule as configuration: every compositor animation off except the workspace
+change (120 ms, ease-out) and a layer's appearance (approvals, 100 ms fade).
+`desktop/themes` holds the four official variants as TOML with every token of §3
+named and its source recorded; where this document names a variant without values
+(Graphite, High Contrast, Light's state colours) the value is derived and marked so.
+Not yet built: the approval surface (§10), the verification display (§11), fonts (§4),
+and any pixel.

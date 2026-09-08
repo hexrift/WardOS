@@ -1,0 +1,58 @@
+# Ward High Contrast — WCAG AAA (docs/design-language.md §3).
+#
+# The design names the variant and its target (AAA: ≥ 7:1 for text) and gives
+# no values, so every token is derived: pure black ground, white text, and the
+# four state hues lightened until each clears 7:1 on the ground while keeping
+# its identity (green stays green, amber amber, red red). Hue is preserved so a
+# user switching from Ward Dark reads the same meanings.
+
+[meta]
+name = "Ward High Contrast"
+id = "ward-high-contrast"
+variant = "dark"
+contrast = "AAA"
+source = "design-language.md §3 (named only; values derived)"
+
+[palette]
+ground = { value = "#000000", role = "Host layer", source = "derived: AAA ground" }
+panel = { value = "#0A0A0A", role = "Surfaces", source = "derived" }
+separator = { value = "#3A3A3A", role = "Separator", source = "derived: visible 1 px on black" }
+text = { value = "#FFFFFF", role = "Primary text", source = "derived: 21:1 on ground" }
+text_muted = { value = "#C8C8C8", role = "Secondary text", source = "derived: ≥ 12:1 on ground" }
+accent = { value = "#9CC3EA", role = "Active agent, focus, selection", source = "derived: Ward Dark accent, lightened to ≥ 7:1" }
+verified = { value = "#8FD9A8", role = "Verified, pass", source = "derived: Ward Dark verified, lightened to ≥ 7:1" }
+restricted = { value = "#F0C85A", role = "Restricted, ask pending", source = "derived: Ward Dark restricted, lightened to ≥ 7:1" }
+denied = { value = "#FF8A8A", role = "Denied, failed", source = "derived: Ward Dark denied, lightened to ≥ 7:1" }
+
+[tones]
+dim = "text_muted"
+ink = "text"
+accent = "accent"
+ok = "verified"
+warn = "restricted"
+deny = "denied"
+
+# Brightest xterm-256 cells of each hue (derived).
+[terminal]
+dim = 251
+ink = 231
+accent = 153
+ok = 157
+warn = 221
+deny = 210
+
+[geometry]
+radius_px = 4          # the low end of 4–8 px: crisper edges at high contrast
+separator_px = 1
+grid_px = 8
+shadow_levels = 0      # no shadow can be read against black; the approval surface uses its border
+
+[motion]
+transition_ms = 100    # the low end of 100–150 ms
+easing = "linear"
+animated = ["agent-start", "workspace-change", "verification-begin", "approval-appear", "agent-finish"]
+
+[typography]
+sans = ["Inter", "Geist", "sans-serif"]
+mono = ["JetBrains Mono", "Commit Mono", "monospace"]
+tabular_numerals = true
