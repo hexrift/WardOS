@@ -241,8 +241,8 @@ Content-Length: 0\\r\\n\\r\\n').encode())\n\
 print(s.recv(200).split(b'\\r\\n')[0].decode()); print('key='+key)";
     let opts = LaunchOpts {
         env: gateway.env.clone(),
-        interactive: false,
         gateways: vec![gateway],
+        ..LaunchOpts::default()
     };
     let report = session
         .launch(&["python3".into(), "-c".into(), script.into()], &opts)
@@ -272,5 +272,75 @@ print(s.recv(200).split(b'\\r\\n')[0].decode()); print('key='+key)";
     assert!(
         granted,
         "a CredentialGranted record must be in the sealed log"
+    );
+}
+
+#[test]
+fn hooks_answer_ask_under_step_through_and_are_logged_as_claims() {
+    if !sandbox::available() || !std::path::Path::new("/usr/bin/python3").exists() {
+        eprintln!("skipping: bubblewrap or python3 not available");
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    fs::write(
+        project.path().join(".ward/policy.yaml"),
+        "network: localhost_only\ncontainers: none\nobserver: !step_through\n  pause_before_writes: true\n",
+    )
+    .unwrap();
+    let mut session = Session::start_in(project.path(), state.path()).expect("start");
+    let log = session.log_path();
+    // The agent's view: the seeded settings file and the hook socket.
+    let script = r"import json, os, socket
+print(open('/home/agent/.claude/settings.json').read().count('ward-agent hook'))
+def ask(req):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(os.environ['WARD_SOCKET'])
+    s.sendall((json.dumps(req) + '\n').encode())
+    return s.makefile().readline().strip()
+print(ask({'hook': 'PreToolUse', 'tool': 'Write', 'summary': '/work/a.rs'}))
+print(ask({'hook': 'PreToolUse', 'tool': 'Read', 'summary': '/work/a.rs'}))
+print(ask({'hook': 'Stop'}))";
+    let settings = ward_daemon::agents::profile("claude")
+        .and_then(|p| p.settings)
+        .map(|s| (s.path.to_owned(), (s.content)()));
+    let opts = LaunchOpts {
+        settings,
+        ..LaunchOpts::default()
+    };
+    let report = session
+        .launch(&["python3".into(), "-c".into(), script.into()], &opts)
+        .expect("launch");
+    let lines: Vec<&str> = report.stdout.lines().collect();
+    assert_eq!(
+        lines.first(),
+        Some(&"5"),
+        "{}\n{}",
+        report.stdout,
+        report.stderr
+    );
+    assert!(lines[1].contains("\"ask\""), "{}", lines[1]);
+    assert!(lines[2].contains("\"allow\""), "{}", lines[2]);
+    session.stop(EndReason::UserStop).expect("stop");
+
+    let claims: Vec<String> = LogReader::open(&log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|r| r.origin == ward_events::Origin::Agent)
+        .filter_map(|r| match r.event {
+            // Payload text isolates non-ASCII (the arrow) in BiDi wrappers; strip them.
+            WardEvent::AgentClaim { payload, .. } => {
+                Some(payload.to_string().replace(['\u{2068}', '\u{2069}'], ""))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        claims,
+        [
+            "PreToolUse Write /work/a.rs → ask",
+            "PreToolUse Read /work/a.rs → allow",
+            "Stop"
+        ]
     );
 }

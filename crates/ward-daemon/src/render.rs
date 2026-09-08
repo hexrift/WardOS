@@ -154,6 +154,7 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
             ACCENT,
             format!("{service} → {} (proxy-injected)", scope.subject.as_str()),
         ),
+        WardEvent::AgentClaim { kind, payload } => (claim_verb(*kind), DIM, payload.to_string()),
         WardEvent::SessionEnded { .. } => ("END", DIM, "session".to_string()),
         _ => return None,
     };
@@ -171,6 +172,14 @@ fn change_verb(kind: ward_events::FileChangeKind) -> &'static str {
         K::Rename => "MOVE",
         K::Chmod => "MODE",
         K::Symlink => "LINK",
+    }
+}
+
+fn claim_verb(kind: ward_events::ClaimKind) -> &'static str {
+    use ward_events::ClaimKind as K;
+    match kind {
+        K::ToolUse => "TOOL",
+        K::Note | K::Plan => "NOTE",
     }
 }
 
