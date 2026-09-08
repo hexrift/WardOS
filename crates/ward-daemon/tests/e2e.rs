@@ -806,8 +806,10 @@ fn github_remote_goes_through_the_gateway_with_the_host_token() {
     .unwrap()
     .strip_headers(ward_daemon::github::GIT.strip)
     .plain_upstream(true);
+    let (git_paths, _) = ward_daemon::github::scope_paths(&["hexrift/WardOS".to_owned()]);
     let gateway = ward_daemon::gateway::Gateway::new(&ward_daemon::github::GIT, route)
-        .with_permissions(vec!["contents:read".into()]);
+        .with_permissions(vec!["contents:read".into()])
+        .map_route(|r| r.scope(git_paths, false));
 
     let state = tempfile::tempdir().unwrap();
     let project = scratch_project();
@@ -842,6 +844,7 @@ while True:
     let script = format!(
         "python3 -c \"{relay}\" & sleep 0.5; \
          git ls-remote https://github.com/hexrift/WardOS.git 2>&1 | head -2; \
+         curl -s -o /dev/null -w 'other:%{{http_code}}\n' http://127.0.0.1:3128/github/other/repo.git/info/refs; \
          env | grep -c ghp_ || true"
     );
     let argv: Vec<String> = ["sh", "-c", &script]
@@ -853,6 +856,11 @@ while True:
     assert!(
         report.stdout.trim().ends_with('0'),
         "the token must not be in the sandbox environment: {}",
+        report.stdout
+    );
+    assert!(
+        report.stdout.contains("other:403"),
+        "another repository is outside the credential scope: {}",
         report.stdout
     );
 

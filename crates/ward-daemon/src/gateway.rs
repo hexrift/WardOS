@@ -123,6 +123,13 @@ impl Gateway {
         }
     }
 
+    /// Transform the route (scope it, for instance).
+    #[must_use]
+    pub fn map_route(mut self, f: impl FnOnce(GatewayRoute) -> GatewayRoute) -> Self {
+        self.route = f(self.route);
+        self
+    }
+
     /// Record these permissions in the grant instead of the default.
     #[must_use]
     pub fn with_permissions(mut self, permissions: Vec<String>) -> Self {

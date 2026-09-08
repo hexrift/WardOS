@@ -103,10 +103,14 @@ pub fn grant(
     };
     let write = scope.permissions.contains("contents:write");
     let permissions: Vec<String> = scope.permissions.iter().cloned().collect();
+    let (git_paths, api_paths) = scope_paths(&repos);
     let mut gateways = Vec::new();
-    for spec in [&GIT, &API] {
+    for (spec, paths) in [(&GIT, git_paths), (&API, api_paths)] {
         match Gateway::resolve(spec, state)? {
-            Some(g) => gateways.push(g.with_permissions(permissions.clone())),
+            Some(g) => gateways.push(
+                g.with_permissions(permissions.clone())
+                    .map_route(|r| r.scope(paths, write)),
+            ),
             None => return Ok(Grant::NoKey),
         }
     }
@@ -262,6 +266,12 @@ mod tests {
                 assert_eq!(repos, vec!["hexrift/WardOS"]);
                 assert!(!write);
                 assert_eq!(gateways[0].permissions, vec!["contents:read"]);
+                let dbg = format!("{:?}", gateways[0].route);
+                assert!(
+                    dbg.contains("/hexrift/WardOS.git") && dbg.contains("write: false"),
+                    "{dbg}"
+                );
+                assert!(!dbg.contains("ghp_test"), "{dbg}");
                 assert!(gateways[1].env.contains(&(
                     "GITHUB_API_URL".into(),
                     "http://127.0.0.1:3128/github-api".into()
