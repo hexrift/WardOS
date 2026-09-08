@@ -180,3 +180,54 @@ pub fn selftest_evidence(session: &mut Session) -> Result<Vec<ProbeResult>> {
     }
     Ok(out)
 }
+
+/// ST-005: exit 0 only if the host `ward` process (`$1`, the supervisor of this
+/// launch) can be signalled from inside the sandbox.
+pub const ST_005: &str =
+    "kill -0 \"$1\" 2>/dev/null && exit 0; kill -TERM \"$1\" 2>/dev/null && exit 0; exit 1";
+/// ST-006: exit 0 only if the launch's host run directory (`$1`, where the
+/// verifier scratch trees and the sockets live, and which exists on the host for
+/// the whole launch) is visible. Creating a same-named path in the sandbox's own
+/// private `/tmp` would prove nothing, so only visibility counts.
+pub const ST_006: &str = "test -e \"$1\" && exit 0; exit 1";
+/// ST-008: exit 0 only if the snapshot CAS (`$1`, present on the host) is visible.
+pub const ST_008: &str = "test -e \"$1\" && exit 0; exit 1";
+
+/// Run the verifier-boundary probes (ST-005, ST-006, ST-008) inside `session`:
+/// the sandbox is told the host pid of its supervisor, its own run directory and
+/// the CAS root, and must reach none of them.
+pub fn selftest_verifier(session: &mut Session) -> Result<Vec<ProbeResult>> {
+    let run_dir = crate::session::run_dir_path(session.id())
+        .to_string_lossy()
+        .into_owned();
+    let cas = session
+        .state_root()
+        .join("cas")
+        .to_string_lossy()
+        .into_owned();
+    let probes = [
+        (
+            "ST-005 kill-verifier",
+            ST_005,
+            std::process::id().to_string(),
+        ),
+        ("ST-006 write-verifier-state", ST_006, run_dir),
+        ("ST-008 modify-entry-snapshot", ST_008, cas),
+    ];
+    let mut out = Vec::with_capacity(probes.len());
+    for (name, script, arg) in probes {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            "sh".to_string(),
+            arg,
+        ];
+        let report = session.launch(&argv, &LaunchOpts::default())?;
+        out.push(ProbeResult {
+            name,
+            blocked: report.code != Some(0),
+        });
+    }
+    Ok(out)
+}

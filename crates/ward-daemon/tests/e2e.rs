@@ -155,6 +155,11 @@ fn selftest_blocks_every_probe() {
     for r in &evidence {
         assert!(r.blocked, "{} must be denied in the sandbox", r.name);
     }
+    let verifier = ward_daemon::selftest_verifier(&mut session).expect("verifier probes");
+    assert_eq!(verifier.len(), 3);
+    for r in &verifier {
+        assert!(r.blocked, "{} must be denied in the sandbox", r.name);
+    }
     session.stop(EndReason::UserStop).expect("stop");
     let names: Vec<&str> = creds.iter().map(|r| r.name).collect();
     assert_eq!(names.len(), 2, "{names:?}");
@@ -883,4 +888,40 @@ while True:
             if scope.permissions.iter().any(|p| p.as_str() == "contents:read"))
         });
     assert!(granted, "the grant records the policy scope");
+}
+
+/// ST-019: a hostile verify command gets no network, cannot see the real worktree
+/// or the host, and nothing it writes survives into the next verification.
+#[test]
+fn st019_hostile_verify_command_is_contained_and_disposable() {
+    if !sandbox::available() {
+        eprintln!("skipping: bubblewrap not available");
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let w = project.path();
+    fs::create_dir_all(w.join(".tamperward")).unwrap();
+    // Exit 0 (a "pass") only if the network, a host-only file (`/etc/hostname` is
+    // never bound), or a /tmp marker from a previous run is reachable; also try to
+    // leave a file behind in what the verifier sees as the worktree.
+    fs::write(
+        w.join(".tamperward/config.yml"),
+        "verify:\n  command: >-\n    (timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' && exit 0);\n    test -e /etc/hostname && exit 0; test -e /tmp/marker && exit 0; touch /tmp/marker;\n    echo scratch > /work/leak; exit 1\n  budget_secs: 20\n",
+    )
+    .unwrap();
+    let mut session = Session::start_in(w, state.path()).expect("start");
+    let first = session.verify().expect("verify");
+    assert!(!first.passed, "{}", first.output);
+    let second = session.verify().expect("verify");
+    assert!(
+        !second.passed,
+        "a marker from the first run must not persist: {}",
+        second.output
+    );
+    assert!(
+        !w.join("leak").exists(),
+        "the verifier wrote to its scratch tree, not the worktree"
+    );
+    session.stop(EndReason::UserStop).expect("stop");
 }
