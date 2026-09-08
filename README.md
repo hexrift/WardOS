@@ -61,6 +61,13 @@ the verifier restores the pristine copy; the real one-line fix passes.
 
 ![ward verify on the demo: the bug fails, a weakened protected test is restored from the entry snapshot and still fails, the real fix is VERIFIED](assets/ward-verify.png)
 
+Each session's log has one writer. `ward up` starts a per-session `wardd` that owns the
+hash chain behind a control socket; every `ward` command writes through it, TamperWard
+appends its decisions as `origin=tamperward` evidence, and `ward watch` follows the log
+live from another terminal. Without a daemon, every command still works in-process.
+
+![A daemon-backed session: ward up spawns wardd, a producer and a TamperWard evidence record write through the control socket, and ward watch streams every row live until the session ends](assets/ward-watch.png)
+
 ```bash
 cargo build --release
 ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
@@ -115,8 +122,10 @@ with the model-API key held on the host and injected by the proxy; and Claude Co
 reporting to `wardd`, with `step_through` policies holding before writes and network
 tools; and `ward verify`, a disposable offline verifier that takes protected tests and
 the verify config from the entry snapshot, so weakening the judge changes nothing.
-Phase 0 and Phase 1 are complete, Phase 2 and the first Phase 3 slice are in; the
-TamperWard control plane, immutable host image and desktop shell are later phases.
+Phase 3 so far: a per-session `wardd` as the single log writer with a control socket
+(`ward watch`, `ward evidence append`, `ward session describe`, `ward snapshot …`), the
+building blocks TamperWard drives. Phase 0 and Phase 1 are complete; the semantic
+TamperWard rules, immutable host image and desktop shell are later phases.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the phase plan and what remains for the
 Phase 2 gate, and [`docs/experiments.md`](docs/experiments.md) for the recorded results
