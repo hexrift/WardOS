@@ -152,24 +152,39 @@ pub const ST_009: &str = "test -r \"$1\" && exit 0; test -d \"$2\" && exit 0; ex
 pub const ST_010: &str = "test -e \"$1\" || exit 1; \
      echo tamper >> \"$1\" 2>/dev/null && exit 0; rm -f \"$1\" 2>/dev/null && exit 0; exit 1";
 
-/// Run the evidence probes (ST-009, ST-010) inside `session`: the sandbox is
-/// handed the host paths of its own log and state root and tries to read, append
-/// to, or remove them. Blocked means the evidence is out of the agent's reach.
+/// ST-017: exit 0 only if the session's control socket (`$1`, the TamperWard
+/// and observer surface of ADR-0015) is visible or connectable.
+pub const ST_017: &str = "test -e \"$1\" && exit 0; exit 1";
+
+/// Run the evidence probes (ST-009, ST-010, ST-017) inside `session`: the sandbox
+/// is handed the host paths of its own log, state root and control socket and
+/// tries to read, append to, remove or reach them. Blocked means the evidence and
+/// the control plane are out of the agent's reach.
 pub fn selftest_evidence(session: &mut Session) -> Result<Vec<ProbeResult>> {
     const PROBES: &[(&str, &str)] = &[
         ("ST-009 read-evidence", ST_009),
         ("ST-010 rewrite-evidence", ST_010),
+        ("ST-017 control-socket-abuse", ST_017),
     ];
     let log = session.log_path().to_string_lossy().into_owned();
     let state = session.state_root().to_string_lossy().into_owned();
+    let control = crate::session::session_dir(session.state_root(), session.id())
+        .join(crate::control::SOCKET_NAME)
+        .to_string_lossy()
+        .into_owned();
     let mut out = Vec::with_capacity(PROBES.len());
     for (name, script) in PROBES {
+        let arg = if *name == "ST-017 control-socket-abuse" {
+            control.clone()
+        } else {
+            log.clone()
+        };
         let argv = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
             (*script).to_string(),
             "sh".to_string(),
-            log.clone(),
+            arg,
             state.clone(),
         ];
         let report = session.launch(&argv, &LaunchOpts::default())?;
