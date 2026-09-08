@@ -43,7 +43,7 @@ commands inside an isolated sandbox with live kernel-origin file events, routes 
 network request through a per-session policy proxy, and records everything to an
 append-only, hash-chained event log that persists across commands.
 
-![A WardOS session: security panel, live observer with network decisions, isolation self-test](assets/ward-session.png)
+![A WardOS session: security panel with the daemon line, live observer with network decisions, the four self-test groups at 15/15](assets/ward-session.png)
 
 Claude Code runs inside that sandbox unmodified. The model-API key stays on the host:
 the agent gets a placeholder and a base URL on the session proxy, which injects the real
