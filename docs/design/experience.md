@@ -32,6 +32,26 @@ who want a standard, auditable agent workstation they can hand to engineers.
 A general-purpose daily driver for non-developers; a server OS; a hardened appliance with
 no local user. Those are distractions from the agent-workstation thesis.
 
+### Non-negotiable constraints: minimal footprint & fast
+
+Minimal and fast are not "nice to have" — they are hard constraints that override
+convenience. A smaller image pulls faster, reads faster off a stick, updates faster over
+`bootc`, and boots faster; a leaner running system has fewer services to start, fewer
+things to break, and more headroom for the agent's own work. Concretely:
+
+- **Footprint budget.** Target a compressed image well under 2 GB and a booted root under
+  ~6 GB. Every package earns its place (`image/packages.txt` already carries a "why" per
+  line); the default answer to "should we add this?" is *no* unless it serves the thesis
+  or a common laptop's hardware. Applications come from Flathub at first boot, not the
+  image.
+- **No monolithic dependencies when a targeted one exists** — the `linux-firmware`
+  decision below is the first example.
+- **Fast is measured, not felt.** Boot budget in §4.1; runtime responsiveness (GPU accel,
+  trimmed effects) in §4.4. Regressions in image size or boot time are treated as bugs.
+
+Where minimal and reliable genuinely conflict (drivers on unknown hardware), we resolve it
+with *two image variants*, not one bloated image — see §2 and §4.2.
+
 ---
 
 ## 2. How is it used? (deployment model)
@@ -107,16 +127,30 @@ userspace (firmware/USB read time is the medium's, not ours). Prove it with
 - **Trim the plymouth→greeter→session handoff.** Confirm the splash never *blocks* on a
   slow unit and that autologin starts the compositor the instant `graphical.target` is
   reached. **P1.** (`image/`, `desktop/systemd/` autologin drop-in)
-- **A slim, no-firmware image variant** for VM/known-hardware installs (linux-firmware is
-  ~400 MB and irrelevant in a VM). Flagship image keeps full firmware for laptops. **P2.**
+- **Two image variants, minimal by default.** The **flagship** image ships a *curated
+  firmware subset* (§4.2) and no full `linux-firmware`; a **`live`/`try`** image (and
+  optionally a laptop-broad build) keeps full firmware for booting unknown hardware off a
+  stick. A VM install needs no firmware at all. This is how we keep the default minimal
+  without stranding an evaluator's Wi-Fi. **P1.** (`image/Containerfile`, a build arg)
 
 ### 4.2 Drivers & hardware
 
 Goal: **on mainstream laptop hardware, everything works on first boot** — Wi-Fi,
 Bluetooth, GPU acceleration, audio, touchpad gestures, backlight/keys, suspend, fingerprint.
 
-- ✓ **`linux-firmware`** added (#98) — Wi-Fi/GPU/Bluetooth firmware; QEMU never needed it,
-  hardware does. **P0.**
+- ✓ **Firmware exists at all** — added `linux-firmware` (#98) so the T480s had Wi-Fi;
+  QEMU never needed it, hardware does. But the full package is ~400 MB and violates the
+  footprint constraint. **P0 done; superseded by the next item.**
+- **Replace the monolith with a curated firmware subset (minimal).** Fedora splits
+  firmware into per-vendor subpackages; the flagship image should install only what common
+  laptops need — e.g. Intel Wi-Fi (`iwlwifi-mvm-firmware`), Intel/AMD GPU
+  (`intel-gpu-firmware`, `amd-gpu-firmware`), common Wi-Fi/BT (`realtek-firmware`,
+  `mediatek-firmware`/`mt7xxx-firmware`, `atheros-firmware`, `brcmfmac-firmware`) — cutting
+  hundreds of MB while keeping mainstream hardware working. Exact set proven by
+  `check-packages` on Fedora 44 and by a re-flash on the T480s **before** dropping the
+  monolith, so we never regress the Wi-Fi we just fixed. Unknown hardware is served by the
+  full-firmware `live` variant (§4.1), not by bloating the default. **P1.**
+  (`image/packages.txt`, `image/Containerfile` build arg)
 - **GPU acceleration must be real, not llvmpipe.** The perceived lag is very likely
   software rendering. Verify with `hyprctl systeminfo`; ensure the userspace stack is
   present per vendor: Intel (`intel-media-driver` for VAAPI), AMD (`mesa-va-drivers`),
@@ -196,6 +230,9 @@ work safely* — not decoration (ADR-0019).
 
 ## 5. How we'll know it worked (success signals)
 
+- **Footprint:** flagship compressed image < 2 GB, booted root < ~6 GB; `check-packages`
+  clean; every package still justified by a one-line "why". Image size tracked per build
+  and a growth treated as a regression.
 - **Boot:** `systemd-analyze` userspace ≤ 10 s on an SSD install; no unit > 5 s on the
   critical chain; desktop visible ≤ 20 s from power.
 - **Drivers:** on the T480s (and one AMD + one NVIDIA reference machine), Wi-Fi,
@@ -223,11 +260,14 @@ work safely* — not decoration (ADR-0019).
 
 1. **P0 (reliability, mostly done):** confirm #98 on hardware; add boot-timing + GPU-renderer
    probes to `ward doctor`; ensure real GPU acceleration.
-2. **P1 (onboarding):** one coherent graphical first-run (Wi-Fi → login pref → key →
-   project → start agent); greeter; move first-boot work off the critical path.
-3. **P1 (discoverability):** empty-workspace hint cards; bar launcher + power control +
+2. **P1 (minimal & fast):** curated firmware subset + full-firmware `live` variant; package
+   audit against the footprint budget; move first-boot work off the critical path;
+   hostonly initramfs for installs. Track image size per build.
+3. **P1 (onboarding):** one coherent graphical first-run (Wi-Fi → login pref → key →
+   project → start agent); greeter; ending on the agent running.
+4. **P1 (discoverability):** empty-workspace hint cards; bar launcher + power control +
    tooltips; `Super + /` help; make the workspace labels act.
-4. **P2 (delight + polish):** performance auto-fallback; window-rule cleanup; slim VM image;
+5. **P2 (delight + polish):** performance auto-fallback; window-rule cleanup; slim VM image;
    fingerprint/FIDO2 login; drop cosmetic nags.
 
 Each becomes an ADR (for the decisions) and issues (for the work), tracked against
