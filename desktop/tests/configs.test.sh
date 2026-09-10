@@ -300,11 +300,29 @@ touch "$XDG_CONFIG_HOME/wardos/bash-override"
 out=$(bash -ic "WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; type wardos_prompt >/dev/null 2>&1 && echo loaded || echo skipped" 2>/dev/null)
 [[ $out == skipped ]] || fail "profile.d ignored the override marker"
 rm "$XDG_CONFIG_HOME/wardos/bash-override"
-# profile.d on tty1 without a Wayland display: exec uwsm start hyprland.desktop.
+# profile.d on tty1 without a Wayland display: starts uwsm start hyprland.desktop.
 mock tty 'echo /dev/tty1'
 bash -ic "unset WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE; WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'" 2>/dev/null
 assert_logged '^uwsm start hyprland.desktop$'
 assert_logged '^tty $'
+
+# profile.d resilience: a compositor that fails to start must not crash-loop through
+# the autologin. It falls back from uwsm to Hyprland, and if neither comes up it drops
+# to an interactive shell on tty1 (control returns to the login shell) with a log left.
+mock uwsm 'exit 1'
+mock Hyprland 'exit 1'
+: >"$MOCK_LOG"
+out=$(bash -ic "unset WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE; WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; echo REACHED_SHELL" 2>/dev/null)
+[[ $out == *REACHED_SHELL* ]] || fail "profile.d crash-looped on a failed session instead of dropping to a shell"
+assert_logged '^uwsm start hyprland.desktop$'
+assert_logged '^Hyprland $'
+assert_file "$XDG_STATE_HOME/wardos/session-start.log"
+# A clean session exit (uwsm returns 0) ends the login shell rather than falling through.
+mock uwsm
+: >"$MOCK_LOG"
+out=$(bash -ic "unset WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE; WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; echo REACHED_SHELL" 2>/dev/null)
+[[ $out != *REACHED_SHELL* ]] || fail "profile.d fell through after a clean session exit"
+assert_not_logged '^Hyprland $'
 
 # --- systemd units ------------------------------------------------------------
 unit_has() { grep -q "^$2" "$1" || fail "$(basename "$1") lacks $2"; }
