@@ -1,7 +1,11 @@
 # WardOS Design Language
 
 Status: living document; the project's phase is in docs/status.toml and the README.
-Decision record: [ADR-0007](decisions/ADR-0007-desktop-and-shell.md).
+Decision records: [ADR-0007](decisions/ADR-0007-desktop-and-shell.md) (desktop/shell),
+[ADR-0021](decisions/ADR-0021-ward-field-agentic-desktop.md) (the Ward Field visual system).
+Interactive references live in [`design/storyboard/`](design/storyboard/) (`wardos.html` is
+the definitive preview; `ward-field.html` is the field proving ground; `DESIGN.md` has the
+tokens, timings and rationale).
 
 ## 1. Identity
 
@@ -31,6 +35,31 @@ Everything in the shell belongs to exactly one layer. The host layer looks the s
 whether or not an agent is running. The agent layer is where activity, state and
 verification live.
 
+## 2a. The Ward Field (ADR-0021)
+
+The agent layer's visible expression is the **Ward Field**: an almost-black topography
+(flowing contour lines) that *is* the desktop ground — there is no stock wallpaper. At
+rest it is nearly invisible; when an agent forms intent the field lifts and reveals the
+relationship between intent, the files it touches and verification, then settles when the
+outcome is verified. A screenshot of stock WardOS is recognisable as WardOS by the field
+alone. It obeys the semantic colour rule below strictly (violet only for intent/action,
+green only for verified), and it degrades to a static field under reduced motion or
+software rendering.
+
+Around it sits a small, spatial interaction vocabulary — surfaces emerge from where they
+belong and vanish when unneeded (*nothing appears merely to show WardOS is clever*):
+
+* **Command Weave** — one surface (Super) that reads *intent*, replacing the launcher,
+  search, terminal-command and agent-prompt distinction.
+* **Proof Rail** — a 2–4 px step spine that blooms into an inspectable timeline of what the
+  agent did; never terminal-watching.
+* **Decision Receipt** — a receipt attached to the affected file when an action is
+  consequential (risk made legible, not a scary modal); TamperWard's evidence surfaces here.
+* **Workspace Rooms** — named lifecycle contexts **BUILD · VERIFY · SHIP**, with the one
+  trust pill `WARD / VERIFIED ↔ REVIEW`.
+
+Interactive references: [`design/storyboard/`](design/storyboard/).
+
 ## 3. Colour: colour means something
 
 Restrained neutral base with **one** accent. State colours are used deliberately and
@@ -43,9 +72,10 @@ rarely so that security state stays visible.
 | Separator | `#24272B` | `#D6D6D2` | Thin, 1 px |
 | Text | `#D9D9D6` | `#1A1B1E` | Primary |
 | Text muted | `#8A8D91` | `#6B6E73` | Secondary |
-| Accent | one hue, restrained blue-grey (`#7FA1C3`) | same, darker | *Active agent*, focus, selection |
-| Verified | muted green (`#6FAE8A`) | same, darker | `✓ VERIFIED`, pass |
-| Restricted | amber (`#C9A24A`) | same, darker | limited network, `ask` pending |
+| Accent | muted electric violet (`#8E7CF0`) | same, darker | *Agent intent / action*, focus, selection (ADR-0021; supersedes the earlier blue-grey accent) |
+| Verified | muted green (`#6FAE8A` / `#6FB08A`) | same, darker | `✓ VERIFIED`, pass, proof |
+| Restricted | amber (`#C9A24A` / `#D6A45C`) | same, darker | review / attention, limited network, `ask` pending |
+| Cool neutral | blue-grey (`#6E88AE`) | same, darker | occasional; keywords, secondary tags — never a second accent |
 | Denied / failed | red (`#C25A5A`) | same, darker | used sparingly, never animated |
 
 Rules: no gradients; no glow; state colour on the glyph or a 2 px marker, not on whole
