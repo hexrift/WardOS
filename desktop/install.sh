@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Apply the WardOS desktop to an existing Fedora (docs/desktop.md §Layout, ADR-0016).
 #
-#   desktop/install.sh [--autologin] [--no-flatpaks] [--destdir DIR] [--dry-run]
+#   desktop/install.sh [--no-flatpaks] [--destdir DIR] [--dry-run]
 #
 # Steps, each printed before it runs: enable the COPRs of image/coprs.txt (dnf5-plugins
 # and `dnf copr enable`, or their .repo files into /etc/yum.repos.d on rpm-ostree) and
@@ -9,8 +9,8 @@
 # bootc: layered, takes effect after a reboot);
 # place the desktop tree with image/install-desktop.sh (sudo); enable the user units;
 # add Flathub and install desktop/flatpaks.txt (--no-flatpaks skips); then say how to
-# start Hyprland. --autologin also installs the tty1 autologin drop-in for the user
-# `wardos`, which the image has and a Fedora with a display manager should not.
+# start Hyprland. Login on a dev install is whatever display manager the host already
+# has; the WardOS greeter (greetd) is set up by the image, not here.
 # --destdir installs the tree somewhere other than / (staging, tests). --dry-run prints
 # every command and runs none. Root is asked for with sudo, per step, never for the
 # whole script.
@@ -27,13 +27,11 @@ flatpaks_file=$repo_root/desktop/flatpaks.txt
 # The file that marks an rpm-ostree/bootc host; overridable for tests.
 ostree_marker=${WARDOS_OSTREE_MARKER:-/run/ostree-booted}
 
-autologin=0
 flatpaks=1
 destdir=/
 dry_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --autologin) autologin=1; shift ;;
     --no-flatpaks) flatpaks=0; shift ;;
     --destdir) destdir=$2; shift 2 ;;
     --destdir=*) destdir=${1#--destdir=}; shift ;;
@@ -93,9 +91,7 @@ else
 fi
 
 # --- 2. the desktop tree --------------------------------------------------------------
-install_args=()
-[[ $autologin -eq 1 ]] || install_args+=(--no-autologin)
-run sudo "$repo_root/image/install-desktop.sh" "${install_args[@]}" "$repo_root/desktop" "$destdir"
+run sudo "$repo_root/image/install-desktop.sh" "$repo_root/desktop" "$destdir"
 
 # --- 3. user units (the preset written by install-desktop.sh) -------------------------
 units=()

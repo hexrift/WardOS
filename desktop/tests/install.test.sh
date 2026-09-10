@@ -17,7 +17,7 @@ $(cat "$1")"; }
 # --- a fake desktop tree with every kind of file the layout names --------------------
 make_tree() {
   local t=$1
-  mkdir -p "$t"/{bin,lib,hyprland,config/{waybar,foot,mako,fuzzel,btop,fastfetch,hyprlock,nvim,gtk,chromium,bash,xcompose},themes/ward-dark/backgrounds,systemd/user,systemd/system/getty@tty1.service.d,webapps,tuis,shell/src,theme/src,tests}
+  mkdir -p "$t"/{bin,lib,hyprland,config/{waybar,foot,mako,fuzzel,btop,fastfetch,hyprlock,nvim,gtk,chromium,bash,xcompose},themes/ward-dark/backgrounds,systemd/user,webapps,tuis,shell/src,theme/src,tests}
   printf '#!/usr/bin/env bash\necho hi\n' >"$t/bin/wardos-hello"
   chmod 0644 "$t/bin/wardos-hello" # the installer must make it executable
   echo 'wardos_lib=1' >"$t/lib/wardos.sh"
@@ -41,7 +41,6 @@ make_tree() {
   printf '[Unit]\nDescription=bar\n[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\n' >"$t/systemd/user/wardos-bar.service"
   printf '[Unit]\nDescription=battery\n[Service]\nExecStart=/bin/true\n' >"$t/systemd/user/wardos-battery-monitor.service"
   printf '[Unit]\nDescription=battery timer\n[Timer]\nOnUnitActiveSec=5m\n[Install]\nWantedBy=timers.target\n' >"$t/systemd/user/wardos-battery-monitor.timer"
-  printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --noclear --autologin wardos %%I linux\n' >"$t/systemd/system/getty@tty1.service.d/autologin.conf"
   echo 'name=GitHub' >"$t/webapps/github.conf"
   echo 'name=btop' >"$t/tuis/btop.conf"
   printf '# default apps\norg.signal.Signal\n\ncom.spotify.Client # music\n' >"$t/flatpaks.txt"
@@ -93,7 +92,8 @@ assert_contains "$preset" "enable wardos-bar.service"
 assert_contains "$preset" "enable wardos-battery-monitor.timer"
 # A service without [Install] is pulled in by its timer, never preset-enabled.
 ! grep -q "enable wardos-battery-monitor.service" "$preset" || fail "preset lists a unit without [Install]"
-assert_file "$dest/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+# Login is greetd (image-owned): install-desktop.sh installs no getty autologin drop-in.
+assert_missing "$dest/etc/systemd/system/getty@tty1.service.d/autologin.conf"
 assert_file "$dest/usr/share/wardos/webapps/github.conf"
 assert_file "$dest/usr/share/wardos/tuis/btop.conf"
 assert_file "$dest/usr/share/wardos/flatpaks.txt"
@@ -105,18 +105,17 @@ assert_missing "$dest/usr/share/wardos/install.sh"
 assert_missing "$dest/usr/share/wardos/src"
 assert_contains "$TMP/out" "bin"
 
-# --- install-desktop.sh: --no-autologin, an existing /etc/xdg/<c> directory, a sparse tree
+# --- install-desktop.sh: an existing /etc/xdg/<c> directory, a sparse tree ------------
 rm -rf "$dest"
 mkdir -p "$dest/etc/xdg/foot"
 echo 'old' >"$dest/etc/xdg/foot/other.ini"
-bash "$repo/image/install-desktop.sh" --no-autologin "$TMP/desktop" "$dest" >/dev/null
-assert_missing "$dest/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+bash "$repo/image/install-desktop.sh" "$TMP/desktop" "$dest" >/dev/null
 # An existing real directory is kept and filled, not replaced by a link.
 [[ ! -L "$dest/etc/xdg/foot" ]] || fail "existing /etc/xdg/foot must not become a link"
 assert_file "$dest/etc/xdg/foot/foot.ini"
 assert_file "$dest/etc/xdg/foot/other.ini"
 # Idempotent: a second run over the same DESTDIR succeeds.
-bash "$repo/image/install-desktop.sh" --no-autologin "$TMP/desktop" "$dest" >/dev/null
+bash "$repo/image/install-desktop.sh" "$TMP/desktop" "$dest" >/dev/null
 
 rm -rf "$dest" "$TMP/sparse"
 mkdir -p "$TMP/sparse/hyprland"
@@ -163,7 +162,8 @@ for u in swayosd.service wardos-approve.service wardos-battery-monitor.timer; do
   assert_contains "$root/usr/lib/systemd/user-preset/90-wardos.preset" "enable $u"
   assert_logged "^systemctl --user preset .*$u"
 done
-# Existing Fedora: no tty1 autologin unless asked for.
+# Existing Fedora: WardOS installs no getty autologin drop-in (login is greetd on the
+# image; a dev install keeps whatever display manager the host already has).
 assert_missing "$root/etc/systemd/system/getty@tty1.service.d/autologin.conf"
 grep -q 'uwsm start hyprland.desktop' "$TMP/out" || fail "login instructions missing:
 $(cat "$TMP/out")"

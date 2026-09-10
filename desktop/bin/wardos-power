@@ -4,7 +4,7 @@
 # Usage: wardos-power lock | suspend | relaunch | restart | shutdown | menu
 #   lock        hyprlock
 #   suspend     systemctl suspend (hypridle locks first, see config/hypridle)
-#   relaunch    leave Hyprland (hyprctl dispatch exit); the autologin starts it again
+#   relaunch    leave Hyprland (hyprctl dispatch exit); greetd shows the login screen again
 #   restart     systemctl reboot
 #   shutdown    systemctl poweroff
 #   menu        pick one of the five in the picker (Super + Shift + Escape)

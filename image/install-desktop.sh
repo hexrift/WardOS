@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
 # Place the desktop tree (desktop/) into a root filesystem (docs/desktop.md §Layout).
 #
-#   image/install-desktop.sh [--no-autologin] SRC DESTDIR
+#   image/install-desktop.sh SRC DESTDIR
 #
 # SRC is a checkout's desktop/ directory, DESTDIR the root to install into: "/" in the
 # image build (Containerfile), "/" again from desktop/install.sh on an existing Fedora,
 # a temp directory in desktop/tests/install.test.sh. Every part is optional: what SRC
 # does not contain is skipped, so the script works while the tree is still being filled
-# in. --no-autologin leaves the getty@tty1 drop-in out (existing installs with a display
-# manager). Sources (shell/, theme/), tests/ and install.sh never land on the host.
+# in. Login is greetd, set up by the image itself (image/rootfs/etc/greetd and the
+# Containerfile), not here. Sources (shell/, theme/), tests/ and install.sh never land.
 set -euo pipefail
 
 usage() {
   sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-autologin=1
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --no-autologin) autologin=0; shift ;;
     -h | --help) usage; exit 0 ;;
     -*) echo "install-desktop.sh: unknown argument: $1" >&2; usage >&2; exit 2 ;;
     *) args+=("$1"); shift ;;
@@ -134,12 +132,3 @@ if [[ -d "$src/systemd/user" ]]; then
   say "systemd/user → /usr/lib/systemd/user (preset: $(grep -c '^enable' "$preset") units)"
 fi
 
-dropin="$src/systemd/system/getty@tty1.service.d/autologin.conf"
-if [[ -f "$dropin" ]]; then
-  if [[ $autologin -eq 1 ]]; then
-    install -D -m 0644 "$dropin" "$dest/etc/systemd/system/getty@tty1.service.d/autologin.conf"
-    say "getty@tty1 autologin drop-in → /etc/systemd/system/getty@tty1.service.d/"
-  else
-    say "getty@tty1 autologin drop-in skipped (--no-autologin)"
-  fi
-fi

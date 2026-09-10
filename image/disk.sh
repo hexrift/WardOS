@@ -7,7 +7,7 @@
 #
 # Defaults: image localhost/wardos:<git describe --tags --always>, output ./image/out,
 # rootfs btrfs (ADR-0001), arch this machine's. --user writes a bootc-image-builder
-# config that creates the first user (wheel; the desktop's autologin expects `wardos`)
+# config that creates the first user (wheel; the greeter's default user is `wardos`)
 # with --password (or WARDOS_PASSWORD in the environment, which keeps it out of `ps`)
 # and/or --ssh-key. The installer ISO encrypts the disk unless told --no-luks
 # (ADR-0017): a kickstart asks Anaconda for full-disk encryption, the passphrase typed

@@ -28,6 +28,12 @@ nodejs24-npm          # `npm ci` from image/agents/package-lock.json at build ti
 # --- security posture (ADR-0017) ----------------------------------------------------------
 firewalld             # host firewall, enabled, default zone `wardos` (nothing inbound); image/README.md "Security posture"
 
+# --- login (greetd) -----------------------------------------------------------------
+greetd                # minimal login manager; authenticates the user then runs the session (docs/desktop.md §Login)
+gtkgreet              # graphical greeter for greetd, themed to Ward Dark (/etc/greetd/wardos-greeter.css)
+cage                  # single-window Wayland kiosk compositor that hosts gtkgreet (`cage -s`)
+librsvg2              # SVG loader so gtkgreet can draw the WardOS mark from the greeter CSS
+
 # --- compositor and session ---------------------------------------------------------
 hyprland              # the compositor (ADR-0007) (COPR mineiro/hyprland)
 hyprlock              # lock screen (COPR mineiro/hyprland)

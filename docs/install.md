@@ -146,10 +146,11 @@ that **erases and reformats the target disk**. To try WardOS, use `qcow2` or `ra
 [which image to use](../image/README.md#three-kinds-of-image-which-one-and-the-one-that-erases-a-disk)
 and [trying it from a USB stick](../image/README.md#trying-wardos-from-a-usb-stick-no-install).
 
-`--user wardos` creates the first user (wheel), which the tty1 autologin expects; with
-`--luks` Anaconda asks for the passphrase during the installation. First boot logs in
-on tty1, `uwsm` starts Hyprland, `wardos-first-run` copies the configs and hands over
-to `wardos-welcome` (theme, key, first project, first agent; [`onboarding.md`](onboarding.md)),
+`--user wardos` creates the first user (wheel), the greeter's default; with
+`--luks` Anaconda asks for the passphrase during the installation. First boot shows the
+greetd login screen; after you log in `uwsm` starts Hyprland, `wardos-first-run` copies
+the configs and hands over to `wardos-welcome` (theme, key, first project, first agent;
+[`onboarding.md`](onboarding.md)),
 and Flathub plus `desktop/flatpaks.txt` arrive in the background. Updates:
 `wardos-update` (`bootc upgrade`; the previous deployment stays, `bootc rollback`).
 The image has one browser (Chromium; Firefox is `wardos-install app
@@ -168,9 +169,10 @@ It enables the COPRs of `image/coprs.txt` (the Hyprland ecosystem Fedora does no
 package, lazygit), installs `image/packages.txt`, places the tree with `image/install-desktop.sh` under
 `/usr/share/wardos` and `/etc/xdg` (sudo, per step), enables the user units, adds
 Flathub and the default applications, and prints how to log in: pick "Hyprland (uwsm)"
-at GDM or SDDM, or `uwsm start hyprland.desktop` from a console. It does not install
-the tty1 autologin unless told `--autologin`, and never touches your `~/.config`:
-that is `wardos-first-run`'s job, with a backup next to anything it replaces.
+at GDM or SDDM, or `uwsm start hyprland.desktop` from a console. On a dev install login
+stays with whatever display manager the host already has — the WardOS greeter (greetd)
+ships on the image, not here — and it never touches your `~/.config`: that is
+`wardos-first-run`'s job, with a backup next to anything it replaces.
 
 ## 7. macOS, ARM, Windows
 

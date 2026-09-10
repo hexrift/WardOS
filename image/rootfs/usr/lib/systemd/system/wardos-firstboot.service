@@ -6,8 +6,12 @@
 [Unit]
 Description=WardOS first-boot host check (ward doctor)
 Documentation=https://github.com/hexrift/WardOS/blob/main/image/README.md
-After=local-fs.target systemd-tmpfiles-setup.service
+After=local-fs.target systemd-tmpfiles-setup.service greetd.service
 Wants=systemd-tmpfiles-setup.service
+# Ordered after greetd so the login screen is already on the display before `ward doctor`
+# runs: the report is informational and must never delay the first thing the user sees
+# ("speed as identity", docs/design-language.md §1). It still gates nothing — greetd does
+# not wait for it, so a slow probe cannot hold back the desktop either.
 # Once per deployment: the report's presence is the marker. Delete it to re-run.
 ConditionPathExists=!/var/lib/wardos/doctor.txt
 

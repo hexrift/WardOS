@@ -30,7 +30,7 @@ on:
         description: "Release tag for source=release (empty: the Containerfile default)"
         default: ""
       user:
-        description: "First user (the desktop's autologin expects wardos)"
+        description: "First user (the greeter's default user is wardos)"
         default: wardos
       luks:
         description: "ISO only: ask Anaconda for full-disk encryption"

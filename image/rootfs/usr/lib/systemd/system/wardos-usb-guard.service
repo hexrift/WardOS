@@ -5,17 +5,30 @@
 [Unit]
 Description=WardOS USB-boot disk guard (internal disks read-only when run from USB)
 Documentation=https://github.com/hexrift/WardOS/blob/main/image/README.md
-DefaultDependencies=no
-After=local-fs.target systemd-udev-settle.service
-Wants=systemd-udev-settle.service
-Before=sysinit.target shutdown.target
+# It needs two things: the block devices enumerated (udev coldplug, systemd-udev-trigger)
+# and the root mounted (local-fs). It runs before any interactive login can write to a
+# disk, which on a live USB boot — where the internal disks are never auto-mounted — is a
+# safe and early enough window. It deliberately does NOT pull in the deprecated
+# systemd-udev-settle.service: that is an unbounded wait for the *entire* udev queue to
+# drain, ordered before sysinit.target, so on hardware with a slow-settling device it
+# stalls the whole boot until its own timeout (the first-hardware boot spent minutes
+# here). A short, bounded `udevadm settle` in ExecStartPre catches the internal disks,
+# and TimeoutStartSec makes the unit itself incapable of hanging the boot.
+After=systemd-udev-trigger.service local-fs.target
+Before=greetd.service getty@tty1.service
 Conflicts=shutdown.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Best-effort, bounded: `-` so a timeout or missing udevadm never fails the unit, and
+# the internal SATA/NVMe disks are present long before 8s on any real machine.
+ExecStartPre=-/usr/bin/udevadm settle --timeout=8
 ExecStart=/usr/libexec/wardos-usb-guard
+# The work (findmnt, lsblk, blockdev over a handful of disks) is milliseconds; the cap is
+# a backstop so a wedged blockdev on a failing disk can never stall the boot.
+TimeoutStartSec=20s
 StandardOutput=journal+console
 
 [Install]
-WantedBy=sysinit.target
+WantedBy=multi-user.target

@@ -148,26 +148,32 @@ the tree does not contain yet is skipped.
 | `config/<component>/` | `/usr/share/wardos/config/<component>/` | Copied to `~/.config` by `wardos-first-run`; re-applied by `wardos-refresh` |
 | `config/{waybar,foot,mako,fuzzel,btop,fastfetch}/` | also `/etc/xdg/<component>` → the above | These read `XDG_CONFIG_DIRS`, so they work before any first-run copy; an existing real `/etc/xdg/<component>` (a Fedora that ships one) is filled, not replaced |
 | `config/gtk/settings.ini` | also `/etc/xdg/gtk-3.0/settings.ini`, `/etc/xdg/gtk-4.0/settings.ini` | One file, two real directories (GTK reads `settings.ini` from `XDG_CONFIG_DIRS`; `gtk.css` only from the home directory, first-run's job) |
-| `config/bash/profile.d-wardos.sh` | `/etc/profile.d/wardos.sh` | Session environment; starts `uwsm` on tty1 |
+| `config/bash/profile.d-wardos.sh` | `/etc/profile.d/wardos.sh` | Login-shell defaults (the WardOS bashrc); the graphical session is greetd's job, not this file's |
 | `config/xcompose/XCompose` | `/usr/share/wardos/config/xcompose/` | Copied to `~/.XCompose` by first-run |
 | `themes/` | `/usr/share/wardos/themes/` | TOML token files and backgrounds |
 | `webapps/`, `tuis/`, `flatpaks.txt` | `/usr/share/wardos/` | Defaults for `wardos-webapp`, `wardos-tui`, `wardos-flathub` |
 | `systemd/user/*` | `/usr/lib/systemd/user/` + `/usr/lib/systemd/user-preset/90-wardos.preset` | The preset enables every unit that has an `[Install]` section (a timer's service has none and is pulled in by its timer) |
-| `systemd/system/getty@tty1.service.d/autologin.conf` | `/etc/systemd/system/getty@tty1.service.d/` | Autologin; `--no-autologin` skips it (what `desktop/install.sh` does unless told `--autologin`) |
 | `shell/`, `theme/`, `tests/`, `install.sh` | — | Sources and tests never land on the host; the two crates are built in stage 1 |
 
 `desktop/tests/install.test.sh` runs the script against a temp `DESTDIR` with a fake
 tree of every kind of file and asserts on every row above.
 
-### Autologin
+### Login (greetd)
 
-The image logs `wardos` in on tty1 without a password (the getty drop-in) and
-`/etc/profile.d/wardos.sh` starts Hyprland through `uwsm` there, so a machine boots
-into the desktop; hyprlock, not the login prompt, is the lock. The user is not in the
+The machine boots — through Plymouth — to a real login screen: `greetd` on VT 1 runs a
+graphical greeter (`cage` hosting `gtkgreet`) styled to the Ward Dark palette
+(`/etc/greetd/wardos-greeter.css`), continuous with the splash before it. greetd
+authenticates the user through PAM; on success `gtkgreet` runs `/usr/libexec/wardos-session`,
+which starts Hyprland under `uwsm` (so `graphical-session.target` and the WardOS user
+units come up as at any login). There is no autologin — the login screen is the first
+thing shown, and it appears in seconds, not after a long boot (`wardos-usb-guard` and
+`wardos-firstboot` are bounded so nothing stalls the path to it). Once in, hyprlock is
+the lock. The greeter itself runs unprivileged as the `greeter` system user
+(`/usr/lib/sysusers.d/wardos-greeter.conf`); `cage -s` keeps Ctrl+Alt+F2…F6 reaching a
+text console, so a greeter failure can never lock you out. The login user is not in the
 image (bootc images carry no accounts): create it when making the disk,
-`disk.sh --user wardos …` ([below](#users-and-luks)), or with your own config. A
-different first user works too; then edit the drop-in's `--autologin` name in your
-`/etc`, which bootc keeps across upgrades.
+`disk.sh --user wardos …` ([below](#users-and-luks)), or with your own config; the
+greeter's default user is `wardos` but any user the greeter authenticates works.
 
 ### Flathub and the default applications
 
@@ -450,7 +456,7 @@ baseline.
 0600, printed with the password redacted) that creates the first user in `wheel`, with
 `--password PW` (or `WARDOS_PASSWORD` in the environment, which keeps it out of `ps`)
 and/or `--ssh-key FILE`; one of the two is required, or nobody could use `sudo`. The
-desktop's autologin expects `wardos`. `--config FILE` passes your own TOML instead
+greeter's default user is `wardos`. `--config FILE` passes your own TOML instead
 (the two are exclusive); a minimal one:
 
 ```toml
@@ -543,7 +549,7 @@ needs, and publishes the result:
   architecture (`x86_64`, `aarch64`, or `both` for one job per architecture, each on a
   runner of that architecture), the binaries (`checkout` compiles this commit,
   `release` takes the published tarball of `--release`), the first user (`wardos`,
-  which the autologin expects) and, for the ISO, `luks`. The disks appear as the run's
+  the greeter's default) and, for the ISO, `luks`. The disks appear as the run's
   `wardos-disks-<arch>` artifact for 14 days, with a `SHA256SUMS.<arch>`.
 * **On every published release**: both disks of both architectures are built from that
   release's tarballs and attached to the release as `wardos-<tag>-<arch>.qcow2.zst` and
@@ -620,7 +626,7 @@ or the App Store):
    use; the qcow2 ships small.
 4. Boot is **UEFI** (the only firmware Apple Virtualization offers for Linux, and what
    the image expects: bootc installs to the EFI system partition). Start the machine:
-   Plymouth, the tty1 autologin, Hyprland.
+   Plymouth, the greetd login screen, then Hyprland after you log in.
 
 Caveats, all *unverified* on real Apple hardware until someone records them the way
 E-09 does for the reference laptop:
@@ -652,7 +658,8 @@ image and its disks are for a VM or a PC, not for WSL2.
    (delete it to re-run, or `systemctl start wardos-firstboot`).
 3. `wardos-flathub.service` waits for the network, adds Flathub and installs the default
    applications in the background ([above](#flathub-and-the-default-applications)).
-4. tty1 logs `wardos` in and `uwsm` starts Hyprland; `wardos-first-run` copies the
+4. greetd shows the login screen; after you log in `uwsm` starts Hyprland and
+   `wardos-first-run` copies the
    configs, asks for a theme, runs `ward doctor` and shows the keys.
    `bootc container lint` ran clean at the end of the build (10 checks, no warnings
    once the install-time caches and logs under `/var`, `/run` and `/tmp` are swept).
@@ -714,6 +721,6 @@ bash desktop/tests/run.sh
 docker build -f image/Containerfile --build-arg WARDOS_SOURCE=builder -t wardos:ci .
 ```
 
-What no check can do and E-09 must: that the qcow2 boots, that `getty@tty1` logs the
-user in and `uwsm` brings Hyprland up, that the Plymouth theme is the early one, that
+What no check can do and E-09 must: that the qcow2 boots, that greetd shows the login
+screen and `uwsm` brings Hyprland up after login, that the Plymouth theme is the early one, that
 Anaconda asks for the LUKS passphrase, that `ward doctor` exits 0 on the host.
