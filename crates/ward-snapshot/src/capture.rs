@@ -379,7 +379,10 @@ mod git_context_tests {
         // A crafted HEAD must not make wardd read a host file outside the worktree.
         let dir = worktree_with_head("ref: /etc/hostname\n");
         let ctx = read_git_context(dir.path()).unwrap();
-        assert_eq!(ctx.head, None, "an absolute ref target was followed off the tree");
+        assert_eq!(
+            ctx.head, None,
+            "an absolute ref target was followed off the tree"
+        );
         assert_eq!(ctx.branch, None);
     }
 
