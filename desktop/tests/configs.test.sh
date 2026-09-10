@@ -307,21 +307,25 @@ assert_logged '^uwsm start hyprland.desktop$'
 assert_logged '^tty $'
 
 # profile.d resilience: a compositor that fails to start must not crash-loop through
-# the autologin. It falls back from uwsm to Hyprland, and if neither comes up it drops
-# to an interactive shell on tty1 (control returns to the login shell) with a log left.
+# the autologin. It walks the uwsm docs' ladder — managed entry, then the bare binary
+# (needs no wayland-sessions entry), then Hyprland directly — and if none comes up it
+# drops to an interactive shell on tty1 (control returns to the login shell), log left.
 mock uwsm 'exit 1'
 mock Hyprland 'exit 1'
 : >"$MOCK_LOG"
 out=$(bash -ic "unset WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE; WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; echo REACHED_SHELL" 2>/dev/null)
 [[ $out == *REACHED_SHELL* ]] || fail "profile.d crash-looped on a failed session instead of dropping to a shell"
 assert_logged '^uwsm start hyprland.desktop$'
+assert_logged '^uwsm start hyprland$'   # bare-binary fallback (no session entry needed)
 assert_logged '^Hyprland $'
 assert_file "$XDG_STATE_HOME/wardos/session-start.log"
-# A clean session exit (uwsm returns 0) ends the login shell rather than falling through.
-mock uwsm
+# The bare-binary fallback fires only when the managed entry fails: succeed on the entry
+# and neither the binary form nor Hyprland is reached, and the login shell ends.
+mock uwsm 'test "$2" = hyprland.desktop'   # `uwsm start hyprland.desktop` -> 0, else 1
 : >"$MOCK_LOG"
 out=$(bash -ic "unset WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE; WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; echo REACHED_SHELL" 2>/dev/null)
-[[ $out != *REACHED_SHELL* ]] || fail "profile.d fell through after a clean session exit"
+[[ $out != *REACHED_SHELL* ]] || fail "profile.d fell through after a clean session start"
+assert_not_logged '^uwsm start hyprland$'
 assert_not_logged '^Hyprland $'
 
 # --- systemd units ------------------------------------------------------------

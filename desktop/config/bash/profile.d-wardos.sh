@@ -36,16 +36,21 @@ if [ -z "$WAYLAND_DISPLAY" ] && [ -z "$HYPRLAND_INSTANCE_SIGNATURE" ] && [ "$(tt
   mkdir -p "$_wardos_log" 2>/dev/null || true
   _wardos_log="$_wardos_log/session-start.log"
   : >"$_wardos_log" 2>/dev/null || true
-  # Run the session; a clean exit ends the login shell (fresh session next time).
-  _wardos_try() { "$@" >>"$_wardos_log" 2>&1; }
+  # Run a step, logging the command and its output; a clean exit ends the login shell
+  # (so the autologin starts a fresh session next time — the old `exec` behaviour).
+  _wardos_try() { printf '$ %s\n' "$*" >>"$_wardos_log"; "$@" >>"$_wardos_log" 2>&1; }
   if command -v uwsm >/dev/null 2>&1; then
+    # uwsm's own readiness screen, recorded for diagnosis. Advisory, not a gate: a
+    # getty autologin can run under multi-user.target, where `may-start` is stricter
+    # than our launch needs (uwsm docs, "check may-start").
+    _wardos_try uwsm check may-start || true
+    # `uwsm start hyprland.desktop` needs a wayland-sessions entry of that id; the bare
+    # binary name needs none (uwsm docs). Try the managed entry, then the binary, then
+    # Hyprland directly — so a missing/renamed session entry can't stop the desktop.
     _wardos_try uwsm start hyprland.desktop && exit 0
-    # uwsm could not start the session (e.g. a missing/broken session entry): try the
-    # compositor directly before giving up, so a working Hyprland still comes up.
-    command -v Hyprland >/dev/null 2>&1 && { _wardos_try Hyprland && exit 0; }
-  elif command -v Hyprland >/dev/null 2>&1; then
-    _wardos_try Hyprland && exit 0
+    _wardos_try uwsm start hyprland && exit 0
   fi
+  command -v Hyprland >/dev/null 2>&1 && { _wardos_try Hyprland && exit 0; }
   # The session could not start. Do NOT re-exec into the autologin (that crash-loops
   # with nothing to read): surface the reason and stay on a usable shell on tty1.
   echo
