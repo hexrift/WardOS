@@ -73,11 +73,17 @@ impl Profile {
     pub fn baseline() -> Self {
         Self {
             default_action: Action::Allow,
+            // Each native arch is listed with its 32-bit compat ABIs so a process
+            // making a syscall under a compat ABI presents the arch the deny rules are
+            // written for — otherwise the syscall numbers differ and, under a
+            // default-allow profile, the denied families slip through (the 32-bit
+            // bypass). x86_64 carries X86 + X32; aarch64 carries the 32-bit ARM ABI.
             architectures: vec![
                 "SCMP_ARCH_X86_64".to_string(),
                 "SCMP_ARCH_X86".to_string(),
                 "SCMP_ARCH_X32".to_string(),
                 "SCMP_ARCH_AARCH64".to_string(),
+                "SCMP_ARCH_ARM".to_string(),
             ],
             syscalls: vec![
                 // Mount family: block remounting the rootfs or escaping the mount ns.
@@ -123,5 +129,29 @@ impl Profile {
             .iter()
             .flat_map(|s| s.names.iter().map(String::as_str))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod arch_tests {
+    use super::Profile;
+
+    #[test]
+    fn baseline_lists_each_native_arch_with_its_compat_abis() {
+        let archs = Profile::baseline().architectures;
+        // A default-allow profile relies on every reachable ABI being listed, or a
+        // syscall under an unlisted compat ABI evades the per-name deny rules.
+        for a in [
+            "SCMP_ARCH_X86_64",
+            "SCMP_ARCH_X86", // x86_64's 32-bit compat
+            "SCMP_ARCH_X32",
+            "SCMP_ARCH_AARCH64",
+            "SCMP_ARCH_ARM", // aarch64's 32-bit compat
+        ] {
+            assert!(
+                archs.iter().any(|x| x == a),
+                "seccomp profile is missing {a}"
+            );
+        }
     }
 }

@@ -49,10 +49,18 @@ fn table(tag: &str) -> Result<Table> {
             .ok()
             .map(|s| s.id().into())
     }
+    fn arm(name: &str) -> Option<i64> {
+        syscalls::arm::Sysno::from_str(name)
+            .ok()
+            .map(|s| s.id().into())
+    }
     match tag {
         "SCMP_ARCH_X86_64" | "SCMP_ARCH_X32" => Ok(x86_64),
         "SCMP_ARCH_X86" => Ok(x86),
         "SCMP_ARCH_AARCH64" => Ok(aarch64),
+        // aarch64's 32-bit compat ABI, so its denials are emitted for the aarch32
+        // syscall numbers too (symmetry with X86/X32 under X86_64).
+        "SCMP_ARCH_ARM" => Ok(arm),
         other => Err(AgentError::UnsupportedArch(other.to_string())),
     }
 }
