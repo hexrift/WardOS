@@ -608,6 +608,266 @@ pub fn firewall(active: Option<bool>, zone: Option<&str>) -> Check {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hardware Baseline 1: what this machine gives a session, and how fast.
+//
+// This is a *report*, run on reference hardware to drive fixes from facts
+// rather than assumptions. Every check is best-effort: a missing capability is
+// a `Warn`, never a `Fail` — the host-readiness checks above own the blocking
+// verdict. Probes shell out and are bounded by `PROBE_TIMEOUT`; in an
+// environment without the tool (CI), each degrades to a `Warn`, so the pure
+// classifiers below are what the tests pin.
+// ---------------------------------------------------------------------------
+
+/// The hardware and performance baseline (Hardware Baseline 1).
+#[must_use]
+pub fn hardware() -> Vec<Check> {
+    vec![
+        gpu(),
+        wifi(any_net_iface_wireless()),
+        bluetooth(dir_nonempty("/sys/class/bluetooth")),
+        audio(),
+        suspend(suspend_supported(read("/sys/power/state").as_deref())),
+        container_runtime(),
+        kvm(Path::new("/dev/kvm").exists()),
+        boot_time(probe("systemd-analyze", &["time"]).as_deref()),
+        memory(read("/proc/meminfo").as_deref()),
+    ]
+}
+
+/// Whether any interface under `/sys/class/net` is wireless.
+fn any_net_iface_wireless() -> bool {
+    std::fs::read_dir("/sys/class/net")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| e.path().join("wireless").exists())
+}
+
+/// Whether a directory exists and has at least one entry.
+fn dir_nonempty(path: &str) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_some())
+}
+
+fn gpu() -> Check {
+    let renderer = probe("glxinfo", &["-B"])
+        .and_then(|o| renderer_in_glxinfo(&o))
+        .or_else(|| probe("hyprctl", &["systeminfo"]).and_then(|o| gpu_in_hyprctl(&o)));
+    let node = Path::new("/dev/dri/renderD128").exists() || Path::new("/dev/dri/card0").exists();
+    let (status, detail) = gpu_status(renderer.as_deref(), node);
+    Check::new("GPU acceleration", status, detail)
+}
+
+/// Classify a GPU renderer string. Software rasterisers (llvmpipe et al.) are the
+/// thing to catch on real hardware — they mean "no acceleration", which reads as
+/// lag; a named hardware renderer is `Ok`.
+#[must_use]
+pub fn gpu_status(renderer: Option<&str>, render_node: bool) -> (Status, String) {
+    match renderer {
+        Some(r) if is_software_renderer(r) => (
+            Status::Warn,
+            format!(
+                "software rendering ({r}) — no GPU acceleration; check mesa drivers + linux-firmware"
+            ),
+        ),
+        Some(r) => (Status::Ok, r.to_owned()),
+        None if render_node => (
+            Status::Warn,
+            "GPU device present, acceleration unverified (no glxinfo/hyprctl)".to_owned(),
+        ),
+        None => (Status::Warn, "no GPU renderer detected".to_owned()),
+    }
+}
+
+/// A renderer that runs on the CPU rather than a GPU.
+#[must_use]
+pub fn is_software_renderer(renderer: &str) -> bool {
+    let r = renderer.to_ascii_lowercase();
+    ["llvmpipe", "softpipe", "swrast", "software"]
+        .iter()
+        .any(|s| r.contains(s))
+}
+
+/// `OpenGL renderer string:` from `glxinfo -B`.
+#[must_use]
+pub fn renderer_in_glxinfo(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|l| l.trim().strip_prefix("OpenGL renderer string:"))
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// The first non-empty line of the `GPU information` block of `hyprctl systeminfo`.
+#[must_use]
+pub fn gpu_in_hyprctl(out: &str) -> Option<String> {
+    let mut lines = out.lines();
+    while let Some(l) = lines.next() {
+        if l.to_ascii_lowercase().contains("gpu information") {
+            return lines
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
+fn wifi(present: bool) -> Check {
+    if present {
+        Check::new("Wi-Fi", Status::Ok, "wireless interface present")
+    } else {
+        Check::new(
+            "Wi-Fi",
+            Status::Warn,
+            "no wireless interface (some laptops need linux-firmware)",
+        )
+    }
+}
+
+fn bluetooth(present: bool) -> Check {
+    if present {
+        Check::new("Bluetooth", Status::Ok, "controller present")
+    } else {
+        Check::new("Bluetooth", Status::Warn, "no Bluetooth controller")
+    }
+}
+
+fn audio() -> Check {
+    if probe("pactl", &["info"]).is_some() || probe("wpctl", &["status"]).is_some() {
+        Check::new("audio", Status::Ok, "PipeWire responding")
+    } else if which("pipewire").is_some() {
+        Check::new(
+            "audio",
+            Status::Warn,
+            "PipeWire installed; not verified running",
+        )
+    } else {
+        Check::new("audio", Status::Warn, "no PipeWire on PATH")
+    }
+}
+
+fn suspend(supported: bool) -> Check {
+    if supported {
+        Check::new("suspend/resume", Status::Ok, "kernel offers suspend-to-RAM")
+    } else {
+        Check::new(
+            "suspend/resume",
+            Status::Warn,
+            "no 'mem' in /sys/power/state",
+        )
+    }
+}
+
+/// `mem` in `/sys/power/state` means suspend-to-RAM is available.
+#[must_use]
+pub fn suspend_supported(state: Option<&str>) -> bool {
+    state.is_some_and(|s| s.split_whitespace().any(|t| t == "mem"))
+}
+
+fn container_runtime() -> Check {
+    if probe("podman", &["info", "--format", "{{.Host.Arch}}"]).is_some() {
+        Check::new("container runtime", Status::Ok, "podman")
+    } else if which("podman").is_some() {
+        Check::new(
+            "container runtime",
+            Status::Warn,
+            "podman present but `podman info` failed (rootless setup?)",
+        )
+    } else {
+        Check::new("container runtime", Status::Warn, "podman not found")
+    }
+}
+
+fn kvm(present: bool) -> Check {
+    if present {
+        Check::new(
+            "KVM",
+            Status::Ok,
+            "/dev/kvm present — Capsule microVM/VM tiers available",
+        )
+    } else {
+        Check::new(
+            "KVM",
+            Status::Warn,
+            "no /dev/kvm; Capsule microVM/VM tiers unavailable (sandbox/container tiers still work)",
+        )
+    }
+}
+
+fn boot_time(analyze: Option<&str>) -> Check {
+    match analyze.and_then(boot_to_desktop_secs) {
+        Some(s) => Check::new(
+            "boot → userspace",
+            if s <= 30.0 { Status::Ok } else { Status::Warn },
+            format!("{s:.1}s (systemd-analyze)"),
+        ),
+        None => Check::new(
+            "boot → userspace",
+            Status::Warn,
+            "systemd-analyze unavailable",
+        ),
+    }
+}
+
+/// Seconds to userspace from `systemd-analyze time`: the `(userspace)` figure when
+/// present, else the total after `=`. Handles `Nmin Ms` and `Ns`.
+#[must_use]
+pub fn boot_to_desktop_secs(out: &str) -> Option<f64> {
+    for line in out.lines() {
+        if let Some(idx) = line.find("(userspace)") {
+            // The duration before "(userspace)" is one token ("9.702s") or two
+            // ("1min 2.500s"); take the last two and drop a leading non-duration.
+            let toks: Vec<&str> = line[..idx].split_whitespace().collect();
+            let cand = match toks.as_slice() {
+                [.., a, b] if a.ends_with("min") => format!("{a} {b}"),
+                [.., b] => (*b).to_owned(),
+                [] => continue,
+            };
+            if let Some(v) = parse_secs(&cand) {
+                return Some(v);
+            }
+        }
+    }
+    out.rsplit('=').next().and_then(|t| parse_secs(t.trim()))
+}
+
+/// `12.807s` or `1min 2.3s` → seconds.
+fn parse_secs(tok: &str) -> Option<f64> {
+    let s = tok.trim().strip_suffix('s')?;
+    if let Some((mins, secs)) = s.split_once("min ") {
+        return Some(mins.trim().parse::<f64>().ok()? * 60.0 + secs.trim().parse::<f64>().ok()?);
+    }
+    s.trim().parse().ok()
+}
+
+fn memory(meminfo: Option<&str>) -> Check {
+    match meminfo.and_then(used_mem_mb) {
+        Some(mb) => Check::new("idle memory", Status::Ok, format!("{mb} MB in use")),
+        None => Check::new("idle memory", Status::Warn, "cannot read /proc/meminfo"),
+    }
+}
+
+/// Memory in use (MemTotal − MemAvailable), in MiB, from `/proc/meminfo`.
+#[must_use]
+pub fn used_mem_mb(meminfo: &str) -> Option<u64> {
+    let kb = |key: &str| {
+        meminfo.lines().find_map(|l| {
+            l.strip_prefix(key)
+                .and_then(|r| r.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        })
+    };
+    let total = kb("MemTotal:")?;
+    let avail = kb("MemAvailable:")?;
+    Some(total.saturating_sub(avail) / 1024)
+}
+
+/// Whether the hardware baseline has any blocking check (there are none by design,
+/// but callers can ask). Kept for symmetry with [`healthy`].
+#[must_use]
+pub fn baseline_ready(checks: &[Check]) -> bool {
+    checks.iter().all(|c| c.status != Status::Fail)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -891,5 +1151,100 @@ mod tests {
             assert_eq!(names.iter().filter(|x| **x == n).count(), 1, "{n}");
         }
         let _ = healthy(&checks);
+    }
+}
+
+#[cfg(test)]
+mod hardware_tests {
+    use super::*;
+
+    #[test]
+    fn software_renderers_are_flagged() {
+        assert!(is_software_renderer("llvmpipe (LLVM 17.0.6, 256 bits)"));
+        assert!(is_software_renderer("softpipe"));
+        assert!(is_software_renderer("SWRAST"));
+        assert!(!is_software_renderer(
+            "Mesa Intel(R) UHD Graphics 620 (KBL GT2)"
+        ));
+    }
+
+    #[test]
+    fn gpu_status_classifies() {
+        assert_eq!(
+            gpu_status(Some("Mesa Intel(R) UHD Graphics 620"), true).0,
+            Status::Ok
+        );
+        assert_eq!(gpu_status(Some("llvmpipe"), true).0, Status::Warn);
+        assert_eq!(gpu_status(None, true).0, Status::Warn); // device present, unverified
+        assert_eq!(gpu_status(None, false).0, Status::Warn);
+    }
+
+    #[test]
+    fn renderer_parsed_from_glxinfo() {
+        let out = "name of display: :0\nOpenGL renderer string: Mesa Intel(R) UHD Graphics 620 (KBL GT2)\nOpenGL version string: 4.6";
+        assert_eq!(
+            renderer_in_glxinfo(out).as_deref(),
+            Some("Mesa Intel(R) UHD Graphics 620 (KBL GT2)")
+        );
+        assert_eq!(renderer_in_glxinfo("nothing here"), None);
+    }
+
+    #[test]
+    fn gpu_parsed_from_hyprctl() {
+        let out = "Hyprland 0.56\n\nGPU information:\n\tIntel Corporation UHD Graphics 620\n";
+        assert_eq!(
+            gpu_in_hyprctl(out).as_deref(),
+            Some("Intel Corporation UHD Graphics 620")
+        );
+    }
+
+    #[test]
+    fn boot_seconds_prefer_userspace() {
+        let out = "Startup finished in 3.104s (kernel) + 9.702s (userspace) = 12.807s";
+        assert_eq!(boot_to_desktop_secs(out), Some(9.702));
+    }
+
+    #[test]
+    fn boot_seconds_total_fallback() {
+        // No "(userspace)" label: take the total after '='.
+        assert_eq!(boot_to_desktop_secs("Startup finished = 8.5s"), Some(8.5));
+    }
+
+    #[test]
+    fn boot_seconds_handle_minutes() {
+        let out = "Startup finished in 1min 2.500s (userspace) = 1min 2.500s";
+        assert_eq!(boot_to_desktop_secs(out), Some(62.5));
+    }
+
+    #[test]
+    fn suspend_reads_state() {
+        assert!(suspend_supported(Some("freeze mem disk")));
+        assert!(!suspend_supported(Some("freeze")));
+        assert!(!suspend_supported(None));
+    }
+
+    #[test]
+    fn used_memory_from_meminfo() {
+        let m = "MemTotal:        8000000 kB\nMemFree:  100000 kB\nMemAvailable:    7000000 kB\n";
+        // (8000000 - 7000000) kB = 1000000 kB / 1024 = 976 MiB
+        assert_eq!(used_mem_mb(m), Some(976));
+        assert_eq!(used_mem_mb("garbage"), None);
+    }
+
+    #[test]
+    fn hardware_probes_are_non_blocking_and_named() {
+        // Runs the real (best-effort) probes in the test environment: whatever the
+        // machine reports, the baseline never blocks and every row is named.
+        let checks = hardware();
+        assert!(baseline_ready(&checks));
+        for name in [
+            "GPU acceleration",
+            "Wi-Fi",
+            "KVM",
+            "idle memory",
+            "boot → userspace",
+        ] {
+            assert!(checks.iter().any(|c| c.name == name), "missing {name}");
+        }
     }
 }
