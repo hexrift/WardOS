@@ -311,6 +311,32 @@ adoption path for non-WardOS hosts.
 | 10–12 | Credential broker (GitHub, model-API gateway), nested containers | E-04 |
 | 12 | **Phase 2 gate**; Phase 3 TamperWard adapter starts | E-12 |
 
+## Platform pillars (design + architecture direction)
+
+Three decisions set the shape of WardOS beyond the phase plan; each has an ADR and the
+interactive references in [`design/storyboard/`](design/storyboard/):
+
+* **The Ward Field desktop** ([ADR-0021](decisions/ADR-0021-ward-field-agentic-desktop.md)) —
+  the visual/interaction language: a reactive topography desktop, semantic colour (violet
+  intent / green verified / amber review), Command Weave, Proof Rail, Decision Receipt,
+  BUILD·VERIFY·SHIP rooms.
+* **Capsules** ([ADR-0022](decisions/ADR-0022-capsules.md)) — isolation as a first-class
+  primitive: one `Ward Capsule API` and a policy engine that picks the lightest boundary
+  (sandbox → container → microVM → VM) proportional to risk, with controlled promotion and
+  no copy-back. Unifies the existing sandbox/verifier/network mechanisms; KVM/QEMU is the
+  microVM/VM foundation.
+* **Ward Studio + the Ward Agent Runtime** ([ADR-0023](decisions/ADR-0023-ward-studio-and-agent-runtime.md),
+  *proposed/roadmap*) — a first-party agentic IDE whose unit of work is *work*, over a
+  provider-agnostic agent runtime (Claude/Codex/Gemini/local as replaceable brains). WardOS
+  owns intent, state, isolation and evidence; other editors stay first-class.
+
+**Sequencing (design the APIs now, build in this order):** WardOS solid → Capsules + the Ward
+APIs → a thin Ward Studio prototype → agent orchestration + proof → mature editor
+capabilities. The first Ward Studio prototype is deliberately narrow (TypeScript/Python/Rust +
+terminal + Git + LSP + Claude/Codex + Capsules + TamperWard) and expands only if that
+experience is exceptional. None of this blocks the reliability → onboarding → discoverability
+work on the shipping image.
+
 ## Non-goals
 
 WardOS 0.1 is not: a replacement for every Linux distribution; a Kubernetes distribution;

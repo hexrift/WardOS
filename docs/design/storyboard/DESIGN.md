@@ -94,6 +94,7 @@ No decorative or "hacker" type. Nothing below ~11px is load-bearing.
 | **Verified chit** | collapses all proof to one seal | click reveals TamperWard evidence (progressive disclosure) |
 | **Result** | outcome + Review / Commit / **Undo** | Undo is first-class — powerful actions stay reversible |
 | **Next-up** | "what should I work on next?" | real repo signals: PR #98, failed CI, agent result |
+| **Capsule surface** (ADR-0022) | isolation made legible | a quiet `Capsule · network restricted` footer chip while the agent works + an on-demand facts panel (filesystem / network / devices / privilege / lifetime); promotion via Review / Discard / **Apply to workspace** on SHIP — never a VM dashboard |
 
 ## Animation timings
 
