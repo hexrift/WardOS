@@ -321,6 +321,7 @@ assert_logged '^Hyprland $'
 assert_file "$XDG_STATE_HOME/wardos/session-start.log"
 # The bare-binary fallback fires only when the managed entry fails: succeed on the entry
 # and neither the binary form nor Hyprland is reached, and the login shell ends.
+# shellcheck disable=SC2016  # $2 is for the generated mock to expand at run time, not here
 mock uwsm 'test "$2" = hyprland.desktop'   # `uwsm start hyprland.desktop` -> 0, else 1
 : >"$MOCK_LOG"
 out=$(bash -ic "unset WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE; WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; echo REACHED_SHELL" 2>/dev/null)
