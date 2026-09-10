@@ -7,11 +7,12 @@
      Semantic colour: graphite at rest · violet = intent/action ·
      green = verified/proof · amber = review/attention (ADR-0019).
      Coordinate system 1440×900 (16:10). ============================ */
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+  /* Self-contained: WardOS ships Inter (rsms-inter-fonts) and JetBrains Mono
+     (jetbrains-mono-fonts) locally, so we name them and fall back — no remote fetch. */
   :root{
-    --ground:#0B0D10; --g2:#12151C; --g3:#171B23; --g4:#1C212B;
+    --ground:#0B0D10; --g2:#141821; --g3:#171B23; --g4:#1C212B;
     --ink:#ECE7DE; --ink2:#C4C0B8; --dim:#8A8780; --faint:#565758;
-    --verify:#6FB08A; --intent:#8E7CF0; --amber:#D6A45C; --cool:#6E88AE;
+    --verify:#6FB08A; --intent:#8E7CF0; --amber:#D6A45C; --cool:#5E7CA6; --cool-ink:#8FA8CC;
     --edge:rgba(236,231,222,.09); --edge2:rgba(236,231,222,.05);
     --vs:rgba(142,124,240,.14); --gs:rgba(111,176,138,.14); --as:rgba(214,164,92,.14);
     --ui:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
@@ -23,16 +24,15 @@
   html,body{height:100%}
   body{margin:0; background:#050608; color:var(--ink); font-family:var(--ui);
     -webkit-font-smoothing:antialiased; overflow:hidden; display:flex; flex-direction:column; height:100vh;}
-  #frame{flex:1; display:grid; place-items:center; overflow:hidden; position:relative;
-    background:radial-gradient(130% 130% at 50% 0%,#0a0c11,#050608 72%);}
+  #frame{flex:1; display:grid; place-items:center; overflow:hidden; position:relative; background:#070809;}
   #scaler{transform-origin:center center;}
   .stage{position:relative; width:1440px; height:900px; background:var(--ground); overflow:hidden;
     border-radius:14px; box-shadow:0 40px 120px -30px rgba(0,0,0,.85),0 0 0 1px rgba(236,231,222,.04);}
   .field{position:absolute; inset:0; z-index:0;}
 
-  /* ---- glyph ---- */
+  /* ---- glyph: neutral at rest (semantic colour is reserved for state, not brand) ---- */
   .glyph{display:inline-block; vertical-align:middle;}
-  .glyph .a{stroke:var(--intent);} .glyph .b{stroke:var(--ink);} .glyph .s{stroke:url(#ws);}
+  .glyph .a{stroke:var(--ink2);} .glyph .b{stroke:var(--ink);} .glyph .s{stroke:var(--dim);}
 
   /* ============================================================
      HEADER (calibrate / build / verify / ship)
@@ -44,12 +44,16 @@
   .stage[data-scene="agent"] .hdr,.stage[data-scene="verify"] .hdr,.stage[data-scene="ship"] .hdr{opacity:1;}
   .hdr .brand{display:flex; align-items:center; gap:11px;}
   .hdr .wm{font-weight:600; letter-spacing:.14em; font-size:12px;}
-  .nav{display:flex; gap:22px; margin-left:8px;}
-  .nav .ph{color:var(--faint); letter-spacing:.15em; font-weight:500; position:relative; padding:4px 0; background:none;border:none;font-family:inherit;font-size:12px;cursor:pointer;}
-  .nav .ph.on{color:var(--ink);}
-  .nav .ph.on::after{content:""; position:absolute; left:0; right:0; bottom:-2px; height:1.5px; background:var(--ink);}
-  .hdr .room{margin-left:auto; color:var(--dim); letter-spacing:.14em; font-size:11px;}
-  .pill{margin-left:26px; display:flex; align-items:center; gap:8px; padding:7px 13px; border-radius:20px;
+  /* Rooms are locations, not tabs: current room is braced and full-ink; the others almost
+     disappear; no selected-button underline (ADR-0021 / DESIGN.md). */
+  .nav{display:flex; gap:26px; margin-left:14px;}
+  .nav .ph{color:var(--ink); letter-spacing:.18em; font-weight:500; opacity:.32; padding:4px 0;
+    background:none;border:none;font-family:inherit;font-size:12px;cursor:pointer; transition:opacity var(--room) var(--ease);}
+  .nav .ph:hover{opacity:.55;}
+  .nav .ph.on{opacity:1;}
+  .nav .ph.on::before{content:"{ "; color:var(--dim);}
+  .nav .ph.on::after{content:" }"; color:var(--dim);}
+  .pill{margin-left:auto; display:flex; align-items:center; gap:8px; padding:7px 13px; border-radius:20px;
     border:1px solid var(--edge); color:var(--ink2); letter-spacing:.1em; font-size:11px; font-weight:500;}
   .pill .d{width:7px;height:7px;border-radius:50%;background:var(--verify);}
   .stage[data-ward="review"] .pill{border-color:rgba(214,164,92,.4); color:var(--amber);}
@@ -83,7 +87,9 @@
   .gut{width:44px; padding:14px 0; text-align:right; color:var(--faint); font-family:var(--mono); font-size:12.5px; line-height:1.95; border-right:1px solid var(--edge2);}
   .code{flex:1; padding:14px 20px; font-family:var(--mono); font-size:13px; line-height:1.95; color:var(--ink2); overflow:hidden;}
   .code .ln{white-space:pre; position:relative;}
-  .code .kw{color:var(--cool)} .code .fn{color:var(--ink)} .code .str{color:var(--verify)} .code .dec{color:var(--intent)}
+  /* Syntax colour is non-semantic (cool neutral + warm neutrals); violet/green are reserved for state. */
+  .code .kw{color:var(--cool-ink)} .code .fn{color:var(--ink)} .code .str{color:#B7997A} .code .dec{color:var(--dim)}
+  /* The hot line's violet is legitimate: it marks where the agent's intent is acting. */
   .code .ln.hot{background:var(--vs); box-shadow:inset 2px 0 var(--intent);}
   .ed-term{border-top:1px solid var(--edge2); padding:11px 16px; font-family:var(--mono); font-size:12px; color:var(--dim); min-height:64px;
     opacity:0; max-height:0; transition:opacity var(--surf),max-height var(--surf); overflow:hidden;}
@@ -94,12 +100,12 @@
   /* ============================================================
      PROOF RAIL — hairline at rest, blooms into a panel
      ============================================================ */
-  .rail{position:absolute; right:0; top:72px; bottom:64px; width:56px; z-index:6; pointer-events:none;
-    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:26px;
-    transition:opacity var(--room);}
+  /* At rest the Proof Rail is a 2px neutral graphite trace — no green, no sidebar. */
+  .rail{position:absolute; right:0; top:120px; bottom:110px; width:2px; z-index:6; pointer-events:none;
+    background:rgba(236,231,222,.06); opacity:0; transition:opacity var(--room);}
   .stage[data-scene="build"] .rail,.stage[data-scene="weave"] .rail,.stage[data-scene="ship"] .rail{opacity:1;}
-  .stage[data-scene="agent"] .rail,.stage[data-scene="verify"] .rail{opacity:0;} /* replaced by panel */
-  .rail .rd{width:6px;height:6px;border-radius:50%;background:var(--verify);opacity:.5;box-shadow:0 0 8px rgba(111,176,138,.4);}
+  .stage[data-scene="agent"] .rail,.stage[data-scene="verify"] .rail{opacity:0;} /* replaced by the panel while working */
+  .rail .rd{display:none;}
 
   .railpanel{position:absolute; right:28px; top:72px; width:270px; z-index:6;
     opacity:0; transform:translateX(10px); pointer-events:none;
@@ -121,11 +127,13 @@
   /* ============================================================
      COMMAND WEAVE
      ============================================================ */
-  .weave{position:absolute; left:50%; top:300px; width:560px; transform:translate(-50%,8px) scale(.98); z-index:12;
-    background:rgba(20,24,31,.94); backdrop-filter:blur(20px); border:1px solid var(--edge); border-radius:15px;
+  /* Command Weave emerges from the user's locus (JS sets left/top/transform-origin from the
+     focused line; these are the safe fallback). Solid surface — no glass. */
+  .weave{position:absolute; left:96px; top:236px; width:560px; transform:translateY(10px) scale(.985); transform-origin:16px 120px; z-index:12;
+    background:var(--g2); border:1px solid var(--edge); border-radius:14px;
     box-shadow:0 30px 80px -24px rgba(0,0,0,.8); opacity:0; pointer-events:none; overflow:hidden;
     transition:opacity var(--surf) var(--ease),transform var(--surf) var(--spring);}
-  .stage[data-scene="weave"] .weave{opacity:1; transform:translate(-50%,0) scale(1); pointer-events:auto;}
+  .stage[data-scene="weave"] .weave{opacity:1; transform:none; pointer-events:auto;}
   .wv-h{padding:18px 22px 4px; font-size:10px; letter-spacing:.18em; color:var(--intent); font-weight:600;}
   .wv-q{padding:2px 22px 14px; font-size:20px; color:var(--ink); letter-spacing:-.01em;}
   .wv-in{margin:0 18px; padding:13px 16px; border:1px solid rgba(142,124,240,.5); border-radius:10px; background:rgba(142,124,240,.05);
@@ -135,8 +143,9 @@
   .wv-routes{display:grid; grid-template-columns:repeat(4,1fr); gap:9px; padding:16px 18px 6px;}
   .rt{padding:14px; border-radius:10px; border:1px solid var(--edge); background:rgba(236,231,222,.02); cursor:pointer; transition:border-color var(--fast),background var(--fast);}
   .rt:hover,.rt.sel{border-color:rgba(142,124,240,.5); background:var(--vs);}
-  .rt .d{width:8px;height:8px;border-radius:50%;margin-bottom:10px;}
-  .rt.code .d{background:var(--intent)} .rt.agent .d{background:var(--verify)} .rt.files .d{background:var(--ink)} .rt.system .d{background:var(--amber)}
+  /* Route markers are neutral; the weave's violet is the intent-selection accent only. */
+  .rt .d{width:8px;height:8px;border-radius:50%;margin-bottom:10px;background:var(--dim);opacity:.6;}
+  .rt.sel .d{background:var(--intent);opacity:1;}
   .rt .rn{font-size:12px; letter-spacing:.12em; color:var(--ink); font-weight:600;}
   .rt .rs{font-size:11px; color:var(--dim); margin-top:4px; line-height:1.35;}
   .wv-keys{display:flex; gap:22px; padding:12px 22px 18px; font-size:11px; color:var(--faint);}
@@ -148,16 +157,20 @@
     opacity:0; transform:scale(.85) translate(-16px,-8px); transform-origin:left center; pointer-events:none;
     transition:opacity var(--surf),transform var(--surf) var(--spring);}
   .stage[data-scene="agent"] .intent{opacity:1; transform:none;}
-  .intent::before{content:""; position:absolute; left:-26px; top:24px; width:26px; height:1px; background:linear-gradient(90deg,transparent,var(--intent));}
+  .intent::before{content:""; position:absolute; left:-26px; top:24px; width:26px; height:1px; background:var(--intent); opacity:.55;}
   .intent .k{padding:12px 15px 0; font-size:10px; letter-spacing:.16em; color:var(--intent); font-weight:600;}
   .intent .t{padding:8px 15px 4px; font-size:14px; color:var(--ink);}
   .intent .s{padding:0 15px 14px; font-size:11.5px; color:var(--dim); font-family:var(--mono);}
 
   /* ---- Decision Receipt (blocked) ---- */
-  .receipt{position:absolute; z-index:12; left:300px; top:360px; width:330px;
+  /* Decision Receipt blooms from the affected object (JS anchors it to the changed line;
+     these are the fallback). A solid tether + node point back to that line. */
+  .receipt{position:absolute; z-index:12; left:392px; top:300px; width:330px;
     background:var(--g4); border:1px solid rgba(214,164,92,.5); border-radius:12px; box-shadow:0 28px 70px -22px rgba(0,0,0,.8);
-    opacity:0; transform:scale(.9) translateY(8px); transform-origin:center; pointer-events:none;
+    opacity:0; transform:scale(.92) translate(-14px,4px); transform-origin:left top; pointer-events:none;
     transition:opacity var(--surf),transform var(--surf) var(--spring);}
+  .receipt::before{content:""; position:absolute; left:16px; top:-20px; width:1px; height:20px; background:var(--amber); opacity:.55;}
+  .receipt::after{content:""; position:absolute; left:13px; top:-24px; width:6px; height:6px; border-radius:50%; background:var(--amber); box-shadow:0 0 8px var(--as);}
   .stage[data-scene="verify"] .receipt{opacity:1; transform:none; pointer-events:auto;}
   .rc-k{padding:14px 18px 0; font-size:10px; letter-spacing:.16em; color:var(--amber); font-weight:600;}
   .rc-t{padding:8px 18px 2px; font-size:16px; color:var(--ink); letter-spacing:-.01em;}
@@ -169,8 +182,9 @@
   .rc-a .kbd{margin-left:auto; font-family:var(--mono); font-size:11px; color:var(--faint);}
 
   /* ---- Outcome Verified ---- */
+  /* SHIP-room result. Solid surface; the green border/seal are legitimate (verified outcome). */
   .outcome{position:absolute; z-index:12; left:50%; top:300px; transform:translate(-50%,10px) scale(.96); width:460px;
-    background:rgba(18,24,20,.95); backdrop-filter:blur(14px); border:1px solid rgba(111,176,138,.5); border-radius:15px;
+    background:var(--g2); border:1px solid rgba(111,176,138,.5); border-radius:14px;
     box-shadow:0 30px 80px -24px rgba(0,0,0,.8); opacity:0; pointer-events:none;
     transition:opacity var(--surf),transform var(--surf) var(--spring);}
   .stage[data-scene="ship"] .outcome{opacity:1; transform:translate(-50%,0) scale(1); pointer-events:auto;}
@@ -189,7 +203,8 @@
     align-content:center; padding:0 26px; opacity:0; transform:translateY(8px); pointer-events:none;
     transition:opacity var(--surf) var(--ease),transform var(--surf) var(--ease);}
   .stage[data-scene="calibrate"] .cal{opacity:1; transform:none; pointer-events:auto;}
-  .cal-k{font-size:10px; letter-spacing:.2em; color:var(--intent); font-weight:600;}
+  /* Onboarding carries no agent intent — the eyebrow and CTA stay neutral, not violet. */
+  .cal-k{font-size:10px; letter-spacing:.2em; color:var(--dim); font-weight:600;}
   .cal-h{font-size:36px; font-weight:600; letter-spacing:-.025em; margin:14px 0 0; line-height:1.08; text-wrap:balance; max-width:9em;}
   .cal-sub{font-size:13.5px; color:var(--dim); margin-top:12px;}
   .cal-rows{margin-top:34px; display:flex; flex-direction:column; gap:22px; max-width:560px;}
@@ -198,7 +213,8 @@
   .cal-row .lab{width:130px; font-size:14px; color:var(--ink);}
   .seg{display:flex; gap:8px;}
   .seg button{font-family:var(--ui); font-size:12.5px; padding:8px 15px; border-radius:8px; border:1px solid var(--edge); background:rgba(236,231,222,.02); color:var(--dim); cursor:pointer; transition:all var(--fast);}
-  .seg button.on{border-color:rgba(142,124,240,.6); background:var(--vs); color:var(--ink);}
+  /* Selection here is a user preference, not agent intent — neutral, not violet. */
+  .seg button.on{border-color:rgba(236,231,222,.42); background:rgba(236,231,222,.06); color:var(--ink);}
   .cal-side{align-self:center;}
   .prev{background:var(--g2); border:1px solid var(--edge); border-radius:13px; padding:18px;}
   .prev-k{font-size:10px; letter-spacing:.16em; color:var(--dim); text-transform:uppercase;}
@@ -206,10 +222,10 @@
   .prev-win{height:130px; background:var(--g3); border:1px solid var(--edge2); border-radius:9px; padding:14px; display:flex; gap:10px; position:relative; overflow:hidden;}
   .prev-win .pl{flex:1; display:flex; flex-direction:column; gap:9px;}
   .prev-win .pl i{height:5px; border-radius:3px; background:rgba(236,231,222,.1); display:block;}
-  .prev-win .pl i:nth-child(1){width:70%} .prev-win .pl i:nth-child(2){width:52%;background:var(--vs)} .prev-win .pl i:nth-child(3){width:64%} .prev-win .pl i:nth-child(4){width:40%}
-  .prev-win .pr{width:3px; background:linear-gradient(var(--verify),transparent); border-radius:2px;}
+  .prev-win .pl i:nth-child(1){width:70%} .prev-win .pl i:nth-child(2){width:52%} .prev-win .pl i:nth-child(3){width:64%} .prev-win .pl i:nth-child(4){width:40%}
+  .prev-win .pr{width:2px; background:rgba(236,231,222,.14); border-radius:2px;}
   .prev-note{font-size:12px; color:var(--dim); margin-top:14px;} .prev-note b{color:var(--ink2);}
-  .cal-cont{margin-top:18px; width:100%; font-family:var(--ui); font-size:14px; color:#fff; background:var(--intent); border:none; padding:12px; border-radius:10px; cursor:pointer; opacity:.92; transition:opacity var(--fast);}
+  .cal-cont{margin-top:18px; width:100%; font-family:var(--ui); font-size:14px; color:var(--ground); background:var(--ink); border:none; padding:12px; border-radius:10px; cursor:pointer; opacity:.92; transition:opacity var(--fast);}
   .cal-cont:hover{opacity:1;}
 
   /* ============================================================
@@ -252,22 +268,16 @@
   #ctl .spacer{flex:1} #ctl select{font-family:var(--ui); background:rgba(236,231,222,.04); color:var(--ink2); border:1px solid var(--edge); border-radius:8px; padding:7px 9px; font-size:12px;}
   #ctl label{display:flex; align-items:center; gap:6px; cursor:pointer;}
   body.demo #ctl{display:none;}
-  *:focus-visible{outline:2px solid var(--intent); outline-offset:2px;}
+  /* Focus ring uses the neutral cool, not the semantic violet. */
+  *:focus-visible{outline:2px solid var(--cool); outline-offset:2px;}
   @media (prefers-reduced-motion:reduce){*{transition-duration:70ms !important;}}
   body.reduce *{transition-property:opacity !important;}
 
-  svg.defs{position:absolute;width:0;height:0;}
 </style>
-
-<svg class="defs"><defs>
-  <linearGradient id="ws" x1="0" y1="0" x2="0" y2="1">
-    <stop offset="0" stop-color="#8E7CF0"/><stop offset="1" stop-color="#6FB08A"/>
-  </linearGradient>
-</defs></svg>
 
 <div id="frame"><div id="scaler">
   <div class="stage" id="stage" data-scene="boot" data-ward="verified">
-    <canvas class="field" id="field" width="1440" height="900"></canvas>
+    <canvas class="field" id="field" width="1440" height="900" aria-hidden="true"></canvas>
 
     <!-- header -->
     <header class="hdr">
@@ -281,7 +291,6 @@
         <button class="ph" data-ph="verify">VERIFY</button>
         <button class="ph" data-ph="ship">SHIP</button>
       </nav>
-      <span class="room">ROOM 01 / PROJECT ORBIT</span>
       <span class="pill"><span class="d"></span><span id="wardLabel">WARD / VERIFIED</span></span>
     </header>
 
@@ -339,11 +348,11 @@
         <p class="cal-sub">Three choices. Everything else stays out of the way.</p>
         <div class="cal-rows">
           <div class="cal-row"><span class="num">01</span><span class="lab">Navigation</span>
-            <div class="seg"><button>Guided</button><button class="on">Hybrid</button><button>Keyboard‑first</button></div></div>
+            <div class="seg"><button class="on">Keyboard + mouse</button><button>Keyboard‑first</button></div></div>
           <div class="cal-row"><span class="num">02</span><span class="lab">Agent autonomy</span>
-            <div class="seg"><button>Ask</button><button class="on">Guarded</button><button>Auto</button></div></div>
+            <div class="seg"><button class="on">Ask before changes</button><button>Routine automatically</button><button>Custom</button></div></div>
           <div class="cal-row"><span class="num">03</span><span class="lab">Motion</span>
-            <div class="seg"><button>Reduced</button><button class="on">Precise</button><button>Expressive</button></div></div>
+            <div class="seg" data-cal="motion"><button class="on">Full</button><button>Reduced</button></div></div>
         </div>
       </div>
       <div class="cal-side">
@@ -451,17 +460,29 @@
     '<div class="rp-foot">'+d.foot+'</div>';}
 
   function setOv(id){['boot','gate'].forEach(o=>$('#'+o).classList.toggle('on',o===id));}
+  // Spatial causality: measure a target in stage-logical (unscaled) px and bloom a surface
+  // below it, with the transform-origin at the target so it emerges from its cause.
+  function stagePt(el){const sr=stage.getBoundingClientRect(),er=el.getBoundingClientRect(),sc=sr.width/1440||1;
+    return{x:(er.left-sr.left)/sc,y:(er.top-sr.top)/sc,w:er.width/sc,h:er.height/sc};}
+  function anchorBelow(sel,targetSel,w,gap){
+    const s=document.querySelector(sel),t=document.querySelector(targetSel); if(!s||!t)return;
+    const p=stagePt(t),left=Math.max(24,Math.min(Math.round(p.x-6),1440-w-24)),top=Math.round(p.y+p.h+gap);
+    s.style.left=left+'px'; s.style.top=top+'px'; s.style.transformOrigin=Math.round(p.x-left+8)+'px '+(-gap)+'px';
+  }
   function enter(i){
     clr(); const s=SCENES[i]; stage.dataset.scene=s.id;
     setOv(s.id==='boot'?'boot':s.id==='gate'?'gate':null);
     // phase nav + ward pill
     const ph = (s.id==='verify')?'verify':(s.id==='ship')?'ship':(['build','weave','agent'].includes(s.id))?'build':null;
-    document.querySelectorAll('.nav .ph').forEach(b=>b.classList.toggle('on',b.dataset.ph===ph));
+    document.querySelectorAll('.nav .ph').forEach(b=>{const on=b.dataset.ph===ph;b.classList.toggle('on',on);b.setAttribute('aria-current',on?'true':'false');});
     stage.dataset.ward = (s.id==='verify')?'review':'verified';
     $('#wardLabel').textContent = (s.id==='verify')?'WARD / REVIEW':'WARD / VERIFIED';
     $('#footRight').textContent = (s.id==='agent')?'PROOF RAIL / live':(s.id==='verify')?'PROOF RAIL / 1 blocked':'PROOF RAIL / 3 quiet events';
     if(s.id==='agent') rail(RAIL_BUILD);
     if(s.id==='verify') rail(RAIL_VERIFY);
+    // Weave and Receipt bloom from the focused line (locus), not fixed coordinates.
+    if(s.id==='weave') requestAnimationFrame(()=>anchorBelow('.weave','.code .ln.hot',560,22));
+    if(s.id==='verify') requestAnimationFrame(()=>anchorBelow('.receipt','.code .ln.hot',330,26));
     if(s.id==='agent'){ $('#termOut').innerHTML='running…'; sched(()=>$('#termOut').innerHTML='................  <span class="pass">18 passed in 1.42s</span>',2600); }
     else { $('#termOut').innerHTML='................  <span class="pass">18 passed in 1.42s</span>'; }
     updateCtl(i);
@@ -481,7 +502,10 @@
   $('#calCont').onclick=()=>goto(2); $('#unlock').onclick=()=>goto(3);
   $('#rcInspect').onclick=()=>{}; // reserved
   document.querySelectorAll('.nav .ph').forEach(b=>b.onclick=()=>{const m={build:3,verify:6,ship:7};goto(m[b.dataset.ph]);});
-  document.querySelectorAll('.seg').forEach(g=>g.querySelectorAll('button').forEach(b=>b.onclick=()=>{g.querySelectorAll('button').forEach(x=>x.classList.remove('on'));b.classList.add('on');}));
+  document.querySelectorAll('.seg').forEach(g=>g.querySelectorAll('button').forEach(b=>b.onclick=()=>{
+    g.querySelectorAll('button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
+    if(g.dataset.cal==='motion'){const red=/reduced/i.test(b.textContent);document.body.classList.toggle('reduce',red);$('#rm').checked=red;}
+  }));
   document.querySelectorAll('.rt').forEach(r=>r.onclick=()=>{document.querySelectorAll('.rt').forEach(x=>x.classList.remove('sel'));r.classList.add('sel');});
   addEventListener('keydown',e=>{if(e.key==='ArrowRight')goto(idx+1);else if(e.key==='ArrowLeft')goto(idx-1);else if(e.key===' '){e.preventDefault();setPlaying(!playing);}});
   (function fillLoop(){if(playing){const p=Math.min(1,(performance.now()-segStart)/(SCENES[idx].dur*1000));$('#fill').style.width=(p*100)+'%';}requestAnimationFrame(fillLoop);})();
@@ -513,7 +537,8 @@
     const sc=SCENES[idx].id, tg=F[sc]||F.build, k=reduce()?1:.11;
     cur.i+=(tg.i-cur.i)*k;cur.v+=(tg.v-cur.v)*k;cur.e+=(tg.e-cur.e)*k;
     cur.ecx+=(tg.ec[0]-cur.ecx)*k;cur.ecy+=(tg.ec[1]-cur.ecy)*k;
-    if(!reduce())t+=0.0016+0.006*.6;
+    // Drift scales with agent activity: near-still at rest (calm, cheap), livelier under work.
+    if(!reduce())t+=0.0009+(cur.i+cur.v)*0.006;
     ctx.clearRect(0,0,W,H);ctx.fillStyle='#0B0D10';ctx.fillRect(0,0,W,H);
     const acc=accent(),css=a=>'rgba('+(acc[0]|0)+','+(acc[1]|0)+','+(acc[2]|0)+','+a+')',act=cur.i+cur.v;
     if(act>.02){const gr=ctx.createRadialGradient(cur.ecx,cur.ecy,0,cur.ecx,cur.ecy,430);

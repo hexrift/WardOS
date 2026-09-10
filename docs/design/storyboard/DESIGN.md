@@ -48,13 +48,13 @@ on any host ground.
 | Token | Hex | Role |
 |-------|-----|------|
 | `--ground` | `#0B0D10` | mineral black, faint blue-graphite bias — the field |
-| `--ground-2` | `#12151C` | raised graphite (weave, rail panel) |
+| `--ground-2` | `#141821` | raised graphite (weave, rail panel) |
 | `--ground-3` | `#181C25` | windows, receipts |
 | `--ink` | `#ECE7DE` | warm off-white — primary type |
 | `--ink-dim` | `#8A8780` | muted warm grey — secondary type |
 | `--verify` | `#6FB08A` | **restrained** verification green — proof, done states |
 | `--intent` | `#8E7CF0` | muted electric violet — **agent intent only** |
-| `--cool` | `#6E88AE` | occasional cool neutral blue — keywords, PR tags |
+| `--cool` | `#5E7CA6` | occasional cool neutral blue — focus ring, PR tags (a lighter `#8FA8CC` for small code keywords to hold contrast) |
 | `--edge` | `rgba(236,231,222,.09)` | hairlines |
 
 **Colour discipline.** Violet means *agent intent* and nothing else; green means *verified*
@@ -84,7 +84,7 @@ No decorative or "hacker" type. Nothing below ~11px is load-bearing.
 
 | Component | What it is | Signature detail |
 |-----------|------------|------------------|
-| **Rooms rail** | workspaces as words (`BUILD · RESEARCH · REVIEW`), top edge | sliding spring underline; never numbers |
+| **Rooms rail** | workspaces as words (`BUILD · VERIFY · SHIP`), top edge | current room lit, siblings recede; never numbers, never tabs |
 | **Status** | one quiet line, top-right | a single state pulse: green ready / violet working |
 | **Focus Canvas** | the active window, centred, inset | fades in with a small spring; everything else recedes |
 | **Command Weave** | one universal input | expands from the locus; shows a few *intent* interpretations + context/capability chips; ↵ launches |
@@ -186,6 +186,40 @@ product):
 - **The governing rule:** *nothing appears merely to show WardOS is clever; it appears only
   because the user needs it now.* This is what keeps the design out of the
   "AI-operating-system dashboard" trap.
+
+## Invariants & enforcement
+
+These are treated as invariants, not aesthetics, and are checked by
+`check-invariants.sh` (run it from anywhere; it greps all three prototypes):
+
+- **Semantic colour is absolute.** `--intent` (violet) appears only for agent intent/action
+  (the weave input + selected route, the acting line, the acting proof-rail node); `--verify`
+  (green) only for a genuinely verified outcome (passed tests, the outcome seal, done rail
+  nodes, the verified trust pill). `--amber` is review/attention (the trust pill in VERIFY,
+  the Decision Receipt, the denied node). At rest the desktop is graphite + warm off-white:
+  the glyph, syntax strings and decorators, route markers, idle status dot and the resting
+  Proof Rail carry **no** violet or green. State is never colour-only — every coloured state
+  also carries text.
+- **No glass, no chrome gradients, no remote fonts.** No `backdrop-filter`; no CSS
+  `linear-/radial-gradient` in UI chrome (the Ward Field's `ctx.createRadialGradient` energy
+  falloff/attenuation is the sole, deliberate exception, inside the canvas); Inter and
+  JetBrains Mono are named (the faces WardOS ships) with fallbacks — never fetched.
+- **Command Weave originates from the locus.** JS measures the focused line and blooms the
+  weave from it (`transform-origin` at the caret), with a centred fallback only if no locus
+  exists — never a hard-coded centre.
+- **Decision Receipt is anchored to its cause.** JS anchors it to the affected line with a
+  tether; it is not a fixed-coordinate card.
+- **Proof Rail is a 2 px graphite trace at rest**, blooming into the panel only while the
+  agent works, settling back toward neutral after.
+- **Rooms are locations** (`{ BUILD }` lit, VERIFY/SHIP receded) — no tabs, no underline, no
+  `ROOM 01`. `BUILD · VERIFY · SHIP` is the one vocabulary across all files.
+
+Coordinate system is 1440×900 (16:10); motion budget ~150 ms micro / ~220 ms surfaces /
+~260 ms rooms, interruptible, opacity-only under reduced motion (also driven by the CALIBRATE
+Motion choice). Field drift scales with agent activity — near-still at rest.
+
+> CI wiring of `check-invariants.sh` is a follow-up: `verify.yml` is the TamperWard-protected
+> merge authority and is intentionally not modified from a design PR.
 
 ## Quality bar (self-check)
 

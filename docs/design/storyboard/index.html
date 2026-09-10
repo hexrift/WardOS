@@ -6,7 +6,7 @@
      Committed single visual world (mineral-black OS surface).
      Every colour painted explicitly so it holds on any host ground.
      ============================================================ */
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+  /* Self-contained: WardOS ships Inter and JetBrains Mono locally; named with fallbacks, no remote fetch. */
 
   :root{
     --ground:#0B0D10;        /* mineral black, faint blue-graphite bias */
@@ -42,7 +42,7 @@
 
   /* ---- letterbox + scaled stage ---- */
   #frame{flex:1; display:grid; place-items:center; overflow:hidden; position:relative;
-    background:radial-gradient(120% 120% at 50% 0%, #0a0c11 0%, #050608 70%);}
+    background:#070809;}
   #scaler{transform-origin:center center;}
   .stage{
     position:relative; width:1440px; height:810px;
@@ -68,12 +68,12 @@
   /* Rooms rail — words, not numbers, top edge */
   .rooms{position:absolute; top:0; left:0; right:0; height:52px; display:flex;
     align-items:center; gap:34px; padding:0 34px; z-index:6;
-    -webkit-mask-image:linear-gradient(#000,#000); font-size:12.5px;}
+    font-size:12.5px;}
   .rooms .brand{display:flex; align-items:center; gap:10px; margin-right:8px;}
   .rooms .glyph{width:15px; height:15px; position:relative;}
   .rooms .glyph::before,.rooms .glyph::after{content:"";position:absolute;inset:0;
     border:1.4px solid var(--ink);border-radius:3px;}
-  .rooms .glyph::after{transform:scale(.52);border-color:var(--verify);opacity:.9;border-radius:2px;}
+  .rooms .glyph::after{transform:scale(.52);border-color:var(--ink-dim);opacity:.9;border-radius:2px;}
   .rooms .wordmark{font-weight:600; letter-spacing:.12em; font-size:12px; color:var(--ink);}
   .room{position:relative; color:var(--ink-dim); letter-spacing:.16em; font-weight:500;
     cursor:pointer; padding:6px 2px; transition:color var(--e-micro) var(--ease); background:none;border:none;font-family:inherit;font-size:inherit;}
@@ -81,7 +81,7 @@
   .room[aria-current="true"]{color:var(--ink)}
   .room .dot{display:inline-block; width:5px;height:5px;border-radius:50%;
     background:currentColor; margin-right:8px; vertical-align:middle; opacity:.5;}
-  .room[aria-current="true"] .dot{background:var(--verify);opacity:1;}
+  .room[aria-current="true"] .dot{background:var(--ink);opacity:1;}
   #roomUnderline{position:absolute; bottom:8px; height:1.5px; background:var(--ink);
     transition:left var(--e-space) var(--spring), width var(--e-space) var(--spring); opacity:.85;}
 
@@ -90,7 +90,7 @@
     gap:20px; padding:0 30px; z-index:6; font-size:12px; color:var(--ink-dim);
     font-variant-numeric:tabular-nums;}
   .status .state{display:flex; align-items:center; gap:8px; color:var(--ink-2);}
-  .status .pulse{width:7px;height:7px;border-radius:50%;background:var(--verify);
+  .status .pulse{width:7px;height:7px;border-radius:50%;background:var(--ink-faint);
     box-shadow:0 0 0 0 var(--verify-soft); position:relative;}
   .stage[data-agent="1"] .status .pulse{background:var(--intent);}
   .status .metric{opacity:.9}
@@ -125,7 +125,7 @@
   .code{flex:1; padding:16px 22px; font-family:var(--mono); font-size:13px; line-height:1.85;
     overflow:hidden; color:var(--ink-2);}
   .code .ln{white-space:pre; transition:background var(--e-surface) var(--ease);}
-  .code .kw{color:var(--cool)} .code .fn{color:var(--ink)} .code .str{color:var(--verify)}
+  .code .kw{color:var(--cool)} .code .fn{color:var(--ink)} .code .str{color:#B7997A}
   .code .cm{color:var(--ink-faint)} .code .num{color:#C7A98B}
   .code .hot{background:var(--intent-soft); border-radius:3px; box-shadow:-14px 0 0 var(--intent-soft),14px 0 0 var(--intent-soft);}
   .code .add{background:var(--verify-soft); box-shadow:-14px 0 0 var(--verify-soft),14px 0 0 var(--verify-soft);}
@@ -137,7 +137,7 @@
   .stage[data-scene="06"] .rail,
   .stage[data-scene="07"] .rail,
   .stage[data-scene="08"] .rail{opacity:1;}
-  .rail:hover,.rail.open{width:250px; background:rgba(16,19,26,.94); backdrop-filter:blur(12px) saturate(1.1);
+  .rail:hover,.rail.open{width:250px; background:#12151c;
     border:1px solid var(--edge); border-radius:12px; box-shadow:var(--shadow); padding:15px 16px 1px;}
   .rail .step{position:relative; display:flex; align-items:flex-start; gap:12px;
     padding:0 0 20px 0; min-height:30px; width:100%;}
@@ -162,7 +162,7 @@
      ============================================================ */
   .weave{position:absolute; z-index:12; left:50%; top:38%; width:620px;
     transform:translate(-50%,-6px) scale(.97); transform-origin:center top;
-    background:rgba(20,23,30,.92); backdrop-filter:blur(18px) saturate(1.1);
+    background:#181c25;
     border:1px solid var(--edge); border-radius:14px; box-shadow:var(--shadow);
     opacity:0; pointer-events:none; transition:opacity var(--e-surface) var(--ease),transform var(--e-surface) var(--spring);
     overflow:hidden;}
@@ -263,7 +263,7 @@
      RESULT card (scene 09)
      ============================================================ */
   .result{position:absolute; z-index:13; left:50%; top:50%; transform:translate(-50%,-46%) scale(.97);
-    width:440px; background:rgba(20,23,30,.94); backdrop-filter:blur(16px);
+    width:440px; background:#181c25;
     border:1px solid var(--edge); border-radius:16px; box-shadow:var(--shadow);
     opacity:0; pointer-events:none; transition:opacity var(--e-space),transform var(--e-space) var(--spring); text-align:left;}
   .stage[data-scene="09"] .result{opacity:1; transform:translate(-50%,-50%) scale(1); pointer-events:auto;}
@@ -301,7 +301,7 @@
   .overlay.on{opacity:1; pointer-events:auto;}
 
   /* boot */
-  #boot{background:radial-gradient(90% 90% at 50% 45%,#0c0f14 0%,#070809 75%);}
+  #boot{background:#0b0d10;}
   .boot-c{display:flex; flex-direction:column; align-items:center; gap:22px;}
   .boot-glyph{width:56px; height:56px; position:relative;}
   .boot-glyph .sq{position:absolute; inset:0; border:1.6px solid var(--ink); border-radius:11px; opacity:0;
@@ -342,7 +342,7 @@
 
   /* login */
   #login .lg-c{display:flex; flex-direction:column; align-items:center; gap:20px;}
-  .lg-av{width:74px;height:74px;border-radius:50%; background:linear-gradient(150deg,#1c2029,#12151c);
+  .lg-av{width:74px;height:74px;border-radius:50%; background:#1c2029;
     border:1px solid var(--edge); display:grid; place-items:center; font-size:26px; font-weight:500; color:var(--ink-2);}
   .lg-name{font-size:18px; color:var(--ink); font-weight:500;}
   .lg-field{width:280px; height:42px; border-radius:10px; border:1px solid var(--edge); background:rgba(236,231,222,.02);
@@ -396,8 +396,8 @@
         <nav class="rooms" id="rooms">
           <div class="brand"><span class="glyph"></span><span class="wordmark">WARDOS</span></div>
           <button class="room" data-room="0" aria-current="true"><span class="dot"></span>BUILD</button>
-          <button class="room" data-room="1"><span class="dot"></span>RESEARCH</button>
-          <button class="room" data-room="2"><span class="dot"></span>REVIEW</button>
+          <button class="room" data-room="1"><span class="dot"></span>VERIFY</button>
+          <button class="room" data-room="2"><span class="dot"></span>SHIP</button>
           <div id="roomUnderline"></div>
         </nav>
         <div class="status">

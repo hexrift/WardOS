@@ -8,7 +8,7 @@
      Gradients live ONLY inside the canvas (energy falloff / attenuation).
      Coordinate system 1440×900 (16:10, laptop-native); 16:9 is a crop.
      ============================================================ */
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+  /* Self-contained: WardOS ships Inter and JetBrains Mono locally; named with fallbacks, no remote fetch. */
   :root{
     --ground:#0B0D10; --ground-2:#12151C; --ground-3:#181C25;
     --ink:#ECE7DE; --ink-2:#C4C0B8; --ink-dim:#8A8780; --ink-faint:#565758;
@@ -25,7 +25,7 @@
     -webkit-font-smoothing:antialiased; overflow:hidden; display:flex; flex-direction:column; height:100vh;}
 
   #frame{flex:1; display:grid; place-items:center; overflow:hidden; position:relative;
-    background:radial-gradient(130% 130% at 50% 0%,#0a0c11,#050608 72%);}
+    background:#070809;}
   #scaler{transform-origin:center center;}
   .viewport{width:1440px; height:900px; overflow:hidden; border-radius:14px; position:relative;
     box-shadow:0 40px 120px -30px rgba(0,0,0,.85), 0 0 0 1px rgba(236,231,222,.04);
@@ -64,7 +64,7 @@
 
   /* Command Weave locus — the work origin. Appears when intent forms. */
   .weave{position:absolute; left:340px; top:300px; width:440px; z-index:4;
-    background:rgba(18,21,28,.86); backdrop-filter:blur(16px); border:1px solid var(--edge);
+    background:#12161f; border:1px solid var(--edge);
     border-radius:13px; padding:16px 18px; display:flex; align-items:center; gap:13px;
     opacity:0; transform:translateY(6px) scale(.98); transform-origin:center; pointer-events:none;
     transition:opacity var(--surface) var(--ease), transform var(--surface) var(--ease);}
@@ -102,7 +102,7 @@
     transition:opacity var(--surface) var(--ease), transform var(--surface) var(--ease);}
   .stage[data-state="verifying"] .receipt,.stage[data-state="acting"] .receipt{opacity:1; transform:none;}
   .receipt::after{content:""; position:absolute; right:-30px; top:22px; width:30px; height:1px;
-    background:linear-gradient(90deg,var(--intent),transparent); opacity:.7;}
+    background:var(--intent); opacity:.55;}
   .rc-h{padding:13px 16px 10px; border-bottom:1px solid var(--edge-2);}
   .rc-k{font-size:10px; letter-spacing:.18em; color:var(--intent); font-weight:600;}
   .rc-t{font-size:13.5px; color:var(--ink); margin-top:6px; font-family:var(--mono); display:flex; gap:10px; align-items:baseline;}
@@ -161,8 +161,8 @@
         <div class="chrome">
           <div class="rooms" id="rooms">
             <button class="room here" data-room="0"><span class="br">{</span>BUILD<span class="br">}</span></button>
-            <button class="room" data-room="1"><span class="br">{</span>RESEARCH<span class="br">}</span></button>
-            <button class="room" data-room="2"><span class="br">{</span>REVIEW<span class="br">}</span></button>
+            <button class="room" data-room="1"><span class="br">{</span>VERIFY<span class="br">}</span></button>
+            <button class="room" data-room="2"><span class="br">{</span>SHIP<span class="br">}</span></button>
           </div>
           <div class="status">
             <span>wardos</span><span id="clock">09:24</span>
