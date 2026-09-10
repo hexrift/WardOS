@@ -12,9 +12,9 @@ name = "ward_shell_core"
 path = "src/lib.rs"
 
 [dependencies]
-ward-daemon = { path = "../ward-daemon", version = "0.3.4" }
-ward-events = { path = "../ward-events", version = "0.3.4" }
-ward-policy = { path = "../ward-policy", version = "0.3.4" }
+ward-daemon = { path = "../ward-daemon", version = "0.3.5" }
+ward-events = { path = "../ward-events", version = "0.3.5" }
+ward-policy = { path = "../ward-policy", version = "0.3.5" }
 serde = { workspace = true }
 
 [lints]

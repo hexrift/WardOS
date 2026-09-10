@@ -18,18 +18,30 @@ wardos_help "$@"
 marker="$(wardos_config_dir)/first-run-done"
 if [[ -e "$marker" && "${1:-}" != --force ]]; then exit 0; fi
 
-wardos-refresh --all
+# Record that first-run has happened BEFORE the best-effort steps below. They run
+# under `set -e`, and if one exited non-zero after this point the script would abort
+# with the marker unwritten — so the next login would run first-run again, re-copying
+# the defaults and letting wardos-refresh's backup overwrite the user's real `.bak`
+# (silent config-backup loss). Writing the marker first makes first-run idempotent
+# regardless of any single step failing.
+mkdir -p "$(dirname "$marker")"
+date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
+
+# Each step is best-effort: a failure is reported and skipped, never fatal, so the
+# rest of onboarding (down to wardos-welcome) still runs.
+wardos-refresh --all ||
+  wardos_notify "Defaults not applied" "Run 'wardos-refresh --all' in a terminal"
 if wardos_has wardos-theme && ! wardos-theme set ward-dark; then
   wardos_notify "Theme not applied" "Run 'wardos-theme set ward-dark' in a terminal"
 fi
 if wardos_has ward && ! ward doctor; then
   wardos_notify "ward doctor found problems" "Run 'ward doctor' in a terminal"
 fi
-wardos-webapp install --defaults
-wardos-tui install --defaults
+wardos-webapp install --defaults ||
+  wardos_notify "Web apps not registered" "Run 'wardos-webapp install --defaults' in a terminal"
+wardos-tui install --defaults ||
+  wardos_notify "Terminal apps not registered" "Run 'wardos-tui install --defaults' in a terminal"
 
-mkdir -p "$(dirname "$marker")"
-date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
 wardos_notify "Welcome to WardOS" "Super + Space opens the command centre; Super + K shows the keys"
 wardos-keys
 # The walkthrough keeps its own marker, so a login that skipped it can run it later.

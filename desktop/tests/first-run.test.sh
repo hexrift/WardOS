@@ -37,3 +37,20 @@ wardos-first-run
 assert_logged '^wardos-keys $'
 assert_file "$marker"
 assert_logged '^notify-send -a WardOS .*Theme not applied'
+
+# A failing setup step is non-fatal AND the marker is still written, so a re-login does
+# not run first-run again (which would re-copy the defaults and clobber the user's real
+# config backup). Onboarding continues to wardos-welcome despite the failure.
+for c in wardos-refresh wardos-theme ward wardos-webapp wardos-tui; do mock "$c"; done
+rm -f "$marker"
+mock wardos-refresh "exit 1"
+: >"$MOCK_LOG"
+wardos-first-run
+assert_file "$marker"
+assert_logged '^notify-send -a WardOS .*Defaults not applied'
+assert_logged '^wardos-keys $'
+assert_logged '^wardos-welcome $'
+# The next login is a no-op: the marker survived the failed step, so nothing re-runs.
+: >"$MOCK_LOG"
+wardos-first-run
+[[ ! -s "$MOCK_LOG" ]] || fail "first-run re-ran after a failed step; log: $(cat "$MOCK_LOG")"
