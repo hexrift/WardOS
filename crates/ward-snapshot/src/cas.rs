@@ -52,11 +52,16 @@ impl Cas {
         self.blob_path(d).exists()
     }
 
-    /// Read a blob by digest.
+    /// Read a blob by digest, verifying its content still hashes to `d`.
     pub fn get_blob(&self, d: Digest) -> Result<Vec<u8>> {
         let path = self.blob_path(d);
         match fs::read(&path) {
-            Ok(b) => Ok(b),
+            // The id IS the content hash, so a read must re-hash: a corrupted or
+            // tampered blob is refused, never served as authentic.
+            Ok(b) if Digest::of(&b) == d => Ok(b),
+            Ok(_) => Err(SnapshotError::Integrity(format!(
+                "blob {d} does not hash to its id"
+            ))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(SnapshotError::NotFound(format!("blob {d}")))
             }
@@ -88,7 +93,15 @@ impl Cas {
             }
             Err(e) => return Err(SnapshotError::io(&path, e)),
         };
-        Manifest::parse(&bytes)
+        let manifest = Manifest::parse(&bytes)?;
+        // The manifest is stored under its own id; if the parsed content no longer
+        // hashes to the requested id it is corrupt or tampered — refuse it.
+        if manifest.id() != id {
+            return Err(SnapshotError::Integrity(format!(
+                "manifest {id} does not hash to its id"
+            )));
+        }
+        Ok(manifest)
     }
 
     fn meta_path(&self, id: SnapshotId, role: SnapshotRole) -> PathBuf {
@@ -136,4 +149,50 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         f.sync_all().map_err(|e| SnapshotError::io(&tmp, e))?;
     }
     fs::rename(&tmp, path).map_err(|e| SnapshotError::io(path, e))
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::manifest::{Entry, EntryType};
+
+    #[test]
+    fn a_corrupted_blob_is_refused_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(dir.path()).unwrap();
+        let d = cas.put_blob(b"hello").unwrap();
+        assert_eq!(cas.get_blob(d).unwrap(), b"hello");
+        // Tamper with the stored bytes so they no longer hash to their id.
+        fs::write(cas.blob_path(d), b"HELLO").unwrap();
+        assert!(
+            matches!(cas.get_blob(d), Err(SnapshotError::Integrity(_))),
+            "a blob that does not hash to its id must be refused, not served"
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_hash_to_its_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(dir.path()).unwrap();
+        let empty = Manifest::from_entries(Vec::new()).unwrap();
+        let id = cas.put_manifest(&empty).unwrap();
+        assert!(cas.get_manifest(id).is_ok());
+        // Overwrite the stored manifest with a different but well-formed manifest:
+        // it parses fine, but its content no longer hashes to `id`.
+        let other = Manifest::from_entries(vec![Entry {
+            path: b"a".to_vec(),
+            kind: EntryType::Dir,
+            mode: 0o755,
+            size: 0,
+            content: None,
+        }])
+        .unwrap();
+        assert_ne!(other.id(), id);
+        fs::write(cas.manifest_path(id), other.serialize()).unwrap();
+        assert!(
+            matches!(cas.get_manifest(id), Err(SnapshotError::Integrity(_))),
+            "a manifest that does not hash to its requested id must be refused"
+        );
+    }
 }

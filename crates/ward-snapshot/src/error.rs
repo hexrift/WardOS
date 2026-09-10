@@ -34,6 +34,12 @@ pub enum SnapshotError {
     /// Capture exceeded the configured byte budget.
     #[error("capture exceeded max_bytes budget of {0} bytes")]
     BudgetExceeded(u64),
+
+    /// A stored object's content does not hash to the id it was requested by:
+    /// on-disk corruption or tampering. The CAS's core promise is that an id
+    /// names exactly its content, so such an object must be refused, not served.
+    #[error("integrity: {0}")]
+    Integrity(String),
 }
 
 /// Convenience alias for results in this crate.
