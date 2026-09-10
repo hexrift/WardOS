@@ -13,6 +13,7 @@
 
 mod capability;
 mod default;
+pub mod hosts;
 mod ids;
 mod merge;
 mod policy;

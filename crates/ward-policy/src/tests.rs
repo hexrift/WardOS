@@ -46,6 +46,14 @@ impl PermitsAtMost for ResourceLimits {
 }
 impl PermitsAtMost for NetworkCapability {
     fn permits_at_most(&self, c: &Self) -> bool {
+        // Independent oracle. Presets form a totally ordered breadth ladder (nested by
+        // design), so a rank compare is the right check for preset-vs-preset. But any
+        // pairing that involves a `Custom` allowlist must be checked by real host-set
+        // containment, NOT by rank — the whole point of the bug this guards is that
+        // `Custom` has no honest scalar rank. We decide containment over a representative
+        // host universe: every preset host, the labels the `Custom` generator draws from,
+        // and loopback/unlisted names. `self` permits-at-most `c` iff every host `self`
+        // would allow, `c` allows too.
         fn rank(n: &NetworkCapability) -> u8 {
             match n {
                 NetworkCapability::Offline => 0,
@@ -56,8 +64,41 @@ impl PermitsAtMost for NetworkCapability {
                 NetworkCapability::Unrestricted => 5,
             }
         }
+        fn permits(cap: &NetworkCapability, host: &str) -> bool {
+            use crate::hosts;
+            match cap {
+                NetworkCapability::Offline => false,
+                NetworkCapability::LocalhostOnly => hosts::is_localhost_name(host),
+                NetworkCapability::Registries => {
+                    hosts::any_matches(hosts::REGISTRY_HOSTS.iter().copied(), host)
+                }
+                NetworkCapability::Development => hosts::any_matches(
+                    hosts::REGISTRY_HOSTS
+                        .iter()
+                        .chain(hosts::DEVELOPMENT_HOSTS)
+                        .copied(),
+                    host,
+                ),
+                NetworkCapability::Custom(set) => {
+                    hosts::any_matches(set.iter().map(String::as_str), host)
+                }
+                NetworkCapability::Unrestricted => true,
+            }
+        }
         match (self, c) {
             (NetworkCapability::Custom(a), NetworkCapability::Custom(b)) => a.is_subset(b),
+            (NetworkCapability::Custom(_), _) | (_, NetworkCapability::Custom(_)) => {
+                // Custom generator draws hosts from {"a","b","c"}; add every preset host
+                // and loopback/unlisted representatives so the universe is exhaustive.
+                const EXTRA: &[&str] =
+                    &["a", "b", "c", "localhost", "x.localhost", "other.example"];
+                crate::hosts::REGISTRY_HOSTS
+                    .iter()
+                    .copied()
+                    .chain(crate::hosts::DEVELOPMENT_HOSTS.iter().copied())
+                    .chain(EXTRA.iter().copied())
+                    .all(|h| !permits(self, h) || permits(c, h))
+            }
             _ => rank(self) <= rank(c),
         }
     }
@@ -348,6 +389,57 @@ fn st007_project_cannot_open_network() {
     let m = merged(&Policy::default(), &Policy::default(), &project);
     // default network is Development; a project asking for Unrestricted is clamped to it.
     assert_eq!(m.network, NetworkCapability::Development);
+}
+
+fn custom(hosts: &[&str]) -> NetworkCapability {
+    NetworkCapability::Custom(hosts.iter().map(|h| (*h).to_owned()).collect())
+}
+
+#[test]
+fn custom_narrows_a_preset_instead_of_being_dropped() {
+    // Regression: `meet` used to rank `Custom` above every preset but `Unrestricted`,
+    // so it discarded the allowlist and returned the preset — the documented `!custom`
+    // narrowing became a silent no-op (fail-open). A `Custom` allowlist under the
+    // `Development` default must actually restrict egress to (its ∩ the preset).
+    let m = NetworkCapability::meet(&NetworkCapability::Development, &custom(&["github.com"]));
+    assert_eq!(
+        m,
+        custom(&["github.com"]),
+        "Custom allowlist was dropped for the preset"
+    );
+    // Symmetric, and it must not matter which operand is which.
+    assert_eq!(
+        NetworkCapability::meet(&custom(&["github.com"]), &NetworkCapability::Development),
+        custom(&["github.com"])
+    );
+    // A host the preset does not permit is dropped, never silently kept.
+    assert_eq!(
+        NetworkCapability::meet(&NetworkCapability::Registries, &custom(&["github.com"])),
+        custom(&[]),
+        "github.com is not a registry host; the meet must not permit it"
+    );
+    // And the merge path (system=Development default, project=!custom) narrows for real.
+    let project = with_network(custom(&["github.com"]));
+    let m = merged(&Policy::default(), &Policy::default(), &project);
+    assert_eq!(m.network, custom(&["github.com"]));
+}
+
+#[test]
+fn st007_hostile_project_cannot_rewiden_a_custom_ceiling() {
+    // A restrictive system policy pins egress to one internal host; a hostile in-repo
+    // policy asks for the whole Development preset. The lower-trust project must not be
+    // able to widen the ceiling back up — the merged network stays within the Custom set.
+    let system = with_network(custom(&["internal.mirror.corp"]));
+    let project = with_network(NetworkCapability::Development);
+    let m = merged(&system, &Policy::default(), &project);
+    assert!(
+        m.network
+            .permits_at_most(&custom(&["internal.mirror.corp"])),
+        "project widened a restrictive Custom system ceiling to a preset: {:?}",
+        m.network
+    );
+    // Concretely, none of the Development hosts leak through.
+    assert_eq!(m.network, custom(&[]));
 }
 
 #[test]
