@@ -140,6 +140,45 @@ target (React + TypeScript + a spring library): each scene is a desktop *state*,
 component a view fed by the same tokens — exactly how `ward-shell` renders the real bar,
 menu and panels from shared TOML tokens today.
 
+## Prove the field first — `ward-field.html`
+
+Because the whole identity collapses if the Ward Field is mediocre, it is prototyped on its
+own — `ward-field.html`, a proving ground — before any launcher, settings, onboarding or
+window chrome. It renders real **marching-squares topography** over an evolving scalar field
+that swells and ripples *around the work locus*, driven by a live agent-activity state
+machine (idle → intent → acting → verifying → verified) with tuning knobs (density / flow /
+energy) so the identity can be dialled in. Field states in `screens/field-*.png`.
+
+Refinements now treated as rules (from art direction, applied here and binding on the
+product):
+
+- **Identity hierarchy:** (1) Ward Field — the environmental signature; (2) spatial
+  behaviour — things emerge from where they belong; (3) semantic colour; (4) typography and
+  restraint; (5) the interaction vocabulary (Command Weave / Proof Rail / Receipts).
+- **Semantic colour is absolute.** At rest there is *no* violet and *no* green anywhere —
+  pure graphite. Violet means agent intent/action and nothing else; green means verified
+  outcome and nothing else. Even the status dot obeys this (neutral → violet working →
+  green verified); Rooms use ink only.
+- **The field is the desktop.** No stock wallpaper — almost-black topography reacting to
+  work is the ground, so stock WardOS is recognisable by the field alone. A wallpaper is
+  optional, not the identity.
+- **Gradients live only inside the canvas** (energy falloff, edge light-attenuation) so the
+  field reads spatial, never diagrammatic — never in UI chrome, buttons or panels.
+- **Spatial causality.** Threads and the Decision Receipt originate from the work locus and
+  the affected file — the receipt *blooms from the file* with a tether — not from the centre.
+- **Rooms are locations, not tabs.** The current room is lit with `{ }` braces and full ink;
+  inactive rooms almost disappear. No selected-button underline.
+- **Proof Rail is 2–4 px at rest.** A structural hairline that blooms only when there is
+  something worth showing; if it ever reads as a permanent sidebar, the concept has failed.
+- **Speed is identity.** ~150 ms micro, ~220 ms Command Weave, ~250 ms Rooms; everything
+  interruptible; nothing "floats in beautifully" over half a second.
+- **Coordinate system is 1440×900 (16:10, laptop-native).** 16:9 is a cinematic *crop* for
+  the demo film, not the design target — a ThinkPad/MacBook-class display must not feel
+  cramped vertically.
+- **The governing rule:** *nothing appears merely to show WardOS is clever; it appears only
+  because the user needs it now.* This is what keeps the design out of the
+  "AI-operating-system dashboard" trap.
+
 ## Quality bar (self-check)
 
 - **Recognisable with the logo removed?** Yes — the Ward Field + words-not-numbers rooms +
