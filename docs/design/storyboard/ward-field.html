@@ -1,0 +1,411 @@
+<title>Ward Field</title>
+<meta name="color-scheme" content="dark">
+<style>
+  /* ============================================================
+     WARD FIELD — the environmental signature, proven first.
+     The field IS the desktop. Semantic colour is absolute:
+       graphite = at rest · violet = agent intent/action · green = verified.
+     Gradients live ONLY inside the canvas (energy falloff / attenuation).
+     Coordinate system 1440×900 (16:10, laptop-native); 16:9 is a crop.
+     ============================================================ */
+  /* Self-contained: WardOS ships Inter and JetBrains Mono locally; named with fallbacks, no remote fetch. */
+  :root{
+    --ground:#0B0D10; --ground-2:#12151C; --ground-3:#181C25;
+    --ink:#ECE7DE; --ink-2:#C4C0B8; --ink-dim:#8A8780; --ink-faint:#565758;
+    --verify:#6FB08A; --intent:#8E7CF0; --cool:#6E88AE;
+    --edge:rgba(236,231,222,.09); --edge-2:rgba(236,231,222,.05);
+    --ui:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+    --mono:'JetBrains Mono',ui-monospace,Menlo,monospace;
+    --fast:150ms; --surface:220ms; --room:250ms;
+    --ease:cubic-bezier(.22,.61,.36,1);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0; background:#050608; color:var(--ink); font-family:var(--ui);
+    -webkit-font-smoothing:antialiased; overflow:hidden; display:flex; flex-direction:column; height:100vh;}
+
+  #frame{flex:1; display:grid; place-items:center; overflow:hidden; position:relative;
+    background:#070809;}
+  #scaler{transform-origin:center center;}
+  .viewport{width:1440px; height:900px; overflow:hidden; border-radius:14px; position:relative;
+    box-shadow:0 40px 120px -30px rgba(0,0,0,.85), 0 0 0 1px rgba(236,231,222,.04);
+    transition:height var(--room) var(--ease);}
+  .viewport.crop{height:810px;}
+  .stage{position:absolute; left:0; top:0; width:1440px; height:900px; background:var(--ground);
+    transition:transform var(--room) var(--ease);}
+  .viewport.crop .stage{transform:translateY(-45px);}
+  .field{position:absolute; inset:0; z-index:0; display:block;}
+
+  /* ---- minimal, subordinate chrome ---- */
+  .chrome{position:absolute; inset:0; z-index:3; pointer-events:none; font-size:12.5px;}
+  .rooms{position:absolute; top:34px; left:38px; display:flex; gap:30px; align-items:baseline; pointer-events:auto;}
+  .room{background:none; border:none; font-family:inherit; cursor:pointer; letter-spacing:.16em;
+    font-size:12.5px; font-weight:500; color:var(--ink-faint); opacity:.55;
+    transition:opacity var(--room) var(--ease),color var(--room) var(--ease); padding:0;}
+  .room:hover{opacity:.8}
+  .room .br{opacity:0; transition:opacity var(--room) var(--ease); color:var(--ink-dim);}
+  .room.here{color:var(--ink); opacity:1; font-weight:600;}
+  .room.here .br{opacity:.7}
+  .status{position:absolute; top:34px; right:38px; display:flex; gap:20px; align-items:center;
+    color:var(--ink-dim); font-variant-numeric:tabular-nums;}
+  .status .st{display:flex; align-items:center; gap:8px; color:var(--ink-2);}
+  .status .dot{width:7px;height:7px;border-radius:50%;background:var(--ink-faint);
+    transition:background var(--surface) var(--ease), box-shadow var(--surface) var(--ease);}
+  .stage[data-state="intent"] .dot,.stage[data-state="acting"] .dot,.stage[data-state="verifying"] .dot{
+    background:var(--intent); box-shadow:0 0 0 4px rgba(142,124,240,.16);}
+  .stage[data-state="verified"] .dot{background:var(--verify); box-shadow:0 0 0 4px rgba(111,176,138,.16);}
+
+  /* idle hint — appears only at rest, because that's when the user needs it */
+  .hint{position:absolute; left:50%; bottom:46px; transform:translateX(-50%); color:var(--ink-dim);
+    display:flex; gap:10px; align-items:center; opacity:0; transition:opacity var(--surface) var(--ease); pointer-events:none;}
+  .stage[data-state="idle"] .hint{opacity:1;}
+  .hint kbd{font-family:var(--mono); font-size:11px; color:var(--ink-2); border:1px solid var(--edge);
+    border-radius:6px; padding:3px 7px; background:rgba(236,231,222,.03);}
+
+  /* Command Weave locus — the work origin. Appears when intent forms. */
+  .weave{position:absolute; left:340px; top:300px; width:440px; z-index:4;
+    background:#12161f; border:1px solid var(--edge);
+    border-radius:13px; padding:16px 18px; display:flex; align-items:center; gap:13px;
+    opacity:0; transform:translateY(6px) scale(.98); transform-origin:center; pointer-events:none;
+    transition:opacity var(--surface) var(--ease), transform var(--surface) var(--ease);}
+  .stage[data-state="intent"] .weave,.stage[data-state="acting"] .weave{opacity:1; transform:none;}
+  .weave .sig{width:15px;height:15px;flex:none;position:relative;}
+  .weave .sig::before,.weave .sig::after{content:"";position:absolute;inset:0;border:1.5px solid var(--intent);border-radius:4px;}
+  .weave .sig::after{transform:scale(.5);opacity:.8;}
+  .weave .q{font-size:16px; color:var(--ink); flex:1;}
+  .weave .q .c{display:inline-block;width:2px;height:17px;background:var(--intent);vertical-align:-3px;animation:bl 1s steps(1) infinite;}
+  @keyframes bl{50%{opacity:0}}
+
+  /* file + verify anchors — the things work touches */
+  .node{position:absolute; z-index:4; display:flex; align-items:center; gap:9px; pointer-events:none;
+    color:var(--ink-dim); font-family:var(--mono); font-size:12px; opacity:.4;
+    transition:opacity var(--surface) var(--ease),color var(--surface) var(--ease);}
+  .node .pt{width:8px;height:8px;border-radius:50%;background:var(--ink-faint); flex:none;
+    transition:background var(--fast) var(--ease),box-shadow var(--fast) var(--ease);}
+  #fileA{left:1052px; top:412px;} #fileB{left:1052px; top:492px;} #verifyN{left:1052px; top:648px;}
+  .stage[data-state="acting"] #fileA,.stage[data-state="acting"] #fileB,
+  .stage[data-state="verifying"] #fileA,.stage[data-state="verifying"] #fileB{opacity:1; color:var(--ink-2);}
+  .stage[data-state="acting"] #fileA .pt,.stage[data-state="acting"] #fileB .pt,
+  .stage[data-state="verifying"] #fileA .pt,.stage[data-state="verifying"] #fileB .pt{
+    background:var(--intent); box-shadow:0 0 10px 1px rgba(142,124,240,.5);}
+  .stage[data-state="verifying"] #verifyN,.stage[data-state="verified"] #verifyN{opacity:1; color:var(--ink-2);}
+  .stage[data-state="verifying"] #verifyN .pt,.stage[data-state="verified"] #verifyN .pt{
+    background:var(--verify); box-shadow:0 0 10px 1px rgba(111,176,138,.5);}
+  .stage[data-state="verified"] #fileA .pt,.stage[data-state="verified"] #fileB .pt{
+    background:var(--verify); box-shadow:0 0 10px 1px rgba(111,176,138,.45);}
+
+  /* Decision Receipt — blooms FROM the affected file (spatial causality) */
+  .receipt{position:absolute; left:726px; top:392px; width:300px; z-index:5;
+    background:var(--ground-3); border:1px solid var(--edge); border-radius:12px;
+    box-shadow:0 24px 60px -20px rgba(0,0,0,.7); transform-origin:right top;
+    opacity:0; transform:scale(.7) translate(28px,10px); pointer-events:none;
+    transition:opacity var(--surface) var(--ease), transform var(--surface) var(--ease);}
+  .stage[data-state="verifying"] .receipt,.stage[data-state="acting"] .receipt{opacity:1; transform:none;}
+  .receipt::after{content:""; position:absolute; right:-30px; top:22px; width:30px; height:1px;
+    background:var(--intent); opacity:.55;}
+  .rc-h{padding:13px 16px 10px; border-bottom:1px solid var(--edge-2);}
+  .rc-k{font-size:10px; letter-spacing:.18em; color:var(--intent); font-weight:600;}
+  .rc-t{font-size:13.5px; color:var(--ink); margin-top:6px; font-family:var(--mono); display:flex; gap:10px; align-items:baseline;}
+  .rc-t .d{font-size:11.5px;color:var(--ink-dim)} .rc-t .d .p{color:var(--verify)} .rc-t .d .m{color:#C88B7B}
+  .rc-b{padding:11px 16px; font-size:12px; color:var(--ink-2); line-height:1.5;}
+  .rc-b b{color:var(--ink-dim); font-weight:500; letter-spacing:.1em; font-size:10px; text-transform:uppercase; display:block; margin-bottom:3px;}
+  .rc-a{display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--edge-2);}
+  .rc-a button{flex:1; font-family:var(--ui); font-size:12.5px; padding:9px; border-radius:8px; cursor:pointer;
+    border:1px solid var(--edge); background:transparent; color:var(--ink-2); pointer-events:auto;}
+  .rc-a .ok{background:rgba(111,176,138,.14); border-color:rgba(111,176,138,.35); color:#B8E0C8;}
+
+  /* verified chit */
+  .chit{position:absolute; left:1010px; top:700px; z-index:5; display:flex; align-items:center; gap:11px;
+    background:var(--ground-3); border:1px solid rgba(111,176,138,.3); border-radius:11px; padding:12px 16px;
+    opacity:0; transform:scale(.85) translateY(6px); transform-origin:left top; pointer-events:none;
+    transition:opacity var(--surface) var(--ease),transform var(--surface) var(--ease); box-shadow:0 24px 60px -20px rgba(0,0,0,.7);}
+  .stage[data-state="verified"] .chit{opacity:1; transform:none;}
+  .chit .seal{width:26px;height:26px;border-radius:7px;display:grid;place-items:center;color:var(--verify);
+    background:rgba(111,176,138,.14);border:1px solid rgba(111,176,138,.3); font-size:13px;}
+  .chit .t{font-size:13px;color:var(--ink)} .chit .t b{color:var(--verify)} .chit .s{font-size:11.5px;color:var(--ink-dim);margin-top:1px;}
+
+  /* crop letterbox marks (only in crop mode, subtle) */
+  .cropbar{position:absolute; left:0; right:0; height:45px; z-index:8; pointer-events:none;
+    display:none; align-items:center; justify-content:flex-end; padding:0 18px;
+    font-family:var(--mono); font-size:10px; letter-spacing:.1em; color:var(--ink-faint);}
+  .viewport.crop .cropbar{display:flex;}
+  .cropbar.top{top:0} .cropbar.bot{bottom:0}
+
+  /* ============================================================
+     Controls (dev only; hidden in #demo)
+     ============================================================ */
+  #ctl{flex:none; min-height:52px; display:flex; align-items:center; gap:10px; padding:9px 16px;
+    background:#070809; border-top:1px solid var(--edge-2); color:var(--ink-dim); font-size:12px; flex-wrap:wrap;}
+  #ctl button{font-family:var(--ui); color:var(--ink-2); background:rgba(236,231,222,.04);
+    border:1px solid var(--edge); border-radius:8px; padding:7px 11px; cursor:pointer; font-size:12px; transition:all var(--fast) var(--ease);}
+  #ctl button:hover{color:var(--ink); border-color:rgba(236,231,222,.2);}
+  #ctl button.on{color:var(--ink); border-color:rgba(142,124,240,.5); background:rgba(142,124,240,.12);}
+  #ctl .sep{width:1px; height:22px; background:var(--edge); margin:0 4px;}
+  #ctl .grp{display:flex; align-items:center; gap:7px;}
+  #ctl label{display:flex; align-items:center; gap:7px; cursor:pointer; user-select:none;}
+  #ctl input[type=range]{width:88px; accent-color:var(--intent);}
+  #ctl .val{font-family:var(--mono); color:var(--ink-faint); min-width:26px; font-size:11px;}
+  #ctl .state{font-family:var(--mono); color:var(--ink); min-width:96px; text-transform:capitalize;}
+  #ctl .spacer{flex:1}
+  body.demo #ctl{display:none;}
+  *:focus-visible{outline:2px solid var(--intent); outline-offset:2px;}
+  @media (prefers-reduced-motion: reduce){ *{transition-duration:70ms !important;} }
+</style>
+
+<div id="frame">
+  <div id="scaler">
+    <div class="viewport" id="viewport">
+      <div class="stage" id="stage" data-state="idle">
+        <canvas class="field" id="field" width="1440" height="900"></canvas>
+
+        <div class="chrome">
+          <div class="rooms" id="rooms">
+            <button class="room here" data-room="0"><span class="br">{</span>BUILD<span class="br">}</span></button>
+            <button class="room" data-room="1"><span class="br">{</span>VERIFY<span class="br">}</span></button>
+            <button class="room" data-room="2"><span class="br">{</span>SHIP<span class="br">}</span></button>
+          </div>
+          <div class="status">
+            <span>wardos</span><span id="clock">09:24</span>
+            <span class="st"><span class="dot"></span><span id="stateLabel">Ready</span></span>
+          </div>
+
+          <div class="weave"><span class="sig"></span><div class="q" id="weaveQ">Fix the failing auth tests<span class="c"></span></div></div>
+
+          <div class="node" id="fileA"><span class="pt"></span>auth/token.ts</div>
+          <div class="node" id="fileB"><span class="pt"></span>auth/token.test.ts</div>
+          <div class="node" id="verifyN"><span class="pt"></span>verify · disposable</div>
+
+          <aside class="receipt">
+            <div class="rc-h"><div class="rc-k">CHANGE RECEIPT</div>
+              <div class="rc-t">token.ts <span class="d"><span class="p">+9</span> <span class="m">−4</span></span></div></div>
+            <div class="rc-b"><b>Why</b>Token expiry compared against local time; switch to UTC.</div>
+            <div class="rc-a"><button>Inspect</button><button class="ok">Allow once</button></div>
+          </aside>
+
+          <div class="chit"><span class="seal">✓</span><div><div class="t"><b>Verified</b></div><div class="s">42 / 42 · boundaries intact</div></div></div>
+
+          <div class="hint"><kbd>Super</kbd><span>+</span><kbd>Space</kbd><span style="color:var(--ink-faint)">— do almost anything</span></div>
+          <div class="cropbar top">WARD FIELD · 16:9 CROP</div>
+          <div class="cropbar bot"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="ctl">
+  <div class="grp">
+    <button id="bRun">▶ Run cycle</button>
+    <div class="sep"></div>
+    <button data-s="idle">Idle</button>
+    <button data-s="intent">Intent</button>
+    <button data-s="acting">Act</button>
+    <button data-s="verifying">Verify</button>
+    <button data-s="verified">Verified</button>
+  </div>
+  <div class="sep"></div>
+  <span class="state" id="stateOut">idle</span>
+  <div class="spacer"></div>
+  <div class="grp"><label>Density <input type="range" id="sDensity" min="10" max="34" value="26"><span class="val" id="vDensity">26</span></label></div>
+  <div class="grp"><label>Flow <input type="range" id="sFlow" min="0" max="100" value="45"><span class="val" id="vFlow">45</span></label></div>
+  <div class="grp"><label>Energy <input type="range" id="sEnergy" min="0" max="100" value="60"><span class="val" id="vEnergy">60</span></label></div>
+  <div class="sep"></div>
+  <button id="bAuto">Auto‑loop</button>
+  <button id="bCrop">16:9 crop</button>
+  <button id="bRM">Reduced motion</button>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  const $=s=>document.querySelector(s);
+  const stage=$('#stage'), viewport=$('#viewport');
+  const cv=$('#field'), ctx=cv.getContext('2d');
+  const W=1440,H=900, DPR=Math.min(2,window.devicePixelRatio||1);
+  cv.width=W*DPR; cv.height=H*DPR; ctx.scale(DPR,DPR);
+
+  const prefersReduce=()=>document.body.classList.contains('rm')||window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------- semantic colour ---------- */
+  const GRAPH=[58,65,80], VIOLET=[142,124,240], GREEN=[111,176,138];
+  const lerp=(a,b,k)=>a+(b-a)*k;
+  const mix=(c1,c2,k)=>[lerp(c1[0],c2[0],k),lerp(c1[1],c2[1],k),lerp(c1[2],c2[2],k)];
+
+  /* ---------- agent-activity state ---------- */
+  // Each state sets TARGETS the field eases toward. Colour is strictly semantic:
+  // intent/act -> violet ; verify/verified -> green ; idle -> graphite (no accent).
+  const STATES={
+    idle:     {intent:0.00, verify:0.00, energy:0.16, ec:[720,450], label:'Ready'},
+    intent:   {intent:1.00, verify:0.00, energy:0.52, ec:[560,320], label:'Intent'},
+    acting:   {intent:1.00, verify:0.00, energy:0.72, ec:[560,320], label:'Agent working'},
+    verifying:{intent:0.55, verify:0.75, energy:0.72, ec:[720,560], label:'Verifying'},
+    verified: {intent:0.00, verify:1.00, energy:0.46, ec:[900,600], label:'Verified'},
+  };
+  let cur={intent:0,verify:0,energy:0.16,ecx:720,ecy:450};
+  let target=STATES.idle, stateName='idle';
+  function setState(name){
+    stateName=name; target=STATES[name]; stage.dataset.state=name;
+    $('#stateLabel').textContent=STATES[name].label; $('#stateOut').textContent=name;
+    [...document.querySelectorAll('#ctl [data-s]')].forEach(b=>b.classList.toggle('on',b.dataset.s===name));
+  }
+
+  /* ---------- run cycle ---------- */
+  let cycleT=[]; function clearCycle(){cycleT.forEach(clearTimeout);cycleT=[];}
+  function runCycle(){
+    clearCycle();
+    const seq=[['intent',0],['acting',1400],['verifying',3600],['verified',5200],['idle',7600]];
+    seq.forEach(([s,ms])=>cycleT.push(setTimeout(()=>setState(s),ms)));
+  }
+  let auto=false, autoT=null;
+  function loop(){ if(!auto)return; runCycle(); autoT=setTimeout(loop,9200); }
+
+  /* ---------- field engine: marching-squares topography ---------- */
+  let flow=0.45, energyGain=0.60, cell=22, t=0;
+  function fieldAt(x,y){
+    const nx=x*0.0044, ny=y*0.0044;
+    let v = Math.sin(nx + t) + Math.sin(ny*1.08 - t*0.82)
+          + 0.8*Math.sin((nx+ny)*0.82 + t*0.5)
+          + 0.55*Math.sin((nx-ny)*1.28 - t*0.34);
+    const dx=x-cur.ecx, dy=y-cur.ecy, d2=dx*dx+dy*dy;
+    const sig=300, g=Math.exp(-d2/(2*sig*sig));
+    // energy: the field swells and ripples AROUND the work locus
+    v += cur.energy*energyGain*(2.4*g + 1.0*g*Math.sin(Math.sqrt(d2)*0.019 - t*2.3));
+    return v;
+  }
+  function accent(){
+    // graphite -> violet by intent, then toward green by verify (verify wins as it rises)
+    let c=mix(GRAPH,VIOLET,Math.min(1,cur.intent));
+    c=mix(c,GREEN,Math.min(1,cur.verify));
+    return c;
+  }
+  function seg(level, x0,y0,v0, x1,y1,v1){ const tt=(level-v0)/(v1-v0); return [x0+(x1-x0)*tt, y0+(y1-y0)*tt]; }
+
+  const LEVELS=[-1.7,-1.13,-0.57,0,0.57,1.13,1.7];
+  let cols,rows,grid;
+  function alloc(){ cols=Math.ceil(W/cell)+1; rows=Math.ceil(H/cell)+1; grid=new Float32Array(cols*rows); }
+  alloc();
+
+  function draw(){
+    // ease current -> target (speed = identity: ~200ms settle)
+    const k=prefersReduce()?1:0.12;
+    cur.intent+=(target.intent-cur.intent)*k;
+    cur.verify+=(target.verify-cur.verify)*k;
+    cur.energy+=(target.energy-cur.energy)*k;
+    cur.ecx+=(target.ec[0]-cur.ecx)*k; cur.ecy+=(target.ec[1]-cur.ecy)*k;
+    if(!prefersReduce()) t+=0.0016+flow*0.006;
+
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle='#0B0D10'; ctx.fillRect(0,0,W,H);
+
+    const acc=accent(); const accCss=a=>'rgba('+(acc[0]|0)+','+(acc[1]|0)+','+(acc[2]|0)+','+a+')';
+    const glowActive=cur.intent+cur.verify; // >0 only when there's real agent activity
+
+    // 1) energy glow inside the canvas (allowed gradient: light attenuation around work)
+    if(glowActive>0.02){
+      const gr=ctx.createRadialGradient(cur.ecx,cur.ecy,0,cur.ecx,cur.ecy,420);
+      gr.addColorStop(0,accCss(0.10*Math.min(1,glowActive)*cur.energy*1.6));
+      gr.addColorStop(1,'rgba(11,13,16,0)');
+      ctx.fillStyle=gr; ctx.fillRect(0,0,W,H);
+    }
+
+    // 2) sample scalar field once
+    for(let j=0;j<rows;j++){ const y=j*cell; const base=j*cols;
+      for(let i=0;i<cols;i++){ grid[base+i]=fieldAt(i*cell,y); } }
+
+    // 3) marching squares — one path per iso level
+    for(let li=0;li<LEVELS.length;li++){
+      const L=LEVELS[li];
+      // Near-invisible at rest, revealed by activity: lift is driven mostly by real
+      // agent activity (intent+verify) and the energy swell, with a low idle floor.
+      const lift=0.34 + 1.15*Math.min(1, cur.energy*0.5 + glowActive*0.62);
+      const a=(0.05 + (1-Math.abs(L)/1.7)*0.095) * lift;
+      ctx.beginPath();
+      for(let j=0;j<rows-1;j++){ const y0=j*cell,y1=y0+cell,rb=j*cols,rn=rb+cols;
+        for(let i=0;i<cols-1;i++){ const x0=i*cell,x1=x0+cell;
+          const a0=grid[rb+i],b0=grid[rb+i+1],c0=grid[rn+i+1],d0=grid[rn+i];
+          let cs=0; if(a0>L)cs|=8; if(b0>L)cs|=4; if(c0>L)cs|=2; if(d0>L)cs|=1;
+          if(cs===0||cs===15)continue;
+          const T=()=>seg(L,x0,y0,a0,x1,y0,b0), R=()=>seg(L,x1,y0,b0,x1,y1,c0),
+                B=()=>seg(L,x1,y1,c0,x0,y1,d0), Lf=()=>seg(L,x0,y1,d0,x0,y0,a0);
+          const line=(p,q)=>{ctx.moveTo(p[0],p[1]);ctx.lineTo(q[0],q[1]);};
+          switch(cs){
+            case 1: case 14: line(Lf(),B()); break;
+            case 2: case 13: line(B(),R()); break;
+            case 3: case 12: line(Lf(),R()); break;
+            case 4: case 11: line(T(),R()); break;
+            case 5: line(Lf(),T()); line(B(),R()); break;
+            case 6: case 9: line(T(),B()); break;
+            case 7: case 8: line(Lf(),T()); break;
+            case 10: line(T(),R()); line(Lf(),B()); break;
+          }
+        }
+      }
+      ctx.strokeStyle=accCss(Math.max(0.014,a)); ctx.lineWidth=1; ctx.lineJoin='round'; ctx.stroke();
+    }
+
+    // 4) relationship threads — ONLY during real agent activity, from the work locus
+    drawThreads(accCss);
+
+    // 5) edge attenuation (depth; keeps it spatial, not diagrammatic)
+    const vg=ctx.createRadialGradient(720,430,330,720,430,960);
+    vg.addColorStop(0,'rgba(11,13,16,0)'); vg.addColorStop(1,'rgba(6,7,9,0.52)');
+    ctx.fillStyle=vg; ctx.fillRect(0,0,W,H);
+
+    requestAnimationFrame(draw);
+  }
+  function cubic(a,b,c,d,k){const m=1-k;return m*m*m*a+3*m*m*k*b+3*m*k*k*c+k*k*k*d;}
+  function thread(p1,p2,a,col){
+    if(a<0.02)return; const mx=(p1[0]+p2[0])/2;
+    ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.bezierCurveTo(mx,p1[1],mx,p2[1],p2[0],p2[1]);
+    ctx.strokeStyle=col(a*0.55); ctx.lineWidth=1.2; ctx.stroke();
+    if(prefersReduce())return;
+    const k=(Math.sin(t*7)+1)/2, bx=cubic(p1[0],mx,mx,p2[0],k), by=cubic(p1[1],p1[1],p2[1],p2[1],k);
+    ctx.beginPath(); ctx.arc(bx,by,2.2,0,7); ctx.fillStyle=col(Math.min(.9,a*3)); ctx.fill();
+  }
+  const LOC=[560,320], FA=[1056,416], FB=[1056,496], VN=[1056,652];
+  function drawThreads(accCss){
+    // violet: intent locus -> files (agent action). green: files -> verify (proof).
+    if(cur.intent>0.04){ const vc=a=>'rgba(142,124,240,'+a+')';
+      thread(LOC,FA,cur.intent,vc); thread(LOC,FB,cur.intent*0.85,vc);
+      ctx.beginPath(); ctx.arc(LOC[0],LOC[1],3.2,0,7); ctx.fillStyle=vc(cur.intent*0.8); ctx.fill(); }
+    if(cur.verify>0.04){ const gc=a=>'rgba(111,176,138,'+a+')';
+      thread(FA,VN,cur.verify,gc); thread(FB,VN,cur.verify*0.8,gc); }
+  }
+
+  /* ---------- controls ---------- */
+  $('#bRun').onclick=()=>{ auto=false; $('#bAuto').classList.remove('on'); if(autoT)clearTimeout(autoT); runCycle(); };
+  document.querySelectorAll('#ctl [data-s]').forEach(b=>b.onclick=()=>{ auto=false; $('#bAuto').classList.remove('on'); if(autoT)clearTimeout(autoT); clearCycle(); setState(b.dataset.s); });
+  $('#bAuto').onclick=function(){ auto=!auto; this.classList.toggle('on',auto); if(auto)loop(); else{clearCycle(); if(autoT)clearTimeout(autoT);} };
+  $('#bCrop').onclick=function(){ viewport.classList.toggle('crop'); this.classList.toggle('on'); fit(); };
+  $('#bRM').onclick=function(){ document.body.classList.toggle('rm'); this.classList.toggle('on'); };
+  const bind=(id,vid,fn)=>{const el=$(id);el.oninput=()=>{fn(+el.value);$(vid).textContent=el.value;};};
+  bind('#sDensity','#vDensity',v=>{cell=Math.round(720/v); alloc();}); // higher density -> smaller cell
+  bind('#sFlow','#vFlow',v=>flow=v/100);
+  bind('#sEnergy','#vEnergy',v=>energyGain=v/100);
+  cell=Math.round(720/26); alloc();
+
+  document.querySelectorAll('.room').forEach((b,i)=>b.onclick=()=>{
+    document.querySelectorAll('.room').forEach(x=>x.classList.remove('here')); b.classList.add('here'); });
+
+  window.addEventListener('keydown',e=>{ if(e.key===' '){e.preventDefault(); $('#bRun').click();} });
+
+  function clock(){const d=new Date();$('#clock').textContent=String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');}
+  clock(); setInterval(clock,15000);
+
+  /* ---------- responsive + demo route ---------- */
+  function fit(){
+    const ctlH=document.body.classList.contains('demo')?0:($('#ctl').offsetHeight||56);
+    const vpH=viewport.classList.contains('crop')?810:900;
+    const s=Math.min((window.innerWidth-24)/W,(window.innerHeight-ctlH-24)/vpH);
+    $('#scaler').style.transform='scale('+s+')';
+  }
+  window.addEventListener('resize',fit);
+  function checkDemo(){ if(location.hash==='#demo'||location.hash==='#/demo'){ document.body.classList.add('demo'); if(!viewport.classList.contains('crop')){viewport.classList.add('crop');$('#bCrop').classList.add('on');} fit(); auto=true; $('#bAuto').classList.add('on'); loop(); } }
+  window.addEventListener('hashchange',checkDemo);
+
+  setState('idle'); fit(); requestAnimationFrame(draw);
+  checkDemo();
+  // start a calm demonstration shortly after load unless #demo already did
+  if(!document.body.classList.contains('demo')) setTimeout(()=>{ if(stateName==='idle'){ auto=true; $('#bAuto').classList.add('on'); loop(); } }, 1400);
+})();
+</script>
