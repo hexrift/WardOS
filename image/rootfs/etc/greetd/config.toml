@@ -8,6 +8,13 @@
 # /usr/libexec/wardos-session, which starts Hyprland under uwsm (so graphical-session.target
 # and the WardOS user services come up exactly as a normal login).
 #
+# gtkgreet runs WITHOUT `-l` (layer-shell): cage does not implement wlr-layer-shell, so a
+# layer surface commits a 0x0 geometry, cage disconnects the client and greetd relaunches
+# it — a flicker/crash-loop (E-09). cage makes its single top-level fullscreen on its own,
+# which is exactly what a plain gtkgreet window needs. `-l` is only for full compositors
+# (sway, Hyprland). The greeter's home /var/lib/greeter is created by tmpfiles.d so cage
+# has a working directory and a writable shader cache.
+#
 # `cage -s` keeps VT switching enabled (Ctrl+Alt+F2…F6 reach a text console), so a greeter
 # or session failure can never lock the machine out — the belt-and-braces the cage docs
 # recommend.
@@ -17,5 +24,5 @@
 vt = 1
 
 [default_session]
-command = "cage -s -- gtkgreet -l -s /etc/greetd/wardos-greeter.css -c /usr/libexec/wardos-session"
+command = "cage -s -- gtkgreet -s /etc/greetd/wardos-greeter.css -c /usr/libexec/wardos-session"
 user = "greeter"

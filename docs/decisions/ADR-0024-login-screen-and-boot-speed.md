@@ -75,5 +75,12 @@ classic offender. "Speed should be part of the product" was an explicit instruct
   `systemd-sysusers` run that creates the `greeter` user. A slow *first* boot is recoverable;
   an unbootable image is not. It is tracked as a follow-up pending a tested change and a
   confirmed second-boot time on E-09.
+* E-09 greeter boot (first flash) exposed two greeter faults, both fixed: `gtkgreet` was
+  launched with `-l` (layer-shell), but `cage` implements no `wlr-layer-shell`, so the
+  greeter committed a 0×0 surface, cage dropped it and greetd relaunched it — a flicker
+  loop; `-l` is dropped (cage fullscreens a plain window). And the `greeter` home
+  `/var/lib/greeter` was never created, so cage had no working directory and no writable
+  shader cache; a tmpfiles.d entry now creates it before greetd starts. Only a real boot
+  surfaces these — CI builds the image but does not run the compositor.
 * Still to verify on hardware (E-09): a *second* boot's time (should be far below 331 s),
-  and that the greeter renders and authenticates on the reference laptop.
+  and that the greeter now renders and authenticates on the reference laptop.
