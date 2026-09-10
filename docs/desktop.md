@@ -97,6 +97,7 @@ menu path is scriptable and testable.
 | `wardos-welcome [--again] [step…]` | the first-login walkthrough ([`onboarding.md`](onboarding.md) §1): `theme` (from `wardos-theme list`), `keys` (a terminal running `ward vault set NAME`, never a menu), `project` (a directory picker over `~` or a URL to clone, then `ward init`), `agent` (`ward claude` there, the trust bar in one line), `done` (the card; writes `~/.config/wardos/welcome-done`); one step by name any time, `--again` the whole; `clone URL DIR` is the project step's terminal command |
 | `wardos-version` | image and tool versions (`bootc status`, `ward --version`) |
 | `wardos-about` | the About surface (fastfetch with the WardOS logo) |
+| `wardos-baseline [file]` | one-file hardware/diagnostics bundle (`ward doctor` + boot, GPU, network, power facts) for reference-hardware acceptance and support; prints the path (`baseline.test.sh`) |
 
 The configurations rely on these details of the commands: `wardos-launch webapp` gives
 its Chromium window the class `wardos-webapp-<name>` and `wardos-launch tui` its terminal

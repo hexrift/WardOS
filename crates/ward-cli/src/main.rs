@@ -428,6 +428,12 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Doctor => {
             let checks = ward_daemon::doctor::run();
             print!("{}", render::doctor_panel(&checks));
+            // Hardware Baseline 1: the machine's capabilities and speed, as facts. A
+            // report — degraded rows never change the exit code (host readiness owns it).
+            print!(
+                "{}",
+                render::hardware_panel(&ward_daemon::doctor::hardware())
+            );
             Ok(if ward_daemon::doctor::healthy(&checks) {
                 ExitCode::SUCCESS
             } else {
