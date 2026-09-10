@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# wardos-baseline — one-command hardware/diagnostics bundle (docs/desktop.md §Commands).
+#
+# Usage: wardos-baseline [FILE]
+#
+# Writes `ward doctor` plus raw hardware, boot, GPU, network and power diagnostics to a
+# single text file (default $XDG_STATE_HOME/wardos/baseline-<timestamp>.txt) and prints
+# its path — for reference-hardware acceptance (Hardware Baseline 1) and support. It only
+# reads; it changes nothing. Missing tools are noted and skipped, never fatal.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+out="${1:-$(wardos_state_dir)/baseline-$(date -u +%Y%m%dT%H%M%SZ).txt}"
+mkdir -p "$(dirname "$out")"
+
+# section TITLE CMD [ARG…]: append a headed block; skip cleanly when CMD is absent.
+section() {
+  local title=$1
+  shift
+  printf '\n===== %s =====\n' "$title" >>"$out"
+  if wardos_has "$1"; then
+    "$@" >>"$out" 2>&1 || printf '(command failed)\n' >>"$out"
+  else
+    printf '(%s not installed)\n' "$1" >>"$out"
+  fi
+}
+
+{
+  printf 'WardOS hardware baseline bundle\n'
+  printf 'date        %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'kernel      %s\n' "$(uname -sr)"
+  printf 'machine     %s\n' "$(uname -m)"
+} >"$out"
+
+section "ward doctor"          ward doctor
+section "boot time"            systemd-analyze time
+section "boot blame (top 20)"  sh -c 'systemd-analyze blame | head -20'
+section "boot errors"          sh -c 'journalctl -b -p 3 --no-pager | tail -40'
+section "compositor"           hyprctl systeminfo
+section "gpu"                  sh -c 'ls -1 /sys/class/drm 2>/dev/null; command -v glxinfo >/dev/null 2>&1 && glxinfo -B'
+section "network"              ip -o addr
+section "rfkill (wifi/bt)"     rfkill list
+section "audio"                wpctl status
+section "pci"                  lspci
+section "memory"               free -h
+section "suspend states"       cat /sys/power/state
+
+printf '\nWrote %s\n' "$out"
+wardos_notify "Baseline saved" "$out" 2>/dev/null || true
+printf '%s\n' "$out"

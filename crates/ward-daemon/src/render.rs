@@ -690,6 +690,38 @@ pub fn doctor_panel(checks: &[crate::doctor::Check]) -> String {
     s
 }
 
+/// The `ward doctor` hardware baseline block (Hardware Baseline 1): what this machine
+/// gives a session and how fast, with an overall verdict. A report — a degraded row is
+/// a dot, never a blocker.
+#[must_use]
+pub fn hardware_panel(checks: &[crate::doctor::Check]) -> String {
+    use crate::doctor::Status;
+    let mut s = format!("\n{ACCENT}WARDOS{RESET} {INK}hardware baseline{RESET}\n\n");
+    for c in checks {
+        let (color, mark) = match c.status {
+            Status::Ok => (OK, "✓"),
+            Status::Warn => (WARN, "·"),
+            Status::Fail => (DENY, "✗"),
+        };
+        let _ = writeln!(
+            s,
+            "  {INK}{:<20}{RESET}{color}{mark}{RESET} {DIM}{}{RESET}",
+            c.name, c.detail
+        );
+    }
+    let fails = checks.iter().filter(|c| c.status == Status::Fail).count();
+    let warns = checks.iter().filter(|c| c.status == Status::Warn).count();
+    let verdict = if fails > 0 {
+        format!("{DENY}not ready{RESET} {DIM}· {fails} blocking{RESET}")
+    } else if warns > 0 {
+        format!("{OK}usable{RESET} {DIM}· {warns} to verify{RESET}")
+    } else {
+        format!("{OK}READY{RESET}")
+    };
+    let _ = write!(s, "\n  {INK}Overall{RESET}  {verdict}\n");
+    s
+}
+
 /// The `ward verify` summary block: what was restored, the verdict, and on failure
 /// the tail of the verifier's output.
 #[must_use]
