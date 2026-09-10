@@ -4,6 +4,14 @@ An interactive preview of the WardOS product idea:
 
 > **Human intent → constrained agent action → visible proof.**
 
+> **`wardos.html` is the definitive realization** of the refined art direction: the
+> `BUILD · VERIFY · SHIP` rooms, the `WARD / VERIFIED`↔`WARD / REVIEW` trust pill, the Y ward
+> glyph, WARD GATE ("unlock the room, not the whole machine"), CALIBRATE (Navigation / Agent
+> autonomy / Motion), and the signature **TamperWard-denied moment** — an agent's shortcut
+> (delete a failing test) is blocked, and it corrects course. Eight screens over the proven
+> Ward Field. `index.html` is the earlier ten-scene cut; `ward-field.html` is the field
+> proving ground. All three share the same tokens and field engine.
+
 Live artifact: published from `index.html`. Screen-recordable demo route: append `#demo`
 to the URL (hides the dev controller, autoplays ~60 s). Screenshots of every scene are in
 `screens/`.
