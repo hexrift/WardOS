@@ -194,11 +194,63 @@ impl NetworkCapability {
 impl Lattice for NetworkCapability {
     fn meet(a: &Self, b: &Self) -> Self {
         match (a, b) {
+            // Two explicit allowlists: the hosts permitted by both.
             (Self::Custom(sa), Self::Custom(sb)) => {
                 Self::Custom(sa.intersection(sb).cloned().collect())
             }
+            // An explicit allowlist against a preset. `Custom` is NOT a scalar rung on
+            // the breadth ladder — `["github.com"]` is far narrower than `Development`,
+            // not just below `Unrestricted` — so a rank comparison here silently drops
+            // the allowlist and returns the preset, which both makes a documented
+            // `!custom` narrowing a no-op and lets a lower-trust layer widen a
+            // restrictive `Custom` back to the preset (a fail-open, ST-007). Instead keep
+            // exactly the allowlist entries that the preset itself already permits, so
+            // the result is never broader than either operand.
+            (Self::Custom(s), preset) | (preset, Self::Custom(s)) => Self::Custom(
+                s.iter()
+                    .filter(|pat| preset_covers(preset, pat))
+                    .cloned()
+                    .collect(),
+            ),
+            // Two presets: the totally ordered breadth ladder.
             _ if a.rank() <= b.rank() => a.clone(),
             _ => b.clone(),
+        }
+    }
+}
+
+/// Does the preset `preset` permit **every** host that the allowlist pattern `pat`
+/// would? Used to intersect a `Custom` allowlist with a preset without widening.
+///
+/// An exact name is kept when the preset lists it. A wildcard (`*.foo`) is kept only
+/// when the whole subtree is within the preset — true for `Unrestricted`, and for the
+/// localhost subtree under `LocalhostOnly`, but never for the finite registry/development
+/// lists (they cannot cover an entire wildcard subtree). `preset` is assumed non-`Custom`
+/// (the `Custom`/`Custom` case is handled by intersection in [`Lattice::meet`]).
+fn preset_covers(preset: &NetworkCapability, pat: &str) -> bool {
+    match preset {
+        NetworkCapability::Unrestricted => true,
+        // Offline permits nothing; the `Custom` arm is unreachable (handled by
+        // intersection in `meet`) and folded in here only to be exhaustive.
+        NetworkCapability::Offline | NetworkCapability::Custom(_) => false,
+        NetworkCapability::LocalhostOnly => {
+            let base = pat.strip_prefix("*.").unwrap_or(pat);
+            base.eq_ignore_ascii_case("localhost")
+                || base.to_ascii_lowercase().ends_with(".localhost")
+        }
+        NetworkCapability::Registries => {
+            !pat.contains('*')
+                && crate::hosts::any_matches(crate::hosts::REGISTRY_HOSTS.iter().copied(), pat)
+        }
+        NetworkCapability::Development => {
+            !pat.contains('*')
+                && crate::hosts::any_matches(
+                    crate::hosts::REGISTRY_HOSTS
+                        .iter()
+                        .chain(crate::hosts::DEVELOPMENT_HOSTS)
+                        .copied(),
+                    pat,
+                )
         }
     }
 }
