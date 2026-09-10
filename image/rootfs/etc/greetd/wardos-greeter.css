@@ -1,0 +1,84 @@
+/* WardOS login theme for gtkgreet (GTK 3 CSS subset).
+ *
+ * The login screen is a HOST-layer surface (docs/design-language.md §2): stable, calm,
+ * trusted, and it never shouts. These are the Ward Dark tokens (§3) so the greeter is
+ * visually continuous with the Plymouth splash that precedes it — the same near-black
+ * ground (#0E0F11), the same warm off-white type (#D9D9D6), the WardOS mark centred above
+ * a single quiet login box. The one accent is the violet focus ring (§3: violet is
+ * focus/selection); a failed login is the sparingly-used denied red. No gradients, no glow.
+ */
+
+window {
+  background-color: #0E0F11;
+  /* The WardOS mark, sitting above the vertically-centred login box. */
+  background-image: url("/etc/greetd/wardos-mark.svg");
+  background-repeat: no-repeat;
+  background-position: center 28%;
+  background-size: 76px 76px;
+  color: #D9D9D6;
+  font-family: "Inter", "Inter Variable", sans-serif;
+  font-size: 12pt;
+}
+
+label {
+  color: #D9D9D6;
+}
+
+/* PAM prompts and secondary text sit quiet. */
+label.prompt,
+label:disabled {
+  color: #8A8D91;
+}
+
+entry {
+  background-color: #16181B;
+  color: #D9D9D6;
+  caret-color: #D9D9D6;
+  border: 1px solid #24272B;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 4px 0;
+  box-shadow: none;
+}
+
+entry:focus {
+  border-color: #8E7CF0;   /* violet: focus/selection, the single accent (§3) */
+  box-shadow: none;
+}
+
+/* Selection follows the accent. */
+entry selection,
+selection {
+  background-color: #8E7CF0;
+  color: #0E0F11;
+}
+
+button,
+combobox button {
+  background-color: #16181B;
+  background-image: none;
+  color: #D9D9D6;
+  border: 1px solid #24272B;
+  border-radius: 6px;
+  padding: 8px 14px;
+  margin: 4px 0;
+  box-shadow: none;
+  text-shadow: none;
+}
+
+button:hover,
+combobox button:hover {
+  border-color: #8E7CF0;
+}
+
+button:active,
+button:checked {
+  background-color: #1B1E23;
+  border-color: #8E7CF0;
+}
+
+/* A rejected login: red, used sparingly and never animated (§3). */
+label.error,
+.error {
+  color: #C25A5A;
+}

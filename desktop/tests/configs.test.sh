@@ -292,42 +292,23 @@ printf 'WARDOS_ACCENT=#7FA1C3\nWARDOS_TEXT_MUTED=#8A8D91\n' >"$XDG_CONFIG_HOME/w
 out=$(bash -c "source '$root/config/bash/prompt'; wardos_prompt; printf '%s' \"\$PS1\"")
 [[ $out == *'38;2;127;161;195'* ]] || fail "prompt does not use the accent from colors.env: $out"
 # profile.d: no override marker -> sources the shipped bashrc; the marker stops it.
-mock uwsm
-mock tty 'echo /dev/pts/3'
+# (Starting the graphical session is greetd's job now, not this file's — see the greeter
+# checks below and greeter.test.sh.)
 out=$(bash -ic "WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; type wardos_prompt >/dev/null && echo loaded" 2>/dev/null)
 [[ $out == loaded ]] || fail "profile.d did not load the shipped bashrc"
 touch "$XDG_CONFIG_HOME/wardos/bash-override"
 out=$(bash -ic "WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; type wardos_prompt >/dev/null 2>&1 && echo loaded || echo skipped" 2>/dev/null)
 [[ $out == skipped ]] || fail "profile.d ignored the override marker"
 rm "$XDG_CONFIG_HOME/wardos/bash-override"
-# profile.d on tty1 without a Wayland display: starts uwsm start hyprland.desktop.
+# profile.d must NOT start a session any more: even on tty1 with no Wayland display,
+# sourcing it touches neither uwsm nor Hyprland (greetd owns login).
+mock uwsm
+mock Hyprland
 mock tty 'echo /dev/tty1'
+: >"$MOCK_LOG"
 bash -ic "unset WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE; WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'" 2>/dev/null
-assert_logged '^uwsm start hyprland.desktop$'
-assert_logged '^tty $'
-
-# profile.d resilience: a compositor that fails to start must not crash-loop through
-# the autologin. It walks the uwsm docs' ladder — managed entry, then the bare binary
-# (needs no wayland-sessions entry), then Hyprland directly — and if none comes up it
-# drops to an interactive shell on tty1 (control returns to the login shell), log left.
-mock uwsm 'exit 1'
-mock Hyprland 'exit 1'
-: >"$MOCK_LOG"
-out=$(bash -ic "unset WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE; WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; echo REACHED_SHELL" 2>/dev/null)
-[[ $out == *REACHED_SHELL* ]] || fail "profile.d crash-looped on a failed session instead of dropping to a shell"
-assert_logged '^uwsm start hyprland.desktop$'
-assert_logged '^uwsm start hyprland$'   # bare-binary fallback (no session entry needed)
-assert_logged '^Hyprland $'
-assert_file "$XDG_STATE_HOME/wardos/session-start.log"
-# The bare-binary fallback fires only when the managed entry fails: succeed on the entry
-# and neither the binary form nor Hyprland is reached, and the login shell ends.
-# shellcheck disable=SC2016  # $2 is for the generated mock to expand at run time, not here
-mock uwsm 'test "$2" = hyprland.desktop'   # `uwsm start hyprland.desktop` -> 0, else 1
-: >"$MOCK_LOG"
-out=$(bash -ic "unset WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE; WARDOS_CONFIG='$root/config'; source '$root/config/bash/profile.d-wardos.sh'; echo REACHED_SHELL" 2>/dev/null)
-[[ $out != *REACHED_SHELL* ]] || fail "profile.d fell through after a clean session start"
-assert_not_logged '^uwsm start hyprland$'
-assert_not_logged '^Hyprland $'
+assert_not_logged '^uwsm'
+assert_not_logged '^Hyprland'
 
 # --- systemd units ------------------------------------------------------------
 unit_has() { grep -q "^$2" "$1" || fail "$(basename "$1") lacks $2"; }
@@ -342,7 +323,6 @@ unit_has "$root/systemd/user/wardos-approve.service" 'ExecStart=.*wardos-approve
 unit_has "$root/systemd/user/wardos-approve.service" 'WantedBy=graphical-session.target'
 unit_has "$root/systemd/user/swayosd.service" 'ExecStart=.*swayosd-server --style %h/.config/wardos/theme/current/swayosd.css'
 unit_has "$root/systemd/user/wardos-battery-monitor.timer" 'OnUnitActiveSec=2min'
-unit_has "$root/systemd/system/getty@tty1.service.d/autologin.conf" 'ExecStart=-/usr/sbin/agetty .*--autologin wardos'
 
 # --- flatpaks: one id per line with a purpose ---------------------------------
 grep -Ev '^#|^$' "$root/flatpaks.txt" | grep -Evq '^[a-z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_-]+)+ +# .+$' \

@@ -157,10 +157,11 @@ RUN --mount=type=cache,target=/var/cache/libdnf5,sharing=locked \
 COPY --from=binaries /out/ /usr/bin/
 
 # The desktop tree (docs/desktop.md §Layout): commands to /usr/bin, defaults to
-# /usr/share/wardos and /etc/xdg, user units and their preset, the tty1 autologin
-# drop-in for the `wardos` user. Placed by the same script desktop/install.sh uses on an
-# existing Fedora, so the two installs cannot drift apart. One COPY stages the script
-# beside the tree: every step here commits a multi-gigabyte layer, so steps are few.
+# /usr/share/wardos and /etc/xdg, user units and their preset. Login is greetd, set up
+# separately from image/rootfs/etc/greetd and the systemctl step below (no tty1
+# autologin). Placed by the same script desktop/install.sh uses on an existing Fedora, so
+# the two installs cannot drift apart. One COPY stages the script beside the tree: every
+# step here commits a multi-gigabyte layer, so steps are few.
 COPY image/install-desktop.sh desktop/ /tmp/stage/
 RUN test -x /usr/bin/ward && test -x /usr/bin/wardd && test -x /usr/bin/ward-agent \
     && ls -l /usr/bin/ward* \
@@ -248,7 +249,8 @@ RUN ver=$(sed -n 's/^VERSION_ID=//p' /usr/lib/os-release) \
 # now) and gates on its own reachability check, so Flathub setup is unaffected.
 RUN systemctl mask serial-getty@ttyS0.service NetworkManager-wait-online.service \
     && systemctl enable wardos-firstboot.service wardos-flathub.service wardos-usb-guard.service \
-         firewalld.service bootc-fetch-apply-updates.timer \
+         firewalld.service bootc-fetch-apply-updates.timer greetd.service \
+    && systemctl set-default graphical.target \
     && sed -i 's/^DefaultZone=.*/DefaultZone=wardos/' /etc/firewalld/firewalld.conf \
     && grep -q '^DefaultZone=wardos$' /etc/firewalld/firewalld.conf \
     && if rpm -q plymouth-plugin-script >/dev/null 2>&1; then plymouth-set-default-theme wardos; \

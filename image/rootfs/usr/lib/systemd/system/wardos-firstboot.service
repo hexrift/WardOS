@@ -6,8 +6,12 @@
 [Unit]
 Description=WardOS first-boot host check (ward doctor)
 Documentation=https://github.com/hexrift/WardOS/blob/main/image/README.md
-After=local-fs.target systemd-tmpfiles-setup.service
+After=local-fs.target systemd-tmpfiles-setup.service greetd.service
 Wants=systemd-tmpfiles-setup.service
+# Ordered after greetd so the login screen is already on the display before `ward doctor`
+# runs: the report is informational and must never delay the first thing the user sees
+# ("speed as identity", docs/design-language.md §1). It still gates nothing — greetd does
+# not wait for it, so a slow probe cannot hold back the desktop either.
 # Once per deployment: the report's presence is the marker. Delete it to re-run.
 ConditionPathExists=!/var/lib/wardos/doctor.txt
 
@@ -17,8 +21,14 @@ ExecStart=/usr/bin/ward doctor
 StandardOutput=truncate:/var/lib/wardos/doctor.txt
 StandardError=inherit
 # ward doctor caps each probe at 5s; bound the whole run so a wedged probe can never
-# stall the boot (it showed "no limit" on the first hardware boot).
+# stall the boot (it showed "no limit", 71s, on the first hardware boot — systemd-analyze
+# blame, E-09). Combined with the ordering after greetd, the report can never delay the
+# login screen.
 TimeoutStartSec=60s
+# Run at the lowest priority: the report spawns many short probes, and on slow media
+# (a USB boot) that I/O must not compete with the session the user has just logged into.
+Nice=19
+IOSchedulingClass=idle
 # The report is informational: a non-zero exit from `ward doctor` still leaves the file,
 # and the unit shows in `systemctl --failed`, which is the intended signal.
 

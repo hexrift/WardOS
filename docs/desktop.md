@@ -26,7 +26,7 @@ desktop/
   themes/       <id>.toml token files (+ optional <id>/backgrounds/) → /usr/share/wardos/themes
   theme/        Rust crate `wardos-theme`: renders a theme into every component's format
   webapps/      default web apps (name, url, icon)     tuis/  default terminal apps
-  systemd/      user units (battery monitor, approval listener, swayosd) and the autologin drop-in
+  systemd/      user units (battery monitor, approval listener, swayosd)
   flatpaks.txt  default Flathub applications, one id per line with its purpose
   tests/        run.sh (shellcheck + every *.test.sh with a mocked PATH)
   install.sh    apply the desktop on an existing Fedora (Workstation, Silverblue, Kinoite)
@@ -53,10 +53,10 @@ a link to that directory (so `source = ./envs.conf` resolves), `config/` →
 `gtk/settings.ini` copied to `/etc/xdg/gtk-3.0` and `gtk-4.0`, `bash/profile.d-wardos.sh`
 → `/etc/profile.d/wardos.sh`, `themes/`, `webapps/`, `tuis/`, `flatpaks.txt` →
 `/usr/share/wardos/`, `systemd/user/` → `/usr/lib/systemd/user` with
-`/usr/lib/systemd/user-preset/90-wardos.preset` enabling every unit that has `[Install]`,
-the getty drop-in → `/etc/systemd/system/getty@tty1.service.d/` (the image; an existing
-Fedora only with `install.sh --autologin`). `shell/`, `theme/` and `tests/` never land on
-the host. Every row is asserted by `desktop/tests/install.test.sh` against a temp root.
+`/usr/lib/systemd/user-preset/90-wardos.preset` enabling every unit that has `[Install]`.
+Login is greetd, set up by the image itself (`image/rootfs/etc/greetd`), not by this
+step. `shell/`, `theme/` and `tests/` never land on the host. Every row is asserted by
+`desktop/tests/install.test.sh` against a temp root.
 
 User state: `~/.config/wardos/` (theme choice, rendered theme in `theme/current/`, user
 overrides), `~/.local/share/wardos/` (web app profiles, installed themes, fonts),
@@ -390,7 +390,7 @@ command, key and test exist on `main`.
 | Chromium default browser, theme colour | chromium, `chromium.json` fragment | ✔ config: `config/chromium/chromium-flags.conf`, `BROWSER=chromium` |
 | Nautilus | nautilus | |
 | Plymouth boot splash | WardOS Plymouth theme | ✔ `image/rootfs/usr/share/plymouth/themes/wardos/` (WARD on the ground, 2 px progress, passphrase prompt), selected in the `Containerfile` and in the initramfs (the image build proves it); its look at boot is E-09's |
-| Autologin into Hyprland | getty autologin + uwsm | ✔ `systemd/system/getty@tty1.service.d/autologin.conf`, `config/bash/profile.d-wardos.sh` (tested); placed by `image/install-desktop.sh` (`--no-autologin` for existing Fedoras), the user from `image/disk.sh --user wardos` (`install.test.sh`) |
+| Login screen into Hyprland | greetd greeter (graphical, Ward Dark) → uwsm | ✔ `image/rootfs/etc/greetd/` (`config.toml`, `wardos-greeter.css`, the `greeter` sysusers), `image/rootfs/usr/libexec/wardos-session` (uwsm + fallback), enabled in the `Containerfile`; `greeter.test.sh`. A real login screen, not autologin (ADR-0024); the user from `image/disk.sh --user wardos` |
 | Full-disk encryption at install | `image/disk.sh` (Anaconda kickstart on the ISO, on by default; bootc-image-builder has no LUKS) | ✔ `image/disk.sh --type iso` encrypts unless `--no-luks` (ADR-0017), `install.test.sh`; passphrase prompt unverified until E-09 |
 | omarchy-update, migrations | `wardos-update` (bootc upgrade, flatpak, refresh) | ✔ `wardos-update [system\|flatpaks\|themes\|configs\|--check]`, `wardos-refresh <component>\|--all`; `update.test.sh`, `refresh.test.sh`; image side: `bootc upgrade`, `image/boot/README.md` |
 | Snapshots and rollback (Limine + snapper) | bootc deployments, `bootc rollback` | ✔ every upgrade keeps the previous deployment; `bootc rollback` (`image/boot/README.md`) |

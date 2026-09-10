@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# wardos-session — the WardOS graphical session, launched by the greeter (gtkgreet -c)
+# after greetd has authenticated the user through PAM. greetd runs this as the logged-in
+# user inside their PAM/logind session, so XDG_RUNTIME_DIR and the seat are already set up.
+#
+# It must stay in the foreground for the whole session: greetd (and gtkgreet) treat this
+# command's exit as the session ending and return to the login screen. `uwsm start` does
+# exactly that — it launches Hyprland as a systemd user session and blocks until the
+# graphical session ends (uwsm docs), which also brings up graphical-session.target and
+# the WardOS user units (wardos-approve, swayosd, …). Bare `Hyprland` is the fallback for
+# an image without uwsm, so a missing or renamed session entry can never leave the user
+# with no desktop.
+set -u
+
+if command -v uwsm >/dev/null 2>&1; then
+  # A wayland-sessions entry id first (managed session), then the compositor name; either
+  # blocks until the session ends and returns its exit status.
+  uwsm start hyprland.desktop && exit 0
+  uwsm start hyprland && exit 0
+fi
+
+exec Hyprland

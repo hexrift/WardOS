@@ -1,0 +1,21 @@
+# WardOS login — greetd configuration (docs/desktop.md §Login, docs/design-language.md §2
+# "HOST layer"). greetd authenticates the real user through PAM, then runs the session as
+# that user; the greeter itself runs unprivileged as `greeter`.
+#
+# The greeter is graphical and on-brand: `cage` (a single-window Wayland kiosk compositor)
+# hosts `gtkgreet`, styled to the Ward Dark palette by /etc/greetd/wardos-greeter.css so it
+# is continuous with the Plymouth splash before it. On authentication gtkgreet runs
+# /usr/libexec/wardos-session, which starts Hyprland under uwsm (so graphical-session.target
+# and the WardOS user services come up exactly as a normal login).
+#
+# `cage -s` keeps VT switching enabled (Ctrl+Alt+F2…F6 reach a text console), so a greeter
+# or session failure can never lock the machine out — the belt-and-braces the cage docs
+# recommend.
+
+[terminal]
+# greetd owns VT 1, the VT Plymouth hands off to; there is no getty autologin any more.
+vt = 1
+
+[default_session]
+command = "cage -s -- gtkgreet -l -s /etc/greetd/wardos-greeter.css -c /usr/libexec/wardos-session"
+user = "greeter"
