@@ -14,7 +14,7 @@ description = "WardOS: session egress proxy — the only way out of a sandbox"
 test-loopback = []
 
 [dependencies]
-ward-policy = { path = "../ward-policy", version = "0.3.0" }
+ward-policy = { path = "../ward-policy", version = "0.3.1" }
 thiserror = { workspace = true }
 # Gateway routes: TLS to the real upstream with the `ring` backend (no
 # aws-lc-rs), trust roots from the host's certificate store, and a

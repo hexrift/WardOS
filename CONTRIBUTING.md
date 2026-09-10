@@ -36,6 +36,31 @@ the same script runs in CI, so a green run locally is a green run there.
   `docs/*.md`, and an ADR when a decision changes.
 * Squash merge; the pull request title becomes the commit subject.
 
+## Versioning
+
+WardOS follows [Semantic Versioning](https://semver.org): `MAJOR.MINOR.PATCH`. The
+single source of truth is `version` under `[workspace.package]` in the root
+[`Cargo.toml`](Cargo.toml); every crate and the image inherit it, and `git describe`
+against the release tag is what labels a built image.
+
+**The rule — a pull request that changes shipped behaviour bumps the version in the
+same pull request.** `main` must never carry shippable changes ahead of its version.
+
+* **PATCH** (`0.3.0` → `0.3.1`) — bug fixes and other backwards-compatible fixes,
+  including desktop/image fixes that change what a booted machine does.
+* **MINOR** (`0.3.0` → `0.4.0`) — new, backwards-compatible features.
+* **MAJOR** (`0.3.0` → `1.0.0`) — incompatible changes. Pre-1.0, a breaking change is
+  a MINOR bump and is called out in the pull request.
+
+Docs-only, test-only or refactor-only changes that alter no shipped behaviour do not
+bump the version. When in doubt, bump PATCH.
+
+Bumping means: edit the root `[workspace.package]` `version`, update the inter-crate
+`version = "…"` requirements across every workspace member to match, refresh
+`Cargo.lock` (`cargo update --workspace`), and confirm `cargo build --workspace`. After
+the pull request merges, the release is cut from the tag (`.github/workflows/release.yml`,
+dispatched with the `vX.Y.Z` version) and `image/Containerfile` is pinned to it.
+
 ## Reporting a vulnerability
 
 See [`SECURITY.md`](SECURITY.md). Do not open a public issue for an unfixed vulnerability.
