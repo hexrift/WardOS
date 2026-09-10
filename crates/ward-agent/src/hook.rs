@@ -88,7 +88,12 @@ pub fn summarise(tool: Option<&str>, input: Option<&Value>) -> Option<String> {
     let input = input?;
     let field = |key: &str| input.get(key).and_then(Value::as_str);
     let text = match tool.unwrap_or_default() {
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => field("file_path"),
+        "Write" | "Edit" | "MultiEdit" => field("file_path"),
+        // NotebookEdit carries its path in `notebook_path`, not `file_path`. Without
+        // this the summary falls through to the whole tool_input JSON, so the daemon's
+        // protected-tests check (which matches a `tests/` path prefix) never fires and
+        // an edit to a protected test notebook is not denied — a fail-open.
+        "NotebookEdit" => field("notebook_path").or_else(|| field("file_path")),
         "Bash" => field("command"),
         "Read" | "Glob" | "Grep" => field("file_path")
             .or_else(|| field("pattern"))
@@ -189,10 +194,27 @@ mod tests {
 
     #[test]
     fn write_family_uses_file_path() {
-        for tool in ["Write", "Edit", "MultiEdit", "NotebookEdit"] {
+        for tool in ["Write", "Edit", "MultiEdit"] {
             let input = json!({"file_path": "/work/src/lib.rs", "content": "x"});
             assert_eq!(summary(tool, &input).as_deref(), Some("/work/src/lib.rs"));
         }
+    }
+
+    #[test]
+    fn notebook_edit_uses_notebook_path() {
+        // NotebookEdit's path is in notebook_path; summarising the wrong field would
+        // hide the path from the protected-tests deny (fail-open).
+        let input = json!({"notebook_path": "/work/tests/foo.ipynb", "new_source": "x"});
+        assert_eq!(
+            summary("NotebookEdit", &input).as_deref(),
+            Some("/work/tests/foo.ipynb")
+        );
+        // Falls back to file_path if a caller only supplies that.
+        let legacy = json!({"file_path": "/work/tests/bar.ipynb"});
+        assert_eq!(
+            summary("NotebookEdit", &legacy).as_deref(),
+            Some("/work/tests/bar.ipynb")
+        );
     }
 
     #[test]
