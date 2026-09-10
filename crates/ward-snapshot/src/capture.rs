@@ -316,10 +316,25 @@ fn read_git_context(root: &Path) -> Option<GitContext> {
     let head = fs::read_to_string(root.join(".git").join("HEAD")).ok()?;
     let head = head.trim();
     if let Some(reference) = head.strip_prefix("ref: ") {
-        let branch = reference.rsplit('/').next().map(str::to_string);
-        let sha = fs::read_to_string(root.join(".git").join(reference))
-            .ok()
-            .map(|s| s.trim().to_string());
+        // `.git/HEAD` lives inside the captured (agent-controlled) worktree, so its
+        // `ref:` target is untrusted input. A real symref is a relative `refs/...`
+        // path; anything else — an absolute path, a `..` escape, a NUL — must not be
+        // followed, or a crafted HEAD would make the host wardd read an arbitrary file
+        // (e.g. `ref: /etc/shadow`) and embed its contents in the snapshot metadata.
+        let safe = reference.starts_with("refs/")
+            && crate::manifest::validate_path(reference.as_bytes()).is_ok();
+        let branch = if safe {
+            reference.rsplit('/').next().map(str::to_string)
+        } else {
+            None
+        };
+        let sha = if safe {
+            fs::read_to_string(root.join(".git").join(reference))
+                .ok()
+                .map(|s| s.trim().to_string())
+        } else {
+            None
+        };
         Some(GitContext {
             head: sha,
             branch,
@@ -331,5 +346,71 @@ fn read_git_context(root: &Path) -> Option<GitContext> {
             branch: None,
             detached: true,
         })
+    }
+}
+
+#[cfg(test)]
+mod git_context_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::read_git_context;
+    use std::fs;
+
+    fn worktree_with_head(head: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(git.join("HEAD"), head).unwrap();
+        dir
+    }
+
+    #[test]
+    fn follows_a_legitimate_symref() {
+        let dir = worktree_with_head("ref: refs/heads/main\n");
+        fs::create_dir_all(dir.path().join(".git/refs/heads")).unwrap();
+        fs::write(dir.path().join(".git/refs/heads/main"), "abc123\n").unwrap();
+        let ctx = read_git_context(dir.path()).unwrap();
+        assert_eq!(ctx.head.as_deref(), Some("abc123"));
+        assert_eq!(ctx.branch.as_deref(), Some("main"));
+        assert!(!ctx.detached);
+    }
+
+    #[test]
+    fn refuses_an_absolute_ref_target() {
+        // A crafted HEAD must not make wardd read a host file outside the worktree.
+        let dir = worktree_with_head("ref: /etc/hostname\n");
+        let ctx = read_git_context(dir.path()).unwrap();
+        assert_eq!(
+            ctx.head, None,
+            "an absolute ref target was followed off the tree"
+        );
+        assert_eq!(ctx.branch, None);
+    }
+
+    #[test]
+    fn refuses_a_traversal_ref_target() {
+        let dir = worktree_with_head("ref: ../../../../etc/hostname\n");
+        let ctx = read_git_context(dir.path()).unwrap();
+        assert_eq!(ctx.head, None, "a `..` ref target escaped the worktree");
+        assert_eq!(ctx.branch, None);
+    }
+
+    #[test]
+    fn refuses_a_ref_outside_refs() {
+        // Even a relative, traversal-free target is not followed unless it is a refs/ path.
+        let dir = worktree_with_head("ref: config\n");
+        fs::write(dir.path().join(".git/config"), "[core]\n").unwrap();
+        let ctx = read_git_context(dir.path()).unwrap();
+        assert_eq!(ctx.head, None, "a non-refs/ ref target was followed");
+    }
+
+    #[test]
+    fn detached_head_is_recorded_verbatim() {
+        let dir = worktree_with_head("0123456789abcdef0123456789abcdef01234567\n");
+        let ctx = read_git_context(dir.path()).unwrap();
+        assert_eq!(
+            ctx.head.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert!(ctx.detached);
     }
 }
