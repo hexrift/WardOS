@@ -82,5 +82,27 @@ classic offender. "Speed should be part of the product" was an explicit instruct
   `/var/lib/greeter` was never created, so cage had no working directory and no writable
   shader cache; a tmpfiles.d entry now creates it before greetd starts. Only a real boot
   surfaces these — CI builds the image but does not run the compositor.
-* Still to verify on hardware (E-09): a *second* boot's time (should be far below 331 s),
-  and that the greeter now renders and authenticates on the reference laptop.
+* A second round of E-09 hardware findings, once the greeter rendered and the desktop
+  came up, is addressed alongside the login work so the reference laptop is reflashed
+  once:
+  - **Wi-Fi was dead.** Fedora 44 split `linux-firmware` into per-device subpackages that
+    are *weak* dependencies, and the image builds with `--setopt=install_weak_deps=False`,
+    so the Intel 8265's `iwlwifi-8265-*` ucode (in `iwlwifi-mvm-firmware`) was never
+    installed — `dmesg` showed "no suitable firmware found" and `nmtui` listed no wireless
+    device. `iwlwifi-mvm-firmware` and `iwlwifi-dvm-firmware` are now named explicitly in
+    `image/packages.txt`.
+  - **Onboarding stalled behind `ward doctor`.** `wardos-first-run` ran `ward doctor`
+    synchronously; the same probe run that took ~70 s at boot (it cold-starts every agent
+    to read its version) also blocked the welcome, the keys and the walkthrough on the
+    first login. It is now detached — the `wardos-firstboot` service still writes the full
+    report — so onboarding is responsive on slow media.
+  - **Two duplicate toasts.** The theme was applied (and announced) by *both* the desktop
+    autostart and `wardos-first-run`, and the "Welcome to WardOS" greeting was sent by both
+    `wardos-first-run` and the walkthrough. The per-login theme re-apply is now quiet
+    (`wardos-theme set -q`, the login re-apply is not a *change*), and the walkthrough is
+    the single sender of the greeting.
+* Still to verify on hardware (E-09): a *second* boot's time (should be far below 331 s);
+  that the greeter renders and authenticates (the first-round fix); and, from this round,
+  that Wi-Fi associates, the duplicate toasts are gone, and onboarding is responsive.
+  The blue-gradient wallpaper (Ward Dark ground not painting) is still under live
+  diagnosis and is deliberately not guessed at here.

@@ -91,9 +91,25 @@ assert_eq "$(readlink "$XDG_CONFIG_HOME/btop/themes/wardos.theme")" "$current_di
 wardos-theme set catppuccin-latte
 assert_logged 'color-scheme prefer-light$'
 
+# set -q renders and reloads exactly like set, but sends no notification: it is the
+# routine per-login re-apply (autostart, wardos-first-run), not a theme change, so a
+# toast each login would be noise (E-09 duplicate-toast fix).
+: >"$MOCK_LOG"
+wardos-theme set -q nord
+assert_logged "^wardos-theme-render nord --out $current_dir$"
+assert_logged '^hyprctl reload$'
+assert_eq "$(cat "$current_dir/id")" "nord"
+assert_not_logged '^notify-send'
+# --quiet is the long form; an id is still required.
+: >"$MOCK_LOG"
+wardos-theme set --quiet ward-dark
+assert_eq "$(cat "$current_dir/id")" "ward-dark"
+assert_not_logged '^notify-send'
+if wardos-theme set -q 2>/dev/null; then fail "set -q still needs an id"; fi
+
 # set refuses an unknown id and leaves the current theme alone.
 if wardos-theme set no-such-theme 2>/dev/null; then fail "set no-such-theme should fail"; fi
-assert_eq "$(wardos-theme current)" "catppuccin-latte"
+assert_eq "$(wardos-theme current)" "ward-dark"
 
 # next: alphabetical, wrapping.
 wardos-theme set nord
