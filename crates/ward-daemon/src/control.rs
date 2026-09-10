@@ -7,7 +7,7 @@
 //! [`Request::Append`] to a daemon. [`serve_connection`] is the daemon side for the
 //! requests a sink needs; the daemon binary adds the rest.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -472,22 +472,38 @@ pub fn serve_connection(stream: UnixStream, log: &mut Option<LocalLog>) {
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
-    for line in BufReader::new(stream)
-        .lines()
-        .map_while(std::result::Result::ok)
-    {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        // Cap each request line: a newline-less stream would otherwise grow the
+        // buffer without bound (an OOM vector from a same-user client).
+        match (&mut reader)
+            .take(crate::daemon::MAX_REQUEST_BYTES)
+            .read_line(&mut line)
+        {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        if crate::daemon::request_too_large(&line) {
+            let _ = write_response(&mut writer, &Response::Error("request too large".into()));
+            return;
+        }
         let (response, done) = match serde_json::from_str::<Request>(&line) {
             Ok(request) => handle(log, request),
             Err(e) => (Response::Error(format!("bad request: {e}")), false),
         };
-        let Ok(mut bytes) = serde_json::to_vec(&response) else {
-            return;
-        };
-        bytes.push(b'\n');
-        if writer.write_all(&bytes).is_err() || done {
+        if write_response(&mut writer, &response).is_err() || done {
             return;
         }
     }
+}
+
+/// Write one JSON response line to the client.
+fn write_response(writer: &mut UnixStream, response: &Response) -> std::io::Result<()> {
+    let mut bytes = serde_json::to_vec(response).unwrap_or_default();
+    bytes.push(b'\n');
+    writer.write_all(&bytes)
 }
 
 /// Monotonic session time of `at`; anything before the session started is 0.

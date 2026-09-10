@@ -24,7 +24,7 @@
 //! every other command adopts the socket through
 //! [`Session::open_current`](crate::session::Session::open_current).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -53,6 +53,18 @@ pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 pub const BINARY: &str = "wardd";
 /// Longest socket path Linux accepts (`sun_path` is 108 bytes with the NUL).
 pub const MAX_SOCKET_PATH: usize = 107;
+
+/// Largest control-socket request line accepted. The protocol's requests are
+/// small JSON objects; a client that streams bytes without a newline would
+/// otherwise grow the read buffer without bound (an out-of-memory / abort
+/// vector from a same-user client). 1 MiB is far above any real request.
+pub const MAX_REQUEST_BYTES: u64 = 1 << 20;
+
+/// A request line hit the [`MAX_REQUEST_BYTES`] cap without a terminating
+/// newline — a truncated, oversized line that must be rejected, not parsed.
+pub(crate) fn request_too_large(line: &str) -> bool {
+    line.len() as u64 >= MAX_REQUEST_BYTES && !line.ends_with('\n')
+}
 
 /// The control socket of `session` under `state`.
 #[must_use]
@@ -540,16 +552,21 @@ impl Served {
     /// Reverse [`Self::pause`]: release the approvals, open the proxy, thaw
     /// the processes, append `SessionResumed`.
     fn resume(&mut self) -> Result<Box<EventRecord>> {
-        let Some(paused) = self.paused.take() else {
+        let Some(paused) = self.paused.as_ref() else {
             return Err(Error::Daemon("not paused".into()));
         };
+        // Clear the on-disk pause marker FIRST. The session proxies read it to refuse
+        // egress, so it is the load-bearing part of a resume: if it fails we must leave
+        // the session fully paused (marker present, approvals held, processes frozen)
+        // and return the error, not half-resume into a state where the proxy still
+        // refuses traffic while the daemon believes it is running (which a later
+        // Resume would reject as "not paused"). Nothing is mutated before this succeeds.
+        pause::clear_marker(&self.state, &self.session)?;
         self.approvals.set_paused(false);
-        let cleared = pause::clear_marker(&self.state, &self.session);
         pause::thaw(&paused.frozen);
-        cleared?;
-        let record = self.append(WardEvent::SessionResumed {
-            paused_for: paused.since.elapsed(),
-        })?;
+        let paused_for = paused.since.elapsed();
+        self.paused = None;
+        let record = self.append(WardEvent::SessionResumed { paused_for })?;
         Ok(Box::new(record))
     }
 
@@ -601,9 +618,15 @@ fn serve_stream(stream: UnixStream, served: &Arc<Mutex<Served>>) -> bool {
     let mut line = String::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
+        // Bound each request line so a newline-less stream cannot grow `line`
+        // without limit; a Take yields at most MAX_REQUEST_BYTES per read.
+        match (&mut reader).take(MAX_REQUEST_BYTES).read_line(&mut line) {
             Ok(0) | Err(_) => return false,
             Ok(_) => {}
+        }
+        if request_too_large(&line) {
+            let _ = write_line(&mut writer, &Response::Error("request too large".into()));
+            return false;
         }
         let (response, done) = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Subscribe { from_seq }) => {
@@ -711,6 +734,22 @@ mod tests {
         WardEvent,
     };
     use ward_policy::{Policy, merge};
+
+    #[test]
+    fn oversized_request_line_is_rejected() {
+        // A complete line (ends in newline) under the cap is fine, however long.
+        assert!(!request_too_large("{\"x\":1}\n"));
+        assert!(!request_too_large(""));
+        // A line at/over the cap with no terminating newline is a truncated,
+        // unbounded stream and must be rejected rather than parsed.
+        let cap = usize::try_from(MAX_REQUEST_BYTES).unwrap();
+        let huge = "x".repeat(cap);
+        assert!(request_too_large(&huge));
+        // At the cap but properly terminated is still accepted.
+        let mut capped = "x".repeat(cap - 1);
+        capped.push('\n');
+        assert!(!request_too_large(&capped));
+    }
 
     fn working() -> WardEvent {
         WardEvent::AgentStateChanged {
