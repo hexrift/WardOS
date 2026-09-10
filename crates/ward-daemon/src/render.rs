@@ -416,9 +416,7 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
             (change_verb(*kind), Tone::Ink, path.to_string())
         }
         WardEvent::FileRead { path, .. } => ("READ", Tone::Dim, path.to_string()),
-        WardEvent::NetworkRequested { host, port, .. } => {
-            ("NET", Tone::Warn, format!("{host}:{port}"))
-        }
+        ev @ WardEvent::NetworkRequested { .. } => net_requested_cells(ev),
         WardEvent::NetworkDenied { dst, .. } => ("DENY", Tone::Deny, denied_dst(dst)),
         WardEvent::CredentialGranted { service, scope, .. } => (
             "CRED",
@@ -775,6 +773,29 @@ fn claim_verb(kind: ward_events::ClaimKind) -> &'static str {
     }
 }
 
+/// Observer cells for a `NetworkRequested` record. Honour the decision so a denied
+/// request never reads as amber "attention": today the egress path emits denials as
+/// `NetworkDenied` (so this is `Allow` in practice), but `feed.rs` already counts a
+/// `Deny` here as denied — keep the row consistent with that and with any future or
+/// replayed `Deny`.
+fn net_requested_cells(event: &WardEvent) -> (&'static str, Tone, String) {
+    let WardEvent::NetworkRequested {
+        host,
+        port,
+        decision,
+        ..
+    } = event
+    else {
+        // Only ever called for the NetworkRequested arm of observer_cells.
+        return ("NET", Tone::Warn, String::new());
+    };
+    let (verb, tone) = match decision {
+        ward_events::Decision::Deny => ("DENY", Tone::Deny),
+        _ => ("NET", Tone::Warn),
+    };
+    (verb, tone, format!("{host}:{port}"))
+}
+
 fn denied_dst(dst: &ward_events::DeniedDst) -> String {
     use ward_events::DeniedDst as D;
     match dst {
@@ -983,6 +1004,54 @@ mod tests {
         assert!(observer_row(&records[4]).unwrap().contains(OK));
         assert_eq!(observer_row(&records[5]), None);
         assert_eq!(plain(&kind_row(&records[5])), "01:01  agent_state_changed");
+    }
+
+    #[test]
+    fn network_request_row_colour_follows_the_decision() {
+        use std::time::Duration;
+        use ward_events::{
+            Blake3Hash, Chain, Decision, HostName, Origin, Pid, ProcessRef, RuleRef, SessionId,
+            Timestamp,
+        };
+        let by = ProcessRef {
+            pid: Pid::new(7).unwrap(),
+            comm: None,
+        };
+        let rule = RuleRef::new("allowlisted").unwrap();
+        let mk = |decision| WardEvent::NetworkRequested {
+            host: HostName::new("api.github.com").unwrap(),
+            port: 443,
+            decision,
+            rule: rule.clone(),
+            by: by.clone(),
+        };
+        let mut chain = Chain::genesis(SessionId::from_u128(1), Blake3Hash::ZERO);
+        let allow = chain
+            .append(
+                Origin::Proxy,
+                mk(Decision::Allow),
+                Timestamp::mono(Duration::from_secs(1)),
+            )
+            .unwrap();
+        let deny = chain
+            .append(
+                Origin::Proxy,
+                mk(Decision::Deny),
+                Timestamp::mono(Duration::from_secs(2)),
+            )
+            .unwrap();
+        // Allowed: amber NET. Denied: red DENY — never amber. (The verb column is
+        // padded to five, so NET/DENY carry trailing spaces before the subject.)
+        assert_eq!(
+            plain(&observer_row(&allow).unwrap()),
+            "00:01  NET   api.github.com:443"
+        );
+        assert!(observer_row(&allow).unwrap().contains(WARN));
+        assert_eq!(
+            plain(&observer_row(&deny).unwrap()),
+            "00:02  DENY  api.github.com:443"
+        );
+        assert!(observer_row(&deny).unwrap().contains(DENY));
     }
 
     #[test]
