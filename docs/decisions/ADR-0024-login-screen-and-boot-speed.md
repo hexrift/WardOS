@@ -101,8 +101,15 @@ classic offender. "Speed should be part of the product" was an explicit instruct
     `wardos-first-run` and the walkthrough. The per-login theme re-apply is now quiet
     (`wardos-theme set -q`, the login re-apply is not a *change*), and the walkthrough is
     the single sender of the greeting.
+  - **A blue gradient, not the Ward Dark ground.** The desktop showed Hyprland's stock
+    wallpaper. `disable_hyprland_logo` was set, but that removes only the logo overlay —
+    the built-in wallpaper is a *separate* setting, `misc:force_default_wallpaper`, which
+    defaults to `-1` (a random built-in gradient) and sits on top of `background_color`.
+    Whenever `swaybg` had not painted yet (the first frame, before the theme fragment
+    renders, a swaybg hiccup) that gradient showed instead of the ground.
+    `force_default_wallpaper = 0` in `looknfeel.conf` disables it, so `background_color`
+    (the theme's `#0E0F11` ground) is the base under swaybg from the first frame.
 * Still to verify on hardware (E-09): a *second* boot's time (should be far below 331 s);
   that the greeter renders and authenticates (the first-round fix); and, from this round,
-  that Wi-Fi associates, the duplicate toasts are gone, and onboarding is responsive.
-  The blue-gradient wallpaper (Ward Dark ground not painting) is still under live
-  diagnosis and is deliberately not guessed at here.
+  that Wi-Fi associates, the duplicate toasts are gone, onboarding is responsive, and the
+  ground is Ward Dark rather than the stock gradient.
