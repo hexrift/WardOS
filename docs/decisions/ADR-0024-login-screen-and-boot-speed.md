@@ -59,7 +59,21 @@ classic offender. "Speed should be part of the product" was an explicit instruct
 * `greeter.test.sh` asserts the greetd config, the Ward Dark theme, the greeter user, and
   the session launcher's foreground/fallback behaviour; `configs.test.sh` and
   `install.test.sh` assert the autologin path is gone.
-* Still to verify on hardware (E-09): the exact 331 s culprit against
-  `systemd-analyze blame`/`critical-chain`, and that the greeter renders and authenticates
-  on the reference laptop. The unit timeouts bound the worst case regardless of the
-  specific culprit; the blame data closes the boot-P0 investigation.
+* `systemd-analyze blame` from the reference laptop (a USB-stick boot) named the three
+  heavy units, and this change addresses them: `systemd-udev-settle.service` (67 s — WardOS
+  was its only puller, so it is gone), `wardos-firstboot.service` (`ward doctor`, 71 s — now
+  ordered after greetd, capped, and idle-priority, so it is off the path to the login
+  screen), and `ldconfig.service` (78 s — see below). Slow USB flash I/O amplified all of
+  them; on the installed SSD each is a fraction of that, and every one is a *one-time*
+  first-boot cost — the second boot of a deployment skips `ldconfig` (ConditionNeedsUpdate),
+  `ward doctor` (its marker) and the settle wait, so it is dramatically faster.
+* `ldconfig.service` (the stock glibc "rebuild dynamic linker cache") is deliberately left
+  untouched. It is `ConditionNeedsUpdate`-gated (fires once per deployment, before
+  `sysinit.target`) and its safe elimination is not something that can be validated without
+  a hardware boot: masking risks an unbootable image if the baked cache is ever wrong, and
+  reordering/stamp tricks risk a dependency cycle or, worse, suppressing the sibling
+  `systemd-sysusers` run that creates the `greeter` user. A slow *first* boot is recoverable;
+  an unbootable image is not. It is tracked as a follow-up pending a tested change and a
+  confirmed second-boot time on E-09.
+* Still to verify on hardware (E-09): a *second* boot's time (should be far below 331 s),
+  and that the greeter renders and authenticates on the reference laptop.
