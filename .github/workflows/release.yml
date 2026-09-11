@@ -158,47 +158,62 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            # An existing tag must already resolve to this build's commit. Otherwise a
-            # rerun from a different ref would clobber assets under an unrelated release
-            # and label them as source they were not built from -- reject that instead.
-            obj_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.sha')"
-            obj_type="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.type')"
-            if [[ "$obj_type" == "tag" ]]; then
-              obj_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${obj_sha}" --jq '.object.sha')"
-            fi
-            if [[ "$obj_sha" != "$GITHUB_SHA" ]]; then
-              echo "refusing to publish: tag $TAG points at $obj_sha, not the build commit $GITHUB_SHA" >&2
-              exit 1
-            fi
-            # Same tag, same commit: an idempotent retry. Before clobbering, pull
-            # the already-published tarballs and their .sha256 checksums and compare
-            # them byte-for-byte with what this run rebuilt. A rebuild at the same
-            # commit must reproduce the published bytes exactly: identical assets are
-            # a no-op (skip the upload), differing bytes are refused before anything
-            # is overwritten.
-            #
-            # download-published.sh enumerates the release's real assets and pulls
-            # exactly the expected ones, failing the job on any auth/API/network/
-            # download error. Inability to READ the existing release must never look
-            # like "no assets exist" and authorize a clobber -- so its non-zero exit
-            # fails this step here, before check-assets could ever say "upload".
-            mkdir -p published
-            bash scripts/release/download-published.sh "$TAG" dist published
-            rc=0
-            bash scripts/release/check-assets.sh dist published || rc=$?
-            case "$rc" in
-              0)  echo "published assets are byte-identical; nothing to upload." ;;
-              10) gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber ;;
-              *)  echo "refusing to overwrite the published release; see check-assets output above." >&2
-                  exit 1 ;;
-            esac
-          else
-            # --target binds the new tag to this build's commit; the .sha256 assets
-            # record each tarball's checksum alongside it.
-            gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
-              --target "$GITHUB_SHA" --title "WardOS $TAG" --generate-notes
-          fi
+          # Bind the tag to this build's commit BEFORE either branch below, and
+          # independently of whether a Release exists yet. An existing tag must
+          # already resolve to $GITHUB_SHA -- otherwise a rerun from a different
+          # ref would publish assets under a tag that names unrelated source. A
+          # tag that exists while no Release does yet is the case this guards:
+          # without it the create path would bind a new release to that stale
+          # tag. An absent tag is fine; the create path binds it to $GITHUB_SHA.
+          # A non-404 tag-lookup error fails the job (fail closed).
+          bash scripts/release/check-tag-commit.sh "$TAG" "$GITHUB_SHA"
+
+          # Does a Release already exist? release-exists.sh maps a clean 404 to
+          # "not found" (exit 2 -> create), a success to "exists" (exit 0 ->
+          # reconcile), and ANY other lookup error to a hard failure (exit 1).
+          # A `gh release view` alone would treat an auth/API/network failure as
+          # "does not exist" and clobber under a release it could not read.
+          rc=0
+          bash scripts/release/release-exists.sh "$TAG" || rc=$?
+          case "$rc" in
+            0)
+              # The release exists at this commit (the tag guard above already
+              # proved the tag binds to $GITHUB_SHA). Idempotent retry: before
+              # clobbering, pull the already-published tarballs and their .sha256
+              # checksums and compare them byte-for-byte with what this run
+              # rebuilt. A rebuild at the same commit must reproduce the
+              # published bytes exactly: identical assets are a no-op (skip the
+              # upload), differing bytes are refused before anything is
+              # overwritten.
+              #
+              # download-published.sh enumerates the release's real assets and
+              # pulls exactly the expected ones, failing the job on any auth/API/
+              # network/download error. Inability to READ the existing release
+              # must never look like "no assets exist" and authorize a clobber --
+              # so its non-zero exit fails this step here, before check-assets
+              # could ever say "upload".
+              mkdir -p published
+              bash scripts/release/download-published.sh "$TAG" dist published
+              arc=0
+              bash scripts/release/check-assets.sh dist published || arc=$?
+              case "$arc" in
+                0)  echo "published assets are byte-identical; nothing to upload." ;;
+                10) gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber ;;
+                *)  echo "refusing to overwrite the published release; see check-assets output above." >&2
+                    exit 1 ;;
+              esac
+              ;;
+            2)
+              # No release yet, and the tag guard above verified any existing tag
+              # binds to $GITHUB_SHA (or is absent). --target binds a new tag to
+              # this commit; the .sha256 assets record each tarball's checksum.
+              gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
+                --target "$GITHUB_SHA" --title "WardOS $TAG" --generate-notes
+              ;;
+            *)
+              echo "refusing to publish: could not determine whether release $TAG exists." >&2
+              exit 1 ;;
+          esac
       # The disks for this release, for every architecture that has a tarball. A
       # release created with the workflow's own token does not fire other workflows'
       # `release:` triggers (GitHub's rule for GITHUB_TOKEN events, workflow_dispatch
