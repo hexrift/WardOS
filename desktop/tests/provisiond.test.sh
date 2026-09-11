@@ -184,4 +184,48 @@ out=$(printf 'ACCOUNT\nnewadmin\nNew Admin\npw\n' | wardos-provisiond)
 [[ -e "$acct_dir/newadmin" ]] || fail "the new admin is created after reconciliation"
 assert_file "$WARDOS_PROVISIONED_MARKER"
 
+# --- durability fault injection (#127 review): a failed fsync must fail the write CLOSED,
+# never be swallowed with `|| true`. `sync <path>` (coreutils) fsyncs that path and exits
+# non-zero on a flush error; the broker's write_durable checks both the file flush and the
+# directory flush. Mocking `sync` lets us fail each independently.
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK" "$WARDOS_PROVISION_JOURNAL"
+mock useradd
+mock chpasswd
+mock userdel
+mock id 'exit 1'
+
+# File-flush failure: the fsync of the journal's temp file fails, so the very first durable
+# write in the transaction fails and the account is never created, no marker is written.
+: >"$MOCK_LOG"
+# shellcheck disable=SC2016
+mock sync 'case "$1" in *.tmp.*) exit 1 ;; esac; exit 0'
+out=$(printf 'ACCOUNT\nfaye\nFaye\npw\n' | wardos-provisiond)
+[[ "$out" == ERR* ]] || fail "a file-flush (fsync) failure must fail the durable write closed; got: $out"
+assert_not_logged '^useradd'
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "no marker after a failed file flush"
+[[ ! -e "$WARDOS_PROVISION_JOURNAL" ]] || fail "the temp is cleaned up after a failed file flush"
+
+# Directory-flush failure: the file flush succeeds but the fsync of the containing directory
+# fails, so write_durable still returns non-zero and the transaction fails closed.
+: >"$MOCK_LOG"
+rm -f "$WARDOS_PROVISION_JOURNAL"
+# shellcheck disable=SC2016
+mock sync 'case "$1" in *.tmp.*) exit 0 ;; *) exit 1 ;; esac'
+out=$(printf 'ACCOUNT\ngwen\nGwen\npw\n' | wardos-provisiond)
+[[ "$out" == ERR* ]] || fail "a directory-flush (fsync) failure must fail the durable write closed; got: $out"
+assert_not_logged '^useradd'
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "no marker after a failed directory flush"
+
+# KEYMAP persistence failure (#127 review item 2): if the chosen layout cannot be recorded
+# durably for the new user's Hyprland session, the broker must report an error, not OK — the
+# earlier "provisioning says success, first desktop gets a different layout" failure mode.
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_KEYBOARD_STATE"
+: >"$MOCK_LOG"
+mock sync 'exit 1' # any flush of the keyboard-layout record fails
+out=$(printf 'KEYMAP\ngb\n' | wardos-provisiond)
+[[ "$out" == ERR* ]] || fail "KEYMAP must report an error when the layout cannot be persisted; got: $out"
+assert_logged '^localectl set-x11-keymap gb$' # the system keymap step still ran
+[[ ! -e "$WARDOS_KEYBOARD_STATE" ]] || fail "a failed persist leaves no half-written layout record"
+mock sync 'exit 0' # restore a succeeding flush for any later use
+
 echo "ok   provisiond.test.sh internal assertions"

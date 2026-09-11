@@ -38,29 +38,38 @@ refuse_if_provisioned() { if provisioned; then deny "already provisioned"; fi; }
 # marker; the next ACCOUNT reconciles it under the lock before creating anything.
 journal="${WARDOS_PROVISION_JOURNAL:-/var/lib/wardos/provision.journal}"
 
-# Durably write CONTENT to PATH: a temp file, flushed, atomically renamed into place, then
-# the containing directory flushed so the rename survives a power cut. Every step is checked
-# and a failure returns non-zero — callers test the return explicitly (errexit is not relied
-# on, since these run inside `if !`/`||`). A power cut leaves PATH either absent or fully
-# present, never truncated.
+# fsync PATH (a file or a directory) to stable storage, returning its real exit status. This
+# is `sync PATH` from coreutils, which fsync(2)s exactly that path; unlike a bare `sync` it
+# reports a flush failure as a non-zero exit. It is NEVER swallowed with `|| true`: a lost
+# flush is exactly the power-cut durability failure the journal/marker ordering exists to
+# prevent, so it must propagate and fail the write closed.
+fsync_path() { sync "$1"; }
+
+# Durably write CONTENT to PATH: a temp file, its data flushed, atomically renamed into place,
+# then the containing directory flushed so the rename itself survives a power cut. EVERY step
+# — including both fsyncs — is checked and any failure returns non-zero (the temp is cleaned
+# up); callers test the return explicitly (errexit is not relied on, since these run inside
+# `if !`/`||`). A power cut leaves PATH either absent or fully present, never truncated, and a
+# failed flush is reported rather than masked as success.
 write_durable() {
   local path=$1 content=$2 dir tmp
   dir=$(dirname "$path")
   mkdir -p "$dir" || return 1
   tmp="$path.tmp.$$"
   printf '%s\n' "$content" >"$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
-  sync "$tmp" 2>/dev/null || sync 2>/dev/null || true
+  fsync_path "$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
   mv -f "$tmp" "$path" || { rm -f "$tmp" 2>/dev/null; return 1; }
-  sync "$dir" 2>/dev/null || sync 2>/dev/null || true
+  fsync_path "$dir" || return 1
   return 0
 }
 
-# Durably remove PATH; returns non-zero if it still exists afterward.
+# Durably remove PATH; returns non-zero if it still exists afterward or the directory flush
+# that makes the removal survive a power cut fails (checked, never swallowed).
 remove_durable() {
   local path=$1
   rm -f "$path" 2>/dev/null || return 1
   [[ ! -e "$path" ]] || return 1
-  sync "$(dirname "$path")" 2>/dev/null || sync 2>/dev/null || true
+  fsync_path "$(dirname "$path")" || return 1
   return 0
 }
 
@@ -89,10 +98,12 @@ do_keymap() {
   localectl set-x11-keymap "$v" 2>/dev/null || deny "could not set keymap"
   # Record the choice so the new user's Hyprland config adopts it on first login: localectl
   # sets the console/greeter keymap, but Hyprland reads its own kb_layout, so without this
-  # the desktop would start on the default layout, not the one chosen at provisioning.
+  # the desktop would start on the default layout, not the one chosen at provisioning. The
+  # write is durable and CHECKED — a persistence failure is reported as an error rather than
+  # acknowledged as OK, so the broker never says the layout was set while the first desktop
+  # would come up on a different one.
   local kbstate="${WARDOS_KEYBOARD_STATE:-/var/lib/wardos/keyboard-layout}"
-  mkdir -p "$(dirname "$kbstate")" 2>/dev/null || true
-  printf '%s\n' "$v" >"$kbstate" 2>/dev/null || true
+  write_durable "$kbstate" "$v" || deny "could not record the keyboard layout"
   reply OK
 }
 

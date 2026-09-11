@@ -6,11 +6,16 @@
 # wardos-provisiond@<n>.service per connection, so each request is a short-lived root
 # process that reads one request and exits.
 #
-# The socket opens only while the machine is unprovisioned: once
-# /var/lib/wardos/provisioned exists it is never listened on again (belt-and-braces
-# alongside the broker's own refusal). It is group-owned by the greeter (the locked,
-# nologin bootstrap identity that runs the provisioning UI) and mode 0660, so only that
-# session can reach it.
+# ConditionPathExists=!/var/lib/wardos/provisioned is evaluated when this socket unit
+# STARTS, i.e. at boot: on any boot where the machine is already provisioned the socket
+# is not started and never listens. It does NOT close a socket that is already listening
+# when the marker is written mid-session — that only takes effect on the next boot/restart.
+# Within the provisioning session the guarantee that no second provisioning happens is the
+# broker's own refusal: wardos-provisiond checks the marker and denies every mutating verb
+# once it exists. So the condition disables the socket across reboots (belt-and-braces) and
+# the broker's refusal is the authoritative in-session guarantee. The socket is group-owned
+# by the greeter (the locked, nologin bootstrap identity that runs the provisioning UI) and
+# mode 0660, so only that session can reach it.
 [Unit]
 Description=WardOS first-boot provisioning broker socket
 Documentation=https://github.com/hexrift/WardOS/blob/main/docs/decisions/ADR-0027-first-boot-provisioning.md

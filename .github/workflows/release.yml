@@ -145,8 +145,11 @@ jobs:
       # `release:` triggers (GitHub's rule for GITHUB_TOKEN events, workflow_dispatch
       # excepted), so the disk workflow is dispatched here, once, and attaches the
       # qcow2 and ISO of each architecture to the release itself.
+      # No `user=` is passed: release disks ship UNPROVISIONED (ADR-0027) — no baked account,
+      # the real user is created at first boot. Passing `user=wardos` here would opt production
+      # release disks back into the DEV-ONLY seeded-account path, which must never happen.
       - name: Build and attach the disks
         env:
           GH_TOKEN: ${{ github.token }}
           DISK_ARCH: ${{ steps.built.outputs.disk_arch }}
-        run: gh workflow run disk.yml --ref "$GITHUB_REF_NAME" -f type=both -f source=release -f "release=$TAG" -f "arch=$DISK_ARCH" -f user=wardos -f luks=false
+        run: gh workflow run disk.yml --ref "$GITHUB_REF_NAME" -f type=both -f source=release -f "release=$TAG" -f "arch=$DISK_ARCH" -f luks=false
