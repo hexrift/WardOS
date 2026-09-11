@@ -515,9 +515,9 @@ fn cmd_doctor() -> ExitCode {
 fn cmd_desktop(argv: &[String]) -> ward_daemon::Result<ExitCode> {
     use std::os::unix::process::CommandExt as _;
     // clap's external_subcommand hands us at least the verb.
-    let (verb, rest) = argv
-        .split_first()
-        .ok_or_else(|| ward_daemon::Error::Project("no command given; run `ward --help`".to_owned()))?;
+    let (verb, rest) = argv.split_first().ok_or_else(|| {
+        ward_daemon::Error::Project("no command given; run `ward --help`".to_owned())
+    })?;
     let Some(program) = desktop_command(verb) else {
         return Err(ward_daemon::Error::Project(format!(
             "unknown command '{verb}'; run `ward --help`, or install the desktop command `wardos-{verb}`"
