@@ -28,6 +28,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
     steps:
+      - uses: actions/checkout@v7
       - name: Resolve version
         id: version
         run: |
@@ -36,6 +37,12 @@ jobs:
           case "$tag" in v[0-9]*) ;; *) echo "not a v* tag: $tag" >&2; exit 1 ;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+      # The tag must name exactly the workspace version of the source it is cut from.
+      # A mistyped version, or a dispatch from a ref whose Cargo.toml disagrees, is
+      # rejected here -- before any build runs (build `needs: version`) or any asset
+      # is published.
+      - name: Tag matches the workspace version
+        run: bash scripts/release/check-version.sh "${{ steps.version.outputs.tag }}"
 
   # One job per architecture, on a runner of that architecture: the binaries are built
   # and smoke-tested natively, and the tarball name carries `uname -m` of the machine
@@ -87,7 +94,10 @@ jobs:
         run: |
           set -euo pipefail
           dir="dist/wardos-${VERSION}-${ARCH}-linux"
-          "${dir}/ward" --version
+          # The compiled binary must report the version this release is labelled with.
+          # A tarball whose `ward` was built from other source is rejected here, before
+          # the artifact is uploaded (upload-artifact runs after this step).
+          bash scripts/release/check-binary-version.sh "$VERSION" "${dir}/ward"
           "${dir}/wardd" --help >/dev/null
           "${dir}/ward-agent" --help >/dev/null
           "${dir}/ward-shell" --help >/dev/null
@@ -135,8 +145,23 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
+            # An existing tag must already resolve to this build's commit. Otherwise a
+            # rerun from a different ref would clobber assets under an unrelated release
+            # and label them as source they were not built from -- reject that instead.
+            obj_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.sha')"
+            obj_type="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.type')"
+            if [[ "$obj_type" == "tag" ]]; then
+              obj_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${obj_sha}" --jq '.object.sha')"
+            fi
+            if [[ "$obj_sha" != "$GITHUB_SHA" ]]; then
+              echo "refusing to publish: tag $TAG points at $obj_sha, not the build commit $GITHUB_SHA" >&2
+              exit 1
+            fi
+            # Same tag, same commit: an idempotent retry of this release's own assets.
             gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
           else
+            # --target binds the new tag to this build's commit; the .sha256 assets
+            # record each tarball's checksum alongside it.
             gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
               --target "$GITHUB_SHA" --title "WardOS $TAG" --generate-notes
           fi
