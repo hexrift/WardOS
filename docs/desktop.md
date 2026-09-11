@@ -93,7 +93,8 @@ menu path is scriptable and testable.
 | `wardos-battery-monitor` | low-battery notifications (timer unit) |
 | `wardos-screensaver` | terminal text effects on idle, any key exits |
 | `wardos-share <file>` | serve a file on the LAN with a QR code (python http.server + qrencode) |
-| `wardos-first-run` | first login: copy configs, the default theme, `ward doctor`, the default apps, show the keys, then `wardos-welcome` |
+| `wardos-calibrate [--force] [step…]` | first-boot system setup, CALIBRATE ([ADR-0026](decisions/ADR-0026-first-run-calibrate.md)): `locale` (`localectl set-locale`), `keyboard` (Hyprland `kb_layout` live + persisted, and `localectl set-x11-keymap`), `timezone` (region → city, `timedatectl set-timezone`), `password` (one terminal running `passwd`, off the default path); no arguments runs the guided flow with a review that changes any choice, once (`~/.config/wardos/calibrate-done`); a step with a value applies it non-interactively. Keyboard-first, offline, polkit not `sudo` |
+| `wardos-first-run` | first login: copy configs, the default theme, `ward doctor`, the default apps, show the keys, `wardos-calibrate`, then `wardos-welcome` |
 | `wardos-welcome [--again] [step…]` | the first-login walkthrough ([`onboarding.md`](onboarding.md) §1): `theme` (from `wardos-theme list`), `keys` (a terminal running `ward vault set NAME`, never a menu), `project` (a directory picker over `~` or a URL to clone, then `ward init`), `agent` (`ward claude` there, the trust bar in one line), `done` (the card; writes `~/.config/wardos/welcome-done`); one step by name any time, `--again` the whole; `clone URL DIR` is the project step's terminal command |
 | `wardos-version` | image and tool versions (`bootc status`, `ward --version`) |
 | `wardos-about` | the About surface (fastfetch with the WardOS logo) |

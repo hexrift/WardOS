@@ -14,7 +14,9 @@ boot → welcome → ward vault set → ward init → ward claude → ward verif
 **A machine of its own.** Boot the installer ISO or the disk image
 ([`image/README.md`](../image/README.md)). tty1 logs in, Hyprland starts, and
 `wardos-first-run` copies the default configurations, applies Ward Dark, runs `ward
-doctor`, registers the web and terminal apps, shows the keys, then opens the welcome.
+doctor`, registers the web and terminal apps, shows the keys, runs **CALIBRATE**
+(`wardos-calibrate` — language, keyboard layout and timezone, and optionally a login
+password; [ADR-0026](decisions/ADR-0026-first-run-calibrate.md)), then opens the welcome.
 Claude Code (`claude`), Codex (`codex`), TamperWard (`tamperward`) and `ward` are in the
 image at pinned versions; nothing is downloaded at first boot.
 

@@ -4,7 +4,7 @@
 # shellcheck source=desktop/tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 setup_env
-for c in wardos-refresh wardos-theme ward wardos-keys wardos-webapp wardos-tui notify-send wardos-welcome; do mock "$c"; done
+for c in wardos-refresh wardos-theme ward wardos-keys wardos-webapp wardos-tui notify-send wardos-calibrate wardos-welcome; do mock "$c"; done
 marker="$XDG_CONFIG_HOME/wardos/first-run-done"
 
 wardos-first-run --help | grep -q '^Usage' || fail "--help prints the usage block"
@@ -18,7 +18,13 @@ assert_logged '^wardos-tui install --defaults$'
 assert_logged '^wardos-keys $'
 assert_logged '^notify-send -a WardOS .*Welcome'
 assert_file "$marker"
-# The walkthrough comes last, after the keys, once the marker is written.
+# CALIBRATE runs after the keys and before the walkthrough (ADR-0026).
+assert_logged '^wardos-calibrate $'
+calibrate_line=$(grep -n '^wardos-calibrate $' "$MOCK_LOG" | head -n1 | cut -d: -f1)
+welcome_line=$(grep -n '^wardos-welcome $' "$MOCK_LOG" | head -n1 | cut -d: -f1)
+[[ -n "$calibrate_line" && -n "$welcome_line" && "$calibrate_line" -lt "$welcome_line" ]] ||
+  fail "wardos-calibrate runs before wardos-welcome; log: $(cat "$MOCK_LOG")"
+# The walkthrough comes last, after the keys and calibrate, once the marker is written.
 assert_logged '^wardos-welcome $'
 [[ "$(tail -n1 "$MOCK_LOG")" == "wardos-welcome " ]] || fail "wardos-welcome is the last step; log: $(cat "$MOCK_LOG")"
 

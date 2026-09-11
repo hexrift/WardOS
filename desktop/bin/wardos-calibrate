@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# wardos-calibrate — first-boot system setup: CALIBRATE (docs/desktop.md §Commands,
+# ADR-0026).
+#
+# Usage: wardos-calibrate [--force] [STEP…]
+#   wardos-calibrate            the guided flow once (language, keyboard, timezone, then a
+#                               review that can change any choice or set a password), then
+#                               the marker ~/.config/wardos/calibrate-done. Nothing once the
+#                               marker exists.
+#   wardos-calibrate --force    the guided flow again, marker or not
+#   wardos-calibrate locale     one step, any time: locale | keyboard | timezone | password
+#   wardos-calibrate STEP VALUE apply a step non-interactively (e.g. `timezone Europe/Paris`,
+#                               `locale de_DE.UTF-8`, `keyboard fr`) — scriptable and tested.
+#
+# Keyboard-first: every question is a wardos-menu-select menu (mouse works too), so the
+# normal path never opens a terminal; only the optional password step does, exactly as the
+# key step in wardos-welcome does. Every system change goes through polkit (localectl /
+# timedatectl talk to systemd over D-Bus and the session's polkit agent authorises), never
+# sudo. Each apply is best-effort: a failure is reported and the flow continues. Nothing
+# here needs the network.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+marker="$(wardos_config_dir)/calibrate-done"
+keep="· keep current"
+back="‹ back"
+
+# --- current values, for the "keep current" labels and to skip no-op applies ----------
+
+current_locale() { localectl status 2>/dev/null | sed -n 's/.*System Locale: *LANG=//p' | head -n1; }
+current_keymap() { localectl status 2>/dev/null | sed -n 's/.* X11 Layout: *//p' | head -n1; }
+current_timezone() { timedatectl show -p Timezone --value 2>/dev/null || true; }
+
+# --- apply helpers: each prints a warning and returns non-zero on failure, never exits ---
+
+apply_locale() {
+  local loc=$1
+  [[ -n "$loc" ]] || return 0
+  if localectl set-locale "LANG=$loc"; then
+    wardos_notify "Language" "$loc (takes effect at the next login)"
+  else
+    wardos_notify "Language not set" "Could not apply $loc; try again from the menu"
+    return 1
+  fi
+}
+
+apply_keyboard() {
+  local layout=$1 ok=0
+  [[ -n "$layout" ]] || return 0
+  # The running Hyprland session, so the change is felt immediately.
+  if wardos_has hyprctl; then hyprctl keyword input:kb_layout "$layout" >/dev/null 2>&1 || ok=1; fi
+  # Persist it in the user's Hyprland input.conf (created from the default when missing).
+  local conf
+  conf=$(hypr_input_conf)
+  if grep -Eq '^[[:space:]]*kb_layout[[:space:]]*=' "$conf"; then
+    wardos_backup "$conf"
+    sed -i -E "s|^([[:space:]]*kb_layout[[:space:]]*=[[:space:]]*).*$|\1$layout|" "$conf"
+  fi
+  # The console and the greeter (localectl, polkit).
+  localectl set-x11-keymap "$layout" || ok=1
+  if [[ $ok -eq 0 ]]; then
+    wardos_notify "Keyboard" "$layout"
+  else
+    wardos_notify "Keyboard partly set" "$layout applied where it could be; check wardos-setup input"
+    return 1
+  fi
+}
+
+apply_timezone() {
+  local tz=$1
+  [[ -n "$tz" ]] || return 0
+  if timedatectl set-timezone "$tz"; then
+    wardos_notify "Timezone" "$tz"
+  else
+    wardos_notify "Timezone not set" "Could not apply $tz; try again from the menu"
+    return 1
+  fi
+}
+
+# The user's copy of the shipped Hyprland input fragment, created from the default when
+# missing (so a change to kb_layout always has a file to land in).
+hypr_input_conf() {
+  local file="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/input.conf"
+  if [[ ! -f "$file" ]]; then
+    mkdir -p "$(dirname "$file")"
+    if [[ -f "$(wardos_hypr_dir)/input.conf" ]]; then
+      cp "$(wardos_hypr_dir)/input.conf" "$file"
+    else
+      printf 'input {\n    kb_layout = us\n}\n' >"$file"
+    fi
+  fi
+  printf '%s\n' "$file"
+}
+
+# --- interactive pickers: print the chosen value, empty when kept/cancelled -------------
+
+pick_locale() {
+  local cur choice
+  cur=$(current_locale)
+  choice=$(
+    {
+      printf '%s\n' "$keep${cur:+ ($cur)}"
+      # UTF-8 locales only, the ones a desktop should offer.
+      localectl list-locales 2>/dev/null | grep -Ei '\.utf-?8$' || true
+    } | wardos_menu "Language · the system language and formats"
+  ) || return 0
+  [[ "$choice" == "$keep"* ]] && return 0
+  printf '%s\n' "$choice"
+}
+
+pick_keyboard() {
+  local cur choice
+  cur=$(current_keymap)
+  choice=$(
+    {
+      printf '%s\n' "$keep${cur:+ ($cur)}"
+      localectl list-x11-keymap-layouts 2>/dev/null || true
+    } | wardos_menu "Keyboard · the layout for the desktop, console and login"
+  ) || return 0
+  [[ "$choice" == "$keep"* ]] && return 0
+  printf '%s\n' "$choice"
+}
+
+pick_timezone() {
+  local cur region city zones regions
+  cur=$(current_timezone)
+  zones=$(timedatectl list-timezones 2>/dev/null || true)
+  [[ -n "$zones" ]] || { wardos_notify "Timezone" "No timezone data on this host"; return 0; }
+  while true; do
+    regions=$(printf '%s\n' "$zones" | cut -d/ -f1 | sort -u)
+    region=$(
+      printf '%s\n%s\n' "$keep${cur:+ ($cur)}" "$regions" | wardos_menu "Timezone · region"
+    ) || return 0
+    [[ "$region" == "$keep"* ]] && return 0
+    # A single-segment zone (UTC, GMT…) is the answer as it stands.
+    if ! printf '%s\n' "$zones" | grep -q "^$region/"; then
+      printf '%s\n' "$region"
+      return 0
+    fi
+    city=$(
+      {
+        printf '%s\n' "$back"
+        printf '%s\n' "$zones" | sed -n "s|^$region/||p" | sort
+      } | wardos_menu "Timezone · $region"
+    ) || return 0
+    [[ "$city" == "$back" ]] && continue
+    printf '%s\n' "$region/$city"
+    return 0
+  done
+}
+
+# The optional password step: one terminal window running passwd for the current user.
+set_password() {
+  if [[ -t 0 && -t 1 ]]; then
+    passwd
+  elif wardos_has wardos-launch; then
+    wardos-launch run wardos-passwd passwd
+  else
+    wardos_notify "Set a password" "Run 'passwd' in a terminal"
+  fi
+}
+
+# --- the guided flow: collect, review (change anything / password), apply ---------------
+
+guided() {
+  local loc="" kbd="" tz="" choice
+  loc=$(pick_locale) || true
+  kbd=$(pick_keyboard) || true
+  tz=$(pick_timezone) || true
+  while true; do
+    choice=$(wardos_menu "Review · your first-boot setup" \
+      "Apply and continue" \
+      "Language · ${loc:-keep current}" \
+      "Keyboard · ${kbd:-keep current}" \
+      "Timezone · ${tz:-keep current}" \
+      "Set a login password" \
+      "Skip the rest") || break
+    case "$choice" in
+      "Apply and continue") break ;;
+      "Language ·"*) loc=$(pick_locale) || true ;;
+      "Keyboard ·"*) kbd=$(pick_keyboard) || true ;;
+      "Timezone ·"*) tz=$(pick_timezone) || true ;;
+      "Set a login password") set_password ;;
+      "Skip the rest") return 0 ;;
+      *) break ;;
+    esac
+  done
+  # Best-effort applies: a failure notifies and never stops the others.
+  apply_locale "$loc" || true
+  apply_keyboard "$kbd" || true
+  apply_timezone "$tz" || true
+}
+
+run_step() {
+  case "$1" in
+    locale)
+      local v=${2:-}
+      [[ -n "$v" ]] || v=$(pick_locale) || true
+      apply_locale "$v"
+      ;;
+    keyboard)
+      local v=${2:-}
+      [[ -n "$v" ]] || v=$(pick_keyboard) || true
+      apply_keyboard "$v"
+      ;;
+    timezone)
+      local v=${2:-}
+      [[ -n "$v" ]] || v=$(pick_timezone) || true
+      apply_timezone "$v"
+      ;;
+    password) set_password ;;
+    run) guided ;;
+    *) wardos_die "no step '$1' (locale, keyboard, timezone, password, run)" ;;
+  esac
+}
+
+force=0
+if [[ "${1:-}" == --force ]]; then
+  force=1
+  shift
+fi
+
+# A named step (with or without a value) runs on its own, any time, marker or not.
+if [[ $# -gt 0 ]]; then
+  run_step "$@"
+  exit
+fi
+
+# The guided flow: once, unless --force. The marker is written after the flow so a cancel
+# before it does not count as done.
+if [[ -e "$marker" && $force -eq 0 ]]; then exit 0; fi
+guided
+mkdir -p "$(dirname "$marker")"
+date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
