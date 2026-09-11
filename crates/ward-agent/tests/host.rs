@@ -11,7 +11,7 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
@@ -380,6 +380,12 @@ fn relay_threads_do_not_outlive_the_agent() {
 #[test]
 fn forwards_sigterm_to_the_agent_with_a_relay_running() {
     let rw = tempfile::tempdir().unwrap();
+    // The agent touches this file (inside the writable tree) *after* installing its
+    // TERM trap. We wait for it to appear before signalling, so the SIGTERM reaches an
+    // agent that is up with its trap armed — not the shim still in Landlock/seccomp/mount
+    // setup, which would treat the signal as a failure and exit SHIM_FAILURE (125). A
+    // fixed sleep here raced that setup on a loaded CI runner and made the test flaky.
+    let ready = rw.path().join("ready");
     let mut child = shim(rw.path())
         .arg("--relay")
         .arg(format!(
@@ -387,15 +393,21 @@ fn forwards_sigterm_to_the_agent_with_a_relay_running() {
             free_port(),
             rw.path().join("never.sock").display()
         ))
-        .args([
-            "--",
-            "sh",
-            "-c",
-            "trap 'exit 42' TERM; while :; do sleep 0.05; done",
-        ])
+        .args(["--", "sh", "-c"])
+        .arg(format!(
+            "trap 'exit 42' TERM; : >{}; while :; do sleep 0.05; done",
+            ready.display()
+        ))
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ready.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the agent never signalled readiness (its TERM trap was never installed)"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     kill(
         Pid::from_raw(i32::try_from(child.id()).unwrap()),
         Signal::SIGTERM,
