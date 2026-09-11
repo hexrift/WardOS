@@ -158,28 +158,37 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Bind the tag to this build's commit BEFORE either branch below, and
-          # independently of whether a Release exists yet. An existing tag must
-          # already resolve to $GITHUB_SHA -- otherwise a rerun from a different
-          # ref would publish assets under a tag that names unrelated source. A
-          # tag that exists while no Release does yet is the case this guards:
-          # without it the create path would bind a new release to that stale
-          # tag. An absent tag is fine; the create path binds it to $GITHUB_SHA.
-          # A non-404 tag-lookup error fails the job (fail closed).
-          bash scripts/release/check-tag-commit.sh "$TAG" "$GITHUB_SHA"
-
-          # Does a Release already exist? release-exists.sh maps a clean 404 to
-          # "not found" (exit 2 -> create), a success to "exists" (exit 0 ->
-          # reconcile), and ANY other lookup error to a hard failure (exit 1).
-          # A `gh release view` alone would treat an auth/API/network failure as
-          # "does not exist" and clobber under a release it could not read.
+          # The tag-commit and release-existence decisions are JOINT, not
+          # independent: whether an absent tag ref is acceptable depends on
+          # whether a Release already exists. So resolve release existence first,
+          # then feed it into the tag check.
+          #
+          # release-exists.sh maps a clean 404 to "not found" (exit 2 -> create),
+          # a success to "exists" (exit 0 -> reconcile), and ANY other lookup
+          # error to a hard failure (exit 1). A `gh release view` alone would
+          # treat an auth/API/network failure as "does not exist" and clobber
+          # under a release it could not read.
           rc=0
           bash scripts/release/release-exists.sh "$TAG" || rc=$?
           case "$rc" in
-            0)
-              # The release exists at this commit (the tag guard above already
-              # proved the tag binds to $GITHUB_SHA). Idempotent retry: before
-              # clobbering, pull the already-published tarballs and their .sha256
+            0) release_exists=true ;;
+            2) release_exists=false ;;
+            *) echo "refusing to publish: could not determine whether release $TAG exists." >&2
+               exit 1 ;;
+          esac
+
+          # Bind the tag to this build's commit before either branch below. A tag
+          # that exists must resolve to $GITHUB_SHA in both states. A missing tag
+          # ref is acceptable ONLY when no Release exists yet (the create path
+          # binds it); if a Release exists, a deleted/repointed tag no longer
+          # binds those assets to this source and is refused (round-4). A non-404
+          # tag-lookup error fails the job (fail closed).
+          bash scripts/release/check-tag-commit.sh "$TAG" "$GITHUB_SHA" "$release_exists"
+
+          if [[ "$release_exists" == "true" ]]; then
+              # The release exists and its tag provably binds to $GITHUB_SHA
+              # (verified jointly above). Idempotent retry: before clobbering,
+              # pull the already-published tarballs and their .sha256
               # checksums and compare them byte-for-byte with what this run
               # rebuilt. A rebuild at the same commit must reproduce the
               # published bytes exactly: identical assets are a no-op (skip the
@@ -202,18 +211,14 @@ jobs:
                 *)  echo "refusing to overwrite the published release; see check-assets output above." >&2
                     exit 1 ;;
               esac
-              ;;
-            2)
-              # No release yet, and the tag guard above verified any existing tag
-              # binds to $GITHUB_SHA (or is absent). --target binds a new tag to
-              # this commit; the .sha256 assets record each tarball's checksum.
+          else
+              # No release yet, and the joint tag check above verified any
+              # existing tag binds to $GITHUB_SHA (or is absent). --target binds a
+              # new tag to this commit; the .sha256 assets record each tarball's
+              # checksum alongside it.
               gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
                 --target "$GITHUB_SHA" --title "WardOS $TAG" --generate-notes
-              ;;
-            *)
-              echo "refusing to publish: could not determine whether release $TAG exists." >&2
-              exit 1 ;;
-          esac
+          fi
       # The disks for this release, for every architecture that has a tarball. A
       # release created with the workflow's own token does not fire other workflows'
       # `release:` triggers (GitHub's rule for GITHUB_TOKEN events, workflow_dispatch
