@@ -198,7 +198,8 @@ installs it: the base moved to `fedora-bootc:44` (Fedora 42 reached end of life 
 Fedora retired Hyprland after it), the packages come from a checked manifest
 (`packages.txt`) and three named COPRs (`coprs.txt`), the initramfs carries the WardOS
 Plymouth theme, first boot adds Flathub and the default applications, and
-`disk.sh --user … --luks` builds the installable ISO. CI proves the names exist (`image
+`disk.sh --type iso --luks` builds the installable, encrypted ISO (it bakes no account — the
+disk boots unprovisioned and the real user is created at first boot, ADR-0027). CI proves the names exist (`image
 packages`) and builds the whole image with `bootc container lint` at the end (`image
 build`), so a merge to `main` is a bootable image by construction. `desktop/install.sh`
 applies the same desktop to an existing Fedora. Still ahead: boot it in QEMU and on the

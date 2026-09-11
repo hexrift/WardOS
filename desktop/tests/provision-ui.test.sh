@@ -132,6 +132,51 @@ unset XKB_DEFAULT_LAYOUT
 grep -q '^KEYMAP$' "$socat_in" || fail "E4: the chosen keyboard is applied via the broker at create time"
 grep -q '^ACCOUNT$' "$socat_in" || fail "E4: the account is created once the layout is live"
 
+# --- blocker 1: the restage carry-over must live in a GREETER-WRITABLE runtime dir ---------
+# The socket's root-owned /run/wardos (RuntimeDirectory 0755) is NOT writable by the greeter, so
+# the stage file needs its own greeter-owned, non-symlinkable directory shipped by tmpfiles.d.
+# (a) The tmpfiles.d entry exists and declares greeter:greeter 0700 ownership on the stage dir.
+repo_root=$(cd "$WARDOS_ROOT/.." && pwd)
+tmpfiles="$repo_root/image/rootfs/usr/lib/tmpfiles.d/wardos-provision.conf"
+[[ -f "$tmpfiles" ]] || fail "blocker 1: the provisioning-stage tmpfiles.d entry must exist ($tmpfiles)"
+grep -Eq '^d[[:space:]]+/run/wardos-provision[[:space:]]+0700[[:space:]]+greeter[[:space:]]+greeter([[:space:]]|$)' "$tmpfiles" ||
+  fail "blocker 1: the stage dir must be created greeter:greeter 0700, not root/0755; got: $(cat "$tmpfiles")"
+# The UI's default stage path is that greeter-owned dir, not the broker's root-owned /run/wardos.
+grep -Eq 'WARDOS_PROVISION_STAGE:-/run/wardos-provision/' "$repo_root/desktop/bin/wardos-provision-ui" ||
+  fail "blocker 1: wardos-provision-ui must default the stage to /run/wardos-provision/"
+grep -Eq 'WARDOS_PROVISION_STAGE:-/run/wardos-provision/' "$repo_root/desktop/bin/wardos-greetd-session" ||
+  fail "blocker 1: wardos-greetd-session must default the stage to /run/wardos-provision/"
+
+# (b) A persistence failure is NEVER silently swallowed into an infinite picker loop: when the
+# stage dir is unwritable, save_state fails and request_restage exits a DISTINCT non-75 status
+# (not 75, which the bootstrap session relaunches at once) and writes nothing. Point the stage
+# under a regular FILE so mkdir -p of its dir fails for any uid (root included, as in CI).
+: >"$socat_in"
+: >"$TMP/stage-block" # a regular file; a stage dir cannot be created under it
+unset XKB_DEFAULT_LAYOUT
+rc=0
+printf '%s\n' "de" 1 |
+  WARDOS_PROVISION_STAGE="$TMP/stage-block/provision.stage" wardos-provision-ui || rc=$?
+[[ "$rc" -ne 75 ]] || fail "blocker 1: a restage that cannot persist must NOT exit 75 into a silent re-loop"
+[[ "$rc" -ne 0 ]] || fail "blocker 1: a persistence failure must be a visible non-zero exit; got $rc"
+[[ ! -e "$TMP/stage-block/provision.stage" ]] || fail "blocker 1: no stage file is written when persistence fails"
+[[ ! -s "$socat_in" ]] || fail "blocker 1: no broker traffic on a failed restage; got: $(cat "$socat_in")"
+
+# (c) Positive round-trip: a successful restage writes the value ATOMICALLY (readable back, and
+# no leftover temp file in the stage dir). Use a fresh writable dir; the pick differs from the
+# live layout, so it restages (exit 75) after persisting.
+: >"$socat_in"
+stage_dir="$TMP/stage-ok"
+mkdir -p "$stage_dir"
+rm -f "$WARDOS_PROVISIONED_MARKER"
+unset XKB_DEFAULT_LAYOUT
+rc=0
+printf '%s\n' "de" 1 |
+  WARDOS_PROVISION_STAGE="$stage_dir/provision.stage" wardos-provision-ui || rc=$?
+[[ "$rc" -eq 75 ]] || fail "blocker 1: a persisted restage exits 75; got $rc"
+grep -q '^KEYMAP=de$' "$stage_dir/provision.stage" || fail "blocker 1: the saved layout must round-trip via the stage file"
+[[ -z "$(find "$stage_dir" -maxdepth 1 -name '*.tmp*' 2>/dev/null)" ]] || fail "blocker 1: the atomic write must leave no temp file behind"
+
 # --- already provisioned: the UI does nothing and does not touch the broker ---------------
 : >"$socat_in"
 rm -f "$WARDOS_PROVISION_STAGE"

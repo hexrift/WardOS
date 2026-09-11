@@ -33,6 +33,19 @@ provisioned() { [[ -e "$marker" ]]; }
 # Refuse every mutating verb once provisioned: there is exactly one provisioning.
 refuse_if_provisioned() { if provisioned; then deny "already provisioned"; fi; }
 
+# Acquire the exclusive provisioning lock, then AUTHORITATIVELY re-check the marker under it.
+# Every mutating verb (LOCALE/KEYMAP/TIMEZONE/ACCOUNT) runs through this before it mutates, so a
+# request that passes its cheap pre-lock check cannot race an ACCOUNT that commits the marker and
+# then mutate an already-provisioned machine: the post-acquisition re-check refuses it. The lock
+# file is root-writable /run/wardos/provisiond.lock (the broker runs as root); the fd stays open
+# for this short-lived per-connection process and is released when it exits.
+lock_and_recheck() {
+  mkdir -p "$(dirname "$lockfile")" 2>/dev/null || true
+  exec {lockfd}>"$lockfile"
+  flock -x "$lockfd"
+  refuse_if_provisioned
+}
+
 # The durable record of an in-progress account transaction (#127). Its presence means an
 # ACCOUNT created — or may have created — an account that did not reach the committed
 # marker; the next ACCOUNT reconciles it under the lock before creating anything.
@@ -222,32 +235,32 @@ case "$verb" in
     if provisioned; then reply "OK provisioned"; else reply "OK unprovisioned"; fi
     ;;
   LOCALE)
-    refuse_if_provisioned
+    refuse_if_provisioned # cheap fast-reject; the authoritative re-check is under the lock
     IFS= read -r v || deny "missing value"
+    lock_and_recheck
     do_locale "$v"
     ;;
   KEYMAP)
-    refuse_if_provisioned
+    refuse_if_provisioned # cheap fast-reject; the authoritative re-check is under the lock
     IFS= read -r v || deny "missing value"
+    lock_and_recheck
     do_keymap "$v"
     ;;
   TIMEZONE)
-    refuse_if_provisioned
+    refuse_if_provisioned # cheap fast-reject; the authoritative re-check is under the lock
     IFS= read -r v || deny "missing value"
+    lock_and_recheck
     do_timezone "$v"
     ;;
   ACCOUNT)
-    refuse_if_provisioned
+    refuse_if_provisioned # cheap fast-reject; the authoritative re-check is under the lock
     IFS= read -r user || deny "missing username"
     IFS= read -r fullname || deny "missing full name"
     IFS= read -r password || deny "missing password"
     # Serialize the whole check → create → commit under an exclusive lock, then re-check
     # state after acquiring it: two concurrent connections must not both pass the
     # unprovisioned check and create two administrator accounts.
-    mkdir -p "$(dirname "$lockfile")" 2>/dev/null || true
-    exec {lockfd}>"$lockfile"
-    flock -x "$lockfd"
-    refuse_if_provisioned
+    lock_and_recheck
     do_account "$user" "$fullname" "$password"
     ;;
   *) deny "unknown verb" ;;

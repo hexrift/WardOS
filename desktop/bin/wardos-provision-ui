@@ -29,10 +29,17 @@ wardos_help "$@"
 sock="${WARDOS_PROVISION_SOCK:-/run/wardos/provision.sock}"
 marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
 # The non-secret carry-over across a keyboard restage (never the password): what has been chosen
-# so the relaunched session resumes without re-asking. On tmpfs (/run), wiped on reboot.
-stage="${WARDOS_PROVISION_STAGE:-/run/wardos/provision.stage}"
+# so the relaunched session resumes without re-asking. On tmpfs (/run), wiped on reboot. It lives
+# in its OWN greeter-owned, 0700, non-symlinkable runtime directory (image tmpfiles.d
+# wardos-provision.conf), NOT the broker's root-owned /run/wardos — the greeter cannot write
+# there, so a restage could never persist and the picker would loop forever (ADR-0027 blocker).
+stage="${WARDOS_PROVISION_STAGE:-/run/wardos-provision/provision.stage}"
 # The exit status that asks the bootstrap session to relaunch cage under the chosen layout.
 RESTAGE_RC=75
+# A DISTINCT exit status for a restage that could not persist its carry-over: the bootstrap
+# session must treat it as a visible, bounded error rather than re-showing the picker forever
+# (never silently swallow a persistence failure into an infinite loop).
+STAGE_FAIL_RC=76
 
 last_err=""
 loc="" kbd="" variant="" tz="" fullname="" user="" pass="" phase=""
@@ -207,8 +214,16 @@ ask_password() {
 
 # --- restage state (survives the cage relaunch; never the password) ----------------------
 stage_get() { [[ -f "$stage" ]] && sed -n "s/^$1=//p" "$stage" | head -n1; }
+# Persist the non-secret carry-over ATOMICALLY: write a temp file in the SAME directory, flush
+# it (best-effort — the atomic rename is the real guarantee), then mv -f into place, so a
+# concurrent read never sees a torn file and a failed write never leaves a half-written stage.
+# Returns NON-ZERO on any failure (it no longer swallows the error): request_restage checks the
+# result and surfaces a persistence failure rather than exiting 75 into a silent picker loop.
 save_state() {
-  mkdir -p "$(dirname "$stage")" 2>/dev/null || true
+  local dir tmp
+  dir=$(dirname "$stage")
+  mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$stage.tmp.$$"
   {
     printf 'PHASE=%s\n' "$phase"
     printf 'KEYMAP=%s\n' "$kbd"
@@ -217,7 +232,16 @@ save_state() {
     printf 'TIMEZONE=%s\n' "$tz"
     printf 'FULLNAME=%s\n' "$fullname"
     printf 'USERNAME=%s\n' "$user"
-  } >"$stage" 2>/dev/null || true
+  } >"$tmp" 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  }
+  sync "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$stage" 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  }
+  return 0
 }
 load_state() {
   [[ -f "$stage" ]] || return 0
@@ -230,8 +254,16 @@ load_state() {
   user=$(stage_get USERNAME)
 }
 # Persist the carry-over and ask the bootstrap session to relaunch cage under the chosen layout.
+# The persist is CHECKED: if it fails (the runtime stage dir is not writable), the restage could
+# never be applied, so we do NOT exit 75 into a silent re-loop — we print a clear error to the
+# foot terminal and exit STAGE_FAIL_RC, a distinct status the bootstrap session treats as a
+# bounded error rather than re-showing the picker forever.
 request_restage() {
-  save_state
+  if ! save_state; then
+    status "Could not save your choices to '$stage' — the keyboard layout cannot be applied."
+    say "  The provisioning runtime directory is not writable; provisioning cannot continue."
+    exit "$STAGE_FAIL_RC"
+  fi
   status "Applying the keyboard layout '$kbd'…"
   exit "$RESTAGE_RC"
 }
@@ -328,7 +360,9 @@ provision() {
     user=$(ask_username) || return 1
     pass=$(ask_password) || return 1
     phase=collected
-    save_state
+    # Best-effort resume checkpoint; a failure here is not fatal (only a review-triggered
+    # restage needs the carry-over, and request_restage strictly checks its own persist).
+    save_state || true
   else
     pass=$(ask_password) || return 1
   fi

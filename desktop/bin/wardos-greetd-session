@@ -27,7 +27,10 @@
 set -u
 
 marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
-stage="${WARDOS_PROVISION_STAGE:-/run/wardos/provision.stage}"
+# The restage carry-over lives in the greeter-owned /run/wardos-provision (image tmpfiles.d
+# wardos-provision.conf), NOT the broker's root-owned /run/wardos: the UI runs as greeter and
+# must be able to write it (ADR-0027 blocker).
+stage="${WARDOS_PROVISION_STAGE:-/run/wardos-provision/provision.stage}"
 
 # The provisioned greeter, unchanged: cage hosting a plain (NOT layer-shell, so no `-l`)
 # gtkgreet, styled to Ward Dark, handing off to /usr/libexec/wardos-session on auth.
@@ -41,6 +44,11 @@ stage_get() { [[ -f "$stage" ]] && sed -n "s/^$1=//p" "$stage" | head -n1; }
 
 # The provisioning UI exits with this status to ask for a cage relaunch under the chosen layout.
 RESTAGE_RC=75
+# The UI exits with this DISTINCT status when it could not persist its restage carry-over (the
+# runtime stage dir is unwritable). Re-showing the picker cannot help — the next pick could not
+# persist either — so this is bounded, not retried forever (never a silent infinite picker loop).
+STAGE_FAIL_RC=76
+stage_fails=0
 
 # Unprovisioned: the staged cage+foot bootstrap session. Loop until the machine is provisioned.
 while [[ ! -e "$marker" ]]; do
@@ -53,11 +61,30 @@ while [[ ! -e "$marker" ]]; do
   [[ -n "$variant" ]] && export XKB_DEFAULT_VARIANT="$variant"
   rc=0
   cage -s -- foot --app-id wardos-provision -e wardos-provision-ui || rc=$?
-  # Provisioned: leave the loop and hand off to the greeter. A deliberate restage relaunches
-  # at once. Anything else that did not provision (the UI was abandoned, or cage failed to
-  # start) pauses briefly before relaunching so a broken compositor cannot spin in a hot loop.
+  # Provisioned: leave the loop and hand off to the greeter.
   [[ -e "$marker" ]] && break
-  [[ "$rc" -eq "$RESTAGE_RC" ]] || sleep 1
+  if [[ "$rc" -eq "$RESTAGE_RC" ]]; then
+    # A deliberate, successfully persisted restage: relaunch at once under the chosen layout.
+    stage_fails=0
+    continue
+  fi
+  if [[ "$rc" -eq "$STAGE_FAIL_RC" ]]; then
+    # The UI could not persist its restage state. This is not fixable by re-showing the picker,
+    # so bound the retries and stop rather than spin the picker forever (the UI already printed
+    # a visible error to the foot terminal). VT-switch recovery stays available throughout.
+    stage_fails=$((stage_fails + 1))
+    echo "wardos-greetd-session: provisioning could not persist its restage state (attempt $stage_fails/3)" >&2
+    if [[ "$stage_fails" -ge 3 ]]; then
+      echo "wardos-greetd-session: restage persistence keeps failing; stopping the provisioning loop" >&2
+      break
+    fi
+    sleep 2
+    continue
+  fi
+  # Anything else that did not provision (the UI was abandoned, or cage failed to start) pauses
+  # briefly before relaunching so a broken compositor cannot spin in a hot loop.
+  stage_fails=0
+  sleep 1
 done
 
 run_greeter

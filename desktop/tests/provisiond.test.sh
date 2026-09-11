@@ -129,6 +129,31 @@ results="$(cat "$TMP/c1" "$TMP/c2")"
 [[ "$(grep -c '^OK$' <<<"$results")" -eq 1 ]] || fail "exactly one ACCOUNT should win; got: $results"
 grep -q 'already provisioned' <<<"$results" || fail "the losing ACCOUNT must be refused; got: $results"
 
+# --- blocker 4: EVERY mutating verb re-checks the marker AFTER the lock, not only ACCOUNT.
+# A KEYMAP (or LOCALE/TIMEZONE) request can pass its cheap pre-lock check while the machine is
+# still unprovisioned, block on the lock, and reach the front of the queue only AFTER an ACCOUNT
+# committed the marker. Before the fix it mutated the just-finalized machine; now the
+# post-acquisition re-check refuses it and it mutates NOTHING. Deterministic: we hold the lock
+# from outside so the KEYMAP request blocks after its pre-lock check, commit the marker while it
+# is blocked (as a winning ACCOUNT would), then release — the re-check is guaranteed to see the
+# committed marker regardless of scheduling.
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK" "$WARDOS_PROVISION_JOURNAL" "$WARDOS_KEYBOARD_STATE"
+: >"$MOCK_LOG"
+mock localectl # if the verb reaches its mutation, set-x11-keymap would be logged (the bug)
+exec {holdfd}>"$WARDOS_PROVISION_LOCK"
+flock -x "$holdfd" # hold the exclusive lock so the broker's flock blocks
+printf 'KEYMAP\nfr\n' | wardos-provisiond >"$TMP/late.out" 2>/dev/null &
+latepid=$!
+sleep 0.3                          # let KEYMAP pass its pre-lock check and block on the lock
+: >"$WARDOS_PROVISIONED_MARKER"    # a concurrent ACCOUNT commits the marker while KEYMAP waits
+flock -u "$holdfd"                 # release: KEYMAP now acquires the lock and re-checks
+exec {holdfd}>&-
+wait "$latepid"
+[[ "$(cat "$TMP/late.out")" == "ERR already provisioned" ]] ||
+  fail "blocker 4: a KEYMAP that locks after ACCOUNT committed must be refused; got: $(cat "$TMP/late.out")"
+assert_not_logged 'set-x11-keymap' # the finalized machine must NOT be mutated
+[[ ! -e "$WARDOS_KEYBOARD_STATE" ]] || fail "blocker 4: the refused KEYMAP must not record a layout"
+
 # --- #127: an unresolved transaction (failed rollback) refuses a second admin, then recovers
 # Stateful account mocks share an on-disk account set, so a failed userdel really leaves the
 # account behind and the next request must reconcile it — never add a second administrator.
