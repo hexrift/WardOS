@@ -21,12 +21,12 @@
 # the tools and the image keep separate release cadences. `builder` compiles this
 # checkout instead (development images, the "image build" CI job).
 ARG WARDOS_SOURCE=release
-ARG WARDOS_RELEASE=v0.3.0
+ARG WARDOS_RELEASE=v0.4.1
 # One checksum per architecture the release ships: WARDOS_SHA256 is the x86_64
-# tarball's, WARDOS_SHA256_AARCH64 the aarch64 one's (v0.3 carries both, and
+# tarball's, WARDOS_SHA256_AARCH64 the aarch64 one's (v0.4.1 carries both, and
 # build.sh fetches the one for --arch).
-ARG WARDOS_SHA256=0473dd5201c2b7e4eb63ccbb723b0bed3226d18f3f7f0a035f8f105855532a6c
-ARG WARDOS_SHA256_AARCH64=347d54631f2d4827b22db275539b770b636b6593488c0a042a33b0421f3f498c
+ARG WARDOS_SHA256=8ed12f1dbf0b5cd4f5bb009773b5315ba658f51080ff646220d305a8b1f17930
+ARG WARDOS_SHA256_AARCH64=eceb8ef33a20a3bb34c02efc18578ea8217cd9ca32fef937c0e6c8bb0beecbfd
 
 # Stage 1a: a published release. The three host binaries are required; ward-shell and
 # wardos-theme-render are copied when the tarball has them (release tarballs from v0.2
