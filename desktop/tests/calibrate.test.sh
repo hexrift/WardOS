@@ -106,4 +106,26 @@ assert_file "$marker"
 wardos-calibrate password
 assert_logged '^wardos-launch run wardos-passwd passwd$'
 
+# --- a cancelled review writes NO marker (unfinished setup is not recorded as complete) --
+rm -f "$marker"
+: >"$MOCK_LOG"
+# Empty answers: every picker and the review menu are cancelled (dismissed with Escape).
+reset_menu ""
+wardos-calibrate
+[[ ! -e "$marker" ]] || fail "a cancelled review must not write the completion marker"
+assert_not_logged '^localectl set-locale'
+assert_not_logged '^timedatectl set-timezone'
+
+# --- an invalid non-interactive keyboard value mutates nothing and exits non-zero --------
+# Seed a known-good layout first, then confirm a bogus value leaves it untouched.
+: >"$MOCK_LOG"
+wardos-calibrate keyboard de
+grep -Eq '^[[:space:]]*kb_layout[[:space:]]*=[[:space:]]*de$' "$input_conf" || fail "seed de"
+: >"$MOCK_LOG"
+if wardos-calibrate keyboard boguslayout 2>/dev/null; then fail "invalid keyboard must exit non-zero"; fi
+assert_not_logged 'set-x11-keymap boguslayout'
+assert_not_logged '^hyprctl keyword input:kb_layout boguslayout'
+grep -Eq '^[[:space:]]*kb_layout[[:space:]]*=[[:space:]]*de$' "$input_conf" ||
+  fail "invalid keyboard must not change input.conf; got: $(grep kb_layout "$input_conf")"
+
 echo "ok   calibrate.test.sh internal assertions"

@@ -50,6 +50,13 @@ apply_locale() {
 apply_keyboard() {
   local layout=$1 ok=0
   [[ -n "$layout" ]] || return 0
+  # Validate against the supported layouts BEFORE any write: an unknown layout must never
+  # be persisted into the user's config (the interactive picker only offers valid ones; a
+  # non-interactive `keyboard <bad>` is rejected here, leaving all state untouched).
+  if ! localectl list-x11-keymap-layouts 2>/dev/null | grep -qxF -- "$layout"; then
+    wardos_notify "Keyboard" "Unknown layout '$layout'; nothing changed"
+    return 1
+  fi
   # The running Hyprland session, so the change is felt immediately.
   if wardos_has hyprctl; then hyprctl keyword input:kb_layout "$layout" >/dev/null 2>&1 || ok=1; fi
   # Persist it in the user's Hyprland input.conf (created from the default when missing).
@@ -165,6 +172,11 @@ set_password() {
 
 # --- the guided flow: collect, review (change anything / password), apply ---------------
 
+# The guided flow. Returns 0 only when the user reaches a confirmed terminal choice —
+# "Apply and continue" (settings applied) or "Skip the rest" (a deliberate no-change
+# finish). A cancelled review (the menu dismissed with Escape) returns non-zero and applies
+# nothing, so the caller does NOT write the completion marker and the flow runs again next
+# login rather than recording an unfinished setup as complete.
 guided() {
   local loc="" kbd="" tz="" choice
   loc=$(pick_locale) || true
@@ -177,21 +189,23 @@ guided() {
       "Keyboard · ${kbd:-keep current}" \
       "Timezone · ${tz:-keep current}" \
       "Set a login password" \
-      "Skip the rest") || break
+      "Skip the rest") || return 1 # cancelled: not completed, no marker
     case "$choice" in
-      "Apply and continue") break ;;
+      "Apply and continue")
+        # Best-effort applies: a failure notifies and never stops the others.
+        apply_locale "$loc" || true
+        apply_keyboard "$kbd" || true
+        apply_timezone "$tz" || true
+        return 0
+        ;;
       "Language ·"*) loc=$(pick_locale) || true ;;
       "Keyboard ·"*) kbd=$(pick_keyboard) || true ;;
       "Timezone ·"*) tz=$(pick_timezone) || true ;;
       "Set a login password") set_password ;;
       "Skip the rest") return 0 ;;
-      *) break ;;
+      *) return 1 ;;
     esac
   done
-  # Best-effort applies: a failure notifies and never stops the others.
-  apply_locale "$loc" || true
-  apply_keyboard "$kbd" || true
-  apply_timezone "$tz" || true
 }
 
 run_step() {
@@ -229,9 +243,11 @@ if [[ $# -gt 0 ]]; then
   exit
 fi
 
-# The guided flow: once, unless --force. The marker is written after the flow so a cancel
-# before it does not count as done.
+# The guided flow: once, unless --force. The marker is written ONLY when guided() reaches a
+# confirmed terminal choice (Apply or Skip); a cancelled review leaves no marker, so an
+# unfinished setup is never recorded as complete and the flow runs again next login.
 if [[ -e "$marker" && $force -eq 0 ]]; then exit 0; fi
-guided
-mkdir -p "$(dirname "$marker")"
-date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
+if guided; then
+  mkdir -p "$(dirname "$marker")"
+  date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
+fi

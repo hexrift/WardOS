@@ -81,5 +81,7 @@ account-creation path where it already works.
   are untouched, so this cannot regress the E-09 reliability fixes (#116).
 - Friendly language **names** (rather than locale codes) and a graphical pre-login flow are
   named follow-ups; neither blocks this slice.
-- Fixes/feature → the version bump rides the Ward Shell MINOR line (ADR-0025); no protected
-  surface, CODEOWNERS path, or `docs/security-model.md` guarantee changes.
+- User-visible feature → its own MINOR bump in this PR (`0.4.0` → `0.5.0`, workspace version
+  + inter-crate pins + lockfile); merge-order collisions on the workspace version against the
+  other stacked PRs are resolved at merge. No protected surface, CODEOWNERS path, or
+  `docs/security-model.md` guarantee changes.
