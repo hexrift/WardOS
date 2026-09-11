@@ -47,29 +47,27 @@ jobs:
         run: bash scripts/verify/tamperward.sh
       # Named, machine-checkable evidence that the mandatory isolation regressions
       # executed (issue #124). The e2e binary is already built by the step above, so
-      # this only re-runs it; under WARD_REQUIRE_ISOLATION a skip is impossible, and
-      # the grep fails the job if one ever regresses back in.
+      # this only re-runs it (default libtest format: one `test <name> ... ok` line
+      # each — no --nocapture, whose interleaving would corrupt those lines). The
+      # checker holds an explicit inventory of the namespace, verifier-corpus and
+      # egress test names, proves each ran exactly once with `ok`, ties the ST-029
+      # corpus to its fixed row catalogue, and fails the required job — publishing
+      # the names and counts to the step summary — if any evidence is missing.
+      - name: Checker self-test (the gate can go red — issue #124)
+        run: bash scripts/verify/check-isolation-evidence.test.sh
       - name: Isolation execution summary (issue #124)
         env:
           WARD_REQUIRE_ISOLATION: "1"
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/isolation.log"
-          cargo test -p ward-daemon --test e2e --all-features -- --nocapture 2>&1 | tee "$log"
-          if grep -Eq 'skipping: (bubblewrap|python3|a Rust toolchain)' "$log"; then
-            echo "::error::an isolation prerequisite was skipped under WARD_REQUIRE_ISOLATION" >&2
+          cargo test -p ward-daemon --test e2e --all-features > "$log" 2>&1 || {
+            cat "$log"
+            echo "::error::the e2e isolation suite did not pass under WARD_REQUIRE_ISOLATION" >&2
             exit 1
-          fi
-          {
-            echo "### Isolation regressions executed (issue #124)"
-            echo ""
-            echo "Namespace, verifier (ST-029 corpus) and egress tests ran with"
-            echo "WARD_REQUIRE_ISOLATION=1; a missing prerequisite fails the job, never skips."
-            echo ""
-            echo '```'
-            grep -E 'test result: ok\.' "$log"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          }
+          cat "$log"
+          bash scripts/verify/check-isolation-evidence.sh "$log"
 
   deny:
     name: cargo-deny (advisories · licenses · sources)
