@@ -216,6 +216,33 @@ out=$(printf 'ACCOUNT\ngwen\nGwen\npw\n' | wardos-provisiond)
 assert_not_logged '^useradd'
 [[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "no marker after a failed directory flush"
 
+# Marker directory-flush failure AFTER the marker was renamed into place (#119 review): the
+# marker file DID land on disk (temp write + temp fsync + rename all succeeded) and only the
+# trailing fsync of the marker's directory failed. The machine is provisioned and consistent,
+# so the freshly created account must NOT be rolled back — the invariant is that a failed
+# durability sync never leaves the marker present with the account removed. Put the marker in
+# its own directory (MK_DIR) so only that directory's fsync can be failed, leaving the
+# journal's directory flush intact.
+export MK_DIR="$TMP/mk"
+export WARDOS_PROVISIONED_MARKER="$MK_DIR/provisioned"
+rm -rf "$MK_DIR"
+rm -f "$WARDOS_PROVISION_LOCK" "$WARDOS_PROVISION_JOURNAL"
+: >"$MOCK_LOG"
+mock useradd
+mock chpasswd
+mock userdel
+mock id 'exit 1'
+# Fail ONLY the fsync of the marker directory; every temp-file fsync, the journal directory
+# fsync, and the keyboard-state fsync still succeed. So the marker temp is written, fsynced
+# and renamed, and only fsync_path "$MK_DIR" (the trailing directory flush) fails.
+# shellcheck disable=SC2016
+mock sync 'case "$1" in "$MK_DIR") exit 1 ;; esac; exit 0'
+out=$(printf 'ACCOUNT\nheidi\nHeidi\npw\n' | wardos-provisiond)
+assert_file "$WARDOS_PROVISIONED_MARKER"                 # the marker landed: committed
+assert_not_logged '^userdel'                             # never roll a committed account back
+[[ "$out" == OK ]] || fail "a trailing marker dir-fsync failure with the marker present must reply OK; got: $out"
+mock sync 'exit 0' # restore a succeeding flush for later use
+
 # KEYMAP persistence failure (#127 review item 2): if the chosen layout cannot be recorded
 # durably for the new user's Hyprland session, the broker must report an error, not OK — the
 # earlier "provisioning says success, first desktop gets a different layout" failure mode.
