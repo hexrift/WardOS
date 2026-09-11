@@ -6,8 +6,9 @@
 # Run by Hyprland's autostart. Once, unless --force (the marker is
 # ~/.config/wardos/first-run-done): copies every default configuration into ~/.config
 # (wardos-refresh --all), sets the Ward Dark theme, runs `ward doctor`, registers the
-# shipped web and terminal apps as .desktop entries, shows the key bindings, then hands
-# over to wardos-welcome (theme, keys, first project, first agent). Tools that are not
+# shipped web and terminal apps as .desktop entries, shows the key bindings, runs
+# wardos-calibrate (language, keyboard, timezone — CALIBRATE, ADR-0026), then hands over
+# to wardos-welcome (theme, keys, first project, first agent). Tools that are not
 # installed are skipped.
 set -euo pipefail
 # shellcheck source=desktop/lib/wardos.sh disable=SC1091
@@ -59,5 +60,9 @@ wardos-keys
 # The walkthrough (wardos-welcome, below) is the single sender of the "Welcome to WardOS"
 # greeting — a second one here would be the duplicate toast the reference laptop showed
 # (E-09), and it duplicated wardos-keys, which shows the keys on the next line anyway.
+# CALIBRATE (ADR-0026): language, keyboard and timezone before the walkthrough, so the
+# machine is usable in the user's own language and layout first. It keeps its own marker,
+# is best-effort, and never blocks the walkthrough.
+if wardos_has wardos-calibrate; then wardos-calibrate || true; fi
 # The walkthrough keeps its own marker, so a login that skipped it can run it later.
 if wardos_has wardos-welcome; then wardos-welcome; fi

@@ -4,7 +4,7 @@
 # shellcheck source=desktop/tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 setup_env
-for c in wardos-refresh wardos-theme ward wardos-keys wardos-webapp wardos-tui notify-send wardos-welcome; do mock "$c"; done
+for c in wardos-refresh wardos-theme ward wardos-keys wardos-webapp wardos-tui notify-send wardos-calibrate wardos-welcome; do mock "$c"; done
 marker="$XDG_CONFIG_HOME/wardos/first-run-done"
 
 wardos-first-run --help | grep -q '^Usage' || fail "--help prints the usage block"
@@ -21,6 +21,12 @@ assert_logged '^wardos-webapp install --defaults$'
 assert_logged '^wardos-tui install --defaults$'
 assert_logged '^wardos-keys $'
 assert_file "$marker"
+# CALIBRATE runs after the keys and before the walkthrough (ADR-0026).
+assert_logged '^wardos-calibrate $'
+calibrate_line=$(grep -n '^wardos-calibrate $' "$MOCK_LOG" | head -n1 | cut -d: -f1)
+welcome_line=$(grep -n '^wardos-welcome $' "$MOCK_LOG" | head -n1 | cut -d: -f1)
+[[ -n "$calibrate_line" && -n "$welcome_line" && "$calibrate_line" -lt "$welcome_line" ]] ||
+  fail "wardos-calibrate runs before wardos-welcome; log: $(cat "$MOCK_LOG")"
 # first-run does not send the "Welcome to WardOS" greeting: the walkthrough (wardos-welcome)
 # is its single sender, so the reference laptop's duplicate toast cannot recur (E-09).
 assert_not_logged 'Welcome to WardOS'
