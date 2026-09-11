@@ -3,20 +3,61 @@
 # unprivileged, locked bootstrap user set in /etc/greetd/config.toml) instead of a fixed
 # command. It is marker-gated:
 #
-#   /var/lib/wardos/provisioned ABSENT  → the first-boot provisioning UI (cage kiosk),
-#                                         which creates the real user through the broker.
+#   /var/lib/wardos/provisioned ABSENT  → the first-boot provisioning UI, a foot-hosted TUI
+#                                         (wardos-provision-ui) under cage, which creates the
+#                                         real user through the broker.
 #   /var/lib/wardos/provisioned PRESENT → the normal greeter (cage hosting gtkgreet),
 #                                         byte-for-byte the provisioned-machine login, so a
 #                                         provisioned machine boots exactly as it does today.
 #
-# `cage -s` keeps VT switching enabled (a text console stays reachable for recovery), the
-# same belt-and-braces the greeter uses.
+# The provisioning UI is an xdg-shell client: cage supports xdg-shell only (wlr-layer-shell is
+# an open upstream PR), so a layer-shell client (fuzzel) aborts under cage — the T480s hardware
+# failure. foot is xdg-shell, so cage hosts foot which runs the TUI.
+#
+# `cage -s` keeps VT switching enabled (a text console stays reachable for recovery), the same
+# belt-and-braces the greeter uses, on BOTH paths.
+#
+# Keyboard staging (A5): the keyboard chosen in the UI must be the compositor's LIVE input
+# layout before any password is typed. The chosen layout is persisted (by the UI) to the stage
+# file; this session ALWAYS launches cage with XKB_DEFAULT_LAYOUT set from it, so after the UI
+# records a new layout and exits, the next launch brings cage up under that layout — the UI then
+# sees its choice already live and proceeds to the password. The loop runs until the marker
+# exists (provisioning succeeded); a UI that was abandoned simply relaunches. Staging is
+# idempotent: an unchanged layout re-launches to the same state and the UI does not re-ask it.
 set -u
 
 marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
+stage="${WARDOS_PROVISION_STAGE:-/run/wardos/provision.stage}"
 
-if [[ -e "$marker" ]]; then
+# The provisioned greeter, unchanged: cage hosting a plain (NOT layer-shell, so no `-l`)
+# gtkgreet, styled to Ward Dark, handing off to /usr/libexec/wardos-session on auth.
+run_greeter() {
   exec cage -s -- gtkgreet -s /etc/greetd/wardos-greeter.css -c /usr/libexec/wardos-session
-fi
+}
 
-exec cage -s -- wardos-provision-ui
+stage_get() { [[ -f "$stage" ]] && sed -n "s/^$1=//p" "$stage" | head -n1; }
+
+[[ -e "$marker" ]] && run_greeter
+
+# The provisioning UI exits with this status to ask for a cage relaunch under the chosen layout.
+RESTAGE_RC=75
+
+# Unprovisioned: the staged cage+foot bootstrap session. Loop until the machine is provisioned.
+while [[ ! -e "$marker" ]]; do
+  # Bring cage up under the keyboard layout chosen so far (if any). Reading it every iteration
+  # makes the relaunch after a keyboard pick land on the chosen layout without depending on how
+  # cage/foot propagate the client's exit status.
+  layout=$(stage_get KEYMAP)
+  variant=$(stage_get VARIANT)
+  [[ -n "$layout" ]] && export XKB_DEFAULT_LAYOUT="$layout"
+  [[ -n "$variant" ]] && export XKB_DEFAULT_VARIANT="$variant"
+  rc=0
+  cage -s -- foot --app-id wardos-provision -e wardos-provision-ui || rc=$?
+  # Provisioned: leave the loop and hand off to the greeter. A deliberate restage relaunches
+  # at once. Anything else that did not provision (the UI was abandoned, or cage failed to
+  # start) pauses briefly before relaunching so a broken compositor cannot spin in a hot loop.
+  [[ -e "$marker" ]] && break
+  [[ "$rc" -eq "$RESTAGE_RC" ]] || sleep 1
+done
+
+run_greeter

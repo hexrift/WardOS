@@ -1,29 +1,46 @@
 #!/usr/bin/env bash
-# wardos-provision-ui — the first-boot provisioning UI (CALIBRATE provisioning form,
-# ADR-0027). Runs UNPRIVILEGED in the cage kiosk before any human account exists (the
-# greetd session selector starts it while /var/lib/wardos/provisioned is absent). It
-# collects language, keyboard, timezone, full name, username and a masked password, then
-# asks the root broker (wardos-provisiond, over its socket) to apply them and create the
-# user. It performs no privileged operation itself — the broker validates and commits.
-# Keyboard-first (fuzzel; mouse works too), offline.
+# wardos-provision-ui — the first-boot provisioning UI (ADR-0027). Runs UNPRIVILEGED in the
+# cage kiosk before any human account exists (wardos-greetd-session starts it while
+# /var/lib/wardos/provisioned is absent). It collects keyboard, language, timezone, full name,
+# username and a masked password, then asks the root broker (wardos-provisiond, over its
+# socket) to apply them and create the user. It performs no privileged operation itself — the
+# broker validates and commits.
+#
+# It is a SELF-CONTAINED terminal UI (plain bash reading the terminal), hosted by foot inside
+# cage. cage speaks xdg-shell only, so a layer-shell client (fuzzel) aborts under it — the
+# observed T480s hardware failure; foot is xdg-shell and keyboard-first, so the whole flow
+# lives here as numbered menus and prompts, with no fuzzel/menu-select and no dependence on a
+# desktop notification daemon (all status and errors are printed to this UI).
+#
+# The keyboard is asked FIRST, and the chosen layout is (re)established as the compositor's live
+# input layout BEFORE any free-text or password entry (A5): when the pick differs from the layout
+# cage is running (XKB_DEFAULT_LAYOUT), the UI records its state and exits 75, and the cage+foot
+# bootstrap session (wardos-greetd-session) re-launches cage with XKB_DEFAULT_LAYOUT set to the
+# choice. Only the non-secret carry-over is persisted across a restage; the password is always
+# entered under the corrected layout and is never written to disk.
 #
 # Usage: wardos-provision-ui
 set -euo pipefail
 # shellcheck source=desktop/lib/wardos.sh disable=SC1091
 source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
   source /usr/lib/wardos/wardos.sh
-# shellcheck source=desktop/lib/calibrate.sh disable=SC1091
-source "${WARDOS_CALIBRATE_LIB:-$(dirname "$(readlink -f "$0")")/../lib/calibrate.sh}" 2>/dev/null ||
-  source /usr/lib/wardos/calibrate.sh
 wardos_help "$@"
 
 sock="${WARDOS_PROVISION_SOCK:-/run/wardos/provision.sock}"
 marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
-last_err=""
+# The non-secret carry-over across a keyboard restage (never the password): what has been chosen
+# so the relaunched session resumes without re-asking. On tmpfs (/run), wiped on reboot.
+stage="${WARDOS_PROVISION_STAGE:-/run/wardos/provision.stage}"
+# The exit status that asks the bootstrap session to relaunch cage under the chosen layout.
+RESTAGE_RC=75
 
-# broker VERB [LINE…]: one request over the socket; true iff the reply begins "OK". The
-# request is built by a printf builtin and piped straight to socat, so no field (the
-# password included) is ever an argv of an external process.
+last_err=""
+loc="" kbd="" variant="" tz="" fullname="" user="" pass="" phase=""
+
+# --- broker transport --------------------------------------------------------------------
+# broker VERB [LINE…]: one request over the socket; true iff the reply begins "OK". The request
+# is built by a printf builtin and piped straight to socat, so no field (the password included)
+# is ever an argv of an external process.
 broker() {
   local out
   out=$(printf '%s\n' "$@" | socat - "UNIX-CONNECT:$sock" 2>/dev/null) || out="ERR broker unreachable"
@@ -31,21 +48,140 @@ broker() {
   [[ "$out" == OK* ]]
 }
 
-# Free text and masked secret: a menu with no items returns what was typed (empty = none).
-typed() { printf '' | wardos-menu-select --prompt "$1" || true; }
-secret() { printf '' | wardos-menu-select --password --prompt "$1" || true; }
+# --- the on-screen surface (this UI owns its own status/error output) --------------------
+# Prompts and status go to stderr so command substitution captures only the chosen value;
+# under foot both streams are the one terminal.
+say() { printf '%s\n' "$*" >&2; }
+status() { printf '\n  %s\n' "$*" >&2; }
+heading() {
+  printf '\n== WardOS · first-boot setup ==\n%s\n' "$1" >&2
+}
 
-# A username that meets the broker's policy; re-asks on an invalid or empty entry (bounded,
-# so a wedged input can never loop forever — the session just restarts provisioning).
+# --- terminal input ----------------------------------------------------------------------
+# tui_read PROMPT: one line of free text (empty allowed). tui_secret: the same, unechoed.
+tui_read() {
+  local ans
+  printf '%s\n> ' "$1" >&2
+  IFS= read -r ans || return 1
+  printf '%s' "$ans"
+}
+tui_secret() {
+  local ans
+  printf '%s\n> ' "$1" >&2
+  IFS= read -rs ans || {
+    printf '\n' >&2
+    return 1
+  }
+  printf '\n' >&2
+  printf '%s' "$ans"
+}
+
+# tui_pick PROMPT KEEP_LABEL ITEMS: a filter-then-number picker that scales to the long
+# localectl/timedatectl lists. ITEMS is the newline-separated candidate list (passed as an
+# argument, NOT on stdin, because stdin is where the person types their filter and choice).
+# Prints the chosen item, or empty for "keep current". A read EOF (abandoned input) prints empty
+# and returns non-zero so callers can treat it as a cancel.
+tui_pick() {
+  local prompt=$1 keep=$2 items=$3 filter matches count sel i line
+  while true; do
+    heading "$prompt"
+    say "  Type part of a name to filter, then Enter (Enter alone lists all)."
+    printf 'filter> ' >&2
+    IFS= read -r filter || return 1
+    if [[ -n "$filter" ]]; then
+      matches=$(printf '%s\n' "$items" | grep -iF -- "$filter" 2>/dev/null || true)
+    else
+      matches=$items
+    fi
+    if [[ -z "$matches" ]]; then
+      status "Nothing matched '$filter'; try again."
+      continue
+    fi
+    say ""
+    say "  0) $keep"
+    count=0
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      count=$((count + 1))
+      printf '  %d) %s\n' "$count" "$line" >&2
+      if [[ $count -ge 60 ]]; then
+        say "  … more than 60 matches; type a longer filter to narrow the list."
+        break
+      fi
+    done <<<"$matches"
+    printf 'choose> ' >&2
+    IFS= read -r sel || return 1
+    [[ "$sel" == 0 ]] && return 0 # keep current
+    if [[ "$sel" =~ ^[0-9]+$ ]] && ((sel >= 1 && sel <= count)); then
+      i=0
+      while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        i=$((i + 1))
+        if ((i == sel)); then
+          printf '%s' "$line"
+          return 0
+        fi
+      done <<<"$matches"
+    fi
+    status "'$sel' is not one of the choices; try again."
+  done
+}
+
+# --- pickers (same data sources as the in-session CALIBRATE, terminal-native here) -------
+current_keymap() { localectl status 2>/dev/null | sed -n 's/.* X11 Layout: *//p' | head -n1; }
+current_locale() { localectl status 2>/dev/null | sed -n 's/.*System Locale: *LANG=//p' | head -n1; }
+current_timezone() { timedatectl show -p Timezone --value 2>/dev/null || true; }
+
+pick_keyboard() {
+  local cur items
+  cur=$(current_keymap)
+  items=$(localectl list-x11-keymap-layouts 2>/dev/null || true)
+  tui_pick "Keyboard layout — for the desktop, console and login" "keep current${cur:+ ($cur)}" "$items"
+}
+
+pick_locale() {
+  local cur items
+  cur=$(current_locale)
+  items=$(localectl list-locales 2>/dev/null | grep -Ei '\.utf-?8$' || true)
+  tui_pick "Language — the system language and formats" "keep current${cur:+ ($cur)}" "$items"
+}
+
+pick_timezone() {
+  local cur zones regions region cities city
+  cur=$(current_timezone)
+  zones=$(timedatectl list-timezones 2>/dev/null || true)
+  if [[ -z "$zones" ]]; then
+    status "No timezone data on this host; keeping the current timezone."
+    return 0
+  fi
+  while true; do
+    regions=$(printf '%s\n' "$zones" | cut -d/ -f1 | sort -u)
+    region=$(tui_pick "Timezone — region" "keep current${cur:+ ($cur)}" "$regions") || return 1
+    [[ -z "$region" ]] && return 0 # keep current
+    # A single-segment zone (UTC, GMT…) is the answer as it stands.
+    if ! printf '%s\n' "$zones" | grep -q "^$region/"; then
+      printf '%s\n' "$region"
+      return 0
+    fi
+    cities=$(printf '%s\n' "$zones" | sed -n "s|^$region/||p" | sort)
+    city=$(tui_pick "Timezone — $region (0 goes back to the region list)" "‹ back to region" "$cities") || return 1
+    [[ -z "$city" ]] && continue # back to region
+    printf '%s/%s\n' "$region" "$city"
+    return 0
+  done
+}
+
+# A username that meets the broker's policy; re-asks on an invalid entry (bounded, so wedged
+# input can never loop forever — the session just restarts provisioning).
 ask_username() {
   local u i
   for ((i = 0; i < 12; i++)); do
-    u=$(typed "Username · lower-case letters, digits, - or _ (e.g. alex)")
+    u=$(tui_read "Username — lower-case letters, digits, - or _ (e.g. alex)") || return 1
     if [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-      printf '%s\n' "$u"
+      printf '%s' "$u"
       return 0
     fi
-    wardos_notify "Username" "Use lower-case letters, digits, - or _ (max 32)"
+    status "Use lower-case letters, digits, - or _ (max 32)."
   done
   return 1
 }
@@ -54,65 +190,158 @@ ask_username() {
 ask_password() {
   local p1 p2 i
   for ((i = 0; i < 12; i++)); do
-    p1=$(secret "Password · for your account")
+    p1=$(tui_secret "Password — for your account") || return 1
     if [[ -z "$p1" ]]; then
-      wardos_notify "Password" "A password is required"
+      status "A password is required."
       continue
     fi
-    p2=$(secret "Password · type it again")
+    p2=$(tui_secret "Password — type it again") || return 1
     if [[ "$p1" == "$p2" ]]; then
       printf '%s' "$p1"
       return 0
     fi
-    wardos_notify "Password" "The two entries did not match; try again"
+    status "The two entries did not match; try again."
   done
   return 1
 }
 
-provision() {
-  local loc kbd tz fullname user pass choice
-  loc=$(calibrate_pick_locale) || true
-  kbd=$(calibrate_pick_keyboard) || true
-  tz=$(calibrate_pick_timezone) || true
-  fullname=$(typed "Your name · shown on the login screen (optional)")
-  user=$(ask_username) || return 1
-  pass=$(ask_password) || return 1
+# --- restage state (survives the cage relaunch; never the password) ----------------------
+stage_get() { [[ -f "$stage" ]] && sed -n "s/^$1=//p" "$stage" | head -n1; }
+save_state() {
+  mkdir -p "$(dirname "$stage")" 2>/dev/null || true
+  {
+    printf 'PHASE=%s\n' "$phase"
+    printf 'KEYMAP=%s\n' "$kbd"
+    printf 'VARIANT=%s\n' "$variant"
+    printf 'LOCALE=%s\n' "$loc"
+    printf 'TIMEZONE=%s\n' "$tz"
+    printf 'FULLNAME=%s\n' "$fullname"
+    printf 'USERNAME=%s\n' "$user"
+  } >"$stage" 2>/dev/null || true
+}
+load_state() {
+  [[ -f "$stage" ]] || return 0
+  phase=$(stage_get PHASE)
+  kbd=$(stage_get KEYMAP)
+  variant=$(stage_get VARIANT)
+  loc=$(stage_get LOCALE)
+  tz=$(stage_get TIMEZONE)
+  fullname=$(stage_get FULLNAME)
+  user=$(stage_get USERNAME)
+}
+# Persist the carry-over and ask the bootstrap session to relaunch cage under the chosen layout.
+request_restage() {
+  save_state
+  status "Applying the keyboard layout '$kbd'…"
+  exit "$RESTAGE_RC"
+}
 
+# ensure_keyboard: the FIRST question (A5). The chosen layout must be the compositor's LIVE
+# layout before any password is typed. XKB_DEFAULT_LAYOUT is what cage is currently running.
+ensure_keyboard() {
+  local staged="${XKB_DEFAULT_LAYOUT:-}" chosen
+  # Already established: the chosen layout matches what cage is running.
+  [[ -n "$kbd" && "$kbd" == "$staged" ]] && return 0
+  # Chosen but not yet live (a relaunch has not applied it, or a review change): restage.
+  [[ -n "$kbd" && "$kbd" != "$staged" ]] && request_restage
+  # Not yet chosen: ask. Menu selection (numbers/arrows/Enter) is layout-independent, so this
+  # first question is safe under the console default layout.
+  chosen=$(pick_keyboard) || chosen=""
+  if [[ -z "$chosen" ]]; then
+    kbd="" # keep current: whatever the console/greeter layout already is; no restage, no KEYMAP
+    return 0
+  fi
+  kbd=$chosen
+  [[ "$kbd" != "$staged" ]] && request_restage
+  return 0
+}
+
+# --- the transaction (B1): apply only chosen settings; ACCOUNT only if all of them succeed --
+# ADR-0027: the provisioned marker is written ONLY after full success. The broker commits the
+# marker inside ACCOUNT, so ACCOUNT must not be attempted while any requested setting failed —
+# a failed apply surfaces in this UI and returns to the review, never proceeding.
+attempt_create() {
+  if [[ -n "$loc" ]] && ! broker LOCALE "$loc"; then
+    status "Language could not be set: ${last_err}. Nothing was created — adjust and try again."
+    return 1
+  fi
+  if [[ -n "$kbd" ]] && ! broker KEYMAP "$kbd"; then
+    status "Keyboard could not be set: ${last_err}. Nothing was created — adjust and try again."
+    return 1
+  fi
+  if [[ -n "$tz" ]] && ! broker TIMEZONE "$tz"; then
+    status "Timezone could not be set: ${last_err}. Nothing was created — adjust and try again."
+    return 1
+  fi
+  if broker ACCOUNT "$user" "$fullname" "$pass"; then
+    status "Welcome to WardOS — account created. Sign in as '$user'."
+    rm -f "$stage" 2>/dev/null || true
+    return 0
+  fi
+  status "Account not created: ${last_err}. Adjust and try again."
+  return 1
+}
+
+review() {
+  local choice v newkbd
   while true; do
-    choice=$(wardos_menu "Review · create your WardOS account" \
-      "Create account and finish" \
-      "Language · ${loc:-keep current}" \
-      "Keyboard · ${kbd:-keep current}" \
-      "Timezone · ${tz:-keep current}" \
-      "Name · ${fullname:-—}" \
-      "Username · $user") || continue # cancel just redraws; there is no skip here
+    heading "Review — create your WardOS account"
+    say "  1) Create account and finish"
+    say "  2) Keyboard  · ${kbd:-keep current}"
+    say "  3) Language  · ${loc:-keep current}"
+    say "  4) Timezone  · ${tz:-keep current}"
+    say "  5) Name      · ${fullname:-—}"
+    say "  6) Username  · ${user}"
+    printf 'choose> ' >&2
+    IFS= read -r choice || return 1
     case "$choice" in
-      "Create account and finish")
-        # Best-effort settings first; then the account, which commits the marker on success.
-        [[ -n "$loc" ]] && { broker LOCALE "$loc" || wardos_notify "Language" "$last_err"; }
-        [[ -n "$kbd" ]] && { broker KEYMAP "$kbd" || wardos_notify "Keyboard" "$last_err"; }
-        [[ -n "$tz" ]] && { broker TIMEZONE "$tz" || wardos_notify "Timezone" "$last_err"; }
-        if broker ACCOUNT "$user" "$fullname" "$pass"; then
-          wardos_notify "Welcome to WardOS" "Account created — sign in as $user"
-          return 0
+      1) attempt_create && return 0 ;;
+      2)
+        # A keyboard change in the review restages cage (so the layout is live for the fresh
+        # password) preserving every other field; the password is re-entered afterwards.
+        newkbd=$(pick_keyboard) || newkbd=""
+        if [[ -n "$newkbd" ]]; then
+          kbd=$newkbd
+          [[ "$kbd" != "${XKB_DEFAULT_LAYOUT:-}" ]] && request_restage
         fi
-        # Failed: tell the person and stay in the review so they can adjust and retry.
-        wardos_notify "Account not created" "$last_err"
         ;;
-      "Language ·"*) loc=$(calibrate_pick_locale) || true ;;
-      "Keyboard ·"*) kbd=$(calibrate_pick_keyboard) || true ;;
-      "Timezone ·"*) tz=$(calibrate_pick_timezone) || true ;;
-      "Name ·"*) fullname=$(typed "Your name · shown on the login screen (optional)") ;;
-      "Username ·"*) user=$(ask_username) || return 1 ;;
-      *) : ;;
+      3) if v=$(pick_locale); then loc=$v; fi ;;
+      4) if v=$(pick_timezone); then tz=$v; fi ;;
+      5) if v=$(tui_read "Your name — shown on the login screen (optional)"); then fullname=$v; fi ;;
+      6) user=$(ask_username) || return 1 ;;
+      *) status "Type a number from 1 to 6." ;;
     esac
   done
 }
 
-# Already provisioned (a stray run): do nothing so greetd falls through to the greeter.
+provision() {
+  load_state
+  # 1) Keyboard first, established as the live layout (may exit RESTAGE_RC to relaunch cage).
+  ensure_keyboard
+  # 2) Collect the rest under the corrected layout, once. On a resume after a review-triggered
+  #    keyboard restage (phase already "collected") only the password is re-asked — the other
+  #    fields were carried over — because it must be typed under the corrected layout.
+  if [[ "$phase" != collected ]]; then
+    loc=$(pick_locale) || loc=""
+    tz=$(pick_timezone) || tz=""
+    fullname=$(tui_read "Your name — shown on the login screen (optional)") || fullname=""
+    user=$(ask_username) || return 1
+    pass=$(ask_password) || return 1
+    phase=collected
+    save_state
+  else
+    pass=$(ask_password) || return 1
+  fi
+  # 3) Review and commit.
+  review
+}
+
+# Already provisioned (a stray run): do nothing so the bootstrap session falls through to the
+# greeter. The marker file is the gate — no broker traffic here (ADR-0027).
 [[ -e "$marker" ]] && exit 0
 
-# One provisioning pass; if the account fields were abandoned, exit non-zero so greetd
-# relaunches the provisioning session rather than reaching a desktop that does not exist.
+# One provisioning pass. A RESTAGE_RC exit is handled by the caller (relaunch under the chosen
+# layout); any other non-zero means the account fields were abandoned, so exit non-zero and let
+# the bootstrap session relaunch provisioning rather than reach a desktop that does not exist.
 provision || exit 1
 exit 0

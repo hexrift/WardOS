@@ -28,12 +28,20 @@ $(grep '^command' "$cfg")"
 ! grep -q '\[initial_session\]' "$cfg" || fail "greetd must not auto-login (no [initial_session])"
 
 # The selector: provisioned -> cage hosting gtkgreet (styled, handing off to wardos-session);
-# unprovisioned -> the provisioning UI under cage.
+# unprovisioned -> the provisioning UI as a foot-hosted TUI under cage (xdg-shell; cage has no
+# layer-shell, so the UI is NOT fuzzel).
 assert_file "$selector"
 grep -Eq 'cage -s -- gtkgreet .*-c /usr/libexec/wardos-session' "$selector" \
   || fail "the selector's greeter path must run gtkgreet in cage and hand off to wardos-session"
 assert_contains "$selector" '-s /etc/greetd/wardos-greeter.css'
-assert_contains "$selector" 'cage -s -- wardos-provision-ui'
+# The bootstrap path runs the provisioning UI inside foot under cage -s (VT recovery kept).
+grep -Eq 'cage -s -- foot .* wardos-provision-ui' "$selector" \
+  || fail "the selector's bootstrap path must host wardos-provision-ui in foot under cage -s"
+# The provisioning UI must not be launched as a layer-shell client (fuzzel) under cage. Check
+# executable lines only (a comment may still name fuzzel to explain why it is avoided).
+if grep -vE '^[[:space:]]*#' "$selector" | grep -q 'fuzzel'; then
+  fail "the bootstrap UI must not use fuzzel under cage (no layer-shell)"
+fi
 # cage has no wlr-layer-shell: the selector's gtkgreet must NOT run in layer-shell mode
 # (`-l`), or it commits a 0x0 surface, cage disconnects it and greetd crash-loops the
 # greeter — the E-09 flicker loop. cage fullscreens a plain gtkgreet window on its own.

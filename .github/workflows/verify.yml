@@ -139,6 +139,11 @@ jobs:
       - run: |
           sudo apt-get update -q
           sudo apt-get install -y -q shellcheck
+          # fuzzel powers E1 (fuzzel-config.test.sh): `fuzzel --check-config` on the shipped
+          # config. It lives in the Ubuntu universe archive; install it best-effort so the check
+          # RUNS here. If the archive lacks it the test self-skips (documenting the gap) rather
+          # than faking a pass; on the image itself fuzzel 1.14 is present and the check is real.
+          sudo apt-get install -y -q fuzzel || echo "fuzzel unavailable in the archive; E1 (fuzzel --check-config) will skip — run it on the image where fuzzel 1.14 ships"
       - run: bash desktop/tests/run.sh
 
   # The release helpers (scripts/release): every script shellcheck-clean, every

@@ -36,6 +36,18 @@ if [[ ! -e "$marker" || "${1:-}" == --force ]]; then
   # onboarding still runs.
   wardos-refresh --all ||
     wardos_notify "Defaults not applied" "Run 'wardos-refresh --all' in a terminal"
+  # First-boot provisioning (ADR-0027) already collected language, keyboard and timezone before
+  # this account existed, so CALIBRATE must NOT re-ask them on this user's first login: seed the
+  # completion marker when the machine is provisioned and CALIBRATE has not already run. Without
+  # this the new user is asked locale/keyboard/timezone a second time. (The keyboard layout is
+  # still re-applied to this user's Hyprland config below — seeding suppresses the questions, not
+  # the layout adoption.)
+  provisioned_marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
+  cal_marker="$(wardos_config_dir)/calibrate-done"
+  if [[ -e "$provisioned_marker" && ! -e "$cal_marker" ]]; then
+    mkdir -p "$(dirname "$cal_marker")"
+    date -u +%Y-%m-%dT%H:%M:%SZ >"$cal_marker"
+  fi
   # Adopt a first-boot provisioning keyboard choice (ADR-0027) into this user's Hyprland
   # config: the provisioning broker set the system/console keymap, but wardos-refresh has just
   # reset input.conf to the default layout, so re-apply the chosen one for the desktop itself.

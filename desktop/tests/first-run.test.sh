@@ -146,3 +146,31 @@ printf 'fr\n' >"$WARDOS_KEYBOARD_STATE"
 : >"$MOCK_LOG"
 wardos-first-run
 assert_logged '^wardos-calibrate keyboard-local fr$'
+
+# --- E6 (ADR-0027): after a successful first-boot provisioning, the new user's first login must
+# NOT re-ask the CALIBRATE questions (provisioning already collected language/keyboard/timezone),
+# yet the chosen keyboard layout is still applied to this user's Hyprland config. The provisioned
+# marker being present is the signal that setup completed: first-run seeds calibrate-done so the
+# guided CALIBRATE self-skips, while the keyboard-local handoff still runs.
+setup_env
+for c in wardos-refresh wardos-theme ward wardos-keys wardos-webapp wardos-tui notify-send wardos-welcome; do mock "$c"; done
+# The calibrate mock mirrors the real stage contract: the guided run (no args) skips when its
+# marker exists (logging SKIP) and otherwise records completion (logging ASKED); keyboard-local
+# just applies. So a re-ask is observable as an ASKED line.
+# shellcheck disable=SC2016
+mock wardos-calibrate 'case "${1:-}" in
+  keyboard-local) exit 0 ;;
+  "") m="$XDG_CONFIG_HOME/wardos/calibrate-done"
+     if [[ -e "$m" ]]; then printf "SKIP\n" >>"$MOCK_LOG"; else printf "ASKED\n" >>"$MOCK_LOG"; mkdir -p "$(dirname "$m")"; : >"$m"; fi ;;
+esac'
+export WARDOS_PROVISIONED_MARKER="$TMP/provisioned"
+: >"$WARDOS_PROVISIONED_MARKER" # the machine was provisioned
+export WARDOS_KEYBOARD_STATE="$TMP/keyboard-layout"
+printf 'fr\n' >"$WARDOS_KEYBOARD_STATE"
+cal_marker="$XDG_CONFIG_HOME/wardos/calibrate-done"
+: >"$MOCK_LOG"
+wardos-first-run
+assert_file "$cal_marker"                              # CALIBRATE-complete state seeded on first login
+assert_logged '^SKIP$'                                 # the guided CALIBRATE self-skipped (no re-ask)
+assert_not_logged '^ASKED$'                            # the CALIBRATE questions were NOT re-asked
+assert_logged '^wardos-calibrate keyboard-local fr$'   # the provisioning keyboard layout is still applied

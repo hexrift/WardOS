@@ -46,10 +46,19 @@ user, and any default-password account.
   marker **present** → it execs the normal `gtkgreet` greeter (today's #116 command, verbatim).
   greetd's `user` stays the unprivileged, locked bootstrap identity throughout; no real user
   is ever autologged-in.
-- **Provisioning UI** (`wardos-provision-ui`, **unprivileged**): the keyboard-first fuzzel
-  CALIBRATE flow — language, keyboard, timezone, full name, username, password (+confirm),
-  review — running as the locked bootstrap identity inside the cage kiosk. It performs **no**
-  privileged operation itself; it hands validated choices to the broker.
+- **Provisioning UI** (`wardos-provision-ui`, **unprivileged**): the keyboard-first CALIBRATE
+  flow — keyboard, language, timezone, full name, username, password (+confirm), review —
+  running as the locked bootstrap identity inside the cage kiosk. It performs **no** privileged
+  operation itself; it hands validated choices to the broker.
+  - **Implementation amendment (owner-approved, after the T480s hardware boot):** the UI is a
+    **foot-hosted terminal UI (xdg-shell), not fuzzel.** cage supports xdg-shell only
+    (wlr-layer-shell is an open upstream PR), so fuzzel — a layer-shell client — aborts under
+    cage and the provisioning UI never renders. The bootstrap therefore runs `cage -s -- foot …
+    wardos-provision-ui`, a self-contained bash TUI. The keyboard is asked **first** and the
+    chosen layout is re-established as the compositor's live input layout (the session relaunches
+    cage with `XKB_DEFAULT_LAYOUT` from the recorded choice) **before** any password is typed, so
+    a non-US password is entered under the intended layout. A future graphical (E-10 toolkit)
+    surface remains a follow-up; the desktop's post-login fuzzel is unaffected.
 - **Provisioning broker** (`wardos-provisiond`, **root, socket-activated**): a systemd
   service exposing a Unix socket with a **narrow, validated verb set** — `set-locale`,
   `set-keymap`, `set-timezone`, `create-account`, `complete`. It performs `useradd`/`chpasswd`/
