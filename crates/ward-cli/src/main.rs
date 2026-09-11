@@ -32,7 +32,10 @@ use ward_events::{EndReason, LogReader};
 #[command(
     name = "ward",
     version,
-    about = "Secure sessions for autonomous coding agents"
+    about = "Secure sessions for autonomous coding agents",
+    after_help = "Any other verb runs the matching WardOS desktop command: `ward <verb> …` \
+runs `wardos-<verb> …` (e.g. `ward theme`, `ward setup wifi`, `ward install`, `ward update`). \
+Run `ward <verb> --help` for a desktop command's own help."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -191,6 +194,13 @@ enum Command {
         #[arg(long, conflicts_with = "tui")]
         plain: bool,
     },
+    /// Any other verb runs the matching WardOS desktop command: `ward <verb> …` runs
+    /// `wardos-<verb> …` when that command is installed (docs/desktop.md §Commands). So
+    /// `ward theme set ward-dark` is `wardos-theme set ward-dark`, `ward setup wifi` is
+    /// `wardos-setup wifi`, and `ward` is the single command you type in the terminal —
+    /// the secure session core here, the desktop verbs in the `wardos-*` family.
+    #[command(external_subcommand)]
+    Desktop(Vec<String>),
 }
 
 /// How `ward watch` shows the stream.
@@ -425,21 +435,7 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         } => cmd_pause(&dir.unwrap_or_else(cwd), reason.as_deref(), status),
         Command::Resume { dir } => cmd_resume(&dir.unwrap_or_else(cwd)),
         Command::Verify { dir } => cmd_verify(&dir.unwrap_or_else(cwd)),
-        Command::Doctor => {
-            let checks = ward_daemon::doctor::run();
-            print!("{}", render::doctor_panel(&checks));
-            // Hardware Baseline 1: the machine's capabilities and speed, as facts. A
-            // report — degraded rows never change the exit code (host readiness owns it).
-            print!(
-                "{}",
-                render::hardware_panel(&ward_daemon::doctor::hardware())
-            );
-            Ok(if ward_daemon::doctor::healthy(&checks) {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
-        }
+        Command::Doctor => Ok(cmd_doctor()),
         Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
         Command::Replay { log, verify, json } => {
             let report = replay::replay(&log, replay::Options { verify, json })?;
@@ -490,7 +486,79 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             },
             WatchMode::select(tui, plain, std::io::stdout().is_terminal()),
         ),
+        Command::Desktop(argv) => cmd_desktop(&argv),
     }
+}
+
+/// `ward doctor`: host-readiness checks, then the Hardware Baseline 1 panel. Only the
+/// readiness checks decide the exit code; the hardware panel is a report, so a degraded
+/// row (software rendering, no Wi-Fi) never fails the command.
+fn cmd_doctor() -> ExitCode {
+    let checks = ward_daemon::doctor::run();
+    print!("{}", render::doctor_panel(&checks));
+    print!(
+        "{}",
+        render::hardware_panel(&ward_daemon::doctor::hardware())
+    );
+    if ward_daemon::doctor::healthy(&checks) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// A `ward <verb> …` that is not one of the built-in subcommands above runs the WardOS
+/// desktop command `wardos-<verb> …` when one is on `PATH` (docs/desktop.md §Commands),
+/// replacing this process with it so its exit status, signals and terminal are the
+/// caller's. This makes `ward` the one command a user types: the session core is here,
+/// the desktop verbs (`theme`, `setup`, `install`, `update`, …) are the `wardos-*` family.
+fn cmd_desktop(argv: &[String]) -> ward_daemon::Result<ExitCode> {
+    use std::os::unix::process::CommandExt as _;
+    // clap's external_subcommand hands us at least the verb.
+    let (verb, rest) = argv.split_first().ok_or_else(|| {
+        ward_daemon::Error::Project("no command given; run `ward --help`".to_owned())
+    })?;
+    let Some(program) = desktop_command(verb) else {
+        return Err(ward_daemon::Error::Project(format!(
+            "unknown command '{verb}'; run `ward --help`, or install the desktop command `wardos-{verb}`"
+        )));
+    };
+    // Replace this process: `ward theme set X` becomes `wardos-theme set X`, so signals,
+    // exit status and the controlling terminal all belong to the desktop command. exec
+    // only returns if the execve itself fails (it was on PATH a moment ago; a race or a
+    // permission change is the realistic cause).
+    let err = std::process::Command::new(&program).args(rest).exec();
+    Err(ward_daemon::Error::Project(format!(
+        "cannot run {program}: {err}"
+    )))
+}
+
+/// The desktop command backing `ward <verb>`: `wardos-<verb>` when it is an executable on
+/// `PATH`, else `None`. The verb must be a single bare word — no `/`, no leading `-` — so
+/// `ward` can only ever reach the `wardos-*` family, never an arbitrary path or option.
+fn desktop_command(verb: &str) -> Option<String> {
+    verb_program(verb).filter(|program| on_path(program))
+}
+
+/// `wardos-<verb>` for a syntactically valid verb, else `None` (pure; the `PATH` lookup is
+/// [`on_path`]). A valid verb is a non-empty bare word: no path separator, no leading dash.
+fn verb_program(verb: &str) -> Option<String> {
+    (!verb.is_empty() && !verb.starts_with('-') && !verb.contains('/'))
+        .then(|| format!("wardos-{verb}"))
+}
+
+/// Whether `name` is an executable file somewhere on `PATH`.
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| on_path_in(name, &path))
+}
+
+/// [`on_path`] against an explicit `PATH` value (testable without touching the environment).
+fn on_path_in(name: &str, path: &std::ffi::OsStr) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::env::split_paths(path).any(|dir| {
+        std::fs::metadata(dir.join(name))
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
 }
 
 /// `ward init`: everything the command reads from its environment is gathered here
@@ -1086,8 +1154,59 @@ fn cwd() -> PathBuf {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::{Cli, Command, SessionCmd, WatchMode, pending_text};
+    use super::{
+        Cli, Command, SessionCmd, WatchMode, desktop_command, on_path_in, pending_text,
+        verb_program,
+    };
     use clap::Parser as _;
+
+    #[test]
+    fn an_unknown_verb_is_captured_as_a_desktop_command() {
+        // The built-ins still parse to their own variants…
+        assert!(matches!(
+            Cli::parse_from(["ward", "doctor"]).command,
+            Command::Doctor
+        ));
+        // …and anything else is handed through verbatim (verb first) for the wardos-* bridge.
+        let argv = match Cli::parse_from(["ward", "theme", "set", "ward-dark"]).command {
+            Command::Desktop(argv) => argv,
+            _ => Vec::new(),
+        };
+        assert_eq!(argv, ["theme", "set", "ward-dark"]);
+    }
+
+    #[test]
+    fn verb_program_maps_only_bare_words_to_the_wardos_family() {
+        assert_eq!(verb_program("theme").as_deref(), Some("wardos-theme"));
+        assert_eq!(verb_program("setup").as_deref(), Some("wardos-setup"));
+        // A verb can never smuggle a path or an option through the wardos- prefix.
+        assert_eq!(verb_program(""), None);
+        assert_eq!(verb_program("../etc/passwd"), None);
+        assert_eq!(verb_program("a/b"), None);
+        assert_eq!(verb_program("-rf"), None);
+    }
+
+    #[test]
+    fn on_path_in_finds_only_executable_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        // A non-executable file and a directory of the right name are both misses.
+        std::fs::write(path.join("wardos-plain"), "x").unwrap();
+        std::fs::create_dir(path.join("wardos-dir")).unwrap();
+        // An executable file is the hit.
+        let exe = path.join("wardos-theme");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let os_path = std::ffi::OsString::from(path);
+        assert!(on_path_in("wardos-theme", &os_path));
+        assert!(!on_path_in("wardos-plain", &os_path)); // present but not executable
+        assert!(!on_path_in("wardos-dir", &os_path)); // a directory, not a file
+        assert!(!on_path_in("wardos-absent", &os_path));
+        // desktop_command composes the two: a rejected verb never reaches PATH.
+        assert_eq!(desktop_command("../x"), None);
+    }
 
     #[test]
     fn session_pending_and_grants_take_json_and_print_the_three_blocks() {
