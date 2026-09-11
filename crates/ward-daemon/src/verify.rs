@@ -328,24 +328,17 @@ fn protected_files(
         .filter(|e| e.kind == EntryType::Dir)
         .filter_map(|e| std::str::from_utf8(&e.path).ok())
         .collect();
-    // Every path the entry snapshot carries, of any kind: a candidate entry whose path is
-    // one of these is not a plant and is handled by the file overlay above (or, for entry
-    // symlinks, deliberately left as materialised). Anything else under a protected dir is
-    // candidate-only.
-    let entry_paths: std::collections::HashSet<&str> = manifests[0]
-        .entries()
+    // Every symlink path in either snapshot. Under a protected directory these must be
+    // enumerated alongside the files, so the manifest-driven overlay reaches them: an entry
+    // symlink is restored to its exact stored target — a candidate that keeps the path a
+    // symlink but redirects it cannot slip candidate-controlled content past the verifier —
+    // and a candidate-only symlink stand-in is removed (#122). Restoration decides per path
+    // from the entry manifest, so listing entry and candidate symlinks together is safe.
+    let links: Vec<&str> = manifests
         .iter()
-        .filter_map(|e| std::str::from_utf8(&e.path).ok())
-        .collect();
-    // Candidate-planted symlinks the entry does not have: under a protected directory they
-    // are stand-ins that must be removed (the overlay's `None` branch unlinks them without
-    // following), so a symlink cannot slip a protected test past verification (#122).
-    let planted_links: Vec<&str> = manifests[1]
-        .entries()
-        .iter()
+        .flat_map(ward_snapshot::Manifest::entries)
         .filter(|e| e.kind == EntryType::Symlink)
         .filter_map(|e| std::str::from_utf8(&e.path).ok())
-        .filter(|p| !entry_paths.contains(p))
         .collect();
     let mut out: Vec<String> = Vec::new();
     for pattern in patterns {
@@ -364,7 +357,7 @@ fn protected_files(
                 let prefix = format!("{d}/");
                 files
                     .iter()
-                    .chain(planted_links.iter())
+                    .chain(links.iter())
                     .copied()
                     .filter(|f| f.starts_with(&prefix))
                     .collect()
@@ -1013,6 +1006,58 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "the planted directory and its symlink are left untouched, never followed"
+        );
+    }
+
+    #[test]
+    fn prepare_restores_an_entry_symlink_reached_through_a_directory_pattern() {
+        // A protected DIRECTORY pattern must also cover entry symlinks under it: a candidate
+        // that keeps the path a symlink but redirects its target must not slip
+        // candidate-controlled content past the verifier — the entry's exact target is
+        // restored (#122). Covers a live and a dangling entry symlink, both redirected.
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        std::fs::create_dir_all(w.join(".tamperward")).unwrap();
+        std::fs::create_dir_all(w.join("tests")).unwrap();
+        std::fs::write(
+            w.join(CONFIG_PATH),
+            "protected:\n  tests: [tests/]\nverify:\n  command: true\n",
+        )
+        .unwrap();
+        std::fs::write(w.join("tests/keep.rs"), "keep").unwrap();
+        std::os::unix::fs::symlink("pristine-target", w.join("tests/link")).unwrap();
+        std::os::unix::fs::symlink("/does/not/exist", w.join("tests/dead")).unwrap();
+        let store = SnapshotStore::open(state.path().join("cas")).unwrap();
+        let entry = store
+            .store_snapshot(w, SnapshotRole::Entry, CaptureOptions::default())
+            .unwrap();
+
+        // Candidate: keep both as symlinks but redirect their targets to attacker content.
+        std::fs::remove_file(w.join("tests/link")).unwrap();
+        std::os::unix::fs::symlink("evil-target", w.join("tests/link")).unwrap();
+        std::fs::remove_file(w.join("tests/dead")).unwrap();
+        std::os::unix::fs::symlink("/tmp/evil", w.join("tests/dead")).unwrap();
+        let v = prepare(&store, w, entry, state.path()).unwrap();
+
+        assert!(v.restored.contains(&"tests/link".to_string()));
+        assert!(v.restored.contains(&"tests/dead".to_string()));
+        let link = v.scratch.join("tests/link");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::path::Path::new("pristine-target"),
+            "the entry's target is restored, not the candidate's redirect"
+        );
+        assert_eq!(
+            std::fs::read_link(v.scratch.join("tests/dead")).unwrap(),
+            std::path::Path::new("/does/not/exist"),
+            "a dangling entry symlink is restored through the directory pattern too"
         );
     }
 }
