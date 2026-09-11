@@ -33,15 +33,40 @@ provisioned() { [[ -e "$marker" ]]; }
 # Refuse every mutating verb once provisioned: there is exactly one provisioning.
 refuse_if_provisioned() { if provisioned; then deny "already provisioned"; fi; }
 
-# Atomic marker write: a temp file fsync'd and renamed into place, so a power cut leaves
-# the marker either absent (re-provision) or fully present, never truncated.
+# The durable record of an in-progress account transaction (#127). Its presence means an
+# ACCOUNT created — or may have created — an account that did not reach the committed
+# marker; the next ACCOUNT reconciles it under the lock before creating anything.
+journal="${WARDOS_PROVISION_JOURNAL:-/var/lib/wardos/provision.journal}"
+
+# Durably write CONTENT to PATH: a temp file, flushed, atomically renamed into place, then
+# the containing directory flushed so the rename survives a power cut. Every step is checked
+# and a failure returns non-zero — callers test the return explicitly (errexit is not relied
+# on, since these run inside `if !`/`||`). A power cut leaves PATH either absent or fully
+# present, never truncated.
+write_durable() {
+  local path=$1 content=$2 dir tmp
+  dir=$(dirname "$path")
+  mkdir -p "$dir" || return 1
+  tmp="$path.tmp.$$"
+  printf '%s\n' "$content" >"$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  sync "$tmp" 2>/dev/null || sync 2>/dev/null || true
+  mv -f "$tmp" "$path" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  sync "$dir" 2>/dev/null || sync 2>/dev/null || true
+  return 0
+}
+
+# Durably remove PATH; returns non-zero if it still exists afterward.
+remove_durable() {
+  local path=$1
+  rm -f "$path" 2>/dev/null || return 1
+  [[ ! -e "$path" ]] || return 1
+  sync "$(dirname "$path")" 2>/dev/null || sync 2>/dev/null || true
+  return 0
+}
+
+# The marker is the transaction's commit point, written durably and last.
 commit_marker() {
-  local tmp="$marker.tmp.$$"
-  mkdir -p "$(dirname "$marker")"
-  date -u +%Y-%m-%dT%H:%M:%SZ >"$tmp"
-  # Flush the data, then rename (rename is atomic within the filesystem).
-  if command -v sync >/dev/null 2>&1; then sync "$tmp" 2>/dev/null || sync; fi
-  mv -f "$tmp" "$marker"
+  write_durable "$marker" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
 valid_locale() { [[ "$1" =~ ^[A-Za-z0-9._@-]+$ ]]; }
@@ -78,6 +103,39 @@ do_timezone() {
   reply OK
 }
 
+# Reconcile any unresolved prior transaction recorded in the journal, under the exclusive
+# lock, before a new account is created (#127). A journal entry means a previous ACCOUNT
+# created — or may have created — an account that never reached the committed marker: an
+# error whose rollback failed, or a crash/power loss mid-transaction. Roll it back — if the
+# recorded account still exists, remove it — and only when it is gone is the transaction
+# resolved and the journal cleared. If the removal FAILS the transaction stays unresolved
+# and this connection is REFUSED: the broker never creates a second administrator while a
+# first is unresolved, and never silently accumulates accounts.
+reconcile_pending() {
+  [[ -e "$journal" ]] || return 0
+  local pending
+  pending=$(head -n1 "$journal" 2>/dev/null)
+  if [[ -n "$pending" ]] && id -u "$pending" >/dev/null 2>&1; then
+    userdel -r "$pending" 2>/dev/null ||
+      deny "provisioning unresolved: an interrupted account ('$pending') could not be removed; recovery required"
+  fi
+  remove_durable "$journal" ||
+    deny "provisioning unresolved: the transaction journal could not be cleared; recovery required"
+}
+
+# Roll back a created-but-uncommitted account after a mid-transaction failure. userdel's
+# result is checked, never suppressed: on success the journal is cleared (transaction
+# resolved); on FAILURE the journal — naming this account — is left in place on purpose, so
+# reconcile_pending refuses and retries the removal on the next attempt rather than leaving
+# a silent second administrator (#127). Either way this connection is denied with `reason`.
+rollback_account() {
+  local user=$1 reason=$2
+  if userdel -r "$user" 2>/dev/null; then
+    remove_durable "$journal" || true
+  fi
+  deny "$reason"
+}
+
 do_account() {
   local user=$1 fullname=$2 password=$3
   valid_username "$user" || deny "invalid username"
@@ -89,23 +147,41 @@ do_account() {
   case "$user" in
     root | daemon | bin | sys | adm | nobody | nogroup | greeter | ward-provision) deny "name is reserved" ;;
   esac
+
+  # Resolve any interrupted prior transaction first. This may `deny` (and exit) if a previous
+  # attempt is unresolved, so no second administrator is ever created over an unresolved one.
+  reconcile_pending
+
   # NO ADOPTION: any name already in use — a system account (e.g. nobody=65534) or a human
   # one — is refused, never elevated or mutated. On an unprovisioned machine there is no
   # human account to adopt, and adopting one could not be rolled back cleanly.
   if id -u "$user" >/dev/null 2>&1; then deny "name already in use"; fi
 
-  # Create the account, set its password, and commit the marker as ONE transaction: any
-  # failure after useradd rolls the new account back (userdel -r), so a retry can never
-  # leave a second administrator, a passwordless account, or a half-provisioned machine.
-  useradd -m -c "$fullname" -G wheel -s /bin/bash "$user" 2>/dev/null || deny "could not create account"
+  # Journal the intended transaction BEFORE any account mutation, durably, so a crash or a
+  # failed rollback always leaves a record the next attempt reconciles. Then create the
+  # account, set its password and commit the marker as one transaction; on ANY failure the
+  # account is rolled back (and the journal only cleared if that rollback succeeds).
+  write_durable "$journal" "$user" || deny "could not record the provisioning transaction"
+
+  if ! useradd -m -c "$fullname" -G wheel -s /bin/bash "$user" 2>/dev/null; then
+    # useradd failed: roll back any partial account it left, else clear the journal (nothing
+    # was created) so a clean failure does not strand the machine as unresolved.
+    if id -u "$user" >/dev/null 2>&1; then
+      rollback_account "$user" "could not create account"
+    fi
+    remove_durable "$journal" || true
+    deny "could not create account"
+  fi
   if ! printf '%s:%s\n' "$user" "$password" | chpasswd 2>/dev/null; then
-    userdel -r "$user" 2>/dev/null || true
-    deny "could not set password"
+    rollback_account "$user" "could not set password"
   fi
   if ! commit_marker; then
-    userdel -r "$user" 2>/dev/null || true
-    deny "could not mark provisioned"
+    rollback_account "$user" "could not mark provisioned"
   fi
+  # Committed: the marker is the durable commit point. Clear the now-resolved journal
+  # (best-effort — a lingering journal past the marker is inert, since a provisioned machine
+  # refuses every further ACCOUNT).
+  remove_durable "$journal" || true
   reply OK
 }
 

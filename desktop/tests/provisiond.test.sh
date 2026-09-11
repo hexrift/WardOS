@@ -8,6 +8,7 @@ setup_env
 
 export WARDOS_PROVISIONED_MARKER="$TMP/provisioned"
 export WARDOS_PROVISION_LOCK="$TMP/provisiond.lock"
+export WARDOS_PROVISION_JOURNAL="$TMP/provision.journal"
 export WARDOS_KEYBOARD_STATE="$TMP/keyboard-layout"
 for c in localectl timedatectl useradd usermod chpasswd userdel getent; do mock "$c"; done
 
@@ -127,5 +128,60 @@ n=$(grep -c '^useradd' "$MOCK_LOG" || true)
 results="$(cat "$TMP/c1" "$TMP/c2")"
 [[ "$(grep -c '^OK$' <<<"$results")" -eq 1 ]] || fail "exactly one ACCOUNT should win; got: $results"
 grep -q 'already provisioned' <<<"$results" || fail "the losing ACCOUNT must be refused; got: $results"
+
+# --- #127: an unresolved transaction (failed rollback) refuses a second admin, then recovers
+# Stateful account mocks share an on-disk account set, so a failed userdel really leaves the
+# account behind and the next request must reconcile it — never add a second administrator.
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK" "$WARDOS_PROVISION_JOURNAL"
+acct_dir="$TMP/accounts"
+rm -rf "$acct_dir"
+mkdir -p "$acct_dir"
+export ACCT_DIR="$acct_dir"
+# shellcheck disable=SC2016
+mock useradd 'u="${@: -1}"; : >"$ACCT_DIR/$u"'
+# shellcheck disable=SC2016
+mock id 'for a in "$@"; do case "$a" in -*) ;; *) if [[ -e "$ACCT_DIR/$a" ]]; then echo 1000; exit 0; else exit 1; fi ;; esac; done; exit 1'
+# shellcheck disable=SC2016
+mock userdel '[[ -n "${USERDEL_FAIL:-}" ]] && exit 1; u="${@: -1}"; rm -f "$ACCT_DIR/$u"; exit 0'
+mock chpasswd 'exit 1' # force a mid-transaction failure so rollback runs
+
+# ACCOUNT alice: chpasswd fails AND userdel fails → alice remains, the transaction is left
+# unresolved (its journal persists), and no marker is written.
+out=$(printf 'ACCOUNT\nalice\nAlice\npw\n' | USERDEL_FAIL=1 wardos-provisiond)
+[[ "$out" == ERR* ]] || fail "a failed apply must report ERR; got: $out"
+[[ -e "$acct_dir/alice" ]] || fail "a failed userdel leaves the account (stateful mock)"
+[[ -e "$WARDOS_PROVISION_JOURNAL" ]] || fail "an unresolved transaction keeps its journal"
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "a failed transaction must not mark provisioned"
+
+# A DIFFERENT username is now REFUSED while alice is unresolved and cannot be cleaned up
+# (this is the reproduced bug: two residual administrators).
+out=$(printf 'ACCOUNT\nbob\nBob\npw\n' | USERDEL_FAIL=1 wardos-provisiond)
+[[ "$out" == ERR*unresolved* ]] || fail "a second admin must be refused while unresolved; got: $out"
+[[ ! -e "$acct_dir/bob" ]] || fail "no second account is created while unresolved"
+[[ "$(find "$acct_dir" -maxdepth 1 -type f | wc -l)" -eq 1 ]] ||
+  fail "must not accumulate administrators: $(ls "$acct_dir")"
+
+# Recovery: once userdel can succeed and the password applies, the next attempt reconciles
+# (removes alice), creates the new admin, and commits — exactly one administrator results.
+mock chpasswd # succeeds now
+out=$(printf 'ACCOUNT\nbob\nBob\npw\n' | wardos-provisiond) # USERDEL_FAIL unset → userdel ok
+[[ "$out" == OK ]] || fail "recovery must create the admin once cleanup succeeds; got: $out"
+[[ ! -e "$acct_dir/alice" ]] || fail "the unresolved account is removed on recovery"
+[[ -e "$acct_dir/bob" ]] || fail "the new admin is created on recovery"
+[[ ! -e "$WARDOS_PROVISION_JOURNAL" ]] || fail "the journal is cleared after a committed recovery"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+
+# --- #127: a crash mid-transaction (journal + orphan account, no marker) reconciles on the
+# next attempt — the deterministic restart case.
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK"
+rm -rf "$acct_dir"
+mkdir -p "$acct_dir"
+: >"$acct_dir/ghost"                            # an orphan a crashed attempt left behind
+printf 'ghost\n' >"$WARDOS_PROVISION_JOURNAL"   # its durable transaction record
+out=$(printf 'ACCOUNT\nnewadmin\nNew Admin\npw\n' | wardos-provisiond)
+[[ "$out" == OK ]] || fail "a restart must reconcile the orphan and proceed; got: $out"
+[[ ! -e "$acct_dir/ghost" ]] || fail "the orphan from the interrupted attempt is removed"
+[[ -e "$acct_dir/newadmin" ]] || fail "the new admin is created after reconciliation"
+assert_file "$WARDOS_PROVISIONED_MARKER"
 
 echo "ok   provisiond.test.sh internal assertions"
