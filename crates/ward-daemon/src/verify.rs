@@ -6,6 +6,8 @@
 //! The command runs in a bare sandbox with no egress and the host toolchains bound
 //! read-only, and the parsed result is what the session records.
 
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -125,48 +127,80 @@ pub fn prepare(
     let config = Config::parse(&String::from_utf8_lossy(&yaml))?;
     let manifest_hash = *blake3::hash(&yaml).as_bytes();
 
-    // A fresh, private destination every call: a reused scratch could still hold a symlink
-    // or an altered file planted by an earlier verifier run, which the overlay below would
-    // then trust (#122). The per-process sequence plus the pid make the path unique.
-    let scratch = scratch_root.join(format!(
-        "verify-{}-{}-{}",
-        &candidate.digest().to_hex()[..12],
-        std::process::id(),
-        SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    ));
+    // A fresh, private destination created *exclusively*: `fresh_scratch` makes a brand-new
+    // empty directory with `create_dir` (which fails if the path already exists) and tries
+    // another name on collision, so materialisation always writes into a directory proven
+    // empty — no verifier run can inherit a symlink or altered file a previous one left, even
+    // after a daemon restart or PID reuse (the name carries a nanosecond clock) (#122).
+    let scratch = fresh_scratch(scratch_root, &candidate.digest().to_hex()[..12])?;
     store.materialize(candidate, &scratch).map_err(snap)?;
+
+    // Restoration is driven by the ENTRY snapshot's manifest — its kind, content and mode —
+    // never by what the candidate materialised: a candidate that turned a protected file into
+    // a symlink cannot make us follow it, and a protected entry symlink is restored as a
+    // symlink rather than flattened into a regular file holding its target bytes (#122).
+    let entry_manifest = store.manifest(entry).map_err(snap)?;
+    let entry_by_path: std::collections::HashMap<&[u8], &ward_snapshot::Entry> = entry_manifest
+        .entries()
+        .iter()
+        .map(|e| (e.path.as_slice(), e))
+        .collect();
     let mut restored = Vec::new();
     for rel in protected_files(store, entry, candidate, &config.protected.tests)? {
         let rel = &rel;
-        let pristine = store.cat(entry, Path::new(rel)).ok();
-        // Resolve the destination inside `scratch` WITHOUT following any symlink the
-        // candidate planted: every ancestor is proven — or created — as a real directory,
-        // and the leaf below is inspected with a non-following lstat. Otherwise a candidate
-        // could symlink a protected file, or its parent, to a host path and make this
-        // overlay read or write outside the verifier tree with the daemon's authority,
-        // before the sandbox even starts (#122).
+        // Resolve the destination inside `scratch` WITHOUT following any candidate symlink:
+        // every ancestor is proven — or created — as a real directory, and the leaf is
+        // inspected with a non-following lstat. Otherwise a candidate could symlink a
+        // protected file, or its parent, to a host path and make this overlay read or write
+        // outside the verifier tree with the daemon's authority, before the sandbox starts.
         let target = overlay_dest(&scratch, rel)?;
         let leaf = std::fs::symlink_metadata(&target).ok();
-        match &pristine {
-            Some(bytes) => {
-                // Already the pristine bytes as a real regular file? Leave it untouched.
-                // A symlink or a directory here is a candidate plant, never "already
-                // correct": clear it (without following) so the write lands on a fresh
-                // real file inside scratch.
+        match entry_by_path.get(rel.as_bytes()) {
+            // A protected regular file: restore its exact bytes AND mode. Equal bytes with a
+            // candidate-altered mode is not "already correct", so the mode is compared too.
+            Some(ent) if ent.kind == EntryType::File => {
+                let bytes = store.cat(entry, Path::new(rel)).map_err(snap)?;
+                let mode = ent.mode & 0o7777;
                 if let Some(m) = &leaf {
                     if m.file_type().is_file()
+                        && m.permissions().mode() & 0o7777 == mode
                         && std::fs::read(&target).ok().as_deref() == Some(bytes.as_slice())
                     {
                         continue;
                     }
                     remove_planted(&target, m)?;
                 }
-                std::fs::write(&target, bytes).map_err(|e| Error::io(&target, e))?;
+                std::fs::write(&target, &bytes).map_err(|e| Error::io(&target, e))?;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+                    .map_err(|e| Error::io(&target, e))?;
             }
+            // A protected symlink: restore it AS a symlink to the entry's stored target,
+            // never followed and never flattened into a regular file.
+            Some(ent) if ent.kind == EntryType::Symlink => {
+                let link = store.cat(entry, Path::new(rel)).map_err(snap)?;
+                if let Some(m) = &leaf {
+                    if m.file_type().is_symlink()
+                        && std::fs::read_link(&target)
+                            .is_ok_and(|t| t.as_os_str().as_bytes() == link.as_slice())
+                    {
+                        continue;
+                    }
+                    remove_planted(&target, m)?;
+                }
+                std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&link), &target)
+                    .map_err(|e| Error::io(&target, e))?;
+            }
+            // The entry carries this protected path as a directory, submodule or an
+            // unsupported node: it is not a restorable leaf, so fail closed rather than guess.
+            Some(_) => {
+                return Err(Error::Project(format!(
+                    "protected path {rel:?} is not a file or symlink in the entry snapshot"
+                )));
+            }
+            // Candidate-only: the entry has no such protected path, so nothing may stand in
+            // for it — remove any candidate copy, a real file or a planted symlink/directory,
+            // unlinked in place and never followed.
             None => match &leaf {
-                // The entry has no such protected file, so nothing may stand in for it:
-                // remove any candidate copy — a real file, or a planted symlink/directory,
-                // unlinked in place and never followed to its target.
                 Some(m) => remove_planted(&target, m)?,
                 None => continue,
             },
@@ -226,6 +260,44 @@ fn remove_planted(path: &Path, meta: &std::fs::Metadata) -> Result<()> {
         std::fs::remove_file(path)
     };
     r.map_err(|e| Error::io(path, e))
+}
+
+/// A brand-new, private scratch directory under `root`. The name carries the candidate
+/// `tag`, the pid, a nanosecond clock and a per-process counter, so it does not repeat even
+/// across a daemon restart or PID reuse; [`create_fresh_dir`] then makes it *exclusively*,
+/// so materialisation always writes into a directory proven empty (#122).
+fn fresh_scratch(root: &Path, tag: &str) -> Result<PathBuf> {
+    let pid = std::process::id();
+    let tag = tag.to_owned();
+    create_fresh_dir(
+        root,
+        std::iter::repeat_with(move || {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("verify-{tag}-{pid}-{nanos}-{seq}")
+        }),
+    )
+}
+
+/// Create the first of `names` under `root` that does not already exist, with `create_dir`
+/// (never `create_dir_all`), so the returned directory is genuinely new and empty and a
+/// leftover a previous run planted at any candidate name is skipped rather than reused
+/// (#122). Bounded to the first 64 names so an all-colliding iterator cannot spin forever.
+fn create_fresh_dir(root: &Path, names: impl Iterator<Item = String>) -> Result<PathBuf> {
+    std::fs::create_dir_all(root).map_err(|e| Error::io(root, e))?;
+    for name in names.take(64) {
+        let dir = root.join(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {} // taken: try the next name
+            Err(e) => return Err(Error::io(&dir, e)),
+        }
+    }
+    Err(Error::Project(
+        "could not create a fresh verifier scratch directory".to_owned(),
+    ))
 }
 
 /// Expand `protected.tests` into the files the verifier restores, in manifest order
@@ -474,6 +546,8 @@ impl Toolchains {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
@@ -814,7 +888,131 @@ mod tests {
             .unwrap();
         let a = prepare(&store, w, entry, state.path()).unwrap();
         let b = prepare(&store, w, entry, state.path()).unwrap();
-        assert_ne!(a.scratch, b.scratch, "each prepare must get its own scratch tree");
+        assert_ne!(
+            a.scratch, b.scratch,
+            "each prepare must get its own scratch tree"
+        );
         assert!(a.scratch.is_dir() && b.scratch.is_dir());
+    }
+
+    #[test]
+    fn prepare_restores_a_protected_entry_symlink_as_a_symlink_not_a_file() {
+        // The entry snapshot has a protected path that is a symlink; the candidate replaces
+        // it with a regular file whose bytes equal the link target. Restoration must recreate
+        // it AS a symlink to the entry's stored target — never flatten the target bytes into
+        // a regular file, and never follow it (#122). The target is dangling on purpose.
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        std::fs::create_dir_all(w.join(".tamperward")).unwrap();
+        std::fs::create_dir_all(w.join("tests")).unwrap();
+        std::fs::write(
+            w.join(CONFIG_PATH),
+            "protected:\n  tests: [tests/link]\nverify:\n  command: true\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../secret-target", w.join("tests/link")).unwrap();
+        let store = SnapshotStore::open(state.path().join("cas")).unwrap();
+        let entry = store
+            .store_snapshot(w, SnapshotRole::Entry, CaptureOptions::default())
+            .unwrap();
+
+        // Candidate: the symlink is now a regular file whose contents equal the link target.
+        std::fs::remove_file(w.join("tests/link")).unwrap();
+        std::fs::write(w.join("tests/link"), "../secret-target").unwrap();
+        let v = prepare(&store, w, entry, state.path()).unwrap();
+
+        assert_eq!(v.restored, vec!["tests/link"]);
+        let leaf = std::fs::symlink_metadata(v.scratch.join("tests/link")).unwrap();
+        assert!(
+            leaf.file_type().is_symlink(),
+            "a protected entry symlink must be restored as a symlink, not a regular file"
+        );
+        assert_eq!(
+            std::fs::read_link(v.scratch.join("tests/link")).unwrap(),
+            std::path::Path::new("../secret-target")
+        );
+    }
+
+    #[test]
+    fn prepare_restores_a_protected_file_mode_even_when_bytes_match() {
+        // The candidate leaves a protected file's bytes intact but changes its mode. Equal
+        // bytes with a candidate-controlled mode is not "already correct": the entry's mode
+        // must be restored, so the overlay does not take the `continue` path here (#122).
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        std::fs::create_dir_all(w.join(".tamperward")).unwrap();
+        std::fs::create_dir_all(w.join("tests")).unwrap();
+        std::fs::write(
+            w.join(CONFIG_PATH),
+            "protected:\n  tests: [tests/run.sh]\nverify:\n  command: true\n",
+        )
+        .unwrap();
+        std::fs::write(w.join("tests/run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            w.join("tests/run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let store = SnapshotStore::open(state.path().join("cas")).unwrap();
+        let entry = store
+            .store_snapshot(w, SnapshotRole::Entry, CaptureOptions::default())
+            .unwrap();
+
+        // Candidate: same bytes, but the executable bit is dropped.
+        std::fs::set_permissions(
+            w.join("tests/run.sh"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let v = prepare(&store, w, entry, state.path()).unwrap();
+
+        assert_eq!(v.restored, vec!["tests/run.sh"]);
+        let mode = std::fs::symlink_metadata(v.scratch.join("tests/run.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "the entry's mode must be restored, not the candidate's"
+        );
+    }
+
+    #[test]
+    fn create_fresh_dir_skips_a_pre_existing_planted_directory() {
+        // A directory a previous run left at a candidate name — here with a planted symlink
+        // inside — must be skipped, not reused or followed: create_fresh_dir tries the next
+        // name and returns a genuinely new, empty directory, and the external canary the
+        // plant points at is never touched (#122).
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let canary = outside.path().join("canary");
+        std::fs::write(&canary, "DO NOT TOUCH").unwrap();
+        let root = tmp.path().join("scratchroot");
+        std::fs::create_dir_all(&root).unwrap();
+        let planted = root.join("a");
+        std::fs::create_dir(&planted).unwrap();
+        std::os::unix::fs::symlink(&canary, planted.join("link")).unwrap();
+
+        let got = create_fresh_dir(
+            &root,
+            ["a".to_owned(), "a".to_owned(), "b".to_owned()].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(got, root.join("b"));
+        assert!(
+            got.is_dir() && std::fs::read_dir(&got).unwrap().next().is_none(),
+            "the returned scratch is a fresh, empty directory"
+        );
+        assert_eq!(std::fs::read_to_string(&canary).unwrap(), "DO NOT TOUCH");
+        assert!(
+            std::fs::symlink_metadata(planted.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted directory and its symlink are left untouched, never followed"
+        );
     }
 }
