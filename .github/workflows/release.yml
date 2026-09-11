@@ -177,10 +177,14 @@ jobs:
             # commit must reproduce the published bytes exactly: identical assets are
             # a no-op (skip the upload), differing bytes are refused before anything
             # is overwritten.
+            #
+            # download-published.sh enumerates the release's real assets and pulls
+            # exactly the expected ones, failing the job on any auth/API/network/
+            # download error. Inability to READ the existing release must never look
+            # like "no assets exist" and authorize a clobber -- so its non-zero exit
+            # fails this step here, before check-assets could ever say "upload".
             mkdir -p published
-            gh release download "$TAG" --dir published \
-              --pattern '*.tar.gz' --pattern '*.tar.gz.sha256' \
-              --clobber 2>/dev/null || true
+            bash scripts/release/download-published.sh "$TAG" dist published
             rc=0
             bash scripts/release/check-assets.sh dist published || rc=$?
             case "$rc" in
@@ -204,4 +208,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DISK_ARCH: ${{ steps.built.outputs.disk_arch }}
-        run: gh workflow run disk.yml --ref "$GITHUB_REF_NAME" -f type=both -f source=release -f "release=$TAG" -f "arch=$DISK_ARCH" -f user=wardos -f luks=false
+        run: |
+          set -euo pipefail
+          # No `-f user=...` here on purpose: per ADR-0027 (#119) a production
+          # release disk ships UNPROVISIONED. The disk workflow's blank `user`
+          # default leaves no account, and the real user is created at first
+          # boot -- requesting the `wardos` dev-seed account would ship a
+          # pre-provisioned login on every published disk. guard-release-dispatch
+          # fails the job if a non-blank user field ever slips back in.
+          args=(disk.yml --ref "$GITHUB_REF_NAME"
+                -f type=both -f source=release -f "release=$TAG"
+                -f "arch=$DISK_ARCH" -f luks=false)
+          bash scripts/release/guard-release-dispatch.sh "${args[@]}"
+          gh workflow run "${args[@]}"
