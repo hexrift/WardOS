@@ -13,6 +13,7 @@
 //! elsewhere; this crate only generates the declarative surface and drives the
 //! runtime.
 
+pub mod ci;
 pub mod error;
 pub mod runtime;
 pub mod seccomp;

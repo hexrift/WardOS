@@ -10,8 +10,19 @@ new toolkit (E-10 stays deferred) and does not touch the image boot path or the 
 
 `wardos-first-run` calls `wardos-calibrate` **before** `wardos-welcome`: the machine is made
 usable (right language, keys, clock) first, then the agent walkthrough runs. CALIBRATE has
-its own marker (`~/.config/wardos/calibrate-done`), so it runs once and `wardos-welcome` is
-unaffected by whether it ran.
+its own marker (`~/.config/wardos/calibrate-done`), and `wardos-welcome` is unaffected by
+whether it ran.
+
+**Resume until complete (not merely "once").** `wardos-first-run` separates the one-time
+default copy (guarded by `first-run-done`, never repeated, so a later login can't re-run
+`wardos-refresh` and overwrite the user's config backups) from the resumable stages
+(CALIBRATE, then the walkthrough), which it invokes on **every** login. CALIBRATE writes its
+marker only when the flow reaches a confirmed terminal state whose applies succeeded, or when
+the user deliberately chooses **Skip the rest** (do-not-ask-again). A **cancelled** review or
+a **failed** apply (e.g. `localectl`/`timedatectl` refuses a value) leaves the marker unset,
+so the next login offers CALIBRATE again — an unconfigured machine is never silently recorded
+as complete. Best-effort still means every selected setting is attempted; the result is only
+aggregated to decide whether to record completion.
 
 ### What CALIBRATE does, and how it applies
 - **Language / locale** — from `localectl list-locales` (UTF-8 only), applied with

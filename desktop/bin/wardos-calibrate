@@ -152,11 +152,17 @@ guided() {
       "Skip the rest") || return 1 # cancelled: not completed, no marker
     case "$choice" in
       "Apply and continue")
-        # Best-effort applies: a failure notifies and never stops the others.
-        apply_locale "$loc" || true
-        apply_keyboard "$kbd" || true
-        apply_timezone "$tz" || true
-        return 0
+        # Best-effort but result-aggregating: attempt every selected setting (a failure
+        # notifies and never stops the others), then report whether ALL requested applies
+        # succeeded. A non-zero return here means the caller does NOT write the completion
+        # marker, so a machine left with an unapplied keyboard/locale/timezone is re-offered
+        # CALIBRATE next login rather than silently recorded as done (#125). "keep current"
+        # applies nothing and counts as success.
+        local ok=0
+        apply_locale "$loc" || ok=1
+        apply_keyboard "$kbd" || ok=1
+        apply_timezone "$tz" || ok=1
+        return "$ok"
         ;;
       "Language ·"*) loc=$(calibrate_pick_locale) || true ;;
       "Keyboard ·"*) kbd=$(calibrate_pick_keyboard) || true ;;

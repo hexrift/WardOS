@@ -17,8 +17,11 @@ boot → welcome → ward vault set → ward init → ward claude → ward verif
 doctor`, registers the web and terminal apps, shows the keys, runs **CALIBRATE**
 (`wardos-calibrate` — language, keyboard layout and timezone, and optionally a login
 password; [ADR-0026](decisions/ADR-0026-first-run-calibrate.md)), then opens the welcome.
-Claude Code (`claude`), Codex (`codex`), TamperWard (`tamperward`) and `ward` are in the
-image at pinned versions; nothing is downloaded at first boot.
+The default-config copy happens once; CALIBRATE and the welcome are **resumable** — if you
+cancel or an apply fails, they are offered again next login (without re-copying your config)
+until each is finished, so a half-set-up machine is never left recorded as done. Claude Code
+(`claude`), Codex (`codex`), TamperWard (`tamperward`) and `ward` are in the image at pinned
+versions; nothing is downloaded at first boot.
 
 **A Linux you already have.** One line installs `ward`, `wardd` and `ward-agent` and
 runs `ward doctor` ([`install.md`](install.md) §1); the desktop is optional (§6). The

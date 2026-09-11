@@ -517,8 +517,7 @@ mod tests {
 
     #[test]
     fn budget_kills_an_overrunning_launch() {
-        if !available() {
-            eprintln!("skipping: bubblewrap not available");
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
             return;
         }
         let out = Launch::new("/tmp", vec!["sh".into(), "-c".into(), "sleep 5".into()])

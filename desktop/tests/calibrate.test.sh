@@ -139,4 +139,39 @@ assert_not_logged 'set-x11-keymap'
 if wardos-calibrate keyboard-local nope 2>/dev/null; then fail "invalid keyboard-local must exit non-zero"; fi
 grep -Eq '^[[:space:]]*kb_layout[[:space:]]*=[[:space:]]*gb$' "$input_conf" || fail "invalid keyboard-local must not change input.conf"
 
+# --- a FAILED apply is NOT recorded as complete, and is retried next login (#125) -------
+# Distinct from a cancelled review (no marker) and a deliberate "Skip the rest" (marker):
+# every selected setting is still attempted, but if any requested apply fails the marker is
+# withheld, so the machine is not left stranded with an unapplied setting and CALIBRATE is
+# offered again next login until it succeeds.
+rm -f "$marker"
+# shellcheck disable=SC2016
+mock timedatectl 'case "${1:-}" in
+  list-timezones) printf "%s\n" Europe/Paris Europe/London America/New_York UTC ;;
+  show) printf "UTC\n" ;;
+  set-timezone) exit 1 ;;
+esac'
+: >"$MOCK_LOG"
+reset_menu "de_DE.UTF-8" "de" "Europe" "Paris" "Apply and continue"
+wardos-calibrate
+assert_logged '^localectl set-locale LANG=de_DE.UTF-8$' # the others are still attempted
+[[ ! -e "$marker" ]] || fail "a failed apply must not record completion"
+# Next login: the marker is still absent, so CALIBRATE runs again (retry).
+: >"$MOCK_LOG"
+reset_menu "de_DE.UTF-8" "de" "Europe" "Paris" "Apply and continue"
+wardos-calibrate
+[[ ! -e "$marker" ]] || fail "an unresolved failed apply is retried, not recorded"
+assert_logged '^localectl set-locale LANG=de_DE.UTF-8$'
+# The apply now succeeds: completion is recorded and the flow stops re-offering.
+# shellcheck disable=SC2016
+mock timedatectl 'case "${1:-}" in
+  list-timezones) printf "%s\n" Europe/Paris Europe/London America/New_York UTC ;;
+  show) printf "UTC\n" ;;
+esac'
+: >"$MOCK_LOG"
+reset_menu "de_DE.UTF-8" "de" "Europe" "Paris" "Apply and continue"
+wardos-calibrate
+assert_logged '^timedatectl set-timezone Europe/Paris$'
+assert_file "$marker"
+
 echo "ok   calibrate.test.sh internal assertions"
