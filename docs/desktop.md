@@ -69,6 +69,15 @@ One family, one help convention (`wardos-<name> --help` prints the usage block a
 of the script). Menu-facing commands take their choices from arguments too, so every
 menu path is scriptable and testable.
 
+**`ward` is the command surface (ADR-0025).** In the terminal you type one verb, `ward`:
+the secure session core (`ward init`, `ward up`, `ward verify`, `ward doctor`, `ward
+claude`, …) and the desktop verbs below, which `ward` reaches by running `wardos-<verb>`.
+So `ward theme set ward-dark` runs `wardos-theme set ward-dark`, `ward setup wifi` runs
+`wardos-setup wifi`, and `ward <verb> --help` shows that command's own help. Any verb that
+is neither a built-in nor an installed `wardos-<verb>` is an error naming what is missing.
+The `wardos-*` names keep working unchanged (autostart, menus and `.desktop` entries still
+use them); `ward` is the front door for people.
+
 | Command | Does |
 | --- | --- |
 | `wardos-menu [path…]` | The menu tree (below), fuzzel-rendered; `wardos-menu style theme` jumps in |
