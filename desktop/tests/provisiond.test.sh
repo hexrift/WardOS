@@ -217,12 +217,14 @@ assert_not_logged '^useradd'
 [[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "no marker after a failed directory flush"
 
 # Marker directory-flush failure AFTER the marker was renamed into place (#119 review): the
-# marker file DID land on disk (temp write + temp fsync + rename all succeeded) and only the
-# trailing fsync of the marker's directory failed. The machine is provisioned and consistent,
-# so the freshly created account must NOT be rolled back — the invariant is that a failed
-# durability sync never leaves the marker present with the account removed. Put the marker in
-# its own directory (MK_DIR) so only that directory's fsync can be failed, leaving the
-# journal's directory flush intact.
+# marker file DID land on disk (temp write + temp fsync + rename all succeeded) but the fsync
+# of its directory — the barrier that proves the rename survives a power cut — fails, AND the
+# single retry of that flush fails too. The rename is NOT proven durable, so the broker must
+# NOT acknowledge OK: it treats the transaction as INDETERMINATE, keeps the journal (naming
+# this account) for reconcile, and replies recovery-required. The freshly created account is
+# NOT rolled back — the invariant that a failed durability sync never leaves the marker
+# present with the account removed still holds. Put the marker in its own directory (MK_DIR)
+# so only that directory's fsync can be failed, leaving the journal's directory flush intact.
 export MK_DIR="$TMP/mk"
 export WARDOS_PROVISIONED_MARKER="$MK_DIR/provisioned"
 rm -rf "$MK_DIR"
@@ -232,16 +234,56 @@ mock useradd
 mock chpasswd
 mock userdel
 mock id 'exit 1'
-# Fail ONLY the fsync of the marker directory; every temp-file fsync, the journal directory
-# fsync, and the keyboard-state fsync still succeed. So the marker temp is written, fsynced
-# and renamed, and only fsync_path "$MK_DIR" (the trailing directory flush) fails.
+# Fail EVERY fsync of the marker directory (the initial commit flush AND the single retry);
+# every temp-file fsync, the journal directory fsync, and the keyboard-state fsync still
+# succeed. So the marker temp is written, fsynced and renamed, and only fsync_path "$MK_DIR"
+# (the trailing directory flush and its retry) fails.
 # shellcheck disable=SC2016
 mock sync 'case "$1" in "$MK_DIR") exit 1 ;; esac; exit 0'
 out=$(printf 'ACCOUNT\nheidi\nHeidi\npw\n' | wardos-provisiond)
-assert_file "$WARDOS_PROVISIONED_MARKER"                 # the marker landed: committed
-assert_not_logged '^userdel'                             # never roll a committed account back
-[[ "$out" == OK ]] || fail "a trailing marker dir-fsync failure with the marker present must reply OK; got: $out"
-mock sync 'exit 0' # restore a succeeding flush for later use
+[[ "$out" == ERR*unresolved* ]] ||
+  fail "an unconfirmable marker durability barrier must report recovery-required, not OK; got: $out"
+assert_not_logged '^userdel'                             # never roll the account back
+assert_file "$WARDOS_PROVISIONED_MARKER"                 # the marker is present (renamed into place)
+[[ -e "$WARDOS_PROVISION_JOURNAL" ]] ||
+  fail "an indeterminate transaction must keep its journal for reconcile"
+
+# Power loss after the indeterminate state (#119 review): the not-yet-durable marker is
+# dropped by the crash while the journalled orphan account survives. On the next boot the
+# machine is unprovisioned; reconcile_pending MUST remove that orphan before creating any new
+# account, so a user picking a DIFFERENT name cannot end up as a second administrator. Use the
+# stateful ACCT_DIR mocks so the removal is observable.
+mk_acct_dir="$TMP/mk-accounts"
+rm -rf "$mk_acct_dir"
+mkdir -p "$mk_acct_dir"
+export ACCT_DIR="$mk_acct_dir"
+# shellcheck disable=SC2016
+mock useradd 'u="${@: -1}"; : >"$ACCT_DIR/$u"'
+# shellcheck disable=SC2016
+mock id 'for a in "$@"; do case "$a" in -*) ;; *) if [[ -e "$ACCT_DIR/$a" ]]; then echo 1000; exit 0; else exit 1; fi ;; esac; done; exit 1'
+# shellcheck disable=SC2016
+mock userdel 'u="${@: -1}"; rm -f "$ACCT_DIR/$u"; exit 0'
+mock chpasswd
+: >"$ACCT_DIR/heidi"                          # the orphan account the indeterminate txn created
+printf 'heidi\n' >"$WARDOS_PROVISION_JOURNAL" # its journal still names it
+rm -f "$WARDOS_PROVISIONED_MARKER"            # the crash dropped the not-yet-durable marker
+rm -f "$WARDOS_PROVISION_LOCK"
+mock sync 'exit 0'                            # storage recovered: flushes succeed again
+out=$(printf 'ACCOUNT\nolga\nOlga\npw\n' | wardos-provisiond)
+[[ "$out" == OK ]] || fail "recovery after an indeterminate crash must create the admin once; got: $out"
+[[ ! -e "$mk_acct_dir/heidi" ]] || fail "the orphan from the indeterminate transaction must be reconciled away"
+[[ -e "$mk_acct_dir/olga" ]] || fail "the new admin is created after reconciliation"
+[[ "$(find "$mk_acct_dir" -maxdepth 1 -type f | wc -l)" -eq 1 ]] ||
+  fail "a power loss after the indeterminate state must not yield two administrators: $(ls "$mk_acct_dir")"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+[[ ! -e "$WARDOS_PROVISION_JOURNAL" ]] || fail "the journal is cleared after a committed recovery"
+
+# Restore simple mocks and a succeeding flush for the tests that follow.
+mock useradd
+mock chpasswd
+mock userdel
+mock id 'exit 1'
+mock sync 'exit 0'
 
 # KEYMAP persistence failure (#127 review item 2): if the chosen layout cannot be recorded
 # durably for the new user's Hyprland session, the broker must report an error, not OK — the

@@ -186,15 +186,27 @@ do_account() {
   if ! printf '%s:%s\n' "$user" "$password" | chpasswd 2>/dev/null; then
     rollback_account "$user" "could not set password"
   fi
-  # commit_marker may fail at the trailing directory fsync AFTER the marker was renamed into
-  # place. Roll the account back ONLY when the marker did NOT land — otherwise the marker and
-  # the account are both present and consistent (the machine IS provisioned) and rolling the
-  # account back would leave a provisioned marker with no human account. A failed durability
-  # sync on an already-committed marker is surfaced to the journal/stderr, not by destroying a
-  # committed account: marker-present means committed, and rollback_account/deny still handle
-  # the true failure (marker genuinely absent) path with userdel + ERR.
-  if ! commit_marker && [[ ! -e "$marker" ]]; then
-    rollback_account "$user" "could not mark provisioned"
+  # commit_marker may fail either before the marker landed or at the trailing directory fsync
+  # AFTER the marker was renamed into place. These are NOT the same outcome:
+  if ! commit_marker; then
+    if [[ ! -e "$marker" ]]; then
+      # The marker never landed (e.g. its parent directory could not be created): a true
+      # failure. Roll the freshly created account back — nothing is committed.
+      rollback_account "$user" "could not mark provisioned"
+    fi
+    # The marker was renamed into place but the fsync of its directory failed, so the rename
+    # is NOT proven durable: a power loss here could drop the marker while keeping the account,
+    # leaving the next boot unprovisioned with an orphan account the no-adoption rule refuses —
+    # inviting a SECOND administrator under a different name. Acknowledging OK when the
+    # durability barrier explicitly failed would be wrong. Retry the directory flush once; if
+    # it still fails the transaction is INDETERMINATE. Leave the journal in place (it names
+    # this account) and report recovery-required: if a power loss then drops the not-yet-durable
+    # marker, the next request's reconcile_pending removes this orphan BEFORE creating any new
+    # account, so the crash path can never yield two administrators.
+    if ! fsync_path "$(dirname "$marker")"; then
+      deny "provisioning unresolved: the marker was written but its durability could not be confirmed; recovery required"
+    fi
+    # The retry flush succeeded: the marker is now durable — fall through to the success tail.
   fi
   # Committed: the marker is the durable commit point. Clear the now-resolved journal
   # (best-effort — a lingering journal past the marker is inert, since a provisioned machine
