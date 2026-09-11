@@ -580,8 +580,7 @@ mod tests {
 
     #[test]
     fn budget_fails_a_verifier_that_outruns_it() {
-        if !crate::sandbox::available() {
-            eprintln!("skipping: bubblewrap not available");
+        if !ward_sandbox::ci::isolation_ready(crate::sandbox::available(), "bubblewrap") {
             return;
         }
         let state = tempfile::tempdir().unwrap();
