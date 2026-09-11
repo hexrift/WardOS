@@ -15,10 +15,10 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use ward_events::{ClaimKind, PayloadText, WardEvent};
@@ -32,6 +32,25 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// How much longer than its own timeout a hold waits for the daemon's answer
 /// before treating the daemon as gone.
 const HOLD_GRACE: Duration = Duration::from_secs(5);
+
+/// Largest hook request we will buffer before rejecting it (#123). A request is one JSON
+/// line of `{hook, tool, summary}`, so this is deliberately far tighter than the control
+/// socket's 1 MiB cap (`daemon::MAX_REQUEST_BYTES`): the agent-facing socket needs no
+/// megabyte request, and a smaller ceiling bounds the buffer a hostile client can force.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// Whole-request deadline, enforced in addition to the per-read idle [`READ_TIMEOUT`]: a
+/// client that dribbles bytes just often enough never to trip the idle timeout is still
+/// cut off here, so a request cannot be stretched without bound (#123).
+const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
+/// Most connections served concurrently. Past this the accept loop refuses the next
+/// connection at once with the overload response ([`overload_reject`]) instead of spawning
+/// another handler, so a flood of connections cannot create unbounded host threads and the
+/// accept loop is never itself blocked serving one (#123).
+const MAX_HANDLERS: usize = 64;
+/// Most undrained claims held in memory. Past this a claim is dropped and counted rather
+/// than grown without bound; the drop is surfaced on the next drain, never silently folded
+/// into the evidence as if it were complete (#123).
+const MAX_PENDING_CLAIMS: usize = 4096;
 
 /// Where an `ask` goes to wait for the user.
 pub trait Holder: Send + Sync {
@@ -251,6 +270,8 @@ pub fn to_event(claim: &Claim) -> WardEvent {
 pub struct Hooks {
     socket: PathBuf,
     claims: Arc<Mutex<Vec<Claim>>>,
+    /// Claims dropped because the pending buffer was full (#123); surfaced on drain.
+    dropped: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -272,35 +293,89 @@ impl Hooks {
         protected: Vec<String>,
         holder: Option<Arc<dyn Holder>>,
     ) -> Result<Self> {
+        Self::start_inner(
+            dir,
+            observer,
+            protected,
+            holder,
+            MAX_HANDLERS,
+            MAX_PENDING_CLAIMS,
+            REQUEST_DEADLINE,
+        )
+    }
+
+    /// [`Hooks::start_with`] with the concurrency cap, pending-claim cap and whole-request
+    /// deadline given explicitly (production uses [`MAX_HANDLERS`]/[`MAX_PENDING_CLAIMS`]/
+    /// [`REQUEST_DEADLINE`]); the parameters let the overload and slow-drip regressions drive
+    /// the bounds at a small, deterministic scale.
+    fn start_inner(
+        dir: &Path,
+        observer: ObserverMode,
+        protected: Vec<String>,
+        holder: Option<Arc<dyn Holder>>,
+        max_handlers: usize,
+        max_claims: usize,
+        deadline: Duration,
+    ) -> Result<Self> {
         let socket = dir.join("hooks.sock");
         let listener = UnixListener::bind(&socket)
             .map_err(|e| Error::Sandbox(format!("hook socket {}: {e}", socket.display())))?;
         let claims = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (claims, shutdown) = (claims.clone(), shutdown.clone());
+            let (claims, dropped, shutdown) = (claims.clone(), dropped.clone(), shutdown.clone());
             std::thread::spawn(move || {
                 let protected = Arc::new(protected);
-                let mut held: Vec<JoinHandle<()>> = Vec::new();
+                // Handler threads in flight. The accept loop never serves a connection
+                // itself: it spawns a handler up to `max_handlers`, and once that many are
+                // live it sends a fast overload reply and closes the connection instead
+                // (#123). So the loop is never occupied by a held approval — ordinary
+                // requests keep being accepted and answered promptly — the concurrent
+                // service count is exactly `max_handlers` (not +1 for the accept thread),
+                // and shutdown never joins a handler blocked on a hold.
+                let live = Arc::new(AtomicUsize::new(0));
                 for stream in listener.incoming().flatten() {
                     if shutdown.load(Ordering::SeqCst) {
                         break;
                     }
-                    held.retain(|h| !h.is_finished());
-                    let (protected, claims, holder) =
-                        (Arc::clone(&protected), Arc::clone(&claims), holder.clone());
-                    held.push(std::thread::spawn(move || {
-                        serve(stream, observer, &protected, &claims, holder.as_deref());
-                    }));
-                }
-                for h in held {
-                    let _ = h.join();
+                    if live.load(Ordering::SeqCst) >= max_handlers {
+                        // Defined overload response: refuse and close at once (never block
+                        // the accept loop), counted so the drop is surfaced on the next
+                        // drain rather than silently lost.
+                        overload_reject(stream, &dropped);
+                        continue;
+                    }
+                    live.fetch_add(1, Ordering::SeqCst);
+                    let (protected, claims, dropped, holder, live) = (
+                        Arc::clone(&protected),
+                        Arc::clone(&claims),
+                        Arc::clone(&dropped),
+                        holder.clone(),
+                        Arc::clone(&live),
+                    );
+                    std::thread::spawn(move || {
+                        serve(
+                            stream,
+                            &Serve {
+                                observer,
+                                protected: &protected,
+                                claims: &claims,
+                                dropped: &dropped,
+                                max_claims,
+                                deadline,
+                                holder: holder.as_deref(),
+                            },
+                        );
+                        live.fetch_sub(1, Ordering::SeqCst);
+                    });
                 }
             })
         };
         Ok(Self {
             socket,
             claims,
+            dropped,
             shutdown,
             thread: Some(thread),
         })
@@ -312,18 +387,39 @@ impl Hooks {
     }
 
     /// Claims recorded since the last drain, as log events with their arrival
-    /// time, in arrival order.
+    /// time, in arrival order. If any requests were dropped under overload — the
+    /// pending-claim buffer full, or a connection refused at the handler cap — a
+    /// final note records how many, so the drained evidence is never presented as
+    /// complete when it is not (#123).
     pub fn drain_events(&self) -> Vec<(SystemTime, WardEvent)> {
-        self.claims
+        let mut events: Vec<(SystemTime, WardEvent)> = self
+            .claims
             .lock()
             .map(|mut v| std::mem::take(&mut *v))
             .unwrap_or_default()
             .iter()
             .map(|c| (c.at, to_event(c)))
-            .collect()
+            .collect();
+        let dropped = self.dropped.swap(0, Ordering::SeqCst);
+        if dropped > 0 {
+            events.push((
+                SystemTime::now(),
+                WardEvent::AgentClaim {
+                    kind: ClaimKind::Note,
+                    payload: PayloadText::new(&format!(
+                        "{dropped} hook request(s) dropped under overload (handler cap reached \
+                         or the pending-claim buffer full); this evidence is incomplete"
+                    )),
+                },
+            ));
+        }
+        events
     }
 
-    /// Stop the listener and remove the socket.
+    /// Stop the listener and remove the socket. Non-blocking: it flags shutdown, unblocks
+    /// and joins only the accept thread — which never serves a request itself — so a handler
+    /// blocked on a held approval cannot delay shutdown (#123). In-flight handlers finish on
+    /// their own; each is bounded by its hold timeout.
     pub fn stop(mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         // Unblock the accept loop; it sees the flag and exits.
@@ -335,38 +431,124 @@ impl Hooks {
     }
 }
 
+/// The shared context a connection is served against: the observer mode, the protected
+/// set, the claim buffer and its cap, the overflow counter, the whole-request deadline and
+/// the optional holder. Bundled so [`serve`] takes one context rather than a long argument
+/// list, and cloned cheaply (borrows) per handler.
+struct Serve<'a> {
+    observer: ObserverMode,
+    protected: &'a [String],
+    claims: &'a Mutex<Vec<Claim>>,
+    dropped: &'a AtomicUsize,
+    max_claims: usize,
+    deadline: Duration,
+    holder: Option<&'a dyn Holder>,
+}
+
 /// Handle one connection: read a line, decide, hold an `ask` when there is a
 /// holder, record, reply. Malformed input closes the connection silently.
-fn serve(
-    mut stream: UnixStream,
-    observer: ObserverMode,
-    protected: &[String],
-    claims: &Mutex<Vec<Claim>>,
-    holder: Option<&dyn Holder>,
-) {
-    drop(stream.set_read_timeout(Some(READ_TIMEOUT)));
-    let mut line = String::new();
-    let Ok(Some(req)) = BufReader::new(&stream)
-        .read_line(&mut line)
-        .map(|_| serde_json::from_str::<HookRequest>(&line).ok())
-    else {
+fn serve(mut stream: UnixStream, cx: &Serve) {
+    let Some(req) = read_request(&stream, cx.deadline) else {
         return;
     };
-    let mut response = decide(&observer, protected, &req);
-    if let (HookDecision::Ask, Some(holder)) = (response.decision, holder) {
+    let mut response = decide(&cx.observer, cx.protected, &req);
+    if let (HookDecision::Ask, Some(holder)) = (response.decision, cx.holder) {
         let tool = req.tool.as_deref().unwrap_or_default();
         let summary = req.summary.as_deref().unwrap_or_default();
         if let Some(held) = holder.hold(tool, summary, &response.reason) {
             response = held;
         }
     }
-    if let Ok(mut v) = claims.lock() {
-        v.push(Claim {
-            at: SystemTime::now(),
-            request: req,
-            decision: response.decision,
-        });
+    if let Ok(mut v) = cx.claims.lock() {
+        // Bound the pending buffer: past the cap the claim is dropped and counted (surfaced
+        // on the next drain), so a flood of hook requests cannot grow memory without bound
+        // and the drop is never silently presented as complete evidence (#123).
+        if v.len() < cx.max_claims {
+            v.push(Claim {
+                at: SystemTime::now(),
+                request: req,
+                decision: response.decision,
+            });
+        } else {
+            cx.dropped.fetch_add(1, Ordering::SeqCst);
+        }
     }
+    if let Ok(mut json) = serde_json::to_vec(&response) {
+        json.push(b'\n');
+        drop(stream.write_all(&json));
+    }
+}
+
+/// Read one newline-terminated JSON request, bounded in both size and time. Returns
+/// `None` — closing the connection silently — on a malformed, oversized, idle-timed-out,
+/// slow-dripped or truncated request (#123). The size cap ([`MAX_REQUEST_BYTES`]) stops an
+/// unbounded line from growing the buffer; the whole-request `deadline` is enforced
+/// *strictly* — each blocking read waits at most the time left (capped at [`READ_TIMEOUT`]
+/// for liveness), and the deadline is checked before every block — so a client that keeps
+/// the connection just active enough to dodge the idle timeout cannot stretch the request
+/// past `deadline`.
+fn read_request(stream: &UnixStream, deadline: Duration) -> Option<HookRequest> {
+    let end = Instant::now() + deadline;
+    let mut reader = BufReader::new(stream);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        // Never block past the whole-request deadline: bound this read to the smaller of the
+        // time left and the idle timeout, and give up if the deadline has already arrived.
+        let remaining = end.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        if stream
+            .set_read_timeout(Some(remaining.min(READ_TIMEOUT)))
+            .is_err()
+        {
+            return None;
+        }
+        let (found, consumed, over) = {
+            let available = match reader.fill_buf() {
+                Ok(chunk) if !chunk.is_empty() => chunk,
+                // EOF before a newline, a timeout, or a read error: give up.
+                _ => return None,
+            };
+            // The size cap counts the request bytes before the newline, and it is checked
+            // even when the newline arrives in the same chunk — otherwise a single oversized
+            // read carrying its own newline would slip past it.
+            if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                let over = buf.len() + pos > MAX_REQUEST_BYTES;
+                if !over {
+                    buf.extend_from_slice(&available[..pos]);
+                }
+                (true, pos + 1, over)
+            } else {
+                let take = available.len();
+                let over = buf.len() + take > MAX_REQUEST_BYTES;
+                if !over {
+                    buf.extend_from_slice(available);
+                }
+                (false, take, over)
+            }
+        };
+        reader.consume(consumed);
+        if over {
+            return None; // oversized: request exceeds the byte cap
+        }
+        if found {
+            break;
+        }
+    }
+    serde_json::from_slice::<HookRequest>(&buf).ok()
+}
+
+/// The defined overload response (#123): the accept loop is at its handler cap, so refuse
+/// this connection at once with a `Deny` and close — never blocking the loop or spawning
+/// past the cap. Counted as a dropped request so [`Hooks::drain_events`] surfaces it.
+fn overload_reject(mut stream: UnixStream, dropped: &AtomicUsize) {
+    dropped.fetch_add(1, Ordering::SeqCst);
+    drop(stream.set_write_timeout(Some(READ_TIMEOUT)));
+    let response = HookResponse {
+        decision: HookDecision::Deny,
+        reason: "hook broker overloaded".to_owned(),
+    };
     if let Ok(mut json) = serde_json::to_vec(&response) {
         json.push(b'\n');
         drop(stream.write_all(&json));
@@ -985,5 +1167,224 @@ mod tests {
         let resp = holder.hold("Write", "/work/a.rs", "r").unwrap();
         assert_eq!(resp.decision, HookDecision::Deny);
         assert_eq!(resp.reason, "approval: session ended");
+    }
+
+    #[test]
+    fn a_request_at_the_size_cap_is_answered_and_over_it_is_refused() {
+        // #123: the request buffer is bounded. A request whose bytes-before-newline equal
+        // the cap is still answered; one byte over is refused with no reply, and the
+        // refusal does not wedge the listener.
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = Hooks::start(dir.path(), step(false, false), protected()).unwrap();
+        let socket = hooks.socket().to_path_buf();
+        let base = r#"{"hook":"Stop"}"#;
+        let pad = MAX_REQUEST_BYTES - base.len();
+
+        let at_cap = format!("{base}{}\n", " ".repeat(pad));
+        assert_eq!(at_cap.len() - 1, MAX_REQUEST_BYTES);
+        let resp: HookResponse = serde_json::from_str(&roundtrip(&socket, &at_cap)).unwrap();
+        assert_eq!(resp.decision, HookDecision::Allow);
+
+        let over = format!("{base}{}\n", " ".repeat(pad + 1));
+        assert_eq!(over.len() - 1, MAX_REQUEST_BYTES + 1);
+        assert_eq!(
+            roundtrip(&socket, &over),
+            "",
+            "an oversized request is refused"
+        );
+
+        // The listener still answers a normal request after refusing the oversized one.
+        let resp: HookResponse =
+            serde_json::from_str(&roundtrip(&socket, "{\"hook\":\"Stop\"}\n")).unwrap();
+        assert_eq!(resp.decision, HookDecision::Allow);
+        // Only the two answered requests were recorded; the oversized one left no claim.
+        assert_eq!(hooks.drain_events().len(), 2);
+        hooks.stop();
+    }
+
+    #[test]
+    fn a_truncated_request_without_a_newline_is_refused() {
+        // #123: partial input that closes before a newline yields no decision and no claim.
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = Hooks::start(dir.path(), step(false, false), protected()).unwrap();
+        let mut stream = UnixStream::connect(hooks.socket()).unwrap();
+        stream.write_all(br#"{"hook":"Sto"#).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        BufReader::new(&stream).read_line(&mut reply).unwrap();
+        assert_eq!(reply, "", "a truncated request gets no decision");
+        assert!(hooks.drain_events().is_empty());
+        hooks.stop();
+    }
+
+    #[test]
+    fn a_claim_flood_is_bounded_and_the_overflow_is_surfaced() {
+        // #123: past the pending-claim cap, claims are dropped and counted, and the drop is
+        // surfaced on drain as a final note — never silently folded into the evidence.
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = Hooks::start_inner(
+            dir.path(),
+            step(false, false),
+            protected(),
+            None,
+            MAX_HANDLERS,
+            3,
+            REQUEST_DEADLINE,
+        )
+        .unwrap();
+        let socket = hooks.socket().to_path_buf();
+        for _ in 0..5 {
+            let resp: HookResponse =
+                serde_json::from_str(&roundtrip(&socket, "{\"hook\":\"Stop\"}\n")).unwrap();
+            assert_eq!(resp.decision, HookDecision::Allow);
+        }
+        let events = hooks.drain_events();
+        assert_eq!(events.len(), 4, "three kept claims plus one overflow note");
+        for e in &events[..3] {
+            assert_claim(&e.1, ClaimKind::Note, "Stop");
+        }
+        match &events[3].1 {
+            WardEvent::AgentClaim { kind, payload } => {
+                assert_eq!(*kind, ClaimKind::Note);
+                assert!(
+                    payload.content().contains("dropped"),
+                    "{}",
+                    payload.content()
+                );
+                assert!(payload.content().starts_with('2'), "{}", payload.content());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        hooks.stop();
+    }
+
+    fn held_hooks_capped(dir: &Path, max_handlers: usize) -> (Hooks, Arc<Approvals>) {
+        let approvals = Arc::new(Approvals::new());
+        let holder = LocalHolder {
+            approvals: Arc::clone(&approvals),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+            timeout: Duration::from_secs(10),
+        };
+        let hooks = Hooks::start_inner(
+            dir,
+            step(true, true),
+            protected(),
+            Some(Arc::new(holder)),
+            max_handlers,
+            MAX_PENDING_CLAIMS,
+            REQUEST_DEADLINE,
+        )
+        .unwrap();
+        (hooks, approvals)
+    }
+
+    #[test]
+    fn at_the_handler_cap_excess_connections_get_a_fast_overload_deny() {
+        // #123: with all handler slots held by pending approvals, the accept loop is NOT
+        // occupied — an excess connection gets a prompt, defined overload Deny (never a
+        // hang), the held asks are unaffected, and the rejection is surfaced on drain.
+        let dir = tempfile::tempdir().unwrap();
+        let (hooks, approvals) = held_hooks_capped(dir.path(), 2);
+        let held: Vec<_> = (0..2)
+            .map(|_| ask_in_background(hooks.socket(), WRITE))
+            .collect();
+        assert!(
+            crate::daemon::wait_until(Duration::from_secs(2), || approvals.pending().len() == 2),
+            "both handler slots are held by pending approvals"
+        );
+
+        // An excess connection is refused at once with the overload Deny, not held: the
+        // accept loop stays responsive while the two handlers are saturated.
+        let started = std::time::Instant::now();
+        let reply = roundtrip(hooks.socket(), WRITE);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the overload reply is prompt, not blocked on a held approval"
+        );
+        let resp: HookResponse = serde_json::from_str(&reply).unwrap();
+        assert_eq!(resp.decision, HookDecision::Deny);
+        assert_eq!(resp.reason, "hook broker overloaded");
+
+        // The two genuinely held asks are still answerable.
+        for p in approvals.pending() {
+            let _ = approvals.answer(p.id, ApprovalDecision::Allow);
+        }
+        for a in held {
+            let resp: HookResponse = serde_json::from_str(&a.join().unwrap()).unwrap();
+            assert_eq!(resp.decision, HookDecision::Allow);
+        }
+        // The refused connection is surfaced, not silently lost.
+        let events = hooks.drain_events();
+        assert!(
+            events.iter().any(|(_, e)| matches!(
+                e,
+                WardEvent::AgentClaim { payload, .. } if payload.content().contains("dropped")
+            )),
+            "the overload rejection is surfaced on drain: {events:?}"
+        );
+        hooks.stop();
+    }
+
+    #[test]
+    fn a_slow_drip_request_is_cut_off_at_the_deadline() {
+        // #123: a client that holds the connection open without ever sending a newline is
+        // cut off at the whole-request deadline (here 300 ms), strictly — well before the
+        // 5 s idle timeout could elapse.
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = Hooks::start_inner(
+            dir.path(),
+            step(false, false),
+            protected(),
+            None,
+            MAX_HANDLERS,
+            MAX_PENDING_CLAIMS,
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let stream = UnixStream::connect(hooks.socket()).unwrap();
+        (&stream).write_all(br#"{"hook":"Sto"#).unwrap(); // a partial line, never terminated
+        let started = std::time::Instant::now();
+        let mut reply = String::new();
+        let _ = BufReader::new(&stream).read_line(&mut reply);
+        let elapsed = started.elapsed();
+        assert_eq!(reply, "", "a slow-drip request gets no decision");
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "not cut off before the deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < READ_TIMEOUT,
+            "cut off at the deadline, well before the idle timeout: {elapsed:?}"
+        );
+        hooks.stop();
+    }
+
+    #[test]
+    fn stop_is_prompt_while_handlers_are_saturated() {
+        // #123: shutdown must not wait for in-flight handlers blocked on held approvals; the
+        // accept thread never serves, so joining it is immediate.
+        let dir = tempfile::tempdir().unwrap();
+        let (hooks, approvals) = held_hooks_capped(dir.path(), 2);
+        let held: Vec<_> = (0..2)
+            .map(|_| ask_in_background(hooks.socket(), WRITE))
+            .collect();
+        assert!(
+            crate::daemon::wait_until(Duration::from_secs(2), || approvals.pending().len() == 2),
+            "both handler slots are held"
+        );
+        let started = std::time::Instant::now();
+        hooks.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "stop did not wait for the 10 s holds: {:?}",
+            started.elapsed()
+        );
+        // Release the holds so the lingering handlers exit and the asks complete.
+        for p in approvals.pending() {
+            let _ = approvals.answer(p.id, ApprovalDecision::Allow);
+        }
+        for a in held {
+            let _ = a.join();
+        }
     }
 }
