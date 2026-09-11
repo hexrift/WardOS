@@ -253,9 +253,12 @@ grep -E '^\s*(size|position) = ' "$lock" | tr -d ' ' | cut -d= -f2 | tr ',' '\n'
 # --- looknfeel: geometry (§5) and motion (§12) ------------------------------------
 lnf=$root/hyprland/looknfeel.conf
 for want in 'gaps_in = 4' 'gaps_out = 8' 'border_size = 1' 'rounding = 6' \
-  'animation = workspaces, 1, 1.2, wardOut, slide' 'animation = layers, 1, 1.0, wardOut, fade'; do
+  'animation = workspaces, 1, 1.2, wardOut, slide' 'animation = layers, 1, 1.0, wardOut, fade' \
+  'force_default_wallpaper = 0'; do
   grep -q "^\s*$want$" "$lnf" || fail "looknfeel.conf lacks '$want'"
 done
+# Hyprland's built-in wallpaper (a blue gradient) must be off, or it shows through before
+# swaybg paints — the "doesn't look like what we agreed on" ground (E-09).
 grep -E '^\s*animation = ' "$lnf" | grep -Ev '^\s*animation = (workspaces|layers), 1' | grep -Evq ', 0$' && fail "looknfeel.conf: only the workspace slide and the layer fade animate (§12)"
 grep -Eq '^\s*(pseudotile|vfr|workspace_swipe)' "$lnf" && fail "looknfeel.conf: an option Hyprland 0.56 no longer has"
 

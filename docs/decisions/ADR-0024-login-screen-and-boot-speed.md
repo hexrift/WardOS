@@ -75,5 +75,41 @@ classic offender. "Speed should be part of the product" was an explicit instruct
   `systemd-sysusers` run that creates the `greeter` user. A slow *first* boot is recoverable;
   an unbootable image is not. It is tracked as a follow-up pending a tested change and a
   confirmed second-boot time on E-09.
-* Still to verify on hardware (E-09): a *second* boot's time (should be far below 331 s),
-  and that the greeter renders and authenticates on the reference laptop.
+* E-09 greeter boot (first flash) exposed two greeter faults, both fixed: `gtkgreet` was
+  launched with `-l` (layer-shell), but `cage` implements no `wlr-layer-shell`, so the
+  greeter committed a 0×0 surface, cage dropped it and greetd relaunched it — a flicker
+  loop; `-l` is dropped (cage fullscreens a plain window). And the `greeter` home
+  `/var/lib/greeter` was never created, so cage had no working directory and no writable
+  shader cache; a tmpfiles.d entry now creates it before greetd starts. Only a real boot
+  surfaces these — CI builds the image but does not run the compositor.
+* A second round of E-09 hardware findings, once the greeter rendered and the desktop
+  came up, is addressed alongside the login work so the reference laptop is reflashed
+  once:
+  - **Wi-Fi was dead.** Fedora 44 split `linux-firmware` into per-device subpackages that
+    are *weak* dependencies, and the image builds with `--setopt=install_weak_deps=False`,
+    so the Intel 8265's `iwlwifi-8265-*` ucode (in `iwlwifi-mvm-firmware`) was never
+    installed — `dmesg` showed "no suitable firmware found" and `nmtui` listed no wireless
+    device. `iwlwifi-mvm-firmware` and `iwlwifi-dvm-firmware` are now named explicitly in
+    `image/packages.txt`.
+  - **Onboarding stalled behind `ward doctor`.** `wardos-first-run` ran `ward doctor`
+    synchronously; the same probe run that took ~70 s at boot (it cold-starts every agent
+    to read its version) also blocked the welcome, the keys and the walkthrough on the
+    first login. It is now detached — the `wardos-firstboot` service still writes the full
+    report — so onboarding is responsive on slow media.
+  - **Two duplicate toasts.** The theme was applied (and announced) by *both* the desktop
+    autostart and `wardos-first-run`, and the "Welcome to WardOS" greeting was sent by both
+    `wardos-first-run` and the walkthrough. The per-login theme re-apply is now quiet
+    (`wardos-theme set -q`, the login re-apply is not a *change*), and the walkthrough is
+    the single sender of the greeting.
+  - **A blue gradient, not the Ward Dark ground.** The desktop showed Hyprland's stock
+    wallpaper. `disable_hyprland_logo` was set, but that removes only the logo overlay —
+    the built-in wallpaper is a *separate* setting, `misc:force_default_wallpaper`, which
+    defaults to `-1` (a random built-in gradient) and sits on top of `background_color`.
+    Whenever `swaybg` had not painted yet (the first frame, before the theme fragment
+    renders, a swaybg hiccup) that gradient showed instead of the ground.
+    `force_default_wallpaper = 0` in `looknfeel.conf` disables it, so `background_color`
+    (the theme's `#0E0F11` ground) is the base under swaybg from the first frame.
+* Still to verify on hardware (E-09): a *second* boot's time (should be far below 331 s);
+  that the greeter renders and authenticates (the first-round fix); and, from this round,
+  that Wi-Fi associates, the duplicate toasts are gone, onboarding is responsive, and the
+  ground is Ward Dark rather than the stock gradient.

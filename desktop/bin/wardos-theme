@@ -4,7 +4,8 @@
 # Usage:
 #   wardos-theme list                ids of every theme, shipped and installed, sorted
 #   wardos-theme current             the id in use (ward-dark until one is set)
-#   wardos-theme set <id>            render <id> into ~/.config/wardos/theme/current, reload
+#   wardos-theme set [-q] <id>       render <id> into ~/.config/wardos/theme/current, reload
+#                                    (-q: no notification — the login re-apply, not a change)
 #   wardos-theme next                the id after the current one in `list`, wrapping
 #   wardos-theme install <git-url>   clone into ~/.local/share/wardos/themes/<name>, set it
 #   wardos-theme remove <id>         delete an installed theme; shipped themes are refused
@@ -127,12 +128,18 @@ notify() {
   notify-send -a WardOS "$@"
 }
 
+# set_theme [-q] <id>: render, reload every component, and (unless -q) announce it.
+# -q is for the routine re-apply at every login (autostart, wardos-first-run): the
+# theme has not *changed*, so a toast on each login would be noise. An explicit change
+# (`next`, `install`, the welcome walkthrough) announces itself.
 set_theme() {
+  local quiet=0
+  if [[ ${1:-} == -q || ${1:-} == --quiet ]]; then quiet=1; shift; fi
   local id=$1
   render "$id"
   reload
   read_env
-  notify "Theme · ${WARDOS_THEME_NAME:-$id}"
+  [[ $quiet == 1 ]] || notify "Theme · ${WARDOS_THEME_NAME:-$id}"
 }
 
 next() {
@@ -227,7 +234,16 @@ verb=${1:-}
 case $verb in
   list) list ;;
   current) current ;;
-  set) [[ -n ${2:-} ]] || die "set needs an id"; set_theme "$2" ;;
+  set)
+    shift
+    if [[ ${1:-} == -q || ${1:-} == --quiet ]]; then
+      [[ -n ${2:-} ]] || die "set needs an id"
+      set_theme -q "$2"
+    else
+      [[ -n ${1:-} ]] || die "set needs an id"
+      set_theme "$1"
+    fi
+    ;;
   next) next ;;
   install) [[ -n ${2:-} ]] || die "install needs a git URL"; install "$2" ;;
   remove) [[ -n ${2:-} ]] || die "remove needs an id"; remove "$2" ;;

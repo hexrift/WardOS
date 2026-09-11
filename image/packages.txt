@@ -13,6 +13,8 @@ bubblewrap            # sandbox builder used by wardd (ADR-0002, ADR-0013)
 git                   # snapshot/worktree plumbing (ADR-0010), `ward init` on repositories
 curl                  # transport for `ward` self-checks and the egress relay tests
 linux-firmware        # Wi-Fi/GPU/Bluetooth firmware; without it a laptop has no wireless (E-09: T480s had no Wi-Fi)
+iwlwifi-mvm-firmware   # Intel MVM Wi-Fi ucode (7260..AX210, incl. the 8265 on E-09): Fedora 44 split this out of linux-firmware as a WEAK dep, and the image builds with install_weak_deps=False, so it must be named
+iwlwifi-dvm-firmware   # Intel DVM Wi-Fi ucode (older 1000/2000/5000/6000 cards): same split, named for the same reason
 python3               # scripts/security-check and hook adapters
 openssh-clients       # agent-side git-over-ssh through the credential broker
 rustup                # rustup-init only, no toolchain: `wardos-install dev rust` puts one in ~/.rustup and ~/.cargo, which the verifier binds (image/README.md "Size")
