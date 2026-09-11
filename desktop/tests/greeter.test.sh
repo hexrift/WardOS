@@ -24,6 +24,10 @@ grep -Eq '^command = "cage -s -- gtkgreet .*-c /usr/libexec/wardos-session"' "$c
   || fail "greetd command must run gtkgreet in cage and hand off to the WardOS session:
 $(grep '^command' "$cfg")"
 assert_contains "$cfg" '-s /etc/greetd/wardos-greeter.css'
+# cage has no wlr-layer-shell: gtkgreet must NOT run in layer-shell mode (`-l`), or it
+# commits a 0x0 surface, cage disconnects it, and greetd crash-loops the greeter — a
+# flicker loop (E-09). cage fullscreens a plain gtkgreet window on its own.
+grep '^command' "$cfg" | grep -Eq -- '(^| )-l( |$)' && fail "gtkgreet must not use -l under cage (cage has no layer-shell)"
 # No [initial_session]: the user explicitly asked for a real login screen, not autologin.
 ! grep -q '\[initial_session\]' "$cfg" || fail "greetd must not auto-login (no [initial_session])"
 
@@ -43,6 +47,10 @@ grep -q 'entry:focus' "$css" || fail "the focus state must be styled (the one ac
 assert_file "$sysusers"
 grep -Eq '^u greeter ' "$sysusers" || fail "sysusers must create the 'greeter' user"
 grep -Eq '^m greeter video' "$sysusers" || fail "the greeter needs the 'video' group for DRM"
+# ...and its home exists (cage needs a working dir + a writable shader cache, E-09).
+tmpfiles=$repo/image/rootfs/usr/lib/tmpfiles.d/wardos-greeter.conf
+assert_file "$tmpfiles"
+grep -Eq '^d /var/lib/greeter ' "$tmpfiles" || fail "tmpfiles must create the greeter home /var/lib/greeter"
 
 # --- the launcher: shape and shell hygiene --------------------------------------------
 assert_file "$launcher"
