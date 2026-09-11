@@ -548,9 +548,9 @@ needs, and publishes the result:
 * **By hand**: Actions → *disk* → *Run workflow*. Choose `qcow2`, `iso` or `both`, the
   architecture (`x86_64`, `aarch64`, or `both` for one job per architecture, each on a
   runner of that architecture), the binaries (`checkout` compiles this commit,
-  `release` takes the published tarball of `--release`), the first user (`wardos`,
-  the greeter's default) and, for the ISO, `luks`. The disks appear as the run's
-  `wardos-disks-<arch>` artifact for 14 days, with a `SHA256SUMS.<arch>`.
+  `release` takes the published tarball of `--release`), an **optional dev-only**
+  pre-created `user`/`password` (blank = unprovisioned) and, for the ISO, `luks`. The disks
+  appear as the run's `wardos-disks-<arch>` artifact for 14 days, with a `SHA256SUMS.<arch>`.
 * **On every published release**: both disks of both architectures are built from that
   release's tarballs and attached to the release as `wardos-<tag>-<arch>.qcow2.zst` and
   `.iso.zst`. GitHub caps a release asset at 2 GiB and bootc-image-builder's disks are
@@ -560,10 +560,12 @@ needs, and publishes the result:
   external host, so a release stays one page with everything on it; the run's artifact
   carries the same files unsplit for 14 days.
 
-The first user's password in these disks is `wardos`. Change it at first login
-(`passwd`); the ISO with `luks` additionally asks for the disk passphrase during the
-install. The same workflow runs `check-packages.sh --arch aarch64 --discover` so the
-log says whether the COPRs the image depends on still build for aarch64.
+By default these disks are **unprovisioned** (no pre-created account): first boot runs the
+provisioning session (CALIBRATE) which creates the real user with a password of their
+choosing (ADR-0027). Only a dev build that set the workflow's `user`/`password` inputs bakes
+a pre-created account. The ISO with `luks` additionally asks for the disk passphrase during
+the install. The same workflow runs `check-packages.sh --arch aarch64 --discover` so the log
+says whether the COPRs the image depends on still build for aarch64.
 
 **On a Mac.** Docker Desktop can build the container image
 (`docker build -f image/Containerfile --platform linux/arm64 -t wardos .` on Apple
@@ -607,8 +609,8 @@ no aarch64 tarball, so `build.sh --arch aarch64 --source release` says so and st
 
 **Getting the aarch64 disk.** Actions → *disk* → *Run workflow* with `arch=aarch64`,
 `type=qcow2` (the artifact `wardos-disks-aarch64`), or take
-`wardos-<ver>-aarch64.qcow2.zst` from a release and `zstd -d` it. The first user is
-`wardos`, password `wardos`; change it at first login.
+`wardos-<ver>-aarch64.qcow2.zst` from a release and `zstd -d` it. Release disks are
+unprovisioned: first boot creates your account (ADR-0027).
 
 **UTM on an Apple-silicon Mac** (M1 and later; UTM 4.x from [mac.getutm.app](https://mac.getutm.app)
 or the App Store):

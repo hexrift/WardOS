@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# wardos-dev-seed — seed a known development account and mark the machine provisioned
+# (ADR-0027 §Dev escape hatch). NON-PRODUCTION: runs only on images built with
+# WARDOS_DEV_SEED_USER (the Containerfile drops /usr/lib/wardos/dev-seed-user then), so a
+# CI or hardware-iteration image boots straight to a desktop instead of the first-boot
+# provisioning session. Production images ship without the flag file and unprovisioned.
+#
+# Runs at first boot (a root systemd oneshot before greetd), where /var and /home are real
+# machine state — not at build time, where bootc does not persist /var or /home content.
+set -euo pipefail
+
+flag=/usr/lib/wardos/dev-seed-user
+marker=/var/lib/wardos/provisioned
+# The password (if any) is a first-boot systemd credential — never a file baked into the
+# image. Absent → the account is left LOCKED (no shared credential is ever persisted).
+credfile="${CREDENTIALS_DIRECTORY:-/dev/null}/wardos-dev-seed.password"
+[[ -e "$flag" && ! -e "$marker" ]] || exit 0
+
+user=$(head -n1 "$flag")
+if [[ ! "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+  echo "wardos-dev-seed: invalid seed username '$user'" >&2
+  exit 1
+fi
+
+if ! id -u "$user" >/dev/null 2>&1; then
+  useradd -m -c "WardOS dev" -G wheel -s /bin/bash "$user"
+fi
+if [[ -s "$credfile" ]]; then
+  printf '%s:%s\n' "$user" "$(head -n1 "$credfile")" | chpasswd
+  echo "wardos-dev-seed: set '$user' password from the wardos-dev-seed.password credential" >&2
+else
+  passwd -l "$user" >/dev/null 2>&1 || usermod -L "$user" 2>/dev/null || true
+  echo "wardos-dev-seed: no password credential; '$user' left locked" >&2
+fi
+
+mkdir -p "$(dirname "$marker")"
+date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
+echo "wardos-dev-seed: seeded development account '$user'; machine marked provisioned" >&2

@@ -73,3 +73,13 @@ wait_logged '^ward doctor$'  # let the detached doctor finish before the log is 
 : >"$MOCK_LOG"
 wardos-first-run
 [[ ! -s "$MOCK_LOG" ]] || fail "first-run re-ran after a failed step; log: $(cat "$MOCK_LOG")"
+
+# A first-boot provisioning keyboard choice (ADR-0027) is adopted into this user's Hyprland
+# config on first login: with the recorded layout present, first-run calls keyboard-local.
+for c in wardos-refresh wardos-theme ward wardos-keys wardos-webapp wardos-tui notify-send wardos-calibrate wardos-welcome; do mock "$c"; done
+export WARDOS_KEYBOARD_STATE="$TMP/keyboard-layout"
+printf 'fr\n' >"$WARDOS_KEYBOARD_STATE"
+rm -f "$marker"
+: >"$MOCK_LOG"
+wardos-first-run
+assert_logged '^wardos-calibrate keyboard-local fr$'

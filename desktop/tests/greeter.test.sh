@@ -12,24 +12,33 @@ sysusers=$repo/image/rootfs/usr/lib/sysusers.d/wardos-greeter.conf
 assert_contains() { grep -Fq -- "$2" "$1" || fail "expected '$2' in $1:
 $(cat "$1")"; }
 
-# --- greetd config: greeter on VT 1, unprivileged, graphical via cage + gtkgreet ------
+# --- greetd config: greeter on VT 1, unprivileged, via the marker-gated selector --------
 cfg=$greetd/config.toml
+selector=$repo/desktop/bin/wardos-greetd-session
 assert_file "$cfg"
 assert_contains "$cfg" '[terminal]'
 assert_contains "$cfg" 'vt = 1'
 assert_contains "$cfg" '[default_session]'
 assert_contains "$cfg" 'user = "greeter"'
-# The greeter is cage hosting gtkgreet, styled by the Ward Dark CSS, running our launcher.
-grep -Eq '^command = "cage -s -- gtkgreet .*-c /usr/libexec/wardos-session"' "$cfg" \
-  || fail "greetd command must run gtkgreet in cage and hand off to the WardOS session:
+# greetd runs the selector (ADR-0027), not a fixed command.
+grep -Eq '^command = "wardos-greetd-session"' "$cfg" \
+  || fail "greetd command must run the selector wardos-greetd-session:
 $(grep '^command' "$cfg")"
-assert_contains "$cfg" '-s /etc/greetd/wardos-greeter.css'
-# cage has no wlr-layer-shell: gtkgreet must NOT run in layer-shell mode (`-l`), or it
-# commits a 0x0 surface, cage disconnects it, and greetd crash-loops the greeter — a
-# flicker loop (E-09). cage fullscreens a plain gtkgreet window on its own.
-grep '^command' "$cfg" | grep -Eq -- '(^| )-l( |$)' && fail "gtkgreet must not use -l under cage (cage has no layer-shell)"
 # No [initial_session]: the user explicitly asked for a real login screen, not autologin.
 ! grep -q '\[initial_session\]' "$cfg" || fail "greetd must not auto-login (no [initial_session])"
+
+# The selector: provisioned -> cage hosting gtkgreet (styled, handing off to wardos-session);
+# unprovisioned -> the provisioning UI under cage.
+assert_file "$selector"
+grep -Eq 'cage -s -- gtkgreet .*-c /usr/libexec/wardos-session' "$selector" \
+  || fail "the selector's greeter path must run gtkgreet in cage and hand off to wardos-session"
+assert_contains "$selector" '-s /etc/greetd/wardos-greeter.css'
+assert_contains "$selector" 'cage -s -- wardos-provision-ui'
+# cage has no wlr-layer-shell: the selector's gtkgreet must NOT run in layer-shell mode
+# (`-l`), or it commits a 0x0 surface, cage disconnects it and greetd crash-loops the
+# greeter — the E-09 flicker loop. cage fullscreens a plain gtkgreet window on its own.
+# (The guard moved here from config.toml when greetd's command became the selector.)
+grep -n 'gtkgreet' "$selector" | grep -Eq -- '(^| )-l( |$)' && fail "gtkgreet must not use -l under cage (cage has no layer-shell)"
 
 # --- Ward Dark theme (docs/design-language.md §3): host-layer palette, continuous with
 #     the Plymouth splash; the single accent is the violet focus ring; the mark is drawn.

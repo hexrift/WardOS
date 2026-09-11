@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# wardos-provisiond — the first-boot provisioning broker (ADR-0027). Runs as root, one
+# instance per connection (a socket-activated Accept=yes service): systemd hands the
+# accepted connection as stdin/stdout, this reads one request, performs one narrowly
+# defined operation, writes one reply line, and exits.
+#
+# It is the privilege boundary: the provisioning UI (wardos-provision-ui) is unprivileged
+# and can only ask for these verbs; the broker validates every field and refuses all
+# mutating verbs once the machine is provisioned. Password material is read once and fed
+# to `chpasswd` on stdin — never an argument, an environment value, or a log line.
+#
+# Protocol (one verb per connection, line-based on stdin; one reply line on stdout):
+#   STATUS                            -> OK provisioned | OK unprovisioned
+#   LOCALE\n<locale>                  -> OK | ERR <msg>     (localectl set-locale)
+#   KEYMAP\n<layout>                  -> OK | ERR <msg>     (localectl set-x11-keymap)
+#   TIMEZONE\n<tz>                    -> OK | ERR <msg>     (timedatectl set-timezone)
+#   ACCOUNT\n<username>\n<fullname>\n<password>
+#                                     -> OK | ERR <msg>     (create the user, set the
+#                                        password, then commit the provisioned marker —
+#                                        the transactional commit point)
+set -euo pipefail
+
+marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
+lockfile="${WARDOS_PROVISION_LOCK:-/run/wardos/provisiond.lock}"
+
+reply() { printf '%s\n' "$*"; }
+deny() {
+  reply "ERR $*"
+  exit 0
+}
+provisioned() { [[ -e "$marker" ]]; }
+
+# Refuse every mutating verb once provisioned: there is exactly one provisioning.
+refuse_if_provisioned() { if provisioned; then deny "already provisioned"; fi; }
+
+# Atomic marker write: a temp file fsync'd and renamed into place, so a power cut leaves
+# the marker either absent (re-provision) or fully present, never truncated.
+commit_marker() {
+  local tmp="$marker.tmp.$$"
+  mkdir -p "$(dirname "$marker")"
+  date -u +%Y-%m-%dT%H:%M:%SZ >"$tmp"
+  # Flush the data, then rename (rename is atomic within the filesystem).
+  if command -v sync >/dev/null 2>&1; then sync "$tmp" 2>/dev/null || sync; fi
+  mv -f "$tmp" "$marker"
+}
+
+valid_locale() { [[ "$1" =~ ^[A-Za-z0-9._@-]+$ ]]; }
+valid_layout() { [[ "$1" =~ ^[a-z][a-z0-9_-]*$ ]]; }
+valid_timezone() { [[ "$1" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*$ && "$1" != *".."* ]]; }
+# A conservative username policy (a subset of what useradd allows): lower-case start,
+# then lower-case, digits, underscore or dash; at most 32 characters.
+valid_username() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+
+do_locale() {
+  local v=$1
+  valid_locale "$v" || deny "invalid locale"
+  localectl set-locale "LANG=$v" 2>/dev/null || deny "could not set locale"
+  reply OK
+}
+
+do_keymap() {
+  local v=$1
+  valid_layout "$v" || deny "invalid keyboard layout"
+  localectl set-x11-keymap "$v" 2>/dev/null || deny "could not set keymap"
+  # Record the choice so the new user's Hyprland config adopts it on first login: localectl
+  # sets the console/greeter keymap, but Hyprland reads its own kb_layout, so without this
+  # the desktop would start on the default layout, not the one chosen at provisioning.
+  local kbstate="${WARDOS_KEYBOARD_STATE:-/var/lib/wardos/keyboard-layout}"
+  mkdir -p "$(dirname "$kbstate")" 2>/dev/null || true
+  printf '%s\n' "$v" >"$kbstate" 2>/dev/null || true
+  reply OK
+}
+
+do_timezone() {
+  local v=$1
+  valid_timezone "$v" || deny "invalid timezone"
+  timedatectl set-timezone "$v" 2>/dev/null || deny "could not set timezone"
+  reply OK
+}
+
+do_account() {
+  local user=$1 fullname=$2 password=$3
+  valid_username "$user" || deny "invalid username"
+  [[ -n "$password" ]] || deny "empty password"
+  # GECOS must not carry a field separator or control characters.
+  [[ "$fullname" != *:* && "$fullname" != *$'\n'* ]] || deny "invalid full name"
+
+  # Never adopt a reserved/system identity, even one nsswitch resolves.
+  case "$user" in
+    root | daemon | bin | sys | adm | nobody | nogroup | greeter | ward-provision) deny "name is reserved" ;;
+  esac
+  # NO ADOPTION: any name already in use — a system account (e.g. nobody=65534) or a human
+  # one — is refused, never elevated or mutated. On an unprovisioned machine there is no
+  # human account to adopt, and adopting one could not be rolled back cleanly.
+  if id -u "$user" >/dev/null 2>&1; then deny "name already in use"; fi
+
+  # Create the account, set its password, and commit the marker as ONE transaction: any
+  # failure after useradd rolls the new account back (userdel -r), so a retry can never
+  # leave a second administrator, a passwordless account, or a half-provisioned machine.
+  useradd -m -c "$fullname" -G wheel -s /bin/bash "$user" 2>/dev/null || deny "could not create account"
+  if ! printf '%s:%s\n' "$user" "$password" | chpasswd 2>/dev/null; then
+    userdel -r "$user" 2>/dev/null || true
+    deny "could not set password"
+  fi
+  if ! commit_marker; then
+    userdel -r "$user" 2>/dev/null || true
+    deny "could not mark provisioned"
+  fi
+  reply OK
+}
+
+# Read the verb, then only the lines that verb needs.
+IFS= read -r verb || deny "empty request"
+case "$verb" in
+  STATUS)
+    if provisioned; then reply "OK provisioned"; else reply "OK unprovisioned"; fi
+    ;;
+  LOCALE)
+    refuse_if_provisioned
+    IFS= read -r v || deny "missing value"
+    do_locale "$v"
+    ;;
+  KEYMAP)
+    refuse_if_provisioned
+    IFS= read -r v || deny "missing value"
+    do_keymap "$v"
+    ;;
+  TIMEZONE)
+    refuse_if_provisioned
+    IFS= read -r v || deny "missing value"
+    do_timezone "$v"
+    ;;
+  ACCOUNT)
+    refuse_if_provisioned
+    IFS= read -r user || deny "missing username"
+    IFS= read -r fullname || deny "missing full name"
+    IFS= read -r password || deny "missing password"
+    # Serialize the whole check → create → commit under an exclusive lock, then re-check
+    # state after acquiring it: two concurrent connections must not both pass the
+    # unprovisioned check and create two administrator accounts.
+    mkdir -p "$(dirname "$lockfile")" 2>/dev/null || true
+    exec {lockfd}>"$lockfile"
+    flock -x "$lockfd"
+    refuse_if_provisioned
+    do_account "$user" "$fullname" "$password"
+    ;;
+  *) deny "unknown verb" ;;
+esac

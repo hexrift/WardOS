@@ -122,6 +122,14 @@ if [[ -n "$user" && -z "$password" && -z "$ssh_key" ]]; then
   echo "disk.sh: --user needs --password (or WARDOS_PASSWORD) or --ssh-key, or nobody can use sudo" >&2
   exit 2
 fi
+if [[ -n "$user" ]]; then
+  # A pre-created account is a dev/specialised convenience, NOT the production model
+  # (ADR-0027): consumer/hardware images ship WITHOUT --user and create the real user at
+  # first boot (provisioning), so they carry no shared credential.
+  echo "disk.sh: WARNING --user bakes a pre-created account ('$user') into the image; this is" >&2
+  echo "         for development/unattended installs only. Omit --user for a production image," >&2
+  echo "         which is unprovisioned and creates its user at first boot (ADR-0027)." >&2
+fi
 if [[ $luks -eq 1 && "$type" != iso ]]; then
   # The bootc-image-builder blueprint knows plain, lvm and btrfs partitions and nothing
   # encrypted; disk encryption is Anaconda's job, so it is only reachable through the

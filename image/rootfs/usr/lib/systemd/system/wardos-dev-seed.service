@@ -1,0 +1,28 @@
+# WardOS development-image account seed (NON-PRODUCTION, ADR-0027 §Dev escape hatch).
+#
+# CI and hardware iteration need a machine that boots straight to a desktop. When the image
+# was built with WARDOS_DEV_SEED_USER, the Containerfile drops /usr/lib/wardos/dev-seed-user
+# and this unit (gated on that flag file, and on the machine being unprovisioned) seeds the
+# named development account and writes the provisioned marker at first boot — so the greetd
+# selector goes straight to the greeter instead of the provisioning UI. Production images
+# are built WITHOUT the flag file, so this unit is a permanent no-op there and the machine
+# ships unprovisioned. It runs before greetd so the marker exists before the selector reads it.
+[Unit]
+Description=WardOS development image account seed (non-production)
+Documentation=https://github.com/hexrift/WardOS/blob/main/docs/decisions/ADR-0027-first-boot-provisioning.md
+ConditionPathExists=/usr/lib/wardos/dev-seed-user
+ConditionPathExists=!/var/lib/wardos/provisioned
+After=systemd-tmpfiles-setup.service local-fs.target
+Wants=systemd-tmpfiles-setup.service
+Before=greetd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/wardos-dev-seed
+# The dev password, if any, is delivered as a first-boot systemd credential (never baked
+# into an image layer): deliver it with `systemd.set_credential=wardos-dev-seed.password:…`
+# on the kernel command line, or a credentials file. Absent → the account stays locked.
+ImportCredential=wardos-dev-seed.password
+
+[Install]
+WantedBy=multi-user.target

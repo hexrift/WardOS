@@ -1,0 +1,18 @@
+# WardOS first-boot provisioning broker, one instance per connection (ADR-0027).
+#
+# Socket-activated by wardos-provisiond.socket (Accept=yes): systemd hands the accepted
+# connection as this instance's stdin/stdout, the broker reads one request, performs one
+# narrowly defined operation (localectl/timedatectl, or create the first user), writes one
+# reply line, and exits. It is root because it creates the account and sets system state,
+# but it is narrow: it validates every field, refuses all mutating verbs once the machine
+# is provisioned, and never logs the password (fed to chpasswd on stdin).
+[Unit]
+Description=WardOS first-boot provisioning broker (connection %i)
+Documentation=https://github.com/hexrift/WardOS/blob/main/docs/decisions/ADR-0027-first-boot-provisioning.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/wardos-provisiond
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal

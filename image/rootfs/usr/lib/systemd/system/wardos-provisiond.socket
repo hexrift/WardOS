@@ -1,0 +1,28 @@
+# WardOS first-boot provisioning broker socket (ADR-0027).
+#
+# The unprivileged provisioning UI (wardos-provision-ui, run by the greetd session
+# selector while the machine is unprovisioned) connects here to ask the root broker to
+# apply locale/keyboard/timezone and create the first user. Accept=yes spawns one
+# wardos-provisiond@<n>.service per connection, so each request is a short-lived root
+# process that reads one request and exits.
+#
+# The socket opens only while the machine is unprovisioned: once
+# /var/lib/wardos/provisioned exists it is never listened on again (belt-and-braces
+# alongside the broker's own refusal). It is group-owned by the greeter (the locked,
+# nologin bootstrap identity that runs the provisioning UI) and mode 0660, so only that
+# session can reach it.
+[Unit]
+Description=WardOS first-boot provisioning broker socket
+Documentation=https://github.com/hexrift/WardOS/blob/main/docs/decisions/ADR-0027-first-boot-provisioning.md
+ConditionPathExists=!/var/lib/wardos/provisioned
+
+[Socket]
+ListenStream=/run/wardos/provision.sock
+SocketMode=0660
+SocketGroup=greeter
+Accept=yes
+RuntimeDirectory=wardos
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=sockets.target

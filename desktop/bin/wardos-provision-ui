@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# wardos-provision-ui — the first-boot provisioning UI (CALIBRATE provisioning form,
+# ADR-0027). Runs UNPRIVILEGED in the cage kiosk before any human account exists (the
+# greetd session selector starts it while /var/lib/wardos/provisioned is absent). It
+# collects language, keyboard, timezone, full name, username and a masked password, then
+# asks the root broker (wardos-provisiond, over its socket) to apply them and create the
+# user. It performs no privileged operation itself — the broker validates and commits.
+# Keyboard-first (fuzzel; mouse works too), offline.
+#
+# Usage: wardos-provision-ui
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+# shellcheck source=desktop/lib/calibrate.sh disable=SC1091
+source "${WARDOS_CALIBRATE_LIB:-$(dirname "$(readlink -f "$0")")/../lib/calibrate.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/calibrate.sh
+wardos_help "$@"
+
+sock="${WARDOS_PROVISION_SOCK:-/run/wardos/provision.sock}"
+marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
+last_err=""
+
+# broker VERB [LINE…]: one request over the socket; true iff the reply begins "OK". The
+# request is built by a printf builtin and piped straight to socat, so no field (the
+# password included) is ever an argv of an external process.
+broker() {
+  local out
+  out=$(printf '%s\n' "$@" | socat - "UNIX-CONNECT:$sock" 2>/dev/null) || out="ERR broker unreachable"
+  last_err="${out#ERR }"
+  [[ "$out" == OK* ]]
+}
+
+# Free text and masked secret: a menu with no items returns what was typed (empty = none).
+typed() { printf '' | wardos-menu-select --prompt "$1" || true; }
+secret() { printf '' | wardos-menu-select --password --prompt "$1" || true; }
+
+# A username that meets the broker's policy; re-asks on an invalid or empty entry (bounded,
+# so a wedged input can never loop forever — the session just restarts provisioning).
+ask_username() {
+  local u i
+  for ((i = 0; i < 12; i++)); do
+    u=$(typed "Username · lower-case letters, digits, - or _ (e.g. alex)")
+    if [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+      printf '%s\n' "$u"
+      return 0
+    fi
+    wardos_notify "Username" "Use lower-case letters, digits, - or _ (max 32)"
+  done
+  return 1
+}
+
+# A password entered twice and matching (masked); re-asks on empty or mismatch (bounded).
+ask_password() {
+  local p1 p2 i
+  for ((i = 0; i < 12; i++)); do
+    p1=$(secret "Password · for your account")
+    if [[ -z "$p1" ]]; then
+      wardos_notify "Password" "A password is required"
+      continue
+    fi
+    p2=$(secret "Password · type it again")
+    if [[ "$p1" == "$p2" ]]; then
+      printf '%s' "$p1"
+      return 0
+    fi
+    wardos_notify "Password" "The two entries did not match; try again"
+  done
+  return 1
+}
+
+provision() {
+  local loc kbd tz fullname user pass choice
+  loc=$(calibrate_pick_locale) || true
+  kbd=$(calibrate_pick_keyboard) || true
+  tz=$(calibrate_pick_timezone) || true
+  fullname=$(typed "Your name · shown on the login screen (optional)")
+  user=$(ask_username) || return 1
+  pass=$(ask_password) || return 1
+
+  while true; do
+    choice=$(wardos_menu "Review · create your WardOS account" \
+      "Create account and finish" \
+      "Language · ${loc:-keep current}" \
+      "Keyboard · ${kbd:-keep current}" \
+      "Timezone · ${tz:-keep current}" \
+      "Name · ${fullname:-—}" \
+      "Username · $user") || continue # cancel just redraws; there is no skip here
+    case "$choice" in
+      "Create account and finish")
+        # Best-effort settings first; then the account, which commits the marker on success.
+        [[ -n "$loc" ]] && { broker LOCALE "$loc" || wardos_notify "Language" "$last_err"; }
+        [[ -n "$kbd" ]] && { broker KEYMAP "$kbd" || wardos_notify "Keyboard" "$last_err"; }
+        [[ -n "$tz" ]] && { broker TIMEZONE "$tz" || wardos_notify "Timezone" "$last_err"; }
+        if broker ACCOUNT "$user" "$fullname" "$pass"; then
+          wardos_notify "Welcome to WardOS" "Account created — sign in as $user"
+          return 0
+        fi
+        # Failed: tell the person and stay in the review so they can adjust and retry.
+        wardos_notify "Account not created" "$last_err"
+        ;;
+      "Language ·"*) loc=$(calibrate_pick_locale) || true ;;
+      "Keyboard ·"*) kbd=$(calibrate_pick_keyboard) || true ;;
+      "Timezone ·"*) tz=$(calibrate_pick_timezone) || true ;;
+      "Name ·"*) fullname=$(typed "Your name · shown on the login screen (optional)") ;;
+      "Username ·"*) user=$(ask_username) || return 1 ;;
+      *) : ;;
+    esac
+  done
+}
+
+# Already provisioned (a stray run): do nothing so greetd falls through to the greeter.
+[[ -e "$marker" ]] && exit 0
+
+# One provisioning pass; if the account fields were abandoned, exit non-zero so greetd
+# relaunches the provisioning session rather than reaching a desktop that does not exist.
+provision || exit 1
+exit 0

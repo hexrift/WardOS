@@ -101,6 +101,14 @@ FROM quay.io/fedora/fedora-bootc:44
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG WARDOS_VERSION=dev
+# NON-PRODUCTION build knob (ADR-0027 §Dev escape hatch): when WARDOS_DEV_SEED_USER is set,
+# the image seeds that development account (LOCKED — no password) and marks itself
+# provisioned at first boot, so CI/hardware images skip the first-boot provisioning session.
+# The account's password, if wanted, is delivered at boot as the systemd credential
+# `wardos-dev-seed.password` (a first-boot secret channel) — never baked into an image layer.
+# Empty for production images, which ship unprovisioned: no human account, no credential.
+# Only a username (not a secret) is ever written into the image.
+ARG WARDOS_DEV_SEED_USER=
 
 LABEL org.wardos.version="${WARDOS_VERSION}" \
       containers.bootc="1" \
@@ -243,12 +251,26 @@ RUN ver=$(sed -n 's/^VERSION_ID=//p' /usr/lib/os-release) \
     && mv /usr/lib/os-release.wardos /usr/lib/os-release \
     && grep -q '^NAME="WardOS"$' /usr/lib/os-release
 
+# The dev-seed flag file (ADR-0027): written only when the image is built with
+# WARDOS_DEV_SEED_USER, so wardos-dev-seed.service seeds a known account at first boot.
+# Production builds leave it empty and ship unprovisioned; the build asserts that below.
+RUN if [ -n "${WARDOS_DEV_SEED_USER}" ]; then \
+      printf '%s\n' "${WARDOS_DEV_SEED_USER}" >/usr/lib/wardos/dev-seed-user; \
+      echo "WardOS: NON-PRODUCTION image; dev account '${WARDOS_DEV_SEED_USER}' seeded LOCKED at first boot (deliver the wardos-dev-seed.password credential to log in)"; \
+    else \
+      test ! -e /usr/lib/wardos/dev-seed-user; \
+      test ! -e /var/lib/wardos/provisioned; \
+    fi
+# Assert no plaintext credential is ever baked into the image (production or dev).
+RUN test ! -e /usr/lib/wardos/dev-seed-password
+
 # Masking NetworkManager-wait-online keeps a boot with no network (a laptop before Wi-Fi
 # is set up, E-09) from stalling ~60s on network-online.target: nothing here must block
 # boot on the network. wardos-flathub still orders after network-online (reached at once
 # now) and gates on its own reachability check, so Flathub setup is unaffected.
 RUN systemctl mask serial-getty@ttyS0.service NetworkManager-wait-online.service \
     && systemctl enable wardos-firstboot.service wardos-flathub.service wardos-usb-guard.service \
+         wardos-provisiond.socket wardos-dev-seed.service \
          firewalld.service bootc-fetch-apply-updates.timer greetd.service \
     && systemctl set-default graphical.target \
     && sed -i 's/^DefaultZone=.*/DefaultZone=wardos/' /etc/firewalld/firewalld.conf \

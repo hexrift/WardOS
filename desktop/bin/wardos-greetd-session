@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# wardos-greetd-session — greetd's session selector (ADR-0027). greetd runs this (as the
+# unprivileged, locked bootstrap user set in /etc/greetd/config.toml) instead of a fixed
+# command. It is marker-gated:
+#
+#   /var/lib/wardos/provisioned ABSENT  → the first-boot provisioning UI (cage kiosk),
+#                                         which creates the real user through the broker.
+#   /var/lib/wardos/provisioned PRESENT → the normal greeter (cage hosting gtkgreet),
+#                                         byte-for-byte the provisioned-machine login, so a
+#                                         provisioned machine boots exactly as it does today.
+#
+# `cage -s` keeps VT switching enabled (a text console stays reachable for recovery), the
+# same belt-and-braces the greeter uses.
+set -u
+
+marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
+
+if [[ -e "$marker" ]]; then
+  exec cage -s -- gtkgreet -s /etc/greetd/wardos-greeter.css -c /usr/libexec/wardos-session
+fi
+
+exec cage -s -- wardos-provision-ui

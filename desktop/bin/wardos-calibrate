@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# wardos-calibrate — first-boot system setup: CALIBRATE (docs/desktop.md §Commands,
-# ADR-0026).
+# wardos-calibrate — in-session system settings: CALIBRATE (docs/desktop.md §Commands,
+# ADR-0026). The first-boot *provisioning* form (before any human account exists) is
+# wardos-provision-ui (ADR-0027); both share the pickers in lib/calibrate.sh.
 #
 # Usage: wardos-calibrate [--force] [STEP…]
 #   wardos-calibrate            the guided flow once (language, keyboard, timezone, then a
@@ -22,17 +23,12 @@ set -euo pipefail
 # shellcheck source=desktop/lib/wardos.sh disable=SC1091
 source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
   source /usr/lib/wardos/wardos.sh
+# shellcheck source=desktop/lib/calibrate.sh disable=SC1091
+source "${WARDOS_CALIBRATE_LIB:-$(dirname "$(readlink -f "$0")")/../lib/calibrate.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/calibrate.sh
 wardos_help "$@"
 
 marker="$(wardos_config_dir)/calibrate-done"
-keep="· keep current"
-back="‹ back"
-
-# --- current values, for the "keep current" labels and to skip no-op applies ----------
-
-current_locale() { localectl status 2>/dev/null | sed -n 's/.*System Locale: *LANG=//p' | head -n1; }
-current_keymap() { localectl status 2>/dev/null | sed -n 's/.* X11 Layout: *//p' | head -n1; }
-current_timezone() { timedatectl show -p Timezone --value 2>/dev/null || true; }
 
 # --- apply helpers: each prints a warning and returns non-zero on failure, never exits ---
 
@@ -87,6 +83,27 @@ apply_timezone() {
   fi
 }
 
+# keyboard-local LAYOUT: apply a validated layout to THIS user's Hyprland config only — the
+# running session and input.conf, NOT the system keymap. Used on a provisioned user's first
+# login (ADR-0027) to adopt the layout chosen at provisioning: the broker already set the
+# system keymap, but wardos-refresh resets input.conf to the default, so the desktop needs
+# the chosen layout re-applied here.
+apply_keyboard_local() {
+  local layout=$1
+  [[ -n "$layout" ]] || return 0
+  if ! localectl list-x11-keymap-layouts 2>/dev/null | grep -qxF -- "$layout"; then
+    wardos_notify "Keyboard" "Unknown layout '$layout'; nothing changed"
+    return 1
+  fi
+  if wardos_has hyprctl; then hyprctl keyword input:kb_layout "$layout" >/dev/null 2>&1 || true; fi
+  local conf
+  conf=$(hypr_input_conf)
+  if grep -Eq '^[[:space:]]*kb_layout[[:space:]]*=' "$conf"; then
+    wardos_backup "$conf"
+    sed -i -E "s|^([[:space:]]*kb_layout[[:space:]]*=[[:space:]]*).*$|\1$layout|" "$conf"
+  fi
+}
+
 # The user's copy of the shipped Hyprland input fragment, created from the default when
 # missing (so a change to kb_layout always has a file to land in).
 hypr_input_conf() {
@@ -100,63 +117,6 @@ hypr_input_conf() {
     fi
   fi
   printf '%s\n' "$file"
-}
-
-# --- interactive pickers: print the chosen value, empty when kept/cancelled -------------
-
-pick_locale() {
-  local cur choice
-  cur=$(current_locale)
-  choice=$(
-    {
-      printf '%s\n' "$keep${cur:+ ($cur)}"
-      # UTF-8 locales only, the ones a desktop should offer.
-      localectl list-locales 2>/dev/null | grep -Ei '\.utf-?8$' || true
-    } | wardos_menu "Language · the system language and formats"
-  ) || return 0
-  [[ "$choice" == "$keep"* ]] && return 0
-  printf '%s\n' "$choice"
-}
-
-pick_keyboard() {
-  local cur choice
-  cur=$(current_keymap)
-  choice=$(
-    {
-      printf '%s\n' "$keep${cur:+ ($cur)}"
-      localectl list-x11-keymap-layouts 2>/dev/null || true
-    } | wardos_menu "Keyboard · the layout for the desktop, console and login"
-  ) || return 0
-  [[ "$choice" == "$keep"* ]] && return 0
-  printf '%s\n' "$choice"
-}
-
-pick_timezone() {
-  local cur region city zones regions
-  cur=$(current_timezone)
-  zones=$(timedatectl list-timezones 2>/dev/null || true)
-  [[ -n "$zones" ]] || { wardos_notify "Timezone" "No timezone data on this host"; return 0; }
-  while true; do
-    regions=$(printf '%s\n' "$zones" | cut -d/ -f1 | sort -u)
-    region=$(
-      printf '%s\n%s\n' "$keep${cur:+ ($cur)}" "$regions" | wardos_menu "Timezone · region"
-    ) || return 0
-    [[ "$region" == "$keep"* ]] && return 0
-    # A single-segment zone (UTC, GMT…) is the answer as it stands.
-    if ! printf '%s\n' "$zones" | grep -q "^$region/"; then
-      printf '%s\n' "$region"
-      return 0
-    fi
-    city=$(
-      {
-        printf '%s\n' "$back"
-        printf '%s\n' "$zones" | sed -n "s|^$region/||p" | sort
-      } | wardos_menu "Timezone · $region"
-    ) || return 0
-    [[ "$city" == "$back" ]] && continue
-    printf '%s\n' "$region/$city"
-    return 0
-  done
 }
 
 # The optional password step: one terminal window running passwd for the current user.
@@ -179,9 +139,9 @@ set_password() {
 # login rather than recording an unfinished setup as complete.
 guided() {
   local loc="" kbd="" tz="" choice
-  loc=$(pick_locale) || true
-  kbd=$(pick_keyboard) || true
-  tz=$(pick_timezone) || true
+  loc=$(calibrate_pick_locale) || true
+  kbd=$(calibrate_pick_keyboard) || true
+  tz=$(calibrate_pick_timezone) || true
   while true; do
     choice=$(wardos_menu "Review · your first-boot setup" \
       "Apply and continue" \
@@ -198,9 +158,9 @@ guided() {
         apply_timezone "$tz" || true
         return 0
         ;;
-      "Language ·"*) loc=$(pick_locale) || true ;;
-      "Keyboard ·"*) kbd=$(pick_keyboard) || true ;;
-      "Timezone ·"*) tz=$(pick_timezone) || true ;;
+      "Language ·"*) loc=$(calibrate_pick_locale) || true ;;
+      "Keyboard ·"*) kbd=$(calibrate_pick_keyboard) || true ;;
+      "Timezone ·"*) tz=$(calibrate_pick_timezone) || true ;;
       "Set a login password") set_password ;;
       "Skip the rest") return 0 ;;
       *) return 1 ;;
@@ -212,22 +172,25 @@ run_step() {
   case "$1" in
     locale)
       local v=${2:-}
-      [[ -n "$v" ]] || v=$(pick_locale) || true
+      [[ -n "$v" ]] || v=$(calibrate_pick_locale) || true
       apply_locale "$v"
       ;;
     keyboard)
       local v=${2:-}
-      [[ -n "$v" ]] || v=$(pick_keyboard) || true
+      [[ -n "$v" ]] || v=$(calibrate_pick_keyboard) || true
       apply_keyboard "$v"
       ;;
     timezone)
       local v=${2:-}
-      [[ -n "$v" ]] || v=$(pick_timezone) || true
+      [[ -n "$v" ]] || v=$(calibrate_pick_timezone) || true
       apply_timezone "$v"
+      ;;
+    keyboard-local)
+      apply_keyboard_local "${2:-}"
       ;;
     password) set_password ;;
     run) guided ;;
-    *) wardos_die "no step '$1' (locale, keyboard, timezone, password, run)" ;;
+    *) wardos_die "no step '$1' (locale, keyboard, keyboard-local, timezone, password, run)" ;;
   esac
 }
 

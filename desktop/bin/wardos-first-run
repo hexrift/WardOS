@@ -32,6 +32,13 @@ date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
 # rest of onboarding (down to wardos-welcome) still runs.
 wardos-refresh --all ||
   wardos_notify "Defaults not applied" "Run 'wardos-refresh --all' in a terminal"
+# Adopt a first-boot provisioning keyboard choice (ADR-0027) into this user's Hyprland
+# config: the provisioning broker set the system/console keymap, but wardos-refresh has just
+# reset input.conf to the default layout, so re-apply the chosen one for the desktop itself.
+kbstate="${WARDOS_KEYBOARD_STATE:-/var/lib/wardos/keyboard-layout}"
+if [[ -s "$kbstate" ]] && wardos_has wardos-calibrate; then
+  wardos-calibrate keyboard-local "$(head -n1 "$kbstate")" || true
+fi
 # -q: the desktop autostart already re-applies the theme on every login, so a first-run
 # toast on top of it would be the duplicate "Theme · …" the reference laptop showed (E-09).
 if wardos_has wardos-theme && ! wardos-theme set -q ward-dark; then

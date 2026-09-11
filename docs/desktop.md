@@ -58,6 +58,21 @@ Login is greetd, set up by the image itself (`image/rootfs/etc/greetd`), not by 
 step. `shell/`, `theme/` and `tests/` never land on the host. Every row is asserted by
 `desktop/tests/install.test.sh` against a temp root.
 
+**First-boot provisioning ([ADR-0027](decisions/ADR-0027-first-boot-provisioning.md)).**
+The image ships unprovisioned — no human account. greetd runs `wardos-greetd-session`,
+which while `/var/lib/wardos/provisioned` is absent starts the provisioning UI
+(`wardos-provision-ui`) under cage instead of the greeter: an unprivileged fuzzel flow that
+collects language, keyboard, timezone, name, username and a masked password, then asks the
+root broker (`wardos-provisiond`, socket-activated on `/run/wardos/provision.sock`, group
+`greeter`, mode 0660) to apply them and create the real user. The broker writes the marker
+on success; from then on the selector runs the normal greeter and the broker refuses. A
+build-time `WARDOS_DEV_SEED_USER` seeds a **locked** dev account (username only — no baked
+password) and the marker at first boot (`wardos-dev-seed.service`) so CI/hardware images skip
+provisioning; a password, if wanted, arrives as the first-boot systemd credential
+`wardos-dev-seed.password`. Production images ship without it, unprovisioned.
+`greetd`'s `config.toml` runs `wardos-greetd-session`, so the selector is live; on a
+provisioned machine its greeter path is byte-for-byte the #116 login.
+
 User state: `~/.config/wardos/` (theme choice, rendered theme in `theme/current/`, user
 overrides), `~/.local/share/wardos/` (web app profiles, installed themes, fonts),
 `~/.local/state/wardos/` (toggles, last screenshot, record pid). Image-owned defaults
@@ -104,6 +119,9 @@ use them); `ward` is the front door for people.
 | `wardos-share <file>` | serve a file on the LAN with a QR code (python http.server + qrencode) |
 | `wardos-calibrate [--force] [step…]` | first-boot system setup, CALIBRATE ([ADR-0026](decisions/ADR-0026-first-run-calibrate.md)): `locale` (`localectl set-locale`), `keyboard` (Hyprland `kb_layout` live + persisted, and `localectl set-x11-keymap`), `timezone` (region → city, `timedatectl set-timezone`), `password` (one terminal running `passwd`, off the default path); no arguments runs the guided flow with a review that changes any choice, once (`~/.config/wardos/calibrate-done`); a step with a value applies it non-interactively. Keyboard-first, offline, polkit not `sudo` |
 | `wardos-first-run` | first login: copy configs, the default theme, `ward doctor`, the default apps, show the keys, `wardos-calibrate`, then `wardos-welcome` |
+| `wardos-greetd-session` | greetd's session selector ([ADR-0027](decisions/ADR-0027-first-boot-provisioning.md)): `/var/lib/wardos/provisioned` absent → the provisioning UI under cage; present → the normal `gtkgreet` greeter (byte-for-byte the provisioned-machine login) |
+| `wardos-provision-ui` | first-boot provisioning UI (CALIBRATE provisioning form): unprivileged fuzzel flow — language, keyboard, timezone, name, username, masked password — that asks the broker to apply them and create the first user. No privileged operation itself |
+| `wardos-provisiond` | the root provisioning broker (socket-activated, one instance per connection): validated verbs `LOCALE`/`KEYMAP`/`TIMEZONE`/`ACCOUNT`/`STATUS`; refuses once provisioned; the password is fed to `chpasswd` on stdin, never logged; `ACCOUNT` is the transactional commit that writes the marker |
 | `wardos-welcome [--again] [step…]` | the first-login walkthrough ([`onboarding.md`](onboarding.md) §1): `theme` (from `wardos-theme list`), `keys` (a terminal running `ward vault set NAME`, never a menu), `project` (a directory picker over `~` or a URL to clone, then `ward init`), `agent` (`ward claude` there, the trust bar in one line), `done` (the card; writes `~/.config/wardos/welcome-done`); one step by name any time, `--again` the whole; `clone URL DIR` is the project step's terminal command |
 | `wardos-version` | image and tool versions (`bootc status`, `ward --version`) |
 | `wardos-about` | the About surface (fastfetch with the WardOS logo) |
