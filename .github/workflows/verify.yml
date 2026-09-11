@@ -21,15 +21,53 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: pip install pyyaml
-      # Let the bubblewrap-guarded isolation tests actually run on the runner.
-      - name: Install bubblewrap and allow unprivileged user namespaces
+      # Issue #124: the bubblewrap-guarded namespace, verifier and egress tests must
+      # RUN on the runner, never skip. Install bubblewrap and allow unprivileged user
+      # namespaces, then FAIL the required job when the sandbox cannot actually be
+      # created — a green check must never hide skipped security assertions.
+      - name: Require working isolation (bubblewrap + unprivileged user namespaces)
         run: |
+          set -euo pipefail
           sudo apt-get update -q
           sudo apt-get install -y -q bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
-          bwrap --unshare-all --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind-try /lib64 /lib64 --proc /proc --dev /dev -- /bin/true && echo "bwrap userns: OK" || echo "bwrap userns: unavailable (guarded tests will skip)"
-      - run: bash scripts/verify/tamperward.sh
+          if bwrap --unshare-all --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind-try /lib64 /lib64 --proc /proc --dev /dev -- /bin/true; then
+            echo "bwrap userns: OK"
+          else
+            echo "::error::bubblewrap cannot create a user namespace on this runner; the isolation tests would skip. Failing the required job per issue #124." >&2
+            exit 1
+          fi
+      # WARD_REQUIRE_ISOLATION turns a missing isolation prerequisite from a silent
+      # skip into a hard test failure (crates/ward-sandbox/src/ci.rs), so this merge
+      # authority cannot pass with the namespace/verifier/egress assertions skipped.
+      - name: Verify (isolation tests required to run, not skip — issue #124)
+        env:
+          WARD_REQUIRE_ISOLATION: "1"
+        run: bash scripts/verify/tamperward.sh
+      # Named, machine-checkable evidence that the mandatory isolation regressions
+      # executed (issue #124). The e2e binary is already built by the step above, so
+      # this only re-runs it (default libtest format: one `test <name> ... ok` line
+      # each — no --nocapture, whose interleaving would corrupt those lines). The
+      # checker holds an explicit inventory of the namespace, verifier-corpus and
+      # egress test names, proves each ran exactly once with `ok`, ties the ST-029
+      # corpus to its fixed row catalogue, and fails the required job — publishing
+      # the names and counts to the step summary — if any evidence is missing.
+      - name: Checker self-test (the gate can go red — issue #124)
+        run: bash scripts/verify/check-isolation-evidence.test.sh
+      - name: Isolation execution summary (issue #124)
+        env:
+          WARD_REQUIRE_ISOLATION: "1"
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/isolation.log"
+          cargo test -p ward-daemon --test e2e --all-features > "$log" 2>&1 || {
+            cat "$log"
+            echo "::error::the e2e isolation suite did not pass under WARD_REQUIRE_ISOLATION" >&2
+            exit 1
+          }
+          cat "$log"
+          bash scripts/verify/check-isolation-evidence.sh "$log"
 
   deny:
     name: cargo-deny (advisories · licenses · sources)

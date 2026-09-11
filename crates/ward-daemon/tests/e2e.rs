@@ -26,8 +26,7 @@ fn scratch_project() -> tempfile::TempDir {
 
 #[test]
 fn session_runs_and_seals_a_log() {
-    if !sandbox::available() {
-        eprintln!("skipping: bubblewrap not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap") {
         return;
     }
     let state = tempfile::tempdir().unwrap();
@@ -46,8 +45,7 @@ fn session_runs_and_seals_a_log() {
 
 #[test]
 fn up_run_status_stop_lifecycle() {
-    if !sandbox::available() {
-        eprintln!("skipping: bubblewrap not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap") {
         return;
     }
     let state = tempfile::tempdir().unwrap();
@@ -126,8 +124,7 @@ fn up_run_status_stop_lifecycle() {
 
 #[test]
 fn selftest_blocks_every_probe() {
-    if !sandbox::available() {
-        eprintln!("skipping: bubblewrap not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap") {
         return;
     }
     let project = scratch_project();
@@ -194,11 +191,11 @@ fn selftest_blocks_every_probe() {
 /// runner without IPv6, and nothing may be `Reached`.
 #[test]
 fn egress_and_surface_probes_never_reach() {
-    if !sandbox::available()
-        || !std::path::Path::new("/usr/bin/python3").exists()
-            && !std::path::Path::new("/usr/local/bin/python3").exists()
+    let have_python = std::path::Path::new("/usr/bin/python3").exists()
+        || std::path::Path::new("/usr/local/bin/python3").exists();
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap")
+        || !ward_sandbox::ci::isolation_ready(have_python, "python3")
     {
-        eprintln!("skipping: bubblewrap or python3 not available");
         return;
     }
     let project = scratch_project();
@@ -252,8 +249,7 @@ fn egress_and_surface_probes_never_reach() {
 /// be `REACHED`. The catalogue is fixed so a dropped or renamed row is caught.
 #[test]
 fn hostile_verifier_corpus_is_contained() {
-    if !sandbox::available() {
-        eprintln!("skipping: bubblewrap not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap") {
         return;
     }
     let results = ward_daemon::selftest_verifier_corpus().expect("verifier corpus");
@@ -284,11 +280,11 @@ fn hostile_verifier_corpus_is_contained() {
 /// socket, and a private destination is denied there and recorded (ADR-0014).
 #[test]
 fn sandboxed_egress_goes_through_the_proxy_and_private_is_denied() {
-    if !sandbox::available()
-        || !std::path::Path::new("/usr/bin/python3").exists()
-            && !std::path::Path::new("/usr/local/bin/python3").exists()
+    let have_python = std::path::Path::new("/usr/bin/python3").exists()
+        || std::path::Path::new("/usr/local/bin/python3").exists();
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap")
+        || !ward_sandbox::ci::isolation_ready(have_python, "python3")
     {
-        eprintln!("skipping: bubblewrap or python3 not available");
         return;
     }
     let state = tempfile::tempdir().unwrap();
@@ -342,8 +338,12 @@ fn spawn_upstream() -> (u16, Arc<Mutex<String>>) {
 
 #[test]
 fn gateway_injects_the_host_key_and_the_sandbox_never_holds_it() {
-    if !sandbox::available() || !std::path::Path::new("/usr/bin/python3").exists() {
-        eprintln!("skipping: bubblewrap or python3 not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap")
+        || !ward_sandbox::ci::isolation_ready(
+            std::path::Path::new("/usr/bin/python3").exists(),
+            "python3",
+        )
+    {
         return;
     }
     let (port, seen) = spawn_upstream();
@@ -412,8 +412,12 @@ print(s.recv(200).split(b'\\r\\n')[0].decode()); print('key='+key)";
 
 #[test]
 fn hooks_answer_ask_under_step_through_and_are_logged_as_claims() {
-    if !sandbox::available() || !std::path::Path::new("/usr/bin/python3").exists() {
-        eprintln!("skipping: bubblewrap or python3 not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap")
+        || !ward_sandbox::ci::isolation_ready(
+            std::path::Path::new("/usr/bin/python3").exists(),
+            "python3",
+        )
+    {
         return;
     }
     let state = tempfile::tempdir().unwrap();
@@ -487,8 +491,12 @@ print(ask({'hook': 'Stop'}))";
 /// and the real fix passes.
 #[test]
 fn verify_ignores_a_weakened_protected_test_and_passes_the_real_fix() {
-    if !sandbox::available() || !ward_daemon::verify::Toolchains::detect().has_rust() {
-        eprintln!("skipping: bubblewrap or a Rust toolchain not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap")
+        || !ward_sandbox::ci::isolation_ready(
+            ward_daemon::verify::Toolchains::detect().has_rust(),
+            "a Rust toolchain",
+        )
+    {
         return;
     }
     let demo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ward-demo");
@@ -584,8 +592,7 @@ fn verify_ignores_a_weakened_protected_test_and_passes_the_real_fix() {
 /// carrying the entry id and policy hash.
 #[test]
 fn snapshot_primitives_answer_from_the_cas_and_describe_carries_the_facts() {
-    if !sandbox::available() {
-        eprintln!("skipping: bubblewrap not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap") {
         return;
     }
     let state = tempfile::tempdir().unwrap();
@@ -667,8 +674,12 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// computed at `ward up` and the proxy enforces that one.
 #[test]
 fn st007_policy_rewrite_mid_session_does_not_widen_the_network() {
-    if !sandbox::available() || !std::path::Path::new("/usr/bin/python3").exists() {
-        eprintln!("skipping: bubblewrap or python3 not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap")
+        || !ward_sandbox::ci::isolation_ready(
+            std::path::Path::new("/usr/bin/python3").exists(),
+            "python3",
+        )
+    {
         return;
     }
     let state = tempfile::tempdir().unwrap();
@@ -701,8 +712,12 @@ print(s.recv(200).split(b'\\r\\n')[0].decode())";
 /// `Origin::Agent` claim, never as a kernel, proxy or daemon fact.
 #[test]
 fn st016_forged_semantic_events_stay_agent_origin_claims() {
-    if !sandbox::available() || !std::path::Path::new("/usr/bin/python3").exists() {
-        eprintln!("skipping: bubblewrap or python3 not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap")
+        || !ward_sandbox::ci::isolation_ready(
+            std::path::Path::new("/usr/bin/python3").exists(),
+            "python3",
+        )
+    {
         return;
     }
     let state = tempfile::tempdir().unwrap();
@@ -746,8 +761,7 @@ for req in ({'hook': 'PostToolUse', 'tool': 'Read', 'summary': 'FORGED kernel re
 /// replay/live boundary, and `stop` seals a log that verifies.
 #[test]
 fn daemon_owns_the_log_streams_to_a_subscriber_and_seals_on_stop() {
-    if !sandbox::available() {
-        eprintln!("skipping: bubblewrap not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap") {
         return;
     }
     let state = tempfile::tempdir().unwrap();
@@ -912,8 +926,7 @@ fn assert_stream_matches_sealed_log(seen: &[EventRecord], log: &std::path::Path)
 /// the sandbox never holds the token.
 #[test]
 fn github_remote_goes_through_the_gateway_with_the_host_token() {
-    if !sandbox::available() {
-        eprintln!("skipping: bubblewrap not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap") {
         return;
     }
     let (port, seen) = spawn_upstream();
@@ -1013,8 +1026,7 @@ while True:
 /// or the host, and nothing it writes survives into the next verification.
 #[test]
 fn st019_hostile_verify_command_is_contained_and_disposable() {
-    if !sandbox::available() {
-        eprintln!("skipping: bubblewrap not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap") {
         return;
     }
     let state = tempfile::tempdir().unwrap();
@@ -1053,8 +1065,7 @@ fn st019_hostile_verify_command_is_contained_and_disposable() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn pause_freezes_the_sandbox_closes_the_proxy_and_resume_lets_it_finish() {
-    if !sandbox::available() {
-        eprintln!("skipping: bubblewrap not available");
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap") {
         return;
     }
     let state = tempfile::tempdir().unwrap();
