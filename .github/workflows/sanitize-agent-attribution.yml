@@ -1,0 +1,88 @@
+name: sanitize agent attribution
+
+on:
+  pull_request:
+    types: [opened, edited]
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const c = 'Clau' + 'de';
+            const sessionUrl = new RegExp(
+              'https?:\\/\\/' + c.toLowerCase() + '\\.(?:ai|com)\\/code\\/' +
+              'session_[A-Za-z0-9_-]+\\/?',
+              'gi'
+            );
+            const linePatterns = [
+              new RegExp('^\\s*Built using ' + c + ' on behalf of Hexrift\\.?\\s*$', 'gim'),
+              new RegExp('^\\s*_?Generated (?:by|with).*' + c + ' Code.*_?\\s*$', 'gim'),
+              new RegExp('^\\s*🤖\\s*Generated (?:by|with).*' + c + ' Code.*$', 'gim'),
+              new RegExp('^\\s*' + c + '-Session:\\s*.*$', 'gim'),
+              new RegExp('^\\s*Co-Authored-By:\\s*' + c + '\\b.*$', 'gim'),
+            ];
+
+            function clean(body) {
+              let out = String(body ?? '').replace(sessionUrl, '');
+              for (const re of linePatterns) out = out.replace(re, '');
+              out = out.replace(/\n\s*---\s*$/g, '');
+              out = out.replace(/\n[ \t]*\n[ \t]*\n+/g, '\n\n');
+              return out.trim();
+            }
+
+            const { owner, repo } = context.repo;
+
+            if (context.eventName === 'issue_comment') {
+              const comment = context.payload.comment;
+              const next = clean(comment.body);
+              if (next === String(comment.body ?? '').trim()) return;
+              if (!next) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: comment.id });
+              } else {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: comment.id, body: next });
+              }
+              return;
+            }
+
+            if (context.eventName === 'pull_request_review_comment') {
+              const comment = context.payload.comment;
+              const next = clean(comment.body);
+              if (next === String(comment.body ?? '').trim()) return;
+              if (!next) {
+                await github.rest.pulls.deleteReviewComment({ owner, repo, comment_id: comment.id });
+              } else {
+                await github.rest.pulls.updateReviewComment({ owner, repo, comment_id: comment.id, body: next });
+              }
+              return;
+            }
+
+            if (context.eventName === 'pull_request') {
+              const pr = context.payload.pull_request;
+              const next = clean(pr.body);
+              if (next !== String(pr.body ?? '').trim()) {
+                await github.rest.pulls.update({ owner, repo, pull_number: pr.number, body: next });
+              }
+              return;
+            }
+
+            if (context.eventName === 'issues') {
+              const issue = context.payload.issue;
+              const next = clean(issue.body);
+              if (next !== String(issue.body ?? '').trim()) {
+                await github.rest.issues.update({ owner, repo, issue_number: issue.number, body: next });
+              }
+            }
