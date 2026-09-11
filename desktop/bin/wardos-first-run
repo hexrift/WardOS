@@ -16,53 +16,60 @@ source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev
   source /usr/lib/wardos/wardos.sh
 wardos_help "$@"
 
+# One-time defaults vs resumable onboarding (ADR-0026, #125). The default configuration is
+# copied ONCE, guarded by first-run-done: re-copying it on a later login would let
+# wardos-refresh's backup overwrite the user's real `.bak` — silent config-backup loss. The
+# onboarding *stages* (CALIBRATE, then the walkthrough) are separate and resumable: each
+# keeps its own completion marker and is offered again on every login until it is finished,
+# so a cancelled stage resumes next login without touching the user's configuration.
 marker="$(wardos_config_dir)/first-run-done"
-if [[ -e "$marker" && "${1:-}" != --force ]]; then exit 0; fi
+if [[ ! -e "$marker" || "${1:-}" == --force ]]; then
+  # Record that the one-time init has happened BEFORE the best-effort steps below. They run
+  # under `set -e`, and if one exited non-zero after this point the block would abort with
+  # the marker unwritten — so the next login would re-copy the defaults and let
+  # wardos-refresh's backup overwrite the user's real `.bak`. Writing the marker first makes
+  # the init idempotent regardless of any single step failing.
+  mkdir -p "$(dirname "$marker")"
+  date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
 
-# Record that first-run has happened BEFORE the best-effort steps below. They run
-# under `set -e`, and if one exited non-zero after this point the script would abort
-# with the marker unwritten — so the next login would run first-run again, re-copying
-# the defaults and letting wardos-refresh's backup overwrite the user's real `.bak`
-# (silent config-backup loss). Writing the marker first makes first-run idempotent
-# regardless of any single step failing.
-mkdir -p "$(dirname "$marker")"
-date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
+  # Each step is best-effort: a failure is reported and skipped, never fatal, so the rest of
+  # onboarding still runs.
+  wardos-refresh --all ||
+    wardos_notify "Defaults not applied" "Run 'wardos-refresh --all' in a terminal"
+  # -q: the desktop autostart already re-applies the theme on every login, so a first-run
+  # toast on top of it would be the duplicate "Theme · …" the reference laptop showed (E-09).
+  if wardos_has wardos-theme && ! wardos-theme set -q ward-dark; then
+    wardos_notify "Theme not applied" "Run 'wardos-theme set ward-dark' in a terminal"
+  fi
+  # `ward doctor` cold-starts every shipped agent to read its version, so on slow media
+  # (a USB boot) it runs for tens of seconds — on the reference laptop the boot-time run
+  # took ~70s (E-09). It is purely informational here (the wardos-firstboot service writes
+  # the full report to /var/lib/wardos/doctor.txt regardless), so it must never hold up the
+  # rest of onboarding. Run it detached and only surface a notification on real problems.
+  if wardos_has ward; then
+    # Fully detached: redirect the whole subshell so it holds none of first-run's stdio open
+    # (a background child keeping the exec-once's pipe open can itself read as a stall).
+    (ward doctor >/dev/null 2>&1 ||
+      wardos_notify "ward doctor found problems" "Run 'ward doctor' in a terminal") \
+      </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
+  wardos-webapp install --defaults ||
+    wardos_notify "Web apps not registered" "Run 'wardos-webapp install --defaults' in a terminal"
+  wardos-tui install --defaults ||
+    wardos_notify "Terminal apps not registered" "Run 'wardos-tui install --defaults' in a terminal"
 
-# Each step is best-effort: a failure is reported and skipped, never fatal, so the
-# rest of onboarding (down to wardos-welcome) still runs.
-wardos-refresh --all ||
-  wardos_notify "Defaults not applied" "Run 'wardos-refresh --all' in a terminal"
-# -q: the desktop autostart already re-applies the theme on every login, so a first-run
-# toast on top of it would be the duplicate "Theme · …" the reference laptop showed (E-09).
-if wardos_has wardos-theme && ! wardos-theme set -q ward-dark; then
-  wardos_notify "Theme not applied" "Run 'wardos-theme set ward-dark' in a terminal"
+  wardos-keys
 fi
-# `ward doctor` cold-starts every shipped agent to read its version, so on slow media
-# (a USB boot) it runs for tens of seconds — on the reference laptop the boot-time run
-# took ~70s (E-09). It is purely informational here (the wardos-firstboot service writes
-# the full report to /var/lib/wardos/doctor.txt regardless), so it must never hold up the
-# rest of onboarding — the welcome, the keys, the walkthrough. Run it detached and only
-# surface a notification if the host has real problems.
-if wardos_has ward; then
-  # Fully detached: redirect the whole subshell so it holds none of first-run's stdio
-  # open (a background child keeping the exec-once's pipe open can itself read as a stall).
-  (ward doctor >/dev/null 2>&1 ||
-    wardos_notify "ward doctor found problems" "Run 'ward doctor' in a terminal") \
-    </dev/null >/dev/null 2>&1 &
-  disown 2>/dev/null || true
-fi
-wardos-webapp install --defaults ||
-  wardos_notify "Web apps not registered" "Run 'wardos-webapp install --defaults' in a terminal"
-wardos-tui install --defaults ||
-  wardos_notify "Terminal apps not registered" "Run 'wardos-tui install --defaults' in a terminal"
 
-wardos-keys
-# The walkthrough (wardos-welcome, below) is the single sender of the "Welcome to WardOS"
-# greeting — a second one here would be the duplicate toast the reference laptop showed
-# (E-09), and it duplicated wardos-keys, which shows the keys on the next line anyway.
+# Resumable onboarding stages, offered on every login until each records its own completion
+# (#125). Both self-guard on their markers (calibrate-done / welcome-done) and are
+# best-effort: a cancelled CALIBRATE leaves no marker and is re-offered next login, while
+# "Skip the rest" — or a finished walkthrough — writes the marker and never prompts again.
+# Neither re-copies configuration, so resuming an unfinished stage never overwrites the
+# user's files or backups. The walkthrough (wardos-welcome) remains the single sender of the
+# "Welcome to WardOS" greeting; first-run never sends it (the E-09 duplicate-toast fix).
 # CALIBRATE (ADR-0026): language, keyboard and timezone before the walkthrough, so the
-# machine is usable in the user's own language and layout first. It keeps its own marker,
-# is best-effort, and never blocks the walkthrough.
+# machine is usable in the user's own language and layout first.
 if wardos_has wardos-calibrate; then wardos-calibrate || true; fi
-# The walkthrough keeps its own marker, so a login that skipped it can run it later.
 if wardos_has wardos-welcome; then wardos-welcome; fi
