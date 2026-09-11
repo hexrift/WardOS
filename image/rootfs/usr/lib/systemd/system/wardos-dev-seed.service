@@ -7,6 +7,11 @@
 # selector goes straight to the greeter instead of the provisioning UI. Production images
 # are built WITHOUT the flag file, so this unit is a permanent no-op there and the machine
 # ships unprovisioned. It runs before greetd so the marker exists before the selector reads it.
+#
+# With no usable password credential (see below) the seed is a no-op that writes NO marker:
+# the machine stays unprovisioned and the first-boot provisioning UI runs, so there is always
+# a way in (it never leaves a locked account behind a "provisioned" marker). This is the ONLY
+# development account mechanism; image/disk.sh does not pre-create a first user.
 [Unit]
 Description=WardOS development image account seed (non-production)
 Documentation=https://github.com/hexrift/WardOS/blob/main/docs/decisions/ADR-0027-first-boot-provisioning.md
@@ -19,9 +24,18 @@ Before=greetd.service
 [Service]
 Type=oneshot
 ExecStart=/usr/libexec/wardos-dev-seed
-# The dev password, if any, is delivered as a first-boot systemd credential (never baked
-# into an image layer): deliver it with `systemd.set_credential=wardos-dev-seed.password:…`
-# on the kernel command line, or a credentials file. Absent → the account stays locked.
+# The dev account's password, if any, is delivered as a first-boot systemd credential (never
+# baked into an image layer). ImportCredential accepts it from whichever source systemd was
+# given it on this boot; deliver it from a PROPER source for anything real:
+#   * an ENCRYPTED system credential — `systemd-creds encrypt` then
+#     `systemd.set_credential_encrypted=wardos-dev-seed.password:…` on the kernel command
+#     line, or a LoadCredentialEncrypted= drop-in — or
+#   * a firmware/SMBIOS credential (`io.systemd.credential:…`), or a credentials directory.
+# Do NOT use the plaintext `systemd.set_credential=wardos-dev-seed.password:…` form for a real
+# password: kernel-cmdline credentials are world-readable via /proc/cmdline (systemd documents
+# them as unsuitable for sensitive data), so that form is INSECURE and only acceptable for
+# disposable lab/test images — it is not a secret channel. With no credential delivered the
+# account is not created and the machine stays unprovisioned (first-boot provisioning runs).
 ImportCredential=wardos-dev-seed.password
 
 [Install]

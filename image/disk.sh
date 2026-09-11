@@ -2,16 +2,18 @@
 # Turn a built WardOS image into a bootable disk with bootc-image-builder.
 #
 #   image/disk.sh --type qcow2|raw|iso [--image NAME] [--output DIR] [--rootfs FS]
-#                 [--arch x86_64|aarch64] [--user NAME [--password PW] [--ssh-key FILE]]
-#                 [--luks | --no-luks] [--config FILE] [--dry-run]
+#                 [--arch x86_64|aarch64] [--luks | --no-luks] [--config FILE] [--dry-run]
 #
 # Defaults: image localhost/wardos:<git describe --tags --always>, output ./image/out,
-# rootfs btrfs (ADR-0001), arch this machine's. --user writes a bootc-image-builder
-# config that creates the first user (wheel; the greeter's default user is `wardos`)
-# with --password (or WARDOS_PASSWORD in the environment, which keeps it out of `ps`)
-# and/or --ssh-key. The installer ISO encrypts the disk unless told --no-luks
-# (ADR-0017): a kickstart asks Anaconda for full-disk encryption, the passphrase typed
-# at install time. A `raw` image is a whole-disk image you write to a USB stick and
+# rootfs btrfs (ADR-0001), arch this machine's. NO first user is created here: every disk
+# ships UNPROVISIONED and creates the real user at first boot (ADR-0027 first-boot
+# provisioning), so no disk carries a shared credential and no disk can ever boot with an
+# existing wheel account while WardOS still thinks it is unprovisioned. The ONE development
+# escape hatch is a build-time knob, not a disk-build one: build the image with
+# `image/build.sh --dev-seed-user NAME` and wardos-dev-seed seeds that account (and marks
+# the machine provisioned) at first boot. The installer ISO encrypts the disk unless told
+# --no-luks (ADR-0017): a kickstart asks Anaconda for full-disk encryption, the passphrase
+# typed at install time. A `raw` image is a whole-disk image you write to a USB stick and
 # boot a machine from: it runs WardOS entirely off the stick and never touches the
 # machine's own disk, which is the way to try WardOS on real hardware without an
 # install (see image/README.md). A qcow2 and a raw image are never encrypted (the
@@ -25,7 +27,7 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -40,9 +42,6 @@ output="$repo_root/image/out"
 rootfs="btrfs"
 arch=""
 config=""
-user=""
-password=${WARDOS_PASSWORD:-}
-ssh_key=""
 # "" until the flags are read: the type's default (iso: on); 1 for --luks, 0 for --no-luks.
 luks=""
 dry_run=0
@@ -61,12 +60,16 @@ while [[ $# -gt 0 ]]; do
     --arch=*) arch=${1#--arch=}; shift ;;
     --config) config=$2; shift 2 ;;
     --config=*) config=${1#--config=}; shift ;;
-    --user) user=$2; shift 2 ;;
-    --user=*) user=${1#--user=}; shift ;;
-    --password) password=$2; shift 2 ;;
-    --password=*) password=${1#--password=}; shift ;;
-    --ssh-key) ssh_key=$2; shift 2 ;;
-    --ssh-key=*) ssh_key=${1#--ssh-key=}; shift ;;
+    # --user/--password/--ssh-key were removed (ADR-0027): disk.sh never pre-creates a first
+    # user. The real user is created at first boot (provisioning); the dev escape hatch is
+    # image/build.sh --dev-seed-user. Reject them with a pointer so a stale invocation fails
+    # loudly instead of silently building an image with an unexpected account model.
+    --user | --user=* | --password | --password=* | --ssh-key | --ssh-key=*)
+      echo "disk.sh: ${1%%=*} was removed (ADR-0027): disks ship unprovisioned and create the" >&2
+      echo "         user at first boot. For a dev account, build the image with" >&2
+      echo "         image/build.sh --dev-seed-user NAME (wardos-dev-seed seeds it at first boot)." >&2
+      exit 2
+      ;;
     --luks) luks=1; shift ;;
     --no-luks) luks=0; shift ;;
     --dry-run) dry_run=1; shift ;;
@@ -79,6 +82,14 @@ case "$type" in
   qcow2 | raw | iso) ;;
   "") echo "disk.sh: --type qcow2|raw|iso is required" >&2; exit 2 ;;
   *) echo "disk.sh: unsupported --type '$type' (qcow2, raw or iso)" >&2; exit 2 ;;
+esac
+
+# rootfs is interpolated into the generated kickstart (`autopart --type=…`) and passed to
+# bootc-image-builder; keep it to the filesystems both accept so nothing arbitrary is
+# interpolated into the config.
+case "$rootfs" in
+  btrfs | ext4 | xfs) ;;
+  *) echo "disk.sh: --rootfs must be btrfs, ext4 or xfs (got '$rootfs')" >&2; exit 2 ;;
 esac
 
 if [[ -z "$image" ]]; then
@@ -105,30 +116,14 @@ if [[ -n "$config" && ! -f "$config" ]]; then
   echo "disk.sh: config file not found: $config" >&2
   exit 1
 fi
-if [[ -n "$config" && ( -n "$user" || "$luks" == 1 ) ]]; then
-  echo "disk.sh: --config carries its own users and partitioning; drop it or drop --user/--luks" >&2
+if [[ -n "$config" && "$luks" == 1 ]]; then
+  echo "disk.sh: --config carries its own partitioning; drop it or drop --luks" >&2
   exit 2
 fi
 if [[ -z "$luks" ]]; then
   # Encrypted by default where encryption is possible (ADR-0017): the installer ISO,
   # unless a --config brings its own partitioning. --no-luks is the explicit opt-out.
   if [[ "$type" == iso && -z "$config" ]]; then luks=1; else luks=0; fi
-fi
-if [[ -n "$ssh_key" && ! -f "$ssh_key" ]]; then
-  echo "disk.sh: ssh key file not found: $ssh_key" >&2
-  exit 1
-fi
-if [[ -n "$user" && -z "$password" && -z "$ssh_key" ]]; then
-  echo "disk.sh: --user needs --password (or WARDOS_PASSWORD) or --ssh-key, or nobody can use sudo" >&2
-  exit 2
-fi
-if [[ -n "$user" ]]; then
-  # A pre-created account is a dev/specialised convenience, NOT the production model
-  # (ADR-0027): consumer/hardware images ship WITHOUT --user and create the real user at
-  # first boot (provisioning), so they carry no shared credential.
-  echo "disk.sh: WARNING --user bakes a pre-created account ('$user') into the image; this is" >&2
-  echo "         for development/unattended installs only. Omit --user for a production image," >&2
-  echo "         which is unprovisioned and creates its user at first boot (ADR-0027)." >&2
 fi
 if [[ $luks -eq 1 && "$type" != iso ]]; then
   # The bootc-image-builder blueprint knows plain, lvm and btrfs partitions and nothing
@@ -139,45 +134,32 @@ if [[ $luks -eq 1 && "$type" != iso ]]; then
 fi
 
 # --- the generated bootc-image-builder config -------------------------------------------
-# bootc-image-builder refuses [[customizations.user]] next to a custom kickstart, so with
-# --luks the user is a kickstart `user` line instead; without it, the builder's own user
-# customization does the same job on both output types.
+# The only thing disk.sh generates is the LUKS kickstart (--type iso --luks): full-disk
+# encryption is Anaconda's job. It creates NO user and locks root: the disk boots
+# unprovisioned and the first-boot provisioning UI creates the real user (ADR-0027), so a
+# generated config can never establish a wheel account without the provisioned marker.
 write_config() {
-  local key=""
-  if [[ -n "$ssh_key" ]]; then key=$(<"$ssh_key"); fi
-  echo "# Generated by image/disk.sh; do not commit (it may hold a password)."
-  if [[ $luks -eq 1 ]]; then
-    echo "[customizations.installer.kickstart]"
-    echo 'contents = """'
-    echo "# Full-disk encryption: autopart --encrypted without --passphrase makes Anaconda"
-    echo "# ask for one during the installation (unverified until E-09)."
-    echo "zerombr"
-    echo "clearpart --all --initlabel --disklabel=gpt"
-    echo "autopart --noswap --type=${rootfs} --encrypted"
-    echo "network --bootproto=dhcp --device=link --activate --onboot=on"
-    echo "lang en_US.UTF-8"
-    echo "keyboard us"
-    echo "timezone UTC --utc"
-    echo "rootpw --lock"
-    if [[ -n "$user" ]]; then
-      local line="user --name=${user} --groups=wheel"
-      if [[ -n "$password" ]]; then line+=" --password=${password} --plaintext"; fi
-      echo "$line"
-      if [[ -n "$key" ]]; then echo "sshkey --username=${user} \"${key}\""; fi
-    fi
-    echo "reboot"
-    echo '"""'
-  elif [[ -n "$user" ]]; then
-    echo "[[customizations.user]]"
-    echo "name = \"${user}\""
-    if [[ -n "$password" ]]; then echo "password = \"${password}\""; fi
-    if [[ -n "$key" ]]; then echo "key = \"${key}\""; fi
-    echo 'groups = ["wheel"]'
-  fi
+  echo "# Generated by image/disk.sh; do not commit."
+  echo "[customizations.installer.kickstart]"
+  echo 'contents = """'
+  echo "# Full-disk encryption: autopart --encrypted without --passphrase makes Anaconda"
+  echo "# ask for one during the installation (unverified until E-09)."
+  echo "zerombr"
+  echo "clearpart --all --initlabel --disklabel=gpt"
+  echo "autopart --noswap --type=${rootfs} --encrypted"
+  echo "network --bootproto=dhcp --device=link --activate --onboot=on"
+  echo "lang en_US.UTF-8"
+  echo "keyboard us"
+  echo "timezone UTC --utc"
+  # No `user` line and root locked: no pre-created account. The first user is created at
+  # first boot by the provisioning UI (ADR-0027).
+  echo "rootpw --lock"
+  echo "reboot"
+  echo '"""'
 }
 
 generated=""
-if [[ -n "$user" || $luks -eq 1 ]]; then
+if [[ $luks -eq 1 ]]; then
   mkdir -p "$output"
   generated="$output/config.toml"
   (umask 077 && write_config >"$generated")
@@ -216,8 +198,7 @@ printf '%q ' "${cmd[@]}"
 printf '\n'
 if [[ -n "$generated" ]]; then
   echo "disk.sh: wrote $generated (mode 0600):"
-  # Never echo the password; the file has it.
-  (password='********' && write_config) | sed 's/^/  /'
+  write_config | sed 's/^/  /'
 fi
 
 if [[ $dry_run -eq 1 ]]; then

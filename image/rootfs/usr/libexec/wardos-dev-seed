@@ -1,38 +1,87 @@
 #!/usr/bin/env bash
-# wardos-dev-seed — seed a known development account and mark the machine provisioned
-# (ADR-0027 §Dev escape hatch). NON-PRODUCTION: runs only on images built with
-# WARDOS_DEV_SEED_USER (the Containerfile drops /usr/lib/wardos/dev-seed-user then), so a
-# CI or hardware-iteration image boots straight to a desktop instead of the first-boot
-# provisioning session. Production images ship without the flag file and unprovisioned.
+# wardos-dev-seed — the ONE development escape hatch (ADR-0027 §Dev escape hatch).
+# NON-PRODUCTION: runs only on images built with WARDOS_DEV_SEED_USER (the Containerfile
+# drops /usr/lib/wardos/dev-seed-user then), so a CI or hardware-iteration image can boot
+# straight to a desktop instead of the first-boot provisioning session. Production images
+# ship without the flag file and unprovisioned. There is no disk-build `--user` account
+# path: image/disk.sh no longer creates a first user, so a machine can never boot with an
+# existing wheel account while WardOS still thinks it is unprovisioned.
 #
 # Runs at first boot (a root systemd oneshot before greetd), where /var and /home are real
-# machine state — not at build time, where bootc does not persist /var or /home content.
+# machine state — not at build time, where bootc does not persist /var or /home content
+# (this is exactly why the provisioned marker, which lives in /var, must be written at first
+# boot and not baked at build time).
+#
+# Behaviour (ADR-0027 §Dev escape hatch, matching the wardos-provisiond account policy):
+#   * The seed username is validated against the SAME regex and reserved-name blocklist as
+#     the broker (wardos-provisiond). A reserved name (root/daemon/…) or one that already
+#     exists is REFUSED: the account is never created, adopted, altered or locked, and the
+#     marker is NOT written — the machine simply stays unprovisioned and first-boot
+#     provisioning runs (recoverable), never "existing admin + provisioned but no login".
+#   * With a usable password credential: the dev account is created (in wheel), its password
+#     set, and only then is the machine marked provisioned.
+#   * With NO credential: nothing is mutated and NO marker is written. The machine falls back
+#     to canonical first-boot provisioning (the provisioning UI runs), so the operator always
+#     has a way in. It never produces the old "locked account + provisioned marker" dead end
+#     (a greeter with no usable login and provisioning disabled). Deliver the credential (see
+#     the unit and Containerfile) on a later boot to seed the account then.
 set -euo pipefail
 
-flag=/usr/lib/wardos/dev-seed-user
-marker=/var/lib/wardos/provisioned
-# The password (if any) is a first-boot systemd credential — never a file baked into the
-# image. Absent → the account is left LOCKED (no shared credential is ever persisted).
+flag="${WARDOS_DEV_SEED_FLAG:-/usr/lib/wardos/dev-seed-user}"
+marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
+# The password, if any, is delivered at boot as a systemd credential — NEVER a file baked
+# into an image layer, and NEVER a secret on the kernel command line (see the unit file: a
+# plaintext `systemd.set_credential=` is world-readable via /proc/cmdline and is testing-only;
+# a real password comes from an encrypted or firmware credential). systemd exposes the
+# delivered credential to this oneshot under $CREDENTIALS_DIRECTORY. Absent → fall back to
+# canonical provisioning (no account, no marker); never a persisted shared credential.
 credfile="${CREDENTIALS_DIRECTORY:-/dev/null}/wardos-dev-seed.password"
+
+# Nothing to do unless this is a dev-seed image that is still unprovisioned. Reboot
+# idempotency: once the marker exists (this run seeded, or provisioning ran), exit at once.
 [[ -e "$flag" && ! -e "$marker" ]] || exit 0
 
 user=$(head -n1 "$flag")
+
+# The exact conservative username policy of wardos-provisiond (kept in lockstep): lower-case
+# start, then lower-case/digits/underscore/dash, at most 32 characters.
 if [[ ! "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-  echo "wardos-dev-seed: invalid seed username '$user'" >&2
+  echo "wardos-dev-seed: invalid seed username '$user'; not seeding (machine stays unprovisioned)" >&2
   exit 1
 fi
 
-if ! id -u "$user" >/dev/null 2>&1; then
-  useradd -m -c "WardOS dev" -G wheel -s /bin/bash "$user"
-fi
-if [[ -s "$credfile" ]]; then
-  printf '%s:%s\n' "$user" "$(head -n1 "$credfile")" | chpasswd
-  echo "wardos-dev-seed: set '$user' password from the wardos-dev-seed.password credential" >&2
-else
-  passwd -l "$user" >/dev/null 2>&1 || usermod -L "$user" 2>/dev/null || true
-  echo "wardos-dev-seed: no password credential; '$user' left locked" >&2
+# NO ADOPTION of a reserved/system identity — the exact blocklist wardos-provisiond refuses.
+# A reserved seed name is a build misconfiguration: refuse it, mutate nothing (never touch
+# root or any system account), write no marker. The machine stays unprovisioned.
+case "$user" in
+  root | daemon | bin | sys | adm | nobody | nogroup | greeter | ward-provision)
+    echo "wardos-dev-seed: seed username '$user' is reserved; refusing to seed (machine stays unprovisioned)" >&2
+    exit 1
+    ;;
+esac
+
+# NO ADOPTION of an existing account either: never elevate, alter or lock a name already in
+# use (a human or a system account). Refuse, mutate nothing, write no marker.
+if id -u "$user" >/dev/null 2>&1; then
+  echo "wardos-dev-seed: seed username '$user' already exists; refusing to adopt it (machine stays unprovisioned)" >&2
+  exit 1
 fi
 
+# No usable credential → do NOT create a locked account and do NOT write the marker. Fall
+# back to canonical first-boot provisioning so the operator can always get in (recoverable).
+if [[ ! -s "$credfile" ]]; then
+  echo "wardos-dev-seed: no password credential for '$user'; leaving the machine UNPROVISIONED so first-boot provisioning runs (deliver the wardos-dev-seed.password credential to seed the account instead)" >&2
+  exit 0
+fi
+
+# Credential present: create the dev account, set its password, then mark provisioned last.
+useradd -m -c "WardOS dev" -G wheel -s /bin/bash "$user"
+printf '%s:%s\n' "$user" "$(head -n1 "$credfile")" | chpasswd
+echo "wardos-dev-seed: set '$user' password from the wardos-dev-seed.password credential" >&2
+
+# The marker (the commit point) is written last and only after a usable account exists.
 mkdir -p "$(dirname "$marker")"
-date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
+tmp="$marker.tmp.$$"
+date -u +%Y-%m-%dT%H:%M:%SZ >"$tmp"
+mv -f "$tmp" "$marker"
 echo "wardos-dev-seed: seeded development account '$user'; machine marked provisioned" >&2

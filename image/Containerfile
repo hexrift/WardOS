@@ -101,13 +101,18 @@ FROM quay.io/fedora/fedora-bootc:44
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG WARDOS_VERSION=dev
-# NON-PRODUCTION build knob (ADR-0027 §Dev escape hatch): when WARDOS_DEV_SEED_USER is set,
-# the image seeds that development account (LOCKED — no password) and marks itself
-# provisioned at first boot, so CI/hardware images skip the first-boot provisioning session.
-# The account's password, if wanted, is delivered at boot as the systemd credential
-# `wardos-dev-seed.password` (a first-boot secret channel) — never baked into an image layer.
-# Empty for production images, which ship unprovisioned: no human account, no credential.
-# Only a username (not a secret) is ever written into the image.
+# NON-PRODUCTION build knob (ADR-0027 §Dev escape hatch) — the ONE development account
+# mechanism: when WARDOS_DEV_SEED_USER is set, wardos-dev-seed seeds that development
+# account and marks the machine provisioned at first boot, so CI/hardware images skip the
+# first-boot provisioning session. The account's password is delivered at boot as the
+# systemd credential `wardos-dev-seed.password` — never baked into an image layer. For a
+# real password deliver it from a PROPER source (an ENCRYPTED systemd credential, or a
+# firmware/SMBIOS credential); the plaintext `systemd.set_credential=` kernel-cmdline form
+# is world-readable via /proc/cmdline (INSECURE, testing-only — not a secret channel).
+# With NO credential delivered, wardos-dev-seed creates nothing and writes no marker: the
+# machine stays unprovisioned and first-boot provisioning runs (recoverable), never a locked
+# account behind a provisioned marker. Empty for production images, which ship unprovisioned:
+# no human account, no credential. Only a username (not a secret) is ever written into the image.
 ARG WARDOS_DEV_SEED_USER=
 
 LABEL org.wardos.version="${WARDOS_VERSION}" \
@@ -256,7 +261,7 @@ RUN ver=$(sed -n 's/^VERSION_ID=//p' /usr/lib/os-release) \
 # Production builds leave it empty and ship unprovisioned; the build asserts that below.
 RUN if [ -n "${WARDOS_DEV_SEED_USER}" ]; then \
       printf '%s\n' "${WARDOS_DEV_SEED_USER}" >/usr/lib/wardos/dev-seed-user; \
-      echo "WardOS: NON-PRODUCTION image; dev account '${WARDOS_DEV_SEED_USER}' seeded LOCKED at first boot (deliver the wardos-dev-seed.password credential to log in)"; \
+      echo "WardOS: NON-PRODUCTION image; dev account '${WARDOS_DEV_SEED_USER}' seeded at first boot when the wardos-dev-seed.password credential is delivered (else the machine stays unprovisioned)"; \
     else \
       test ! -e /usr/lib/wardos/dev-seed-user; \
       test ! -e /var/lib/wardos/provisioned; \

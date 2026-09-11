@@ -30,7 +30,7 @@ on:
         description: "Release tag for source=release (empty: the Containerfile default)"
         default: ""
       user:
-        description: "DEV ONLY: bake a pre-created first user (blank = unprovisioned; the real user is created at first boot, ADR-0027). Its password comes from the WARDOS_DEV_SEED_PASSWORD repo secret, not a plaintext input"
+        description: "DEV ONLY: seed a development account NAME via the WARDOS_DEV_SEED_USER build-arg (blank = unprovisioned; the real user is created at first boot, ADR-0027). wardos-dev-seed creates it and marks the machine provisioned at FIRST BOOT; no account or credential is baked into the disk. Deliver the password at boot as a systemd credential (see the unit) to log in, else the machine stays unprovisioned and runs first-boot provisioning"
         default: ""
       luks:
         description: "ISO only: ask Anaconda for full-disk encryption"
@@ -80,13 +80,13 @@ jobs:
       RELEASE: ${{ github.event.inputs.release || github.event.release.tag_name || '' }}
       # Blank by default (releases and unspecified builds): the disk ships UNPROVISIONED and
       # creates the real user at first boot (ADR-0027), so it carries no shared credential.
-      # A dev build can opt into a pre-created account via the workflow's user/password inputs.
+      # A dev build can opt into a seed account: FIRST_USER is passed as the image build's
+      # WARDOS_DEV_SEED_USER build-arg (the ONE dev escape hatch), NOT a disk-build --user.
+      # wardos-dev-seed creates the account and writes the provisioned marker together at
+      # first boot, so a disk can never boot "existing wheel account + unprovisioned".
       FIRST_USER: ${{ github.event.inputs.user || '' }}
       LUKS: ${{ github.event.inputs.luks || 'false' }}
       DRAFT_RELEASE: ${{ github.event.inputs.draft_release || '' }}
-      # Only used when FIRST_USER is set (a dev build). Sourced from a repo SECRET, never a
-      # plaintext workflow input, so it does not appear in run inputs or logs.
-      WARDOS_PASSWORD: ${{ secrets.WARDOS_DEV_SEED_PASSWORD }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -105,28 +105,25 @@ jobs:
           set -euo pipefail
           args=(--source "$SOURCE" --arch "$ARCH" --tag localhost/wardos:ci)
           if [[ -n "$RELEASE" ]]; then args+=(--release "$RELEASE"); fi
+          # DEV opt-in: seed the account via the build-arg (wardos-dev-seed at first boot),
+          # NOT a disk-build --user. Blank leaves the image unprovisioned. build.sh validates
+          # the name and refuses reserved ones. The password is never baked; it is delivered
+          # as a first-boot systemd credential when the disk is booted (see the unit).
+          if [[ -n "$FIRST_USER" ]]; then args+=(--dev-seed-user "$FIRST_USER"); fi
           sudo -E ./image/build.sh "${args[@]}"
-      - name: Pre-created account (dev opt-in; blank = unprovisioned)
-        run: |
-          set -euo pipefail
-          if [[ -n "$FIRST_USER" ]]; then
-            echo "USER_ARGS=--user $FIRST_USER" >>"$GITHUB_ENV"
-          else
-            echo "USER_ARGS=" >>"$GITHUB_ENV"
-          fi
       - name: qcow2
         if: env.TYPE == 'qcow2' || env.TYPE == 'both'
-        run: sudo -E ./image/disk.sh --type qcow2 --arch "$ARCH" --image localhost/wardos:ci $USER_ARGS --output "$PWD/image/out"
+        run: sudo -E ./image/disk.sh --type qcow2 --arch "$ARCH" --image localhost/wardos:ci --output "$PWD/image/out"
       - name: raw
         if: env.TYPE == 'raw'
-        run: sudo -E ./image/disk.sh --type raw --arch "$ARCH" --image localhost/wardos:ci $USER_ARGS --output "$PWD/image/out"
+        run: sudo -E ./image/disk.sh --type raw --arch "$ARCH" --image localhost/wardos:ci --output "$PWD/image/out"
       - name: iso
         if: env.TYPE == 'iso' || env.TYPE == 'both'
         run: |
           set -euo pipefail
           args=(--type iso --arch "$ARCH" --image localhost/wardos:ci --output "$PWD/image/out")
-          if [[ -n "$FIRST_USER" ]]; then args+=(--user "$FIRST_USER"); fi
-          # disk.sh encrypts the ISO by default (ADR-0017); luks=false has to say so.
+          # disk.sh encrypts the ISO by default (ADR-0017); luks=false has to say so. No
+          # --user: the dev account (if any) is already baked as the dev-seed build-arg above.
           if [[ "$LUKS" == "true" ]]; then args+=(--luks); else args+=(--no-luks); fi
           sudo -E ./image/disk.sh "${args[@]}"
       - name: Name and checksum the disks

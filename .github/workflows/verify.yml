@@ -112,9 +112,11 @@ jobs:
       - name: scripts explain themselves without podman or docker
         run: |
           ./image/build.sh --dry-run
+          # The ONE dev escape hatch is a build-arg, not a disk-build --user (ADR-0027).
+          ./image/build.sh --source checkout --dev-seed-user wardos --dry-run
           ./image/disk.sh --type qcow2 --dry-run
           ./image/disk.sh --type iso --dry-run
-          ./image/disk.sh --type iso --luks --user wardos --password ci --output /tmp/disk-ci --dry-run
+          ./image/disk.sh --type iso --luks --output /tmp/disk-ci --dry-run
           ./image/check-packages.sh --dry-run
           ./image/install-desktop.sh --help >/dev/null
 
