@@ -12,10 +12,15 @@ set -euo pipefail
 tag="${1:?usage: check-version.sh <tag> [cargo-toml]}"
 cargo_toml="${2:-Cargo.toml}"
 
-case "$tag" in
-  v[0-9]*) ;;
-  *) echo "check-version: not a v* release tag: '$tag'" >&2; exit 1 ;;
-esac
+# Strict tag grammar: v<major>.<minor>.<patch> with optional SemVer prerelease
+# (-rc.1) and build metadata (+meta). Anchored end-to-end so a value carrying
+# shell metacharacters (e.g. 'v1.2.3; touch pwned' or 'v1.2.3$(...)') is rejected
+# here rather than treated as a tag -- the workflow reads this value from a
+# dispatch input, so the grammar is the gate that keeps junk out of the release.
+if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+  echo "check-version: not a valid v<semver> release tag: '$tag'" >&2
+  exit 1
+fi
 
 if [[ ! -f "$cargo_toml" ]]; then
   echo "check-version: no such Cargo.toml: '$cargo_toml'" >&2

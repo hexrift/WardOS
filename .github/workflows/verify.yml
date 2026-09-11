@@ -141,6 +141,18 @@ jobs:
           sudo apt-get install -y -q shellcheck
       - run: bash desktop/tests/run.sh
 
+  # The release helpers (scripts/release): every script shellcheck-clean, every
+  # bash regression green -- the tag/version/asset binding for issue #126.
+  release-scripts:
+    name: release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q shellcheck
+      - run: bash scripts/release/run.sh
+
   # The Hyprland the image ships parses the shipped Hyprland tree (image/check-hyprland.sh):
   # a removed or renamed option shows up here, not in the booted desktop's error bar.
   hyprland-config:
