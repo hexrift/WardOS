@@ -44,4 +44,31 @@ mock cage 'printf "cage-xkb=%s\n" "${XKB_DEFAULT_LAYOUT:-none}" >>"$MOCK_LOG"; t
 wardos-greetd-session
 assert_logged '^cage-xkb=de$'
 
+# --- FAIL CLOSED (#119 review): a persistent provisioning/restage failure must NEVER fall
+#     through to the provisioned greeter while the marker is ABSENT. The provisioning UI keeps
+#     exiting with the restage-persist-failure status (76) and never touches the marker; after
+#     the bounded retries the selector leaves its loop with no marker, and it MUST fail closed
+#     (exit non-zero → greetd restarts the provisioning session), NOT present gtkgreet on a
+#     machine with no human account. `sleep` is mocked so the bounded backoff is instant
+#     (deterministic, not timing-based). --------------------------------------------------------
+: >"$MOCK_LOG"
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_STAGE"
+mock sleep                       # the bounded backoff must not actually wait
+mock cage 'exit 76'              # the UI cannot persist its restage state, and never provisions
+rc=0
+wardos-greetd-session || rc=$?
+[[ $rc -ne 0 ]] || fail "a persistent restage failure with the marker ABSENT must fail closed (non-zero exit), not fall through to the greeter"
+assert_not_logged 'gtkgreet'     # the provisioned greeter must NEVER run without the marker
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "the fail-closed path must not have created a marker"
+
+# --- run_greeter is reachable ONLY with the marker present: the belt-and-braces guard on the
+#     greeter call refuses even a direct fall-through when the marker is absent. Here the loop
+#     is skipped (marker present at entry) and the greeter runs; the pairing with the case above
+#     proves gtkgreet ⇔ marker present. -----------------------------------------------------------
+: >"$MOCK_LOG"
+: >"$WARDOS_PROVISIONED_MARKER"
+mock cage
+wardos-greetd-session
+assert_logged '^cage -s -- gtkgreet '   # marker present → greeter runs
+
 echo "ok   greetd-session.test.sh internal assertions"

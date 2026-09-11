@@ -150,9 +150,11 @@ Every disk `disk.sh` builds ships **unprovisioned** (ADR-0027): it bakes no user
 The **first boot** runs a keyboard-first provisioning session that creates the real user
 (wheel) and applies language/keyboard/timezone before handing off to the greeter. With
 `--luks` Anaconda asks for the disk passphrase during the installation. (For a throwaway
-dev image that skips provisioning, bake a locked seed account at build time with
+dev image that skips provisioning, bake a seed *username* at build time with
 `./image/build.sh --dev-seed-user NAME` and deliver its password as a first-boot systemd
-credential; never for a production image.) After you log in `uwsm` starts Hyprland,
+credential — the account and marker are then seeded transactionally on first boot; with no
+credential nothing is created and the machine runs first-boot provisioning. Never for a
+production image.) After you log in `uwsm` starts Hyprland,
 `wardos-first-run` copies
 the configs and hands over to `wardos-welcome` (theme, key, first project, first agent;
 [`onboarding.md`](onboarding.md)),

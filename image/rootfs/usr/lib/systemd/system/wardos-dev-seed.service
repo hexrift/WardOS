@@ -19,7 +19,13 @@ ConditionPathExists=/usr/lib/wardos/dev-seed-user
 ConditionPathExists=!/var/lib/wardos/provisioned
 After=systemd-tmpfiles-setup.service local-fs.target
 Wants=systemd-tmpfiles-setup.service
-Before=greetd.service
+# Ordered before BOTH greetd (which launches the marker-gated session selector) AND the
+# provisioning broker socket, so that on any unprovisioned boot this seed runs — and, crucially,
+# its reconcile-on-entry removes an orphan account left by an interrupted prior seed — BEFORE
+# canonical first-boot provisioning can start. Without the socket ordering the broker could
+# begin listening (and the provisioning UI reach it) while a dev-seed orphan still exists,
+# letting canonical provisioning create a SECOND administrator under a different name.
+Before=greetd.service wardos-provisiond.socket
 
 [Service]
 Type=oneshot

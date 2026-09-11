@@ -133,26 +133,50 @@ through a broker rather than running privileged.** It generalises to later WardO
 ## Dev / test escape hatch
 CI and hardware iteration need a machine that skips provisioning. A **build-time** Containerfile
 arg (default off) — `WARDOS_DEV_SEED_USER=<name>` — bakes only a *username* (never a secret) so
-`wardos-dev-seed.service` seeds that development user (in `wheel`) **locked** and writes the
-marker **at first boot** (not at build time, where bootc does not persist `/var` or `/home`).
-The account's password is **never baked into an image layer**: it is delivered, if wanted, as a
-**first-boot systemd credential** `wardos-dev-seed.password`
-(`systemd.set_credential=…` on the kernel command line, or a credentials file); with none, the
-account stays locked. The image build asserts no `dev-seed-password` file exists in any layer.
-The `disk` workflow's `user` input is blank by default (release disks are unprovisioned) and,
-when a dev sets it, it is passed as `image/build.sh --dev-seed-user NAME` (the
-`WARDOS_DEV_SEED_USER` build-arg), **not** a disk-build `--user`; the password is never baked
-into a layer or the disk and is delivered at first boot as the `wardos-dev-seed.password`
-systemd credential (else the account stays locked and the machine runs first-boot provisioning).
-This escape hatch must never be the production default.
+`wardos-dev-seed.service` can seed that development user **at first boot** (not at build time,
+where bootc does not persist `/var` or `/home`). The account's password is **never baked into an
+image layer**: it is delivered, if wanted, as a **first-boot systemd credential**
+`wardos-dev-seed.password` (`systemd.set_credential=…` on the kernel command line, or a
+credentials file). The seed's behaviour matches the broker's account policy exactly:
+
+- **No credential** → the seed creates **no account and no marker**. The machine stays
+  unprovisioned and falls back to **canonical first-boot provisioning** (the provisioning UI
+  runs), so an operator always has a way in. There is never a "locked account behind a
+  provisioned marker" dead end; deliver the credential on a later boot to seed the account then.
+- **With a usable credential** → the dev account (in `wheel`), its password, and the provisioned
+  marker are established as **one transaction** with the same broker-grade durability discipline
+  as `wardos-provisiond`'s `ACCOUNT` verb: a durable journal written *before* any mutation,
+  **reconcile-on-entry** of any interrupted prior attempt (a checked `userdel -r` of the
+  orphan it names — refusing, not creating a second account, if that removal fails), and a
+  **checked rollback** on any failure (a `chpasswd` or marker-write failure removes the freshly
+  created account; a rollback that itself fails keeps the journal and refuses rather than leave a
+  residual `wheel` account). The marker is the commit point, written durably and last, and the
+  journal is cleared only once it has committed.
+- A **reserved, invalid, or already-existing** seed name is **refused without any mutation** —
+  the account is never created, adopted, altered or locked, and no marker is written; the machine
+  stays unprovisioned.
+
+`wardos-dev-seed.service` is ordered **before both `greetd` and the provisioning broker socket**,
+so on any unprovisioned boot the seed's reconcile-on-entry runs (removing an orphan from an
+interrupted prior seed) *before* canonical provisioning could start — the machine can never boot
+with a usable administrator while it still reads as unprovisioned, the window in which canonical
+provisioning would create a second administrator. The image build asserts no `dev-seed-password`
+file exists in any layer. The `disk` workflow's `user` input is blank by default (release disks
+are unprovisioned) and, when a dev sets it, it is passed as `image/build.sh --dev-seed-user NAME`
+(the `WARDOS_DEV_SEED_USER` build-arg), **not** a disk-build `--user`; the password is never baked
+into a layer or the disk and is delivered at first boot as the `wardos-dev-seed.password` systemd
+credential (else the machine stays unprovisioned and runs first-boot provisioning). This escape
+hatch must never be the production default.
 
 ## Relationship to the installer
 Anaconda / bootc-image-builder MAY still create users for specialised or unattended deployment
 scenarios via their own kickstart/config. `image/disk.sh` itself **no longer pre-creates any
 account** — its `--user`/`--password`/`--ssh-key` flags were removed, so every disk it builds is
 **unprovisioned**. A development account is baked instead through
-`image/build.sh --dev-seed-user NAME`, which `wardos-dev-seed` seeds (locked) and marks
-provisioned at first boot. The **canonical consumer flow is first-boot provisioning**, not an
+`image/build.sh --dev-seed-user NAME`, which `wardos-dev-seed` seeds — transactionally, and only
+with a delivered credential — and marks provisioned at first boot (with no credential it creates
+nothing and the machine runs first-boot provisioning). The **canonical consumer flow is
+first-boot provisioning**, not an
 installer-created account; the default consumer image is unprovisioned regardless of install
 medium.
 

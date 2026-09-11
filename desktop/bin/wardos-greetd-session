@@ -34,7 +34,20 @@ stage="${WARDOS_PROVISION_STAGE:-/run/wardos-provision/provision.stage}"
 
 # The provisioned greeter, unchanged: cage hosting a plain (NOT layer-shell, so no `-l`)
 # gtkgreet, styled to Ward Dark, handing off to /usr/libexec/wardos-session on auth.
+#
+# FAIL CLOSED: the provisioned greeter is reachable ONLY with the marker present. Every path
+# that reaches the greeter — the fast path at the top, and the fall-through after the
+# provisioning loop — funnels through here, and a persistent provisioning/restage failure
+# leaves that loop with the marker still ABSENT. Presenting a login greeter then would be the
+# exact dead end the marker gate exists to prevent: a machine with no human account. So this
+# guards the greeter call itself: with no marker it refuses and exits non-zero, so greetd
+# restarts the provisioning session (VT-switch recovery stays available) rather than dropping
+# to a greeter no one can log in to.
 run_greeter() {
+  if [[ ! -e "$marker" ]]; then
+    echo "wardos-greetd-session: provisioning did not complete (marker absent); refusing to start the provisioned greeter and failing closed so greetd restarts the provisioning session" >&2
+    exit 1
+  fi
   exec cage -s -- gtkgreet -s /etc/greetd/wardos-greeter.css -c /usr/libexec/wardos-session
 }
 
@@ -75,7 +88,11 @@ while [[ ! -e "$marker" ]]; do
     stage_fails=$((stage_fails + 1))
     echo "wardos-greetd-session: provisioning could not persist its restage state (attempt $stage_fails/3)" >&2
     if [[ "$stage_fails" -ge 3 ]]; then
-      echo "wardos-greetd-session: restage persistence keeps failing; stopping the provisioning loop" >&2
+      # Bounded, so the picker does not spin forever. This leaves the loop with the marker
+      # ABSENT, so the fall-through below hits run_greeter's marker guard and FAILS CLOSED
+      # (exit non-zero → greetd restarts the provisioning session); it never presents the
+      # provisioned greeter on a machine with no human account.
+      echo "wardos-greetd-session: restage persistence keeps failing; stopping the provisioning loop (will fail closed)" >&2
       break
     fi
     sleep 2
@@ -87,4 +104,8 @@ while [[ ! -e "$marker" ]]; do
   sleep 1
 done
 
+# The loop exited. If it exited because provisioning succeeded, the marker is present and
+# run_greeter hands off to the provisioned greeter; if it exited on a persistent restage
+# failure (or any other non-marker path), the marker is absent and run_greeter fails closed
+# rather than presenting a greeter no one can log in to.
 run_greeter

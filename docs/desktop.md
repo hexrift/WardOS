@@ -69,10 +69,15 @@ password, then asks the
 root broker (`wardos-provisiond`, socket-activated on `/run/wardos/provision.sock`, group
 `greeter`, mode 0660) to apply them and create the real user. The broker writes the marker
 on success; from then on the selector runs the normal greeter and the broker refuses. A
-build-time `WARDOS_DEV_SEED_USER` seeds a **locked** dev account (username only — no baked
-password) and the marker at first boot (`wardos-dev-seed.service`) so CI/hardware images skip
-provisioning; a password, if wanted, arrives as the first-boot systemd credential
-`wardos-dev-seed.password`. Production images ship without it, unprovisioned.
+build-time `WARDOS_DEV_SEED_USER` bakes a dev *username* only (no baked password) so
+`wardos-dev-seed.service` can seed that account at first boot and skip provisioning on CI/hardware
+images. The seed is transactional and mirrors the broker: **with** the first-boot systemd
+credential `wardos-dev-seed.password` it creates the `wheel` user, sets the password and commits
+the marker as one journalled/rolled-back transaction; **without** a credential it creates no
+account and no marker, so the machine stays unprovisioned and first-boot provisioning runs (no
+locked-account dead end). It runs before greetd and the broker socket, reconciling any orphan from
+an interrupted prior seed before canonical provisioning could start. Production images ship
+without the flag, unprovisioned.
 `greetd`'s `config.toml` runs `wardos-greetd-session`, so the selector is live; on a
 provisioned machine its greeter path is byte-for-byte the #116 login.
 
