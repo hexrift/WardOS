@@ -29,7 +29,9 @@ rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_STAGE"
 # shellcheck disable=SC2016  # $WARDOS_PROVISIONED_MARKER expands in the mock, not now
 mock cage 'touch "$WARDOS_PROVISIONED_MARKER"'
 wardos-greetd-session
-assert_logged '^cage -s -- foot --app-id wardos-provision -e wardos-provision-ui$'
+assert_logged '^cage -s -- foot -c /etc/greetd/wardos-provision-foot.ini --app-id wardos-provision -e wardos-provision-ui$'
+# The bootstrap terminal must use the image-owned config, not the greeter account's HOME.
+assert_not_logged '~/.config/wardos/theme/current/foot.ini'
 # cage keeps VT switching (`-s`) on the bootstrap path too (text-console recovery).
 grep -Eq '^cage -s -- foot ' "$MOCK_LOG" || fail "the bootstrap cage must use -s (VT recovery)"
 # When provisioning finishes the loop hands off to the greeter.

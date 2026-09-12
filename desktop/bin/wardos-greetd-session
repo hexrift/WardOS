@@ -53,6 +53,20 @@ run_greeter() {
 
 stage_get() { [[ -f "$stage" ]] && sed -n "s/^$1=//p" "$stage" | head -n1; }
 
+# Hardware acceptance guard: foot must allocate a PTY before the provisioning TUI can run.
+# Probe the same kernel PTY multiplexor foot uses and fail with useful device diagnostics instead
+# of letting cage relaunch a terminal that can only print "failed to open PTY: Permission denied".
+# Closing the master immediately releases the throwaway PTY; no slave is opened or retained.
+require_pty_allocator() {
+  local pty_fd
+  if ! exec {pty_fd}<>/dev/ptmx; then
+    echo "wardos-greetd-session: /dev/ptmx is not openable by the greeter; first-boot provisioning cannot allocate a PTY" >&2
+    ls -lZ /dev/ptmx /dev/pts/ptmx 2>&1 >&2 || true
+    return 1
+  fi
+  exec {pty_fd}>&-
+}
+
 # Cross-component fail-closed inhibit (#119 review): the dev-seed transaction journal (image
 # escape hatch, wardos-dev-seed) is present ONLY while a dev-seed account transaction is
 # unresolved/interrupted — meaning the machine may hold a residual wheel account with NO
@@ -70,6 +84,7 @@ if [[ -e "$dev_seed_journal" ]]; then
 fi
 
 [[ -e "$marker" ]] && run_greeter
+require_pty_allocator || exit 1
 
 # The provisioning UI exits with this status to ask for a cage relaunch under the chosen layout.
 RESTAGE_RC=75
@@ -89,7 +104,7 @@ while [[ ! -e "$marker" ]]; do
   [[ -n "$layout" ]] && export XKB_DEFAULT_LAYOUT="$layout"
   [[ -n "$variant" ]] && export XKB_DEFAULT_VARIANT="$variant"
   rc=0
-  cage -s -- foot --app-id wardos-provision -e wardos-provision-ui || rc=$?
+  cage -s -- foot -c /etc/greetd/wardos-provision-foot.ini --app-id wardos-provision -e wardos-provision-ui || rc=$?
   # Provisioned: leave the loop and hand off to the greeter.
   [[ -e "$marker" ]] && break
   if [[ "$rc" -eq "$RESTAGE_RC" ]]; then
