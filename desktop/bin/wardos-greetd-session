@@ -53,20 +53,31 @@ run_greeter() {
 
 stage_get() { [[ -f "$stage" ]] && sed -n "s/^$1=//p" "$stage" | head -n1; }
 
-# Hardware acceptance guard: foot must allocate a PTY before the provisioning TUI can run.
-# Probe the same kernel PTY multiplexor foot uses and fail with useful device diagnostics instead
-# of letting cage relaunch a terminal that can only print "failed to open PTY: Permission denied".
-# Closing the master immediately releases the throwaway PTY; no slave is opened or retained.
+# Hardware acceptance guard: foot needs a COMPLETE PTY pair (master + slave) before the
+# provisioning TUI can run. A bare open of /dev/ptmx is insufficient: the slave grant/unlock/open
+# can still fail. Python is already a WardOS runtime dependency, and pty.openpty() exercises that
+# complete allocation under the exact unprivileged greeter identity that greetd uses here.
 require_pty_allocator() {
-  local pty_fd
-  if ! exec {pty_fd}<>/dev/ptmx; then
-    echo "wardos-greetd-session: /dev/ptmx is not openable by the greeter; first-boot provisioning cannot allocate a PTY" >&2
+  if ! python3 - <<'PY'
+import os
+import pty
+
+master, slave = pty.openpty()
+try:
+    os.write(slave, b"W")
+    if os.read(master, 1) != b"W":
+        raise OSError("PTY data-path probe did not round-trip")
+finally:
+    os.close(slave)
+    os.close(master)
+PY
+  then
+    echo "wardos-greetd-session: the greeter cannot allocate and use a complete PTY pair; first-boot provisioning cannot start foot" >&2
     ls -lZ /dev/ptmx /dev/pts/ptmx 2>&1 >&2 || true
+    mount | grep -E '(^| )devpts( |$)| on /dev/pts ' >&2 || true
     return 1
   fi
-  exec {pty_fd}>&-
 }
-
 # Cross-component fail-closed inhibit (#119 review): the dev-seed transaction journal (image
 # escape hatch, wardos-dev-seed) is present ONLY while a dev-seed account transaction is
 # unresolved/interrupted — meaning the machine may hold a residual wheel account with NO
