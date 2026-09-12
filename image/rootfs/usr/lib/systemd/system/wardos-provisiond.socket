@@ -16,10 +16,21 @@
 # the broker's refusal is the authoritative in-session guarantee. The socket is group-owned
 # by the greeter (the locked, nologin bootstrap identity that runs the provisioning UI) and
 # mode 0660, so only that session can reach it.
+#
+# ConditionPathExists=!/var/lib/wardos/dev-seed.journal is a cross-component fail-closed inhibit
+# (#119 review): while an interrupted dev-seed transaction is unresolved (its journal present),
+# the machine may hold a residual wheel account with NO provisioned marker, so canonical
+# provisioning must NOT be reachable that boot — otherwise the broker would create a SECOND
+# administrator over the orphan. Because wardos-dev-seed.service is ordered `Before=` this
+# socket, the condition is evaluated AFTER dev-seed has run: an unresolved journal ⇒ the socket
+# never starts ⇒ the broker cannot accept ACCOUNT this boot. wardos-dev-seed reconciles and
+# clears the journal on the NEXT boot before anything else, and only then does this condition
+# pass. The broker keeps its own defense-in-depth refusal on the journal too.
 [Unit]
 Description=WardOS first-boot provisioning broker socket
 Documentation=https://github.com/hexrift/WardOS/blob/main/docs/decisions/ADR-0027-first-boot-provisioning.md
 ConditionPathExists=!/var/lib/wardos/provisioned
+ConditionPathExists=!/var/lib/wardos/dev-seed.journal
 
 [Socket]
 ListenStream=/run/wardos/provision.sock

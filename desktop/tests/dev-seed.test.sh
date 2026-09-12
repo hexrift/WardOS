@@ -303,4 +303,42 @@ assert_logged '^userdel -r devuser$'          # the orphan is reconciled away fi
 [[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "T5c: no credential must leave the machine unprovisioned"
 [[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "T5c: reconcile clears the journal even on the fall-back path"
 
+# --- Newline-only / whitespace-only / control-only credential (#119 review): a credential FILE
+#     that is NON-EMPTY ([[ -s ]] passes) but yields an empty/whitespace/control-only password
+#     after `head -n1` must be treated exactly like NO credential — NO account, NO marker, fall
+#     back to canonical first-boot provisioning. Validating only `[[ -s "$credfile" ]]` would let
+#     such a file through to `useradd` + a blank-password wheel account behind a provisioned
+#     marker. Cover several non-empty-but-unusable shapes. ------------------------------------
+for junk in newline spaces tabs control crlf; do
+  reset_state
+  printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
+  mock id 'exit 1'
+  case "$junk" in
+    newline) printf '\n' >"$credfile" ;;
+    spaces) printf '   \n' >"$credfile" ;;
+    tabs) printf '\t\t\n' >"$credfile" ;;
+    control) printf '\x01\x02\n' >"$credfile" ;;
+    crlf) printf '\r\n' >"$credfile" ;;
+  esac
+  # Prove the file is non-empty, so this genuinely exercises "value validation", not just `-s`.
+  [[ -s "$credfile" ]] || fail "$junk: the credential file must be non-empty (proving -s alone is insufficient)"
+  run_seed
+  [[ $rc -eq 0 ]] || fail "$junk credential must fall back cleanly (exit 0), not error; rc=$rc"
+  assert_not_logged '^useradd' # no account created from an unusable password
+  assert_not_logged '^chpasswd'
+  assert_not_logged '^usermod'
+  [[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "$junk credential must NOT write the provisioned marker"
+done
+
+# A credential with real content AFTER leading whitespace is still usable (not over-rejected):
+# the value has usable characters, so the account is created and the machine provisioned.
+reset_state
+printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
+printf '  hunter2secret\n' >"$credfile"
+mock id 'exit 1'
+run_seed
+[[ $rc -eq 0 ]] || fail "a credential with usable content must still seed; rc=$rc"
+assert_logged '^useradd -m -c WardOS dev -G wheel -s /bin/bash devuser$'
+assert_file "$WARDOS_PROVISIONED_MARKER"
+
 echo "ok   dev-seed.test.sh internal assertions"

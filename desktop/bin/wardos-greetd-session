@@ -53,6 +53,22 @@ run_greeter() {
 
 stage_get() { [[ -f "$stage" ]] && sed -n "s/^$1=//p" "$stage" | head -n1; }
 
+# Cross-component fail-closed inhibit (#119 review): the dev-seed transaction journal (image
+# escape hatch, wardos-dev-seed) is present ONLY while a dev-seed account transaction is
+# unresolved/interrupted — meaning the machine may hold a residual wheel account with NO
+# provisioned marker. Neither provisioning path may proceed that boot: launching the canonical
+# provisioning UI could create a SECOND administrator over the orphan, and presenting the greeter
+# would be the very "residual admin + no way in / wrong way in" state the guards exist to prevent.
+# So guard EARLY (before either path) and FAIL CLOSED — same discipline as the marker guard:
+# refuse and exit non-zero so greetd restarts the session (VT-switch recovery stays available).
+# wardos-dev-seed's reconcile-on-entry removes the orphan and clears the journal on the NEXT boot
+# BEFORE anything else; only then does this guard pass and provisioning/greeter proceed.
+dev_seed_journal="${WARDOS_DEV_SEED_JOURNAL:-/var/lib/wardos/dev-seed.journal}"
+if [[ -e "$dev_seed_journal" ]]; then
+  echo "wardos-greetd-session: an unresolved dev-seed transaction journal is present ($dev_seed_journal); refusing to launch the provisioning UI or the greeter and failing closed so greetd restarts (dev-seed recovery required — the next boot reconciles it first)" >&2
+  exit 1
+fi
+
 [[ -e "$marker" ]] && run_greeter
 
 # The provisioning UI exits with this status to ask for a cage relaunch under the chosen layout.

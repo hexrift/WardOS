@@ -18,19 +18,35 @@
 #              under cage does NOT abort on startup and stays alive for the bounded interval —
 #              the exact regression the T480s hit.
 #
-# GATING / WHAT CANNOT BE EXERCISED HERE, AND WHY:
-#   - If `cage` or `foot` is not installed, the test SKIPS with a clear message (never FAILS on
-#     a compositor-less runner). CI runs it for real in a Fedora container (matching the image's
-#     Fedora 44 cage/foot/wlroots) — see the `desktop-compositor` job in .github/workflows/verify.yml.
-#   - If the binaries ARE installed but the headless compositor cannot bring up ANY surface here
-#     (no wlroots headless backend on this kernel/container), Proof A's startup marker never
-#     appears; the test SKIPS and prints cage's own diagnostics rather than faking a pass. The
-#     genuine end-to-end proof on real graphics hardware remains the hardware boot (the USB build).
+# REQUIRE-MODE vs OPTIONAL SKIP (#119 review):
+#   - By DEFAULT (WARDOS_SMOKE_REQUIRE unset) an environmental gap — cage/foot absent, or the
+#     headless compositor cannot bring up ANY surface here — is a documented SKIP (never a FAIL on
+#     a compositor-less dev box or runner).
+#   - With WARDOS_SMOKE_REQUIRE=1 every such gap is a FAILURE instead. The dedicated CI job
+#     (`desktop-compositor` in .github/workflows/verify.yml) EXPLICITLY installs the compositor
+#     stack and sets this, so the required check can NEVER go green via a skip — it must actually
+#     exercise the boundary. The genuine end-to-end proof on real graphics hardware remains the
+#     hardware boot (the USB build); this is the headless CI boundary.
 # shellcheck source=desktop/tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 setup_env
 
+# In require-mode an environmental gap is a hard failure; otherwise a documented skip (exit 0).
+# CI's desktop-compositor job sets WARDOS_SMOKE_REQUIRE=1 (it installs cage/foot/wlroots itself).
+require="${WARDOS_SMOKE_REQUIRE:-}"
+
+# audit LINE: print named evidence to the log AND, in CI, to the job step summary, so a green
+# check is provably the boundary running (Proof A, the negative control, real-UI Proof B) rather
+# than an environmental skip.
+audit() {
+  echo "$1"
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then printf '%s\n' "$1" >>"$GITHUB_STEP_SUMMARY"; fi
+}
+
 if ! command -v cage >/dev/null 2>&1 || ! command -v foot >/dev/null 2>&1; then
+  if [[ -n "$require" ]]; then
+    fail "WARDOS_SMOKE_REQUIRE=1 but cage and/or foot is not installed — the required desktop-compositor job must exercise the boundary, not skip; install the compositor stack (cage foot wlroots)"
+  fi
   echo "skip cage-smoke.test.sh: cage and/or foot not installed (run where the compositor ships; the CI desktop-compositor job runs it on Fedora with real cage/foot/wlroots)"
   exit 0
 fi
@@ -89,8 +105,13 @@ cage_pid=$!
 # its marker before it could fail): SKIP and document, do not FAIL on a compositor-less runner.
 if ! wait_marker "$up" 120; then
   teardown "$cage_pid"
+  diag=$(sed 's/^/    /' "$cage_log" 2>/dev/null || true)
+  if [[ -n "$require" ]]; then
+    fail "WARDOS_SMOKE_REQUIRE=1 but no surface came up here (headless wlroots backend unavailable) — the required desktop-compositor job must exercise the boundary, not skip. cage said:
+$diag"
+  fi
   echo "skip cage-smoke.test.sh: cage/foot are installed but no surface came up in this environment (headless wlroots backend unavailable here); cage said:"
-  sed 's/^/    /' "$cage_log" 2>/dev/null || true
+  echo "$diag"
   echo "  (the CI desktop-compositor job runs this for real on Fedora; the final proof is the hardware boot)"
   exit 0
 fi
@@ -101,6 +122,7 @@ sleep "$interval"
 alive "$cage_pid" || fail "Proof A: the boundary did not stay alive for ${interval}s after the surface came up (cage exited); cage said:
 $(cat "$cage_log" 2>/dev/null)"
 teardown "$cage_pid"
+audit "cage-smoke: Proof A EXECUTED and PASSED — cage+foot brought a surface up, ran the client (startup marker observed), and it stayed alive ${interval}s"
 
 # --- Negative self-check: a client that dies on startup is DETECTED as dead --------------
 # This proves the liveness assertion above is real: the SAME boundary with a client that exits
@@ -125,24 +147,67 @@ if alive "$dying_pid"; then
   teardown "$dying_pid"
   fail "negative self-check: a client that dies on startup was NOT detected — the smoke would not catch the T480s failure (a layer-shell client aborting under cage)"
 fi
+audit "cage-smoke: negative control EXECUTED and PASSED — a client that exits on startup was detected DEAD after ${interval}s (the smoke is not a no-op)"
 
 # --- Proof B: the REAL shipped wardos-provision-ui stays alive under the real boundary ----
 # Byte-for-byte the bootstrap command from wardos-greetd-session. The marker is absent, so the
 # UI enters provisioning and blocks reading the terminal — it must NOT abort under cage (the
 # T480s regression). Point WARDOS_LIB at the in-tree lib and the socket at an unused path (the
 # UI blocks on input long before it would reach the broker), and put desktop/bin on PATH.
+#
+# POSITIVE real-UI evidence (#119 review): a bare `kill -0` on the outer cage PID can be satisfied
+# by a cage/foot hang BEFORE the client is ever exec'd. So the client is a thin wrapper that writes
+# a startup marker as its LAST act immediately BEFORE `exec`-ing the real wardos-provision-ui: the
+# marker's presence proves foot actually ran the client and reached the real-UI exec, and where
+# pgrep is available we further assert a wardos-provision-ui process is present as a descendant.
+# This positive evidence is REQUIRED to appear (Proof A already proved the compositor can bring a
+# surface up here, so a missing marker now is a genuine hang, not an environmental gap) BEFORE the
+# liveness interval — a hang before client execution now FAILS rather than passing a bare kill -0.
 export WARDOS_LIB="$WARDOS_ROOT/lib/wardos.sh"
 export WARDOS_PROVISIONED_MARKER="$TMP/ui-provisioned" # absent → the UI runs the provisioning flow
 export WARDOS_PROVISION_STAGE="$TMP/ui-stage"
 export WARDOS_PROVISION_SOCK="$TMP/ui-nosock"
+ui_up="$TMP/ui.up"
+ui_client="$TMP/ui-client.sh"
+cat >"$ui_client" <<EOF
+#!/usr/bin/env bash
+: >"$ui_up"
+exec wardos-provision-ui
+EOF
+chmod +x "$ui_client"
 : >"$cage_log"
-cage -s -- foot --app-id wardos-provision -e wardos-provision-ui >"$cage_log" 2>&1 &
+cage -s -- foot --app-id wardos-provision -e "$ui_client" >"$cage_log" 2>&1 &
 ui_pid=$!
-# Give the real client time to come up and (if it were going to abort) do so, then assert it is
-# still alive: the shipped surface came up under cage and stayed alive.
+# REQUIRED positive evidence: foot launched the client and reached the real-UI exec.
+if ! wait_marker "$ui_up" 120; then
+  teardown "$ui_pid"
+  fail "Proof B: foot never launched the real wardos-provision-ui (startup marker absent) — cage/foot hung before client execution; cage said:
+$(cat "$cage_log" 2>/dev/null)"
+fi
+# Extra descendant evidence where pgrep is available: the real UI process is actually present
+# under the boundary (bounded poll, so the exec just after the marker is not raced).
+ui_evidence="startup marker"
+if command -v pgrep >/dev/null 2>&1; then
+  ui_seen=0
+  for ((i = 0; i < 30; i++)); do
+    if pgrep -f 'wardos-provision-ui' >/dev/null 2>&1; then
+      ui_seen=1
+      break
+    fi
+    sleep 0.1
+  done
+  [[ "$ui_seen" -eq 1 ]] || {
+    teardown "$ui_pid"
+    fail "Proof B: no wardos-provision-ui process is present under the boundary after its startup marker; cage said:
+$(cat "$cage_log" 2>/dev/null)"
+  }
+  ui_evidence="startup marker + live descendant"
+fi
+# Only now the liveness assertion: the real UI came up and did NOT abort on startup (T480s class).
 sleep "$((interval + 2))"
 alive "$ui_pid" || fail "Proof B: the real wardos-provision-ui aborted on startup under cage+foot (the T480s failure class); cage said:
 $(cat "$cage_log" 2>/dev/null)"
 teardown "$ui_pid"
+audit "cage-smoke: real-UI Proof B EXECUTED and PASSED — foot launched the real wardos-provision-ui ($ui_evidence) and it stayed alive $((interval + 2))s under cage"
 
 echo "ok   cage-smoke.test.sh internal assertions (real cage+foot+wardos-provision-ui boundary)"

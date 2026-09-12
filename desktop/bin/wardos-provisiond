@@ -22,6 +22,14 @@ set -euo pipefail
 
 marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
 lockfile="${WARDOS_PROVISION_LOCK:-/run/wardos/provisiond.lock}"
+# The dev-seed transaction journal (image escape hatch, wardos-dev-seed, ADR-0027 §Dev escape
+# hatch) lives at its OWN path, distinct from this broker's provision.journal. Its presence means
+# an interrupted dev-seed may have left a residual wheel account with NO provisioned marker — the
+# state canonical provisioning must never build a SECOND administrator over. The socket unit
+# already refuses to start while it exists (ConditionPathExists=!…, evaluated after dev-seed runs
+# because dev-seed is ordered Before= it), so the broker is normally never reached in that state;
+# this broker refuses on it too as defense in depth.
+dev_seed_journal="${WARDOS_DEV_SEED_JOURNAL:-/var/lib/wardos/dev-seed.journal}"
 
 # Per-field size caps (hardening, #119 review item 5). Every line the broker reads is bounded to
 # a documented maximum so a hostile client on the socket cannot make it buffer unbounded data; a
@@ -60,6 +68,15 @@ provisioned() { [[ -e "$marker" ]]; }
 # Refuse every mutating verb once provisioned: there is exactly one provisioning.
 refuse_if_provisioned() { if provisioned; then deny "already provisioned"; fi; }
 
+# Defense in depth (#119 review): refuse every mutating verb while an interrupted dev-seed
+# transaction is unresolved (its journal present). The socket's ConditionPathExists should have
+# kept the broker from starting at all in that state, but a residual dev-seed orphan wheel
+# account with no provisioned marker must never let the broker create a SECOND administrator, so
+# refuse here too. wardos-dev-seed reconciles and clears the journal on the next boot first.
+refuse_if_dev_seed_unresolved() {
+  if [[ -e "$dev_seed_journal" ]]; then deny "provisioning unresolved: dev-seed recovery required"; fi
+}
+
 # Acquire the exclusive provisioning lock, then AUTHORITATIVELY re-check the marker under it.
 # Every mutating verb (LOCALE/KEYMAP/TIMEZONE/ACCOUNT) runs through this before it mutates, so a
 # request that passes its cheap pre-lock check cannot race an ACCOUNT that commits the marker and
@@ -71,6 +88,10 @@ lock_and_recheck() {
   exec {lockfd}>"$lockfile"
   flock -x "$lockfd"
   refuse_if_provisioned
+  # Under the lock, after dev-seed would have completed: refuse if a dev-seed transaction is
+  # still unresolved (defense in depth behind the socket's ConditionPathExists), so no mutating
+  # verb — ACCOUNT above all — proceeds over a residual dev-seed orphan.
+  refuse_if_dev_seed_unresolved
 }
 
 # The durable record of an in-progress account transaction (#127). Its presence means an

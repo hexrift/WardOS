@@ -174,9 +174,14 @@ jobs:
         run: dnf install -y --setopt=install_weak_deps=False cage foot fuzzel wlroots dejavu-sans-mono-fonts socat
       # The un-mocked integration smoke: cage (headless) hosting foot running the real
       # wardos-provision-ui, proving the first surface comes up and STAYS ALIVE, and that a
-      # client which dies on startup is detected (the T480s failure class). It SKIPS (never
-      # FAILS) only if the headless compositor cannot come up at all here, printing why.
+      # client which dies on startup is detected (the T480s failure class). This job EXPLICITLY
+      # installs the compositor stack above, so WARDOS_SMOKE_REQUIRE=1 makes an environmental gap
+      # (stack missing, or no headless surface) a FAILURE, not a skip — the required check cannot
+      # go green without exercising the boundary (#119 review). The test prints named evidence
+      # that Proof A, the negative control, and real-UI Proof B each executed and passed.
       - name: Cage + foot + wardos-provision-ui headless smoke (issue #119 item 4)
+        env:
+          WARDOS_SMOKE_REQUIRE: "1"
         run: bash desktop/tests/cage-smoke.test.sh
       # Secondary (owner note): validate the SHIPPED fuzzel config under the image's real
       # fuzzel 1.14 (`fuzzel --check-config`), not the Ubuntu 1.9.2 that self-skips in `desktop`.

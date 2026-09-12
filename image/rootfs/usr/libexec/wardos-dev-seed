@@ -174,6 +174,19 @@ if [[ ! -s "$credfile" ]]; then
   exit 0
 fi
 
+# Validate the extracted credential VALUE, not merely that the file is non-empty: a file that is
+# only a newline (or only whitespace/control characters) is non-empty ([[ -s ]] passes) yet
+# `head -n1` yields an empty or unusable password. Extract the first line and REJECT an empty,
+# whitespace-only or control-only value BEFORE any mutation — a chpasswd with such a value would
+# either fail or, worse, set a blank/unusable password on a wheel account and then mark the
+# machine provisioned. Treat it exactly like no credential: no account, no marker, fall back to
+# canonical first-boot provisioning (recoverable).
+password=$(head -n1 "$credfile")
+if [[ -z "${password//[[:space:][:cntrl:]]/}" ]]; then
+  echo "wardos-dev-seed: the wardos-dev-seed.password credential for '$user' yields no usable password (empty, whitespace-only or control-only); leaving the machine UNPROVISIONED so first-boot provisioning runs" >&2
+  exit 0
+fi
+
 # Journal the intended transaction BEFORE any account mutation, durably, so a crash or a
 # failed rollback always leaves a record the next boot reconciles. Then create the account,
 # set its password and commit the marker as ONE transaction; on ANY failure the account is
@@ -194,7 +207,7 @@ if ! useradd -m -c "WardOS dev" -G wheel -s /bin/bash "$user" 2>/dev/null; then
   exit 1
 fi
 
-if ! printf '%s:%s\n' "$user" "$(head -n1 "$credfile")" | chpasswd 2>/dev/null; then
+if ! printf '%s:%s\n' "$user" "$password" | chpasswd 2>/dev/null; then
   rollback_account "$user" "could not set the password"
 fi
 echo "wardos-dev-seed: set '$user' password from the wardos-dev-seed.password credential" >&2

@@ -10,6 +10,11 @@ export WARDOS_PROVISIONED_MARKER="$TMP/provisioned"
 export WARDOS_PROVISION_LOCK="$TMP/provisiond.lock"
 export WARDOS_PROVISION_JOURNAL="$TMP/provision.journal"
 export WARDOS_KEYBOARD_STATE="$TMP/keyboard-layout"
+# The dev-seed transaction journal, isolated in $TMP so the broker's defense-in-depth inhibit is
+# exercised deterministically and never trips on a real /var journal on a dev box (absent by
+# default; the inhibit regressions below create it, and the state-machine drive lets the REAL
+# wardos-dev-seed create it via a forced rollback failure).
+export WARDOS_DEV_SEED_JOURNAL="$TMP/dev-seed.journal"
 for c in localectl timedatectl useradd usermod chpasswd userdel getent; do mock "$c"; done
 
 # ask VERB-AND-LINES… : feed the lines as one request, print the reply.
@@ -379,6 +384,113 @@ ok_name=$(printf 'A%.0s' {1..63})
 out=$(printf 'ACCOUNT\nalice\n%s\npw\n' "$ok_name" | wardos-provisiond)
 [[ "$out" == OK ]] || fail "a valid full name near the cap must be accepted; got: $out"
 assert_logged "^useradd -m -c $ok_name -G wheel -s /bin/bash alice\$"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+
+# === #119 review: cross-component dev-seed inhibit (fail-closed state machine). An interrupted
+# dev-seed transaction (its journal present) must inhibit ALL of canonical provisioning that boot,
+# so a residual dev-seed wheel orphan can never gain a SECOND administrator. The authoritative
+# inhibit is the socket unit's ConditionPathExists (asserted statically — CI cannot boot systemd);
+# the broker refuses every mutating verb as DEFENSE IN DEPTH while the journal exists, and accepts
+# only once reconciliation has cleared it. ======================================================
+rm -f "$WARDOS_DEV_SEED_JOURNAL"
+
+# (a) Declaration assertions: the socket unit inhibits on BOTH the provisioned marker and the
+# dev-seed journal, and dev-seed is ordered Before= the socket so the condition is evaluated AFTER
+# dev-seed runs (an unresolved journal ⇒ the socket never starts that boot).
+socket_unit="$test_root/image/rootfs/usr/lib/systemd/system/wardos-provisiond.socket"
+assert_file "$socket_unit"
+grep -Eq '^ConditionPathExists=!/var/lib/wardos/dev-seed\.journal$' "$socket_unit" ||
+  fail "(a) the broker socket must declare ConditionPathExists=!/var/lib/wardos/dev-seed.journal"
+grep -Eq '^ConditionPathExists=!/var/lib/wardos/provisioned$' "$socket_unit" ||
+  fail "(a) the broker socket must keep ConditionPathExists=!/var/lib/wardos/provisioned"
+dev_seed_unit="$test_root/image/rootfs/usr/lib/systemd/system/wardos-dev-seed.service"
+assert_file "$dev_seed_unit"
+grep -Eq '^Before=.*wardos-provisiond\.socket' "$dev_seed_unit" ||
+  fail "(a) wardos-dev-seed.service must be ordered Before= wardos-provisiond.socket (so the socket condition is evaluated after dev-seed)"
+
+# (c) Broker defense-in-depth: with the dev-seed journal present, EVERY mutating verb is refused
+# and NOTHING is created/mutated — even on an unprovisioned machine.
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK" "$WARDOS_PROVISION_JOURNAL"
+: >"$MOCK_LOG"
+mock useradd
+mock chpasswd
+mock userdel
+mock id 'exit 1'
+mock localectl
+mock sync 'exit 0'
+printf 'devuser\n' >"$WARDOS_DEV_SEED_JOURNAL" # an unresolved dev-seed transaction
+out=$(printf 'ACCOUNT\nalice\nAlice\npw\n' | wardos-provisiond)
+[[ "$out" == ERR*unresolved*dev-seed* ]] ||
+  fail "(c) the broker must refuse ACCOUNT while the dev-seed journal exists; got: $out"
+assert_not_logged '^useradd'
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "(c) a dev-seed-inhibited ACCOUNT must not mark provisioned"
+# The inhibit lives in lock_and_recheck, so it covers LOCALE/KEYMAP/TIMEZONE too.
+[[ "$(printf 'KEYMAP\nfr\n' | wardos-provisiond)" == ERR*unresolved*dev-seed* ]] ||
+  fail "(c) the broker must refuse KEYMAP while the dev-seed journal exists"
+assert_not_logged 'set-x11-keymap'
+
+# (d) The full drive from a REAL forced dev-seed rollback failure — not a synthetic journal file —
+# through the broker refusing, then reconciliation, then the broker accepting exactly once.
+seed="$test_root/image/rootfs/usr/libexec/wardos-dev-seed"
+assert_file "$seed"
+ds_acct="$TMP/ds-accounts"
+rm -rf "$ds_acct"
+mkdir -p "$ds_acct"
+export ACCT_DIR="$ds_acct"
+export WARDOS_DEV_SEED_FLAG="$TMP/dev-seed-user"
+export CREDENTIALS_DIRECTORY="$TMP/ds-creds"
+mkdir -p "$CREDENTIALS_DIRECTORY"
+ds_cred="$CREDENTIALS_DIRECTORY/wardos-dev-seed.password"
+# Stateful account mocks shared by the dev-seed run and the broker: a userdel really removes (or,
+# when forced, really leaves) the account, so the reconcile is observable. USERDEL_FAIL forces the
+# dev-seed rollback failure deterministically.
+# shellcheck disable=SC2016
+mock useradd 'u="${@: -1}"; : >"$ACCT_DIR/$u"'
+# shellcheck disable=SC2016
+mock id 'for a in "$@"; do case "$a" in -*) ;; *) if [[ -e "$ACCT_DIR/$a" ]]; then echo 1000; exit 0; else exit 1; fi ;; esac; done; exit 1'
+# shellcheck disable=SC2016
+mock userdel '[[ -n "${USERDEL_FAIL:-}" ]] && exit 1; u="${@: -1}"; rm -f "$ACCT_DIR/$u"; exit 0'
+mock sync 'exit 0'
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK" "$WARDOS_PROVISION_JOURNAL" "$WARDOS_DEV_SEED_JOURNAL"
+printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
+printf 'hunter2secret\n' >"$ds_cred"
+mock chpasswd 'exit 1' # force a mid-transaction failure so the dev-seed rollback runs
+
+# Step 1: the dev-seed rollback ITSELF fails → the journal remains, a residual wheel orphan
+# remains, and NO marker is written (the exact dangerous state).
+ds_rc=0
+USERDEL_FAIL=1 bash "$seed" || ds_rc=$?
+[[ $ds_rc -ne 0 ]] || fail "(d) a failed dev-seed rollback must refuse (recovery required)"
+[[ -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "(d) a failed dev-seed rollback must LEAVE the journal"
+[[ -e "$ds_acct/devuser" ]] || fail "(d) a failed userdel leaves the dev-seed orphan account"
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "(d) an unresolved dev-seed transaction must not mark provisioned"
+
+# Step 2: the broker cannot create ANY administrator while that journal is unresolved — this is
+# the reproduced defect (a SECOND admin under a different name during the same boot).
+mock chpasswd # the broker's own chpasswd would succeed; the inhibit must stop it first
+out=$(printf 'ACCOUNT\nbob\nBob\npw\n' | wardos-provisiond)
+[[ "$out" == ERR*unresolved*dev-seed* ]] ||
+  fail "(d) the broker must refuse ACCOUNT while the dev-seed journal is unresolved; got: $out"
+[[ ! -e "$ds_acct/bob" ]] || fail "(d) no second administrator is created while the dev-seed journal is unresolved"
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "(d) an inhibited ACCOUNT must not mark provisioned"
+
+# Step 3: the next boot reconciles — userdel works now and NO credential is delivered, so dev-seed
+# removes the orphan, clears the journal, and falls back UNPROVISIONED (no account, no marker).
+rm -f "$ds_cred"
+ds_rc=0
+bash "$seed" || ds_rc=$? # USERDEL_FAIL unset → reconcile succeeds
+[[ $ds_rc -eq 0 ]] || fail "(d) the reconcile boot must fall back cleanly; rc=$ds_rc"
+[[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "(d) reconcile must CLEAR the dev-seed journal"
+[[ ! -e "$ds_acct/devuser" ]] || fail "(d) reconcile must remove the dev-seed orphan"
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "(d) a no-credential reconcile leaves the machine unprovisioned"
+
+# Step 4: with the journal cleared, canonical provisioning proceeds — the broker accepts ACCOUNT
+# and commits exactly ONE administrator.
+out=$(printf 'ACCOUNT\nbob\nBob\npw\n' | wardos-provisiond)
+[[ "$out" == OK ]] || fail "(d) the broker must accept ACCOUNT once the dev-seed journal is reconciled; got: $out"
+[[ -e "$ds_acct/bob" ]] || fail "(d) the sole administrator is created after reconciliation"
+[[ "$(find "$ds_acct" -maxdepth 1 -type f | wc -l)" -eq 1 ]] ||
+  fail "(d) reconciliation must not yield two administrators: $(ls "$ds_acct")"
 assert_file "$WARDOS_PROVISIONED_MARKER"
 
 echo "ok   provisiond.test.sh internal assertions"

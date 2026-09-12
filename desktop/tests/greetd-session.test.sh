@@ -9,6 +9,9 @@ setup_env
 
 export WARDOS_PROVISIONED_MARKER="$TMP/provisioned"
 export WARDOS_PROVISION_STAGE="$TMP/provision.stage"
+# The dev-seed transaction journal, isolated in $TMP so the inhibit regression can drive it and
+# so the selector's new fail-closed guard never trips on a real /var journal on a dev box.
+export WARDOS_DEV_SEED_JOURNAL="$TMP/dev-seed.journal"
 
 # --- provisioned → the normal greeter (byte-for-byte today's command) --------------------
 : >"$MOCK_LOG"
@@ -70,5 +73,43 @@ assert_not_logged 'gtkgreet'     # the provisioned greeter must NEVER run withou
 mock cage
 wardos-greetd-session
 assert_logged '^cage -s -- gtkgreet '   # marker present → greeter runs
+
+# --- #119 review: cross-component dev-seed inhibit. While the dev-seed transaction journal is
+#     present (an interrupted dev-seed may have left a residual wheel account with NO provisioned
+#     marker), the selector must launch NEITHER the provisioning UI NOR the greeter — it FAILS
+#     CLOSED (exit non-zero → greetd restarts, VT recovery available), the same discipline as the
+#     marker guard, and guarded EARLY so it holds whether or not the marker is present. --------
+# (b1) journal present, marker ABSENT (the dangerous unprovisioned + orphan state): fail closed;
+#      no foot (provisioning UI), no gtkgreet. The cage mock would provision if the loop ran — it
+#      must NOT be reached.
+: >"$MOCK_LOG"
+rm -f "$WARDOS_PROVISIONED_MARKER"
+# shellcheck disable=SC2016  # $WARDOS_PROVISIONED_MARKER expands in the mock, not now
+mock cage 'touch "$WARDOS_PROVISIONED_MARKER"'
+printf 'devuser\n' >"$WARDOS_DEV_SEED_JOURNAL"
+rc=0
+wardos-greetd-session || rc=$?
+[[ $rc -ne 0 ]] || fail "an unresolved dev-seed journal must make the selector FAIL CLOSED (non-zero exit)"
+assert_not_logged 'foot'     # the provisioning UI must NOT launch
+assert_not_logged 'gtkgreet' # the greeter must NOT launch
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "the dev-seed-inhibited path must not run cage/provision"
+
+# (b2) journal present, marker ALSO present: still fail closed (the guard is EARLY, ahead of the
+#      marker fast-path), so a lingering unresolved journal never lets the greeter come up either.
+: >"$MOCK_LOG"
+: >"$WARDOS_PROVISIONED_MARKER"
+mock cage
+rc=0
+wardos-greetd-session || rc=$?
+[[ $rc -ne 0 ]] || fail "an unresolved dev-seed journal must fail closed even with the marker present"
+assert_not_logged 'gtkgreet'
+
+# Once reconciliation clears the journal, the selector resumes normally (marker present → greeter).
+: >"$MOCK_LOG"
+rm -f "$WARDOS_DEV_SEED_JOURNAL"
+: >"$WARDOS_PROVISIONED_MARKER"
+mock cage
+wardos-greetd-session
+assert_logged '^cage -s -- gtkgreet ' # journal cleared → the normal greeter runs again
 
 echo "ok   greetd-session.test.sh internal assertions"
