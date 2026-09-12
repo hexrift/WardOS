@@ -31,11 +31,26 @@ mock cage 'touch "$WARDOS_PROVISIONED_MARKER"'
 wardos-greetd-session
 assert_logged '^cage -s -- foot -c /etc/greetd/wardos-provision-foot.ini --app-id wardos-provision -e wardos-provision-ui$'
 # The bootstrap terminal must use the image-owned config, not the greeter account's HOME.
-assert_not_logged '~/.config/wardos/theme/current/foot.ini'
+assert_not_logged '\\.config/wardos/theme/current/foot\\.ini'
 # cage keeps VT switching (`-s`) on the bootstrap path too (text-console recovery).
 grep -Eq '^cage -s -- foot ' "$MOCK_LOG" || fail "the bootstrap cage must use -s (VT recovery)"
 # When provisioning finishes the loop hands off to the greeter.
 assert_logged '^cage -s -- gtkgreet '
+
+# --- PTY allocator failure is fail-closed and diagnostic ----------------------------------
+# Force the complete allocator probe to fail. The selector must exit non-zero, emit the
+# actionable diagnostic, and never launch Cage/foot.
+: >"$MOCK_LOG"
+rm -f "$WARDOS_PROVISIONED_MARKER"
+mock python3 'exit 1'
+mock cage 'fail "cage must not run when the greeter cannot allocate a PTY"'
+pty_err="$TMP/pty.err"
+rc=0
+wardos-greetd-session 2>"$pty_err" || rc=$?
+[[ "$rc" -ne 0 ]] || fail "PTY allocation failure must fail closed"
+grep -Fq 'cannot allocate and use a complete PTY pair' "$pty_err" || fail "PTY failure must emit the greeter diagnostic"
+assert_not_logged '^cage '
+rm -f "$MOCK_DIR/python3" "$MOCK_DIR/cage"
 
 # --- E4: keymap staging plumbing — the session launches cage with XKB_DEFAULT_LAYOUT set from
 #     the chosen layout, so the compositor's live layout matches BEFORE password entry -------
