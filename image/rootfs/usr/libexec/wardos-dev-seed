@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# wardos-dev-seed — the ONE development escape hatch (ADR-0027 §Dev escape hatch).
+# NON-PRODUCTION: runs only on images built with WARDOS_DEV_SEED_USER (the Containerfile
+# drops /usr/lib/wardos/dev-seed-user then), so a CI or hardware-iteration image can boot
+# straight to a desktop instead of the first-boot provisioning session. Production images
+# ship without the flag file and unprovisioned. There is no disk-build `--user` account
+# path: image/disk.sh no longer creates a first user, so a machine can never boot with an
+# existing wheel account while WardOS still thinks it is unprovisioned.
+#
+# Runs at first boot (a root systemd oneshot before greetd AND before the provisioning
+# broker socket), where /var and /home are real machine state — not at build time, where
+# bootc does not persist /var or /home content (this is exactly why the provisioned marker,
+# which lives in /var, must be written at first boot and not baked at build time).
+#
+# Behaviour (ADR-0027 §Dev escape hatch, matching the wardos-provisiond ACCOUNT policy):
+#   * The seed username is validated against the SAME regex and reserved-name blocklist as
+#     the broker (wardos-provisiond). A reserved name (root/daemon/…), an invalid name, or
+#     one that already exists is REFUSED: the account is never created, adopted, altered or
+#     locked, and the marker is NOT written — the machine simply stays unprovisioned and
+#     first-boot provisioning runs (recoverable), never "existing admin + provisioned but no
+#     login".
+#   * With NO credential: nothing is mutated and NO marker is written. The machine falls back
+#     to canonical first-boot provisioning (the provisioning UI runs), so the operator always
+#     has a way in. It never produces the old "locked account + provisioned marker" dead end.
+#     Deliver the credential (see the unit and Containerfile) on a later boot to seed then.
+#   * With a usable password credential: the dev account (in wheel), its password, and the
+#     provisioned marker are established as ONE transaction with the SAME broker-grade
+#     durability discipline as wardos-provisiond's ACCOUNT verb — a durable journal written
+#     BEFORE any mutation, reconcile-on-entry of any interrupted prior attempt, and a CHECKED
+#     rollback on any failure. The account and marker are never established half-way: a
+#     chpasswd/marker failure rolls the freshly created account back (checked); a rollback
+#     that itself fails keeps the journal and refuses (never a residual wheel account); and
+#     the marker (the commit point, written durably and last) clears the journal only once it
+#     has committed. This mirrors the broker so a dev image can never boot with a usable
+#     administrator while the machine still reads as unprovisioned — the window in which
+#     canonical provisioning could create a SECOND administrator.
+set -euo pipefail
+
+flag="${WARDOS_DEV_SEED_FLAG:-/usr/lib/wardos/dev-seed-user}"
+marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
+# The durable record of an in-progress seed transaction, at its OWN path (distinct from the
+# broker's /var/lib/wardos/provision.journal). Its presence means a seed created — or may have
+# created — an account that never reached the committed marker; the next boot reconciles it
+# before creating anything. Mirrors wardos-provisiond's journal, self-contained here (the
+# broker is deliberately NOT refactored into a shared lib — another change touches it).
+journal="${WARDOS_DEV_SEED_JOURNAL:-/var/lib/wardos/dev-seed.journal}"
+# The password, if any, is delivered at boot as a systemd credential — NEVER a file baked
+# into an image layer, and NEVER a secret on the kernel command line (see the unit file: a
+# plaintext `systemd.set_credential=` is world-readable via /proc/cmdline and is testing-only;
+# a real password comes from an encrypted or firmware credential). systemd exposes the
+# delivered credential to this oneshot under $CREDENTIALS_DIRECTORY. Absent → fall back to
+# canonical provisioning (no account, no marker); never a persisted shared credential.
+credfile="${CREDENTIALS_DIRECTORY:-/dev/null}/wardos-dev-seed.password"
+
+# fsync PATH (a file or a directory) to stable storage, returning its real exit status. This
+# is `sync PATH` from coreutils, which fsync(2)s exactly that path; unlike a bare `sync` it
+# reports a flush failure as a non-zero exit. It is NEVER swallowed with `|| true`: a lost
+# flush is exactly the power-cut durability failure the journal/marker ordering exists to
+# prevent, so it must propagate and fail the write closed. (Mirrors wardos-provisiond.)
+fsync_path() { sync "$1"; }
+
+# Durably write CONTENT to PATH: a temp file, its data flushed, atomically renamed into place,
+# then the containing directory flushed so the rename itself survives a power cut. EVERY step
+# — including both fsyncs — is checked and any failure returns non-zero (the temp is cleaned
+# up); callers test the return explicitly (errexit is not relied on, since these run inside
+# `if !`/`||`). A power cut leaves PATH either absent or fully present, never truncated.
+write_durable() {
+  local path=$1 content=$2 dir tmp
+  dir=$(dirname "$path")
+  mkdir -p "$dir" || return 1
+  tmp="$path.tmp.$$"
+  printf '%s\n' "$content" >"$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  fsync_path "$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$path" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  fsync_path "$dir" || return 1
+  return 0
+}
+
+# Durably remove PATH; returns non-zero if it still exists afterward or the directory flush
+# that makes the removal survive a power cut fails (checked, never swallowed).
+remove_durable() {
+  local path=$1
+  rm -f "$path" 2>/dev/null || return 1
+  [[ ! -e "$path" ]] || return 1
+  fsync_path "$(dirname "$path")" || return 1
+  return 0
+}
+
+# The marker is the transaction's commit point, written durably and last.
+commit_marker() { write_durable "$marker" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
+
+# Roll back a created-but-uncommitted account after a mid-transaction failure. userdel's
+# result is CHECKED, never suppressed: on success the journal is cleared (transaction
+# resolved); on FAILURE the journal — naming this account — is left in place on purpose so the
+# next boot's reconcile retries the removal rather than leaving a silent residual wheel
+# account. Either way this seed attempt fails visibly (mirrors wardos-provisiond).
+rollback_account() {
+  local user=$1 reason=$2
+  if userdel -r "$user" 2>/dev/null; then
+    remove_durable "$journal" || true
+  else
+    echo "wardos-dev-seed: $reason, AND rolling the account '$user' back failed; keeping the journal and refusing (recovery required — a later boot with userdel working will reconcile it before re-seeding)" >&2
+    exit 1
+  fi
+  echo "wardos-dev-seed: $reason; rolled the account '$user' back (machine stays unprovisioned)" >&2
+  exit 1
+}
+
+# Reconcile any unresolved prior transaction recorded in the journal, BEFORE this attempt
+# creates anything (mirrors wardos-provisiond's reconcile_pending). A journal entry means a
+# previous seed created — or may have created — an account that never reached the committed
+# marker (a crash/power loss mid-transaction, or a rollback that itself failed). Remove the
+# recorded account with a CHECKED userdel; only when it is gone is the journal cleared. If the
+# removal FAILS, do NOT create a second account and do NOT fall through to a state where
+# canonical provisioning would add another admin — leave the journal and fail visibly, exactly
+# as the broker refuses.
+reconcile_pending() {
+  [[ -e "$journal" ]] || return 0
+  local pending
+  pending=$(head -n1 "$journal" 2>/dev/null)
+  if [[ -n "$pending" ]] && id -u "$pending" >/dev/null 2>&1; then
+    if ! userdel -r "$pending" 2>/dev/null; then
+      echo "wardos-dev-seed: an interrupted seed account ('$pending') could not be removed; refusing to seed (recovery required — a later boot with userdel working will reconcile it first)" >&2
+      exit 1
+    fi
+  fi
+  remove_durable "$journal" || {
+    echo "wardos-dev-seed: the seed transaction journal could not be cleared; refusing to seed (recovery required)" >&2
+    exit 1
+  }
+}
+
+# Nothing to do unless this is a dev-seed image that is still unprovisioned. Reboot
+# idempotency: once the marker exists (this run seeded, or provisioning ran), exit at once.
+[[ -e "$flag" && ! -e "$marker" ]] || exit 0
+
+user=$(head -n1 "$flag")
+
+# The exact conservative username policy of wardos-provisiond (kept in lockstep): lower-case
+# start, then lower-case/digits/underscore/dash, at most 32 characters.
+if [[ ! "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+  echo "wardos-dev-seed: invalid seed username '$user'; not seeding (machine stays unprovisioned)" >&2
+  exit 1
+fi
+
+# NO ADOPTION of a reserved/system identity — the exact blocklist wardos-provisiond refuses.
+# A reserved seed name is a build misconfiguration: refuse it, mutate nothing (never touch
+# root or any system account), write no marker. The machine stays unprovisioned.
+case "$user" in
+  root | daemon | bin | sys | adm | nobody | nogroup | greeter | ward-provision)
+    echo "wardos-dev-seed: seed username '$user' is reserved; refusing to seed (machine stays unprovisioned)" >&2
+    exit 1
+    ;;
+esac
+
+# Resolve any interrupted prior transaction FIRST, before any account mutation and before the
+# no-credential fall-back: an orphan from a crashed prior seed must be removed so canonical
+# provisioning cannot later create a second administrator over it. This may exit non-zero (and
+# leave the journal) if the orphan cannot be removed — recovery required, retried next boot.
+reconcile_pending
+
+# NO ADOPTION of an existing account either: never elevate, alter or lock a name already in
+# use (a human or a system account). Refuse, mutate nothing, write no marker. Checked AFTER
+# reconcile so an orphan the reconcile just removed is not mistaken for a name in use.
+if id -u "$user" >/dev/null 2>&1; then
+  echo "wardos-dev-seed: seed username '$user' already exists; refusing to adopt it (machine stays unprovisioned)" >&2
+  exit 1
+fi
+
+# No usable credential → do NOT create an account and do NOT write the marker. Fall back to
+# canonical first-boot provisioning so the operator can always get in (recoverable).
+if [[ ! -s "$credfile" ]]; then
+  echo "wardos-dev-seed: no password credential for '$user'; leaving the machine UNPROVISIONED so first-boot provisioning runs (deliver the wardos-dev-seed.password credential to seed the account instead)" >&2
+  exit 0
+fi
+
+# Validate the extracted credential VALUE, not merely that the file is non-empty: a file that is
+# only a newline (or only whitespace/control characters) is non-empty ([[ -s ]] passes) yet
+# `head -n1` yields an empty or unusable password. Extract the first line and REJECT an empty,
+# whitespace-only or control-only value BEFORE any mutation — a chpasswd with such a value would
+# either fail or, worse, set a blank/unusable password on a wheel account and then mark the
+# machine provisioned. Treat it exactly like no credential: no account, no marker, fall back to
+# canonical first-boot provisioning (recoverable).
+password=$(head -n1 "$credfile")
+if [[ -z "${password//[[:space:][:cntrl:]]/}" ]]; then
+  echo "wardos-dev-seed: the wardos-dev-seed.password credential for '$user' yields no usable password (empty, whitespace-only or control-only); leaving the machine UNPROVISIONED so first-boot provisioning runs" >&2
+  exit 0
+fi
+
+# Journal the intended transaction BEFORE any account mutation, durably, so a crash or a
+# failed rollback always leaves a record the next boot reconciles. Then create the account,
+# set its password and commit the marker as ONE transaction; on ANY failure the account is
+# rolled back (checked) and the journal is only cleared once the marker has committed.
+write_durable "$journal" "$user" || {
+  echo "wardos-dev-seed: could not record the seed transaction journal; not seeding (machine stays unprovisioned)" >&2
+  exit 1
+}
+
+if ! useradd -m -c "WardOS dev" -G wheel -s /bin/bash "$user" 2>/dev/null; then
+  # useradd failed: roll back any partial account it left, else clear the journal (nothing was
+  # created) so a clean failure does not strand the machine as unresolved.
+  if id -u "$user" >/dev/null 2>&1; then
+    rollback_account "$user" "could not create the account"
+  fi
+  remove_durable "$journal" || true
+  echo "wardos-dev-seed: could not create the seed account '$user'; not seeding (machine stays unprovisioned)" >&2
+  exit 1
+fi
+
+if ! printf '%s:%s\n' "$user" "$password" | chpasswd 2>/dev/null; then
+  rollback_account "$user" "could not set the password"
+fi
+echo "wardos-dev-seed: set '$user' password from the wardos-dev-seed.password credential" >&2
+
+# commit_marker may fail either before the marker landed, or at the trailing directory fsync
+# AFTER the marker was renamed into place. These are NOT the same outcome (mirrors the broker):
+if ! commit_marker; then
+  if [[ ! -e "$marker" ]]; then
+    # The marker never landed (e.g. its parent directory could not be created): a true
+    # failure. Roll the freshly created account back — nothing is committed.
+    rollback_account "$user" "could not mark provisioned"
+  fi
+  # The marker was renamed into place but the fsync of its directory failed, so the rename is
+  # NOT proven durable: a power loss here could drop the marker while keeping the account,
+  # leaving the next boot unprovisioned with an orphan account — inviting a SECOND administrator
+  # under a different name. Retry the directory flush once; if it still fails the transaction is
+  # INDETERMINATE. Leave the journal in place (it names this account) and report recovery-
+  # required: if a power loss then drops the not-yet-durable marker, the next boot's reconcile
+  # removes this orphan BEFORE anything else, so the crash path can never yield two admins.
+  if ! fsync_path "$(dirname "$marker")"; then
+    echo "wardos-dev-seed: the marker was written but its durability could not be confirmed; refusing to acknowledge success (recovery required — the next boot reconciles before anything else)" >&2
+    exit 1
+  fi
+  # The retry flush succeeded: the marker is now durable — fall through to the success tail.
+fi
+
+# Committed: the marker is the durable commit point. Clear the now-resolved journal
+# (best-effort — a lingering journal past the marker is inert, since a provisioned machine
+# gates this script out at the top on the next boot).
+remove_durable "$journal" || true
+echo "wardos-dev-seed: seeded development account '$user'; machine marked provisioned" >&2

@@ -112,9 +112,11 @@ jobs:
       - name: scripts explain themselves without podman or docker
         run: |
           ./image/build.sh --dry-run
+          # The ONE dev escape hatch is a build-arg, not a disk-build --user (ADR-0027).
+          ./image/build.sh --source checkout --dev-seed-user wardos --dry-run
           ./image/disk.sh --type qcow2 --dry-run
           ./image/disk.sh --type iso --dry-run
-          ./image/disk.sh --type iso --luks --user wardos --password ci --output /tmp/disk-ci --dry-run
+          ./image/disk.sh --type iso --luks --output /tmp/disk-ci --dry-run
           ./image/check-packages.sh --dry-run
           ./image/install-desktop.sh --help >/dev/null
 
@@ -139,7 +141,80 @@ jobs:
       - run: |
           sudo apt-get update -q
           sudo apt-get install -y -q shellcheck
+          # fuzzel powers E1 (fuzzel-config.test.sh): `fuzzel --check-config` on the shipped
+          # config. It lives in the Ubuntu universe archive; install it best-effort so the check
+          # RUNS here. If the archive lacks it the test self-skips (documenting the gap) rather
+          # than faking a pass; on the image itself fuzzel 1.14 is present and the check is real.
+          sudo apt-get install -y -q fuzzel || echo "fuzzel unavailable in the archive; E1 (fuzzel --check-config) will skip — run it on the image where fuzzel 1.14 ships"
       - run: bash desktop/tests/run.sh
+
+  # The REAL cage + foot + wardos-provision-ui bootstrap boundary, run headlessly (#119
+  # review item 4). greetd-session.test.sh MOCKS cage, so it cannot catch a protocol/session/
+  # environment mismatch of the sort the T480s exposed (a layer-shell client aborting under
+  # cage). This job runs the un-mocked boundary on Fedora — the same release the image ships
+  # (image/Containerfile pins quay.io/fedora/fedora-bootc:44), with the real cage/foot/wlroots
+  # and the real fuzzel 1.14 — so the smoke and the fuzzel config check are AUTHORITATIVE here,
+  # not the self-skips they fall back to on a compositor-less/older-fuzzel runner. wlroots runs
+  # on its headless backend, software-rendered (pixman), so no GPU/DRM is needed on the runner.
+  desktop-compositor:
+    name: desktop compositor smoke (Fedora)
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      # actions/checkout needs git (and tar) present in this minimal Fedora container.
+      - name: Install git for checkout
+        run: dnf install -y --setopt=install_weak_deps=False git-core tar
+      - uses: actions/checkout@v7
+      # cage/foot/wlroots host the boundary; fuzzel 1.14 makes fuzzel-config.test.sh's
+      # `--check-config` authoritative; a monospace font so foot can actually open a window;
+      # socat is the broker transport the shipped UI uses (not reached in the smoke, installed
+      # so the shipped client runs exactly as on the image). These are the versions the image
+      # ships — the Fedora 44 repos here are the same the fedora-bootc:44 base resolves.
+      - name: Install the shipped compositor stack (cage + foot + wlroots + fuzzel)
+        run: dnf install -y --setopt=install_weak_deps=False cage foot fuzzel wlroots dejavu-sans-mono-fonts socat python3 shadow-utils systemd
+      # Hardware regression from the T480s: validate the exact devpts inode and the exact
+      # unprivileged identity the image ships. First make the target inaccessible and prove a
+      # complete master+slave allocation fails as greeter; then apply the IMAGE'S tmpfiles rule,
+      # prove it repairs /dev/pts/ptmx to 0666, and prove the same greeter can allocate/use a PTY.
+      # This catches the broken z /dev/ptmx symlink rule: changing the symlink path does not
+      # repair the active devpts target. The container has its own devpts mount, so the mutation
+      # is isolated to this CI job.
+      - name: PTY invariant under the shipped greeter identity
+        run: |
+          set -euo pipefail
+          getent group video >/dev/null || groupadd -r video
+          getent passwd greeter >/dev/null || useradd -r -M -d /var/lib/greeter -s /usr/sbin/nologin -G video greeter
+          chmod 0600 /dev/pts/ptmx
+          if runuser -u greeter -- python3 -c 'import pty; pty.openpty()'; then
+            echo "::error::negative control failed: greeter allocated a PTY while /dev/pts/ptmx was 0600" >&2
+            exit 1
+          fi
+          systemd-tmpfiles --create image/rootfs/usr/lib/tmpfiles.d/wardos-pty.conf
+          test "$(stat -Lc '%a' /dev/pts/ptmx)" = "666" || {
+            ls -lZ /dev/ptmx /dev/pts/ptmx || true
+            echo "::error::the shipped tmpfiles rule did not restore /dev/pts/ptmx to 0666" >&2
+            exit 1
+          }
+          runuser -u greeter -- python3 -c 'import os,pty; m,s=pty.openpty(); os.write(s,b"W"); assert os.read(m,1)==b"W"; os.close(s); os.close(m)'
+          echo "pty-bootstrap: negative control PASSED; shipped tmpfiles repair PASSED; greeter full PTY allocation PASSED"
+      # The un-mocked integration smoke: cage (headless) hosting foot running the real
+      # wardos-provision-ui, proving the first surface comes up and STAYS ALIVE, and that a
+      # client which dies on startup is detected (the T480s failure class). This job EXPLICITLY
+      # installs the compositor stack above, so WARDOS_SMOKE_REQUIRE=1 makes an environmental gap
+      # (stack missing, or no headless surface) a FAILURE, not a skip — the required check cannot
+      # go green without exercising the boundary (#119 review). The test prints named evidence
+      # that Proof A, the negative control, and real-UI Proof B each executed and passed.
+      - name: Cage + foot + wardos-provision-ui headless smoke as shipped greeter (issue #119 item 4)
+        run: |
+          set -euo pipefail
+          summary=/tmp/wardos-cage-smoke-summary
+          install -o greeter -g greeter -m 0600 /dev/null "$summary"
+          runuser -u greeter -- env WARDOS_SMOKE_REQUIRE=1 GITHUB_STEP_SUMMARY="$summary" bash desktop/tests/cage-smoke.test.sh
+          cat "$summary" >>"$GITHUB_STEP_SUMMARY"
+      # Secondary (owner note): validate the SHIPPED fuzzel config under the image's real
+      # fuzzel 1.14 (`fuzzel --check-config`), not the Ubuntu 1.9.2 that self-skips in `desktop`.
+      - name: fuzzel --check-config on the shipped config (Fedora 44 fuzzel 1.14)
+        run: bash desktop/tests/fuzzel-config.test.sh
 
   # The release helpers (scripts/release): every script shellcheck-clean, every
   # bash regression green -- the tag/version/asset binding for issue #126.

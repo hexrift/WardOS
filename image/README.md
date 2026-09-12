@@ -21,7 +21,7 @@ not.
 | `agents/package.json`, `agents/package-lock.json` | `/usr/lib/wardos/agents/`, then `node_modules/` from `npm ci`; `/usr/bin/{claude,codex,tamperward}` | Claude Code, Codex and TamperWard at exact versions (ADR-0017; [`agents/README.md`](agents/README.md)) |
 | `rootfs/usr/libexec/wardos-flathub` | `/usr/libexec/wardos-flathub` | Adds Flathub and installs `desktop/flatpaks.txt`, run once by `wardos-flathub.service` |
 | `build.sh` | — | `podman build` wrapper; tags `localhost/wardos:<git describe>` and stamps the version label; `--arch x86_64|aarch64` |
-| `disk.sh` | — | `bootc-image-builder` wrapper; qcow2 for QEMU, ISO for installation (encrypted unless `--no-luks`); `--user`, `--arch` |
+| `disk.sh` | — | `bootc-image-builder` wrapper; qcow2 for QEMU, ISO for installation (encrypted unless `--no-luks`); `--arch`. Creates **no** account — every disk boots unprovisioned (ADR-0027) |
 | `sysctl.d/50-wardos.conf` | `/usr/lib/sysctl.d/` | Unprivileged user namespaces for `wardd`'s sandboxes |
 | `tmpfiles.d/wardos.conf` | `/usr/lib/tmpfiles.d/` | Creates `/var/lib/wardos` at boot |
 | `systemd/wardos-firstboot.service` | `/usr/lib/systemd/system/` | Runs `ward doctor` once, keeps the report |
@@ -171,9 +171,10 @@ thing shown, and it appears in seconds, not after a long boot (`wardos-usb-guard
 the lock. The greeter itself runs unprivileged as the `greeter` system user
 (`/usr/lib/sysusers.d/wardos-greeter.conf`); `cage -s` keeps Ctrl+Alt+F2…F6 reaching a
 text console, so a greeter failure can never lock you out. The login user is not in the
-image (bootc images carry no accounts): create it when making the disk,
-`disk.sh --user wardos …` ([below](#users-and-luks)), or with your own config; the
-greeter's default user is `wardos` but any user the greeter authenticates works.
+image (bootc images carry no accounts) and is **not** baked into the disk either: every
+disk boots unprovisioned and the **first-boot provisioning session creates the real user**
+(in `wheel`) before the greeter appears (ADR-0027, [below](#users-and-luks)). The greeter
+then authenticates whatever user provisioning created.
 
 ### Flathub and the default applications
 
@@ -391,8 +392,8 @@ the desktop with no installer at all.
 ### Trying WardOS from a USB stick (no install)
 
 ```sh
-sudo ./image/disk.sh --type raw --user wardos --image ghcr.io/hexrift/wardos:latest
-# -> image/out/raw/wardos.raw
+sudo ./image/disk.sh --type raw --image ghcr.io/hexrift/wardos:latest
+# -> image/out/raw/wardos.raw (boots unprovisioned; first boot creates the user)
 ```
 
 Write it to a USB stick (this erases the **stick**, not the internal disk) and boot the
@@ -432,9 +433,9 @@ disk for the build layers (the desktop's packages are most of it) and the output
 
 ```sh
 git clone https://github.com/hexrift/WardOS && cd WardOS
-sudo ./image/build.sh                                        # -> localhost/wardos:<git describe>
-sudo ./image/disk.sh --type qcow2 --user wardos --password …  # -> image/out/qcow2/disk.qcow2
-sudo ./image/disk.sh --type iso --user wardos                # -> image/out/bootiso/install.iso, LUKS
+sudo ./image/build.sh                     # -> localhost/wardos:<git describe>
+sudo ./image/disk.sh --type qcow2         # -> image/out/qcow2/disk.qcow2 (unprovisioned)
+sudo ./image/disk.sh --type iso           # -> image/out/bootiso/install.iso, LUKS
 ```
 
 Both scripts print the exact command they are about to run; `--dry-run` prints it and
@@ -442,7 +443,7 @@ exits without needing podman:
 
 ```sh
 ./image/build.sh --dry-run
-./image/disk.sh --type qcow2 --user wardos --password x --dry-run
+./image/disk.sh --type qcow2 --dry-run
 ```
 
 `--rootfs` defaults to `btrfs` (ADR-0001; `/work` snapshots want it). The builder image is
@@ -452,19 +453,20 @@ baseline.
 
 ### Users and LUKS
 
-`disk.sh --user NAME` writes a bootc-image-builder config (`<output>/config.toml`, mode
-0600, printed with the password redacted) that creates the first user in `wheel`, with
-`--password PW` (or `WARDOS_PASSWORD` in the environment, which keeps it out of `ps`)
-and/or `--ssh-key FILE`; one of the two is required, or nobody could use `sudo`. The
-greeter's default user is `wardos`. `--config FILE` passes your own TOML instead
-(the two are exclusive); a minimal one:
+`disk.sh` creates **no** account (ADR-0027): the `--user`/`--password`/`--ssh-key` flags
+were removed, and every disk it builds — qcow2, raw or iso — ships **unprovisioned**. The
+real human account is created at **first boot** by the keyboard-first provisioning session,
+which collects language/keyboard/timezone, a full name, a username and a password, creates
+the user in `wheel`, marks the machine provisioned, and hands off to the greeter. A stale
+`--user`/`--password`/`--ssh-key` invocation is rejected with a pointer to the dev escape
+hatch below.
 
-```toml
-[[customizations.user]]
-name = "wardos"
-password = "change-me-on-first-login"
-groups = ["wheel"]
-```
+For a throwaway **development** image that skips provisioning, bake a *locked* seed account
+at build time: `image/build.sh --dev-seed-user NAME` (the one dev escape hatch, NON-PRODUCTION).
+`wardos-dev-seed` creates that account and writes the provisioned marker at first boot; its
+password is never baked into a layer or the disk — deliver it at first boot as the
+`wardos-dev-seed.password` systemd credential, or the account stays locked and normal
+first-boot provisioning runs instead.
 
 `disk.sh --type iso` gives full-disk encryption **by default** (ADR-0017); `--no-luks`
 is the opt-out, `--luks` the explicit form, and the dry-run says which applies. The
@@ -472,24 +474,23 @@ blueprint that bootc-image-builder consumes knows `plain`, `lvm` and `btrfs` par
 and nothing encrypted (`osbuild/blueprint`, `disk_customizations.go`), so a qcow2
 cannot be encrypted by the builder and `disk.sh` refuses `--luks` for it; the
 installer ISO can, through an Anaconda kickstart that `disk.sh` generates (a `--config`
-of your own carries its own partitioning, so no kickstart is generated next to it):
+of your own carries its own partitioning, so no kickstart is generated next to it). The
+generated kickstart creates **no** account and locks root — it can never establish a wheel
+account without the provisioned marker — so the disk boots unprovisioned like every other:
 
 ```text
 zerombr
 clearpart --all --initlabel --disklabel=gpt
 autopart --noswap --type=btrfs --encrypted
 network --bootproto=dhcp --device=link --activate --onboot=on
-lang en_US.UTF-8 / keyboard us / timezone UTC --utc / rootpw --lock
-user --name=wardos --groups=wheel --password=… --plaintext
+lang en_US.UTF-8 / keyboard us / timezone UTC --utc
+rootpw --lock
 reboot
 ```
 
 `autopart --encrypted` without `--passphrase` makes Anaconda ask for one during the
 installation, so no passphrase is ever written to a file (*unverified* until E-09; the
-generated file says so). bootc-image-builder refuses `[[customizations.user]]` next to a
-custom kickstart, which is why the user becomes a kickstart `user` line in this mode
-(`--no-luks --user` falls back to `[[customizations.user]]`). At boot the passphrase
-is typed on the Plymouth surface.
+generated file says so). At boot the passphrase is typed on the Plymouth surface.
 
 ### Boot-testing in QEMU
 
@@ -516,8 +517,7 @@ Every merge to `main` that passes the image build pushes the result to
 machine that only wants a disk never builds anything:
 
 ```sh
-sudo WARDOS_PASSWORD='choose-one' image/disk.sh --type qcow2 --user wardos \
-  --image ghcr.io/hexrift/wardos:latest
+sudo image/disk.sh --type qcow2 --image ghcr.io/hexrift/wardos:latest
 ```
 
 `disk.sh` pulls a registry reference it does not have and hands it to
@@ -548,9 +548,9 @@ needs, and publishes the result:
 * **By hand**: Actions → *disk* → *Run workflow*. Choose `qcow2`, `iso` or `both`, the
   architecture (`x86_64`, `aarch64`, or `both` for one job per architecture, each on a
   runner of that architecture), the binaries (`checkout` compiles this commit,
-  `release` takes the published tarball of `--release`), the first user (`wardos`,
-  the greeter's default) and, for the ISO, `luks`. The disks appear as the run's
-  `wardos-disks-<arch>` artifact for 14 days, with a `SHA256SUMS.<arch>`.
+  `release` takes the published tarball of `--release`), an **optional dev-only**
+  pre-created `user`/`password` (blank = unprovisioned) and, for the ISO, `luks`. The disks
+  appear as the run's `wardos-disks-<arch>` artifact for 14 days, with a `SHA256SUMS.<arch>`.
 * **On every published release**: both disks of both architectures are built from that
   release's tarballs and attached to the release as `wardos-<tag>-<arch>.qcow2.zst` and
   `.iso.zst`. GitHub caps a release asset at 2 GiB and bootc-image-builder's disks are
@@ -560,10 +560,12 @@ needs, and publishes the result:
   external host, so a release stays one page with everything on it; the run's artifact
   carries the same files unsplit for 14 days.
 
-The first user's password in these disks is `wardos`. Change it at first login
-(`passwd`); the ISO with `luks` additionally asks for the disk passphrase during the
-install. The same workflow runs `check-packages.sh --arch aarch64 --discover` so the
-log says whether the COPRs the image depends on still build for aarch64.
+By default these disks are **unprovisioned** (no pre-created account): first boot runs the
+provisioning session (CALIBRATE) which creates the real user with a password of their
+choosing (ADR-0027). Only a dev build that set the workflow's `user`/`password` inputs bakes
+a pre-created account. The ISO with `luks` additionally asks for the disk passphrase during
+the install. The same workflow runs `check-packages.sh --arch aarch64 --discover` so the log
+says whether the COPRs the image depends on still build for aarch64.
 
 **On a Mac.** Docker Desktop can build the container image
 (`docker build -f image/Containerfile --platform linux/arm64 -t wardos .` on Apple
@@ -607,8 +609,8 @@ no aarch64 tarball, so `build.sh --arch aarch64 --source release` says so and st
 
 **Getting the aarch64 disk.** Actions → *disk* → *Run workflow* with `arch=aarch64`,
 `type=qcow2` (the artifact `wardos-disks-aarch64`), or take
-`wardos-<ver>-aarch64.qcow2.zst` from a release and `zstd -d` it. The first user is
-`wardos`, password `wardos`; change it at first login.
+`wardos-<ver>-aarch64.qcow2.zst` from a release and `zstd -d` it. Release disks are
+unprovisioned: first boot creates your account (ADR-0027).
 
 **UTM on an Apple-silicon Mac** (M1 and later; UTM 4.x from [mac.getutm.app](https://mac.getutm.app)
 or the App Store):
@@ -694,7 +696,7 @@ CI runs, on every pull request and push (`verify.yml`):
 
 | Job | What |
 | --- | --- |
-| `image lint` | hadolint on `Containerfile`, shellcheck (`--severity=style`) on `image/*.sh`, the dry-runs of `build.sh`, `disk.sh` (plain and `--luks --user`), `check-packages.sh`, and `install-desktop.sh --help` |
+| `image lint` | hadolint on `Containerfile`, shellcheck (`--severity=style`) on `image/*.sh`, the dry-runs of `build.sh` (plain and `--dev-seed-user`), `disk.sh` (`qcow2`, `iso`, and `iso --luks`), `check-packages.sh`, and `install-desktop.sh --help` |
 | `image packages` | `check-packages.sh`: every name in `packages.txt` exists in the pinned Fedora release (plus `coprs.txt`) |
 | `hyprland config` | `image/check-hyprland.sh`: `Hyprland --verify-config` on `desktop/hyprland/` inside a `fedora:<release>` container with the COPRs, so the tree matches the compositor the image ships |
 | `desktop scripts` | `desktop/tests/run.sh`, which includes `install.test.sh` (install-desktop, desktop/install.sh, wardos-flathub, check-packages.sh, disk.sh) |

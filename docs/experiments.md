@@ -284,7 +284,8 @@ contents.
 * **E-09 (base OS chain on reference hardware) — first boot, partial.** 2026-09-08,
   a Fedora laptop, QEMU/KVM with OVMF and virtio-gpu, the image built on
   the laptop with `image/build.sh` (podman) from commit 762d193 and written with
-  `image/disk.sh --type qcow2 --user wardos`. The disk boots through UEFI to the
+  `image/disk.sh --type qcow2 --user wardos` (the `--user` flag was removed later, in
+  ADR-0027; disks now ship unprovisioned and create the user at first boot). The disk boots through UEFI to the
   desktop: tty1 autologin into Hyprland 0.56.2 (from the `mineiro/hyprland` COPR on
   Fedora 44), Waybar with the trust bar, foot as the terminal. Findings: Hyprland's
   error bar listed three options removed since the config was written

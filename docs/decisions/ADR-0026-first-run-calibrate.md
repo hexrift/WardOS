@@ -60,6 +60,11 @@ means completing this first-run path before the more visual Ward Field work (Pha
 is much easier to judge once a fresh machine can complete a coherent first-run flow.
 
 ### The one architectural decision: account creation stays with the installer
+> **Superseded by [ADR-0027](ADR-0027-first-boot-provisioning.md).** First-boot provisioning
+> is now the canonical way a WardOS machine gets its human account; the installer-owned model
+> below was reversed. CALIBRATE's language/keyboard/timezone settings (this ADR) stand and
+> become part of the provisioning session.
+
 Net-new **user-account creation** is **not** in CALIBRATE. The install paths already collect
 it: `image/disk.sh --user NAME` writes the account (in `wheel`) and its password into the
 bootc-image-builder customization or the Anaconda kickstart, and the ISO installer asks at

@@ -287,60 +287,52 @@ $(cat "$TMP/out")"
 ! sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo/image/packages.txt" | grep -Ev '^[A-Za-z0-9._+-]+$' || fail "packages.txt has a bad name"
 ! sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo/image/coprs.txt" | grep -Ev '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' || fail "coprs.txt has a bad entry"
 
-# --- image/disk.sh: --user and --luks write the bootc-image-builder config -----------
+# --- image/disk.sh: NO user is ever created; --luks writes the encrypted kickstart -------
+# ADR-0027: every disk ships UNPROVISIONED and creates the first user at FIRST BOOT. The one
+# development account mechanism is image/build.sh --dev-seed-user (a build-arg), NOT a
+# disk-build account, so disk.sh rejects --user/--password/--ssh-key and never emits a user
+# in any generated config — a disk can never boot "existing wheel account + unprovisioned".
 setup_env
 out=$TMP/disk
-bash "$repo/image/disk.sh" --type qcow2 --user wardos --password 'p&ss/w.rd' --output "$out" --dry-run >"$TMP/out"
-assert_file "$out/config.toml"
-assert_contains "$out/config.toml" '[[customizations.user]]'
-assert_contains "$out/config.toml" 'name = "wardos"'
-assert_contains "$out/config.toml" 'password = "p&ss/w.rd"'
-assert_contains "$out/config.toml" 'groups = ["wheel"]'
-assert_eq "$(stat -c %a "$out/config.toml")" 600
-! grep -q 'p&ss/w.rd' "$TMP/out" || fail "dry-run output must not show the password"
-grep -q -- '--config /config.toml' "$TMP/out" || fail "generated config not passed to the builder"
-# --luks: the installer's kickstart, user inside it, no [[customizations.user]].
-echo 'ssh-ed25519 AAAATEST key@test' >"$TMP/key.pub"
-WARDOS_PASSWORD=secret bash "$repo/image/disk.sh" --type iso --luks --user wardos --ssh-key "$TMP/key.pub" --output "$out" --dry-run >"$TMP/out"
+# The removed account flags are refused, with a pointer to first-boot provisioning.
+for f in --user --password --ssh-key; do
+  if bash "$repo/image/disk.sh" --type qcow2 "$f" x --output "$out" --dry-run >"$TMP/out" 2>&1; then
+    fail "disk.sh must reject the removed $f flag"
+  fi
+  grep -q 'first boot' "$TMP/out" || fail "disk.sh $f rejection should point at first-boot provisioning"
+done
+# --luks: the installer's kickstart, root locked, encrypted, and NO user line.
+bash "$repo/image/disk.sh" --type iso --luks --output "$out" --dry-run >"$TMP/out"
 assert_contains "$out/config.toml" '[customizations.installer.kickstart]'
 assert_contains "$out/config.toml" 'autopart --noswap --type=btrfs --encrypted'
-assert_contains "$out/config.toml" 'user --name=wardos --groups=wheel --password=secret --plaintext'
-assert_contains "$out/config.toml" 'sshkey --username=wardos "ssh-ed25519 AAAATEST key@test"'
 assert_contains "$out/config.toml" 'rootpw --lock'
-! grep -q 'customizations.user' "$out/config.toml" || fail "--luks must not also use customizations.user"
-! grep -q 'secret' "$TMP/out" || fail "dry-run output must not show WARDOS_PASSWORD"
-# Refusals: LUKS on qcow2, a user with no way in, --config together with --user or --luks.
-! bash "$repo/image/disk.sh" --type qcow2 --luks --output "$out" --dry-run 2>/dev/null || fail "--luks on qcow2 must fail"
-! bash "$repo/image/disk.sh" --type qcow2 --user wardos --output "$out" --dry-run 2>/dev/null || fail "--user without a password or key must fail"
-! bash "$repo/image/disk.sh" --type iso --user wardos --password x --config "$out/config.toml" --output "$out" --dry-run 2>/dev/null || fail "--config with --user must fail"
-! bash "$repo/image/disk.sh" --type iso --luks --config "$out/config.toml" --output "$out" --dry-run 2>/dev/null || fail "--config with --luks must fail"
-# The ISO encrypts by default (ADR-0017): a bare --type iso gets the LUKS kickstart, the
-# user inside it when given, and says so; --no-luks is the opt-out.
+! grep -q 'user --name' "$out/config.toml" || fail "the LUKS kickstart must not create a user"
+! grep -q 'customizations.user' "$out/config.toml" || fail "the LUKS kickstart must not create a user"
+assert_eq "$(stat -c %a "$out/config.toml")" 600
+grep -q -- '--config /config.toml' "$TMP/out" || fail "generated config not passed to the builder"
+# The ISO encrypts by default (ADR-0017): a bare --type iso gets the LUKS kickstart (still no
+# user) and says so; --no-luks is the opt-out.
 rm -rf "$out"
 bash "$repo/image/disk.sh" --type iso --output "$out" --dry-run >"$TMP/out"
 assert_contains "$out/config.toml" 'autopart --noswap --type=btrfs --encrypted'
-! grep -q 'user --name' "$out/config.toml" || fail "no user was asked for"
+! grep -q 'user --name' "$out/config.toml" || fail "no user is ever created"
 assert_contains "$TMP/out" 'full-disk encryption on'
 assert_contains "$TMP/out" '--no-luks'
 grep -q -- '--config /config.toml' "$TMP/out" || fail "the default LUKS kickstart must reach the builder"
-rm -rf "$out"
-WARDOS_PASSWORD=secret bash "$repo/image/disk.sh" --type iso --user wardos --output "$out" --dry-run >"$TMP/out"
-assert_contains "$out/config.toml" 'autopart --noswap --type=btrfs --encrypted'
-assert_contains "$out/config.toml" 'user --name=wardos --groups=wheel --password=secret --plaintext'
-! grep -q 'customizations.user' "$out/config.toml" || fail "a default-LUKS iso must carry the user in the kickstart"
 rm -rf "$out"
 bash "$repo/image/disk.sh" --type iso --no-luks --output "$out" --dry-run >"$TMP/out"
 assert_missing "$out/config.toml"
 ! grep -q -- '--config' "$TMP/out" || fail "no config expected with --no-luks"
 assert_contains "$TMP/out" 'full-disk encryption off'
-# --no-luks with a user falls back to the builder's own user customization.
-bash "$repo/image/disk.sh" --type iso --no-luks --user wardos --password x --output "$out" --dry-run >"$TMP/out"
-assert_contains "$out/config.toml" '[[customizations.user]]'
-! grep -q 'encrypted' "$out/config.toml" || fail "--no-luks must not encrypt"
+# Refusals: LUKS on qcow2, --config together with --luks, an unsupported --rootfs.
+! bash "$repo/image/disk.sh" --type qcow2 --luks --output "$out" --dry-run 2>/dev/null || fail "--luks on qcow2 must fail"
+mkdir -p "$out"
+echo '[customizations]' >"$TMP/own.toml"
+! bash "$repo/image/disk.sh" --type iso --luks --config "$TMP/own.toml" --output "$out" --dry-run 2>/dev/null || fail "--config with --luks must fail"
+! bash "$repo/image/disk.sh" --type qcow2 --rootfs zfs --output "$out" --dry-run 2>/dev/null || fail "an unsupported --rootfs must fail"
 # A --config on the ISO carries its own partitioning: no default kickstart is generated.
 rm -rf "$out"
 mkdir -p "$out"
-echo '[[customizations.user]]' >"$TMP/own.toml"
 bash "$repo/image/disk.sh" --type iso --config "$TMP/own.toml" --output "$out" --dry-run >"$TMP/out"
 assert_missing "$out/config.toml"
 assert_contains "$TMP/out" 'full-disk encryption off'

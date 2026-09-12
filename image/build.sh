@@ -2,7 +2,8 @@
 # Build the WardOS host image (image/Containerfile) with podman.
 #
 #   image/build.sh [--source release|checkout] [--release vX.Y.Z] [--arch x86_64|aarch64]
-#                  [--tag NAME] [--version V] [--dry-run] [-- extra podman build args]
+#                  [--tag NAME] [--version V] [--dev-seed-user NAME] [--dry-run]
+#                  [-- extra podman build args]
 #
 # Defaults: --source release (the published tarball of --release, default the newest
 # tag reachable from HEAD, else the Containerfile default; checksum fetched from the
@@ -12,12 +13,16 @@
 # architecture; aarch64 tarballs exist from v0.3), the default being this machine's.
 # Tag localhost/wardos:<git describe --tags --always>, version = the same describe
 # string, passed in as --build-arg WARDOS_VERSION for the org.wardos.version label.
-# Run it as root (sudo) when the image is going to feed image/disk.sh, because
-# bootc-image-builder reads root's container storage. See image/README.md.
+# --dev-seed-user NAME is the ONE development escape hatch (ADR-0027, NON-PRODUCTION): it
+# passes --build-arg WARDOS_DEV_SEED_USER=NAME so wardos-dev-seed seeds that account (and
+# marks the machine provisioned) at first boot; the password, if any, is delivered as a
+# first-boot systemd credential, never baked in. Omit it for a production image, which
+# ships unprovisioned. Run it as root (sudo) when the image is going to feed image/disk.sh,
+# because bootc-image-builder reads root's container storage. See image/README.md.
 set -euo pipefail
 
 usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -29,6 +34,7 @@ version=""
 source="release"
 release=""
 arch=""
+dev_seed_user=""
 dry_run=0
 extra=()
 
@@ -44,12 +50,31 @@ while [[ $# -gt 0 ]]; do
     --release=*) release=${1#--release=}; shift ;;
     --arch) arch=$2; shift 2 ;;
     --arch=*) arch=${1#--arch=}; shift ;;
+    --dev-seed-user) dev_seed_user=$2; shift 2 ;;
+    --dev-seed-user=*) dev_seed_user=${1#--dev-seed-user=}; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h | --help) usage; exit 0 ;;
     --) shift; extra=("$@"); break ;;
     *) echo "build.sh: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+# The dev-seed username (NON-PRODUCTION escape hatch) is baked into the image as the
+# wardos-dev-seed flag file, so validate it here against the SAME conservative policy
+# wardos-provisiond / wardos-dev-seed enforce, and refuse a reserved name — a build-time
+# failure beats an image that quietly seeds nothing (or the wrong identity) at first boot.
+if [[ -n "$dev_seed_user" ]]; then
+  if [[ ! "$dev_seed_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    echo "build.sh: --dev-seed-user '$dev_seed_user' is not a valid username" >&2
+    exit 2
+  fi
+  case "$dev_seed_user" in
+    root | daemon | bin | sys | adm | nobody | nogroup | greeter | ward-provision)
+      echo "build.sh: --dev-seed-user '$dev_seed_user' is a reserved name" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 if [[ -z "$version" ]]; then
   version=$(git describe --tags --always 2>/dev/null || echo dev)
@@ -85,6 +110,11 @@ cmd=("$podman_bin" build
   --tag "$tag"
   --file image/Containerfile
   --build-arg "WARDOS_VERSION=${version}")
+# NON-PRODUCTION dev escape hatch (ADR-0027): only when asked. Stage 2 of the Containerfile
+# reads this regardless of --source, so it works for both checkout and release binaries.
+if [[ -n "$dev_seed_user" ]]; then
+  cmd+=(--build-arg "WARDOS_DEV_SEED_USER=${dev_seed_user}")
+fi
 case "$source" in
   release)
     if [[ -z "$release" ]]; then

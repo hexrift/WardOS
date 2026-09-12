@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# wardos-greetd-session — greetd's session selector (ADR-0027). greetd runs this (as the
+# unprivileged, locked bootstrap user set in /etc/greetd/config.toml) instead of a fixed
+# command. It is marker-gated:
+#
+#   /var/lib/wardos/provisioned ABSENT  → the first-boot provisioning UI, a foot-hosted TUI
+#                                         (wardos-provision-ui) under cage, which creates the
+#                                         real user through the broker.
+#   /var/lib/wardos/provisioned PRESENT → the normal greeter (cage hosting gtkgreet),
+#                                         byte-for-byte the provisioned-machine login, so a
+#                                         provisioned machine boots exactly as it does today.
+#
+# The provisioning UI is an xdg-shell client: cage supports xdg-shell only (wlr-layer-shell is
+# an open upstream PR), so a layer-shell client (fuzzel) aborts under cage — the T480s hardware
+# failure. foot is xdg-shell, so cage hosts foot which runs the TUI.
+#
+# `cage -s` keeps VT switching enabled (a text console stays reachable for recovery), the same
+# belt-and-braces the greeter uses, on BOTH paths.
+#
+# Keyboard staging (A5): the keyboard chosen in the UI must be the compositor's LIVE input
+# layout before any password is typed. The chosen layout is persisted (by the UI) to the stage
+# file; this session ALWAYS launches cage with XKB_DEFAULT_LAYOUT set from it, so after the UI
+# records a new layout and exits, the next launch brings cage up under that layout — the UI then
+# sees its choice already live and proceeds to the password. The loop runs until the marker
+# exists (provisioning succeeded); a UI that was abandoned simply relaunches. Staging is
+# idempotent: an unchanged layout re-launches to the same state and the UI does not re-ask it.
+set -u
+
+marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
+# The restage carry-over lives in the greeter-owned /run/wardos-provision (image tmpfiles.d
+# wardos-provision.conf), NOT the broker's root-owned /run/wardos: the UI runs as greeter and
+# must be able to write it (ADR-0027 blocker).
+stage="${WARDOS_PROVISION_STAGE:-/run/wardos-provision/provision.stage}"
+
+# The provisioned greeter, unchanged: cage hosting a plain (NOT layer-shell, so no `-l`)
+# gtkgreet, styled to Ward Dark, handing off to /usr/libexec/wardos-session on auth.
+#
+# FAIL CLOSED: the provisioned greeter is reachable ONLY with the marker present. Every path
+# that reaches the greeter — the fast path at the top, and the fall-through after the
+# provisioning loop — funnels through here, and a persistent provisioning/restage failure
+# leaves that loop with the marker still ABSENT. Presenting a login greeter then would be the
+# exact dead end the marker gate exists to prevent: a machine with no human account. So this
+# guards the greeter call itself: with no marker it refuses and exits non-zero, so greetd
+# restarts the provisioning session (VT-switch recovery stays available) rather than dropping
+# to a greeter no one can log in to.
+run_greeter() {
+  if [[ ! -e "$marker" ]]; then
+    echo "wardos-greetd-session: provisioning did not complete (marker absent); refusing to start the provisioned greeter and failing closed so greetd restarts the provisioning session" >&2
+    exit 1
+  fi
+  exec cage -s -- gtkgreet -s /etc/greetd/wardos-greeter.css -c /usr/libexec/wardos-session
+}
+
+stage_get() { [[ -f "$stage" ]] && sed -n "s/^$1=//p" "$stage" | head -n1; }
+
+# Hardware acceptance guard: foot needs a COMPLETE PTY pair (master + slave) before the
+# provisioning TUI can run. A bare open of /dev/ptmx is insufficient: the slave grant/unlock/open
+# can still fail. Python is already a WardOS runtime dependency, and pty.openpty() exercises that
+# complete allocation under the exact unprivileged greeter identity that greetd uses here.
+require_pty_allocator() {
+  if ! python3 - <<'PY'
+import os
+import pty
+
+master, slave = pty.openpty()
+try:
+    os.write(slave, b"W")
+    if os.read(master, 1) != b"W":
+        raise OSError("PTY data-path probe did not round-trip")
+finally:
+    os.close(slave)
+    os.close(master)
+PY
+  then
+    echo "wardos-greetd-session: the greeter cannot allocate and use a complete PTY pair; first-boot provisioning cannot start foot" >&2
+    ls -lZ /dev/ptmx /dev/pts/ptmx 2>&1 >&2 || true
+    mount | grep -E '(^| )devpts( |$)| on /dev/pts ' >&2 || true
+    return 1
+  fi
+}
+# Cross-component fail-closed inhibit (#119 review): the dev-seed transaction journal (image
+# escape hatch, wardos-dev-seed) is present ONLY while a dev-seed account transaction is
+# unresolved/interrupted — meaning the machine may hold a residual wheel account with NO
+# provisioned marker. Neither provisioning path may proceed that boot: launching the canonical
+# provisioning UI could create a SECOND administrator over the orphan, and presenting the greeter
+# would be the very "residual admin + no way in / wrong way in" state the guards exist to prevent.
+# So guard EARLY (before either path) and FAIL CLOSED — same discipline as the marker guard:
+# refuse and exit non-zero so greetd restarts the session (VT-switch recovery stays available).
+# wardos-dev-seed's reconcile-on-entry removes the orphan and clears the journal on the NEXT boot
+# BEFORE anything else; only then does this guard pass and provisioning/greeter proceed.
+dev_seed_journal="${WARDOS_DEV_SEED_JOURNAL:-/var/lib/wardos/dev-seed.journal}"
+if [[ -e "$dev_seed_journal" ]]; then
+  echo "wardos-greetd-session: an unresolved dev-seed transaction journal is present ($dev_seed_journal); refusing to launch the provisioning UI or the greeter and failing closed so greetd restarts (dev-seed recovery required — the next boot reconciles it first)" >&2
+  exit 1
+fi
+
+[[ -e "$marker" ]] && run_greeter
+require_pty_allocator || exit 1
+
+# The provisioning UI exits with this status to ask for a cage relaunch under the chosen layout.
+RESTAGE_RC=75
+# The UI exits with this DISTINCT status when it could not persist its restage carry-over (the
+# runtime stage dir is unwritable). Re-showing the picker cannot help — the next pick could not
+# persist either — so this is bounded, not retried forever (never a silent infinite picker loop).
+STAGE_FAIL_RC=76
+stage_fails=0
+
+# Unprovisioned: the staged cage+foot bootstrap session. Loop until the machine is provisioned.
+while [[ ! -e "$marker" ]]; do
+  # Bring cage up under the keyboard layout chosen so far (if any). Reading it every iteration
+  # makes the relaunch after a keyboard pick land on the chosen layout without depending on how
+  # cage/foot propagate the client's exit status.
+  layout=$(stage_get KEYMAP)
+  variant=$(stage_get VARIANT)
+  [[ -n "$layout" ]] && export XKB_DEFAULT_LAYOUT="$layout"
+  [[ -n "$variant" ]] && export XKB_DEFAULT_VARIANT="$variant"
+  rc=0
+  cage -s -- foot -c /etc/greetd/wardos-provision-foot.ini --app-id wardos-provision -e wardos-provision-ui || rc=$?
+  # Provisioned: leave the loop and hand off to the greeter.
+  [[ -e "$marker" ]] && break
+  if [[ "$rc" -eq "$RESTAGE_RC" ]]; then
+    # A deliberate, successfully persisted restage: relaunch at once under the chosen layout.
+    stage_fails=0
+    continue
+  fi
+  if [[ "$rc" -eq "$STAGE_FAIL_RC" ]]; then
+    # The UI could not persist its restage state. This is not fixable by re-showing the picker,
+    # so bound the retries and stop rather than spin the picker forever (the UI already printed
+    # a visible error to the foot terminal). VT-switch recovery stays available throughout.
+    stage_fails=$((stage_fails + 1))
+    echo "wardos-greetd-session: provisioning could not persist its restage state (attempt $stage_fails/3)" >&2
+    if [[ "$stage_fails" -ge 3 ]]; then
+      # Bounded, so the picker does not spin forever. This leaves the loop with the marker
+      # ABSENT, so the fall-through below hits run_greeter's marker guard and FAILS CLOSED
+      # (exit non-zero → greetd restarts the provisioning session); it never presents the
+      # provisioned greeter on a machine with no human account.
+      echo "wardos-greetd-session: restage persistence keeps failing; stopping the provisioning loop (will fail closed)" >&2
+      break
+    fi
+    sleep 2
+    continue
+  fi
+  # Anything else that did not provision (the UI was abandoned, or cage failed to start) pauses
+  # briefly before relaunching so a broken compositor cannot spin in a hot loop.
+  stage_fails=0
+  sleep 1
+done
+
+# The loop exited. If it exited because provisioning succeeded, the marker is present and
+# run_greeter hands off to the provisioned greeter; if it exited on a persistent restage
+# failure (or any other non-marker path), the marker is absent and run_greeter fails closed
+# rather than presenting a greeter no one can log in to.
+run_greeter
