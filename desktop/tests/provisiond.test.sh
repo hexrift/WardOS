@@ -322,4 +322,63 @@ assert_logged '^localectl set-x11-keymap gb$' # the system keymap step still ran
 [[ ! -e "$WARDOS_KEYBOARD_STATE" ]] || fail "a failed persist leaves no half-written layout record"
 mock sync 'exit 0' # restore a succeeding flush for any later use
 
+# --- #119 review item 5: bounded request/field sizes, and control-char/length rejection of the
+# free-form full name. A hostile client on the socket must not be able to send unbounded data,
+# and the GECOS full name (the one free-form account field) must reject ANY control character
+# and stay within a length cap — the old check rejected only ':' and a literal newline.
+export WARDOS_PROVISIONED_MARKER="$TMP/provisioned" # back to a clean marker path after MK_DIR
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK" "$WARDOS_PROVISION_JOURNAL"
+mock useradd
+mock chpasswd
+mock userdel
+mock id 'exit 1'
+mock localectl
+mock sync 'exit 0'
+
+# An over-long field line is DENIED before the verb acts (bounded read, cap 64 for a locale).
+: >"$MOCK_LOG"
+long_locale=$(printf 'a%.0s' {1..100})
+out=$(printf 'LOCALE\n%s\n' "$long_locale" | wardos-provisiond)
+[[ "$out" == ERR* ]] || fail "an over-long locale line must be denied; got: $out"
+assert_not_logged 'set-locale' # rejected before (and instead of) acting on it
+
+# A full name with a TAB is denied (control char), and nothing is created.
+: >"$MOCK_LOG"
+rm -f "$WARDOS_PROVISIONED_MARKER"
+out=$(printf 'ACCOUNT\nalice\nAda\tLovelace\npw\n' | wardos-provisiond)
+[[ "$out" == ERR* ]] || fail "a full name containing a TAB must be denied; got: $out"
+assert_not_logged '^useradd'
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "a rejected full name must not mark provisioned"
+
+# A full name with a carriage return is denied.
+: >"$MOCK_LOG"
+out=$(printf 'ACCOUNT\nalice\nAda\rLovelace\npw\n' | wardos-provisiond)
+[[ "$out" == ERR* ]] || fail "a full name containing a CR must be denied; got: $out"
+assert_not_logged '^useradd'
+
+# A full name with an embedded control byte (0x01) is denied.
+: >"$MOCK_LOG"
+out=$(printf 'ACCOUNT\nalice\nAda\x01Lovelace\npw\n' | wardos-provisiond)
+[[ "$out" == ERR* ]] || fail "a full name containing a control byte must be denied; got: $out"
+assert_not_logged '^useradd'
+
+# A full name OVER the length cap (65 chars, cap is 64) is denied, and nothing is created.
+: >"$MOCK_LOG"
+long_name=$(printf 'A%.0s' {1..65})
+out=$(printf 'ACCOUNT\nalice\n%s\npw\n' "$long_name" | wardos-provisiond)
+[[ "$out" == ERR* ]] || fail "a full name over the length cap must be denied; got: $out"
+assert_not_logged '^useradd'
+
+# A valid full name UNDER the cap (63 chars, no control chars) is ACCEPTED: the account is
+# created and the marker committed. This proves the tightened check did not reject legitimate
+# names near the cap.
+: >"$MOCK_LOG"
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK" "$WARDOS_PROVISION_JOURNAL"
+mock id 'exit 1'
+ok_name=$(printf 'A%.0s' {1..63})
+out=$(printf 'ACCOUNT\nalice\n%s\npw\n' "$ok_name" | wardos-provisiond)
+[[ "$out" == OK ]] || fail "a valid full name near the cap must be accepted; got: $out"
+assert_logged "^useradd -m -c $ok_name -G wheel -s /bin/bash alice\$"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+
 echo "ok   provisiond.test.sh internal assertions"

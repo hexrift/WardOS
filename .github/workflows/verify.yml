@@ -148,6 +148,41 @@ jobs:
           sudo apt-get install -y -q fuzzel || echo "fuzzel unavailable in the archive; E1 (fuzzel --check-config) will skip — run it on the image where fuzzel 1.14 ships"
       - run: bash desktop/tests/run.sh
 
+  # The REAL cage + foot + wardos-provision-ui bootstrap boundary, run headlessly (#119
+  # review item 4). greetd-session.test.sh MOCKS cage, so it cannot catch a protocol/session/
+  # environment mismatch of the sort the T480s exposed (a layer-shell client aborting under
+  # cage). This job runs the un-mocked boundary on Fedora — the same release the image ships
+  # (image/Containerfile pins quay.io/fedora/fedora-bootc:44), with the real cage/foot/wlroots
+  # and the real fuzzel 1.14 — so the smoke and the fuzzel config check are AUTHORITATIVE here,
+  # not the self-skips they fall back to on a compositor-less/older-fuzzel runner. wlroots runs
+  # on its headless backend, software-rendered (pixman), so no GPU/DRM is needed on the runner.
+  desktop-compositor:
+    name: desktop compositor smoke (Fedora)
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      # actions/checkout needs git (and tar) present in this minimal Fedora container.
+      - name: Install git for checkout
+        run: dnf install -y --setopt=install_weak_deps=False git-core tar
+      - uses: actions/checkout@v7
+      # cage/foot/wlroots host the boundary; fuzzel 1.14 makes fuzzel-config.test.sh's
+      # `--check-config` authoritative; a monospace font so foot can actually open a window;
+      # socat is the broker transport the shipped UI uses (not reached in the smoke, installed
+      # so the shipped client runs exactly as on the image). These are the versions the image
+      # ships — the Fedora 44 repos here are the same the fedora-bootc:44 base resolves.
+      - name: Install the shipped compositor stack (cage + foot + wlroots + fuzzel)
+        run: dnf install -y --setopt=install_weak_deps=False cage foot fuzzel wlroots dejavu-sans-mono-fonts socat
+      # The un-mocked integration smoke: cage (headless) hosting foot running the real
+      # wardos-provision-ui, proving the first surface comes up and STAYS ALIVE, and that a
+      # client which dies on startup is detected (the T480s failure class). It SKIPS (never
+      # FAILS) only if the headless compositor cannot come up at all here, printing why.
+      - name: Cage + foot + wardos-provision-ui headless smoke (issue #119 item 4)
+        run: bash desktop/tests/cage-smoke.test.sh
+      # Secondary (owner note): validate the SHIPPED fuzzel config under the image's real
+      # fuzzel 1.14 (`fuzzel --check-config`), not the Ubuntu 1.9.2 that self-skips in `desktop`.
+      - name: fuzzel --check-config on the shipped config (Fedora 44 fuzzel 1.14)
+        run: bash desktop/tests/fuzzel-config.test.sh
+
   # The release helpers (scripts/release): every script shellcheck-clean, every
   # bash regression green -- the tag/version/asset binding for issue #126.
   release-scripts:

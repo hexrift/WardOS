@@ -16,3 +16,56 @@ ExecStart=/usr/bin/wardos-provisiond
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
+
+# --- sandboxing (ADR-0027, #119 review item 5) -------------------------------------------
+# The broker is root because it creates the first account and sets system state, but it does a
+# narrow, fixed set of things: run useradd/chpasswd (write /etc/passwd+shadow+group and create
+# /home/<user>), and ask systemd-localed/systemd-timedated over the SYSTEM D-Bus (localectl/
+# timedatectl are thin D-Bus clients — the daemons, not this process, write /etc/locale.conf,
+# the keymap and /etc/localtime). It also writes its own marker/journal/keyboard record under
+# /var/lib/wardos and takes a lock under /run/wardos. The directives below keep exactly what
+# that needs and drop the rest. The final proof is a hardware boot (a booted system with real
+# localed/timedated); each retained privilege is justified, and the one to watch is noted.
+NoNewPrivileges=yes
+# Read-only whole filesystem except the few trees the broker legitimately writes: /etc (passwd/
+# shadow/group via useradd+chpasswd), /home (the new user's home, created by useradd -m and
+# removed by userdel -r on rollback), /var (the marker, journal and keyboard record under
+# /var/lib/wardos, plus useradd's /var/log/lastlog and /var/spool/mail/<user>), and /run/wardos
+# (the per-connection lock; the socket unit's RuntimeDirectory creates the directory). The
+# D-Bus system socket is only connected to, not written, so it needs no ReadWritePaths entry.
+ProtectSystem=strict
+ReadWritePaths=/etc /var /home /run/wardos
+# useradd -m must create and populate /home/<user>, so /home cannot be hidden — keep it visible
+# (the default) rather than blinding the one operation the broker exists to perform.
+ProtectHome=no
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# set-timezone is delegated to systemd-timedated over D-Bus, so this process never sets the
+# clock itself; deny the clock-setting syscalls and CAP_SYS_TIME it does not need.
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+# The broker creates no setuid/setgid files (useradd's home dir and skel copies carry no such
+# bits on the shipped image). Watch this one on the hardware boot: if a future /etc/skel ever
+# ships a setgid file, useradd would need this relaxed.
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Only local IPC is needed: AF_UNIX for the passed connection and the D-Bus system bus, and
+# AF_NETLINK for NSS/systemd lookups. No internet sockets are ever required here.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# The minimal capability set for account creation, each justified:
+#   CAP_CHOWN        chown the new home and its files to the new user (useradd -m, userdel -r).
+#   CAP_DAC_OVERRIDE edit the mode-0000 /etc/shadow (useradd/chpasswd) despite its permissions.
+#   CAP_FOWNER       set modes/ownership on files the process does not own (home, skel copies).
+#   CAP_FSETID       preserve setgid bits when copying /etc/skel / setting the group dir.
+#   CAP_SETUID       chpasswd's PAM stack and useradd may switch/verify uid during the update.
+#   CAP_SETGID       create the user's primary group and set group ownership.
+# Everything else (CAP_SYS_ADMIN, CAP_NET_*, CAP_SYS_TIME, …) is dropped.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID CAP_SETUID CAP_SETGID
+# A conservative system-service syscall allowlist covers bash, useradd/chpasswd, the D-Bus
+# clients and the coreutils the broker uses (mv/rm/mkdir/sync/date/head/id); the dangerous
+# groups (@mount, @swap, @reboot, @module, @obsolete, raw I/O) are not in it.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

@@ -23,10 +23,37 @@ set -euo pipefail
 marker="${WARDOS_PROVISIONED_MARKER:-/var/lib/wardos/provisioned}"
 lockfile="${WARDOS_PROVISION_LOCK:-/run/wardos/provisiond.lock}"
 
+# Per-field size caps (hardening, #119 review item 5). Every line the broker reads is bounded to
+# a documented maximum so a hostile client on the socket cannot make it buffer unbounded data; a
+# line at or over its cap is DENIED, never truncated-and-acted-on (see read_bounded). The caps
+# are generous for legitimate input: locale/timezone strings and the username policy (≤32) sit
+# well under theirs, the GECOS full name is capped at MAX_FULLNAME, and the password cap is large
+# enough for a long passphrase yet still bounded.
+MAX_VERB=32
+MAX_LOCALE=64
+MAX_LAYOUT=32
+MAX_TIMEZONE=64
+MAX_USERNAME=64 # the username policy itself caps at 32; this bounds the read before validation
+MAX_FULLNAME=64
+MAX_PASSWORD=1024
+
 reply() { printf '%s\n' "$*"; }
 deny() {
   reply "ERR $*"
   exit 0
+}
+
+# read_bounded VAR MAX LABEL: read one line into VAR, but never buffer more than MAX+1 characters
+# — `read -n` stops at the cap (or the newline, whichever is first), so a hostile client cannot
+# send unbounded data. A line whose length exceeds MAX is DENIED (rejected, not truncated). The
+# read stays line-oriented; returns non-zero on EOF/short read so the caller denies with a
+# field-specific "missing" message, exactly as the unbounded reads it replaces did.
+read_bounded() {
+  local __var=$1 __max=$2 __label=$3 __line __rc=0
+  IFS= read -r -n $((__max + 1)) __line || __rc=$?
+  if ((${#__line} > __max)); then deny "$__label too long (max $__max)"; fi
+  printf -v "$__var" '%s' "$__line"
+  return "$__rc"
 }
 provisioned() { [[ -e "$marker" ]]; }
 
@@ -98,6 +125,21 @@ valid_timezone() { [[ "$1" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*$ && "$1" != 
 # then lower-case, digits, underscore or dash; at most 32 characters.
 valid_username() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
 
+# The GECOS full name is the one account field that is free-form, so it needs an explicit content
+# policy (#119 review item 5). The previous check rejected only ':' and a literal newline; this
+# rejects ':' (the passwd/GECOS field separator) AND *any* control character — every C0 control,
+# DEL, and an embedded TAB/CR/etc. ([[:cntrl:]] matches them all; an embedded NUL cannot reach
+# here because bash `read` terminates the value at a NUL) — and enforces the MAX_FULLNAME length
+# cap. The locale/layout/timezone/username fields keep their strict regexes, none of which admit
+# a control character, so this closes the only field that otherwise could.
+valid_fullname() {
+  local v=$1
+  ((${#v} <= MAX_FULLNAME)) || return 1
+  [[ "$v" != *:* ]] || return 1
+  [[ "$v" != *[[:cntrl:]]* ]] || return 1
+  return 0
+}
+
 do_locale() {
   local v=$1
   valid_locale "$v" || deny "invalid locale"
@@ -164,8 +206,8 @@ do_account() {
   local user=$1 fullname=$2 password=$3
   valid_username "$user" || deny "invalid username"
   [[ -n "$password" ]] || deny "empty password"
-  # GECOS must not carry a field separator or control characters.
-  [[ "$fullname" != *:* && "$fullname" != *$'\n'* ]] || deny "invalid full name"
+  # GECOS must carry no field separator, no control character, and stay within the length cap.
+  valid_fullname "$fullname" || deny "invalid full name"
 
   # Never adopt a reserved/system identity, even one nsswitch resolves.
   case "$user" in
@@ -228,35 +270,38 @@ do_account() {
   reply OK
 }
 
-# Read the verb, then only the lines that verb needs.
-IFS= read -r verb || deny "empty request"
+# Read the verb (bounded), then only the lines that verb needs — each bounded to its cap.
+# Pre-declared so their bounded reads (which assign via printf -v inside read_bounded) are
+# visible to static analysis.
+verb="" v="" user="" fullname="" password=""
+read_bounded verb "$MAX_VERB" "request" || deny "empty request"
 case "$verb" in
   STATUS)
     if provisioned; then reply "OK provisioned"; else reply "OK unprovisioned"; fi
     ;;
   LOCALE)
     refuse_if_provisioned # cheap fast-reject; the authoritative re-check is under the lock
-    IFS= read -r v || deny "missing value"
+    read_bounded v "$MAX_LOCALE" "locale" || deny "missing value"
     lock_and_recheck
     do_locale "$v"
     ;;
   KEYMAP)
     refuse_if_provisioned # cheap fast-reject; the authoritative re-check is under the lock
-    IFS= read -r v || deny "missing value"
+    read_bounded v "$MAX_LAYOUT" "keyboard layout" || deny "missing value"
     lock_and_recheck
     do_keymap "$v"
     ;;
   TIMEZONE)
     refuse_if_provisioned # cheap fast-reject; the authoritative re-check is under the lock
-    IFS= read -r v || deny "missing value"
+    read_bounded v "$MAX_TIMEZONE" "timezone" || deny "missing value"
     lock_and_recheck
     do_timezone "$v"
     ;;
   ACCOUNT)
     refuse_if_provisioned # cheap fast-reject; the authoritative re-check is under the lock
-    IFS= read -r user || deny "missing username"
-    IFS= read -r fullname || deny "missing full name"
-    IFS= read -r password || deny "missing password"
+    read_bounded user "$MAX_USERNAME" "username" || deny "missing username"
+    read_bounded fullname "$MAX_FULLNAME" "full name" || deny "missing full name"
+    read_bounded password "$MAX_PASSWORD" "password" || deny "missing password"
     # Serialize the whole check → create → commit under an exclusive lock, then re-check
     # state after acquiring it: two concurrent connections must not both pass the
     # unprovisioned check and create two administrator accounts.
