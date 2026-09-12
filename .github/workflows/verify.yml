@@ -171,7 +171,32 @@ jobs:
       # so the shipped client runs exactly as on the image). These are the versions the image
       # ships — the Fedora 44 repos here are the same the fedora-bootc:44 base resolves.
       - name: Install the shipped compositor stack (cage + foot + wlroots + fuzzel)
-        run: dnf install -y --setopt=install_weak_deps=False cage foot fuzzel wlroots dejavu-sans-mono-fonts socat
+        run: dnf install -y --setopt=install_weak_deps=False cage foot fuzzel wlroots dejavu-sans-mono-fonts socat python3 shadow-utils systemd
+      # Hardware regression from the T480s: validate the exact devpts inode and the exact
+      # unprivileged identity the image ships. First make the target inaccessible and prove a
+      # complete master+slave allocation fails as greeter; then apply the IMAGE'S tmpfiles rule,
+      # prove it repairs /dev/pts/ptmx to 0666, and prove the same greeter can allocate/use a PTY.
+      # This catches the broken z /dev/ptmx symlink rule: changing the symlink path does not
+      # repair the active devpts target. The container has its own devpts mount, so the mutation
+      # is isolated to this CI job.
+      - name: PTY invariant under the shipped greeter identity
+        run: |
+          set -euo pipefail
+          getent group video >/dev/null || groupadd -r video
+          getent passwd greeter >/dev/null || useradd -r -M -d /var/lib/greeter -s /usr/sbin/nologin -G video greeter
+          chmod 0600 /dev/pts/ptmx
+          if runuser -u greeter -- python3 -c 'import pty; pty.openpty()'; then
+            echo "::error::negative control failed: greeter allocated a PTY while /dev/pts/ptmx was 0600" >&2
+            exit 1
+          fi
+          systemd-tmpfiles --create image/rootfs/usr/lib/tmpfiles.d/wardos-pty.conf
+          test "$(stat -Lc '%a' /dev/pts/ptmx)" = "666" || {
+            ls -lZ /dev/ptmx /dev/pts/ptmx || true
+            echo "::error::the shipped tmpfiles rule did not restore /dev/pts/ptmx to 0666" >&2
+            exit 1
+          }
+          runuser -u greeter -- python3 -c 'import os,pty; m,s=pty.openpty(); os.write(s,b"W"); assert os.read(m,1)==b"W"; os.close(s); os.close(m)'
+          echo "pty-bootstrap: negative control PASSED; shipped tmpfiles repair PASSED; greeter full PTY allocation PASSED"
       # The un-mocked integration smoke: cage (headless) hosting foot running the real
       # wardos-provision-ui, proving the first surface comes up and STAYS ALIVE, and that a
       # client which dies on startup is detected (the T480s failure class). This job EXPLICITLY
@@ -179,10 +204,13 @@ jobs:
       # (stack missing, or no headless surface) a FAILURE, not a skip — the required check cannot
       # go green without exercising the boundary (#119 review). The test prints named evidence
       # that Proof A, the negative control, and real-UI Proof B each executed and passed.
-      - name: Cage + foot + wardos-provision-ui headless smoke (issue #119 item 4)
-        env:
-          WARDOS_SMOKE_REQUIRE: "1"
-        run: bash desktop/tests/cage-smoke.test.sh
+      - name: Cage + foot + wardos-provision-ui headless smoke as shipped greeter (issue #119 item 4)
+        run: |
+          set -euo pipefail
+          summary=/tmp/wardos-cage-smoke-summary
+          install -o greeter -g greeter -m 0600 /dev/null "$summary"
+          runuser -u greeter -- env WARDOS_SMOKE_REQUIRE=1 GITHUB_STEP_SUMMARY="$summary" bash desktop/tests/cage-smoke.test.sh
+          cat "$summary" >>"$GITHUB_STEP_SUMMARY"
       # Secondary (owner note): validate the SHIPPED fuzzel config under the image's real
       # fuzzel 1.14 (`fuzzel --check-config`), not the Ubuntu 1.9.2 that self-skips in `desktop`.
       - name: fuzzel --check-config on the shipped config (Fedora 44 fuzzel 1.14)
