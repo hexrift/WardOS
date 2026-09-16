@@ -177,6 +177,43 @@ printf '%s\n' "de" 1 |
 grep -q '^KEYMAP=de$' "$stage_dir/provision.stage" || fail "blocker 1: the saved layout must round-trip via the stage file"
 [[ -z "$(find "$stage_dir" -maxdepth 1 -name '*.tmp*' 2>/dev/null)" ]] || fail "blocker 1: the atomic write must leave no temp file behind"
 
+# Missing system catalogs must still offer a visible keep-current choice.
+: >"$socat_in"
+rm -f "$WARDOS_PROVISION_STAGE"
+mock localectl 'exit 1'
+run_ui "" 0 "" 0 "" 0 "Ada" "alice" "pw" "pw" 1 ||
+  fail "missing keyboard/locale catalogs must not block account setup"
+grep -q '^ACCOUNT$' "$socat_in" || fail "account request after keeping unavailable settings"
+
+# Numeric choices are decimal, bounded to the displayed menu, and retryable.
+: >"$socat_in"
+rm -f "$WARDOS_PROVISION_STAGE"
+# shellcheck disable=SC2016
+mock localectl 'case "${1:-}" in list-locales) for n in {1..10}; do printf "test%s.UTF-8\n" "$n"; done ;; esac'
+run_ui "" 0 "" 999999999999999999999999999999 "" 08 "" 0 "Ada" "alice" "pw" "pw" 1 ||
+  fail "numeric menu choices must recover and accept leading-zero decimal input"
+grep -q '^test8.UTF-8$' "$socat_in" || fail "08 must choose the eighth item"
+mock localectl 'exit 1'
+
+# Enforce the broker password length limit before confirmation or account submission.
+: >"$socat_in"
+rm -f "$WARDOS_PROVISION_STAGE"
+printf -v too_long '%01025d' 0
+run_ui "" 0 "" 0 "" 0 "Ada" "alice" "$too_long" "valid-password" "valid-password" 1 ||
+  fail "overlong password must be corrected before reaching review"
+grep -q '^valid-password$' "$socat_in" || fail "corrected password reaches the broker"
+if grep -q "$too_long" "$socat_in"; then fail "overlong password must not reach broker"; fi
+
+# A password rejected by the broker can be replaced from review without losing fields.
+: >"$socat_in"
+rm -f "$WARDOS_PROVISION_STAGE"
+# shellcheck disable=SC2016
+mock socat 'req=$(cat); printf "%s\n" "$req" >>"'"$socat_in"'"; case "$req" in *old-password*) printf "ERR could not set password\n" ;; *) printf "OK\n" ;; esac'
+run_ui "" 0 "" 0 "" 0 "Ada" "alice" "old-password" "old-password" 1 7 \
+  "replacement-password" "replacement-password" 1 || fail "password rejection must be recoverable from review"
+[[ $(grep -c '^ACCOUNT$' "$socat_in") -eq 2 ]] || fail "exactly two account attempts"
+grep -q '^replacement-password$' "$socat_in" || fail "replacement password reaches broker"
+
 # --- already provisioned: the UI does nothing and does not touch the broker ---------------
 : >"$socat_in"
 rm -f "$WARDOS_PROVISION_STAGE"

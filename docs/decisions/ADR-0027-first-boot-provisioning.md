@@ -68,6 +68,13 @@ user, and any default-password account.
     visibly and bounds the relaunch loop rather than re-showing the picker forever. A future
     graphical (E-10 toolkit) surface remains a follow-up; the desktop's post-login fuzzel is
     unaffected.
+  - **Setup recovery:** every settings picker keeps its `0` option available even when
+    the system catalog is unavailable or a filter has no matches. Numbered choices use
+    bounded decimal input. Review offers **Change password** after a rejected account
+    request without discarding other fields; password entry checks the broker's
+    1024-character limit before confirmation. Passwords remain memory-only. A failed
+    broker response says completion could not be confirmed, because losing a reply does
+    not prove that the account transaction was rolled back.
 - **Provisioning broker** (`wardos-provisiond`, **root, socket-activated**): a systemd
   service exposing a Unix socket with a **narrow, validated verb set** — `STATUS` (read-only),
   `LOCALE`, `KEYMAP`, `TIMEZONE`, and `ACCOUNT`. `ACCOUNT` is the **transactional commit**: it

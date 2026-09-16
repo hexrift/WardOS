@@ -101,8 +101,11 @@ tui_pick() {
       matches=$items
     fi
     if [[ -z "$matches" ]]; then
-      status "Nothing matched '$filter'; try again."
-      continue
+      if [[ -z "$items" ]]; then
+        status "The system list is unavailable. You can keep the current setting."
+      else
+        status "Nothing matched '$filter'. Choose 0 to keep current, or Enter to filter again."
+      fi
     fi
     say ""
     say "  0) $keep"
@@ -119,7 +122,10 @@ tui_pick() {
     printf 'choose> ' >&2
     IFS= read -r sel || return 1
     [[ "$sel" == 0 ]] && return 0 # keep current
-    if [[ "$sel" =~ ^[0-9]+$ ]] && ((sel >= 1 && sel <= count)); then
+    # At most 60 entries are displayed. Bound input before decimal arithmetic so
+    # leading zeroes are harmless and oversized numbers cannot overflow.
+    if [[ "$sel" =~ ^[0-9]{1,2}$ ]] && ((10#$sel >= 1 && 10#$sel <= count)); then
+      sel=$((10#$sel))
       i=0
       while IFS= read -r line; do
         [[ -n "$line" ]] || continue
@@ -200,6 +206,10 @@ ask_password() {
     p1=$(tui_secret "Password — for your account") || return 1
     if [[ -z "$p1" ]]; then
       status "A password is required."
+      continue
+    fi
+    if (( ${#p1} > 1024 )); then
+      status "Use a password of at most 1024 characters."
       continue
     fi
     p2=$(tui_secret "Password — type it again") || return 1
@@ -310,7 +320,7 @@ attempt_create() {
     rm -f "$stage" 2>/dev/null || true
     return 0
   fi
-  status "Account not created: ${last_err}. Adjust and try again."
+  status "Setup could not confirm completion: ${last_err}. Review your choices and try again."
   return 1
 }
 
@@ -324,6 +334,7 @@ review() {
     say "  4) Timezone  · ${tz:-keep current}"
     say "  5) Name      · ${fullname:-—}"
     say "  6) Username  · ${user}"
+    say "  7) Change password"
     printf 'choose> ' >&2
     IFS= read -r choice || return 1
     case "$choice" in
@@ -341,7 +352,8 @@ review() {
       4) if v=$(pick_timezone); then tz=$v; fi ;;
       5) if v=$(tui_read "Your name — shown on the login screen (optional)"); then fullname=$v; fi ;;
       6) user=$(ask_username) || return 1 ;;
-      *) status "Type a number from 1 to 6." ;;
+      7) if v=$(ask_password); then pass=$v; fi ;;
+      *) status "Type a number from 1 to 7." ;;
     esac
   done
 }
