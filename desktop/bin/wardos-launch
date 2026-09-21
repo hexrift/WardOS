@@ -47,8 +47,15 @@ case "$what" in
     app_id=$1
     shift
     # The command runs through sh so the window shows its output and waits for Enter.
+    # Exit contract: this process's own exit status is always the child command's ("$@"'s),
+    # never the close prompt's. The child's status is captured right after it runs, shown
+    # ([done] or [failed, exit N]) before the prompt, and re-asserted with `exit` as the very
+    # last statement — whether `read` sees Enter, a failure, or EOF (Ctrl-D closes the window
+    # without changing the reported status either way).
+    # shellcheck disable=SC2016  # the inner script's $@/$status expand when IT runs, not now
     exec "$(wardos_terminal)" "$(wardos_terminal_class_flag)" "$app_id" -e sh -c \
-      '"$@"; printf "\n[done]  press Enter to close\n"; read -r _' sh "$@"
+      '"$@"; status=$?; if [ "$status" -eq 0 ]; then printf "\n[done]  press Enter to close\n"; else printf "\n[failed, exit %s]  press Enter to close\n" "$status"; fi; read -r _ || true; exit "$status"' \
+      sh "$@"
     ;;
   browser)
     if [[ "${1:-}" == --project ]]; then
