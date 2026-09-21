@@ -91,6 +91,19 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      # RELEASE is free text on workflow_dispatch (no `type: choice`, unlike release.yml's
+      # tag input) and later becomes a `sudo mv` destination component ("Name and checksum
+      # the disks" below). Gate it here, before anything reads it, on the same `v<semver>`
+      # grammar release.yml's "Resolve version" step enforces -- an unset value (the
+      # Containerfile-default / checkout path) is left alone.
+      - name: RELEASE matches the release tag grammar
+        if: env.RELEASE != ''
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "not a valid v<semver> release tag: '$RELEASE'" >&2
+            exit 1
+          fi
       - name: Free runner disk
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup
