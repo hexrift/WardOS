@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -218,17 +219,24 @@ impl Walker<'_> {
         } else if ft.is_file() {
             self.stats.files_total += 1;
             let size = meta.len();
-            // Check the budget against the file's known size *before* reading any
-            // of its bytes: `hash_file` (both the plain and incremental/cache-fill
-            // paths) does a whole-file `fs::read`, so checking only after would let
-            // a single oversized file be fully buffered in memory ahead of the
-            // rejection — a memory DoS of the host process (issue #160).
+            // Check the budget against the file's *claimed* size before reading
+            // any of its bytes: this is a cheap early reject for a file whose
+            // metadata already declares it over budget (issue #160). It is not
+            // sufficient on its own, though: the tree is agent-controlled, so the
+            // file can grow or be replaced between this `symlink_metadata` and the
+            // read that follows (a TOCTOU). The authoritative bound therefore lives
+            // in `hash_file`, which reads at most `remaining + 1` bytes and rejects
+            // overflow before hashing or storing anything — capping peak allocation
+            // regardless of what `metadata().len()` claimed here.
             let prospective_total = self.total_bytes.saturating_add(size);
             if prospective_total > self.opts.max_bytes {
                 return Err(SnapshotError::BudgetExceeded(self.opts.max_bytes));
             }
-            let digest = self.hash_file(&abs, &meta)?;
-            self.total_bytes = prospective_total;
+            // Account by the bytes *actually* read within budget, not the metadata
+            // size, so a file that shrank or grew between metadata and read is
+            // counted by what was truly buffered.
+            let (digest, read_len) = self.hash_file(&abs, &meta)?;
+            self.total_bytes = self.total_bytes.saturating_add(read_len);
             self.push(rel, EntryType::File, mode, size, Some(digest));
         } else if ft.is_fifo() || ft.is_socket() || ft.is_block_device() || ft.is_char_device() {
             self.push(rel, EntryType::Unsupported, mode, 0, None);
@@ -236,7 +244,11 @@ impl Walker<'_> {
         Ok(())
     }
 
-    fn hash_file(&mut self, abs: &Path, meta: &fs::Metadata) -> Result<Digest> {
+    /// Hash (and, when there is a CAS, store) one regular file, returning its
+    /// digest and the number of content bytes actually read. Every read here is
+    /// bounded by the remaining budget via [`Walker::read_within_budget`], so an
+    /// over-budget file is rejected before any blob is stored.
+    fn hash_file(&mut self, abs: &Path, meta: &fs::Metadata) -> Result<(Digest, u64)> {
         if self.opts.incremental {
             let mtime = meta.modified().map_err(|e| SnapshotError::io(abs, e))?;
             let size = meta.len();
@@ -250,25 +262,43 @@ impl Walker<'_> {
                 if let Some(cas) = self.cas
                     && !cas.has_blob(d)
                 {
-                    let bytes = fs::read(abs).map_err(|e| SnapshotError::io(abs, e))?;
+                    // CAS-backfill read: still agent-controlled input, so bound it
+                    // against the remaining budget just like a fresh read.
+                    let bytes = self.read_within_budget(abs)?;
                     cas.put_blob(&bytes)?;
                 }
                 self.stats.files_cached += 1;
-                return Ok(d);
+                // The metadata matched the cache, so the content length is `size`.
+                return Ok((d, size));
             }
-            let bytes = fs::read(abs).map_err(|e| SnapshotError::io(abs, e))?;
+            let bytes = self.read_within_budget(abs)?;
+            let n = bytes.len() as u64;
             let d = self.store(&bytes)?;
             self.cache.map.insert(abs.to_path_buf(), (mtime, size, d));
             self.stats.files_hashed += 1;
-            self.stats.bytes_hashed += bytes.len() as u64;
-            Ok(d)
+            self.stats.bytes_hashed += n;
+            Ok((d, n))
         } else {
-            let bytes = fs::read(abs).map_err(|e| SnapshotError::io(abs, e))?;
+            let bytes = self.read_within_budget(abs)?;
+            let n = bytes.len() as u64;
             let d = self.store(&bytes)?;
             self.stats.files_hashed += 1;
-            self.stats.bytes_hashed += bytes.len() as u64;
-            Ok(d)
+            self.stats.bytes_hashed += n;
+            Ok((d, n))
         }
+    }
+
+    /// Read a candidate file's bytes while enforcing the remaining byte budget on
+    /// the read itself. Opens the file once and reads at most `remaining + 1`
+    /// bytes; if that sentinel byte is reached the file is over budget and
+    /// [`SnapshotError::BudgetExceeded`] is returned before any hashing or store,
+    /// so peak allocation is capped at `remaining + 1` no matter what the earlier
+    /// `metadata().len()` claimed. A result of `<= remaining` bytes is the whole
+    /// file (the cap was not hit), hashed and stored as-is.
+    fn read_within_budget(&self, abs: &Path) -> Result<Vec<u8>> {
+        let file = fs::File::open(abs).map_err(|e| SnapshotError::io(abs, e))?;
+        let remaining = self.opts.max_bytes.saturating_sub(self.total_bytes);
+        read_capped(file, remaining, self.opts.max_bytes, abs)
     }
 
     /// The digest of one leaf, stored when there is a CAS to store it in.
@@ -295,6 +325,33 @@ impl Walker<'_> {
             content,
         });
     }
+}
+
+/// Read from `reader` into a `Vec`, buffering at most `remaining + 1` bytes.
+///
+/// This is the authoritative byte-budget bound. It is deliberately independent
+/// of any prior `metadata().len()`: an agent-controlled file can grow or be
+/// replaced after its metadata was observed, so only bounding the read itself
+/// caps allocation. At most `remaining + 1` bytes are ever buffered; if the
+/// `+ 1` sentinel byte is present the source held more than `remaining` bytes
+/// and [`SnapshotError::BudgetExceeded`] is returned (with the configured
+/// `max_bytes`) before the bytes are handed back for hashing or storage.
+/// Otherwise the returned `Vec` is the complete content (the cap was not hit).
+///
+/// `path` is used only to tag any I/O error with its source file.
+fn read_capped(reader: impl Read, remaining: u64, max_bytes: u64, path: &Path) -> Result<Vec<u8>> {
+    // Cap the reader at one byte past the budget: reaching that extra byte is
+    // proof of overflow, while a shorter read is a complete, in-budget file.
+    let cap = remaining.saturating_add(1);
+    let mut buf = Vec::new();
+    reader
+        .take(cap)
+        .read_to_end(&mut buf)
+        .map_err(|e| SnapshotError::io(path, e))?;
+    if buf.len() as u64 > remaining {
+        return Err(SnapshotError::BudgetExceeded(max_bytes));
+    }
+    Ok(buf)
 }
 
 fn read_dir_names(dir: &Path) -> Result<Vec<Vec<u8>>> {
@@ -418,5 +475,72 @@ mod git_context_tests {
             Some("0123456789abcdef0123456789abcdef01234567")
         );
         assert!(ctx.detached);
+    }
+}
+
+#[cfg(test)]
+mod bounded_read_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::read_capped;
+    use crate::error::SnapshotError;
+    use std::io;
+    use std::path::Path;
+
+    /// The read is bounded by `remaining + 1`, not by any metadata length. A
+    /// reader that yields bytes without end — standing in for a file that grew
+    /// or was swapped for a larger one after its (stale) metadata was observed —
+    /// is rejected as over budget without buffering the whole stream.
+    ///
+    /// This is the regression for the TOCTOU that the metadata-only pre-check
+    /// could not close: the old path did an unbounded `fs::read`, which on this
+    /// endless source would never return (exhausting host memory). The bounded
+    /// read returning `BudgetExceeded` instead — and, because the error is
+    /// returned before any bytes are handed back, storing no blob — is the fix.
+    #[test]
+    fn a_source_longer_than_metadata_claimed_is_rejected_by_the_read_itself() {
+        // `io::repeat` yields its byte forever; reaching `read_capped`'s return at
+        // all proves the read is capped independently of the source's true length.
+        let grown = io::repeat(b'x');
+        let err = read_capped(grown, 1024, 1024, Path::new("grew-after-metadata")).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::BudgetExceeded(1024)),
+            "an over-budget read must be rejected before its bytes are returned for storage, \
+             got {err:?}"
+        );
+    }
+
+    /// A source of exactly `remaining` bytes is in budget: the `+ 1` sentinel is
+    /// never reached, so the complete content is returned verbatim for hashing
+    /// and storage — the digest of an in-budget file is unchanged by the bound.
+    #[test]
+    fn a_source_exactly_at_the_budget_is_returned_whole() {
+        let content = vec![b'a'; 1024];
+        let bytes = read_capped(content.as_slice(), 1024, 1024, Path::new("fits")).unwrap();
+        assert_eq!(
+            bytes, content,
+            "an at-budget file must be read back in full"
+        );
+    }
+
+    /// One byte past the remaining budget trips the sentinel and is rejected,
+    /// even though only `remaining + 1` bytes were ever buffered.
+    #[test]
+    fn one_byte_over_the_budget_trips_the_sentinel() {
+        let content = vec![b'a'; 1025];
+        let err = read_capped(content.as_slice(), 1024, 1024, Path::new("over")).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::BudgetExceeded(1024)),
+            "got {err:?}"
+        );
+    }
+
+    /// With no budget left, even a single readable byte is over budget.
+    #[test]
+    fn a_nonempty_source_with_no_remaining_budget_is_rejected() {
+        let err = read_capped([0u8].as_slice(), 0, 4096, Path::new("no-room")).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::BudgetExceeded(4096)),
+            "got {err:?}"
+        );
     }
 }
