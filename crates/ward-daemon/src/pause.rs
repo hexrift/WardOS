@@ -310,12 +310,23 @@ fn freeze_signals(pids: &[u32]) {
 }
 
 /// Move `pids` into the cgroup at `dir` and freeze it, waiting for the kernel
-/// to report the freeze settled.
+/// to report the freeze settled. On any failure, every pid already migrated
+/// in is moved back to `dir`'s parent first, so the caller always finds `dir`
+/// with no live members left to remove — a cgroup can only be `rmdir`'d once
+/// it has none (cgroup-v2 admin guide).
 fn freeze_cgroup(dir: &Path, pids: &[u32]) -> std::io::Result<()> {
+    let mut migrated = Vec::with_capacity(pids.len());
     for pid in pids {
-        fs::write(dir.join("cgroup.procs"), pid.to_string())?;
+        if let Err(e) = fs::write(dir.join("cgroup.procs"), pid.to_string()) {
+            migrate_back(dir, &migrated);
+            return Err(e);
+        }
+        migrated.push(*pid);
     }
-    fs::write(dir.join("cgroup.freeze"), "1")?;
+    if let Err(e) = fs::write(dir.join("cgroup.freeze"), "1") {
+        migrate_back(dir, &migrated);
+        return Err(e);
+    }
     let deadline = Instant::now() + FREEZE_SETTLE;
     loop {
         let events = fs::read_to_string(dir.join("cgroup.events")).unwrap_or_default();
@@ -323,9 +334,24 @@ fn freeze_cgroup(dir: &Path, pids: &[u32]) -> std::io::Result<()> {
             return Ok(());
         }
         if Instant::now() >= deadline {
+            migrate_back(dir, &migrated);
             return Err(std::io::Error::other("cgroup did not freeze in time"));
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Move `pids` out of `dir` back to its parent cgroup. Best-effort, like the
+/// rest of this module's cleanup: a pid already gone needs no migration (its
+/// membership ended with it), and there is no parent to fall back to for a
+/// root cgroup (`dir` is always `ward-<tail>` under one, so this is only
+/// defensive).
+fn migrate_back(dir: &Path, pids: &[u32]) {
+    let Some(parent) = dir.parent() else {
+        return;
+    };
+    for pid in pids {
+        let _ = fs::write(parent.join("cgroup.procs"), pid.to_string());
     }
 }
 
@@ -487,6 +513,33 @@ mod tests {
         fs::write(dir.join("cgroup.freeze"), "0\n").unwrap();
         fs::write(dir.join("cgroup.procs"), "").unwrap();
         assert_eq!(select_cgroup(Some(base.path()), session), Some(dir));
+    }
+
+    /// A failure partway through `freeze_cgroup` (here: the `cgroup.freeze`
+    /// write, once every pid has already been moved in) must not leave any
+    /// pid behind in `dir` — otherwise the caller's `remove_dir` fails with
+    /// `EBUSY` and the directory leaks (#171). Migrated pids land back in the
+    /// parent cgroup's `cgroup.procs`, the same file a real kernel would use.
+    #[test]
+    fn a_failure_after_migrating_pids_moves_them_back_to_the_parent() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("ward-testxxxx");
+        fs::create_dir(&dir).unwrap();
+        // `cgroup.freeze` is a directory, not a file: the write after both
+        // pids are already in `cgroup.procs` is guaranteed to fail.
+        fs::create_dir(dir.join("cgroup.freeze")).unwrap();
+
+        let err = freeze_cgroup(&dir, &[111, 222]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory);
+
+        // Both pids were rolled back into the parent, last write winning
+        // (the fake `cgroup.procs` is a plain file, not a real membership
+        // set) — proof `migrate_back` ran rather than the dir being left
+        // with live members.
+        assert_eq!(
+            fs::read_to_string(base.path().join("cgroup.procs")).unwrap(),
+            "222"
+        );
     }
 
     #[test]

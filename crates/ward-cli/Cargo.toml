@@ -12,10 +12,10 @@ name = "ward"
 path = "src/main.rs"
 
 [dependencies]
-ward-daemon = { path = "../ward-daemon", version = "0.7.9" }
-ward-events = { path = "../ward-events", version = "0.7.9" }
-ward-policy = { path = "../ward-policy", version = "0.7.9" }
-ward-shell-core = { path = "../ward-shell-core", version = "0.7.9" }
+ward-daemon = { path = "../ward-daemon", version = "0.7.10" }
+ward-events = { path = "../ward-events", version = "0.7.10" }
+ward-policy = { path = "../ward-policy", version = "0.7.10" }
+ward-shell-core = { path = "../ward-shell-core", version = "0.7.10" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
