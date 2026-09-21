@@ -42,6 +42,12 @@ on:
   release:
     types: [published]
 
+# Default every job to read-only; only the `disk` job below writes, and it already
+# declares that explicitly (issue #164). `plan` and `aarch64` need no repo scope at
+# all, so this closes the gap of them silently inheriting an ambient org/repo default.
+permissions:
+  contents: read
+
 jobs:
   # Which architectures to build: the input, or both for a published release.
   plan:

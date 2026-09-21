@@ -13,9 +13,11 @@ on:
         description: "Release tag to create, e.g. v0.1.0"
         required: true
 
+# Default to read-only; only the `release` job below writes (issue #164). `version`
+# only checks out and validates the tag string, and `build` only compiles, packages
+# and uploads artifacts -- neither needs contents:write or actions:write.
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -78,10 +80,11 @@ jobs:
       ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the same commit as verify.yml (issue #165); see that file's comment.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (2026-09-21)
         with:
           toolchain: 1.94.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
         with:
           key: ${{ matrix.arch }}
       - name: The runner is the architecture it claims
@@ -134,6 +137,11 @@ jobs:
     needs: [version, build]
     if: ${{ !cancelled() && needs.version.result == 'success' }}
     runs-on: ubuntu-latest
+    # The only job here that publishes: `gh release create/upload` needs
+    # contents:write, and dispatching disk.yml below needs actions:write (#164).
+    permissions:
+      contents: write
+      actions: write
     env:
       TAG: ${{ needs.version.outputs.tag }}
       VERSION: ${{ needs.version.outputs.version }}
