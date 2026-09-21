@@ -314,6 +314,103 @@ fn materialize_refuses_writing_through_a_symlink_ancestor() {
     assert!(!Path::new("/tmp/pwn").exists());
 }
 
+/// Whatever a capture records, the manifest must describe the blobs it stored:
+/// every file/symlink entry's size equals the length of its stored blob and
+/// every referenced digest resolves in the CAS. This is the invariant the
+/// authoritative-content fix upholds; a `cat` (which re-hashes on read) standing
+/// in for materialisation must never see a `NotFound` or a size mismatch.
+#[test]
+fn every_manifest_entry_size_matches_its_resolvable_blob() {
+    let cas = tempdir().unwrap();
+    let store = SnapshotStore::open(cas.path()).unwrap();
+    let dir = tempdir().unwrap();
+    write_file(dir.path(), b"a", b"one");
+    write_file(dir.path(), b"b/c", b"twelve bytes");
+    write_file(dir.path(), b"empty", b"");
+    std::os::unix::fs::symlink("a", dir.path().join("link")).unwrap();
+
+    let id = store
+        .store_snapshot(dir.path(), SnapshotRole::Entry, CaptureOptions::default())
+        .unwrap();
+    let manifest = store.manifest(id).unwrap();
+
+    for e in manifest.entries().iter().filter(|e| e.content.is_some()) {
+        let rel = p(&e.path);
+        let bytes = store
+            .cat(id, rel)
+            .unwrap_or_else(|err| panic!("{rel:?} references an unresolvable blob: {err:?}"));
+        assert_eq!(
+            e.size,
+            bytes.len() as u64,
+            "{rel:?}: manifest size must equal its stored blob length"
+        );
+    }
+
+    // And the whole tree materialises without a NotFound.
+    let dest = tempdir().unwrap();
+    store.materialize(id, dest.path()).unwrap();
+}
+
+fn blob_count(cas: &Path) -> usize {
+    let mut n = 0;
+    for shard in fs::read_dir(cas.join("blobs")).unwrap() {
+        n += fs::read_dir(shard.unwrap().path()).unwrap().count();
+    }
+    n
+}
+
+/// A single file larger than `max_bytes` must be rejected by budget size
+/// alone, without ever being read and stored as a blob (issue #160: reading
+/// the whole file before the budget check risks exhausting host memory).
+#[test]
+fn a_file_over_max_bytes_is_rejected_before_being_read_into_a_blob() {
+    let cas = tempdir().unwrap();
+    let store = SnapshotStore::open(cas.path()).unwrap();
+    let dir = tempdir().unwrap();
+    write_file(dir.path(), b"huge", &vec![b'x'; 4096]);
+
+    let opts = CaptureOptions {
+        max_bytes: 1024,
+        ..CaptureOptions::default()
+    };
+    let err = store
+        .capture(dir.path(), SnapshotRole::Entry, opts)
+        .unwrap_err();
+    assert!(
+        matches!(err, SnapshotError::BudgetExceeded(1024)),
+        "got {err:?}"
+    );
+    assert_eq!(
+        blob_count(cas.path()),
+        0,
+        "an over-budget file must be rejected before its bytes are read and stored"
+    );
+}
+
+/// Several small files that individually fit under `max_bytes` but together
+/// exceed it must still be rejected once the running total would cross the
+/// budget, and files already accepted keep being counted and hashed.
+#[test]
+fn cumulative_bytes_over_budget_across_several_small_files_are_rejected() {
+    let cas = tempdir().unwrap();
+    let store = SnapshotStore::open(cas.path()).unwrap();
+    let dir = tempdir().unwrap();
+    write_file(dir.path(), b"a", &vec![b'a'; 600]);
+    write_file(dir.path(), b"b", &vec![b'b'; 600]);
+
+    let opts = CaptureOptions {
+        max_bytes: 1000,
+        ..CaptureOptions::default()
+    };
+    let err = store
+        .capture(dir.path(), SnapshotRole::Entry, opts)
+        .unwrap_err();
+    assert!(
+        matches!(err, SnapshotError::BudgetExceeded(1000)),
+        "got {err:?}"
+    );
+}
+
 fn write_blob(cas_root: &Path, bytes: &[u8]) {
     let hex = Digest::of(bytes).to_hex();
     let dir = cas_root.join("blobs").join(&hex[..2]);

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -41,11 +42,28 @@ impl Default for CaptureOptions {
     }
 }
 
+/// One cached result: the `(mtime, meta_len)` validation key a later walk
+/// re-checks, plus the *authoritative* content that key stood for — the length
+/// of the bytes actually read and hashed (which may differ from `meta_len` if
+/// the file changed between its metadata and its read) and their digest.
+#[derive(Clone, Copy, Debug)]
+struct CacheEntry {
+    /// `mtime` observed when the entry was warmed (validation key).
+    mtime: SystemTime,
+    /// `metadata().len()` observed when the entry was warmed (validation key).
+    meta_len: u64,
+    /// Length of the bytes actually read, hashed, and (when a CAS was present)
+    /// stored: the authoritative size for the manifest, never `meta_len`.
+    content_len: u64,
+    /// Digest of exactly those `content_len` bytes.
+    digest: Digest,
+}
+
 /// A cache of file content hashes keyed by path, mtime, and size, letting an
 /// incremental capture skip re-reading and re-hashing unchanged files.
 #[derive(Clone, Debug, Default)]
 pub struct HashCache {
-    map: HashMap<PathBuf, (SystemTime, u64, Digest)>,
+    map: HashMap<PathBuf, CacheEntry>,
 }
 
 impl HashCache {
@@ -129,6 +147,8 @@ fn walk(
         stats,
         entries: Vec::new(),
         total_bytes: 0,
+        #[cfg(test)]
+        after_meta: None,
     };
     let mut rules = Rules::default();
     walker.walk_dir(root, b"", &mut rules)?;
@@ -140,6 +160,11 @@ fn walk(
     })
 }
 
+/// Test-only hook fired between a regular file's metadata and its read; see
+/// [`Walker::after_meta`].
+#[cfg(test)]
+type AfterMetaHook = Box<dyn Fn(&Path)>;
+
 struct Walker<'a> {
     /// Where leaves go; `None` digests without storing.
     cas: Option<&'a Cas>,
@@ -148,6 +173,12 @@ struct Walker<'a> {
     stats: &'a mut CaptureStats,
     entries: Vec<Entry>,
     total_bytes: u64,
+    /// Test-only seam: fired for each regular file after its metadata has been
+    /// observed but before its bytes are read, so a test can inject a
+    /// change-between-metadata-and-read (the TOCTOU) deterministically. Never
+    /// set on a real capture.
+    #[cfg(test)]
+    after_meta: Option<AfterMetaHook>,
 }
 
 impl Walker<'_> {
@@ -218,51 +249,146 @@ impl Walker<'_> {
         } else if ft.is_file() {
             self.stats.files_total += 1;
             let size = meta.len();
-            let digest = self.hash_file(&abs, &meta)?;
-            self.total_bytes += size;
-            if self.total_bytes > self.opts.max_bytes {
+            // Cheap, non-authoritative early reject against the file's *claimed*
+            // size, before opening it: skips a doomed file open/read when metadata
+            // alone already declares it over budget (issue #160). It is not
+            // sufficient on its own, and not only because of the fresh-read TOCTOU
+            // (the tree is agent-controlled, so the file can grow or be replaced
+            // between this `symlink_metadata` and the read that follows): a plain
+            // incremental cache hit never opens the file at all, and its cached
+            // `content_len` can exceed this file's *current* `meta.len()` (e.g. the
+            // file was larger when the cache was warmed, or shrank afterward without
+            // invalidating the `(mtime, meta_len)` key some other file's identical
+            // metadata happens to share) — so a pre-check against `size` can pass
+            // while the entry actually pushed is over budget. The authoritative
+            // check is the one below, against `hash_file`'s real `read_len`.
+            let prospective_total = self.total_bytes.saturating_add(size);
+            if prospective_total > self.opts.max_bytes {
                 return Err(SnapshotError::BudgetExceeded(self.opts.max_bytes));
             }
-            self.push(rel, EntryType::File, mode, size, Some(digest));
+            // Test-only seam: the metadata above is now captured, so fire the hook
+            // before the read to reproduce a file that changes between its
+            // metadata and its read (see `after_meta`). Never set on a real
+            // capture, so this is a no-op in production.
+            #[cfg(test)]
+            if let Some(hook) = self.after_meta.as_ref() {
+                hook(&abs);
+            }
+            // The opened bytes are authoritative. `hash_file` returns the digest
+            // of, and the number of bytes in, what it actually read and stored —
+            // never the earlier `symlink_metadata().len()`, which a file that
+            // shrank or grew between metadata and read would misreport. Both the
+            // byte accounting and the manifest size use that real read length, so
+            // every manifest file size equals the length of the blob that was
+            // hashed and stored under `digest`.
+            let (digest, read_len) = self.hash_file(&abs, &meta)?;
+            // The authoritative budget check, against `read_len` rather than the
+            // pre-check's `size`: a plain incremental cache hit (see `hash_file`)
+            // returns a cached `content_len` without ever opening the file, so this
+            // is the only gate that bounds it. Reject before the entry is accepted
+            // into the manifest or `total_bytes` advances.
+            let prospective_total = self.total_bytes.saturating_add(read_len);
+            if prospective_total > self.opts.max_bytes {
+                return Err(SnapshotError::BudgetExceeded(self.opts.max_bytes));
+            }
+            self.total_bytes = prospective_total;
+            self.push(rel, EntryType::File, mode, read_len, Some(digest));
         } else if ft.is_fifo() || ft.is_socket() || ft.is_block_device() || ft.is_char_device() {
             self.push(rel, EntryType::Unsupported, mode, 0, None);
         }
         Ok(())
     }
 
-    fn hash_file(&mut self, abs: &Path, meta: &fs::Metadata) -> Result<Digest> {
+    /// Hash (and, when there is a CAS, store) one regular file, returning its
+    /// digest and the number of content bytes actually read. Every read here is
+    /// bounded by the remaining budget via [`Walker::read_within_budget`], so an
+    /// over-budget file is rejected before any blob is stored.
+    fn hash_file(&mut self, abs: &Path, meta: &fs::Metadata) -> Result<(Digest, u64)> {
         if self.opts.incremental {
             let mtime = meta.modified().map_err(|e| SnapshotError::io(abs, e))?;
-            let size = meta.len();
-            if let Some(&(mt, sz, d)) = self.cache.map.get(abs)
-                && mt == mtime
-                && sz == size
+            let meta_len = meta.len();
+            if let Some(entry) = self.cache.map.get(abs).copied()
+                && entry.mtime == mtime
+                && entry.meta_len == meta_len
             {
                 // The cache may have been warmed by a digest-only walk, or by
                 // a capture into another CAS: a hit says what the bytes hash
                 // to, not that this store holds them.
                 if let Some(cas) = self.cas
-                    && !cas.has_blob(d)
+                    && !cas.has_blob(entry.digest)
                 {
-                    let bytes = fs::read(abs).map_err(|e| SnapshotError::io(abs, e))?;
-                    cas.put_blob(&bytes)?;
+                    // CAS-backfill read: still agent-controlled input, so bound it
+                    // against the remaining budget just like a fresh read. The
+                    // opened bytes — not the cached digest — are authoritative:
+                    // the file can have changed since the cache was warmed even
+                    // though its `(mtime, len)` still match, so we publish the
+                    // digest `put_blob` actually stored, never the cached one
+                    // whose blob is (by definition of this branch) absent here.
+                    let bytes = self.read_within_budget(abs)?;
+                    let read_len = bytes.len() as u64;
+                    let stored = cas.put_blob(&bytes)?;
+                    if stored != entry.digest {
+                        // Content changed since the cache was warmed. Refresh the
+                        // stale entry so later files and captures see the real
+                        // digest and length, and return the freshly stored digest
+                        // — returning `entry.digest` here would name a blob this
+                        // CAS does not hold, so a later materialize would hit
+                        // `NotFound`.
+                        self.cache.map.insert(
+                            abs.to_path_buf(),
+                            CacheEntry {
+                                mtime,
+                                meta_len,
+                                content_len: read_len,
+                                digest: stored,
+                            },
+                        );
+                        self.stats.files_cached += 1;
+                        return Ok((stored, read_len));
+                    }
                 }
                 self.stats.files_cached += 1;
-                return Ok(d);
+                // The cached digest is backed by a stored blob (either it was
+                // already present, or the backfill above stored matching bytes),
+                // so its recorded content length is the authoritative size.
+                return Ok((entry.digest, entry.content_len));
             }
-            let bytes = fs::read(abs).map_err(|e| SnapshotError::io(abs, e))?;
-            let d = self.store(&bytes)?;
-            self.cache.map.insert(abs.to_path_buf(), (mtime, size, d));
+            let bytes = self.read_within_budget(abs)?;
+            let read_len = bytes.len() as u64;
+            let digest = self.store(&bytes)?;
+            self.cache.map.insert(
+                abs.to_path_buf(),
+                CacheEntry {
+                    mtime,
+                    meta_len,
+                    content_len: read_len,
+                    digest,
+                },
+            );
             self.stats.files_hashed += 1;
-            self.stats.bytes_hashed += bytes.len() as u64;
-            Ok(d)
+            self.stats.bytes_hashed += read_len;
+            Ok((digest, read_len))
         } else {
-            let bytes = fs::read(abs).map_err(|e| SnapshotError::io(abs, e))?;
-            let d = self.store(&bytes)?;
+            let bytes = self.read_within_budget(abs)?;
+            let read_len = bytes.len() as u64;
+            let digest = self.store(&bytes)?;
             self.stats.files_hashed += 1;
-            self.stats.bytes_hashed += bytes.len() as u64;
-            Ok(d)
+            self.stats.bytes_hashed += read_len;
+            Ok((digest, read_len))
         }
+    }
+
+    /// Read a candidate file's bytes while enforcing the remaining byte budget on
+    /// the read itself. Opens the file once and reads at most `remaining + 1`
+    /// bytes; if that sentinel byte is reached the file is over budget and
+    /// [`SnapshotError::BudgetExceeded`] is returned before any hashing or store,
+    /// so peak allocation is capped at `remaining + 1` no matter what the earlier
+    /// `metadata().len()` claimed. A result of `<= remaining` bytes is the whole
+    /// file (the cap was not hit), hashed and stored as-is.
+    fn read_within_budget(&self, abs: &Path) -> Result<Vec<u8>> {
+        let file = fs::File::open(abs).map_err(|e| SnapshotError::io(abs, e))?;
+        let remaining = self.opts.max_bytes.saturating_sub(self.total_bytes);
+        read_capped(file, remaining, self.opts.max_bytes, abs)
     }
 
     /// The digest of one leaf, stored when there is a CAS to store it in.
@@ -289,6 +415,33 @@ impl Walker<'_> {
             content,
         });
     }
+}
+
+/// Read from `reader` into a `Vec`, buffering at most `remaining + 1` bytes.
+///
+/// This is the authoritative byte-budget bound. It is deliberately independent
+/// of any prior `metadata().len()`: an agent-controlled file can grow or be
+/// replaced after its metadata was observed, so only bounding the read itself
+/// caps allocation. At most `remaining + 1` bytes are ever buffered; if the
+/// `+ 1` sentinel byte is present the source held more than `remaining` bytes
+/// and [`SnapshotError::BudgetExceeded`] is returned (with the configured
+/// `max_bytes`) before the bytes are handed back for hashing or storage.
+/// Otherwise the returned `Vec` is the complete content (the cap was not hit).
+///
+/// `path` is used only to tag any I/O error with its source file.
+fn read_capped(reader: impl Read, remaining: u64, max_bytes: u64, path: &Path) -> Result<Vec<u8>> {
+    // Cap the reader at one byte past the budget: reaching that extra byte is
+    // proof of overflow, while a shorter read is a complete, in-budget file.
+    let cap = remaining.saturating_add(1);
+    let mut buf = Vec::new();
+    reader
+        .take(cap)
+        .read_to_end(&mut buf)
+        .map_err(|e| SnapshotError::io(path, e))?;
+    if buf.len() as u64 > remaining {
+        return Err(SnapshotError::BudgetExceeded(max_bytes));
+    }
+    Ok(buf)
 }
 
 fn read_dir_names(dir: &Path) -> Result<Vec<Vec<u8>>> {
@@ -412,5 +565,326 @@ mod git_context_tests {
             Some("0123456789abcdef0123456789abcdef01234567")
         );
         assert!(ctx.detached);
+    }
+}
+
+#[cfg(test)]
+mod bounded_read_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::read_capped;
+    use crate::error::SnapshotError;
+    use std::io;
+    use std::path::Path;
+
+    /// The read is bounded by `remaining + 1`, not by any metadata length. A
+    /// reader that yields bytes without end — standing in for a file that grew
+    /// or was swapped for a larger one after its (stale) metadata was observed —
+    /// is rejected as over budget without buffering the whole stream.
+    ///
+    /// This is the regression for the TOCTOU that the metadata-only pre-check
+    /// could not close: the old path did an unbounded `fs::read`, which on this
+    /// endless source would never return (exhausting host memory). The bounded
+    /// read returning `BudgetExceeded` instead — and, because the error is
+    /// returned before any bytes are handed back, storing no blob — is the fix.
+    #[test]
+    fn a_source_longer_than_metadata_claimed_is_rejected_by_the_read_itself() {
+        // `io::repeat` yields its byte forever; reaching `read_capped`'s return at
+        // all proves the read is capped independently of the source's true length.
+        let grown = io::repeat(b'x');
+        let err = read_capped(grown, 1024, 1024, Path::new("grew-after-metadata")).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::BudgetExceeded(1024)),
+            "an over-budget read must be rejected before its bytes are returned for storage, \
+             got {err:?}"
+        );
+    }
+
+    /// A source of exactly `remaining` bytes is in budget: the `+ 1` sentinel is
+    /// never reached, so the complete content is returned verbatim for hashing
+    /// and storage — the digest of an in-budget file is unchanged by the bound.
+    #[test]
+    fn a_source_exactly_at_the_budget_is_returned_whole() {
+        let content = vec![b'a'; 1024];
+        let bytes = read_capped(content.as_slice(), 1024, 1024, Path::new("fits")).unwrap();
+        assert_eq!(
+            bytes, content,
+            "an at-budget file must be read back in full"
+        );
+    }
+
+    /// One byte past the remaining budget trips the sentinel and is rejected,
+    /// even though only `remaining + 1` bytes were ever buffered.
+    #[test]
+    fn one_byte_over_the_budget_trips_the_sentinel() {
+        let content = vec![b'a'; 1025];
+        let err = read_capped(content.as_slice(), 1024, 1024, Path::new("over")).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::BudgetExceeded(1024)),
+            "got {err:?}"
+        );
+    }
+
+    /// With no budget left, even a single readable byte is over budget.
+    #[test]
+    fn a_nonempty_source_with_no_remaining_budget_is_rejected() {
+        let err = read_capped([0u8].as_slice(), 0, 4096, Path::new("no-room")).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::BudgetExceeded(4096)),
+            "got {err:?}"
+        );
+    }
+}
+
+/// The opened/read content — not any earlier `symlink_metadata()` or a warm
+/// cache entry — is authoritative for both the manifest size and the published
+/// digest, so every manifest file entry describes the blob actually stored.
+#[cfg(test)]
+mod authoritative_content_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use crate::cas::Cas;
+    use crate::ignore::Rules;
+    use crate::manifest::Manifest;
+    use std::fs;
+    use std::path::Path;
+
+    /// Drive a `Walker` directly over `root`, optionally firing `after_meta` for
+    /// each regular file between its metadata and its read. This is the seam that
+    /// lets a test reproduce a change-between-metadata-and-read deterministically,
+    /// which a real filesystem race could only do by luck.
+    fn capture_tree(
+        cas: Option<&Cas>,
+        root: &Path,
+        opts: CaptureOptions,
+        cache: &mut HashCache,
+        after_meta: Option<AfterMetaHook>,
+    ) -> Result<Manifest> {
+        let mut stats = CaptureStats::default();
+        let mut walker = Walker {
+            cas,
+            opts,
+            cache,
+            stats: &mut stats,
+            entries: Vec::new(),
+            total_bytes: 0,
+            after_meta,
+        };
+        let mut rules = Rules::default();
+        walker.walk_dir(root, b"", &mut rules)?;
+        Manifest::from_entries(walker.entries)
+    }
+
+    /// A file that shrinks between its metadata and its read (staying under
+    /// budget) must be recorded at its *read* length, and the stored blob must be
+    /// exactly those bytes. Against the pre-fix code — which wrote
+    /// `symlink_metadata().len()` into the manifest — `entry.size` was 64 while
+    /// the blob held 8 bytes, so this assertion failed.
+    #[test]
+    fn manifest_size_is_the_read_length_not_the_stale_metadata_length() {
+        let work = tempfile::tempdir().unwrap();
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(cas_dir.path()).unwrap();
+
+        let target = work.path().join("f");
+        fs::write(&target, vec![b'a'; 64]).unwrap();
+
+        // Between metadata (64 bytes) and read, replace the file with 8 bytes.
+        let swap_to = target.clone();
+        let hook: Box<dyn Fn(&Path)> = Box::new(move |abs: &Path| {
+            if abs == swap_to {
+                fs::write(&swap_to, vec![b'b'; 8]).unwrap();
+            }
+        });
+
+        let mut cache = HashCache::new();
+        let manifest = capture_tree(
+            Some(&cas),
+            work.path(),
+            CaptureOptions::default(),
+            &mut cache,
+            Some(hook),
+        )
+        .unwrap();
+
+        let entry = manifest.get(b"f").expect("file entry present");
+        let digest = entry.content.expect("a file carries content");
+        let blob = cas.get_blob(digest).expect("the referenced blob is stored");
+        assert_eq!(
+            entry.size,
+            blob.len() as u64,
+            "manifest size must equal the stored blob's length, not the stale metadata length"
+        );
+        assert_eq!(
+            entry.size, 8,
+            "the read length (8), not the metadata length (64), is authoritative"
+        );
+        assert_eq!(blob, vec![b'b'; 8]);
+    }
+
+    /// An incremental cache hit whose blob is absent from *this* CAS, where the
+    /// file changed (same length, same validating mtime) between the cache lookup
+    /// and the bounded read, must publish the digest that was actually stored —
+    /// so a later materialize resolves it instead of hitting `NotFound`. Against
+    /// the pre-fix code — which discarded `put_blob`'s digest and returned the
+    /// cached `d` — the manifest named the absent old digest and `get_blob`
+    /// below failed.
+    #[test]
+    fn a_cache_hit_with_absent_blob_publishes_the_stored_digest_not_the_stale_one() {
+        let work = tempfile::tempdir().unwrap();
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(cas_dir.path()).unwrap();
+
+        let target = work.path().join("f");
+        let original = vec![b'a'; 32];
+        fs::write(&target, &original).unwrap();
+
+        let opts = CaptureOptions {
+            incremental: true,
+            ..CaptureOptions::default()
+        };
+
+        // Warm the cache with a digest-only walk (no CAS): the cache now knows
+        // `digest(original)` for `f`'s `(mtime, len)`, but no blob was stored, so
+        // it is absent from the real CAS below.
+        let mut cache = HashCache::new();
+        let warm = capture_tree(None, work.path(), opts, &mut cache, None).unwrap();
+        let cached_digest = warm.get(b"f").unwrap().content.unwrap();
+        assert!(
+            !cas.has_blob(cached_digest),
+            "precondition: the cached digest's blob is absent from this CAS"
+        );
+
+        // Between the (metadata-validated) cache lookup and the read, swap in a
+        // *different* body of the same length. The cache still validates because
+        // `hash_file` checks the metadata captured before this hook ran, exactly
+        // as a real TOCTOU would leave a stale but matching `(mtime, len)`.
+        let changed = vec![b'z'; 32];
+        let swap_to = target.clone();
+        let new_body = changed.clone();
+        let hook: Box<dyn Fn(&Path)> = Box::new(move |abs: &Path| {
+            if abs == swap_to {
+                fs::write(&swap_to, &new_body).unwrap();
+            }
+        });
+
+        let manifest = capture_tree(Some(&cas), work.path(), opts, &mut cache, Some(hook)).unwrap();
+
+        let entry = manifest.get(b"f").unwrap();
+        let published = entry.content.unwrap();
+        // The published digest must resolve in this CAS and hash to the stored
+        // bytes: a subsequent materialize does not hit `NotFound`.
+        let blob = cas
+            .get_blob(published)
+            .expect("the published digest must resolve in this CAS");
+        assert_eq!(blob, changed, "the stored blob is the freshly-read content");
+        assert_eq!(
+            entry.size,
+            changed.len() as u64,
+            "the manifest size is the freshly-read length"
+        );
+        assert_ne!(
+            published, cached_digest,
+            "the stale cached digest (whose blob is absent here) must not be published"
+        );
+        assert_eq!(published, Digest::of(&changed));
+    }
+
+    /// The general invariant, driven end to end: for a captured tree with no
+    /// injected race, every file/symlink entry's size equals its stored blob's
+    /// length and every referenced digest resolves in the CAS.
+    #[test]
+    fn every_captured_entry_size_matches_its_resolvable_blob() {
+        let work = tempfile::tempdir().unwrap();
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(cas_dir.path()).unwrap();
+
+        fs::create_dir_all(work.path().join("d")).unwrap();
+        fs::write(work.path().join("a"), b"one").unwrap();
+        fs::write(work.path().join("d/b"), b"twelve bytes").unwrap();
+        fs::write(work.path().join("empty"), b"").unwrap();
+        std::os::unix::fs::symlink("a", work.path().join("link")).unwrap();
+
+        let mut cache = HashCache::new();
+        let manifest = capture_tree(
+            Some(&cas),
+            work.path(),
+            CaptureOptions::default(),
+            &mut cache,
+            None,
+        )
+        .unwrap();
+
+        for entry in manifest.entries().iter().filter(|e| e.content.is_some()) {
+            let digest = entry.content.unwrap();
+            let blob = cas.get_blob(digest).unwrap_or_else(|e| {
+                panic!(
+                    "entry {:?} references a digest that does not resolve: {e:?}",
+                    String::from_utf8_lossy(&entry.path)
+                )
+            });
+            assert_eq!(
+                entry.size,
+                blob.len() as u64,
+                "entry {:?} size must equal its stored blob length",
+                String::from_utf8_lossy(&entry.path)
+            );
+        }
+    }
+
+    /// A plain incremental cache hit — current `(mtime, meta_len)` matches a warm
+    /// cache entry and the cached blob is already present in this CAS — never
+    /// opens the file, so `hash_file` returns the cached `content_len` without any
+    /// bounded read. The pre-check ahead of `hash_file` only ever sees the small
+    /// *current* `meta.len()`, so it passes; if the cached `content_len` is larger
+    /// (the file was bigger when the cache was warmed, then shrank without the
+    /// validation key changing), only a check against the cache hit's real
+    /// `read_len` after `hash_file` returns can catch it. Against the pre-fix
+    /// code — which only checked `size` before calling `hash_file` and never
+    /// re-checked `read_len` after — this cache hit was accepted, silently
+    /// pushing a 100-byte entry and a 100-byte `total_bytes` under a 50-byte
+    /// budget.
+    #[test]
+    fn a_stale_cache_hit_over_budget_is_rejected_even_though_current_metadata_is_small() {
+        let work = tempfile::tempdir().unwrap();
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(cas_dir.path()).unwrap();
+
+        let target = work.path().join("f");
+        fs::write(&target, vec![b'a'; 1]).unwrap();
+        let meta = fs::symlink_metadata(&target).unwrap();
+        let mtime = meta.modified().unwrap();
+
+        // A 100-byte blob, already stored, standing in for what the cache warmed
+        // against this file before it shrank to 1 byte (or any other reason the
+        // cached content_len now exceeds the current metadata length while the
+        // `(mtime, meta_len)` validation key still matches).
+        let stale_content = vec![b'z'; 100];
+        let stale_digest = cas.put_blob(&stale_content).unwrap();
+        assert!(cas.has_blob(stale_digest), "precondition: blob is present");
+
+        let mut cache = HashCache::new();
+        cache.map.insert(
+            target.clone(),
+            CacheEntry {
+                mtime,
+                meta_len: meta.len(),
+                content_len: stale_content.len() as u64,
+                digest: stale_digest,
+            },
+        );
+
+        let opts = CaptureOptions {
+            incremental: true,
+            max_bytes: 50,
+            ..CaptureOptions::default()
+        };
+
+        let err = capture_tree(Some(&cas), work.path(), opts, &mut cache, None).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::BudgetExceeded(50)),
+            "a cache hit whose cached content_len (100) exceeds max_bytes (50) must be \
+             rejected even though the current metadata length (1) alone would pass the \
+             pre-check, got {err:?}"
+        );
     }
 }
