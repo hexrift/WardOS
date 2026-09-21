@@ -10,6 +10,7 @@
 //! This backend is defence-by-construction, not defence-in-depth: what the agent
 //! cannot see, it cannot reach.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -22,10 +23,19 @@ use crate::error::{Error, Result};
 pub struct Outcome {
     /// Exit code, or `None` if terminated by a signal.
     pub code: Option<i32>,
-    /// Captured stdout.
+    /// Captured stdout. Bounded to a head and tail when a capture limit is set.
     pub stdout: String,
-    /// Captured stderr.
+    /// Captured stderr. Bounded to a head and tail when a capture limit is set.
     pub stderr: String,
+    /// Total bytes the child wrote to stdout, before any truncation.
+    pub stdout_bytes: u64,
+    /// Total bytes the child wrote to stderr, before any truncation.
+    pub stderr_bytes: u64,
+    /// Whether `stdout` or `stderr` dropped bytes from the middle to stay in budget.
+    pub truncated: bool,
+    /// Full copies of lines whose start matched the capture's keep-prefix, taken from
+    /// the complete streams (stdout then stderr) regardless of head/tail truncation.
+    pub kept_lines: Vec<String>,
     /// Wall-clock duration.
     pub duration: Duration,
     /// The launch was killed because it outran its budget.
@@ -143,6 +153,8 @@ pub struct Launch {
     shim_flags: Vec<String>,
     stdio: StdioMode,
     budget: Option<Duration>,
+    capture_bytes: Option<usize>,
+    keep_prefix: Option<String>,
 }
 
 impl Launch {
@@ -161,6 +173,8 @@ impl Launch {
             shim_flags: Vec::new(),
             stdio: StdioMode::Capture,
             budget: None,
+            capture_bytes: None,
+            keep_prefix: None,
         }
     }
 
@@ -225,6 +239,24 @@ impl Launch {
     #[must_use]
     pub fn stdio(mut self, stdio: StdioMode) -> Self {
         self.stdio = stdio;
+        self
+    }
+
+    /// Bound each captured stream to roughly `bytes` retained in memory (a head and a
+    /// tail), draining and dropping the middle so a large writer can neither exhaust
+    /// memory nor deadlock on a full pipe. Only meaningful with [`StdioMode::Capture`].
+    #[must_use]
+    pub fn capture_bytes(mut self, bytes: usize) -> Self {
+        self.capture_bytes = Some(bytes);
+        self
+    }
+
+    /// Keep full copies of captured lines that start with `prefix` (e.g. test-result
+    /// summaries), taken from the whole stream even when the retained text is
+    /// truncated — so counts are never read from text that was dropped.
+    #[must_use]
+    pub fn keep_lines(mut self, prefix: impl Into<String>) -> Self {
+        self.keep_prefix = Some(prefix.into());
         self
     }
 
@@ -349,31 +381,177 @@ impl Launch {
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
         let mut child = cmd.spawn().map_err(launch_err)?;
-        let stdout = child.stdout.take().map(drain);
-        let stderr = child.stderr.take().map(drain);
+        let bound = self.capture_bytes;
+        let keep = self.keep_prefix.clone();
+        let stdout = child.stdout.take().map(|r| drain(r, bound, keep.clone()));
+        let stderr = child.stderr.take().map(|r| drain(r, bound, keep));
         let (status, timed_out) = wait_within(&mut child, self.budget)?;
-        let collect = |h: Option<std::thread::JoinHandle<Vec<u8>>>| {
-            h.and_then(|h| h.join().ok())
-                .map(|b| String::from_utf8_lossy(&b).into_owned())
-                .unwrap_or_default()
+        let collect = |h: Option<std::thread::JoinHandle<StreamCapture>>| {
+            h.and_then(|h| h.join().ok()).unwrap_or_default()
         };
+        let out = collect(stdout);
+        let err = collect(stderr);
+        let mut kept_lines = out.kept_lines;
+        kept_lines.extend(err.kept_lines);
         Ok(Outcome {
             code: status.and_then(|s| s.code()),
-            stdout: collect(stdout),
-            stderr: collect(stderr),
+            stdout: out.text,
+            stderr: err.text,
+            stdout_bytes: out.total,
+            stderr_bytes: err.total,
+            truncated: out.truncated || err.truncated,
+            kept_lines,
             duration: start.elapsed(),
             timed_out,
         })
     }
 }
 
-/// Read a child stream to the end on its own thread.
-fn drain<R: std::io::Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>> {
+/// A single child stream captured within a memory budget.
+#[derive(Default)]
+struct StreamCapture {
+    /// Retained text: the head, a truncation marker when bytes were dropped, then the tail.
+    text: String,
+    /// Total bytes read from the stream, before truncation.
+    total: u64,
+    /// Whether any bytes were dropped from the middle.
+    truncated: bool,
+    /// Full copies of lines that started with the keep-prefix, from the whole stream.
+    kept_lines: Vec<String>,
+}
+
+/// Bytes of matched lines kept per stream before further matches are ignored (the
+/// stream is still drained), so a pathological writer cannot grow this without bound.
+const MAX_KEPT_LINE_BYTES: usize = 256 * 1024;
+
+/// Longest single line buffered while scanning for the keep-prefix; a longer line
+/// is still drained but only its first `MAX_LINE_SCAN` bytes are examined.
+const MAX_LINE_SCAN: usize = 8 * 1024;
+
+/// Read a child stream to EOF on its own thread. With no `bound` this is a plain
+/// read-to-end (the original behaviour for callers that set no capture limit). With
+/// a `bound` it retains only a head and tail within roughly `bound` bytes while still
+/// draining the rest, and with a `keep_prefix` it also retains full copies of matching
+/// lines taken from the complete stream, independent of the head/tail truncation.
+fn drain<R: std::io::Read + Send + 'static>(
+    mut r: R,
+    bound: Option<usize>,
+    keep_prefix: Option<String>,
+) -> std::thread::JoinHandle<StreamCapture> {
     std::thread::spawn(move || {
+        if let Some(bound) = bound {
+            return drain_bounded(&mut r, bound, keep_prefix.as_deref());
+        }
+        // Unbounded: the original read-to-end behaviour for callers with no limit.
         let mut buf = Vec::new();
         let _ = r.read_to_end(&mut buf);
-        buf
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let mut kept_lines = Vec::new();
+        if let Some(prefix) = keep_prefix.as_deref() {
+            let mut kept_bytes = 0;
+            for line in text.lines() {
+                push_kept_line(line.as_bytes(), prefix, &mut kept_lines, &mut kept_bytes);
+            }
+        }
+        StreamCapture {
+            total: buf.len() as u64,
+            text,
+            truncated: false,
+            kept_lines,
+        }
     })
+}
+
+/// Retain a head and a tail within `bound` bytes, dropping the middle, while
+/// counting the full byte total and capturing keep-prefix lines from the whole stream.
+fn drain_bounded<R: std::io::Read>(
+    r: &mut R,
+    bound: usize,
+    keep_prefix: Option<&str>,
+) -> StreamCapture {
+    use std::fmt::Write as _;
+    let tail_limit = (bound / 4).max(1);
+    let head_limit = bound.saturating_sub(tail_limit);
+    let mut head: Vec<u8> = Vec::new();
+    let mut tail: VecDeque<u8> = VecDeque::new();
+    let mut total: u64 = 0;
+    let mut truncated = false;
+    let mut kept_lines: Vec<String> = Vec::new();
+    let mut kept_bytes = 0usize;
+    let mut line: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n as u64;
+                for &b in &buf[..n] {
+                    if head.len() < head_limit {
+                        head.push(b);
+                    } else {
+                        tail.push_back(b);
+                        if tail.len() > tail_limit {
+                            tail.pop_front();
+                            truncated = true;
+                        }
+                    }
+                    if let Some(prefix) = keep_prefix {
+                        if b == b'\n' {
+                            push_kept_line(&line, prefix, &mut kept_lines, &mut kept_bytes);
+                            line.clear();
+                        } else if line.len() < MAX_LINE_SCAN {
+                            line.push(b);
+                        }
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    if let Some(prefix) = keep_prefix
+        && !line.is_empty()
+    {
+        push_kept_line(&line, prefix, &mut kept_lines, &mut kept_bytes);
+    }
+    let text = if truncated {
+        let dropped = total.saturating_sub((head.len() + tail.len()) as u64);
+        let mut s = String::from_utf8_lossy(&head).into_owned();
+        let _ = write!(
+            s,
+            "\n[verifier output truncated: {dropped} bytes dropped; kept first {} and last {} of {total} bytes]\n",
+            head.len(),
+            tail.len(),
+        );
+        let tail_bytes: Vec<u8> = tail.into_iter().collect();
+        s.push_str(&String::from_utf8_lossy(&tail_bytes));
+        s
+    } else {
+        // Nothing was dropped: head then tail is the whole stream, in order.
+        let mut bytes = head;
+        bytes.extend(tail);
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    StreamCapture {
+        text,
+        total,
+        truncated,
+        kept_lines,
+    }
+}
+
+/// Push `line` (a full line, without its newline) to `out` when it starts with
+/// `prefix` and the per-stream keep budget is not yet spent.
+fn push_kept_line(line: &[u8], prefix: &str, out: &mut Vec<String>, kept_bytes: &mut usize) {
+    if *kept_bytes >= MAX_KEPT_LINE_BYTES {
+        return;
+    }
+    let text = String::from_utf8_lossy(line);
+    let text = text.strip_suffix('\r').unwrap_or(&text);
+    if text.starts_with(prefix) {
+        *kept_bytes += text.len();
+        out.push(text.to_string());
+    }
 }
 
 /// Wait for `child`, killing it once `budget` elapses. Returns the exit status
@@ -536,9 +714,115 @@ mod tests {
     }
 
     #[test]
+    fn bounded_capture_drains_a_large_pipe_without_hanging() {
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        // Emit far more than the pipe buffer and the capture budget, with a summary
+        // line at the end, then exit non-zero. A reader that stopped at the budget
+        // instead of draining would leave the child blocked on a full pipe until the
+        // budget killed it (timed_out, code None); asserting a clean exit 7 proves it
+        // drained everything while keeping only a bounded head and tail.
+        let script = "for i in $(seq 1 5000); do echo \"line $i padded xxxxxxxxxxxxxxxxxxxxxxxxxx\"; done; echo 'test result: ok. 3 passed; 1 failed; 0 ignored'; exit 7";
+        let out = Launch::new("/tmp", vec!["sh".into(), "-c".into(), script.into()])
+            .capture_bytes(4096)
+            .keep_lines("test result:")
+            .budget(Duration::from_secs(20))
+            .run()
+            .unwrap();
+        assert!(
+            !out.timed_out,
+            "the pipe was drained, so the child finished"
+        );
+        assert_eq!(out.code, Some(7), "exit code survives truncation");
+        assert!(out.truncated);
+        assert!(
+            out.stdout.len() < 4096 + 256,
+            "retained {} bytes",
+            out.stdout.len()
+        );
+        assert!(
+            out.stdout_bytes > 100_000,
+            "full total {} counted",
+            out.stdout_bytes
+        );
+        assert!(
+            out.kept_lines.iter().any(|l| l.contains("3 passed")),
+            "summary kept from the full stream: {:?}",
+            out.kept_lines
+        );
+    }
+
+    #[test]
     fn args_without_shim_exec_argv_directly() {
         let a = Launch::new("/tmp", vec!["sh".into(), "-c".into(), "id".into()])
             .args(Path::new("/tmp"));
         assert_eq!(&a[a.len() - 4..], &["--", "sh", "-c", "id"]);
+    }
+
+    #[test]
+    fn bounded_capture_keeps_head_and_tail_and_counts_every_byte() {
+        // 10 KiB of distinct content, captured within a 1 KiB budget.
+        let input: Vec<u8> = (0..10_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let cap = drain_bounded(&mut std::io::Cursor::new(input.clone()), 1024, None);
+        assert!(cap.truncated);
+        assert_eq!(
+            cap.total, 10_000,
+            "full byte total is reported, not the kept size"
+        );
+        // Retained text stays within budget plus the one marker line.
+        assert!(
+            cap.text.len() < 1024 + 128,
+            "retained {} bytes",
+            cap.text.len()
+        );
+        // The very start and the very end both survive; the middle is gone.
+        assert!(
+            cap.text
+                .starts_with(std::str::from_utf8(&input[..64]).unwrap())
+        );
+        let tail = std::str::from_utf8(&input[input.len() - 64..]).unwrap();
+        assert!(cap.text.ends_with(tail));
+        assert!(cap.text.contains("verifier output truncated"));
+        assert!(cap.text.contains("10000 bytes"));
+    }
+
+    #[test]
+    fn bounded_capture_keeps_everything_under_budget() {
+        let input = b"short and complete output\n".to_vec();
+        let cap = drain_bounded(&mut std::io::Cursor::new(input.clone()), 1 << 20, None);
+        assert!(!cap.truncated);
+        assert_eq!(cap.total, input.len() as u64);
+        assert_eq!(cap.text.as_bytes(), &input[..]);
+    }
+
+    #[test]
+    fn bounded_capture_keeps_summary_line_dropped_from_the_middle() {
+        // A `test result:` line buried in the middle is dropped from the retained
+        // head/tail text, yet still captured in full for the summary parser.
+        let mut input = vec![b'x'; 4000];
+        input.extend_from_slice(b"\ntest result: ok. 7 passed; 2 failed; 0 ignored\n");
+        input.extend(std::iter::repeat_n(b'y', 4000));
+        let cap = drain_bounded(&mut std::io::Cursor::new(input), 1024, Some("test result:"));
+        assert!(cap.truncated);
+        assert!(
+            !cap.text.contains("test result:"),
+            "the summary line is not in the retained window",
+        );
+        assert_eq!(
+            cap.kept_lines,
+            vec!["test result: ok. 7 passed; 2 failed; 0 ignored"]
+        );
+    }
+
+    #[test]
+    fn bounded_capture_handles_multibyte_without_panicking() {
+        // 2-byte chars across an odd budget: must stay bounded and not panic on a
+        // split char boundary (from_utf8_lossy handles the seam).
+        let input = "é".repeat(5000).into_bytes();
+        let cap = drain_bounded(&mut std::io::Cursor::new(input.clone()), 999, None);
+        assert!(cap.truncated);
+        assert_eq!(cap.total, input.len() as u64);
+        assert!(cap.text.len() < 999 + 128);
     }
 }
