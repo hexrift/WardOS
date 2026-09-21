@@ -75,6 +75,13 @@ grep -q Hidden <<<"$apps" && fail "NoDisplay entries are hidden"
 XDG_DATA_DIRS="$TMP/none" wardos-menu apps Firefox
 assert_logged '^gtk-launch org.mozilla.firefox$'
 
+# A .desktop id with shell metacharacters must not be eval'd as a second command (#172).
+evil_id="pwn;touch pwned-marker"
+printf '[Desktop Entry]\nName=Evil\nExec=true\n' >"$XDG_DATA_HOME/applications/$evil_id.desktop"
+(cd "$TMP" && XDG_DATA_DIRS="$TMP/none" wardos-menu apps Evil)
+[[ -e "$TMP/pwned-marker" ]] && fail "gtk-launch id was eval'd: shell injection created pwned-marker"
+assert_logged "^gtk-launch $evil_id\$"
+
 # Without ward-shell the AGENTS and SECURITY sections are the static list.
 rm "$MOCK_DIR/ward-shell"
 top=$(wardos-menu --list)

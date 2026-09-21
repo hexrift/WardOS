@@ -79,7 +79,7 @@ apps_items() {
         s == "[Desktop Entry]" && ($1 == "NoDisplay" || $1 == "Hidden") && $2 == "true" { hidden = 1 }
         s == "[Desktop Entry]" && $1 == "Name" && !n { n = $2 }
         END { if (!hidden) print n }' "$f")
-      [[ -n "$name" ]] && item "$name" "gtk-launch $id"
+      [[ -n "$name" ]] && item "$name" "gtk-launch $(printf '%q' "$id")"
     done
   done | sort -f
 }
