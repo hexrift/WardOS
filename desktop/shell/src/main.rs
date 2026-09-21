@@ -141,21 +141,28 @@ impl Digester {
     }
 
     /// Digest `s`'s worktree and tell the model. A tree that cannot be read
-    /// leaves the model as it was and says why once on stderr.
+    /// marks freshness unavailable — the current-tree (green) indication is
+    /// withdrawn while the historical verdict stays (#136) — and says why once
+    /// on stderr. The successful result is applied through the observation
+    /// generation, so a read that lost a race to a newer change is dropped.
     fn observe(&mut self, s: &mut Snapshot) {
         let opts = CaptureOptions {
             incremental: true,
             ..candidate_options()
         };
         let mut stats = CaptureStats::default();
+        let generation = s.model.observation_gen();
         let worktree = &s.description.worktree;
         match ward_snapshot::digest_manifest(worktree, opts, &mut self.cache, &mut stats) {
             Ok(manifest) => {
                 let changes = self.changes(s, &manifest);
                 s.model
-                    .observe_worktree(ev_snapshot(manifest.id()), changes);
+                    .observe_if_current(generation, ev_snapshot(manifest.id()), changes);
             }
-            Err(e) => eprintln!("ward-shell: {}: {e}", worktree.display()),
+            Err(e) => {
+                s.model.mark_freshness_unavailable();
+                eprintln!("ward-shell: {}: {e}", worktree.display());
+            }
         }
     }
 
