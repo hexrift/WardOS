@@ -379,10 +379,16 @@ pub struct Outcome {
     pub passed: bool,
     /// Counts parsed from the output.
     pub summary: VerifySummary,
-    /// Combined stdout and stderr.
+    /// Combined stdout and stderr, bounded to a head and tail (see [`MAX_OUTPUT_BYTES`]).
     pub output: String,
-    /// BLAKE3 of `output`: the result document's hash in the log.
+    /// BLAKE3 of `output`: the retained result document's hash in the log. This
+    /// covers the retained (possibly truncated) text, not the full byte stream;
+    /// [`output_bytes`](Self::output_bytes) records the complete size.
     pub result_hash: [u8; 32],
+    /// Total bytes the verifier wrote to stdout and stderr, before truncation.
+    pub output_bytes: u64,
+    /// Whether `output` dropped bytes from the middle of the stream to stay in budget.
+    pub output_truncated: bool,
 }
 
 /// Run the verification command over the prepared tree, offline, with the host
@@ -395,13 +401,21 @@ pub fn execute(v: &Verification) -> Result<Outcome> {
     ];
     let mut launch = Launch::new(&v.scratch, argv)
         .stdio(StdioMode::Capture)
+        // Bound peak capture memory: each stream keeps a head and tail within half
+        // the document budget (so the combined document stays near MAX_OUTPUT_BYTES)
+        // while the rest is drained and dropped. `keep_lines` retains the runner's
+        // `test result:` lines from the whole stream so counts survive truncation.
+        .capture_bytes(MAX_OUTPUT_BYTES / 2)
+        .keep_lines("test result:")
         .budget(Duration::from_secs(v.config.verify.budget_secs));
     for (k, val) in Toolchains::detect().env() {
         launch = launch.env(k, val);
     }
     launch = Toolchains::detect().mount(launch);
     let out = launch.run()?;
-    let mut output = cap(format!("{}{}", out.stdout, out.stderr));
+    let combined = format!("{}{}", out.stdout, out.stderr);
+    let combined_over = combined.len() > MAX_OUTPUT_BYTES;
+    let mut output = cap(combined);
     if out.timed_out {
         use std::fmt::Write as _;
         let _ = write!(
@@ -410,7 +424,9 @@ pub fn execute(v: &Verification) -> Result<Outcome> {
             v.config.verify.budget_secs
         );
     }
-    let mut summary = parse_summary(&output);
+    // Counts come from the runner's result lines captured across the *whole* stream,
+    // never from `output`, which may have had its middle dropped.
+    let mut summary = parse_summary(&out.kept_lines.join("\n"));
     summary.steps_total = 1;
     summary.duration = out.duration;
     let passed = out.code == Some(0) && !out.timed_out;
@@ -424,6 +440,8 @@ pub fn execute(v: &Verification) -> Result<Outcome> {
         summary,
         result_hash: *blake3::hash(output.as_bytes()).as_bytes(),
         output,
+        output_bytes: out.stdout_bytes + out.stderr_bytes,
+        output_truncated: out.truncated || combined_over,
     })
 }
 
