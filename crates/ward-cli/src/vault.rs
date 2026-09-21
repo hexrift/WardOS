@@ -28,11 +28,13 @@ fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Error {
 /// replaced with a symlink immediately after this call returns — a plain
 /// check-then-reopen-by-path could not close that window.
 ///
-/// `O_NOFOLLOW` alone (no `O_DIRECTORY`) is deliberate: combined, Linux reports a
-/// symlink-to-a-directory as `ENOTDIR` — the `O_DIRECTORY` check runs first and a
-/// symlink is never a directory type — indistinguishable from a plain non-directory
-/// file. Checked apart, a symlink is reliably `ELOOP`, and a non-directory file is
-/// caught by the explicit `is_dir` check below.
+/// `O_DIRECTORY` (with `O_NOFOLLOW`) is what makes the open itself the whole check:
+/// success guarantees a real directory, so no follow-up `fstat` is needed, and a
+/// symlink or any other non-directory node (`ELOOP`/`ENOTDIR`) is refused uniformly.
+/// Critically, `O_DIRECTORY` is also what keeps this safe against a pre-planted FIFO
+/// (plausible for a shared or reused state dir) — a plain `O_RDONLY` open with no
+/// `O_DIRECTORY` would instead block indefinitely waiting for a writer that will
+/// never come, turning `ward vault set` into a hang.
 fn open_real_dir(dir: &Path, mode: u32) -> Result<rustix::fd::OwnedFd> {
     match std::fs::DirBuilder::new().mode(mode).create(dir) {
         Ok(()) => {}
@@ -41,28 +43,25 @@ fn open_real_dir(dir: &Path, mode: u32) -> Result<rustix::fd::OwnedFd> {
     }
     let fd = rustix::fs::open(
         dir,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     )
     .map_err(|e| {
-        if e == rustix::io::Errno::LOOP {
+        if matches!(e, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
             Error::Project(format!(
-                "{}: refusing to use a symlink as a directory",
+                "{}: refusing to use a symlink or non-directory as the vault directory",
                 dir.display()
             ))
         } else {
             io(dir, e.into())
         }
     })?;
-    let st = rustix::fs::fstat(&fd).map_err(|e| io(dir, e.into()))?;
-    if !rustix::fs::FileType::from_raw_mode(st.st_mode).is_dir() {
-        return Err(Error::Project(format!(
-            "{}: refusing to use a non-directory as the vault directory",
-            dir.display()
-        )));
-    }
     // A directory that existed with looser permissions is tightened, not trusted —
-    // now that it is confirmed real, through the fd (fchmod) rather than the path.
+    // now that O_DIRECTORY has confirmed it real, through the fd (fchmod) rather
+    // than the path.
     rustix::fs::fchmod(&fd, rustix::fs::Mode::from_raw_mode(mode))
         .map_err(|e| io(dir, e.into()))?;
     Ok(fd)
@@ -117,13 +116,22 @@ pub fn set(state: &Path, name: &str, value: &str) -> Result<PathBuf> {
     // user's first `set` makes it fail with `ELOOP` instead of following it into
     // whatever the link points at, and nothing between validating `dir` and this call
     // can redirect where the entry actually lands.
+    //
+    // Deliberately no `O_TRUNC` here, and `O_NONBLOCK` instead of the plain blocking
+    // open the leaf-level fix started with: a pre-existing name could be a FIFO (a
+    // blocking open with no reader hangs `ward vault set`, same failure mode
+    // `open_real_dir` closed for the directory) or a hard link this process doesn't
+    // own the other name of — truncating either as part of the open, before there is
+    // any chance to check what was actually opened, would be unbounded blast radius.
+    // `O_NONBLOCK` has no effect on a plain regular file's later reads/writes, so it
+    // costs nothing in the common case.
     let file_fd = match rustix::fs::openat(
         &dir_fd,
         name,
         rustix::fs::OFlags::WRONLY
             | rustix::fs::OFlags::CREATE
-            | rustix::fs::OFlags::TRUNC
             | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
             | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::from_raw_mode(0o600),
     ) {
@@ -136,10 +144,23 @@ pub fn set(state: &Path, name: &str, value: &str) -> Result<PathBuf> {
         }
         Err(e) => return Err(io(&path, e.into())),
     };
-    // Permissions go through the already-open fd (fchmod), not the path again, so a
-    // node swapped in after the open above can't be the one that gets chmod'd 0600.
+    // Only now, with the node open and nothing further to resolve, is it safe to ask
+    // what it actually is: a plain regular file with no other names (`st_nlink == 1`)
+    // pointing at the same data — never a FIFO/device/etc., and never a hard link
+    // that would make truncating it here also truncate whatever else names it.
+    let st = rustix::fs::fstat(&file_fd).map_err(|e| io(&path, e.into()))?;
+    if !rustix::fs::FileType::from_raw_mode(st.st_mode).is_file() || st.st_nlink != 1 {
+        return Err(Error::Project(format!(
+            "{}: refusing to write through a non-regular or hard-linked file",
+            path.display()
+        )));
+    }
+    // Permissions and truncation go through the already-open, now-verified fd, not
+    // the path again, so a node swapped in after the open above can't be the one
+    // that gets chmod'd or truncated.
     rustix::fs::fchmod(&file_fd, rustix::fs::Mode::from_raw_mode(0o600))
         .map_err(|e| io(&path, e.into()))?;
+    rustix::fs::ftruncate(&file_fd, 0).map_err(|e| io(&path, e.into()))?;
     let mut file: std::fs::File = file_fd.into();
     writeln!(file, "{value}").map_err(|e| io(&path, e))?;
     Ok(path)
@@ -362,6 +383,122 @@ mod tests {
         assert!(
             !outside.path().join("GITHUB_TOKEN").exists(),
             "must never write into the symlink's target directory"
+        );
+    }
+
+    #[test]
+    fn refuses_a_fifo_planted_at_the_vault_directory_path() {
+        // Before the O_DIRECTORY fix, open_real_dir opened `dir` with plain
+        // O_RDONLY; a FIFO with no writer blocks that open forever. This must
+        // return an error, not block — a regression here would hang this test.
+        let state = tempfile::tempdir().unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir(state.path()),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+
+        let Err(err) = set(state.path(), "GITHUB_TOKEN", "ghp-secret") else {
+            panic!("expected the FIFO at vault/ to be refused");
+        };
+        assert!(err.to_string().contains("non-directory"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_fifo_planted_at_the_entry_path() {
+        // The leaf open dropped O_TRUNC and added O_NONBLOCK specifically so a
+        // pre-existing FIFO can never be opened-and-truncated, and can never block
+        // this call waiting for a reader. With no reader present (the realistic
+        // case — nothing in this flow spawns one) O_NONBLOCK itself makes the open
+        // fail outright (ENXIO) rather than wait; if a reader ever were present, the
+        // is_file/nlink check right after the open would refuse it instead. Either
+        // way this must return an error quickly, never hang and never truncate the
+        // FIFO — a regression to a blocking open would hang this test.
+        let state = tempfile::tempdir().unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir(state.path()))
+            .unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            gateway::vault_file(state.path(), "GITHUB_TOKEN"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+
+        assert!(
+            set(state.path(), "GITHUB_TOKEN", "ghp-secret").is_err(),
+            "a FIFO vault entry must be refused, not opened and truncated"
+        );
+    }
+
+    #[test]
+    fn refuses_a_hard_linked_entry() {
+        // O_NOFOLLOW alone refuses a symlink but not a hard link: opening one
+        // succeeds like any other regular file, so only the st_nlink check stops a
+        // pre-planted alias from having its target silently truncated and rewritten.
+        let state = tempfile::tempdir().unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir(state.path()))
+            .unwrap();
+        let aliased = state.path().join("aliased-secret");
+        std::fs::write(&aliased, "do not touch").unwrap();
+        std::fs::hard_link(&aliased, gateway::vault_file(state.path(), "GITHUB_TOKEN")).unwrap();
+
+        let Err(err) = set(state.path(), "GITHUB_TOKEN", "ghp-secret") else {
+            panic!("expected the hard-linked entry to be refused");
+        };
+        assert!(err.to_string().contains("hard-linked"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&aliased).unwrap(),
+            "do not touch",
+            "the aliased file must never be truncated or rewritten"
+        );
+    }
+
+    #[test]
+    fn the_entry_lands_in_the_validated_directory_even_if_its_name_is_later_replaced() {
+        // Simulates exactly the race the second review round flagged: after
+        // `open_real_dir` validates `vault/` and returns its fd, an attacker renames
+        // that real directory aside and puts a symlink in its place before the entry
+        // is created. `openat` resolves against the held fd's inode, not whatever the
+        // name currently points at, so the entry must still land inside the original
+        // directory.
+        let state = tempfile::tempdir().unwrap();
+        let real = dir(state.path());
+        let dir_fd = open_real_dir(&real, 0o700).unwrap();
+
+        let moved_aside = state.path().join("moved-aside");
+        std::fs::rename(&real, &moved_aside).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), &real).unwrap();
+
+        let file_fd = rustix::fs::openat(
+            &dir_fd,
+            "GITHUB_TOKEN",
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .unwrap();
+        drop(std::fs::File::from(file_fd));
+
+        assert!(
+            moved_aside.join("GITHUB_TOKEN").exists(),
+            "the entry must land in the directory open_real_dir actually validated"
+        );
+        assert!(
+            !outside.path().join("GITHUB_TOKEN").exists(),
+            "never in the replacement symlink's target"
         );
     }
 

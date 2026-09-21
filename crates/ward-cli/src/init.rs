@@ -9,7 +9,7 @@
 //! wrote; `--dry-run` reports the plan and touches nothing.
 
 use std::fmt::Write as _;
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -259,40 +259,36 @@ fn dir_argument(dir: &Path) -> String {
 /// currently points there, so it stays correct even if `dir` is renamed away and
 /// replaced with a symlink immediately after this call returns.
 ///
-/// `O_NOFOLLOW` alone (no `O_DIRECTORY`) is deliberate: combined, Linux reports a
-/// symlink-to-a-directory as `ENOTDIR` — the `O_DIRECTORY` check runs first and a
-/// symlink is never a directory type — which would be indistinguishable from a plain
-/// non-directory file. Checked apart, a symlink is reliably `ELOOP` here, and a
-/// non-directory file is caught by the explicit `is_dir` check below.
+/// `O_DIRECTORY` (with `O_NOFOLLOW`) is what makes the open itself the whole check:
+/// success guarantees a real directory, so no follow-up `fstat` is needed, and a
+/// symlink or any other non-directory node (`ELOOP`/`ENOTDIR`) is refused uniformly.
+/// Critically, `O_DIRECTORY` is also what keeps this safe against a pre-planted FIFO
+/// — a plain `O_RDONLY` open with no `O_DIRECTORY` would instead block indefinitely
+/// waiting for a writer that will never come, turning `ward init` into a hang.
 fn open_real_dir(dir: &Path) -> Result<rustix::fd::OwnedFd> {
     match std::fs::create_dir(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(io(dir, e)),
     }
-    let fd = rustix::fs::open(
+    rustix::fs::open(
         dir,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     )
     .map_err(|e| {
-        if e == rustix::io::Errno::LOOP {
+        if matches!(e, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
             Error::Project(format!(
-                "{}: refusing to use a symlink as a directory",
+                "{}: refusing to use a symlink or non-directory as a directory",
                 dir.display()
             ))
         } else {
             io(dir, e.into())
         }
-    })?;
-    let st = rustix::fs::fstat(&fd).map_err(|e| io(dir, e.into()))?;
-    if !rustix::fs::FileType::from_raw_mode(st.st_mode).is_dir() {
-        return Err(Error::Project(format!(
-            "{}: refusing to use a non-directory as a directory",
-            dir.display()
-        )));
-    }
-    Ok(fd)
+    })
 }
 
 /// Write `content` to `path` unless the file exists; `dry` only reports.
@@ -342,55 +338,74 @@ const SESSIONS_IGNORE: &str = ".ward/sessions/";
 /// Append the session-state line to `.gitignore` in a git repository that does not
 /// ignore it yet. Appending is the one edit `ward init` makes to a user's file: the
 /// line is additive and marked, and a repository that commits session state leaks it.
+///
+/// Unlike the template files above, `.gitignore` is meant to be read and appended to
+/// when it already exists, so it can't just refuse any pre-existing node the way
+/// `write_new` does — only a symlink, via `O_NOFOLLOW`. That refusal has to be the
+/// open itself, not a check before it: a `.gitignore` that exists is opened exactly
+/// once here, and every read and write goes through that same fd, so there is no
+/// separate pathname lookup later in the function for a concurrent rename or
+/// replacement to target.
 fn ignore_sessions(dir: &Path, dry: bool) -> Result<Outcome> {
     if !dir.join(".git").exists() {
         return Ok(Outcome::Skipped("not a git repository".to_owned()));
     }
     let path = dir.join(".gitignore");
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path);
+    let (existing_file, existing) = match opened {
+        Ok(mut f) => {
+            let mut text = String::new();
+            f.read_to_string(&mut text).map_err(|e| io(&path, e))?;
+            (Some(f), text)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, String::new()),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(Error::Project(format!(
+                "{}: refusing to write through a symlink",
+                path.display()
+            )));
+        }
         Err(e) => return Err(io(&path, e)),
     };
     if existing.lines().any(ignores_sessions) {
         return Ok(Outcome::Kept);
     }
-    if !dry {
-        let mut text = existing;
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        let _ = writeln!(text, "# WardOS session state, never committed (ward init)");
-        let _ = writeln!(text, "{SESSIONS_IGNORE}");
-        // Unlike the template files above, `.gitignore` is meant to be read and
-        // appended to when it already exists, so it can't just refuse any pre-existing
-        // node the way `write_new` does. Instead the write itself opens with
-        // `O_NOFOLLOW`: a `.gitignore` that already exists as a symlink — the
-        // attacker-controlled case a hostile clone can ship — makes this one syscall
-        // fail with `ELOOP` instead of following it, with no separate check an
-        // attacker could race between checking and using.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .and_then(|mut f| f.write_all(text.as_bytes()))
-            .map_err(|e| {
-                if e.raw_os_error() == Some(libc::ELOOP) {
-                    Error::Project(format!(
-                        "{}: refusing to write through a symlink",
-                        path.display()
-                    ))
-                } else {
-                    io(&path, e)
-                }
-            })?;
-    }
-    Ok(Outcome::Note(format!(
+    let outcome = Outcome::Note(format!(
         "{SESSIONS_IGNORE} {}",
         if dry { "would be added" } else { "added" }
-    )))
+    ));
+    if dry {
+        return Ok(outcome);
+    }
+    let mut text = existing;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let _ = writeln!(text, "# WardOS session state, never committed (ward init)");
+    let _ = writeln!(text, "{SESSIONS_IGNORE}");
+    match existing_file {
+        // The line above always makes `text` strictly longer than what was read, so
+        // overwriting from the start needs no truncate.
+        Some(mut f) => {
+            f.seek(SeekFrom::Start(0)).map_err(|e| io(&path, e))?;
+            f.write_all(text.as_bytes()).map_err(|e| io(&path, e))?;
+        }
+        // Didn't exist when opened above: create it fresh with the same O_EXCL
+        // guarantee `write_new` uses, refusing a symlink planted in the meantime too.
+        None => {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .and_then(|mut f| f.write_all(text.as_bytes()))
+                .map_err(|e| io(&path, e))?;
+        }
+    }
+    Ok(outcome)
 }
 
 /// Whether one `.gitignore` line already covers the session state (`.ward/sessions`,
@@ -733,6 +748,71 @@ mod tests {
         assert!(
             !outside.path().join("policy.yaml").exists(),
             "must never write into the symlink's target directory"
+        );
+    }
+
+    #[test]
+    fn refuses_a_fifo_planted_at_the_parent_directory_path() {
+        // `open_real_dir` opens `dir` with plain O_RDONLY before the O_DIRECTORY fix,
+        // opening a FIFO with no writer blocks forever — turning a hostile project
+        // into a hang instead of a clean refusal. This must return an error, not
+        // block; if it regressed to blocking this test itself would hang.
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.path().join(".ward"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+
+        let Err(err) = run(&options(dir.path(), state.path())) else {
+            panic!("expected the FIFO at .ward to be refused");
+        };
+        assert!(err.to_string().contains("non-directory"), "{err}");
+    }
+
+    #[test]
+    fn the_leaf_lands_in_the_validated_directory_even_if_its_name_is_later_replaced() {
+        // Simulates exactly the race the second review round flagged: after
+        // `open_real_dir` validates `.ward` and returns its fd, an attacker renames
+        // that real directory aside and puts a symlink in its place before the leaf
+        // is created. Because `openat` resolves against the held fd's inode, not
+        // whatever the name currently points at, the leaf must still land inside the
+        // original directory — proving the fd-relative design closes the window a
+        // second pathname-based check could not.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join(".ward");
+        std::fs::create_dir(&real).unwrap();
+        let dir_fd = open_real_dir(&real).unwrap();
+
+        let moved_aside = dir.path().join("moved-aside");
+        std::fs::rename(&real, &moved_aside).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), &real).unwrap();
+
+        let file_fd = rustix::fs::openat(
+            &dir_fd,
+            "leaf.txt",
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o644),
+        )
+        .unwrap();
+        drop(std::fs::File::from(file_fd));
+
+        assert!(
+            moved_aside.join("leaf.txt").exists(),
+            "the leaf must land in the directory open_real_dir actually validated"
+        );
+        assert!(
+            !outside.path().join("leaf.txt").exists(),
+            "never in the replacement symlink's target"
         );
     }
 
