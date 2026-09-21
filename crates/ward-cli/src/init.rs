@@ -10,6 +10,7 @@
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -250,6 +251,30 @@ fn dir_argument(dir: &Path) -> String {
     }
 }
 
+/// Create `dir` if it is absent; refuse to reuse it if it already exists as anything
+/// other than a real, non-symlink directory (its parent must already exist — every
+/// caller here is one level under the already-created, canonicalized project root).
+///
+/// Plain `create_dir`/`create_dir_all` treat an existing symlink-to-directory as
+/// "already there" and silently resolve through it on every open beneath it — exactly
+/// the shape of a hostile project shipping `.ward -> /somewhere/real` or
+/// `.tamperward -> …`, which `write_new`'s own `O_EXCL` on the leaf file can't catch
+/// since `O_NOFOLLOW`/`O_EXCL` only ever govern the final path component.
+fn ensure_real_dir(dir: &Path) -> Result<()> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match dir.symlink_metadata() {
+            Ok(meta) if meta.is_dir() => Ok(()),
+            Ok(_) => Err(Error::Project(format!(
+                "{}: refusing to use a symlink as a directory",
+                dir.display()
+            ))),
+            Err(e) => Err(io(dir, e)),
+        },
+        Err(e) => Err(io(dir, e)),
+    }
+}
+
 /// Write `content` to `path` unless the file exists; `dry` only reports.
 ///
 /// A cloned project directory is untrusted content, not just an unwritten disk: it can
@@ -266,7 +291,7 @@ fn write_new(path: &Path, content: &str, dry: bool) -> Result<Outcome> {
         return Ok(Outcome::Written);
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+        ensure_real_dir(parent)?;
     }
     let mut file = match std::fs::OpenOptions::new()
         .write(true)
@@ -293,20 +318,6 @@ fn ignore_sessions(dir: &Path, dry: bool) -> Result<Outcome> {
         return Ok(Outcome::Skipped("not a git repository".to_owned()));
     }
     let path = dir.join(".gitignore");
-    // Unlike the template files above, `.gitignore` is meant to be read and appended
-    // to when it already exists — so this can't just refuse any pre-existing node. A
-    // `.gitignore` that already exists as a symlink is exactly the attacker-controlled
-    // case (a hostile clone can ship one aimed anywhere), so that one case is refused;
-    // a plain file or an absent path both proceed as before.
-    if path
-        .symlink_metadata()
-        .is_ok_and(|m| m.file_type().is_symlink())
-    {
-        return Err(Error::Project(format!(
-            "{}: refusing to write through a symlink",
-            path.display()
-        )));
-    }
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -322,7 +333,30 @@ fn ignore_sessions(dir: &Path, dry: bool) -> Result<Outcome> {
         }
         let _ = writeln!(text, "# WardOS session state, never committed (ward init)");
         let _ = writeln!(text, "{SESSIONS_IGNORE}");
-        std::fs::write(&path, text).map_err(|e| io(&path, e))?;
+        // Unlike the template files above, `.gitignore` is meant to be read and
+        // appended to when it already exists, so it can't just refuse any pre-existing
+        // node the way `write_new` does. Instead the write itself opens with
+        // `O_NOFOLLOW`: a `.gitignore` that already exists as a symlink — the
+        // attacker-controlled case a hostile clone can ship — makes this one syscall
+        // fail with `ELOOP` instead of following it, with no separate check an
+        // attacker could race between checking and using.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .and_then(|mut f| f.write_all(text.as_bytes()))
+            .map_err(|e| {
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    Error::Project(format!(
+                        "{}: refusing to write through a symlink",
+                        path.display()
+                    ))
+                } else {
+                    io(&path, e)
+                }
+            })?;
     }
     Ok(Outcome::Note(format!(
         "{SESSIONS_IGNORE} {}",
@@ -648,6 +682,29 @@ mod tests {
             .find(|s| s.path == ".ward/policy.yaml")
             .unwrap();
         assert_eq!(policy_step.outcome, Outcome::Kept);
+    }
+
+    #[test]
+    fn refuses_to_write_through_a_symlinked_parent_directory() {
+        // A hostile project can ship `.ward` itself as a symlink to a real, existing
+        // directory outside the project — with no `policy.yaml` inside it yet. The
+        // leaf-level `O_EXCL` in `write_new` can't catch this: it only ever governs
+        // the final path component, and `create_dir_all` would otherwise treat an
+        // existing symlink-to-directory as "already there" and write straight through
+        // it. `ensure_real_dir` must refuse it before any leaf write is attempted.
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".ward")).unwrap();
+
+        let Err(err) = run(&options(dir.path(), state.path())) else {
+            panic!("expected the symlinked .ward directory to be refused");
+        };
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(
+            !outside.path().join("policy.yaml").exists(),
+            "must never write into the symlink's target directory"
+        );
     }
 
     #[test]

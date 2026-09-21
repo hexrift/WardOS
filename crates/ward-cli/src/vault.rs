@@ -56,39 +56,58 @@ pub fn set(state: &Path, name: &str, value: &str) -> Result<PathBuf> {
         )));
     }
     let dir = dir(state);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|e| io(&dir, e))?;
-    // A directory that existed with looser permissions is tightened, not trusted.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| io(&dir, e))?;
-    let path = gateway::vault_file(state, name);
-    // The directory above is tightened, not trusted; the file itself needs the same
-    // treatment. `create(true)` alone follows a pre-existing symlink, so a name an
-    // attacker could plant ahead of the user's first `set` (e.g. in a shared or
-    // reused state dir) would redirect the plaintext value into whatever the link
-    // points at instead of refusing. A vault entry is expected to sometimes already
-    // exist as a real file (re-running `set` updates it), so unlike `ward init`'s
-    // templates this can't use `create_new` outright — only a symlink is refused.
-    if path
-        .symlink_metadata()
-        .is_ok_and(|m| m.file_type().is_symlink())
-    {
-        return Err(Error::Project(format!(
-            "{}: refusing to write through a symlink",
-            path.display()
-        )));
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
     }
-    let mut file = std::fs::OpenOptions::new()
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A directory that existed with looser permissions is tightened, not
+            // trusted — but only once confirmed real. `create` above never follows a
+            // symlink for the final component (it fails `AlreadyExists` instead), and
+            // `symlink_metadata` here never follows one either, so a pre-planted
+            // `vault -> /somewhere/real` (e.g. in a shared or reused state dir) is
+            // refused rather than silently written through.
+            let meta = dir.symlink_metadata().map_err(|e| io(&dir, e))?;
+            if !meta.is_dir() {
+                return Err(Error::Project(format!(
+                    "{}: refusing to use a symlink as the vault directory",
+                    dir.display()
+                )));
+            }
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| io(&dir, e))?;
+        }
+        Err(e) => return Err(io(&dir, e)),
+    }
+    let path = gateway::vault_file(state, name);
+    // The directory above is real, not just trusted; the file itself needs the same
+    // treatment. A vault entry is expected to sometimes already exist as a real file
+    // (re-running `set` updates it), so unlike `ward init`'s templates this can't
+    // refuse every pre-existing node — only a symlink. `O_NOFOLLOW` makes the open
+    // itself the one thing that decides that, rather than a separate, racable check:
+    // a name an attacker planted ahead of the user's first `set` makes this open fail
+    // with `ELOOP` instead of following it into whatever the link points at.
+    let mut file = match std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
-        .map_err(|e| io(&path, e))?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+    {
+        Ok(file) => file,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(Error::Project(format!(
+                "{}: refusing to write through a symlink",
+                path.display()
+            )));
+        }
+        Err(e) => return Err(io(&path, e)),
+    };
+    // Permissions go through the already-open fd (fchmod), not the path again, so a
+    // node swapped in after the open above can't be the one that gets chmod'd 0600.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|e| io(&path, e))?;
     writeln!(file, "{value}").map_err(|e| io(&path, e))?;
     Ok(path)
@@ -290,6 +309,26 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(gateway::vault_file(state.path(), "GITHUB_TOKEN")).unwrap(),
             "ghp-second\n"
+        );
+    }
+
+    #[test]
+    fn refuses_to_use_a_symlinked_vault_directory() {
+        // `$WARD_STATE_DIR/vault` itself as a symlink to a real, existing directory
+        // (e.g. a shared or reused state dir) is a deterministic hijack: with no
+        // `GITHUB_TOKEN` file inside it yet, `DirBuilder::create`'s `AlreadyExists`
+        // recovery must not treat "a symlink to a real directory" as "already there".
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir(state.path())).unwrap();
+
+        let Err(err) = set(state.path(), "GITHUB_TOKEN", "ghp-secret") else {
+            panic!("expected the symlinked vault directory to be refused");
+        };
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(
+            !outside.path().join("GITHUB_TOKEN").exists(),
+            "must never write into the symlink's target directory"
         );
     }
 

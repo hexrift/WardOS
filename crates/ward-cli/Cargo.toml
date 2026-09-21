@@ -21,6 +21,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
