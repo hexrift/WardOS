@@ -347,11 +347,20 @@ out=$(printf 'ACCOUNT\nivy\nIvy\npw\n' | wardos-provisiond)
   fail "#153: a rollback whose journal directory-fsync fails (and its retry) must say so, not just the original reason; got: $out"
 [[ ! -e "$jn_acct_dir/ivy" ]] || fail "#153: userdel still ran; the account is gone despite the journal-fsync failure"
 [[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "#153: a rolled-back transaction must not mark provisioned"
-# The next request: the journal's `rm -f` really succeeded (only its directory fsync failed),
-# so reconcile_pending finds no journal at all and proceeds straight to a clean ACCOUNT once
-# storage recovers — never stuck refusing on a failure that was already fully rolled back.
+# The unconfirmed removal is NOT trusted: the journal (still naming ivy) is durably re-written
+# rather than assumed gone, so it survives for the next request's reconcile_pending to find.
+[[ "$(cat "$WARDOS_PROVISION_JOURNAL" 2>/dev/null)" == ivy ]] ||
+  fail "#153: an unconfirmed journal removal must leave a recovery record naming the rolled-back account"
+# While storage stays bad, a SUBSEQUENT request must be REFUSED, not silently accepted: ivy no
+# longer exists (userdel already succeeded), so reconcile_pending skips straight to clearing
+# the re-written journal — which fails again for the same reason — and denies.
+mock chpasswd # would succeed now; the reconcile refusal must stop the request before it matters
+out=$(printf 'ACCOUNT\njudy\nJudy\npw\n' | wardos-provisiond)
+[[ "$out" == ERR*unresolved* ]] ||
+  fail "#153: a request must be refused while the re-written journal still cannot be cleared; got: $out"
+[[ ! -e "$jn_acct_dir/judy" ]] || fail "#153: no account is created while the journal cleanup remains unconfirmed"
+# Once storage recovers, the SAME request reconciles the stale journal and proceeds cleanly.
 mock sync 'exit 0'
-mock chpasswd # succeeds now
 out=$(printf 'ACCOUNT\njudy\nJudy\npw\n' | wardos-provisiond)
 [[ "$out" == OK ]] || fail "#153: the next request must succeed once storage recovers; got: $out"
 assert_file "$WARDOS_PROVISIONED_MARKER"
@@ -456,6 +465,48 @@ dev_seed_unit="$test_root/image/rootfs/usr/lib/systemd/system/wardos-dev-seed.se
 assert_file "$dev_seed_unit"
 grep -Eq '^Before=.*wardos-provisiond\.socket' "$dev_seed_unit" ||
   fail "(a) wardos-dev-seed.service must be ordered Before= wardos-provisiond.socket (so the socket condition is evaluated after dev-seed)"
+
+# (b) Boot-reachability (#152 review): a reconciliation added only INSIDE wardos-dev-seed is
+# unreachable at boot if the UNIT's own ConditionPathExists= lines can still exclude the exact
+# state it must handle. systemd combines repeated ConditionPathExists= lines with a logical AND
+# by default (they combine with OR only via an explicit '|' trigger prefix, unused in this
+# repository), so evaluate the REAL shipped unit's conditions the same way systemd would, against
+# the #152 reproduction (a dev-seed image whose marker already committed, with a stale journal
+# alongside it) to PROVE ExecStart is actually reached — not merely that the script does the
+# right thing when invoked directly, which bypasses unit activation entirely.
+# eval_unit_conditions UNIT PRESENT…: read every `ConditionPathExists=[!]PATH` line from UNIT and
+# return success only if all of them hold, given that exactly the paths listed in PRESENT exist.
+eval_unit_conditions() {
+  local unit=$1
+  shift
+  local -a present=("$@")
+  local line path neg exists p
+  while IFS= read -r line; do
+    case "$line" in
+      ConditionPathExists=*) ;;
+      *) continue ;;
+    esac
+    path=${line#ConditionPathExists=}
+    neg=0
+    case "$path" in '!'*) neg=1; path=${path#'!'} ;; esac
+    exists=0
+    for p in "${present[@]}"; do [[ "$p" == "$path" ]] && exists=1; done
+    if ((neg)); then
+      ((exists == 0)) || return 1
+    else
+      ((exists == 1)) || return 1
+    fi
+  done <"$unit"
+  return 0
+}
+eval_unit_conditions "$dev_seed_unit" /usr/lib/wardos/dev-seed-user /var/lib/wardos/provisioned ||
+  fail "(b) #152: with the dev-seed flag present and the marker already committed, wardos-dev-seed.service's own ConditionPathExists gating must still let ExecStart run, so the stale-journal reconciliation in the script is reachable at boot"
+eval_unit_conditions "$dev_seed_unit" /usr/lib/wardos/dev-seed-user ||
+  fail "(b) the plain unprovisioned dev-seed case (flag present, marker absent) must still reach ExecStart"
+eval_unit_conditions "$dev_seed_unit" /var/lib/wardos/provisioned &&
+  fail "(b) a production image (no dev-seed flag) must never reach ExecStart, provisioned or not"
+eval_unit_conditions "$dev_seed_unit" &&
+  fail "(b) a production image (no dev-seed flag) must never reach ExecStart, provisioned or not"
 
 # (c) Broker defense-in-depth: with the dev-seed journal present, EVERY mutating verb is refused
 # and NOTHING is created/mutated — even on an unprovisioned machine.

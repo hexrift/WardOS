@@ -2,21 +2,30 @@
 #
 # CI and hardware iteration need a machine that boots straight to a desktop. When the image
 # was built with WARDOS_DEV_SEED_USER, the Containerfile drops /usr/lib/wardos/dev-seed-user
-# and this unit (gated on that flag file, and on the machine being unprovisioned) seeds the
-# named development account and writes the provisioned marker at first boot — so the greetd
-# selector goes straight to the greeter instead of the provisioning UI. Production images
-# are built WITHOUT the flag file, so this unit is a permanent no-op there and the machine
-# ships unprovisioned. It runs before greetd so the marker exists before the selector reads it.
+# and this unit (gated on that flag file) seeds the named development account and writes the
+# provisioned marker at first boot — so the greetd selector goes straight to the greeter
+# instead of the provisioning UI. Production images are built WITHOUT the flag file, so this
+# unit is a permanent no-op there and the machine ships unprovisioned. It runs before greetd
+# so the marker exists before the selector reads it.
 #
 # With no usable password credential (see below) the seed is a no-op that writes NO marker:
 # the machine stays unprovisioned and the first-boot provisioning UI runs, so there is always
 # a way in (it never leaves a locked account behind a "provisioned" marker). This is the ONLY
 # development account mechanism; image/disk.sh does not pre-create a first user.
+#
+# Gated ONLY on the flag file, not on the marker (#152 review): systemd ANDs repeated
+# ConditionPathExists= lines by default (they OR only with an explicit '|' prefix, unused
+# here), so a second `ConditionPathExists=!…/provisioned` would make systemd skip ExecStart —
+# and everything the script does, including reconciling a STALE journal left by its own
+# already-committed marker — on exactly the boot that needs it. The script's own guards
+# already make every already-provisioned boot a fast, side-effect-free no-op (its
+# marker+journal reconcile touches nothing when there is nothing to reconcile, and its
+# idempotency exit follows right after), so gating in bash rather than in the unit costs
+# nothing and keeps the one behaviour this unit exists to provide reachable at boot.
 [Unit]
 Description=WardOS development image account seed (non-production)
 Documentation=https://github.com/hexrift/WardOS/blob/main/docs/decisions/ADR-0027-first-boot-provisioning.md
 ConditionPathExists=/usr/lib/wardos/dev-seed-user
-ConditionPathExists=!/var/lib/wardos/provisioned
 After=systemd-tmpfiles-setup.service local-fs.target
 Wants=systemd-tmpfiles-setup.service
 # Ordered before BOTH greetd (which launches the marker-gated session selector) AND the

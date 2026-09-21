@@ -256,6 +256,53 @@ assert_logged '^userdel -r devuser$'                 # the orphan was reconciled
 assert_file "$WARDOS_PROVISIONED_MARKER"
 [[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "the journal is cleared after a committed recovery"
 
+# --- T4b (#153 review): userdel succeeds but the journal's OWN directory fsync fails (and its
+# retry) during rollback. remove_durable already unlinked the journal by then — there is
+# nothing left to "put back" — so the seed must durably RE-WRITE the same journal record rather
+# than stand down, and a later boot must REFUSE to re-seed while that record still cannot be
+# cleared, never silently re-seed as if the failed flush never happened. -----------------------
+seed_stateful_mocks
+reset_state
+export jn_dir="$TMP/jn" # exported: the sync mock below runs as a separate process and reads it
+rm -rf "$jn_dir"
+mkdir -p "$jn_dir"
+export WARDOS_DEV_SEED_JOURNAL="$jn_dir/dev-seed.journal"
+printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
+cred_on
+mock chpasswd 'exit 1' # force a mid-transaction failure so rollback runs
+: >"$TMP/jn-sync-calls"
+# shellcheck disable=SC2016
+mock sync 'case "$1" in
+  "$jn_dir")
+    n=$(($(cat "$TMP/jn-sync-calls") + 1)); echo "$n" >"$TMP/jn-sync-calls"
+    [[ "$n" -eq 1 ]] && exit 0
+    exit 1
+    ;;
+esac
+exit 0'
+run_seed
+[[ $rc -ne 0 ]] || fail "T4b: a rollback whose journal directory-fsync fails must still fail the seed"
+[[ ! -e "$acct_dir/devuser" ]] || fail "T4b: userdel still ran; the account is gone despite the journal-fsync failure"
+[[ "$(cat "$WARDOS_DEV_SEED_JOURNAL" 2>/dev/null)" == devuser ]] ||
+  fail "T4b: an unconfirmed journal removal must leave a recovery record naming the rolled-back account"
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "T4b: an unresolved transaction must not mark provisioned"
+# While storage stays bad, the NEXT boot must REFUSE to re-seed, not silently proceed: devuser
+# no longer exists (userdel already succeeded), so reconcile_pending skips straight to clearing
+# the re-written journal — which fails again for the same reason — and refuses.
+mock chpasswd # would succeed now; the reconcile refusal must stop the seed before it matters
+: >"$MOCK_LOG"
+run_seed
+[[ $rc -ne 0 ]] || fail "T4b: a later boot must refuse while the re-written journal still cannot be cleared"
+assert_not_logged '^useradd' # never re-seed while the prior cleanup remains unconfirmed
+# Once storage recovers, the SAME boot's retry reconciles the stale journal and seeds cleanly.
+mock sync 'exit 0'
+run_seed
+[[ $rc -eq 0 ]] || fail "T4b: the next boot must seed once storage recovers; rc=$rc"
+[[ "$(acct_count)" -eq 1 ]] || fail "T4b: recovery must yield exactly one admin: $(ls "$acct_dir")"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+[[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "T4b: the journal is cleared after a committed recovery"
+export WARDOS_DEV_SEED_JOURNAL="$TMP/dev-seed.journal" # back to the default path after jn_dir
+
 # --- T5. Interruption between each mutation → the next boot reconciles to a single-admin
 #         provisioned OR a cleanly-unprovisioned state, NEVER two usable admins. ---------------
 

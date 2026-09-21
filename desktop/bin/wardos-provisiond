@@ -216,19 +216,25 @@ reconcile_pending() {
 # reconcile_pending refuses and retries the removal on the next attempt rather than leaving
 # a silent second administrator (#127). Either way this connection is denied with `reason`.
 #
-# The journal removal itself is never suppressed with `|| true` either (#153): a lost
+# The journal removal itself is never suppressed with `|| true` either (#153 review): a lost
 # directory-fsync flush there is exactly the power-cut durability gap the journal exists to
-# prevent, so retry it once (mirroring commit_marker's own indeterminate-directory-fsync
-# retry) and, if it still fails, say so in the reply instead of silently reporting only
-# `reason` as if cleanup were uneventful. The account is already gone either way — userdel
-# succeeded — so reconcile_pending's next run tolerates a resurrected journal fine (it finds
-# no account under that name and clears the journal itself); this only makes a failure that
-# used to vanish without a trace visible to the caller and the log.
+# prevent. `remove_durable` unlinks THEN fsyncs the directory, so once the unlink succeeds the
+# journal is gone from this process's view regardless of whether the trailing fsync then
+# fails — there is nothing left to "put back". So a failed flush here (retried once, mirroring
+# commit_marker's own indeterminate-directory-fsync retry) does NOT stand down: it durably
+# RE-WRITES the same journal record naming `user`, restoring a recovery record that survives
+# even though the original unlink's own durability could not be confirmed. If a crash then
+# reverts that original unlink, the next request's reconcile_pending finds a journal naming an
+# account that no longer exists (`id -u` fails, since userdel already succeeded here) and
+# simply retries clearing it; if THAT retry's flush also fails, reconcile_pending DENIES the
+# new request rather than silently accepting one while this cleanup remains unconfirmed —
+# exactly the "refuse until reconciled" contract #127 established for the rest of the journal.
 rollback_account() {
   local user=$1 reason=$2
   if userdel -r "$user" 2>/dev/null; then
     if ! { remove_durable "$journal" || remove_durable "$journal"; }; then
-      deny "$reason (rollback complete but the transaction journal's removal could not be durably confirmed; recovery may be required on the next attempt)"
+      write_durable "$journal" "$user" || true
+      deny "$reason (rollback complete but the transaction journal's removal could not be durably confirmed; recovery required — the next request will not proceed until it clears)"
     fi
   fi
   deny "$reason"
