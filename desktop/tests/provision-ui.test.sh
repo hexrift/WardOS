@@ -214,6 +214,20 @@ run_ui "" 0 "" 0 "" 0 "Ada" "alice" "old-password" "old-password" 1 7 \
 [[ $(grep -c '^ACCOUNT$' "$socat_in") -eq 2 ]] || fail "exactly two account attempts"
 grep -q '^replacement-password$' "$socat_in" || fail "replacement password reaches broker"
 
+# --- issue #163: broker() must give socat a generous close-timeout, not the 0.5s default ----
+# socat's default -t is 0.5s: after the request pipe EOFs, socat half-closes and terminates 0.5s
+# later regardless of whether the slow (useradd+chpasswd(yescrypt)+fsync) reply has arrived, so a
+# slow-but-SUCCESSFUL ACCOUNT is misreported as a failure on a machine that is actually
+# provisioned. The suite mocks socat, so this timing cannot be exercised at run time; assert
+# instead that broker()'s socat invocation carries an explicit -t comfortably above worst-case
+# first-boot latency (>= 30s).
+ui_script="$repo_root/desktop/bin/wardos-provision-ui"
+socat_t=$(grep -oE 'socat[[:space:]]+-t[[:space:]]+[0-9]+' "$ui_script" | grep -oE '[0-9]+$' | head -n1)
+[[ -n "$socat_t" ]] ||
+  fail "#163: broker() must invoke socat with an explicit -t close-timeout; got: $(grep -n 'socat' "$ui_script")"
+[[ "$socat_t" -ge 30 ]] ||
+  fail "#163: the socat close-timeout must be >= 30s (worst-case first-boot useradd+chpasswd+fsync); got -t $socat_t"
+
 # --- already provisioned: the UI does nothing and does not touch the broker ---------------
 : >"$socat_in"
 rm -f "$WARDOS_PROVISION_STAGE"

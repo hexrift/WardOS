@@ -48,9 +48,17 @@ loc="" kbd="" variant="" tz="" fullname="" user="" pass="" phase=""
 # broker VERB [LINE…]: one request over the socket; true iff the reply begins "OK". The request
 # is built by a printf builtin and piped straight to socat, so no field (the password included)
 # is ever an argv of an external process.
+#
+# `-t 30` (#163): after the request pipe EOFs, socat half-closes the write side and waits for the
+# broker's reply on the read side. Its DEFAULT half-close timeout (-t) is 0.5s, so a slow but
+# SUCCESSFUL ACCOUNT — useradd + chpasswd(yescrypt) + the account-database fsyncs are heavy on
+# first boot — would have socat terminate before the "OK" arrived, misreporting a machine that
+# was in fact provisioned as a failure. 30s sits comfortably above worst-case first-boot latency.
+# Only -t is set (not -T): -T is a TOTAL inactivity timeout, and a legitimately slow broker holds
+# the connection idle while it works, so a -T here could itself sever a slow-but-succeeding call.
 broker() {
   local out
-  out=$(printf '%s\n' "$@" | socat - "UNIX-CONNECT:$sock" 2>/dev/null) || out="ERR broker unreachable"
+  out=$(printf '%s\n' "$@" | socat -t 30 - "UNIX-CONNECT:$sock" 2>/dev/null) || out="ERR broker unreachable"
   last_err="${out#ERR }"
   [[ "$out" == OK* ]]
 }
