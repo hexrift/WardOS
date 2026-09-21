@@ -289,8 +289,17 @@ if ! commit_marker; then
   # The retry flush succeeded: the marker is now durable — fall through to the success tail.
 fi
 
-# Committed: the marker is the durable commit point. Clear the now-resolved journal
-# (best-effort — a lingering journal past the marker is inert, since a provisioned machine
-# gates this script out at the top on the next boot).
-remove_durable "$journal" || true
+# Committed: the marker is the durable commit point. Clear the now-resolved journal, with a
+# bounded retry-once (mirroring rollback_account's / commit_marker's retry-once discipline for an
+# indeterminate directory fsync). This is purely opportunistic and NEVER load-bearing: past the
+# committed marker a lingering journal is inert — this script is gated out at the top on the next
+# boot, and wardos-greetd-session's marker-first check (#162) keeps the machine usable regardless
+# — so a persistent failure is logged, never fatal. But the retry means the common transient case
+# (a one-off directory-fsync hiccup) actually clears the journal on this boot rather than leaving
+# a stale one behind for the selector's best-effort (possibly unprivileged) cleanup to trip over.
+if ! remove_durable "$journal"; then
+  if ! remove_durable "$journal"; then
+    echo "wardos-dev-seed: seeded '$user' and committed the marker, but could not durably clear the now-inert transaction journal ($journal); it is harmless (the committed marker gates re-seeding out on the next boot)" >&2
+  fi
+fi
 echo "wardos-dev-seed: seeded development account '$user'; machine marked provisioned" >&2

@@ -438,6 +438,42 @@ assert_logged '^userdel -r devuser$'          # the orphan is reconciled away fi
 [[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "T5c: no credential must leave the machine unprovisioned"
 [[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "T5c: reconcile clears the journal even on the fall-back path"
 
+# --- T7 [#162, defense-in-depth]: a committed seed clears its now-inert journal with a bounded
+# retry-once, so a one-off directory-fsync hiccup does NOT strand a stale journal (which the
+# unprivileged wardos-greetd-session may not be able to clear). The marker is the durable commit
+# point and is written FIRST here (its dir is $TMP, untouched by the mock); the FIRST post-commit
+# journal-clear directory fsync then fails and the RETRY succeeds, so the journal really is gone
+# and the seed still succeeds. The journal lives in its own dir (jn_dir) with a call-counted sync
+# mock: call 1 (its initial durable write) succeeds, call 2 (the first clear) fails, call 3 (the
+# retry) succeeds — proving the retry both runs and clears it.
+seed_stateful_mocks
+reset_state
+printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
+cred_on
+export jn_dir="$TMP/jn7" # exported: the mock `sync` runs in a separate process
+rm -rf "$jn_dir"
+mkdir -p "$jn_dir"
+export WARDOS_DEV_SEED_JOURNAL="$jn_dir/dev-seed.journal"
+rm -f "$TMP/commit-synccount"
+# shellcheck disable=SC2016
+mock sync 'case "$1" in
+  "$jn_dir")
+    n=$(($(cat "$TMP/commit-synccount" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$TMP/commit-synccount"
+    [[ "$n" -eq 2 ]] && exit 1
+    ;;
+esac
+exit 0'
+run_seed
+[[ $rc -eq 0 ]] || fail "T7: a transient post-commit journal-clear fsync must not fail the seed; rc=$rc"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+[[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] ||
+  fail "T7: the retry-once must clear the now-inert journal on the second attempt, not strand it"
+[[ "$(cat "$TMP/commit-synccount" 2>/dev/null)" -eq 3 ]] ||
+  fail "T7: the post-commit clear must retry exactly once (3 journal-dir fsyncs total); got $(cat "$TMP/commit-synccount" 2>/dev/null)"
+mock sync 'exit 0'
+export WARDOS_DEV_SEED_JOURNAL="$TMP/dev-seed.journal" # back to the clean journal path
+
 # --- Newline-only / whitespace-only / control-only credential (#119 review): a credential FILE
 #     that is NON-EMPTY ([[ -s ]] passes) but yields an empty/whitespace/control-only password
 #     after `head -n1` must be treated exactly like NO credential — NO account, NO marker, fall

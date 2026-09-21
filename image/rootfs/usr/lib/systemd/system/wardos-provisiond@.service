@@ -62,8 +62,12 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK
 #   CAP_FSETID       preserve setgid bits when copying /etc/skel / setting the group dir.
 #   CAP_SETUID       chpasswd's PAM stack and useradd may switch/verify uid during the update.
 #   CAP_SETGID       create the user's primary group and set group ownership.
+#   CAP_AUDIT_WRITE  shadow-utils (useradd/chpasswd) emit AUDIT_ADD_USER/AUDIT_USER_MGMT records
+#                    to the kernel audit log for the account creation (issue #170); without it the
+#                    first-admin creation is not audited. The AF_NETLINK the record needs is
+#                    already permitted by RestrictAddressFamilies above.
 # Everything else (CAP_SYS_ADMIN, CAP_NET_*, CAP_SYS_TIME, …) is dropped.
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID CAP_SETUID CAP_SETGID
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE
 # A conservative system-service syscall allowlist covers bash, useradd/chpasswd, the D-Bus
 # clients and the coreutils the broker uses (mv/rm/mkdir/sync/date/head/id); the dangerous
 # groups (@mount, @swap, @reboot, @module, @obsolete, raw I/O) are not in it.
