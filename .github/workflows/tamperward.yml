@@ -1,0 +1,66 @@
+# Protected by .tamperward.yml (ci). This runs the TamperWard tool itself as a
+# merge-authority gate, over the PR's commit range.
+name: tamperward
+
+# The diff-time protected-surface gate (.tamperward.yml): the same deterministic
+# engine as the agent hook and pre-commit, run over the PR's commit range, so a
+# change that would delete a test, skip it, weaken an assertion, lower coverage,
+# rewrite a trusted fixture, or tamper with CI/hooks is caught here rather than in
+# the booted result. A block clears ONLY via the out-of-band label
+# `tamperward:allow:<rule>@<head-sha>` applied by someone with triage access or
+# higher — never a file the PR itself can commit.
+#
+# labeled/unlabeled re-run the gate because the sign-off is read from the EVENT
+# payload: a label applied after a failure could otherwise never take effect, and
+# revoking a sign-off must re-block rather than linger green.
+#
+# Scope note (WardOS): this adds the diff-time `check`. Pristine re-execution of
+# the verify suite (`tamperward verify`, from .tamperward.yml's `verify.command`)
+# needs the full Rust + bubblewrap toolchain, and the identical command
+# (`bash scripts/verify/tamperward.sh`) is already run on the PR head by the
+# `verify` job in verify.yml; wiring the base-pristine `verify` step here is a
+# follow-up. To make this the merge authority you must ALSO, in branch protection,
+# require this check AND enable "Require review from Code Owners" — a
+# `pull_request` workflow runs from the PR's own head, so without that a PR could
+# replace the gate and still present a green required check.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  tamperward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The gate is fetched from the registry at gate time from inside the checked-out
+    # pull request, and `npm` reads `.npmrc` from the working directory — a PR that
+    # commits one line, `registry=https://…`, would otherwise choose where the
+    # authority judging it is downloaded from. An environment variable outranks a
+    # project `.npmrc` in npm's config precedence, so this pins the SOURCE, not just
+    # the version string in the pin below.
+    env:
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the range diff needs both endpoints
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Resolve out-of-band sign-off from PR labels
+        id: oob
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          RULES="$(printf '%s' "$LABELS" | jq -r '.[] | select(startswith("tamperward:allow:")) | sub("^tamperward:allow:"; "")' | paste -sd, -)"
+          echo "rules=$RULES" >> "$GITHUB_OUTPUT"
+      - name: Tamperward gate (diff-time)
+        env:
+          TAMPERWARD_OOB_SIGNOFF: ${{ steps.oob.outputs.rules }}
+          # Binds each approval to the commit it was granted for: labels persist
+          # across pushes, so an unbound one would clear every later finding on the
+          # same PR. Labels must read tamperward:allow:<rule>@<head-sha>.
+          TAMPERWARD_OOB_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: npx --yes tamperward@2.10.3 check --diff "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
