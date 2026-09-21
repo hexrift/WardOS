@@ -9,6 +9,7 @@
 //! wrote; `--dry-run` reports the plan and touches nothing.
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -250,16 +251,34 @@ fn dir_argument(dir: &Path) -> String {
 }
 
 /// Write `content` to `path` unless the file exists; `dry` only reports.
+///
+/// A cloned project directory is untrusted content, not just an unwritten disk: it can
+/// ship a dangling symlink at one of these paths, and `Path::exists` follows symlinks
+/// and reports `false` for a dangling one. `symlink_metadata` sees the link itself, so
+/// any pre-existing node here — dangling or not — counts as present and is left alone.
+/// The write itself additionally opens with `create_new` (`O_EXCL`), so even a link
+/// planted in the window between that check and this open is refused, not followed.
 fn write_new(path: &Path, content: &str, dry: bool) -> Result<Outcome> {
-    if path.exists() {
+    if path.symlink_metadata().is_ok() {
         return Ok(Outcome::Kept);
     }
-    if !dry {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-        }
-        std::fs::write(path, content).map_err(|e| io(path, e))?;
+    if dry {
+        return Ok(Outcome::Written);
     }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(Outcome::Kept),
+        Err(e) => return Err(io(path, e)),
+    };
+    file.write_all(content.as_bytes())
+        .map_err(|e| io(path, e))?;
     Ok(Outcome::Written)
 }
 
@@ -274,6 +293,20 @@ fn ignore_sessions(dir: &Path, dry: bool) -> Result<Outcome> {
         return Ok(Outcome::Skipped("not a git repository".to_owned()));
     }
     let path = dir.join(".gitignore");
+    // Unlike the template files above, `.gitignore` is meant to be read and appended
+    // to when it already exists — so this can't just refuse any pre-existing node. A
+    // `.gitignore` that already exists as a symlink is exactly the attacker-controlled
+    // case (a hostile clone can ship one aimed anywhere), so that one case is refused;
+    // a plain file or an absent path both proceed as before.
+    if path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(Error::Project(format!(
+            "{}: refusing to write through a symlink",
+            path.display()
+        )));
+    }
     let existing = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -431,7 +464,7 @@ pub fn find_tamperward(path_var: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
 
@@ -584,6 +617,53 @@ mod tests {
             "/.ward/\n",
             "already covered"
         );
+    }
+
+    #[test]
+    fn refuses_to_write_a_template_through_a_pre_planted_symlink() {
+        // A cloned project can ship a dangling symlink at one of `write_new`'s paths.
+        // `Path::exists` would report that as absent and `std::fs::write` would follow
+        // it, so this must never create or touch whatever the link points at.
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("clobbered");
+        std::fs::create_dir_all(dir.path().join(".ward")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".ward/policy.yaml")).unwrap();
+
+        let report = run(&options(dir.path(), state.path())).unwrap();
+        assert!(!target.exists(), "the symlink's target must not be created");
+        assert!(
+            dir.path()
+                .join(".ward/policy.yaml")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted symlink itself is left untouched"
+        );
+        let policy_step = report
+            .steps
+            .iter()
+            .find(|s| s.path == ".ward/policy.yaml")
+            .unwrap();
+        assert_eq!(policy_step.outcome, Outcome::Kept);
+    }
+
+    #[test]
+    fn refuses_to_append_the_gitignore_line_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("clobbered");
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".gitignore")).unwrap();
+
+        let Err(err) = run(&options(dir.path(), state.path())) else {
+            panic!("expected the planted symlink to be refused");
+        };
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!target.exists(), "the symlink's target must not be created");
     }
 
     #[test]

@@ -65,6 +65,22 @@ pub fn set(state: &Path, name: &str, value: &str) -> Result<PathBuf> {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| io(&dir, e))?;
     let path = gateway::vault_file(state, name);
+    // The directory above is tightened, not trusted; the file itself needs the same
+    // treatment. `create(true)` alone follows a pre-existing symlink, so a name an
+    // attacker could plant ahead of the user's first `set` (e.g. in a shared or
+    // reused state dir) would redirect the plaintext value into whatever the link
+    // points at instead of refusing. A vault entry is expected to sometimes already
+    // exist as a real file (re-running `set` updates it), so unlike `ward init`'s
+    // templates this can't use `create_new` outright — only a symlink is refused.
+    if path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(Error::Project(format!(
+            "{}: refusing to write through a symlink",
+            path.display()
+        )));
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -208,7 +224,7 @@ fn read_secret(prompt: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::panic)]
 
     use super::*;
 
@@ -243,6 +259,38 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "sk-two\n");
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&dir(state.path())), 0o700);
+    }
+
+    #[test]
+    fn refuses_to_write_the_secret_through_a_pre_planted_symlink() {
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("clobbered");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir(state.path()))
+            .unwrap();
+        std::os::unix::fs::symlink(&target, gateway::vault_file(state.path(), "GITHUB_TOKEN"))
+            .unwrap();
+
+        let Err(err) = set(state.path(), "GITHUB_TOKEN", "ghp-secret") else {
+            panic!("expected the planted symlink to be refused");
+        };
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(
+            !target.exists(),
+            "the secret must never reach the link's target"
+        );
+
+        // A real, previously-stored value is still replaced in place (no symlink).
+        std::fs::remove_file(gateway::vault_file(state.path(), "GITHUB_TOKEN")).unwrap();
+        set(state.path(), "GITHUB_TOKEN", "ghp-first").unwrap();
+        set(state.path(), "GITHUB_TOKEN", "ghp-second").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(gateway::vault_file(state.path(), "GITHUB_TOKEN")).unwrap(),
+            "ghp-second\n"
+        );
     }
 
     #[test]
