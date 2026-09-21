@@ -314,6 +314,43 @@ fn materialize_refuses_writing_through_a_symlink_ancestor() {
     assert!(!Path::new("/tmp/pwn").exists());
 }
 
+/// Whatever a capture records, the manifest must describe the blobs it stored:
+/// every file/symlink entry's size equals the length of its stored blob and
+/// every referenced digest resolves in the CAS. This is the invariant the
+/// authoritative-content fix upholds; a `cat` (which re-hashes on read) standing
+/// in for materialisation must never see a `NotFound` or a size mismatch.
+#[test]
+fn every_manifest_entry_size_matches_its_resolvable_blob() {
+    let cas = tempdir().unwrap();
+    let store = SnapshotStore::open(cas.path()).unwrap();
+    let dir = tempdir().unwrap();
+    write_file(dir.path(), b"a", b"one");
+    write_file(dir.path(), b"b/c", b"twelve bytes");
+    write_file(dir.path(), b"empty", b"");
+    std::os::unix::fs::symlink("a", dir.path().join("link")).unwrap();
+
+    let id = store
+        .store_snapshot(dir.path(), SnapshotRole::Entry, CaptureOptions::default())
+        .unwrap();
+    let manifest = store.manifest(id).unwrap();
+
+    for e in manifest.entries().iter().filter(|e| e.content.is_some()) {
+        let rel = p(&e.path);
+        let bytes = store
+            .cat(id, rel)
+            .unwrap_or_else(|err| panic!("{rel:?} references an unresolvable blob: {err:?}"));
+        assert_eq!(
+            e.size,
+            bytes.len() as u64,
+            "{rel:?}: manifest size must equal its stored blob length"
+        );
+    }
+
+    // And the whole tree materialises without a NotFound.
+    let dest = tempdir().unwrap();
+    store.materialize(id, dest.path()).unwrap();
+}
+
 fn blob_count(cas: &Path) -> usize {
     let mut n = 0;
     for shard in fs::read_dir(cas.join("blobs")).unwrap() {
