@@ -78,23 +78,65 @@ PY
     return 1
   fi
 }
-# Cross-component fail-closed inhibit (#119 review): the dev-seed transaction journal (image
-# escape hatch, wardos-dev-seed) is present ONLY while a dev-seed account transaction is
-# unresolved/interrupted — meaning the machine may hold a residual wheel account with NO
-# provisioned marker. Neither provisioning path may proceed that boot: launching the canonical
-# provisioning UI could create a SECOND administrator over the orphan, and presenting the greeter
-# would be the very "residual admin + no way in / wrong way in" state the guards exist to prevent.
-# So guard EARLY (before either path) and FAIL CLOSED — same discipline as the marker guard:
-# refuse and exit non-zero so greetd restarts the session (VT-switch recovery stays available).
-# wardos-dev-seed's reconcile-on-entry removes the orphan and clears the journal on the NEXT boot
-# BEFORE anything else; only then does this guard pass and provisioning/greeter proceed.
+# Cross-component fail-closed inhibit (#119 review, refined by #152): the dev-seed transaction
+# journal (image escape hatch, wardos-dev-seed) is normally present ONLY while a dev-seed account
+# transaction is unresolved/interrupted — meaning the machine may hold a residual wheel account
+# with NO provisioned marker. In THAT state neither provisioning path may proceed this boot:
+# launching the canonical provisioning UI could create a SECOND administrator over the orphan,
+# and presenting the greeter would be the very "residual admin + no way in / wrong way in" state
+# the guards exist to prevent.
+#
+# But the marker is the transaction's durable commit point (wardos-provisiond / wardos-dev-seed
+# both write it last, then best-effort clear this journal). A journal that is STILL present once
+# the marker is ALSO present cannot be that unresolved pre-commit state — it is a stale leftover
+# of the post-commit journal clear itself: a crash/power-loss between the marker landing and the
+# journal being removed, or a failed directory fsync inside that removal. Nothing downstream of a
+# committed marker should stay blocked forever by an artifact that exists only to protect the
+# PRE-commit window (#152) — that would leave a fully provisioned machine permanently unloginable
+# via the greeter. So: marker present → the journal is provably stale; clear it best-effort (loud
+# on failure, never fatal — the marker already proves provisioning succeeded) and proceed exactly
+# as an unprovisioned dev-seed reconcile would have. Marker absent → keep today's discipline
+# unchanged: guard EARLY (before either path) and FAIL CLOSED, same as the marker guard itself.
 dev_seed_journal="${WARDOS_DEV_SEED_JOURNAL:-/var/lib/wardos/dev-seed.journal}"
+
+# Durable-remove helper local to this thin selector script (unlike the broker/dev-seed
+# transaction scripts, it has no fsync_path/remove_durable of its own). BEST-EFFORT, MAY
+# LEGITIMATELY FAIL, AND IS PURELY OPPORTUNISTIC — never load-bearing: this selector runs as
+# the unprivileged, locked `greeter` user (greetd's session command), while the dev-seed
+# journal is created by wardos-dev-seed running as ROOT in a root-owned directory
+# (image/rootfs/etc/greetd/config.toml), so an unprivileged `rm -f` against it can fail with
+# EACCES every time in production. There is NO other, privileged cleanup path for this case
+# (owner review): wardos-dev-seed's own unit is gated
+# `ConditionPathExists=!/var/lib/wardos/provisioned`, so it never even starts once the marker
+# this branch requires is present — a stale post-commit journal is therefore genuinely,
+# permanently inert once the marker exists, not "eventually reconciled". The caller proceeds
+# to run_greeter regardless of this helper's outcome either way — but that outcome is reported
+# HONESTLY: an rm -f failure is never silently treated as success (a bare
+# `rm -f path 2>/dev/null` with the exit status discarded would do exactly that, since a no-op
+# directory fsync afterward "succeeds" whether or not the file was actually removed).
+remove_best_effort() {
+  local path=$1
+  if rm -f "$path" 2>/dev/null; then
+    if ! sync "$(dirname "$path")" 2>/dev/null; then
+      echo "wardos-greetd-session: removed $path but could not durably confirm it (parent directory fsync failed); it is inert either way now that the marker is present" >&2
+    fi
+  else
+    echo "wardos-greetd-session: could not remove $path (likely the root/greeter permission boundary — this selector runs unprivileged, and nothing privileged reconciles this case); leaving it in place, but it is inert now that the marker is present" >&2
+  fi
+}
+
+if [[ -e "$marker" ]]; then
+  if [[ -e "$dev_seed_journal" ]]; then
+    echo "wardos-greetd-session: the provisioned marker is present and a dev-seed transaction journal ($dev_seed_journal) is also present; the marker is the durable commit point so this journal is a stale leftover of an interrupted post-commit cleanup — clearing it and proceeding to the greeter" >&2
+    remove_best_effort "$dev_seed_journal"
+  fi
+  run_greeter
+fi
+
 if [[ -e "$dev_seed_journal" ]]; then
   echo "wardos-greetd-session: an unresolved dev-seed transaction journal is present ($dev_seed_journal); refusing to launch the provisioning UI or the greeter and failing closed so greetd restarts (dev-seed recovery required — the next boot reconciles it first)" >&2
   exit 1
 fi
-
-[[ -e "$marker" ]] && run_greeter
 require_pty_allocator || exit 1
 
 # The provisioning UI exits with this status to ask for a cage relaunch under the chosen layout.
