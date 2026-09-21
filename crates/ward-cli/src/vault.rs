@@ -7,7 +7,7 @@
 //! value is never printed back: `list` says whether a key is set, and nothing more.
 
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
 use ward_daemon::{Error, Result, gateway};
@@ -18,6 +18,54 @@ fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Error {
         path: path.into(),
         source,
     }
+}
+
+/// Open `dir` as a verified, non-symlink real directory, creating it (mode `0o700`)
+/// first if it is absent — its own parent must already exist. Returns a directory fd
+/// so the caller can create the vault entry beneath *that exact directory instance*
+/// via `openat`: an fd-relative open resolves against the fd's inode, not whatever
+/// name currently points there, so it stays correct even if `dir` is renamed away and
+/// replaced with a symlink immediately after this call returns — a plain
+/// check-then-reopen-by-path could not close that window.
+///
+/// `O_NOFOLLOW` alone (no `O_DIRECTORY`) is deliberate: combined, Linux reports a
+/// symlink-to-a-directory as `ENOTDIR` — the `O_DIRECTORY` check runs first and a
+/// symlink is never a directory type — indistinguishable from a plain non-directory
+/// file. Checked apart, a symlink is reliably `ELOOP`, and a non-directory file is
+/// caught by the explicit `is_dir` check below.
+fn open_real_dir(dir: &Path, mode: u32) -> Result<rustix::fd::OwnedFd> {
+    match std::fs::DirBuilder::new().mode(mode).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(io(dir, e)),
+    }
+    let fd = rustix::fs::open(
+        dir,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|e| {
+        if e == rustix::io::Errno::LOOP {
+            Error::Project(format!(
+                "{}: refusing to use a symlink as a directory",
+                dir.display()
+            ))
+        } else {
+            io(dir, e.into())
+        }
+    })?;
+    let st = rustix::fs::fstat(&fd).map_err(|e| io(dir, e.into()))?;
+    if !rustix::fs::FileType::from_raw_mode(st.st_mode).is_dir() {
+        return Err(Error::Project(format!(
+            "{}: refusing to use a non-directory as the vault directory",
+            dir.display()
+        )));
+    }
+    // A directory that existed with looser permissions is tightened, not trusted —
+    // now that it is confirmed real, through the fd (fchmod) rather than the path.
+    rustix::fs::fchmod(&fd, rustix::fs::Mode::from_raw_mode(mode))
+        .map_err(|e| io(dir, e.into()))?;
+    Ok(fd)
 }
 
 /// The keys the proxy knows how to inject, listed first by `list` even when unset.
@@ -59,56 +107,40 @@ pub fn set(state: &Path, name: &str, value: &str) -> Result<PathBuf> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
     }
-    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // A directory that existed with looser permissions is tightened, not
-            // trusted — but only once confirmed real. `create` above never follows a
-            // symlink for the final component (it fails `AlreadyExists` instead), and
-            // `symlink_metadata` here never follows one either, so a pre-planted
-            // `vault -> /somewhere/real` (e.g. in a shared or reused state dir) is
-            // refused rather than silently written through.
-            let meta = dir.symlink_metadata().map_err(|e| io(&dir, e))?;
-            if !meta.is_dir() {
-                return Err(Error::Project(format!(
-                    "{}: refusing to use a symlink as the vault directory",
-                    dir.display()
-                )));
-            }
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| io(&dir, e))?;
-        }
-        Err(e) => return Err(io(&dir, e)),
-    }
+    let dir_fd = open_real_dir(&dir, 0o700)?;
     let path = gateway::vault_file(state, name);
-    // The directory above is real, not just trusted; the file itself needs the same
-    // treatment. A vault entry is expected to sometimes already exist as a real file
-    // (re-running `set` updates it), so unlike `ward init`'s templates this can't
-    // refuse every pre-existing node — only a symlink. `O_NOFOLLOW` makes the open
-    // itself the one thing that decides that, rather than a separate, racable check:
-    // a name an attacker planted ahead of the user's first `set` makes this open fail
-    // with `ELOOP` instead of following it into whatever the link points at.
-    let mut file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-    {
-        Ok(file) => file,
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+    // A vault entry is expected to sometimes already exist as a real file (re-running
+    // `set` updates it), so unlike `ward init`'s templates this can't refuse every
+    // pre-existing node — only a symlink. Creating it beneath the already-verified
+    // directory fd (`openat`, not a second pathname lookup) with `O_NOFOLLOW` makes
+    // this one call the entire decision: a name an attacker planted ahead of the
+    // user's first `set` makes it fail with `ELOOP` instead of following it into
+    // whatever the link points at, and nothing between validating `dir` and this call
+    // can redirect where the entry actually lands.
+    let file_fd = match rustix::fs::openat(
+        &dir_fd,
+        name,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::TRUNC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    ) {
+        Ok(fd) => fd,
+        Err(e) if e == rustix::io::Errno::LOOP => {
             return Err(Error::Project(format!(
                 "{}: refusing to write through a symlink",
                 path.display()
             )));
         }
-        Err(e) => return Err(io(&path, e)),
+        Err(e) => return Err(io(&path, e.into())),
     };
     // Permissions go through the already-open fd (fchmod), not the path again, so a
     // node swapped in after the open above can't be the one that gets chmod'd 0600.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| io(&path, e))?;
+    rustix::fs::fchmod(&file_fd, rustix::fs::Mode::from_raw_mode(0o600))
+        .map_err(|e| io(&path, e.into()))?;
+    let mut file: std::fs::File = file_fd.into();
     writeln!(file, "{value}").map_err(|e| io(&path, e))?;
     Ok(path)
 }
@@ -246,6 +278,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn mode(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777

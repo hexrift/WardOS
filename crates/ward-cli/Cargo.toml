@@ -22,6 +22,7 @@ serde_json = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -251,28 +251,48 @@ fn dir_argument(dir: &Path) -> String {
     }
 }
 
-/// Create `dir` if it is absent; refuse to reuse it if it already exists as anything
-/// other than a real, non-symlink directory (its parent must already exist — every
-/// caller here is one level under the already-created, canonicalized project root).
+/// Open `dir` as a verified, non-symlink real directory, creating it first if it is
+/// absent (its own parent must already exist — every caller here is one level under
+/// an already-created, canonicalized directory). Returns a directory fd so the caller
+/// can create a leaf beneath *that exact directory instance* via `openat`: unlike a
+/// pathname, an fd-relative open resolves against the fd's inode, not whatever name
+/// currently points there, so it stays correct even if `dir` is renamed away and
+/// replaced with a symlink immediately after this call returns.
 ///
-/// Plain `create_dir`/`create_dir_all` treat an existing symlink-to-directory as
-/// "already there" and silently resolve through it on every open beneath it — exactly
-/// the shape of a hostile project shipping `.ward -> /somewhere/real` or
-/// `.tamperward -> …`, which `write_new`'s own `O_EXCL` on the leaf file can't catch
-/// since `O_NOFOLLOW`/`O_EXCL` only ever govern the final path component.
-fn ensure_real_dir(dir: &Path) -> Result<()> {
+/// `O_NOFOLLOW` alone (no `O_DIRECTORY`) is deliberate: combined, Linux reports a
+/// symlink-to-a-directory as `ENOTDIR` — the `O_DIRECTORY` check runs first and a
+/// symlink is never a directory type — which would be indistinguishable from a plain
+/// non-directory file. Checked apart, a symlink is reliably `ELOOP` here, and a
+/// non-directory file is caught by the explicit `is_dir` check below.
+fn open_real_dir(dir: &Path) -> Result<rustix::fd::OwnedFd> {
     match std::fs::create_dir(dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match dir.symlink_metadata() {
-            Ok(meta) if meta.is_dir() => Ok(()),
-            Ok(_) => Err(Error::Project(format!(
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(io(dir, e)),
+    }
+    let fd = rustix::fs::open(
+        dir,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|e| {
+        if e == rustix::io::Errno::LOOP {
+            Error::Project(format!(
                 "{}: refusing to use a symlink as a directory",
                 dir.display()
-            ))),
-            Err(e) => Err(io(dir, e)),
-        },
-        Err(e) => Err(io(dir, e)),
+            ))
+        } else {
+            io(dir, e.into())
+        }
+    })?;
+    let st = rustix::fs::fstat(&fd).map_err(|e| io(dir, e.into()))?;
+    if !rustix::fs::FileType::from_raw_mode(st.st_mode).is_dir() {
+        return Err(Error::Project(format!(
+            "{}: refusing to use a non-directory as a directory",
+            dir.display()
+        )));
     }
+    Ok(fd)
 }
 
 /// Write `content` to `path` unless the file exists; `dry` only reports.
@@ -281,8 +301,9 @@ fn ensure_real_dir(dir: &Path) -> Result<()> {
 /// ship a dangling symlink at one of these paths, and `Path::exists` follows symlinks
 /// and reports `false` for a dangling one. `symlink_metadata` sees the link itself, so
 /// any pre-existing node here — dangling or not — counts as present and is left alone.
-/// The write itself additionally opens with `create_new` (`O_EXCL`), so even a link
-/// planted in the window between that check and this open is refused, not followed.
+/// The leaf is then created beneath a freshly opened, verified parent directory fd
+/// (`open_real_dir`) with `O_EXCL | O_NOFOLLOW`, so neither the parent nor the leaf
+/// can be redirected through a symlink planted at any point up to that single call.
 fn write_new(path: &Path, content: &str, dry: bool) -> Result<Outcome> {
     if path.symlink_metadata().is_ok() {
         return Ok(Outcome::Kept);
@@ -290,18 +311,26 @@ fn write_new(path: &Path, content: &str, dry: bool) -> Result<Outcome> {
     if dry {
         return Ok(Outcome::Written);
     }
-    if let Some(parent) = path.parent() {
-        ensure_real_dir(parent)?;
-    }
-    let mut file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(Outcome::Kept),
-        Err(e) => return Err(io(path, e)),
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| Error::Project(format!("{}: not a file path", path.display())))?;
+    let dir_fd = open_real_dir(parent)?;
+    let file_fd = match rustix::fs::openat(
+        &dir_fd,
+        leaf,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::from_raw_mode(0o666),
+    ) {
+        Ok(fd) => fd,
+        Err(e) if e == rustix::io::Errno::EXIST => return Ok(Outcome::Kept),
+        Err(e) => return Err(io(path, e.into())),
     };
+    let mut file: std::fs::File = file_fd.into();
     file.write_all(content.as_bytes())
         .map_err(|e| io(path, e))?;
     Ok(Outcome::Written)
