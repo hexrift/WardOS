@@ -249,15 +249,19 @@ impl Walker<'_> {
         } else if ft.is_file() {
             self.stats.files_total += 1;
             let size = meta.len();
-            // Check the budget against the file's *claimed* size before reading
-            // any of its bytes: this is a cheap early reject for a file whose
-            // metadata already declares it over budget (issue #160). It is not
-            // sufficient on its own, though: the tree is agent-controlled, so the
-            // file can grow or be replaced between this `symlink_metadata` and the
-            // read that follows (a TOCTOU). The authoritative bound therefore lives
-            // in `hash_file`, which reads at most `remaining + 1` bytes and rejects
-            // overflow before hashing or storing anything — capping peak allocation
-            // regardless of what `metadata().len()` claimed here.
+            // Cheap, non-authoritative early reject against the file's *claimed*
+            // size, before opening it: skips a doomed file open/read when metadata
+            // alone already declares it over budget (issue #160). It is not
+            // sufficient on its own, and not only because of the fresh-read TOCTOU
+            // (the tree is agent-controlled, so the file can grow or be replaced
+            // between this `symlink_metadata` and the read that follows): a plain
+            // incremental cache hit never opens the file at all, and its cached
+            // `content_len` can exceed this file's *current* `meta.len()` (e.g. the
+            // file was larger when the cache was warmed, or shrank afterward without
+            // invalidating the `(mtime, meta_len)` key some other file's identical
+            // metadata happens to share) — so a pre-check against `size` can pass
+            // while the entry actually pushed is over budget. The authoritative
+            // check is the one below, against `hash_file`'s real `read_len`.
             let prospective_total = self.total_bytes.saturating_add(size);
             if prospective_total > self.opts.max_bytes {
                 return Err(SnapshotError::BudgetExceeded(self.opts.max_bytes));
@@ -278,7 +282,16 @@ impl Walker<'_> {
             // every manifest file size equals the length of the blob that was
             // hashed and stored under `digest`.
             let (digest, read_len) = self.hash_file(&abs, &meta)?;
-            self.total_bytes = self.total_bytes.saturating_add(read_len);
+            // The authoritative budget check, against `read_len` rather than the
+            // pre-check's `size`: a plain incremental cache hit (see `hash_file`)
+            // returns a cached `content_len` without ever opening the file, so this
+            // is the only gate that bounds it. Reject before the entry is accepted
+            // into the manifest or `total_bytes` advances.
+            let prospective_total = self.total_bytes.saturating_add(read_len);
+            if prospective_total > self.opts.max_bytes {
+                return Err(SnapshotError::BudgetExceeded(self.opts.max_bytes));
+            }
+            self.total_bytes = prospective_total;
             self.push(rel, EntryType::File, mode, read_len, Some(digest));
         } else if ft.is_fifo() || ft.is_socket() || ft.is_block_device() || ft.is_char_device() {
             self.push(rel, EntryType::Unsupported, mode, 0, None);
@@ -816,5 +829,62 @@ mod authoritative_content_tests {
                 String::from_utf8_lossy(&entry.path)
             );
         }
+    }
+
+    /// A plain incremental cache hit — current `(mtime, meta_len)` matches a warm
+    /// cache entry and the cached blob is already present in this CAS — never
+    /// opens the file, so `hash_file` returns the cached `content_len` without any
+    /// bounded read. The pre-check ahead of `hash_file` only ever sees the small
+    /// *current* `meta.len()`, so it passes; if the cached `content_len` is larger
+    /// (the file was bigger when the cache was warmed, then shrank without the
+    /// validation key changing), only a check against the cache hit's real
+    /// `read_len` after `hash_file` returns can catch it. Against the pre-fix
+    /// code — which only checked `size` before calling `hash_file` and never
+    /// re-checked `read_len` after — this cache hit was accepted, silently
+    /// pushing a 100-byte entry and a 100-byte `total_bytes` under a 50-byte
+    /// budget.
+    #[test]
+    fn a_stale_cache_hit_over_budget_is_rejected_even_though_current_metadata_is_small() {
+        let work = tempfile::tempdir().unwrap();
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(cas_dir.path()).unwrap();
+
+        let target = work.path().join("f");
+        fs::write(&target, vec![b'a'; 1]).unwrap();
+        let meta = fs::symlink_metadata(&target).unwrap();
+        let mtime = meta.modified().unwrap();
+
+        // A 100-byte blob, already stored, standing in for what the cache warmed
+        // against this file before it shrank to 1 byte (or any other reason the
+        // cached content_len now exceeds the current metadata length while the
+        // `(mtime, meta_len)` validation key still matches).
+        let stale_content = vec![b'z'; 100];
+        let stale_digest = cas.put_blob(&stale_content).unwrap();
+        assert!(cas.has_blob(stale_digest), "precondition: blob is present");
+
+        let mut cache = HashCache::new();
+        cache.map.insert(
+            target.clone(),
+            CacheEntry {
+                mtime,
+                meta_len: meta.len(),
+                content_len: stale_content.len() as u64,
+                digest: stale_digest,
+            },
+        );
+
+        let opts = CaptureOptions {
+            incremental: true,
+            max_bytes: 50,
+            ..CaptureOptions::default()
+        };
+
+        let err = capture_tree(Some(&cas), work.path(), opts, &mut cache, None).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::BudgetExceeded(50)),
+            "a cache hit whose cached content_len (100) exceeds max_bytes (50) must be \
+             rejected even though the current metadata length (1) alone would pass the \
+             pre-check, got {err:?}"
+        );
     }
 }
