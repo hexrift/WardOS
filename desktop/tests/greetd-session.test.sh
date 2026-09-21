@@ -134,7 +134,9 @@ assert_logged '^cage -s -- gtkgreet '
 #      that with a stubbed `rm` that always fails (this test process itself can otherwise remove
 #      anything under $TMP, so only a stub proves the boundary deterministically). The selector
 #      must still reach the greeter (the marker is authoritative regardless of cleanup success —
-#      the durable cleanup is wardos-dev-seed's job, proven separately in dev-seed.test.sh's T6),
+#      there is no other, privileged cleanup path: wardos-dev-seed's own unit is gated
+#      `ConditionPathExists=!<marker>`, so a stale post-commit journal is genuinely permanently
+#      inert once the marker exists, never actively reconciled by anything),
 #      and it must say HONESTLY that the removal failed rather than discarding rm's exit status
 #      and implying success (the previous `rm -f "$path" 2>/dev/null` bug this replaces).
 : >"$MOCK_LOG"

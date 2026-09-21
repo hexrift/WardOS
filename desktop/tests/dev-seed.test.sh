@@ -334,12 +334,48 @@ run_seed
 assert_file "$WARDOS_PROVISIONED_MARKER"
 export WARDOS_DEV_SEED_JOURNAL="$TMP/dev-seed.journal" # back to the clean journal path after jn_dir
 
-# --- T6 [#152]: a STALE journal left behind by an ALREADY-COMMITTED marker must be reconciled
-# away here — before the idempotency exit — so it never permanently blocks the downstream
-# guards that treat ANY dev-seed journal as an unresolved transaction (the broker socket's
-# ConditionPathExists and wardos-greetd-session's early guard). This is NOT an unresolved
-# transaction: the marker is the commit point and it is already present, so the seed must not
-# touch the account (no useradd, no userdel) — only clear the stale journal and exit cleanly.
+# --- T4d [#153d, owner follow-up review]: reconcile_pending applies the SAME account_db_durable
+# gate before clearing a journal naming an already-gone PRIOR pending account — not just
+# rollback_account. A journal names 'oldguy' (a DIFFERENT, prior interrupted transaction) that
+# really exists; this run seeds 'devuser'. userdel of the orphan succeeds, but the account
+# database's own durability cannot be confirmed, so the journal must stay untouched and this
+# attempt must refuse — never fall through to seeding devuser over an unconfirmed reconcile.
+seed_stateful_mocks
+reset_state
+printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
+cred_on
+: >"$acct_dir/oldguy"          # the orphan from a prior interrupted transaction really exists
+printf 'oldguy\n' >"$WARDOS_DEV_SEED_JOURNAL"
+# shellcheck disable=SC2016
+mock sync 'case "$1" in "/etc/passwd") exit 1 ;; esac; exit 0'
+recon_err="$TMP/dev-seed-reconcile.err"
+rc=0
+bash "$seed" 2>"$recon_err" || rc=$?
+[[ $rc -ne 0 ]] || fail "T4d: reconcile must refuse when account-database durability is unconfirmed"
+assert_logged '^userdel -r oldguy$'            # the orphan really was removed
+[[ ! -e "$acct_dir/oldguy" ]] || fail "T4d: the orphan is really gone"
+assert_not_logged '^useradd'                   # devuser must never be created over an unresolved reconcile
+assert_file "$WARDOS_DEV_SEED_JOURNAL"          # unconfirmed durability → the journal must stay untouched
+grep -Fiq 'database' "$recon_err" ||
+  fail "T4d: refusal must explain the account-database durability could not be confirmed; got: $(cat "$recon_err")"
+# Once storage recovers, the SAME preserved journal reconciles and devuser seeds cleanly.
+mock sync 'exit 0'
+: >"$MOCK_LOG"
+run_seed
+[[ $rc -eq 0 ]] || fail "T4d: the next attempt must reconcile the preserved journal and seed cleanly; rc=$rc"
+[[ "$(acct_count)" -eq 1 ]] || fail "T4d: recovery must yield exactly one admin: $(ls "$acct_dir")"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+[[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "T4d: the preserved journal must be cleared once reconciled"
+
+# --- T6 [#152, owner follow-up review]: a STALE journal left behind by an ALREADY-COMMITTED
+# marker is genuinely INERT, not actively reconciled here. This unit's own systemd condition
+# (ConditionPathExists=!<marker>) means ExecStart never runs once the marker exists in
+# production, so there is no privileged path in this script (or anywhere else) that could
+# safely clear such a journal — attempting one here would be dead code that never executes on
+# a real boot. The idempotency exit below must therefore fire on marker presence ALONE,
+# regardless of a stale journal alongside it, and must touch nothing: no useradd, no userdel,
+# no journal removal, no marker rewrite. (Recovery from this case is wardos-greetd-session's
+# job — see its own greetd-session.test.sh (b2)/(b3) — not this unit's.)
 seed_stateful_mocks
 reset_state
 printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
@@ -350,7 +386,7 @@ run_seed
 [[ $rc -eq 0 ]] || fail "T6: a stale journal alongside a committed marker must not fail the seed; rc=$rc"
 assert_not_logged '^useradd' # already provisioned: no new account
 assert_not_logged '^userdel' # the marker is genuinely committed; the account is NOT rolled back
-[[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "T6: the stale journal must be durably cleared"
+[[ -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "T6: a stale journal is inert, not this unit's to clear — it must be left untouched"
 assert_file "$WARDOS_PROVISIONED_MARKER"
 [[ -e "$acct_dir/devuser" ]] || fail "T6: the already-committed account must be left untouched"
 

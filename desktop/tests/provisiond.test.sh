@@ -414,6 +414,93 @@ mock userdel
 mock id 'exit 1'
 mock sync 'exit 0'
 
+# --- #153c [owner follow-up review]: account_db_durable's OWN directory-durability step must be
+# exercised too, not just individual-file content flushes. fsync(file) alone does not make a
+# shadow-utils rename durable — the containing directory (/etc) must be fsynced as well, the
+# same file-then-directory ordering write_durable/remove_durable already use. Fail ONLY the
+# fsync of "/etc" itself; every individual /etc/* file succeeds.
+export JN_DIR="$TMP/jn"
+rm -rf "$JN_DIR"
+mkdir -p "$JN_DIR"
+export WARDOS_PROVISION_JOURNAL="$JN_DIR/provision.journal"
+rb_acct_dir="$TMP/rb-accounts-etcdir"
+rm -rf "$rb_acct_dir"
+mkdir -p "$rb_acct_dir"
+export ACCT_DIR="$rb_acct_dir"
+# shellcheck disable=SC2016
+mock useradd 'u="${@: -1}"; : >"$ACCT_DIR/$u"'
+# shellcheck disable=SC2016
+mock id 'for a in "$@"; do case "$a" in -*) ;; *) if [[ -e "$ACCT_DIR/$a" ]]; then echo 1000; exit 0; else exit 1; fi ;; esac; done; exit 1'
+# shellcheck disable=SC2016
+mock userdel 'u="${@: -1}"; rm -f "$ACCT_DIR/$u"; exit 0'
+mock chpasswd 'exit 1' # force the mid-transaction failure so rollback runs
+# shellcheck disable=SC2016
+mock sync 'case "$1" in "/etc") exit 1 ;; esac; exit 0'
+: >"$MOCK_LOG"
+rb_err="$TMP/rollback-etcdir.err"
+out=$(printf 'ACCOUNT\njudy\nJudy\npw\n' | wardos-provisiond 2>"$rb_err")
+[[ "$out" == ERR* ]] || fail "#153c: the original chpasswd failure must still be reported; got: $out"
+[[ ! -e "$rb_acct_dir/judy" ]] || fail "#153c: userdel really removed the rolled-back account"
+assert_file "$WARDOS_PROVISION_JOURNAL" # /etc's own directory fsync failed → journal untouched
+grep -Fiq 'database' "$rb_err" ||
+  fail "#153c: an /etc directory-fsync failure must be reported as an unconfirmed account-database durability, not silently passed; got: $(cat "$rb_err")"
+mock sync 'exit 0'
+mock chpasswd
+out=$(printf 'ACCOUNT\nkyle\nKyle\npw\n' | wardos-provisiond)
+[[ "$out" == OK ]] || fail "#153c: a following request must reconcile the preserved journal and provision cleanly; got: $out"
+[[ ! -e "$WARDOS_PROVISION_JOURNAL" ]] || fail "#153c: the preserved journal must be cleared once reconciled"
+unset ACCT_DIR
+export WARDOS_PROVISION_JOURNAL="$TMP/provision.journal"
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK"
+mock useradd
+mock chpasswd
+mock userdel
+mock id 'exit 1'
+mock sync 'exit 0'
+
+# --- #153d [owner follow-up review]: reconcile_pending applies the SAME account_db_durable
+# gate before clearing a journal it finds naming an already-gone pending account — not just
+# rollback_account. Otherwise recovering from a PRIOR unresolved transaction reproduces the
+# exact #153 bug the rollback-path fix just closed: a userdel that "succeeded" but is not yet
+# durable, immediately followed by a durably cleared journal.
+recon_acct_dir="$TMP/recon-accounts"
+rm -rf "$recon_acct_dir"
+mkdir -p "$recon_acct_dir"
+export ACCT_DIR="$recon_acct_dir"
+: >"$recon_acct_dir/liam" # the pending account from a prior interrupted transaction really exists
+printf 'liam\n' >"$WARDOS_PROVISION_JOURNAL"
+# shellcheck disable=SC2016
+mock useradd 'u="${@: -1}"; : >"$ACCT_DIR/$u"'
+# shellcheck disable=SC2016
+mock id 'for a in "$@"; do case "$a" in -*) ;; *) if [[ -e "$ACCT_DIR/$a" ]]; then echo 1000; exit 0; else exit 1; fi ;; esac; done; exit 1'
+# shellcheck disable=SC2016
+mock userdel 'u="${@: -1}"; rm -f "$ACCT_DIR/$u"; exit 0' # the orphan really gets removed
+# shellcheck disable=SC2016
+mock sync 'case "$1" in "/etc/passwd") exit 1 ;; esac; exit 0' # account-database durability unconfirmed
+: >"$MOCK_LOG"
+out=$(printf 'ACCOUNT\nmia\nMia\npw\n' | wardos-provisiond)
+[[ "$out" == ERR* ]] || fail "#153d: reconcile must refuse when account-database durability is unconfirmed; got: $out"
+assert_logged '^userdel -r liam$'                       # the orphan really was removed
+[[ ! -e "$recon_acct_dir/liam" ]] || fail "#153d: the orphan is really gone"
+assert_not_logged '^useradd' # the new ACCOUNT must never proceed past an unresolved reconcile
+assert_file "$WARDOS_PROVISION_JOURNAL" # unconfirmed durability → the journal must stay untouched
+grep -Fiq 'database' <<<"$out" ||
+  fail "#153d: refusal must explain the account-database durability could not be confirmed; got: $out"
+# Once storage recovers, the SAME preserved journal reconciles (no orphan under that name any
+# more) and the new ACCOUNT proceeds.
+mock sync 'exit 0'
+out=$(printf 'ACCOUNT\nmia\nMia\npw\n' | wardos-provisiond)
+[[ "$out" == OK ]] || fail "#153d: a following request must reconcile the preserved journal and provision cleanly; got: $out"
+[[ -e "$recon_acct_dir/mia" ]] || fail "#153d: the following request must create the new admin"
+[[ ! -e "$WARDOS_PROVISION_JOURNAL" ]] || fail "#153d: the preserved journal must be cleared once reconciled"
+unset ACCT_DIR
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK"
+mock useradd
+mock chpasswd
+mock userdel
+mock id 'exit 1'
+mock sync 'exit 0'
+
 # KEYMAP persistence failure (#127 review item 2): if the chosen layout cannot be recorded
 # durably for the new user's Hyprland session, the broker must report an error, not OK — the
 # earlier "provisioning says success, first desktop gets a different layout" failure mode.

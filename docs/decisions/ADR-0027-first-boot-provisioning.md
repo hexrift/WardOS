@@ -121,15 +121,23 @@ through a broker rather than running privileged.** It generalises to later WardO
   place but whose directory `fsync` cannot be confirmed (even after one retry) is treated as
   **indeterminate** — the journal is kept and the connection replies *recovery-required* rather
   than acknowledging success, so a later power loss that drops the not-yet-durable marker is
-  reconciled (the orphan removed) on the next boot. A rollback's own journal cleanup never
-  outruns the account removal it records: `userdel` does not `fsync` its own writes to the
-  account database, so the journal — the only recovery record — is cleared only *after* that
-  database's own durability is independently confirmed (`/etc/passwd` &c., each `fsync`ed);
-  until then the journal is left completely untouched, never attempted, so a crash between the
-  two cannot leave a removal whose only record has already been discarded. Once that durability
-  is confirmed, a residual failure to clear the journal itself is provably harmless (retried
-  once, then reported rather than swallowed) — `reconcile_pending` safely tolerates a
-  resurrected journal naming an account already known to be durably gone.
+  reconciled (the orphan removed) on the next boot. Neither a rollback nor a reconcile's own
+  journal cleanup ever outruns the account removal it records: `userdel` does not `fsync` its
+  own writes to the account database, so the journal — the only recovery record — is cleared
+  only *after* that database's own durability is independently confirmed. Confirming durability
+  means more than flushing each file's content (`/etc/passwd`, `/etc/shadow`, `/etc/group`,
+  `/etc/gshadow`, `/etc/subuid`/`/etc/subgid` where present): `shadow-utils` commits each of
+  them by writing a temp file and renaming it into place — the same pattern `write_durable`/
+  `remove_durable` use elsewhere — and a rename's directory entry is not durable until the
+  containing directory (`/etc`) is itself `fsync`ed, so that runs too, after the files. Until
+  all of that succeeds the journal is left completely untouched, never attempted, in *both*
+  `rollback_account` (a fresh mid-transaction failure) and `reconcile_pending` (a prior
+  transaction found on the next attempt) — so a crash between an account removal and its
+  journal record cannot leave a removal whose only record has already been discarded, however
+  it was reached. Once that durability is confirmed, a residual failure to clear the journal
+  itself is provably harmless (retried once, then reported rather than swallowed) —
+  `reconcile_pending` safely tolerates a resurrected journal naming an account already known to
+  be durably gone.
 - **Transactional against power loss** — `ACCOUNT` creates the user and sets its password as one
   broker operation that rolls the half-created user back on failure. Every durable write uses the
   same ordering — write a **temp** file, **`fsync`** it, **`rename`** it into place, then
@@ -175,23 +183,21 @@ credentials file). The seed's behaviour matches the broker's account policy exac
 so on any unprovisioned boot the seed's reconcile-on-entry runs (removing an orphan from an
 interrupted prior seed) *before* canonical provisioning could start — the machine can never boot
 with a usable administrator while it still reads as unprovisioned, the window in which canonical
-provisioning would create a second administrator. Because that same unit already runs first on
-*every* boot, it also reconciles a state a downstream guard cannot itself tell apart from an
-unresolved transaction: a **stale journal left behind by its own already-committed marker** (its
-post-commit cleanup crashed, or lost the directory `fsync` that would have confirmed it). Both the
-broker socket's `ConditionPathExists=!…dev-seed.journal` and `wardos-greetd-session`'s early guard
-fail closed on *any* journal, by design, since neither can safely distinguish stale from
-unresolved on its own — so before its own idempotency check, `wardos-dev-seed` clears a journal
-found alongside an already-present marker (retried once), rather than leaving a valid,
-already-provisioned boot permanently unable to reach the greeter. `wardos-greetd-session` itself
-also checks the marker *first*: if it is present, any dev-seed journal is provably stale (a
-committed marker is the transaction's durable commit point) and a best-effort removal is
-attempted before proceeding to the greeter regardless of that removal's outcome — the selector
-runs as the unprivileged `greeter` user against a journal `wardos-dev-seed` created as root, so
-this removal may legitimately fail with EACCES in production; when it does, the failure is
-reported honestly (never silently discarded as if it had succeeded), and the authoritative,
-durably-confirmed cleanup remains `wardos-dev-seed`'s, above. The image build asserts no
-`dev-seed-password`
+provisioning would create a second administrator. That reconcile-on-entry is gated the same way
+the rest of the unit is (`ConditionPathExists=!/var/lib/wardos/provisioned`): it runs on every
+*unprovisioned* boot, but **not** once the marker exists — systemd never even starts `ExecStart`
+then. So a **stale journal left behind by its own already-committed marker** (its post-commit
+cleanup crashed, or lost the directory `fsync` that would have confirmed it) is *not* actively
+reconciled by this unit, or by any other privileged path — there isn't one. It is, instead,
+provably **inert**: `wardos-greetd-session` checks the marker *first*, and once it is present any
+leftover dev-seed journal cannot be the pre-commit unresolved-transaction state its own guard
+exists to catch (a committed marker is the transaction's durable commit point), so the selector
+proceeds to the greeter regardless. It makes a best-effort removal attempt on the way there — the
+selector runs as the unprivileged `greeter` user against a journal `wardos-dev-seed` created as
+root, so this may legitimately fail with EACCES in production, and when it does the failure is
+reported honestly (never silently discarded as if it had succeeded) rather than claimed as
+"cleaned up" — but nothing downstream depends on that attempt succeeding, and no future boot
+comes back to clear it either. The image build asserts no `dev-seed-password`
 file exists in any layer. The `disk` workflow's `user` input is blank by default (release disks
 are unprovisioned) and, when a dev sets it, it is passed as `image/build.sh --dev-seed-user NAME`
 (the `WARDOS_DEV_SEED_USER` build-arg), **not** a disk-build `--user`; the password is never baked
