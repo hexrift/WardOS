@@ -15,7 +15,7 @@ use ward_daemon::approvals::{host_of, service_name};
 use ward_daemon::describe::SessionDescription;
 use ward_daemon::render::{Tone, network_text, network_tone};
 use ward_events::{CapabilityKind, Decision, EventRecord, GrantScope, WardEvent};
-use ward_policy::{AccessMode, CapabilityManifest, CredentialRule, NetworkCapability, ServiceId};
+use ward_policy::{AccessMode, CapabilityManifest, NetworkCapability};
 
 use crate::panel::Group;
 use crate::settings::Row;
@@ -232,10 +232,10 @@ const fn access_word(mode: AccessMode) -> &'static str {
 fn denials(m: &CapabilityManifest) -> Vec<Row> {
     let structural = |label: &str| Row::new(label, "denied", Tone::Ok);
     let rule = |label: &str, service: &str| {
-        let value = match m.credentials.get(&ServiceId(service.to_owned())) {
-            None | Some(CredentialRule::Deny) => "denied",
-            Some(CredentialRule::Ask(_)) => "ask",
-            Some(CredentialRule::Allow(_)) => "allowed",
+        let value = match worst_credential_decision(m, service) {
+            ward_policy::Decision::Deny => "denied",
+            ward_policy::Decision::Ask => "ask",
+            ward_policy::Decision::Allow => "allowed",
         };
         let tone = if value == "denied" {
             Tone::Ok
@@ -251,6 +251,28 @@ fn denials(m: &CapabilityManifest) -> Vec<Row> {
         rule("Cloud creds", "cloud-*"),
         rule("Publish creds", "npm-publish"),
     ]
+}
+
+/// The most restrictive [`ward_policy::Decision`] among every credential rule
+/// whose service id falls under `service`'s prefix (its text with any
+/// trailing `*` stripped), evaluated through
+/// [`CapabilityManifest::credential_decision`].
+///
+/// A plain `m.credentials.get(&ServiceId(service))` lookup only ever sees a
+/// rule keyed by that exact literal string, so a narrower, more restrictive
+/// wildcard sharing the same prefix (e.g. `cloud-danger-*` deny alongside a
+/// broader `cloud-*` ask) is invisible to it — the trust bar would then show
+/// a laxer standing denial than enforcement actually applies. Scanning every
+/// service under the prefix and taking the worst case keeps this panel
+/// honest about what enforcement will do.
+fn worst_credential_decision(m: &CapabilityManifest, service: &str) -> ward_policy::Decision {
+    let prefix = service.strip_suffix('*').unwrap_or(service);
+    m.credentials
+        .keys()
+        .filter(|id| id.0.starts_with(prefix))
+        .map(|id| m.credential_decision(id))
+        .max()
+        .unwrap_or(ward_policy::Decision::Deny)
 }
 
 /// The "Current agent authority" panel (ADR-0019): filesystem, network,
@@ -308,6 +330,7 @@ mod tests {
     use ward_events::{
         CapabilityRequest, CredentialDelivery, DecisionSource, NameText, Origin, Scope, ShortText,
     };
+    use ward_policy::{CredentialRule, ServiceId};
 
     fn decided(kind: CapabilityKind, target: &str, grant: Option<GrantScope>) -> WardEvent {
         WardEvent::CapabilityDecided {
@@ -523,5 +546,36 @@ mod tests {
         assert!(groups[0].rows[0].value.starts_with("/work read-only"));
         let cloud = &groups[2].rows[2];
         assert_eq!((cloud.value.as_str(), cloud.tone), ("ask", Tone::Warn));
+    }
+
+    #[test]
+    fn standing_denials_reflect_the_most_restrictive_overlapping_wildcard() {
+        // Regression for issue #159: a broad `cloud-*` => Ask alongside a
+        // narrower, more restrictive `cloud-danger-*` => Deny must still show
+        // the trust bar's "Cloud creds" row as denied, not ask — a literal
+        // `credentials.get("cloud-*")` lookup would miss the narrower rule
+        // entirely and disagree with what `credential_decision` enforces.
+        let mut d = description(NetworkCapability::Development);
+        d.manifest.credentials.insert(
+            ServiceId("cloud-*".into()),
+            CredentialRule::Ask(ward_policy::CredentialScope::default()),
+        );
+        d.manifest
+            .credentials
+            .insert(ServiceId("cloud-danger-*".into()), CredentialRule::Deny);
+        assert_eq!(
+            d.manifest
+                .credential_decision(&ServiceId("cloud-danger-x".into())),
+            ward_policy::Decision::Deny
+        );
+        assert_eq!(
+            d.manifest
+                .credential_decision(&ServiceId("cloud-aws".into())),
+            ward_policy::Decision::Ask
+        );
+
+        let groups = authority_panel(&d, &Authority::default());
+        let cloud = &groups[2].rows[2];
+        assert_eq!((cloud.value.as_str(), cloud.tone), ("denied", Tone::Ok));
     }
 }
