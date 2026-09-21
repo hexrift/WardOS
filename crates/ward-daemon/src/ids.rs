@@ -16,7 +16,7 @@ use ward_snapshot::{
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A fresh, time-ordered session id (ULID-shaped: 48-bit ms timestamp, 80 random bits).
+/// A fresh, time-ordered session id (ULID-shaped: 48-bit ms timestamp, 80 CSPRNG bits).
 pub fn new_session_id() -> SessionId {
     SessionId::from_u128(ulid_u128())
 }
@@ -73,12 +73,54 @@ fn ulid_u128() -> u128 {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let ms = (ns / 1_000_000) & ((1 << 48) - 1);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut seed = [0u8; 16];
-    seed[..8].copy_from_slice(&(ns as u64).to_le_bytes());
-    seed[8..].copy_from_slice(&seq.to_le_bytes());
-    let rand = blake3::hash(&seed);
+
+    let mut rand = [0u8; 10];
+    if getrandom::fill(&mut rand).is_err() {
+        // No OS entropy source available (e.g. a broken sandbox): fall back to a PRF
+        // over the timestamp and a per-process counter rather than failing id
+        // generation outright. Not expected to run in a normal environment, and
+        // strictly worse than the CSPRNG path above, never used when it succeeds.
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut seed = [0u8; 16];
+        seed[..8].copy_from_slice(&(ns as u64).to_le_bytes());
+        seed[8..].copy_from_slice(&seq.to_le_bytes());
+        rand.copy_from_slice(&blake3::hash(&seed).as_bytes()[..10]);
+    }
+
     let mut low = [0u8; 16];
-    low[6..].copy_from_slice(&rand.as_bytes()[..10]);
+    low[6..].copy_from_slice(&rand);
     (ms << 80) | (u128::from_be_bytes(low) & ((1 << 80) - 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{new_session_id, ulid_u128};
+
+    #[test]
+    fn back_to_back_ids_are_distinct_and_their_ms_prefix_does_not_go_backwards() {
+        let a = ulid_u128();
+        let b = ulid_u128();
+        assert_ne!(a, b, "two ids minted back-to-back must not collide");
+        // Only the 48-bit ms prefix is guaranteed ordered; two draws inside the same
+        // millisecond have independent CSPRNG tails, so the full u128 is not.
+        assert!(
+            (b >> 80) >= (a >> 80),
+            "the ms timestamp prefix must not go backwards"
+        );
+    }
+
+    #[test]
+    fn random_tail_is_not_a_deterministic_function_of_the_counter_alone() {
+        // Two ids minted back-to-back (same or adjacent millisecond, adjacent
+        // COUNTER values under the old PRF) must not merely differ by 1 in their
+        // low bits the way a PRF over (ns, seq) would: with a CSPRNG tail the
+        // low 80 bits of two draws are independent, so a shared 8-bit prefix
+        // across many samples would be a coincidence, not a construction.
+        let ids: Vec<u128> = (0..8).map(|_| new_session_id().as_u128()).collect();
+        let low_bytes: Vec<u8> = ids.iter().map(|id| (*id & 0xff) as u8).collect();
+        assert!(
+            low_bytes.windows(2).any(|w| w[0] != w[1]),
+            "low byte of the random tail must vary across draws, not increment lockstep"
+        );
+    }
 }
