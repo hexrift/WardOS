@@ -6,6 +6,12 @@ on:
   push:
     branches: [main]
 
+# Default every job in this workflow to read-only; a job that needs more scope
+# grants it itself (issue #164). None of these jobs write to the repo, packages,
+# or releases, so no job below overrides this.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -15,11 +21,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the commit `stable` pointed at on 2026-09-21 (issue #165): the
+      # action force-moves this branch, so a tag/branch reference here is the most
+      # mutable possible supply-chain input to a required merge-authority check.
+      # Bump the SHA (and this comment) when picking up a newer toolchain.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (2026-09-21)
         with:
           toolchain: 1.94.1
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
       - run: pip install pyyaml
       # Issue #124: the bubblewrap-guarded namespace, verifier and egress tests must
       # RUN on the runner, never skip. Install bubblewrap and allow unprivileged user
@@ -74,7 +84,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1
         with:
           command: check advisories licenses sources bans
 
