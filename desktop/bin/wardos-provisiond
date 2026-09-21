@@ -215,10 +215,21 @@ reconcile_pending() {
 # resolved); on FAILURE the journal — naming this account — is left in place on purpose, so
 # reconcile_pending refuses and retries the removal on the next attempt rather than leaving
 # a silent second administrator (#127). Either way this connection is denied with `reason`.
+#
+# The journal removal itself is never suppressed with `|| true` either (#153): a lost
+# directory-fsync flush there is exactly the power-cut durability gap the journal exists to
+# prevent, so retry it once (mirroring commit_marker's own indeterminate-directory-fsync
+# retry) and, if it still fails, say so in the reply instead of silently reporting only
+# `reason` as if cleanup were uneventful. The account is already gone either way — userdel
+# succeeded — so reconcile_pending's next run tolerates a resurrected journal fine (it finds
+# no account under that name and clears the journal itself); this only makes a failure that
+# used to vanish without a trace visible to the caller and the log.
 rollback_account() {
   local user=$1 reason=$2
   if userdel -r "$user" 2>/dev/null; then
-    remove_durable "$journal" || true
+    if ! { remove_durable "$journal" || remove_durable "$journal"; }; then
+      deny "$reason (rollback complete but the transaction journal's removal could not be durably confirmed; recovery may be required on the next attempt)"
+    fi
   fi
   deny "$reason"
 }

@@ -303,6 +303,26 @@ assert_logged '^userdel -r devuser$'          # the orphan is reconciled away fi
 [[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "T5c: no credential must leave the machine unprovisioned"
 [[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "T5c: reconcile clears the journal even on the fall-back path"
 
+# --- T6 (#152): a STALE journal left behind by an ALREADY-COMMITTED marker must be reconciled
+# away here — before the idempotency exit — so it never permanently blocks the downstream
+# guards that treat ANY dev-seed journal as an unresolved transaction (the broker socket's
+# ConditionPathExists and wardos-greetd-session's early guard). This is NOT an unresolved
+# transaction: the marker is the commit point and it is already present, so the seed must not
+# touch the account (no useradd, no userdel) — only clear the stale journal and exit cleanly.
+seed_stateful_mocks
+reset_state
+printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
+: >"$WARDOS_PROVISIONED_MARKER"                # committed on a prior boot
+printf 'devuser\n' >"$WARDOS_DEV_SEED_JOURNAL" # …but that boot's journal cleanup did not durably finish
+: >"$acct_dir/devuser"                         # the seeded account is real and already exists
+run_seed
+[[ $rc -eq 0 ]] || fail "T6: a stale journal alongside a committed marker must not fail the seed; rc=$rc"
+assert_not_logged '^useradd' # already provisioned: no new account
+assert_not_logged '^userdel' # the marker is genuinely committed; the account is NOT rolled back
+[[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "T6: the stale journal must be durably cleared"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+[[ -e "$acct_dir/devuser" ]] || fail "T6: the already-committed account must be left untouched"
+
 # --- Newline-only / whitespace-only / control-only credential (#119 review): a credential FILE
 #     that is NON-EMPTY ([[ -s ]] passes) but yields an empty/whitespace/control-only password
 #     after `head -n1` must be treated exactly like NO credential — NO account, NO marker, fall

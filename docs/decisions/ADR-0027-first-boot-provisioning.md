@@ -121,7 +121,10 @@ through a broker rather than running privileged.** It generalises to later WardO
   place but whose directory `fsync` cannot be confirmed (even after one retry) is treated as
   **indeterminate** — the journal is kept and the connection replies *recovery-required* rather
   than acknowledging success, so a later power loss that drops the not-yet-durable marker is
-  reconciled (the orphan removed) on the next boot.
+  reconciled (the orphan removed) on the next boot. A rollback's own journal removal is never
+  swallowed either: `userdel` succeeding is checked independently of whether the journal's
+  directory `fsync` can then be confirmed (retried once), and a durability failure there is
+  reported in the reply rather than silently folded into the original failure reason.
 - **Transactional against power loss** — `ACCOUNT` creates the user and sets its password as one
   broker operation that rolls the half-created user back on failure. Every durable write uses the
   same ordering — write a **temp** file, **`fsync`** it, **`rename`** it into place, then
@@ -167,7 +170,15 @@ credentials file). The seed's behaviour matches the broker's account policy exac
 so on any unprovisioned boot the seed's reconcile-on-entry runs (removing an orphan from an
 interrupted prior seed) *before* canonical provisioning could start — the machine can never boot
 with a usable administrator while it still reads as unprovisioned, the window in which canonical
-provisioning would create a second administrator. The image build asserts no `dev-seed-password`
+provisioning would create a second administrator. Because that same unit already runs first on
+*every* boot, it also reconciles the one state a downstream guard cannot itself tell apart from
+an unresolved transaction: a **stale journal left behind by its own already-committed marker**
+(its post-commit cleanup did not durably finish). Both the broker socket's
+`ConditionPathExists=!…dev-seed.journal` and `wardos-greetd-session`'s early guard fail closed on
+*any* journal, by design, since neither can safely distinguish stale from unresolved on its own —
+so before its own idempotency check, `wardos-dev-seed` clears a journal found alongside an
+already-present marker (retried once), rather than leaving a valid, already-provisioned boot
+permanently unable to reach the greeter. The image build asserts no `dev-seed-password`
 file exists in any layer. The `disk` workflow's `user` input is blank by default (release disks
 are unprovisioned) and, when a dev sets it, it is passed as `image/build.sh --dev-seed-user NAME`
 (the `WARDOS_DEV_SEED_USER` build-arg), **not** a disk-build `--user`; the password is never baked

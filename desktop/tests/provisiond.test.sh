@@ -308,6 +308,55 @@ out=$(printf 'ACCOUNT\nolga\nOlga\npw\n' | wardos-provisiond)
 assert_file "$WARDOS_PROVISIONED_MARKER"
 [[ ! -e "$WARDOS_PROVISION_JOURNAL" ]] || fail "the journal is cleared after a committed recovery"
 
+# --- #153: rollback_account's own journal removal must not suppress a directory-fsync
+# failure with `|| true`. userdel succeeds (the account really is gone — stateful ACCT_DIR
+# mock), but the journal's directory fsync fails on every call from the second onward (the
+# retry, mirroring commit_marker's own indeterminate-directory-fsync retry, fails too), so the
+# broker must say so in its reply instead of silently reporting only the original failure
+# reason as if the journal's durable removal were uneventful. Isolate the journal in its own
+# directory (JN_DIR) so only ITS directory fsync is affected; the account mutation calls are
+# unaffected and the write that journals the transaction (BEFORE useradd — the first fsync of
+# JN_DIR) still succeeds.
+export JN_DIR="$TMP/jn"
+mkdir -p "$JN_DIR"
+export WARDOS_PROVISION_JOURNAL="$JN_DIR/provision.journal"
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK"
+jn_acct_dir="$TMP/jn-accounts"
+rm -rf "$jn_acct_dir"
+mkdir -p "$jn_acct_dir"
+export ACCT_DIR="$jn_acct_dir"
+# shellcheck disable=SC2016
+mock useradd 'u="${@: -1}"; : >"$ACCT_DIR/$u"'
+# shellcheck disable=SC2016
+mock id 'for a in "$@"; do case "$a" in -*) ;; *) if [[ -e "$ACCT_DIR/$a" ]]; then echo 1000; exit 0; else exit 1; fi ;; esac; done; exit 1'
+# shellcheck disable=SC2016
+mock userdel 'u="${@: -1}"; rm -f "$ACCT_DIR/$u"; exit 0'
+mock chpasswd 'exit 1' # force a mid-transaction failure so rollback_account runs
+: >"$TMP/jn-sync-calls"
+# shellcheck disable=SC2016
+mock sync 'case "$1" in
+  "$JN_DIR")
+    n=$(($(cat "$TMP/jn-sync-calls") + 1)); echo "$n" >"$TMP/jn-sync-calls"
+    [[ "$n" -eq 1 ]] && exit 0
+    exit 1
+    ;;
+esac
+exit 0'
+out=$(printf 'ACCOUNT\nivy\nIvy\npw\n' | wardos-provisiond)
+[[ "$out" == ERR*"could not set password"*"durably confirmed"* ]] ||
+  fail "#153: a rollback whose journal directory-fsync fails (and its retry) must say so, not just the original reason; got: $out"
+[[ ! -e "$jn_acct_dir/ivy" ]] || fail "#153: userdel still ran; the account is gone despite the journal-fsync failure"
+[[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "#153: a rolled-back transaction must not mark provisioned"
+# The next request: the journal's `rm -f` really succeeded (only its directory fsync failed),
+# so reconcile_pending finds no journal at all and proceeds straight to a clean ACCOUNT once
+# storage recovers — never stuck refusing on a failure that was already fully rolled back.
+mock sync 'exit 0'
+mock chpasswd # succeeds now
+out=$(printf 'ACCOUNT\njudy\nJudy\npw\n' | wardos-provisiond)
+[[ "$out" == OK ]] || fail "#153: the next request must succeed once storage recovers; got: $out"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+export WARDOS_PROVISION_JOURNAL="$TMP/provision.journal" # back to the default path after JN_DIR
+
 # Restore simple mocks and a succeeding flush for the tests that follow.
 mock useradd
 mock chpasswd
