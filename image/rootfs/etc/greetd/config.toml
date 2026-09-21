@@ -2,27 +2,23 @@
 # "HOST layer"). greetd authenticates the real user through PAM, then runs the session as
 # that user; the greeter itself runs unprivileged as `greeter`.
 #
-# The greeter is graphical and on-brand: `cage` (a single-window Wayland kiosk compositor)
-# hosts `gtkgreet`, styled to the Ward Dark palette by /etc/greetd/wardos-greeter.css so it
-# is continuous with the Plymouth splash before it. On authentication gtkgreet runs
-# /usr/libexec/wardos-session, which starts Hyprland under uwsm (so graphical-session.target
-# and the WardOS user services come up exactly as a normal login).
+# greetd runs `wardos-greetd-session`, the marker-gated selector (ADR-0027), as the
+# unprivileged `greeter` user. While /var/lib/wardos/provisioned is absent it starts the
+# first-boot provisioning UI under `cage`; once the machine is provisioned it starts the
+# normal greeter — `cage` (a single-window Wayland kiosk compositor) hosting `gtkgreet`,
+# styled to the Ward Dark palette by /etc/greetd/wardos-greeter.css so it is continuous with
+# the Plymouth splash before it. On authentication gtkgreet runs /usr/libexec/wardos-session,
+# which starts Hyprland under uwsm (so graphical-session.target and the WardOS user services
+# come up exactly as a normal login).
 #
-# gtkgreet runs WITHOUT `-l` (layer-shell): cage does not implement wlr-layer-shell, so a
-# layer surface commits a 0x0 geometry, cage disconnects the client and greetd relaunches
-# it — a flicker/crash-loop (E-09). cage makes its single top-level fullscreen on its own,
-# which is exactly what a plain gtkgreet window needs. `-l` is only for full compositors
-# (sway, Hyprland). The greeter's home /var/lib/greeter is created by tmpfiles.d so cage
-# has a working directory and a writable shader cache.
-#
-# `cage -s` keeps VT switching enabled (Ctrl+Alt+F2…F6 reach a text console), so a greeter
-# or session failure can never lock the machine out — the belt-and-braces the cage docs
-# recommend.
+# Both paths use `cage -s`, which keeps VT switching enabled (Ctrl+Alt+F2…F6 reach a text
+# console), so a greeter or session failure can never lock the machine out — the
+# belt-and-braces the cage docs recommend.
 
 [terminal]
 # greetd owns VT 1, the VT Plymouth hands off to; there is no getty autologin any more.
 vt = 1
 
 [default_session]
-command = "cage -s -- gtkgreet -s /etc/greetd/wardos-greeter.css -c /usr/libexec/wardos-session"
+command = "wardos-greetd-session"
 user = "greeter"

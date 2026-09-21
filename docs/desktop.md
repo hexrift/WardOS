@@ -58,6 +58,29 @@ Login is greetd, set up by the image itself (`image/rootfs/etc/greetd`), not by 
 step. `shell/`, `theme/` and `tests/` never land on the host. Every row is asserted by
 `desktop/tests/install.test.sh` against a temp root.
 
+**First-boot provisioning ([ADR-0027](decisions/ADR-0027-first-boot-provisioning.md)).**
+The image ships unprovisioned — no human account. greetd runs `wardos-greetd-session`,
+which while `/var/lib/wardos/provisioned` is absent starts the provisioning UI
+(`wardos-provision-ui`) under cage instead of the greeter: an unprivileged foot-hosted terminal
+UI (cage speaks xdg-shell only, so a layer-shell client like fuzzel aborts under it — hence a
+self-contained TUI, not fuzzel) that asks the keyboard FIRST and re-establishes the compositor's
+live layout before password entry, then collects language, timezone, name, username and a masked
+password, then asks the
+root broker (`wardos-provisiond`, socket-activated on `/run/wardos/provision.sock`, group
+`greeter`, mode 0660) to apply them and create the real user. The broker writes the marker
+on success; from then on the selector runs the normal greeter and the broker refuses. A
+build-time `WARDOS_DEV_SEED_USER` bakes a dev *username* only (no baked password) so
+`wardos-dev-seed.service` can seed that account at first boot and skip provisioning on CI/hardware
+images. The seed is transactional and mirrors the broker: **with** the first-boot systemd
+credential `wardos-dev-seed.password` it creates the `wheel` user, sets the password and commits
+the marker as one journalled/rolled-back transaction; **without** a credential it creates no
+account and no marker, so the machine stays unprovisioned and first-boot provisioning runs (no
+locked-account dead end). It runs before greetd and the broker socket, reconciling any orphan from
+an interrupted prior seed before canonical provisioning could start. Production images ship
+without the flag, unprovisioned.
+`greetd`'s `config.toml` runs `wardos-greetd-session`, so the selector is live; on a
+provisioned machine its greeter path is byte-for-byte the #116 login.
+
 User state: `~/.config/wardos/` (theme choice, rendered theme in `theme/current/`, user
 overrides), `~/.local/share/wardos/` (web app profiles, installed themes, fonts),
 `~/.local/state/wardos/` (toggles, last screenshot, record pid). Image-owned defaults
@@ -104,6 +127,9 @@ use them); `ward` is the front door for people.
 | `wardos-share <file>` | serve a file on the LAN with a QR code (python http.server + qrencode) |
 | `wardos-calibrate [--force] [step…]` | first-boot system setup, CALIBRATE ([ADR-0026](decisions/ADR-0026-first-run-calibrate.md)): `locale` (`localectl set-locale`), `keyboard` (Hyprland `kb_layout` live + persisted, and `localectl set-x11-keymap`), `timezone` (region → city, `timedatectl set-timezone`), `password` (one terminal running `passwd`, off the default path); no arguments runs the guided flow with a review that changes any choice. Offered every login until it **completes**: the marker (`~/.config/wardos/calibrate-done`) is written only when the applies succeed or you choose *Skip the rest*; a cancelled review or a failed apply leaves it unset, so an unconfigured machine is re-offered next login rather than recorded as done. A step with a value applies it non-interactively. Keyboard-first, offline, polkit not `sudo` |
 | `wardos-first-run` | first login: copy configs (once, guarded by `~/.config/wardos/first-run-done` — never re-copied, so a resumed login can't clobber the user's config backups), the default theme, `ward doctor`, the default apps, show the keys; then the resumable stages `wardos-calibrate` and `wardos-welcome`, offered each login until each records its own completion |
+| `wardos-greetd-session` | greetd's session selector ([ADR-0027](decisions/ADR-0027-first-boot-provisioning.md)): `/var/lib/wardos/provisioned` absent → the provisioning UI under cage; present → the normal `gtkgreet` greeter (byte-for-byte the provisioned-machine login) |
+| `wardos-provision-ui` | first-boot provisioning UI (CALIBRATE provisioning form): unprivileged foot-hosted TUI under cage (xdg-shell, not fuzzel) — keyboard first (re-established as the live layout before password entry), then language, timezone, name, username, masked password — that asks the broker to apply them and create the first user. No privileged operation itself |
+| `wardos-provisiond` | the root provisioning broker (socket-activated, one instance per connection): validated verbs `LOCALE`/`KEYMAP`/`TIMEZONE`/`ACCOUNT`/`STATUS`; refuses once provisioned; the password is fed to `chpasswd` on stdin, never logged; `ACCOUNT` is the transactional commit that writes the marker |
 | `wardos-welcome [--again] [step…]` | the first-login walkthrough ([`onboarding.md`](onboarding.md) §1): `theme` (from `wardos-theme list`), `keys` (a terminal running `ward vault set NAME`, never a menu), `project` (a directory picker over `~` or a URL to clone, then `ward init`), `agent` (`ward claude` there, the trust bar in one line), `done` (the card; writes `~/.config/wardos/welcome-done`); one step by name any time, `--again` the whole; `clone URL DIR` is the project step's terminal command |
 | `wardos-version` | image and tool versions (`bootc status`, `ward --version`) |
 | `wardos-about` | the About surface (fastfetch with the WardOS logo) |
@@ -400,7 +426,7 @@ command, key and test exist on `main`.
 | Chromium default browser, theme colour | chromium, `chromium.json` fragment | ✔ config: `config/chromium/chromium-flags.conf`, `BROWSER=chromium` |
 | Nautilus | nautilus | |
 | Plymouth boot splash | WardOS Plymouth theme | ✔ `image/rootfs/usr/share/plymouth/themes/wardos/` (WARD on the ground, 2 px progress, passphrase prompt), selected in the `Containerfile` and in the initramfs (the image build proves it); its look at boot is E-09's |
-| Login screen into Hyprland | greetd greeter (graphical, Ward Dark) → uwsm | ✔ `image/rootfs/etc/greetd/` (`config.toml`, `wardos-greeter.css`, the `greeter` sysusers), `image/rootfs/usr/libexec/wardos-session` (uwsm + fallback), enabled in the `Containerfile`; `greeter.test.sh`. A real login screen, not autologin (ADR-0024); the user from `image/disk.sh --user wardos` |
+| Login screen into Hyprland | greetd greeter (graphical, Ward Dark) → uwsm | ✔ `image/rootfs/etc/greetd/` (`config.toml`, `wardos-greeter.css`, the `greeter` sysusers), `image/rootfs/usr/libexec/wardos-session` (uwsm + fallback), enabled in the `Containerfile`; `greeter.test.sh`. A real login screen, not autologin (ADR-0024); the user is created by first-boot provisioning (ADR-0027), not baked into the disk |
 | Full-disk encryption at install | `image/disk.sh` (Anaconda kickstart on the ISO, on by default; bootc-image-builder has no LUKS) | ✔ `image/disk.sh --type iso` encrypts unless `--no-luks` (ADR-0017), `install.test.sh`; passphrase prompt unverified until E-09 |
 | omarchy-update, migrations | `wardos-update` (bootc upgrade, flatpak, refresh) | ✔ `wardos-update [system\|flatpaks\|themes\|configs\|--check]`, `wardos-refresh <component>\|--all`; `update.test.sh`, `refresh.test.sh`; image side: `bootc upgrade`, `image/boot/README.md` |
 | Snapshots and rollback (Limine + snapper) | bootc deployments, `bootc rollback` | ✔ every upgrade keeps the previous deployment; `bootc rollback` (`image/boot/README.md`) |

@@ -128,6 +128,17 @@ assert_not_logged '^hyprctl keyword input:kb_layout boguslayout'
 grep -Eq '^[[:space:]]*kb_layout[[:space:]]*=[[:space:]]*de$' "$input_conf" ||
   fail "invalid keyboard must not change input.conf; got: $(grep kb_layout "$input_conf")"
 
+# --- keyboard-local writes the Hyprland config only, not the system keymap ---------------
+# (used on a provisioned user's first login to adopt the provisioning layout; ADR-0027).
+: >"$MOCK_LOG"
+wardos-calibrate keyboard-local gb
+grep -Eq '^[[:space:]]*kb_layout[[:space:]]*=[[:space:]]*gb$' "$input_conf" || fail "keyboard-local writes input.conf"
+assert_not_logged 'set-x11-keymap'
+# An invalid keyboard-local value changes nothing and exits non-zero.
+: >"$MOCK_LOG"
+if wardos-calibrate keyboard-local nope 2>/dev/null; then fail "invalid keyboard-local must exit non-zero"; fi
+grep -Eq '^[[:space:]]*kb_layout[[:space:]]*=[[:space:]]*gb$' "$input_conf" || fail "invalid keyboard-local must not change input.conf"
+
 # --- a FAILED apply is NOT recorded as complete, and is retried next login (#125) -------
 # Distinct from a cancelled review (no marker) and a deliberate "Skip the rest" (marker):
 # every selected setting is still attempted, but if any requested apply fails the marker is

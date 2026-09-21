@@ -31,6 +31,10 @@ setup_env() {
   export PATH="$MOCK_DIR:$test_root/desktop/bin:$PATH"
   export WARDOS_MENU_BACKEND=stdin
   export WARDOS_MENU_CHOICE=""
+  # Isolate the first-boot provisioned marker (ADR-0027) from the host's real /var path so a
+  # provisioned dev box does not change test behaviour; absent by default, tests that need it
+  # present create this file (or override the variable).
+  export WARDOS_PROVISIONED_MARKER="$TMP/provisioned"
   trap 'rm -rf "$TMP"' EXIT
 }
 

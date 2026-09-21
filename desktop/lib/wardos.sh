@@ -93,14 +93,19 @@ wardos_editor_is_terminal() {
   esac
 }
 
-# wardos_notify TITLE [BODY] [notify-send options…]. The desktop sends nothing when
-# notify-send is missing (a plain terminal session) but never fails on it.
+# wardos_notify TITLE [BODY] [notify-send options…]. A notification is best-effort and never
+# fatal: it sends nothing when notify-send is missing (a plain terminal session), AND swallows
+# a send that fails because no org.freedesktop.Notifications service owns the bus — the pre-login
+# / bootstrap case, where the binary exists but mako only starts post-login under Hyprland. Left
+# unswallowed, that non-zero return aborts any `set -e` caller (e.g. the first-boot provisioning
+# session), so the notification's failure is contained here; callers that need a visible surface
+# print it themselves (the provisioning UI routes all status/errors to its own TUI, ADR-0027).
 wardos_notify() {
   wardos_has notify-send || return 0
   local title=$1 body=${2:-}
   shift
   [[ $# -gt 0 ]] && shift
-  notify-send -a WardOS "$@" "$title" "$body"
+  notify-send -a WardOS "$@" "$title" "$body" 2>/dev/null || return 0
 }
 
 # wardos_menu PROMPT [ITEM…]: items as arguments, or one per line on stdin when none.

@@ -4,6 +4,10 @@
 # state. Anything not named here follows Fedora's own presets.
 enable wardos-firstboot.service
 enable wardos-flathub.service
+# First-boot provisioning (ADR-0027): the broker socket opens only while unprovisioned;
+# the dev-seed unit is a no-op unless the image was built with WARDOS_DEV_SEED_USER.
+enable wardos-provisiond.socket
+enable wardos-dev-seed.service
 # Host firewall, default zone `wardos` (/etc/firewalld/zones/wardos.xml): nothing inbound.
 enable firewalld.service
 # Timed image updates: fetch and stage the next ghcr.io/hexrift/wardos:latest (the
