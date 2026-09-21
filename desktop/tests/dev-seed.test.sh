@@ -256,6 +256,52 @@ assert_logged '^userdel -r devuser$'                 # the orphan was reconciled
 assert_file "$WARDOS_PROVISIONED_MARKER"
 [[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "the journal is cleared after a committed recovery"
 
+# --- T4b [#153]: rollback SUCCEEDS (userdel removes the orphan) but the journal's directory
+# fsync fails on both the removal and its one retry (mirroring commit_marker's own retry-once
+# discipline). Before the fix this was `remove_durable "$journal" || true`: silently dropped, no
+# trace at all. Now it must be visible on stderr, and a later boot must still recover cleanly —
+# the account really is gone (only the journal-cleanup's durability is unconfirmed), so this is
+# purely about observability, not a change to recovery (T1 above already proves that path). The
+# journal is put in its own directory (jn_dir) with a call-counted sync mock so its initial
+# durable write (call 1) succeeds while the rollback's removal and retry (calls 2 and 3) fail.
+seed_stateful_mocks
+reset_state
+printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
+cred_on
+mock chpasswd 'exit 1' # force the mid-transaction failure so rollback runs
+export jn_dir="$TMP/jn" # exported: the mock `sync` script runs in a separate process
+rm -rf "$jn_dir"
+mkdir -p "$jn_dir"
+export WARDOS_DEV_SEED_JOURNAL="$jn_dir/dev-seed.journal"
+rm -f "$TMP/rb-synccount"
+# shellcheck disable=SC2016
+mock sync 'case "$1" in
+  "$jn_dir")
+    n=$(($(cat "$TMP/rb-synccount" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$TMP/rb-synccount"
+    [[ "$n" -gt 1 ]] && exit 1
+    ;;
+esac
+exit 0'
+rb_err="$TMP/dev-seed-rollback.err"
+rc=0
+bash "$seed" 2>"$rb_err" || rc=$?
+[[ $rc -ne 0 ]] || fail "#153: a chpasswd failure must still fail the seed"
+assert_logged '^userdel -r devuser$' # the account really is rolled back
+[[ "$(acct_count)" -eq 0 ]] || fail "#153: userdel really removed the rolled-back account: $(ls "$acct_dir")"
+grep -Fq 'devuser' "$rb_err" ||
+  fail "#153: the previously-swallowed journal-cleanup failure must now be visible on stderr; got: $(cat "$rb_err")"
+grep -Fiq 'journal' "$rb_err" || fail "#153: the stderr diagnostic must mention the journal; got: $(cat "$rb_err")"
+# A later boot still recovers cleanly (the journal file itself really is gone).
+mock chpasswd
+mock sync 'exit 0'
+: >"$MOCK_LOG"
+run_seed
+[[ $rc -eq 0 ]] || fail "#153: the next boot must seed cleanly after the rollback; rc=$rc"
+[[ "$(acct_count)" -eq 1 ]] || fail "#153: recovery must yield exactly one admin: $(ls "$acct_dir")"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+export WARDOS_DEV_SEED_JOURNAL="$TMP/dev-seed.journal" # back to the clean journal path after jn_dir
+
 # --- T5. Interruption between each mutation → the next boot reconciles to a single-admin
 #         provisioned OR a cleanly-unprovisioned state, NEVER two usable admins. ---------------
 

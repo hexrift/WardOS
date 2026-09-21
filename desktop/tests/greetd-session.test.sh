@@ -111,15 +111,21 @@ assert_not_logged 'foot'     # the provisioning UI must NOT launch
 assert_not_logged 'gtkgreet' # the greeter must NOT launch
 [[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "the dev-seed-inhibited path must not run cage/provision"
 
-# (b2) journal present, marker ALSO present: still fail closed (the guard is EARLY, ahead of the
-#      marker fast-path), so a lingering unresolved journal never lets the greeter come up either.
+# (b2) [#152] journal present, marker ALSO present: the marker is the durable transaction commit
+#      point, so a journal still present alongside it cannot be a real unresolved pre-commit
+#      transaction — it is provably stale (e.g. the marker committed but a crash/power-loss, or a
+#      failed directory fsync inside remove_durable, kept the post-commit journal clear from
+#      completing). Before the fix this fell into the SAME fail-closed branch as (b1) and refused
+#      forever: a fully provisioned machine permanently unloginable via the greeter. The selector
+#      must now clear the stale journal and reach the greeter anyway.
 : >"$MOCK_LOG"
 : >"$WARDOS_PROVISIONED_MARKER"
+printf 'devuser\n' >"$WARDOS_DEV_SEED_JOURNAL"
 mock cage
-rc=0
-wardos-greetd-session || rc=$?
-[[ $rc -ne 0 ]] || fail "an unresolved dev-seed journal must fail closed even with the marker present"
-assert_not_logged 'gtkgreet'
+wardos-greetd-session
+assert_logged '^cage -s -- gtkgreet '
+[[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] ||
+  fail "#152: a stale dev-seed journal past a committed marker must be cleared, not leave the machine unloginable forever"
 
 # Once reconciliation clears the journal, the selector resumes normally (marker present → greeter).
 : >"$MOCK_LOG"

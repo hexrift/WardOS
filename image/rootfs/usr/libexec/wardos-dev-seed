@@ -94,10 +94,21 @@ commit_marker() { write_durable "$marker" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
 # resolved); on FAILURE the journal — naming this account — is left in place on purpose so the
 # next boot's reconcile retries the removal rather than leaving a silent residual wheel
 # account. Either way this seed attempt fails visibly (mirrors wardos-provisiond).
+#
+# The journal-cleanup step's OWN outcome (#153) is never silently dropped, unlike the previous
+# `remove_durable "$journal" || true`: a userdel success followed by a remove_durable failure
+# retries the removal ONCE (mirroring commit_marker's own retry-once discipline for an
+# indeterminate directory-fsync failure below) and, if it still fails, logs a clear line — the
+# account really is gone, only the journal-cleanup's durability is unconfirmed, and this is
+# harmless: the next boot's reconcile_pending safely retries clearing it either way.
 rollback_account() {
   local user=$1 reason=$2
   if userdel -r "$user" 2>/dev/null; then
-    remove_durable "$journal" || true
+    if ! remove_durable "$journal"; then
+      if ! remove_durable "$journal"; then
+        echo "wardos-dev-seed: $reason; rolled the account '$user' back but could not durably confirm clearing its transaction journal ($journal); journal-cleanup durability is unconfirmed and will be retried by the next boot's reconcile_pending" >&2
+      fi
+    fi
   else
     echo "wardos-dev-seed: $reason, AND rolling the account '$user' back failed; keeping the journal and refusing (recovery required — a later boot with userdel working will reconcile it before re-seeding)" >&2
     exit 1

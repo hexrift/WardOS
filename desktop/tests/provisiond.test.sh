@@ -315,6 +315,68 @@ mock userdel
 mock id 'exit 1'
 mock sync 'exit 0'
 
+# --- #153: rollback_account's journal-cleanup failure must be VISIBLE, not silently swallowed
+# with `remove_durable "$journal" || true`. userdel SUCCEEDS (the account really is rolled back)
+# but the journal's directory fsync fails on both the removal and its one retry (mirroring
+# commit_marker's own retry-once discipline for an indeterminate directory-fsync failure). The
+# journal lives in its own directory (JN_DIR, like the MK_DIR trick above) so only ITS directory
+# fsync can be targeted; a call counter lets the journal's own initial durable write succeed
+# (call 1) while every later fsync of that directory (the rollback's removal and its retry,
+# calls 2 and 3) fails, so the failure genuinely happens inside rollback_account, not earlier.
+export JN_DIR="$TMP/jn"
+rm -rf "$JN_DIR"
+mkdir -p "$JN_DIR"
+export WARDOS_PROVISION_JOURNAL="$JN_DIR/provision.journal"
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK"
+rb_acct_dir="$TMP/rb-accounts"
+rm -rf "$rb_acct_dir"
+mkdir -p "$rb_acct_dir"
+export ACCT_DIR="$rb_acct_dir"
+# shellcheck disable=SC2016
+mock useradd 'u="${@: -1}"; : >"$ACCT_DIR/$u"'
+# shellcheck disable=SC2016
+mock id 'for a in "$@"; do case "$a" in -*) ;; *) if [[ -e "$ACCT_DIR/$a" ]]; then echo 1000; exit 0; else exit 1; fi ;; esac; done; exit 1'
+# shellcheck disable=SC2016
+mock userdel 'u="${@: -1}"; rm -f "$ACCT_DIR/$u"; exit 0' # rollback's userdel SUCCEEDS
+mock chpasswd 'exit 1'                                    # forces the mid-transaction failure
+rm -f "$TMP/rb-synccount"
+# shellcheck disable=SC2016
+mock sync 'case "$1" in
+  "$JN_DIR")
+    n=$(($(cat "$TMP/rb-synccount" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$TMP/rb-synccount"
+    [[ "$n" -gt 1 ]] && exit 1
+    ;;
+esac
+exit 0'
+: >"$MOCK_LOG"
+rb_err="$TMP/rollback.err"
+out=$(printf 'ACCOUNT\nfrank\nFrank\npw\n' | wardos-provisiond 2>"$rb_err")
+[[ "$out" == ERR* ]] || fail "#153: the original chpasswd failure must still be reported; got: $out"
+assert_logged '^userdel -r frank$'                    # the account really is rolled back
+[[ ! -e "$rb_acct_dir/frank" ]] || fail "#153: userdel really removed the rolled-back account"
+grep -Fq 'frank' "$rb_err" || fail "#153: the previously-swallowed journal-cleanup failure must now be visible on stderr; got: $(cat "$rb_err")"
+grep -Fiq 'journal' "$rb_err" || fail "#153: the stderr diagnostic must mention the journal; got: $(cat "$rb_err")"
+
+# A following request still reconciles and provisions exactly one administrator: the journal file
+# itself really is gone (rm -f succeeded; only its directory fsync could not be confirmed), so
+# reconcile_pending sees nothing pending and proceeds cleanly — the fix is purely about
+# observability, not a change to recovery (which the #127 regressions above already prove).
+mock chpasswd # succeeds again
+mock sync 'exit 0' # storage recovered: the sync-counting mock's job is done
+out=$(printf 'ACCOUNT\ngrace\nGrace\npw\n' | wardos-provisiond)
+[[ "$out" == OK ]] || fail "#153: a following request must still reconcile/provision cleanly; got: $out"
+[[ -e "$rb_acct_dir/grace" ]] || fail "#153: the following request must create the new admin"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+unset ACCT_DIR
+export WARDOS_PROVISION_JOURNAL="$TMP/provision.journal" # back to a clean journal path after JN_DIR
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK"
+mock useradd
+mock chpasswd
+mock userdel
+mock id 'exit 1'
+mock sync 'exit 0'
+
 # KEYMAP persistence failure (#127 review item 2): if the chosen layout cannot be recorded
 # durably for the new user's Hyprland session, the broker must report an error, not OK — the
 # earlier "provisioning says success, first desktop gets a different layout" failure mode.

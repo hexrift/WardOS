@@ -215,10 +215,25 @@ reconcile_pending() {
 # resolved); on FAILURE the journal — naming this account — is left in place on purpose, so
 # reconcile_pending refuses and retries the removal on the next attempt rather than leaving
 # a silent second administrator (#127). Either way this connection is denied with `reason`.
+#
+# The journal-cleanup step's OWN outcome (#153) is never silently dropped, unlike the previous
+# `remove_durable "$journal" || true`: a userdel success followed by a remove_durable failure
+# retries the removal ONCE (mirroring commit_marker's own retry-once discipline for an
+# indeterminate directory-fsync failure below) and, if it still fails, logs a clear line — the
+# account really is gone, only the journal-cleanup's durability is unconfirmed, and this is
+# harmless: reconcile_pending safely retries clearing it on the next request either way. A
+# userdel FAILURE is logged too, stating plainly (not just implied by the comment above) that
+# the journal is being left in place on purpose for reconcile_pending.
 rollback_account() {
   local user=$1 reason=$2
   if userdel -r "$user" 2>/dev/null; then
-    remove_durable "$journal" || true
+    if ! remove_durable "$journal"; then
+      if ! remove_durable "$journal"; then
+        echo "wardos-provisiond: rolled back account '$user' ($reason) but could not durably confirm clearing its transaction journal ($journal); journal-cleanup durability is unconfirmed and will be retried by reconcile_pending on the next request" >&2
+      fi
+    fi
+  else
+    echo "wardos-provisiond: could not roll back account '$user' ($reason); leaving the transaction journal ($journal) in place on purpose so reconcile_pending retries it on the next request" >&2
   fi
   deny "$reason"
 }
