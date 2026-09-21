@@ -1128,12 +1128,37 @@ pub fn run_dir_path(session_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("ward-{tail}"))
 }
 
+/// The `run_dir` reuses a fixed, predictable name in shared, world-writable
+/// `/tmp` (see [`run_dir_path`]), so an `AlreadyExists` on create must never be
+/// trusted blindly: another local user can pre-plant (or race-recreate, right
+/// after this session's own `remove_dir_all`) that path as a symlink to a
+/// directory they control, and have the egress/hook sockets and seed files
+/// this function's caller writes into `dir` land there instead (ST-023, T7,
+/// CWE-377). `mkdir` fails on an existing symlink without following it, so on
+/// `AlreadyExists` we `lstat` the node ourselves and refuse to reuse anything
+/// that isn't a real, non-symlink directory we own at exactly mode 0700.
 fn run_dir(session_id: &str) -> Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let dir = run_dir_path(session_id);
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => Ok(dir),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(&dir).map_err(|e| Error::io(&dir, e))?;
+            let owned_private_dir = !meta.is_symlink()
+                && meta.is_dir()
+                && meta.uid() == nix::unistd::getuid().as_raw()
+                && meta.permissions().mode() & 0o777 == 0o700;
+            if owned_private_dir {
+                Ok(dir)
+            } else {
+                Err(Error::io(
+                    &dir,
+                    std::io::Error::other(
+                        "refusing to reuse an existing run dir that is not a private directory we own",
+                    ),
+                ))
+            }
+        }
         Err(e) => Err(Error::io(&dir, e)),
     }
 }
@@ -1311,6 +1336,56 @@ mod tests {
         let bytes = serde_json::to_vec_pretty(&meta).unwrap();
         let back: SessionMeta = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(meta, back);
+    }
+
+    #[test]
+    fn run_dir_creates_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let id = "run_dir_test_create";
+        let dir = run_dir_path(id);
+        let _ = std::fs::remove_dir_all(&dir);
+        let created = run_dir(id).unwrap();
+        let meta = std::fs::symlink_metadata(&created).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        std::fs::remove_dir_all(&created).unwrap();
+    }
+
+    #[test]
+    fn run_dir_reuses_its_own_private_directory() {
+        let id = "run_dir_test_reuse0";
+        let dir = run_dir_path(id);
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = run_dir(id).unwrap();
+        let second = run_dir(id).unwrap();
+        assert_eq!(first, second);
+        std::fs::remove_dir_all(&first).unwrap();
+    }
+
+    /// #155: a co-resident local user who wins the race between this session's
+    /// `remove_dir_all` and its next `run_dir` call — or who simply pre-plants
+    /// the fixed, predictable path — can leave a symlink at `run_dir_path`. A
+    /// bare `AlreadyExists` on `mkdir` must never be trusted: the egress/hook
+    /// sockets and seed files the caller then writes "into" that path would
+    /// really land wherever the symlink points, outside `run_dir`'s 0700
+    /// directory (ST-023).
+    #[test]
+    fn run_dir_refuses_a_planted_symlink() {
+        let id = "run_dir_test_evilsym";
+        let dir = run_dir_path(id);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
+        let attacker_dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(attacker_dir.path(), &dir).unwrap();
+
+        let err = run_dir(id).unwrap_err();
+        assert!(!err.to_string().is_empty());
+        // The symlink itself must be left alone (never followed/removed) so the
+        // failure is visible rather than silently "fixed" out from under the
+        // other user.
+        assert!(std::fs::symlink_metadata(&dir).unwrap().is_symlink());
+
+        std::fs::remove_file(&dir).unwrap();
     }
 
     #[test]
