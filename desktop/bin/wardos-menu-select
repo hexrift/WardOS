@@ -11,7 +11,8 @@
 #           wardos-theme has rendered one.
 #   stdin   answers from WARDOS_MENU_CHOICE (tests, scripts): the item equal to it, else
 #           the first item it is a prefix of, else the text itself. Empty = cancelled.
-#           Several answers separated by newlines feed successive menus.
+#           Several answers separated by newlines feed successive menus, tracked by a
+#           cursor file under XDG_RUNTIME_DIR (required — see stdin_answer below).
 set -euo pipefail
 # shellcheck source=desktop/lib/wardos.sh disable=SC1091
 source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
@@ -41,9 +42,22 @@ done
 
 # The stdin backend's answer list: a cursor file remembers how many answers this list has
 # already given, so a walk through the menu tree consumes one per menu.
+#
+# #173: shared TMPDIR/tmp is world-writable, and bash's path-based test operators (-d, -O,
+# stat) each perform their own separate lookup, so validating a path there and then reusing
+# it is a TOCTOU race regardless of how many checks are stacked — another local user who can
+# write to that directory can swap what sits at the name between any two of those lookups
+# (or between the last check and the write), no matter whether the thing observed by each
+# individual check looks safe. There is no way to close that race with path-based checks in
+# a namespace someone else can write to. XDG_RUNTIME_DIR instead names a directory created
+# for this user alone (systemd-logind, mode 0700, per-uid): no other local user has write
+# access to it at all, so nothing there can be swapped out from under a fixed name. Require
+# it rather than build an unsafe substitute in shared /tmp.
 stdin_answer() {
   local choices=${WARDOS_MENU_CHOICE:-} cursor_file idx=0 key n
-  cursor_file="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/wardos-menu-select.cursor"
+  [[ -n "${XDG_RUNTIME_DIR:-}" ]] ||
+    wardos_die "the stdin menu backend needs XDG_RUNTIME_DIR (a private per-user directory); refusing to fall back to shared TMPDIR/tmp"
+  cursor_file="$XDG_RUNTIME_DIR/wardos-menu-select.cursor"
   key=$(printf '%s' "$choices" | cksum | cut -d' ' -f1)
   if [[ -f "$cursor_file" ]] && [[ "$(head -n1 "$cursor_file")" == "$key" ]]; then
     idx=$(($(tail -n1 "$cursor_file") + 1))
