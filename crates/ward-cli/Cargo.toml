@@ -12,15 +12,17 @@ name = "ward"
 path = "src/main.rs"
 
 [dependencies]
-ward-daemon = { path = "../ward-daemon", version = "0.7.8" }
-ward-events = { path = "../ward-events", version = "0.7.8" }
-ward-policy = { path = "../ward-policy", version = "0.7.8" }
-ward-shell-core = { path = "../ward-shell-core", version = "0.7.8" }
+ward-daemon = { path = "../ward-daemon", version = "0.7.9" }
+ward-events = { path = "../ward-events", version = "0.7.9" }
+ward-policy = { path = "../ward-policy", version = "0.7.9" }
+ward-shell-core = { path = "../ward-shell-core", version = "0.7.9" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
