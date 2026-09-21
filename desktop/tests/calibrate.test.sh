@@ -23,7 +23,7 @@ mock hyprctl
 mock notify-send
 mock wardos-launch
 marker="$XDG_CONFIG_HOME/wardos/calibrate-done"
-cursor="$XDG_RUNTIME_DIR/wardos-menu-select.cursor"
+cursor="$XDG_RUNTIME_DIR/wardos-menu-select.$(id -u)/cursor"
 
 # reset_menu ANSWERS…: fresh cursor + the successive menu answers for the next flow.
 reset_menu() {

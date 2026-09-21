@@ -41,9 +41,23 @@ done
 
 # The stdin backend's answer list: a cursor file remembers how many answers this list has
 # already given, so a walk through the menu tree consumes one per menu.
+#
+# The TMPDIR/tmp fallback base is shared and world-writable, so a fixed name written there
+# with a plain `>` redirect is a classic predictable-tempfile symlink target (CWE-377).
+# Rather than trust the mode of whatever XDG_RUNTIME_DIR/TMPDIR happen to be, this makes and
+# owns a private subdirectory under the base itself — created with mode 0700, and never
+# trusted on reuse: anything already there that isn't still a real, unowned-by-anyone-else,
+# mode-0700 directory is refused rather than written through.
 stdin_answer() {
-  local choices=${WARDOS_MENU_CHOICE:-} cursor_file idx=0 key n
-  cursor_file="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/wardos-menu-select.cursor"
+  local choices=${WARDOS_MENU_CHOICE:-} base cursor_dir cursor_file idx=0 key n
+  base="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+  cursor_dir="$base/wardos-menu-select.$(id -u)"
+  mkdir -m 0700 -p "$cursor_dir" 2>/dev/null || true
+  [[ -d "$cursor_dir" && ! -L "$cursor_dir" && -O "$cursor_dir" ]] ||
+    wardos_die "refusing to use $cursor_dir: not a directory we own"
+  [[ "$(stat -c '%a' "$cursor_dir")" == 700 ]] ||
+    wardos_die "refusing to use $cursor_dir: not mode 0700"
+  cursor_file="$cursor_dir/cursor"
   key=$(printf '%s' "$choices" | cksum | cut -d' ' -f1)
   if [[ -f "$cursor_file" ]] && [[ "$(head -n1 "$cursor_file")" == "$key" ]]; then
     idx=$(($(tail -n1 "$cursor_file") + 1))

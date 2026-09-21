@@ -33,3 +33,20 @@ mkdir -p "$XDG_CONFIG_HOME/wardos/theme/current"
 : >"$XDG_CONFIG_HOME/wardos/theme/current/fuzzel.ini"
 printf 'Lock\n' | wardos-menu-select --prompt Power --lines 5 >/dev/null
 assert_logged "^fuzzel --dmenu --prompt Power  --config $XDG_CONFIG_HOME/wardos/theme/current/fuzzel.ini --lines 5$"
+
+# stdin backend: a symlink planted at the cursor dir's path (another local user racing
+# a shared temp base) must never be followed/written through (#173, CWE-377).
+export WARDOS_MENU_BACKEND=stdin
+export WARDOS_MENU_CHOICE="Lock"
+evil_target="$TMP/evil-owned-by-someone-else"
+mkdir -p "$evil_target"
+cursor_dir="$XDG_RUNTIME_DIR/wardos-menu-select.$(id -u)"
+rm -rf "$cursor_dir"
+ln -s "$evil_target" "$cursor_dir"
+if printf 'Lock\n' | wardos-menu-select >/dev/null 2>"$TMP/stderr"; then
+  fail "a planted symlink at the cursor dir must be refused, not followed"
+fi
+grep -q "not a directory we own" "$TMP/stderr" || fail "expected a clear refusal message"
+[[ -L "$cursor_dir" ]] || fail "the planted symlink must be left alone, never replaced"
+[[ ! -e "$evil_target/cursor" ]] || fail "the cursor must never be written through the symlink"
+rm -f "$cursor_dir"
