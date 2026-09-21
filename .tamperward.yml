@@ -93,8 +93,12 @@ signoff:
 
 verify:
   command: bash scripts/verify/tamperward.sh
-  # WardOS verification may involve compilation and integration work.
-  budget: 1800
+  # `tamperward verify` re-runs this command in TWO materialised copies (visible
+  # and pristine), each a cold `cargo fmt/clippy/test --workspace` with no target
+  # cache — so the budget must cover two full workspace builds, not one. Raised
+  # from the Phase-0 placeholder (1800, set when no Rust code existed) now that the
+  # pristine-verify job in .github/workflows/tamperward.yml actually runs it.
+  budget: 3600
   # Everything the command delegates to must be frozen/restored from the trusted base
   # during pristine verification.
   inputs:
