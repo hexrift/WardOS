@@ -15,7 +15,12 @@ export WARDOS_KEYBOARD_STATE="$TMP/keyboard-layout"
 # default; the inhibit regressions below create it, and the state-machine drive lets the REAL
 # wardos-dev-seed create it via a forced rollback failure).
 export WARDOS_DEV_SEED_JOURNAL="$TMP/dev-seed.journal"
-for c in localectl timedatectl useradd usermod chpasswd userdel getent; do mock "$c"; done
+# `sync` is mocked by default too (account_db_durable fsyncs real /etc/passwd &c. on the
+# rollback/reconcile success path, and this test runner is not root in CI, so an unmocked
+# `sync /etc/shadow` genuinely fails with EACCES there): individual tests below that want a
+# real failure override it locally and restore a succeeding mock afterward, exactly like
+# useradd/chpasswd/userdel already do.
+for c in localectl timedatectl useradd usermod chpasswd userdel getent sync; do mock "$c"; done
 
 # ask VERB-AND-LINES… : feed the lines as one request, print the reply.
 ask() { printf '%s\n' "$@" | wardos-provisiond; }
