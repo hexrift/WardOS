@@ -360,3 +360,38 @@ assert_contains "$TMP/out" "  no project mentions nothing"
 assert_contains "$TMP/out" "  solopasha/hyprland: no fedora-"
 assert_contains "$TMP/out" "  dejan/lazygit: not found"
 assert_logged '^curl -fsSL https://copr.fedorainfracloud.org/api_3/project/search\?query=hyprland$'
+
+# --- system preset agrees with what the image enables (issue #161) -----------------
+# image/rootfs/.../system-preset/90-wardos.preset claims to list exactly the units the
+# Containerfile's `systemctl enable` line enables, so `systemctl preset-all` on an
+# installed host (or a reset) lands on the same state as a fresh image build. Parse
+# that enable line (backslash-continued, ended by the next `&&`) out of the
+# Containerfile and check the preset both names every one of them and names nothing
+# beyond them, order and comments aside.
+sys_preset=$repo/image/rootfs/usr/lib/systemd/system-preset/90-wardos.preset
+assert_file "$sys_preset"
+enabled_units=$(awk '
+  !grabbed && /systemctl enable/ && $0 !~ /^[[:space:]]*#/ {
+    grab = 1; grabbed = 1; sub(/^.*systemctl enable/, "")
+  }
+  grab {
+    line = $0
+    if (line ~ /&&/) { sub(/&&.*/, "", line); grab = 0 }
+    else { sub(/\\[[:space:]]*$/, "", line) }
+    print line
+  }
+' "$repo/image/Containerfile")
+[[ -n "${enabled_units//[[:space:]]/}" ]] || fail "no systemctl enable line found in Containerfile"
+# One unit per line, for exact-line comparison below.
+enabled_units_list=$(for u in $enabled_units; do printf '%s\n' "$u"; done)
+unit_count=0
+for u in $enabled_units; do
+  unit_count=$((unit_count + 1))
+  assert_contains "$sys_preset" "enable $u"
+done
+[[ $unit_count -ge 6 ]] || fail "systemctl enable line parsed too few units ($unit_count)"
+# ...and the preset enables nothing the Containerfile doesn't.
+while read -r u; do
+  [[ -n "$u" ]] || continue
+  printf '%s\n' "$enabled_units_list" | grep -qxF "$u" || fail "$sys_preset enables $u, which the Containerfile's systemctl enable line does not"
+done < <(sed -n 's/^enable[[:space:]]\+\([^[:space:]]\+\)[[:space:]]*$/\1/p' "$sys_preset")
