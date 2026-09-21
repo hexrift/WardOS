@@ -334,12 +334,15 @@ run_seed
 assert_file "$WARDOS_PROVISIONED_MARKER"
 export WARDOS_DEV_SEED_JOURNAL="$TMP/dev-seed.journal" # back to the clean journal path after jn_dir
 
-# --- T6 [#152]: a STALE journal left behind by an ALREADY-COMMITTED marker must be reconciled
-# away here — before the idempotency exit — so it never permanently blocks the downstream
-# guards that treat ANY dev-seed journal as an unresolved transaction (the broker socket's
-# ConditionPathExists and wardos-greetd-session's early guard). This is NOT an unresolved
-# transaction: the marker is the commit point and it is already present, so the seed must not
-# touch the account (no useradd, no userdel) — only clear the stale journal and exit cleanly.
+# --- T6 [#152, owner follow-up review]: a STALE journal left behind by an ALREADY-COMMITTED
+# marker is genuinely INERT, not actively reconciled here. This unit's own systemd condition
+# (ConditionPathExists=!<marker>) means ExecStart never runs once the marker exists in
+# production, so there is no privileged path in this script (or anywhere else) that could
+# safely clear such a journal — attempting one here would be dead code that never executes on
+# a real boot. The idempotency exit below must therefore fire on marker presence ALONE,
+# regardless of a stale journal alongside it, and must touch nothing: no useradd, no userdel,
+# no journal removal, no marker rewrite. (Recovery from this case is wardos-greetd-session's
+# job — see its own greetd-session.test.sh (b2)/(b3) — not this unit's.)
 seed_stateful_mocks
 reset_state
 printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
@@ -350,7 +353,7 @@ run_seed
 [[ $rc -eq 0 ]] || fail "T6: a stale journal alongside a committed marker must not fail the seed; rc=$rc"
 assert_not_logged '^useradd' # already provisioned: no new account
 assert_not_logged '^userdel' # the marker is genuinely committed; the account is NOT rolled back
-[[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "T6: the stale journal must be durably cleared"
+[[ -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "T6: a stale journal is inert, not this unit's to clear — it must be left untouched"
 assert_file "$WARDOS_PROVISIONED_MARKER"
 [[ -e "$acct_dir/devuser" ]] || fail "T6: the already-committed account must be left untouched"
 

@@ -15,7 +15,12 @@ export WARDOS_KEYBOARD_STATE="$TMP/keyboard-layout"
 # default; the inhibit regressions below create it, and the state-machine drive lets the REAL
 # wardos-dev-seed create it via a forced rollback failure).
 export WARDOS_DEV_SEED_JOURNAL="$TMP/dev-seed.journal"
-for c in localectl timedatectl useradd usermod chpasswd userdel getent; do mock "$c"; done
+# `sync` is mocked by default too (account_db_durable fsyncs real /etc/passwd &c. on the
+# rollback/reconcile success path, and this test runner is not root in CI, so an unmocked
+# `sync /etc/shadow` genuinely fails with EACCES there): individual tests below that want a
+# real failure override it locally and restore a succeeding mock afterward, exactly like
+# useradd/chpasswd/userdel already do.
+for c in localectl timedatectl useradd usermod chpasswd userdel getent sync; do mock "$c"; done
 
 # ask VERB-AND-LINES… : feed the lines as one request, print the reply.
 ask() { printf '%s\n' "$@" | wardos-provisiond; }
@@ -458,6 +463,51 @@ out=$(printf 'ACCOUNT\nkarl\nKarl\npw\n' | wardos-provisiond)
 [[ ! -e "$WARDOS_PROVISION_JOURNAL" ]] || fail "#153c: the preserved journal must be cleared once reconciled"
 assert_file "$WARDOS_PROVISIONED_MARKER"
 unset ACCT_DIR
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK"
+mock useradd
+mock chpasswd
+mock userdel
+mock id 'exit 1'
+mock sync 'exit 0'
+
+# --- #153-etcdir [owner follow-up review]: account_db_durable's OWN directory-durability step
+# must be exercised too, not just individual-file content flushes. fsync(file) alone does not
+# make a shadow-utils rename durable — the containing directory (/etc) must be fsynced as well,
+# the same file-then-directory ordering write_durable/remove_durable already use. Fail ONLY the
+# fsync of "/etc" itself; every individual /etc/* file succeeds. Exercised via rollback_account
+# (a fresh mid-transaction failure), distinct from #153c's reconcile_pending coverage above.
+export JN_DIR="$TMP/jn"
+rm -rf "$JN_DIR"
+mkdir -p "$JN_DIR"
+export WARDOS_PROVISION_JOURNAL="$JN_DIR/provision.journal"
+rb_acct_dir="$TMP/rb-accounts-etcdir"
+rm -rf "$rb_acct_dir"
+mkdir -p "$rb_acct_dir"
+export ACCT_DIR="$rb_acct_dir"
+# shellcheck disable=SC2016
+mock useradd 'u="${@: -1}"; : >"$ACCT_DIR/$u"'
+# shellcheck disable=SC2016
+mock id 'for a in "$@"; do case "$a" in -*) ;; *) if [[ -e "$ACCT_DIR/$a" ]]; then echo 1000; exit 0; else exit 1; fi ;; esac; done; exit 1'
+# shellcheck disable=SC2016
+mock userdel 'u="${@: -1}"; rm -f "$ACCT_DIR/$u"; exit 0'
+mock chpasswd 'exit 1' # force the mid-transaction failure so rollback runs
+# shellcheck disable=SC2016
+mock sync 'case "$1" in "/etc") exit 1 ;; esac; exit 0'
+: >"$MOCK_LOG"
+rb_err="$TMP/rollback-etcdir.err"
+out=$(printf 'ACCOUNT\njudy\nJudy\npw\n' | wardos-provisiond 2>"$rb_err")
+[[ "$out" == ERR* ]] || fail "#153-etcdir: the original chpasswd failure must still be reported; got: $out"
+[[ ! -e "$rb_acct_dir/judy" ]] || fail "#153-etcdir: userdel really removed the rolled-back account"
+assert_file "$WARDOS_PROVISION_JOURNAL" # /etc's own directory fsync failed → journal untouched
+grep -Fiq 'database' "$rb_err" ||
+  fail "#153-etcdir: an /etc directory-fsync failure must be reported as an unconfirmed account-database durability, not silently passed; got: $(cat "$rb_err")"
+mock sync 'exit 0'
+mock chpasswd
+out=$(printf 'ACCOUNT\nkyle\nKyle\npw\n' | wardos-provisiond)
+[[ "$out" == OK ]] || fail "#153-etcdir: a following request must reconcile the preserved journal and provision cleanly; got: $out"
+[[ ! -e "$WARDOS_PROVISION_JOURNAL" ]] || fail "#153-etcdir: the preserved journal must be cleared once reconciled"
+unset ACCT_DIR
+export WARDOS_PROVISION_JOURNAL="$TMP/provision.journal"
 rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK"
 mock useradd
 mock chpasswd
