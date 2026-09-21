@@ -190,32 +190,6 @@ do_timezone() {
   reply OK
 }
 
-# Reconcile any unresolved prior transaction recorded in the journal, under the exclusive
-# lock, before a new account is created (#127). A journal entry means a previous ACCOUNT
-# created — or may have created — an account that never reached the committed marker: an
-# error whose rollback failed, or a crash/power loss mid-transaction. Roll it back — if the
-# recorded account still exists, remove it — and only when it is gone is the transaction
-# resolved and the journal cleared. If the removal FAILS the transaction stays unresolved
-# and this connection is REFUSED: the broker never creates a second administrator while a
-# first is unresolved, and never silently accumulates accounts.
-reconcile_pending() {
-  [[ -e "$journal" ]] || return 0
-  local pending
-  pending=$(head -n1 "$journal" 2>/dev/null)
-  if [[ -n "$pending" ]] && id -u "$pending" >/dev/null 2>&1; then
-    userdel -r "$pending" 2>/dev/null ||
-      deny "provisioning unresolved: an interrupted account ('$pending') could not be removed; recovery required"
-  fi
-  # The same ordering #153 requires of rollback_account applies here (owner review): clearing
-  # the journal is only safe once the account database's own durability is confirmed. Without
-  # this, a userdel above that "succeeded" but was not yet durable, followed by a durably
-  # cleared journal, reproduces the exact bug reconcile_pending exists to fix.
-  account_db_durable ||
-    deny "provisioning unresolved: the account database's durability could not be confirmed; recovery required"
-  remove_durable "$journal" ||
-    deny "provisioning unresolved: the transaction journal could not be cleared; recovery required"
-}
-
 # Confirm the account database itself (not the journal) is durable. userdel does not fsync
 # its own writes to these files, so a userdel that returns success is not, by itself, proof
 # that the removal survives a crash. This matters because remove_durable(journal) UNLINKS
@@ -225,23 +199,39 @@ reconcile_pending() {
 # removal not yet durable, so the account could reappear on reboot with nothing left to
 # reconcile it. Confirming this FIRST, and refusing to touch the journal at all until it
 # succeeds, keeps the journal as a valid recovery record across exactly that crash window.
-#
-# Fsyncing each file only flushes its CONTENT (#153 owner follow-up review): shadow-utils
-# commits every one of these by writing a temp file and RENAMING it over the target, the same
-# pattern write_durable/remove_durable use elsewhere in this file, and a rename's directory
-# entry is not durable until the containing directory itself is fsynced. So /etc — the
-# directory all of them live in — is fsynced too, after the files, mirroring the file-then-
-# directory ordering those helpers already use. subuid/subgid are included since useradd may
-# allocate subordinate ID ranges there (Fedora's default login.defs); both are optional and
-# skipped when absent, like the rest of this list.
 account_db_durable() {
   local f
-  for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/subuid /etc/subgid; do
+  for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do
     [[ -e "$f" ]] || continue
     fsync_path "$f" || return 1
   done
-  fsync_path /etc || return 1
   return 0
+}
+
+# Reconcile any unresolved prior transaction recorded in the journal, under the exclusive
+# lock, before a new account is created (#127). A journal entry means a previous ACCOUNT
+# created — or may have created — an account that never reached the committed marker: an
+# error whose rollback failed, or a crash/power loss mid-transaction. Roll it back — if the
+# recorded account still exists, remove it — and only when it is gone (AND its removal's own
+# durability is confirmed, above — this is the exact same userdel-doesn't-fsync gap
+# rollback_account guards against below, reachable here too since this is what actually
+# retries a rollback that failed or was interrupted, #153) is the transaction resolved and
+# the journal cleared. If either check FAILS the transaction stays unresolved and this
+# connection is REFUSED: the broker never creates a second administrator while a first is
+# unresolved, never silently accumulates accounts, and never discards the only recovery
+# record for an account removal that might not survive a crash.
+reconcile_pending() {
+  [[ -e "$journal" ]] || return 0
+  local pending
+  pending=$(head -n1 "$journal" 2>/dev/null)
+  if [[ -n "$pending" ]] && id -u "$pending" >/dev/null 2>&1; then
+    userdel -r "$pending" 2>/dev/null ||
+      deny "provisioning unresolved: an interrupted account ('$pending') could not be removed; recovery required"
+    account_db_durable ||
+      deny "provisioning unresolved: the removed account's own durability could not be confirmed; recovery required"
+  fi
+  remove_durable "$journal" ||
+    deny "provisioning unresolved: the transaction journal could not be cleared; recovery required"
 }
 
 # Roll back a created-but-uncommitted account after a mid-transaction failure. userdel's

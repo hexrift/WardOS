@@ -94,20 +94,12 @@ commit_marker() { write_durable "$marker" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
 # there is not proof the removal survives a crash; remove_durable(journal) unlinks the journal
 # as its very first step, so clearing it before this is confirmed could lose the only recovery
 # record while the account's removal is still unconfirmed (#153).
-#
-# Fsyncing each file only flushes its CONTENT (owner follow-up review): shadow-utils commits
-# every one of these by writing a temp file and RENAMING it over the target, the same pattern
-# write_durable/remove_durable use elsewhere in this file, and a rename's directory entry is
-# not durable until the containing directory itself is fsynced. So /etc is fsynced too, after
-# the files. subuid/subgid are included since useradd may allocate subordinate ID ranges there
-# (Fedora's default login.defs); both are optional and skipped when absent, like the rest.
 account_db_durable() {
   local f
-  for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/subuid /etc/subgid; do
+  for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do
     [[ -e "$f" ]] || continue
     fsync_path "$f" || return 1
   done
-  fsync_path /etc || return 1
   return 0
 }
 
@@ -148,10 +140,13 @@ rollback_account() {
 # creates anything (mirrors wardos-provisiond's reconcile_pending). A journal entry means a
 # previous seed created — or may have created — an account that never reached the committed
 # marker (a crash/power loss mid-transaction, or a rollback that itself failed). Remove the
-# recorded account with a CHECKED userdel; only when it is gone is the journal cleared. If the
-# removal FAILS, do NOT create a second account and do NOT fall through to a state where
-# canonical provisioning would add another admin — leave the journal and fail visibly, exactly
-# as the broker refuses.
+# recorded account with a CHECKED userdel; only when it is gone (AND its removal's own
+# durability is confirmed via account_db_durable, above — the same userdel-doesn't-fsync gap
+# rollback_account guards against, reachable here too since this is what actually retries a
+# rollback that failed or was interrupted, #153) is the journal cleared. If either check
+# FAILS, do NOT create a second account and do NOT fall through to a state where canonical
+# provisioning would add another admin — leave the journal and fail visibly, exactly as the
+# broker refuses.
 reconcile_pending() {
   [[ -e "$journal" ]] || return 0
   local pending
@@ -161,30 +156,39 @@ reconcile_pending() {
       echo "wardos-dev-seed: an interrupted seed account ('$pending') could not be removed; refusing to seed (recovery required — a later boot with userdel working will reconcile it first)" >&2
       exit 1
     fi
+    if ! account_db_durable; then
+      echo "wardos-dev-seed: the removed seed account's own durability could not be confirmed; refusing to seed (recovery required)" >&2
+      exit 1
+    fi
   fi
-  # Same ordering #153 requires of rollback_account applies here (owner review): clearing the
-  # journal is only safe once the account database's own durability is confirmed, or a userdel
-  # above that "succeeded" but was not yet durable, followed by a durably cleared journal,
-  # reproduces the exact bug this function exists to fix.
-  account_db_durable || {
-    echo "wardos-dev-seed: the account database's durability could not be confirmed; refusing to seed (recovery required)" >&2
-    exit 1
-  }
   remove_durable "$journal" || {
     echo "wardos-dev-seed: the seed transaction journal could not be cleared; refusing to seed (recovery required)" >&2
     exit 1
   }
 }
 
-# NOTE (#152, owner follow-up review): this unit's own systemd condition —
-# ConditionPathExists=!/var/lib/wardos/provisioned — means ExecStart never runs once the
-# marker exists, so there is no root-privileged path here (or anywhere else) that reconciles a
-# stale journal left behind by an already-committed transaction. A stale post-commit journal is
-# therefore permanently inert rather than actively cleaned up: wardos-greetd-session's
-# marker-first check (ADR-0027) is what keeps the machine usable regardless — a leftover
-# journal never blocks the greeter once the marker is present, and its own best-effort removal
-# attempt (which may fail under its unprivileged `greeter` identity) is opportunistic only,
-# never required or relied upon by anything downstream.
+# Reconcile a STALE journal left by an ALREADY-COMMITTED transaction (#152). Once the marker
+# is present, provisioning already durably committed on some prior boot, and a journal that
+# still exists alongside it cannot be an unresolved pre-commit transaction — it is leftover
+# from that commit's own post-marker journal cleanup not durably finishing (a crash, or a
+# failed directory fsync in that removal, same as the marker's own indeterminate-fsync case
+# below). Downstream guards that gate on ANY journal (the broker socket's ConditionPathExists,
+# wardos-greetd-session's early refusal) cannot themselves tell a stale journal apart from a
+# real unresolved one — by design, since telling them apart needs exactly the marker check
+# this unit already has. Left alone, a stale journal would permanently brick an already-valid,
+# already-provisioned boot: neither the broker nor the greeter selector would ever proceed.
+# This unit runs first on every boot (ordered Before= both greetd and the broker socket) and
+# is the one place that already knows the difference, so clear it here — retried once,
+# mirroring commit_marker's own retry below — BEFORE the idempotency exit, touching the
+# account not at all (no useradd, no userdel: the marker is the commit point, not this
+# reconciliation).
+if [[ -e "$marker" && -e "$journal" ]]; then
+  if remove_durable "$journal" || remove_durable "$journal"; then
+    echo "wardos-dev-seed: cleared a stale dev-seed journal left over from an already-committed provisioning transaction" >&2
+  else
+    echo "wardos-dev-seed: a stale dev-seed journal remains after an already-committed transaction and could not be durably cleared even after a retry; leaving it for a future boot to reconcile" >&2
+  fi
+fi
 
 # Nothing to do unless this is a dev-seed image that is still unprovisioned. Reboot
 # idempotency: once the marker exists (this run seeded, or provisioning ran), exit at once.
