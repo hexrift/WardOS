@@ -480,6 +480,38 @@ fn lower_layer_cannot_introduce_service_above_ceiling() {
     );
 }
 
+#[test]
+fn overlapping_wildcards_resolve_to_the_most_restrictive_decision() {
+    // Regression for issue #159: BTreeMap iteration order sorts `'*'` before
+    // letters, so `credential_decision` used to `return` the first wildcard
+    // match it encountered — the broad `cloud-*` => Ask — which shadowed the
+    // narrower, more restrictive `cloud-danger-*` => Deny. The invariant
+    // elsewhere in this crate (see `merge::Lattice` impls) is that the more
+    // restrictive rule always wins, so this must pick `Deny` for any service
+    // both wildcards match, and fall back to the sole matching wildcard
+    // (`Ask`) when only the broad one applies.
+    // Exercise `credential_decision` directly against a manifest with both
+    // wildcards present, rather than through `merge` (whose own narrowing
+    // would collapse `Ask` under the default `cloud-*` => `Deny` ceiling and
+    // mask the bug under test).
+    let mut m = default_manifest();
+    m.credentials = BTreeMap::from([
+        (
+            ServiceId("cloud-*".into()),
+            CredentialRule::Ask(CredentialScope::default()),
+        ),
+        (ServiceId("cloud-danger-*".into()), CredentialRule::Deny),
+    ]);
+    assert_eq!(
+        m.credential_decision(&ServiceId("cloud-danger-x".into())),
+        Decision::Deny
+    );
+    assert_eq!(
+        m.credential_decision(&ServiceId("cloud-aws".into())),
+        Decision::Ask
+    );
+}
+
 // --- default manifest ------------------------------------------------------
 
 #[test]

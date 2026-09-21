@@ -55,6 +55,17 @@ impl Serialize for Blake3Hash {
 impl<'de> Deserialize<'de> for Blake3Hash {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let hex = String::deserialize(d)?;
+        // Reject anything but exactly 64 hex chars up front — without this, the
+        // chunked `hex.get(i*2..i*2+2)` scan below only ever reads the first 64
+        // bytes and silently ignores trailing garbage, so a 64-hex-char digest
+        // with extra bytes appended would still parse (issue #169). Mirrors
+        // `ward_snapshot::id::Digest::from_hex`'s length check.
+        if hex.len() != 64 {
+            return Err(serde::de::Error::custom(format!(
+                "expected 64 hex chars, got {}",
+                hex.len()
+            )));
+        }
         let bytes = (0..32)
             .map(|i| {
                 hex.get(i * 2..i * 2 + 2)
@@ -65,5 +76,43 @@ impl<'de> Deserialize<'de> for Blake3Hash {
         let mut out = [0u8; 32];
         out.copy_from_slice(&bytes);
         Ok(Self(out))
+    }
+}
+
+#[cfg(test)]
+mod blake3_hash_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::Blake3Hash;
+
+    #[test]
+    fn valid_64_char_hex_round_trips() {
+        let hex = "ab".repeat(32);
+        let json = format!("\"{hex}\"");
+        let parsed: Blake3Hash = serde_json::from_str(&json).expect("valid digest");
+        assert_eq!(parsed.to_hex(), hex);
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("serialize"),
+            json,
+            "must serialize back to the same 64-char hex string"
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_after_64_hex_chars_are_rejected() {
+        // Regression for issue #169: the old chunked scan only ever read the
+        // first 64 chars and never checked the string's total length, so
+        // `"<64 hex><garbage>"` parsed as if the garbage were not there.
+        let hex = format!("{}garbage", "ab".repeat(32));
+        let json = format!("\"{hex}\"");
+        assert!(
+            serde_json::from_str::<Blake3Hash>(&json).is_err(),
+            "a digest with trailing bytes after 64 hex chars must not deserialize"
+        );
+    }
+
+    #[test]
+    fn too_short_hex_is_rejected() {
+        let json = format!("\"{}\"", "ab".repeat(31));
+        assert!(serde_json::from_str::<Blake3Hash>(&json).is_err());
     }
 }

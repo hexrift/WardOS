@@ -226,18 +226,24 @@ pub struct CapabilityManifest {
 impl CapabilityManifest {
     /// Effective decision for a credential request, honouring wildcard (`prefix-*`)
     /// deny classes and defaulting to `Deny` for any unlisted service.
+    ///
+    /// When several wildcard rules match, the *most restrictive* decision wins
+    /// (`Deny` > `Ask` > `Allow`, matching [`crate::merge`]'s narrowing order),
+    /// not just the first match in `BTreeMap` order — otherwise a broad `Ask`
+    /// entry that sorts before a narrower `Deny` (`'*'` sorts before letters)
+    /// would silently shadow it.
     #[must_use]
     pub fn credential_decision(&self, service: &ServiceId) -> Decision {
         if let Some(rule) = self.credentials.get(service) {
             return rule.decision();
         }
-        for (listed, rule) in &self.credentials {
-            if let Some(prefix) = listed.0.strip_suffix('*')
-                && service.0.starts_with(prefix)
-            {
-                return rule.decision();
-            }
-        }
-        Decision::Deny
+        self.credentials
+            .iter()
+            .filter_map(|(listed, rule)| {
+                let prefix = listed.0.strip_suffix('*')?;
+                service.0.starts_with(prefix).then(|| rule.decision())
+            })
+            .max()
+            .unwrap_or(Decision::Deny)
     }
 }
