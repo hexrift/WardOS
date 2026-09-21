@@ -41,19 +41,23 @@ welcome_items() {
 }
 
 # The upper sections: SECTION<TAB>label<TAB>command, from the shell or the static list.
+# ward-shell's command column is already a complete, ready-to-run command line (Command::shell,
+# crates/ward-shell-core/src/launcher.rs — e.g. `foot -D <dir> -- ward claude`, or a bare `foot`/
+# `chromium`/`wardos-menu system`), so it runs as-is. Only the static fallback's commands are
+# bare `ward …`, so it wraps each one in a terminal itself.
 upper_items() {
-  local lines=$shell_lines
-  if [[ -z "$lines" ]]; then
-    lines=$(printf '%s\n' \
-      $'AGENTS\tStart Claude\tward claude' \
-      $'AGENTS\tStart Codex\tward codex' \
-      $'AGENTS\tSessions\tward session list' \
-      $'SECURITY\tVerify current project\tward verify' \
-      $'SECURITY\tEvidence\tward evidence' \
-      $'SECURITY\tSnapshots\tward snapshot list' \
-      $'SECURITY\tStatus\tward status')
+  if [[ -n "$shell_lines" ]]; then
+    printf '%s\n' "$shell_lines"
+  else
+    printf '%s\n' \
+      $'AGENTS\tStart Claude\twardos-launch terminal ward claude' \
+      $'AGENTS\tStart Codex\twardos-launch terminal ward codex' \
+      $'AGENTS\tSessions\twardos-launch terminal ward session list' \
+      $'SECURITY\tVerify current project\twardos-launch terminal ward verify' \
+      $'SECURITY\tEvidence\twardos-launch terminal ward evidence' \
+      $'SECURITY\tSnapshots\twardos-launch terminal ward snapshot list' \
+      $'SECURITY\tStatus\twardos-launch terminal ward status'
   fi
-  printf '%s\n' "$lines" | awk -F'\t' 'NF >= 3 { print $1 "\t" $2 "\twardos-launch terminal " $3 }'
 }
 
 system_items() {

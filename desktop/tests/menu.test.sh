@@ -4,10 +4,12 @@
 source "$(dirname "$0")/lib.sh"
 setup_env
 for c in wardos-capture wardos-toggle wardos-power wardos-setup wardos-install wardos-remove \
-  wardos-update wardos-keys wardos-launch wardos-theme wardos-font gtk-launch; do
+  wardos-update wardos-keys wardos-launch wardos-theme wardos-font gtk-launch foot; do
   mock "$c"
 done
-mock ward-shell 'printf "PROJECTS\tpayments-api\tward open /p/payments-api\nAGENTS\tStart Claude\tward claude\n"'
+# Real ward-shell output (Command::shell, crates/ward-shell-core/src/launcher.rs): the command
+# column is already a complete, ready-to-run command line, not a bare `ward …` invocation.
+mock ward-shell 'printf "PROJECTS\tpayments-api\tfoot -D /p/payments-api\nAGENTS\tStart Claude\tfoot -D /p/payments-api -- ward claude\n"'
 
 wardos-menu --help | grep -q '^Usage' || fail "--help prints the usage block"
 
@@ -54,11 +56,13 @@ wardos-menu appearance theme nord
 assert_logged '^wardos-theme set nord$'
 wardos-menu appearance font "Noto Sans"
 assert_logged '^wardos-font set Noto Sans$'
-# A leaf of ward-shell runs the command it named.
+# A leaf of ward-shell runs its already-complete command line directly — never re-wrapped in
+# another terminal (#156: that produced `foot -e foot -D … -- ward claude`, a nested window).
 wardos-menu agents "Start Claude"
-assert_logged '^wardos-launch terminal ward claude$'
+assert_logged '^foot -D /p/payments-api -- ward claude$'
+assert_not_logged '^wardos-launch terminal foot'
 wardos-menu projects payments-api
-assert_logged '^wardos-launch terminal ward open /p/payments-api$'
+assert_logged '^foot -D /p/payments-api$'
 
 # Walking the tree through the picker: one answer per level.
 export WARDOS_MENU_CHOICE=$'SYSTEM     Capture\nScreenshot output'

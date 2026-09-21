@@ -89,15 +89,53 @@ remove_durable() {
 # The marker is the transaction's commit point, written durably and last.
 commit_marker() { write_durable "$marker" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
 
+# Confirm the account database itself (not the journal) is durable -- mirrors
+# wardos-provisiond's account_db_durable. userdel does not fsync its own writes, so success
+# there is not proof the removal survives a crash; remove_durable(journal) unlinks the journal
+# as its very first step, so clearing it before this is confirmed could lose the only recovery
+# record while the account's removal is still unconfirmed (#153).
+#
+# Fsyncing each file only flushes its CONTENT (owner follow-up review): shadow-utils commits
+# every one of these by writing a temp file and RENAMING it over the target, the same pattern
+# write_durable/remove_durable use elsewhere in this file, and a rename's directory entry is
+# not durable until the containing directory itself is fsynced. So /etc is fsynced too, after
+# the files. subuid/subgid are included since useradd may allocate subordinate ID ranges there
+# (Fedora's default login.defs); both are optional and skipped when absent, like the rest.
+account_db_durable() {
+  local f
+  for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/subuid /etc/subgid; do
+    [[ -e "$f" ]] || continue
+    fsync_path "$f" || return 1
+  done
+  fsync_path /etc || return 1
+  return 0
+}
+
 # Roll back a created-but-uncommitted account after a mid-transaction failure. userdel's
-# result is CHECKED, never suppressed: on success the journal is cleared (transaction
-# resolved); on FAILURE the journal — naming this account — is left in place on purpose so the
-# next boot's reconcile retries the removal rather than leaving a silent residual wheel
-# account. Either way this seed attempt fails visibly (mirrors wardos-provisiond).
+# result is CHECKED, never suppressed: on success (AND once the account database's own
+# durability is confirmed, above) the journal is cleared; on userdel FAILURE, or when that
+# durability cannot be confirmed, the journal — naming this account — is left completely
+# untouched on purpose so the next boot's reconcile retries rather than leaving a silent
+# residual wheel account (#127) or losing the only recovery record for an unconfirmed removal
+# (#153). Either way this seed attempt fails visibly (mirrors wardos-provisiond).
+#
+# Once account-database durability is confirmed, the journal's own removal keeps a bounded
+# retry-once (mirroring commit_marker's retry-once discipline for an indeterminate directory
+# fsync below) and, if it still fails, logs rather than silently dropping it — this residual
+# failure is now provably harmless: the account's durability was already confirmed
+# independently, so the next boot's reconcile_pending safely retries clearing it either way.
 rollback_account() {
   local user=$1 reason=$2
   if userdel -r "$user" 2>/dev/null; then
-    remove_durable "$journal" || true
+    if account_db_durable; then
+      if ! remove_durable "$journal"; then
+        if ! remove_durable "$journal"; then
+          echo "wardos-dev-seed: $reason; rolled the account '$user' back, confirmed durable, but could not durably confirm clearing its transaction journal ($journal); journal-cleanup durability is unconfirmed and will be retried by the next boot's reconcile_pending" >&2
+        fi
+      fi
+    else
+      echo "wardos-dev-seed: $reason; rolled the account '$user' back but could not confirm the account database's own durability; keeping the transaction journal ($journal) in place on purpose rather than risk losing the only recovery record" >&2
+    fi
   else
     echo "wardos-dev-seed: $reason, AND rolling the account '$user' back failed; keeping the journal and refusing (recovery required — a later boot with userdel working will reconcile it before re-seeding)" >&2
     exit 1
@@ -110,10 +148,13 @@ rollback_account() {
 # creates anything (mirrors wardos-provisiond's reconcile_pending). A journal entry means a
 # previous seed created — or may have created — an account that never reached the committed
 # marker (a crash/power loss mid-transaction, or a rollback that itself failed). Remove the
-# recorded account with a CHECKED userdel; only when it is gone is the journal cleared. If the
-# removal FAILS, do NOT create a second account and do NOT fall through to a state where
-# canonical provisioning would add another admin — leave the journal and fail visibly, exactly
-# as the broker refuses.
+# recorded account with a CHECKED userdel; only when it is gone (AND its removal's own
+# durability is confirmed via account_db_durable, above — the same userdel-doesn't-fsync gap
+# rollback_account guards against, reachable here too since this is what actually retries a
+# rollback that failed or was interrupted, #153) is the journal cleared. If either check
+# FAILS, do NOT create a second account and do NOT fall through to a state where canonical
+# provisioning would add another admin — leave the journal and fail visibly, exactly as the
+# broker refuses.
 reconcile_pending() {
   [[ -e "$journal" ]] || return 0
   local pending
@@ -123,12 +164,26 @@ reconcile_pending() {
       echo "wardos-dev-seed: an interrupted seed account ('$pending') could not be removed; refusing to seed (recovery required — a later boot with userdel working will reconcile it first)" >&2
       exit 1
     fi
+    if ! account_db_durable; then
+      echo "wardos-dev-seed: the removed seed account's own durability could not be confirmed; refusing to seed (recovery required)" >&2
+      exit 1
+    fi
   fi
   remove_durable "$journal" || {
     echo "wardos-dev-seed: the seed transaction journal could not be cleared; refusing to seed (recovery required)" >&2
     exit 1
   }
 }
+
+# NOTE (#152, owner follow-up review): this unit's own systemd condition —
+# ConditionPathExists=!/var/lib/wardos/provisioned — means ExecStart never runs once the
+# marker exists, so there is no root-privileged path here (or anywhere else) that reconciles a
+# stale journal left behind by an already-committed transaction. A stale post-commit journal is
+# therefore permanently inert rather than actively cleaned up: wardos-greetd-session's
+# marker-first check (ADR-0027) is what keeps the machine usable regardless — a leftover
+# journal never blocks the greeter once the marker is present, and its own best-effort removal
+# attempt (which may fail under its unprivileged `greeter` identity) is opportunistic only,
+# never required or relied upon by anything downstream.
 
 # Nothing to do unless this is a dev-seed image that is still unprovisioned. Reboot
 # idempotency: once the marker exists (this run seeded, or provisioning ran), exit at once.

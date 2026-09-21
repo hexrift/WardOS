@@ -111,15 +111,47 @@ assert_not_logged 'foot'     # the provisioning UI must NOT launch
 assert_not_logged 'gtkgreet' # the greeter must NOT launch
 [[ ! -e "$WARDOS_PROVISIONED_MARKER" ]] || fail "the dev-seed-inhibited path must not run cage/provision"
 
-# (b2) journal present, marker ALSO present: still fail closed (the guard is EARLY, ahead of the
-#      marker fast-path), so a lingering unresolved journal never lets the greeter come up either.
+# (b2) [#152] journal present, marker ALSO present: the marker is the durable transaction commit
+#      point, so a journal still present alongside it cannot be a real unresolved pre-commit
+#      transaction — it is provably stale (e.g. the marker committed but a crash/power-loss, or a
+#      failed directory fsync inside remove_durable, kept the post-commit journal clear from
+#      completing). Before the fix this fell into the SAME fail-closed branch as (b1) and refused
+#      forever: a fully provisioned machine permanently unloginable via the greeter. The selector
+#      must now reach the greeter anyway, and — since this test process can genuinely remove the
+#      file — clear the stale journal along the way.
 : >"$MOCK_LOG"
 : >"$WARDOS_PROVISIONED_MARKER"
+printf 'devuser\n' >"$WARDOS_DEV_SEED_JOURNAL"
 mock cage
-rc=0
-wardos-greetd-session || rc=$?
-[[ $rc -ne 0 ]] || fail "an unresolved dev-seed journal must fail closed even with the marker present"
-assert_not_logged 'gtkgreet'
+wardos-greetd-session
+assert_logged '^cage -s -- gtkgreet '
+[[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] ||
+  fail "#152: a stale dev-seed journal past a committed marker must be cleared, not leave the machine unloginable forever"
+
+# (b3) [#152 review] the REAL production ownership boundary: wardos-greetd-session runs as the
+#      unprivileged, locked `greeter` user, while wardos-dev-seed creates the journal as ROOT in
+#      a root-owned directory — an unprivileged `rm -f` against it fails with EACCES. Simulate
+#      that with a stubbed `rm` that always fails (this test process itself can otherwise remove
+#      anything under $TMP, so only a stub proves the boundary deterministically). The selector
+#      must still reach the greeter (the marker is authoritative regardless of cleanup success —
+#      there is no other, privileged cleanup path: wardos-dev-seed's own unit is gated
+#      `ConditionPathExists=!<marker>`, so a stale post-commit journal is genuinely permanently
+#      inert once the marker exists, never actively reconciled by anything),
+#      and it must say HONESTLY that the removal failed rather than discarding rm's exit status
+#      and implying success (the previous `rm -f "$path" 2>/dev/null` bug this replaces).
+: >"$MOCK_LOG"
+: >"$WARDOS_PROVISIONED_MARKER"
+printf 'devuser\n' >"$WARDOS_DEV_SEED_JOURNAL"
+mock cage
+mock rm 'exit 1' # simulates the root/greeter permission boundary deterministically
+b3_err="$TMP/greetd-b3.err"
+wardos-greetd-session 2>"$b3_err"
+assert_logged '^cage -s -- gtkgreet ' # the greeter still runs — cleanup success is never required
+rm -f "$MOCK_DIR/rm" # restore the real rm immediately: later test-script cleanup needs it to work
+[[ -e "$WARDOS_DEV_SEED_JOURNAL" ]] ||
+  fail "#152: when rm fails, the journal must genuinely remain (never claimed removed when it was not)"
+grep -Fiq 'could not remove' "$b3_err" ||
+  fail "#152: an rm failure must be reported honestly, not silently discarded; got: $(cat "$b3_err")"
 
 # Once reconciliation clears the journal, the selector resumes normally (marker present → greeter).
 : >"$MOCK_LOG"
