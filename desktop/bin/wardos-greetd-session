@@ -100,15 +100,27 @@ PY
 dev_seed_journal="${WARDOS_DEV_SEED_JOURNAL:-/var/lib/wardos/dev-seed.journal}"
 
 # Durable-remove helper local to this thin selector script (unlike the broker/dev-seed
-# transaction scripts, it has no fsync_path/remove_durable of its own): rm -f the path, then
-# fsync its parent directory so the removal survives a power cut. Best-effort BY DESIGN — it is
-# only ever used to clear an artifact already proven stale below — so a failure here is logged
-# loudly on stderr but must never block the caller.
+# transaction scripts, it has no fsync_path/remove_durable of its own). BEST-EFFORT AND MAY
+# LEGITIMATELY FAIL: this selector runs as the unprivileged, locked `greeter` user (greetd's
+# session command), while the dev-seed journal is created by wardos-dev-seed running as ROOT
+# in a root-owned directory (image/rootfs/etc/greetd/config.toml) — an unprivileged `rm -f`
+# against it can fail with EACCES every time in production. That is fine: this is only a
+# same-boot convenience, never load-bearing. The AUTHORITATIVE, durable cleanup lives in
+# wardos-dev-seed itself, which runs first, as root, ordered Before= greetd, and reconciles the
+# identical stale-journal-past-a-committed-marker case there (own marker-present check) with
+# real permission to remove it. So the caller here proceeds to run_greeter regardless of this
+# helper's outcome — but that outcome is reported HONESTLY: an rm -f failure is never silently
+# treated as success (a bare `rm -f path 2>/dev/null` with the exit status discarded would do
+# exactly that, since a no-op directory fsync afterward "succeeds" whether or not the file was
+# actually removed).
 remove_best_effort() {
   local path=$1
-  rm -f "$path" 2>/dev/null
-  if ! sync "$(dirname "$path")" 2>/dev/null; then
-    echo "wardos-greetd-session: could not durably confirm removal of $path (parent directory fsync failed); continuing anyway — it is inert past a committed marker" >&2
+  if rm -f "$path" 2>/dev/null; then
+    if ! sync "$(dirname "$path")" 2>/dev/null; then
+      echo "wardos-greetd-session: removed $path but could not durably confirm it (parent directory fsync failed); wardos-dev-seed will reconcile it on a future boot if it reappears" >&2
+    fi
+  else
+    echo "wardos-greetd-session: could not remove $path (likely the root/greeter permission boundary — this selector runs unprivileged); leaving it for wardos-dev-seed's root-privileged reconciliation" >&2
   fi
 }
 

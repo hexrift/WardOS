@@ -256,14 +256,46 @@ assert_logged '^userdel -r devuser$'                 # the orphan was reconciled
 assert_file "$WARDOS_PROVISIONED_MARKER"
 [[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "the journal is cleared after a committed recovery"
 
-# --- T4b [#153]: rollback SUCCEEDS (userdel removes the orphan) but the journal's directory
+# --- T4b [#153a]: rollback's userdel SUCCEEDS, but the ACCOUNT DATABASE's own durability
+# (account_db_durable: /etc/passwd &c.) cannot be confirmed. The journal must be left
+# COMPLETELY UNTOUCHED — no removal attempted at all — since userdel never fsyncs its own
+# writes, and unlinking the only recovery record before that is independently confirmed is
+# exactly the #153 gap: a crash could lose the account removal while the journal (the sole
+# trace of it) is already gone.
+seed_stateful_mocks
+reset_state
+printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
+cred_on
+mock chpasswd 'exit 1' # force the mid-transaction failure so rollback runs
+# shellcheck disable=SC2016
+mock sync 'case "$1" in "/etc/passwd") exit 1 ;; esac; exit 0'
+rb_err="$TMP/dev-seed-rollback-a.err"
+rc=0
+bash "$seed" 2>"$rb_err" || rc=$?
+[[ $rc -ne 0 ]] || fail "#153a: a chpasswd failure must still fail the seed"
+assert_logged '^userdel -r devuser$' # the account really is rolled back
+[[ "$(acct_count)" -eq 0 ]] || fail "#153a: userdel really removed the rolled-back account: $(ls "$acct_dir")"
+assert_file "$WARDOS_DEV_SEED_JOURNAL" # the journal must be LEFT IN PLACE, never attempted
+grep -Fiq 'database' "$rb_err" ||
+  fail "#153a: the stderr diagnostic must explain the account-database durability could not be confirmed; got: $(cat "$rb_err")"
+# A later boot, once storage recovers, reconciles the still-present journal (no orphan under
+# that name any more — really removed above) and seeds cleanly.
+mock chpasswd
+mock sync 'exit 0'
+: >"$MOCK_LOG"
+run_seed
+[[ $rc -eq 0 ]] || fail "#153a: the next boot must reconcile the preserved journal and seed cleanly; rc=$rc"
+[[ "$(acct_count)" -eq 1 ]] || fail "#153a: recovery must yield exactly one admin: $(ls "$acct_dir")"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+[[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "#153a: the preserved journal must be cleared once reconciled"
+
+# --- T4c [#153b]: once the account database IS confirmed durable, the journal's own directory
 # fsync fails on both the removal and its one retry (mirroring commit_marker's own retry-once
-# discipline). Before the fix this was `remove_durable "$journal" || true`: silently dropped, no
-# trace at all. Now it must be visible on stderr, and a later boot must still recover cleanly —
-# the account really is gone (only the journal-cleanup's durability is unconfirmed), so this is
-# purely about observability, not a change to recovery (T1 above already proves that path). The
-# journal is put in its own directory (jn_dir) with a call-counted sync mock so its initial
-# durable write (call 1) succeeds while the rollback's removal and retry (calls 2 and 3) fail.
+# discipline). This residual failure is now provably harmless (the account's durability was
+# already confirmed independently), so it must be visible on stderr rather than silently
+# dropped, and a later boot must still recover cleanly. The journal is put in its own directory
+# (jn_dir) with a call-counted sync mock so its initial durable write (call 1) succeeds while
+# the rollback's removal and retry (calls 2 and 3) fail.
 seed_stateful_mocks
 reset_state
 printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
@@ -283,24 +315,44 @@ mock sync 'case "$1" in
     ;;
 esac
 exit 0'
-rb_err="$TMP/dev-seed-rollback.err"
+rb_err="$TMP/dev-seed-rollback-b.err"
 rc=0
 bash "$seed" 2>"$rb_err" || rc=$?
-[[ $rc -ne 0 ]] || fail "#153: a chpasswd failure must still fail the seed"
+[[ $rc -ne 0 ]] || fail "#153b: a chpasswd failure must still fail the seed"
 assert_logged '^userdel -r devuser$' # the account really is rolled back
-[[ "$(acct_count)" -eq 0 ]] || fail "#153: userdel really removed the rolled-back account: $(ls "$acct_dir")"
+[[ "$(acct_count)" -eq 0 ]] || fail "#153b: userdel really removed the rolled-back account: $(ls "$acct_dir")"
 grep -Fq 'devuser' "$rb_err" ||
-  fail "#153: the previously-swallowed journal-cleanup failure must now be visible on stderr; got: $(cat "$rb_err")"
-grep -Fiq 'journal' "$rb_err" || fail "#153: the stderr diagnostic must mention the journal; got: $(cat "$rb_err")"
+  fail "#153b: the previously-swallowed journal-cleanup failure must now be visible on stderr; got: $(cat "$rb_err")"
+grep -Fiq 'journal' "$rb_err" || fail "#153b: the stderr diagnostic must mention the journal; got: $(cat "$rb_err")"
 # A later boot still recovers cleanly (the journal file itself really is gone).
 mock chpasswd
 mock sync 'exit 0'
 : >"$MOCK_LOG"
 run_seed
-[[ $rc -eq 0 ]] || fail "#153: the next boot must seed cleanly after the rollback; rc=$rc"
-[[ "$(acct_count)" -eq 1 ]] || fail "#153: recovery must yield exactly one admin: $(ls "$acct_dir")"
+[[ $rc -eq 0 ]] || fail "#153b: the next boot must seed cleanly after the rollback; rc=$rc"
+[[ "$(acct_count)" -eq 1 ]] || fail "#153b: recovery must yield exactly one admin: $(ls "$acct_dir")"
 assert_file "$WARDOS_PROVISIONED_MARKER"
 export WARDOS_DEV_SEED_JOURNAL="$TMP/dev-seed.journal" # back to the clean journal path after jn_dir
+
+# --- T6 [#152]: a STALE journal left behind by an ALREADY-COMMITTED marker must be reconciled
+# away here — before the idempotency exit — so it never permanently blocks the downstream
+# guards that treat ANY dev-seed journal as an unresolved transaction (the broker socket's
+# ConditionPathExists and wardos-greetd-session's early guard). This is NOT an unresolved
+# transaction: the marker is the commit point and it is already present, so the seed must not
+# touch the account (no useradd, no userdel) — only clear the stale journal and exit cleanly.
+seed_stateful_mocks
+reset_state
+printf 'devuser\n' >"$WARDOS_DEV_SEED_FLAG"
+: >"$WARDOS_PROVISIONED_MARKER"                # committed on a prior boot
+printf 'devuser\n' >"$WARDOS_DEV_SEED_JOURNAL" # …but that boot's journal cleanup did not durably finish
+: >"$acct_dir/devuser"                         # the seeded account is real and already exists
+run_seed
+[[ $rc -eq 0 ]] || fail "T6: a stale journal alongside a committed marker must not fail the seed; rc=$rc"
+assert_not_logged '^useradd' # already provisioned: no new account
+assert_not_logged '^userdel' # the marker is genuinely committed; the account is NOT rolled back
+[[ ! -e "$WARDOS_DEV_SEED_JOURNAL" ]] || fail "T6: the stale journal must be durably cleared"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+[[ -e "$acct_dir/devuser" ]] || fail "T6: the already-committed account must be left untouched"
 
 # --- T5. Interruption between each mutation → the next boot reconciles to a single-admin
 #         provisioned OR a cleanly-unprovisioned state, NEVER two usable admins. ---------------

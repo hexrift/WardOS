@@ -89,25 +89,44 @@ remove_durable() {
 # The marker is the transaction's commit point, written durably and last.
 commit_marker() { write_durable "$marker" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
 
+# Confirm the account database itself (not the journal) is durable -- mirrors
+# wardos-provisiond's account_db_durable. userdel does not fsync its own writes, so success
+# there is not proof the removal survives a crash; remove_durable(journal) unlinks the journal
+# as its very first step, so clearing it before this is confirmed could lose the only recovery
+# record while the account's removal is still unconfirmed (#153).
+account_db_durable() {
+  local f
+  for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do
+    [[ -e "$f" ]] || continue
+    fsync_path "$f" || return 1
+  done
+  return 0
+}
+
 # Roll back a created-but-uncommitted account after a mid-transaction failure. userdel's
-# result is CHECKED, never suppressed: on success the journal is cleared (transaction
-# resolved); on FAILURE the journal — naming this account — is left in place on purpose so the
-# next boot's reconcile retries the removal rather than leaving a silent residual wheel
-# account. Either way this seed attempt fails visibly (mirrors wardos-provisiond).
+# result is CHECKED, never suppressed: on success (AND once the account database's own
+# durability is confirmed, above) the journal is cleared; on userdel FAILURE, or when that
+# durability cannot be confirmed, the journal — naming this account — is left completely
+# untouched on purpose so the next boot's reconcile retries rather than leaving a silent
+# residual wheel account (#127) or losing the only recovery record for an unconfirmed removal
+# (#153). Either way this seed attempt fails visibly (mirrors wardos-provisiond).
 #
-# The journal-cleanup step's OWN outcome (#153) is never silently dropped, unlike the previous
-# `remove_durable "$journal" || true`: a userdel success followed by a remove_durable failure
-# retries the removal ONCE (mirroring commit_marker's own retry-once discipline for an
-# indeterminate directory-fsync failure below) and, if it still fails, logs a clear line — the
-# account really is gone, only the journal-cleanup's durability is unconfirmed, and this is
-# harmless: the next boot's reconcile_pending safely retries clearing it either way.
+# Once account-database durability is confirmed, the journal's own removal keeps a bounded
+# retry-once (mirroring commit_marker's retry-once discipline for an indeterminate directory
+# fsync below) and, if it still fails, logs rather than silently dropping it — this residual
+# failure is now provably harmless: the account's durability was already confirmed
+# independently, so the next boot's reconcile_pending safely retries clearing it either way.
 rollback_account() {
   local user=$1 reason=$2
   if userdel -r "$user" 2>/dev/null; then
-    if ! remove_durable "$journal"; then
+    if account_db_durable; then
       if ! remove_durable "$journal"; then
-        echo "wardos-dev-seed: $reason; rolled the account '$user' back but could not durably confirm clearing its transaction journal ($journal); journal-cleanup durability is unconfirmed and will be retried by the next boot's reconcile_pending" >&2
+        if ! remove_durable "$journal"; then
+          echo "wardos-dev-seed: $reason; rolled the account '$user' back, confirmed durable, but could not durably confirm clearing its transaction journal ($journal); journal-cleanup durability is unconfirmed and will be retried by the next boot's reconcile_pending" >&2
+        fi
       fi
+    else
+      echo "wardos-dev-seed: $reason; rolled the account '$user' back but could not confirm the account database's own durability; keeping the transaction journal ($journal) in place on purpose rather than risk losing the only recovery record" >&2
     fi
   else
     echo "wardos-dev-seed: $reason, AND rolling the account '$user' back failed; keeping the journal and refusing (recovery required — a later boot with userdel working will reconcile it before re-seeding)" >&2
@@ -140,6 +159,29 @@ reconcile_pending() {
     exit 1
   }
 }
+
+# Reconcile a STALE journal left by an ALREADY-COMMITTED transaction (#152). Once the marker
+# is present, provisioning already durably committed on some prior boot, and a journal that
+# still exists alongside it cannot be an unresolved pre-commit transaction — it is leftover
+# from that commit's own post-marker journal cleanup not durably finishing (a crash, or a
+# failed directory fsync in that removal, same as the marker's own indeterminate-fsync case
+# below). Downstream guards that gate on ANY journal (the broker socket's ConditionPathExists,
+# wardos-greetd-session's early refusal) cannot themselves tell a stale journal apart from a
+# real unresolved one — by design, since telling them apart needs exactly the marker check
+# this unit already has. Left alone, a stale journal would permanently brick an already-valid,
+# already-provisioned boot: neither the broker nor the greeter selector would ever proceed.
+# This unit runs first on every boot (ordered Before= both greetd and the broker socket) and
+# is the one place that already knows the difference, so clear it here — retried once,
+# mirroring commit_marker's own retry below — BEFORE the idempotency exit, touching the
+# account not at all (no useradd, no userdel: the marker is the commit point, not this
+# reconciliation).
+if [[ -e "$marker" && -e "$journal" ]]; then
+  if remove_durable "$journal" || remove_durable "$journal"; then
+    echo "wardos-dev-seed: cleared a stale dev-seed journal left over from an already-committed provisioning transaction" >&2
+  else
+    echo "wardos-dev-seed: a stale dev-seed journal remains after an already-committed transaction and could not be durably cleared even after a retry; leaving it for a future boot to reconcile" >&2
+  fi
+fi
 
 # Nothing to do unless this is a dev-seed image that is still unprovisioned. Reboot
 # idempotency: once the marker exists (this run seeded, or provisioning ran), exit at once.

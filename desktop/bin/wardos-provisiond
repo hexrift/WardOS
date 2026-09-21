@@ -210,27 +210,50 @@ reconcile_pending() {
     deny "provisioning unresolved: the transaction journal could not be cleared; recovery required"
 }
 
+# Confirm the account database itself (not the journal) is durable. userdel does not fsync
+# its own writes to these files, so a userdel that returns success is not, by itself, proof
+# that the removal survives a crash. This matters because remove_durable(journal) UNLINKS
+# the journal as its very first step (#153 review): if the journal is cleared before the
+# account database's own durability is independently known, a crash between the two could
+# persist them inconsistently — the journal (the only recovery record) gone, but userdel's
+# removal not yet durable, so the account could reappear on reboot with nothing left to
+# reconcile it. Confirming this FIRST, and refusing to touch the journal at all until it
+# succeeds, keeps the journal as a valid recovery record across exactly that crash window.
+account_db_durable() {
+  local f
+  for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do
+    [[ -e "$f" ]] || continue
+    fsync_path "$f" || return 1
+  done
+  return 0
+}
+
 # Roll back a created-but-uncommitted account after a mid-transaction failure. userdel's
-# result is checked, never suppressed: on success the journal is cleared (transaction
-# resolved); on FAILURE the journal — naming this account — is left in place on purpose, so
-# reconcile_pending refuses and retries the removal on the next attempt rather than leaving
-# a silent second administrator (#127). Either way this connection is denied with `reason`.
+# result is checked, never suppressed: on success (AND once the account database's own
+# durability is confirmed, above) the journal is cleared; on userdel FAILURE, or when account
+# database durability cannot be confirmed, the journal — naming this account — is left
+# completely untouched on purpose, so reconcile_pending refuses and retries on the next
+# attempt rather than leaving a silent second administrator (#127) or losing the only
+# recovery record for an account whose removal was never confirmed durable (#153). Either way
+# this connection is denied with `reason`.
 #
-# The journal-cleanup step's OWN outcome (#153) is never silently dropped, unlike the previous
-# `remove_durable "$journal" || true`: a userdel success followed by a remove_durable failure
-# retries the removal ONCE (mirroring commit_marker's own retry-once discipline for an
-# indeterminate directory-fsync failure below) and, if it still fails, logs a clear line — the
-# account really is gone, only the journal-cleanup's durability is unconfirmed, and this is
-# harmless: reconcile_pending safely retries clearing it on the next request either way. A
-# userdel FAILURE is logged too, stating plainly (not just implied by the comment above) that
-# the journal is being left in place on purpose for reconcile_pending.
+# Once account-database durability is confirmed, the journal's OWN removal keeps a bounded
+# retry-once (mirroring commit_marker's retry-once discipline for an indeterminate directory
+# fsync below) and, if it still fails, logs rather than silently dropping it (previously a
+# bare `remove_durable "$journal" || true`) — this residual failure is now provably harmless:
+# the account's durability was already confirmed independently, so reconcile_pending safely
+# retries clearing a resurrected journal on the next request either way.
 rollback_account() {
   local user=$1 reason=$2
   if userdel -r "$user" 2>/dev/null; then
-    if ! remove_durable "$journal"; then
+    if account_db_durable; then
       if ! remove_durable "$journal"; then
-        echo "wardos-provisiond: rolled back account '$user' ($reason) but could not durably confirm clearing its transaction journal ($journal); journal-cleanup durability is unconfirmed and will be retried by reconcile_pending on the next request" >&2
+        if ! remove_durable "$journal"; then
+          echo "wardos-provisiond: rolled back account '$user' ($reason), confirmed durable, but could not durably confirm clearing its transaction journal ($journal); journal-cleanup durability is unconfirmed and will be retried by reconcile_pending on the next request" >&2
+        fi
       fi
+    else
+      echo "wardos-provisiond: rolled back account '$user' ($reason) but could not confirm the account database's own durability; leaving the transaction journal ($journal) in place on purpose rather than risk losing the only recovery record" >&2
     fi
   else
     echo "wardos-provisiond: could not roll back account '$user' ($reason); leaving the transaction journal ($journal) in place on purpose so reconcile_pending retries it on the next request" >&2

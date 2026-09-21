@@ -315,14 +315,13 @@ mock userdel
 mock id 'exit 1'
 mock sync 'exit 0'
 
-# --- #153: rollback_account's journal-cleanup failure must be VISIBLE, not silently swallowed
-# with `remove_durable "$journal" || true`. userdel SUCCEEDS (the account really is rolled back)
-# but the journal's directory fsync fails on both the removal and its one retry (mirroring
-# commit_marker's own retry-once discipline for an indeterminate directory-fsync failure). The
-# journal lives in its own directory (JN_DIR, like the MK_DIR trick above) so only ITS directory
-# fsync can be targeted; a call counter lets the journal's own initial durable write succeed
-# (call 1) while every later fsync of that directory (the rollback's removal and its retry,
-# calls 2 and 3) fails, so the failure genuinely happens inside rollback_account, not earlier.
+# --- #153a: rollback_account must NOT clear the journal until the ACCOUNT DATABASE's own
+# durability is confirmed first. userdel SUCCEEDS (the account really is removed from ACCT_DIR)
+# but /etc/passwd's fsync (account_db_durable) fails, so the journal must be left COMPLETELY
+# UNTOUCHED — no rm -f attempted at all — preserving it as the only recovery record across a
+# crash where userdel's own writes (never fsynced by userdel itself) might not survive but the
+# journal's removal would have. This is the actual #153 gap: unlinking the journal before this
+# confirmation says nothing about whether the account removal it records is itself durable.
 export JN_DIR="$TMP/jn"
 rm -rf "$JN_DIR"
 mkdir -p "$JN_DIR"
@@ -339,6 +338,44 @@ mock id 'for a in "$@"; do case "$a" in -*) ;; *) if [[ -e "$ACCT_DIR/$a" ]]; th
 # shellcheck disable=SC2016
 mock userdel 'u="${@: -1}"; rm -f "$ACCT_DIR/$u"; exit 0' # rollback's userdel SUCCEEDS
 mock chpasswd 'exit 1'                                    # forces the mid-transaction failure
+# Fail ONLY /etc/passwd's fsync (account_db_durable's first check); everything else, including
+# the journal's own initial durable write and its directory, succeeds.
+# shellcheck disable=SC2016
+mock sync 'case "$1" in "/etc/passwd") exit 1 ;; esac; exit 0'
+: >"$MOCK_LOG"
+rb_err="$TMP/rollback-a.err"
+out=$(printf 'ACCOUNT\nfrank\nFrank\npw\n' | wardos-provisiond 2>"$rb_err")
+[[ "$out" == ERR* ]] || fail "#153a: the original chpasswd failure must still be reported; got: $out"
+assert_logged '^userdel -r frank$'                    # the account really is rolled back
+[[ ! -e "$rb_acct_dir/frank" ]] || fail "#153a: userdel really removed the rolled-back account"
+assert_file "$WARDOS_PROVISION_JOURNAL" # the journal must be LEFT IN PLACE, never attempted
+grep -Fiq 'database' "$rb_err" || fail "#153a: the stderr diagnostic must explain the account-database durability could not be confirmed; got: $(cat "$rb_err")"
+
+# A following request, once storage recovers, reconciles the still-present journal (pending
+# user 'frank' no longer exists — really removed above — so reconcile_pending just clears the
+# journal) and provisions cleanly.
+mock chpasswd
+mock sync 'exit 0'
+out=$(printf 'ACCOUNT\ngrace\nGrace\npw\n' | wardos-provisiond)
+[[ "$out" == OK ]] || fail "#153a: a following request must reconcile the preserved journal and provision cleanly; got: $out"
+[[ -e "$rb_acct_dir/grace" ]] || fail "#153a: the following request must create the new admin"
+[[ ! -e "$WARDOS_PROVISION_JOURNAL" ]] || fail "#153a: the preserved journal must be cleared once reconciled"
+assert_file "$WARDOS_PROVISIONED_MARKER"
+
+# --- #153b: once the account database IS confirmed durable, the journal's own cleanup keeps
+# its retry-once-then-report discipline (this residual failure is now provably harmless: the
+# account's durability was already confirmed independently). userdel SUCCEEDS and every
+# /etc/* fsync succeeds, but the journal's OWN directory fsync fails on both the removal and
+# its one retry — a call counter lets the journal's initial durable write succeed (call 1)
+# while every later fsync of that directory (the rollback's removal and its retry, calls 2
+# and 3) fails, so the failure genuinely happens inside rollback_account's journal cleanup,
+# not account_db_durable or the initial write.
+rm -rf "$JN_DIR"
+mkdir -p "$JN_DIR"
+rm -f "$WARDOS_PROVISIONED_MARKER" "$WARDOS_PROVISION_LOCK"
+rm -rf "$rb_acct_dir"
+mkdir -p "$rb_acct_dir"
+mock chpasswd 'exit 1'
 rm -f "$TMP/rb-synccount"
 # shellcheck disable=SC2016
 mock sync 'case "$1" in
@@ -350,23 +387,23 @@ mock sync 'case "$1" in
 esac
 exit 0'
 : >"$MOCK_LOG"
-rb_err="$TMP/rollback.err"
-out=$(printf 'ACCOUNT\nfrank\nFrank\npw\n' | wardos-provisiond 2>"$rb_err")
-[[ "$out" == ERR* ]] || fail "#153: the original chpasswd failure must still be reported; got: $out"
-assert_logged '^userdel -r frank$'                    # the account really is rolled back
-[[ ! -e "$rb_acct_dir/frank" ]] || fail "#153: userdel really removed the rolled-back account"
-grep -Fq 'frank' "$rb_err" || fail "#153: the previously-swallowed journal-cleanup failure must now be visible on stderr; got: $(cat "$rb_err")"
-grep -Fiq 'journal' "$rb_err" || fail "#153: the stderr diagnostic must mention the journal; got: $(cat "$rb_err")"
+rb_err="$TMP/rollback-b.err"
+out=$(printf 'ACCOUNT\nheidi\nHeidi\npw\n' | wardos-provisiond 2>"$rb_err")
+[[ "$out" == ERR* ]] || fail "#153b: the original chpasswd failure must still be reported; got: $out"
+assert_logged '^userdel -r heidi$'
+[[ ! -e "$rb_acct_dir/heidi" ]] || fail "#153b: userdel really removed the rolled-back account"
+grep -Fq 'heidi' "$rb_err" || fail "#153b: the previously-swallowed journal-cleanup failure must now be visible on stderr; got: $(cat "$rb_err")"
+grep -Fiq 'journal' "$rb_err" || fail "#153b: the stderr diagnostic must mention the journal; got: $(cat "$rb_err")"
 
 # A following request still reconciles and provisions exactly one administrator: the journal file
 # itself really is gone (rm -f succeeded; only its directory fsync could not be confirmed), so
 # reconcile_pending sees nothing pending and proceeds cleanly — the fix is purely about
 # observability, not a change to recovery (which the #127 regressions above already prove).
-mock chpasswd # succeeds again
-mock sync 'exit 0' # storage recovered: the sync-counting mock's job is done
-out=$(printf 'ACCOUNT\ngrace\nGrace\npw\n' | wardos-provisiond)
-[[ "$out" == OK ]] || fail "#153: a following request must still reconcile/provision cleanly; got: $out"
-[[ -e "$rb_acct_dir/grace" ]] || fail "#153: the following request must create the new admin"
+mock chpasswd
+mock sync 'exit 0'
+out=$(printf 'ACCOUNT\nivan\nIvan\npw\n' | wardos-provisiond)
+[[ "$out" == OK ]] || fail "#153b: a following request must still reconcile/provision cleanly; got: $out"
+[[ -e "$rb_acct_dir/ivan" ]] || fail "#153b: the following request must create the new admin"
 assert_file "$WARDOS_PROVISIONED_MARKER"
 unset ACCT_DIR
 export WARDOS_PROVISION_JOURNAL="$TMP/provision.journal" # back to a clean journal path after JN_DIR
