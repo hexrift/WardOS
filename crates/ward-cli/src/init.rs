@@ -10,7 +10,7 @@
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -346,6 +346,14 @@ const SESSIONS_IGNORE: &str = ".ward/sessions/";
 /// once here, and every read and write goes through that same fd, so there is no
 /// separate pathname lookup later in the function for a concurrent rename or
 /// replacement to target.
+///
+/// `O_NOFOLLOW` alone only refuses a symlink; it says nothing about what kind of
+/// non-symlink node was opened. `O_NONBLOCK` (a no-op once we know it's a plain
+/// regular file) keeps a pre-planted FIFO from turning the read below into an
+/// indefinite block, and the `is_file`/`nlink` check right after the open refuses a
+/// FIFO outright and refuses a hard link to some other same-user file — opening one
+/// succeeds like any regular file, so only that check stops its target from being
+/// silently rewritten.
 fn ignore_sessions(dir: &Path, dry: bool) -> Result<Outcome> {
     if !dir.join(".git").exists() {
         return Ok(Outcome::Skipped("not a git repository".to_owned()));
@@ -354,10 +362,17 @@ fn ignore_sessions(dir: &Path, dry: bool) -> Result<Outcome> {
     let opened = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&path);
     let (existing_file, existing) = match opened {
         Ok(mut f) => {
+            let meta = f.metadata().map_err(|e| io(&path, e))?;
+            if !meta.is_file() || meta.nlink() != 1 {
+                return Err(Error::Project(format!(
+                    "{}: refusing to read or write a non-regular or hard-linked file",
+                    path.display()
+                )));
+            }
             let mut text = String::new();
             f.read_to_string(&mut text).map_err(|e| io(&path, e))?;
             (Some(f), text)
@@ -830,6 +845,54 @@ mod tests {
         };
         assert!(err.to_string().contains("symlink"), "{err}");
         assert!(!target.exists(), "the symlink's target must not be created");
+    }
+
+    #[test]
+    fn refuses_a_fifo_planted_at_the_gitignore_path() {
+        // O_NOFOLLOW alone says nothing about the node's type: opening a FIFO
+        // read/write succeeds even without O_NONBLOCK (a Linux-specific exception
+        // for O_RDWR on a FIFO), and the subsequent blocking read then waits forever
+        // for data that will never arrive. This must return an error quickly, never
+        // hang — a regression here would hang this test.
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.path().join(".gitignore"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+
+        let Err(err) = run(&options(dir.path(), state.path())) else {
+            panic!("expected the FIFO at .gitignore to be refused");
+        };
+        assert!(err.to_string().contains("non-regular"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_hard_linked_gitignore() {
+        // O_NOFOLLOW refuses a symlink but not a hard link: opening one succeeds
+        // like any other regular file, so only the st_nlink check stops the
+        // aliased file from being silently rewritten with .gitignore's contents.
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let aliased = dir.path().join("aliased-secret");
+        std::fs::write(&aliased, "do not touch").unwrap();
+        std::fs::hard_link(&aliased, dir.path().join(".gitignore")).unwrap();
+
+        let Err(err) = run(&options(dir.path(), state.path())) else {
+            panic!("expected the hard-linked .gitignore to be refused");
+        };
+        assert!(err.to_string().contains("hard-linked"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&aliased).unwrap(),
+            "do not touch",
+            "the aliased file must never be truncated or rewritten"
+        );
     }
 
     #[test]
