@@ -638,7 +638,7 @@ fn serve_gateway<C: Conn>(
     if shared.paused() {
         return refuse_paused(&mut client);
     }
-    let head = match route.rewrite_head(parsed) {
+    let head = match route.rewrite_head(parsed, framing) {
         Ok(head) => head,
         Err(reason) => return respond(&mut client, 502, "Bad Gateway", reason),
     };
