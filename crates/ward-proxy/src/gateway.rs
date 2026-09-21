@@ -28,7 +28,7 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use zeroize::Zeroizing;
 
 use crate::error::Error;
-use crate::http::{self, Host, Method, Parsed, Request, Target};
+use crate::http::{self, Framing, Host, Method, Parsed, Request, Target};
 use crate::secret::Secret;
 
 /// One path prefix mapped to one authenticated upstream.
@@ -280,9 +280,15 @@ impl GatewayRoute {
 
     /// Rebuild the request head for the upstream, injecting the credential.
     ///
-    /// This is the single place the secret is read. The returned buffer is
-    /// zeroed on drop; the error text never contains header values.
-    pub(crate) fn rewrite_head(&self, parsed: &Parsed) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    /// `framing` is the body framing already selected by
+    /// [`http::body_framing`] for this request. This is the single place the
+    /// secret is read. The returned buffer is zeroed on drop; the error text
+    /// never contains header values.
+    pub(crate) fn rewrite_head(
+        &self,
+        parsed: &Parsed,
+        framing: Framing,
+    ) -> Result<Zeroizing<Vec<u8>>, &'static str> {
         const TRAILER: &[u8] = b"\r\nConnection: close\r\n\r\n";
         let Method::Forward { verb, path } = &parsed.request.method else {
             return Err("gateway routes serve forward requests only");
@@ -300,6 +306,13 @@ impl GatewayRoute {
         // `Expect: 100-continue` is answered by the proxy (see `proxy::serve`),
         // never forwarded.
         drop.push("expect".to_owned());
+        // RFC 9112 §6.3: an intermediary forwarding a chunked message MUST
+        // first remove any received Content-Length — the framing this
+        // gateway actually reads (`body_framing`, TE-over-CL) is the one it
+        // must also be the one it advertises upstream.
+        if framing == Framing::Chunked {
+            drop.push("content-length".to_owned());
+        }
         let stripped = self.strip_prefix(path);
         let plain = http::build_head(parsed, verb, &stripped, &self.host_header(), &drop);
         // Sized up front so the buffer holding the secret never reallocates
@@ -504,7 +517,9 @@ mod tests {
              Content-Type: application/json\r\n\
              Content-Length: 2",
         );
-        let head = route().rewrite_head(&p).unwrap();
+        let head = route()
+            .rewrite_head(&p, http::body_framing(&p).unwrap())
+            .unwrap();
         assert_eq!(
             std::str::from_utf8(&head).unwrap(),
             format!(
@@ -524,6 +539,30 @@ mod tests {
         );
     }
 
+    /// RFC 9112 §6.3: when both `Transfer-Encoding` and `Content-Length` are
+    /// present, chunked framing wins and the intermediary MUST drop
+    /// `Content-Length` before forwarding — otherwise the upstream is told a
+    /// body length that need not match the chunked bytes actually sent,
+    /// which is a request-smuggling vector.
+    #[test]
+    fn chunked_framing_drops_content_length_before_forwarding() {
+        let p = parsed(
+            "POST /anthropic/v1/messages HTTP/1.1\r\n\
+             Host: 127.0.0.1:3128\r\n\
+             Transfer-Encoding: chunked\r\n\
+             Content-Length: 999",
+        );
+        let framing = http::body_framing(&p).unwrap();
+        assert_eq!(framing, Framing::Chunked);
+        let head = route().rewrite_head(&p, framing).unwrap();
+        let text = std::str::from_utf8(&head).unwrap();
+        assert!(text.contains("Transfer-Encoding: chunked\r\n"), "{text}");
+        assert!(
+            !text.to_ascii_lowercase().contains("content-length"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn injected_header_always_replaces_the_client_copy() {
         let r = GatewayRoute::new(
@@ -535,7 +574,7 @@ mod tests {
         )
         .unwrap();
         let p = parsed("GET /g HTTP/1.1\r\nHost: h\r\nauthorization: Bearer fake");
-        let head = r.rewrite_head(&p).unwrap();
+        let head = r.rewrite_head(&p, Framing::None).unwrap();
         let text = std::str::from_utf8(&head).unwrap();
         assert!(!text.contains("fake"), "{text}");
         assert!(text.starts_with("GET / HTTP/1.1\r\nHost: example.com:8443\r\n"));
@@ -565,19 +604,19 @@ mod tests {
         )
         .unwrap();
         let err = bad
-            .rewrite_head(&parsed("GET /g HTTP/1.1\r\nHost: h"))
+            .rewrite_head(&parsed("GET /g HTTP/1.1\r\nHost: h"), Framing::None)
             .unwrap_err();
         assert!(!err.contains("evil"), "{err}");
         let empty =
             GatewayRoute::new("/g", "example.com", 443, "x-api-key", Secret::from("")).unwrap();
         assert!(
             empty
-                .rewrite_head(&parsed("GET /g HTTP/1.1\r\nHost: h"))
+                .rewrite_head(&parsed("GET /g HTTP/1.1\r\nHost: h"), Framing::None)
                 .is_err()
         );
         assert!(
             route()
-                .rewrite_head(&parsed("CONNECT a.com:1 HTTP/1.1"))
+                .rewrite_head(&parsed("CONNECT a.com:1 HTTP/1.1"), Framing::None)
                 .is_err()
         );
     }
