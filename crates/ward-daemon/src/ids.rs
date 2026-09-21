@@ -3,7 +3,7 @@
 //! Each Phase 1 crate defines its own id newtypes so it can be built and tested
 //! independently. The daemon is where they meet, so the few conversions live here.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ward_events::{
@@ -14,11 +14,29 @@ use ward_snapshot::{
     CaptureMode as SnapCaptureMode, SnapshotId as SnapSnapshotId, SnapshotRole as SnapSnapshotRole,
 };
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
+use crate::error::Error;
+
+/// No OS entropy source was available to mint an id's random bits.
+#[derive(Debug)]
+pub struct NoEntropy;
+
+impl fmt::Display for NoEntropy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("no OS entropy source available")
+    }
+}
+
+impl std::error::Error for NoEntropy {}
 
 /// A fresh, time-ordered session id (ULID-shaped: 48-bit ms timestamp, 80 CSPRNG bits).
-pub fn new_session_id() -> SessionId {
-    SessionId::from_u128(ulid_u128())
+///
+/// Fails rather than falling back to a predictable construction if the OS entropy
+/// source is unavailable: a session id that looks random but isn't would be worse
+/// than an explicit startup failure.
+pub fn new_session_id() -> Result<SessionId, Error> {
+    ulid_u128()
+        .map(SessionId::from_u128)
+        .map_err(|e| Error::Events(e.to_string()))
 }
 
 /// A stable project id derived from the canonical project path.
@@ -66,8 +84,17 @@ pub fn ev_hash(bytes: [u8; 32]) -> EvHash {
     EvHash::from_bytes(bytes)
 }
 
+fn ulid_u128() -> Result<u128, NoEntropy> {
+    ulid_u128_from(|buf| getrandom::fill(buf).map_err(|_| NoEntropy))
+}
+
+/// The ULID construction, parameterized over how the random tail is filled so tests
+/// can drive it with a fixed source or a forced failure instead of real OS entropy.
 #[allow(clippy::cast_possible_truncation)]
-fn ulid_u128() -> u128 {
+fn ulid_u128_from<F>(fill: F) -> Result<u128, NoEntropy>
+where
+    F: FnOnce(&mut [u8]) -> Result<(), NoEntropy>,
+{
     let ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -75,31 +102,23 @@ fn ulid_u128() -> u128 {
     let ms = (ns / 1_000_000) & ((1 << 48) - 1);
 
     let mut rand = [0u8; 10];
-    if getrandom::fill(&mut rand).is_err() {
-        // No OS entropy source available (e.g. a broken sandbox): fall back to a PRF
-        // over the timestamp and a per-process counter rather than failing id
-        // generation outright. Not expected to run in a normal environment, and
-        // strictly worse than the CSPRNG path above, never used when it succeeds.
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut seed = [0u8; 16];
-        seed[..8].copy_from_slice(&(ns as u64).to_le_bytes());
-        seed[8..].copy_from_slice(&seq.to_le_bytes());
-        rand.copy_from_slice(&blake3::hash(&seed).as_bytes()[..10]);
-    }
+    fill(&mut rand)?;
 
     let mut low = [0u8; 16];
     low[6..].copy_from_slice(&rand);
-    (ms << 80) | (u128::from_be_bytes(low) & ((1 << 80) - 1))
+    Ok((ms << 80) | (u128::from_be_bytes(low) & ((1 << 80) - 1)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{new_session_id, ulid_u128};
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::{NoEntropy, ulid_u128, ulid_u128_from};
 
     #[test]
     fn back_to_back_ids_are_distinct_and_their_ms_prefix_does_not_go_backwards() {
-        let a = ulid_u128();
-        let b = ulid_u128();
+        let a = ulid_u128().expect("OS entropy source available in tests");
+        let b = ulid_u128().expect("OS entropy source available in tests");
         assert_ne!(a, b, "two ids minted back-to-back must not collide");
         // Only the 48-bit ms prefix is guaranteed ordered; two draws inside the same
         // millisecond have independent CSPRNG tails, so the full u128 is not.
@@ -110,17 +129,41 @@ mod tests {
     }
 
     #[test]
-    fn random_tail_is_not_a_deterministic_function_of_the_counter_alone() {
-        // Two ids minted back-to-back (same or adjacent millisecond, adjacent
-        // COUNTER values under the old PRF) must not merely differ by 1 in their
-        // low bits the way a PRF over (ns, seq) would: with a CSPRNG tail the
-        // low 80 bits of two draws are independent, so a shared 8-bit prefix
-        // across many samples would be a coincidence, not a construction.
-        let ids: Vec<u128> = (0..8).map(|_| new_session_id().as_u128()).collect();
-        let low_bytes: Vec<u8> = ids.iter().map(|id| (*id & 0xff) as u8).collect();
+    fn successful_fill_places_exactly_those_bytes_in_the_low_80_bits() {
+        let id = ulid_u128_from(|buf| {
+            buf.copy_from_slice(&[0xAA; 10]);
+            Ok(())
+        })
+        .expect("fill succeeded");
+        let low = id & ((1u128 << 80) - 1);
+        assert_eq!(low, u128::from_be_bytes([0xAAu8; 16]) & ((1u128 << 80) - 1));
+    }
+
+    #[test]
+    fn two_fills_with_different_bytes_produce_different_ids() {
+        let a = ulid_u128_from(|buf| {
+            buf.copy_from_slice(&[0x11; 10]);
+            Ok(())
+        })
+        .expect("fill succeeded");
+        let b = ulid_u128_from(|buf| {
+            buf.copy_from_slice(&[0x22; 10]);
+            Ok(())
+        })
+        .expect("fill succeeded");
+        assert_ne!(
+            a & ((1u128 << 80) - 1),
+            b & ((1u128 << 80) - 1),
+            "distinct entropy must produce distinct random tails"
+        );
+    }
+
+    #[test]
+    fn entropy_source_failure_fails_closed_instead_of_falling_back() {
+        let result = ulid_u128_from(|_| Err(NoEntropy));
         assert!(
-            low_bytes.windows(2).any(|w| w[0] != w[1]),
-            "low byte of the random tail must vary across draws, not increment lockstep"
+            result.is_err(),
+            "a broken entropy source must not silently produce a predictable id"
         );
     }
 }

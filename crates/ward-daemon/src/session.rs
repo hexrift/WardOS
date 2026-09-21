@@ -251,7 +251,7 @@ impl Session {
             .map_err(|e| Error::io(project_dir, e))?;
         let project_id = project_id_for(&worktree);
         let project_id_str = project_id.to_string();
-        let session = new_session_id();
+        let session = new_session_id()?;
         let session_str = session.to_string();
 
         let project_policy = load_project_policy(&worktree)?;
