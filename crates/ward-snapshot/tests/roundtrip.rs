@@ -314,6 +314,66 @@ fn materialize_refuses_writing_through_a_symlink_ancestor() {
     assert!(!Path::new("/tmp/pwn").exists());
 }
 
+fn blob_count(cas: &Path) -> usize {
+    let mut n = 0;
+    for shard in fs::read_dir(cas.join("blobs")).unwrap() {
+        n += fs::read_dir(shard.unwrap().path()).unwrap().count();
+    }
+    n
+}
+
+/// A single file larger than `max_bytes` must be rejected by budget size
+/// alone, without ever being read and stored as a blob (issue #160: reading
+/// the whole file before the budget check risks exhausting host memory).
+#[test]
+fn a_file_over_max_bytes_is_rejected_before_being_read_into_a_blob() {
+    let cas = tempdir().unwrap();
+    let store = SnapshotStore::open(cas.path()).unwrap();
+    let dir = tempdir().unwrap();
+    write_file(dir.path(), b"huge", &vec![b'x'; 4096]);
+
+    let opts = CaptureOptions {
+        max_bytes: 1024,
+        ..CaptureOptions::default()
+    };
+    let err = store
+        .capture(dir.path(), SnapshotRole::Entry, opts)
+        .unwrap_err();
+    assert!(
+        matches!(err, SnapshotError::BudgetExceeded(1024)),
+        "got {err:?}"
+    );
+    assert_eq!(
+        blob_count(cas.path()),
+        0,
+        "an over-budget file must be rejected before its bytes are read and stored"
+    );
+}
+
+/// Several small files that individually fit under `max_bytes` but together
+/// exceed it must still be rejected once the running total would cross the
+/// budget, and files already accepted keep being counted and hashed.
+#[test]
+fn cumulative_bytes_over_budget_across_several_small_files_are_rejected() {
+    let cas = tempdir().unwrap();
+    let store = SnapshotStore::open(cas.path()).unwrap();
+    let dir = tempdir().unwrap();
+    write_file(dir.path(), b"a", &vec![b'a'; 600]);
+    write_file(dir.path(), b"b", &vec![b'b'; 600]);
+
+    let opts = CaptureOptions {
+        max_bytes: 1000,
+        ..CaptureOptions::default()
+    };
+    let err = store
+        .capture(dir.path(), SnapshotRole::Entry, opts)
+        .unwrap_err();
+    assert!(
+        matches!(err, SnapshotError::BudgetExceeded(1000)),
+        "got {err:?}"
+    );
+}
+
 fn write_blob(cas_root: &Path, bytes: &[u8]) {
     let hex = Digest::of(bytes).to_hex();
     let dir = cas_root.join("blobs").join(&hex[..2]);

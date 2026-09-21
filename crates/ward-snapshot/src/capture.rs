@@ -218,11 +218,17 @@ impl Walker<'_> {
         } else if ft.is_file() {
             self.stats.files_total += 1;
             let size = meta.len();
-            let digest = self.hash_file(&abs, &meta)?;
-            self.total_bytes += size;
-            if self.total_bytes > self.opts.max_bytes {
+            // Check the budget against the file's known size *before* reading any
+            // of its bytes: `hash_file` (both the plain and incremental/cache-fill
+            // paths) does a whole-file `fs::read`, so checking only after would let
+            // a single oversized file be fully buffered in memory ahead of the
+            // rejection — a memory DoS of the host process (issue #160).
+            let prospective_total = self.total_bytes.saturating_add(size);
+            if prospective_total > self.opts.max_bytes {
                 return Err(SnapshotError::BudgetExceeded(self.opts.max_bytes));
             }
+            let digest = self.hash_file(&abs, &meta)?;
+            self.total_bytes = prospective_total;
             self.push(rel, EntryType::File, mode, size, Some(digest));
         } else if ft.is_fifo() || ft.is_socket() || ft.is_block_device() || ft.is_char_device() {
             self.push(rel, EntryType::Unsupported, mode, 0, None);
