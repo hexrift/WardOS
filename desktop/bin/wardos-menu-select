@@ -52,7 +52,10 @@ stdin_answer() {
   local choices=${WARDOS_MENU_CHOICE:-} base cursor_dir cursor_file idx=0 key n
   base="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
   cursor_dir="$base/wardos-menu-select.$(id -u)"
-  mkdir -m 0700 -p "$cursor_dir" 2>/dev/null || true
+  # No -p: $base (XDG_RUNTIME_DIR, or TMPDIR/tmp) always exists already, and -m only
+  # applies to the deepest directory -p creates (SC2174) — irrelevant here since this
+  # is the one level we create, but a plain mkdir keeps that obviously true.
+  mkdir -m 0700 "$cursor_dir" 2>/dev/null || true
   [[ -d "$cursor_dir" && ! -L "$cursor_dir" && -O "$cursor_dir" ]] ||
     wardos_die "refusing to use $cursor_dir: not a directory we own"
   [[ "$(stat -c '%a' "$cursor_dir")" == 700 ]] ||
