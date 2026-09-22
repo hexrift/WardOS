@@ -327,6 +327,23 @@ impl RemoteSink {
             .set_read_timeout(timeout)
             .map_err(|e| Error::Sandbox(format!("control socket: {e}")))
     }
+
+    /// A duplicate file descriptor of this sink's underlying socket, sharing
+    /// the same kernel connection [`Self::next_response`]/[`Self::next_within`]
+    /// read from (review 5284703397 of #210, finding 2): `UnixStream::shutdown`
+    /// acts on the socket itself, not on any one fd referencing it, so calling
+    /// it on this clone from another thread unblocks a read pending on
+    /// *this* sink right now — including one with no read timeout set at all
+    /// — with an immediate `Ok(0)`/EOF, the same shape a blocked read already
+    /// gets when the daemon on the other end hangs up on its own.
+    /// [`follow_pending_all`](crate::client::follow_pending_all) uses this to
+    /// give its watcher threads a way to be told "stop" that a quiet,
+    /// unbounded `next_response` actually observes.
+    pub fn try_clone_socket(&self) -> Result<UnixStream> {
+        self.writer
+            .try_clone()
+            .map_err(|e| Error::Sandbox(format!("control socket: {e}")))
+    }
 }
 
 impl Sink for RemoteSink {
