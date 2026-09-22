@@ -162,13 +162,23 @@ jobs:
   #    for an older commit that happens to finish its builds later can never clobber
   #    a newer commit's already-promoted `latest`. The per-commit `<sha>` tag is still
   #    written either way, so every complete build stays individually addressable.
-  # `latest` is promoted from the `<sha>` index by NAME, not rebuilt from the two
-  # per-architecture tags: those stay mutable for as long as the registry keeps them,
-  # so re-deriving `latest` from them again at promotion time could pick up a
-  # different child than the one just validated above. `<sha>` is written exactly
-  # once, by the "Build the per-commit two-architecture index" step above, and
-  # nothing else in this workflow ever writes it again — so copying it is copying
-  # precisely what was inspected, not reconstructing something that might have moved.
+  # `latest` is promoted by DIGEST (`repo@sha256:...`), not by name and not rebuilt
+  # from the two per-architecture tags: every tag this workflow writes — `<sha>`
+  # included — stays mutable for as long as the registry keeps it, so a retry of this
+  # same commit (which reruns `build`/`build-aarch64` and rewrites all three short-SHA
+  # tags, possibly with different bytes if an upstream input moved) could otherwise
+  # make a later promotion pick up a different child than the one this run actually
+  # validated. The digest is captured once, right after the index above is built, and
+  # threaded through to promotion as a step output — so promotion always targets
+  # exactly what THIS run inspected, never whatever `<sha>` happens to resolve to by
+  # the time the promote step runs. `scripts/release/promote-latest.test.sh` proves
+  # this with a mocked `docker`: staying-current promotes the captured digest and
+  # nothing else, and a superseded run never invokes `docker` at all — which is also
+  # #149's cancellation case, made concrete rather than left as a comment: a job killed
+  # at any point up to and including the whole staleness check has issued no `docker`
+  # command that could touch `latest`, and the one command that does is the promotion
+  # itself, gated on that check. (A cancellation mid-build can still leave `<sha>`
+  # written — that's a private, per-commit tag, not the shared channel this guards.)
   # `concurrency` below serializes this job's own runs so two can't interleave a
   # promotion, but GitHub keeps at most one *pending* run per group (a third queued
   # run replaces the second, it does not queue behind it) — this bounds concurrent
@@ -177,11 +187,6 @@ jobs:
   # also needs `contents: read` alongside `packages: write` — every other job here
   # that touches repository content already carries it (and now also checks the repo
   # out, to reach the decision logic below at scripts/release/*.sh).
-  #
-  # Cancellation before promotion (#149's third acceptance case) is safe by
-  # construction rather than by test: `latest` is written by exactly one command, the
-  # last one below, so a job cancelled at any earlier point -- mid-build, mid-validate,
-  # mid-staleness-check -- has touched nothing but its own ephemeral /tmp/index.json.
   manifest:
     name: multi-arch manifest
     needs: [build, build-aarch64]
@@ -198,6 +203,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Build the per-commit two-architecture index
+        id: build_index
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -208,27 +214,30 @@ jobs:
           docker buildx imagetools create -t "$repo:$sha" \
             "$repo:$sha-x86_64" "$repo:$sha-aarch64"
           docker buildx imagetools inspect "$repo:$sha" --raw | tee /tmp/index.json
+          # Captured now, right after the index is built, so promotion later can
+          # target exactly this content by digest instead of whatever `<sha>`
+          # happens to resolve to by then (see the job comment above).
+          digest="$(docker buildx imagetools inspect "$repo:$sha" | awk '/^Digest:/{print $2}')"
+          [ -n "$digest" ] || { echo "build_index: could not read the digest of $repo:$sha" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       # scripts/release/check-multiarch-index.test.sh covers one architecture's
       # manifest missing from the index (#149's first acceptance case).
       - name: Validate both architectures are present before promoting
         run: bash scripts/release/check-multiarch-index.sh /tmp/index.json
 
+      # scripts/release/promote-latest.test.sh covers: staying-current promotes
+      # exactly the digest captured above and nothing else; a run superseded by a
+      # newer commit (out-of-order completion, #149's second acceptance case) never
+      # invokes docker at all, which is also the cancellation case made concrete
+      # (see the job comment above); and a retry of a still-current commit
+      # re-promotes the same call deterministically (#149's fourth case).
       - name: Promote latest, unless a newer commit has already landed on main
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          head_sha="$(git ls-remote "https://x-access-token:${GHCR_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | cut -f1)"
-          # scripts/release/check-not-stale.test.sh covers overlapping runs
-          # finishing out of order and retrying an already-published commit
-          # (#149's second and fourth acceptance cases).
-          bash scripts/release/check-not-stale.sh "$GITHUB_SHA" "$head_sha" || exit 0
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
-          sha="${GITHUB_SHA::7}"
-          # Copy the index by name, not by rebuilding it from the (mutable) per-arch
-          # tags again: this is exactly the object the previous two steps built and
-          # validated, so promoting it is promoting what was actually checked.
-          docker buildx imagetools create -t "$repo:latest" "$repo:$sha"
-          docker buildx imagetools inspect "$repo:latest"
+          head_sha="$(git ls-remote "https://x-access-token:${GHCR_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | cut -f1)"
+          bash scripts/release/promote-latest.sh "$repo" "${{ steps.build_index.outputs.digest }}" "$GITHUB_SHA" "$head_sha"
