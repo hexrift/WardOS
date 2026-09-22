@@ -44,7 +44,11 @@ mapfile -t coprs < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo_r
 # COPR enable and both dnf installs get a bounded, backed-off retry (issue #198: `retry`,
 # kept identical to image/dnf-retry.sh's -- this copy runs inside an ephemeral container
 # that can't source a host file without a bind mount) so a transient upstream COPR/mirror
-# hiccup self-heals within the one job run instead of failing it outright.
+# hiccup self-heals within the one job run instead of failing it outright. Each step,
+# retried or not (including the final, un-retried Hyprland verify itself), echoes
+# dnf-retry.sh's DNF_RETRY_STEP_MARK to stderr right before it starts, so the caller's
+# classify_dnf_failure (via last_step_tail) sees only the step actually running when the
+# container exited, not an earlier step's already-recovered transient hiccup.
 # shellcheck disable=SC2016  # $@ and $HOME expand inside the container's bash
 inner='set -e
 retry() {
@@ -59,8 +63,13 @@ retry() {
     n=$((n + 1))
   done
 }
+echo "##dnf-retry:step##" >&2
 retry 3 5 dnf -y -q install dnf5-plugins >/dev/null
-for c in "$@"; do retry 3 5 dnf -y -q copr enable "$c" >/dev/null; done
+for c in "$@"; do
+  echo "##dnf-retry:step##" >&2
+  retry 3 5 dnf -y -q copr enable "$c" >/dev/null
+done
+echo "##dnf-retry:step##" >&2
 retry 3 5 dnf -y -q --setopt=install_weak_deps=False install hyprland util-linux >/dev/null
 mkdir -p /etc/xdg && ln -sfn /desktop/hyprland /etc/xdg/hypr
 # Hyprland refuses to run as root, so a plain user does the parsing.
@@ -69,6 +78,7 @@ mkdir -p /home/check/.config/wardos/theme/current
 printf "general {\n  col.active_border = rgb(7FA1C3)\n  col.inactive_border = rgb(24272B)\n}\nmisc {\n  background_color = rgb(0E0F11)\n}\n" \
   > /home/check/.config/wardos/theme/current/hyprland.conf
 chown -R check:check /home/check
+echo "##dnf-retry:step##" >&2
 runuser -u check -- bash -c "export XDG_RUNTIME_DIR=/tmp/xdg-check HOME=/home/check; mkdir -m 700 -p \$XDG_RUNTIME_DIR; Hyprland --version | head -n 1; Hyprland --verify-config -c /etc/xdg/hypr/hyprland.conf"'
 cmd=("$runtime" run --rm
   --volume "$repo_root/desktop:/desktop:ro"
@@ -85,13 +95,20 @@ if [[ $dry_run -eq 1 ]]; then exit 0; fi
 # container's own status. `set +e`/`PIPESTATUS[0]` capture the container's exit code, not
 # `tee`'s.
 logfile=$(mktemp)
-trap 'rm -f "$logfile"' EXIT
+tailfile=$(mktemp)
+trap 'rm -f "$logfile" "$tailfile"' EXIT
 set +e
 "${cmd[@]}" 2>&1 | tee "$logfile"
 status=${PIPESTATUS[0]}
 set -e
-if [[ $status -ne 0 ]] && [[ $(classify_dnf_failure "$logfile") == transient ]]; then
-  echo "check-hyprland.sh: exited $status after exhausting its dnf/copr retries -- this looks" \
-    "like an upstream COPR/mirror/network outage (issue #198), not a Hyprland config regression." >&2
+if [[ $status -ne 0 ]]; then
+  # issue #198 review: classify only the step that was actually running when the
+  # container exited, not the whole combined log -- see the DNF_RETRY_STEP_MARK note
+  # above.
+  last_step_tail "$logfile" >"$tailfile"
+  if [[ $(classify_dnf_failure "$tailfile") == transient ]]; then
+    echo "check-hyprland.sh: exited $status after exhausting its dnf/copr retries -- this looks" \
+      "like an upstream COPR/mirror/network outage (issue #198), not a Hyprland config regression." >&2
+  fi
 fi
 exit "$status"

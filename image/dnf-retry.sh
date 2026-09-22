@@ -35,6 +35,10 @@ retry() {
 # real missing/renamed package, or any other dnf error). Pattern-matched against known
 # transient wording, not exhaustive; a miss falls back to "genuine" -- the safe default,
 # since it never quietly waves off a real failure as someone else's outage.
+#
+# Callers should classify last_step_tail's output, not a whole multi-step log: an
+# earlier step's transient hiccup that then recovered on its own retry must not paint a
+# later, unrelated, genuinely-failing step as an outage (or vice versa).
 classify_dnf_failure() {
   local file=$1
   if grep -qEi \
@@ -43,5 +47,28 @@ classify_dnf_failure() {
     echo transient
   else
     echo genuine
+  fi
+}
+
+# The marker each container-side copy of retry's caller prints to its own stderr
+# immediately before a distinct step starts (the dnf5-plugins install, each COPR
+# enable, the final install/repoquery, or a step that isn't retried at all, like
+# Hyprland's own --verify-config in check-hyprland.sh): whatever a container's combined
+# log says before the LAST marker belongs to a step that, by the time the container
+# exited, had already either succeeded or not yet been reached -- only the text after
+# it can belong to the step that was actually running when the container exited.
+DNF_RETRY_STEP_MARK='##dnf-retry:step##'
+
+# last_step_tail FILE: prints FILE's content from after the last DNF_RETRY_STEP_MARK
+# line, or the whole file when no marker appears (a failure before the first marked
+# step, or a caller that never marks one) -- never a narrower view than classifying the
+# whole file in that case, only ever narrower once a step boundary is known.
+last_step_tail() {
+  local file=$1 line
+  line=$(grep -nF "$DNF_RETRY_STEP_MARK" "$file" 2>/dev/null | tail -n 1 | cut -d: -f1)
+  if [[ -n "$line" ]]; then
+    tail -n "+$((line + 1))" "$file"
+  else
+    cat "$file" 2>/dev/null
   fi
 }
