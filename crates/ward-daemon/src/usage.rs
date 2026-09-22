@@ -210,35 +210,54 @@ pub fn scan_scratch(state: &Path) -> Result<Vec<ScratchEntry>> {
 }
 
 /// The full session id [`crate::session::run_dir`] recorded as this
-/// directory's owner, if the marker is present and non-empty.
+/// directory's owner, if the marker is present, non-empty, and a real file —
+/// never a symlink. The OS temp dir is shared and world-writable, so another
+/// local user can plant `<ward-*>/.ward-owner` as a symlink to an arbitrary
+/// path (e.g. a victim's private key); reading through it would disclose that
+/// target's content verbatim as this entry's reported owner. A symlinked
+/// marker is therefore treated exactly like a missing one, never followed.
 fn read_owner_marker(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join(OWNER_MARKER)).ok()?;
+    let marker = dir.join(OWNER_MARKER);
+    let meta = std::fs::symlink_metadata(&marker).ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&marker).ok()?;
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
 }
 
+/// Sum every regular file's size under `dir`, recursing into subdirectories.
+/// Iterative (an explicit worklist, not self-recursion): `dir` is under the
+/// shared, world-writable OS temp dir, so another local user can create an
+/// arbitrarily deep chain of nested directories there with no filesystem
+/// depth limit low enough to stop them; a call-stack recursion over that
+/// input is a local stack-overflow DoS reachable by any co-resident user.
 fn sum_dir_bytes(dir: &Path, total: &mut u64) -> Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Error::io(dir, e)),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|e| Error::io(dir, e))?;
-        // See the matching comment in `add_dir_files`: an entry can legitimately
-        // vanish between being listed and being `stat`ed.
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(Error::io(dir, e)),
+            Err(e) => return Err(Error::io(&dir, e)),
         };
-        if file_type.is_dir() {
-            sum_dir_bytes(&entry.path(), total)?;
-        } else if file_type.is_file() {
-            match entry.metadata() {
-                Ok(m) => *total += m.len(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(Error::io(dir, e)),
+        for entry in entries {
+            let entry = entry.map_err(|e| Error::io(&dir, e))?;
+            // See the matching comment in `add_dir_files`: an entry can
+            // legitimately vanish between being listed and being `stat`ed.
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::io(&dir, e)),
+            };
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                match entry.metadata() {
+                    Ok(m) => *total += m.len(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Error::io(&dir, e)),
+                }
             }
         }
     }
@@ -246,10 +265,26 @@ fn sum_dir_bytes(dir: &Path, total: &mut u64) -> Result<()> {
 }
 
 /// Classify one scratch entry's owning operation (see [`ScratchStatus`]).
+///
+/// `owner` is untrusted: it comes verbatim from a marker file inside a
+/// shared, world-writable directory, with only `trim()` + non-empty checks
+/// applied by [`read_owner_marker`]. Before it reaches a path join
+/// ([`session_dir`]) or a socket lookup ([`daemon::serving`]), it must parse
+/// as an actual [`ward_events::SessionId`] — the same `sess_<26-char
+/// Crockford ULID>` shape [`crate::ids::new_session_id`] generates. Without
+/// this, a marker containing e.g. `../../../../etc` would let
+/// `session_dir`/`socket_path` resolve outside `sessions/`, turning this
+/// read-only report into a path-traversal existence oracle (via
+/// `head_file_path(..).exists()`) and letting an attacker who can bind a
+/// Unix socket at a path of their choosing spoof `ScratchStatus::Active`.
+/// Anything that doesn't parse is `Unknown`, exactly like an absent marker.
 fn classify(state: &Path, owner: Option<&str>) -> ScratchStatus {
     let Some(owner) = owner else {
         return ScratchStatus::Unknown;
     };
+    if owner.parse::<ward_events::SessionId>().is_err() {
+        return ScratchStatus::Unknown;
+    }
     if daemon::serving(state, owner) {
         return ScratchStatus::Active;
     }
@@ -358,11 +393,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ward-usagetest-ghost-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(OWNER_MARKER), "sess_never_recorded").unwrap();
+        // Well-formed (a real `SessionId`'s own textual shape), just never
+        // recorded anywhere on disk.
+        let owner = ward_events::SessionId::from_u128(0x1234).to_string();
+        std::fs::write(dir.join(OWNER_MARKER), &owner).unwrap();
 
         let entries = scan_scratch(state.path()).unwrap();
         let entry = entries.iter().find(|e| e.path == dir).unwrap();
-        assert_eq!(entry.owner.as_deref(), Some("sess_never_recorded"));
+        assert_eq!(entry.owner.as_deref(), Some(owner.as_str()));
         assert_eq!(
             entry.status,
             ScratchStatus::Unknown,
@@ -373,10 +411,94 @@ mod tests {
     }
 
     #[test]
+    fn a_scratch_dir_whose_owner_marker_does_not_parse_as_a_session_id_is_unknown() {
+        // A marker that isn't a real `SessionId`'s textual shape must never
+        // reach `session_dir`/`daemon::serving`'s path joins — see the doc
+        // comment on `classify`. A path-traversal payload is the sharpest
+        // instance: if it were joined in unchecked, `session_dir` would
+        // resolve outside `sessions/`, turning this read-only report into an
+        // existence oracle for an attacker-chosen path.
+        let state = tempfile::tempdir().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("ward-usagetest-traversal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(OWNER_MARKER), "../../../../etc/passwd").unwrap();
+
+        let entries = scan_scratch(state.path()).unwrap();
+        let entry = entries.iter().find(|e| e.path == dir).unwrap();
+        assert_eq!(entry.owner.as_deref(), Some("../../../../etc/passwd"));
+        assert_eq!(
+            entry.status,
+            ScratchStatus::Unknown,
+            "a marker that isn't a real SessionId's shape must classify as Unknown, \
+             never reach a path join"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_scratch_dir_whose_owner_marker_is_a_symlink_is_treated_as_unset() {
+        // The OS temp dir is shared and world-writable: another local user
+        // can plant `.ward-owner` as a symlink to an arbitrary file (e.g. a
+        // victim's private key). Reading through it would disclose that
+        // file's content verbatim as this entry's reported owner — see the
+        // doc comment on `read_owner_marker`.
+        let state = tempfile::tempdir().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("ward-usagetest-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            secret.path(),
+            "sess_should_never_be_disclosed_via_a_symlink",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(secret.path(), dir.join(OWNER_MARKER)).unwrap();
+
+        let entries = scan_scratch(state.path()).unwrap();
+        let entry = entries.iter().find(|e| e.path == dir).unwrap();
+        assert_eq!(
+            entry.owner, None,
+            "a symlinked marker must never be followed or its target disclosed"
+        );
+        assert_eq!(entry.status, ScratchStatus::Unknown);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sum_dir_bytes_handles_a_deeply_nested_tree_without_recursing_on_the_call_stack() {
+        // Not a literal stack-overflow reproduction (that would abort the
+        // whole test process rather than fail cleanly) — this proves the
+        // iterative worklist walk produces the right answer over a tree far
+        // deeper than a routine one, which self-recursion could not do
+        // without growing the call stack proportionally.
+        let mut dir = tempfile::tempdir().unwrap().keep();
+        let root = dir.clone();
+        // Bounded by PATH_MAX (each level adds "d/" to the absolute path),
+        // not by any property of the walk itself — comfortably deeper than
+        // any real scratch-directory tree, which is the point.
+        for _ in 0..1500 {
+            dir.push("d");
+            std::fs::create_dir(&dir).unwrap();
+        }
+        std::fs::write(dir.join("leaf"), vec![b'z'; 7]).unwrap();
+
+        let mut total = 0u64;
+        sum_dir_bytes(&root, &mut total).unwrap();
+        assert_eq!(total, 7);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn a_scratch_dir_whose_owner_session_is_sealed_is_orphaned() {
         let state = tempfile::tempdir().unwrap();
-        let owner = "sess_usagetest_sealed";
-        let log_dir = session_dir(state.path(), owner);
+        let owner = ward_events::SessionId::from_u128(0x005e_a1ed).to_string();
+        let log_dir = session_dir(state.path(), &owner);
         std::fs::create_dir_all(&log_dir).unwrap();
         let log_path = log_dir.join("events.log");
         std::fs::write(&log_path, b"sealed log contents").unwrap();
@@ -389,7 +511,7 @@ mod tests {
             std::env::temp_dir().join(format!("ward-usagetest-sealed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(OWNER_MARKER), owner).unwrap();
+        std::fs::write(dir.join(OWNER_MARKER), owner.as_bytes()).unwrap();
         std::fs::write(dir.join("socket-standin"), vec![b'y'; 5]).unwrap();
         // The marker itself is a real file under `dir` too, so it counts toward
         // the entry's bytes exactly like any other leftover scratch content.
@@ -448,8 +570,8 @@ mod tests {
         use crate::daemon::bind_socket;
 
         let state = tempfile::tempdir().unwrap();
-        let owner = "sess_usagetest_active";
-        let log_dir = session_dir(state.path(), owner);
+        let owner = ward_events::SessionId::from_u128(0x00ac_71fe).to_string();
+        let log_dir = session_dir(state.path(), &owner);
         std::fs::create_dir_all(&log_dir).unwrap();
         // Deliberately unsealed: an active session's log has no HEAD file yet.
         // Were `classify` to check the log before the daemon, this would
@@ -478,7 +600,7 @@ mod tests {
             std::env::temp_dir().join(format!("ward-usagetest-active-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(OWNER_MARKER), owner).unwrap();
+        std::fs::write(dir.join(OWNER_MARKER), owner.as_bytes()).unwrap();
 
         let entries = scan_scratch(state.path()).unwrap();
         let entry = entries.iter().find(|e| e.path == dir).unwrap();
