@@ -130,28 +130,11 @@ fi
 # image/dnf-retry.test.sh actually exercises -- this copy runs inside an ephemeral
 # container that can't source a host file without a bind mount) so a transient upstream
 # COPR/mirror hiccup self-heals within the one job run instead of failing it outright.
+# Kept on one logical line (`;`-separated, not newlines): desktop/tests/install.test.sh
+# asserts on this command with a single-line `^...$` regex against the mocked docker
+# invocation, which logs the whole argv as one line.
 # shellcheck disable=SC2016  # the $1/$@ are for the inner bash, expanded in the container
-inner='set -e
-retry() {
-  local max=$1 delay=$2 n=1 rc=0
-  shift 2
-  until "$@"; do
-    rc=$?
-    if [ "$n" -ge "$max" ]; then return "$rc"; fi
-    echo "retry: attempt $n/$max failed (exit $rc), retrying in ${delay}s: $*" >&2
-    sleep "$delay"
-    delay=$((delay * 2))
-    n=$((n + 1))
-  done
-}
-n=$1; shift
-if [ "$n" -gt 0 ]; then retry 3 5 dnf -y -q install dnf5-plugins >&2; fi
-while [ "$n" -gt 0 ]; do
-  echo "copr enable $1" >&2
-  retry 3 5 dnf -y -q copr enable "$1" >&2
-  shift; n=$((n - 1))
-done
-retry 3 5 dnf -q repoquery --qf "%{name}\n" "$@"'
+inner='set -e; retry() { local max=$1 delay=$2 n=1 rc=0; shift 2; until "$@"; do rc=$?; if [ "$n" -ge "$max" ]; then return "$rc"; fi; echo "retry: attempt $n/$max failed (exit $rc), retrying in ${delay}s: $*" >&2; sleep "$delay"; delay=$((delay * 2)); n=$((n + 1)); done; }; n=$1; shift; if [ "$n" -gt 0 ]; then retry 3 5 dnf -y -q install dnf5-plugins >&2; fi; while [ "$n" -gt 0 ]; do echo "copr enable $1" >&2; retry 3 5 dnf -y -q copr enable "$1" >&2; shift; n=$((n - 1)); done; retry 3 5 dnf -q repoquery --qf "%{name}\n" "$@"'
 cmd=("$runtime" run --rm "quay.io/fedora/fedora:${release}"
   bash -c "$inner" -- "${#coprs[@]}")
 if [[ ${#coprs[@]} -gt 0 ]]; then cmd+=("${coprs[@]}"); fi
