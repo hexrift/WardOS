@@ -452,7 +452,7 @@ mod tests {
 
         // The next read fails: the candidate is kept as history, but the digest
         // is not presented as the current tree and green is withdrawn (#136).
-        model.mark_freshness_unavailable();
+        model.mark_freshness_unavailable(model.observation_gen());
         let candidate = row(&model, "Verified candidate");
         assert_eq!(
             (candidate.value.as_str(), candidate.tone),

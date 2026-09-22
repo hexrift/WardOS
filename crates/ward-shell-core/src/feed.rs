@@ -320,8 +320,14 @@ impl Model {
 
     /// The reading viewer could not digest the worktree: withdraw the current
     /// (green) freshness while keeping the historical verdict and last digest.
-    pub const fn mark_freshness_unavailable(&mut self) {
-        self.freshness = Freshness::Unavailable;
+    /// Applied only if no invalidation has happened since the read began
+    /// (`generation` from [`Model::observation_gen`]), mirroring
+    /// [`Model::observe_if_current`] — a late *failure* that lost the race must
+    /// not clobber a newer, already-applied success back to unavailable (#136).
+    pub const fn mark_freshness_unavailable(&mut self, generation: u64) {
+        if generation == self.obs_gen {
+            self.freshness = Freshness::Unavailable;
+        }
     }
 
     /// A worktree change invalidates freshness at once and bumps the generation,

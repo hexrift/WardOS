@@ -908,7 +908,7 @@ mod tests {
         // A reading viewer whose digest fails (unreadable/removed/interrupted):
         // freshness is unavailable, so the state is Unknown — amber, not green —
         // and the candidate is kept as history (#136).
-        model.mark_freshness_unavailable();
+        model.mark_freshness_unavailable(model.observation_gen());
         assert_eq!(
             model.verify_state(),
             V::Unknown {
@@ -923,7 +923,7 @@ mod tests {
         // content shows stale — freshness is decided by the current observation.
         model.observe_worktree(snapshot(), Some(0));
         assert_eq!(model.verify_state(), V::Verified(snapshot()));
-        model.mark_freshness_unavailable();
+        model.mark_freshness_unavailable(model.observation_gen());
         assert_eq!(
             model.verify_state(),
             V::Unknown {
@@ -974,6 +974,42 @@ mod tests {
         let generation = model.observation_gen();
         model.observe_if_current(generation, snapshot(), Some(0));
         assert_eq!(model.verify_state(), V::Verified(snapshot()));
+    }
+
+    #[test]
+    fn a_late_failure_cannot_clobber_a_newer_success_over_a_stale_generation() {
+        use VerifyState as V;
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested(), verify_passed()]) {
+            model.apply(rec);
+        }
+        model.observe_worktree(snapshot(), Some(0));
+        assert_eq!(model.verify_state(), V::Verified(snapshot()));
+
+        // A slow read starts (captures the generation), then a change
+        // invalidates freshness before it finishes.
+        let stale_generation = model.observation_gen();
+        model.invalidate_freshness();
+
+        // A newer read, started after the invalidation, completes successfully.
+        let current_generation = model.observation_gen();
+        model.observe_if_current(current_generation, snapshot(), Some(0));
+        assert_eq!(model.verify_state(), V::Verified(snapshot()));
+
+        // The original slow read finally fails. Because it began before the
+        // invalidation, it lost the race and must not retract the newer,
+        // already-applied success back to Unknown.
+        model.mark_freshness_unavailable(stale_generation);
+        assert_eq!(model.verify_state(), V::Verified(snapshot()));
+
+        // A failure captured at the current generation does apply.
+        model.mark_freshness_unavailable(model.observation_gen());
+        assert_eq!(
+            model.verify_state(),
+            V::Unknown {
+                candidate: snapshot()
+            }
+        );
     }
 
     #[test]
