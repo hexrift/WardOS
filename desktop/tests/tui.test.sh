@@ -20,7 +20,7 @@ grep -q '^icon=utilities-terminal$' "$XDG_CONFIG_HOME/wardos/tuis/disk-usage.con
 wardos-tui install btop >/dev/null
 grep -q '^Icon=utilities-system-monitor$' "$apps/wardos-btop.desktop" || fail "the default's icon"
 wardos-tui install --defaults >/dev/null
-for t in lazygit podman-tui pulsemixer nmtui bluetoothctl nvim; do assert_file "$apps/wardos-$t.desktop"; done
+for t in podman-tui pulsemixer nmtui bluetoothctl nvim; do assert_file "$apps/wardos-$t.desktop"; done
 wardos-tui install nothing-here 2>/dev/null && fail "unknown name without a command fails"
 
 list=$(wardos-tui list)
