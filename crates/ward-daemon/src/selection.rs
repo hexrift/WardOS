@@ -91,17 +91,30 @@ fn lock_selection(state: &Path) -> Result<Flock<File>> {
 }
 
 /// The registry's contents, or the empty selection (`None`, generation 0)
-/// when nothing has chosen one yet: a registry that has simply never been
-/// written behaves exactly like no selection, not an error, since every
-/// reader already has a fallback for "none chosen yet" ([`crate::client::
-/// desktop_socket`] picks the newest live session and records it). This
-/// degrades a genuine read failure the same way, logging why rather than
-/// staying silent about it (#141 finding 2) — every caller of `current`
-/// already has its own fallback for "no selection", so aborting whatever
-/// asked would only replace one degraded answer with a harder failure it is
-/// not equipped to handle; [`read_for_write`] is the read the *write* side
-/// uses instead, precisely because it cannot afford that same latitude
-/// (review 5284361040 of #210, finding 1).
+/// when nothing has chosen one yet, or when it cannot be read or parsed at
+/// all: a registry that has simply never been written behaves exactly like
+/// no selection, not an error, since every reader already has a fallback
+/// for "none chosen yet" ([`crate::client::desktop_socket`] picks the
+/// newest live session and records it). This degrades a genuine read *or
+/// parse* failure the same way, logging why rather than staying silent
+/// about it (#141 finding 2) — every caller of `current` already has its
+/// own fallback for "no selection" and none of them is a writer, so
+/// aborting whatever asked would only replace one degraded answer with a
+/// harder failure it is not equipped to handle.
+///
+/// This is a deliberate difference from [`read_for_write`], not the old
+/// blanket "any read failure means generation 0" behaviour left in place
+/// unexamined (review 5284703397 of #210, finding 1): `read_for_write` now
+/// propagates a corrupt-but-present file as `Err` instead of folding it into
+/// `Selection::default()`, because the *write* side treating unreadable
+/// bytes as "nothing selected" would silently discard whatever selection and
+/// generation were really recorded there and let a write (or a stale
+/// `select_if_unchanged`'s compare) proceed from fabricated state. `current`
+/// has no write to protect that way — it only ever hands its caller a
+/// `Selection` to read, and every one of those callers was already treating
+/// "no selection" as a legitimate, expected answer before this ever
+/// mattered, so degrading here on their behalf loses nothing a write-side
+/// degrade would have quietly cost.
 #[must_use]
 pub fn current(state: &Path) -> Selection {
     read_for_write(state).unwrap_or_else(|e| {
@@ -114,21 +127,37 @@ pub fn current(state: &Path) -> Selection {
 }
 
 /// The registry's contents for a locked read-compare-write transaction:
-/// `Ok(default)` both for "not written yet" and for "written, but not valid
-/// JSON" — every writer here goes through [`write_atomic`], so a file that
-/// exists, was read, but does not parse can only mean something outside
-/// WardOS wrote garbage over it, not a torn write this registry could have
-/// produced itself, and is therefore safe to treat as a reset the same way
-/// [`current`] does. A real I/O failure (permissions, a full disk, a path
-/// that is not even a regular file) is different: `Err`, not folded into
-/// generation 0. Called only while holding [`lock_selection`], so together
-/// they are what actually closes finding 1's race — folding *this* case into
-/// generation 0 the way an ordinary reader may would let a write proceed, or
-/// a stale [`select_if_unchanged`] believe nothing has changed, while
-/// genuinely unable to tell what is on disk.
+/// `Ok(default)` only for "not written yet"
+/// ([`std::io::ErrorKind::NotFound`]) — the one case that really does mean
+/// "nothing chosen yet". A file that exists, was read, but does not parse as
+/// a [`Selection`] is now `Err`, not folded into generation 0 (review
+/// 5284703397 of #210, finding 1, correcting the previous round's own
+/// reasoning here): every writer here goes through [`write_atomic`], so a
+/// file in this state can only mean something outside WardOS wrote garbage
+/// over the registry — not a torn write this registry could have produced
+/// itself — but "not torn by us" is not the same claim as "safe to discard".
+/// A writer that reset such a file to generation 0 would silently throw away
+/// whatever selection and generation were really recorded there, and let an
+/// automatic fallback or an explicit `select`/`select_if_unchanged` proceed
+/// as if from a clean slate instead of refusing to guess. A real I/O failure
+/// (permissions, a full disk, a path that is not even a regular file) was
+/// already `Err` here, not folded into generation 0, since the previous
+/// round of review (5284361040 of #210, finding 1); this makes the parse
+/// failure behave the same way instead of being the one case still quietly
+/// treated as "fine, reset it". Called only while holding [`lock_selection`],
+/// so together they are what actually closes finding 1's original race —
+/// folding either case into generation 0 the way [`current`] deliberately
+/// still may would let a write proceed, or a stale [`select_if_unchanged`]
+/// believe nothing has changed, while genuinely unable to tell what is on
+/// disk.
 fn read_for_write(state: &Path) -> Result<Selection> {
     match std::fs::read(path(state)) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            Error::Daemon(format!(
+                "desktop selection at {} is not valid JSON: {e}",
+                path(state).display()
+            ))
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Selection::default()),
         Err(e) => Err(Error::io(path(state), e)),
     }
@@ -307,14 +336,68 @@ mod tests {
         assert_eq!(current(state.path()).session, None);
     }
 
+    /// `current` keeps its old, deliberate latitude: an ordinary reader with
+    /// its own "no selection" fallback gets `Selection::default()` rather
+    /// than an error it is not equipped to handle, even when the file on
+    /// disk is genuinely corrupt (not merely absent). See `current`'s doc
+    /// comment for why this remains correct even though the write side
+    /// below no longer shares it.
     #[test]
-    fn a_corrupt_registry_reads_as_no_selection_rather_than_failing() {
+    fn current_degrades_a_corrupt_registry_to_no_selection_for_an_ordinary_reader() {
         let state = tempfile::tempdir().unwrap();
         std::fs::write(path(state.path()), b"not json").unwrap();
         assert_eq!(current(state.path()), Selection::default());
-        // Writing still works: a bad file is replaced, not preserved.
-        let after = select(state.path(), Some("sess_a")).unwrap();
-        assert_eq!(after.generation, 1);
+    }
+
+    /// Review 5284703397 of #210, finding 1 — correcting this test's previous
+    /// assertion: a registry that exists but is genuinely corrupt (not
+    /// "never written") must never be silently reset to generation 1 by a
+    /// writer. The old shape here asserted the opposite (`select` succeeding
+    /// and starting over from generation 1), which is exactly the bug —
+    /// discarding whatever selection and generation the corrupt file was
+    /// really recording, and proceeding from fabricated state. Both `select`
+    /// and `select_if_unchanged` must instead fail outright, leaving the
+    /// corrupt bytes on disk completely untouched for a human (or a future,
+    /// smarter recovery path) to actually look at.
+    #[test]
+    fn a_corrupt_registry_is_never_overwritten_by_a_writer() {
+        let state = tempfile::tempdir().unwrap();
+        let registry = path(state.path());
+        let corrupt: &[u8] = b"not json";
+        std::fs::write(&registry, corrupt).unwrap();
+
+        let err = select(state.path(), Some("sess_a")).unwrap_err();
+        assert!(
+            matches!(err, Error::Daemon(_)),
+            "expected a parse-failure error, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&registry).unwrap(),
+            corrupt,
+            "select must not touch the corrupt file after failing to parse it"
+        );
+
+        let err = select_if_unchanged(state.path(), Some("sess_a"), 0).unwrap_err();
+        assert!(
+            matches!(err, Error::Daemon(_)),
+            "expected a parse-failure error, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&registry).unwrap(),
+            corrupt,
+            "select_if_unchanged must not touch the corrupt file after failing to parse it"
+        );
+
+        let err = clear(state.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::Daemon(_)),
+            "expected a parse-failure error, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&registry).unwrap(),
+            corrupt,
+            "clear must not touch the corrupt file after failing to parse it either"
+        );
     }
 
     /// #141 finding 2: `desktop_socket`'s automatic fallback observes the
