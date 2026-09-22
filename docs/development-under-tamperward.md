@@ -226,19 +226,27 @@ can never grant itself the sign-off it needs. Concretely:
   timestamps, trailing whitespace, blank lines, other content a reviewer would not weigh),
   the generic cost of finding *some* pair that shares a target prefix scales with the square
   root of the prefix's bit length, roughly 2^52 work for a 104-bit prefix rather than 2^104 —
-  the same order of magnitude publicly demonstrated for full chosen-prefix SHA-1 collisions
-  (e.g. the 2017 SHAttered attack, since improved on). That is a real, if expensive, budget
-  for a well-resourced adversary, not a theoretical one — so the 26-character prefix is a
-  meaningfully stronger fallback than the 12-character guidance it replaces, but it is a
-  **temporary, non-authoritative compatibility fallback**, not a resolution of the underlying
-  gap: it does not by itself close #203, and should not be cited as though it does. The gate
-  reads labels from the triggering event (`labeled`/`unlabeled` are both in the workflow's
-  `on.pull_request.types`), so applying it re-runs the check rather than requiring a new
-  push. The prefix binding means a later push invalidates the sign-off and needs a fresh
-  label bound to the new head — intentional (§ci-tampering's whole point is that a sign-off
-  can't quietly outlive the diff it was read against) — and is also why the label should be
-  removed once the PR it was granted on merges or its head changes, rather than trusted to
-  become harmless on its own.
+  the same order of magnitude publicly demonstrated for a real chosen-prefix SHA-1 attack:
+  "SHA-1 is a Shambles" (Leurent & Peyrin, 2020), which finds two inputs with *attacker-chosen,
+  independent* prefixes colliding after appended near-collision blocks. (The earlier 2017
+  SHAttered result was an identical-prefix collision — the same shared prefix on both sides —
+  a materially easier, different attack; it is not the right citation for the chosen-prefix
+  claim made here.) That is a real, if expensive, budget for a well-resourced adversary, not
+  a theoretical one — so the 26-character prefix is a meaningfully stronger fallback than the
+  12-character guidance it replaces, but it is a **temporary, non-authoritative compatibility
+  fallback**, not a resolution of the underlying gap: it does not by itself close #203, and
+  should not be cited as though it does. The gate reads labels from the triggering event
+  (`labeled`/`unlabeled` are both in the workflow's `on.pull_request.types`), so applying it
+  re-runs the check rather than requiring a new push. An *ordinary* later push — one nobody
+  deliberately ground to match — normally stops matching the label's prefix and needs a fresh
+  one bound to the new head, which is what makes a routine rebase behave as intended
+  (§ci-tampering's whole point is that a sign-off can't quietly outlive the diff it was read
+  against). **That is not a security guarantee against the attack this section just
+  described**: a successor deliberately prepared to share the labeled prefix remains
+  authorized by a label nobody removed. Do not rely on a later push to invalidate a stale
+  label — remove the label itself (or downgrade to the strongest available mechanism at that
+  point) as soon as the PR it was granted on merges, closes, or gets a head that no longer
+  needs it; the removal is the control, not the push.
 * **How, once available — the actual resolution.** A full-object-id sign-off mechanism that
   fits GitHub's label-length cap without relying on a display-SHA prefix at all (e.g. a
   versioned, hashed token binding the rule, optional file, and the complete head object id)
