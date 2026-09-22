@@ -214,15 +214,24 @@ pub fn scan_scratch(state: &Path) -> Result<Vec<ScratchEntry>> {
 /// never a symlink. The OS temp dir is shared and world-writable, so another
 /// local user can plant `<ward-*>/.ward-owner` as a symlink to an arbitrary
 /// path (e.g. a victim's private key); reading through it would disclose that
-/// target's content verbatim as this entry's reported owner. A symlinked
-/// marker is therefore treated exactly like a missing one, never followed.
+/// target's content verbatim as this entry's reported owner. The open itself
+/// carries `O_NOFOLLOW`, so a symlink is refused atomically by the kernel at
+/// open time — a separate `symlink_metadata` check beforehand would leave a
+/// TOCTOU window for that same attacker to swap the marker for a symlink
+/// between the check and a later unguarded read. A symlinked (or otherwise
+/// unopenable) marker is treated exactly like a missing one.
 fn read_owner_marker(dir: &Path) -> Option<String> {
+    use std::io::Read;
+
     let marker = dir.join(OWNER_MARKER);
-    let meta = std::fs::symlink_metadata(&marker).ok()?;
-    if meta.file_type().is_symlink() {
-        return None;
-    }
-    let text = std::fs::read_to_string(&marker).ok()?;
+    let fd = nix::fcntl::open(
+        &marker,
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .ok()?;
+    let mut text = String::new();
+    std::fs::File::from(fd).read_to_string(&mut text).ok()?;
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
 }
