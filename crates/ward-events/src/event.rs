@@ -460,6 +460,12 @@ pub enum ObserverSource {
     /// The session egress proxy's decision recorder (`NetworkRequested` /
     /// `NetworkDenied`).
     Network,
+    /// The agent hook broker's claim buffer (`AgentClaim`). A hook request the
+    /// broker could not record — the pending-claim buffer full, a connection
+    /// refused at the handler cap, or a handler still in flight when the final
+    /// flush cut over — is reported here rather than as an agent note, so the
+    /// gap is visible in every observer mode including Quiet.
+    Hook,
 }
 
 impl ObserverSource {
@@ -469,6 +475,7 @@ impl ObserverSource {
         match self {
             Self::Filesystem => "filesystem",
             Self::Network => "network",
+            Self::Hook => "hook",
         }
     }
 }

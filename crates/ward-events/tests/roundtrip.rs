@@ -616,6 +616,17 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Wardd,
+            // Every `ObserverSource` is carried over the wire and through the
+            // log, the hook broker included: a hook claim the broker had to
+            // refuse is an observer gap, not an agent note.
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Hook,
+                dropped: 2,
+                capacity: 4096,
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -705,8 +716,9 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
         .filter(|r| Filter::quiet().matches(r))
         .count();
     // The nine of Quiet mode, the three host interventions (ADR-0019 §3) and the
-    // observer's own "this record is incomplete" marker (#137).
-    assert_eq!(quiet, 13);
+    // observer's own "this record is incomplete" markers — one per source, the
+    // hook broker included (#137).
+    assert_eq!(quiet, 14);
 }
 
 #[test]
