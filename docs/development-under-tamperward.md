@@ -113,6 +113,16 @@ re-execution + `run` envelope + authoritative CI + independent VM escape tests. 
 first-class Rust detector pack for TamperWard is a natural later contribution that WardOS
 motivates.
 
+### 4.1a Agent attribution and session metadata
+
+Separate from what TamperWard judges, but the same "protect the control plane, not just
+the code" instinct: [`CLAUDE.md`](../CLAUDE.md) is this repository's decided policy on
+whether an agent's commits, PRs, issues, and comments may carry model/tool attribution or
+an AI session link (they may not — see issue #204 for why). `.claude/settings.json` is
+already one of the `hooks` surfaces `.tamperward.yml` protects above; the enforcement
+script (`scripts/verify/no-agent-attribution.sh`) lives under the protected `config` glob
+for the same reason the rest of `scripts/verify/**` does.
+
 ### 4.2 CODEOWNERS (human-review-only surfaces)
 
 To be committed as `.github/CODEOWNERS` when the reviewer handles are confirmed:

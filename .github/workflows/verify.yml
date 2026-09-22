@@ -21,6 +21,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The attribution guard below diffs base..head, which needs history
+          # beyond the default single-commit shallow clone.
+          fetch-depth: 0
+      # CLAUDE.md / issue #204: fail fast, before the expensive build below, if
+      # this PR's title, body, or added commits carry agent attribution or an AI
+      # session link.
+      - name: Reject agent attribution and session metadata
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: bash scripts/verify/no-agent-attribution.sh
       # Pinned to the commit `stable` pointed at on 2026-09-21 (issue #165): the
       # action force-moves this branch, so a tag/branch reference here is the most
       # mutable possible supply-chain input to a required merge-authority check.
