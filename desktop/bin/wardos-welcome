@@ -75,7 +75,8 @@ step_keys() {
       OpenAI*) name=OPENAI_API_KEY ;;
       *) return 0 ;;
     esac
-    in_terminal wardos-vault ward vault set "$name"
+    in_terminal wardos-vault ward vault set "$name" ||
+      echo "wardos-welcome: setting $name failed; open Keys again to retry" >&2
     [[ $round == 1 ]] || return 0
   done
 }
@@ -134,20 +135,31 @@ step_project() {
   case "$choice" in
     "Choose a directory")
       dir=$(pick_dir "$HOME") || return 0
-      in_terminal wardos-init ward init "$dir"
+      in_terminal wardos-init ward init "$dir" || {
+        echo "wardos-welcome: setting up $dir failed; open Project again to retry" >&2
+        return 0
+      }
       ;;
     "Clone a repository")
       url=$(typed "Repository URL (https://… or git@…)")
       [[ -n "$url" ]] || return 0
       dir="$HOME/$(basename "${url%.git}")"
       if [[ -d "$dir" ]]; then
-        in_terminal wardos-init ward init "$dir"
+        in_terminal wardos-init ward init "$dir" || {
+          echo "wardos-welcome: setting up $dir failed; open Project again to retry" >&2
+          return 0
+        }
       else
-        in_terminal wardos-init wardos-welcome clone "$url" "$dir"
+        in_terminal wardos-init wardos-welcome clone "$url" "$dir" || {
+          echo "wardos-welcome: cloning $url failed; open Project again to retry" >&2
+          return 0
+        }
       fi
       ;;
     *) return 0 ;;
   esac
+  # Only a confirmed-successful clone/init above reaches here: a failed one returns above,
+  # so a failed step is never recorded as the project the agent step then starts in (#142).
   mkdir -p "$(dirname "$project_file")"
   printf '%s\n' "$dir" >"$project_file"
 }
@@ -169,7 +181,8 @@ step_agent() {
   local bar="The trust bar, top of the screen: project, agent state, network, credentials, observer, TamperWard; green is verified, amber restricted, red denied."
   printf '%s\n' "$bar"
   wardos_notify "The trust bar" "$bar"
-  in_terminal wardos-agent ward "$choice" "$project"
+  in_terminal wardos-agent ward "$choice" "$project" ||
+    echo "wardos-welcome: starting the agent failed; open Agent again to retry" >&2
 }
 
 step_done() {
