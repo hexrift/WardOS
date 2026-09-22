@@ -846,7 +846,7 @@ fn cmd_pending_all(follow: bool, json: bool) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     if follow {
         let out = std::sync::Mutex::new(std::io::stdout());
-        client::follow_pending_all(&state, FOLLOW_SETTLE, move |sa| {
+        client::follow_pending_all(&state, FOLLOW_SETTLE, client::REDISCOVER, move |sa| {
             let agent = sa.agent.as_deref().unwrap_or("agent");
             let text = pending_all_line(&sa.approval, agent, &sa.session, &sa.project, json);
             // A closed pipe is the reader's choice, not an error.
@@ -856,49 +856,64 @@ fn cmd_pending_all(follow: bool, json: bool) -> ward_daemon::Result<ExitCode> {
         })?;
         return Ok(ExitCode::SUCCESS);
     }
-    let live = daemon::live_sessions(&state)?;
-    if live.is_empty() {
+    let results = client::pending_all(&state)?;
+    if results.is_empty() {
         if !json {
             println!("  no live sessions");
         }
         return Ok(ExitCode::SUCCESS);
     }
     let mut any = false;
-    for meta in live {
-        let Ok(socket) = client::desktop_socket(Path::new("."), &state, Some(&meta.id)) else {
-            continue;
-        };
-        let Ok(mut sink) = client::connect(&socket) else {
-            continue;
-        };
-        let Ok(description) = client::describe(&mut sink) else {
-            continue;
-        };
-        let agent = description
-            .agent
-            .as_ref()
-            .map_or("agent", |a| a.name.as_str());
-        let Ok(pending) = client::pending(&mut sink) else {
-            continue;
-        };
-        for approval in &pending {
-            any = true;
-            print!(
-                "{}",
-                pending_all_line(
-                    approval,
-                    agent,
-                    &description.session,
-                    &description.project,
-                    json
-                )
-            );
+    let mut unreachable = false;
+    for result in &results {
+        match &result.outcome {
+            Ok((description, pending)) => {
+                let agent = description
+                    .agent
+                    .as_ref()
+                    .map_or("agent", |a| a.name.as_str());
+                for approval in pending {
+                    any = true;
+                    print!(
+                        "{}",
+                        pending_all_line(
+                            approval,
+                            agent,
+                            &description.session,
+                            &description.project,
+                            json
+                        )
+                    );
+                }
+            }
+            // A session `live_sessions` listed but that could not actually be
+            // asked (#141 finding 5) is reported, not skipped: silently
+            // dropping it would let "no pending approvals" claim a session
+            // this never actually inspected.
+            Err(e) => {
+                unreachable = true;
+                print!("{}", unreachable_line(&result.session, e, json));
+            }
         }
     }
-    if !any && !json {
+    if !any && !unreachable && !json {
         println!("  no pending approvals");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One line for a live session [`client::pending_all`] could not query, JSON
+/// or text — visible instead of silently vanishing behind "no pending
+/// approvals" (#141 finding 5).
+fn unreachable_line(session: &str, error: &ward_daemon::Error, json: bool) -> String {
+    if json {
+        format!(
+            "{}\n",
+            serde_json::json!({ "session": session, "error": error.to_string() })
+        )
+    } else {
+        format!("  {session} · unreachable: {error}\n")
+    }
 }
 
 /// `ward session select [ID] [--show] [--clear]` (#141): the desktop's shared
@@ -1173,6 +1188,39 @@ fn cmd_run(dir: &Path, argv: &[String]) -> ward_daemon::Result<ExitCode> {
     Ok(exit_code(code))
 }
 
+/// `ward pause --status`'s word for `session` when one is pinned, else for
+/// `dir`'s current session: `paused` (the marker exists), `running` (a
+/// session but no marker) or `none` (no session at all). Needs no daemon.
+///
+/// A pinned `--session` reads that session's own marker, through
+/// [`SessionMeta::load`] — never `dir`'s current session — so a no-argument
+/// toggle pinned to one session is never told about a different session's
+/// state (#141 finding 3: `WARDOS_SESSION` must pin the status decision
+/// exactly the way it already pins pause and resume themselves).
+fn pause_status_word(
+    dir: &Path,
+    state: &Path,
+    session: Option<&str>,
+) -> ward_daemon::Result<&'static str> {
+    let meta = match session {
+        Some(id) => match SessionMeta::load(state, id) {
+            Ok(meta) => Some(meta),
+            Err(ward_daemon::Error::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(e) => return Err(e),
+        },
+        None => SessionMeta::current(dir, state)?,
+    };
+    Ok(match meta {
+        Some(meta) if ward_daemon::pause::marker_path(state, &meta.id).exists() => "paused",
+        Some(_) => "running",
+        None => "none",
+    })
+}
+
 /// `ward pause`: one request to the daemon, which does the whole operation;
 /// the row it answers with is the record of it. `--status` reads the marker the
 /// daemon leaves for the proxies, so it needs no daemon. `--all` (#141 item 5)
@@ -1194,12 +1242,7 @@ fn cmd_pause(
 ) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     if status {
-        let word = match SessionMeta::current(dir, &state)? {
-            Some(meta) if ward_daemon::pause::marker_path(&state, &meta.id).exists() => "paused",
-            Some(_) => "running",
-            None => "none",
-        };
-        println!("{word}");
+        println!("{}", pause_status_word(dir, &state, session)?);
         return Ok(ExitCode::SUCCESS);
     }
     if all {
@@ -1391,7 +1434,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
         Cli, Command, SessionCmd, WatchMode, desktop_command, observer_degraded_warning,
-        on_path_in, pending_all_line, pending_text, verb_program,
+        on_path_in, pause_status_word, pending_all_line, pending_text, unreachable_line,
+        verb_program,
     };
     use clap::Parser as _;
     use std::time::Duration;
@@ -1627,5 +1671,89 @@ mod tests {
         assert_eq!(WatchMode::select(false, false, false), WatchMode::Plain);
         assert_eq!(WatchMode::select(false, true, true), WatchMode::Plain);
         assert_eq!(WatchMode::select(true, false, false), WatchMode::Tui);
+    }
+
+    /// A session record at `state/sessions/<id>/session.json`, minimal enough
+    /// for `SessionMeta::load` and `pause_status_word` — the same shape
+    /// `ward-daemon`'s own client tests build (`spawn_pool_session`).
+    fn write_session(state: &std::path::Path, id: &str, project: &std::path::Path, started: u64) {
+        let dir = ward_daemon::session::session_dir(state, id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = ward_daemon::SessionMeta {
+            id: id.to_owned(),
+            project: project.to_path_buf(),
+            project_id: "proj_demo".to_owned(),
+            entry_snapshot: "blake3:abc".to_owned(),
+            manifest: ward_policy::merge(
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                ward_policy::SessionId(id.to_owned()),
+                ward_policy::ProjectId("proj_demo".to_owned()),
+            ),
+            started_unix_ms: started,
+            agent: None,
+        };
+        std::fs::write(dir.join("session.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
+
+    /// #141 finding 3: `--status --session <id>` must read that session's own
+    /// marker, never the project's current session — `sess_a` (the project's
+    /// current session) and `sess_b` (pinned explicitly) are put in opposite
+    /// pause states, so reading the wrong one is caught immediately.
+    #[test]
+    fn pause_status_word_reads_the_pinned_sessions_own_state() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let worktree = project.path().canonicalize().unwrap();
+        write_session(state.path(), "sess_a", &worktree, 1);
+        write_session(state.path(), "sess_b", &worktree, 2);
+        ward_daemon::pause::write_marker(state.path(), "sess_a", "because").unwrap();
+
+        // The project's current session is sess_a (paused).
+        let project_id = ward_daemon::ids::project_id_for(&worktree).to_string();
+        let current = state
+            .path()
+            .join("projects")
+            .join(&project_id)
+            .join("current");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, "sess_a").unwrap();
+
+        assert_eq!(
+            pause_status_word(project.path(), state.path(), None).unwrap(),
+            "paused",
+            "no --session: the project's current session, sess_a"
+        );
+        assert_eq!(
+            pause_status_word(project.path(), state.path(), Some("sess_b")).unwrap(),
+            "running",
+            "--session sess_b: sess_b's own state, not sess_a's just because \
+             sess_a is the project's current session"
+        );
+        assert_eq!(
+            pause_status_word(project.path(), state.path(), Some("sess_a")).unwrap(),
+            "paused",
+            "--session sess_a: the same session, reached the pinned way"
+        );
+        assert_eq!(
+            pause_status_word(project.path(), state.path(), Some("sess_missing")).unwrap(),
+            "none",
+            "a pinned id naming no session is `none`, not an error"
+        );
+    }
+
+    #[test]
+    fn unreachable_line_is_visible_text_or_json_never_indistinguishable_from_empty() {
+        let err = ward_daemon::Error::Events("daemon refused describe: not ready".to_owned());
+        let text = unreachable_line("sess_broken", &err, false);
+        assert_eq!(
+            text,
+            "  sess_broken · unreachable: events: daemon refused describe: not ready\n"
+        );
+        let json = unreachable_line("sess_broken", &err, true);
+        let value: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+        assert_eq!(value["session"], "sess_broken");
+        assert!(value["error"].as_str().unwrap().contains("not ready"));
     }
 }
