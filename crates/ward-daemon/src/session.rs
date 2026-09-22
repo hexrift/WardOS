@@ -752,15 +752,18 @@ impl Session {
     /// progress step per restored protected path and one for the command, then the
     /// pass or fail with the parsed summary and the output hash.
     ///
-    /// Once `VerificationStarted` is on the log, every exit path is guaranteed exactly
-    /// one terminal verification record before this returns — `VerificationPassed`,
+    /// Once `VerificationStarted` is on the log, every exit path leaves exactly one
+    /// terminal verification record behind it — `VerificationPassed`,
     /// `VerificationFailed`, or, when the run could not be carried to either of those
     /// (the sandbox runtime failed to launch, a step in between errored, …),
-    /// `VerificationErrored` (#139). A subscriber watching the log therefore never sees
-    /// a `VerificationStarted` with nothing after it: an unexecuted suite is recorded
-    /// as neither a pass nor a failure. The real error is still returned to the caller
-    /// either way — the terminal record does not replace it, only ensures the log
-    /// itself carries a definite outcome.
+    /// `VerificationErrored` (#139). A subscriber watching the log therefore never
+    /// *silently* sees a `VerificationStarted` with nothing after it: an unexecuted
+    /// suite is recorded as neither a pass nor a failure. The real error is still
+    /// returned to the caller either way — the terminal record does not replace it,
+    /// only ensures the log itself carries a definite outcome. If appending that
+    /// terminal record itself fails (the sink is gone, disk full, …), the caller's
+    /// error says so explicitly instead of quietly discarding it — see
+    /// [`verify_prepared`](Self::verify_prepared).
     pub fn verify(&mut self) -> Result<VerifyReport> {
         let store = SnapshotStore::open(self.state.join("cas"))
             .map_err(|e| Error::Snapshot(e.to_string()))?;
@@ -783,8 +786,8 @@ impl Session {
     }
 
     /// Records and runs a verification that has already been prepared: the request
-    /// and start, then a guaranteed terminal record (#139), then cleanup. Split out
-    /// of [`verify`](Self::verify) so it can be exercised directly with a hand-built
+    /// and start, then a terminal record (#139), then cleanup. Split out of
+    /// [`verify`](Self::verify) so it can be exercised directly with a hand-built
     /// [`verify::Verification`], without needing a real `.tamperward/config.yml` or a
     /// working sandbox runtime, to prove that a `verify::execute` failure still ends
     /// the log in `VerificationErrored` rather than a bare `VerificationStarted`.
@@ -817,16 +820,31 @@ impl Session {
         let result = self.run_prepared_verification(prepared, candidate);
         let _ = std::fs::remove_dir_all(&prepared.scratch);
         let _ = std::fs::remove_dir(scratch_root);
-        result.inspect_err(|e| {
-            // Best effort: emitting the terminal record can itself fail (e.g. the sink
-            // is gone), but that never changes what the caller sees below — the real
-            // error always propagates, this only tries to leave the log honest.
-            let reason = ShortText::new(&e.to_string());
-            let _ = self.emit(
-                Origin::Verifier,
-                WardEvent::VerificationErrored { candidate, reason },
-            );
-        })
+        match result {
+            Ok(report) => Ok(report),
+            Err(e) => {
+                let reason = ShortText::new(&e.to_string());
+                match self.emit(
+                    Origin::Verifier,
+                    WardEvent::VerificationErrored { candidate, reason },
+                ) {
+                    // The terminal record is on the log; the caller still sees the
+                    // real failure that produced it.
+                    Ok(()) => Err(e),
+                    // The append itself failed too, so the log may still end at
+                    // `VerificationStarted` — exactly the silent gap this function
+                    // exists to close. Never discard that: fold both failures into
+                    // what the caller sees, so this case is distinguishable from an
+                    // ordinary verification error whose terminal record was written
+                    // successfully.
+                    Err(emit_err) => Err(Error::Events(format!(
+                        "verification failed ({e}), and the terminal record for it \
+                         could not be written ({emit_err}); the log may still end at \
+                         VerificationStarted"
+                    ))),
+                }
+            }
+        }
     }
 
     /// The steps of a prepared verification once `VerificationStarted` is recorded:
@@ -1559,6 +1577,119 @@ mod tests {
                 assert!(!reason.as_str().is_empty(), "the reason is never blank");
             }
             other => panic!("expected VerificationErrored last, got {other:?}"),
+        }
+    }
+
+    /// A [`Sink`] wrapper that lets the first `allow` appends through to `inner`
+    /// and fails every one after that — used to prove #139's terminal-record
+    /// append itself is never silently discarded when it fails too.
+    struct FailAfter {
+        inner: Box<dyn Sink>,
+        allow: usize,
+    }
+
+    impl Sink for FailAfter {
+        fn append(
+            &mut self,
+            origin: Origin,
+            event: WardEvent,
+            at: SystemTime,
+        ) -> Result<ward_events::EventRecord> {
+            if self.allow == 0 {
+                return Err(Error::Events("simulated sink failure".to_owned()));
+            }
+            self.allow -= 1;
+            self.inner.append(origin, event, at)
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            self.inner.sync()
+        }
+
+        fn seal(self: Box<Self>) -> Result<()> {
+            self.inner.seal()
+        }
+
+        fn stop(self: Box<Self>, reason: EndReason) -> Result<()> {
+            self.inner.stop(reason)
+        }
+    }
+
+    /// #139 (review follow-up): if the terminal `VerificationErrored` append
+    /// *itself* fails — the exact case the discarded `let _ = self.emit(..)` in
+    /// an earlier revision of this fix silently swallowed — the caller's error
+    /// must say so, not just return the original verification error as if the
+    /// log had been left in a known-good state. Otherwise a subscriber has no
+    /// way to learn that the log may still be stuck at `VerificationStarted`.
+    #[test]
+    fn a_terminal_append_failure_is_never_silently_discarded() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        // Let VerificationRequested and VerificationStarted through, then fail
+        // every append after that — including the VerificationErrored this test
+        // is about.
+        session.sink = Box::new(FailAfter {
+            inner: std::mem::replace(&mut session.sink, Box::new(NullSink)),
+            allow: 2,
+        });
+
+        let entry: ward_snapshot::SnapshotId = session.entry_snapshot.parse().unwrap();
+        let candidate = ward_snapshot::SnapshotId(ward_snapshot::Digest::from_bytes([0xcd; 32]));
+        let scratch_root = state.path().join("scratch-root");
+        let prepared = verify::Verification {
+            candidate,
+            config: verify::Config {
+                protected: verify::Protected::default(),
+                verify: verify::VerifyCommand {
+                    command: "true".to_owned(),
+                    budget_secs: 5,
+                },
+            },
+            manifest_hash: [9u8; 32],
+            restored: Vec::new(),
+            scratch: scratch_root.join("does-not-exist"),
+        };
+
+        let err = session
+            .verify_prepared(&prepared, entry, &scratch_root)
+            .expect_err("execute must fail on a missing scratch tree");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("simulated sink failure"),
+            "the append failure must be surfaced, not discarded: {msg}"
+        );
+        assert!(
+            !msg.is_empty(),
+            "the original verification failure must still be represented: {msg}"
+        );
+    }
+
+    /// A placeholder [`Sink`] only ever used as the `inner` `mem::replace`
+    /// swaps out of `FailAfter` in the test above; every call would panic, but
+    /// `FailAfter` never forwards to it once wrapped.
+    struct NullSink;
+
+    impl Sink for NullSink {
+        fn append(
+            &mut self,
+            _origin: Origin,
+            _event: WardEvent,
+            _at: SystemTime,
+        ) -> Result<ward_events::EventRecord> {
+            unreachable!("NullSink is replaced before any append")
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            unreachable!("NullSink is replaced before any use")
+        }
+
+        fn seal(self: Box<Self>) -> Result<()> {
+            unreachable!("NullSink is replaced before any use")
+        }
+
+        fn stop(self: Box<Self>, _reason: EndReason) -> Result<()> {
+            unreachable!("NullSink is replaced before any use")
         }
     }
 }
