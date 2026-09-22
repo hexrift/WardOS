@@ -3,20 +3,26 @@
 # (ADR-0019 §3, docs/desktop.md §Commands, docs/security-model.md G13).
 #
 # Usage:
-#   wardos-pause            running: pause (processes frozen, network closed, credential
-#                           grants suspended, approvals held), then offer the exits;
-#                           already paused: offer the exits
-#   wardos-pause pause      pause and offer the exits
-#   wardos-pause resume     resume, no questions
+#   wardos-pause            running: pause THIS session (processes frozen, network closed,
+#                           credential grants suspended, approvals held), then offer the
+#                           exits; already paused: offer the exits
+#   wardos-pause pause      pause this session and offer the exits
+#   wardos-pause resume     resume this session, no questions
 #   wardos-pause menu       the exits: Resume / Stop & preserve workspace /
 #                           Stop & restore entry state / Inspect activity
-#   wardos-pause --status   print paused, running or none (for the bar)
+#   wardos-pause pause-all  pause every live session (#141 item 5: a distinct, explicit
+#                           scope from pausing this one), one result line each
+#   wardos-pause --status   print paused, running or none for this session (for the bar)
 #   wardos-pause --help
 #
-# The session is WARDOS_PROJECT's (default: the current directory). Everything goes
-# through `ward pause`, `ward resume`, `ward stop [--restore-entry]` and `ward watch`;
-# the menu is wardos-menu-select (WARDOS_MENU_BACKEND=fuzzel|stdin). A cancelled menu
-# changes nothing: a paused session stays paused until you say otherwise.
+# "This session" is WARDOS_SESSION's when set (an immutable, explicitly pinned id — a
+# switcher or an approval panel's "pause this session" passes the id it is showing, so
+# it can never be silently retargeted by another session starting or the desktop's
+# selection changing meanwhile), else WARDOS_PROJECT's (default: the current directory,
+# which for the bar and the keybind below is the desktop's selected session).
+# Everything goes through `ward pause`, `ward resume`, `ward stop [--restore-entry]` and
+# `ward watch`; the menu is wardos-menu-select (WARDOS_MENU_BACKEND=fuzzel|stdin). A
+# cancelled menu changes nothing: a paused session stays paused until you say otherwise.
 set -euo pipefail
 # shellcheck source=desktop/lib/wardos.sh disable=SC1091
 source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
@@ -24,21 +30,31 @@ source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev
 wardos_help "$@"
 
 project=${WARDOS_PROJECT:-$PWD}
+session_flag=()
+[[ -n ${WARDOS_SESSION:-} ]] && session_flag=(--session "$WARDOS_SESSION")
 
 # paused, running or none: the daemon's marker, read by `ward pause --status`.
 status() { ward pause --status "$project" 2>/dev/null || echo none; }
 
 # The one notification of a pause (ADR-0019 §3), critical so it stays until read.
 do_pause() {
-  ward pause "$project"
+  ward pause "${session_flag[@]}" "$project"
   wardos_notify "AGENTS PAUSED" \
     "network closed · credential grants suspended · processes frozen · workspace retained" \
     -u critical
 }
 
 do_resume() {
-  ward resume "$project"
+  ward resume "${session_flag[@]}" "$project"
   wardos_notify "Agents resumed" "" -t 2000
+}
+
+# "Pause all sessions" (#141 item 5): every live session, not just this one, each its own
+# result line, so the notification is a per-session summary rather than one verdict.
+do_pause_all() {
+  local out
+  out=$(ward pause --all --reason "${WARDOS_PAUSE_REASON:-host requested: pause all}") || true
+  wardos_notify "ALL SESSIONS PAUSED" "$out" -u critical
 }
 
 # The exits of a pause. Cancelling is an answer too: everything stays held.
@@ -68,6 +84,7 @@ case "${1:-}" in
     ;;
   resume) do_resume ;;
   menu) menu ;;
+  pause-all) do_pause_all ;;
   "")
     case "$(status)" in
       running)
@@ -78,5 +95,5 @@ case "${1:-}" in
       *) wardos_die "no agent session for $project (ward up)" ;;
     esac
     ;;
-  *) wardos_die "pause, resume, menu or --status? (--help)" ;;
+  *) wardos_die "pause, resume, menu, pause-all or --status? (--help)" ;;
 esac

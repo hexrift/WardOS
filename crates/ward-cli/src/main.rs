@@ -130,17 +130,32 @@ enum Command {
     Pause {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
+        /// The session id, instead of looking one up (#141: an immutable,
+        /// explicitly pinned target — a switcher or an approval panel's "pause
+        /// this session" passes the id it is showing, not just a directory,
+        /// so a session ending or another one starting in the meantime cannot
+        /// silently redirect this to a different session).
+        #[arg(long, conflicts_with = "all")]
+        session: Option<String>,
         /// Why, in your words; recorded with the pause.
         #[arg(long)]
         reason: Option<String>,
         /// Print `paused` or `running` for the current session and change nothing.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         status: bool,
+        /// Pause every live session, not just one (#141 item 5: "Pause all
+        /// sessions" is a distinct, explicit action from pausing the selected
+        /// one). Prints one result line per session.
+        #[arg(long)]
+        all: bool,
     },
     /// Resume a paused session and record it.
     Resume {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
+        /// The session id, instead of looking one up.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Verify the worktree in a disposable trusted verifier (`.tamperward/config.yml`).
     Verify {
@@ -296,15 +311,23 @@ enum SessionCmd {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
         /// The session id, instead of looking one up.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         session: Option<String>,
+        /// Every live session's approvals, multiplexed (#141 item 4), not just
+        /// the one `dir`/`--session` would resolve to: an approval in a second
+        /// session is never invisible just because the bar shows the first.
+        /// Each line's `session` and `project` name which one it is.
+        #[arg(long, conflicts_with = "session")]
+        all: bool,
         /// Keep printing each approval as it becomes pending, until the daemon
-        /// closes the stream (exit 0).
+        /// closes the stream (exit 0). With `--all`, until every live
+        /// session's stream has (a session that starts afterwards is not
+        /// picked up until `pending --all` is run again).
         #[arg(long)]
         follow: bool,
         /// One JSON object per approval: `{id, tool, summary, claim, authority:
         /// {rule, destination, network, method, credential, repository,
-        /// lifetime}, requested_at_unix_ms, agent, session}`.
+        /// lifetime}, requested_at_unix_ms, agent, session, project}`.
         #[arg(long)]
         json: bool,
     },
@@ -335,6 +358,24 @@ enum SessionCmd {
         /// The session id, as `ward session pending` lists it.
         #[arg(long)]
         session: Option<String>,
+    },
+    /// The desktop's shared selection (#141): the session `wardos-pause`,
+    /// `wardos-approve` and the bar mean when nothing more specific pins one.
+    /// With an id, set it (a keyboard-first switcher's `ward-shell switcher
+    /// --lines` picks a line whose command is this); `--show` (the default
+    /// with no id) prints it; `--clear` picks it again from the newest live
+    /// session next time something asks.
+    Select {
+        /// The session id to select.
+        #[arg(conflicts_with = "clear")]
+        id: Option<String>,
+        /// Print the current selection and change nothing (the default with
+        /// no id and no `--clear`).
+        #[arg(long, conflicts_with_all = ["id", "clear"])]
+        show: bool,
+        /// Clear the selection.
+        #[arg(long)]
+        clear: bool,
     },
 }
 
@@ -430,10 +471,20 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Stop { dir, restore_entry } => cmd_stop(&dir.unwrap_or_else(cwd), restore_entry),
         Command::Pause {
             dir,
+            session,
             reason,
             status,
-        } => cmd_pause(&dir.unwrap_or_else(cwd), reason.as_deref(), status),
-        Command::Resume { dir } => cmd_resume(&dir.unwrap_or_else(cwd)),
+            all,
+        } => cmd_pause(
+            &dir.unwrap_or_else(cwd),
+            session.as_deref(),
+            reason.as_deref(),
+            status,
+            all,
+        ),
+        Command::Resume { dir, session } => {
+            cmd_resume(&dir.unwrap_or_else(cwd), session.as_deref())
+        }
         Command::Verify { dir } => cmd_verify(&dir.unwrap_or_else(cwd)),
         Command::Doctor => Ok(cmd_doctor()),
         Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
@@ -446,24 +497,7 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
                 ExitCode::FAILURE
             })
         }
-        Command::Session(SessionCmd::Describe { dir, json }) => {
-            cmd_describe(&dir.unwrap_or_else(cwd), json)
-        }
-        Command::Session(SessionCmd::Pending {
-            dir,
-            session,
-            follow,
-            json,
-        }) => cmd_pending(&dir.unwrap_or_else(cwd), session.as_deref(), follow, json),
-        Command::Session(SessionCmd::Grants { dir, session, json }) => {
-            cmd_grants(&dir.unwrap_or_else(cwd), session.as_deref(), json)
-        }
-        Command::Session(SessionCmd::Approve {
-            id,
-            decision,
-            dir,
-            session,
-        }) => cmd_approve(&dir.unwrap_or_else(cwd), session.as_deref(), id, decision),
+        Command::Session(cmd) => cmd_session(cmd),
         Command::Snapshot(SnapshotCmd::Create { dir, role }) => {
             cmd_snapshot_create(&dir.unwrap_or_else(cwd), role.into())
         }
@@ -487,6 +521,37 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             WatchMode::select(tui, plain, std::io::stdout().is_terminal()),
         ),
         Command::Desktop(argv) => cmd_desktop(&argv),
+    }
+}
+
+/// `ward session <…>`: session facts for TamperWard, and the approvals/grants
+/// desk (ADR-0016, #141).
+fn cmd_session(cmd: SessionCmd) -> ward_daemon::Result<ExitCode> {
+    match cmd {
+        SessionCmd::Describe { dir, json } => cmd_describe(&dir.unwrap_or_else(cwd), json),
+        SessionCmd::Pending {
+            dir,
+            session,
+            all,
+            follow,
+            json,
+        } => {
+            if all {
+                cmd_pending_all(follow, json)
+            } else {
+                cmd_pending(&dir.unwrap_or_else(cwd), session.as_deref(), follow, json)
+            }
+        }
+        SessionCmd::Select { id, show, clear } => cmd_session_select(id.as_deref(), show, clear),
+        SessionCmd::Grants { dir, session, json } => {
+            cmd_grants(&dir.unwrap_or_else(cwd), session.as_deref(), json)
+        }
+        SessionCmd::Approve {
+            id,
+            decision,
+            dir,
+            session,
+        } => cmd_approve(&dir.unwrap_or_else(cwd), session.as_deref(), id, decision),
     }
 }
 
@@ -687,6 +752,9 @@ struct PendingLine<'a> {
     agent: &'a str,
     /// The session id.
     session: &'a str,
+    /// Its project id (#141: `--all` names it prominently so an approval in a
+    /// second session cannot be mistaken for one in the session the bar shows).
+    project: &'a str,
 }
 
 /// `ward session pending [--follow] [--json]`: what the daemon holds, each as
@@ -714,6 +782,7 @@ fn cmd_pending(
                 approval,
                 agent,
                 session: &description.session,
+                project: &description.project,
             };
             serde_json::to_string(&line).map_or_else(|_| String::new(), |j| format!("{j}\n"))
         } else {
@@ -744,6 +813,112 @@ fn pending_text(approval: &ward_daemon::approvals::Approval, agent: &str) -> Str
         tool = approval.tool,
         blocks = approval.blocks(),
     )
+}
+
+/// One line of `ward session pending --all`, JSON or text, tagged with the
+/// session and project it belongs to.
+fn pending_all_line(
+    approval: &ward_daemon::approvals::Approval,
+    agent: &str,
+    session: &str,
+    project: &str,
+    json: bool,
+) -> String {
+    if json {
+        let line = PendingLine {
+            approval,
+            agent,
+            session,
+            project,
+        };
+        serde_json::to_string(&line).map_or_else(|_| String::new(), |j| format!("{j}\n"))
+    } else {
+        format!("{project} · {session}\n{}", pending_text(approval, agent))
+    }
+}
+
+/// `ward session pending --all [--follow] [--json]` (#141 items 4 and 6):
+/// every live session's approvals, multiplexed and each line naming its
+/// session and project, independently of which one is selected — an approval
+/// in a second session is never invisible just because the bar shows the
+/// first.
+fn cmd_pending_all(follow: bool, json: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    if follow {
+        let out = std::sync::Mutex::new(std::io::stdout());
+        client::follow_pending_all(&state, FOLLOW_SETTLE, move |sa| {
+            let agent = sa.agent.as_deref().unwrap_or("agent");
+            let text = pending_all_line(&sa.approval, agent, &sa.session, &sa.project, json);
+            // A closed pipe is the reader's choice, not an error.
+            if let Ok(mut out) = out.lock() {
+                let _ = write!(out, "{text}").and_then(|()| out.flush());
+            }
+        })?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let live = daemon::live_sessions(&state)?;
+    if live.is_empty() {
+        if !json {
+            println!("  no live sessions");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut any = false;
+    for meta in live {
+        let Ok(socket) = client::desktop_socket(Path::new("."), &state, Some(&meta.id)) else {
+            continue;
+        };
+        let Ok(mut sink) = client::connect(&socket) else {
+            continue;
+        };
+        let Ok(description) = client::describe(&mut sink) else {
+            continue;
+        };
+        let agent = description
+            .agent
+            .as_ref()
+            .map_or("agent", |a| a.name.as_str());
+        let Ok(pending) = client::pending(&mut sink) else {
+            continue;
+        };
+        for approval in &pending {
+            any = true;
+            print!(
+                "{}",
+                pending_all_line(
+                    approval,
+                    agent,
+                    &description.session,
+                    &description.project,
+                    json
+                )
+            );
+        }
+    }
+    if !any && !json {
+        println!("  no pending approvals");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward session select [ID] [--show] [--clear]` (#141): the desktop's shared
+/// selection — read it, set it explicitly (what a keyboard-first switcher's
+/// chosen line runs), or clear it back to "pick the newest live session next
+/// time something asks".
+fn cmd_session_select(id: Option<&str>, _show: bool, clear: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let selection = if clear {
+        ward_daemon::selection::clear(&state)?
+    } else if let Some(id) = id {
+        ward_daemon::selection::select(&state, Some(id))?
+    } else {
+        ward_daemon::selection::current(&state)
+    };
+    match selection.session {
+        Some(id) => println!("{id}"),
+        None => println!("(none)"),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `ward session grants [--json]`: the temporary authority the session holds.
@@ -1000,8 +1175,23 @@ fn cmd_run(dir: &Path, argv: &[String]) -> ward_daemon::Result<ExitCode> {
 
 /// `ward pause`: one request to the daemon, which does the whole operation;
 /// the row it answers with is the record of it. `--status` reads the marker the
-/// daemon leaves for the proxies, so it needs no daemon.
-fn cmd_pause(dir: &Path, reason: Option<&str>, status: bool) -> ward_daemon::Result<ExitCode> {
+/// daemon leaves for the proxies, so it needs no daemon. `--all` (#141 item 5)
+/// is the other, explicit scope: every live session, one result line each,
+/// instead of the one `dir`/`--session` would resolve to.
+///
+/// The single-session path resolves through [`client::desktop_socket`], the
+/// same function `pending`/`grants`/`approve` already use, so `wardos-pause`
+/// agrees with the bar and with `wardos-approve` about which session "no
+/// session named" means, instead of independently falling back to its own
+/// notion of the current one (#141's evidence against the old
+/// `client::socket_path`-only resolution here).
+fn cmd_pause(
+    dir: &Path,
+    session: Option<&str>,
+    reason: Option<&str>,
+    status: bool,
+    all: bool,
+) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     if status {
         let word = match SessionMeta::current(dir, &state)? {
@@ -1012,7 +1202,31 @@ fn cmd_pause(dir: &Path, reason: Option<&str>, status: bool) -> ward_daemon::Res
         println!("{word}");
         return Ok(ExitCode::SUCCESS);
     }
-    let mut sink = client::connect(&client::socket_path(dir, &state)?)?;
+    if all {
+        let results = client::pause_all(&state, reason.unwrap_or_default())?;
+        if results.is_empty() {
+            println!("  no live sessions");
+        }
+        let mut failed = false;
+        for result in &results {
+            match &result.outcome {
+                Ok(record) => match render::observer_row(record) {
+                    Some(row) => println!("  {} · {row}", result.session),
+                    None => println!("  {} · paused", result.session),
+                },
+                Err(e) => {
+                    failed = true;
+                    println!("  {} · not paused: {e}", result.session);
+                }
+            }
+        }
+        return Ok(if failed {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
     let record = client::pause(&mut sink, reason.unwrap_or_default())?;
     if let Some(row) = render::observer_row(&record) {
         println!("{row}");
@@ -1024,9 +1238,9 @@ fn cmd_pause(dir: &Path, reason: Option<&str>, status: bool) -> ward_daemon::Res
 }
 
 /// `ward resume`: the daemon reverses the pause and answers with its record.
-fn cmd_resume(dir: &Path) -> ward_daemon::Result<ExitCode> {
+fn cmd_resume(dir: &Path, session: Option<&str>) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
-    let mut sink = client::connect(&client::socket_path(dir, &state)?)?;
+    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
     let record = client::resume(&mut sink)?;
     if let Some(row) = render::observer_row(&record) {
         println!("{row}");
@@ -1177,7 +1391,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
         Cli, Command, SessionCmd, WatchMode, desktop_command, observer_degraded_warning,
-        on_path_in, pending_text, verb_program,
+        on_path_in, pending_all_line, pending_text, verb_program,
     };
     use clap::Parser as _;
     use std::time::Duration;
@@ -1289,16 +1503,114 @@ mod tests {
     }
 
     #[test]
+    fn session_pending_all_and_select_parse() {
+        let cli = Cli::parse_from(["ward", "session", "pending", "--all", "--follow"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCmd::Pending {
+                all: true,
+                follow: true,
+                session: None,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["ward", "session", "pending", "--all", "--session", "sess_x"])
+                .is_err(),
+            "--all and --session are different scopes"
+        );
+
+        let cli = Cli::parse_from(["ward", "session", "select", "sess_x"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCmd::Select { id: Some(ref id), show: false, clear: false })
+                if id == "sess_x"
+        ));
+        let cli = Cli::parse_from(["ward", "session", "select"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCmd::Select {
+                id: None,
+                show: false,
+                clear: false
+            })
+        ));
+        let cli = Cli::parse_from(["ward", "session", "select", "--clear"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCmd::Select {
+                id: None,
+                clear: true,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["ward", "session", "select", "sess_x", "--clear"]).is_err(),
+            "an id and --clear are different requests"
+        );
+
+        // `pending_all_line` names the session and project the single-session
+        // line leaves implicit.
+        let approval = ward_daemon::approvals::Approval::new(
+            7,
+            "Write",
+            "/work/a.rs",
+            ward_daemon::approvals::Authority::none("r", "/work/a.rs"),
+            0,
+        );
+        let text = pending_all_line(&approval, "claude", "sess_a", "proj_payments", false);
+        assert!(text.starts_with("proj_payments · sess_a\n"), "{text}");
+        let json = pending_all_line(&approval, "claude", "sess_a", "proj_payments", true);
+        let value: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+        assert_eq!(value["session"], "sess_a");
+        assert_eq!(value["project"], "proj_payments");
+        assert_eq!(value["id"], 7);
+    }
+
+    #[test]
     fn pause_resume_and_restore_entry_parse() {
         let cli = Cli::try_parse_from(["ward", "pause", "--reason", "looks wrong"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Pause { dir: None, reason: Some(r), status: false } if r == "looks wrong"
+            Command::Pause { dir: None, reason: Some(r), status: false, all: false, .. } if r == "looks wrong"
         ));
         let cli = Cli::try_parse_from(["ward", "pause", "/p", "--status"]).unwrap();
         assert!(matches!(cli.command, Command::Pause { status: true, .. }));
+        let cli = Cli::try_parse_from(["ward", "pause", "--all", "--reason", "incident"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pause {
+                all: true,
+                session: None,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["ward", "pause", "--all", "--status"]).is_err(),
+            "--all and --status are different scopes"
+        );
+        assert!(
+            Cli::try_parse_from(["ward", "pause", "--all", "--session", "sess_x"]).is_err(),
+            "--all pauses every session; --session pins one"
+        );
+        let cli = Cli::try_parse_from(["ward", "pause", "--session", "sess_pin"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pause { session: Some(s), .. } if s == "sess_pin"
+        ));
         let cli = Cli::try_parse_from(["ward", "resume"]).unwrap();
-        assert!(matches!(cli.command, Command::Resume { dir: None }));
+        assert!(matches!(
+            cli.command,
+            Command::Resume {
+                dir: None,
+                session: None
+            }
+        ));
+        let cli = Cli::try_parse_from(["ward", "resume", "--session", "sess_pin"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Resume { session: Some(s), .. } if s == "sess_pin"
+        ));
         let cli = Cli::try_parse_from(["ward", "stop", "--restore-entry"]).unwrap();
         assert!(matches!(
             cli.command,

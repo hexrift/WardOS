@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# wardos-session-switch — the keyboard-first session switcher
+# (#141 item 3, ADR-0016, docs/desktop.md §Commands).
+#
+# Usage:
+#   wardos-session-switch   pick a live session — project, agent state (PAUSED
+#                           included), pending approvals, verification freshness
+#                           (`ward-shell switcher --lines`) — and make it the
+#                           desktop's selection (`ward session select <id>`), which
+#                           the bar, `wardos-approve` and `wardos-pause` then all
+#                           agree on the next time they ask for "no session named"
+#   wardos-session-switch --help
+#
+# The menu is wardos-menu-select (WARDOS_MENU_BACKEND=fuzzel|stdin). A cancelled menu
+# changes nothing: the desktop's selection stays whatever it already was, and — because
+# selecting only ever writes the shared registry, never an id a caller already has in
+# hand — it can never retarget an approval already open on some other session.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+lines=$(ward-shell switcher --lines 2>/dev/null || true)
+if [[ -z $lines ]]; then
+  wardos_notify "No live sessions" "Super + Space → Start Claude" -t 2500
+  exit 0
+fi
+
+# label<TAB>command, dropping the constant SECTIONS column: the label is what the
+# menu shows, the command is `ward session select <id>` for that one line's session,
+# quoted with its id at the time this ran — not re-resolved after the choice.
+items=$(printf '%s\n' "$lines" | cut -f2,3)
+label=$(printf '%s\n' "$items" | cut -f1 | wardos_menu Session) || exit 0
+command=$(printf '%s\n' "$items" | awk -F'\t' -v l="$label" '$1 == l { print $2; exit }')
+[[ -n "$command" ]] || exit 0
+eval "$command"

@@ -14,12 +14,16 @@ echo running >"$WARD_STATE_FILE"
 # --- --help --------------------------------------------------------------------
 "$pause" --help | grep -q '^Usage:' || fail "--help prints the usage block"
 "$pause" --help | grep -q 'Stop & restore entry state' || fail "--help names the exits"
+"$pause" --help | grep -q 'pause-all' || fail "--help names pause-all (#141 item 5)"
 
 # A `ward` whose pause state lives in a file, so the toggle can be walked through.
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "pause --status "*) cat "$WARD_STATE_FILE" ;;
+  "pause --all --reason "*) printf "  sess_a · paused\n  sess_b · not paused: already paused\n" ;;
+  "pause --session "*) echo paused >"$WARD_STATE_FILE" ;;
   "pause "*) echo paused >"$WARD_STATE_FILE" ;;
+  "resume --session "*) echo running >"$WARD_STATE_FILE" ;;
   "resume "*) echo running >"$WARD_STATE_FILE" ;;
   "stop "*) echo none >"$WARD_STATE_FILE" ;;
   "watch "*) : ;;
@@ -87,6 +91,22 @@ assert_logged '^ward resume /home/dev/payments-api$'
 WARDOS_MENU_CHOICE=Resume "$pause" menu
 assert_not_logged '^ward pause /home'
 assert_logged '^ward resume /home/dev/payments-api$'
+
+# --- pause-all: every live session, its own result line, its own notification (#141) ---
+: >"$MOCK_LOG"
+"$pause" pause-all
+assert_logged '^ward pause --all --reason host requested: pause all$'
+assert_logged 'ALL SESSIONS PAUSED   sess_a · paused$'
+assert_logged 'sess_b · not paused: already paused$'
+assert_not_logged '^ward pause /home'
+
+# --- WARDOS_SESSION pins an immutable target (#141 item 2): it is never re-resolved
+# from the directory, so a stale or superseded project session cannot be reached instead ---
+: >"$MOCK_LOG"
+echo running >"$WARD_STATE_FILE"
+WARDOS_SESSION=sess_pinned WARDOS_MENU_CHOICE=Resume "$pause"
+assert_logged '^ward pause --session sess_pinned /home/dev/payments-api$'
+assert_logged '^ward resume --session sess_pinned /home/dev/payments-api$'
 
 # --- no session: a plain refusal, nothing run ------------------------------------
 : >"$MOCK_LOG"

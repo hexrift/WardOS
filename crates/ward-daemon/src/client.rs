@@ -46,11 +46,20 @@ pub fn socket_path(project_dir: &Path, state: &Path) -> Result<PathBuf> {
     Ok(session_dir(state, &meta.id).join(SOCKET_NAME))
 }
 
-/// The control socket the desktop means (ADR-0016): `session`'s when one is
-/// named; else `project_dir`'s current session when it has one; else the
-/// newest session a daemon serves, since the bar and the approval listener run
-/// from the home directory, not a project. [`Error::Project`] when there is
-/// none of those.
+/// The control socket the desktop means (ADR-0016, #141): `session`'s when one
+/// is named — an id a caller already has in hand (an approval's own
+/// `--session`, a switcher's pinned target) is used exactly as given and
+/// never checked against [`selection`](crate::selection) or "newest", so
+/// selection changes elsewhere can never retarget it; else `project_dir`'s
+/// current session when it has one, since a human running `ward` inside a
+/// project always means that project's session; else the desktop's shared
+/// selection, kept if its daemon still answers — the session every other
+/// desktop-wide surface (the bar, the switcher, `wardos-approve`,
+/// `wardos-pause` with no session pinned) just asked about, so they agree
+/// with each other instead of each independently recomputing "newest" and
+/// risking a different answer; else the newest session a daemon serves,
+/// adopted and recorded as the new shared selection so the *next* ask agrees
+/// with this one. [`Error::Project`] when there is none of those.
 pub fn desktop_socket(project_dir: &Path, state: &Path, session: Option<&str>) -> Result<PathBuf> {
     if let Some(id) = session {
         return Ok(session_dir(state, id).join(SOCKET_NAME));
@@ -58,8 +67,18 @@ pub fn desktop_socket(project_dir: &Path, state: &Path, session: Option<&str>) -
     if let Some(meta) = SessionMeta::current(project_dir, state).ok().flatten() {
         return Ok(session_dir(state, &meta.id).join(SOCKET_NAME));
     }
+    if let Some(id) = crate::selection::current(state).session
+        && crate::daemon::serving(state, &id)
+    {
+        return Ok(session_dir(state, &id).join(SOCKET_NAME));
+    }
     match crate::daemon::newest_live(state)? {
-        Some(meta) => Ok(session_dir(state, &meta.id).join(SOCKET_NAME)),
+        Some(meta) => {
+            // Best-effort: a registry we cannot write still lets this one call
+            // through with the session it found; the next call just looks again.
+            let _ = crate::selection::select(state, Some(&meta.id));
+            Ok(session_dir(state, &meta.id).join(SOCKET_NAME))
+        }
         None => Err(Error::Project(format!(
             "no session for {} and no live session anywhere; run `ward up` to start one",
             project_dir.display()
@@ -84,6 +103,35 @@ pub fn pause(sink: &mut RemoteSink, reason: &str) -> Result<EventRecord> {
 /// `SessionResumed` record.
 pub fn resume(sink: &mut RemoteSink) -> Result<EventRecord> {
     expect_record(sink.call(&Request::Resume)?)
+}
+
+/// One session's outcome from [`pause_all`].
+#[derive(Debug)]
+pub struct SessionPauseResult {
+    /// The session's id.
+    pub session: String,
+    /// The `SessionPaused` record, or why this session could not be paused
+    /// (already paused, or gone between listing and asking).
+    pub outcome: Result<EventRecord>,
+}
+
+/// `ward pause --all` (#141 item 5): "Pause all sessions", distinct from
+/// pausing the one selected session. Every session live when this is called
+/// is paused as its own operation, on its own connection, and reported on its
+/// own line — one session refusing (or having ended in the meantime) does not
+/// stop the rest from being paused, and does not stop being reported.
+pub fn pause_all(state: &Path, reason: &str) -> Result<Vec<SessionPauseResult>> {
+    let live = crate::daemon::live_sessions(state)?;
+    let mut results = Vec::with_capacity(live.len());
+    for meta in live {
+        let socket = session_dir(state, &meta.id).join(SOCKET_NAME);
+        let outcome = connect(&socket).and_then(|mut sink| pause(&mut sink, reason));
+        results.push(SessionPauseResult {
+            session: meta.id,
+            outcome,
+        });
+    }
+    Ok(results)
 }
 
 fn expect_record(response: Response) -> Result<EventRecord> {
@@ -239,6 +287,80 @@ pub fn follow_pending(
             list(&mut emitted, &mut emit)?;
         }
     }
+}
+
+/// One approval as [`follow_pending_all`] reports it: which live session it
+/// belongs to, so a multiplexed view (or a notification) can name it
+/// prominently instead of leaving the session implicit the way a single-session
+/// follow can.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionApproval {
+    /// The session's id.
+    pub session: String,
+    /// Its project id, from `session describe`.
+    pub project: String,
+    /// The agent's product name, when recorded.
+    pub agent: Option<String>,
+    /// The approval itself.
+    pub approval: Approval,
+}
+
+/// `ward session pending --all --follow` (#141 items 4 and 6): every live
+/// session's approvals, multiplexed, independently of which one the desktop
+/// has selected — an approval in a second session must never be invisible
+/// just because the bar is showing the first.
+///
+/// One [`follow_pending`] watcher per session live when this is called; each
+/// ends on its own when that session's stream closes or seals, the same as a
+/// single-session follow, and this returns once every one of them has. A
+/// session that starts *after* this call began is not picked up until the
+/// caller asks again — the same "try again" shape a session ending and a
+/// fresh one replacing it already has for a single-session follow — so no
+/// separate lifecycle-notification channel is needed for new sessions to be
+/// discovered in practice: `wardos-approve --watch`'s own retry loop already
+/// calls this again once every round.
+pub fn follow_pending_all(
+    state: &Path,
+    idle: Duration,
+    emit: impl FnMut(SessionApproval) + Send + 'static,
+) -> Result<()> {
+    let live = crate::daemon::live_sessions(state)?;
+    let emit = std::sync::Arc::new(std::sync::Mutex::new(emit));
+    let mut handles = Vec::with_capacity(live.len());
+    for meta in live {
+        let socket = session_dir(state, &meta.id).join(SOCKET_NAME);
+        let session_id = meta.id.clone();
+        let emit = std::sync::Arc::clone(&emit);
+        handles.push(std::thread::spawn(move || -> Result<()> {
+            let (project, agent) = match connect(&socket).and_then(|mut sink| describe(&mut sink)) {
+                Ok(d) => (d.project, d.agent.map(|a| a.name)),
+                // Gone before we could ask it anything: nothing to follow.
+                Err(_) => return Ok(()),
+            };
+            follow_pending(&socket, idle, |approval| {
+                if let Ok(mut emit) = emit.lock() {
+                    emit(SessionApproval {
+                        session: session_id.clone(),
+                        project: project.clone(),
+                        agent: agent.clone(),
+                        approval,
+                    });
+                }
+            })?;
+            Ok(())
+        }));
+    }
+    for handle in handles {
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(Error::Events(
+                    "a session's approval watcher panicked".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What `ward watch` prints.
@@ -969,5 +1091,280 @@ mod tests {
             err.to_string(),
             "events: daemon refused evidence: not an evidence kind"
         );
+    }
+
+    // -- #141: the shared selection `desktop_socket` falls back to, and the
+    // multiplexed operations (`pause_all`, `follow_pending_all`) that act on
+    // every live session at once. All three need a stand-in that, unlike
+    // `fake_daemon` above, answers more than one connection: the `serving()`
+    // probe `desktop_socket`/`live_sessions` makes is its own connection,
+    // separate from whatever the caller does next.
+
+    /// A session under `state` with a real control socket that answers as many
+    /// connections as asked, one thread each: `Ping`, `Describe`, `Pending`
+    /// (`pending`, unconditionally), and `Pause` (`pause_outcome`, when given —
+    /// otherwise refused). `Subscribe` never streams anything; it holds the
+    /// connection for `hold` (longer than a caller's `idle`, so a
+    /// `follow_pending` reaches `Quiet` and lists what is pending) and then
+    /// closes it, so a follower reaches its own end without this stand-in ever
+    /// having to track subscribers explicitly.
+    fn spawn_pool_session(
+        state: &Path,
+        id: &str,
+        started_unix_ms: u64,
+        pending: Vec<Approval>,
+        pause_outcome: Option<std::result::Result<EventRecord, String>>,
+        hold: Duration,
+    ) {
+        let meta = SessionMeta {
+            id: id.to_owned(),
+            project: PathBuf::from("/tmp/demo"),
+            project_id: format!("proj_{id}"),
+            entry_snapshot: "blake3:abc".to_owned(),
+            manifest: ward_policy::merge(
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                ward_policy::SessionId(id.to_owned()),
+                ward_policy::ProjectId(format!("proj_{id}")),
+            ),
+            started_unix_ms,
+            agent: None,
+        };
+        let dir = session_dir(state, id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let description = meta.describe();
+        let listener = UnixListener::bind(dir.join(SOCKET_NAME)).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let description = description.clone();
+                let pending = pending.clone();
+                let pause_outcome = pause_outcome.clone();
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let reply = |writer: &mut std::os::unix::net::UnixStream, r: &Response| {
+                        let mut b = serde_json::to_vec(r).unwrap();
+                        b.push(b'\n');
+                        let _ = writer.write_all(&b);
+                    };
+                    for line in BufReader::new(stream)
+                        .lines()
+                        .map_while(std::result::Result::ok)
+                    {
+                        let Ok(request) = serde_json::from_str::<Request>(&line) else {
+                            continue;
+                        };
+                        match request {
+                            Request::Ping => reply(&mut writer, &Response::Ok),
+                            Request::Describe => reply(
+                                &mut writer,
+                                &Response::Description(serde_json::to_value(&description).unwrap()),
+                            ),
+                            Request::Pending => {
+                                reply(&mut writer, &Response::Pending(pending.clone()));
+                            }
+                            Request::Subscribe { .. } => {
+                                std::thread::sleep(hold);
+                                break;
+                            }
+                            Request::Pause { .. } => match &pause_outcome {
+                                Some(Ok(rec)) => {
+                                    reply(&mut writer, &Response::Record(Box::new(rec.clone())));
+                                }
+                                Some(Err(e)) => reply(&mut writer, &Response::Error(e.clone())),
+                                None => reply(
+                                    &mut writer,
+                                    &Response::Error("pause not configured".into()),
+                                ),
+                            },
+                            other => panic!("unexpected request {other:?}"),
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// A `SessionPaused` record, for `pause_all`'s ok outcome.
+    fn paused_record() -> EventRecord {
+        let mut chain = Chain::genesis(SessionId::from_u128(9), Blake3Hash::from_bytes([3; 32]));
+        chain
+            .append(
+                Origin::Wardd,
+                WardEvent::SessionPaused {
+                    method: ward_events::PauseMethod::Sigstop,
+                    reason: ward_events::ShortText::new("because"),
+                },
+                Timestamp::mono(Duration::from_secs(0)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn desktop_socket_shares_a_registry_backed_selection_across_calls() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap(); // no session of its own
+        spawn_pool_session(
+            state.path(),
+            "sess_a",
+            1,
+            vec![],
+            None,
+            Duration::from_millis(50),
+        );
+        spawn_pool_session(
+            state.path(),
+            "sess_b",
+            2,
+            vec![],
+            None,
+            Duration::from_millis(50),
+        );
+
+        // Nothing selected yet: the newest live session is picked and recorded.
+        let first = desktop_socket(project.path(), state.path(), None).unwrap();
+        assert_eq!(first, session_dir(state.path(), "sess_b").join(SOCKET_NAME));
+        assert_eq!(
+            crate::selection::current(state.path()).session.as_deref(),
+            Some("sess_b")
+        );
+
+        // A third, newer session starts; the bar, the switcher and
+        // `wardos-pause` still agree on the one already selected instead of
+        // each silently jumping to "whatever is newest now".
+        spawn_pool_session(
+            state.path(),
+            "sess_c",
+            3,
+            vec![],
+            None,
+            Duration::from_millis(50),
+        );
+        let second = desktop_socket(project.path(), state.path(), None).unwrap();
+        assert_eq!(
+            second, first,
+            "the shared selection does not drift on its own"
+        );
+
+        // An id given explicitly always wins, and never touches the registry:
+        // this is the immutable binding item 2 of #141 asks for.
+        let explicit = desktop_socket(project.path(), state.path(), Some("sess_c")).unwrap();
+        assert_eq!(
+            explicit,
+            session_dir(state.path(), "sess_c").join(SOCKET_NAME)
+        );
+        assert_eq!(
+            crate::selection::current(state.path()).session.as_deref(),
+            Some("sess_b"),
+            "an explicit session id never consults or changes the registry"
+        );
+    }
+
+    #[test]
+    fn desktop_socket_replaces_a_selection_whose_session_is_no_longer_live() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        // A stale selection: recorded once, nothing serves it any more.
+        crate::selection::select(state.path(), Some("sess_gone")).unwrap();
+        spawn_pool_session(
+            state.path(),
+            "sess_live",
+            5,
+            vec![],
+            None,
+            Duration::from_millis(50),
+        );
+        let socket = desktop_socket(project.path(), state.path(), None).unwrap();
+        assert_eq!(
+            socket,
+            session_dir(state.path(), "sess_live").join(SOCKET_NAME)
+        );
+        assert_eq!(
+            crate::selection::current(state.path()).session.as_deref(),
+            Some("sess_live"),
+            "an ended selection is replaced, not followed into an error"
+        );
+    }
+
+    #[test]
+    fn pause_all_reports_a_per_session_outcome_ok_or_error() {
+        let state = tempfile::tempdir().unwrap();
+        spawn_pool_session(
+            state.path(),
+            "sess_a",
+            1,
+            vec![],
+            Some(Ok(paused_record())),
+            Duration::from_millis(50),
+        );
+        spawn_pool_session(
+            state.path(),
+            "sess_b",
+            2,
+            vec![],
+            Some(Err("already paused".to_owned())),
+            Duration::from_millis(50),
+        );
+        let mut results = pause_all(state.path(), "because").unwrap();
+        results.sort_by(|a, b| a.session.cmp(&b.session));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].session, "sess_a");
+        assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
+        assert_eq!(results[1].session, "sess_b");
+        assert_eq!(
+            results[1].outcome.as_ref().unwrap_err().to_string(),
+            "already paused",
+            "one session refusing does not stop the rest being paused or reported"
+        );
+    }
+
+    #[test]
+    fn follow_pending_all_multiplexes_every_live_sessions_approvals() {
+        let state = tempfile::tempdir().unwrap();
+        let a = Approval::new(
+            1,
+            "Write",
+            "/work/a.rs",
+            crate::approvals::Authority::none("r", "/work/a.rs"),
+            0,
+        );
+        let b = Approval::new(
+            2,
+            "Write",
+            "/work/b.rs",
+            crate::approvals::Authority::none("r", "/work/b.rs"),
+            0,
+        );
+        spawn_pool_session(
+            state.path(),
+            "sess_a",
+            1,
+            vec![a],
+            None,
+            Duration::from_millis(80),
+        );
+        spawn_pool_session(
+            state.path(),
+            "sess_b",
+            2,
+            vec![b],
+            None,
+            Duration::from_millis(80),
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = std::sync::Arc::clone(&seen);
+        follow_pending_all(state.path(), Duration::from_millis(30), move |sa| {
+            collected.lock().unwrap().push(sa);
+        })
+        .unwrap();
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_by(|x: &SessionApproval, y| x.session.cmp(&y.session));
+        assert_eq!(seen.len(), 2, "one approval named per live session");
+        assert_eq!(seen[0].session, "sess_a");
+        assert_eq!(seen[0].project, "proj_sess_a");
+        assert_eq!(seen[0].approval.id, 1);
+        assert_eq!(seen[1].session, "sess_b");
+        assert_eq!(seen[1].approval.id, 2);
     }
 }
