@@ -105,6 +105,18 @@ the three COPRs). `check-packages.sh --dry-run` prints the command without a con
 runtime; `check-packages.sh --discover NAME...` asks the COPR API which projects carry
 a name for the pinned release, which is how the COPRs below were chosen.
 
+The `dnf5-plugins` install, each `copr enable`, and the package install itself each get a
+bounded, backed-off retry (issue #198: `image/dnf-retry.sh`'s `retry`, reproduced verbatim
+inside the container each of `check-packages.sh`/`check-hyprland.sh` runs it in and in the
+Containerfile's own COPR-install step, since none of them can source a host file without a
+bind mount), so a transient upstream COPR/mirror hiccup self-heals within the one run
+instead of failing outright. When the retries are exhausted, `check-packages.sh` and
+`check-hyprland.sh` both read the captured dnf/copr output through
+`image/dnf-retry.sh`'s `classify_dnf_failure` and say plainly whether the failure looks
+like that kind of outage or a real missing/renamed package, instead of leaving that for
+whoever sees the red check to re-derive from the raw dnf log (`image/dnf-retry.test.sh`,
+CI job "image lint").
+
 ### COPRs
 
 [`coprs.txt`](coprs.txt) lists COPR repositories, one `owner/project` per line with the
@@ -696,7 +708,7 @@ CI runs, on every pull request and push (`verify.yml`):
 
 | Job | What |
 | --- | --- |
-| `image lint` | hadolint on `Containerfile`, shellcheck (`--severity=style`) on `image/*.sh`, the dry-runs of `build.sh` (plain and `--dev-seed-user`), `disk.sh` (`qcow2`, `iso`, and `iso --luks`), `check-packages.sh`, and `install-desktop.sh --help` |
+| `image lint` | hadolint on `Containerfile`, shellcheck (`--severity=style`) on `image/*.sh`, `image/dnf-retry.test.sh` (issue #198's retry/classification regressions), the dry-runs of `build.sh` (plain and `--dev-seed-user`), `disk.sh` (`qcow2`, `iso`, and `iso --luks`), `check-packages.sh`, and `install-desktop.sh --help` |
 | `image packages` | `check-packages.sh`: every name in `packages.txt` exists in the pinned Fedora release (plus `coprs.txt`) |
 | `hyprland config` | `image/check-hyprland.sh`: `Hyprland --verify-config` on `desktop/hyprland/` inside a `fedora:<release>` container with the COPRs, so the tree matches the compositor the image ships |
 | `desktop scripts` | `desktop/tests/run.sh`, which includes `install.test.sh` (install-desktop, desktop/install.sh, wardos-flathub, check-packages.sh, disk.sh) |

@@ -14,6 +14,8 @@ usage() {
 }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=image/dnf-retry.sh
+source "$repo_root/image/dnf-retry.sh"
 release=$(sed -n 's|^FROM quay.io/fedora/fedora-bootc:\([0-9][0-9]*\)$|\1|p' "$repo_root/image/Containerfile" | head -n 1)
 dry_run=0
 while [[ $# -gt 0 ]]; do
@@ -38,11 +40,37 @@ mapfile -t coprs < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo_r
 # as the image does (/etc/xdg/hypr → the tree), render the theme fragment the last
 # `source` line wants (the fragment's shape is what matters, so a stand-in with the
 # same keys is enough), then verify.
+#
+# COPR enable and both dnf installs get a bounded, backed-off retry (issue #198: `retry`,
+# kept identical to image/dnf-retry.sh's -- this copy runs inside an ephemeral container
+# that can't source a host file without a bind mount) so a transient upstream COPR/mirror
+# hiccup self-heals within the one job run instead of failing it outright. Each step,
+# retried or not (including the final, un-retried Hyprland verify itself), echoes
+# dnf-retry.sh's DNF_RETRY_STEP_MARK to stderr right before it starts, so the caller's
+# classify_dnf_failure (via last_step_tail) sees only the step actually running when the
+# container exited, not an earlier step's already-recovered transient hiccup.
 # shellcheck disable=SC2016  # $@ and $HOME expand inside the container's bash
 inner='set -e
-dnf -y -q install dnf5-plugins >/dev/null
-for c in "$@"; do dnf -y -q copr enable "$c" >/dev/null; done
-dnf -y -q --setopt=install_weak_deps=False install hyprland util-linux >/dev/null
+retry() {
+  local max=$1 delay=$2 n=1 rc=0
+  shift 2
+  until "$@"; do
+    rc=$?
+    if [ "$n" -ge "$max" ]; then return "$rc"; fi
+    echo "retry: attempt $n/$max failed (exit $rc), retrying in ${delay}s: $*" >&2
+    sleep "$delay"
+    delay=$((delay * 2))
+    n=$((n + 1))
+  done
+}
+echo "##dnf-retry:step##" >&2
+retry 3 5 dnf -y -q install dnf5-plugins >/dev/null
+for c in "$@"; do
+  echo "##dnf-retry:step##" >&2
+  retry 3 5 dnf -y -q copr enable "$c" >/dev/null
+done
+echo "##dnf-retry:step##" >&2
+retry 3 5 dnf -y -q --setopt=install_weak_deps=False install hyprland util-linux >/dev/null
 mkdir -p /etc/xdg && ln -sfn /desktop/hyprland /etc/xdg/hypr
 # Hyprland refuses to run as root, so a plain user does the parsing.
 useradd -m check
@@ -50,6 +78,7 @@ mkdir -p /home/check/.config/wardos/theme/current
 printf "general {\n  col.active_border = rgb(7FA1C3)\n  col.inactive_border = rgb(24272B)\n}\nmisc {\n  background_color = rgb(0E0F11)\n}\n" \
   > /home/check/.config/wardos/theme/current/hyprland.conf
 chown -R check:check /home/check
+echo "##dnf-retry:step##" >&2
 runuser -u check -- bash -c "export XDG_RUNTIME_DIR=/tmp/xdg-check HOME=/home/check; mkdir -m 700 -p \$XDG_RUNTIME_DIR; Hyprland --version | head -n 1; Hyprland --verify-config -c /etc/xdg/hypr/hyprland.conf"'
 cmd=("$runtime" run --rm
   --volume "$repo_root/desktop:/desktop:ro"
@@ -60,4 +89,26 @@ cmd=("$runtime" run --rm
 echo "check-hyprland.sh: Fedora ${release}, COPRs: ${coprs[*]:-none}; would run:"
 printf '  %q' "${cmd[@]}"; printf '\n'
 if [[ $dry_run -eq 1 ]]; then exit 0; fi
-exec "${cmd[@]}"
+
+# Not exec'd: the combined output is tee'd to a log too, so a failure after the inner
+# retries are exhausted can be classified (issue #198) before this script exits with the
+# container's own status. `set +e`/`PIPESTATUS[0]` capture the container's exit code, not
+# `tee`'s.
+logfile=$(mktemp)
+tailfile=$(mktemp)
+trap 'rm -f "$logfile" "$tailfile"' EXIT
+set +e
+"${cmd[@]}" 2>&1 | tee "$logfile"
+status=${PIPESTATUS[0]}
+set -e
+if [[ $status -ne 0 ]]; then
+  # issue #198 review: classify only the step that was actually running when the
+  # container exited, not the whole combined log -- see the DNF_RETRY_STEP_MARK note
+  # above.
+  last_step_tail "$logfile" >"$tailfile"
+  if [[ $(classify_dnf_failure "$tailfile") == transient ]]; then
+    echo "check-hyprland.sh: exited $status after exhausting its dnf/copr retries -- this looks" \
+      "like an upstream COPR/mirror/network outage (issue #198), not a Hyprland config regression." >&2
+  fi
+fi
+exit "$status"
