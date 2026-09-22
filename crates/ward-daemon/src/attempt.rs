@@ -26,11 +26,46 @@
 //! reads and writes its own private marker file, which is safe to do even mid-unwind.
 //! The actual terminal-record guarantee comes from [`reconcile_dangling_attempts`],
 //! run through the same [`Sink`] the session already writes through.
+//!
+//! # A marker is not evidence its owner died (review of #208)
+//!
+//! A marker on disk means only "an attempt was allocated and has not finished yet" —
+//! that is equally true of a healthy in-flight verification and of one an earlier,
+//! now-dead process abandoned. [`reconcile_dangling_attempts`] therefore never treats
+//! a marker's mere existence as dangling: each marker records the pid of the process
+//! that wrote it, alongside that pid's own `/proc` start time (so a pid the kernel
+//! later hands to an unrelated process is not mistaken for the original owner — see
+//! [`owner_is_gone`]). Reconciliation only closes out a marker whose owning process is
+//! verifiably gone, or whose marker was written by *this very process* (the only way
+//! that can be asked about is a leftover the same process's own earlier `verify()`
+//! call abandoned, never a concurrent one). This makes it safe to call
+//! `reconcile_dangling_attempts` from every context that (re)takes ownership of a
+//! session's log, including an ordinary client's `Session::open_current` — a second
+//! `ward` invocation opening the same session can no longer ever interrupt a
+//! verification another, still-running process is genuinely carrying out.
+//!
+//! # Crash-consistent markers
+//!
+//! A marker is the *only* durable evidence of a dangling attempt, so its own
+//! writes and removals are made crash-safe: [`write_marker`] writes to a temp file
+//! in the same directory, `fsync`s it, renames it into place, then `fsync`s the
+//! directory; [`remove_marker_durably`] removes the file and `fsync`s the directory
+//! afterward. A marker [`read_marker`] cannot parse — corrupt or truncated, most
+//! likely from a crash mid-write before this scheme landed, or from disk damage —
+//! is never silently deleted: [`reconcile_dangling_attempts`] still emits a terminal
+//! record for it (its attempt id survives in the file name, which this process
+//! controls and never trusts less than the content), then quarantines the original
+//! bytes alongside it (`<attempt>.json.corrupt`) rather than destroying the only
+//! evidence of what happened. Reconciliation is also terminal-aware: before treating
+//! any marker as dangling, it checks whether the log already holds a terminal record
+//! for that attempt, so a marker that resurfaces after a crash between a terminal
+//! append and that marker's own not-yet-durable removal is retired quietly instead of
+//! producing a second, contradictory terminal record.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use ward_events::{AttemptId, Origin, ShortText, SnapshotId, VerifyRequester, WardEvent};
@@ -45,6 +80,43 @@ fn attempts_dir(session_dir: &Path) -> PathBuf {
 
 fn marker_path(session_dir: &Path, attempt: AttemptId) -> PathBuf {
     attempts_dir(session_dir).join(format!("{}.json", attempt.get()))
+}
+
+/// `<session_dir>/events.log`, exactly as `Session`/`serve` open it — reconciliation
+/// needs read-only access to the log alongside the `Sink` it appends through, to
+/// check whether an attempt already has a terminal record (`attempt_already_terminal`)
+/// before ever treating its marker as dangling.
+fn events_log_path(session_dir: &Path) -> PathBuf {
+    session_dir.join("events.log")
+}
+
+/// Where a marker that fails to parse is preserved (`reconcile_dangling_attempts`)
+/// instead of being silently deleted: alongside the original name so it is easy to
+/// find, `.corrupt`-suffixed so it is never picked up as a live marker again (it no
+/// longer has the `.json` extension the scan filters on).
+fn quarantine_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("marker");
+    path.with_file_name(format!("{name}.corrupt"))
+}
+
+/// A private temp path in the same directory as `path`, for the write-then-rename
+/// [`write_marker`] uses to land an update atomically. Unique per call so a rapid
+/// `start` immediately followed by `bind_candidate` (or two attempts racing, which
+/// should not happen in the single-attempt-at-a-time model this crate uses today,
+/// but costs nothing to make safe anyway) never collide.
+fn tmp_marker_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("marker");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()))
 }
 
 /// The durable record of one in-flight attempt: written by [`AttemptGuard::start`],
@@ -64,20 +136,165 @@ struct Marker {
     /// text [`reconcile_dangling_attempts`] otherwise falls back to. Never
     /// load-bearing for correctness.
     note: Option<String>,
+    /// The pid of the process that wrote this marker (`std::process::id()` at
+    /// [`AttemptGuard::start`]). A marker alone is not evidence its owner died — it
+    /// is equally present for a healthy in-flight attempt — so reconciliation never
+    /// acts on one without first checking this pid (see [`owner_is_gone`]).
+    pid: u32,
+    /// `pid`'s own `/proc/<pid>/stat` start time, captured alongside it, so a pid
+    /// the kernel later reuses for an unrelated process is never mistaken for the
+    /// original owner still being alive. `None` when it could not be read (e.g. a
+    /// non-Linux or minimal sandbox at the moment of writing) — reconciliation then
+    /// treats a live `pid` as still owned, the safer default (see [`owner_is_gone`]).
+    owner_started_ticks: Option<u64>,
 }
 
+/// `fsync` the regular file at `path` after writing `bytes` to it (truncating any
+/// existing content) — the first half of the durable write [`write_marker`] performs
+/// as write-temp / fsync / rename / fsync-directory.
+fn write_file_durably(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| Error::io(path, e))?;
+    file.write_all(bytes).map_err(|e| Error::io(path, e))?;
+    file.sync_all().map_err(|e| Error::io(path, e))
+}
+
+/// `fsync` a directory so a rename or unlink already applied to it survives a crash
+/// (POSIX only guarantees a directory entry change is durable once its directory's
+/// own fd has been synced, not merely the file that moved).
+fn sync_dir(dir: &Path) -> Result<()> {
+    let dir_file = std::fs::File::open(dir).map_err(|e| Error::io(dir, e))?;
+    dir_file.sync_all().map_err(|e| Error::io(dir, e))
+}
+
+/// Write `marker` to `path` crash-consistently: the bytes land in a private temp
+/// file in the same directory, are `fsync`'d, then atomically renamed over `path`
+/// (a rename is a single directory-entry update — a crash before or after it never
+/// leaves a half-written marker at `path` itself), and finally the directory is
+/// `fsync`'d so the rename itself survives a crash immediately afterward.
 fn write_marker(path: &Path, marker: &Marker) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-    }
+    let parent = path.parent().ok_or_else(|| {
+        Error::Events(format!(
+            "{}: attempt marker path has no parent directory",
+            path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
     let bytes =
         serde_json::to_vec(marker).map_err(|e| Error::Events(format!("attempt marker: {e}")))?;
-    std::fs::write(path, bytes).map_err(|e| Error::io(path, e))
+    let tmp = tmp_marker_path(path);
+    write_file_durably(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
+    sync_dir(parent)
 }
 
-fn read_marker(path: &Path) -> Option<Marker> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// What reading a marker file found: parsed content, benignly gone (a race with
+/// whoever last touched it — never itself an error), or present but unreadable —
+/// [`reconcile_dangling_attempts`] handles that last case by quarantining rather
+/// than deleting, since a corrupt marker is still the only evidence of an attempt.
+enum MarkerRead {
+    Ok(Marker),
+    Gone,
+    Corrupt,
+}
+
+fn read_marker(path: &Path) -> MarkerRead {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MarkerRead::Gone,
+        Err(_) => return MarkerRead::Corrupt,
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(marker) => MarkerRead::Ok(marker),
+        Err(_) => MarkerRead::Corrupt,
+    }
+}
+
+/// Remove the marker at `path` and make that removal durable by `fsync`ing its
+/// directory afterward. An already-gone marker (removed by a concurrent pass, or by
+/// [`AttemptGuard::finish`] racing a reconciliation pass) is not an error.
+///
+/// Best-effort by design at every call site that does not itself need to fail on a
+/// cleanup problem: once a terminal record is durably appended and synced, a marker
+/// that fails to be removed is untidy, never incorrect — the next reconciliation
+/// pass finds the attempt already terminal (`attempt_already_terminal`) and retires
+/// the leftover quietly rather than ever emitting a second terminal record for it.
+fn remove_marker_durably(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::io(path, e)),
+    }
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Preserve an unreadable marker at `path` by renaming it to [`quarantine_path`]
+/// instead of deleting it, so the only evidence of whatever attempt it concerned
+/// survives for inspection, then `fsync`s the directory so that rename is durable.
+fn quarantine_marker(path: &Path) -> Result<()> {
+    let target = quarantine_path(path);
+    std::fs::rename(path, &target).map_err(|e| Error::io(path, e))?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// The attempt id encoded in a marker's own file name (`<attempt>.json`) — trusted
+/// even when the file's *content* cannot be parsed, since this process controls the
+/// naming scheme itself ([`marker_path`]). `None` for anything in the attempts
+/// directory that this scheme did not create, which reconciliation then leaves
+/// entirely alone.
+fn attempt_id_from_filename(path: &Path) -> Option<u64> {
+    path.file_stem()?.to_str()?.parse().ok()
+}
+
+/// The Linux `/proc/<pid>/stat` "starttime" field (proc(5)): the time `pid` started,
+/// in clock ticks since boot. `None` once `pid` no longer exists (or, in a minimal
+/// sandbox without `/proc`, always).
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name between the parens can itself contain spaces or literal
+    // parens; anchor on the *last* ')' the kernel is guaranteed to close it with,
+    // exactly as `pause.rs`'s `parent_of` does for the same file. `starttime` is
+    // proc(5) field 22 overall; fields 1 (pid) and 2 (the parenthesised comm) are
+    // already consumed by that anchor, so it is index 19 of what `split_whitespace`
+    // yields afterward.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Whether the process that wrote `marker` can no longer be the one a caller needs
+/// to worry about (#139 item 1, the review of #208's finding 1): either it is
+/// verifiably dead, or it *is* the process asking right now — which can only mean
+/// the [`AttemptGuard`] for this marker already dropped earlier in this very
+/// process (that is the only way this function could be reached with the marker
+/// still on disk), so it is unconditionally stale, the same-process leftover
+/// `Session::verify()`'s own opening reconciliation exists to close out.
+///
+/// A live pid that is *not* this process is never treated as gone: a marker's mere
+/// existence is not evidence its owner died, it is equally present for a healthy
+/// in-flight verification, and interrupting that attempt out from under it is
+/// exactly the bug this function exists to close. Pid reuse is handled by comparing
+/// `/proc`'s own start-time field rather than trusting a live pid alone.
+fn owner_is_gone(marker: &Marker) -> bool {
+    if marker.pid == std::process::id() {
+        return true;
+    }
+    match process_start_ticks(marker.pid) {
+        None => true,
+        Some(now_ticks) => marker
+            .owner_started_ticks
+            .is_some_and(|then_ticks| then_ticks != now_ticks),
+    }
 }
 
 /// The next attempt number for this session: one past the highest
@@ -98,6 +315,53 @@ pub fn next_attempt_id(log_path: &Path) -> AttemptId {
         })
         .max();
     AttemptId::new(max.map_or(1, |m| m.saturating_add(1)))
+}
+
+/// Whether `attempt`'s own record in the log at `log_path` is already followed by a
+/// terminal verification record: `Passed`, `Failed`, `Errored` (none of which carry
+/// an `AttemptId` of their own — the single-attempt-at-a-time model this crate uses
+/// today is what makes "the next one after this attempt's `AttemptStarted`" a safe
+/// reading of them), or `Cancelled`/`Interrupted` naming this exact attempt.
+/// Defensively, a *later* `AttemptStarted` for a different attempt also counts —
+/// this attempt could only still be open if that had not yet begun. A log this
+/// process cannot open, or that never even recorded this attempt starting, is not
+/// terminal (the safe default: reconciliation still gets a chance to close it out).
+///
+/// This is what makes [`reconcile_dangling_attempts`] idempotent against a marker
+/// that resurfaces after a crash between a terminal append and that marker's own
+/// not-yet-durable removal (review of #208, finding 2): such a marker is retired
+/// quietly instead of producing a second, contradictory terminal record.
+fn attempt_already_terminal(log_path: &Path, attempt: AttemptId) -> bool {
+    let Ok(reader) = ward_events::LogReader::open(log_path) else {
+        return false;
+    };
+    let mut seen_start = false;
+    for record in reader.filter_map(std::result::Result::ok) {
+        match record.event {
+            WardEvent::VerificationAttemptStarted { attempt: a, .. } => {
+                if a == attempt {
+                    seen_start = true;
+                } else if seen_start {
+                    return true;
+                }
+            }
+            WardEvent::VerificationPassed { .. }
+            | WardEvent::VerificationFailed { .. }
+            | WardEvent::VerificationErrored { .. }
+                if seen_start =>
+            {
+                return true;
+            }
+            WardEvent::VerificationCancelled { attempt: a, .. }
+            | WardEvent::VerificationInterrupted { attempt: a, .. }
+                if seen_start && a == attempt =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// RAII marker for one verification attempt (#139).
@@ -124,6 +388,7 @@ impl AttemptGuard {
         requested_by: VerifyRequester,
     ) -> Result<Self> {
         let path = marker_path(session_dir, attempt);
+        let pid = std::process::id();
         write_marker(
             &path,
             &Marker {
@@ -132,6 +397,8 @@ impl AttemptGuard {
                 candidate: None,
                 started_unix_ms: unix_ms(SystemTime::now()),
                 note: None,
+                pid,
+                owner_started_ticks: process_start_ticks(pid),
             },
         )?;
         Ok(Self {
@@ -146,7 +413,7 @@ impl AttemptGuard {
     /// the marker only means a later reconciliation's `VerificationInterrupted` would
     /// carry `candidate: None` instead of the real one, never a wrong one.
     pub fn bind_candidate(&self, candidate: SnapshotId) {
-        if let Some(mut marker) = read_marker(&self.path) {
+        if let MarkerRead::Ok(mut marker) = read_marker(&self.path) {
             marker.candidate = Some(candidate.to_string());
             let _ = write_marker(&self.path, &marker);
         }
@@ -154,9 +421,16 @@ impl AttemptGuard {
 
     /// The attempt reached a terminal record that was durably appended: remove the
     /// marker so no future reconciliation pass mistakes it for dangling.
+    ///
+    /// Best-effort, deliberately: the terminal record is already durably on the log
+    /// by the time every caller reaches this, so a failure to remove the marker
+    /// itself is untidy, never a correctness problem — `reconcile_dangling_attempts`
+    /// is terminal-aware and idempotent (see [`attempt_already_terminal`]), so a
+    /// marker that outlives this call is simply retired, quietly, the next time
+    /// anything reconciles this session.
     pub fn finish(mut self) {
         self.finished = true;
-        let _ = std::fs::remove_file(&self.path);
+        let _ = remove_marker_durably(&self.path);
     }
 }
 
@@ -168,7 +442,7 @@ impl Drop for AttemptGuard {
         // Best-effort, and touches only this attempt's own private marker file —
         // never the shared event log (see the module doc comment) — so this is safe
         // to do even mid-unwind.
-        if let Some(mut marker) = read_marker(&self.path) {
+        if let MarkerRead::Ok(mut marker) = read_marker(&self.path) {
             marker.note.get_or_insert_with(|| {
                 "the process running this attempt exited without recording a terminal \
                  result (an early return, a panic, or the process ending outright)"
@@ -210,11 +484,28 @@ pub fn finalize_interrupted(
 /// daemon's own startup (#139, the literal ask), a client's `Session::open_current`,
 /// or the start of a fresh `verify()` — so a dangling attempt is never left showing
 /// "running" for longer than it takes for anything to look at the session again.
-/// Markers this pass cannot even parse are removed without an event: a corrupt
-/// marker carries no attempt to report on, but must not jam every future
-/// reconciliation pass forever either.
 ///
-/// Returns the number of attempts reconciled.
+/// A marker is only ever treated as dangling once its owning process is verifiably
+/// gone, or it is this very process's own earlier leftover (see [`owner_is_gone`]) —
+/// never merely because a marker exists, which is equally true of a healthy
+/// in-flight attempt (review of #208, finding 1). Before acting on any marker,
+/// reconciliation also checks whether its attempt already has a terminal record in
+/// the log ([`attempt_already_terminal`]), so a marker that resurfaces after a crash
+/// between a terminal append and its own not-yet-durable removal is retired quietly
+/// instead of producing a duplicate, contradictory terminal record (finding 2).
+/// Markers this pass cannot even parse are never silently deleted: their attempt id
+/// (from the file name, which this process controls) still gets a terminal record
+/// when one is not already on the log, and the unreadable original is quarantined
+/// alongside it (`<attempt>.json.corrupt`) rather than destroyed.
+///
+/// Every failure mode here — the directory cannot be listed, the append or its sync
+/// fails, or a marker cannot be removed/quarantined once its terminal record (if
+/// any) is on the log — is returned, never swallowed (finding 3): every call site
+/// propagates it rather than discarding it with `let _ = `.
+///
+/// Returns the number of attempts for which a `VerificationInterrupted` record was
+/// newly appended (never counting one already found terminal, or a live one left
+/// alone).
 pub fn reconcile_dangling_attempts(sink: &mut dyn Sink, session_dir: &Path) -> Result<usize> {
     let dir = attempts_dir(session_dir);
     let entries = match std::fs::read_dir(&dir) {
@@ -232,33 +523,99 @@ pub fn reconcile_dangling_attempts(sink: &mut dyn Sink, session_dir: &Path) -> R
     // order.
     paths.sort();
 
+    let log_path = events_log_path(session_dir);
     let mut reconciled = 0usize;
     for path in paths {
-        let Some(marker) = read_marker(&path) else {
-            let _ = std::fs::remove_file(&path);
-            continue;
-        };
-        let attempt = AttemptId::new(marker.attempt);
-        let candidate = marker.candidate.as_deref().and_then(|s| s.parse().ok());
-        let reason = ShortText::new(marker.note.as_deref().unwrap_or(
-            "the process serving this session ended before the attempt reached a terminal result",
-        ));
-        sink.append(
-            Origin::Wardd,
-            WardEvent::VerificationInterrupted {
-                attempt,
-                candidate,
-                reason,
-            },
-            SystemTime::now(),
-        )?;
-        let _ = std::fs::remove_file(&path);
-        reconciled += 1;
-    }
-    if reconciled > 0 {
-        sink.sync()?;
+        match read_marker(&path) {
+            // Gone since the directory listing (a concurrent `finish()`, or a
+            // concurrent reconciliation pass): nothing left to do, and not an error.
+            MarkerRead::Gone => {}
+            MarkerRead::Corrupt => {
+                // Only this process's own naming scheme puts a `.json` file here; a
+                // foreign one (no parseable numeric stem) is left completely alone.
+                if let Some(id) = attempt_id_from_filename(&path) {
+                    let attempt = AttemptId::new(id);
+                    if !attempt_already_terminal(&log_path, attempt) {
+                        sink.append(
+                            Origin::Wardd,
+                            WardEvent::VerificationInterrupted {
+                                attempt,
+                                candidate: None,
+                                reason: ShortText::new(
+                                    "this attempt's marker file could not be read (corrupt \
+                                     or truncated, most likely a crash mid-write); the \
+                                     original was quarantined alongside it for inspection",
+                                ),
+                            },
+                            SystemTime::now(),
+                        )?;
+                        sink.sync()?;
+                        reconciled += 1;
+                    }
+                    quarantine_marker(&path)?;
+                }
+            }
+            MarkerRead::Ok(marker) => {
+                let attempt = AttemptId::new(marker.attempt);
+                if attempt_already_terminal(&log_path, attempt) {
+                    // A resurrected marker (finding 2): its own attempt already has a
+                    // terminal record, most likely because this exact marker's
+                    // removal, after an earlier successful reconciliation or a normal
+                    // `AttemptGuard::finish`, was not itself durable before a crash.
+                    // Retire it without touching the log again.
+                    remove_marker_durably(&path)?;
+                    continue;
+                }
+                if !owner_is_gone(&marker) {
+                    // A live, different process still owns this attempt (finding 1):
+                    // never interrupt a verification on the strength of a marker
+                    // file alone.
+                    continue;
+                }
+                let candidate = marker.candidate.as_deref().and_then(|s| s.parse().ok());
+                let reason = ShortText::new(marker.note.as_deref().unwrap_or(
+                    "the process serving this session ended before the attempt reached a \
+                     terminal result",
+                ));
+                sink.append(
+                    Origin::Wardd,
+                    WardEvent::VerificationInterrupted {
+                        attempt,
+                        candidate,
+                        reason,
+                    },
+                    SystemTime::now(),
+                )?;
+                // Durable before the marker — the only other evidence of this
+                // attempt — is removed.
+                sink.sync()?;
+                remove_marker_durably(&path)?;
+                reconciled += 1;
+            }
+        }
     }
     Ok(reconciled)
+}
+
+/// Test-only: write a marker for `attempt` naming `pid` as its owner, exactly as
+/// [`AttemptGuard::start`] would for *this* process's own pid — used by
+/// `session::tests` to prove `Session::open_current` never interrupts a live
+/// attempt another process genuinely owns (review of #208, finding 1), without
+/// `session.rs` needing to know this module's on-disk marker schema.
+#[cfg(test)]
+pub(crate) fn test_marker_owned_by(session_dir: &Path, attempt: AttemptId, pid: u32) -> Result<()> {
+    write_marker(
+        &marker_path(session_dir, attempt),
+        &Marker {
+            attempt: attempt.get(),
+            requested_by: VerifyRequester::User,
+            candidate: None,
+            started_unix_ms: unix_ms(SystemTime::now()),
+            note: None,
+            pid,
+            owner_started_ticks: process_start_ticks(pid),
+        },
+    )
 }
 
 /// A cooperative cancellation handle for one `Session::verify()` call (#139).
@@ -299,6 +656,8 @@ impl CancelToken {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+    use std::process::{Child, Command, Stdio};
+
     use ward_events::{Blake3Hash, EventRecord, LogReader, SessionId};
 
     use super::*;
@@ -323,6 +682,49 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect()
+    }
+
+    /// A real, independently-alive child process, killed and reaped on drop — used
+    /// to stand in for "another process is genuinely still running this attempt"
+    /// without any fixed sleep duration to race against (mirrors the pattern
+    /// `pause.rs`'s process-tree tests already use).
+    struct LiveChild(Child);
+
+    impl LiveChild {
+        fn spawn() -> Self {
+            Self(
+                Command::new("sh")
+                    .args(["-c", "while :; do :; done"])
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for LiveChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A marker naming `pid` as its owner, with a correctly matching `/proc` start
+    /// time when one can be read (a real spawned child always has one on Linux).
+    fn marker_owned_by(attempt: AttemptId, pid: u32) -> Marker {
+        Marker {
+            attempt: attempt.get(),
+            requested_by: VerifyRequester::User,
+            candidate: None,
+            started_unix_ms: unix_ms(SystemTime::now()),
+            note: None,
+            pid,
+            owner_started_ticks: process_start_ticks(pid),
+        }
     }
 
     #[test]
@@ -389,12 +791,10 @@ mod tests {
         let guard = AttemptGuard::start(dir.path(), attempt, VerifyRequester::User).unwrap();
         assert!(marker_path(dir.path(), attempt).exists());
         guard.bind_candidate(candidate());
-        assert!(
-            read_marker(&marker_path(dir.path(), attempt))
-                .unwrap()
-                .candidate
-                .is_some()
-        );
+        match read_marker(&marker_path(dir.path(), attempt)) {
+            MarkerRead::Ok(marker) => assert!(marker.candidate.is_some()),
+            _ => panic!("marker must still parse"),
+        }
         guard.finish();
         assert!(!marker_path(dir.path(), attempt).exists());
     }
@@ -413,8 +813,9 @@ mod tests {
             guard.bind_candidate(candidate());
             // Dropped here without `finish()` — e.g. an early `?` return.
         }
-        let marker = read_marker(&marker_path(dir.path(), attempt))
-            .expect("the marker survives an unfinished guard's drop");
+        let MarkerRead::Ok(marker) = read_marker(&marker_path(dir.path(), attempt)) else {
+            panic!("the marker survives an unfinished guard's drop");
+        };
         assert_eq!(
             marker.candidate.as_deref(),
             Some(candidate().to_string()).as_deref()
@@ -494,8 +895,97 @@ mod tests {
         }
     }
 
+    /// Review of #208, finding 1: a marker alone is not evidence its owner died — a
+    /// live, *different* process's marker must be left completely alone, exactly as
+    /// it would be if a second `ward` command merely opened the same session while a
+    /// first one's `verify()` is still genuinely in flight.
     #[test]
-    fn reconcile_removes_an_unparseable_marker_without_jamming_on_it() {
+    fn reconcile_leaves_a_marker_alone_while_its_owning_process_is_still_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = fresh_log(dir.path());
+        let attempt = AttemptId::new(1);
+        let owner = LiveChild::spawn();
+        let marker = marker_owned_by(attempt, owner.pid());
+        write_marker(&marker_path(dir.path(), attempt), &marker).unwrap();
+
+        let n = reconcile_dangling_attempts(&mut log, dir.path()).unwrap();
+        assert_eq!(n, 0, "a live owner's attempt is never interrupted");
+        assert!(
+            marker_path(dir.path(), attempt).exists(),
+            "the marker survives untouched"
+        );
+        log.sync().unwrap();
+        assert!(
+            read_back(&dir.path().join("events.log")).is_empty(),
+            "nothing was appended for a still-owned attempt"
+        );
+    }
+
+    /// The other half of the same finding: once that owning process actually exits,
+    /// the exact same marker *is* reconciled — proving the fix is about the owner's
+    /// liveness, not merely refusing to reconcile "second callers" outright.
+    #[test]
+    fn reconcile_closes_out_the_marker_once_its_owning_process_has_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = fresh_log(dir.path());
+        let attempt = AttemptId::new(1);
+        let pid = {
+            let owner = LiveChild::spawn();
+            let pid = owner.pid();
+            let marker = marker_owned_by(attempt, pid);
+            write_marker(&marker_path(dir.path(), attempt), &marker).unwrap();
+            pid
+            // `owner` drops here: killed and reaped, so `pid` is genuinely gone by
+            // the time reconciliation runs below.
+        };
+        assert!(
+            crate::daemon::wait_until(std::time::Duration::from_secs(2), || {
+                process_start_ticks(pid).is_none()
+            }),
+            "the child pid disappears from /proc once reaped"
+        );
+
+        let n = reconcile_dangling_attempts(&mut log, dir.path()).unwrap();
+        assert_eq!(n, 1, "the now-dead owner's attempt is reconciled");
+        assert!(!marker_path(dir.path(), attempt).exists());
+        log.sync().unwrap();
+        match &read_back(&dir.path().join("events.log"))
+            .last()
+            .unwrap()
+            .event
+        {
+            WardEvent::VerificationInterrupted { attempt: got, .. } => {
+                assert_eq!(*got, attempt);
+            }
+            other => panic!("expected VerificationInterrupted, got {other:?}"),
+        }
+    }
+
+    /// A pid the kernel has since handed to an unrelated process must not be
+    /// mistaken for the marker's original owner still being alive: the recorded
+    /// `/proc` start time no longer matches, so the marker is reconciled rather than
+    /// left dangling forever behind someone else's long-lived process.
+    #[test]
+    fn reconcile_treats_a_stale_start_time_as_a_reused_pid_not_a_live_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = fresh_log(dir.path());
+        let attempt = AttemptId::new(1);
+        let owner = LiveChild::spawn();
+        let mut marker = marker_owned_by(attempt, owner.pid());
+        // Pretend the marker was written by a much earlier process that happened to
+        // share this pid; a real start time here would never equal this.
+        marker.owner_started_ticks = Some(1);
+        write_marker(&marker_path(dir.path(), attempt), &marker).unwrap();
+
+        let n = reconcile_dangling_attempts(&mut log, dir.path()).unwrap();
+        assert_eq!(n, 1, "a mismatched start time means the real owner is gone");
+    }
+
+    /// Finding 2: a marker `reconcile_dangling_attempts` cannot parse is never
+    /// silently deleted — its attempt id (from the file name) still gets a terminal
+    /// record, and the unreadable original is quarantined, not destroyed.
+    #[test]
+    fn reconcile_quarantines_an_unparseable_marker_and_still_emits_a_terminal_record() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = fresh_log(dir.path());
         let bad = attempts_dir(dir.path()).join("7.json");
@@ -503,8 +993,104 @@ mod tests {
         std::fs::write(&bad, b"not json").unwrap();
 
         let n = reconcile_dangling_attempts(&mut log, dir.path()).unwrap();
-        assert_eq!(n, 0, "an unparseable marker reconciles no event");
-        assert!(!bad.exists(), "but it is still cleared out");
+        assert_eq!(
+            n, 1,
+            "the attempt id from the file name still gets a record"
+        );
+        assert!(
+            !bad.exists(),
+            "the corrupt original is moved, not left in place"
+        );
+        assert!(
+            bad.with_file_name("7.json.corrupt").exists(),
+            "…and preserved for inspection rather than deleted"
+        );
+        log.sync().unwrap();
+        match &read_back(&dir.path().join("events.log"))
+            .last()
+            .unwrap()
+            .event
+        {
+            WardEvent::VerificationInterrupted {
+                attempt, candidate, ..
+            } => {
+                assert_eq!(attempt.get(), 7);
+                assert_eq!(*candidate, None, "a corrupt marker never invents one");
+            }
+            other => panic!("expected VerificationInterrupted, got {other:?}"),
+        }
+
+        // Reconciling again finds nothing left under the `.json` extension the scan
+        // filters on: the quarantined file is not picked up a second time.
+        assert_eq!(
+            reconcile_dangling_attempts(&mut log, dir.path()).unwrap(),
+            0
+        );
+    }
+
+    /// Finding 2, the crash-resurrection case: a marker whose attempt already has a
+    /// terminal record in the log — as if an earlier `finish()`/reconciliation
+    /// removed it, but a crash right after meant the removal itself never became
+    /// durable and the marker resurfaced — must be retired quietly, never turned
+    /// into a second, contradictory `VerificationInterrupted`.
+    #[test]
+    fn reconcile_is_idempotent_against_a_marker_resurrected_after_its_attempt_already_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = fresh_log(dir.path());
+        let attempt = AttemptId::new(1);
+        log.append(
+            Origin::Wardd,
+            WardEvent::VerificationAttemptStarted {
+                attempt,
+                requested_by: VerifyRequester::User,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+        log.append(
+            Origin::User,
+            WardEvent::VerificationCancelled {
+                attempt,
+                candidate: None,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+        // The marker "resurrects": present on disk even though its attempt already
+        // reached a terminal record above (its own removal was not durable before a
+        // hypothetical crash right after the cancel).
+        let owner = LiveChild::spawn();
+        drop(owner); // dead by the time we reconcile, so liveness is not what saves it
+        let marker = Marker {
+            attempt: attempt.get(),
+            requested_by: VerifyRequester::User,
+            candidate: None,
+            started_unix_ms: unix_ms(SystemTime::now()),
+            note: None,
+            pid: 999_999, // not this process, and (barring an absurd coincidence) dead
+            owner_started_ticks: None,
+        };
+        write_marker(&marker_path(dir.path(), attempt), &marker).unwrap();
+
+        let n = reconcile_dangling_attempts(&mut log, dir.path()).unwrap();
+        assert_eq!(
+            n, 0,
+            "no new terminal record for an attempt that already has one"
+        );
+        assert!(
+            !marker_path(dir.path(), attempt).exists(),
+            "the resurrected marker is still cleaned up"
+        );
+        log.sync().unwrap();
+        let records = read_back(&dir.path().join("events.log"));
+        let interrupted = records
+            .iter()
+            .filter(|r| matches!(r.event, WardEvent::VerificationInterrupted { .. }))
+            .count();
+        assert_eq!(
+            interrupted, 0,
+            "the log must never end up with both Cancelled and Interrupted for one attempt"
+        );
     }
 
     #[test]
@@ -515,6 +1101,132 @@ mod tests {
             reconcile_dangling_attempts(&mut log, dir.path()).unwrap(),
             0
         );
+    }
+
+    /// Finding 3: a directory listing failure is surfaced from
+    /// `reconcile_dangling_attempts`, never swallowed inside it.
+    #[test]
+    fn reconcile_surfaces_a_read_dir_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = fresh_log(dir.path());
+        // `attempts` exists as a plain file, not a directory: `read_dir` on it fails
+        // with a real, privilege-independent error (not-a-directory), regardless of
+        // who runs the test.
+        std::fs::write(attempts_dir(dir.path()), b"not a directory").unwrap();
+
+        let err = reconcile_dangling_attempts(&mut log, dir.path())
+            .expect_err("a non-directory attempts path must not read as \"nothing to do\"");
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// A [`Sink`] whose `append` and/or `sync` can be made to fail on demand, to
+    /// prove `reconcile_dangling_attempts` surfaces both failure kinds rather than
+    /// swallowing them (finding 3).
+    struct FailingSink {
+        inner: LocalLog,
+        fail_append: bool,
+        fail_sync: bool,
+    }
+
+    impl Sink for FailingSink {
+        fn append(
+            &mut self,
+            origin: Origin,
+            event: WardEvent,
+            at: SystemTime,
+        ) -> Result<EventRecord> {
+            if self.fail_append {
+                return Err(Error::Events("simulated append failure".to_owned()));
+            }
+            self.inner.append(origin, event, at)
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            if self.fail_sync {
+                return Err(Error::Events("simulated sync failure".to_owned()));
+            }
+            self.inner.sync()
+        }
+
+        fn seal(self: Box<Self>) -> Result<()> {
+            Box::new(self.inner).seal()
+        }
+
+        fn stop(self: Box<Self>, reason: ward_events::EndReason) -> Result<()> {
+            Box::new(self.inner).stop(reason)
+        }
+    }
+
+    #[test]
+    fn reconcile_surfaces_an_append_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new(1);
+        drop(AttemptGuard::start(dir.path(), attempt, VerifyRequester::User).unwrap());
+        let mut sink = FailingSink {
+            inner: fresh_log(dir.path()),
+            fail_append: true,
+            fail_sync: false,
+        };
+
+        let err = reconcile_dangling_attempts(&mut sink, dir.path())
+            .expect_err("an append failure must not be swallowed");
+        assert!(err.to_string().contains("simulated append failure"));
+        assert!(
+            marker_path(dir.path(), attempt).exists(),
+            "the marker is left in place when its terminal record could not be appended"
+        );
+    }
+
+    #[test]
+    fn reconcile_surfaces_a_sync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new(1);
+        drop(AttemptGuard::start(dir.path(), attempt, VerifyRequester::User).unwrap());
+        let mut sink = FailingSink {
+            inner: fresh_log(dir.path()),
+            fail_append: false,
+            fail_sync: true,
+        };
+
+        let err = reconcile_dangling_attempts(&mut sink, dir.path())
+            .expect_err("a sync failure must not be swallowed");
+        assert!(err.to_string().contains("simulated sync failure"));
+        assert!(
+            marker_path(dir.path(), attempt).exists(),
+            "the marker is left in place when its terminal record was not durably synced"
+        );
+    }
+
+    /// Finding 3: a marker that cannot be removed once its terminal record is
+    /// durably on the log still surfaces that failure — the append itself is not
+    /// undone or hidden, only the cleanup step is left visibly incomplete.
+    #[test]
+    fn reconcile_surfaces_a_quarantine_failure_after_the_terminal_record_still_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = fresh_log(dir.path());
+        let bad = attempts_dir(dir.path()).join("7.json");
+        std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+        std::fs::write(&bad, b"not json").unwrap();
+        // Pre-occupy the quarantine destination with a directory: renaming a file
+        // onto an existing directory fails (EISDIR) regardless of privilege, so this
+        // is deterministic whether the suite runs as root or not.
+        std::fs::create_dir_all(bad.with_file_name("7.json.corrupt")).unwrap();
+
+        let err = reconcile_dangling_attempts(&mut log, dir.path())
+            .expect_err("a quarantine failure must not be swallowed");
+        assert!(!err.to_string().is_empty());
+        log.sync().unwrap();
+        match &read_back(&dir.path().join("events.log"))
+            .last()
+            .unwrap()
+            .event
+        {
+            WardEvent::VerificationInterrupted { attempt, .. } => assert_eq!(attempt.get(), 7),
+            other => panic!(
+                "the terminal record must still have been appended before the \
+                 cleanup step failed, got {other:?}"
+            ),
+        }
     }
 
     #[test]
