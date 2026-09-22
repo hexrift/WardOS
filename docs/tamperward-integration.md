@@ -162,7 +162,12 @@ and the host Rust toolchain bound read-only, killed past `verify.budget_secs` (d
 (origin User), `VerificationStarted` with pristine, candidate and config hash, one
 `VerificationProgress` per restored path and one for the command, and
 `VerificationPassed` / `VerificationFailed` with the parsed counts and the BLAKE3 of
-the output (origin Verifier). The hook layer denies `Write`/`Edit` tool calls on
+the output (origin Verifier). If the verifier command cannot even be run — the sandbox
+runtime fails to launch, or a step between `VerificationStarted` and the verdict errors
+out — the log gets `VerificationErrored { candidate, reason }` instead, so a
+subscriber never sees `VerificationStarted` as the last verification record for a
+candidate and never confuses "could not run" with "ran and failed" (#139). The hook
+layer denies `Write`/`Edit` tool calls on
 protected paths with `protected by TamperWard policy: tests`. The end-to-end test runs
 the scenario above on `examples/ward-demo`: the bug fails, a weakened protected test
 still fails (the verifier never saw the edit), the real fix passes. Not yet: the
