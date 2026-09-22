@@ -69,6 +69,14 @@ impl Recorder {
         self.0.drain().items
     }
 
+    /// Count `n` decisions as lost without having been offered — the connections
+    /// still being served when the terminal flush's bounded quiesce ran out, whose
+    /// decisions this recorder will now never see. Surfaced by the next drain as
+    /// the same explicit marker an overflow produces.
+    pub fn record_dropped(&self, n: u64) {
+        self.0.record_dropped(n);
+    }
+
     /// How many decisions are waiting to be drained.
     #[must_use]
     pub fn queued(&self) -> usize {
@@ -236,6 +244,29 @@ impl Egress {
         self.recorder.queued()
     }
 
+    /// Stop the proxy and wait, for at most `timeout`, until every connection it
+    /// was still serving has finished — so a decision made across the cutover is in
+    /// the recorder before the caller's final [`drain_observations`](Self::drain_observations),
+    /// rather than being recorded into a queue nothing will drain again.
+    ///
+    /// Returns how many connections were still in flight when the wait ran out.
+    /// Those are counted as refused decisions, so the gap they represent is
+    /// surfaced by the next drain as an explicit `ObservationsDropped` marker
+    /// instead of being silently discarded with the proxy. The wait is bounded on
+    /// purpose: a relay that will not wind down must not be able to hold the
+    /// daemon's shutdown open.
+    pub fn quiesce(&self, timeout: Duration) -> usize {
+        // Stops accepting, asks every relay to wind down and joins the acceptor;
+        // idempotent, so the later `stop` is still safe.
+        self.handle.shutdown();
+        crate::daemon::wait_until(timeout, || self.handle.active_connections() == 0);
+        let remaining = self.handle.active_connections();
+        if remaining > 0 {
+            self.recorder.record_dropped(remaining as u64);
+        }
+        remaining
+    }
+
     /// Stop the proxy and remove the socket.
     pub fn stop(self) {
         if let Some((stop, thread)) = self.watcher {
@@ -366,6 +397,59 @@ mod tests {
                 port: 1,
             },
         }
+    }
+
+    /// One HTTP request straight at the proxy's Unix socket; the reply is whatever
+    /// the policy decided, and the decision is recorded either way.
+    fn ask_proxy(socket: &Path, host: &str) -> String {
+        use std::io::{Read as _, Write as _};
+        let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        stream
+            .write_all(
+                format!("GET http://{host}/ HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let mut reply = String::new();
+        drop(stream.read_to_string(&mut reply));
+        reply
+    }
+
+    /// #137: the terminal flush quiesces the proxy *before* it drains the recorder,
+    /// so a decision cannot be accepted into a queue that will never be drained
+    /// again. After quiescing, nothing can reach the proxy at all, and everything it
+    /// decided is still there for the drain that follows.
+    #[test]
+    fn quiescing_stops_the_proxy_before_its_decisions_are_drained() {
+        let dir = tempfile::tempdir().unwrap();
+        let egress = Egress::start(dir.path(), &NetworkCapability::Offline, Vec::new()).unwrap();
+        let reply = ask_proxy(egress.socket(), "example.com");
+        assert!(!reply.is_empty(), "the proxy answered the request");
+
+        // Quiesce first: stop accepting and wait for the connections still being
+        // served, so the drain below is a cutover rather than a race.
+        assert_eq!(
+            egress.quiesce(Duration::from_secs(5)),
+            0,
+            "no connection was left in flight"
+        );
+        let obs = egress.drain_observations(&by());
+        assert!(
+            obs.iter()
+                .any(|o| matches!(o.event, WardEvent::NetworkDenied { .. })),
+            "the decision made before the cutover must still be flushed: {obs:?}"
+        );
+        assert!(
+            !obs.iter()
+                .any(|o| matches!(o.event, WardEvent::ObservationsDropped { .. })),
+            "a proxy that quiesced cleanly is not a gap: {obs:?}"
+        );
+        // Quiesced means quiesced: nothing can be decided after the drain.
+        assert!(
+            std::os::unix::net::UnixStream::connect(egress.socket()).is_err(),
+            "the proxy socket must be gone once the proxy has been quiesced"
+        );
+        egress.stop();
     }
 
     #[test]

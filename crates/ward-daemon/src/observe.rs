@@ -17,18 +17,28 @@
 //!   far behind the drain has fallen (`docs/security-model.md` G14).
 //! * **Overflow is recorded, never silent.** A push into a full queue is *refused*
 //!   (the queue is never rewritten behind an already-accepted observation) and
-//!   counted; the next drain turns the count into an explicit
+//!   counted *under the same lock*; the next drain takes the observations and the
+//!   refusals together and turns the count into an explicit
 //!   [`WardEvent::ObservationsDropped`] marker, appended right after the batch it
-//!   accompanies.
+//!   accompanies. Because the two are one atomic epoch, a refusal can never be
+//!   split across two markers, attached to a batch it did not accompany, or lost to
+//!   a drain that reset the count between the refusal and its being recorded. Every
+//!   bounded source has its own [`ObserverSource`], the hook broker included, so no
+//!   gap is reported as something an observer mode may hide.
 //! * **Order is preserved across drains.** Each queue is FIFO, and the drain visits
 //!   its sources in a fixed order, so no drain can reorder observations relative to
 //!   an earlier one. Every observation keeps its own observation time, which is what
 //!   the record is stamped with — ingestion time is only when it reached the log.
+//! * **The last drain is a cutover, not a race.** [`Observers::finish`] quiesces
+//!   each producer — stops it accepting new work and waits, for a bounded time, for
+//!   what it already had in flight — *before* draining that producer for the last
+//!   time, so a decision or claim completed across the cutover is flushed rather
+//!   than discarded with the producer. A producer still busy when the bound runs out
+//!   is counted and marked like any other gap.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use ward_events::{ObserverSource, Origin, ProcessRef, SandboxPath, SandboxRoot, WardEvent};
@@ -52,6 +62,22 @@ pub const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
 /// ingested as a batch instead of waiting out [`DRAIN_INTERVAL`] and risking the
 /// bound. Whichever comes first wins.
 pub const DRAIN_BATCH: usize = 256;
+
+/// The longest the terminal flush waits for one producer to go quiet before it
+/// drains that producer for the last time.
+///
+/// The wait is what makes the final drain a *cutover* rather than a race: the
+/// producer is first stopped from accepting new work, then given this long to
+/// finish what it already had in flight, and only then drained. It is bounded
+/// because a handler wedged on something that never returns must not be able to
+/// wedge the daemon's shutdown with it; a producer still busy when it runs out is
+/// a real gap in the record, and is counted and marked exactly as an overflow is.
+///
+/// It applies to each producer separately, so the flush is bounded by this times
+/// the number of producers, not by anything a producer can choose. In practice
+/// nothing waits at all: the child is gone by the time the flush runs, so the
+/// proxy's connections and the broker's handlers have already finished.
+pub const QUIESCE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One observation, ready to append: when its source saw it, which trusted source
 /// that was, and the record it becomes.
@@ -99,11 +125,26 @@ impl<T> Default for Drained<T> {
 /// evicted to admit a newer one, so what the log receives is always a contiguous,
 /// correctly ordered prefix of what the source offered between two drains, followed
 /// by a marker for the rest.
+///
+/// The queued observations and the count of refusals live behind **one** lock, so
+/// each `push` and each `drain` is a single atomic epoch: a refusal is either
+/// wholly inside the batch the next drain takes or wholly inside the one after,
+/// never split between them, attached to a batch it did not accompany, or lost
+/// because a drain reset the count after the refusal decided but before it was
+/// recorded. That is what lets the marker's documented contract — "immediately
+/// follows and bounds the batch it accompanies" — actually hold.
 #[derive(Debug)]
 pub struct Bounded<T> {
-    items: Mutex<VecDeque<T>>,
-    dropped: AtomicU64,
+    queue: Mutex<Queue<T>>,
     capacity: usize,
+}
+
+/// The one piece of state a [`Bounded`] guards: the observations and the refusals
+/// that belong to the same drain epoch.
+#[derive(Debug)]
+struct Queue<T> {
+    items: VecDeque<T>,
+    dropped: u64,
 }
 
 impl<T> Bounded<T> {
@@ -111,8 +152,10 @@ impl<T> Bounded<T> {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            items: Mutex::new(VecDeque::new()),
-            dropped: AtomicU64::new(0),
+            queue: Mutex::new(Queue {
+                items: VecDeque::new(),
+                dropped: 0,
+            }),
             capacity: capacity.max(1),
         }
     }
@@ -123,41 +166,50 @@ impl<T> Bounded<T> {
         self.capacity
     }
 
+    /// The guarded state. A producer that panicked mid-push poisons the lock but
+    /// cannot corrupt what it guards — a `VecDeque` and a counter — and dropping the
+    /// queue on the floor would lose observations already accepted, so the guard is
+    /// recovered and the queue keeps working.
+    fn locked(&self) -> MutexGuard<'_, Queue<T>> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Offer one observation. Returns whether it was accepted; a refusal is counted
-    /// and surfaced by the next [`drain`](Self::drain), never silently discarded.
-    ///
-    /// A poisoned lock — a producer that panicked mid-push — counts as a refusal for
-    /// the same reason: the observation is gone, and the log must say so.
+    /// under the same lock that saw the queue full, so the next
+    /// [`drain`](Self::drain) that takes the batch takes the refusal with it.
     pub fn push(&self, item: T) -> bool {
-        let Ok(mut items) = self.items.lock() else {
-            self.dropped.fetch_add(1, Ordering::SeqCst);
-            return false;
-        };
-        if items.len() >= self.capacity {
-            drop(items);
-            self.dropped.fetch_add(1, Ordering::SeqCst);
+        let mut queue = self.locked();
+        if queue.items.len() >= self.capacity {
+            queue.dropped = queue.dropped.saturating_add(1);
             return false;
         }
-        items.push_back(item);
+        queue.items.push_back(item);
         true
+    }
+
+    /// Count `n` observations as refused without offering them: what a producer
+    /// reports when it lost them before the queue ever saw them (a connection
+    /// turned away at a handler cap, an in-flight handler that outlived the final
+    /// flush's bounded wait). Surfaced by the next drain exactly as an overflow is.
+    pub fn record_dropped(&self, n: u64) {
+        let mut queue = self.locked();
+        queue.dropped = queue.dropped.saturating_add(n);
     }
 
     /// How many observations are waiting right now.
     #[must_use]
     pub fn queued(&self) -> usize {
-        self.items.lock().map_or(0, |items| items.len())
+        self.locked().items.len()
     }
 
     /// Take everything queued, plus the number refused since the previous drain.
+    /// Both come out of one lock acquisition, so a concurrent producer cannot slip
+    /// a refusal between the items and the count.
     pub fn drain(&self) -> Drained<T> {
-        let items = self
-            .items
-            .lock()
-            .map(|mut items| items.drain(..).collect())
-            .unwrap_or_default();
+        let mut queue = self.locked();
         Drained {
-            items,
-            dropped: self.dropped.swap(0, Ordering::SeqCst),
+            items: queue.items.drain(..).collect(),
+            dropped: std::mem::take(&mut queue.dropped),
         }
     }
 }
@@ -389,12 +441,7 @@ impl Observers {
             out.extend(egress.drain_observations(by));
         }
         if let Some(hooks) = &self.hooks {
-            out.extend(
-                hooks
-                    .drain_events()
-                    .into_iter()
-                    .map(|(at, event)| Observation::new(at, Origin::Agent, event)),
-            );
+            out.extend(hooks.drain_observations());
         }
         out
     }
@@ -402,22 +449,50 @@ impl Observers {
     /// Stop every producer and return what they still held. Call exactly once: the
     /// producers are gone afterwards, so a second call returns nothing and cannot
     /// append a record twice.
+    ///
+    /// Each producer is **quiesced before its own final drain**, never after. A
+    /// producer is first stopped from accepting new work and then waited on — for at
+    /// most [`QUIESCE_TIMEOUT`] — until the work it already had in flight has
+    /// finished and reached its queue; only then is that queue drained for the last
+    /// time. Draining a producer that is still live would race the drain against a
+    /// legitimate decision or claim and discard whatever lost, with no later drain
+    /// and no marker to say so.
+    ///
+    /// The wait is bounded, so a wedged handler cannot hold shutdown open; a
+    /// producer that is still busy when it runs out is reported the same way an
+    /// overflow is — counted into that source's refusals, so the drain below turns
+    /// it into an explicit [`WardEvent::ObservationsDropped`] marker.
     #[must_use]
     pub fn finish(&mut self, by: &ProcessRef) -> Finished {
+        self.finish_within(by, QUIESCE_TIMEOUT)
+    }
+
+    /// [`finish`](Self::finish) with the quiesce wait given explicitly, so the
+    /// regression for a producer that cannot be quiesced does not have to wait out
+    /// the production bound.
+    #[must_use]
+    pub fn finish_within(&mut self, by: &ProcessRef, quiesce: Duration) -> Finished {
         // The watch is drained through its own `finish`, which stops the thread and
-        // makes a last pass over the inotify queue before handing its tail back.
+        // *joins* it — so the inotify loop has made its last pass and can no longer
+        // push — before handing the queue's tail back.
         let watch = self.watcher.take().map(Watcher::finish);
         let mut tail = Vec::new();
-        if let Some(egress) = &self.egress {
+        if let Some(egress) = self.egress.take() {
+            // Stop accepting, let the connections already being served finish
+            // recording their decisions, then take the queue.
+            egress.quiesce(quiesce);
             tail.extend(egress.drain_observations(by));
+            egress.stop();
         }
-        if let Some(hooks) = &self.hooks {
-            tail.extend(
-                hooks
-                    .drain_events()
-                    .into_iter()
-                    .map(|(at, event)| Observation::new(at, Origin::Agent, event)),
-            );
+        if let Some(hooks) = self.hooks.take() {
+            // `Hooks::stop` deliberately leaves in-flight handlers running, and each
+            // of them still holds the claim buffer; quiescing joins the accept thread
+            // *and* waits for those handlers, so a claim decided across the cutover
+            // is in the buffer this drain empties instead of being appended to a
+            // buffer nothing will ever look at again.
+            hooks.quiesce(quiesce);
+            tail.extend(hooks.drain_observations());
+            hooks.stop();
         }
         self.shutdown();
         Finished {
@@ -454,7 +529,13 @@ impl Drop for Observers {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use ward_events::{FileChangeKind, Pid};
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Barrier};
+    use ward_events::{ClaimKind, FileChangeKind, Pid};
+    use ward_policy::{ObserverMode, StepPolicy};
+
+    use crate::hooks::{Holder, HookDecision, HookResponse, Hooks};
 
     fn by() -> ProcessRef {
         ProcessRef {
@@ -485,6 +566,129 @@ mod tests {
         // Draining makes room again.
         assert!(q.push(5));
         assert_eq!(q.drain().items, vec![5]);
+    }
+
+    /// A refusal and the batch it belongs to are one epoch, even under a drain
+    /// running concurrently with the producer that is being refused.
+    ///
+    /// With a bound of one, a push is refused *only* while an observation is
+    /// queued, and only a drain ever removes that observation — so every drain that
+    /// reports a refusal must also hand over the observation the refusal collided
+    /// with. A drain reporting `dropped > 0` with nothing taken is proof that the
+    /// count was moved across a drain boundary: the refusal decided in one epoch and
+    /// was recorded in the next. That is the same misattribution that loses the
+    /// *final* refusal outright when the drain it slipped past is the terminal one.
+    ///
+    /// No sleeps: the two threads rendezvous on a barrier and then run flat out, and
+    /// the assertion is an invariant that holds for every interleaving rather than a
+    /// timing expectation.
+    #[test]
+    fn a_refusal_is_never_counted_into_a_drain_that_did_not_take_the_batch() {
+        const ROUNDS: u64 = 20_000;
+        let q = Arc::new(Bounded::new(1));
+        let start = Arc::new(Barrier::new(2));
+
+        let producer = {
+            let (q, start) = (Arc::clone(&q), Arc::clone(&start));
+            std::thread::spawn(move || {
+                start.wait();
+                for i in 0..ROUNDS {
+                    // One of the two is refused whenever the drain has not been
+                    // through since the last round.
+                    q.push(i);
+                    q.push(i);
+                }
+            })
+        };
+
+        start.wait();
+        let (mut taken, mut refused) = (0u64, 0u64);
+        let mut check = |drained: Drained<u64>| {
+            assert!(
+                drained.dropped == 0 || !drained.items.is_empty(),
+                "a refusal was counted into a drain that took nothing: the queue was \
+                 full when the push was refused, and only a drain empties it, so this \
+                 refusal belongs to an earlier batch"
+            );
+            assert!(
+                drained.items.len() <= 1,
+                "the bound is one: {:?}",
+                drained.items
+            );
+            taken += drained.items.len() as u64;
+            refused += drained.dropped;
+        };
+        while !producer.is_finished() {
+            check(q.drain());
+        }
+        producer.join().unwrap();
+        check(q.drain());
+
+        assert_eq!(
+            taken + refused,
+            2 * ROUNDS,
+            "every offered observation is either taken or counted as refused, exactly once"
+        );
+    }
+
+    /// The drain and the reset of the refusal count are one step relative to
+    /// concurrent producers: across several producers hammering a queue while a
+    /// drainer empties it, every offer is accounted for exactly once — never lost
+    /// between the two, never counted twice — and no drain takes a refusal whose
+    /// batch it did not also take.
+    #[test]
+    fn draining_and_resetting_the_refusal_count_are_atomic_against_pushes() {
+        const PRODUCERS: usize = 4;
+        const EACH: u64 = 5_000;
+        let q = Arc::new(Bounded::new(2));
+        let start = Arc::new(Barrier::new(PRODUCERS + 1));
+
+        let producers: Vec<_> = (0..PRODUCERS)
+            .map(|_| {
+                let (q, start) = (Arc::clone(&q), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    start.wait();
+                    for i in 0..EACH {
+                        q.push(i);
+                    }
+                })
+            })
+            .collect();
+
+        start.wait();
+        let (mut taken, mut refused) = (0u64, 0u64);
+        let check = |drained: &Drained<u64>| {
+            assert!(drained.items.len() <= q.capacity());
+            assert!(
+                drained.dropped == 0 || !drained.items.is_empty(),
+                "the queue was full when these {} refusals happened, and only a drain \
+                 empties it — so the batch they belong to was taken by an earlier drain \
+                 and this count has been moved out of its epoch",
+                drained.dropped
+            );
+        };
+        loop {
+            let drained = q.drain();
+            check(&drained);
+            taken += drained.items.len() as u64;
+            refused += drained.dropped;
+            if producers.iter().all(std::thread::JoinHandle::is_finished) {
+                break;
+            }
+        }
+        for p in producers {
+            p.join().unwrap();
+        }
+        let drained = q.drain();
+        check(&drained);
+        taken += drained.items.len() as u64;
+        refused += drained.dropped;
+
+        assert_eq!(
+            taken + refused,
+            PRODUCERS as u64 * EACH,
+            "an offer must be in exactly one drain epoch, as an item or as a refusal"
+        );
     }
 
     #[test]
@@ -590,6 +794,201 @@ mod tests {
         // The drop must join the watch thread rather than leave it spinning; if it
         // did not, this test would hang here rather than return.
         drop(obs);
+    }
+
+    /// A hook handler that rendezvouses with the test and then never finishes until
+    /// the test says so: a producer that cannot be quiesced inside the bound.
+    struct WedgedHolder {
+        entered: Arc<Barrier>,
+        released: Arc<Barrier>,
+    }
+
+    impl Holder for WedgedHolder {
+        fn hold(&self, _tool: &str, _summary: &str, _reason: &str) -> Option<HookResponse> {
+            self.entered.wait();
+            self.released.wait();
+            Some(HookResponse {
+                decision: HookDecision::Allow,
+                reason: "approval: allowed once".to_owned(),
+            })
+        }
+    }
+
+    /// A hook handler that rendezvouses with the test and then keeps working for a
+    /// known, bounded time: an in-flight producer that is still holding the claim
+    /// buffer exactly when the terminal flush begins, and finishes across it.
+    struct SlowHolder {
+        entered: Arc<Barrier>,
+        work: Duration,
+    }
+
+    impl Holder for SlowHolder {
+        fn hold(&self, _tool: &str, _summary: &str, _reason: &str) -> Option<HookResponse> {
+            // The test releases this the instant before it calls `finish`, so the
+            // handler is provably in flight at the cutover.
+            self.entered.wait();
+            // Still working when `finish` starts. This is the producer's own
+            // duration, not a synchronisation guess: the assertion below does not
+            // depend on how long it is, only that quiescing waits for it.
+            std::thread::sleep(self.work);
+            Some(HookResponse {
+                decision: HookDecision::Allow,
+                reason: "approval: allowed once".to_owned(),
+            })
+        }
+    }
+
+    /// #137: the terminal flush must quiesce each producer *before* draining it.
+    ///
+    /// A hook handler is in flight — blocked in its holder — when `finish` is
+    /// called, and completes while the flush is running. `Hooks::stop` deliberately
+    /// never waits for handlers, so if the final drain runs before the producer is
+    /// quiesced, this claim is appended to a buffer nothing will ever drain again:
+    /// silently lost, with no gap marker, against the guarantee. Quiescing first
+    /// makes the drain a cutover, and the claim lands in the tail.
+    #[test]
+    fn a_hook_claim_completed_across_the_cutover_is_still_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut obs = Observers::new(run_dir.clone());
+
+        let entered = Arc::new(Barrier::new(2));
+        let holder: Arc<dyn Holder> = Arc::new(SlowHolder {
+            entered: Arc::clone(&entered),
+            work: Duration::from_millis(300),
+        });
+        let hooks = Hooks::start_with(
+            &run_dir,
+            ObserverMode::StepThrough(StepPolicy {
+                pause_before_writes: true,
+                pause_before_network: false,
+            }),
+            Vec::new(),
+            Some(holder),
+        )
+        .unwrap();
+        let socket = hooks.socket().to_path_buf();
+        obs.set_hooks(hooks);
+
+        let asking = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&socket).unwrap();
+            stream
+                .write_all(
+                    b"{\"hook\":\"PreToolUse\",\"tool\":\"Write\",\"summary\":\"/work/src/lib.rs\"}\n",
+                )
+                .unwrap();
+            let mut reply = String::new();
+            BufReader::new(&stream).read_line(&mut reply).unwrap();
+            reply
+        });
+
+        // The handler is inside the holder: its claim is not recorded yet, and it is
+        // about to be, right as the flush cuts over.
+        entered.wait();
+        let finished = obs.finish(&by());
+
+        assert!(
+            finished.tail.iter().any(|o| matches!(
+                (&o.origin, &o.event),
+                (
+                    Origin::Agent,
+                    WardEvent::AgentClaim {
+                        kind: ClaimKind::ToolUse,
+                        payload,
+                    }
+                ) if payload.content() == "PreToolUse Write /work/src/lib.rs → allow"
+            )),
+            "an in-flight claim that completed across the cutover must be flushed, not \
+             discarded with the producer: {:?}",
+            finished.tail.iter().map(|o| &o.event).collect::<Vec<_>>()
+        );
+        // Nothing was refused: the producer was quiesced, not given up on.
+        assert!(
+            !finished
+                .tail
+                .iter()
+                .any(|o| matches!(o.event, WardEvent::ObservationsDropped { .. })),
+            "a quiesced producer is not a gap: {:?}",
+            finished.tail.iter().map(|o| &o.event).collect::<Vec<_>>()
+        );
+        // And the agent still got its answer.
+        let reply: HookResponse = serde_json::from_str(&asking.join().unwrap()).unwrap();
+        assert_eq!(reply.decision, HookDecision::Allow);
+    }
+
+    /// The quiesce wait is bounded, and running out of it is a *recorded* gap.
+    ///
+    /// A handler that will not finish cannot hold the daemon's shutdown open — but
+    /// the claim it is still holding will now never be drained, so the flush says so
+    /// with the same explicit marker an overflow produces, in the same place.
+    #[test]
+    fn a_producer_that_cannot_be_quiesced_is_marked_as_a_gap_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut obs = Observers::new(run_dir.clone());
+
+        let entered = Arc::new(Barrier::new(2));
+        // Two barrier parties on the far side: the handler waits there until the
+        // test releases it, which it only does after the flush has given up on it.
+        let released = Arc::new(Barrier::new(2));
+        let holder: Arc<dyn Holder> = Arc::new(WedgedHolder {
+            entered: Arc::clone(&entered),
+            released: Arc::clone(&released),
+        });
+        let hooks = Hooks::start_with(
+            &run_dir,
+            ObserverMode::StepThrough(StepPolicy {
+                pause_before_writes: true,
+                pause_before_network: false,
+            }),
+            Vec::new(),
+            Some(holder),
+        )
+        .unwrap();
+        let socket = hooks.socket().to_path_buf();
+        obs.set_hooks(hooks);
+
+        let asking = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&socket).unwrap();
+            stream
+                .write_all(
+                    b"{\"hook\":\"PreToolUse\",\"tool\":\"Write\",\"summary\":\"/work/src/lib.rs\"}\n",
+                )
+                .unwrap();
+            let mut reply = String::new();
+            drop(BufReader::new(&stream).read_line(&mut reply));
+            reply
+        });
+
+        entered.wait();
+        let started = Instant::now();
+        let finished = obs.finish_within(&by(), Duration::from_millis(100));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait is bounded: a wedged handler must not hold shutdown open, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            finished.tail.iter().any(|o| matches!(
+                (&o.origin, &o.event),
+                (
+                    Origin::Wardd,
+                    WardEvent::ObservationsDropped {
+                        source: ObserverSource::Hook,
+                        dropped: 1,
+                        ..
+                    }
+                )
+            )),
+            "a producer that could not be quiesced is an incomplete capture and must be \
+             recorded like any other gap: {:?}",
+            finished.tail.iter().map(|o| &o.event).collect::<Vec<_>>()
+        );
+
+        released.wait();
+        drop(asking.join());
     }
 
     #[test]
