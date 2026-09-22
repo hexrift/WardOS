@@ -167,7 +167,10 @@ guided() {
       "Language ·"*) loc=$(calibrate_pick_locale) || true ;;
       "Keyboard ·"*) kbd=$(calibrate_pick_keyboard) || true ;;
       "Timezone ·"*) tz=$(calibrate_pick_timezone) || true ;;
-      "Set a login password") set_password ;;
+      # Best-effort like the applies above (#142): a failed password change (or a failed
+      # `wardos-launch run` terminal it opened) must not abort the whole review — it stays
+      # unset and the step can be reopened from the menu.
+      "Set a login password") set_password || true ;;
       "Skip the rest") return 0 ;;
       *) return 1 ;;
     esac
