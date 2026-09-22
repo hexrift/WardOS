@@ -30,7 +30,7 @@
 //! answer and every credential the proxy injects, for `ward session grants`
 //! and the shell's authority panel.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -128,8 +128,23 @@ pub enum Lifetime {
     Once,
     /// Until the session ends.
     Session,
-    /// Until the launch that made it ends (a proxy route).
+    /// Until the launch that made it ends (a proxy route): confirmed still
+    /// running, or cleanly retired at its terminal record.
     Launch,
+    /// Tied to a launch whose owning connection closed without ever
+    /// producing a terminal record (`CommandFinished`/`LaunchAborted`) —
+    /// the client process was killed, crashed, or the socket was otherwise
+    /// severed. `wardd` has no teardown handle into the client-side egress
+    /// proxy (it runs inside the client's own process, not the daemon's), so
+    /// a bare disconnect cannot establish whether the route this grant
+    /// scoped actually ended. This is the honest middle ground between the
+    /// two false claims: reporting it as plain `Launch` would claim it is
+    /// still confirmed running, and retiring it (as `f5d5c19` tried, and was
+    /// reverted for in `0198c95`) would claim it is confirmed safe. Neither
+    /// is supportable from an EOF alone (#140, PR #197 review round 3), and
+    /// this is a terminal answer in its own right: nothing resolves it back
+    /// to `Launch` or forward to retired.
+    LaunchUnknown,
 }
 
 impl Lifetime {
@@ -140,6 +155,7 @@ impl Lifetime {
             Self::Once => "once",
             Self::Session => "session",
             Self::Launch => "launch",
+            Self::LaunchUnknown => "launch (disconnected)",
         }
     }
 }
@@ -235,6 +251,24 @@ pub struct Credential {
     pub permissions: Vec<String>,
     /// When, milliseconds since the Unix epoch.
     pub granted_at_unix_ms: u64,
+    /// An opaque key identifying the launch whose routes this credential was
+    /// injected for, when the daemon could attribute it to one; `None` for a
+    /// credential granted outside a tracked launch (a test, a fixture). This
+    /// is *not* the client-supplied `Pid` on `CommandStarted`/`CommandFinished`
+    /// — that value is chosen independently by each `Session` (every freshly
+    /// opened session starts allocating from the same small range) and can
+    /// collide between two genuinely concurrent launches, which would merge
+    /// their credentials and let one launch's end retire the other's grant
+    /// too. The daemon mints this key itself, scoped to the connection that
+    /// started the launch, so it cannot collide (PR #197 review, finding 2).
+    /// [`Approvals::retire_launch`] removes every credential recorded under a
+    /// given key once that launch's terminal record (`CommandFinished` or
+    /// `LaunchAborted`) lands, so the grant does not outlive the route it was
+    /// scoped to (#140). When the connection instead closes with no terminal
+    /// record ever landing for it, [`Approvals::mark_launch_unknown`] is
+    /// called on the key instead: the credential stays, but reports as
+    /// [`Lifetime::LaunchUnknown`] rather than [`Lifetime::Launch`].
+    pub launch_key: Option<u64>,
 }
 
 impl Credential {
@@ -686,6 +720,11 @@ struct State {
     remembered: BTreeMap<(String, String), Grant>,
     /// The credentials the launches granted, one per service and scope.
     credentials: Vec<Credential>,
+    /// Launch keys whose owning connection closed without ever producing a
+    /// terminal record: [`Approvals::grants`] reports every credential
+    /// recorded under one of these as [`Lifetime::LaunchUnknown`] rather than
+    /// [`Lifetime::Launch`] (see [`Approvals::mark_launch_unknown`]).
+    unknown_launches: BTreeSet<u64>,
     closed: bool,
     /// The session is paused: timeouts stand still and answers are refused.
     paused: bool,
@@ -714,21 +753,23 @@ impl Approvals {
             .contains_key(&(tool.to_owned(), summary.to_owned()))
     }
 
-    /// A credential the launch granted for `host` with `permissions`; a second
-    /// route of the same service and permissions adds its host.
+    /// A credential the launch granted for `host` with `permissions`,
+    /// attributed to `launch_key` (the daemon's own opaque id for the launch
+    /// this grant fell under, when it could tell one); a second route of the
+    /// same service, permissions and launch adds its host rather than making
+    /// a second grant.
     pub fn record_credential(
         &self,
         service: &str,
         host: &str,
         permissions: Vec<String>,
+        launch_key: Option<u64>,
         granted_at_unix_ms: u64,
     ) {
         let mut state = self.lock();
-        if let Some(c) = state
-            .credentials
-            .iter_mut()
-            .find(|c| c.service == service && c.permissions == permissions)
-        {
+        if let Some(c) = state.credentials.iter_mut().find(|c| {
+            c.service == service && c.permissions == permissions && c.launch_key == launch_key
+        }) {
             if !c.hosts.iter().any(|h| h == host) {
                 c.hosts.push(host.to_owned());
             }
@@ -739,7 +780,43 @@ impl Approvals {
             hosts: vec![host.to_owned()],
             permissions,
             granted_at_unix_ms,
+            launch_key,
         });
+    }
+
+    /// Retire every credential granted for launch `key` (the same opaque id
+    /// [`record_credential`](Self::record_credential) was called with):
+    /// called once that launch's route is closed (its terminal record —
+    /// `CommandFinished` or `LaunchAborted` — lands), so a launch-scoped
+    /// grant does not keep showing as active authority once the launch it
+    /// was scoped to has ended (#140). A credential with no launch attributed
+    /// (`launch_key: None`) is never touched here.
+    pub fn retire_launch(&self, key: u64) {
+        let mut state = self.lock();
+        state.credentials.retain(|c| c.launch_key != Some(key));
+        // Nothing can still be reporting `LaunchUnknown` for a credential
+        // that is gone; keeping the key around would only ever be dead
+        // weight (this only ever fires here if a terminal record somehow
+        // still lands for a launch already marked unknown — ordinarily it
+        // cannot, since its owning connection is closed for good, but there
+        // is no reason to leave the marker stale if it does).
+        state.unknown_launches.remove(&key);
+    }
+
+    /// Mark launch `key` as no longer able to report: its owning connection
+    /// closed before a terminal record (`CommandFinished`/`LaunchAborted`)
+    /// ever landed, so `wardd` cannot say whether the route this launch's
+    /// grant was scoped to actually ended (#140, PR #197 review round 3).
+    /// The credential is *not* retired here — that would claim the route is
+    /// confirmed to have ended, which a bare disconnect cannot support (the
+    /// mistake `f5d5c19` made and `0198c95` reverted) — and it is not left
+    /// reporting as plain [`Lifetime::Launch`] either, which would just as
+    /// wrongly claim the launch is still confirmed running. From this call
+    /// on, [`grants`](Self::grants) reports every credential recorded under
+    /// `key` as [`Lifetime::LaunchUnknown`]: a legitimate, terminal answer in
+    /// its own right, not a state anything here tries to resolve further.
+    pub fn mark_launch_unknown(&self, key: u64) {
+        self.lock().unknown_launches.insert(key);
     }
 
     /// The credentials granted so far, in grant order.
@@ -760,7 +837,10 @@ impl Approvals {
                 kind: GrantKind::Credential,
                 label: service_name(&c.service),
                 scope: format!("{} · {}", c.permissions.join(", "), c.hosts.join(", ")),
-                lifetime: Lifetime::Launch,
+                lifetime: match c.launch_key {
+                    Some(key) if state.unknown_launches.contains(&key) => Lifetime::LaunchUnknown,
+                    _ => Lifetime::Launch,
+                },
                 granted_at_unix_ms: c.granted_at_unix_ms,
             })
             .chain(state.remembered.values().cloned())
@@ -1009,6 +1089,7 @@ mod tests {
             hosts: vec!["github.com".into(), "api.github.com".into()],
             permissions: vec!["contents:read".into(), "issues:read".into()],
             granted_at_unix_ms: 1,
+            launch_key: None,
         }
     }
 
@@ -1148,9 +1229,9 @@ mod tests {
         let approvals = Approvals::new();
         assert!(approvals.grants().is_empty());
         let perms = || vec!["contents:read".to_owned(), "issues:read".to_owned()];
-        approvals.record_credential("github", "github.com", perms(), 1);
-        approvals.record_credential("github", "api.github.com", perms(), 2);
-        approvals.record_credential("github", "api.github.com", perms(), 3);
+        approvals.record_credential("github", "github.com", perms(), None, 1);
+        approvals.record_credential("github", "api.github.com", perms(), None, 2);
+        approvals.record_credential("github", "api.github.com", perms(), None, 3);
         assert_eq!(
             approvals.credentials(),
             [Credential {
@@ -1158,6 +1239,7 @@ mod tests {
                 hosts: vec!["github.com".into(), "api.github.com".into()],
                 permissions: perms(),
                 granted_at_unix_ms: 1,
+                launch_key: None,
             }],
             "one credential per service and scope, its hosts merged"
         );
@@ -1195,6 +1277,51 @@ mod tests {
         approvals.answer(2, ApprovalDecision::Allow).unwrap();
         approvals.wait(2, Duration::ZERO);
         assert_eq!(approvals.grants().len(), 2);
+    }
+
+    #[test]
+    fn retiring_a_launch_drops_only_its_own_credentials() {
+        // #140: a launch-scoped credential must not keep showing as active
+        // authority once the launch it was granted for has ended.
+        let approvals = Approvals::new();
+        let perms = || vec!["contents:read".to_owned()];
+        approvals.record_credential("github", "github.com", perms(), Some(2), 1);
+        // A second, concurrent launch grants the same service and scope: it
+        // must stay its own credential, not merge with pid 2's.
+        approvals.record_credential("github", "github.com", perms(), Some(3), 2);
+        // A credential the daemon could not attribute to a launch (none
+        // observed): never retired by a launch ending.
+        approvals.record_credential("npm", "registry.npmjs.org", perms(), None, 3);
+        assert_eq!(approvals.credentials().len(), 3);
+
+        approvals.retire_launch(2);
+        let remaining = approvals.credentials();
+        assert_eq!(remaining.len(), 2, "{remaining:?}");
+        assert!(remaining.iter().all(|c| c.launch_key != Some(2)));
+        assert!(
+            remaining.iter().any(|c| c.launch_key == Some(3)),
+            "the other launch's credential is untouched: {remaining:?}"
+        );
+        assert!(
+            remaining.iter().any(|c| c.launch_key.is_none()),
+            "an unattributed credential is never retired: {remaining:?}"
+        );
+
+        // Retiring a pid that never granted anything is a no-op.
+        approvals.retire_launch(99);
+        assert_eq!(approvals.credentials().len(), 2);
+
+        approvals.retire_launch(3);
+        assert_eq!(
+            approvals.credentials(),
+            [Credential {
+                service: "npm".into(),
+                hosts: vec!["registry.npmjs.org".into()],
+                permissions: perms(),
+                granted_at_unix_ms: 3,
+                launch_key: None,
+            }]
+        );
     }
 
     #[test]
