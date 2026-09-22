@@ -21,7 +21,7 @@ use ward_events::{AgentState, SnapshotId};
 use ward_policy::{CapabilityManifest, NetworkCapability};
 
 use crate::authority::{Authority, grants_segment, network_segment_text};
-use crate::feed::{Model, TamperWard, Verification};
+use crate::feed::{Freshness, Model, TamperWard, Verification};
 
 /// The session facts the trust bar shows. Fixed for the session's lifetime; the
 /// daemon state ([`Model::sealed`]) and the stream-derived segments are the
@@ -152,8 +152,8 @@ pub const fn agent_tone(state: AgentState) -> Tone {
     }
 }
 
-/// The verify segment's five states (ADR-0019 decision 1): what the stream has
-/// said about verification, held against what the worktree digests to now.
+/// The verify segment's six states (ADR-0019 decision 1; #139): what the stream
+/// has said about verification, held against what the worktree digests to now.
 /// The bar shows exactly one, and green appears only while the tree is the
 /// verified candidate, byte for byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,41 +173,71 @@ pub enum VerifyState {
         /// What the worktree digests to now.
         worktree: SnapshotId,
     },
-    /// `VERIFY ✗`: the candidate failed.
+    /// `VERIFY ? …`: the candidate passed, but a reading viewer could not digest
+    /// the current worktree (unreadable, removed or interrupted), so whether the
+    /// verdict still describes the tree is unknown. Never green (#136).
+    Unknown {
+        /// The candidate that passed, kept as history.
+        candidate: SnapshotId,
+    },
+    /// `VERIFY ✗`: the candidate failed. The trusted command ran to completion
+    /// and exited non-zero (or its output said so).
     Failed(SnapshotId),
+    /// `VERIFY ! ERROR`: the attempt on this candidate could not run to a
+    /// pass/fail result at all — an infrastructure error (the sandbox runtime
+    /// failed to launch, a preparation step failed, …) after `VerificationStarted`
+    /// (#139). Distinct from both `Verifying` (still running) and `Failed` (the
+    /// trusted command ran and exited non-zero): an unexecuted suite is never
+    /// shown as a test failure, and never as a pass.
+    Errored(SnapshotId),
 }
 
 impl VerifyState {
-    /// The state from what the stream said and, when a viewer has digested
-    /// the worktree, what it digests to. Without a digest a verdict stands as
-    /// recorded; with one it stands only for the tree it judged.
+    /// The state from what the stream said, what the worktree last digested to,
+    /// and whether that digest is a current observation (`freshness`). A passed
+    /// verdict is green only for a tree that was actually observed to still be
+    /// the candidate: a viewer that never reads the worktree (`ward watch`,
+    /// [`Freshness::NotObserving`]) shows the recorded verdict as history, but a
+    /// reading viewer whose digest failed ([`Freshness::Unavailable`]) shows
+    /// `Unknown`, never green (#136).
     #[must_use]
-    pub const fn of(verification: &Verification, worktree: Option<SnapshotId>) -> Self {
-        match (*verification, worktree) {
+    pub const fn of(
+        verification: &Verification,
+        worktree: Option<SnapshotId>,
+        freshness: Freshness,
+    ) -> Self {
+        match (*verification, freshness) {
             (Verification::NotRun, _) => Self::Never,
             (Verification::Running(candidate), _) => Self::Verifying(candidate),
             (Verification::Failed(v), _) => Self::Failed(v.candidate),
-            (Verification::Passed(v), Some(worktree)) if !same_id(&v.candidate, &worktree) => {
-                Self::Stale {
+            (Verification::Errored(candidate), _) => Self::Errored(candidate),
+            (Verification::Passed(v), Freshness::Unavailable) => Self::Unknown {
+                candidate: v.candidate,
+            },
+            (Verification::Passed(v), Freshness::Fresh) => match worktree {
+                Some(worktree) if !same_id(&v.candidate, &worktree) => Self::Stale {
                     candidate: v.candidate,
                     worktree,
-                }
-            }
-            (Verification::Passed(v), _) => Self::Verified(v.candidate),
+                },
+                _ => Self::Verified(v.candidate),
+            },
+            // NotObserving: the recorded verdict stands as history (e.g. `ward watch`).
+            (Verification::Passed(v), Freshness::NotObserving) => Self::Verified(v.candidate),
         }
     }
 
     /// The colour role: green only for a verdict that describes the tree,
-    /// amber once the tree has moved on, red for a failure, accent while the
-    /// verifier runs, dim before anything was verified.
+    /// amber once the tree has moved on, red for a failure or an errored
+    /// attempt, accent while the verifier runs, dim before anything was
+    /// verified.
     #[must_use]
     pub const fn tone(self) -> Tone {
         match self {
             Self::Never => Tone::Dim,
             Self::Verifying(_) => Tone::Accent,
             Self::Verified(_) => Tone::Ok,
-            Self::Stale { .. } => Tone::Warn,
-            Self::Failed(_) => Tone::Deny,
+            Self::Stale { .. } | Self::Unknown { .. } => Tone::Warn,
+            Self::Failed(_) | Self::Errored(_) => Tone::Deny,
         }
     }
 
@@ -219,7 +249,9 @@ impl VerifyState {
             Self::Verifying(_) => "verifying",
             Self::Verified(_) => "verified",
             Self::Stale { .. } => "stale",
+            Self::Unknown { .. } => "unknown",
             Self::Failed(_) => "failed",
+            Self::Errored(_) => "errored",
         }
     }
 
@@ -232,7 +264,9 @@ impl VerifyState {
             Self::Verifying(c) => format!("VERIFY ◐ {}", short_hex(c)),
             Self::Verified(c) => format!("VERIFY ✓ {}", short_hex(c)),
             Self::Stale { .. } => "VERIFY ~ STALE".to_owned(),
+            Self::Unknown { candidate } => format!("VERIFY ? {}", short_hex(candidate)),
             Self::Failed(_) => "VERIFY ✗".to_owned(),
+            Self::Errored(_) => "VERIFY ! ERROR".to_owned(),
         };
         Segment::new(text, self.tone())
     }
@@ -628,7 +662,7 @@ mod tests {
     use super::*;
     use crate::feed::fixtures::{
         agent, denied, edited, ended, model_with, paused, records, resumed, sequence, snapshot,
-        tamper, verify_failed, verify_passed, verify_requested, wardd,
+        tamper, verify_errored, verify_failed, verify_passed, verify_requested, wardd,
     };
     use ward_events::{Origin, WardEvent};
     use ward_policy::merge;
@@ -763,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn the_verify_segment_is_a_five_state_machine_over_the_stream_and_the_worktree() {
+    fn the_verify_segment_is_a_six_state_machine_over_the_stream_and_the_worktree() {
         use VerifyState as V;
         let h = header(NetworkCapability::Development);
         let mut model = Model::new(false);
@@ -788,7 +822,18 @@ mod tests {
         model.observe_worktree(snapshot(), Some(0));
         assert_eq!(state(&model), V::Failed(snapshot()));
 
-        // ✓ : passed, and the worktree is the candidate.
+        // ! : a retry that could not even run — an infrastructure error, never
+        // shown as "running" or as a test failure (#139).
+        for rec in wardd(&[verify_requested(), verify_errored()]) {
+            model.apply(rec);
+        }
+        assert_eq!(state(&model), V::Errored(snapshot()));
+        assert_ne!(state(&model), V::Verifying(snapshot()));
+        assert_ne!(state(&model), V::Failed(snapshot()));
+        assert_eq!(seg(&model), Segment::new("VERIFY ! ERROR", Tone::Deny));
+
+        // ✓ : passed, and the worktree is the candidate. A pass after an error
+        // clears it, like any other retry.
         for rec in wardd(&[verify_requested(), verify_passed()]) {
             model.apply(rec);
         }
@@ -852,7 +897,15 @@ mod tests {
                 Tone::Warn,
                 "stale",
             ),
+            (
+                V::Unknown {
+                    candidate: snapshot(),
+                },
+                Tone::Warn,
+                "unknown",
+            ),
             (V::Failed(snapshot()), Tone::Deny, "failed"),
+            (V::Errored(snapshot()), Tone::Deny, "errored"),
         ];
         for (state, tone, word) in cases {
             assert_eq!(state.tone(), tone, "{word}");
@@ -861,6 +914,126 @@ mod tests {
             assert!(state.segment().text.starts_with("VERIFY "), "{word}");
         }
         assert_eq!(short_hex(snapshot()), "abababab");
+    }
+
+    #[test]
+    fn freshness_unavailable_withdraws_green_without_losing_the_verdict() {
+        use VerifyState as V;
+        let h = header(NetworkCapability::Development);
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested(), verify_passed()]) {
+            model.apply(rec);
+        }
+
+        // A viewer that never reads the worktree (ward watch): the verdict
+        // stands as history and is shown green.
+        assert_eq!(model.verify_state(), V::Verified(snapshot()));
+
+        // A reading viewer whose digest fails (unreadable/removed/interrupted):
+        // freshness is unavailable, so the state is Unknown — amber, not green —
+        // and the candidate is kept as history (#136).
+        model.mark_freshness_unavailable(model.observation_gen());
+        assert_eq!(
+            model.verify_state(),
+            V::Unknown {
+                candidate: snapshot()
+            }
+        );
+        let seg = TrustBar::new(&h, &model).verified.unwrap();
+        assert_eq!(seg.tone, Tone::Warn);
+        assert_eq!(seg.text, "VERIFY ? abababab");
+
+        // Recovery to the same candidate restores green; recovery to different
+        // content shows stale — freshness is decided by the current observation.
+        model.observe_worktree(snapshot(), Some(0));
+        assert_eq!(model.verify_state(), V::Verified(snapshot()));
+        model.mark_freshness_unavailable(model.observation_gen());
+        assert_eq!(
+            model.verify_state(),
+            V::Unknown {
+                candidate: snapshot()
+            }
+        );
+        model.observe_worktree(edited(), Some(2));
+        assert_eq!(
+            model.verify_state(),
+            V::Stale {
+                candidate: snapshot(),
+                worktree: edited()
+            }
+        );
+    }
+
+    #[test]
+    fn a_late_digest_cannot_restore_green_over_a_newer_invalidation() {
+        use VerifyState as V;
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested(), verify_passed()]) {
+            model.apply(rec);
+        }
+        model.observe_worktree(snapshot(), Some(0));
+        assert_eq!(model.verify_state(), V::Verified(snapshot()));
+
+        // A read captures the generation, then a change invalidates freshness.
+        let generation = model.observation_gen();
+        model.invalidate_freshness();
+        assert_eq!(
+            model.verify_state(),
+            V::Unknown {
+                candidate: snapshot()
+            }
+        );
+
+        // The late read completes for the same candidate: because it began
+        // before the invalidation, it must not restore green.
+        model.observe_if_current(generation, snapshot(), Some(0));
+        assert_eq!(
+            model.verify_state(),
+            V::Unknown {
+                candidate: snapshot()
+            }
+        );
+
+        // A read taken after the invalidation (current generation) does restore it.
+        let generation = model.observation_gen();
+        model.observe_if_current(generation, snapshot(), Some(0));
+        assert_eq!(model.verify_state(), V::Verified(snapshot()));
+    }
+
+    #[test]
+    fn a_late_failure_cannot_clobber_a_newer_success_over_a_stale_generation() {
+        use VerifyState as V;
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested(), verify_passed()]) {
+            model.apply(rec);
+        }
+        model.observe_worktree(snapshot(), Some(0));
+        assert_eq!(model.verify_state(), V::Verified(snapshot()));
+
+        // A slow read starts (captures the generation), then a change
+        // invalidates freshness before it finishes.
+        let stale_generation = model.observation_gen();
+        model.invalidate_freshness();
+
+        // A newer read, started after the invalidation, completes successfully.
+        let current_generation = model.observation_gen();
+        model.observe_if_current(current_generation, snapshot(), Some(0));
+        assert_eq!(model.verify_state(), V::Verified(snapshot()));
+
+        // The original slow read finally fails. Because it began before the
+        // invalidation, it lost the race and must not retract the newer,
+        // already-applied success back to Unknown.
+        model.mark_freshness_unavailable(stale_generation);
+        assert_eq!(model.verify_state(), V::Verified(snapshot()));
+
+        // A failure captured at the current generation does apply.
+        model.mark_freshness_unavailable(model.observation_gen());
+        assert_eq!(
+            model.verify_state(),
+            V::Unknown {
+                candidate: snapshot()
+            }
+        );
     }
 
     #[test]

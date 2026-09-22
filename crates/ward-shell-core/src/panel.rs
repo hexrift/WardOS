@@ -63,7 +63,9 @@ pub fn session_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) ->
         VerifyState::Verifying(_) => "running",
         VerifyState::Verified(_) => "pass",
         VerifyState::Stale { .. } => "pass · stale",
+        VerifyState::Unknown { .. } => "pass · freshness unavailable",
         VerifyState::Failed(_) => "fail",
+        VerifyState::Errored(_) => "error",
     };
     let verify_tone = verify_state.tone();
     let (evidence, evidence_tone) = match model.state.tamperward {
@@ -89,48 +91,16 @@ pub fn session_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) ->
     ]
 }
 
-/// The verify panel (ADR-0019 decision 1): what opens when the verify segment
-/// is chosen. One group, `Verify`, answering what was verified, when, what the
-/// worktree is now and how far it has moved, and what the verifier found.
-#[must_use]
-pub fn verify_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) -> Vec<Group> {
-    let state = model.verify_state();
-    let tone = state.tone();
-    let (verdict, at) = match model.state.verification {
-        Verification::Passed(v) | Verification::Failed(v) => (Some(v), Some(v.at)),
-        Verification::NotRun | Verification::Running(_) => (None, None),
-    };
-    let candidate = match state {
-        VerifyState::Never => Row::new("Verified candidate", "none", Tone::Dim),
-        VerifyState::Verifying(c) => Row::new(
-            "Verified candidate",
-            format!("{} · verifying", short_hex(c)),
-            tone,
+/// The verify panel's "Current digest" and "Changes" rows: what the worktree is
+/// now and how far it has moved from the verified candidate. When freshness is
+/// unavailable ([`VerifyState::Unknown`]) a stale digest is never presented as
+/// the current tree (#136).
+fn freshness_rows(model: &Model, state: VerifyState) -> (Row, Row) {
+    match (model.worktree, state) {
+        (_, VerifyState::Unknown { .. }) => (
+            Row::new("Current digest", "unavailable", Tone::Warn),
+            Row::new("Changes", "unknown", Tone::Warn),
         ),
-        VerifyState::Verified(c) | VerifyState::Stale { candidate: c, .. } => {
-            Row::new("Verified candidate", short_hex(c), tone)
-        }
-        VerifyState::Failed(c) => Row::new(
-            "Verified candidate",
-            format!("{} · failed", short_hex(c)),
-            tone,
-        ),
-    };
-    let time = at.map_or_else(
-        || Row::new("Verified time", "—", Tone::Dim),
-        |at| {
-            let elapsed = now_unix_ms
-                .saturating_sub(d.started_unix_ms)
-                .saturating_sub(u64::try_from(at.as_millis()).unwrap_or(u64::MAX))
-                / 1000;
-            Row::new(
-                "Verified time",
-                format!("at {} · {} ago", session_time(at), duration_text(elapsed)),
-                Tone::Ink,
-            )
-        },
-    );
-    let (digest, changes) = match (model.worktree, state) {
         (None, _) => (
             Row::new("Current digest", "not digested", Tone::Dim),
             Row::new("Changes", "unknown", Tone::Dim),
@@ -154,7 +124,58 @@ pub fn verify_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) -> 
             Row::new("Current digest", short_hex(w.digest), Tone::Ink),
             Row::new("Changes", "—", Tone::Dim),
         ),
+    }
+}
+
+/// The verify panel (ADR-0019 decision 1): what opens when the verify segment
+/// is chosen. One group, `Verify`, answering what was verified, when, what the
+/// worktree is now and how far it has moved, and what the verifier found.
+#[must_use]
+pub fn verify_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) -> Vec<Group> {
+    let state = model.verify_state();
+    let tone = state.tone();
+    let (verdict, at) = match model.state.verification {
+        Verification::Passed(v) | Verification::Failed(v) => (Some(v), Some(v.at)),
+        Verification::NotRun | Verification::Running(_) | Verification::Errored(_) => (None, None),
     };
+    let candidate = match state {
+        VerifyState::Never => Row::new("Verified candidate", "none", Tone::Dim),
+        VerifyState::Verifying(c) => Row::new(
+            "Verified candidate",
+            format!("{} · verifying", short_hex(c)),
+            tone,
+        ),
+        VerifyState::Verified(c)
+        | VerifyState::Stale { candidate: c, .. }
+        | VerifyState::Unknown { candidate: c } => {
+            Row::new("Verified candidate", short_hex(c), tone)
+        }
+        VerifyState::Failed(c) => Row::new(
+            "Verified candidate",
+            format!("{} · failed", short_hex(c)),
+            tone,
+        ),
+        VerifyState::Errored(c) => Row::new(
+            "Verified candidate",
+            format!("{} · error", short_hex(c)),
+            tone,
+        ),
+    };
+    let time = at.map_or_else(
+        || Row::new("Verified time", "—", Tone::Dim),
+        |at| {
+            let elapsed = now_unix_ms
+                .saturating_sub(d.started_unix_ms)
+                .saturating_sub(u64::try_from(at.as_millis()).unwrap_or(u64::MAX))
+                / 1000;
+            Row::new(
+                "Verified time",
+                format!("at {} · {} ago", session_time(at), duration_text(elapsed)),
+                Tone::Ink,
+            )
+        },
+    );
+    let (digest, changes) = freshness_rows(model, state);
     let (evidence, evidence_tone) = match model.state.tamperward {
         TamperWard::Unknown => ("none yet", Tone::Dim),
         TamperWard::Clean => ("clean", Tone::Ok),
@@ -234,8 +255,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::feed::fixtures::{
-        denied, edited, records, snapshot, verify_failed, verify_passed, verify_progress,
-        verify_requested, wardd,
+        denied, edited, records, snapshot, verify_errored, verify_failed, verify_passed,
+        verify_progress, verify_requested, wardd,
     };
     use crate::trust::fixtures::description;
     use ward_events::Origin;
@@ -418,6 +439,69 @@ mod tests {
         assert!(
             text.starts_with("Verify\n────────────────────────\nVerified candidate   abababab\n"),
             "{text}"
+        );
+    }
+
+    /// #139: a verification attempt that errored out (infrastructure failure, not a
+    /// test failure) must read as neither "running" nor "fail" in either panel.
+    #[test]
+    fn an_errored_attempt_reads_as_its_own_row_not_running_or_failed() {
+        let d = description(NetworkCapability::Development);
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested(), verify_errored()]) {
+            model.apply(rec);
+        }
+
+        let groups = session_panel(&d, &model, d.started_unix_ms);
+        let verify = value(&groups, "TamperWard", "Last verify");
+        assert_eq!((verify.value.as_str(), verify.tone), ("error", Tone::Deny));
+        assert_ne!(verify.value, "running");
+        assert_ne!(verify.value, "fail");
+
+        let groups = verify_panel(&d, &model, d.started_unix_ms);
+        let candidate = value(&groups, "Verify", "Verified candidate");
+        assert_eq!(
+            (candidate.value.as_str(), candidate.tone),
+            ("abababab · error", Tone::Deny)
+        );
+        // No verdict was ever recorded for this attempt: the test/integrity rows
+        // stay unset rather than showing zeros a suite never produced.
+        assert_eq!(value(&groups, "Verify", "Tests").value, "—");
+        assert_eq!(value(&groups, "Verify", "Integrity").value, "—");
+    }
+
+    #[test]
+    fn the_verify_panel_shows_freshness_unavailable_when_the_worktree_cannot_be_read() {
+        let d = description(NetworkCapability::Development);
+        let now = d.started_unix_ms;
+        let row = |model: &Model, label: &str| {
+            value(&verify_panel(&d, model, now), "Verify", label).clone()
+        };
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested(), verify_passed()]) {
+            model.apply(rec);
+        }
+        model.observe_worktree(snapshot(), Some(0));
+        assert_eq!(row(&model, "Current digest").value, "abababab");
+
+        // The next read fails: the candidate is kept as history, but the digest
+        // is not presented as the current tree and green is withdrawn (#136).
+        model.mark_freshness_unavailable(model.observation_gen());
+        let candidate = row(&model, "Verified candidate");
+        assert_eq!(
+            (candidate.value.as_str(), candidate.tone),
+            ("abababab", Tone::Warn),
+            "the verdict is kept, no longer green"
+        );
+        let digest = row(&model, "Current digest");
+        assert_eq!(
+            (digest.value.as_str(), digest.tone),
+            ("unavailable", Tone::Warn)
+        );
+        let changes = row(&model, "Changes");
+        assert_eq!(
+            (changes.value.as_str(), changes.tone),
+            ("unknown", Tone::Warn)
         );
     }
 }

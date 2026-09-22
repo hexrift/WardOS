@@ -33,7 +33,7 @@ use crate::ids::{ev_capture, ev_hash, ev_role, ev_snapshot, new_session_id, proj
 use crate::pause;
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
 use crate::verify;
-use crate::watch::{CaptureMode, Captured, Watcher};
+use crate::watch::{CaptureMode, Captured, WatchOutcome, Watcher};
 
 /// A live WardOS session over one project.
 pub struct Session {
@@ -138,6 +138,11 @@ pub struct RunReport {
     pub duration: Duration,
     /// Which capture source produced the file events.
     pub capture: CaptureMode,
+    /// Whether the inotify watch lost coverage of some part of the worktree
+    /// during this run (a nested directory could not be, or could not be
+    /// re-, registered). Always `false` for [`CaptureMode::Scan`], which has
+    /// no notion of partial coverage. See #144.
+    pub observer_degraded: bool,
     /// Captured stdout.
     pub stdout: String,
     /// Captured stderr.
@@ -652,14 +657,9 @@ impl Session {
         let launch = self.prepare(argv, opts, &run_dir, &egress, &hooks)?;
         let outcome = launch.run()?;
 
-        let (captured, capture) = match (watcher, before) {
-            (Some(w), _) => (w.finish(), CaptureMode::Inotify),
-            (None, Some(before)) => {
-                let after = scan(&self.worktree);
-                (scan_changes(&before, &after), CaptureMode::Scan)
-            }
-            (None, None) => (Vec::new(), CaptureMode::Scan),
-        };
+        let watch = watcher.map(Watcher::finish);
+        let (captured, capture, observer_degraded) =
+            collect_captured(watch, before, &self.worktree);
 
         let comm = comm(argv);
         let changed_paths = self.emit_captured(&captured, pid, comm.as_ref())?;
@@ -699,6 +699,7 @@ impl Session {
             files_changed: changed_paths.len(),
             duration: outcome.duration,
             capture,
+            observer_degraded,
             stdout: outcome.stdout,
             stderr: outcome.stderr,
         })
@@ -751,6 +752,19 @@ impl Session {
     /// the candidate snapshot, the start with the pristine id and config hash, one
     /// progress step per restored protected path and one for the command, then the
     /// pass or fail with the parsed summary and the output hash.
+    ///
+    /// Once `VerificationStarted` is on the log, every exit path leaves exactly one
+    /// terminal verification record behind it — `VerificationPassed`,
+    /// `VerificationFailed`, or, when the run could not be carried to either of those
+    /// (the sandbox runtime failed to launch, a step in between errored, …),
+    /// `VerificationErrored` (#139). A subscriber watching the log therefore never
+    /// *silently* sees a `VerificationStarted` with nothing after it: an unexecuted
+    /// suite is recorded as neither a pass nor a failure. The real error is still
+    /// returned to the caller either way — the terminal record does not replace it,
+    /// only ensures the log itself carries a definite outcome. If appending that
+    /// terminal record itself fails (the sink is gone, disk full, …), the caller's
+    /// error says so explicitly instead of quietly discarding it — see
+    /// [`verify_prepared`](Self::verify_prepared).
     pub fn verify(&mut self) -> Result<VerifyReport> {
         let store = SnapshotStore::open(self.state.join("cas"))
             .map_err(|e| Error::Snapshot(e.to_string()))?;
@@ -760,11 +774,30 @@ impl Session {
             .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
         let scratch_root = run_dir(&self.session_str)?;
         // Freeze the agent only for the candidate capture inside `prepare`; the
-        // verifier itself runs from the CAS, not the worktree (ST-018, G5/G9).
+        // verifier itself runs from the CAS, not the worktree (ST-018, G5/G9). A
+        // failure here (missing config, a hostile candidate symlink, …) happens
+        // before any verification-kind record exists, so there is nothing yet for a
+        // terminal record to follow; the caller sees the real error directly, as
+        // before #139.
         let prepared = {
             let _freeze = self.freeze_for_capture();
             verify::prepare(&store, &self.worktree, entry, &scratch_root)?
         };
+        self.verify_prepared(&prepared, entry, &scratch_root)
+    }
+
+    /// Records and runs a verification that has already been prepared: the request
+    /// and start, then a terminal record (#139), then cleanup. Split out of
+    /// [`verify`](Self::verify) so it can be exercised directly with a hand-built
+    /// [`verify::Verification`], without needing a real `.tamperward/config.yml` or a
+    /// working sandbox runtime, to prove that a `verify::execute` failure still ends
+    /// the log in `VerificationErrored` rather than a bare `VerificationStarted`.
+    fn verify_prepared(
+        &mut self,
+        prepared: &verify::Verification,
+        entry: ward_snapshot::SnapshotId,
+        scratch_root: &Path,
+    ) -> Result<VerifyReport> {
         let candidate = ev_snapshot(prepared.candidate);
         self.emit(
             Origin::User,
@@ -782,6 +815,50 @@ impl Session {
                 manifest_hash: ev_hash(prepared.manifest_hash),
             },
         )?;
+
+        // From here on `VerificationStarted` is already on the log, so every path out
+        // of this function attempts to leave a terminal verification record behind
+        // it. If that append itself fails too, the log may still end at
+        // `VerificationStarted` — the `match` below never hides that from the caller.
+        let result = self.run_prepared_verification(prepared, candidate);
+        let _ = std::fs::remove_dir_all(&prepared.scratch);
+        let _ = std::fs::remove_dir(scratch_root);
+        match result {
+            Ok(report) => Ok(report),
+            Err(e) => {
+                let reason = ShortText::new(&e.to_string());
+                match self.emit(
+                    Origin::Verifier,
+                    WardEvent::VerificationErrored { candidate, reason },
+                ) {
+                    // The terminal record is on the log; the caller still sees the
+                    // real failure that produced it.
+                    Ok(()) => Err(e),
+                    // The append itself failed too, so the log may still end at
+                    // `VerificationStarted` — exactly the silent gap this function
+                    // exists to close. Never discard that: fold both failures into
+                    // what the caller sees, so this case is distinguishable from an
+                    // ordinary verification error whose terminal record was written
+                    // successfully.
+                    Err(emit_err) => Err(Error::Events(format!(
+                        "verification failed ({e}), and the terminal record for it \
+                         could not be written ({emit_err}); the log may still end at \
+                         VerificationStarted"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// The steps of a prepared verification once `VerificationStarted` is recorded:
+    /// the restore progress, the command's progress step, then its verdict. An `Err`
+    /// here means none of those reached a terminal verification record; the caller
+    /// ([`verify`](Self::verify)) turns it into `VerificationErrored` (#139).
+    fn run_prepared_verification(
+        &mut self,
+        prepared: &verify::Verification,
+        candidate: ward_events::SnapshotId,
+    ) -> Result<VerifyReport> {
         for rel in &prepared.restored {
             self.emit(
                 Origin::Verifier,
@@ -791,10 +868,7 @@ impl Session {
                 },
             )?;
         }
-        let outcome = verify::execute(&prepared);
-        let _ = std::fs::remove_dir_all(&prepared.scratch);
-        let _ = std::fs::remove_dir(&scratch_root);
-        let outcome = outcome?;
+        let outcome = verify::execute(prepared)?;
         let status = if outcome.passed {
             StepStatus::Pass
         } else {
@@ -826,7 +900,7 @@ impl Session {
             candidate: candidate.to_string(),
             passed: outcome.passed,
             summary: outcome.summary,
-            restored: prepared.restored,
+            restored: prepared.restored.clone(),
             output: outcome.output,
         })
     }
@@ -1212,6 +1286,28 @@ fn clear_current(state: &Path, project_id: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve which file events a run produced: the live inotify watch's finished
+/// outcome when one started, or a before/after scan otherwise. Returns the
+/// events, which source produced them, and whether the watch lost coverage of
+/// part of the worktree (always `false` for a scan, which has no notion of
+/// partial coverage). Takes an already-finished [`WatchOutcome`] rather than a
+/// [`Watcher`] so this mapping can be tested with a synthetic outcome instead
+/// of a live watcher thread.
+fn collect_captured(
+    watch: Option<WatchOutcome>,
+    before: Option<BTreeMap<String, (u128, u64)>>,
+    worktree: &Path,
+) -> (Vec<Captured>, CaptureMode, bool) {
+    match (watch, before) {
+        (Some(watch), _) => (watch.captured, CaptureMode::Inotify, watch.degraded),
+        (None, Some(before)) => {
+            let after = scan(worktree);
+            (scan_changes(&before, &after), CaptureMode::Scan, false)
+        }
+        (None, None) => (Vec::new(), CaptureMode::Scan, false),
+    }
+}
+
 /// Map relative worktree paths to (mtime, size), skipping `.git` and `target`.
 fn scan(worktree: &Path) -> BTreeMap<String, (u128, u64)> {
     let mut out = BTreeMap::new();
@@ -1269,7 +1365,7 @@ fn scan_changes(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
     fn sample_meta(id: &str) -> SessionMeta {
@@ -1303,6 +1399,30 @@ mod tests {
         let argv = vec!["/usr/bin/cargo".to_string(), "test".to_string()];
         assert_eq!(comm(&argv).unwrap().as_str(), "cargo");
         assert!(comm(&[]).is_none());
+    }
+
+    #[test]
+    fn collect_captured_surfaces_watch_degradation_through_run_report() {
+        // A synthetic outcome, not a live watcher: `watch::tests` already
+        // proves a real coverage gap sets `WatchOutcome::degraded` (at the
+        // `add_watch_recursive`/`drain` level, with no background thread to
+        // race). What this checks is only `collect_captured`'s own mapping —
+        // that `degraded` reaches the `RunReport` tuple unchanged — which
+        // needs no live watcher and must not depend on winning a race against
+        // one.
+        let worktree = tempfile::tempdir().unwrap();
+        let watch = WatchOutcome {
+            captured: Vec::new(),
+            degraded: true,
+        };
+
+        let (_, capture, observer_degraded) = collect_captured(Some(watch), None, worktree.path());
+
+        assert_eq!(capture, CaptureMode::Inotify);
+        assert!(
+            observer_degraded,
+            "a coverage gap in the watch must reach RunReport::observer_degraded"
+        );
     }
 
     #[test]
@@ -1431,5 +1551,194 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded, meta);
+    }
+
+    /// #139: once `VerificationStarted` is on the log, a `verify::execute` failure
+    /// (the verifier could not even run) must still end the attempt in exactly one
+    /// terminal record — `VerificationErrored` — never leaving `VerificationStarted`
+    /// as the last verification-kind record.
+    ///
+    /// `verify::execute` is made to fail deterministically, on every host with or
+    /// without bubblewrap installed: `Launch::run` canonicalises its worktree — here
+    /// the verifier's own scratch tree — before it spawns anything, so handing it a
+    /// `Verification` whose `scratch` does not exist fails at that first step, every
+    /// time. This exercises [`Session::verify_prepared`], the exact code
+    /// [`Session::verify`] runs once `verify::prepare` has produced a candidate.
+    #[test]
+    fn verify_execute_failure_ends_the_log_in_verification_errored() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+
+        let entry: ward_snapshot::SnapshotId = session.entry_snapshot.parse().unwrap();
+        let candidate = ward_snapshot::SnapshotId(ward_snapshot::Digest::from_bytes([0xab; 32]));
+        let scratch_root = state.path().join("scratch-root");
+        let prepared = verify::Verification {
+            candidate,
+            config: verify::Config {
+                protected: verify::Protected::default(),
+                verify: verify::VerifyCommand {
+                    command: "true".to_owned(),
+                    budget_secs: 5,
+                },
+            },
+            manifest_hash: [7u8; 32],
+            restored: Vec::new(),
+            scratch: scratch_root.join("does-not-exist"),
+        };
+
+        let err = session
+            .verify_prepared(&prepared, entry, &scratch_root)
+            .expect_err("execute must fail on a missing scratch tree");
+        assert!(
+            !err.to_string().is_empty(),
+            "the real error still propagates to the caller"
+        );
+        session.sync().unwrap();
+
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let verification_kinds: Vec<&str> = records
+            .iter()
+            .filter_map(|r| match &r.event {
+                WardEvent::VerificationRequested { .. } => Some("Requested"),
+                WardEvent::VerificationStarted { .. } => Some("Started"),
+                WardEvent::VerificationProgress { .. } => Some("Progress"),
+                WardEvent::VerificationPassed { .. } => Some("Passed"),
+                WardEvent::VerificationFailed { .. } => Some("Failed"),
+                WardEvent::VerificationErrored { .. } => Some("Errored"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            verification_kinds,
+            vec!["Requested", "Started", "Errored"],
+            "the stream must end the attempt in VerificationErrored, not a bare Started"
+        );
+        match &records.last().unwrap().event {
+            WardEvent::VerificationErrored {
+                candidate: logged,
+                reason,
+            } => {
+                assert_eq!(logged, &ev_snapshot(candidate));
+                assert!(!reason.as_str().is_empty(), "the reason is never blank");
+            }
+            other => panic!("expected VerificationErrored last, got {other:?}"),
+        }
+    }
+
+    /// A [`Sink`] wrapper that lets the first `allow` appends through to `inner`
+    /// and fails every one after that — used to prove #139's terminal-record
+    /// append itself is never silently discarded when it fails too.
+    struct FailAfter {
+        inner: Box<dyn Sink>,
+        allow: usize,
+    }
+
+    impl Sink for FailAfter {
+        fn append(
+            &mut self,
+            origin: Origin,
+            event: WardEvent,
+            at: SystemTime,
+        ) -> Result<ward_events::EventRecord> {
+            if self.allow == 0 {
+                return Err(Error::Events("simulated sink failure".to_owned()));
+            }
+            self.allow -= 1;
+            self.inner.append(origin, event, at)
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            self.inner.sync()
+        }
+
+        fn seal(self: Box<Self>) -> Result<()> {
+            self.inner.seal()
+        }
+
+        fn stop(self: Box<Self>, reason: EndReason) -> Result<()> {
+            self.inner.stop(reason)
+        }
+    }
+
+    /// #139 (review follow-up): if the terminal `VerificationErrored` append
+    /// *itself* fails — the exact case the discarded `let _ = self.emit(..)` in
+    /// an earlier revision of this fix silently swallowed — the caller's error
+    /// must say so, not just return the original verification error as if the
+    /// log had been left in a known-good state. Otherwise a subscriber has no
+    /// way to learn that the log may still be stuck at `VerificationStarted`.
+    #[test]
+    fn a_terminal_append_failure_is_never_silently_discarded() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        // Let VerificationRequested and VerificationStarted through, then fail
+        // every append after that — including the VerificationErrored this test
+        // is about.
+        session.sink = Box::new(FailAfter {
+            inner: std::mem::replace(&mut session.sink, Box::new(NullSink)),
+            allow: 2,
+        });
+
+        let entry: ward_snapshot::SnapshotId = session.entry_snapshot.parse().unwrap();
+        let candidate = ward_snapshot::SnapshotId(ward_snapshot::Digest::from_bytes([0xcd; 32]));
+        let scratch_root = state.path().join("scratch-root");
+        let prepared = verify::Verification {
+            candidate,
+            config: verify::Config {
+                protected: verify::Protected::default(),
+                verify: verify::VerifyCommand {
+                    command: "true".to_owned(),
+                    budget_secs: 5,
+                },
+            },
+            manifest_hash: [9u8; 32],
+            restored: Vec::new(),
+            scratch: scratch_root.join("does-not-exist"),
+        };
+
+        let err = session
+            .verify_prepared(&prepared, entry, &scratch_root)
+            .expect_err("execute must fail on a missing scratch tree");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("simulated sink failure"),
+            "the append failure must be surfaced, not discarded: {msg}"
+        );
+        assert!(
+            !msg.is_empty(),
+            "the original verification failure must still be represented: {msg}"
+        );
+    }
+
+    /// A placeholder [`Sink`] only ever used as the `inner` `mem::replace`
+    /// swaps out of `FailAfter` in the test above; every call would panic, but
+    /// `FailAfter` never forwards to it once wrapped.
+    struct NullSink;
+
+    impl Sink for NullSink {
+        fn append(
+            &mut self,
+            _origin: Origin,
+            _event: WardEvent,
+            _at: SystemTime,
+        ) -> Result<ward_events::EventRecord> {
+            unreachable!("NullSink is replaced before any append")
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            unreachable!("NullSink is replaced before any use")
+        }
+
+        fn seal(self: Box<Self>) -> Result<()> {
+            unreachable!("NullSink is replaced before any use")
+        }
+
+        fn stop(self: Box<Self>, _reason: EndReason) -> Result<()> {
+            unreachable!("NullSink is replaced before any use")
+        }
     }
 }

@@ -166,7 +166,10 @@ an answer that matches nothing is returned as typed, which is how names and URLs
 asked for. `wardos-menu` implies SYSTEM when the first word is not a section
 (`wardos-menu capture`), accepts `style` for Appearance, and runs leaves that need a
 terminal (installs, the system update, DNS, About) through `wardos-launch run
-<app-id> <cmd…>`, a terminal window that stays open when the command ends. Web and
+<app-id> <cmd…>`, a terminal window that stays open when the command ends and exits with
+that command's own status — `[done]` or `[failed, exit N]` — never the close prompt's, so a
+caller that checks it (`wardos-welcome`, `wardos-calibrate`'s password step) can tell a
+failed step from a successful one. Web and
 terminal app definitions are `name=`/`url=`/`icon=` and `name=`/`cmd=`/`icon=` files,
 the user's in `~/.config/wardos/webapps|tuis/` over the shipped ones in
 `/usr/share/wardos/`; `install <name>` alone installs a shipped default and
@@ -344,7 +347,7 @@ live in `~/.local/share/wardos/themes/`.
 [`image/packages.txt`](../image/packages.txt) lists every package the desktop needs, one
 per line with a comment naming what it is for, exact Fedora package names (`fd-find`,
 `pipewire-pulseaudio`). What Fedora does not carry (the Hyprland ecosystem beyond the
-compositor, lazygit) comes from the COPRs of [`image/coprs.txt`](../image/coprs.txt),
+compositor) comes from the COPRs of [`image/coprs.txt`](../image/coprs.txt),
 part of the image's trust set (`image/README.md`, "COPRs"). The `Containerfile` enables
 the COPRs and installs from the manifest, and `desktop/install.sh` layers the same with
 `dnf` or `rpm-ostree`; CI checks every name exists in the Fedora release the image pins
@@ -422,7 +425,7 @@ command, key and test exist on `main`.
 | Docker + lazydocker | podman, podman-compose, podman-tui | |
 | Terminal (Alacritty/Ghostty), bash, prompt, aliases | foot default, alacritty shipped, `config/bash` | ✔ `config/foot`, `config/alacritty`, `config/bash` (prompt tested in `configs.test.sh`) |
 | Neovim (LazyVim) | neovim with a WardOS config and per-theme colours | ✔ config: `config/nvim` (self-contained, `lua/plugins.lua` hook) |
-| btop, fastfetch, lazygit, fzf, ripgrep, fd, bat, eza, zoxide | shipped, configured, themed | ✔ config: `config/btop`, `config/fastfetch`, aliases and fzf/zoxide hooks in `config/bash` |
+| btop, fastfetch, fzf, ripgrep, fd, bat, eza, zoxide | shipped, configured, themed | ✔ config: `config/btop`, `config/fastfetch`, aliases and fzf/zoxide hooks in `config/bash` |
 | Chromium default browser, theme colour | chromium, `chromium.json` fragment | ✔ config: `config/chromium/chromium-flags.conf`, `BROWSER=chromium` |
 | Nautilus | nautilus | |
 | Plymouth boot splash | WardOS Plymouth theme | ✔ `image/rootfs/usr/share/plymouth/themes/wardos/` (WARD on the ground, 2 px progress, passphrase prompt), selected in the `Containerfile` and in the initramfs (the image build proves it); its look at boot is E-09's |

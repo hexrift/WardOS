@@ -60,6 +60,14 @@ pub enum Verification {
     Passed(Verdict),
     /// The last verification failed.
     Failed(Verdict),
+    /// The last attempt on this candidate could not run to a pass/fail result: an
+    /// infrastructure error (the sandbox runtime failed to launch, a preparation
+    /// step failed, …), never the trusted command itself exiting non-zero (#139).
+    /// Carries only the candidate, like [`Verification::Failed`]'s bar segment
+    /// does not carry its `Verdict`'s summary either — the reason text is a
+    /// property of the `VerificationErrored` record, shown on its observer row,
+    /// not of this aggregated state.
+    Errored(SnapshotId),
 }
 
 impl Verification {
@@ -68,7 +76,7 @@ impl Verification {
     pub const fn candidate(&self) -> Option<SnapshotId> {
         match self {
             Self::NotRun => None,
-            Self::Running(c) => Some(*c),
+            Self::Running(c) | Self::Errored(c) => Some(*c),
             Self::Passed(v) | Self::Failed(v) => Some(v.candidate),
         }
     }
@@ -99,6 +107,23 @@ pub struct Worktree {
     /// Manifest entries that differ from the verified candidate, when the shell
     /// could compare (a stored candidate manifest, and a digest that differs).
     pub changes: Option<u64>,
+}
+
+/// Whether the current worktree freshness is known (#136). Separates a
+/// *reading* viewer that has, or has not, a current successful digest from a
+/// viewer that never reads the worktree at all (`ward watch`), so a green
+/// verdict is only ever shown for a tree that was actually observed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Freshness {
+    /// This viewer does not read the worktree (e.g. `ward watch`): the recorded
+    /// verdict stands as history, unqualified by freshness.
+    #[default]
+    NotObserving,
+    /// A reading viewer's last digest succeeded; [`Model::worktree`] is current.
+    Fresh,
+    /// A reading viewer's last digest attempt failed (unreadable, removed or
+    /// interrupted): freshness cannot be asserted, so green is withdrawn.
+    Unavailable,
 }
 
 /// What the stream says about TamperWard.
@@ -158,6 +183,9 @@ impl SessionState {
             WardEvent::VerificationFailed {
                 candidate, summary, ..
             } => self.verification = Verification::Failed(self.verdict(rec, *candidate, *summary)),
+            WardEvent::VerificationErrored { candidate, .. } => {
+                self.verification = Verification::Errored(*candidate);
+            }
             WardEvent::TamperDetected { .. } => self.tamperward = TamperWard::Tampered,
             _ => {}
         }
@@ -195,8 +223,16 @@ pub struct Model {
     pub counters: Counters,
     /// The session state the trust bar shows.
     pub state: SessionState,
-    /// The worktree as last digested, when the viewer can read it.
+    /// The worktree as last *successfully* digested, when the viewer can read it.
+    /// A failed later read does not clear this history; [`Model::freshness`] says
+    /// whether it still describes the tree.
     pub worktree: Option<Worktree>,
+    /// Whether [`Model::worktree`] is a current observation, a stale/failed one,
+    /// or absent because this viewer never reads the worktree (#136).
+    pub freshness: Freshness,
+    /// Observation generation: bumped whenever freshness is invalidated, so a
+    /// digest that began before the invalidation cannot restore green after it.
+    obs_gen: u64,
     /// The daemon closed the stream: the log is sealed.
     pub sealed: bool,
     /// The view tracks the newest row.
@@ -220,6 +256,8 @@ impl Model {
             counters: Counters::default(),
             state: SessionState::default(),
             worktree: None,
+            freshness: Freshness::NotObserving,
+            obs_gen: 0,
             sealed: false,
             follow: true,
             scroll: 0,
@@ -263,20 +301,62 @@ impl Model {
 
     /// The worktree digests to `digest` now, with `changes` manifest entries
     /// differing from the verified candidate where that could be counted. The
-    /// trust bar compares this with the candidate the stream verified.
+    /// trust bar compares this with the candidate the stream verified. Marks the
+    /// observation fresh (a reading viewer with a current digest).
     pub const fn observe_worktree(&mut self, digest: SnapshotId, changes: Option<u64>) {
         self.worktree = Some(Worktree { digest, changes });
+        self.freshness = Freshness::Fresh;
+    }
+
+    /// The generation to capture before a (possibly slow) digest, so its result
+    /// can be discarded if freshness was invalidated in the meantime (#136).
+    #[must_use]
+    pub const fn observation_gen(&self) -> u64 {
+        self.obs_gen
+    }
+
+    /// Apply a completed digest only if no invalidation has happened since the
+    /// read began (`gen` from [`Model::observation_gen`]). A late result that
+    /// lost the race is dropped, so it cannot restore green over a newer change.
+    pub const fn observe_if_current(
+        &mut self,
+        generation: u64,
+        digest: SnapshotId,
+        changes: Option<u64>,
+    ) {
+        if generation == self.obs_gen {
+            self.observe_worktree(digest, changes);
+        }
+    }
+
+    /// The reading viewer could not digest the worktree: withdraw the current
+    /// (green) freshness while keeping the historical verdict and last digest.
+    /// Applied only if no invalidation has happened since the read began
+    /// (`generation` from [`Model::observation_gen`]), mirroring
+    /// [`Model::observe_if_current`] — a late *failure* that lost the race must
+    /// not clobber a newer, already-applied success back to unavailable (#136).
+    pub const fn mark_freshness_unavailable(&mut self, generation: u64) {
+        if generation == self.obs_gen {
+            self.freshness = Freshness::Unavailable;
+        }
+    }
+
+    /// A worktree change invalidates freshness at once and bumps the generation,
+    /// so a digest that began earlier cannot restore green after it (#136).
+    pub const fn invalidate_freshness(&mut self) {
+        self.obs_gen = self.obs_gen.wrapping_add(1);
+        self.freshness = Freshness::Unavailable;
     }
 
     /// The verify segment's state: the stream's verdict held against the
-    /// observed worktree.
+    /// observed worktree and whether that observation is current (#136).
     #[must_use]
     pub const fn verify_state(&self) -> VerifyState {
         let worktree = match self.worktree {
             Some(w) => Some(w.digest),
             None => None,
         };
-        VerifyState::of(&self.state.verification, worktree)
+        VerifyState::of(&self.state.verification, worktree, self.freshness)
     }
 
     /// Every row so far.
@@ -474,6 +554,13 @@ pub(crate) mod fixtures {
             candidate: snapshot(),
             summary: summary(3),
             result_hash: Blake3Hash::from_bytes([0x22; 32]),
+        }
+    }
+
+    pub fn verify_errored() -> WardEvent {
+        WardEvent::VerificationErrored {
+            candidate: snapshot(),
+            reason: ward_events::ShortText::new("sandbox: bubblewrap (bwrap) is not installed"),
         }
     }
 
@@ -702,5 +789,43 @@ mod tests {
         assert!(!model.sealed);
         model.seal();
         assert!(model.sealed);
+    }
+
+    /// #139: a verification attempt that could not run to a pass/fail result (an
+    /// infrastructure error after `VerificationStarted`) must land in a state that
+    /// is neither "still running" nor "tests failed".
+    #[test]
+    fn an_errored_attempt_is_neither_running_nor_failed() {
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested()]) {
+            model.apply(rec);
+        }
+        assert_eq!(model.state.verification, Verification::Running(snapshot()));
+
+        model.apply(wardd(&[verify_errored()]).remove(0));
+        assert_eq!(model.state.verification, Verification::Errored(snapshot()));
+        assert_eq!(model.state.verification.candidate(), Some(snapshot()));
+        assert_ne!(
+            model.state.verification,
+            Verification::Running(snapshot()),
+            "an errored attempt must not still read as running"
+        );
+        assert!(
+            !matches!(model.state.verification, Verification::Failed(_)),
+            "an infra error must not be presented as a test failure"
+        );
+        assert!(
+            !matches!(model.state.verification, Verification::Passed(_)),
+            "an infra error must never be presented as a pass"
+        );
+
+        // A retry after an error runs and can still pass: the error does not stick.
+        for rec in wardd(&[verify_requested(), verify_passed()]) {
+            model.apply(rec);
+        }
+        let Verification::Passed(passed) = model.state.verification else {
+            panic!("{:?}", model.state.verification);
+        };
+        assert_eq!(passed.candidate, snapshot());
     }
 }
