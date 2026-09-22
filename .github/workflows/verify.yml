@@ -119,6 +119,8 @@ jobs:
           if [[ -f install.sh ]]; then files+=(install.sh); fi
           bash -n "${files[@]}"
           shellcheck --severity=style "${files[@]}"
+      - name: dnf/COPR retry and failure-classification regressions (issue #198)
+        run: bash image/dnf-retry.test.sh
       - name: scripts explain themselves without podman or docker
         run: |
           ./image/build.sh --dry-run
