@@ -11,7 +11,10 @@
 //! falling back to a local writer, because a producer that opened the log itself
 //! would fork the chain the daemon owns.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ward_events::{EventKind, EventRecord, WardEvent};
@@ -67,16 +70,26 @@ pub fn desktop_socket(project_dir: &Path, state: &Path, session: Option<&str>) -
     if let Some(meta) = SessionMeta::current(project_dir, state).ok().flatten() {
         return Ok(session_dir(state, &meta.id).join(SOCKET_NAME));
     }
-    if let Some(id) = crate::selection::current(state).session
-        && crate::daemon::serving(state, &id)
+    // The generation observed here is the compare-and-swap's baseline
+    // (#141 finding 2): `newest_live` below probes every live session's
+    // socket, which takes long enough for a concurrent, explicit
+    // `ward session select` to land before this function's own automatic
+    // pick is written — and that explicit choice must win.
+    let observed = crate::selection::current(state);
+    if let Some(id) = &observed.session
+        && crate::daemon::serving(state, id)
     {
-        return Ok(session_dir(state, &id).join(SOCKET_NAME));
+        return Ok(session_dir(state, id).join(SOCKET_NAME));
     }
     match crate::daemon::newest_live(state)? {
         Some(meta) => {
-            // Best-effort: a registry we cannot write still lets this one call
-            // through with the session it found; the next call just looks again.
-            let _ = crate::selection::select(state, Some(&meta.id));
+            // Best-effort, and race-safe: a registry we cannot write still
+            // lets this one call through with the session it found (the next
+            // call just looks again), and a registry a concurrent explicit
+            // select already moved since `observed` is left alone rather
+            // than overwritten with this automatic pick.
+            let _ =
+                crate::selection::select_if_unchanged(state, Some(&meta.id), observed.generation);
             Ok(session_dir(state, &meta.id).join(SOCKET_NAME))
         }
         None => Err(Error::Project(format!(
@@ -127,6 +140,42 @@ pub fn pause_all(state: &Path, reason: &str) -> Result<Vec<SessionPauseResult>> 
         let socket = session_dir(state, &meta.id).join(SOCKET_NAME);
         let outcome = connect(&socket).and_then(|mut sink| pause(&mut sink, reason));
         results.push(SessionPauseResult {
+            session: meta.id,
+            outcome,
+        });
+    }
+    Ok(results)
+}
+
+/// One session's pending approvals from [`pending_all`], or why they could not
+/// be listed.
+#[derive(Debug)]
+pub struct SessionPendingResult {
+    /// The session's id.
+    pub session: String,
+    /// Its description and what it holds pending, or the connect/describe/
+    /// pending failure that stopped this session from being inspected at all.
+    pub outcome: Result<(SessionDescription, Vec<Approval>)>,
+}
+
+/// `ward session pending --all` (without `--follow`): every live session's
+/// approvals, one connection each, on its own line — mirroring [`pause_all`]'s
+/// shape. A session whose connect, describe or pending call fails is reported
+/// with that failure rather than silently dropped (#141 finding 5): before
+/// this, a session skipped here was indistinguishable from one reachable and
+/// genuinely empty, so a caller could print "no pending approvals" without
+/// having actually inspected every listed live session.
+pub fn pending_all(state: &Path) -> Result<Vec<SessionPendingResult>> {
+    let live = crate::daemon::live_sessions(state)?;
+    let mut results = Vec::with_capacity(live.len());
+    for meta in live {
+        let socket = session_dir(state, &meta.id).join(SOCKET_NAME);
+        let outcome = connect(&socket).and_then(|mut sink| {
+            let description = describe(&mut sink)?;
+            let approvals = pending(&mut sink)?;
+            Ok((description, approvals))
+        });
+        results.push(SessionPendingResult {
             session: meta.id,
             outcome,
         });
@@ -305,62 +354,115 @@ pub struct SessionApproval {
     pub approval: Approval,
 }
 
+/// How often [`follow_pending_all`] re-checks `live_sessions` for a session
+/// that started after it began watching: the granularity that is reasonable
+/// for an approval-notification path (a human waiting on a live agent), and
+/// the longest this ever goes without noticing a new session even while every
+/// session it already knows about stays perfectly quiet.
+pub const REDISCOVER: Duration = Duration::from_secs(30);
+
 /// `ward session pending --all --follow` (#141 items 4 and 6): every live
 /// session's approvals, multiplexed, independently of which one the desktop
 /// has selected — an approval in a second session must never be invisible
 /// just because the bar is showing the first.
 ///
-/// One [`follow_pending`] watcher per session live when this is called; each
-/// ends on its own when that session's stream closes or seals, the same as a
-/// single-session follow, and this returns once every one of them has. A
-/// session that starts *after* this call began is not picked up until the
-/// caller asks again — the same "try again" shape a session ending and a
-/// fresh one replacing it already has for a single-session follow — so no
-/// separate lifecycle-notification channel is needed for new sessions to be
-/// discovered in practice: `wardos-approve --watch`'s own retry loop already
-/// calls this again once every round.
+/// One [`follow_pending`] watcher per live session, spawned as it is found:
+/// once for every session live when this call began, then again for any
+/// session `live_sessions` reports that was not already being watched, every
+/// time a watcher finishes or [`REDISCOVER`] passes, whichever comes first —
+/// so a session that starts after watching began is never invisible for
+/// longer than one [`REDISCOVER`] interval, no matter how long every session
+/// watched so far stays live (#141 finding 1: the previous shape joined one
+/// thread per *original* session and could not return, or notice anything
+/// new, until every one of them ended). A watcher that ends — whether the
+/// session sealed, or its `describe` failed and it never got to follow at all
+/// — is dropped from the watched set, so a session that comes back (or a
+/// transient `describe` failure) is retried at the next rediscovery instead
+/// of staying silently forgotten (#141 finding 5). This returns once nothing
+/// is being watched and one more look at `live_sessions` still finds nothing
+/// to pick up.
 pub fn follow_pending_all(
     state: &Path,
     idle: Duration,
+    rediscover: Duration,
     emit: impl FnMut(SessionApproval) + Send + 'static,
 ) -> Result<()> {
-    let live = crate::daemon::live_sessions(state)?;
-    let emit = std::sync::Arc::new(std::sync::Mutex::new(emit));
-    let mut handles = Vec::with_capacity(live.len());
-    for meta in live {
-        let socket = session_dir(state, &meta.id).join(SOCKET_NAME);
-        let session_id = meta.id.clone();
-        let emit = std::sync::Arc::clone(&emit);
-        handles.push(std::thread::spawn(move || -> Result<()> {
-            let (project, agent) = match connect(&socket).and_then(|mut sink| describe(&mut sink)) {
-                Ok(d) => (d.project, d.agent.map(|a| a.name)),
-                // Gone before we could ask it anything: nothing to follow.
-                Err(_) => return Ok(()),
-            };
-            follow_pending(&socket, idle, |approval| {
-                if let Ok(mut emit) = emit.lock() {
-                    emit(SessionApproval {
-                        session: session_id.clone(),
-                        project: project.clone(),
-                        agent: agent.clone(),
-                        approval,
-                    });
-                }
-            })?;
-            Ok(())
-        }));
-    }
-    for handle in handles {
-        match handle.join() {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(Error::Events(
-                    "a session's approval watcher panicked".to_owned(),
-                ));
+    let emit = Arc::new(Mutex::new(emit));
+    // Each watcher thread reports its own end (session id, outcome) here
+    // instead of being `join`ed in a batch, so this can react to whichever
+    // happens first: a watcher finishing, or `rediscover` passing with none
+    // finishing — never blocked on one without a bound from the other.
+    let (done_tx, done_rx) = mpsc::channel::<(String, Result<()>)>();
+    let discover = |watched: &mut HashSet<String>| -> Result<()> {
+        for meta in crate::daemon::live_sessions(state)? {
+            if !watched.insert(meta.id.clone()) {
+                continue;
             }
+            let socket = session_dir(state, &meta.id).join(SOCKET_NAME);
+            let session_id = meta.id.clone();
+            let emit = Arc::clone(&emit);
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                let result = (|| -> Result<()> {
+                    let (project, agent) =
+                        match connect(&socket).and_then(|mut sink| describe(&mut sink)) {
+                            Ok(d) => (d.project, d.agent.map(|a| a.name)),
+                            // Gone before we could ask it anything: nothing to
+                            // follow this round; retried at the next rediscovery.
+                            Err(_) => return Ok(()),
+                        };
+                    follow_pending(&socket, idle, |approval| {
+                        if let Ok(mut emit) = emit.lock() {
+                            emit(SessionApproval {
+                                session: session_id.clone(),
+                                project: project.clone(),
+                                agent: agent.clone(),
+                                approval,
+                            });
+                        }
+                    })?;
+                    Ok(())
+                })();
+                let _ = done_tx.send((session_id, result));
+            });
+        }
+        Ok(())
+    };
+
+    let mut watched = HashSet::new();
+    discover(&mut watched)?;
+    let mut first_err = None;
+    loop {
+        if watched.is_empty() {
+            break;
+        }
+        match done_rx.recv_timeout(rediscover) {
+            Ok((session, result)) => {
+                watched.remove(&session);
+                if let Err(e) = result {
+                    first_err.get_or_insert(e);
+                }
+                // One more look right away when that was the last watcher: a
+                // session that started in the instant this one ended must not
+                // lose out just because it lost the race with this check.
+                if watched.is_empty() {
+                    discover(&mut watched)?;
+                }
+            }
+            // Nothing finished within `rediscover`: every session watched so
+            // far is still quietly live, which is exactly when a new session
+            // would otherwise stay invisible — so this is when to look again.
+            Err(RecvTimeoutError::Timeout) => discover(&mut watched)?,
+            // Cannot happen while `watched` is non-empty: every watcher holds
+            // its own clone of `done_tx`, and so does this scope. Treated as
+            // "nothing left to wait for" rather than panicking.
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// What `ward watch` prints.
@@ -1107,7 +1209,13 @@ mod tests {
     /// connection for `hold` (longer than a caller's `idle`, so a
     /// `follow_pending` reaches `Quiet` and lists what is pending) and then
     /// closes it, so a follower reaches its own end without this stand-in ever
-    /// having to track subscribers explicitly.
+    /// having to track subscribers explicitly. Once a `Subscribe` has held and
+    /// closed, this session is done for good — every connection after that is
+    /// dropped unanswered, the same as a real `wardd` that has sealed its log
+    /// and unlinked its socket, so `serving`/`live_sessions` correctly stop
+    /// counting it (needed for `follow_pending_all`'s rediscovery, #141
+    /// finding 1: without this, a stand-in that keeps accepting connections
+    /// forever would look live forever, and get re-watched forever).
     fn spawn_pool_session(
         state: &Path,
         id: &str,
@@ -1136,11 +1244,17 @@ mod tests {
         std::fs::write(dir.join("session.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
         let description = meta.describe();
         let listener = UnixListener::bind(dir.join(SOCKET_NAME)).unwrap();
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                if ended.load(std::sync::atomic::Ordering::Acquire) {
+                    // Sealed: behave like nothing is listening any more.
+                    continue;
+                }
                 let description = description.clone();
                 let pending = pending.clone();
                 let pause_outcome = pause_outcome.clone();
+                let ended = std::sync::Arc::clone(&ended);
                 std::thread::spawn(move || {
                     let mut writer = stream.try_clone().unwrap();
                     let reply = |writer: &mut std::os::unix::net::UnixStream, r: &Response| {
@@ -1166,6 +1280,7 @@ mod tests {
                             }
                             Request::Subscribe { .. } => {
                                 std::thread::sleep(hold);
+                                ended.store(true, std::sync::atomic::Ordering::Release);
                                 break;
                             }
                             Request::Pause { .. } => match &pause_outcome {
@@ -1354,9 +1469,14 @@ mod tests {
         );
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let collected = std::sync::Arc::clone(&seen);
-        follow_pending_all(state.path(), Duration::from_millis(30), move |sa| {
-            collected.lock().unwrap().push(sa);
-        })
+        follow_pending_all(
+            state.path(),
+            Duration::from_millis(30),
+            Duration::from_millis(30),
+            move |sa| {
+                collected.lock().unwrap().push(sa);
+            },
+        )
         .unwrap();
         let mut seen = seen.lock().unwrap().clone();
         seen.sort_by(|x: &SessionApproval, y| x.session.cmp(&y.session));
@@ -1366,5 +1486,162 @@ mod tests {
         assert_eq!(seen[0].approval.id, 1);
         assert_eq!(seen[1].session, "sess_b");
         assert_eq!(seen[1].approval.id, 2);
+    }
+
+    /// #141 finding 1: a session started well after `follow_pending_all` began
+    /// watching must still be discovered — bounded by `rediscover`, not by
+    /// waiting for the session that was already live to end. `sess_a` is held
+    /// open far longer than the bound this test asserts, so a regression back
+    /// to "one thread per original session, joined at the end" would leave
+    /// `sess_b`'s approval unobserved until `sess_a`'s 600ms hold elapses,
+    /// which the 400ms deadline below catches.
+    #[test]
+    fn follow_pending_all_discovers_a_session_started_after_watching_began() {
+        let state = tempfile::tempdir().unwrap();
+        let a = Approval::new(
+            1,
+            "Write",
+            "/work/a.rs",
+            crate::approvals::Authority::none("r", "/work/a.rs"),
+            0,
+        );
+        spawn_pool_session(
+            state.path(),
+            "sess_a",
+            1,
+            vec![a],
+            None,
+            Duration::from_millis(600),
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = std::sync::Arc::clone(&seen);
+        let state_path = state.path().to_path_buf();
+        let watcher = std::thread::spawn(move || {
+            follow_pending_all(
+                &state_path,
+                Duration::from_millis(30),
+                Duration::from_millis(50),
+                move |sa| {
+                    collected.lock().unwrap().push(sa);
+                },
+            )
+        });
+
+        // sess_b starts only once the watch above is already running.
+        std::thread::sleep(Duration::from_millis(100));
+        let b = Approval::new(
+            2,
+            "Write",
+            "/work/b.rs",
+            crate::approvals::Authority::none("r", "/work/b.rs"),
+            0,
+        );
+        spawn_pool_session(
+            state.path(),
+            "sess_b",
+            2,
+            vec![b],
+            None,
+            Duration::from_millis(100),
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(400);
+        loop {
+            if seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|sa: &SessionApproval| sa.session == "sess_b")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sess_b's approval was never observed within the rediscovery bound"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // sess_a is still being watched (600ms hold): proof this did not wait
+        // for it to end before picking sess_b up.
+        watcher.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn pending_all_reports_a_per_session_outcome_and_never_hides_an_unreachable_one() {
+        let state = tempfile::tempdir().unwrap();
+        let a = Approval::new(
+            1,
+            "Write",
+            "/work/a.rs",
+            crate::approvals::Authority::none("r", "/work/a.rs"),
+            0,
+        );
+        spawn_pool_session(
+            state.path(),
+            "sess_a",
+            1,
+            vec![a],
+            None,
+            Duration::from_millis(50),
+        );
+        // A "live" session (its socket exists and answers `Ping`, so
+        // `live_sessions` lists it) whose `Describe` refuses: the failure a
+        // connect/describe/pending skip must surface instead of silently
+        // dropping (#141 finding 5).
+        let dir = session_dir(state.path(), "sess_broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = SessionMeta {
+            id: "sess_broken".to_owned(),
+            project: PathBuf::from("/tmp/demo"),
+            project_id: "proj_sess_broken".to_owned(),
+            entry_snapshot: "blake3:abc".to_owned(),
+            manifest: ward_policy::merge(
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                ward_policy::SessionId("sess_broken".to_owned()),
+                ward_policy::ProjectId("proj_sess_broken".to_owned()),
+            ),
+            started_unix_ms: 2,
+            agent: None,
+        };
+        std::fs::write(dir.join("session.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let listener = UnixListener::bind(dir.join(SOCKET_NAME)).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    for line in BufReader::new(stream)
+                        .lines()
+                        .map_while(std::result::Result::ok)
+                    {
+                        let request: Request = serde_json::from_str(&line).unwrap();
+                        let reply = match request {
+                            Request::Ping => Response::Ok,
+                            Request::Describe => Response::Error("not ready".into()),
+                            other => panic!("unexpected request {other:?}"),
+                        };
+                        let mut b = serde_json::to_vec(&reply).unwrap();
+                        b.push(b'\n');
+                        let _ = writer.write_all(&b);
+                    }
+                });
+            }
+        });
+
+        let mut results = pending_all(state.path()).unwrap();
+        results.sort_by(|a, b| a.session.cmp(&b.session));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].session, "sess_a");
+        let (description, pending) = results[0].outcome.as_ref().unwrap();
+        assert_eq!(description.session, "sess_a");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(results[1].session, "sess_broken");
+        assert_eq!(
+            results[1].outcome.as_ref().unwrap_err().to_string(),
+            "events: daemon refused describe: not ready",
+            "an unreachable session is reported, never indistinguishable from \
+             one reachable with nothing pending"
+        );
     }
 }
