@@ -170,6 +170,43 @@ Once Phase 2 delivers `ward claude`, WardOS development sessions move inside `wa
 itself, with TamperWard in the loop as described in
 [`tamperward-integration.md`](tamperward-integration.md): the recursion closes.
 
+### 4.4 Out-of-band sign-off mechanics
+
+`tamperward-verify` (§2, the pristine re-execution job in
+[`.github/workflows/tamperward.yml`](../.github/workflows/tamperward.yml)) will fail
+whenever a pull request legitimately grows a protected fixture — most commonly
+`crates/**/tests/**`'s full-catalogue roundtrip fixtures picking up a new, additive
+`WardEvent`/`EventKind` variant. Restoring that fixture to its base-commit state and
+re-running against a candidate that already assumes the new variant exists is expected to
+fail; `tamperward verify` reports this as a `MASKED FAILURE`, which looks identical in the
+check's output to an actual attempt to weaken the suite until a human reads the diff.
+
+This is deliberate, not a gap to route around from inside a pull request: `.tamperward.yml`
+requires `signoff.required_for: [block]`, and CI sign-off is explicitly out-of-band (the
+local `ledger.jsonl` path only covers `tamperward run` on a workstation) so that a candidate
+can never grant itself the sign-off it needs. Concretely:
+
+* **Who** — anyone with *triage* role or higher on this repository. Today that is
+  `@hexrift` (see [`.github/CODEOWNERS`](../.github/CODEOWNERS); the same person this
+  repository's security-sensitive surfaces already route to). Extending this to additional
+  maintainers is a repository-settings change, not a TamperWard or code change.
+* **What to check** — read the failing `tamperward-verify` run's diff of the protected
+  path(s) named in the failure (e.g. `git diff <base>..<head> -- 'crates/**/tests/**'`).
+  Sign off only when every hunk is additive — a new fixture entry, a new assertion, a
+  count bumped up to match — never when a line is removed, loosened, or skipped. A single
+  removed or weakened line anywhere in the protected diff means this is a real block, not a
+  masked failure, and must not be signed off.
+* **How** — apply the label `tamperward:allow:verify@<head-sha>`, with `<head-sha>` the
+  exact commit the PR is currently at, to the pull request. The gate reads labels from the
+  triggering event (`labeled`/`unlabeled` are both in the workflow's `on.pull_request.types`),
+  so applying it re-runs the check rather than requiring a new push. The SHA binding means a
+  later push invalidates the sign-off and needs a fresh label bound to the new head — this is
+  intentional (§ci-tampering's whole point is that a sign-off can't quietly outlive the diff
+  it was read against).
+* **What it does not clear** — a red *visible* suite, a run that could not execute, or any
+  other failing rule. `tamperward:allow:verify@<sha>` clears only a masked failure on the
+  `verify` rule for that one SHA; nothing else.
+
 ## 5. What the dogfooding loop is expected to surface
 
 * Shortcuts agents actually attempt on a systems codebase (skipping flaky isolation tests,
