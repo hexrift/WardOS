@@ -47,6 +47,13 @@ the same script runs in CI, so a green run locally is a green run there.
   review on the diff, not re-request changes for commit metadata a merger can adjust in the
   same click that merges the PR.
 
+  This only settles the trailer on a branch's own commits. A pull request description or
+  comment that itself carries a `Co-Authored-By:`/session-link line is a separate GitHub
+  object squash-merge never touches — it persists exactly as written regardless of what
+  happens to the branch's commits. Whether a given PR body or comment carries one is
+  controlled by whatever tool or session authored it, not by this repository; there is
+  nothing for a merger to edit at merge time for those.
+
 ## Versioning
 
 WardOS follows [Semantic Versioning](https://semver.org): `MAJOR.MINOR.PATCH`. The
