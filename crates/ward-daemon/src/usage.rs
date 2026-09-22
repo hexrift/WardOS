@@ -209,30 +209,67 @@ pub fn scan_scratch(state: &Path) -> Result<Vec<ScratchEntry>> {
     Ok(out)
 }
 
+/// Generous headroom over the exact text a real owner marker ever contains
+/// (`sess_` + a 26-character Crockford ULID body = 31 bytes) plus whatever
+/// trailing whitespace/newline a text editor or shell redirect might add.
+/// Anything longer is refused outright rather than read to EOF: the marker
+/// is untrusted, attacker-controlled input from a shared, world-writable
+/// directory, and an unbounded read would let it force arbitrary memory
+/// growth.
+const MAX_OWNER_MARKER_LEN: usize = 128;
+
 /// The full session id [`crate::session::run_dir`] recorded as this
-/// directory's owner, if the marker is present, non-empty, and a real file —
-/// never a symlink. The OS temp dir is shared and world-writable, so another
-/// local user can plant `<ward-*>/.ward-owner` as a symlink to an arbitrary
-/// path (e.g. a victim's private key); reading through it would disclose that
-/// target's content verbatim as this entry's reported owner. The open itself
-/// carries `O_NOFOLLOW`, so a symlink is refused atomically by the kernel at
-/// open time — a separate `symlink_metadata` check beforehand would leave a
-/// TOCTOU window for that same attacker to swap the marker for a symlink
-/// between the check and a later unguarded read. A symlinked (or otherwise
-/// unopenable) marker is treated exactly like a missing one.
+/// directory's owner, if the marker is present, non-empty, a real regular
+/// file — never a symlink, FIFO, socket or device — and no longer than
+/// [`MAX_OWNER_MARKER_LEN`]. The OS temp dir is shared and world-writable, so
+/// another local user can plant `<ward-*>/.ward-owner` as:
+///
+/// - a symlink to an arbitrary path (e.g. a victim's private key), which
+///   would disclose that target's content verbatim as this entry's reported
+///   owner — refused atomically by the `O_NOFOLLOW` open itself, so there is
+///   no separate check-then-read window to race;
+/// - a FIFO, which a plain blocking open-for-read would wait on forever if
+///   nothing has it open for writing, hanging the whole usage scan —
+///   refused by opening with `O_NONBLOCK` (so the open itself can never
+///   block) and then `fstat`ing the already-open descriptor (not re-stating
+///   the path, which would reopen the TOCTOU window) to require a regular
+///   file before any read is attempted;
+/// - an oversized regular file, which an unbounded read would load into
+///   memory in full — refused by capping the read at
+///   [`MAX_OWNER_MARKER_LEN`] `+ 1` bytes and rejecting anything that fills
+///   that cap, rather than silently truncating and treating a cut-off
+///   marker as legitimate.
+///
+/// Anything that doesn't clear all of the above is treated exactly like a
+/// missing marker.
 fn read_owner_marker(dir: &Path) -> Option<String> {
     use std::io::Read;
 
     let marker = dir.join(OWNER_MARKER);
     let fd = nix::fcntl::open(
         &marker,
-        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_NONBLOCK
+            | nix::fcntl::OFlag::O_CLOEXEC,
         nix::sys::stat::Mode::empty(),
     )
     .ok()?;
-    let mut text = String::new();
-    std::fs::File::from(fd).read_to_string(&mut text).ok()?;
-    let text = text.trim();
+    let file = std::fs::File::from(fd);
+    // `fstat`s the descriptor we already hold open, not the path again — the
+    // object this checks is exactly the object the read below reads from,
+    // with no window for it to have been swapped in between.
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_OWNER_MARKER_LEN as u64 + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() > MAX_OWNER_MARKER_LEN {
+        return None;
+    }
+    let text = std::str::from_utf8(&buf).ok()?.trim();
     (!text.is_empty()).then(|| text.to_owned())
 }
 
@@ -472,6 +509,57 @@ mod tests {
         assert_eq!(
             entry.owner, None,
             "a symlinked marker must never be followed or its target disclosed"
+        );
+        assert_eq!(entry.status, ScratchStatus::Unknown);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_scratch_dir_whose_owner_marker_is_a_fifo_with_no_writer_returns_promptly_as_unset() {
+        // A FIFO with no writer open would block a plain `open(O_RDONLY)`
+        // forever; this test itself would hang if `read_owner_marker` ever
+        // regressed to opening without `O_NONBLOCK`, rather than failing
+        // cleanly — which is exactly why the fix opens non-blocking and
+        // `fstat`s the descriptor before ever attempting a read.
+        let state = tempfile::tempdir().unwrap();
+        let dir = std::env::temp_dir().join(format!("ward-usagetest-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        nix::unistd::mkfifo(
+            &dir.join(OWNER_MARKER),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+
+        let entries = scan_scratch(state.path()).unwrap();
+        let entry = entries.iter().find(|e| e.path == dir).unwrap();
+        assert_eq!(
+            entry.owner, None,
+            "a FIFO marker must never be read from, with or without a writer"
+        );
+        assert_eq!(entry.status, ScratchStatus::Unknown);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_owner_marker_is_rejected_rather_than_truncated() {
+        let state = tempfile::tempdir().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("ward-usagetest-oversized-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // One byte over the cap: large enough to prove the read is bounded
+        // (not merely large by accident), too small to make the test slow.
+        std::fs::write(dir.join(OWNER_MARKER), vec![b'A'; MAX_OWNER_MARKER_LEN + 1]).unwrap();
+
+        let entries = scan_scratch(state.path()).unwrap();
+        let entry = entries.iter().find(|e| e.path == dir).unwrap();
+        assert_eq!(
+            entry.owner, None,
+            "a marker over the length cap must be refused outright, never truncated \
+             and treated as a legitimate (if garbled) owner"
         );
         assert_eq!(entry.status, ScratchStatus::Unknown);
 
