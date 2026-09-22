@@ -15,7 +15,7 @@ not.
 | --- | --- | --- |
 | `Containerfile` | the image | Build or fetch the ward binaries; layer packages, binaries, desktop and configuration on `fedora-bootc` |
 | `packages.txt` | — | Every package the host installs, one per line with the reason; the Containerfile and `desktop/install.sh` read it |
-| `coprs.txt` | `/etc/yum.repos.d/_copr:*.repo` | The COPR repositories enabled before the install (Hyprland's ecosystem, lazygit); part of the trust set |
+| `coprs.txt` | `/etc/yum.repos.d/_copr:*.repo` | The COPR repositories enabled before the install (Hyprland's ecosystem, swayosd); part of the trust set |
 | `check-packages.sh` | — | Proves every name in `packages.txt` exists in the pinned Fedora release plus `coprs.txt` (`dnf repoquery` in a `fedora:<release>` container); CI job "image packages" |
 | `install-desktop.sh` | — | Places `desktop/` into a root (`/` in the build, `/` from `desktop/install.sh`, a temp dir in tests) |
 | `agents/package.json`, `agents/package-lock.json` | `/usr/lib/wardos/agents/`, then `node_modules/` from `npm ci`; `/usr/bin/{claude,codex,tamperward}` | Claude Code, Codex and TamperWard at exact versions (ADR-0017; [`agents/README.md`](agents/README.md)) |
@@ -123,14 +123,13 @@ chroot), which the "image packages" job proves before the build runs.
 
 Fedora retired Hyprland itself after 42 (on 44 without COPRs the check reports
 `hyprland`, `hypridle`, `hyprlock`, `hyprpaper`, `hyprpicker`, `hyprpolkitagent`,
-`hyprsunset`, `xdg-desktop-portal-hyprland`, `uwsm`, `satty`, `swayosd` and `lazygit`
+`hyprsunset`, `xdg-desktop-portal-hyprland`, `uwsm`, `satty` and `swayosd`
 missing), and `solopasha/hyprland`, the COPR everyone used, builds rawhide only now.
 `check-packages.sh --discover NAME...` asks the COPR API which projects mention a name
 and which of them build for the pinned release; the September 2026 run chose the
 smallest trust set: `mineiro/hyprland` (the one repository that carries the whole
-ecosystem, the successor of solopasha's), `erikreider/swayosd` (swayosd by its author)
-and `atim/lazygit` (which has since stopped building lazygit for Fedora 44, so the
-image now enables `dejan/lazygit` for it). `pulsemixer` is not packaged anywhere useful; the image ships
+ecosystem, the successor of solopasha's) and `erikreider/swayosd` (swayosd by its
+author). `pulsemixer` is not packaged anywhere useful; the image ships
 `pavucontrol` and `wardos-setup audio` prefers pulsemixer when present.
 
 ### The desktop in the image
