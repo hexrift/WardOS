@@ -22,7 +22,9 @@ use ward_events::{
 use ward_policy::{CapabilityManifest, NetworkCapability, ObserverMode, Policy, merge};
 use ward_snapshot::{CaptureOptions, SnapshotMeta, SnapshotRole, SnapshotStore};
 
-use crate::attempt::{AttemptGuard, CancelToken, finalize_interrupted, next_attempt_id};
+use crate::attempt::{
+    AttemptGuard, CancelToken, finalize_interrupted, lock_session_verification, next_attempt_id,
+};
 use crate::control::{LocalLog, RemoteSink, SOCKET_NAME, Sink, unix_ms};
 use crate::describe::SessionDescription;
 use crate::egress::Egress;
@@ -799,8 +801,23 @@ impl Session {
     /// not replace it. If appending that terminal record itself also fails (the
     /// sink is gone, disk full, …), the caller's error says so explicitly instead
     /// of quietly discarding it.
+    ///
+    /// One attempt at a time, across every handle (review 5284360930 of #208,
+    /// finding 1): two `Session` handles for this same session — two threads in one
+    /// process, or two entirely separate `ward`/`wardd` processes — can each call this
+    /// concurrently, so the whole body below runs under
+    /// [`lock_session_verification`], acquired before attempt-id allocation and held
+    /// until this call returns on every exit path. See that function's own doc
+    /// comment for the full reasoning, including why it is a lock distinct from
+    /// reconciliation's own.
     pub fn verify(&mut self) -> Result<VerifyReport> {
         let dir = session_dir(&self.state, &self.session_str);
+        // Exclusive and session-scoped for this call's entire lifetime — see the doc
+        // comment above and `lock_session_verification`'s own. An ordinary local
+        // binding, so it releases on every exit path below (an early `?` return, a
+        // panic, or falling off the end) exactly as reliably as it would on success.
+        let _verify_lock = lock_session_verification(&dir)?;
+
         // Close out anything a previous attempt in this session left dangling
         // before allocating a new one. The daemon's own startup and
         // `Session::open_current` already reconcile whenever they (re)take
@@ -809,10 +826,25 @@ impl Session {
         // finishing — without needing a process restart to notice it. Fail closed
         // (review of #208, finding 3): starting a fresh attempt on top of one this
         // process could not confirm was reconciled would risk exactly the
-        // contradictory-history problem #139 exists to prevent.
+        // contradictory-history problem #139 exists to prevent. Also refreshes
+        // `self.sink`'s own cached view of the log via `Sink::resync` (review
+        // 5283028228 of #208, finding 4) — now done under `_verify_lock`, so nothing
+        // else can append between that refresh and this attempt's own first append.
         crate::attempt::reconcile_dangling_attempts(&mut *self.sink, &dir)?;
 
-        let attempt = self.alloc_attempt();
+        // Allocated fresh from the log, under the lock, rather than from this
+        // `Session`'s own cached `next_attempt` field (review 5284360930 of #208,
+        // finding 1): two `Session` handles opened before either had started
+        // verifying would otherwise both cache the very same result from
+        // `open_current`/`start_in` and collide. Safe now that `_verify_lock` above
+        // rules out a second, concurrent allocator for this session — the log
+        // already reflects every attempt any earlier lock holder finished. Still
+        // kept in sync on `self.next_attempt` afterward so `alloc_attempt` (used
+        // directly by tests exercising `verify_prepared` in isolation, and as a
+        // plain in-memory counter with no locking of its own) stays consistent with
+        // what a fresh `verify()` call on this same `Session` would allocate next.
+        let attempt = next_attempt_id(&self.log_path);
+        self.next_attempt = AttemptId::new(attempt.get().saturating_add(1));
         // Allocated, and recorded, before any expensive preparation begins (#139
         // item 2): a subscriber sees this attempt exists, and a reconciliation pass
         // can find and close it out if this process disappears, before candidate
@@ -1224,6 +1256,16 @@ impl Session {
     /// Allocate the next verification attempt id (#139): monotonic for the life of
     /// this `Session`, and never repeats one [`next_attempt_id`] would also hand out
     /// to a fresh `Session` reopened on the same log.
+    ///
+    /// [`Self::verify`] no longer calls this directly (review 5284360930 of #208,
+    /// finding 1): it allocates under [`lock_session_verification`] straight from a
+    /// fresh [`next_attempt_id`] read instead, since this method's cached
+    /// `self.next_attempt` field is exactly what let two separately-opened `Session`
+    /// handles collide on the same id before that fix. Kept as a plain, unlocked
+    /// counter for the tests below that exercise [`Self::verify_prepared`] directly,
+    /// without needing a real `.tamperward/config.yml` for `verify()`'s own
+    /// preparation step to succeed.
+    #[cfg(test)]
     fn alloc_attempt(&mut self) -> AttemptId {
         let attempt = self.next_attempt;
         self.next_attempt = AttemptId::new(attempt.get().saturating_add(1));
@@ -2318,5 +2360,199 @@ mod tests {
             vec!["AttemptStarted"],
             "no VerificationInterrupted was ever emitted for the still-running attempt"
         );
+    }
+
+    /// Review 5284360930 of #208, finding 1 — the deterministic barrier regression the
+    /// review asked for: two independent `Session` handles on the very same session
+    /// (`open_current`, the shape two separate `ward verify` client processes take),
+    /// both opened — and so both caching a `next_attempt` from the very same,
+    /// still-empty log — before either ever calls `verify()`, exactly the ordering the
+    /// finding describes. Racing them to call `verify()` at the same instant must not
+    /// collide: the new session-scoped verify lock must serialize the two calls
+    /// completely, so the log ends up with two distinct attempts, each one's own
+    /// `AttemptStarted`/terminal pair fully written before the other's `AttemptStarted`
+    /// ever appears, and neither ever clobbers the other's marker file.
+    #[test]
+    fn concurrent_verify_calls_on_two_session_handles_are_strictly_serialized() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        session.persist_current().unwrap();
+        let dir = session_dir(state.path(), session.id());
+        drop(session);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let project = project.path().to_path_buf();
+                let state = state.path().to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Both handles open the session — caching the same
+                    // `next_attempt` from the same, still-empty log — before either
+                    // ever calls `verify()`.
+                    let mut session = Session::open_current(&project, &state)
+                        .unwrap()
+                        .expect("the persisted session is found");
+                    barrier.wait();
+                    // Deterministically fails at `verify::prepare` (no
+                    // `.tamperward/config.yml` in a bare `start_in` project), which
+                    // still leaves the attempt with exactly one terminal record —
+                    // `VerificationInterrupted` — the same shape
+                    // `verify_prepare_failure_ends_the_log_in_verification_interrupted_with_no_candidate`
+                    // above already relies on.
+                    session.verify().expect_err("no .tamperward/config.yml")
+                })
+            })
+            .collect();
+        for handle in handles {
+            let err = handle.join().unwrap();
+            assert!(!err.to_string().is_empty());
+        }
+
+        let records: Vec<_> = ward_events::LogReader::open(dir.join("events.log"))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let attempts: Vec<(&str, u64)> = records
+            .iter()
+            .filter_map(|r| match &r.event {
+                WardEvent::VerificationAttemptStarted { attempt, .. } => {
+                    Some(("AttemptStarted", attempt.get()))
+                }
+                WardEvent::VerificationInterrupted { attempt, .. } => {
+                    Some(("Interrupted", attempt.get()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attempts,
+            vec![
+                ("AttemptStarted", 1),
+                ("Interrupted", 1),
+                ("AttemptStarted", 2),
+                ("Interrupted", 2),
+            ],
+            "the two verify() calls must be strictly serialized by the verify lock — \
+             distinct attempt ids, never interleaved: {attempts:?}"
+        );
+        assert!(
+            !dir.join("attempts").join("1.json").exists()
+                && !dir.join("attempts").join("2.json").exists(),
+            "both attempts finish cleanly; neither marker is left dangling or was ever \
+             clobbered by the other"
+        );
+    }
+
+    /// Review 5284360930 of #208, finding 2 — the deterministic barrier regression for
+    /// the other half of the finding: attempt 1's `AttemptGuard` is held (its marker
+    /// genuinely live, `VerificationAttemptStarted` already durably on the log, nothing
+    /// terminal yet) exactly as a real `verify()` call in flight would leave things,
+    /// while a concurrent reconciliation pass runs and this test probes whether the
+    /// verify lock is genuinely still held. Both must find attempt 1 still in flight:
+    /// reconciliation must never remove its marker or treat it as terminal (the
+    /// pid/`LIVE_PATHS` liveness checks this composes with, unchanged by this fix — see
+    /// `lock_session_verification`'s own doc comment), and a non-blocking probe on the
+    /// exact same lock file — deterministic proof, never a timing assumption — must
+    /// fail while attempt 1's holder thread has not yet released it, then succeed once
+    /// it has, at which point the next allocation correctly sees attempt 1 as done.
+    #[test]
+    fn a_still_running_attempt_survives_reconciliation_and_holds_its_lock() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        session.persist_current().unwrap();
+        let dir = session_dir(state.path(), session.id());
+        let project_path = project.path().to_path_buf();
+        let state_path = state.path().to_path_buf();
+        drop(session);
+
+        let attempt = AttemptId::new(1);
+        let marker = dir.join("attempts").join("1.json");
+
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held_dir = dir.clone();
+        let holder = std::thread::spawn(move || {
+            // Stands in for a `verify()` call genuinely still in flight: the verify
+            // lock held for the attempt's whole lifetime — exactly as `Session::verify`
+            // itself now holds it — its `AttemptGuard` alive, and
+            // `VerificationAttemptStarted` already durably on the log, but nothing
+            // terminal yet.
+            let _verify_lock = crate::attempt::lock_session_verification(&held_dir).unwrap();
+            let mut log = LocalLog::open(&held_dir.join("events.log"), SystemTime::now()).unwrap();
+            log.append(
+                Origin::Wardd,
+                WardEvent::VerificationAttemptStarted {
+                    attempt,
+                    requested_by: VerifyRequester::User,
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+            log.sync().unwrap();
+            let guard = AttemptGuard::start(&held_dir, attempt, VerifyRequester::User).unwrap();
+            holding_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            guard.finish();
+            // `_verify_lock` releases only once this closure returns, below.
+        });
+
+        holding_rx.recv().unwrap();
+        assert!(marker.exists());
+
+        // A non-blocking probe on the exact same lock file: it must fail while the
+        // holder thread above has not yet released it, deterministically proving the
+        // lock is genuinely held rather than merely assumed to be from timing.
+        let probe_path = crate::attempt::verify_lock_path(&dir);
+        let probe_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&probe_path)
+            .unwrap();
+        assert!(
+            nix::fcntl::Flock::lock(probe_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .is_err(),
+            "the verify lock must still be held while attempt 1 is in flight"
+        );
+
+        // A reconciliation pass — the same one `Session::open_current` runs — must
+        // leave the still-live marker completely alone.
+        let mut reopened = Session::open_current(&project_path, &state_path)
+            .unwrap()
+            .expect("the persisted session is found");
+        assert!(
+            marker.exists(),
+            "reconciliation must never remove attempt 1's marker while its guard is still live"
+        );
+        assert_eq!(
+            verification_kinds(&mut reopened),
+            vec!["AttemptStarted"],
+            "no VerificationInterrupted for the still-running attempt"
+        );
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            !marker.exists(),
+            "attempt 1's marker is cleanly removed once it actually finishes"
+        );
+
+        // The lock is free now that `verify()` (simulated by the holder thread above)
+        // has fully returned, and the next allocation correctly sees attempt 1's own
+        // `AttemptStarted` already on the log.
+        let probe_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&probe_path)
+            .unwrap();
+        let probe =
+            nix::fcntl::Flock::lock(probe_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .expect("the lock is released once the holder's verify() call returns");
+        drop(probe);
+        assert_eq!(next_attempt_id(&dir.join("events.log")).get(), 2);
     }
 }

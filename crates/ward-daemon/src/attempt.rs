@@ -127,6 +127,42 @@
 //! this pass acquired the lock (including by an entirely separate process) may already
 //! be behind a rival reconciler's own append for a *different* marker, and every append
 //! this pass makes must build on the true head.
+//!
+//! # One verification attempt at a time, across every handle (review 5284360930 of
+//! #208, findings 1 and 2)
+//!
+//! Everything above assumes at most one attempt is ever being allocated or run for a
+//! session at once — `attempt_already_terminal`'s "a later `VerificationAttemptStarted`
+//! implies the earlier one is terminal" heuristic, and `next_attempt_id`'s own "one past
+//! the highest started record" arithmetic, both quietly depend on it. Nothing enforced
+//! that assumption across separate `Session` handles: two `ward verify` client processes
+//! (or two threads sharing one process) can each open the same session and call
+//! `verify()` before either has appended anything, each caching the same
+//! `next_attempt_id` result and then racing [`AttemptGuard::start`]'s unconditional
+//! rename onto the very same marker path — one live attempt's marker clobbering the
+//! other's, and either guard's `finish()` removing the only marker either of them has.
+//! Worse, once a second caller *does* correctly allocate attempt 2 (having opened after
+//! attempt 1's own start was already on the log), `attempt_already_terminal` would treat
+//! attempt 2's own `VerificationAttemptStarted` as proof attempt 1 is done — even though
+//! attempt 1 might still be genuinely running — and a reconciliation pass would remove
+//! attempt 1's marker (the only durable evidence of it) out from under it.
+//!
+//! [`lock_session_verification`] closes this with the same OS-`flock` idiom
+//! [`lock_session_reconciliation`] already established one review round earlier: the
+//! session's own `Session::verify()` acquires it before it ever reads
+//! [`next_attempt_id`], and holds it for the attempt's entire lifetime — allocation
+//! through the terminal append — so two concurrent `verify()` calls for one session can
+//! never both be mid-attempt at once. This is a *separate* lock file from
+//! reconciliation's own, deliberately: `verify()` already calls
+//! [`reconcile_dangling_attempts`] internally, and `flock`'s exclusivity is scoped to an
+//! open file description, not a process, so a second `open()` of the very same lock file
+//! from inside that nested call — even on the very same thread — would block behind the
+//! outer lock it is itself still holding and self-deadlock forever. See
+//! [`lock_session_verification`]'s own doc comment for why *not* sharing a lock with
+//! reconciliation is still safe (it composes with the existing pid/`LIVE_PATHS` liveness
+//! checks rather than needing to serialize against them), and `attempt_already_terminal`'s
+//! own doc comment for why the "later start implies earlier terminal" heuristic is safe
+//! now that this lock makes attempts genuinely serial.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -548,6 +584,23 @@ pub fn next_attempt_id(log_path: &Path) -> AttemptId {
 /// that resurfaces after a crash between a terminal append and that marker's own
 /// not-yet-durable removal (review of #208, finding 2): such a marker is retired
 /// quietly instead of producing a second, contradictory terminal record.
+///
+/// # Is "a later start implies this one is terminal" actually safe? (review 5284360930
+/// of #208, finding 2)
+///
+/// Only because [`lock_session_verification`] now enforces the single-attempt-at-a-time
+/// model this whole function already assumed. Before that lock existed, two `Session`
+/// handles could each allocate and start an attempt concurrently, and this heuristic
+/// would then wrongly conclude the *earlier* of the two was terminal the moment the
+/// later one's own `VerificationAttemptStarted` landed — even while the earlier attempt
+/// was still genuinely running — letting a reconciliation pass remove its marker, the
+/// only durable evidence of it, out from under it. `Session::verify()` now acquires
+/// [`lock_session_verification`] before it ever allocates an attempt id, and holds it
+/// for that attempt's entire lifetime through its own terminal append; a later attempt's
+/// `VerificationAttemptStarted` can therefore only ever reach the log once the earlier
+/// call's `verify()` has already returned in full, terminal append included. A later
+/// start really is proof this one is done — no further change to this function's logic
+/// was needed, only the exclusivity it was implicitly relying on all along.
 fn attempt_already_terminal(log_path: &Path, attempt: AttemptId) -> bool {
     let Ok(reader) = ward_events::LogReader::open(log_path) else {
         return false;
@@ -931,6 +984,79 @@ fn lock_session_reconciliation(session_dir: &Path) -> Result<Flock<std::fs::File
         .map_err(|(_, errno)| Error::io(&path, std::io::Error::from(errno)))
 }
 
+/// `<session_dir>/.verify.lock`: an empty file [`lock_session_verification`] takes an
+/// exclusive, OS-enforced `flock` on for one entire `Session::verify()` call (review
+/// 5284360930 of #208, finding 1). Deliberately a *different* file from
+/// [`reconcile_lock_path`]'s own lock, for a concrete reason rather than mere caution:
+/// `Session::verify()` calls [`reconcile_dangling_attempts`] on itself as its own opening
+/// step, and `flock`'s exclusivity is scoped to an *open file description*, not a
+/// process or thread — a second `open()` of the same path taken from inside that nested
+/// call, even by the very same thread that already holds the outer lock, would block
+/// behind its own still-held lock and self-deadlock `verify()` forever. Two independent
+/// lock files sidestep that entirely. `pub(crate)` so `session.rs`'s own tests can probe
+/// it directly (a non-blocking `flock` on this exact path is the deterministic way to
+/// prove the lock is genuinely held, without timing).
+pub(crate) fn verify_lock_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(".verify.lock")
+}
+
+/// Acquire the exclusive, session-wide verification lock, blocking until any other
+/// `Session::verify()` call currently holding it — another thread in this process, or an
+/// entirely separate `ward`/`wardd` process, since two `Session` handles can each open
+/// the very same session's log concurrently — releases theirs (review 5284360930 of
+/// #208, finding 1: "the single attempt at a time assumption ... is not enforced across
+/// `Session` handles/processes").
+///
+/// `Session::verify()` acquires this before it ever reads [`next_attempt_id`], and holds
+/// it for the attempt's entire lifetime — allocation, [`AttemptGuard::start`],
+/// `verify::prepare`/`verify::execute`, and the terminal append — releasing only once the
+/// call itself returns, on every exit path (the lock is an ordinary local binding, so a
+/// `?` early return or a panic drops, and so releases, it exactly as reliably as a
+/// successful return does). Two concurrent `verify()` calls therefore can never both be
+/// mid-allocation or mid-attempt for the same session: the second simply blocks in the
+/// kernel until the first's lock is released, at which point [`next_attempt_id`] —
+/// recomputed fresh from the log inside the lock, never trusted from a `Session`'s own
+/// cached field, which is exactly what let two separately-opened handles collide on the
+/// same id before this fix — already reflects the first attempt's own
+/// `VerificationAttemptStarted` and terminal records.
+///
+/// This is also what makes `attempt_already_terminal`'s "a later
+/// `VerificationAttemptStarted` implies the earlier one is terminal" heuristic actually
+/// safe (finding 2): every attempt's entire lifecycle, start through terminal append,
+/// now happens while this lock is held, and a later attempt's own
+/// `VerificationAttemptStarted` can only ever be appended once *its own* call has
+/// acquired this lock — which cannot happen until the earlier call's `verify()` has
+/// already returned in full, including its own terminal append. A later start really is
+/// proof the earlier attempt is done. See that function's own doc comment for the
+/// complete cross-reference.
+///
+/// Deliberately does **not** rule out a reconciliation pass
+/// ([`reconcile_dangling_attempts`], its own separate [`lock_session_reconciliation`])
+/// running concurrently with an attempt still live under *this* lock — see
+/// [`verify_lock_path`]'s doc comment for why they are intentionally different lock
+/// files. That composition needs no further guard here: a reconciler only ever treats a
+/// marker as dangling once [`owner_is_gone`] says its owning process (cross-process) or
+/// this process's own [`LIVE_PATHS`] registration (same-process, populated by
+/// [`AttemptGuard::start`] for the guard's entire lifetime, independent of which lock —
+/// if any — happens to be held around it) says it is not. Both of those already hold for
+/// a marker this lock is protecting, exactly as they did before this fix; this lock only
+/// adds exclusivity *between* attempts, never duplicating or racing that existing
+/// liveness logic.
+pub(crate) fn lock_session_verification(session_dir: &Path) -> Result<Flock<std::fs::File>> {
+    let path = verify_lock_path(session_dir);
+    // Only this file's *existence* matters — it is never read or written — so an
+    // already-present lock file (from an earlier call) is opened as-is rather than
+    // truncated, exactly as `lock_session_reconciliation` treats its own.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| Error::io(&path, e))?;
+    Flock::lock(file, FlockArg::LockExclusive)
+        .map_err(|(_, errno)| Error::io(&path, std::io::Error::from(errno)))
+}
+
 /// Close out every dangling attempt marker under `session_dir`: each becomes a
 /// `VerificationInterrupted` record appended through `sink`, then its marker is
 /// removed. Call whenever a process (re)takes ownership of a session's log — the
@@ -960,6 +1086,17 @@ fn lock_session_reconciliation(session_dir: &Path) -> Result<Flock<std::fs::File
 /// fails, or a marker cannot be removed/quarantined once its terminal record (if
 /// any) is on the log — is returned, never swallowed (finding 3): every call site
 /// propagates it rather than discarding it with `let _ = `.
+///
+/// Does not take, or need, [`lock_session_verification`] (review 5284360930 of #208,
+/// finding 2): a live `Session::verify()` call holding that lock is never mistaken for
+/// dangling here regardless, because [`owner_is_gone`] already refuses to treat a
+/// marker as abandoned while its owning process is verifiably alive, or — same
+/// process — while [`AttemptGuard::start`] still has it registered in [`LIVE_PATHS`];
+/// both of those hold for the whole time a `verify()` call is genuinely running,
+/// independent of whichever lock (if any) happens to be held around it at that
+/// instant. Taking the verify lock here too would only add a redundant serialization
+/// this pass does not need, at the cost of a self-deadlock risk from the lock's own
+/// scoping (see [`verify_lock_path`]'s doc comment).
 ///
 /// Returns the number of attempts for which a `VerificationInterrupted` record was
 /// newly appended (never counting one already found terminal, or a live one left
