@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -267,62 +267,20 @@ pub fn to_event(claim: &Claim) -> WardEvent {
     }
 }
 
-/// The handler threads currently serving a connection, and a way to wait for them
-/// to finish.
-///
-/// The count is what the accept loop caps concurrency on ([`MAX_HANDLERS`]) and what
-/// [`Hooks::quiesce`] waits to reach zero before the terminal drain: a handler is
-/// counted from before it is spawned until after it has recorded its claim, so a
-/// count of zero means every claim that will ever be recorded already is.
-#[derive(Default)]
-struct Live {
-    count: Mutex<usize>,
-    idle: Condvar,
-}
-
-impl Live {
-    fn lock(&self) -> MutexGuard<'_, usize> {
-        self.count.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Take a handler slot, unless `max` are already live.
-    fn enter(&self, max: usize) -> bool {
-        let mut count = self.lock();
-        if *count >= max {
-            return false;
-        }
-        *count += 1;
-        true
-    }
-
-    /// Release a handler slot, waking anyone waiting for the last one.
-    fn leave(&self) {
-        let mut count = self.lock();
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            self.idle.notify_all();
-        }
-    }
-
-    /// Wait up to `timeout` for every handler to finish, returning how many were
-    /// still running when the wait ended.
-    fn wait_idle(&self, timeout: Duration) -> usize {
-        let count = self.lock();
-        let (count, _) = self
-            .idle
-            .wait_timeout_while(count, timeout, |count| *count > 0)
-            .unwrap_or_else(PoisonError::into_inner);
-        *count
-    }
-}
-
 /// A running hook listener bound to a Unix socket.
 pub struct Hooks {
     socket: PathBuf,
     /// Claims recorded but not yet drained, with the refusals that belong to the
-    /// same drain epoch (#123, #137).
+    /// same drain epoch, the handlers still in flight, and the terminal cutover
+    /// itself — all behind that queue's one lock (#123, #137).
+    ///
+    /// The handlers in flight are what the accept loop caps concurrency on
+    /// ([`MAX_HANDLERS`]) and what [`Hooks::quiesce`] waits to reach zero before the
+    /// terminal drain: a handler is in the set from before it is spawned until the
+    /// lock acquisition that records its claim, so an empty set means every claim
+    /// that will ever be recorded already is. Keeping the set in the *same* lock as
+    /// the claims is what makes the cutover exact — see [`Bounded`].
     claims: Arc<Bounded<Claim>>,
-    live: Arc<Live>,
     shutdown: Arc<AtomicBool>,
     /// The accept thread, taken by whichever of `quiesce`/`stop` runs first.
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -373,36 +331,37 @@ impl Hooks {
         let listener = UnixListener::bind(&socket)
             .map_err(|e| Error::Sandbox(format!("hook socket {}: {e}", socket.display())))?;
         let claims = Arc::new(Bounded::new(max_claims));
-        // Handler threads in flight. The accept loop never serves a connection itself:
-        // it spawns a handler up to `max_handlers`, and once that many are live it
-        // sends a fast overload reply and closes the connection instead (#123). So the
-        // loop is never occupied by a held approval — ordinary requests keep being
-        // accepted and answered promptly — the concurrent service count is exactly
-        // `max_handlers` (not +1 for the accept thread), and `stop` never joins a
-        // handler blocked on a hold.
-        let live = Arc::new(Live::default());
+        // Handler threads in flight, tracked in the claim queue's own lock. The accept
+        // loop never serves a connection itself: it spawns a handler up to
+        // `max_handlers`, and once that many are live it sends a fast overload reply
+        // and closes the connection instead (#123). So the loop is never occupied by a
+        // held approval — ordinary requests keep being accepted and answered promptly —
+        // the concurrent service count is exactly `max_handlers` (not +1 for the accept
+        // thread), and `stop` never joins a handler blocked on a hold.
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (claims, live, shutdown) = (claims.clone(), live.clone(), shutdown.clone());
+            let (claims, shutdown) = (claims.clone(), shutdown.clone());
             std::thread::spawn(move || {
                 let protected = Arc::new(protected);
                 for stream in listener.incoming().flatten() {
                     if shutdown.load(Ordering::SeqCst) {
                         break;
                     }
-                    if !live.enter(max_handlers) {
+                    if !claims.enter(max_handlers) {
                         // Defined overload response: refuse and close at once (never block
                         // the accept loop), counted so the drop is surfaced on the next
-                        // drain rather than silently lost.
+                        // drain rather than silently lost. This connection never joined
+                        // the in-flight set, so nothing else will account for it.
                         overload_reject(stream, &claims);
                         continue;
                     }
-                    let (protected, claims, holder, live) = (
-                        Arc::clone(&protected),
-                        Arc::clone(&claims),
-                        holder.clone(),
-                        Arc::clone(&live),
-                    );
+                    let (protected, claims, holder) =
+                        (Arc::clone(&protected), Arc::clone(&claims), holder.clone());
+                    // `serve` leaves the in-flight set exactly once, in the same lock
+                    // acquisition that records its claim — so a quiesce that sees the
+                    // set empty has seen every claim there will be, and a handler that
+                    // finishes after the cutover sealed finds it sealed rather than
+                    // appending to a batch already accounted for without it.
                     std::thread::spawn(move || {
                         serve(
                             stream,
@@ -414,9 +373,6 @@ impl Hooks {
                                 holder: holder.as_deref(),
                             },
                         );
-                        // Only now is the claim recorded, so a quiesce that sees the
-                        // count reach zero has seen every claim there will be.
-                        live.leave();
                     });
                 }
             })
@@ -424,7 +380,6 @@ impl Hooks {
         Ok(Self {
             socket,
             claims,
-            live,
             shutdown,
             thread: Mutex::new(Some(thread)),
         })
@@ -501,13 +456,18 @@ impl Hooks {
     /// daemon's shutdown open; the handlers still running when it ends are counted
     /// as refused claims, so [`drain_observations`](Self::drain_observations)
     /// reports the gap as an explicit marker rather than leaving it silent.
+    ///
+    /// Giving up on them is one step, not two: [`Bounded::seal`] reads the final
+    /// in-flight count and commits to it under the very lock a handler has to take
+    /// to record its claim. So a handler that finishes in the instant the wait ran
+    /// out either got its claim into the batch the caller is about to drain — in
+    /// which case the seal never saw it and never counted it — or finds the queue
+    /// sealed and adds nothing, because the seal already counted it. Sampling the
+    /// count first and recording it afterwards is what let one handler be both.
     pub fn quiesce(&self, timeout: Duration) -> usize {
         self.stop_accepting();
-        let remaining = self.live.wait_idle(timeout);
-        if remaining > 0 {
-            self.claims.record_dropped(remaining as u64);
-        }
-        remaining
+        self.claims.wait_idle(timeout);
+        self.claims.seal()
     }
 
     /// Stop the listener and remove the socket. Non-blocking: it flags shutdown, unblocks
@@ -535,8 +495,16 @@ struct Serve<'a> {
 
 /// Handle one connection: read a line, decide, hold an `ask` when there is a
 /// holder, record, reply. Malformed input closes the connection silently.
+///
+/// The handler is in the claim queue's in-flight set on entry (the accept loop put
+/// it there) and leaves it exactly once, on every path out: through
+/// [`Bounded::commit`] when it reached a claim, and through [`Bounded::leave`] when
+/// it did not.
 fn serve(mut stream: UnixStream, cx: &Serve) {
     let Some(req) = read_request(&stream, cx.deadline) else {
+        // No request, so no claim: leave the in-flight set so the broker can still
+        // be seen to go quiet.
+        cx.claims.leave();
         return;
     };
     let mut response = decide(&cx.observer, cx.protected, &req);
@@ -547,11 +515,13 @@ fn serve(mut stream: UnixStream, cx: &Serve) {
             response = held;
         }
     }
-    // Bound the pending buffer: past the cap the claim is refused and counted under the
-    // same lock (surfaced on the next drain), so a flood of hook requests cannot grow
-    // memory without bound and the refusal is never silently presented as complete
-    // evidence (#123).
-    cx.claims.push(Claim {
+    // Record the claim and leave the in-flight set in one lock acquisition (#137), so
+    // the terminal cutover cannot write this handler off as lost in the interval
+    // between the two. Bound the pending buffer while we are there: past the cap the
+    // claim is refused and counted under the same lock (surfaced on the next drain), so
+    // a flood of hook requests cannot grow memory without bound and the refusal is
+    // never silently presented as complete evidence (#123).
+    cx.claims.commit(Claim {
         at: SystemTime::now(),
         request: req,
         decision: response.decision,

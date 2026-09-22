@@ -34,11 +34,16 @@
 //!   what it already had in flight — *before* draining that producer for the last
 //!   time, so a decision or claim completed across the cutover is flushed rather
 //!   than discarded with the producer. A producer still busy when the bound runs out
-//!   is counted and marked like any other gap.
+//!   is counted and marked like any other gap. Giving up is itself a single atomic
+//!   step ([`Bounded::seal`]) taken under the queue's own lock, the same lock a
+//!   producer must take to hand its observation over, so each in-flight producer is
+//!   classified exactly once — accepted into the final batch, or counted in the gap
+//!   marker, never both. The egress proxy and the hook broker close their cutovers
+//!   with that one primitive rather than each sampling a count of their own.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use ward_events::{ObserverSource, Origin, ProcessRef, SandboxPath, SandboxRoot, WardEvent};
@@ -133,18 +138,48 @@ impl<T> Default for Drained<T> {
 /// because a drain reset the count after the refusal decided but before it was
 /// recorded. That is what lets the marker's documented contract — "immediately
 /// follows and bounds the batch it accompanies" — actually hold.
+///
+/// # The terminal cutover
+///
+/// The same lock also holds the producers still **in flight** and whether the
+/// queue has been **sealed**, which is what makes the terminal cutover a single
+/// decision rather than two racing ones. A producer that can be tracked joins the
+/// in-flight set with [`enter`](Self::enter) and leaves it by
+/// [`commit`](Self::commit)ting its observation — leaving and offering in *one*
+/// lock acquisition — or by [`leave`](Self::leave) when it has nothing to offer.
+/// [`seal`](Self::seal) closes the cutover: in one acquisition it flips `sealed`
+/// and counts whatever is still in flight as a gap.
+///
+/// So for every producer exactly one of two things happens, decided by whichever
+/// of the two reaches the lock first and never precomputed from a sampled count:
+///
+/// * it commits before the seal — its observation is in the batch the final drain
+///   takes, and the seal no longer sees it in flight, so nothing counts it; or
+/// * the seal gets there first — the producer is counted once, there and then,
+///   and its later `commit` finds the queue sealed and adds nothing, because the
+///   loss it would report has already been reported for it.
+///
+/// A producer that was never in the in-flight set is not counted by the seal, so
+/// its own late [`push`](Self::push) is refused and counted at that point instead.
+/// Either way an observation is accepted into the final batch or counted in the
+/// gap marker, exactly once, never both.
 #[derive(Debug)]
 pub struct Bounded<T> {
     queue: Mutex<Queue<T>>,
+    /// Woken when the last in-flight producer leaves the set.
+    idle: Condvar,
     capacity: usize,
 }
 
 /// The one piece of state a [`Bounded`] guards: the observations and the refusals
-/// that belong to the same drain epoch.
+/// that belong to the same drain epoch, the producers still in flight, and whether
+/// the terminal cutover has sealed.
 #[derive(Debug)]
 struct Queue<T> {
     items: VecDeque<T>,
     dropped: u64,
+    in_flight: usize,
+    sealed: bool,
 }
 
 impl<T> Bounded<T> {
@@ -155,7 +190,10 @@ impl<T> Bounded<T> {
             queue: Mutex::new(Queue {
                 items: VecDeque::new(),
                 dropped: 0,
+                in_flight: 0,
+                sealed: false,
             }),
+            idle: Condvar::new(),
             capacity: capacity.max(1),
         }
     }
@@ -174,11 +212,62 @@ impl<T> Bounded<T> {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Offer one observation. Returns whether it was accepted; a refusal is counted
-    /// under the same lock that saw the queue full, so the next
+    /// Offer one observation from a producer that is **not** tracked in the
+    /// in-flight set. Returns whether it was accepted; a refusal is counted under
+    /// the same lock that saw the queue full — or saw it sealed — so the next
     /// [`drain`](Self::drain) that takes the batch takes the refusal with it.
+    ///
+    /// An offer made after the cutover [`seal`](Self::seal)ed is refused and
+    /// counted here: the seal counted the producers it could see in flight, and
+    /// this one was not among them, so this is the only place its loss is
+    /// reported.
     pub fn push(&self, item: T) -> bool {
         let mut queue = self.locked();
+        if queue.sealed || queue.items.len() >= self.capacity {
+            queue.dropped = queue.dropped.saturating_add(1);
+            return false;
+        }
+        queue.items.push_back(item);
+        true
+    }
+
+    /// Join the in-flight set, unless `max` producers are already in it or the
+    /// cutover has sealed. Returns whether the slot was taken; a caller refused
+    /// here has produced nothing the seal will account for, so it reports its own
+    /// loss with [`record_dropped`](Self::record_dropped).
+    pub fn enter(&self, max: usize) -> bool {
+        let mut queue = self.locked();
+        if queue.sealed || queue.in_flight >= max {
+            return false;
+        }
+        queue.in_flight += 1;
+        true
+    }
+
+    /// Leave the in-flight set with nothing to offer — a producer that reached no
+    /// observation at all. If the cutover has already sealed, this producer was
+    /// counted as a gap there; that is deliberate, and it is what "a producer that
+    /// could not be quiesced is itself recorded as a gap" means.
+    pub fn leave(&self) {
+        let mut queue = self.locked();
+        self.depart(&mut queue);
+    }
+
+    /// Leave the in-flight set **and** offer this producer's observation, in one
+    /// lock acquisition. Returns whether the observation was accepted.
+    ///
+    /// Doing both under one lock is what makes the cutover exact: the observation
+    /// cannot land in the batch after a [`seal`](Self::seal) has already written
+    /// this producer off, and the seal cannot write it off after the observation
+    /// has been accepted. A sealed queue refuses the observation and counts
+    /// *nothing* — the seal counted this producer already, and counting it twice
+    /// is what turned one loss into a false gap beside its own observation.
+    pub fn commit(&self, item: T) -> bool {
+        let mut queue = self.locked();
+        self.depart(&mut queue);
+        if queue.sealed {
+            return false;
+        }
         if queue.items.len() >= self.capacity {
             queue.dropped = queue.dropped.saturating_add(1);
             return false;
@@ -187,10 +276,56 @@ impl<T> Bounded<T> {
         true
     }
 
+    /// Drop one producer from the in-flight set, waking [`wait_idle`](Self::wait_idle)
+    /// when it was the last.
+    fn depart(&self, queue: &mut Queue<T>) {
+        queue.in_flight = queue.in_flight.saturating_sub(1);
+        if queue.in_flight == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    /// Wait up to `timeout` for the in-flight set to empty. Bounded on purpose: a
+    /// producer that will not finish must not be able to hold the cutover — and
+    /// with it the daemon's shutdown — open.
+    ///
+    /// This is only the wait. Nothing is decided here and no count is sampled, so
+    /// a producer that finishes between the wait ending and the [`seal`](Self::seal)
+    /// is simply a producer the seal sees has already left.
+    pub fn wait_idle(&self, timeout: Duration) {
+        let queue = self.locked();
+        drop(
+            self.idle
+                .wait_timeout_while(queue, timeout, |queue| queue.in_flight > 0)
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+    }
+
+    /// Close the cutover and count whatever is still in flight as a gap, in one
+    /// lock acquisition. Returns how many producers that was.
+    ///
+    /// Reading the final in-flight count and committing to it happen together, so
+    /// there is no interval in which a producer can both hand its observation to
+    /// the batch and be written off as lost. After this the queue accepts nothing
+    /// more: a producer counted here adds nothing when it finally
+    /// [`commit`](Self::commit)s, and an untracked [`push`](Self::push) is refused
+    /// and counted for itself.
+    pub fn seal(&self) -> usize {
+        let mut queue = self.locked();
+        queue.sealed = true;
+        let remaining = queue.in_flight;
+        queue.dropped = queue.dropped.saturating_add(remaining as u64);
+        remaining
+    }
+
     /// Count `n` observations as refused without offering them: what a producer
     /// reports when it lost them before the queue ever saw them (a connection
-    /// turned away at a handler cap, an in-flight handler that outlived the final
-    /// flush's bounded wait). Surfaced by the next drain exactly as an overflow is.
+    /// turned away at a handler cap). Surfaced by the next drain exactly as an
+    /// overflow is.
+    ///
+    /// Never used to account for the terminal cutover — that is [`seal`](Self::seal)'s
+    /// job, and doing it from a separately sampled count is exactly how the same
+    /// producer came to be counted as lost *and* have its observation accepted.
     pub fn record_dropped(&self, n: u64) {
         let mut queue = self.locked();
         queue.dropped = queue.dropped.saturating_add(n);
@@ -461,7 +596,11 @@ impl Observers {
     /// The wait is bounded, so a wedged handler cannot hold shutdown open; a
     /// producer that is still busy when it runs out is reported the same way an
     /// overflow is — counted into that source's refusals, so the drain below turns
-    /// it into an explicit [`WardEvent::ObservationsDropped`] marker.
+    /// it into an explicit [`WardEvent::ObservationsDropped`] marker. Counting it is
+    /// the same lock acquisition that closes the queue to further work
+    /// ([`Bounded::seal`]), so a producer that finishes in the instant the wait ran
+    /// out is on exactly one side of the cutover: its observation is in the batch
+    /// drained below, or it is in the marker, never in both.
     #[must_use]
     pub fn finish(&mut self, by: &ProcessRef) -> Finished {
         self.finish_within(by, QUIESCE_TIMEOUT)
@@ -689,6 +828,127 @@ mod tests {
             PRODUCERS as u64 * EACH,
             "an offer must be in exactly one drain epoch, as an item or as a refusal"
         );
+    }
+
+    /// The terminal cutover is **one** decision about each in-flight producer, made
+    /// under the queue's own lock.
+    ///
+    /// A producer still in flight when the seal happens is counted there and then,
+    /// and the commit it finally makes adds nothing: not to the batch, and not to
+    /// the count a second time. That is the whole difference from sampling "how many
+    /// are still live", releasing the lock and recording a refusal afterwards — in
+    /// that interval the producer could hand its observation over *and* be written
+    /// off as lost, which is one observation accounted for twice.
+    #[test]
+    fn a_producer_sealed_out_of_the_cutover_is_counted_once_and_never_twice() {
+        let q = Bounded::new(8);
+        assert!(q.enter(4), "the producer is in flight");
+        assert_eq!(
+            q.seal(),
+            1,
+            "the seal gives up on it, and counts it doing so"
+        );
+        assert!(
+            !q.commit(1),
+            "the sealed queue takes nothing more: this loss is already reported"
+        );
+
+        let drained = q.drain();
+        assert!(
+            drained.items.is_empty(),
+            "the observation must not also be in the batch: {:?}",
+            drained.items
+        );
+        assert_eq!(
+            drained.dropped, 1,
+            "exactly one offer, exactly one account of it"
+        );
+    }
+
+    /// The symmetric boundary: a producer that commits before the seal is in the
+    /// final batch, and the seal — which reads the in-flight set itself rather than
+    /// a count sampled earlier — no longer sees it, so nothing marks it as a gap.
+    #[test]
+    fn a_producer_that_commits_before_the_seal_is_accepted_and_not_counted() {
+        let q = Bounded::new(8);
+        assert!(q.enter(4));
+        assert!(q.commit(1), "it made the cutover");
+        assert_eq!(q.seal(), 0, "nothing is left in flight to give up on");
+
+        let drained = q.drain();
+        assert_eq!(drained.items, vec![1]);
+        assert_eq!(
+            drained.dropped, 0,
+            "a producer that made the cutover is not a gap"
+        );
+    }
+
+    /// A producer that never joined the in-flight set cannot have been counted by
+    /// the seal, so its own late offer is what reports the loss — once.
+    #[test]
+    fn an_untracked_offer_after_the_seal_is_refused_and_counted_for_itself() {
+        let q = Bounded::new(8);
+        assert!(q.push(1));
+        assert_eq!(q.seal(), 0);
+        assert!(!q.push(2), "a sealed queue accepts nothing more");
+
+        let drained = q.drain();
+        assert_eq!(drained.items, vec![1]);
+        assert_eq!(drained.dropped, 1);
+    }
+
+    /// Every producer racing the seal is classified exactly once.
+    ///
+    /// Each producer joins the in-flight set, rendezvouses with the sealing thread
+    /// on a barrier, and then commits flat out while the seal happens. Whichever of
+    /// the two reaches the queue's lock first decides that producer's fate, so this
+    /// is an invariant over every interleaving rather than a timing expectation: no
+    /// sleeps, and nothing depends on who wins. What it rules out is the interval
+    /// the old shape had — a producer both accepted into the batch and counted in
+    /// the marker, or (with the count sampled before the last commit) neither.
+    #[test]
+    fn every_producer_racing_the_seal_is_accounted_for_exactly_once() {
+        const ROUNDS: usize = 50;
+        const PRODUCERS: usize = 8;
+
+        for _ in 0..ROUNDS {
+            let q = Arc::new(Bounded::new(PRODUCERS));
+            let start = Arc::new(Barrier::new(PRODUCERS + 1));
+            let producers: Vec<_> = (0..PRODUCERS)
+                .map(|i| {
+                    let (q, start) = (Arc::clone(&q), Arc::clone(&start));
+                    std::thread::spawn(move || {
+                        assert!(q.enter(PRODUCERS));
+                        start.wait();
+                        q.commit(i)
+                    })
+                })
+                .collect();
+
+            start.wait();
+            let charged = q.seal() as u64;
+            let accepted = producers
+                .into_iter()
+                .map(|p| p.join().unwrap())
+                .filter(|committed| *committed)
+                .count() as u64;
+            let drained = q.drain();
+
+            assert_eq!(
+                drained.items.len() as u64,
+                accepted,
+                "the batch holds exactly the producers that were told they committed"
+            );
+            assert_eq!(
+                drained.dropped, charged,
+                "the only refusals are the producers the seal gave up on"
+            );
+            assert_eq!(
+                accepted + drained.dropped,
+                PRODUCERS as u64,
+                "every producer is in the batch or in the marker, exactly once"
+            );
+        }
     }
 
     #[test]
@@ -989,6 +1249,112 @@ mod tests {
 
         released.wait();
         drop(asking.join());
+    }
+
+    /// #137: the boundary the quiesce timeout creates is itself atomic — a claim
+    /// that lands *after* the cutover gave up is counted once, and is not in the
+    /// terminal batch beside the marker that counts it.
+    ///
+    /// This is the tighter case the cutover regressions above do not reach. One
+    /// covers a handler that finishes comfortably inside the wait (accepted, no
+    /// marker); the other a handler that never finishes at all (marker, no claim).
+    /// Neither covers a handler that finishes in the instant the wait ran out,
+    /// which is where the classification used to be made twice: `quiesce` sampled
+    /// "one handler still live", released the live-count lock, and *then* recorded
+    /// a refusal, while the handler — racing in that interval — pushed its real
+    /// claim into the same buffer. The terminal batch carried both the
+    /// `AgentClaim` and an `ObservationsDropped { dropped: 1 }` for it: a false gap
+    /// in a record documented to account for every observation exactly once.
+    ///
+    /// The ordering here is a barrier, not a sleep, so the race is decided rather
+    /// than sampled. The handler is parked inside its holder; `quiesce` is given a
+    /// zero wait, so the seal provably happens while that handler is still in
+    /// flight; only then is the handler released, and joining the asking client
+    /// proves its claim was recorded before the terminal drain below.
+    #[test]
+    fn a_hook_claim_that_lands_after_the_seal_is_counted_once_not_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let entered = Arc::new(Barrier::new(2));
+        let released = Arc::new(Barrier::new(2));
+        let holder: Arc<dyn Holder> = Arc::new(WedgedHolder {
+            entered: Arc::clone(&entered),
+            released: Arc::clone(&released),
+        });
+        let hooks = Hooks::start_with(
+            &run_dir,
+            ObserverMode::StepThrough(StepPolicy {
+                pause_before_writes: true,
+                pause_before_network: false,
+            }),
+            Vec::new(),
+            Some(holder),
+        )
+        .unwrap();
+        let socket = hooks.socket().to_path_buf();
+
+        let asking = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&socket).unwrap();
+            stream
+                .write_all(
+                    b"{\"hook\":\"PreToolUse\",\"tool\":\"Write\",\"summary\":\"/work/src/lib.rs\"}\n",
+                )
+                .unwrap();
+            let mut reply = String::new();
+            drop(BufReader::new(&stream).read_line(&mut reply));
+            reply
+        });
+
+        // The handler is inside the holder: in flight, with nothing recorded yet.
+        entered.wait();
+        // A zero wait, so the seal is taken with that handler still in flight —
+        // the exact instant the classification has to be made exactly once.
+        assert_eq!(
+            hooks.quiesce(Duration::ZERO),
+            1,
+            "the cutover gave up on the handler that was still in flight"
+        );
+        // Only now does the handler finish and try to record its claim, before the
+        // terminal drain — the window the sampled-count shape lost.
+        released.wait();
+        drop(asking.join());
+
+        let tail = hooks.drain_observations();
+        hooks.stop();
+
+        let claims = tail
+            .iter()
+            .filter(|o| matches!(o.event, WardEvent::AgentClaim { .. }))
+            .count();
+        let dropped: u64 = tail
+            .iter()
+            .filter_map(|o| match o.event {
+                WardEvent::ObservationsDropped {
+                    source: ObserverSource::Hook,
+                    dropped,
+                    ..
+                } => Some(dropped),
+                _ => None,
+            })
+            .sum();
+
+        assert_eq!(
+            claims,
+            0,
+            "the claim missed the cutover, so it must not be in the terminal batch \
+             alongside the marker that accounts for it: {:?}",
+            tail.iter().map(|o| &o.event).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            claims as u64 + dropped,
+            1,
+            "one offered claim, accounted for exactly once — never both accepted and \
+             counted as dropped, never neither: {:?}",
+            tail.iter().map(|o| &o.event).collect::<Vec<_>>()
+        );
+        assert_eq!(dropped, 1, "and the gap is reported exactly once");
     }
 
     #[test]

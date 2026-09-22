@@ -69,12 +69,19 @@ impl Recorder {
         self.0.drain().items
     }
 
-    /// Count `n` decisions as lost without having been offered — the connections
-    /// still being served when the terminal flush's bounded quiesce ran out, whose
-    /// decisions this recorder will now never see. Surfaced by the next drain as
-    /// the same explicit marker an overflow produces.
-    pub fn record_dropped(&self, n: u64) {
-        self.0.record_dropped(n);
+    /// Close the terminal cutover: from here the recorder accepts nothing more, and
+    /// a decision a straggling connection reaches after this point is refused and
+    /// counted for itself, under the very lock that sealed — so it is surfaced by
+    /// the next drain as the same explicit marker an overflow produces, and can
+    /// never be both recorded and counted as lost.
+    ///
+    /// Returns how many producers the seal had to write off. The proxy's relays are
+    /// not tracked in the recorder's in-flight set (the proxy owns their lifetime),
+    /// so for this recorder that is always zero and every late decision reports
+    /// itself. Counting the proxy's *connections* here instead is what produced the
+    /// false gaps: a connection still relaying has already recorded its decision.
+    pub fn seal(&self) -> usize {
+        self.0.seal()
     }
 
     /// How many decisions are waiting to be drained.
@@ -247,24 +254,29 @@ impl Egress {
     /// Stop the proxy and wait, for at most `timeout`, until every connection it
     /// was still serving has finished — so a decision made across the cutover is in
     /// the recorder before the caller's final [`drain_observations`](Self::drain_observations),
-    /// rather than being recorded into a queue nothing will drain again.
+    /// rather than being recorded into a queue nothing will drain again. The wait is
+    /// bounded on purpose: a relay that will not wind down must not be able to hold
+    /// the daemon's shutdown open.
     ///
-    /// Returns how many connections were still in flight when the wait ran out.
-    /// Those are counted as refused decisions, so the gap they represent is
-    /// surfaced by the next drain as an explicit `ObservationsDropped` marker
-    /// instead of being silently discarded with the proxy. The wait is bounded on
-    /// purpose: a relay that will not wind down must not be able to hold the
-    /// daemon's shutdown open.
+    /// When the wait runs out the cutover is **sealed** ([`Recorder::seal`]) rather
+    /// than guessed at: sealing is one acquisition of the recorder's own lock, the
+    /// lock a proxy thread must take to record a decision, so a straggling
+    /// connection either got its decision into the batch the caller is about to
+    /// drain or finds the recorder sealed and counts that one decision as the gap it
+    /// is. Nothing is counted from a sampled connection count, which is what let the
+    /// same decision appear in the final batch *and* in an `ObservationsDropped`
+    /// marker beside it: a connection still being served has, by then, already
+    /// recorded the decision it was served for.
+    ///
+    /// Returns how many connections were still in flight when the wait ran out,
+    /// which is a report on the proxy, not an accounting of the record.
     pub fn quiesce(&self, timeout: Duration) -> usize {
         // Stops accepting, asks every relay to wind down and joins the acceptor;
         // idempotent, so the later `stop` is still safe.
         self.handle.shutdown();
         crate::daemon::wait_until(timeout, || self.handle.active_connections() == 0);
-        let remaining = self.handle.active_connections();
-        if remaining > 0 {
-            self.recorder.record_dropped(remaining as u64);
-        }
-        remaining
+        self.recorder.seal();
+        self.handle.active_connections()
     }
 
     /// Stop the proxy and remove the socket.
@@ -450,6 +462,104 @@ mod tests {
             "the proxy socket must be gone once the proxy has been quiesced"
         );
         egress.stop();
+    }
+
+    /// A resolver that parks the connection it is asked about until the test
+    /// releases it. Resolution happens after the proxy has started serving the
+    /// request and before it reports its verdict, so this is a proxy thread
+    /// provably in flight with its decision not yet recorded.
+    struct BlockedResolver {
+        entered: Arc<std::sync::Barrier>,
+        released: Arc<std::sync::Barrier>,
+    }
+
+    impl Resolver for BlockedResolver {
+        fn resolve(&self, _host: &str) -> std::io::Result<Vec<IpAddr>> {
+            self.entered.wait();
+            self.released.wait();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such host",
+            ))
+        }
+    }
+
+    /// #137: the egress cutover is sealed, not sampled — a decision that lands
+    /// after the bounded wait ran out is counted once, and is not in the terminal
+    /// batch beside the marker that counts it.
+    ///
+    /// The previous shape read `active_connections()` after the wait and handed
+    /// that number to the recorder as refusals. Two things were wrong with it, and
+    /// both show up here: the count was taken outside the recorder's lock, so a
+    /// straggler could record its decision in the interval and be accounted for
+    /// twice; and a connection is still counted as active long after it has
+    /// recorded its decision, so the number was not a count of lost decisions at
+    /// all.
+    ///
+    /// The ordering is a barrier, not a sleep. The proxy is parked in the resolver,
+    /// so `quiesce` with a zero wait provably seals while that decision is still in
+    /// flight; only then is the proxy released, and joining the client proves the
+    /// decision was recorded before the terminal drain below.
+    #[test]
+    fn a_proxy_decision_that_lands_after_the_seal_is_counted_once_not_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let released = Arc::new(std::sync::Barrier::new(2));
+        let resolver: Arc<dyn Resolver> = Arc::new(BlockedResolver {
+            entered: Arc::clone(&entered),
+            released: Arc::clone(&released),
+        });
+        let allowed =
+            NetworkCapability::Custom(["parked.example".to_owned()].into_iter().collect());
+        let egress = Egress::start_with(dir.path(), &allowed, Vec::new(), resolver).unwrap();
+        let socket = egress.socket().to_path_buf();
+        let asking = std::thread::spawn(move || ask_proxy(&socket, "parked.example"));
+
+        // The proxy is serving the request and has not decided yet.
+        entered.wait();
+        // A zero wait, so the seal is taken with that decision still in flight.
+        egress.quiesce(Duration::ZERO);
+        // Only now does the proxy reach its verdict and try to record it, before
+        // the terminal drain — the window the sampled-count shape lost.
+        released.wait();
+        drop(asking.join());
+
+        let obs = egress.drain_observations(&by());
+        egress.stop();
+
+        let decisions = obs
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o.event,
+                    WardEvent::NetworkDenied { .. } | WardEvent::NetworkRequested { .. }
+                )
+            })
+            .count();
+        let dropped: u64 = obs
+            .iter()
+            .filter_map(|o| match o.event {
+                WardEvent::ObservationsDropped {
+                    source: ObserverSource::Network,
+                    dropped,
+                    ..
+                } => Some(dropped),
+                _ => None,
+            })
+            .sum();
+
+        assert_eq!(
+            decisions, 0,
+            "the decision missed the cutover, so it must not be in the terminal batch \
+             alongside the marker that accounts for it: {obs:?}"
+        );
+        assert_eq!(
+            decisions as u64 + dropped,
+            1,
+            "one decision, accounted for exactly once — never both recorded and \
+             counted as dropped, never neither: {obs:?}"
+        );
+        assert_eq!(dropped, 1, "and the gap is reported exactly once");
     }
 
     #[test]
