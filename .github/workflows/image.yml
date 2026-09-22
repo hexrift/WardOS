@@ -74,9 +74,12 @@ jobs:
             bootc container lint'
       # The image everyone else uses (image/README.md, "The published image"): a merge
       # to main that built and linted is what gets published, never a pull request.
-      # `latest` and `<sha>` are pushed from here as x86_64 images, so they exist even
-      # when the aarch64 build fails; the manifest job below turns them into
-      # two-architecture lists once both builds are in.
+      # Only the architecture-suffixed tags are pushed from here — never unqualified
+      # `latest`/`<sha>` (#149): those name a *two*-architecture image, and this job
+      # only ever has one architecture to offer. The manifest job below is the only
+      # place that writes `latest`/`<sha>`, and only once it has verified both
+      # architectures are actually present, so the shared tag can never be observed
+      # pointing at an x86_64-only image, even transiently.
       - name: Publish to ghcr.io (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
@@ -85,7 +88,7 @@ jobs:
           set -euo pipefail
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
-          for tag in latest "${GITHUB_SHA::7}" latest-x86_64 "${GITHUB_SHA::7}-x86_64"; do
+          for tag in latest-x86_64 "${GITHUB_SHA::7}-x86_64"; do
             docker tag wardos:ci "$repo:$tag"
             docker push "$repo:$tag"
           done
@@ -147,17 +150,33 @@ jobs:
   # per-architecture images, so `bootc switch ghcr.io/hexrift/wardos:latest` and
   # `podman pull` resolve to the right one on either machine. `docker buildx imagetools
   # create` only writes manifests to the registry (no image data moves), which the
-  # workflow token's packages:write allows. Runs only when both builds succeeded;
-  # otherwise `latest` stays the x86_64 image the first job pushed.
+  # workflow token's packages:write allows. Runs only when both builds succeeded, and
+  # is the *only* job that ever writes unqualified `latest`/`<sha>` (#149) — never
+  # x86_64-only, not even transiently. Two more things this job does before and after
+  # that promotion, both from #149's "never an intermediate image, never an
+  # out-of-order overwrite":
+  #  - it inspects the index it just built and fails the job unless both linux/amd64
+  #    and linux/arm64 are actually present, instead of trusting `needs:` alone;
+  #  - it re-checks main's tip immediately before promoting `latest`, and skips that
+  #    step (leaving `latest` alone) if a newer commit has already landed — so a run
+  #    for an older commit that happens to finish its builds later can never clobber
+  #    a newer commit's already-promoted `latest`. The per-commit `<sha>` tag is still
+  #    written either way, so every complete build stays individually addressable.
+  # Also serialized across runs (`concurrency` below, not relying on cancellation) so
+  # two manifest jobs can never interleave their promotion of the same tag.
   manifest:
     name: multi-arch manifest
     needs: [build, build-aarch64]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       packages: write
+    concurrency:
+      group: wardos-image-manifest-${{ github.ref }}
+      cancel-in-progress: false
     steps:
-      - name: Join latest-x86_64 and latest-aarch64 under latest
+      - name: Build the per-commit two-architecture index
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -165,6 +184,28 @@ jobs:
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
           sha="${GITHUB_SHA::7}"
-          docker buildx imagetools create -t "$repo:latest" -t "$repo:$sha" \
+          docker buildx imagetools create -t "$repo:$sha" \
             "$repo:$sha-x86_64" "$repo:$sha-aarch64"
+          docker buildx imagetools inspect "$repo:$sha" --raw | tee /tmp/index.json
+
+      - name: Validate both architectures are present before promoting
+        run: |
+          set -euo pipefail
+          jq -e '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == "amd64")] | length >= 1' /tmp/index.json
+          jq -e '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == "arm64")] | length >= 1' /tmp/index.json
+
+      - name: Promote latest, unless a newer commit has already landed on main
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          head_sha="$(git ls-remote "https://x-access-token:${GHCR_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | cut -f1)"
+          if [ "$head_sha" != "$GITHUB_SHA" ]; then
+            echo "main is now at $head_sha, not $GITHUB_SHA; leaving latest for that commit's own manifest job to promote."
+            exit 0
+          fi
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha="${GITHUB_SHA::7}"
+          docker buildx imagetools create -t "$repo:latest" "$repo:$sha-x86_64" "$repo:$sha-aarch64"
           docker buildx imagetools inspect "$repo:latest"
