@@ -39,7 +39,7 @@ use ward_policy::NetworkCapability;
 
 use crate::error::Error;
 use crate::gateway::{GatewayRoute, Upstream};
-use crate::http::{self, ChunkTracker, Framing, Method, Parsed};
+use crate::http::{self, ChunkTracker, Framing, Method, Parsed, Request};
 use crate::observer::{Decision, Observer};
 use crate::policy::{Pinned, Policy};
 use crate::resolve::{Resolver, SystemResolver};
@@ -413,6 +413,56 @@ impl Drop for Slot {
     }
 }
 
+/// One accepted connection's outstanding verdict.
+///
+/// Taken on the acceptor thread before the connection is served and retired
+/// exactly once — by [`report`](Pending::report) when the connection reached a
+/// verdict, and by the drop otherwise, whatever path serving it left by
+/// (an unparsable head, a paused proxy, a thread that could not be spawned, an
+/// unwind).
+///
+/// It is deliberately **not** the connection's lifetime: it ends at the verdict,
+/// so a tunnel that goes on relaying for minutes after being allowed is not an
+/// outstanding decision. An observer accounting for gaps needs "not decided
+/// yet", not "still connected" — reading the latter for the former reports a
+/// connection whose decision is already recorded as if it had been lost.
+struct Pending {
+    observer: Arc<dyn Observer>,
+    /// Whether the observer asked to be told how this one ends.
+    tracked: bool,
+    /// Whether the verdict has been reported, so the drop does not retire it twice.
+    reported: bool,
+}
+
+impl Pending {
+    /// Announce one accepted connection to `observer`.
+    fn take(observer: &Arc<dyn Observer>) -> Self {
+        Self {
+            observer: Arc::clone(observer),
+            tracked: observer.deciding(),
+            reported: false,
+        }
+    }
+
+    /// Report this connection's one verdict and retire it.
+    fn report(&mut self, req: &Request, decision: Decision, reason: &str) {
+        self.reported = true;
+        if self.tracked {
+            self.observer.decided(req, decision, reason);
+        } else {
+            self.observer.decision(req, decision, reason);
+        }
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if self.tracked && !self.reported {
+            self.observer.undecided();
+        }
+    }
+}
+
 /// A client-side transport. What [`serve`] needs from a stream beyond
 /// `Read + Write`, implemented for both `TcpStream` and `UnixStream` so the
 /// two share one parsing, policy, relay and timeout path.
@@ -478,6 +528,14 @@ fn accept_loop<L: Acceptor>(listener: &L, shared: &Arc<Shared>) {
         let Ok(mut client) = listener.accept() else {
             continue;
         };
+        // The shutdown flag is set before the connect that wakes this loop out of
+        // `accept`, so a connection that arrives with it already set is either that
+        // wake or a client that missed the close by a hair. Neither is served: the
+        // wake is not a request at all, and serving one here would announce a
+        // verdict that will never come to an observer that is winding down.
+        if shared.shutting_down() {
+            continue;
+        }
         if shared.paused() {
             refuse_paused(&mut client);
             continue;
@@ -486,21 +544,30 @@ fn accept_loop<L: Acceptor>(listener: &L, shared: &Arc<Shared>) {
             respond(&mut client, 503, "Service Unavailable", "proxy at capacity");
             continue;
         };
+        // Announced here, on the acceptor thread, rather than on the connection
+        // thread: `Handle::shutdown` joins this loop, so an observer that has seen
+        // `shutdown` return knows no further connection can be announced, and what
+        // it still has outstanding is exactly what may still be decided.
+        let pending = Pending::take(&shared.observer);
         let shared = Arc::clone(shared);
         let spawned = thread::Builder::new()
             .name("ward-proxy-conn".into())
             .spawn(move || {
                 let _slot = slot;
-                serve(client, &shared);
+                serve(client, &shared, pending);
             });
-        // On spawn failure the closure — and with it the stream and slot — is
-        // dropped, which closes the connection and frees the slot.
+        // On spawn failure the closure — and with it the stream, the slot and the
+        // outstanding verdict — is dropped, which closes the connection, frees the
+        // slot and retires the connection as undecided.
         drop(spawned);
     }
 }
 
 /// Serve exactly one request on `client`.
-fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
+///
+/// `pending` is this connection's outstanding verdict: every return below either
+/// reports one through it or drops it, which retires the connection as undecided.
+fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>, mut pending: Pending) {
     let _ = client.set_read_timeout(Some(shared.request_timeout));
     let head = match http::read_head(&mut client) {
         Ok(Ok(head)) => head,
@@ -540,7 +607,7 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
         && let Err(denial) = route.permits(verb, path)
     {
         let reason = format!("gateway {}: {denial}", route.prefix());
-        shared.observer.decision(req, Decision::Deny, &reason);
+        pending.report(req, Decision::Deny, &reason);
         return respond(
             &mut client,
             403,
@@ -555,9 +622,7 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
     ) {
         Ok(pinned) => pinned,
         Err(denial) => {
-            shared
-                .observer
-                .decision(req, Decision::Deny, &denial.to_string());
+            pending.report(req, Decision::Deny, &denial.to_string());
             return respond(
                 &mut client,
                 403,
@@ -570,7 +635,11 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
         || format!("pinned {}", pinned_list(&pinned)),
         |g| format!("gateway {}", g.prefix()),
     );
-    shared.observer.decision(req, Decision::Allow, &reason);
+    pending.report(req, Decision::Allow, &reason);
+    // The verdict is in, so this connection is no longer outstanding: everything
+    // below is the relay, which may run for as long as the tunnel lives without
+    // that ever being a decision still to be made.
+    drop(pending);
     let Some(mut upstream) = connect_pinned(&pinned, shared.connect_timeout) else {
         return respond(
             &mut client,
