@@ -225,14 +225,25 @@ can never grant itself the sign-off it needs. Concretely:
   preimage search: with freedom to vary superficial bits of a candidate on both ends (commit
   timestamps, trailing whitespace, blank lines, other content a reviewer would not weigh),
   the generic cost of finding *some* pair that shares a target prefix scales with the square
-  root of the prefix's bit length, roughly 2^52 work for a 104-bit prefix rather than 2^104 —
-  the same order of magnitude publicly demonstrated for a real chosen-prefix SHA-1 attack:
-  "SHA-1 is a Shambles" (Leurent & Peyrin, 2020), which finds two inputs with *attacker-chosen,
-  independent* prefixes colliding after appended near-collision blocks. (The earlier 2017
-  SHAttered result was an identical-prefix collision — the same shared prefix on both sides —
-  a materially easier, different attack; it is not the right citation for the chosen-prefix
-  claim made here.) That is a real, if expensive, budget for a well-resourced adversary, not
-  a theoretical one — so the 26-character prefix is a meaningfully stronger fallback than the
+  root of the prefix's bit length, roughly 2^52 work for this 104-bit prefix rather than
+  2^104. The right citation for this being a real, demonstrated attack *class* against SHA-1
+  — not merely a textbook one — is "SHA-1 is a Shambles" (Leurent & Peyrin, USENIX Security
+  2020), which produced two inputs with attacker-chosen, independent prefixes colliding after
+  appended near-collision blocks, at a reported cost of about 2^63.4 SHA-1 evaluations. (The
+  earlier 2017 SHAttered result was an identical-prefix collision — the same shared prefix on
+  both sides — a materially easier, different attack; not the right citation for a
+  chosen-prefix claim.) **2^63.4 and 2^52 are not the same order of magnitude — about 2^11.4,
+  roughly 2,700×, apart** — because they answer different questions: the paper's figure is
+  the engineered cost of a *full* 160-bit chosen-prefix collision against unmodified SHA-1,
+  using structure specific to the hash function that beats the generic square-root bound for
+  a full-length target; the 2^52 figure here is the *generic*, structure-agnostic bound for
+  matching only a 104-bit *truncated* prefix of a commit id, a smaller and easier target by
+  construction. The paper is cited only to establish that chosen-prefix attacks against SHA-1
+  are a real, practically-demonstrated capability, not a hypothetical one — not as a
+  measurement of this specific 104-bit target's cost, which has no known engineered attack
+  faster than the generic 2^52 estimate. That estimate alone is what should be weighed: a
+  real, if expensive, budget for a well-resourced adversary, not a theoretical one — so the
+  26-character prefix is a meaningfully stronger fallback than the
   12-character guidance it replaces, but it is a **temporary, non-authoritative compatibility
   fallback**, not a resolution of the underlying gap: it does not by itself close #203, and
   should not be cited as though it does. The gate reads labels from the triggering event
