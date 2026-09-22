@@ -130,11 +130,15 @@ fi
 # image/dnf-retry.test.sh actually exercises -- this copy runs inside an ephemeral
 # container that can't source a host file without a bind mount) so a transient upstream
 # COPR/mirror hiccup self-heals within the one job run instead of failing it outright.
+# Each step also echoes dnf-retry.sh's DNF_RETRY_STEP_MARK to stderr right before it
+# starts, so the caller's classify_dnf_failure (via last_step_tail) can see only the
+# step that was actually running when the container exited, not an earlier step's
+# already-recovered transient hiccup.
 # Kept on one logical line (`;`-separated, not newlines): desktop/tests/install.test.sh
 # asserts on this command with a single-line `^...$` regex against the mocked docker
 # invocation, which logs the whole argv as one line.
 # shellcheck disable=SC2016  # the $1/$@ are for the inner bash, expanded in the container
-inner='set -e; retry() { local max=$1 delay=$2 n=1 rc=0; shift 2; until "$@"; do rc=$?; if [ "$n" -ge "$max" ]; then return "$rc"; fi; echo "retry: attempt $n/$max failed (exit $rc), retrying in ${delay}s: $*" >&2; sleep "$delay"; delay=$((delay * 2)); n=$((n + 1)); done; }; n=$1; shift; if [ "$n" -gt 0 ]; then retry 3 5 dnf -y -q install dnf5-plugins >&2; fi; while [ "$n" -gt 0 ]; do echo "copr enable $1" >&2; retry 3 5 dnf -y -q copr enable "$1" >&2; shift; n=$((n - 1)); done; retry 3 5 dnf -q repoquery --qf "%{name}\n" "$@"'
+inner='set -e; retry() { local max=$1 delay=$2 n=1 rc=0; shift 2; until "$@"; do rc=$?; if [ "$n" -ge "$max" ]; then return "$rc"; fi; echo "retry: attempt $n/$max failed (exit $rc), retrying in ${delay}s: $*" >&2; sleep "$delay"; delay=$((delay * 2)); n=$((n + 1)); done; }; n=$1; shift; if [ "$n" -gt 0 ]; then echo "##dnf-retry:step##" >&2; retry 3 5 dnf -y -q install dnf5-plugins >&2; fi; while [ "$n" -gt 0 ]; do echo "##dnf-retry:step##" >&2; echo "copr enable $1" >&2; retry 3 5 dnf -y -q copr enable "$1" >&2; shift; n=$((n - 1)); done; echo "##dnf-retry:step##" >&2; retry 3 5 dnf -q repoquery --qf "%{name}\n" "$@"'
 cmd=("$runtime" run --rm "quay.io/fedora/fedora:${release}"
   bash -c "$inner" -- "${#coprs[@]}")
 if [[ ${#coprs[@]} -gt 0 ]]; then cmd+=("${coprs[@]}"); fi
@@ -157,14 +161,20 @@ errlog="${TMPDIR:-/tmp}/check-packages.err"
 resolved=$("${cmd[@]}" 2>"$errlog") || status=$?
 mapfile -t missing < <(comm -23 <(printf '%s\n' "${names[@]}") <(printf '%s\n' "$resolved" | sed '/^$/d' | sort -u))
 
+errlog_tail="${TMPDIR:-/tmp}/check-packages.err.tail"
+if [[ $status -ne 0 ]]; then
+  # issue #198 review: classify only the step that was actually running when dnf exited,
+  # not the whole combined log -- an earlier step's transient hiccup that already
+  # recovered on its own retry must not paint a later, unrelated genuine failure (or a
+  # later transient one) as the other kind.
+  last_step_tail "$errlog" >"$errlog_tail"
+fi
 if [[ ${#missing[@]} -gt 0 ]]; then
   echo "check-packages.sh: ${#missing[@]} of ${#names[@]} names do not exist in Fedora ${release} (COPRs: ${coprs[*]:-none}):" >&2
   printf '  %s\n' "${missing[@]}" >&2
   echo "fix the names in $file or add a COPR to $coprs_file (image/README.md, \"Packages\")" >&2
   if [[ $status -ne 0 ]]; then
-    # issue #198: classify before printing, so a red check reads as one or the other
-    # instead of requiring someone to re-derive it from the raw dnf log each time.
-    if [[ $(classify_dnf_failure "$errlog") == transient ]]; then
+    if [[ $(classify_dnf_failure "$errlog_tail") == transient ]]; then
       echo "dnf exited with $status after exhausting its retries, and this looks like an" \
         "upstream COPR/mirror/network outage, not a real package problem -- the names above" \
         "may not actually be missing. Its stderr:" >&2
@@ -176,7 +186,7 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   exit 1
 fi
 if [[ $status -ne 0 ]]; then
-  if [[ $(classify_dnf_failure "$errlog") == transient ]]; then
+  if [[ $(classify_dnf_failure "$errlog_tail") == transient ]]; then
     echo "check-packages.sh: every name resolved, but dnf exited with $status after exhausting" \
       "its retries -- this looks like an upstream COPR/mirror/network outage (issue #198):" >&2
   else

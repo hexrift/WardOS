@@ -66,4 +66,67 @@ EOF
 [[ $(classify_dnf_failure "$tmp/does-not-exist.log") == genuine ]] \
   || fail "a missing log file should classify as genuine (the safe default), not transient"
 
+# last_step_tail: no marker at all -- falls back to the whole file (never narrower than
+# classifying everything, when no step boundary is known).
+no_marker_log="$tmp/no-marker.log"
+printf 'one\ntwo\nthree\n' >"$no_marker_log"
+[[ "$(last_step_tail "$no_marker_log")" == "$(cat "$no_marker_log")" ]] \
+  || fail "with no marker, last_step_tail should return the whole file"
+
+# last_step_tail: returns only what follows the LAST marker, discarding earlier steps.
+multi_step_log="$tmp/multi-step.log"
+{
+  echo "before any marker, should never appear in the tail"
+  echo "$DNF_RETRY_STEP_MARK"
+  echo "first step's own output"
+  echo "$DNF_RETRY_STEP_MARK"
+  echo "second (last) step's own output"
+} >"$multi_step_log"
+tail_out=$(last_step_tail "$multi_step_log")
+[[ "$tail_out" == "second (last) step's own output" ]] \
+  || fail "last_step_tail should return only the last step's own output, got: $tail_out"
+
+# Mixed-sequence regressions (review on #201): an earlier step's transient hiccup that
+# already recovered on its own retry must never paint a later, unrelated failure -- itself
+# genuine, or itself a fresh transient one -- as belonging to that earlier outage.
+
+# transient attempt -> recovery -> a later, unrelated step's genuine failure: classifying
+# the WHOLE log would wrongly say "transient" (the earlier Could-not-resolve-host text is
+# still in the file); classifying last_step_tail's output must say "genuine".
+mixed_genuine_log="$tmp/mixed-genuine.log"
+{
+  echo "$DNF_RETRY_STEP_MARK"
+  echo "retry: attempt 1/3 failed (exit 1), retrying in 5s: dnf -y -q copr enable mineiro/hyprland"
+  echo "Could not resolve host: download.copr.fedorainfracloud.org"
+  echo "(recovered on attempt 2)"
+  echo "$DNF_RETRY_STEP_MARK"
+  echo "Failed to resolve the transaction:"
+  echo "No match for argument: nope-not-a-package"
+} >"$mixed_genuine_log"
+[[ $(classify_dnf_failure "$mixed_genuine_log") == transient ]] \
+  || fail "sanity check: the unscoped whole-file classification should still read transient here"
+last_step_tail "$mixed_genuine_log" >"$mixed_genuine_log.tail"
+[[ $(classify_dnf_failure "$mixed_genuine_log.tail") == genuine ]] \
+  || fail "an earlier recovered transient hiccup must not mask a later step's genuine failure"
+
+# transient earlier attempt (recovers) -> the final step's OWN retries are exhausted on a
+# genuine (non-network) error: still genuine, not transient, even though the file as a
+# whole contains transient-looking text from the earlier, already-recovered step.
+mixed_final_retry_log="$tmp/mixed-final-retry.log"
+{
+  echo "$DNF_RETRY_STEP_MARK"
+  echo "retry: attempt 1/3 failed (exit 1), retrying in 5s: dnf -y -q install dnf5-plugins"
+  echo "Could not resolve host: mirrors.fedoraproject.org"
+  echo "(recovered on attempt 2)"
+  echo "$DNF_RETRY_STEP_MARK"
+  echo "retry: attempt 1/3 failed (exit 1), retrying in 5s: dnf -q repoquery nope-not-a-package"
+  echo "No match for argument: nope-not-a-package"
+  echo "retry: attempt 2/3 failed (exit 1), retrying in 10s: dnf -q repoquery nope-not-a-package"
+  echo "No match for argument: nope-not-a-package"
+  echo "No match for argument: nope-not-a-package"
+} >"$mixed_final_retry_log"
+last_step_tail "$mixed_final_retry_log" >"$mixed_final_retry_log.tail"
+[[ $(classify_dnf_failure "$mixed_final_retry_log.tail") == genuine ]] \
+  || fail "a genuine failure that itself exhausted retries must stay genuine, not inherit an earlier step's transient wording"
+
 echo "ok   image/dnf-retry.test.sh"
