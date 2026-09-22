@@ -566,12 +566,19 @@ fn intervention_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)>
                 reason.as_str()
             ),
         ),
-        WardEvent::SessionPauseUnsettled { pending } => (
+        WardEvent::SessionPauseUnsettled {
+            method,
+            reason,
+            pending,
+        } => (
             "PAUSE?",
             Tone::Warn,
             format!(
-                "{pending} process{} not confirmed stopped · marker and grants held regardless",
-                if *pending == 1 { "" } else { "es" }
+                "{pending} process{} not confirmed stopped ({}) · marker and grants held \
+                 regardless · {}",
+                if *pending == 1 { "" } else { "es" },
+                method.as_str(),
+                reason.as_str()
             ),
         ),
         WardEvent::SessionResumed { paused_for } => (
@@ -1188,15 +1195,19 @@ mod tests {
         let rec = chain
             .append(
                 Origin::Wardd,
-                WardEvent::SessionPauseUnsettled { pending: 2 },
+                WardEvent::SessionPauseUnsettled {
+                    method: ward_events::PauseMethod::Sigstop,
+                    reason: ward_events::ShortText::new("looks wrong"),
+                    pending: 2,
+                },
                 Timestamp::mono(std::time::Duration::from_secs(1)),
             )
             .unwrap();
         let row = plain(&observer_row(&rec).unwrap());
         assert_eq!(
             row,
-            "00:01  PAUSE? 2 processes not confirmed stopped · marker and grants held \
-             regardless"
+            "00:01  PAUSE? 2 processes not confirmed stopped (sigstop) · marker and grants \
+             held regardless · looks wrong"
         );
         assert!(
             observer_row(&rec).unwrap().contains(WARN),

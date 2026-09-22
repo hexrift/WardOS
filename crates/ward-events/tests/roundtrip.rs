@@ -616,7 +616,11 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
         ),
         (
             Origin::Wardd,
-            WardEvent::SessionPauseUnsettled { pending: 2 },
+            WardEvent::SessionPauseUnsettled {
+                method: PauseMethod::Sigstop,
+                reason: text("ward pause"),
+                pending: 2,
+            },
         ),
         (
             Origin::User,

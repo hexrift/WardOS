@@ -346,12 +346,17 @@ struct Paused {
     since: Instant,
 }
 
-/// What [`Served::pause`] produced: the `SessionPaused` record always, and — only
-/// when the freeze could not be confirmed settled within [`pause::FREEZE_SETTLE`]
-/// (the `SIGSTOP` fallback path only; the cgroup freezer is synchronous) — how many
-/// of the session's sandboxed processes had not yet confirmed stopped. Mirrors the
-/// `SessionPauseUnsettled` record appended alongside it, so a caller that only sees
-/// the RPC response (not a log subscriber) still learns the same thing (#145 item 4).
+/// What [`Served::pause`] produced: the one terminal record the pause attempt
+/// appended — `SessionPaused` when the freeze confirmed settled within
+/// [`pause::FREEZE_SETTLE`], `SessionPauseUnsettled` otherwise (the `SIGSTOP`
+/// fallback path only; the cgroup freezer is synchronous and always confirms) —
+/// and, mirroring that same record, `Some(pending)` on the unsettled path.
+/// PR #207 review finding 1: the settle outcome is decided *before* either record
+/// is appended, so the two are mutually exclusive, never "`SessionPaused` now,
+/// qualified later" — a caller that only sees the RPC response (not a log
+/// subscriber) still learns the same single truth the log itself now records
+/// (#145 item 4).
+#[derive(Debug)]
 struct PauseOutcome {
     record: Box<EventRecord>,
     unsettled: Option<u32>,
@@ -533,10 +538,14 @@ impl Served {
     /// Pause the session (ADR-0019 §3), in this order: freeze the sandbox
     /// processes, write the marker every proxy of the session refuses on (new
     /// connections, new requests, credential injection), hold the approvals,
-    /// append `SessionPaused`. The processes are frozen first so nothing can
-    /// use the gap before the proxy notices the marker. Any failure before
-    /// `SessionPaused` is recorded undoes what was done, so the session is
-    /// either paused whole or not at all.
+    /// decide whether the freeze actually settled, and append exactly one
+    /// terminal record for it — `SessionPaused` when confirmed,
+    /// `SessionPauseUnsettled` otherwise. The processes are frozen first so
+    /// nothing can use the gap before the proxy notices the marker. Any failure
+    /// before the terminal record is (successfully) recorded undoes what was
+    /// done, so the session is either paused whole or not at all — see
+    /// [`Self::pause_with`] for the one exception (a *log-only* failure once the
+    /// freeze is already known unsettled).
     ///
     /// Always uses [`pause::settle_outcome`]; see [`Self::pause_with`] for why
     /// this is split out.
@@ -552,15 +561,35 @@ impl Served {
     /// `SIGSTOP` cannot be caught, blocked or ignored by user space, so there is no
     /// way to make a *real* process resist it for a test to race against.
     ///
-    /// `settle` runs after the marker and the held approvals are already in place:
-    /// whether or not the freeze is confirmed changes only whether a qualifying
-    /// `SessionPauseUnsettled` follows `SessionPaused`, never whether the pause
-    /// itself proceeds — #145 item 4's "preserve the safest achievable state"
-    /// applies regardless of the answer.
+    /// `settle` runs after the marker and the held approvals are already in place,
+    /// but — PR #207 review finding 1 — strictly *before* either terminal record is
+    /// appended: the outcome decides which single record gets published, so no
+    /// subscriber, CLI caller, or later log reader can ever see a confirmed
+    /// `SessionPaused` that a moment later turns out to have been unsettled all
+    /// along. Whether or not the freeze is confirmed changes only which record is
+    /// appended, never whether the pause itself proceeds — #145 item 4's "preserve
+    /// the safest achievable state" applies regardless of the answer.
     fn pause_with(
         &mut self,
         reason: &str,
         settle: impl FnOnce(&Frozen) -> Option<u32>,
+    ) -> Result<PauseOutcome> {
+        self.pause_with_appending(reason, settle, Self::append)
+    }
+
+    /// [`Self::pause_with`], with the terminal append itself also injectable: real
+    /// callers always pass [`Self::append`]; a test passes a closure that fails
+    /// deterministically. This is what lets PR #207 review finding 2 — a log-only
+    /// failure on the terminal append must be surfaced, never silently discarded,
+    /// and must never roll back the marker/approvals/frozen tree once the freeze is
+    /// already known unsettled — be exercised without needing a real, reproducible
+    /// disk failure (storage exhaustion) to trigger it, the same reason `settle`
+    /// above is injectable rather than driven by a real timed wait.
+    fn pause_with_appending(
+        &mut self,
+        reason: &str,
+        settle: impl FnOnce(&Frozen) -> Option<u32>,
+        mut append: impl FnMut(&mut Self, WardEvent) -> Result<EventRecord>,
     ) -> Result<PauseOutcome> {
         if self.log.is_none() {
             return Err(Error::Daemon("log is sealed".into()));
@@ -575,28 +604,71 @@ impl Served {
             return Err(e);
         }
         self.approvals.set_paused(true);
-        let event = WardEvent::SessionPaused {
-            method: frozen.method,
-            reason: ShortText::new(&reason),
-        };
-        let record = match self.append(event) {
-            Ok(record) => record,
-            Err(e) => {
-                self.approvals.set_paused(false);
-                let _ = pause::clear_marker(&self.state, &self.session);
-                pause::thaw(&frozen);
-                return Err(e);
-            }
-        };
-        // The marker, the held approvals and the frozen tree already stand — the
-        // safest state #145 item 4 asks for — regardless of what happens from here.
-        // Whether the qualifying record makes it onto the log is best-effort, same
-        // as every other bookkeeping append in this method; the record already on
-        // the log (`SessionPaused`) is never retracted or rewritten for it.
+        // The marker and the held approvals already stand — the safest state #145
+        // item 4 asks for — before the settle check even runs, and stay that way
+        // regardless of its answer or of whether the terminal record below makes it
+        // onto the log.
         let unsettled = settle(&frozen);
-        if let Some(pending) = unsettled {
-            let _ = self.append(WardEvent::SessionPauseUnsettled { pending });
-        }
+        let record = match unsettled {
+            None => match append(
+                self,
+                WardEvent::SessionPaused {
+                    method: frozen.method,
+                    reason: ShortText::new(&reason),
+                },
+            ) {
+                Ok(record) => record,
+                Err(e) => {
+                    // Byte-for-byte the same rollback this append has always had:
+                    // without a durable `SessionPaused` record, the log never
+                    // agrees the session was paused at all, so nothing else about
+                    // it should stand either.
+                    self.approvals.set_paused(false);
+                    let _ = pause::clear_marker(&self.state, &self.session);
+                    pause::thaw(&frozen);
+                    return Err(e);
+                }
+            },
+            Some(pending) => match append(
+                self,
+                WardEvent::SessionPauseUnsettled {
+                    method: frozen.method,
+                    reason: ShortText::new(&reason),
+                    pending,
+                },
+            ) {
+                Ok(record) => record,
+                Err(e) => {
+                    // PR #207 review finding 2: unlike the settled branch above, an
+                    // unsettled pause's marker/approvals/frozen tree are never
+                    // rolled back for a failure of *this* append — they are already
+                    // the safest achievable state, independent of whether the log
+                    // can also say so, and a real, correct freeze must not be undone
+                    // over a log-only failure (e.g. storage exhaustion). `self.paused`
+                    // is still recorded (unlike the early-return above) so `ward
+                    // resume` remains able to release the freeze even though the log
+                    // does not, yet or ever, agree the pause happened. What must not
+                    // happen is silently discarding the failure the way `let _ =
+                    // self.append(...)` used to: the caller has to learn the durable
+                    // history may not actually contain the unsettled record it is
+                    // about to be told happened, exactly the fold
+                    // `Session::verify_prepared` already does for its own terminal-
+                    // append failure (#194).
+                    self.paused = Some(Paused {
+                        frozen,
+                        since: Instant::now(),
+                    });
+                    return Err(Error::Daemon(format!(
+                        "the freeze for session {} could not be confirmed settled \
+                         ({pending} process(es) still pending), and the record of \
+                         that could not be written to the log ({e}); the marker is \
+                         held and approvals stay frozen regardless, but the log may \
+                         not reflect the unsettled pause",
+                        self.session
+                    )));
+                }
+            },
+        };
         self.paused = Some(Paused {
             frozen,
             since: Instant::now(),
@@ -980,14 +1052,17 @@ mod tests {
         ));
     }
 
-    /// #145 items 3-4: when the freeze cannot be confirmed settled within the
-    /// bound, the pause still proceeds — the marker is written and the approvals
-    /// are still held (the safest achievable state) — but the outcome is visibly
-    /// different from a clean pause: the RPC response carries `unsettled`, and a
-    /// `SessionPauseUnsettled` record follows `SessionPaused` on the log, naming
-    /// how many processes were still unconfirmed. `pause_with` injects the settle
-    /// check because `SIGSTOP` cannot be resisted by a real process for a test to
-    /// race against (see `Served::pause_with`'s own doc comment).
+    /// #145 items 3-4, PR #207 review finding 1: when the freeze cannot be
+    /// confirmed settled within the bound, the pause still proceeds — the marker
+    /// is written and the approvals are still held (the safest achievable
+    /// state) — but the outcome is visibly different from a clean pause: the RPC
+    /// response carries `unsettled`, and the log carries `SessionPauseUnsettled`
+    /// *instead of* `SessionPaused`, never both and never the confirmed variant
+    /// first — the settle check now runs before either is appended, so no
+    /// subscriber can ever see a `SessionPaused` that later turns out to have
+    /// been unsettled. `pause_with` injects the settle check because `SIGSTOP`
+    /// cannot be resisted by a real process for a test to race against (see
+    /// `Served::pause_with`'s own doc comment).
     #[test]
     fn an_unsettled_freeze_still_pauses_but_is_never_reported_as_a_clean_success() {
         let dir = tempfile::tempdir().unwrap();
@@ -1004,10 +1079,15 @@ mod tests {
             Some(3),
             "the injected settle check's answer is reported back, unchanged"
         );
-        assert!(matches!(
-            &outcome.record.event,
-            WardEvent::SessionPaused { reason, .. } if reason.as_str() == "looks wrong"
-        ));
+        assert!(
+            matches!(
+                &outcome.record.event,
+                WardEvent::SessionPauseUnsettled { reason, pending: 3, .. }
+                    if reason.as_str() == "looks wrong"
+            ),
+            "{:?}",
+            outcome.record.event
+        );
         // The safest achievable state: preserved exactly as it would be for a
         // confirmed pause, regardless of the settle outcome.
         assert_eq!(
@@ -1035,22 +1115,86 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            ["SessionPaused", "SessionPauseUnsettled"],
-            "the qualifying record follows the pause record it qualifies, in the \
-             same operation, never replacing it"
+            ["SessionPauseUnsettled"],
+            "the single terminal record for an unsettled pause — never a \
+             `SessionPaused` record that a qualifier only later corrects"
         );
-        assert!(matches!(
-            &live[1].event,
-            WardEvent::SessionPauseUnsettled { pending: 3 }
-        ));
 
-        // A settled freeze reports no qualifying record at all: today's behaviour
-        // is unchanged when the daemon can confirm the freeze.
+        // A settled freeze reports `SessionPaused` and nothing else: today's
+        // behaviour is unchanged when the daemon can confirm the freeze.
         lock(&served)
             .resume()
             .expect("resume the unsettled pause so a second pause can be tried");
         let settled = lock(&served).pause_with("", |_frozen| None).unwrap();
         assert_eq!(settled.unsettled, None);
+        assert!(matches!(
+            &settled.record.event,
+            WardEvent::SessionPaused { .. }
+        ));
+    }
+
+    /// PR #207 review finding 2: an append failure on the unsettled path's
+    /// terminal record must never be silently discarded (the old `let _ =
+    /// self.append(...)`) — the caller learns the log may not actually contain
+    /// the `SessionPauseUnsettled` it is about to be told happened, while the
+    /// marker, held approvals and frozen tree all stand exactly as they would
+    /// for a successfully-logged unsettled pause (a log-only failure must never
+    /// undo a real, correct freeze), and `ward resume` still works afterwards.
+    /// The failure is made reproducible the same way `settle` already is
+    /// injected above: `pause_with_appending`'s `append` closure always fails,
+    /// deterministically, with no real disk exhaustion needed.
+    #[test]
+    fn an_unsettled_pauses_append_failure_is_surfaced_not_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let marker = pause::marker_path(dir.path(), "sess_9");
+
+        let err = served
+            .pause_with_appending(
+                "looks wrong",
+                |_frozen| Some(3),
+                |_served, _event| {
+                    Err(Error::Daemon(
+                        "simulated log failure (storage exhaustion)".into(),
+                    ))
+                },
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not be confirmed settled") && msg.contains("3 process"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("simulated log failure"),
+            "the underlying append failure is folded in, not discarded: {msg}"
+        );
+
+        // The safest achievable state stands regardless of the log-only failure:
+        // the marker is on disk, the approvals are held, and the freeze is still
+        // recorded as held — none of it is rolled back for a failure this far in.
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "looks wrong\n",
+            "the marker is written before the settle check even runs"
+        );
+        assert!(served.approvals.paused(), "the approvals stay held");
+        assert!(
+            served.paused.is_some(),
+            "the freeze is still recorded as held, even though the log does not \
+             (yet, or ever) agree the pause happened"
+        );
+
+        // Unlike the old silently-discarded qualifier append, this failure never
+        // leaves the session stuck: `ward resume` still releases the real freeze.
+        let resumed = served
+            .resume()
+            .expect("resume still works after the log-only failure");
+        assert!(matches!(&resumed.event, WardEvent::SessionResumed { .. }));
+        assert!(
+            !marker.exists(),
+            "resume clears the marker despite the earlier failure"
+        );
     }
 
     fn seqs(records: &[EventRecord]) -> Vec<u64> {

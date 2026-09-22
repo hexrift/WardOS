@@ -89,6 +89,17 @@ pub enum AgentState {
     /// The host paused the session (ADR-0019 §3): every sandbox process is
     /// frozen; the agent is neither working nor waiting.
     Paused,
+    /// The host attempted to pause the session but could not confirm, within
+    /// the settle bound, that every sandbox process actually stopped (#145
+    /// items 3-4, PR #207 review finding 1): the marker is written and
+    /// approvals are held exactly as for [`Self::Paused`], but at least one
+    /// process's `SIGSTOP` was not yet confirmed delivered. Deliberately
+    /// distinct from [`Self::Paused`] so a viewer never shows an unconfirmed
+    /// freeze as a clean, confirmed one — the false-confirmation issue #145
+    /// itself is about. Appended at the end: like [`WardEvent`], this enum is
+    /// wire-encoded (`AgentStateChanged`) and postcard identifies variants by
+    /// declaration index, so an existing variant's position must never move.
+    PauseUnsettled,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -837,31 +848,56 @@ pub enum WardEvent {
     },
 
     // -- intervention, continued (origin: Wardd; #145 items 3-4) --
-    /// `SessionPaused`'s freeze could not be confirmed to have settled within the bound
-    /// the daemon gives it (`pause::FREEZE_SETTLE`): at least one of the session's
-    /// sandboxed processes had not yet responded to `SIGSTOP` when the bound expired.
-    /// Only possible for `PauseMethod::Sigstop` — the cgroup freezer path is synchronous
-    /// by construction and always settles before `SessionPaused` is even written.
+    /// The host paused the session (ADR-0019 §3, same operation `SessionPaused`
+    /// records), but could not confirm the freeze settled within the bound the
+    /// daemon gives it (`pause::FREEZE_SETTLE`): at least one of the session's
+    /// sandboxed processes had not yet responded to `SIGSTOP` when the bound
+    /// expired. Only possible for `PauseMethod::Sigstop` — the cgroup freezer
+    /// path is synchronous by construction and always settles before either
+    /// this or `SessionPaused` would be written.
+    ///
+    /// This is the *terminal* record of an unsettled pause attempt — the daemon
+    /// decides the settle outcome before appending anything, so a pause is
+    /// recorded as exactly one of `SessionPaused` xor `SessionPauseUnsettled`,
+    /// never both (PR #207 review finding 1: publishing a confirmed
+    /// `SessionPaused` and only then finding out it was not actually confirmed
+    /// let every reader that stops at the first record — the desktop's trust
+    /// bar included — believe a false confirmation, if only for the settle
+    /// window and, on a failed qualifier append, forever after). Carries the
+    /// same fields `SessionPaused` would have carried, plus `pending`, so a
+    /// reader never needs a prior `SessionPaused` record to make sense of it.
     ///
     /// The pause is not undone and nothing here is a failure of the pause itself: the
     /// marker, the held approvals and the SIGSTOPs already sent all still stand, the
     /// safest state the daemon can preserve without more information. What this record
     /// says is narrower and just as important — that the daemon cannot yet confirm every
-    /// process actually stopped, so a reader must not treat `SessionPaused` alone as
-    /// proof every process is frozen. Per #145 item 4 ("do not report a full success
-    /// after a partial operation"), a `SessionPaused` that could not be confirmed must
-    /// never render identically to one that could.
+    /// process actually stopped, so a reader must not treat this as proof every process
+    /// is frozen, and must not treat it as a `SessionPaused` it merely qualifies. Per
+    /// #145 item 4 ("do not report a full success after a partial operation"), this must
+    /// never render, or be derived into shell state, identically to a confirmed pause.
     ///
-    /// Appended immediately after the `SessionPaused` record it qualifies, in the same
-    /// `pause()` call, never in its place — purely additive, exactly like
-    /// `VerificationErrored` above: postcard identifies variants by declaration index,
-    /// so a new one is always appended at the end, never inserted into or merged with an
-    /// existing variant's fields.
+    /// Purely additive, exactly like `VerificationErrored` above: postcard identifies
+    /// variants by declaration index, so a new one is always appended at the end, never
+    /// inserted into or merged with an existing variant's fields. Its own fields are
+    /// free to be shaped however this record needs them (unlike an already-shipped
+    /// variant's fields, which must never change): this variant has not shipped
+    /// anywhere outside this still-open PR, so nothing on any real log has ever carried
+    /// the earlier, `pending`-only shape.
     SessionPauseUnsettled {
+        /// How the processes were frozen — always `PauseMethod::Sigstop` in practice
+        /// (see above), carried anyway so this record never depends on a prior
+        /// `SessionPaused` having been read to make sense of it.
+        method: PauseMethod,
+        /// Why, in the user's words (`ward pause --reason`), sanitised — the same
+        /// text `SessionPaused` would have carried.
+        reason: ShortText,
         /// Number of the session's sandboxed processes that had not confirmed stopped
         /// (or exited) when the settle bound expired. Never the pid list itself: this is
         /// a durable log record, and which pids they were is meaningful only in the
         /// moment a human or `ward resume` might act on it, not worth keeping forever.
+        /// Always nonzero: a recount of zero pending is a settled freeze, reported as
+        /// `SessionPaused` instead (`pause::settle_outcome` normalizes `Some(0)` to
+        /// `None` for exactly this reason).
         pending: u32,
     },
 }

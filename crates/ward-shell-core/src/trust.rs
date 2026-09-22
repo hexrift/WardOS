@@ -109,7 +109,10 @@ pub fn short_id(id: &str) -> String {
 }
 
 /// The agent's glyph (`docs/design-language.md` §7): a small geometric mark,
-/// never an avatar.
+/// never an avatar. [`AgentState::PauseUnsettled`] gets its own glyph (PR #207
+/// review finding 1) — it must never render identically to [`AgentState::Paused`],
+/// the same "must not read as a confirmed pause" property `render.rs`'s
+/// `PAUSE?`/`PAUSE` observer rows already establish for the underlying records.
 #[must_use]
 pub const fn agent_glyph(state: AgentState) -> &'static str {
     match state {
@@ -120,11 +123,12 @@ pub const fn agent_glyph(state: AgentState) -> &'static str {
         AgentState::Verifying => "◐",
         AgentState::Finished => "✓",
         AgentState::Paused => "‖",
+        AgentState::PauseUnsettled => "‖?",
     }
 }
 
 /// The agent's state word (§7): `idle · working · waiting · blocked · verifying
-/// · finished`.
+/// · finished · paused · unsettled`.
 #[must_use]
 pub const fn agent_word(state: AgentState) -> &'static str {
     match state {
@@ -135,18 +139,19 @@ pub const fn agent_word(state: AgentState) -> &'static str {
         AgentState::Verifying => "verifying",
         AgentState::Finished => "finished",
         AgentState::Paused => "paused",
+        AgentState::PauseUnsettled => "unsettled",
     }
 }
 
 /// The agent's colour role: accent while it moves (working, verifying), amber
-/// while it waits on someone, red while blocked or paused by the host, green
-/// when finished, dim when idle.
+/// while it waits on someone or while a pause is not yet confirmed, red while
+/// blocked or paused by the host, green when finished, dim when idle.
 #[must_use]
 pub const fn agent_tone(state: AgentState) -> Tone {
     match state {
         AgentState::Idle => Tone::Dim,
         AgentState::Working | AgentState::Verifying => Tone::Accent,
-        AgentState::Waiting => Tone::Warn,
+        AgentState::Waiting | AgentState::PauseUnsettled => Tone::Warn,
         AgentState::Blocked | AgentState::Paused => Tone::Deny,
         AgentState::Finished => Tone::Ok,
     }
@@ -592,7 +597,10 @@ impl TrustBar {
 /// `CLAUDE ● working`: the agent's name in capitals, its glyph and its state
 /// word. Dim once the log is sealed: the agent is gone, whatever it last said.
 /// Paused by the host (ADR-0019 §3) the word is `PAUSED`, in capitals like the
-/// bar's other host-owned states, in the denied tone.
+/// bar's other host-owned states, in the denied tone; a pause the host could not
+/// confirm settled (PR #207 review finding 1) reads `PAUSED?` instead — never the
+/// same word as a confirmed pause — in the warn tone [`agent_tone`] already gives
+/// [`AgentState::PauseUnsettled`].
 fn agent_segment(header: &Header, state: AgentState, sealed: bool) -> Segment {
     let name = header
         .agent
@@ -601,6 +609,7 @@ fn agent_segment(header: &Header, state: AgentState, sealed: bool) -> Segment {
     let tone = if sealed { Tone::Dim } else { agent_tone(state) };
     let word = match state {
         AgentState::Paused => "PAUSED",
+        AgentState::PauseUnsettled => "PAUSED?",
         other => agent_word(other),
     };
     Segment::new(format!("{name} {} {word}", agent_glyph(state)), tone)
@@ -661,8 +670,9 @@ mod tests {
     use super::fixtures::description;
     use super::*;
     use crate::feed::fixtures::{
-        agent, denied, edited, ended, model_with, paused, records, resumed, sequence, snapshot,
-        tamper, verify_errored, verify_failed, verify_passed, verify_requested, wardd,
+        agent, denied, edited, ended, model_with, pause_unsettled, paused, records, resumed,
+        sequence, snapshot, tamper, verify_errored, verify_failed, verify_passed, verify_requested,
+        wardd,
     };
     use ward_events::{Origin, WardEvent};
     use ward_policy::merge;
@@ -1121,6 +1131,30 @@ mod tests {
         let segment = TrustBar::new(&h, &model).agent.unwrap();
         assert_eq!(segment.text, "CLAUDE ‖ PAUSED");
         assert_eq!(segment.tone, Tone::Deny);
+        model.apply(wardd(&[resumed()]).remove(0));
+        assert_eq!(
+            TrustBar::new(&h, &model).agent.unwrap().text,
+            "CLAUDE ● working"
+        );
+
+        // #145 items 3-4, PR #207 review finding 1: an unsettled pause reads
+        // `PAUSED?` in the warn tone — distinct from both `PAUSED` (confirmed,
+        // denied tone) and whatever the agent said last — and resume restores
+        // that last word here too.
+        let mut model = Model::new(false);
+        model.apply(wardd(&[agent(S::Working)]).remove(0));
+        model.apply(wardd(&[pause_unsettled()]).remove(0));
+        assert_eq!(model.state.agent, Some(S::PauseUnsettled));
+        assert_eq!(agent_glyph(S::PauseUnsettled), "‖?");
+        assert_eq!(agent_word(S::PauseUnsettled), "unsettled");
+        assert_eq!(agent_tone(S::PauseUnsettled), Tone::Warn);
+        let segment = TrustBar::new(&h, &model).agent.unwrap();
+        assert_eq!(segment.text, "CLAUDE ‖? PAUSED?");
+        assert_eq!(segment.tone, Tone::Warn);
+        assert_ne!(
+            segment.text, "CLAUDE ‖ PAUSED",
+            "an unconfirmed freeze must never render the same as a confirmed one"
+        );
         model.apply(wardd(&[resumed()]).remove(0));
         assert_eq!(
             TrustBar::new(&h, &model).agent.unwrap().text,

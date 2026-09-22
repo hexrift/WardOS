@@ -98,9 +98,14 @@ pub enum WardEvent {
     SessionResumed  { paused_for: Duration },
     EntryRestored   { snapshot: SnapshotId, files: u64, backup: BoundedText },
     // Appended at the end of the catalogue, same reason as VerificationErrored above
-    // (#145 items 3-4): qualifies SessionPaused when the SIGSTOP fallback couldn't be
-    // confirmed to have settled within the daemon's bound — never in its place.
-    SessionPauseUnsettled { pending: u32 },
+    // (#145 items 3-4, PR #207): the daemon decides whether a pause's freeze settled
+    // *before* appending anything, so a pause attempt is recorded as exactly one of
+    // SessionPaused xor SessionPauseUnsettled, never both and never the confirmed one
+    // first — this is the terminal record for an unsettled SIGSTOP-fallback pause,
+    // carrying the same fields SessionPaused would have (so it never depends on a
+    // prior SessionPaused record to make sense of it), plus how many processes were
+    // still not confirmed stopped when the daemon's settle bound expired.
+    SessionPauseUnsettled { method: CgroupFreezer | Sigstop, reason: BoundedText, pending: u32 },
 }
 ```
 
