@@ -133,7 +133,11 @@ pub struct ScratchEntry {
     pub path: PathBuf,
     /// The full session id recorded in its owner marker, when legible.
     pub owner: Option<String>,
-    /// Total bytes found under `path`.
+    /// Total bytes found under `path`, or `0` if some part of it could not
+    /// be read (a subdirectory this process lacks permission for, most
+    /// sharply). `0` here is never a claim that the entry is actually
+    /// empty — see [`ScratchStatus::Unknown`], which always accompanies it
+    /// in that case, for the honest "not established" signal.
     pub bytes: u64,
     /// What the scan could establish about its liveness.
     pub status: ScratchStatus,
@@ -167,7 +171,11 @@ pub enum ScratchStatus {
 /// else. A directory whose name collides with WardOS's own (`ward-*`) but that
 /// something else created is indistinguishable from ours by name alone; its
 /// owner marker will simply be absent or unparseable, and it is reported as
-/// [`ScratchStatus::Unknown`] rather than guessed at.
+/// [`ScratchStatus::Unknown`] rather than guessed at. A single entry this
+/// process cannot fully read (another local user's own `ward-*`-prefixed
+/// directory, made unreadable to us, most sharply) is likewise reported as
+/// `Unknown` rather than aborting the scan of everything else in `/tmp` —
+/// see [`scan_one_entry`].
 pub fn scan_scratch(state: &Path) -> Result<Vec<ScratchEntry>> {
     let temp = std::env::temp_dir();
     let mut out = Vec::new();
@@ -195,18 +203,50 @@ pub fn scan_scratch(state: &Path) -> Result<Vec<ScratchEntry>> {
         }
         let path = entry.path();
         let owner = read_owner_marker(&path);
-        let mut bytes = 0u64;
-        sum_dir_bytes(&path, &mut bytes)?;
-        let status = classify(state, owner.as_deref());
-        out.push(ScratchEntry {
-            path,
-            owner,
-            bytes,
-            status,
-        });
+        out.push(scan_one_entry(state, path, owner, sum_dir_bytes));
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// Build one [`ScratchEntry`], containing any traversal failure to just this
+/// entry. `sum` is [`sum_dir_bytes`] in production, injected here so the
+/// containment behaviour below is directly testable with a synthetic error —
+/// a real permission-denied fixture would be silently bypassed in a test
+/// suite that happens to run as root, where `EACCES` never fires.
+///
+/// The OS temp dir is shared: another local user's `ward-*`-prefixed entry
+/// (or one of ours that raced a concurrent remover) can contain a
+/// subdirectory we cannot read — most sharply, an attacker-owned
+/// `/tmp/ward-*` made deliberately unreadable to us. Before this existed,
+/// that single entry's traversal error propagated out of the whole scan,
+/// so one uninspectable directory anywhere in `/tmp` denied `ward snapshot
+/// usage` entirely, including every one of the caller's own legitimate
+/// entries. A traversal failure here is therefore never propagated: the
+/// byte count from whatever was summed before the failure is discarded
+/// (never presented as if it were the exact, complete total), and the
+/// status is forced to `Unknown` — the same "not established" answer an
+/// absent or unparseable owner marker already gets — regardless of what
+/// the owner marker on its own would otherwise have classified as.
+fn scan_one_entry(
+    state: &Path,
+    path: PathBuf,
+    owner: Option<String>,
+    sum: impl FnOnce(&Path, &mut u64) -> Result<()>,
+) -> ScratchEntry {
+    let mut bytes = 0u64;
+    let status = if sum(&path, &mut bytes).is_ok() {
+        classify(state, owner.as_deref())
+    } else {
+        bytes = 0;
+        ScratchStatus::Unknown
+    };
+    ScratchEntry {
+        path,
+        owner,
+        bytes,
+        status,
+    }
 }
 
 /// Generous headroom over the exact text a real owner marker ever contains
@@ -564,6 +604,89 @@ mod tests {
         assert_eq!(entry.status, ScratchStatus::Unknown);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_traversal_failure_on_one_entry_is_contained_to_that_entry() {
+        // A synthetic failure, not a real permission-denied fixture: a test
+        // suite that happens to run as root would never actually see EACCES
+        // from chmod 000 (root bypasses the DAC check), which would make a
+        // permission-bit-based regression silently pass for the wrong
+        // reason in exactly the environment most likely to run CI as root.
+        // Injecting the error directly exercises the containment logic
+        // itself, independent of who's running the test.
+        let state = tempfile::tempdir().unwrap();
+        let path = PathBuf::from("/tmp/ward-synthetic-failure");
+        let owner = Some("sess_irrelevant".to_owned());
+
+        let entry = scan_one_entry(state.path(), path.clone(), owner, |_, _| {
+            Err(Error::io(
+                &path,
+                std::io::Error::other("EACCES (synthetic)"),
+            ))
+        });
+
+        assert_eq!(entry.path, path);
+        assert_eq!(
+            entry.bytes, 0,
+            "a partial sum from before the failure must never be reported as exact"
+        );
+        assert_eq!(
+            entry.status,
+            ScratchStatus::Unknown,
+            "an entry that could not be fully traversed is not established, \
+             whatever its owner marker on its own would otherwise say"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_entry_does_not_prevent_a_healthy_sibling_from_being_reported() {
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipping: root bypasses the directory permission bits this needs");
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+
+        let denied =
+            std::env::temp_dir().join(format!("ward-usagetest-denied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&denied);
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::create_dir(denied.join("unreadable")).unwrap();
+        std::fs::write(denied.join("unreadable").join("payload"), b"secret").unwrap();
+        std::fs::set_permissions(
+            denied.join("unreadable"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
+
+        let healthy =
+            std::env::temp_dir().join(format!("ward-usagetest-healthy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&healthy);
+        std::fs::create_dir_all(&healthy).unwrap();
+        std::fs::write(healthy.join("payload"), vec![b'h'; 9]).unwrap();
+
+        let result = scan_scratch(state.path());
+
+        // Restore permissions before any assertion can early-return, so
+        // cleanup always runs even if an assertion below fails.
+        std::fs::set_permissions(
+            denied.join("unreadable"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+
+        let entries = result.unwrap();
+        let denied_entry = entries.iter().find(|e| e.path == denied).unwrap();
+        assert_eq!(denied_entry.status, ScratchStatus::Unknown);
+        let healthy_entry = entries.iter().find(|e| e.path == healthy).unwrap();
+        assert_eq!(
+            healthy_entry.bytes, 9,
+            "an unrelated unreadable entry elsewhere in the temp dir must not \
+             degrade a healthy entry's own report"
+        );
+
+        std::fs::remove_dir_all(&denied).unwrap();
+        std::fs::remove_dir_all(&healthy).unwrap();
     }
 
     #[test]
