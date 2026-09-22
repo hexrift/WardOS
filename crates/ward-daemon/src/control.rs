@@ -141,6 +141,19 @@ pub trait Sink: Send {
     fn seal(self: Box<Self>) -> Result<()>;
     /// End the session: append `SessionEnded { reason }` and seal.
     fn stop(self: Box<Self>, reason: EndReason) -> Result<()>;
+    /// Re-read this sink's view of the chain from durable storage, discarding any
+    /// cached head that may now be behind what is actually on disk (review 5283028228
+    /// of #208, finding 4, `crate::attempt::reconcile_dangling_attempts`): a
+    /// [`LocalLog`] caches its `Chain` in memory from the moment it is opened, so two
+    /// independently-opened `LocalLog`s on the same session log can each believe they
+    /// own the true head even after one of them has appended — exactly the divergence
+    /// that would duplicate a sequence number or break the hash-predecessor chain if
+    /// left unchecked. [`RemoteSink`] never caches any chain state locally (every
+    /// append is computed by the daemon's own single, already-serialized `Chain`), so
+    /// it has nothing to refresh and keeps this default no-op.
+    fn resync(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The chain and log in this process (no daemon).
@@ -215,6 +228,30 @@ impl Sink for LocalLog {
     fn stop(mut self: Box<Self>, reason: EndReason) -> Result<()> {
         self.append(Origin::Wardd, session_ended(reason), SystemTime::now())?;
         self.seal()
+    }
+
+    fn resync(&mut self) -> Result<()> {
+        let path = self.log.path().to_path_buf();
+        // A log with nothing appended to it yet has nothing on disk that could have
+        // diverged from this sink's own in-memory genesis-only head — and
+        // `LogWriter::open` cannot even bootstrap a chain head from zero records (it
+        // is only ever taken from the first record's own `prev`), so this is the one
+        // case reopening is skipped rather than attempted. Only one caller can ever
+        // win `LocalLog::create`'s own `create_new`, so a file still empty here means
+        // no rival has appended anything either.
+        let empty = std::fs::metadata(&path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(false);
+        if empty {
+            return Ok(());
+        }
+        // Otherwise reopen in place: re-reads and re-verifies the whole log to recover
+        // the true current head, exactly as `Self::open` does — the same cost this
+        // session already pays every time a fresh `ward` command opens it, just paid
+        // again here so a pass that started with a stale view never appends against it
+        // (finding 4).
+        *self = Self::open(&path, self.started)?;
+        Ok(())
     }
 }
 

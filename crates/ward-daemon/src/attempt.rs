@@ -78,13 +78,63 @@
 //! for that attempt, so a marker that resurfaces after a crash between a terminal
 //! append and that marker's own not-yet-durable removal is retired quietly instead of
 //! producing a second, contradictory terminal record.
+//!
+//! # Publish and register as one step (review 5283028228 of #208, finding 1)
+//!
+//! [`AttemptGuard::start`] and [`claim_marker`] each have a moment where a marker or
+//! claim becomes durably visible on disk — the atomic rename, or the exclusive create —
+//! before [`LIVE_PATHS`] is told about it. A same-process reconciler landing in that
+//! exact window would read a marker/claim bearing this process's own pid, find nothing
+//! in [`LIVE_PATHS`] yet, and treat a perfectly healthy new attempt or claim as
+//! abandoned. [`publish_and_mark_live`] closes the window by holding [`LIVE_PATHS`]'s
+//! own lock across both the publish and the registration, as one step: a concurrent
+//! `is_live`/`claimant_is_gone` check shares that exact lock, so it can only ever run
+//! entirely before the publish (nothing to see yet) or entirely after registration is
+//! also done — never in between.
+//!
+//! # A registration is not just a path (review 5283028228 of #208, finding 2)
+//!
+//! [`LIVE_PATHS`] used to be a bare `HashSet<PathBuf>`, which cannot tell two different
+//! holders of the same on-disk path apart across time. [`MarkerClaim::release`] removes
+//! its claim file, then unregisters — and in the window between those two steps, a new
+//! claimant can create and register the very same path; the old holder's unregister
+//! must not then delete the new holder's live entry. Every registration now gets its
+//! own generation token from [`NEXT_LIVE_TOKEN`], and [`unmark_live`] only removes an
+//! entry when the token it was given still matches the one currently stored for that
+//! path — a compare-and-remove, not a bare removal.
+//!
+//! # A claim is either whole or absent (review 5283028228 of #208, finding 3)
+//!
+//! The old claim scheme wrote an empty file with `create_new` for its exclusivity, then
+//! `write_all`'d the owner's identity into it best-effort — a crash in between left a
+//! truncated claim [`claimant_is_gone`] could never attribute to a pid, wedging its
+//! marker behind an unreadable claim forever. [`create_claim_exclusively`] writes the
+//! claim's content to a private temp file, `fsync`s it, and only then publishes it with
+//! `hard_link` (which, unlike `rename`, fails rather than clobbering when the target
+//! already exists — the same exclusivity `create_new` gave, applied to bytes that were
+//! already complete before they ever became visible). A claim is now either fully
+//! absent or fully readable; the truncated state is unreachable, not merely recovered.
+//!
+//! # Reconciliation is single-writer too (review 5283028228 of #208, finding 4)
+//!
+//! `claim_marker` only serializes access to *one* marker at a time. Two different
+//! dangling markers in one session can still be claimed by two different concurrent
+//! reconcilers, each then appending through its own independently-opened `LocalLog` —
+//! two writers on one log at once, exactly what ADR-0015 rules out.
+//! `reconcile_dangling_attempts` now holds one exclusive, session-scoped `flock`
+//! ([`lock_session_reconciliation`]) for its entire pass, before any marker is even
+//! listed, and calls [`Sink::resync`] once it holds that lock — a `sink` opened before
+//! this pass acquired the lock (including by an entirely separate process) may already
+//! be behind a rival reconciler's own append for a *different* marker, and every append
+//! this pass makes must build on the true head.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use ward_events::{AttemptId, Origin, ShortText, SnapshotId, VerifyRequester, WardEvent};
 
@@ -190,12 +240,13 @@ fn sync_dir(dir: &Path) -> Result<()> {
     dir_file.sync_all().map_err(|e| Error::io(dir, e))
 }
 
-/// Write `marker` to `path` crash-consistently: the bytes land in a private temp
-/// file in the same directory, are `fsync`'d, then atomically renamed over `path`
-/// (a rename is a single directory-entry update — a crash before or after it never
-/// leaves a half-written marker at `path` itself), and finally the directory is
-/// `fsync`'d so the rename itself survives a crash immediately afterward.
-fn write_marker(path: &Path, marker: &Marker) -> Result<()> {
+/// The write half of [`write_marker`]'s durable scheme: `marker`'s bytes land in a
+/// private temp file beside `path`, `fsync`'d, but `path` itself is not touched yet.
+/// Split out from the publish half ([`publish_marker_tmp`]) so [`AttemptGuard::start`]
+/// can publish and register the marker as one atomic step
+/// ([`publish_marker_and_register`]) instead of writing it and registering it as two
+/// separate, raceable steps (review 5283028228 of #208, finding 1).
+fn write_marker_tmp(path: &Path, marker: &Marker) -> Result<PathBuf> {
     let parent = path.parent().ok_or_else(|| {
         Error::Events(format!(
             "{}: attempt marker path has no parent directory",
@@ -207,8 +258,81 @@ fn write_marker(path: &Path, marker: &Marker) -> Result<()> {
         serde_json::to_vec(marker).map_err(|e| Error::Events(format!("attempt marker: {e}")))?;
     let tmp = tmp_marker_path(path);
     write_file_durably(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
+    Ok(tmp)
+}
+
+/// The publish half of [`write_marker`]'s durable scheme: atomically rename `tmp`
+/// (already written and `fsync`'d by [`write_marker_tmp`]) onto `path` (a rename is a
+/// single directory-entry update — a crash before or after it never leaves a
+/// half-written marker at `path` itself), then `fsync` the directory so the rename
+/// itself survives a crash immediately afterward.
+fn publish_marker_tmp(tmp: &Path, path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        Error::Events(format!(
+            "{}: attempt marker path has no parent directory",
+            path.display()
+        ))
+    })?;
+    std::fs::rename(tmp, path).map_err(|e| Error::io(path, e))?;
     sync_dir(parent)
+}
+
+/// Write `marker` to `path` crash-consistently, as a plain update to a marker that is
+/// already published and registered (e.g. [`AttemptGuard::bind_candidate`], or the
+/// best-effort note [`AttemptGuard`]'s `Drop` adds): see [`write_marker_tmp`] and
+/// [`publish_marker_tmp`] for the two halves of the scheme. The marker's *first* publish
+/// goes through [`publish_marker_and_register`] instead, which additionally registers it
+/// in [`LIVE_PATHS`] atomically with the same rename this function also performs.
+fn write_marker(path: &Path, marker: &Marker) -> Result<()> {
+    let tmp = write_marker_tmp(path, marker)?;
+    publish_marker_tmp(&tmp, path)
+}
+
+/// Perform `publish` — the durable filesystem operation that makes some file at `path`
+/// externally visible for the first time (a marker's atomic rename, a claim's exclusive
+/// [`create_claim_exclusively`]) — and, only if it reports having actually won that
+/// publish, register `path` in [`LIVE_PATHS`] before this call's own lock on it is ever
+/// released (review 5283028228 of #208, finding 1). A concurrent same-process
+/// `is_live`/`claimant_is_gone` check acquires that exact same lock, so it can only ever
+/// run either entirely before `publish` runs (and so, for a marker, finds no file at all
+/// — nothing yet to mistake for abandoned) or entirely after this call has also finished
+/// registering — never in between.
+///
+/// `publish` reports `Ok(false)` rather than erroring when it genuinely lost a race for
+/// `path` (only a claim's exclusive create can do this; a marker's rename either lands
+/// or the whole call already returned `Err`); `Ok(None)` here means the same. On success,
+/// returns the registry key and the generation token this registration was minted with —
+/// a later registration of the very same `path` gets a different token (finding 2), so an
+/// old holder's own eventual [`unmark_live`] can never evict a new holder's live
+/// registration for the same on-disk path.
+fn publish_and_mark_live(
+    path: &Path,
+    publish: impl FnOnce() -> Result<bool>,
+) -> Result<Option<(PathBuf, u64)>> {
+    let mut live = live_paths();
+    if !publish()? {
+        return Ok(None);
+    }
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let token = NEXT_LIVE_TOKEN.fetch_add(1, Ordering::SeqCst);
+    live.insert(key.clone(), token);
+    Ok(Some((key, token)))
+}
+
+/// [`publish_and_mark_live`] for a marker's own first publish, whose `publish` is
+/// unconditional — it either lands or the call already returned `Err` — so there is no
+/// genuine "lost the race" outcome to represent; this collapses the `Option` away rather
+/// than making every caller handle a case that cannot happen for a marker.
+fn publish_marker_and_register(
+    path: &Path,
+    publish: impl FnOnce() -> Result<()>,
+) -> Result<(PathBuf, u64)> {
+    publish_and_mark_live(path, || publish().map(|()| true))?.ok_or_else(|| {
+        Error::Events(format!(
+            "{}: marker publish unexpectedly reported losing a race it cannot lose",
+            path.display()
+        ))
+    })
 }
 
 /// What reading a marker file found: parsed content, benignly gone (a race with
@@ -314,39 +438,50 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
 /// consult this registry — keyed by each path's canonical form so two constructions of
 /// the same on-disk file always agree — before ever trusting a same-pid marker/claim
 /// to be stale.
-static LIVE_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+///
+/// The value is a generation token minted by [`NEXT_LIVE_TOKEN`] when that entry was
+/// registered, not merely set membership (review 5283028228 of #208, finding 2): a bare
+/// `HashSet<PathBuf>` cannot tell two different holders of the same on-disk path apart
+/// across time, so an old holder's own delayed [`unmark_live`] — running after a new
+/// holder has already created and registered the very same path, in the window
+/// `MarkerClaim::release` leaves between removing its claim file and unregistering it —
+/// could otherwise delete the *new* holder's live entry instead of its own.
+/// [`unmark_live`] only ever removes an entry whose stored token still matches the one
+/// its own registration was given.
+static LIVE_PATHS: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Mints the generation token each new [`LIVE_PATHS`] entry is registered under
+/// (finding 2). Process-wide and monotonic; only uniqueness across registrations
+/// matters, never a specific value.
+static NEXT_LIVE_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 /// Recover from a poisoned lock rather than propagate the panic: `LIVE_PATHS` is a
 /// best-effort liveness hint, never the sole source of truth (a marker/claim's own pid
 /// and, for a claim, its `/proc` start time remain the authoritative fallback), so a
 /// panic elsewhere while this mutex was held must not cascade into every future
 /// reconciliation call.
-fn live_paths() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+fn live_paths() -> std::sync::MutexGuard<'static, HashMap<PathBuf, u64>> {
     LIVE_PATHS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Record that `path` (already written/created on disk) is live in this process, and
-/// return the canonical key it was registered under, for [`unmark_live`] to remove
-/// later. Falls back to `path` itself if it cannot be canonicalized (e.g. it was
-/// removed a moment later by a racing caller) — still unique enough in practice, and
-/// erring toward "not live" only ever makes reconciliation *more* eager, never less
-/// safe (a genuinely live, different-pid or verifiably-alive-pid owner is still
-/// protected by the checks in [`owner_is_gone`]/[`claimant_is_gone`] regardless).
-fn mark_live(path: &Path) -> PathBuf {
-    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    live_paths().insert(key.clone());
-    key
-}
-
-fn unmark_live(key: &Path) {
-    live_paths().remove(key);
+/// Remove `key`'s [`LIVE_PATHS`] entry, but only if it is still the exact registration
+/// `token` was minted for (finding 2's compare-and-remove): a later registration of the
+/// same path — a new claimant that created and registered it after this holder's own
+/// underlying file was already removed but before this call ran — gets a different
+/// token, and this call must leave that entry alone rather than evicting it.
+fn unmark_live(key: &Path, token: u64) {
+    let mut live = live_paths();
+    if live.get(key) == Some(&token) {
+        live.remove(key);
+    }
 }
 
 fn is_live(path: &Path) -> bool {
     let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    live_paths().contains(&key)
+    live_paths().contains_key(&key)
 }
 
 /// Whether the process that wrote `marker` can no longer be the one a caller needs
@@ -478,6 +613,13 @@ fn claim_marker_path(marker_path: &Path) -> PathBuf {
 struct MarkerClaim {
     claim_path: PathBuf,
     registry_key: PathBuf,
+    /// The generation token this claim's [`LIVE_PATHS`] entry was registered under
+    /// (finding 2): `unmark_live` below only removes that entry while it still holds
+    /// this exact token, so a new claimant that has already re-claimed `claim_path` by
+    /// the time this guard's own unregister runs — the window between removing
+    /// `claim_path` and unregistering it, below — keeps its own live registration
+    /// intact instead of having it deleted out from under it.
+    registry_token: u64,
     released: bool,
 }
 
@@ -488,7 +630,7 @@ impl MarkerClaim {
     fn release(mut self) {
         self.released = true;
         let _ = std::fs::remove_file(&self.claim_path);
-        unmark_live(&self.registry_key);
+        unmark_live(&self.registry_key, self.registry_token);
     }
 }
 
@@ -498,7 +640,7 @@ impl Drop for MarkerClaim {
             return;
         }
         let _ = std::fs::remove_file(&self.claim_path);
-        unmark_live(&self.registry_key);
+        unmark_live(&self.registry_key, self.registry_token);
     }
 }
 
@@ -526,66 +668,84 @@ fn claimant_is_gone(claim_path: &Path) -> Option<bool> {
     })
 }
 
+/// Stake the exclusive claim at `claim_path` with content that is either fully absent
+/// or fully readable, never truncated (review 5283028228 of #208, finding 3): `claim`'s
+/// JSON is written to a private temp file in the same directory and `fsync`'d *before*
+/// anything is ever visible at `claim_path` itself, then published with `hard_link`
+/// rather than `rename` — unlike a rename, linking onto a name that already exists fails
+/// with `AlreadyExists` rather than silently overwriting it, which is exactly the
+/// `create_new`/`O_EXCL` exclusivity `claim_marker` depends on to serialize concurrent
+/// claimants, while still guaranteeing that whatever bytes appear at `claim_path` the
+/// instant it becomes visible are the complete, already-`fsync`'d claim. The old scheme
+/// (`create_new` directly on `claim_path`, then a best-effort `write_all`) could leave a
+/// truncated, unreadable claim behind if a crash landed between those two steps —
+/// [`claimant_is_gone`] can never attribute unreadable content to a pid, so that claim
+/// would wedge its marker out of reach of every future reconciliation pass forever. This
+/// scheme makes that state unreachable rather than adding a separate recovery path for it.
+///
+/// Returns `true` if this call won exclusivity, `false` if a rival already holds
+/// `claim_path` — the caller treats this exactly like `create_new`'s own `AlreadyExists`.
+fn create_claim_exclusively(claim_path: &Path, claim: &Claim) -> Result<bool> {
+    let bytes =
+        serde_json::to_vec(claim).map_err(|e| Error::Events(format!("attempt claim: {e}")))?;
+    let tmp = tmp_marker_path(claim_path);
+    write_file_durably(&tmp, &bytes)?;
+    let result = std::fs::hard_link(&tmp, claim_path);
+    let _ = std::fs::remove_file(&tmp);
+    match result {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(Error::io(claim_path, e)),
+    }
+}
+
 /// Attempt to become the exclusive reconciler finishing `marker_path`'s dangling
 /// attempt (review of #208, finding 2): stakes a claim at [`claim_marker_path`] with
-/// `create_new`, which the OS guarantees only one caller — thread or process, on the
-/// same machine — can ever win for the same path, exactly the "atomic file create with
-/// `O_EXCL` semantics" the review describes.
+/// [`create_claim_exclusively`], which only one caller — thread or process, on the same
+/// machine — can ever win for the same path, exactly the "atomic file create with
+/// `O_EXCL` semantics" the review describes. Publishing that claim and registering it in
+/// [`LIVE_PATHS`] happen as one atomic step through [`publish_and_mark_live`] (review
+/// 5283028228 of #208, finding 1).
 ///
 /// `Ok(None)` means a rival already holds the claim, genuinely concurrently: this
 /// caller must back off without appending anything, the marker is someone else's to
 /// finish. `Ok(Some(_))` is exclusive ownership until the returned guard is dropped or
 /// released — callers still re-check [`attempt_already_terminal`] once they hold it,
-/// since a rival can win, finish, *and* release before this caller even reaches the
-/// `create_new` call, in which case it succeeds with no contention at all and the
-/// re-check is what catches that the work is already done.
+/// since a rival can win, finish, *and* release before this caller even reaches its own
+/// claim attempt, in which case it succeeds with no contention at all and the re-check
+/// is what catches that the work is already done.
 ///
 /// A pre-existing claim file does not always mean a live rival, or reconciliation
 /// could permanently wedge on one left behind by a reconciler that itself died before
-/// finishing: when [`claimant_is_gone`] says so, the stale claim is reclaimed and
-/// `create_new` retried once more.
+/// finishing: when [`claimant_is_gone`] says so, the stale claim is reclaimed and the
+/// exclusive create retried once more.
 fn claim_marker(marker_path: &Path) -> Result<Option<MarkerClaim>> {
     let claim_path = claim_marker_path(marker_path);
     for _ in 0..2 {
         let pid = std::process::id();
-        let bytes = serde_json::to_vec(&Claim {
+        let claim = Claim {
             pid,
             owner_started_ticks: process_start_ticks(pid),
-        })
-        .map_err(|e| Error::Events(format!("attempt claim: {e}")))?;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&claim_path)
-        {
-            Ok(mut file) => {
-                use std::io::Write as _;
-                // Best-effort content: the file's mere existence under `create_new`
-                // is what provides exclusivity. A claim a rival cannot read back
-                // (write failed, or a crash truncated it) is simply never reclaimed
-                // as same-process-stale by `claimant_is_gone` (only ever a
-                // verified-dead pid, which does not depend on this content at all),
-                // so this never compromises correctness — only a rare, harmless
-                // missed opportunity to reclaim a stale claim promptly.
-                let _ = file.write_all(&bytes);
-                let key = mark_live(&claim_path);
+        };
+        match publish_and_mark_live(&claim_path, || {
+            create_claim_exclusively(&claim_path, &claim)
+        })? {
+            Some((registry_key, registry_token)) => {
                 return Ok(Some(MarkerClaim {
                     claim_path,
-                    registry_key: key,
+                    registry_key,
+                    registry_token,
                     released: false,
                 }));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                match claimant_is_gone(&claim_path) {
-                    Some(true) => {
-                        // Stale: left by a reconciler that died before releasing it.
-                        // Reclaim it and retry the exclusive create once.
-                        let _ = std::fs::remove_file(&claim_path);
-                    }
-                    Some(false) | None => return Ok(None),
+            None => match claimant_is_gone(&claim_path) {
+                Some(true) => {
+                    // Stale: left by a reconciler that died before releasing it.
+                    // Reclaim it and retry the exclusive create once.
+                    let _ = std::fs::remove_file(&claim_path);
                 }
-            }
-            Err(e) => return Err(Error::io(&claim_path, e)),
+                Some(false) | None => return Ok(None),
+            },
         }
     }
     // Lost a second race immediately after reclaiming a stale claim: vanishingly
@@ -611,6 +771,10 @@ pub struct AttemptGuard {
     /// live same-process attempt apart from an abandoned one (review of #208,
     /// finding 1).
     registry_key: PathBuf,
+    /// The generation token this guard's [`LIVE_PATHS`] entry was registered under
+    /// (review 5283028228 of #208, finding 2) — see [`MarkerClaim::registry_token`]
+    /// for why a bare path is not enough.
+    registry_token: u64,
     finished: bool,
 }
 
@@ -623,22 +787,25 @@ impl AttemptGuard {
     ) -> Result<Self> {
         let path = marker_path(session_dir, attempt);
         let pid = std::process::id();
-        write_marker(
-            &path,
-            &Marker {
-                attempt: attempt.get(),
-                requested_by,
-                candidate: None,
-                started_unix_ms: unix_ms(SystemTime::now()),
-                note: None,
-                pid,
-                owner_started_ticks: process_start_ticks(pid),
-            },
-        )?;
-        let registry_key = mark_live(&path);
+        let marker = Marker {
+            attempt: attempt.get(),
+            requested_by,
+            candidate: None,
+            started_unix_ms: unix_ms(SystemTime::now()),
+            note: None,
+            pid,
+            owner_started_ticks: process_start_ticks(pid),
+        };
+        let tmp = write_marker_tmp(&path, &marker)?;
+        // Publish (the rename that makes the marker externally visible) and register
+        // in `LIVE_PATHS` as one atomic step (review 5283028228 of #208, finding 1):
+        // see `publish_marker_and_register`.
+        let (registry_key, registry_token) =
+            publish_marker_and_register(&path, || publish_marker_tmp(&tmp, &path))?;
         Ok(Self {
             path,
             registry_key,
+            registry_token,
             finished: false,
         })
     }
@@ -676,7 +843,7 @@ impl Drop for AttemptGuard {
         // dropping mid-abandonment: either way, the in-process handle that could ever
         // call `finish()` on this exact marker is gone as of this call returning, so
         // `owner_is_gone` must no longer see it as live (review of #208, finding 1).
-        unmark_live(&self.registry_key);
+        unmark_live(&self.registry_key, self.registry_token);
         if self.finished {
             return;
         }
@@ -719,6 +886,51 @@ pub fn finalize_interrupted(
     Ok(())
 }
 
+/// `<session_dir>/.attempts-reconcile.lock`: an empty file [`reconcile_dangling_attempts`]
+/// takes an exclusive, OS-enforced `flock` on for its entire pass (review 5283028228 of
+/// #208, finding 4) — see [`lock_session_reconciliation`]. Deliberately outside
+/// [`attempts_dir`] so it is never picked up by that directory's own `.json`-extension
+/// scan.
+fn reconcile_lock_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(".attempts-reconcile.lock")
+}
+
+/// Acquire the exclusive, session-wide reconciliation lock, blocking until any other
+/// reconciler currently inside [`reconcile_dangling_attempts`] for this same session —
+/// another thread, or an entirely separate `ward`/`wardd` process, both real shapes two
+/// of this session's dangling markers can be reconciled from concurrently without a
+/// daemon in the picture — releases theirs.
+///
+/// [`claim_marker`] only serializes access to *one* marker at a time: two different
+/// dangling markers in the same session could still be claimed by two different
+/// concurrent reconcilers, each then appending through its own independently-opened
+/// `LocalLog` — two writers on one log at once, exactly what ADR-0015 rules out (review
+/// 5283028228 of #208, finding 4). Holding this lock for the whole pass, before any
+/// marker is even listed, makes a session's reconciliation single-writer too — the same
+/// guarantee a live session's ordinary `verify()` calls already get from the daemon's
+/// own request mutex (`control.rs`) when one is running, or, daemonless, from simply
+/// being the one process a `Session` is open in.
+///
+/// Unlike `claim_marker`'s file-existence-based exclusivity, an OS `flock` on an open
+/// file description needs no staleness recovery of its own: the kernel releases it the
+/// instant the holder's last reference to the open file closes, including on a crash —
+/// so a reconciler that dies mid-pass can never wedge a session's reconciliation the way
+/// a leftover claim file could.
+fn lock_session_reconciliation(session_dir: &Path) -> Result<Flock<std::fs::File>> {
+    let path = reconcile_lock_path(session_dir);
+    // Only this file's *existence* matters — it is never read or written — so an
+    // already-present lock file (from an earlier pass) is opened as-is rather than
+    // truncated.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| Error::io(&path, e))?;
+    Flock::lock(file, FlockArg::LockExclusive)
+        .map_err(|(_, errno)| Error::io(&path, std::io::Error::from(errno)))
+}
+
 /// Close out every dangling attempt marker under `session_dir`: each becomes a
 /// `VerificationInterrupted` record appended through `sink`, then its marker is
 /// removed. Call whenever a process (re)takes ownership of a session's log — the
@@ -753,12 +965,26 @@ pub fn finalize_interrupted(
 /// newly appended (never counting one already found terminal, or a live one left
 /// alone).
 pub fn reconcile_dangling_attempts(sink: &mut dyn Sink, session_dir: &Path) -> Result<usize> {
+    // Exclusive, session-scoped, for this whole pass (review 5283028228 of #208,
+    // finding 4): see `lock_session_reconciliation`. Acquired before the attempts
+    // directory is even listed, so two reconcilers — two threads, or two entirely
+    // separate client processes racing without a daemon in the picture — can never
+    // both be inside this function for the same session at once.
+    let _lock = lock_session_reconciliation(session_dir)?;
     let dir = attempts_dir(session_dir);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(Error::io(&dir, e)),
     };
+    // `sink` may have been opened — its `Chain` cached in memory — before this pass
+    // ever acquired the lock above, including by an entirely separate process: refresh
+    // it now, while the lock is held, so every append this pass makes below builds on
+    // the true on-disk head rather than a view that may already be behind a rival
+    // reconciler's own append for a *different* dangling marker in this same session
+    // (finding 4's actual corruption risk — a duplicate sequence number, or a `prev`
+    // hash the log has already moved past).
+    sink.resync()?;
     let mut paths: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
@@ -1690,5 +1916,365 @@ mod tests {
             }
             other => panic!("expected VerificationInterrupted, got {other:?}"),
         }
+    }
+
+    /// Review 5283028228 of #208, finding 1 — the deterministic hook/barrier test the
+    /// review asked for, stopped exactly inside the window between a marker's publish
+    /// (its atomic rename, already durably visible on disk under this process's own
+    /// pid) and its `LIVE_PATHS` registration: a concurrent same-process reconciler
+    /// must never observe that window and mistake a healthy new attempt for abandoned.
+    /// The `publish` closure `publish_and_mark_live` runs *while its own lock is held*
+    /// is what lets this test hold the window open for as long as it likes, rather than
+    /// racing a real but tiny window that the old, buggy ordering would only sometimes
+    /// lose.
+    #[test]
+    fn publish_and_mark_live_never_lets_a_reconciler_see_a_marker_published_but_not_yet_registered()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new(1);
+        let path = marker_path(dir.path(), attempt);
+        let marker = marker_owned_by(attempt, std::process::id());
+        let tmp = write_marker_tmp(&path, &marker).unwrap();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (checking_tx, checking_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+
+        let publish_path = path.clone();
+        let publisher = std::thread::spawn(move || {
+            publish_marker_and_register(&publish_path, || {
+                publish_marker_tmp(&tmp, &publish_path)?;
+                // The marker is now durably on disk, bearing this process's own pid —
+                // but `LIVE_PATHS` has not been touched yet, and `publish_and_mark_live`
+                // is still holding its own lock at this exact point (it was acquired
+                // before this closure was ever called). Hold the window open until the
+                // checker thread below has actually read the marker and is about to
+                // make its own liveness check.
+                ready_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+
+        ready_rx.recv().unwrap();
+        let check_path = path.clone();
+        let checker = std::thread::spawn(move || {
+            let marker = match read_marker(&check_path) {
+                MarkerRead::Ok(marker) => marker,
+                MarkerRead::Gone => panic!("the marker must already be durably readable: gone"),
+                MarkerRead::Corrupt => {
+                    panic!("the marker must already be durably readable: corrupt")
+                }
+            };
+            checking_tx.send(()).unwrap();
+            owner_is_gone(&marker, &check_path)
+        });
+
+        // Only release the publisher once the checker has read the marker and is about
+        // to perform the exact liveness check `reconcile_dangling_attempts` would —
+        // `is_live`'s own lock is what then forces it to wait for the registration this
+        // release finally allows to complete.
+        checking_rx.recv().unwrap();
+        go_tx.send(()).unwrap();
+
+        let (registry_key, registry_token) = publisher.join().unwrap().unwrap();
+        let gone = checker.join().unwrap();
+        assert!(
+            !gone,
+            "a marker mid-publish-and-register in this very process must never be \
+             treated as abandoned"
+        );
+        unmark_live(&registry_key, registry_token);
+    }
+
+    /// The claim counterpart of the test above (review 5283028228 of #208, finding 1):
+    /// stopped exactly inside the window between a claim's publish
+    /// ([`create_claim_exclusively`]'s `hard_link`) and its own `LIVE_PATHS`
+    /// registration, a concurrent same-process `claimant_is_gone` check must never
+    /// treat it as stale.
+    #[test]
+    fn publish_and_mark_live_never_lets_claimant_is_gone_see_a_claim_published_but_not_yet_registered()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let claim_path = dir.path().join("1.json.claim");
+        let pid = std::process::id();
+        let claim = Claim {
+            pid,
+            owner_started_ticks: process_start_ticks(pid),
+        };
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (checking_tx, checking_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+
+        let publish_path = claim_path.clone();
+        let publisher = std::thread::spawn(move || {
+            publish_and_mark_live(&publish_path, || {
+                let won = create_claim_exclusively(&publish_path, &claim)?;
+                assert!(won, "nothing else holds this claim yet");
+                ready_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(true)
+            })
+        });
+
+        ready_rx.recv().unwrap();
+        let check_path = claim_path.clone();
+        let checker = std::thread::spawn(move || {
+            checking_tx.send(()).unwrap();
+            claimant_is_gone(&check_path)
+        });
+
+        checking_rx.recv().unwrap();
+        go_tx.send(()).unwrap();
+
+        let (registry_key, registry_token) = publisher.join().unwrap().unwrap().unwrap();
+        let gone = checker.join().unwrap();
+        assert_ne!(
+            gone,
+            Some(true),
+            "a claim mid-publish-and-register in this very process must never be \
+             treated as stale (got {gone:?})"
+        );
+        unmark_live(&registry_key, registry_token);
+    }
+
+    /// Review 5283028228 of #208, finding 2 — the deterministic release/reacquire race
+    /// regression the review asked for: guard A releases (its claim file removed, about
+    /// to unregister) while guard B has already re-claimed the very same path; B's
+    /// `LIVE_PATHS` entry must survive A's delayed, now-stale unregister. Reproduced
+    /// directly rather than with real racing threads, since the sequence itself — not
+    /// its timing — is what a bare `HashSet<PathBuf>` gets wrong.
+    #[test]
+    fn a_delayed_unregister_after_release_does_not_evict_a_new_claimants_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = AttemptId::new(1);
+        // A dangling marker whose owner is verifiably dead, so `claim_marker` succeeds
+        // immediately without contention.
+        let marker = Marker {
+            attempt: attempt.get(),
+            requested_by: VerifyRequester::User,
+            candidate: None,
+            started_unix_ms: unix_ms(SystemTime::now()),
+            note: None,
+            pid: 999_999,
+            owner_started_ticks: None,
+        };
+        let marker_p = marker_path(dir.path(), attempt);
+        write_marker(&marker_p, &marker).unwrap();
+
+        // Guard A wins the claim.
+        let mut claim_a = claim_marker(&marker_p).unwrap().expect("wins the claim");
+        // Simulate the first half of `MarkerClaim::release` only — the claim file is
+        // gone, but `unmark_live` has not run yet (finding 2's exact window).
+        std::fs::remove_file(&claim_a.claim_path).unwrap();
+
+        // A new claimant (guard B) can now win the very same claim path.
+        let claim_b = claim_marker(&marker_p)
+            .unwrap()
+            .expect("re-claims the same path");
+        assert_eq!(
+            claim_a.registry_key, claim_b.registry_key,
+            "both claims are registered under the same on-disk path"
+        );
+        assert_ne!(
+            claim_a.registry_token, claim_b.registry_token,
+            "two registrations of the same path get distinct generations"
+        );
+
+        // Now let guard A's release proceed to its second, delayed step.
+        unmark_live(&claim_a.registry_key, claim_a.registry_token);
+        // Already manually replayed both of `release`'s steps above; mark A released so
+        // its own `Drop` does not redundantly repeat them (harmlessly, but this keeps
+        // the test's intent explicit).
+        claim_a.released = true;
+
+        assert!(
+            is_live(&claim_b.claim_path),
+            "guard B's live registration must survive guard A's delayed, stale unregister"
+        );
+
+        claim_b.release();
+    }
+
+    /// Review 5283028228 of #208, finding 3: a claim published by
+    /// [`create_claim_exclusively`] is either fully absent or fully readable the instant
+    /// it becomes visible — never a 0-byte or partially-written file a crash between the
+    /// old scheme's `create_new` and its best-effort `write_all` could leave behind.
+    #[test]
+    fn create_claim_exclusively_never_leaves_a_truncated_claim_file_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim_path = dir.path().join("1.json.claim");
+        let pid = std::process::id();
+        let claim = Claim {
+            pid,
+            owner_started_ticks: process_start_ticks(pid),
+        };
+
+        assert!(create_claim_exclusively(&claim_path, &claim).unwrap());
+        let bytes = std::fs::read(&claim_path).unwrap();
+        assert!(!bytes.is_empty(), "the claim's content is never truncated");
+        let parsed: Claim = serde_json::from_slice(&bytes)
+            .expect("the claim is always fully parseable the instant it is visible");
+        assert_eq!(parsed.pid, pid);
+
+        // No leftover temp file: the private source name `hard_link` published from is
+        // cleaned up once the publish succeeds.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.path() != claim_path)
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp file left behind: {leftovers:?}"
+        );
+    }
+
+    /// Finding 3, the other half: `create_claim_exclusively` still provides the exact
+    /// `O_EXCL`-style exclusivity `claim_marker` depends on (round-3, review of #208
+    /// finding 2) — a second publish attempt at the same path reports losing, exactly
+    /// like `create_new`'s own `AlreadyExists` did.
+    #[test]
+    fn create_claim_exclusively_still_provides_exclusive_create_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim_path = dir.path().join("1.json.claim");
+        let pid = std::process::id();
+        let claim = Claim {
+            pid,
+            owner_started_ticks: process_start_ticks(pid),
+        };
+
+        assert!(create_claim_exclusively(&claim_path, &claim).unwrap());
+        assert!(
+            !create_claim_exclusively(&claim_path, &claim).unwrap(),
+            "a second publish at the same path must report losing, not overwrite it"
+        );
+    }
+
+    /// Review 5283028228 of #208, finding 4 — two reconciler passes, each opening its
+    /// own `LocalLog` the way two separate `ward` client processes without a daemon
+    /// would, racing to reconcile two *different* dangling markers in the same session
+    /// at the same instant. The resulting log must be well-formed: no duplicate
+    /// sequence numbers, and an unbroken hash-predecessor chain — not just that each
+    /// marker individually got exactly one terminal record.
+    #[test]
+    fn reconcile_races_two_reconcilers_on_two_distinct_dangling_markers_without_corrupting_the_chain()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let log_path = dir_path.join("events.log");
+        let attempt_a = AttemptId::new(1);
+        let attempt_b = AttemptId::new(2);
+        // No `VerificationAttemptStarted` records seeded for either attempt: the
+        // single-attempt-at-a-time model this crate uses today means two of them
+        // coexisting mid-flight, as two genuinely distinct dangling markers, is
+        // already an edge case outside normal operation — `attempt_already_terminal`'s
+        // own defensive "a later `AttemptStarted` for a different attempt also
+        // counts" rule (see its doc comment) would otherwise treat the *older* of two
+        // co-started attempts as already concluded, which is a different, pre-existing
+        // behaviour this test is not about. What this test *is* about — two
+        // independently-opened `LocalLog`s racing to append through the same session's
+        // log at once — is exercised all the same via each marker's own dangling-ness
+        // (`owner_is_gone`) and `claim_marker`'s per-marker exclusivity.
+        {
+            let mut log = fresh_log(&dir_path);
+            // `LocalLog::open` (which both racing threads below use) cannot bootstrap
+            // a chain head from a log with zero records at all, so this seeds exactly
+            // one unrelated record — never a `VerificationAttemptStarted`, to avoid
+            // the cross-attempt heuristic above.
+            log.append(
+                Origin::Wardd,
+                WardEvent::AgentStateChanged {
+                    state: ward_events::AgentState::Working,
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+            log.sync().unwrap();
+        }
+        // Both markers' owners are verifiably dead, so both reconcilers agree both are
+        // dangling and race on actually finishing them, rather than on whether either
+        // is dangling at all.
+        for attempt in [attempt_a, attempt_b] {
+            let marker = Marker {
+                attempt: attempt.get(),
+                requested_by: VerifyRequester::User,
+                candidate: None,
+                started_unix_ms: unix_ms(SystemTime::now()),
+                note: None,
+                pid: 999_999,
+                owner_started_ticks: None,
+            };
+            write_marker(&marker_path(&dir_path, attempt), &marker).unwrap();
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let dir_path = dir_path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut sink =
+                        LocalLog::open(&dir_path.join("events.log"), SystemTime::now()).unwrap();
+                    barrier.wait();
+                    reconcile_dangling_attempts(&mut sink, &dir_path).unwrap()
+                })
+            })
+            .collect();
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(
+            total, 2,
+            "each of the two distinct dangling markers gets exactly one terminal record"
+        );
+        assert!(!marker_path(&dir_path, attempt_a).exists());
+        assert!(!marker_path(&dir_path, attempt_b).exists());
+
+        let records = read_back(&log_path);
+        let mut seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            seqs.len(),
+            sorted.len(),
+            "no duplicate sequence numbers: {seqs:?}"
+        );
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            (0..records.len() as u64).collect::<Vec<_>>(),
+            "sequence numbers are dense and contiguous from 0: {seqs:?}"
+        );
+        // Unbroken hash-predecessor chain: every record's own hash re-verifies, and
+        // each record's `prev` is exactly the previous record's `hash`.
+        for record in &records {
+            record
+                .verify_hash()
+                .expect("every record's stored hash must match its own content");
+        }
+        for pair in records.windows(2) {
+            assert_eq!(
+                pair[1].prev, pair[0].hash,
+                "record {} must chain onto record {}'s hash, not a stale one",
+                pair[1].seq, pair[0].seq
+            );
+        }
+        let interrupted: Vec<AttemptId> = records
+            .into_iter()
+            .filter_map(|r| match r.event {
+                WardEvent::VerificationInterrupted { attempt, .. } => Some(attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            {
+                let mut got = interrupted;
+                got.sort_by_key(|a| a.get());
+                got
+            },
+            vec![attempt_a, attempt_b],
+            "both distinct markers, and only them, got a terminal record"
+        );
     }
 }
