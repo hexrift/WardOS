@@ -89,6 +89,9 @@ pub enum WardEvent {
 
     // integrity
     Anchor { chain_head: Blake3Hash, seq: u64, countersigned_by: Option<TamperWardSig> },
+
+    // observer health (origin: Wardd) — see §9
+    ObservationsDropped { source: Filesystem | Network, dropped: u64, capacity: u64 },
 }
 ```
 
@@ -139,7 +142,7 @@ source of truth, not the socket. Latency budget from kernel event to subscriber 
 
 | Mode | Shows | Blocks? |
 | --- | --- | --- |
-| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed}`, `SessionEnded` | Only on `Ask` |
+| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed}`, `ObservationsDropped`, `SessionEnded` | Only on `Ask` |
 | Live | Everything except `AgentClaim{Note}` | Only on `Ask` |
 | Step-through | Everything; additionally the manifest's `step_policy` marks actions (`FileModified` under given globs, `CommandStarted` matching patterns, any `NetworkRequested`) as `Ask` | Yes, on configured actions |
 
@@ -186,6 +189,34 @@ sess_01J…   payments-api   Claude Code   2026-09-07 22:14 → 22:18   VERIFIED
 ```
 
 with `--json` for tooling and `--verify` to check the chain and anchors offline.
+
+## 9. Live ingestion and bounded buffering
+
+The observers that watch a running command — the inotify watch over the worktree, the
+session proxy's decision recorder, the agent hook broker — each run on their own
+thread. None of them writes the log. Each hands what it sees to a **bounded queue**,
+and the one thread that owns the session's `Sink` drains those queues *while the
+command is still running* and appends what it takes through the same append path as
+every other record. There is still exactly one writer (§5, ADR-0015).
+
+| Property | What it means |
+| --- | --- |
+| Drain cadence | Every 250 ms, or as soon as 256 observations are queued, whichever comes first. Batching amortises the append; the interval bounds how long an observation can sit unrecorded |
+| Terminal flush | When the command ends, the producers are stopped and their tails are appended **exactly once**, before the `CommandFinished` record. Nothing this command observed can be appended twice |
+| Timestamps | A record carries the time its source *observed* the fact, never the time it reached the log, so a live-drained timeline reads exactly as the batched one did |
+| Ordering | Each queue is FIFO and the drain visits its sources in a fixed order (files, network, agent claims), so no drain reorders observations relative to an earlier one |
+| Backpressure | A queue that is full **refuses** the new observation rather than evicting one already accepted. The refusal is counted, and the next drain appends `ObservationsDropped { source, dropped, capacity }` immediately after the batch it accompanies, so an incomplete window is bounded by its neighbours in the log and is never silent |
+| Enforcement | Independent of all of the above. A proxy thread's `Observer::decision` call does one lock, one length comparison and returns; it never waits on the log, on disk or on a UI consumer, so allow/deny decisions are made and answered in real time however far behind ingestion has fallen (`security-model.md` G14) |
+| Failure paths | The producers are owned by one RAII value. A launch that fails before or during the child — the sandbox could not be prepared, the process could not be spawned — still stops every thread, removes the run directory and its sockets, and appends what the producers had already recorded |
+
+`ObservationsDropped` is `origin=Wardd` (an enforcement fact, not an agent claim: it is
+the daemon's own statement that its record of a window is incomplete), is fsynced as a
+critical kind, and is visible in **every** observer mode including Quiet, for the same
+reason `TamperDetected` is.
+
+Not yet built on this: an observer-health panel in the desktop shell (delivery lag,
+last successful drain, cumulative overflow) — issues #138/#141 — and a repeatable p50/p99
+ingestion-latency benchmark against `performance.md`, which is issue #150's subject.
 
 Implemented (Phase 1): the observer rows and a one-line footer (`session · records ·
 entry · files changed · commands · network allowed / denied`); `--json` emits one
