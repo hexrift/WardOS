@@ -140,7 +140,7 @@ bash "$repo/desktop/install.sh" --destdir "$root" >"$TMP/out" 2>&1 || fail "inst
 $(cat "$TMP/out")"
 assert_logged '^sudo dnf -y install dnf5-plugins$'
 assert_logged '^sudo dnf -y copr enable mineiro/hyprland$'
-assert_logged '^sudo dnf -y copr enable atim/lazygit$'
+assert_logged '^sudo dnf -y copr enable dejan/lazygit$'
 assert_logged '^sudo dnf install -y .*hyprland'
 assert_logged '^dnf install -y .*bubblewrap'
 assert_not_logged '^rpm-ostree'
@@ -282,7 +282,7 @@ assert_logged '^podman run'
 bash "$repo/image/check-packages.sh" --dry-run >"$TMP/out"
 grep -q "fedora:$rel " "$TMP/out" || fail "release not derived from the Containerfile:
 $(cat "$TMP/out")"
-grep -q -- '-- 3 mineiro/hyprland erikreider/swayosd atim/lazygit ' "$TMP/out" || fail "coprs.txt not passed:
+grep -q -- '-- 3 mineiro/hyprland erikreider/swayosd dejan/lazygit ' "$TMP/out" || fail "coprs.txt not passed:
 $(cat "$TMP/out")"
 ! sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo/image/packages.txt" | grep -Ev '^[A-Za-z0-9._+-]+$' || fail "packages.txt has a bad name"
 ! sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo/image/coprs.txt" | grep -Ev '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' || fail "coprs.txt has a bad entry"

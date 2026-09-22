@@ -129,7 +129,8 @@ missing), and `solopasha/hyprland`, the COPR everyone used, builds rawhide only 
 and which of them build for the pinned release; the September 2026 run chose the
 smallest trust set: `mineiro/hyprland` (the one repository that carries the whole
 ecosystem, the successor of solopasha's), `erikreider/swayosd` (swayosd by its author)
-and `atim/lazygit`. `pulsemixer` is not packaged anywhere useful; the image ships
+and `atim/lazygit` (which has since stopped building lazygit for Fedora 44, so the
+image now enables `dejan/lazygit` for it). `pulsemixer` is not packaged anywhere useful; the image ships
 `pavucontrol` and `wardos-setup audio` prefers pulsemixer when present.
 
 ### The desktop in the image
