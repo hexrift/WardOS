@@ -82,6 +82,9 @@ pub enum WardEvent {
     VerificationProgress  { step: BoundedText, status: Running | Pass | Fail },
     VerificationPassed    { candidate: SnapshotId, summary: VerifySummary, result_hash: Blake3Hash },
     VerificationFailed    { candidate: SnapshotId, summary: VerifySummary, result_hash: Blake3Hash },
+    // Appended, not grouped above: postcard identifies WardEvent variants by
+    // declaration index, so a new one is always added at the end (#139).
+    VerificationErrored   { candidate: SnapshotId, reason: BoundedText },   // infra failure, not a test failure
     StateAccepted         { snapshot: SnapshotId, by: TamperWard },
 
     // agent claims (origin: Agent) — never enforcement facts
@@ -139,7 +142,7 @@ source of truth, not the socket. Latency budget from kernel event to subscriber 
 
 | Mode | Shows | Blocks? |
 | --- | --- | --- |
-| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed}`, `SessionEnded` | Only on `Ask` |
+| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed,Errored}`, `SessionEnded` | Only on `Ask` |
 | Live | Everything except `AgentClaim{Note}` | Only on `Ask` |
 | Step-through | Everything; additionally the manifest's `step_policy` marks actions (`FileModified` under given globs, `CommandStarted` matching patterns, any `NetworkRequested`) as `Ask` | Yes, on configured actions |
 
