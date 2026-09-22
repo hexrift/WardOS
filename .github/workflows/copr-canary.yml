@@ -1,12 +1,15 @@
 # Not protected by .tamperward.yml as a merge-authority gate the way verify.yml is —
 # this workflow never runs against a pull request and decides nothing about whether one
-# merges. It exists to answer, on its own clock, "are the image's COPRs (image/coprs.txt)
-# currently resolvable" so a PR's "image packages"/"hyprland config" failure can be
-# checked against a signal that already exists, instead of every PR re-deriving "is this
-# my diff or an upstream outage" from raw dnf logs — issue #198 item 3, the piece #201's
-# retry/classification fix explicitly did not cover (a COPR that enables cleanly but no
-# longer publishes a package is not a transient error `retry` can ride out; see #198's
-# 2026-09-22 18:53 UTC recurrence for exactly that shape).
+# merges. It exists to answer, on its own clock, "do image/check-packages.sh and
+# image/check-hyprland.sh pass against main with no PR diff involved" so a PR's
+# "image packages"/"hyprland config" failure can be checked against a signal that
+# already exists, instead of every PR re-deriving "is this my diff or something else"
+# from raw dnf logs — issue #198 item 3, the piece #201's retry/classification fix
+# explicitly did not cover (a COPR that enables cleanly but no longer publishes a
+# package is not a transient error `retry` can ride out; see #198's 2026-09-22
+# 18:53 UTC recurrence for exactly that shape). A red run here rules out a PR's own
+# diff; it is not by itself proof the cause is COPR rather than the runner, the
+# registry, or a pre-existing bug on main — read the failing step's own output.
 name: copr canary
 
 on:
@@ -26,8 +29,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # The same two scripts "image packages"/"hyprland config" run in verify.yml,
-      # run here unpaired from any diff — a failure here can only mean the COPRs
-      # themselves changed, never that a pull request broke something.
+      # run here unpaired from any diff. A failure here rules out one thing precisely:
+      # a pull request's own diff, since there isn't one — main's own packages.txt/
+      # coprs.txt/scripts are what's on trial. It does not by itself prove the COPRs
+      # are the cause: a quay.io pull, the runner's network, or a bug already on main
+      # could equally produce a red run here. Read the failing step's own output for
+      # which package/command actually failed before assuming it's issue #198.
       - name: image packages
         run: bash image/check-packages.sh
       - name: hyprland config
@@ -42,9 +49,10 @@ jobs:
             if [[ "${{ job.status }}" == "success" ]]; then
               echo "Both COPRs in \`image/coprs.txt\` resolved cleanly as of this run."
             else
-              echo "At least one check failed against the COPRs alone, no pull request diff involved."
-              echo "A PR whose \"image packages\"/\"hyprland config\" job fails at roughly this time is very"
-              echo "likely hitting the same upstream gap, not something in its own diff — see the failing"
-              echo "step above for which COPR/package, and [issue #198](https://github.com/hexrift/WardOS/issues/198)."
+              echo "At least one check failed here, with no pull request diff involved — see the failing"
+              echo "step above for which package/COPR/command. That rules out a PR's own diff as the cause;"
+              echo "it is not by itself proof the COPRs are at fault (a registry pull, the runner's network,"
+              echo "or a bug already on main could also produce this). If the failure output does point at"
+              echo "a COPR/package resolution gap, see [issue #198](https://github.com/hexrift/WardOS/issues/198)."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
