@@ -13,6 +13,15 @@
 //! in real time however far behind the log writer or a UI consumer has fallen — and
 //! a decision the queue has no room for is counted and surfaced as an explicit
 //! [`ward_events::WardEvent::ObservationsDropped`] marker, never dropped in silence.
+//!
+//! The recorder also tracks the verdicts that have not been made *yet*: the proxy
+//! announces each accepted connection before it serves it and retires it at its
+//! verdict ([`ward_proxy::Observer::deciding`]), so the connection sits in the
+//! queue's in-flight set for exactly the window in which a decision may still be
+//! produced and not yet recorded — never for the life of a relay, which has long
+//! since decided. [`Egress::quiesce`] can then charge whatever is left in that set
+//! as a gap in the same lock acquisition that closes the queue, so the session's
+//! one terminal drain takes every gap with it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,17 +78,23 @@ impl Recorder {
         self.0.drain().items
     }
 
-    /// Close the terminal cutover: from here the recorder accepts nothing more, and
-    /// a decision a straggling connection reaches after this point is refused and
-    /// counted for itself, under the very lock that sealed — so it is surfaced by
-    /// the next drain as the same explicit marker an overflow produces, and can
-    /// never be both recorded and counted as lost.
+    /// Close the terminal cutover, counting every connection whose verdict has not
+    /// reached the queue yet as a gap — in the one lock acquisition that also shuts
+    /// the queue.
     ///
-    /// Returns how many producers the seal had to write off. The proxy's relays are
-    /// not tracked in the recorder's in-flight set (the proxy owns their lifetime),
-    /// so for this recorder that is always zero and every late decision reports
-    /// itself. Counting the proxy's *connections* here instead is what produced the
-    /// false gaps: a connection still relaying has already recorded its decision.
+    /// Returns how many connections that was. They are the ones the proxy announced
+    /// with [`Observer::deciding`] and has not yet retired, which is *not* the same
+    /// set as the connections it still has open: a tunnel that is still relaying
+    /// recorded its decision when it was allowed and left the set there and then.
+    /// Counting open connections here instead is what produced the false gaps.
+    ///
+    /// Because the proxy announces a connection on its acceptor thread, and
+    /// `Handle::shutdown` — which [`Egress::quiesce`] runs first — joins that
+    /// thread, no connection can join the set after the shutdown returns. So what
+    /// the seal sees really is everything that may still be decided, and charging
+    /// it here, synchronously, is what puts the gap in the batch the caller's one
+    /// terminal drain is about to take. A late verdict that arrives after this adds
+    /// nothing: its loss has already been reported for it.
     pub fn seal(&self) -> usize {
         self.0.seal()
     }
@@ -95,21 +110,62 @@ impl Recorder {
     pub fn capacity(&self) -> usize {
         self.0.capacity()
     }
-}
 
-impl Observer for Recorder {
-    /// Called on a proxy thread, in the path of a live decision. It must never
-    /// block on the log, on disk or on a UI consumer, so it does no more than
-    /// offer the record to the bounded queue: a full queue counts the refusal and
-    /// returns immediately, and the decision the proxy just made stands either way.
-    fn decision(&self, req: &Request, decision: Decision, reason: &str) {
-        self.0.push(Recorded {
+    /// The record one verdict becomes, stamped with the time the proxy decided.
+    fn recorded(req: &Request, decision: Decision, reason: &str) -> Recorded {
+        Recorded {
             at: SystemTime::now(),
             host: req.target.host.clone(),
             port: req.target.port,
             allowed: matches!(decision, Decision::Allow),
             reason: reason.to_owned(),
-        });
+        }
+    }
+}
+
+impl Observer for Recorder {
+    /// Called on a proxy thread, in the path of a live decision, for a connection
+    /// the recorder is *not* tracking — which, since [`Recorder::deciding`] takes
+    /// every connection it is offered, happens only after the cutover sealed. The
+    /// queue refuses the record and counts it, so the loss is still accounted for.
+    fn decision(&self, req: &Request, decision: Decision, reason: &str) {
+        self.0.push(Self::recorded(req, decision, reason));
+    }
+
+    /// One accepted connection joins the set of verdicts still to come, so the
+    /// terminal [`seal`](Recorder::seal) can charge it as a gap if it does not
+    /// reach one in time. Called on the proxy's acceptor thread, which
+    /// `Handle::shutdown` joins — so once the caller's quiesce has shut the proxy
+    /// down, this set only shrinks.
+    ///
+    /// There is no cap of the recorder's own: the proxy already bounds how many
+    /// connections it serves at once, and a second cap here could only refuse a
+    /// connection whose verdict it would then have to account for separately.
+    /// Refused only once the cutover has sealed, and then the verdict accounts for
+    /// itself through [`decision`](Observer::decision).
+    fn deciding(&self) -> bool {
+        self.0.enter(usize::MAX)
+    }
+
+    /// The verdict for a connection this recorder is tracking. It must never block
+    /// on the log, on disk or on a UI consumer, so it does no more than leave the
+    /// set and offer the record to the bounded queue — one lock, one length
+    /// comparison — and the decision the proxy just made stands either way.
+    ///
+    /// Leaving and offering are the *same* lock acquisition, which is what makes
+    /// the cutover exact: this verdict cannot land in the batch after the seal has
+    /// already charged this connection as a gap, and the seal cannot charge it
+    /// after the verdict has been accepted.
+    fn decided(&self, req: &Request, decision: Decision, reason: &str) {
+        self.0.commit(Self::recorded(req, decision, reason));
+    }
+
+    /// A connection that reached no verdict at all — an unparsable head, a request
+    /// that is not a proxy request, a pause that landed while the head was in
+    /// flight. Nothing was decided, so nothing is recorded; it simply stops being a
+    /// verdict the cutover has to wait for.
+    fn undecided(&self) {
+        self.0.leave();
     }
 }
 
@@ -259,21 +315,35 @@ impl Egress {
     /// the daemon's shutdown open.
     ///
     /// When the wait runs out the cutover is **sealed** ([`Recorder::seal`]) rather
-    /// than guessed at: sealing is one acquisition of the recorder's own lock, the
-    /// lock a proxy thread must take to record a decision, so a straggling
-    /// connection either got its decision into the batch the caller is about to
-    /// drain or finds the recorder sealed and counts that one decision as the gap it
-    /// is. Nothing is counted from a sampled connection count, which is what let the
-    /// same decision appear in the final batch *and* in an `ObservationsDropped`
-    /// marker beside it: a connection still being served has, by then, already
-    /// recorded the decision it was served for.
+    /// than guessed at, and the seal charges the connections whose verdicts have
+    /// not reached the recorder yet — the set the proxy maintains through
+    /// [`Observer::deciding`]/[`Observer::decided`], which a connection joins
+    /// before it is served and leaves at its verdict, not at the end of its relay.
+    /// Charging it is one acquisition of the recorder's own lock, the lock a proxy
+    /// thread must take to record a decision, so a straggling connection either got
+    /// its decision into the batch the caller is about to drain or is counted, then
+    /// and there, as the gap it is. Nothing is counted from a sampled connection
+    /// count, which is what let the same decision appear in the final batch *and*
+    /// in an `ObservationsDropped` marker beside it: a connection still being
+    /// served has, by then, already recorded the decision it was served for.
+    ///
+    /// The three steps are in this order for a reason. `shutdown` joins the
+    /// acceptor, so after it no connection can join the set at all; the wait then
+    /// gives the ones already in it their bounded chance to decide; and the seal
+    /// charges whatever is left **before this returns**. That is what makes the
+    /// caller's single terminal [`drain_observations`](Self::drain_observations)
+    /// enough: every gap has been counted by the time the drain runs, so none is
+    /// left for a drain that never happens.
     ///
     /// Returns how many connections were still in flight when the wait ran out,
     /// which is a report on the proxy, not an accounting of the record.
     pub fn quiesce(&self, timeout: Duration) -> usize {
         // Stops accepting, asks every relay to wind down and joins the acceptor;
-        // idempotent, so the later `stop` is still safe.
+        // idempotent, so the later `stop` is still safe. Joining the acceptor is
+        // what closes the set of connections that may still be decided.
         self.handle.shutdown();
+        // An open connection is a superset of an undecided one, so this waits out
+        // the relays too; the seal below is what distinguishes the two.
         crate::daemon::wait_until(timeout, || self.handle.active_connections() == 0);
         self.recorder.seal();
         self.handle.active_connections()
@@ -335,6 +405,8 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
     use ward_events::Pid;
+
+    use crate::observe::Observers;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -560,6 +632,201 @@ mod tests {
              counted as dropped, never neither: {obs:?}"
         );
         assert_eq!(dropped, 1, "and the gap is reported exactly once");
+    }
+
+    /// Count the decisions and the network-gap total in one batch.
+    fn tally(obs: &[Observation]) -> (usize, u64) {
+        let decisions = obs
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o.event,
+                    WardEvent::NetworkDenied { .. } | WardEvent::NetworkRequested { .. }
+                )
+            })
+            .count();
+        let dropped = obs
+            .iter()
+            .filter_map(|o| match o.event {
+                WardEvent::ObservationsDropped {
+                    source: ObserverSource::Network,
+                    dropped,
+                    ..
+                } => Some(dropped),
+                _ => None,
+            })
+            .sum();
+        (decisions, dropped)
+    }
+
+    /// #137: the gap has to be in the batch the terminal drain **already took**.
+    ///
+    /// This is the production ordering, which the regression above does not reach.
+    /// There the blocked decision is released and joined *before* the drain, so the
+    /// refusal it records on arrival is still in the queue when the drain runs. The
+    /// session does not do that: [`crate::observe::Observers::finish_within`]
+    /// quiesces and then drains, immediately, with no join in between and no second
+    /// drain afterwards. A straggler that counts *itself* on arrival therefore
+    /// counts into a `dropped` total nothing will ever emit — the gap is real and
+    /// the record is silent about it, which is exactly what G14 forbids.
+    ///
+    /// So: seal with the decision provably in flight, take the terminal batch, and
+    /// only then let the decision happen. The already-returned batch must carry the
+    /// one gap. A count that only appears afterwards is a count nobody reads.
+    #[test]
+    fn a_decision_still_in_flight_at_the_seal_is_a_gap_in_the_batch_the_drain_already_took() {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let released = Arc::new(std::sync::Barrier::new(2));
+        let resolver: Arc<dyn Resolver> = Arc::new(BlockedResolver {
+            entered: Arc::clone(&entered),
+            released: Arc::clone(&released),
+        });
+        let allowed =
+            NetworkCapability::Custom(["parked.example".to_owned()].into_iter().collect());
+        let egress = Egress::start_with(dir.path(), &allowed, Vec::new(), resolver).unwrap();
+        let socket = egress.socket().to_path_buf();
+        let asking = std::thread::spawn(move || ask_proxy(&socket, "parked.example"));
+
+        // The proxy is serving the request and has not decided yet.
+        entered.wait();
+        // A zero wait, so the seal is taken with that decision still in flight.
+        egress.quiesce(Duration::ZERO);
+        // The one terminal drain, in the place the session performs it: straight
+        // after the quiesce, with the straggler still parked.
+        let terminal = egress.drain_observations(&by());
+        // Only now does the proxy reach its verdict — too late, by construction.
+        released.wait();
+        drop(asking.join());
+
+        let (decisions, dropped) = tally(&terminal);
+        assert_eq!(
+            decisions, 0,
+            "the decision missed the cutover, so it cannot be in the terminal batch: \
+             {terminal:?}"
+        );
+        assert_eq!(
+            dropped, 1,
+            "the batch the drain already returned must carry the gap: a count raised \
+             after it is a count no drain will ever emit: {terminal:?}"
+        );
+
+        // And the straggler adds nothing of its own afterwards — neither the
+        // decision nor a second count of the same loss.
+        let after = egress.drain_observations(&by());
+        egress.stop();
+        assert!(
+            after.is_empty(),
+            "the loss was accounted for in the terminal batch; nothing may be left \
+             over for a drain that never happens: {after:?}"
+        );
+    }
+
+    /// The same, one level up: through the session's real terminal path.
+    ///
+    /// [`crate::observe::Observers::finish_within`] is what production calls, and
+    /// the sequencing under test is its own — quiesce, then the single drain, with
+    /// nothing joining the proxy in between. The tail it returns is the last thing
+    /// the log ever receives for this command, so the gap has to be in it.
+    #[test]
+    fn the_terminal_flush_returns_the_network_gap_for_a_decision_it_gave_up_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let released = Arc::new(std::sync::Barrier::new(2));
+        let resolver: Arc<dyn Resolver> = Arc::new(BlockedResolver {
+            entered: Arc::clone(&entered),
+            released: Arc::clone(&released),
+        });
+        let allowed =
+            NetworkCapability::Custom(["parked.example".to_owned()].into_iter().collect());
+        let egress = Egress::start_with(&run_dir, &allowed, Vec::new(), resolver).unwrap();
+        let socket = egress.socket().to_path_buf();
+        let mut obs = Observers::new(run_dir.clone());
+        obs.set_egress(egress);
+        let asking = std::thread::spawn(move || ask_proxy(&socket, "parked.example"));
+
+        entered.wait();
+        // The real terminal path, with the bound collapsed so the test does not
+        // have to wait it out. It quiesces, drains once and is done.
+        let finished = obs.finish_within(&by(), Duration::ZERO);
+        // The straggler only now reaches its verdict — after the tail was returned.
+        released.wait();
+        drop(asking.join());
+
+        let (decisions, dropped) = tally(&finished.tail);
+        assert_eq!(
+            decisions,
+            0,
+            "the decision missed the cutover: {:?}",
+            finished.tail.iter().map(|o| &o.event).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            dropped,
+            1,
+            "the tail the session appends is the last record of this command, so a \
+             decision the cutover gave up on must be marked in it: {:?}",
+            finished.tail.iter().map(|o| &o.event).collect::<Vec<_>>()
+        );
+        // The marker is the daemon's own statement, which no observer mode may hide.
+        assert!(
+            finished
+                .tail
+                .iter()
+                .any(|o| o.origin == Origin::Wardd && o.origin.is_enforcement_fact())
+        );
+    }
+
+    /// The set the seal charges is "not decided yet", never "still connected".
+    ///
+    /// A connection that has been allowed goes on relaying — a large response body,
+    /// a long-lived tunnel — for as long as it likes, and none of that is a decision
+    /// still to be made: it was recorded when the connection was allowed. Charging
+    /// open connections is what produced false gaps beside their own decisions.
+    #[test]
+    fn a_connection_leaves_the_pending_set_at_its_verdict_not_at_the_end_of_its_relay() {
+        let rec = Recorder::with_capacity(4);
+        assert!(
+            rec.deciding(),
+            "the connection is announced before it is served"
+        );
+        rec.decided(&req("still-relaying.io"), Decision::Allow, "allowlisted");
+        // The relay may run for minutes from here; the verdict is already recorded.
+        assert_eq!(rec.seal(), 0, "there is no verdict left to wait for");
+
+        let drained = rec.drain_bounded();
+        assert_eq!(drained.items.len(), 1);
+        assert_eq!(drained.dropped, 0, "a decided connection is not a gap");
+    }
+
+    /// A connection that reaches no verdict is not a lost observation either: it
+    /// leaves the set with nothing to record, so the cutover has nothing to charge.
+    #[test]
+    fn a_connection_that_never_decides_is_retired_without_a_gap() {
+        let rec = Recorder::with_capacity(4);
+        assert!(rec.deciding());
+        rec.undecided();
+        assert_eq!(rec.seal(), 0);
+        assert_eq!(rec.drain_bounded().dropped, 0);
+    }
+
+    /// A verdict for a connection the seal already charged adds nothing — not the
+    /// decision, and not a second count of the same loss.
+    #[test]
+    fn a_verdict_charged_by_the_seal_is_not_counted_again_when_it_arrives() {
+        let rec = Recorder::with_capacity(4);
+        assert!(rec.deciding());
+        assert_eq!(
+            rec.seal(),
+            1,
+            "the seal gives up on the undecided connection"
+        );
+        rec.decided(&req("too-late.io"), Decision::Deny, "offline");
+
+        let drained = rec.drain_bounded();
+        assert!(drained.items.is_empty(), "{:?}", drained.items);
+        assert_eq!(drained.dropped, 1, "one loss, one account of it");
     }
 
     #[test]

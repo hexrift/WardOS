@@ -234,7 +234,9 @@ impl<T> Bounded<T> {
     /// Join the in-flight set, unless `max` producers are already in it or the
     /// cutover has sealed. Returns whether the slot was taken; a caller refused
     /// here has produced nothing the seal will account for, so it reports its own
-    /// loss with [`record_dropped`](Self::record_dropped).
+    /// loss — with [`record_dropped`](Self::record_dropped) when it has nothing to
+    /// offer, or by offering what it produced through [`push`](Self::push), which
+    /// refuses it and counts it under the same lock.
     pub fn enter(&self, max: usize) -> bool {
         let mut queue = self.locked();
         if queue.sealed || queue.in_flight >= max {
