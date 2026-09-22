@@ -130,10 +130,12 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
     // died or was killed. Reconcile any such dangling attempt into
     // `VerificationInterrupted` before serving a single connection, so a
     // subscriber never sees the eternal "running" spinner this issue is about,
-    // even across a daemon restart. Best-effort: a failure here (a corrupt marker
-    // aside, already handled inside) must not stop the daemon from serving the
-    // session at all.
-    let _ = crate::attempt::reconcile_dangling_attempts(&mut log, &dir);
+    // even across a daemon restart. Fail closed (review of #208, finding 3): a
+    // daemon that could not confirm a dangling attempt was actually closed out
+    // must not start serving the session as though it had been — a client asking
+    // for `Describe`/`Subscribe` right after would otherwise see whatever
+    // half-reconciled state this left behind with nothing to say it is suspect.
+    crate::attempt::reconcile_dangling_attempts(&mut log, &dir)?;
     let description = serde_json::to_value(meta.describe())
         .map_err(|e| Error::Daemon(format!("describe {session}: {e}")))?;
     // What an approval's authority is derived from: the manifest, the

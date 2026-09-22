@@ -358,7 +358,15 @@ impl Session {
             Some(remote) => Box::new(remote),
             None => Box::new(LocalLog::open(&log_path, started)?),
         };
-        let _ = crate::attempt::reconcile_dangling_attempts(&mut *sink, &dir);
+        // Fail closed (review of #208, finding 3): a reconciliation failure here
+        // means this process cannot say whether a dangling attempt was actually
+        // closed out, so it must not hand back a `Session` that looks fully caught
+        // up when it might not be. Safe to call unconditionally, including through
+        // a `RemoteSink` onto a daemon that may be mid-verification (finding 1):
+        // `reconcile_dangling_attempts` never interrupts a marker whose owning
+        // process is still verifiably alive, so a second `ward` command merely
+        // opening this session can no longer ever cut a live attempt short.
+        crate::attempt::reconcile_dangling_attempts(&mut *sink, &dir)?;
         Ok(Some(Self {
             manifest: meta.manifest,
             worktree,
@@ -798,8 +806,11 @@ impl Session {
         // `Session::open_current` already reconcile whenever they (re)take
         // ownership of the log; this additionally covers a same-process leftover —
         // a prior `verify()` call whose `AttemptGuard` dropped without
-        // finishing — without needing a process restart to notice it.
-        let _ = crate::attempt::reconcile_dangling_attempts(&mut *self.sink, &dir);
+        // finishing — without needing a process restart to notice it. Fail closed
+        // (review of #208, finding 3): starting a fresh attempt on top of one this
+        // process could not confirm was reconciled would risk exactly the
+        // contradictory-history problem #139 exists to prevent.
+        crate::attempt::reconcile_dangling_attempts(&mut *self.sink, &dir)?;
 
         let attempt = self.alloc_attempt();
         // Allocated, and recorded, before any expensive preparation begins (#139
@@ -818,21 +829,35 @@ impl Session {
             return self.finalize_cancelled(guard, attempt, None);
         }
 
-        let store = SnapshotStore::open(self.state.join("cas"))
-            .map_err(|e| Error::Snapshot(e.to_string()))?;
-        let entry: ward_snapshot::SnapshotId = self
-            .entry_snapshot
-            .parse()
-            .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
-        let scratch_root = run_dir(&self.session_str)?;
-        // Freeze the agent only for the candidate capture inside `prepare`; the
-        // verifier itself runs from the CAS, not the worktree (ST-018, G5/G9).
-        let prepared = {
-            let _freeze = self.freeze_for_capture();
-            verify::prepare(&store, &self.worktree, entry, &scratch_root)
-        };
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
+        // #139 item 4 (review of #208, finding 4): every fallible step between
+        // `VerificationAttemptStarted` and a bound candidate — opening the CAS,
+        // parsing the entry snapshot id, allocating the scratch `run_dir`, and
+        // `verify::prepare` itself — shares one finalizer below. Before this fix
+        // only `verify::prepare`'s own failure went through it; a `SnapshotStore`,
+        // parse, or `run_dir` failure returned bare, leaving the log stuck at
+        // `VerificationAttemptStarted` until some future reopen's reconciliation
+        // pass happened to notice. The closure returns the entry id and scratch
+        // root alongside the prepared verification so nothing after it has to
+        // recompute them (and, for `run_dir`, risk a second, needless directory
+        // allocation).
+        let prep = (|| -> Result<(ward_snapshot::SnapshotId, PathBuf, verify::Verification)> {
+            let store = SnapshotStore::open(self.state.join("cas"))
+                .map_err(|e| Error::Snapshot(e.to_string()))?;
+            let entry: ward_snapshot::SnapshotId = self
+                .entry_snapshot
+                .parse()
+                .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
+            let scratch_root = run_dir(&self.session_str)?;
+            // Freeze the agent only for the candidate capture inside `prepare`; the
+            // verifier itself runs from the CAS, not the worktree (ST-018, G5/G9).
+            let prepared = {
+                let _freeze = self.freeze_for_capture();
+                verify::prepare(&store, &self.worktree, entry, &scratch_root)?
+            };
+            Ok((entry, scratch_root, prepared))
+        })();
+        let (entry, scratch_root, prepared) = match prep {
+            Ok(prep) => prep,
             Err(e) => {
                 // Unlike a `verify::execute` failure, there is no candidate yet for
                 // a `VerificationErrored` record to name — that field is mandatory,
@@ -1972,6 +1997,112 @@ mod tests {
         );
     }
 
+    /// Review of #208, finding 4, class 1: `SnapshotStore::open` failing (here: its
+    /// `cas` root exists as a plain file, so `create_dir_all` under it cannot
+    /// succeed) after `VerificationAttemptStarted` is already on the log must still
+    /// leave the attempt with exactly one terminal record — `VerificationInterrupted`
+    /// with no candidate — not a bare `AttemptStarted` until some future reopen's
+    /// reconciliation happens to notice.
+    #[test]
+    fn a_snapshot_store_open_failure_after_attempt_started_still_ends_in_interrupted() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        std::fs::remove_dir_all(state.path().join("cas")).unwrap();
+        std::fs::write(state.path().join("cas"), b"not a directory").unwrap();
+
+        let err = session
+            .verify()
+            .expect_err("SnapshotStore::open must fail on a non-directory cas root");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            verification_kinds(&mut session),
+            vec!["AttemptStarted", "Interrupted"],
+            "a SnapshotStore::open failure must not leave the log stuck at AttemptStarted"
+        );
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        match &records.last().unwrap().event {
+            WardEvent::VerificationInterrupted { candidate, .. } => {
+                assert_eq!(*candidate, None, "capture never even started");
+            }
+            other => panic!("expected VerificationInterrupted, got {other:?}"),
+        }
+    }
+
+    /// Review of #208, finding 4, class 2: the entry snapshot id failing to parse
+    /// after `VerificationAttemptStarted` — corrupted `session.json`, in practice —
+    /// must likewise still end the attempt in exactly one terminal record.
+    #[test]
+    fn an_entry_snapshot_parse_failure_after_attempt_started_still_ends_in_interrupted() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        session.entry_snapshot = "not-a-valid-snapshot-id".to_owned();
+
+        let err = session
+            .verify()
+            .expect_err("an unparseable entry snapshot id must fail verify()");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            verification_kinds(&mut session),
+            vec!["AttemptStarted", "Interrupted"],
+            "an entry-snapshot parse failure must not leave the log stuck at AttemptStarted"
+        );
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        match &records.last().unwrap().event {
+            WardEvent::VerificationInterrupted { candidate, .. } => {
+                assert_eq!(*candidate, None);
+            }
+            other => panic!("expected VerificationInterrupted, got {other:?}"),
+        }
+    }
+
+    /// Review of #208, finding 4, class 3: `run_dir` failing (here: a planted
+    /// symlink at its fixed path, ST-023 — see `run_dir_refuses_a_planted_symlink`)
+    /// after `VerificationAttemptStarted` must likewise still end the attempt in
+    /// exactly one terminal record instead of returning bare.
+    #[test]
+    fn a_run_dir_failure_after_attempt_started_still_ends_in_interrupted() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        let planted = run_dir_path(session.id());
+        let _ = std::fs::remove_dir_all(&planted);
+        let _ = std::fs::remove_file(&planted);
+        let attacker_dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(attacker_dir.path(), &planted).unwrap();
+
+        let err = session
+            .verify()
+            .expect_err("run_dir must refuse a planted symlink at its fixed path");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            verification_kinds(&mut session),
+            vec!["AttemptStarted", "Interrupted"],
+            "a run_dir failure must not leave the log stuck at AttemptStarted"
+        );
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        match &records.last().unwrap().event {
+            WardEvent::VerificationInterrupted { candidate, .. } => {
+                assert_eq!(*candidate, None);
+            }
+            other => panic!("expected VerificationInterrupted, got {other:?}"),
+        }
+        // The symlink itself must be left alone (never followed/removed), matching
+        // `run_dir_refuses_a_planted_symlink`'s own assertion.
+        assert!(std::fs::symlink_metadata(&planted).unwrap().is_symlink());
+        std::fs::remove_file(&planted).unwrap();
+    }
+
     /// #139 item 6: a cancel requested before `verify()` even starts preparing
     /// takes effect at the very first checkpoint, before any candidate is
     /// captured — a distinct terminal outcome, `VerificationCancelled`, never
@@ -2114,5 +2245,78 @@ mod tests {
         // The next attempt this (or any) process allocates for the session does
         // not collide with the reconciled one.
         assert_eq!(reopened.alloc_attempt().get(), 2);
+    }
+
+    /// Review of #208, finding 1: a marker is not, by itself, evidence its owner
+    /// died — it is equally present for a healthy in-flight verification. A second
+    /// `ward` invocation that merely opens the same session (`open_current`) while
+    /// a first one's `verify()` is genuinely still running elsewhere must never
+    /// interrupt it. `LiveChild` stands in for that first, still-running process:
+    /// a real, independently-alive pid the marker names as its owner.
+    #[test]
+    fn open_current_never_interrupts_an_attempt_a_live_process_still_owns() {
+        use std::process::{Child, Command, Stdio};
+
+        struct LiveChild(Child);
+        impl LiveChild {
+            fn spawn() -> Self {
+                Self(
+                    Command::new("sh")
+                        .args(["-c", "while :; do :; done"])
+                        .stdout(Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                )
+            }
+        }
+        impl Drop for LiveChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        session.persist_current().unwrap();
+        let dir = session_dir(state.path(), session.id());
+
+        let attempt = AttemptId::new(1);
+        let marker = dir.join("attempts").join("1.json");
+        let owner = LiveChild::spawn();
+        {
+            let mut session = session;
+            session
+                .emit(
+                    Origin::Wardd,
+                    WardEvent::VerificationAttemptStarted {
+                        attempt,
+                        requested_by: VerifyRequester::User,
+                    },
+                )
+                .unwrap();
+            session.sync().unwrap();
+            // A marker naming the still-running `owner` child as this attempt's
+            // owner — the same shape a real `verify()` call leaves while it is
+            // genuinely in flight — never a dead process's leftover.
+            crate::attempt::test_marker_owned_by(&dir, attempt, owner.0.id()).unwrap();
+        }
+        assert!(marker.exists());
+
+        // A second, independent `open_current` — exactly what a concurrent `ward`
+        // command does — must find the attempt still live and leave it alone.
+        let mut reopened = Session::open_current(project.path(), state.path())
+            .unwrap()
+            .expect("the persisted session is found");
+        assert!(
+            marker.exists(),
+            "a live owner's marker must survive a second client's open_current"
+        );
+        assert_eq!(
+            verification_kinds(&mut reopened),
+            vec!["AttemptStarted"],
+            "no VerificationInterrupted was ever emitted for the still-running attempt"
+        );
     }
 }
