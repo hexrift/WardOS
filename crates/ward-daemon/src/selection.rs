@@ -19,10 +19,12 @@
 //! asks for: changing the selection must never retarget an action already
 //! bound to a session.
 
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -46,48 +48,106 @@ fn path(state: &Path) -> PathBuf {
     state.join("desktop-selection.json")
 }
 
+/// `<state>/desktop-selection.lock`: a sibling of the registry itself, whose
+/// only role is something to hold an OS `flock` on — never read or written.
+/// [`lock_selection`] is what actually closes the race review 5284361040 of
+/// #210 (finding 1) describes: `select_if_unchanged`'s old shape re-read the
+/// registry and then wrote it as two separate filesystem operations, so an
+/// explicit [`select`] landing in that gap could still be undone by a stale
+/// automatic fallback finishing after it. Every write transaction below now
+/// holds this lock for its whole read-compare-write critical section, so a
+/// concurrent transaction — another thread, or an entirely separate
+/// `ward`/`wardd` process — cannot interleave with it at all, not just less
+/// often. See `attempt.rs`'s `lock_session_reconciliation` for the same
+/// idiom guarding a different registry's read-compare-write section: an OS
+/// `flock` on an open file description needs no staleness recovery, since
+/// the kernel releases it the instant the holder's last reference closes,
+/// including on a crash.
+fn lock_path(state: &Path) -> PathBuf {
+    state.join("desktop-selection.lock")
+}
+
+/// Acquire the exclusive, whole-registry lock for one read-compare-write
+/// transaction. Blocks until any other transaction currently inside
+/// [`select`], [`select_if_unchanged`] or [`clear`] — another thread, or an
+/// entirely separate `ward`/`wardd` process — releases theirs (review
+/// 5284361040 of #210, finding 1).
+fn lock_selection(state: &Path) -> Result<Flock<File>> {
+    let path = lock_path(state);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    }
+    // Only this file's *existence* matters — it is never read or written —
+    // so an already-present lock file (from an earlier transaction) is
+    // opened as-is rather than truncated.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| Error::io(&path, e))?;
+    Flock::lock(file, FlockArg::LockExclusive)
+        .map_err(|(_, errno)| Error::io(&path, std::io::Error::from(errno)))
+}
+
 /// The registry's contents, or the empty selection (`None`, generation 0)
 /// when nothing has chosen one yet: a registry that has simply never been
 /// written behaves exactly like no selection, not an error, since every
 /// reader already has a fallback for "none chosen yet" ([`crate::client::
-/// desktop_socket`] picks the newest live session and records it). A file
-/// that exists but could not actually be read (permissions, a full disk, …)
-/// is a different thing — folding that into generation 0 the same way would
-/// let a stale [`select_if_unchanged`] compare-and-swap believe nothing has
-/// changed when it cannot tell either way, so that case is surfaced instead
-/// of swallowed. A file that exists, was read, but is not valid JSON is still
-/// folded into the default: every writer here goes through [`write_atomic`],
-/// so that can only mean something outside WardOS wrote garbage over it, not
-/// a torn write this registry could have produced itself.
+/// desktop_socket`] picks the newest live session and records it). This
+/// degrades a genuine read failure the same way, logging why rather than
+/// staying silent about it (#141 finding 2) — every caller of `current`
+/// already has its own fallback for "no selection", so aborting whatever
+/// asked would only replace one degraded answer with a harder failure it is
+/// not equipped to handle; [`read_for_write`] is the read the *write* side
+/// uses instead, precisely because it cannot afford that same latitude
+/// (review 5284361040 of #210, finding 1).
 #[must_use]
 pub fn current(state: &Path) -> Selection {
+    read_for_write(state).unwrap_or_else(|e| {
+        eprintln!(
+            "ward: desktop selection at {} unreadable: {e}",
+            path(state).display()
+        );
+        Selection::default()
+    })
+}
+
+/// The registry's contents for a locked read-compare-write transaction:
+/// `Ok(default)` both for "not written yet" and for "written, but not valid
+/// JSON" — every writer here goes through [`write_atomic`], so a file that
+/// exists, was read, but does not parse can only mean something outside
+/// WardOS wrote garbage over it, not a torn write this registry could have
+/// produced itself, and is therefore safe to treat as a reset the same way
+/// [`current`] does. A real I/O failure (permissions, a full disk, a path
+/// that is not even a regular file) is different: `Err`, not folded into
+/// generation 0. Called only while holding [`lock_selection`], so together
+/// they are what actually closes finding 1's race — folding *this* case into
+/// generation 0 the way an ordinary reader may would let a write proceed, or
+/// a stale [`select_if_unchanged`] believe nothing has changed, while
+/// genuinely unable to tell what is on disk.
+fn read_for_write(state: &Path) -> Result<Selection> {
     match std::fs::read(path(state)) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Selection::default(),
-        Err(e) => {
-            // No logging of its own in this crate (ward-cli/ward-shell own
-            // stdout and stderr); every caller already has a fallback for
-            // "no selection", so this still degrades instead of aborting
-            // whatever asked — but it is not silent about why (#141 finding
-            // 2: an actionable read error must not be indistinguishable from
-            // "nothing chosen yet").
-            eprintln!(
-                "ward: desktop selection at {} unreadable: {e}",
-                path(state).display()
-            );
-            Selection::default()
-        }
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Selection::default()),
+        Err(e) => Err(Error::io(path(state), e)),
     }
 }
 
 /// Record `session` as the desktop's selection and return the new
 /// [`Selection`] — its generation always one more than what was there before,
 /// even when `session` repeats the value already stored: a switcher
-/// re-confirming the same session is still a change it can observe.
+/// re-confirming the same session is still a change it can observe. Holds
+/// [`lock_selection`] for its entire read-compare-write transaction, so two
+/// concurrent `select` calls can no longer both read the same generation and
+/// both win a write (review 5284361040 of #210, finding 1: the previous,
+/// unlocked shape had the same lost-update race `select_if_unchanged`'s
+/// compare-and-swap did).
 pub fn select(state: &Path, session: Option<&str>) -> Result<Selection> {
+    let _guard = lock_selection(state)?;
     let next = Selection {
         session: session.map(ToOwned::to_owned),
-        generation: current(state).generation + 1,
+        generation: read_for_write(state)?.generation + 1,
     };
     write_selection(state, &next)?;
     Ok(next)
@@ -99,20 +159,44 @@ pub fn select(state: &Path, session: Option<&str>) -> Result<Selection> {
 /// fallback is needed, then (picking the newest live session can itself take
 /// a while — connecting to every session's socket) writes its pick. A
 /// concurrent, explicit `ward session select` landing in that gap must always
-/// win, not be undone by the automatic choice arriving after it. This
-/// re-reads the registry right before writing and, when its generation no
-/// longer matches `expected`, writes nothing and simply returns the registry
-/// as it now stands — the caller's stale decision loses, silently, the same
-/// way a losing compare-and-swap always does. (The re-read and the write are
-/// still two separate filesystem operations, not one atomic step, so this
-/// narrows the race to the gap between them rather than closing it
-/// completely; nothing in this registry's callers needs more than that.)
+/// win, not be undone by the automatic choice arriving after it.
+///
+/// The whole read-compare-write transaction now runs under [`lock_selection`]
+/// (review 5284361040 of #210, finding 1): the previous shape re-read the
+/// registry and wrote it as two separate filesystem operations, which only
+/// narrowed the race to the gap between them (its own doc comment said so)
+/// rather than closing it — a concurrent explicit `select` could still land
+/// in exactly that gap and be undone by this function's write landing after
+/// it. With the whole transaction under one lock, nothing can write between
+/// this function's read and its own write at all, so an explicit selection
+/// that lands anywhere around this call either happens entirely before it
+/// (and this call sees it, declines, and hands it back unharmed) or entirely
+/// after it (and is simply the newer state) — never in between.
 pub fn select_if_unchanged(
     state: &Path,
     session: Option<&str>,
     expected: u64,
 ) -> Result<Selection> {
-    let now = current(state);
+    select_if_unchanged_locked(state, session, expected, || {})
+}
+
+/// [`select_if_unchanged`]'s transaction, with a seam only test code uses: a
+/// callback run after the locked read and before the write, so a test can
+/// hold the lock open at exactly the point review 5284361040 of #210
+/// (finding 1) used to be exploitable, and prove a concurrent transaction
+/// really cannot land there any more — not by luck of thread scheduling, but
+/// because it blocks on the same lock. Production callers always pass a
+/// no-op here; this is the one CAS `select_if_unchanged` runs either way, not
+/// a second code path grown just for the test.
+fn select_if_unchanged_locked(
+    state: &Path,
+    session: Option<&str>,
+    expected: u64,
+    between_read_and_write: impl FnOnce(),
+) -> Result<Selection> {
+    let _guard = lock_selection(state)?;
+    let now = read_for_write(state)?;
+    between_read_and_write();
     if now.generation != expected {
         return Ok(now);
     }
@@ -149,7 +233,13 @@ fn write_selection(state: &Path, next: &Selection) -> Result<()> {
 /// interrupted partway (the process killed, the disk full), and a concurrent
 /// reader can then observe a truncated or partial file; a `rename` within one
 /// filesystem is atomic, so a reader only ever sees the whole old file or the
-/// whole new one, never a mix (#141 finding 2).
+/// whole new one, never a mix (#141 finding 2). The rename's directory entry
+/// is then `fsync`'d too (review 5284361040 of #210, finding 1: "fsync the
+/// parent directory if durability is claimed") — a `rename` is atomic the
+/// instant it completes, but on most filesystems that is not yet a promise
+/// it survives a crash immediately after until the directory's own inode is
+/// synced, the same requirement `attempt.rs`'s `sync_dir` follows for its own
+/// atomically-written markers.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -163,7 +253,17 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         f.write_all(bytes).map_err(|e| Error::io(&tmp, e))?;
         f.sync_all().map_err(|e| Error::io(&tmp, e))?;
     }
-    std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))
+    std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
+    sync_dir(dir)
+}
+
+/// `fsync` a directory itself, so a rename or create within it is durable
+/// against a crash immediately after — the same pattern `attempt.rs::sync_dir`
+/// uses for its own atomically-written markers (review 5284361040 of #210,
+/// finding 1).
+fn sync_dir(dir: &Path) -> Result<()> {
+    let dir_file = std::fs::File::open(dir).map_err(|e| Error::io(dir, e))?;
+    dir_file.sync_all().map_err(|e| Error::io(dir, e))
 }
 
 #[cfg(test)]
@@ -314,5 +414,136 @@ mod tests {
             "the race window produced no successful read at all; widen it rather than \
              treating that as proof of anything"
         );
+    }
+
+    /// Review 5284361040 of #210, finding 1: the old `select_if_unchanged`
+    /// re-read the registry and then wrote it as two separate filesystem
+    /// operations, so a concurrent, explicit `select` landing in exactly that
+    /// gap could still be undone by the fallback's write arriving after it —
+    /// its own doc comment said this only narrowed the race. This pauses a
+    /// simulated fallback, via the test-only hook, right after its locked
+    /// read and before its write — precisely that former gap — while a real
+    /// concurrent `select` (the explicit user choice) is spawned and races to
+    /// commit. Because the fallback already holds `lock_selection` before the
+    /// pause even begins, the explicit call cannot acquire it — and therefore
+    /// cannot write — until the fallback's own write has completed and the
+    /// lock is released: the gap the old code exposed no longer exists for
+    /// anything to land in. The assertion is on the only thing that would
+    /// ever matter to a caller: the fallback's write must never be what is on
+    /// disk once the explicit selection has also run.
+    #[test]
+    fn select_if_unchanged_barrier_never_lets_a_paused_fallback_clobber_a_concurrent_explicit_select()
+     {
+        let state = tempfile::tempdir().unwrap();
+        let state_path = state.path().to_path_buf();
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+
+        // The simulated fallback: observed generation 0 (nothing chosen
+        // yet), same as `desktop_socket`'s real fallback would before its
+        // slow "newest live session" probe.
+        let fallback = std::thread::spawn(move || {
+            select_if_unchanged_locked(&state_path, Some("sess_auto_newest"), 0, || {
+                // Still holding `lock_selection` here — the read is done,
+                // the write has not happened yet. Tell the main thread it is
+                // safe to try the explicit select, then wait to be released.
+                paused_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            })
+        });
+
+        // Only spawned once the fallback is confirmed to be paused mid-lock,
+        // so this genuinely contends for `lock_selection` rather than
+        // happening to run before or after it by scheduling luck.
+        paused_rx.recv().unwrap();
+        let state_path = state.path().to_path_buf();
+        let explicit = std::thread::spawn(move || select(&state_path, Some("sess_user_picked")));
+
+        // Let the fallback proceed to its write now that the explicit call
+        // is contending for the same lock.
+        resume_tx.send(()).unwrap();
+
+        let fallback_result = fallback.join().unwrap().unwrap();
+        let explicit_result = explicit.join().unwrap().unwrap();
+
+        assert_eq!(
+            fallback_result.session.as_deref(),
+            Some("sess_auto_newest"),
+            "the fallback still matched its expected generation and wrote"
+        );
+        assert_eq!(explicit_result.session.as_deref(), Some("sess_user_picked"));
+        assert_eq!(
+            current(state.path()),
+            explicit_result,
+            "the fallback's write must never be what is left on disk once the \
+             explicit selection has also run — it is serialized strictly after \
+             the fallback, never interleaved with it"
+        );
+    }
+
+    /// Review 5284361040 of #210, finding 1: "Plain `select` has the same
+    /// lost-update generation race between concurrent writers" as the
+    /// unlocked `select_if_unchanged` did. Many threads calling `select`
+    /// concurrently must never let two of them read the same generation and
+    /// both write `generation + 1` — every call's bump must actually count,
+    /// with none lost to a race. If it does, the final generation would be
+    /// less than the number of calls made.
+    #[test]
+    fn concurrent_selects_never_lose_a_generation_bump_to_a_racing_reader() {
+        let state = tempfile::tempdir().unwrap();
+        let per_thread: u64 = 50;
+        let threads: u64 = 4;
+        let writers: Vec<_> = (0..threads)
+            .map(|i| {
+                let dir = state.path().to_path_buf();
+                std::thread::spawn(move || {
+                    for n in 0..per_thread {
+                        select(&dir, Some(&format!("sess_{i}_{n}"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(
+            current(state.path()).generation,
+            threads * per_thread,
+            "every one of {} concurrent select() calls must bump the generation \
+             by exactly one; a lower count means two calls raced on the same read",
+            threads * per_thread
+        );
+    }
+
+    /// Review 5284361040 of #210, finding 1: a real read failure — not
+    /// "never written yet", not "written but not valid JSON" — must not be
+    /// silently folded into generation 0 by the write side the way `current`
+    /// folds it for an ordinary reader. A directory in the registry's place
+    /// produces a real `io::Error` (`ENOTDIR`) on read that is not
+    /// `NotFound`, so this stands in for a permissions failure or a full disk
+    /// without relying on this test running unprivileged.
+    #[test]
+    fn select_and_select_if_unchanged_surface_a_real_read_failure_instead_of_guessing_generation_zero()
+     {
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(path(state.path())).unwrap();
+
+        let err = select(state.path(), Some("sess_a")).unwrap_err();
+        assert!(
+            matches!(err, Error::Io { .. }),
+            "expected an io error, got {err:?}"
+        );
+        let err = select_if_unchanged(state.path(), Some("sess_a"), 0).unwrap_err();
+        assert!(
+            matches!(err, Error::Io { .. }),
+            "expected an io error, got {err:?}"
+        );
+
+        // `current` is used by callers that already have their own fallback
+        // for "no selection" (the doc comment on `current` explains why);
+        // it still degrades rather than erroring, since it is the write
+        // side's compare-and-swap that cannot afford to guess.
+        assert_eq!(current(state.path()), Selection::default());
     }
 }
