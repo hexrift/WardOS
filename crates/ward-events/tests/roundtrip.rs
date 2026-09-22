@@ -221,7 +221,7 @@ proptest! {
     }
 
     #[test]
-    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u32..(1 << 27), notes in any::<bool>()) {
+    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u64..(1 << 27), notes in any::<bool>()) {
         let sub = Subscribe {
             session: SessionId::from_u128(session),
             from_seq,

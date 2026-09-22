@@ -977,7 +977,7 @@ impl EventKind {
 
     /// Bit position of this kind in an [`EventKindSet`].
     #[must_use]
-    pub const fn bit(self) -> u32 {
+    pub const fn bit(self) -> u64 {
         1 << (self as u8)
     }
 
@@ -1057,24 +1057,44 @@ impl fmt::Display for EventKind {
 
 /// Error returned when an [`EventKindSet`] bitmask contains unknown bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("event kind set contains unknown bits: {0:#010x}")]
-pub struct UnknownKindBits(pub u32);
+#[error("event kind set contains unknown bits: {0:#018x}")]
+pub struct UnknownKindBits(pub u64);
 
-/// A set of [`EventKind`]s as a bitmask.
+/// A set of [`EventKind`]s as a bitmask. Backed by a `u64` (not the `u32` a 32-kind
+/// catalogue would technically still fit in): the catalogue reached the full 32-kind
+/// capacity of a `u32` backing in the same merge that widened this, and every kind
+/// added since has needed the headroom immediately, not eventually. Widening past
+/// `u64` in turn needs the same treatment this commit gives `u32`: a wider backing
+/// type, `bit()`'s shift, `MASK`, and this wire-compatibility contract all revisited
+/// together, not just the shift arithmetic in isolation.
+///
+/// Wire compatibility: postcard's integer encoding is a plain unsigned varint with no
+/// width tag, so a value that previously fit in the `u32` backing (every kind index
+/// `0..32`, i.e. the entire catalogue as it stood before this widening) serializes to
+/// byte-for-byte the same output whether encoded as a `u32` or a `u64` -- see
+/// `a_u32_encoded_set_decodes_identically_as_the_widened_u64_type` below, which proves
+/// this against real postcard bytes rather than asserting it from the format's docs.
+/// No `WIRE_VERSION` bump: this is the same kind of pure-capacity change the crate's
+/// own append-only `WardEvent` convention already treats as backwards compatible, not
+/// a change to what any existing bit means.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(into = "u32")]
-pub struct EventKindSet(u32);
+#[serde(into = "u64")]
+pub struct EventKindSet(u64);
 
 impl EventKindSet {
-    // `EventKind::ALL.len()` can be exactly 32 (the full width of the backing `u32`,
-    // one bit per kind), at which point `1u32 << 32` would overflow -- computed in a
-    // wider type instead, so this stays correct right up to the set's structural
-    // capacity rather than one kind short of it. The truncating cast back to `u32`
-    // is exact, never lossy: the value is at most `u32::MAX` for any `ALL.len()` in
-    // `0..=32`, and a catalogue past 32 kinds needs a wider `EventKindSet` backing
-    // type regardless (every `EventKind::bit()` shift would overflow first).
+    // `EventKind::ALL.len()` can reach exactly 64 (the full width of the backing
+    // `u64`, one bit per kind), at which point `1u64 << 64` would overflow -- checked
+    // explicitly rather than computed in a still-wider type (there is no wider
+    // primitive integer to borrow the headroom from this time), so this stays correct
+    // right up to the set's structural capacity rather than panicking one kind short
+    // of it or silently wrapping past it.
+    // `EventKind::ALL.len()` is at most a few dozen and known at compile time, so
+    // this narrowing to the `u32` `checked_shl` requires is always exact.
     #[allow(clippy::cast_possible_truncation)]
-    const MASK: u32 = ((1u64 << EventKind::ALL.len()) - 1) as u32;
+    const MASK: u64 = match 1u64.checked_shl(EventKind::ALL.len() as u32) {
+        Some(one_past) => one_past - 1,
+        None => u64::MAX,
+    };
 
     /// The empty set.
     pub const EMPTY: Self = Self(0);
@@ -1113,7 +1133,7 @@ impl EventKindSet {
 
     /// Raw bitmask.
     #[must_use]
-    pub const fn bits(self) -> u32 {
+    pub const fn bits(self) -> u64 {
         self.0
     }
 
@@ -1131,14 +1151,14 @@ impl fmt::Debug for EventKindSet {
     }
 }
 
-impl TryFrom<u32> for EventKindSet {
+impl TryFrom<u64> for EventKindSet {
     type Error = UnknownKindBits;
-    fn try_from(bits: u32) -> Result<Self, UnknownKindBits> {
+    fn try_from(bits: u64) -> Result<Self, UnknownKindBits> {
         // Written as "masking to the known bits changes the value" rather than
-        // "masking to the unknown bits is non-zero" (`bits & !MASK != 0`): the
-        // catalogue is at exactly 32 kinds right now, so `MASK` is `u32::MAX` and
-        // `!MASK` is zero -- a mask of zero is always clippy::bad_bit_mask, even
-        // though the check is correct (there are no unknown bits left to have).
+        // "masking to the unknown bits is non-zero" (`bits & !MASK != 0`): if the
+        // catalogue is ever at exactly 64 kinds, `MASK` is `u64::MAX` and `!MASK`
+        // is zero -- a mask of zero is always clippy::bad_bit_mask, even though
+        // the check is correct (there are no unknown bits left to have).
         if bits & Self::MASK != bits {
             return Err(UnknownKindBits(bits));
         }
@@ -1146,15 +1166,15 @@ impl TryFrom<u32> for EventKindSet {
     }
 }
 
-impl From<EventKindSet> for u32 {
-    fn from(set: EventKindSet) -> u32 {
+impl From<EventKindSet> for u64 {
+    fn from(set: EventKindSet) -> u64 {
         set.0
     }
 }
 
 impl<'de> Deserialize<'de> for EventKindSet {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bits = u32::deserialize(deserializer)?;
+        let bits = u64::deserialize(deserializer)?;
         Self::try_from(bits).map_err(serde::de::Error::custom)
     }
 }
@@ -1230,28 +1250,21 @@ mod tests {
     #[test]
     fn kind_bits_are_dense_and_cover_the_mask() {
         for (i, k) in EventKind::ALL.iter().enumerate() {
-            assert_eq!(k.bit(), 1u32 << i, "{k}");
+            assert_eq!(k.bit(), 1u64 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
-        // The catalogue is now exactly 32 kinds wide -- the full capacity of the
-        // `u32` `EventKindSet` backs itself with, one bit per kind. At that exact
-        // size there is no unused bit left for an "unknown kind" pattern to occupy:
-        // `ALL.bits() << 1` drops the top bit rather than setting one beyond the
-        // known range (there is no bit 32 in a `u32`), and `u32::MAX` is now simply
-        // `EventKindSet::ALL`'s own representation, not an invalid one. Both used to
-        // be rejected while the catalogue had room to spare; asserting they are
-        // *accepted* now is what proves the set is dense right up to capacity, the
-        // same property the loop above checks bit-by-bit. Adding a 33rd kind needs
-        // a wider backing type before this stops being true (`EventKind::bit()`'s
-        // own `1 << discriminant` shift would itself overflow first).
+        // The catalogue is currently 32 kinds wide, well inside the `u64` backing's
+        // 64-bit capacity -- so, unlike when the backing type was exactly saturated
+        // at `u32`, there IS a first unused bit right now (bit 32), and a value that
+        // sets it must be rejected as an unknown kind rather than silently accepted.
+        // This is the same "no room past the known kinds to smuggle a bit through"
+        // property `kind_bits_are_dense...`'s name promises, just checked against
+        // the current headroom instead of an exhausted capacity.
         assert_eq!(
-            EventKindSet::try_from(EventKindSet::ALL.bits() << 1).unwrap(),
-            EventKindSet::ALL.without(EventKind::ALL[0])
-        );
-        assert_eq!(
-            postcard::from_bytes::<EventKindSet>(&postcard::to_allocvec(&u32::MAX).unwrap())
-                .unwrap(),
-            EventKindSet::ALL
+            EventKindSet::try_from(EventKindSet::ALL.bits() | (1 << EventKind::ALL.len())),
+            Err(UnknownKindBits(
+                EventKindSet::ALL.bits() | (1 << EventKind::ALL.len())
+            ))
         );
         let set = EventKindSet::only(EventKind::Anchor).with(EventKind::FileRead);
         let bytes = postcard::to_allocvec(&set).unwrap();
@@ -1259,6 +1272,55 @@ mod tests {
         assert_eq!(
             set.without(EventKind::Anchor),
             EventKindSet::only(EventKind::FileRead)
+        );
+    }
+
+    /// Proves the wire-compatibility claim on `EventKindSet`'s own doc comment: data
+    /// serialized back when the type was backed by `u32` (every kind index `0..32`,
+    /// which is the entire catalogue as it stood immediately before this widening)
+    /// decodes identically through the widened `u64` `Deserialize` impl -- checked
+    /// against real postcard bytes, not asserted from the varint format's spec.
+    #[test]
+    fn a_u32_encoded_set_decodes_identically_as_the_widened_u64_type() {
+        // The full pre-widening catalogue: postcard-encode it as a bare `u32`, the
+        // exact wire shape any `EventKindSet` produced before this change would have
+        // had (`#[serde(into = "u32")]` at the time), then decode those bytes through
+        // today's `u64`-backed `Deserialize` impl.
+        let pre_widening_bits: u32 = 0xFFFF_FFFF;
+        let old_wire_bytes = postcard::to_allocvec(&pre_widening_bits).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<EventKindSet>(&old_wire_bytes).unwrap(),
+            EventKindSet::ALL,
+            "a full-catalogue set encoded under the old u32 representation must \
+             decode to today's ALL, not merely to a numerically equal but distinct \
+             value"
+        );
+
+        // A sparser, more realistic value: a handful of kinds near both ends of the
+        // pre-widening 32-bit range, so this isn't only exercising the all-ones case.
+        let sparse_pre_widening_bits: u32 = u32::try_from(
+            EventKind::SessionStarted.bit()
+                | EventKind::Anchor.bit()
+                | EventKind::ObservationsDropped.bit(),
+        )
+        .unwrap();
+        let sparse_old_wire_bytes = postcard::to_allocvec(&sparse_pre_widening_bits).unwrap();
+        let expected = EventKindSet::EMPTY
+            .with(EventKind::SessionStarted)
+            .with(EventKind::Anchor)
+            .with(EventKind::ObservationsDropped);
+        assert_eq!(
+            postcard::from_bytes::<EventKindSet>(&sparse_old_wire_bytes).unwrap(),
+            expected
+        );
+
+        // And the reverse direction: a value round-tripped through today's type
+        // produces the same bytes postcard would have produced for the bare integer
+        // under the old representation, proving the wire shape genuinely didn't
+        // change -- not just that both sides happen to parse each other's output.
+        assert_eq!(
+            postcard::to_allocvec(&expected).unwrap(),
+            sparse_old_wire_bytes
         );
     }
 
