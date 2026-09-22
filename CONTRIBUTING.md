@@ -36,11 +36,16 @@ the same script runs in CI, so a green run locally is a green run there.
   `docs/*.md`, and an ADR when a decision changes.
 * Squash merge; the pull request title becomes the commit subject. A `Co-Authored-By:`
   trailer on a branch's individual commits (from an AI coding assistant or any other tool)
-  is fine as committed and is not a reason to request changes: squash merge collapses the
-  branch to one commit authored by whoever performs the merge, so the trailers on the
-  source branch's commits do not carry forward into `main`'s history. Reviewers should
-  focus review on the diff, not on source-branch commit metadata a squash merge already
-  discards.
+  is fine as committed and is not a reason to request changes on the branch. **It does
+  carry forward**, though: this repository's squash-merge setting
+  (`squash_merge_commit_message: COMMIT_MESSAGES`) defaults the squash commit's message to
+  the concatenated source commit messages, trailers included, and a single-commit pull
+  request's squash message defaults to that one commit's own message verbatim. If a
+  trailer should not land on `main`, whoever performs the merge edits the (always-editable)
+  squash commit message box before confirming — a one-time, merge-time step, not something
+  the branch author can or should do by force-pushing an amend. Reviewers should focus
+  review on the diff, not re-request changes for commit metadata a merger can adjust in the
+  same click that merges the PR.
 
 ## Versioning
 

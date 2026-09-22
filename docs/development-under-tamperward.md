@@ -186,26 +186,50 @@ requires `signoff.required_for: [block]`, and CI sign-off is explicitly out-of-b
 local `ledger.jsonl` path only covers `tamperward run` on a workstation) so that a candidate
 can never grant itself the sign-off it needs. Concretely:
 
-* **Who** — anyone with *triage* role or higher on this repository. Today that is
-  `@hexrift` (see [`.github/CODEOWNERS`](../.github/CODEOWNERS); the same person this
-  repository's security-sensitive surfaces already route to). Extending this to additional
-  maintainers is a repository-settings change, not a TamperWard or code change.
+* **Who** — anyone with GitHub *triage* repository permission or higher. This is a GitHub
+  permission-level fact, checked at
+  `Settings → Collaborators and teams`; it is not the same question as who
+  [`.github/CODEOWNERS`](../.github/CODEOWNERS) routes review to, and CODEOWNERS entries do
+  not by themselves grant or prove label-application authority. Today the only person with
+  that permission is `@hexrift`. Extending this to additional maintainers is a
+  repository-settings change, not a TamperWard or code change.
 * **What to check** — read the failing `tamperward-verify` run's diff of the protected
-  path(s) named in the failure (e.g. `git diff <base>..<head> -- 'crates/**/tests/**'`).
-  Sign off only when every hunk is additive — a new fixture entry, a new assertion, a
-  count bumped up to match — never when a line is removed, loosened, or skipped. A single
-  removed or weakened line anywhere in the protected diff means this is a real block, not a
-  masked failure, and must not be signed off.
-* **How** — apply the label `tamperward:allow:verify@<head-sha>`, with `<head-sha>` the
-  exact commit the PR is currently at, to the pull request. The gate reads labels from the
-  triggering event (`labeled`/`unlabeled` are both in the workflow's `on.pull_request.types`),
-  so applying it re-runs the check rather than requiring a new push. The SHA binding means a
+  path(s) named in the failure (e.g. `git diff <base>..<head> -- 'crates/**/tests/**'`). The
+  sign-off criterion is **semantic, not shape-based**: does the protected-surface change
+  follow from, and stay proportionate to, the implementation change, without reducing what
+  is exercised or how strictly it is checked? A purely additive-looking hunk (new fixture
+  entry, new assertion, a count bumped up) is the common, easy case, but additive shape is
+  not by itself sufficient — an added `#[ignore]`, a widened allowlist, or a loosened bound
+  can also be "additive" while weakening coverage. Conversely, treat *any* deletion,
+  skip, guard removal, or assertion weakening in the protected diff as a hold: those need
+  the same scrutiny as a suppression, and are grounds to withhold sign-off even if the
+  visible suite and the stated intent look reasonable.
+* **How** — apply the label `tamperward:allow:verify@<head-sha>` to the pull request, where
+  `<head-sha>` identifies the exact commit the PR is currently at. **GitHub label names are
+  capped at 50 characters**; `tamperward:allow:verify@` alone is 25, leaving only 25 for the
+  SHA, so a full 40-character SHA (64 characters total) is rejected by GitHub outright — this
+  was hit and confirmed in practice against this repository (see #203) before this note was
+  added. Use an abbreviated SHA instead: `tamperward`'s own OOB-signoff matcher
+  (`oobToken` in the CLI) accepts any prefix of at least 7 hex characters
+  (`sha.length >= 7 && head.startsWith(sha)`), so
+  `tamperward:allow:verify@` + a 12-character abbreviation (`git rev-parse --short=12
+  <head-sha>`, 37 characters total, comfortably under the cap) works and stays effectively
+  unambiguous for a repository this size. The gate reads labels from the triggering event
+  (`labeled`/`unlabeled` are both in the workflow's `on.pull_request.types`), so applying it
+  re-runs the check rather than requiring a new push. The (abbreviated) SHA binding means a
   later push invalidates the sign-off and needs a fresh label bound to the new head — this is
   intentional (§ci-tampering's whole point is that a sign-off can't quietly outlive the diff
   it was read against).
 * **What it does not clear** — a red *visible* suite, a run that could not execute, or any
   other failing rule. `tamperward:allow:verify@<sha>` clears only a masked failure on the
   `verify` rule for that one SHA; nothing else.
+* **Current limits on this being an authoritative control** — branch protection on `main`
+  does not yet require the `tamperward`/`tamperward-verify` checks or Code Owner review, and
+  CODEOWNERS does not yet cover `.github/workflows/**`. Until both are true, a pull request
+  can in principle edit the workflow that enforces this gate (or bypass the required-check
+  list) without a human in the loop; treat the mechanics above as the intended design, not
+  yet as a fully closed loop, and tighten the ruleset/CODEOWNERS as a repository-settings
+  follow-up.
 
 ## 5. What the dogfooding loop is expected to surface
 
