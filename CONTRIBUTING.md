@@ -34,7 +34,38 @@ the same script runs in CI, so a green run locally is a green run there.
 * Tests come with the code. A bug fix starts with the test that reproduces the bug.
 * Keep the documentation current in the same pull request: `README.md`, the relevant
   `docs/*.md`, and an ADR when a decision changes.
-* Squash merge; the pull request title becomes the commit subject.
+* Squash merge; the pull request title becomes the commit subject. **Rule: an AI-assistant
+  `Co-Authored-By:` trailer does not land on `main`.** This repository's squash-merge setting
+  (`squash_merge_commit_message: COMMIT_MESSAGES`) defaults the squash commit's message to
+  the concatenated source commit messages, trailers included, so the merger removes that
+  trailer from the (always-editable) squash commit message box before confirming — a
+  one-time, merge-time step, not something the branch author does by force-pushing an
+  amend. This is existing practice, not a new requirement: `main`'s own history (e.g. the
+  squash commit for #194) already lands with the AI-assistant trailer stripped. Carrying a
+  `Co-Authored-By:` trailer on a branch's own commits while the branch is open is fine and
+  is not a reason to request changes — it is accurate, low-stakes attribution of how the
+  change was written, and it is routinely removed at the one point (the merge) where it
+  would otherwise reach `main`. Reviewers should focus review on the diff, not re-request
+  changes for commit metadata a merger removes in the same click that merges the PR.
+
+* **Rule: a session link never lands anywhere in this repository.** A `Claude-Session:` (or
+  equivalent session-URL) line is operational metadata for whatever tool or session
+  produced the change, not repository content — it must not appear in a commit message, a
+  PR title or description, or a comment, regardless of what a particular session's own
+  operating instructions say elsewhere. This applies independently of the trailer rule
+  above and isn't settled by squash-merge stripping a commit trailer: a PR description or a
+  comment carrying a session link is a separate GitHub object squash-merge never touches, so
+  it persists exactly as written whatever happens to the branch's commits — which is exactly
+  why it must not be added in the first place, on any of the three surfaces, rather than
+  relying on cleanup after the fact. A search of this repository's issues, pull requests and
+  comments at the time this rule was written found no published session link to grandfather
+  — there is nothing currently live to clean up, not an assumption that cleanup is
+  unnecessary in general. If one is found in the future: edit it out of a PR/issue body or a
+  still-editable comment (both are ordinary editable GitHub objects, not append-only), and
+  where GitHub does not allow editing or deleting the surface it is on, use whatever
+  redaction the platform offers and record the limitation rather than leaving it unaddressed.
+  A new session link is a review finding like any other, and if one slips onto a branch's
+  own commit message it is removed by the same merge-time edit as the trailer above.
 
 ## Versioning
 
