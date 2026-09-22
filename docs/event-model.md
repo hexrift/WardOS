@@ -91,7 +91,7 @@ pub enum WardEvent {
     Anchor { chain_head: Blake3Hash, seq: u64, countersigned_by: Option<TamperWardSig> },
 
     // observer health (origin: Wardd) — see §9
-    ObservationsDropped { source: Filesystem | Network, dropped: u64, capacity: u64 },
+    ObservationsDropped { source: Filesystem | Network | Hook, dropped: u64, capacity: u64 },
 }
 ```
 
@@ -202,10 +202,10 @@ every other record. There is still exactly one writer (§5, ADR-0015).
 | Property | What it means |
 | --- | --- |
 | Drain cadence | Every 250 ms, or as soon as 256 observations are queued, whichever comes first. Batching amortises the append; the interval bounds how long an observation can sit unrecorded |
-| Terminal flush | When the command ends, the producers are stopped and their tails are appended **exactly once**, before the `CommandFinished` record. Nothing this command observed can be appended twice |
+| Terminal flush | When the command ends, each producer is **quiesced before its own last drain** — stopped from accepting new work, then waited on (bounded, 2 s) until what it already had in flight has reached its queue — and only then drained, so a decision or claim completed across the cutover is flushed rather than discarded with the producer. The tails are appended **exactly once**, before the `CommandFinished` record. Nothing this command observed can be appended twice, and a producer still busy when the bound runs out is counted and marked like any other gap |
 | Timestamps | A record carries the time its source *observed* the fact, never the time it reached the log, so a live-drained timeline reads exactly as the batched one did |
 | Ordering | Each queue is FIFO and the drain visits its sources in a fixed order (files, network, agent claims), so no drain reorders observations relative to an earlier one |
-| Backpressure | A queue that is full **refuses** the new observation rather than evicting one already accepted. The refusal is counted, and the next drain appends `ObservationsDropped { source, dropped, capacity }` immediately after the batch it accompanies, so an incomplete window is bounded by its neighbours in the log and is never silent |
+| Backpressure | A queue that is full **refuses** the new observation rather than evicting one already accepted. The refusal is counted *under the same lock that saw the queue full*, so the queued observations and the refusals are one atomic drain epoch and a refusal cannot be split across two markers, attached to a batch it did not accompany, or lost to a drain that reset the count between the refusal and its being recorded. The next drain appends `ObservationsDropped { source, dropped, capacity }` immediately after the batch it accompanies, so an incomplete window is bounded by its neighbours in the log and is never silent. Every bounded source has its own `source` — filesystem, network **and the hook broker** — so no gap is reported as something an observer mode may hide |
 | Enforcement | Independent of all of the above. A proxy thread's `Observer::decision` call does one lock, one length comparison and returns; it never waits on the log, on disk or on a UI consumer, so allow/deny decisions are made and answered in real time however far behind ingestion has fallen (`security-model.md` G14) |
 | Failure paths | The producers are owned by one RAII value. A launch that fails before or during the child — the sandbox could not be prepared, the process could not be spawned — still stops every thread, removes the run directory and its sockets, and appends what the producers had already recorded |
 
