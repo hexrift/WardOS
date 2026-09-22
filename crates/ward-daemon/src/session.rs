@@ -1329,6 +1329,34 @@ mod tests {
     }
 
     #[test]
+    fn collect_captured_surfaces_watch_degradation_through_run_report() {
+        let worktree = tempfile::tempdir().unwrap();
+        let watcher = Watcher::start(worktree.path(), false).unwrap();
+
+        // Move a directory in, then remove it again before the watcher thread
+        // can register it, the same injected failure `watch::tests` proves at
+        // the `drain` level — this proves the resulting `degraded` flag
+        // actually reaches `collect_captured`'s `RunReport` tuple, not just
+        // `WatchOutcome` inside the `watch` module.
+        let outside = tempfile::tempdir().unwrap();
+        let src = outside.path().join("gone");
+        std::fs::create_dir_all(&src).unwrap();
+        let dest = worktree.path().join("gone");
+        std::fs::rename(&src, &dest).unwrap();
+        std::fs::remove_dir(&dest).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        let (_, capture, observer_degraded) =
+            collect_captured(Some(watcher), None, worktree.path());
+
+        assert_eq!(capture, CaptureMode::Inotify);
+        assert!(
+            observer_degraded,
+            "a coverage gap in the watch must reach RunReport::observer_degraded"
+        );
+    }
+
+    #[test]
     fn scan_diff_reports_only_changed_paths() {
         let mut before = BTreeMap::new();
         before.insert("a".to_string(), (1u128, 10u64));

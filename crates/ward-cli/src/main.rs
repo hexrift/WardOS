@@ -952,14 +952,22 @@ fn cmd_agent(
     Ok(exit_code(report.code))
 }
 
-/// Tell the user when a run's activity log may be incomplete: the inotify
-/// watch lost coverage of some directory (see [`ward_daemon::RunReport::observer_degraded`]).
+/// The warning to print when a run's activity log may be incomplete (the
+/// inotify watch lost coverage of some directory, see
+/// [`ward_daemon::RunReport::observer_degraded`]), or `None` when it was not.
+/// Split out from [`warn_if_observer_degraded`] so the condition is testable
+/// without capturing stderr.
+fn observer_degraded_warning(report: &ward_daemon::RunReport) -> Option<&'static str> {
+    report.observer_degraded.then_some(
+        "ward: file observation degraded during this run — a directory could not be \
+         watched, so changes under it may be missing from the log above",
+    )
+}
+
+/// Tell the user when a run's activity log may be incomplete.
 fn warn_if_observer_degraded(report: &ward_daemon::RunReport) {
-    if report.observer_degraded {
-        eprintln!(
-            "ward: file observation degraded during this run — a directory could not be \
-             watched, so changes under it may be missing from the log above"
-        );
+    if let Some(warning) = observer_degraded_warning(report) {
+        eprintln!("{warning}");
     }
 }
 
@@ -1168,10 +1176,30 @@ fn cwd() -> PathBuf {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
-        Cli, Command, SessionCmd, WatchMode, desktop_command, on_path_in, pending_text,
-        verb_program,
+        Cli, Command, SessionCmd, WatchMode, desktop_command, observer_degraded_warning,
+        on_path_in, pending_text, verb_program,
     };
     use clap::Parser as _;
+    use std::time::Duration;
+
+    fn sample_report(observer_degraded: bool) -> ward_daemon::RunReport {
+        ward_daemon::RunReport {
+            argv: Vec::new(),
+            code: Some(0),
+            files_changed: 0,
+            duration: Duration::ZERO,
+            capture: ward_daemon::CaptureMode::Inotify,
+            observer_degraded,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn observer_degraded_warning_only_fires_when_the_watch_was_degraded() {
+        assert!(observer_degraded_warning(&sample_report(false)).is_none());
+        assert!(observer_degraded_warning(&sample_report(true)).is_some());
+    }
 
     #[test]
     fn an_unknown_verb_is_captured_as_a_desktop_command() {

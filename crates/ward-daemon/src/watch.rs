@@ -87,7 +87,6 @@ const POLL_CAP_MS: u16 = 500;
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// What a finished [`Watcher`] observed.
-#[derive(Default)]
 pub struct WatchOutcome {
     /// Captured accesses, in observed order.
     pub captured: Vec<Captured>,
@@ -157,8 +156,19 @@ impl Watcher {
     pub fn finish(mut self) -> WatchOutcome {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.wake.write_all(&[1]);
-        self.handle.join().unwrap_or_default()
+        outcome_from_join(self.handle.join())
     }
+}
+
+/// Turn a joined watcher-thread result into the outcome to report. A thread
+/// that panicked observed nothing further and proved nothing about the rest
+/// of the tree, so it is reported degraded with no captured events — never as
+/// a healthy, empty run, which `unwrap_or_default` would silently produce.
+fn outcome_from_join(joined: std::thread::Result<WatchOutcome>) -> WatchOutcome {
+    joined.unwrap_or(WatchOutcome {
+        captured: Vec::new(),
+        degraded: true,
+    })
 }
 
 /// The watcher thread body: drain until told to stop, then drain any tail.
@@ -305,9 +315,13 @@ pub fn change_kind(mask: AddWatchFlags) -> Option<FileChangeKind> {
 
 /// Add a watch for `dir` and, recursively, its non-skipped subdirectories.
 /// `dir` itself failing to register is returned to the caller (the top-level
-/// call fails the whole watch this way); a nested subdirectory failing instead
-/// sets `state.degraded` and is otherwise skipped, so one unwatchable child
-/// does not stop its siblings from being registered.
+/// call fails the whole watch this way); every other way this can fail to see
+/// the whole subtree — `dir` itself cannot be listed, an entry fails mid
+/// iteration, a child's type cannot be determined, or a child directory fails
+/// to register — sets `state.degraded` and continues with whatever siblings
+/// remain, so one unwatchable or unreadable child does not stop the rest from
+/// being registered. [`std::fs::read_dir`] documents both of the first two
+/// failure modes: <https://doc.rust-lang.org/std/fs/fn.read_dir.html>.
 fn add_watch_recursive(
     inotify: &Inotify,
     flags: AddWatchFlags,
@@ -316,17 +330,27 @@ fn add_watch_recursive(
 ) -> Result<(), Errno> {
     let wd = inotify.add_watch(dir, flags)?;
     state.wds.insert(wd, dir.to_path_buf());
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if SKIP.contains(&&*name.to_string_lossy()) {
-                continue;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        state.degraded = true;
+        return Ok(());
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            state.degraded = true;
+            continue;
+        };
+        let name = entry.file_name();
+        if SKIP.contains(&&*name.to_string_lossy()) {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                if add_watch_recursive(inotify, flags, &entry.path(), state).is_err() {
+                    state.degraded = true;
+                }
             }
-            if entry.file_type().is_ok_and(|t| t.is_dir())
-                && add_watch_recursive(inotify, flags, &entry.path(), state).is_err()
-            {
-                state.degraded = true;
-            }
+            Ok(_) => {}
+            Err(_) => state.degraded = true,
         }
     }
     Ok(())
@@ -456,6 +480,98 @@ mod tests {
         // `drain`/`add_watch_recursive`'s `.is_err()` checks, not by this helper
         // itself, so `degraded` is untouched here.
         assert!(!state.degraded);
+    }
+
+    #[test]
+    fn read_dir_failure_on_a_registered_directory_is_recorded_degraded() {
+        // `dir` is a regular *file*, not a directory. `inotify_add_watch` does
+        // not require a directory, so the watch on it succeeds — but
+        // `std::fs::read_dir` then fails deterministically with ENOTDIR. This
+        // is the same shape of failure as a directory that becomes unreadable
+        // after it was registered (permission change, filesystem error): the
+        // watch itself is fine, but its contents cannot be enumerated.
+        let root = tempfile::tempdir().expect("tempdir");
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, b"x").expect("write file");
+        let inotify =
+            Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).expect("inotify init");
+        let flags = AddWatchFlags::IN_CREATE | AddWatchFlags::IN_CLOSE_WRITE;
+        let mut state = WatchState::default();
+
+        let result = add_watch_recursive(&inotify, flags, &file, &mut state);
+
+        assert!(
+            result.is_ok(),
+            "the watch on the file itself still succeeds"
+        );
+        assert!(
+            !state.wds.is_empty(),
+            "the file's own watch must still be registered"
+        );
+        assert!(
+            state.degraded,
+            "a registered directory whose contents cannot be listed must be reported degraded, not silently treated as fully covered"
+        );
+    }
+
+    #[test]
+    fn a_panicked_watch_thread_is_reported_degraded_not_healthy() {
+        let joined =
+            std::thread::spawn(|| -> WatchOutcome { panic!("simulated watcher crash") }).join();
+        assert!(joined.is_err());
+
+        let outcome = outcome_from_join(joined);
+
+        assert!(
+            outcome.degraded,
+            "a watcher thread that panicked must never be reported as a healthy, empty run"
+        );
+        assert!(outcome.captured.is_empty());
+    }
+
+    #[test]
+    fn drain_marks_degraded_when_a_moved_in_directory_vanishes_before_it_is_registered() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let inotify =
+            Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).expect("inotify init");
+        let flags = AddWatchFlags::IN_CREATE
+            | AddWatchFlags::IN_CLOSE_WRITE
+            | AddWatchFlags::IN_DELETE
+            | AddWatchFlags::IN_MOVED_TO
+            | AddWatchFlags::IN_DONT_FOLLOW;
+        let mut state = WatchState::default();
+        add_watch_recursive(&inotify, flags, root.path(), &mut state).expect("watch root");
+
+        // Move a directory in, then remove it again before `drain` (called
+        // directly here, so there is no background thread to race) gets a
+        // chance to see the move and register it. By the time `rename` and
+        // `remove_dir` return, the kernel has already queued both inotify
+        // events on the root watch, so this is deterministic: no sleep, no
+        // thread, no window for the watcher to win the race.
+        let outside = tempfile::tempdir().expect("tempdir");
+        let src = outside.path().join("gone");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        let dest = root.path().join("gone");
+        std::fs::rename(&src, &dest).expect("move dir in");
+        std::fs::remove_dir(&dest).expect("remove before drain can watch it");
+
+        let mut debouncer = Debouncer::new(DEBOUNCE);
+        let mut out = Vec::new();
+        let drained = drain(
+            &inotify,
+            flags,
+            root.path(),
+            &mut state,
+            &mut debouncer,
+            Instant::now(),
+            &mut out,
+        );
+
+        assert!(drained, "the queued move/delete events must be read");
+        assert!(
+            state.degraded,
+            "a moved-in directory that vanished before drain could register it must be reported degraded"
+        );
     }
 
     #[test]
