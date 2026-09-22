@@ -17,4 +17,3 @@
 
 mineiro/hyprland      # Hyprland and its ecosystem, retired from Fedora after 42: hyprland, hypridle, hyprlock, hyprpaper, hyprpicker, hyprpolkitagent, hyprsunset, xdg-desktop-portal-hyprland, uwsm, satty (successor of solopasha/hyprland, which builds rawhide only)
 erikreider/swayosd    # swayosd, packaged by its author
-atim/lazygit          # lazygit (not in Fedora)
