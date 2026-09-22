@@ -52,6 +52,18 @@ calls=$(wc -l <"$log")
 [[ "$calls" == 2 ]] || fail "retry: expected 2 docker calls, got $calls"
 echo "ok   retry of the still-current tip re-promotes the same digest"
 
+# The script never assumes two runs of the same commit produced the same
+# bytes: it has no cache and no memory of a previous invocation, so a
+# second run that was handed a genuinely different (re-)built digest
+# promotes THAT digest faithfully, not a stale one left over from the
+# first call above.
+run_with_fake_docker ghcr.io/example/wardos sha256:c0ffee abc123 abc123
+grep -qF 'buildx imagetools create -t ghcr.io/example/wardos:latest ghcr.io/example/wardos@sha256:c0ffee' "$log" \
+  || fail "rebuilt retry: did not promote the newly given digest"
+grep -qF 'sha256:deadbeef' "$log" \
+  && fail "rebuilt retry: promoted a stale digest from an earlier invocation"
+echo "ok   a differently-rebuilt retry promotes its own digest, not a cached one"
+
 # Missing arguments are rejected rather than silently promoting garbage.
 expect_status 1 "missing digest rejected" bash "$sut" ghcr.io/example/wardos
 expect_status 1 "missing tip sha rejected" bash "$sut" ghcr.io/example/wardos sha256:deadbeef abc123
