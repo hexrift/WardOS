@@ -204,22 +204,33 @@ can never grant itself the sign-off it needs. Concretely:
   skip, guard removal, or assertion weakening in the protected diff as a hold: those need
   the same scrutiny as a suppression, and are grounds to withhold sign-off even if the
   visible suite and the stated intent look reasonable.
-* **How** — apply the label `tamperward:allow:verify@<head-sha>` to the pull request, where
-  `<head-sha>` identifies the exact commit the PR is currently at. **GitHub label names are
-  capped at 50 characters**; `tamperward:allow:verify@` alone is 25, leaving only 25 for the
-  SHA, so a full 40-character SHA (64 characters total) is rejected by GitHub outright — this
-  was hit and confirmed in practice against this repository (see #203) before this note was
-  added. Use an abbreviated SHA instead: `tamperward`'s own OOB-signoff matcher
-  (`oobToken` in the CLI) accepts any prefix of at least 7 hex characters
-  (`sha.length >= 7 && head.startsWith(sha)`), so
-  `tamperward:allow:verify@` + a 12-character abbreviation (`git rev-parse --short=12
-  <head-sha>`, 37 characters total, comfortably under the cap) works and stays effectively
-  unambiguous for a repository this size. The gate reads labels from the triggering event
-  (`labeled`/`unlabeled` are both in the workflow's `on.pull_request.types`), so applying it
-  re-runs the check rather than requiring a new push. The (abbreviated) SHA binding means a
-  later push invalidates the sign-off and needs a fresh label bound to the new head — this is
-  intentional (§ci-tampering's whole point is that a sign-off can't quietly outlive the diff
-  it was read against).
+* **How** — apply the label `tamperward:allow:verify@<sha-prefix>` to the pull request.
+  **GitHub label names are capped at 50 characters**; `tamperward:allow:verify@` alone is 24,
+  leaving 26 for the SHA, so a full 40-character SHA (64 characters total) is rejected by
+  GitHub outright — this was hit and confirmed in practice against this repository (see
+  #203) before this note was added. `tamperward`'s own OOB-signoff matcher (`oobToken` in
+  the CLI) accepts any *prefix* of the head SHA that is at least 7 hex characters
+  (`sha.length >= 7 && head.startsWith(sha)`) — it is a prefix match, not an equality check
+  against the full object id, so treat the label as authorizing "a commit whose id starts
+  with this prefix," not literally "this exact commit and no other." **Use the longest
+  prefix that fits the cap, not the shortest one that works**: `tamperward:allow:verify@` +
+  a 26-character abbreviation (`git rev-parse --short=26 <head-sha>`, exactly 50 characters,
+  the full budget) rather than a short one like 12. A short prefix is not wrong — `git`'s own
+  unambiguous-object convention starts around 7–12 hex characters, and nothing about a
+  normal push can retroactively produce a colliding commit — but a *stale* label left
+  attached to a PR is only as strong as its prefix against a future commit deliberately
+  ground to share it: 12 hex characters is 48 bits, an expensive but not infeasible target
+  for a well-resourced adversary picking their own commit content to match a prefix they can
+  already see labeled on the PR; 26 hex characters (104 bits) is not a realistic target for
+  anyone. There is no reason to spend fewer than the 26 characters the label-length budget
+  actually allows. The gate reads labels from the triggering event (`labeled`/`unlabeled`
+  are both in the workflow's `on.pull_request.types`), so applying it re-runs the check
+  rather than requiring a new push. The prefix binding means a later push invalidates the
+  sign-off and needs a fresh label bound to the new head — this is intentional
+  (§ci-tampering's whole point is that a sign-off can't quietly outlive the diff it was read
+  against) — and, per the paragraph above, is also why the label should be removed (not just
+  left to be superseded) once the PR it was granted on merges or its head changes, rather
+  than trusted to become harmless on its own.
 * **What it does not clear** — a red *visible* suite, a run that could not execute, or any
   other failing rule. `tamperward:allow:verify@<sha>` clears only a masked failure on the
   `verify` rule for that one SHA; nothing else.

@@ -34,25 +34,34 @@ the same script runs in CI, so a green run locally is a green run there.
 * Tests come with the code. A bug fix starts with the test that reproduces the bug.
 * Keep the documentation current in the same pull request: `README.md`, the relevant
   `docs/*.md`, and an ADR when a decision changes.
-* Squash merge; the pull request title becomes the commit subject. A `Co-Authored-By:`
-  trailer on a branch's individual commits (from an AI coding assistant or any other tool)
-  is fine as committed and is not a reason to request changes on the branch. **It does
-  carry forward**, though: this repository's squash-merge setting
+* Squash merge; the pull request title becomes the commit subject. **Rule: an AI-assistant
+  `Co-Authored-By:` trailer does not land on `main`.** This repository's squash-merge setting
   (`squash_merge_commit_message: COMMIT_MESSAGES`) defaults the squash commit's message to
-  the concatenated source commit messages, trailers included, and a single-commit pull
-  request's squash message defaults to that one commit's own message verbatim. If a
-  trailer should not land on `main`, whoever performs the merge edits the (always-editable)
-  squash commit message box before confirming — a one-time, merge-time step, not something
-  the branch author can or should do by force-pushing an amend. Reviewers should focus
-  review on the diff, not re-request changes for commit metadata a merger can adjust in the
-  same click that merges the PR.
+  the concatenated source commit messages, trailers included, so the merger removes that
+  trailer from the (always-editable) squash commit message box before confirming — a
+  one-time, merge-time step, not something the branch author does by force-pushing an
+  amend. This is existing practice, not a new requirement: `main`'s own history (e.g. the
+  squash commit for #194) already lands with the AI-assistant trailer stripped. Carrying a
+  `Co-Authored-By:` trailer on a branch's own commits while the branch is open is fine and
+  is not a reason to request changes — it is accurate, low-stakes attribution of how the
+  change was written, and it is routinely removed at the one point (the merge) where it
+  would otherwise reach `main`. Reviewers should focus review on the diff, not re-request
+  changes for commit metadata a merger removes in the same click that merges the PR.
 
-  This only settles the trailer on a branch's own commits. A pull request description or
-  comment that itself carries a `Co-Authored-By:`/session-link line is a separate GitHub
-  object squash-merge never touches — it persists exactly as written regardless of what
-  happens to the branch's commits. Whether a given PR body or comment carries one is
-  controlled by whatever tool or session authored it, not by this repository; there is
-  nothing for a merger to edit at merge time for those.
+* **Rule: a session link never lands anywhere in this repository.** A `Claude-Session:` (or
+  equivalent session-URL) line is operational metadata for whatever tool or session
+  produced the change, not repository content — it must not appear in a commit message, a
+  PR title or description, or a comment, regardless of what a particular session's own
+  operating instructions say elsewhere. This applies independently of the trailer rule
+  above and isn't settled by squash-merge stripping a commit trailer: a PR description or a
+  comment carrying a session link is a separate GitHub object squash-merge never touches, so
+  it persists exactly as written whatever happens to the branch's commits — which is exactly
+  why it must not be added in the first place, on any of the three surfaces, rather than
+  relying on cleanup after the fact. A session link already published in a PR body or
+  comment from before this rule existed is left as-is: it names an ephemeral, inert session
+  URL, not a secret or an ongoing liability, so there is nothing to retroactively edit or
+  scrub — but a new one is a review finding like any other, and if one slips onto a branch's
+  own commit message it is removed by the same merge-time edit as the trailer above.
 
 ## Versioning
 
