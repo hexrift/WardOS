@@ -162,11 +162,26 @@ jobs:
   #    for an older commit that happens to finish its builds later can never clobber
   #    a newer commit's already-promoted `latest`. The per-commit `<sha>` tag is still
   #    written either way, so every complete build stays individually addressable.
-  # Also serialized across runs (`concurrency` below, not relying on cancellation) so
-  # two manifest jobs can never interleave their promotion of the same tag. The
-  # staleness check reads `main`'s tip over git (not the registry), so this job also
-  # needs `contents: read` alongside `packages: write` — every other job here that
-  # touches repository content already carries it.
+  # `latest` is promoted from the `<sha>` index by NAME, not rebuilt from the two
+  # per-architecture tags: those stay mutable for as long as the registry keeps them,
+  # so re-deriving `latest` from them again at promotion time could pick up a
+  # different child than the one just validated above. `<sha>` is written exactly
+  # once, by the "Build the per-commit two-architecture index" step above, and
+  # nothing else in this workflow ever writes it again — so copying it is copying
+  # precisely what was inspected, not reconstructing something that might have moved.
+  # `concurrency` below serializes this job's own runs so two can't interleave a
+  # promotion, but GitHub keeps at most one *pending* run per group (a third queued
+  # run replaces the second, it does not queue behind it) — this bounds concurrent
+  # writers to one, it does not guarantee every triggering commit gets its own run.
+  # The staleness check reads `main`'s tip over git (not the registry), so this job
+  # also needs `contents: read` alongside `packages: write` — every other job here
+  # that touches repository content already carries it (and now also checks the repo
+  # out, to reach the decision logic below at scripts/release/*.sh).
+  #
+  # Cancellation before promotion (#149's third acceptance case) is safe by
+  # construction rather than by test: `latest` is written by exactly one command, the
+  # last one below, so a job cancelled at any earlier point -- mid-build, mid-validate,
+  # mid-staleness-check -- has touched nothing but its own ephemeral /tmp/index.json.
   manifest:
     name: multi-arch manifest
     needs: [build, build-aarch64]
@@ -180,6 +195,8 @@ jobs:
       group: wardos-image-manifest-${{ github.ref }}
       cancel-in-progress: false
     steps:
+      - uses: actions/checkout@v7
+
       - name: Build the per-commit two-architecture index
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -192,11 +209,10 @@ jobs:
             "$repo:$sha-x86_64" "$repo:$sha-aarch64"
           docker buildx imagetools inspect "$repo:$sha" --raw | tee /tmp/index.json
 
+      # scripts/release/check-multiarch-index.test.sh covers one architecture's
+      # manifest missing from the index (#149's first acceptance case).
       - name: Validate both architectures are present before promoting
-        run: |
-          set -euo pipefail
-          jq -e '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == "amd64")] | length >= 1' /tmp/index.json
-          jq -e '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == "arm64")] | length >= 1' /tmp/index.json
+        run: bash scripts/release/check-multiarch-index.sh /tmp/index.json
 
       - name: Promote latest, unless a newer commit has already landed on main
         env:
@@ -204,12 +220,15 @@ jobs:
         run: |
           set -euo pipefail
           head_sha="$(git ls-remote "https://x-access-token:${GHCR_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | cut -f1)"
-          if [ "$head_sha" != "$GITHUB_SHA" ]; then
-            echo "main is now at $head_sha, not $GITHUB_SHA; leaving latest for that commit's own manifest job to promote."
-            exit 0
-          fi
+          # scripts/release/check-not-stale.test.sh covers overlapping runs
+          # finishing out of order and retrying an already-published commit
+          # (#149's second and fourth acceptance cases).
+          bash scripts/release/check-not-stale.sh "$GITHUB_SHA" "$head_sha" || exit 0
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
           sha="${GITHUB_SHA::7}"
-          docker buildx imagetools create -t "$repo:latest" "$repo:$sha-x86_64" "$repo:$sha-aarch64"
+          # Copy the index by name, not by rebuilding it from the (mutable) per-arch
+          # tags again: this is exactly the object the previous two steps built and
+          # validated, so promoting it is promoting what was actually checked.
+          docker buildx imagetools create -t "$repo:latest" "$repo:$sha"
           docker buildx imagetools inspect "$repo:latest"
