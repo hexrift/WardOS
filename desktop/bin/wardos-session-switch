@@ -27,11 +27,18 @@ if [[ -z $lines ]]; then
   exit 0
 fi
 
-# label<TAB>command, dropping the constant SECTIONS column: the label is what the
-# menu shows, the command is `ward session select <id>` for that one line's session,
-# quoted with its id at the time this ran — not re-resolved after the choice.
-items=$(printf '%s\n' "$lines" | cut -f2,3)
-label=$(printf '%s\n' "$items" | cut -f1 | wardos_menu Session) || exit 0
-command=$(printf '%s\n' "$items" | awk -F'\t' -v l="$label" '$1 == l { print $2; exit }')
+# label<TAB>command, dropping the constant SECTIONS column, each row numbered (#141
+# finding 6): two live sessions can render byte-identical labels — same worktree
+# basename, same agent/pending/verify state — and fuzzel (like the stdin test
+# backend) hands back exactly the text it was given, so re-matching the choice to a
+# session by searching for that text again picks whichever row happens to share it
+# first, not necessarily the row actually picked. The number doubles as a quick way
+# to jump to a specific row, but the reason it is there is to make every row's shown
+# text unique, so the choice can round-trip back to its own command by that number
+# instead of by re-matching free text.
+items=$(printf '%s\n' "$lines" | cut -f2,3 | nl -ba -w1 -s $'\t')
+chosen=$(printf '%s\n' "$items" | awk -F'\t' '{ printf "%s) %s\n", $1, $2 }' | wardos_menu Session) || exit 0
+index=${chosen%%)*}
+command=$(printf '%s\n' "$items" | awk -F'\t' -v i="$index" '$1 == i { print $3; exit }')
 [[ -n "$command" ]] || exit 0
 eval "$command"
