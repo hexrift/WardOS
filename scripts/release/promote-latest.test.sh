@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Regressions for promote-latest.sh (issue #149): `latest` is written by
 # exactly one call, targeting exactly the digest this run captured, only
-# when this run's commit is still main's tip -- a superseded run must never
-# invoke docker at all (the concrete form of "cancellation before
-# promotion is safe": nothing is written unless the gate passes).
+# when this run's commit is still main's tip. Covers three of #149's
+# distinct acceptance cases: a superseded run never invokes docker at all
+# (overlapping runs finishing out of order); a run interrupted strictly
+# before the write leaves `latest` untouched (cancellation before
+# promotion, exercised via a deterministic ready/go rendezvous, not a sleep
+# race); and a retry re-promotes whatever digest it is given, faithfully.
 # shellcheck source=scripts/release/testlib.sh
 source "$(dirname "$0")/testlib.sh"
 
@@ -51,6 +54,34 @@ run_with_fake_docker ghcr.io/example/wardos sha256:deadbeef abc123 abc123
 calls=$(wc -l <"$log")
 [[ "$calls" == 2 ]] || fail "retry: expected 2 docker calls, got $calls"
 echo "ok   retry of the still-current tip re-promotes the same digest"
+
+# Cancellation strictly before the shared-tag write: a genuinely different
+# state from the superseded case above, which never even reaches the write
+# path. This one does, and is interrupted while blocked immediately before
+# the one command that can touch `latest` -- and must leave `latest`
+# untouched. The rendezvous is a file's existence, not a sleep duration, so
+# there is no timing race in what the assertion depends on.
+barrier="$work/barrier"
+mkdir -p "$barrier"
+mkfifo "$barrier/go"
+rm -f "$log"
+PROMOTE_LATEST_BARRIER_DIR="$barrier" DOCKER="$fake_docker" DOCKER_CALL_LOG="$log" \
+  bash "$sut" ghcr.io/example/wardos sha256:deadbeef abc123 abc123 &
+pid=$!
+
+deadline=$((SECONDS + 5))
+until [[ -e "$barrier/ready" ]]; do
+  if ((SECONDS >= deadline)); then
+    kill "$pid" 2>/dev/null || true
+    fail "cancellation: promote-latest.sh never reached the pre-write barrier"
+  fi
+  sleep 0.05
+done
+
+kill -TERM "$pid"
+wait "$pid" 2>/dev/null || true
+[[ ! -s "$log" ]] || fail "cancellation: docker was invoked despite being killed before the write"
+echo "ok   cancellation strictly before the write never touches latest"
 
 # The script never assumes two runs of the same commit produced the same
 # bytes: it has no cache and no memory of a previous invocation, so a
