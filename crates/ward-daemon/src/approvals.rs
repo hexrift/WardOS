@@ -30,7 +30,7 @@
 //! answer and every credential the proxy injects, for `ward session grants`
 //! and the shell's authority panel.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -128,8 +128,23 @@ pub enum Lifetime {
     Once,
     /// Until the session ends.
     Session,
-    /// Until the launch that made it ends (a proxy route).
+    /// Until the launch that made it ends (a proxy route): confirmed still
+    /// running, or cleanly retired at its terminal record.
     Launch,
+    /// Tied to a launch whose owning connection closed without ever
+    /// producing a terminal record (`CommandFinished`/`LaunchAborted`) —
+    /// the client process was killed, crashed, or the socket was otherwise
+    /// severed. `wardd` has no teardown handle into the client-side egress
+    /// proxy (it runs inside the client's own process, not the daemon's), so
+    /// a bare disconnect cannot establish whether the route this grant
+    /// scoped actually ended. This is the honest middle ground between the
+    /// two false claims: reporting it as plain `Launch` would claim it is
+    /// still confirmed running, and retiring it (as `f5d5c19` tried, and was
+    /// reverted for in `0198c95`) would claim it is confirmed safe. Neither
+    /// is supportable from an EOF alone (#140, PR #197 review round 3), and
+    /// this is a terminal answer in its own right: nothing resolves it back
+    /// to `Launch` or forward to retired.
+    LaunchUnknown,
 }
 
 impl Lifetime {
@@ -140,6 +155,7 @@ impl Lifetime {
             Self::Once => "once",
             Self::Session => "session",
             Self::Launch => "launch",
+            Self::LaunchUnknown => "launch (disconnected)",
         }
     }
 }
@@ -248,7 +264,10 @@ pub struct Credential {
     /// [`Approvals::retire_launch`] removes every credential recorded under a
     /// given key once that launch's terminal record (`CommandFinished` or
     /// `LaunchAborted`) lands, so the grant does not outlive the route it was
-    /// scoped to (#140).
+    /// scoped to (#140). When the connection instead closes with no terminal
+    /// record ever landing for it, [`Approvals::mark_launch_unknown`] is
+    /// called on the key instead: the credential stays, but reports as
+    /// [`Lifetime::LaunchUnknown`] rather than [`Lifetime::Launch`].
     pub launch_key: Option<u64>,
 }
 
@@ -701,6 +720,11 @@ struct State {
     remembered: BTreeMap<(String, String), Grant>,
     /// The credentials the launches granted, one per service and scope.
     credentials: Vec<Credential>,
+    /// Launch keys whose owning connection closed without ever producing a
+    /// terminal record: [`Approvals::grants`] reports every credential
+    /// recorded under one of these as [`Lifetime::LaunchUnknown`] rather than
+    /// [`Lifetime::Launch`] (see [`Approvals::mark_launch_unknown`]).
+    unknown_launches: BTreeSet<u64>,
     closed: bool,
     /// The session is paused: timeouts stand still and answers are refused.
     paused: bool,
@@ -768,9 +792,31 @@ impl Approvals {
     /// was scoped to has ended (#140). A credential with no launch attributed
     /// (`launch_key: None`) is never touched here.
     pub fn retire_launch(&self, key: u64) {
-        self.lock()
-            .credentials
-            .retain(|c| c.launch_key != Some(key));
+        let mut state = self.lock();
+        state.credentials.retain(|c| c.launch_key != Some(key));
+        // Nothing can still be reporting `LaunchUnknown` for a credential
+        // that is gone; keeping the key around would only ever be dead
+        // weight (this only ever fires here if a terminal record somehow
+        // still lands for a launch already marked unknown — ordinarily it
+        // cannot, since its owning connection is closed for good, but there
+        // is no reason to leave the marker stale if it does).
+        state.unknown_launches.remove(&key);
+    }
+
+    /// Mark launch `key` as no longer able to report: its owning connection
+    /// closed before a terminal record (`CommandFinished`/`LaunchAborted`)
+    /// ever landed, so `wardd` cannot say whether the route this launch's
+    /// grant was scoped to actually ended (#140, PR #197 review round 3).
+    /// The credential is *not* retired here — that would claim the route is
+    /// confirmed to have ended, which a bare disconnect cannot support (the
+    /// mistake `f5d5c19` made and `0198c95` reverted) — and it is not left
+    /// reporting as plain [`Lifetime::Launch`] either, which would just as
+    /// wrongly claim the launch is still confirmed running. From this call
+    /// on, [`grants`](Self::grants) reports every credential recorded under
+    /// `key` as [`Lifetime::LaunchUnknown`]: a legitimate, terminal answer in
+    /// its own right, not a state anything here tries to resolve further.
+    pub fn mark_launch_unknown(&self, key: u64) {
+        self.lock().unknown_launches.insert(key);
     }
 
     /// The credentials granted so far, in grant order.
@@ -791,7 +837,10 @@ impl Approvals {
                 kind: GrantKind::Credential,
                 label: service_name(&c.service),
                 scope: format!("{} · {}", c.permissions.join(", "), c.hosts.join(", ")),
-                lifetime: Lifetime::Launch,
+                lifetime: match c.launch_key {
+                    Some(key) if state.unknown_launches.contains(&key) => Lifetime::LaunchUnknown,
+                    _ => Lifetime::Launch,
+                },
                 granted_at_unix_ms: c.granted_at_unix_ms,
             })
             .chain(state.remembered.values().cloned())
