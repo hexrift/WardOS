@@ -65,7 +65,13 @@ DNF_RETRY_STEP_MARK='##dnf-retry:step##'
 # whole file in that case, only ever narrower once a step boundary is known.
 last_step_tail() {
   local file=$1 line
-  line=$(grep -nF "$DNF_RETRY_STEP_MARK" "$file" 2>/dev/null | tail -n 1 | cut -d: -f1)
+  # `|| true`: under the callers' `set -e`, grep finding no marker makes this whole
+  # pipeline (pipefail) exit non-zero, and a plain assignment statement is NOT exempt
+  # from errexit just because it's a command substitution -- without this, a log with
+  # no marker would abort the caller's script right here instead of reaching the
+  # documented "no marker -> return the whole file" fallback below. `line` still ends
+  # up empty in that case; `|| true` only neutralises the exit status, not the capture.
+  line=$(grep -nF "$DNF_RETRY_STEP_MARK" "$file" 2>/dev/null | tail -n 1 | cut -d: -f1) || true
   if [[ -n "$line" ]]; then
     tail -n "+$((line + 1))" "$file"
   else
