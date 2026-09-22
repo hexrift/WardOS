@@ -816,7 +816,9 @@ impl Session {
         )?;
 
         // From here on `VerificationStarted` is already on the log, so every path out
-        // of this function must leave a terminal verification record behind it.
+        // of this function attempts to leave a terminal verification record behind
+        // it. If that append itself fails too, the log may still end at
+        // `VerificationStarted` — the `match` below never hides that from the caller.
         let result = self.run_prepared_verification(prepared, candidate);
         let _ = std::fs::remove_dir_all(&prepared.scratch);
         let _ = std::fs::remove_dir(scratch_root);
