@@ -235,6 +235,14 @@ pub struct Credential {
     pub permissions: Vec<String>,
     /// When, milliseconds since the Unix epoch.
     pub granted_at_unix_ms: u64,
+    /// The pid of the launch (its `CommandStarted`) whose routes this
+    /// credential was injected for, when the daemon could attribute it to
+    /// one; `None` for a credential granted outside a tracked launch (a
+    /// test, a fixture). [`Approvals::retire_launch`] removes every
+    /// credential recorded for a given pid once that launch's
+    /// `CommandFinished` lands, so the grant does not outlive the route it
+    /// was scoped to (#140).
+    pub launch_pid: Option<u32>,
 }
 
 impl Credential {
@@ -714,21 +722,23 @@ impl Approvals {
             .contains_key(&(tool.to_owned(), summary.to_owned()))
     }
 
-    /// A credential the launch granted for `host` with `permissions`; a second
-    /// route of the same service and permissions adds its host.
+    /// A credential the launch granted for `host` with `permissions`,
+    /// attributed to `launch_pid` (the pid of the `CommandStarted` the
+    /// daemon saw this grant fall under, when it could tell); a second route
+    /// of the same service, permissions and launch adds its host rather than
+    /// making a second grant.
     pub fn record_credential(
         &self,
         service: &str,
         host: &str,
         permissions: Vec<String>,
+        launch_pid: Option<u32>,
         granted_at_unix_ms: u64,
     ) {
         let mut state = self.lock();
-        if let Some(c) = state
-            .credentials
-            .iter_mut()
-            .find(|c| c.service == service && c.permissions == permissions)
-        {
+        if let Some(c) = state.credentials.iter_mut().find(|c| {
+            c.service == service && c.permissions == permissions && c.launch_pid == launch_pid
+        }) {
             if !c.hosts.iter().any(|h| h == host) {
                 c.hosts.push(host.to_owned());
             }
@@ -739,7 +749,19 @@ impl Approvals {
             hosts: vec![host.to_owned()],
             permissions,
             granted_at_unix_ms,
+            launch_pid,
         });
+    }
+
+    /// Retire every credential granted for launch `pid`: called once that
+    /// launch's route is closed (its `CommandFinished` lands), so a
+    /// launch-scoped grant does not keep showing as active authority once
+    /// the launch it was scoped to has ended (#140). A credential with no
+    /// launch attributed (`launch_pid: None`) is never touched here.
+    pub fn retire_launch(&self, pid: u32) {
+        self.lock()
+            .credentials
+            .retain(|c| c.launch_pid != Some(pid));
     }
 
     /// The credentials granted so far, in grant order.
@@ -1009,6 +1031,7 @@ mod tests {
             hosts: vec!["github.com".into(), "api.github.com".into()],
             permissions: vec!["contents:read".into(), "issues:read".into()],
             granted_at_unix_ms: 1,
+            launch_pid: None,
         }
     }
 
@@ -1148,9 +1171,9 @@ mod tests {
         let approvals = Approvals::new();
         assert!(approvals.grants().is_empty());
         let perms = || vec!["contents:read".to_owned(), "issues:read".to_owned()];
-        approvals.record_credential("github", "github.com", perms(), 1);
-        approvals.record_credential("github", "api.github.com", perms(), 2);
-        approvals.record_credential("github", "api.github.com", perms(), 3);
+        approvals.record_credential("github", "github.com", perms(), None, 1);
+        approvals.record_credential("github", "api.github.com", perms(), None, 2);
+        approvals.record_credential("github", "api.github.com", perms(), None, 3);
         assert_eq!(
             approvals.credentials(),
             [Credential {
@@ -1158,6 +1181,7 @@ mod tests {
                 hosts: vec!["github.com".into(), "api.github.com".into()],
                 permissions: perms(),
                 granted_at_unix_ms: 1,
+                launch_pid: None,
             }],
             "one credential per service and scope, its hosts merged"
         );
@@ -1195,6 +1219,51 @@ mod tests {
         approvals.answer(2, ApprovalDecision::Allow).unwrap();
         approvals.wait(2, Duration::ZERO);
         assert_eq!(approvals.grants().len(), 2);
+    }
+
+    #[test]
+    fn retiring_a_launch_drops_only_its_own_credentials() {
+        // #140: a launch-scoped credential must not keep showing as active
+        // authority once the launch it was granted for has ended.
+        let approvals = Approvals::new();
+        let perms = || vec!["contents:read".to_owned()];
+        approvals.record_credential("github", "github.com", perms(), Some(2), 1);
+        // A second, concurrent launch grants the same service and scope: it
+        // must stay its own credential, not merge with pid 2's.
+        approvals.record_credential("github", "github.com", perms(), Some(3), 2);
+        // A credential the daemon could not attribute to a launch (none
+        // observed): never retired by a launch ending.
+        approvals.record_credential("npm", "registry.npmjs.org", perms(), None, 3);
+        assert_eq!(approvals.credentials().len(), 3);
+
+        approvals.retire_launch(2);
+        let remaining = approvals.credentials();
+        assert_eq!(remaining.len(), 2, "{remaining:?}");
+        assert!(remaining.iter().all(|c| c.launch_pid != Some(2)));
+        assert!(
+            remaining.iter().any(|c| c.launch_pid == Some(3)),
+            "the other launch's credential is untouched: {remaining:?}"
+        );
+        assert!(
+            remaining.iter().any(|c| c.launch_pid.is_none()),
+            "an unattributed credential is never retired: {remaining:?}"
+        );
+
+        // Retiring a pid that never granted anything is a no-op.
+        approvals.retire_launch(99);
+        assert_eq!(approvals.credentials().len(), 2);
+
+        approvals.retire_launch(3);
+        assert_eq!(
+            approvals.credentials(),
+            [Credential {
+                service: "npm".into(),
+                hosts: vec!["registry.npmjs.org".into()],
+                permissions: perms(),
+                granted_at_unix_ms: 3,
+                launch_pid: None,
+            }]
+        );
     }
 
     #[test]

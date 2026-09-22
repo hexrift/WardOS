@@ -354,6 +354,13 @@ struct Served {
     state: PathBuf,
     session: String,
     paused: Option<Paused>,
+    /// Pids of the launches (`CommandStarted`) seen so far whose
+    /// `CommandFinished` has not landed yet, most recently started last. A
+    /// `CredentialGranted` is attributed to the last one, so its grant can be
+    /// retired with it rather than outliving the launch it was scoped to
+    /// (#140); nested or genuinely concurrent launches are an approximation
+    /// here, not the stable per-grant identity #140 asks for in full.
+    open_launches: Vec<u32>,
 }
 
 impl Served {
@@ -376,6 +383,7 @@ impl Served {
             state,
             session,
             paused: None,
+            open_launches: Vec::new(),
         }
     }
 
@@ -420,55 +428,88 @@ impl Served {
                 }
                 self.handle(request)
             }
-            other => {
-                // A credential the launch grants passes through here on its
-                // way to the log; once recorded it is temporary authority the
-                // session holds, and what an approval's authority reports.
-                let credential = match &other {
-                    Request::Append {
-                        event: WardEvent::CredentialGranted { service, scope, .. },
-                        ..
-                    } => Some((
-                        service.as_str().to_owned(),
-                        scope.subject.as_str().to_owned(),
-                        scope
-                            .permissions
-                            .iter()
-                            .map(|p| p.as_str().to_owned())
-                            .collect::<Vec<_>>(),
-                    )),
-                    _ => None,
-                };
-                let subscribers = &mut self.subscribers;
-                let (response, done) = control::handle_with(&mut self.log, other, |record| {
-                    subscribers
-                        .retain(|s| s.send(Delivery::Record(Box::new(record.clone()))).is_ok());
-                });
-                if let (Some((service, subject, permissions)), Response::Record(_)) =
-                    (credential, &response)
-                {
-                    // The subject is the route's upstream, `host:port`.
-                    let host = subject
-                        .rsplit_once(':')
-                        .map_or(subject.as_str(), |(h, _)| h);
-                    self.approvals.record_credential(
-                        &service,
-                        host,
-                        permissions,
-                        control::unix_ms(SystemTime::now()),
-                    );
-                }
-                if done {
-                    for s in self.subscribers.drain(..) {
-                        let _ = s.send(Delivery::End);
-                    }
-                    // A question still open when the log seals is released as
-                    // denied; no record of it can follow the seal.
-                    self.approvals.close();
-                }
-                (response, done)
+            other => self.handle_appendable(other),
+        }
+    }
+
+    /// Every request `handle` does not answer itself: appended to the log,
+    /// fanned out to subscribers, and watched for the two kinds of record
+    /// that feed the grants list — a credential the launch grants (recorded
+    /// as temporary authority) and a launch beginning or ending (`#140`:
+    /// attributes a credential to the launch most recently started and not
+    /// yet finished, and retires that launch's credentials once its
+    /// `CommandFinished` lands, so a grant does not outlive the launch it
+    /// was scoped to).
+    fn handle_appendable(&mut self, other: Request) -> (Response, bool) {
+        let credential = match &other {
+            Request::Append {
+                event: WardEvent::CredentialGranted { service, scope, .. },
+                ..
+            } => Some((
+                service.as_str().to_owned(),
+                scope.subject.as_str().to_owned(),
+                scope
+                    .permissions
+                    .iter()
+                    .map(|p| p.as_str().to_owned())
+                    .collect::<Vec<_>>(),
+                self.open_launches.last().copied(),
+            )),
+            _ => None,
+        };
+        let launch_started = match &other {
+            Request::Append {
+                event: WardEvent::CommandStarted { pid, .. },
+                ..
+            } => Some(pid.get()),
+            _ => None,
+        };
+        let launch_finished = match &other {
+            Request::Append {
+                event: WardEvent::CommandFinished { pid, .. },
+                ..
+            } => Some(pid.get()),
+            _ => None,
+        };
+        let subscribers = &mut self.subscribers;
+        let (response, done) = control::handle_with(&mut self.log, other, |record| {
+            subscribers.retain(|s| s.send(Delivery::Record(Box::new(record.clone()))).is_ok());
+        });
+        if matches!(response, Response::Record(_)) {
+            if let Some((service, subject, permissions, launch_pid)) = credential {
+                // The subject is the route's upstream, `host:port`.
+                let host = subject
+                    .rsplit_once(':')
+                    .map_or(subject.as_str(), |(h, _)| h);
+                self.approvals.record_credential(
+                    &service,
+                    host,
+                    permissions,
+                    launch_pid,
+                    control::unix_ms(SystemTime::now()),
+                );
+            }
+            if let Some(pid) = launch_started {
+                self.open_launches.push(pid);
+            }
+            if let Some(pid) = launch_finished {
+                self.open_launches.retain(|p| *p != pid);
+                // The route this launch's credentials were scoped to is torn
+                // down with it: they are no longer active authority, whether
+                // the launch succeeded, failed or was killed over budget
+                // (every path here reaches `CommandFinished`).
+                self.approvals.retire_launch(pid);
             }
         }
+        if done {
+            for s in self.subscribers.drain(..) {
+                let _ = s.send(Delivery::End);
+            }
+            // A question still open when the log seals is released as
+            // denied; no record of it can follow the seal.
+            self.approvals.close();
+        }
+        (response, done)
     }
 
     /// Append one `wardd`-origin record now, fanned out like any other.
@@ -1250,6 +1291,59 @@ mod tests {
             lock(&served).approvals.grants().len(),
             2,
             "a denial grants nothing"
+        );
+    }
+
+    #[test]
+    fn a_launch_scoped_credential_is_retired_when_the_launch_that_granted_it_ends() {
+        use ward_events::{
+            BoundedArgv, CredentialDelivery, ExitStatus, NameText, Pid, SandboxPath, SandboxRoot,
+            Scope, ServiceId,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+
+        let pid = Pid::new(2).unwrap();
+        let started = WardEvent::CommandStarted {
+            pid,
+            parent: Pid::new(1).unwrap(),
+            argv: BoundedArgv::from_bytes([b"git".as_slice(), b"push".as_slice()]),
+            cwd: SandboxPath::new(SandboxRoot::Work, ".").unwrap(),
+            exe_digest: None,
+        };
+        assert!(lock(&served).append(started).is_ok());
+
+        let granted = WardEvent::CredentialGranted {
+            service: ServiceId::new("github").unwrap(),
+            scope: Scope {
+                subject: ShortText::new("github.com:443"),
+                permissions: vec![NameText::new("contents:read")],
+            },
+            expires: Duration::from_secs(60),
+            delivery: CredentialDelivery::ProxyInjected,
+        };
+        assert!(lock(&served).append(granted).is_ok());
+
+        assert_eq!(
+            lock(&served).approvals.grants().len(),
+            1,
+            "the launch's credential is a grant while it runs"
+        );
+
+        let finished = WardEvent::CommandFinished {
+            pid,
+            exit: ExitStatus::Exited { code: 0 },
+            duration: Duration::from_secs(1),
+        };
+        assert!(lock(&served).append(finished).is_ok());
+
+        // The launch that was granted the credential has ended: the
+        // authority view must not keep showing it as active (issue #140).
+        let grants = lock(&served).approvals.grants();
+        assert!(
+            grants.is_empty(),
+            "a launch-scoped grant must not outlive the launch it was scoped to: {grants:?}"
         );
     }
 
