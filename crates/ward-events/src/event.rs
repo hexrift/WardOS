@@ -819,6 +819,24 @@ pub enum WardEvent {
         /// empty when nothing differed.
         backup: ShortText,
     },
+
+    // -- processes, continued (origin: Kernel; #140 / PR #197 review) --
+    /// A launch could not be carried through to a `CommandFinished`: the sandbox or hook
+    /// setup failed, or the child failed to spawn, after `CommandStarted` (and any credential
+    /// grant scoped to it) was already on the log. Recorded so `CommandStarted` is never the
+    /// last record for a pid — every launch gets a terminal record, and a launch-scoped grant
+    /// does not outlive a launch that never even started, not just one that ran and exited.
+    /// Appended at the end of the catalogue, not grouped with `CommandFinished` above, because
+    /// postcard identifies variants by declaration index and existing indices must never move
+    /// (see the module doc comment); the same discipline `VerificationErrored` follows for an
+    /// unrunnable verification attempt.
+    LaunchAborted {
+        /// The process this closes out (`CommandStarted`'s own pid).
+        pid: Pid,
+        /// Sanitised, bounded description of what stopped the launch (e.g. "egress proxy:
+        /// address already in use"). Never a secret; drawn from the daemon's own error text.
+        reason: ShortText,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -858,11 +876,12 @@ pub enum EventKind {
     SessionPaused = 27,
     SessionResumed = 28,
     EntryRestored = 29,
+    LaunchAborted = 30,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 30] = [
+    pub const ALL: [EventKind; 31] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -893,6 +912,7 @@ impl EventKind {
         EventKind::SessionPaused,
         EventKind::SessionResumed,
         EventKind::EntryRestored,
+        EventKind::LaunchAborted,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
@@ -935,6 +955,7 @@ impl EventKind {
             EventKind::SessionPaused => "session_paused",
             EventKind::SessionResumed => "session_resumed",
             EventKind::EntryRestored => "entry_restored",
+            EventKind::LaunchAborted => "launch_aborted",
         }
     }
 
@@ -1103,6 +1124,7 @@ impl WardEvent {
             WardEvent::SessionPaused { .. } => EventKind::SessionPaused,
             WardEvent::SessionResumed { .. } => EventKind::SessionResumed,
             WardEvent::EntryRestored { .. } => EventKind::EntryRestored,
+            WardEvent::LaunchAborted { .. } => EventKind::LaunchAborted,
         }
     }
 

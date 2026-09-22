@@ -597,6 +597,21 @@ impl Session {
     /// Run a command with explicit options; every run gets the session egress proxy.
     /// Refused while the session is paused: a sandbox started then would run
     /// unfrozen behind a closed proxy, which is neither state the user chose.
+    ///
+    /// Once `CommandStarted` (and any credential grant `opts.gateways` makes) is on
+    /// the log, every exit path leaves exactly one terminal record behind it —
+    /// `CommandFinished`, or, when the launch could not be carried that far (the
+    /// sandbox or hook socket failed to bind, the child failed to spawn, …),
+    /// `LaunchAborted` (#140, PR #197 review). Without this, a credential granted
+    /// above could outlive a launch that never even started: the daemon's
+    /// `open_launches` would keep the pid open forever, exactly the staleness #140
+    /// exists to prevent, just reached through a different exit path than an
+    /// ordinary `CommandFinished`. The real error is still returned to the caller
+    /// unchanged either way — the terminal record is additive, never a substitute
+    /// (the same discipline `VerificationErrored` (#139) uses for `Session::verify`).
+    /// If the terminal record's own append also fails (sink gone, disk full, …),
+    /// that failure is folded into the returned error rather than discarded, so the
+    /// caller learns the log may still end at `CommandStarted`.
     pub fn launch(&mut self, argv: &[String], opts: &LaunchOpts) -> Result<RunReport> {
         self.refuse_while_paused()?;
         self.emit(
@@ -619,6 +634,57 @@ impl Session {
             },
         )?;
 
+        for refusal in &opts.refusals {
+            self.emit(Origin::Wardd, refusal.clone())?;
+        }
+        for g in &opts.gateways {
+            self.emit(Origin::Wardd, g.granted(GATEWAY_TTL)?)?;
+        }
+
+        // From here on `CommandStarted` (and any grant just above) is already on the
+        // log, so the `match` below never lets an error skip past leaving a terminal
+        // record for it.
+        let result = self.run_launch(pid, argv, opts);
+        let outcome = match result {
+            Ok(report) => Ok(report),
+            Err(e) => {
+                let reason = ShortText::new(&e.to_string());
+                Err(
+                    match self.emit(Origin::Kernel, WardEvent::LaunchAborted { pid, reason }) {
+                        Ok(()) => e,
+                        // The fallback terminal record's own append failed too: never
+                        // silently discard that (the exact gap #140/#139 both exist to
+                        // close). Fold both failures into what the caller sees, so this
+                        // is distinguishable from an ordinary abort whose record landed.
+                        Err(emit_err) => Error::Events(format!(
+                            "launch failed ({e}), and the terminal record for it could \
+                             not be written ({emit_err}); the log may still end at \
+                             CommandStarted"
+                        )),
+                    },
+                )
+            }
+        };
+        // The agent is idle either way: the launch finished, or it never got off the
+        // ground. Best-effort — a failure here is secondary to `outcome` above, and
+        // before this fix a failed launch left the agent reporting `Working` forever,
+        // since the function returned early without ever reaching this point.
+        let _ = self.emit(
+            Origin::Wardd,
+            WardEvent::AgentStateChanged {
+                state: AgentState::Idle,
+            },
+        );
+        outcome
+    }
+
+    /// The launch's fallible span, from the sandbox and hook setup through the
+    /// child's own exit and its `CommandFinished`: everything that can fail with
+    /// `CommandStarted` (and any credential grant above it) already on the log. An
+    /// `Err` here means the launch never reached `CommandFinished`;
+    /// [`launch`](Self::launch) turns that into a `LaunchAborted` terminal record
+    /// instead (#140, PR #197 review).
+    fn run_launch(&mut self, pid: Pid, argv: &[String], opts: &LaunchOpts) -> Result<RunReport> {
         let watch_reads = matches!(
             self.manifest.observer,
             ObserverMode::Live | ObserverMode::StepThrough(_)
@@ -630,12 +696,6 @@ impl Session {
             None
         };
 
-        for refusal in &opts.refusals {
-            self.emit(Origin::Wardd, refusal.clone())?;
-        }
-        for g in &opts.gateways {
-            self.emit(Origin::Wardd, g.granted(GATEWAY_TTL)?)?;
-        }
         let run_dir = run_dir(&self.session_str)?;
         let mut egress = Egress::start(
             &run_dir,
@@ -684,12 +744,6 @@ impl Session {
                 pid,
                 exit: exit_status(outcome.code),
                 duration: outcome.duration,
-            },
-        )?;
-        self.emit(
-            Origin::Wardd,
-            WardEvent::AgentStateChanged {
-                state: AgentState::Idle,
             },
         )?;
 

@@ -235,14 +235,21 @@ pub struct Credential {
     pub permissions: Vec<String>,
     /// When, milliseconds since the Unix epoch.
     pub granted_at_unix_ms: u64,
-    /// The pid of the launch (its `CommandStarted`) whose routes this
-    /// credential was injected for, when the daemon could attribute it to
-    /// one; `None` for a credential granted outside a tracked launch (a
-    /// test, a fixture). [`Approvals::retire_launch`] removes every
-    /// credential recorded for a given pid once that launch's
-    /// `CommandFinished` lands, so the grant does not outlive the route it
-    /// was scoped to (#140).
-    pub launch_pid: Option<u32>,
+    /// An opaque key identifying the launch whose routes this credential was
+    /// injected for, when the daemon could attribute it to one; `None` for a
+    /// credential granted outside a tracked launch (a test, a fixture). This
+    /// is *not* the client-supplied `Pid` on `CommandStarted`/`CommandFinished`
+    /// — that value is chosen independently by each `Session` (every freshly
+    /// opened session starts allocating from the same small range) and can
+    /// collide between two genuinely concurrent launches, which would merge
+    /// their credentials and let one launch's end retire the other's grant
+    /// too. The daemon mints this key itself, scoped to the connection that
+    /// started the launch, so it cannot collide (PR #197 review, finding 2).
+    /// [`Approvals::retire_launch`] removes every credential recorded under a
+    /// given key once that launch's terminal record (`CommandFinished` or
+    /// `LaunchAborted`) lands, so the grant does not outlive the route it was
+    /// scoped to (#140).
+    pub launch_key: Option<u64>,
 }
 
 impl Credential {
@@ -723,21 +730,21 @@ impl Approvals {
     }
 
     /// A credential the launch granted for `host` with `permissions`,
-    /// attributed to `launch_pid` (the pid of the `CommandStarted` the
-    /// daemon saw this grant fall under, when it could tell); a second route
-    /// of the same service, permissions and launch adds its host rather than
-    /// making a second grant.
+    /// attributed to `launch_key` (the daemon's own opaque id for the launch
+    /// this grant fell under, when it could tell one); a second route of the
+    /// same service, permissions and launch adds its host rather than making
+    /// a second grant.
     pub fn record_credential(
         &self,
         service: &str,
         host: &str,
         permissions: Vec<String>,
-        launch_pid: Option<u32>,
+        launch_key: Option<u64>,
         granted_at_unix_ms: u64,
     ) {
         let mut state = self.lock();
         if let Some(c) = state.credentials.iter_mut().find(|c| {
-            c.service == service && c.permissions == permissions && c.launch_pid == launch_pid
+            c.service == service && c.permissions == permissions && c.launch_key == launch_key
         }) {
             if !c.hosts.iter().any(|h| h == host) {
                 c.hosts.push(host.to_owned());
@@ -749,19 +756,21 @@ impl Approvals {
             hosts: vec![host.to_owned()],
             permissions,
             granted_at_unix_ms,
-            launch_pid,
+            launch_key,
         });
     }
 
-    /// Retire every credential granted for launch `pid`: called once that
-    /// launch's route is closed (its `CommandFinished` lands), so a
-    /// launch-scoped grant does not keep showing as active authority once
-    /// the launch it was scoped to has ended (#140). A credential with no
-    /// launch attributed (`launch_pid: None`) is never touched here.
-    pub fn retire_launch(&self, pid: u32) {
+    /// Retire every credential granted for launch `key` (the same opaque id
+    /// [`record_credential`](Self::record_credential) was called with):
+    /// called once that launch's route is closed (its terminal record —
+    /// `CommandFinished` or `LaunchAborted` — lands), so a launch-scoped
+    /// grant does not keep showing as active authority once the launch it
+    /// was scoped to has ended (#140). A credential with no launch attributed
+    /// (`launch_key: None`) is never touched here.
+    pub fn retire_launch(&self, key: u64) {
         self.lock()
             .credentials
-            .retain(|c| c.launch_pid != Some(pid));
+            .retain(|c| c.launch_key != Some(key));
     }
 
     /// The credentials granted so far, in grant order.
@@ -1031,7 +1040,7 @@ mod tests {
             hosts: vec!["github.com".into(), "api.github.com".into()],
             permissions: vec!["contents:read".into(), "issues:read".into()],
             granted_at_unix_ms: 1,
-            launch_pid: None,
+            launch_key: None,
         }
     }
 
@@ -1181,7 +1190,7 @@ mod tests {
                 hosts: vec!["github.com".into(), "api.github.com".into()],
                 permissions: perms(),
                 granted_at_unix_ms: 1,
-                launch_pid: None,
+                launch_key: None,
             }],
             "one credential per service and scope, its hosts merged"
         );
@@ -1239,13 +1248,13 @@ mod tests {
         approvals.retire_launch(2);
         let remaining = approvals.credentials();
         assert_eq!(remaining.len(), 2, "{remaining:?}");
-        assert!(remaining.iter().all(|c| c.launch_pid != Some(2)));
+        assert!(remaining.iter().all(|c| c.launch_key != Some(2)));
         assert!(
-            remaining.iter().any(|c| c.launch_pid == Some(3)),
+            remaining.iter().any(|c| c.launch_key == Some(3)),
             "the other launch's credential is untouched: {remaining:?}"
         );
         assert!(
-            remaining.iter().any(|c| c.launch_pid.is_none()),
+            remaining.iter().any(|c| c.launch_key.is_none()),
             "an unattributed credential is never retired: {remaining:?}"
         );
 
@@ -1261,7 +1270,7 @@ mod tests {
                 hosts: vec!["registry.npmjs.org".into()],
                 permissions: perms(),
                 granted_at_unix_ms: 3,
-                launch_pid: None,
+                launch_key: None,
             }]
         );
     }

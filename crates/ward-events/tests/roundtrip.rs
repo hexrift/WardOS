@@ -608,6 +608,13 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Kernel,
+            WardEvent::LaunchAborted {
+                pid: Pid::new(4).unwrap(),
+                reason: text("egress proxy: address already in use"),
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
