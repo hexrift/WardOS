@@ -261,7 +261,7 @@ integrity pass
 
 `✓ VERIFIED` should become recognisable as a WardOS/TamperWard state. It is always
 rendered the same way, in the same place, in the verified colour, and it is bound to
-the snapshot it judged (ADR-0019): the bar's `VERIFY` segment has five states and shows
+the snapshot it judged (ADR-0019): the bar's `VERIFY` segment has six states and shows
 exactly one, decided by content, not by time or heuristics. The shell digests the
 worktree with the snapshot crate's incremental hash cache and compares the id with the
 candidate the last `VerificationPassed` record names; green disappears the moment the
@@ -273,7 +273,8 @@ tree differs from that candidate.
 | verifying | `VERIFY ◐ 7c01a2b3` | accent | the trusted verifier is running on candidate `7c01…` |
 | verified | `VERIFY ✓ 7c01a2b3` | verified green | candidate `7c01…` passed, and the worktree is `7c01…` byte for byte |
 | stale | `VERIFY ~ STALE` | restricted amber | `7c01…` passed, but the worktree has changed since; the verdict is history |
-| failed | `VERIFY ✗` | denied red | the candidate failed |
+| failed | `VERIFY ✗` | denied red | the trusted command ran and the candidate failed |
+| errored | `VERIFY ! ERROR` | denied red | the attempt could not run to a pass/fail result at all (sandbox runtime failed to launch, a preparation step failed, …); never shown as running or as a failed test (#139) |
 
 A failed verdict stays red whatever the tree does next: only a new run changes it. A
 sealed log keeps its verdict; the tree can still make it stale. Clicking the segment
