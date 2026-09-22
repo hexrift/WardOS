@@ -72,12 +72,31 @@ pub fn connect(socket: &Path) -> Result<RemoteSink> {
     RemoteSink::connect(socket).ok_or_else(|| Error::Project(NO_DAEMON.to_owned()))
 }
 
+/// What `ward pause` gets back: the `SessionPaused` record, and — only when the
+/// daemon could not confirm the freeze settled within `pause::FREEZE_SETTLE` (#145
+/// items 3-4) — how many of the session's sandboxed processes had not yet
+/// confirmed stopped.
+pub struct PauseResult {
+    /// The `SessionPaused` record.
+    pub record: EventRecord,
+    /// `Some(pending)` when the freeze could not be confirmed within the bound.
+    pub unsettled: Option<u32>,
+}
+
 /// `ward pause`: the daemon pauses the session as one operation (ADR-0019 §3)
-/// and answers with the `SessionPaused` record.
-pub fn pause(sink: &mut RemoteSink, reason: &str) -> Result<EventRecord> {
-    expect_record(sink.call(&Request::Pause {
+/// and answers with the `SessionPaused` record, plus whether the freeze itself
+/// was confirmed.
+pub fn pause(sink: &mut RemoteSink, reason: &str) -> Result<PauseResult> {
+    match sink.call(&Request::Pause {
         reason: reason.to_owned(),
-    })?)
+    })? {
+        Response::Paused { record, unsettled } => Ok(PauseResult {
+            record: *record,
+            unsettled,
+        }),
+        Response::Error(e) => Err(Error::Project(e)),
+        other => Err(Error::Project(format!("unexpected response {other:?}"))),
+    }
 }
 
 /// `ward resume`: the daemon reverses the pause and answers with the

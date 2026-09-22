@@ -37,8 +37,11 @@ use crate::session::{run_dir_path, session_dir};
 pub const MARKER: &str = "paused";
 /// Where cgroup v2 is mounted.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
-/// How long a cgroup freeze is given to settle before it is trusted.
-const FREEZE_SETTLE: Duration = Duration::from_secs(1);
+/// How long a freeze is given to settle before it is trusted (or, for the signal path,
+/// before `Served::pause` records it as unconfirmed rather than waiting longer — #145
+/// items 3-4). Public so a caller reporting an unsettled pause (the CLI, `ward-cli`'s
+/// `cmd_pause`) can name the actual bound instead of a copy of this number.
+pub const FREEZE_SETTLE: Duration = Duration::from_secs(1);
 
 /// The marker the session's proxies watch: present while paused.
 #[must_use]
@@ -100,6 +103,33 @@ pub fn wait_settled(frozen: &Frozen) -> bool {
     crate::daemon::wait_until(FREEZE_SETTLE, || {
         frozen.pids.iter().all(|&pid| stopped_or_gone(proc, pid))
     })
+}
+
+/// Whether a freeze settled within [`FREEZE_SETTLE`], and how many pids had not when
+/// the bound expired: `None` once every pid is confirmed stopped or gone (always true
+/// for [`PauseMethod::CgroupFreezer`], which is synchronous by construction); `Some(n)`
+/// otherwise, checked once, immediately, with no further waiting — [`wait_settled`]
+/// already spent the bound.
+///
+/// This is what [`crate::daemon::Served::pause`] (ADR-0019 §3, #145 items 3-4) calls to
+/// decide whether the pause it is about to record can be shown as confirmed, and, if
+/// not, how many processes a `SessionPauseUnsettled` record should name.
+#[must_use]
+pub fn settle_outcome(frozen: &Frozen) -> Option<u32> {
+    if wait_settled(frozen) {
+        return None;
+    }
+    let proc = Path::new("/proc");
+    Some(
+        u32::try_from(
+            frozen
+                .pids
+                .iter()
+                .filter(|&&pid| !stopped_or_gone(proc, pid))
+                .count(),
+        )
+        .unwrap_or(u32::MAX),
+    )
 }
 
 /// Whether `pid` is stopped (`SIGSTOP` took hold) or no longer exists.
@@ -641,6 +671,46 @@ mod tests {
             pids: vec![],
             cgroup: None,
         }));
+    }
+
+    /// #145 items 3-4: `settle_outcome` mirrors `wait_settled` when a freeze
+    /// settles, is always `None` for the cgroup freezer (synchronous by
+    /// construction, even with a pid a real freeze could never actually hold —
+    /// [`freeze_cgroup`]'s own wait is what makes this true, not a re-check
+    /// against `/proc`), and, on the signal path, counts exactly the pids still
+    /// not stopped or gone once the bound has expired.
+    #[test]
+    fn settle_outcome_counts_only_what_is_still_not_stopped_after_the_bound() {
+        assert_eq!(
+            settle_outcome(&Frozen {
+                method: PauseMethod::CgroupFreezer,
+                pids: vec![999_999],
+                cgroup: Some(PathBuf::from("/does/not/matter")),
+            }),
+            None
+        );
+        assert_eq!(
+            settle_outcome(&Frozen {
+                method: PauseMethod::Sigstop,
+                pids: vec![],
+                cgroup: None,
+            }),
+            None,
+            "nothing to wait for"
+        );
+        // A pid that never existed reads as `stopped_or_gone` (its tree ended by
+        // itself), so a `Frozen` naming only such pids settles even though nothing
+        // was ever really frozen — `wait_settled`'s existing, intentional behaviour
+        // (`freeze`'s own doc comment: "a pid gone since the scan is not a
+        // failure"); `settle_outcome` must not report it as pending.
+        assert_eq!(
+            settle_outcome(&Frozen {
+                method: PauseMethod::Sigstop,
+                pids: vec![999_999, 999_998],
+                cgroup: None,
+            }),
+            None
+        );
     }
 
     /// A session the user has already paused is already frozen; the capture

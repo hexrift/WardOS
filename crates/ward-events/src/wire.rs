@@ -367,6 +367,10 @@ impl Filter {
 
     /// The Quiet observer mode: state changes, policy denials, capability requests and
     /// decisions, verification outcomes, the host's interventions, session end.
+    ///
+    /// `SessionPauseUnsettled` is in Quiet for the same reason `TamperDetected` is: it
+    /// says the pause the user is being shown is knowingly unconfirmed, which no
+    /// observer mode may hide (#145 item 4).
     #[must_use]
     pub const fn quiet() -> Self {
         Self {
@@ -381,6 +385,7 @@ impl Filter {
                 .with(EventKind::VerificationFailed)
                 .with(EventKind::VerificationErrored)
                 .with(EventKind::SessionPaused)
+                .with(EventKind::SessionPauseUnsettled)
                 .with(EventKind::SessionResumed)
                 .with(EventKind::EntryRestored)
                 .with(EventKind::SessionEnded),

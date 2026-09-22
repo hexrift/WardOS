@@ -18,7 +18,13 @@
 //! (ADR-0019 §3, [`crate::pause`]): one operation under the mutex that freezes
 //! the sandboxes, writes the marker the proxies refuse on, holds the approvals
 //! and appends the record; a `Stop` from paused kills the frozen tree first, so
-//! nothing is left stopped forever, and the workspace is kept as it is.
+//! nothing is left stopped forever, and the workspace is kept as it is. Freezing
+//! a sandbox by signal (no delegated cgroup freezer available) is asynchronous —
+//! `SIGSTOP` is delivered by the kernel, not observed to land — so `Request::Pause`
+//! waits up to [`pause::FREEZE_SETTLE`] to confirm every process actually stopped
+//! before answering; on success this is invisible, on failure the marker and held
+//! approvals still stand (the safest state) but the response and the log both say
+//! plainly that the freeze was not confirmed (#145 items 3-4).
 //!
 //! `ward up` starts the daemon with [`spawn`] and `ward status` asks [`serving`];
 //! every other command adopts the socket through
@@ -340,6 +346,17 @@ struct Paused {
     since: Instant,
 }
 
+/// What [`Served::pause`] produced: the `SessionPaused` record always, and — only
+/// when the freeze could not be confirmed settled within [`pause::FREEZE_SETTLE`]
+/// (the `SIGSTOP` fallback path only; the cgroup freezer is synchronous) — how many
+/// of the session's sandboxed processes had not yet confirmed stopped. Mirrors the
+/// `SessionPauseUnsettled` record appended alongside it, so a caller that only sees
+/// the RPC response (not a log subscriber) still learns the same thing (#145 item 4).
+struct PauseOutcome {
+    record: Box<EventRecord>,
+    unsettled: Option<u32>,
+}
+
 /// The daemon's shared state: the log, the session facts, the subscribers, the
 /// open connections, the approvals it holds, what it derives their authority
 /// from, and the pause in force.
@@ -402,8 +419,13 @@ impl Served {
             Request::Pending => (Response::Pending(self.approvals.pending()), false),
             Request::Grants => (Response::Grants(self.approvals.grants()), false),
             Request::Pause { reason } => (
-                self.pause(&reason)
-                    .map_or_else(|e| Response::Error(refusal(e)), Response::Record),
+                self.pause(&reason).map_or_else(
+                    |e| Response::Error(refusal(e)),
+                    |outcome| Response::Paused {
+                        record: outcome.record,
+                        unsettled: outcome.unsettled,
+                    },
+                ),
                 false,
             ),
             Request::Resume => (
@@ -512,9 +534,34 @@ impl Served {
     /// processes, write the marker every proxy of the session refuses on (new
     /// connections, new requests, credential injection), hold the approvals,
     /// append `SessionPaused`. The processes are frozen first so nothing can
-    /// use the gap before the proxy notices the marker. Any failure undoes
-    /// what was done, so the session is either paused whole or not at all.
-    fn pause(&mut self, reason: &str) -> Result<Box<EventRecord>> {
+    /// use the gap before the proxy notices the marker. Any failure before
+    /// `SessionPaused` is recorded undoes what was done, so the session is
+    /// either paused whole or not at all.
+    ///
+    /// Always uses [`pause::settle_outcome`]; see [`Self::pause_with`] for why
+    /// this is split out.
+    fn pause(&mut self, reason: &str) -> Result<PauseOutcome> {
+        self.pause_with(reason, pause::settle_outcome)
+    }
+
+    /// [`Self::pause`], with the settle check injectable: real callers always pass
+    /// [`pause::settle_outcome`], which waits up to [`pause::FREEZE_SETTLE`] against
+    /// real `/proc` state; a test passes a closure that answers at once, so the
+    /// unsettled path (and the `pending` count it reports) is exercised
+    /// deterministically, with no real un-stoppable process and no real wait —
+    /// `SIGSTOP` cannot be caught, blocked or ignored by user space, so there is no
+    /// way to make a *real* process resist it for a test to race against.
+    ///
+    /// `settle` runs after the marker and the held approvals are already in place:
+    /// whether or not the freeze is confirmed changes only whether a qualifying
+    /// `SessionPauseUnsettled` follows `SessionPaused`, never whether the pause
+    /// itself proceeds — #145 item 4's "preserve the safest achievable state"
+    /// applies regardless of the answer.
+    fn pause_with(
+        &mut self,
+        reason: &str,
+        settle: impl FnOnce(&Frozen) -> Option<u32>,
+    ) -> Result<PauseOutcome> {
         if self.log.is_none() {
             return Err(Error::Daemon("log is sealed".into()));
         }
@@ -532,21 +579,32 @@ impl Served {
             method: frozen.method,
             reason: ShortText::new(&reason),
         };
-        match self.append(event) {
-            Ok(record) => {
-                self.paused = Some(Paused {
-                    frozen,
-                    since: Instant::now(),
-                });
-                Ok(Box::new(record))
-            }
+        let record = match self.append(event) {
+            Ok(record) => record,
             Err(e) => {
                 self.approvals.set_paused(false);
                 let _ = pause::clear_marker(&self.state, &self.session);
                 pause::thaw(&frozen);
-                Err(e)
+                return Err(e);
             }
+        };
+        // The marker, the held approvals and the frozen tree already stand — the
+        // safest state #145 item 4 asks for — regardless of what happens from here.
+        // Whether the qualifying record makes it onto the log is best-effort, same
+        // as every other bookkeeping append in this method; the record already on
+        // the log (`SessionPaused`) is never retracted or rewritten for it.
+        let unsettled = settle(&frozen);
+        if let Some(pending) = unsettled {
+            let _ = self.append(WardEvent::SessionPauseUnsettled { pending });
         }
+        self.paused = Some(Paused {
+            frozen,
+            since: Instant::now(),
+        });
+        Ok(PauseOutcome {
+            record: Box::new(record),
+            unsettled,
+        })
     }
 
     /// Reverse [`Self::pause`]: release the approvals, open the proxy, thaw
@@ -802,6 +860,7 @@ mod tests {
     /// approvals and records itself; a second pause is refused; resume undoes
     /// it and records; a stop from paused seals with the marker gone.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn pause_holds_approvals_writes_the_marker_and_records_until_resume_or_stop() {
         use crate::approvals::ApprovalDecision;
         use ward_events::PauseMethod;
@@ -821,15 +880,19 @@ mod tests {
             !lock(&served).approvals.pending().is_empty()
         }));
 
-        let record = match lock(&served)
+        let (record, unsettled) = match lock(&served)
             .handle(Request::Pause {
                 reason: " looks wrong ".into(),
             })
             .0
         {
-            Response::Record(r) => *r,
+            Response::Paused { record, unsettled } => (*record, unsettled),
             other => panic!("{other:?}"),
         };
+        assert_eq!(
+            unsettled, None,
+            "no real sandbox process runs in this test; an empty pid set settles trivially"
+        );
         assert_eq!(record.origin, Origin::Wardd);
         assert!(matches!(
             &record.event,
@@ -883,7 +946,10 @@ mod tests {
                     reason: String::new()
                 })
                 .0,
-            Response::Record(_)
+            Response::Paused {
+                unsettled: None,
+                ..
+            }
         ));
         assert!(marker.exists());
         let (response, done) = lock(&served).handle(Request::Stop {
@@ -912,6 +978,79 @@ mod tests {
             lock(&served).handle(Request::Pause { reason: String::new() }).0,
             Response::Error(e) if e == "log is sealed"
         ));
+    }
+
+    /// #145 items 3-4: when the freeze cannot be confirmed settled within the
+    /// bound, the pause still proceeds — the marker is written and the approvals
+    /// are still held (the safest achievable state) — but the outcome is visibly
+    /// different from a clean pause: the RPC response carries `unsettled`, and a
+    /// `SessionPauseUnsettled` record follows `SessionPaused` on the log, naming
+    /// how many processes were still unconfirmed. `pause_with` injects the settle
+    /// check because `SIGSTOP` cannot be resisted by a real process for a test to
+    /// race against (see `Served::pause_with`'s own doc comment).
+    #[test]
+    fn an_unsettled_freeze_still_pauses_but_is_never_reported_as_a_clean_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let marker = pause::marker_path(dir.path(), "sess_9");
+        let sub = lock(&served).subscribe(0).unwrap();
+        let (rx, _hangup) = sub.live.unwrap();
+
+        let outcome = lock(&served)
+            .pause_with("looks wrong", |_frozen| Some(3))
+            .unwrap();
+        assert_eq!(
+            outcome.unsettled,
+            Some(3),
+            "the injected settle check's answer is reported back, unchanged"
+        );
+        assert!(matches!(
+            &outcome.record.event,
+            WardEvent::SessionPaused { reason, .. } if reason.as_str() == "looks wrong"
+        ));
+        // The safest achievable state: preserved exactly as it would be for a
+        // confirmed pause, regardless of the settle outcome.
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "looks wrong\n",
+            "the proxies' marker is written either way"
+        );
+        assert!(lock(&served).approvals.paused());
+        assert!(
+            lock(&served).paused.is_some(),
+            "the freeze is still recorded as held"
+        );
+
+        // A second pause is still refused, same as after a confirmed one: an
+        // unsettled pause is a pause, not a no-op.
+        assert!(matches!(
+            lock(&served).handle(Request::Pause { reason: String::new() }).0,
+            Response::Error(e) if e == "already paused"
+        ));
+
+        let (live, _ended) = drain(&rx);
+        let kinds: Vec<_> = live
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            ["SessionPaused", "SessionPauseUnsettled"],
+            "the qualifying record follows the pause record it qualifies, in the \
+             same operation, never replacing it"
+        );
+        assert!(matches!(
+            &live[1].event,
+            WardEvent::SessionPauseUnsettled { pending: 3 }
+        ));
+
+        // A settled freeze reports no qualifying record at all: today's behaviour
+        // is unchanged when the daemon can confirm the freeze.
+        lock(&served)
+            .resume()
+            .expect("resume the unsettled pause so a second pause can be tried");
+        let settled = lock(&served).pause_with("", |_frozen| None).unwrap();
+        assert_eq!(settled.unsettled, None);
     }
 
     fn seqs(records: &[EventRecord]) -> Vec<u64> {

@@ -463,40 +463,10 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
             Tone::Ok,
             format!("snapshot {}", short_hex(&snapshot.to_string())),
         ),
-        WardEvent::SessionPaused { method, reason } => (
-            "PAUSE",
-            Tone::Deny,
-            format!(
-                "agents paused · network closed · grants suspended · processes frozen ({}) · {}",
-                method.as_str(),
-                reason.as_str()
-            ),
-        ),
-        WardEvent::SessionResumed { paused_for } => (
-            "RESUME",
-            Tone::Accent,
-            format!("agents resumed · paused {}", duration_text(*paused_for)),
-        ),
-        WardEvent::EntryRestored {
-            snapshot,
-            files,
-            backup,
-        } => (
-            "RESTORE",
-            Tone::Accent,
-            if backup.as_str().is_empty() {
-                format!(
-                    "entry {} · worktree already matched",
-                    short_hex(&snapshot.to_string())
-                )
-            } else {
-                format!(
-                    "entry {} · {files} paths · replaced files in {}",
-                    short_hex(&snapshot.to_string()),
-                    backup.as_str()
-                )
-            },
-        ),
+        WardEvent::SessionPaused { .. }
+        | WardEvent::SessionPauseUnsettled { .. }
+        | WardEvent::SessionResumed { .. }
+        | WardEvent::EntryRestored { .. } => intervention_cells(&rec.event)?,
         WardEvent::SessionEnded { .. } => ("END", Tone::Dim, "session".to_string()),
         _ => return None,
     };
@@ -575,6 +545,59 @@ fn verification_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)>
                 reason.as_str(),
                 short_hex(&candidate.to_string())
             ),
+        ),
+        _ => return None,
+    })
+}
+
+/// The host intervention rows (ADR-0019 §3, #145 items 3-4): `PAUSE` red for a
+/// confirmed freeze, `PAUSE?` amber for one the daemon could not confirm settled,
+/// `RESUME` and `RESTORE` in accent. Split out from [`observer_cells`] so that
+/// function stays within the line limit, the same reason [`verification_cells`]
+/// above already is its own function.
+fn intervention_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)> {
+    Some(match event {
+        WardEvent::SessionPaused { method, reason } => (
+            "PAUSE",
+            Tone::Deny,
+            format!(
+                "agents paused · network closed · grants suspended · processes frozen ({}) · {}",
+                method.as_str(),
+                reason.as_str()
+            ),
+        ),
+        WardEvent::SessionPauseUnsettled { pending } => (
+            "PAUSE?",
+            Tone::Warn,
+            format!(
+                "{pending} process{} not confirmed stopped · marker and grants held regardless",
+                if *pending == 1 { "" } else { "es" }
+            ),
+        ),
+        WardEvent::SessionResumed { paused_for } => (
+            "RESUME",
+            Tone::Accent,
+            format!("agents resumed · paused {}", duration_text(*paused_for)),
+        ),
+        WardEvent::EntryRestored {
+            snapshot,
+            files,
+            backup,
+        } => (
+            "RESTORE",
+            Tone::Accent,
+            if backup.as_str().is_empty() {
+                format!(
+                    "entry {} · worktree already matched",
+                    short_hex(&snapshot.to_string())
+                )
+            } else {
+                format!(
+                    "entry {} · {files} paths · replaced files in {}",
+                    short_hex(&snapshot.to_string()),
+                    backup.as_str()
+                )
+            },
         ),
         _ => return None,
     })
@@ -1153,6 +1176,39 @@ mod tests {
                 result_hash: Blake3Hash::ZERO,
             }),
             "an infra error must not render with the same verb as a test failure"
+        );
+    }
+
+    /// #145 items 3-4: an unsettled pause gets its own row, distinct in verb and
+    /// tone from a clean `SessionPaused`, naming exactly what remains uncertain.
+    #[test]
+    fn session_pause_unsettled_gets_its_own_row_distinct_from_a_clean_pause() {
+        use ward_events::{Blake3Hash, Chain, Origin, SessionId, Timestamp};
+        let mut chain = Chain::genesis(SessionId::from_u128(3), Blake3Hash::ZERO);
+        let rec = chain
+            .append(
+                Origin::Wardd,
+                WardEvent::SessionPauseUnsettled { pending: 2 },
+                Timestamp::mono(std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+        let row = plain(&observer_row(&rec).unwrap());
+        assert_eq!(
+            row,
+            "00:01  PAUSE? 2 processes not confirmed stopped · marker and grants held \
+             regardless"
+        );
+        assert!(
+            observer_row(&rec).unwrap().contains(WARN),
+            "uncertain, not denied: amber, not the pause row's own red"
+        );
+        assert_ne!(
+            cells_verb(&rec),
+            cells_verb_of(&WardEvent::SessionPaused {
+                method: ward_events::PauseMethod::Sigstop,
+                reason: ward_events::ShortText::new("ward pause"),
+            }),
+            "an unconfirmed freeze must not render with the same verb as a clean pause"
         );
     }
 

@@ -433,6 +433,7 @@ fn summary(event: &WardEvent) -> String {
         }
         WardEvent::AgentClaim { kind, .. } => format!("{kind:?}"),
         WardEvent::SessionPaused { method, reason } => format!("{} · {reason}", method.as_str()),
+        WardEvent::SessionPauseUnsettled { pending } => format!("{pending} pending"),
         WardEvent::SessionResumed { paused_for } => format!("paused {}s", paused_for.as_secs()),
         WardEvent::EntryRestored {
             snapshot,

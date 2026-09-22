@@ -1160,13 +1160,16 @@ fn pause_freezes_the_sandbox_closes_the_proxy_and_resume_lets_it_finish() {
     // Pause: one request, one record.
     let mut control = RemoteSink::connect(&socket).expect("control");
     let paused = ward_daemon::client::pause(&mut control, "e2e: looks wrong").expect("pause");
-    let method = match &paused.event {
+    let method = match &paused.record.event {
         WardEvent::SessionPaused { method, reason } => {
             assert_eq!(reason.as_str(), "e2e: looks wrong");
             *method
         }
         other => panic!("{other:?}"),
     };
+    // A real bubblewrap tree freezes well inside the settle bound: this end-to-end
+    // pause is confirmed, never reported as unsettled (#145 items 3-4).
+    assert_eq!(paused.unsettled, None, "a real freeze settles");
     let pids = tagged();
     assert!(pids.len() >= 2, "bwrap and the shell: {pids:?}");
     let frozen = |pid: u32| match method {

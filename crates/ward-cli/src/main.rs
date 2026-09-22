@@ -1013,9 +1013,21 @@ fn cmd_pause(dir: &Path, reason: Option<&str>, status: bool) -> ward_daemon::Res
         return Ok(ExitCode::SUCCESS);
     }
     let mut sink = client::connect(&client::socket_path(dir, &state)?)?;
-    let record = client::pause(&mut sink, reason.unwrap_or_default())?;
-    if let Some(row) = render::observer_row(&record) {
+    let outcome = client::pause(&mut sink, reason.unwrap_or_default())?;
+    if let Some(row) = render::observer_row(&outcome.record) {
         println!("{row}");
+    }
+    // #145 items 3-4: never let an unconfirmed freeze read as the same clean
+    // success as a confirmed one. The marker and held approvals stand either way
+    // (the safest achievable state) — what's uncertain is only whether every
+    // sandboxed process has actually stopped yet.
+    if let Some(pending) = outcome.unsettled {
+        println!(
+            "  paused, but {pending} process{} had not confirmed stopped within {}s \
+             — the marker is held and approvals stay frozen regardless",
+            if pending == 1 { "" } else { "es" },
+            ward_daemon::pause::FREEZE_SETTLE.as_secs(),
+        );
     }
     println!(
         "  `ward resume` continues; `ward stop` keeps the workspace; `ward stop --restore-entry` restores the entry state"

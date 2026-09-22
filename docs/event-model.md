@@ -92,6 +92,15 @@ pub enum WardEvent {
 
     // integrity
     Anchor { chain_head: Blake3Hash, seq: u64, countersigned_by: Option<TamperWardSig> },
+
+    // host intervention (origin: Wardd; ADR-0019 §3)
+    SessionPaused   { method: CgroupFreezer | Sigstop, reason: BoundedText },
+    SessionResumed  { paused_for: Duration },
+    EntryRestored   { snapshot: SnapshotId, files: u64, backup: BoundedText },
+    // Appended at the end of the catalogue, same reason as VerificationErrored above
+    // (#145 items 3-4): qualifies SessionPaused when the SIGSTOP fallback couldn't be
+    // confirmed to have settled within the daemon's bound — never in its place.
+    SessionPauseUnsettled { pending: u32 },
 }
 ```
 
@@ -142,7 +151,7 @@ source of truth, not the socket. Latency budget from kernel event to subscriber 
 
 | Mode | Shows | Blocks? |
 | --- | --- | --- |
-| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed,Errored}`, `SessionEnded` | Only on `Ask` |
+| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed,Errored}`, the host's interventions (`SessionPaused`, `SessionPauseUnsettled`, `SessionResumed`, `EntryRestored`), `SessionEnded` | Only on `Ask` |
 | Live | Everything except `AgentClaim{Note}` | Only on `Ask` |
 | Step-through | Everything; additionally the manifest's `step_policy` marks actions (`FileModified` under given globs, `CommandStarted` matching patterns, any `NetworkRequested`) as `Ask` | Yes, on configured actions |
 
