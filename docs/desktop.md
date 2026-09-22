@@ -166,7 +166,10 @@ an answer that matches nothing is returned as typed, which is how names and URLs
 asked for. `wardos-menu` implies SYSTEM when the first word is not a section
 (`wardos-menu capture`), accepts `style` for Appearance, and runs leaves that need a
 terminal (installs, the system update, DNS, About) through `wardos-launch run
-<app-id> <cmd…>`, a terminal window that stays open when the command ends. Web and
+<app-id> <cmd…>`, a terminal window that stays open when the command ends and exits with
+that command's own status — `[done]` or `[failed, exit N]` — never the close prompt's, so a
+caller that checks it (`wardos-welcome`, `wardos-calibrate`'s password step) can tell a
+failed step from a successful one. Web and
 terminal app definitions are `name=`/`url=`/`icon=` and `name=`/`cmd=`/`icon=` files,
 the user's in `~/.config/wardos/webapps|tuis/` over the shipped ones in
 `/usr/share/wardos/`; `install <name>` alone installs a shipped default and

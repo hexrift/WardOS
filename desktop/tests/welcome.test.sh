@@ -94,6 +94,43 @@ wardos-welcome agent
 assert_logged "^wardos-launch run wardos-init ward init $HOME$"
 assert_logged "^wardos-launch run wardos-agent ward codex $HOME$"
 
+# --- a failed in_terminal step (wardos-launch run propagating a real child failure, #142)
+# does not crash the walkthrough, and is not recorded as a successful step -----------------
+mock wardos-launch 'exit 17' # stands in for a real failure the fixed wrapper now propagates
+
+rm -f "$project_file"
+: >"$MOCK_LOG"
+export WARDOS_MENU_CHOICE=$'Choose a directory\n· use this directory'
+wardos-welcome project || fail "a failed project step must not crash wardos-welcome"
+assert_logged '^wardos-launch run wardos-init ward init'
+[[ ! -e "$project_file" ]] || fail "a failed init must not be recorded as the chosen project"
+
+# The agent step, with no project remembered, falls back to project (also failing) and still
+# exits cleanly instead of crashing; with no project to show, it never reaches the agent choice.
+: >"$MOCK_LOG"
+export WARDOS_MENU_CHOICE=$'Choose a directory\n· use this directory'
+wardos-welcome agent || fail "a failed project (via the agent step's own fallback) must not crash"
+[[ ! -e "$project_file" ]] || fail "still not recorded as the chosen project"
+assert_not_logged 'wardos-launch run wardos-agent'
+
+# The agent step itself failing (a project is already chosen) does not crash either.
+: >"$MOCK_LOG"
+mkdir -p "$(dirname "$project_file")"
+printf '%s\n' "$HOME/work/app" >"$project_file"
+export WARDOS_MENU_CHOICE=$'Start Claude'
+wardos-welcome agent || fail "a failed agent start must not crash wardos-welcome"
+assert_logged '^wardos-launch run wardos-agent ward claude'
+
+# The keys step: a failed vault set does not crash either, and both rounds are still offered.
+: >"$MOCK_LOG"
+export WARDOS_MENU_CHOICE=$'Anthropic\nOpenAI'
+wardos-welcome keys || fail "a failed key set must not crash wardos-welcome"
+assert_logged 'ward vault set ANTHROPIC_API_KEY$'
+assert_logged 'ward vault set OPENAI_API_KEY$'
+
+mock wardos-launch # restore the always-succeeding mock for what follows
+rm -f "$project_file"
+
 # Missing tools are skipped, not fatal.
 rm "$MOCK_DIR/wardos-theme" "$MOCK_DIR/ward"
 : >"$MOCK_LOG"
