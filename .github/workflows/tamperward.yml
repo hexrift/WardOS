@@ -1,0 +1,131 @@
+# Protected by .tamperward.yml (ci). This runs the TamperWard tool itself as a
+# merge-authority gate, over the PR's commit range.
+name: tamperward
+
+# The diff-time protected-surface gate (.tamperward.yml): the same deterministic
+# engine as the agent hook and pre-commit, run over the PR's commit range, so a
+# change that would delete a test, skip it, weaken an assertion, lower coverage,
+# rewrite a trusted fixture, or tamper with CI/hooks is caught here rather than in
+# the booted result. A block clears ONLY via the out-of-band label
+# `tamperward:allow:<rule>@<head-sha>` applied by someone with triage access or
+# higher — never a file the PR itself can commit.
+#
+# labeled/unlabeled re-run the gate because the sign-off is read from the EVENT
+# payload: a label applied after a failure could otherwise never take effect, and
+# revoking a sign-off must re-block rather than linger green.
+#
+# Scope note (WardOS): this runs both the diff-time `check` and the pristine
+# `tamperward-verify` (see that job's own comment). To make either the merge
+# authority you must ALSO, in branch protection, require the check AND enable
+# "Require review from Code Owners" — a `pull_request` workflow runs from the
+# PR's own head, so without that a PR could replace the gate (this file itself,
+# not just what it invokes) and still present a green required check.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  tamperward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The gate is fetched from the registry at gate time from inside the checked-out
+    # pull request, and `npm` reads `.npmrc` from the working directory — a PR that
+    # commits one line, `registry=https://…`, would otherwise choose where the
+    # authority judging it is downloaded from. An environment variable outranks a
+    # project `.npmrc` in npm's config precedence, so this pins the SOURCE, not just
+    # the version string in the pin below.
+    env:
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the range diff needs both endpoints
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Resolve out-of-band sign-off from PR labels
+        id: oob
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          RULES="$(printf '%s' "$LABELS" | jq -r '.[] | select(startswith("tamperward:allow:")) | sub("^tamperward:allow:"; "")' | paste -sd, -)"
+          echo "rules=$RULES" >> "$GITHUB_OUTPUT"
+      - name: Tamperward gate (diff-time)
+        env:
+          TAMPERWARD_OOB_SIGNOFF: ${{ steps.oob.outputs.rules }}
+          # Binds each approval to the commit it was granted for: labels persist
+          # across pushes, so an unbound one would clear every later finding on the
+          # same PR. Labels must read tamperward:allow:<rule>@<head-sha>.
+          TAMPERWARD_OOB_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: npx --yes tamperward@2.10.3 check --diff "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+
+  # Pristine re-execution (`tamperward verify`): .tamperward.yml's `verify.command`
+  # is run in TWO materialised copies of the tree — as-is (visible) and with the
+  # protected tests/snapshots/config restored from the trusted base (pristine).
+  # visible-green + pristine-red is a MASKED FAILURE (a test edit that makes the
+  # visible suite pass while the base suite fails). This layer is mechanical —
+  # double execution plus exit codes, no diff interpretation — so it is immune to
+  # spelling, which is exactly what makes it the load-bearing gate on a Rust
+  # workspace whose diff-time detectors are pattern-based rather than full-AST.
+  # `tamperward verify --base <sha>` reads the *policy* it re-verifies against
+  # (.tamperward.yml's command/budget/inputs) from that base commit, so the
+  # candidate cannot configure what gets re-run. It CANNOT stop a candidate from
+  # rewriting this job itself — this is a `pull_request` workflow, so GitHub runs
+  # this YAML as checked out from the PR head, not from main (same risk the
+  # top-of-file scope note already flags for the `check` job above); that
+  # orchestration is only trustworthy once branch protection requires this check
+  # and Code Owners review gates `.github/workflows/**`. Provisioned with the same
+  # toolchain as verify.yml so `bash scripts/verify/tamperward.sh` runs identically.
+  tamperward-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # --require-ancestor needs the base to be reachable from HEAD
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      # Pinned to the same commit verify.yml uses (issues #164/#165): the verify
+      # command compiles and runs the whole workspace, so the pristine re-execution
+      # needs the exact toolchain the real suite runs under.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (2026-09-21)
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+      - run: pip install pyyaml
+      # scripts/verify/tamperward.sh runs the bubblewrap-guarded ward-daemon tests.
+      # Install bwrap and allow unprivileged user namespaces so they RUN (matching
+      # verify.yml), best-effort: this job is the masked-failure gate, not the
+      # isolation-coverage gate (#124, in verify.yml), so on a runner without userns
+      # those tests self-skip deterministically in both copies rather than failing
+      # the pristine comparison.
+      - name: Bubblewrap for the verifier suite (best-effort)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+      - name: Resolve out-of-band sign-off from PR labels
+        id: oob
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          RULES="$(printf '%s' "$LABELS" | jq -r '.[] | select(startswith("tamperward:allow:")) | sub("^tamperward:allow:"; "")' | paste -sd, -)"
+          echo "rules=$RULES" >> "$GITHUB_OUTPUT"
+      # `tamperward:allow:verify@<head-sha>` accepts a MASKED_FAILURE a reviewer has
+      # read and judged (an intentional test change where the base suite no longer
+      # applies); it clears nothing else — a red visible suite, or a run that could
+      # not verify, stays red whatever the labels say.
+      - name: Tamperward verify (pristine re-execution)
+        env:
+          TAMPERWARD_OOB_SIGNOFF: ${{ steps.oob.outputs.rules }}
+          TAMPERWARD_OOB_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: npx --yes tamperward@2.10.3 verify --require-ancestor --base "${{ github.event.pull_request.base.sha }}"
