@@ -5,14 +5,24 @@
 //! daemon, so a pause (ADR-0019 §3) reaches it through a file: the egress
 //! watches the session's pause marker ([`Egress::watch_marker`]) and flips the
 //! proxy's paused flag as the marker comes and goes.
+//!
+//! The recorder is deliberately the cheapest thing a proxy thread can do with a
+//! decision: one lock, one length comparison, one push into a bounded queue
+//! ([`crate::observe::Bounded`]) the session drains while the command runs (#137).
+//! Enforcement never waits on ingestion — a proxy thread keeps deciding allow/deny
+//! in real time however far behind the log writer or a UI consumer has fallen — and
+//! a decision the queue has no room for is counted and surfaced as an explicit
+//! [`ward_events::WardEvent::ObservationsDropped`] marker, never dropped in silence.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
-use ward_events::{DeniedDst, DenyReason, HostName, ProcessRef, RuleRef, WardEvent};
+use ward_events::{
+    DeniedDst, DenyReason, HostName, ObserverSource, Origin, ProcessRef, RuleRef, WardEvent,
+};
 use ward_policy::NetworkCapability;
 use ward_proxy::{
     Config, Decision, GatewayRoute, Handle, Host, Observer, Proxy, Request, Resolver,
@@ -20,6 +30,7 @@ use ward_proxy::{
 };
 
 use crate::error::{Error, Result};
+use crate::observe::{Bounded, DEFAULT_CAPACITY, Drained, Observation, overflow_marker};
 
 /// A recorded proxy decision, kept until the session drains it into the log.
 #[derive(Clone, Debug)]
@@ -36,32 +47,79 @@ pub struct Recorded {
     pub reason: String,
 }
 
-/// Collects decisions from the proxy threads.
+/// Collects decisions from the proxy threads into a bounded queue.
 #[derive(Default)]
-pub struct Recorder(Mutex<Vec<Recorded>>);
+pub struct Recorder(Bounded<Recorded>);
 
 impl Recorder {
+    /// A recorder holding at most `capacity` decisions between drains.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(Bounded::new(capacity))
+    }
+
+    /// Take everything recorded so far, with the number of decisions the queue had
+    /// to refuse since the last drain.
+    pub fn drain_bounded(&self) -> Drained<Recorded> {
+        self.0.drain()
+    }
+
     /// Take everything recorded so far.
     pub fn drain(&self) -> Vec<Recorded> {
-        self.0
-            .lock()
-            .map(|mut v| std::mem::take(&mut *v))
-            .unwrap_or_default()
+        self.0.drain().items
+    }
+
+    /// How many decisions are waiting to be drained.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.0.queued()
+    }
+
+    /// The bound this recorder was built with.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
     }
 }
 
 impl Observer for Recorder {
+    /// Called on a proxy thread, in the path of a live decision. It must never
+    /// block on the log, on disk or on a UI consumer, so it does no more than
+    /// offer the record to the bounded queue: a full queue counts the refusal and
+    /// returns immediately, and the decision the proxy just made stands either way.
     fn decision(&self, req: &Request, decision: Decision, reason: &str) {
-        if let Ok(mut v) = self.0.lock() {
-            v.push(Recorded {
-                at: SystemTime::now(),
-                host: req.target.host.clone(),
-                port: req.target.port,
-                allowed: matches!(decision, Decision::Allow),
-                reason: reason.to_owned(),
-            });
-        }
+        self.0.push(Recorded {
+            at: SystemTime::now(),
+            host: req.target.host.clone(),
+            port: req.target.port,
+            allowed: matches!(decision, Decision::Allow),
+            reason: reason.to_owned(),
+        });
     }
+}
+
+/// Recorded decisions as log-ready observations, with the overflow marker when the
+/// recorder had to refuse any. Entries whose host or reason cannot be represented
+/// are skipped (the proxy already validated them).
+#[must_use]
+pub fn observations(
+    drained: &Drained<Recorded>,
+    by: &ProcessRef,
+    capacity: usize,
+) -> Vec<Observation> {
+    let mut out: Vec<Observation> = drained
+        .items
+        .iter()
+        .filter_map(|r| Some(Observation::new(r.at, Origin::Proxy, to_event(r, by)?)))
+        .collect();
+    if drained.dropped > 0 {
+        out.push(overflow_marker(
+            ObserverSource::Network,
+            drained.dropped,
+            capacity,
+        ));
+    }
+    out
 }
 
 /// How often the marker is looked at. The sandbox is frozen before the marker
@@ -96,8 +154,22 @@ impl Egress {
         routes: Vec<GatewayRoute>,
         resolver: Arc<dyn Resolver>,
     ) -> Result<Self> {
+        Self::start_bounded(dir, network, routes, resolver, DEFAULT_CAPACITY)
+    }
+
+    /// [`Egress::start_with`] with an explicit bound on how many decisions the
+    /// recorder may hold between drains. Past it, decisions are counted and
+    /// surfaced as an overflow marker rather than growing without limit — and the
+    /// proxy keeps deciding either way.
+    pub fn start_bounded(
+        dir: &Path,
+        network: &NetworkCapability,
+        routes: Vec<GatewayRoute>,
+        resolver: Arc<dyn Resolver>,
+        capacity: usize,
+    ) -> Result<Self> {
         let socket = dir.join("proxy.sock");
-        let recorder = Arc::new(Recorder::default());
+        let recorder = Arc::new(Recorder::with_capacity(capacity));
         let observer: Arc<dyn Observer> = recorder.clone();
         let config = routes
             .into_iter()
@@ -151,15 +223,17 @@ impl Egress {
         self.recorder.drain()
     }
 
-    /// Decisions made since the last drain, as log events with their decision time.
-    /// Entries whose host or reason cannot be represented are skipped (the proxy
-    /// already validated them).
-    pub fn drain_events(&self, by: &ProcessRef) -> Vec<(SystemTime, WardEvent)> {
-        self.recorder
-            .drain()
-            .iter()
-            .filter_map(|r| Some((r.at, to_event(r, by)?)))
-            .collect()
+    /// Decisions made since the last drain, as log-ready observations keeping their
+    /// decision time, followed by an overflow marker when the recorder had to
+    /// refuse any. Safe to call repeatedly while the command runs.
+    pub fn drain_observations(&self, by: &ProcessRef) -> Vec<Observation> {
+        observations(&self.recorder.drain_bounded(), by, self.recorder.capacity())
+    }
+
+    /// How many decisions are waiting to be drained.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.recorder.queued()
     }
 
     /// Stop the proxy and remove the socket.
@@ -284,18 +358,21 @@ mod tests {
         assert!(!dir.path().join("proxy.sock").exists());
     }
 
+    fn req(host: &str) -> Request {
+        Request {
+            method: ward_proxy::Method::Connect,
+            target: ward_proxy::Target {
+                host: Host::Name(host.into()),
+                port: 1,
+            },
+        }
+    }
+
     #[test]
     fn recorder_drains_once() {
         let rec = Recorder::default();
-        let req = Request {
-            method: ward_proxy::Method::Connect,
-            target: ward_proxy::Target {
-                host: Host::Name("x.io".into()),
-                port: 1,
-            },
-        };
         let before = SystemTime::now();
-        rec.decision(&req, Decision::Deny, "offline");
+        rec.decision(&req("x.io"), Decision::Deny, "offline");
         let drained = rec.drain();
         assert_eq!(drained.len(), 1);
         assert!(
@@ -303,5 +380,54 @@ mod tests {
             "decision time is captured, not drained"
         );
         assert!(rec.drain().is_empty());
+    }
+
+    /// #137: a recorder whose queue is full must never quietly lose a security
+    /// decision. It refuses the record, counts it, and the next drain turns the
+    /// count into one explicit marker beside the decisions it did keep.
+    #[test]
+    fn a_full_recorder_records_an_overflow_marker_instead_of_losing_decisions() {
+        let rec = Recorder::with_capacity(2);
+        rec.decision(&req("kept-one.io"), Decision::Allow, "allowlisted");
+        rec.decision(&req("kept-two.io"), Decision::Deny, "offline");
+        // Past the bound: refused, counted, never silently gone.
+        rec.decision(&req("overflow-one.io"), Decision::Deny, "offline");
+        rec.decision(&req("overflow-two.io"), Decision::Deny, "offline");
+
+        let drained = rec.drain_bounded();
+        assert_eq!(drained.dropped, 2);
+        let obs = observations(&drained, &by(), rec.capacity());
+
+        assert_eq!(obs.len(), 3, "two decisions and one marker: {obs:?}");
+        assert!(matches!(obs[0].event, WardEvent::NetworkRequested { .. }));
+        assert!(matches!(obs[1].event, WardEvent::NetworkDenied { .. }));
+        assert_eq!(
+            obs[2].event,
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Network,
+                dropped: 2,
+                capacity: 2,
+            }
+        );
+        // The marker comes after the batch it accompanies, so the incomplete
+        // window is bounded by the records either side of it.
+        assert_eq!(obs[2].origin, Origin::Wardd);
+    }
+
+    /// The bound is on ingestion only: a recorder that is refusing records still
+    /// returns from `decision` immediately, so the proxy thread that called it
+    /// carries on making decisions in real time.
+    #[test]
+    fn a_full_recorder_still_accepts_decisions_without_failing_the_proxy() {
+        let rec = Recorder::with_capacity(1);
+        for _ in 0..1_000 {
+            rec.decision(&req("busy.io"), Decision::Deny, "offline");
+        }
+        let drained = rec.drain_bounded();
+        assert_eq!(drained.items.len(), 1);
+        assert_eq!(drained.dropped, 999);
+        // And the queue is usable again straight after a drain.
+        rec.decision(&req("after.io"), Decision::Allow, "allowlisted");
+        assert_eq!(rec.drain_bounded().items.len(), 1);
     }
 }

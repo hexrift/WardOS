@@ -386,6 +386,13 @@ impl Hooks {
         &self.socket
     }
 
+    /// How many claims are waiting to be drained, so the session's live drain can
+    /// batch on a claim burst as well as on the interval (#137).
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.claims.lock().map_or(0, |v| v.len())
+    }
+
     /// Claims recorded since the last drain, as log events with their arrival
     /// time, in arrival order. If any requests were dropped under overload — the
     /// pending-claim buffer full, or a connection refused at the handler cap — a
