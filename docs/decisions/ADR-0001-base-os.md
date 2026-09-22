@@ -76,7 +76,9 @@ empty again in the first attempt; the check then showed that Fedora had retired
 Hyprland itself after 42, so three COPRs came back for exactly what 44 lacks
 (`mineiro/hyprland` for the ecosystem, `erikreider/swayosd` from swayosd's author,
 `atim/lazygit`), chosen by `check-packages.sh --discover` from the projects that build
-for 44. Each COPR is part of the image's trust set: its builds are the owner's, not
+for 44. (`atim/lazygit` later stopped building lazygit for Fedora 44 and no COPR
+replaces it, so lazygit was dropped from the image; the trust set is now the two
+Hyprland/swayosd COPRs.) Each COPR is part of the image's trust set: its builds are the owner's, not
 Fedora's, and the repository file stays in the image; the list is kept short, every
 entry justified in `image/coprs.txt`, and an entry leaves the day Fedora packages the
 thing. E-09 runs against 44.
