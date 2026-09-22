@@ -6,9 +6,14 @@ name: tamperward
 # engine as the agent hook and pre-commit, run over the PR's commit range, so a
 # change that would delete a test, skip it, weaken an assertion, lower coverage,
 # rewrite a trusted fixture, or tamper with CI/hooks is caught here rather than in
-# the booted result. A block clears ONLY via the out-of-band label
-# `tamperward:allow:<rule>@<head-sha>` applied by someone with triage access or
-# higher — never a file the PR itself can commit.
+# the booted result. A block clears ONLY via an out-of-band PR label applied by
+# someone with triage access or higher — never a file the PR itself can commit.
+# Preferred is the compact, head-bound token `tw1:<digest>` from
+# `tamperward signoff-label --rule <rule> [--file <path>] --head <full-head-sha>`
+# (tamperward >= 2.33.0), which fits GitHub's 50-character label limit where the
+# legacy `tamperward:allow:<rule>@<head-sha>` spelling does not once the full
+# 40-char head SHA is appended; legacy labels remain accepted. The resolver step
+# below passes both spellings through.
 #
 # labeled/unlabeled re-run the gate because the sign-off is read from the EVENT
 # payload: a label applied after a failure could otherwise never take effect, and
@@ -51,16 +56,17 @@ jobs:
         env:
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
-          RULES="$(printf '%s' "$LABELS" | jq -r '.[] | select(startswith("tamperward:allow:")) | sub("^tamperward:allow:"; "")' | paste -sd, -)"
+          RULES="$(printf '%s' "$LABELS" | jq -r '.[] | if startswith("tamperward:allow:") then sub("^tamperward:allow:"; "") elif startswith("tw1:") then . else empty end' | paste -sd, -)"
           echo "rules=$RULES" >> "$GITHUB_OUTPUT"
       - name: Tamperward gate (diff-time)
         env:
           TAMPERWARD_OOB_SIGNOFF: ${{ steps.oob.outputs.rules }}
           # Binds each approval to the commit it was granted for: labels persist
           # across pushes, so an unbound one would clear every later finding on the
-          # same PR. Labels must read tamperward:allow:<rule>@<head-sha>.
+          # same PR. A `tw1:` token is bound to this head by construction; a legacy
+          # tamperward:allow:<rule>@<head-sha> label is bound by its @<head-sha>.
           TAMPERWARD_OOB_HEAD: ${{ github.event.pull_request.head.sha }}
-        run: npx --yes tamperward@2.10.3 check --diff "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+        run: npx --yes tamperward@2.33.0 check --diff "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
 
   # Pristine re-execution (`tamperward verify`): .tamperward.yml's `verify.command`
   # is run in TWO materialised copies of the tree — as-is (visible) and with the
@@ -118,14 +124,16 @@ jobs:
         env:
           LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
-          RULES="$(printf '%s' "$LABELS" | jq -r '.[] | select(startswith("tamperward:allow:")) | sub("^tamperward:allow:"; "")' | paste -sd, -)"
+          RULES="$(printf '%s' "$LABELS" | jq -r '.[] | if startswith("tamperward:allow:") then sub("^tamperward:allow:"; "") elif startswith("tw1:") then . else empty end' | paste -sd, -)"
           echo "rules=$RULES" >> "$GITHUB_OUTPUT"
-      # `tamperward:allow:verify@<head-sha>` accepts a MASKED_FAILURE a reviewer has
-      # read and judged (an intentional test change where the base suite no longer
-      # applies); it clears nothing else — a red visible suite, or a run that could
-      # not verify, stays red whatever the labels say.
+      # A `verify` sign-off — the compact `tw1:` token from
+      # `tamperward signoff-label --rule verify --head <full-head-sha>`, or the
+      # legacy `tamperward:allow:verify@<head-sha>` label — accepts a MASKED_FAILURE
+      # a reviewer has read and judged (an intentional protected-fixture/test change
+      # where the base suite no longer applies); it clears nothing else — a red
+      # visible suite, or a run that could not verify, stays red whatever the labels say.
       - name: Tamperward verify (pristine re-execution)
         env:
           TAMPERWARD_OOB_SIGNOFF: ${{ steps.oob.outputs.rules }}
           TAMPERWARD_OOB_HEAD: ${{ github.event.pull_request.head.sha }}
-        run: npx --yes tamperward@2.10.3 verify --require-ancestor --base "${{ github.event.pull_request.base.sha }}"
+        run: npx --yes tamperward@2.33.0 verify --require-ancestor --base "${{ github.event.pull_request.base.sha }}"
