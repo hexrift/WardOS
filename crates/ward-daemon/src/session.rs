@@ -33,7 +33,7 @@ use crate::ids::{ev_capture, ev_hash, ev_role, ev_snapshot, new_session_id, proj
 use crate::pause;
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
 use crate::verify;
-use crate::watch::{CaptureMode, Captured, Watcher};
+use crate::watch::{CaptureMode, Captured, WatchOutcome, Watcher};
 
 /// A live WardOS session over one project.
 pub struct Session {
@@ -657,8 +657,9 @@ impl Session {
         let launch = self.prepare(argv, opts, &run_dir, &egress, &hooks)?;
         let outcome = launch.run()?;
 
+        let watch = watcher.map(Watcher::finish);
         let (captured, capture, observer_degraded) =
-            collect_captured(watcher, before, &self.worktree);
+            collect_captured(watch, before, &self.worktree);
 
         let comm = comm(argv);
         let changed_paths = self.emit_captured(&captured, pid, comm.as_ref())?;
@@ -1212,21 +1213,20 @@ fn clear_current(state: &Path, project_id: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resolve which file events a run produced: the live inotify watch when one
-/// started, or a before/after scan otherwise. Returns the events, which
-/// source produced them, and whether the watch lost coverage of part of the
-/// worktree (always `false` for a scan, which has no notion of partial
-/// coverage).
+/// Resolve which file events a run produced: the live inotify watch's finished
+/// outcome when one started, or a before/after scan otherwise. Returns the
+/// events, which source produced them, and whether the watch lost coverage of
+/// part of the worktree (always `false` for a scan, which has no notion of
+/// partial coverage). Takes an already-finished [`WatchOutcome`] rather than a
+/// [`Watcher`] so this mapping can be tested with a synthetic outcome instead
+/// of a live watcher thread.
 fn collect_captured(
-    watcher: Option<Watcher>,
+    watch: Option<WatchOutcome>,
     before: Option<BTreeMap<String, (u128, u64)>>,
     worktree: &Path,
 ) -> (Vec<Captured>, CaptureMode, bool) {
-    match (watcher, before) {
-        (Some(w), _) => {
-            let watch = w.finish();
-            (watch.captured, CaptureMode::Inotify, watch.degraded)
-        }
+    match (watch, before) {
+        (Some(watch), _) => (watch.captured, CaptureMode::Inotify, watch.degraded),
         (None, Some(before)) => {
             let after = scan(worktree);
             (scan_changes(&before, &after), CaptureMode::Scan, false)
@@ -1330,24 +1330,20 @@ mod tests {
 
     #[test]
     fn collect_captured_surfaces_watch_degradation_through_run_report() {
+        // A synthetic outcome, not a live watcher: `watch::tests` already
+        // proves a real coverage gap sets `WatchOutcome::degraded` (at the
+        // `add_watch_recursive`/`drain` level, with no background thread to
+        // race). What this checks is only `collect_captured`'s own mapping —
+        // that `degraded` reaches the `RunReport` tuple unchanged — which
+        // needs no live watcher and must not depend on winning a race against
+        // one.
         let worktree = tempfile::tempdir().unwrap();
-        let watcher = Watcher::start(worktree.path(), false).unwrap();
+        let watch = WatchOutcome {
+            captured: Vec::new(),
+            degraded: true,
+        };
 
-        // Move a directory in, then remove it again before the watcher thread
-        // can register it, the same injected failure `watch::tests` proves at
-        // the `drain` level — this proves the resulting `degraded` flag
-        // actually reaches `collect_captured`'s `RunReport` tuple, not just
-        // `WatchOutcome` inside the `watch` module.
-        let outside = tempfile::tempdir().unwrap();
-        let src = outside.path().join("gone");
-        std::fs::create_dir_all(&src).unwrap();
-        let dest = worktree.path().join("gone");
-        std::fs::rename(&src, &dest).unwrap();
-        std::fs::remove_dir(&dest).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-
-        let (_, capture, observer_degraded) =
-            collect_captured(Some(watcher), None, worktree.path());
+        let (_, capture, observer_degraded) = collect_captured(Some(watch), None, worktree.path());
 
         assert_eq!(capture, CaptureMode::Inotify);
         assert!(
