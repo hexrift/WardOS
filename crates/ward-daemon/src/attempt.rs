@@ -36,13 +36,30 @@
 //! that wrote it, alongside that pid's own `/proc` start time (so a pid the kernel
 //! later hands to an unrelated process is not mistaken for the original owner — see
 //! [`owner_is_gone`]). Reconciliation only closes out a marker whose owning process is
-//! verifiably gone, or whose marker was written by *this very process* (the only way
-//! that can be asked about is a leftover the same process's own earlier `verify()`
-//! call abandoned, never a concurrent one). This makes it safe to call
-//! `reconcile_dangling_attempts` from every context that (re)takes ownership of a
-//! session's log, including an ordinary client's `Session::open_current` — a second
-//! `ward` invocation opening the same session can no longer ever interrupt a
-//! verification another, still-running process is genuinely carrying out.
+//! verifiably gone, or whose marker was written by *this very process* with no live
+//! [`AttemptGuard`] left holding it. That second case cannot be answered from a pid
+//! alone: two `AttemptGuard`s can be alive in one process at once (two `Session`s, or a
+//! `verify()` running on another thread — `CancelToken`'s own API anticipates exactly
+//! that), so a process-local registry ([`LIVE_PATHS`]) tracks which markers a live
+//! guard still holds, and only a marker *absent* from it is the same process's own
+//! abandoned leftover a fresh `verify()`'s opening reconciliation exists to close out.
+//! This makes it safe to call `reconcile_dangling_attempts` from every context that
+//! (re)takes ownership of a session's log, including an ordinary client's
+//! `Session::open_current` — a second `ward` invocation, or a second handle inside one
+//! process, opening the same session can no longer ever interrupt a verification
+//! another live owner is genuinely carrying out.
+//!
+//! # One reconciler at a time per marker (review of #208, finding 2)
+//!
+//! Two reconcilers — two threads, or two separate client processes, both real shapes
+//! `Session::open_current` allows — can observe the very same dangling marker before
+//! either one's append becomes visible to the other. [`claim_marker`] closes that
+//! window with an OS-enforced exclusive claim (`create_new`, i.e. `O_EXCL`) staked on
+//! a sibling file *before* anything is ever appended: only the winner proceeds, the
+//! loser backs off without touching the log at all. A claim surviving its own
+//! reconciler's death is reclaimed the same way a marker's own dead owner is detected
+//! ([`claimant_is_gone`]), so a crash mid-reconciliation can never wedge a marker out
+//! of reach of every future pass.
 //!
 //! # Crash-consistent markers
 //!
@@ -62,9 +79,10 @@
 //! append and that marker's own not-yet-durable removal is retired quietly instead of
 //! producing a second, contradictory terminal record.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -239,9 +257,17 @@ fn remove_marker_durably(path: &Path) -> Result<()> {
 /// Preserve an unreadable marker at `path` by renaming it to [`quarantine_path`]
 /// instead of deleting it, so the only evidence of whatever attempt it concerned
 /// survives for inspection, then `fsync`s the directory so that rename is durable.
+///
+/// `path` already being gone is not an error: a concurrent reconciliation pass racing
+/// on the same corrupt marker (review of #208, finding 2) may have already quarantined
+/// it first, and that rename is exactly as good as this one would have been.
 fn quarantine_marker(path: &Path) -> Result<()> {
     let target = quarantine_path(path);
-    std::fs::rename(path, &target).map_err(|e| Error::io(path, e))?;
+    match std::fs::rename(path, &target) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::io(path, e)),
+    }
     if let Some(parent) = path.parent() {
         sync_dir(parent)?;
     }
@@ -272,22 +298,78 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
+/// A registry of paths this very process currently considers "live": either an
+/// [`AttemptGuard`]'s own marker (so [`owner_is_gone`] can tell a live same-process
+/// attempt apart from an abandoned one — review of #208, finding 1), or a
+/// reconciliation pass's exclusive claim on a marker it is actively finishing (so a
+/// second, concurrent reconciler in this same process can tell a genuinely in-flight
+/// claim apart from one left behind by an earlier crash — finding 2, [`claim_marker`]).
+///
+/// `marker.pid == std::process::id()` only proves *this process* wrote the marker —
+/// it says nothing about whether the specific in-process handle that wrote it (an
+/// `AttemptGuard`, or a claim guard) is still alive, since two of either can exist at
+/// once in one process (two `Session`s, a `verify()` on another thread per
+/// `CancelToken`'s own design, or two reconcilers racing). `/proc` can only answer "is
+/// this *process* still running", never that finer-grained question, so both fixes
+/// consult this registry — keyed by each path's canonical form so two constructions of
+/// the same on-disk file always agree — before ever trusting a same-pid marker/claim
+/// to be stale.
+static LIVE_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Recover from a poisoned lock rather than propagate the panic: `LIVE_PATHS` is a
+/// best-effort liveness hint, never the sole source of truth (a marker/claim's own pid
+/// and, for a claim, its `/proc` start time remain the authoritative fallback), so a
+/// panic elsewhere while this mutex was held must not cascade into every future
+/// reconciliation call.
+fn live_paths() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+    LIVE_PATHS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Record that `path` (already written/created on disk) is live in this process, and
+/// return the canonical key it was registered under, for [`unmark_live`] to remove
+/// later. Falls back to `path` itself if it cannot be canonicalized (e.g. it was
+/// removed a moment later by a racing caller) — still unique enough in practice, and
+/// erring toward "not live" only ever makes reconciliation *more* eager, never less
+/// safe (a genuinely live, different-pid or verifiably-alive-pid owner is still
+/// protected by the checks in [`owner_is_gone`]/[`claimant_is_gone`] regardless).
+fn mark_live(path: &Path) -> PathBuf {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    live_paths().insert(key.clone());
+    key
+}
+
+fn unmark_live(key: &Path) {
+    live_paths().remove(key);
+}
+
+fn is_live(path: &Path) -> bool {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    live_paths().contains(&key)
+}
+
 /// Whether the process that wrote `marker` can no longer be the one a caller needs
 /// to worry about (#139 item 1, the review of #208's finding 1): either it is
-/// verifiably dead, or it *is* the process asking right now — which can only mean
-/// the [`AttemptGuard`] for this marker already dropped earlier in this very
-/// process (that is the only way this function could be reached with the marker
-/// still on disk), so it is unconditionally stale, the same-process leftover
-/// `Session::verify()`'s own opening reconciliation exists to close out.
+/// verifiably dead, or it *is* the process asking right now *and* `marker_path`
+/// (this marker's own on-disk path) is not currently registered in [`LIVE_PATHS`].
+///
+/// A same-pid marker is not automatically stale: `marker.pid == std::process::id()`
+/// only proves this process wrote it, and two [`AttemptGuard`]s can be alive in this
+/// same process at once (two `Session`s, or a `verify()` running on another thread —
+/// the public `CancelToken` API explicitly anticipates that shape). Only when
+/// `LIVE_PATHS` shows no live guard currently holds this exact marker is it safe to
+/// treat as the same-process leftover an earlier, already-dropped `AttemptGuard` left
+/// behind for `Session::verify()`'s own opening reconciliation to close out.
 ///
 /// A live pid that is *not* this process is never treated as gone: a marker's mere
 /// existence is not evidence its owner died, it is equally present for a healthy
 /// in-flight verification, and interrupting that attempt out from under it is
 /// exactly the bug this function exists to close. Pid reuse is handled by comparing
 /// `/proc`'s own start-time field rather than trusting a live pid alone.
-fn owner_is_gone(marker: &Marker) -> bool {
+fn owner_is_gone(marker: &Marker, marker_path: &Path) -> bool {
     if marker.pid == std::process::id() {
-        return true;
+        return !is_live(marker_path);
     }
     match process_start_ticks(marker.pid) {
         None => true,
@@ -364,6 +446,153 @@ fn attempt_already_terminal(log_path: &Path, attempt: AttemptId) -> bool {
     false
 }
 
+/// A claim's own recorded owner: the pid that created it and, when readable, that
+/// pid's `/proc` start time — the same shape as [`Marker`]'s `pid`/`owner_started_ticks`
+/// pair, reused here so a claim's staleness can be judged the exact same way an
+/// attempt's owner is (review of #208, finding 2).
+#[derive(Serialize, Deserialize)]
+struct Claim {
+    pid: u32,
+    owner_started_ticks: Option<u64>,
+}
+
+/// Where [`claim_marker`] stakes its claim on `marker_path`: a sibling file, so it
+/// never collides with a marker this scheme did not itself create and is never picked
+/// up by [`reconcile_dangling_attempts`]'s own `.json`-extension scan.
+fn claim_marker_path(marker_path: &Path) -> PathBuf {
+    let name = marker_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("marker");
+    marker_path.with_file_name(format!("{name}.claim"))
+}
+
+/// Exclusive ownership, held by one reconciliation pass, of finishing exactly one
+/// dangling marker (review of #208, finding 2): appending its terminal record and
+/// removing it. Dropping without calling [`Self::release`] — an early return via `?`
+/// from a failed append/sync, a panic — cleans the claim up all the same, exactly the
+/// same "worst case, an untidy leftover, never a correctness problem" shape
+/// [`AttemptGuard`] already uses for the marker itself: a claim left behind this way
+/// is later recognised as stale (its process is gone, or — same pid — no longer in
+/// [`LIVE_PATHS`]) and reclaimed, never left blocking that marker forever.
+struct MarkerClaim {
+    claim_path: PathBuf,
+    registry_key: PathBuf,
+    released: bool,
+}
+
+impl MarkerClaim {
+    /// The claim finished its job (the terminal record is durably appended and the
+    /// marker itself removed, or turned out to be unnecessary after all): release it
+    /// so no later pass ever mistakes it for still in flight.
+    fn release(mut self) {
+        self.released = true;
+        let _ = std::fs::remove_file(&self.claim_path);
+        unmark_live(&self.registry_key);
+    }
+}
+
+impl Drop for MarkerClaim {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.claim_path);
+        unmark_live(&self.registry_key);
+    }
+}
+
+/// Whether the claim recorded at `claim_path` can safely be treated as abandoned
+/// rather than genuinely in flight right now (review of #208, finding 2) — the same
+/// dead-or-not-live-in-this-process reasoning [`owner_is_gone`] uses for a marker's
+/// own owner, applied to the reconciler that staked this claim instead.
+///
+/// `None` means "cannot tell, and must not guess": the claim vanished (a concurrent
+/// claimant already finished and cleaned up — good news, but this caller must still
+/// back off rather than redo work that may already be done) or could not be parsed.
+/// Only [`claim_marker`] calls this, and only after its own `create_new` has already
+/// lost the exclusivity race, so this is never on the fast, uncontended path.
+fn claimant_is_gone(claim_path: &Path) -> Option<bool> {
+    let bytes = std::fs::read(claim_path).ok()?;
+    let claim: Claim = serde_json::from_slice(&bytes).ok()?;
+    if claim.pid == std::process::id() {
+        return Some(!is_live(claim_path));
+    }
+    Some(match process_start_ticks(claim.pid) {
+        None => true,
+        Some(now_ticks) => claim
+            .owner_started_ticks
+            .is_some_and(|then_ticks| then_ticks != now_ticks),
+    })
+}
+
+/// Attempt to become the exclusive reconciler finishing `marker_path`'s dangling
+/// attempt (review of #208, finding 2): stakes a claim at [`claim_marker_path`] with
+/// `create_new`, which the OS guarantees only one caller — thread or process, on the
+/// same machine — can ever win for the same path, exactly the "atomic file create with
+/// `O_EXCL` semantics" the review describes.
+///
+/// `Ok(None)` means a rival already holds the claim, genuinely concurrently: this
+/// caller must back off without appending anything, the marker is someone else's to
+/// finish. `Ok(Some(_))` is exclusive ownership until the returned guard is dropped or
+/// released — callers still re-check [`attempt_already_terminal`] once they hold it,
+/// since a rival can win, finish, *and* release before this caller even reaches the
+/// `create_new` call, in which case it succeeds with no contention at all and the
+/// re-check is what catches that the work is already done.
+///
+/// A pre-existing claim file does not always mean a live rival, or reconciliation
+/// could permanently wedge on one left behind by a reconciler that itself died before
+/// finishing: when [`claimant_is_gone`] says so, the stale claim is reclaimed and
+/// `create_new` retried once more.
+fn claim_marker(marker_path: &Path) -> Result<Option<MarkerClaim>> {
+    let claim_path = claim_marker_path(marker_path);
+    for _ in 0..2 {
+        let pid = std::process::id();
+        let bytes = serde_json::to_vec(&Claim {
+            pid,
+            owner_started_ticks: process_start_ticks(pid),
+        })
+        .map_err(|e| Error::Events(format!("attempt claim: {e}")))?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&claim_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                // Best-effort content: the file's mere existence under `create_new`
+                // is what provides exclusivity. A claim a rival cannot read back
+                // (write failed, or a crash truncated it) is simply never reclaimed
+                // as same-process-stale by `claimant_is_gone` (only ever a
+                // verified-dead pid, which does not depend on this content at all),
+                // so this never compromises correctness — only a rare, harmless
+                // missed opportunity to reclaim a stale claim promptly.
+                let _ = file.write_all(&bytes);
+                let key = mark_live(&claim_path);
+                return Ok(Some(MarkerClaim {
+                    claim_path,
+                    registry_key: key,
+                    released: false,
+                }));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                match claimant_is_gone(&claim_path) {
+                    Some(true) => {
+                        // Stale: left by a reconciler that died before releasing it.
+                        // Reclaim it and retry the exclusive create once.
+                        let _ = std::fs::remove_file(&claim_path);
+                    }
+                    Some(false) | None => return Ok(None),
+                }
+            }
+            Err(e) => return Err(Error::io(&claim_path, e)),
+        }
+    }
+    // Lost a second race immediately after reclaiming a stale claim: vanishingly
+    // rare, and safe to just back off — the next reconciliation pass tries again.
+    Ok(None)
+}
+
 /// RAII marker for one verification attempt (#139).
 ///
 /// [`Self::start`] writes the marker the moment an attempt is allocated, before any
@@ -377,6 +606,11 @@ fn attempt_already_terminal(log_path: &Path, attempt: AttemptId) -> bool {
 /// silent, permanent "running".
 pub struct AttemptGuard {
     path: PathBuf,
+    /// This guard's own key in [`LIVE_PATHS`], registered in [`Self::start`] and
+    /// always removed in [`Drop`] — the signal [`owner_is_gone`] consults to tell a
+    /// live same-process attempt apart from an abandoned one (review of #208,
+    /// finding 1).
+    registry_key: PathBuf,
     finished: bool,
 }
 
@@ -401,8 +635,10 @@ impl AttemptGuard {
                 owner_started_ticks: process_start_ticks(pid),
             },
         )?;
+        let registry_key = mark_live(&path);
         Ok(Self {
             path,
+            registry_key,
             finished: false,
         })
     }
@@ -436,6 +672,11 @@ impl AttemptGuard {
 
 impl Drop for AttemptGuard {
     fn drop(&mut self) {
+        // Unregistered unconditionally, whether this guard finished cleanly or is
+        // dropping mid-abandonment: either way, the in-process handle that could ever
+        // call `finish()` on this exact marker is gone as of this call returning, so
+        // `owner_is_gone` must no longer see it as live (review of #208, finding 1).
+        unmark_live(&self.registry_key);
         if self.finished {
             return;
         }
@@ -486,17 +727,22 @@ pub fn finalize_interrupted(
 /// "running" for longer than it takes for anything to look at the session again.
 ///
 /// A marker is only ever treated as dangling once its owning process is verifiably
-/// gone, or it is this very process's own earlier leftover (see [`owner_is_gone`]) —
-/// never merely because a marker exists, which is equally true of a healthy
-/// in-flight attempt (review of #208, finding 1). Before acting on any marker,
-/// reconciliation also checks whether its attempt already has a terminal record in
-/// the log ([`attempt_already_terminal`]), so a marker that resurfaces after a crash
-/// between a terminal append and its own not-yet-durable removal is retired quietly
-/// instead of producing a duplicate, contradictory terminal record (finding 2).
-/// Markers this pass cannot even parse are never silently deleted: their attempt id
-/// (from the file name, which this process controls) still gets a terminal record
-/// when one is not already on the log, and the unreadable original is quarantined
-/// alongside it (`<attempt>.json.corrupt`) rather than destroyed.
+/// gone, or it is this very process's own earlier leftover with no live
+/// [`AttemptGuard`] left holding it (see [`owner_is_gone`]) — never merely because a
+/// marker exists, which is equally true of a healthy in-flight attempt, including one
+/// running under a second `AttemptGuard` alive in this exact process (review of #208,
+/// finding 1). Before ever appending for a marker, reconciliation also stakes an
+/// exclusive, OS-enforced claim on it ([`claim_marker`]) and only then re-checks
+/// whether its attempt already has a terminal record in the log
+/// ([`attempt_already_terminal`]) — so a marker that resurfaces after a crash between
+/// a terminal append and its own not-yet-durable removal is retired quietly instead of
+/// producing a duplicate, contradictory terminal record, and so two reconcilers racing
+/// on the very same dangling marker — two threads, or two separate client processes,
+/// both real shapes `Session::open_current` allows — can never both append for it
+/// (finding 2). Markers this pass cannot even parse are never silently deleted: their
+/// attempt id (from the file name, which this process controls) still gets a terminal
+/// record when one is not already on the log, and the unreadable original is
+/// quarantined alongside it (`<attempt>.json.corrupt`) rather than destroyed.
 ///
 /// Every failure mode here — the directory cannot be listed, the append or its sync
 /// fails, or a marker cannot be removed/quarantined once its terminal record (if
@@ -536,21 +782,39 @@ pub fn reconcile_dangling_attempts(sink: &mut dyn Sink, session_dir: &Path) -> R
                 if let Some(id) = attempt_id_from_filename(&path) {
                     let attempt = AttemptId::new(id);
                     if !attempt_already_terminal(&log_path, attempt) {
-                        sink.append(
-                            Origin::Wardd,
-                            WardEvent::VerificationInterrupted {
-                                attempt,
-                                candidate: None,
-                                reason: ShortText::new(
-                                    "this attempt's marker file could not be read (corrupt \
-                                     or truncated, most likely a crash mid-write); the \
-                                     original was quarantined alongside it for inspection",
-                                ),
-                            },
-                            SystemTime::now(),
-                        )?;
-                        sink.sync()?;
-                        reconciled += 1;
+                        // Claimed first (finding 2): two concurrent passes could
+                        // otherwise both pass the check above and both append. A
+                        // rival's claim means this pass backs off from appending
+                        // entirely; `quarantine_marker` below still runs regardless
+                        // (harmless and idempotent — see its own doc comment), so the
+                        // original bytes are preserved by whichever pass gets there.
+                        if let Some(claim) = claim_marker(&path)? {
+                            // Re-checked now that this pass exclusively owns
+                            // finishing this marker: a rival can win, finish, *and*
+                            // release its claim before this pass ever reaches
+                            // `claim_marker`, in which case `create_new` above
+                            // succeeds with no contention at all — this is what
+                            // catches that the work is already done.
+                            if !attempt_already_terminal(&log_path, attempt) {
+                                sink.append(
+                                    Origin::Wardd,
+                                    WardEvent::VerificationInterrupted {
+                                        attempt,
+                                        candidate: None,
+                                        reason: ShortText::new(
+                                            "this attempt's marker file could not be read \
+                                             (corrupt or truncated, most likely a crash \
+                                             mid-write); the original was quarantined \
+                                             alongside it for inspection",
+                                        ),
+                                    },
+                                    SystemTime::now(),
+                                )?;
+                                sink.sync()?;
+                                reconciled += 1;
+                            }
+                            claim.release();
+                        }
                     }
                     quarantine_marker(&path)?;
                 }
@@ -566,10 +830,25 @@ pub fn reconcile_dangling_attempts(sink: &mut dyn Sink, session_dir: &Path) -> R
                     remove_marker_durably(&path)?;
                     continue;
                 }
-                if !owner_is_gone(&marker) {
+                if !owner_is_gone(&marker, &path) {
                     // A live, different process still owns this attempt (finding 1):
                     // never interrupt a verification on the strength of a marker
                     // file alone.
+                    continue;
+                }
+                // Claimed before ever appending (finding 2): the OS guarantees only
+                // one concurrent caller wins `claim_marker`'s exclusive create, so a
+                // rival reconciler that loses the race backs off here without
+                // appending anything, rather than racing this pass to a duplicate
+                // terminal record.
+                let Some(claim) = claim_marker(&path)? else {
+                    continue;
+                };
+                // Re-checked under the claim (see the identical comment in the
+                // `Corrupt` arm above): closes the gap between the check above and
+                // actually acquiring exclusive ownership of this marker.
+                if attempt_already_terminal(&log_path, attempt) {
+                    remove_marker_durably(&path)?;
                     continue;
                 }
                 let candidate = marker.candidate.as_deref().and_then(|s| s.parse().ok());
@@ -590,6 +869,7 @@ pub fn reconcile_dangling_attempts(sink: &mut dyn Sink, session_dir: &Path) -> R
                 // attempt — is removed.
                 sink.sync()?;
                 remove_marker_durably(&path)?;
+                claim.release();
                 reconciled += 1;
             }
         }
@@ -961,6 +1241,76 @@ mod tests {
         }
     }
 
+    /// Review of #208, finding 1: a marker whose recorded pid is *this very process's
+    /// own* is not automatically an abandoned leftover — a second `AttemptGuard` can
+    /// be alive in this same process at once (two `Session`s, or a `verify()` running
+    /// on another thread, exactly what `CancelToken`'s own API anticipates). This is
+    /// the deterministic, same-process counterpart the review asked for: unlike
+    /// `reconcile_leaves_a_marker_alone_while_its_owning_process_is_still_alive`
+    /// above, both markers here share this exact test process's pid throughout, so
+    /// only an in-process liveness check (not `/proc`) can possibly tell them apart.
+    #[test]
+    fn reconcile_leaves_a_same_process_marker_alone_while_its_guard_is_still_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = fresh_log(dir.path());
+        let live_attempt = AttemptId::new(1);
+        let abandoned_attempt = AttemptId::new(2);
+
+        // Two `AttemptGuard`s alive in this one process at once. `live_guard` stays
+        // held for the rest of the test — standing in for a second `Session` (or a
+        // `verify()` on another thread) that is still genuinely in flight.
+        let live_guard =
+            AttemptGuard::start(dir.path(), live_attempt, VerifyRequester::User).unwrap();
+        // `abandoned_guard` drops immediately without `finish()` — a real leftover
+        // this same process's own earlier attempt abandoned, the one case a same-pid
+        // marker is actually safe to reconcile.
+        drop(AttemptGuard::start(dir.path(), abandoned_attempt, VerifyRequester::User).unwrap());
+
+        let n = reconcile_dangling_attempts(&mut log, dir.path()).unwrap();
+        assert_eq!(
+            n, 1,
+            "only the abandoned attempt is reconciled, not the still-live one"
+        );
+        assert!(
+            marker_path(dir.path(), live_attempt).exists(),
+            "the live guard's marker must survive even though it shares this test \
+             process's own pid with the abandoned one"
+        );
+        assert!(
+            !marker_path(dir.path(), abandoned_attempt).exists(),
+            "the abandoned guard's marker, with nothing left holding it, is reconciled"
+        );
+        log.sync().unwrap();
+        let interrupted: Vec<AttemptId> = read_back(&dir.path().join("events.log"))
+            .into_iter()
+            .filter_map(|r| match r.event {
+                WardEvent::VerificationInterrupted { attempt, .. } => Some(attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            interrupted,
+            vec![abandoned_attempt],
+            "exactly the abandoned attempt gets a terminal record, never the live one"
+        );
+
+        // Reconciling again while `live_guard` is still held must still leave it
+        // alone — this is not a one-shot artifact of ordering.
+        assert_eq!(
+            reconcile_dangling_attempts(&mut log, dir.path()).unwrap(),
+            0
+        );
+        assert!(marker_path(dir.path(), live_attempt).exists());
+
+        // Only once the live guard itself finally drops does its own marker become
+        // reconcilable — proving the fix tracks the guard's liveness, not merely
+        // "the first marker seen for a pid".
+        drop(live_guard);
+        let n = reconcile_dangling_attempts(&mut log, dir.path()).unwrap();
+        assert_eq!(n, 1);
+        assert!(!marker_path(dir.path(), live_attempt).exists());
+    }
+
     /// A pid the kernel has since handed to an unrelated process must not be
     /// mistaken for the marker's original owner still being alive: the recorded
     /// `/proc` start time no longer matches, so the marker is reconciled rather than
@@ -1090,6 +1440,94 @@ mod tests {
         assert_eq!(
             interrupted, 0,
             "the log must never end up with both Cancelled and Interrupted for one attempt"
+        );
+    }
+
+    /// Review of #208, finding 2 — the barrier-synchronized regression the review
+    /// asked for: two reconcilers, each with its own independently opened `Sink` (the
+    /// shape two separate `ward` client processes opening the same session directly
+    /// would take, which `Session::open_current` allows), race on the very same
+    /// dangling marker, synchronized to start reconciling at the same instant. The
+    /// OS-enforced exclusive claim in `claim_marker` must ensure only one of them ever
+    /// appends `VerificationInterrupted` for it, never both — regardless of exactly
+    /// how the two threads happen to get scheduled.
+    #[test]
+    fn reconcile_races_two_reconcilers_on_one_dangling_marker_without_duplicating_the_terminal_record()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let log_path = dir_path.join("events.log");
+        let attempt = AttemptId::new(1);
+        {
+            let mut log = fresh_log(&dir_path);
+            log.append(
+                Origin::Wardd,
+                WardEvent::VerificationAttemptStarted {
+                    attempt,
+                    requested_by: VerifyRequester::User,
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+            log.sync().unwrap();
+        }
+        // A marker whose owner is verifiably dead (a pid essentially guaranteed not
+        // to exist on this machine), so both reconcilers agree it is dangling and
+        // race on the claim itself, rather than on whether it is dangling at all.
+        let marker = Marker {
+            attempt: attempt.get(),
+            requested_by: VerifyRequester::User,
+            candidate: None,
+            started_unix_ms: unix_ms(SystemTime::now()),
+            note: None,
+            pid: 999_999,
+            owner_started_ticks: None,
+        };
+        write_marker(&marker_path(&dir_path, attempt), &marker).unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let dir_path = dir_path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut sink =
+                        LocalLog::open(&dir_path.join("events.log"), SystemTime::now()).unwrap();
+                    // Both threads arrive here before either calls into
+                    // `reconcile_dangling_attempts`, maximizing the chance they
+                    // genuinely race on `claim_marker`'s exclusive create — though
+                    // the fix must hold regardless (see the re-check under the claim
+                    // in `reconcile_dangling_attempts` itself), so this is about
+                    // exercising the contended path, not something correctness
+                    // depends on.
+                    barrier.wait();
+                    reconcile_dangling_attempts(&mut sink, &dir_path).unwrap()
+                })
+            })
+            .collect();
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+
+        assert_eq!(
+            total, 1,
+            "exactly one of the two racing reconcilers must report having appended"
+        );
+        let interrupted = read_back(&log_path)
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r.event,
+                    WardEvent::VerificationInterrupted { attempt: a, .. } if a == attempt
+                )
+            })
+            .count();
+        assert_eq!(
+            interrupted, 1,
+            "the marker must produce exactly one VerificationInterrupted record, never two"
+        );
+        assert!(!marker_path(&dir_path, attempt).exists());
+        assert!(
+            !claim_marker_path(&marker_path(&dir_path, attempt)).exists(),
+            "the winning claim is released once its work is done, not left behind"
         );
     }
 
