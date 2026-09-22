@@ -1275,53 +1275,50 @@ mod tests {
         );
     }
 
-    /// Proves the wire-compatibility claim on `EventKindSet`'s own doc comment: data
-    /// serialized back when the type was backed by `u32` (every kind index `0..32`,
-    /// which is the entire catalogue as it stood immediately before this widening)
-    /// decodes identically through the widened `u64` `Deserialize` impl -- checked
-    /// against real postcard bytes, not asserted from the varint format's spec.
+    /// Proves the wire-compatibility claim on `EventKindSet`'s own doc comment:
+    /// data serialized back when the type was backed by `u32` decodes identically
+    /// through the widened `u64` `Deserialize` impl -- checked against real
+    /// postcard bytes, not asserted from the varint format's spec.
+    ///
+    /// Deliberately does not use `EventKindSet::ALL` (grows with the catalogue) or
+    /// `EventKind::ObservationsDropped` (this PR's own newest kind, due to move to
+    /// a higher bit the moment #197 lands ahead of it in the documented merge
+    /// stack): a wire-compatibility fixture has to stay meaningful *after* that
+    /// rebase, not just against today's exact catalogue size. Uses only kinds
+    /// declared long before this PR instead -- `EventKind::bit()`'s own contract
+    /// (never reorder, only append) is what guarantees their bit positions are
+    /// fixed forever, independent of how many more kinds get appended after them.
     #[test]
     fn a_u32_encoded_set_decodes_identically_as_the_widened_u64_type() {
-        // The full pre-widening catalogue: postcard-encode it as a bare `u32`, the
-        // exact wire shape any `EventKindSet` produced before this change would have
-        // had (`#[serde(into = "u32")]` at the time), then decode those bytes through
+        let session_started = EventKind::SessionStarted; // bit 0
+        let file_read = EventKind::FileRead; // bit 3
+        let anchor = EventKind::Anchor; // bit 26
+
+        // A value spanning the low, middle and high end of that stable range:
+        // postcard-encode it as a bare `u32`, the exact wire shape any
+        // `EventKindSet` produced before this change would have had
+        // (`#[serde(into = "u32")]` at the time), then decode those bytes through
         // today's `u64`-backed `Deserialize` impl.
-        let pre_widening_bits: u32 = 0xFFFF_FFFF;
+        let pre_widening_bits: u32 =
+            u32::try_from(session_started.bit() | file_read.bit() | anchor.bit()).unwrap();
         let old_wire_bytes = postcard::to_allocvec(&pre_widening_bits).unwrap();
+        let expected = EventKindSet::EMPTY
+            .with(session_started)
+            .with(file_read)
+            .with(anchor);
         assert_eq!(
             postcard::from_bytes::<EventKindSet>(&old_wire_bytes).unwrap(),
-            EventKindSet::ALL,
-            "a full-catalogue set encoded under the old u32 representation must \
-             decode to today's ALL, not merely to a numerically equal but distinct \
-             value"
-        );
-
-        // A sparser, more realistic value: a handful of kinds near both ends of the
-        // pre-widening 32-bit range, so this isn't only exercising the all-ones case.
-        let sparse_pre_widening_bits: u32 = u32::try_from(
-            EventKind::SessionStarted.bit()
-                | EventKind::Anchor.bit()
-                | EventKind::ObservationsDropped.bit(),
-        )
-        .unwrap();
-        let sparse_old_wire_bytes = postcard::to_allocvec(&sparse_pre_widening_bits).unwrap();
-        let expected = EventKindSet::EMPTY
-            .with(EventKind::SessionStarted)
-            .with(EventKind::Anchor)
-            .with(EventKind::ObservationsDropped);
-        assert_eq!(
-            postcard::from_bytes::<EventKindSet>(&sparse_old_wire_bytes).unwrap(),
-            expected
+            expected,
+            "a set of long-stable kinds encoded under the old u32 representation \
+             must decode to the same set today, not merely to a numerically equal \
+             but distinct value"
         );
 
         // And the reverse direction: a value round-tripped through today's type
         // produces the same bytes postcard would have produced for the bare integer
         // under the old representation, proving the wire shape genuinely didn't
         // change -- not just that both sides happen to parse each other's output.
-        assert_eq!(
-            postcard::to_allocvec(&expected).unwrap(),
-            sparse_old_wire_bytes
-        );
+        assert_eq!(postcard::to_allocvec(&expected).unwrap(), old_wire_bytes);
     }
 
     #[test]
