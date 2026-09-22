@@ -820,6 +820,22 @@ pub enum WardEvent {
         backup: ShortText,
     },
 
+    // -- verification, continued (origin: Wardd; #139) --
+    /// Verification could not run to a pass/fail result: the verifier failed to launch, a
+    /// preparation step failed, or the run was otherwise cut short by an infrastructure
+    /// error rather than by the trusted command exiting non-zero. Recorded so a
+    /// `VerificationStarted` is never the last verification-kind record for a candidate —
+    /// every attempt gets a terminal record, distinct from a test failure. Appended at the
+    /// end of the catalogue, not grouped with `VerificationFailed` above, because postcard
+    /// identifies variants by declaration index and existing indices must never move.
+    VerificationErrored {
+        /// Candidate snapshot the attempt concerned.
+        candidate: SnapshotId,
+        /// Sanitised, bounded description of what stopped the run (e.g. "sandbox: bubblewrap
+        /// (bwrap) is not installed"). Never a secret; drawn from the daemon's own error text.
+        reason: ShortText,
+    },
+
     // -- processes, continued (origin: Kernel; #140 / PR #197 review) --
     /// A launch could not be carried through to a `CommandFinished`: the sandbox or hook
     /// setup failed, or the child failed to spawn, after `CommandStarted` (and any credential
@@ -876,12 +892,13 @@ pub enum EventKind {
     SessionPaused = 27,
     SessionResumed = 28,
     EntryRestored = 29,
-    LaunchAborted = 30,
+    VerificationErrored = 30,
+    LaunchAborted = 31,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 31] = [
+    pub const ALL: [EventKind; 32] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -912,6 +929,7 @@ impl EventKind {
         EventKind::SessionPaused,
         EventKind::SessionResumed,
         EventKind::EntryRestored,
+        EventKind::VerificationErrored,
         EventKind::LaunchAborted,
     ];
 
@@ -955,6 +973,7 @@ impl EventKind {
             EventKind::SessionPaused => "session_paused",
             EventKind::SessionResumed => "session_resumed",
             EventKind::EntryRestored => "entry_restored",
+            EventKind::VerificationErrored => "verification_errored",
             EventKind::LaunchAborted => "launch_aborted",
         }
     }
@@ -976,6 +995,7 @@ impl EventKind {
                 | EventKind::VerificationStarted
                 | EventKind::VerificationPassed
                 | EventKind::VerificationFailed
+                | EventKind::VerificationErrored
                 | EventKind::StateAccepted
                 | EventKind::TamperDetected
                 | EventKind::Anchor
@@ -1003,7 +1023,15 @@ pub struct UnknownKindBits(pub u32);
 pub struct EventKindSet(u32);
 
 impl EventKindSet {
-    const MASK: u32 = (1 << EventKind::ALL.len()) - 1;
+    // `EventKind::ALL.len()` can be exactly 32 (the full width of the backing `u32`,
+    // one bit per kind), at which point `1u32 << 32` would overflow -- computed in a
+    // wider type instead, so this stays correct right up to the set's structural
+    // capacity rather than one kind short of it. The truncating cast back to `u32`
+    // is exact, never lossy: the value is at most `u32::MAX` for any `ALL.len()` in
+    // `0..=32`, and a catalogue past 32 kinds needs a wider `EventKindSet` backing
+    // type regardless (every `EventKind::bit()` shift would overflow first).
+    #[allow(clippy::cast_possible_truncation)]
+    const MASK: u32 = ((1u64 << EventKind::ALL.len()) - 1) as u32;
 
     /// The empty set.
     pub const EMPTY: Self = Self(0);
@@ -1063,7 +1091,12 @@ impl fmt::Debug for EventKindSet {
 impl TryFrom<u32> for EventKindSet {
     type Error = UnknownKindBits;
     fn try_from(bits: u32) -> Result<Self, UnknownKindBits> {
-        if bits & !Self::MASK != 0 {
+        // Written as "masking to the known bits changes the value" rather than
+        // "masking to the unknown bits is non-zero" (`bits & !MASK != 0`): the
+        // catalogue is at exactly 32 kinds right now, so `MASK` is `u32::MAX` and
+        // `!MASK` is zero -- a mask of zero is always clippy::bad_bit_mask, even
+        // though the check is correct (there are no unknown bits left to have).
+        if bits & Self::MASK != bits {
             return Err(UnknownKindBits(bits));
         }
         Ok(Self(bits))
@@ -1124,6 +1157,7 @@ impl WardEvent {
             WardEvent::SessionPaused { .. } => EventKind::SessionPaused,
             WardEvent::SessionResumed { .. } => EventKind::SessionResumed,
             WardEvent::EntryRestored { .. } => EventKind::EntryRestored,
+            WardEvent::VerificationErrored { .. } => EventKind::VerificationErrored,
             WardEvent::LaunchAborted { .. } => EventKind::LaunchAborted,
         }
     }
@@ -1156,10 +1190,25 @@ mod tests {
             assert_eq!(k.bit(), 1u32 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
-        assert!(EventKindSet::try_from(EventKindSet::ALL.bits() << 1).is_err());
-        assert!(
+        // The catalogue is now exactly 32 kinds wide -- the full capacity of the
+        // `u32` `EventKindSet` backs itself with, one bit per kind. At that exact
+        // size there is no unused bit left for an "unknown kind" pattern to occupy:
+        // `ALL.bits() << 1` drops the top bit rather than setting one beyond the
+        // known range (there is no bit 32 in a `u32`), and `u32::MAX` is now simply
+        // `EventKindSet::ALL`'s own representation, not an invalid one. Both used to
+        // be rejected while the catalogue had room to spare; asserting they are
+        // *accepted* now is what proves the set is dense right up to capacity, the
+        // same property the loop above checks bit-by-bit. Adding a 33rd kind needs
+        // a wider backing type before this stops being true (`EventKind::bit()`'s
+        // own `1 << discriminant` shift would itself overflow first).
+        assert_eq!(
+            EventKindSet::try_from(EventKindSet::ALL.bits() << 1).unwrap(),
+            EventKindSet::ALL.without(EventKind::ALL[0])
+        );
+        assert_eq!(
             postcard::from_bytes::<EventKindSet>(&postcard::to_allocvec(&u32::MAX).unwrap())
-                .is_err()
+                .unwrap(),
+            EventKindSet::ALL
         );
         let set = EventKindSet::only(EventKind::Anchor).with(EventKind::FileRead);
         let bytes = postcard::to_allocvec(&set).unwrap();
