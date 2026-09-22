@@ -536,7 +536,12 @@ impl Session {
         let mut refusals = Vec::new();
         let mut notes = Vec::new();
         let requested = grants.iter().any(|g| g == github::SERVICE);
-        match github::grant(&self.manifest, &self.worktree, &self.state, requested)? {
+        // Fixed once, from the entry snapshot's captured `.git/config`, never
+        // from the live worktree at grant time (issue #196): a `.git/config`
+        // edit the agent makes mid-session cannot redirect where a
+        // `RepoSelector::CurrentRepository` credential grant points.
+        let current_repo = github::pinned_origin_repo(&self.state, &self.entry_snapshot);
+        match github::grant(&self.manifest, current_repo.as_deref(), &self.state, requested)? {
             github::Grant::Granted {
                 gateways: routes,
                 repos,

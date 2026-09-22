@@ -128,10 +128,12 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
         .map_err(|e| Error::Daemon(format!("describe {session}: {e}")))?;
     // What an approval's authority is derived from: the manifest, the
     // repository a `current_repository` credential scope means, and the paths
-    // TamperWard protects, all fixed at the session's start.
+    // TamperWard protects, all fixed at the session's start. The repository
+    // comes from the entry snapshot's captured `.git/config`, not the live
+    // worktree (issue #196) — see `github::pinned_origin_repo`.
     let deriver = Deriver::new(
         meta.manifest.clone(),
-        github::origin_repo(&meta.project),
+        github::pinned_origin_repo(state, &meta.entry_snapshot),
         protected_paths(state, &meta.entry_snapshot),
     );
 
