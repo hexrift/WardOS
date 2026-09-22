@@ -94,10 +94,13 @@ signoff:
 verify:
   command: bash scripts/verify/tamperward.sh
   # `tamperward verify` re-runs this command in TWO materialised copies (visible
-  # and pristine), each a cold `cargo fmt/clippy/test --workspace` with no target
-  # cache — so the budget must cover two full workspace builds, not one. Raised
-  # from the Phase-0 placeholder (1800, set when no Rust code existed) now that the
-  # pristine-verify job in .github/workflows/tamperward.yml actually runs it.
+  # and pristine) of a `cargo fmt/clippy/test --workspace` — so the budget must
+  # cover two full workspace builds, not one. tamperward-verify's job does use
+  # Swatinem/rust-cache, which keeps steady state well under this; the budget is
+  # sized for the worst case it can't avoid — the first run against a new
+  # Cargo.lock hash, cold on both copies. Raised from the Phase-0 placeholder
+  # (1800, set when no Rust code existed) now that the pristine-verify job in
+  # .github/workflows/tamperward.yml actually runs it.
   budget: 3600
   # Everything the command delegates to must be frozen/restored from the trusted base
   # during pristine verification.

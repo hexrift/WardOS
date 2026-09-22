@@ -14,15 +14,12 @@ name: tamperward
 # payload: a label applied after a failure could otherwise never take effect, and
 # revoking a sign-off must re-block rather than linger green.
 #
-# Scope note (WardOS): this adds the diff-time `check`. Pristine re-execution of
-# the verify suite (`tamperward verify`, from .tamperward.yml's `verify.command`)
-# needs the full Rust + bubblewrap toolchain, and the identical command
-# (`bash scripts/verify/tamperward.sh`) is already run on the PR head by the
-# `verify` job in verify.yml; wiring the base-pristine `verify` step here is a
-# follow-up. To make this the merge authority you must ALSO, in branch protection,
-# require this check AND enable "Require review from Code Owners" — a
-# `pull_request` workflow runs from the PR's own head, so without that a PR could
-# replace the gate and still present a green required check.
+# Scope note (WardOS): this runs both the diff-time `check` and the pristine
+# `tamperward-verify` (see that job's own comment). To make either the merge
+# authority you must ALSO, in branch protection, require the check AND enable
+# "Require review from Code Owners" — a `pull_request` workflow runs from the
+# PR's own head, so without that a PR could replace the gate (this file itself,
+# not just what it invokes) and still present a green required check.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
@@ -73,8 +70,14 @@ jobs:
   # double execution plus exit codes, no diff interpretation — so it is immune to
   # spelling, which is exactly what makes it the load-bearing gate on a Rust
   # workspace whose diff-time detectors are pattern-based rather than full-AST.
-  # It reads its policy, verification surface and command/budget from the base, so
-  # the candidate cannot configure its own re-execution. Provisioned with the same
+  # `tamperward verify --base <sha>` reads the *policy* it re-verifies against
+  # (.tamperward.yml's command/budget/inputs) from that base commit, so the
+  # candidate cannot configure what gets re-run. It CANNOT stop a candidate from
+  # rewriting this job itself — this is a `pull_request` workflow, so GitHub runs
+  # this YAML as checked out from the PR head, not from main (same risk the
+  # top-of-file scope note already flags for the `check` job above); that
+  # orchestration is only trustworthy once branch protection requires this check
+  # and Code Owners review gates `.github/workflows/**`. Provisioned with the same
   # toolchain as verify.yml so `bash scripts/verify/tamperward.sh` runs identically.
   tamperward-verify:
     runs-on: ubuntu-latest
