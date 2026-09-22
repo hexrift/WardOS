@@ -1290,6 +1290,18 @@ mod tests {
                 bytes: None,
                 status: ScratchStatus::Unknown,
             },
+            // The other side of that same ambiguity: a fully readable
+            // directory that just happens to be genuinely empty. Same
+            // Unknown status as the unreadable entry above, but a real
+            // `Some(0)` — its row must render the actual figure `0 B`, not
+            // fall into the `unavailable` bucket alongside a directory this
+            // process couldn't even inspect.
+            ScratchEntry {
+                path: "/tmp/ward-empty1".into(),
+                owner: None,
+                bytes: Some(0),
+                status: ScratchStatus::Unknown,
+            },
         ];
         let out = plain(&usage_panel(Path::new("/state"), &usage, &scratch));
         assert!(out.contains("/state"));
@@ -1320,6 +1332,13 @@ mod tests {
             unreadable_row.trim_end().ends_with("unavailable"),
             "the unreadable entry's own size column must read 'unavailable', \
              never a byte figure:\n{unreadable_row}"
+        );
+        let empty_row = out.lines().find(|l| l.contains("ward-empty1")).unwrap();
+        assert!(
+            empty_row.trim_end().ends_with("0 B"),
+            "a fully readable, genuinely empty entry's own row must render \
+             the real figure 0 B, never fall into the same 'unavailable' \
+             bucket as an entry that couldn't be inspected at all:\n{empty_row}"
         );
     }
 
