@@ -407,6 +407,7 @@ pub fn observer_row(rec: &EventRecord) -> Option<String> {
 /// The columns of one observer row for a log record, uncoloured. Returns `None`
 /// for records with no row in the compact view.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
     let (verb, tone, subject) = match &rec.event {
         WardEvent::SessionStarted { .. } => ("START", Tone::Accent, "session".to_string()),
@@ -436,7 +437,10 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
         | WardEvent::VerificationProgress { .. }
         | WardEvent::VerificationPassed { .. }
         | WardEvent::VerificationFailed { .. }
-        | WardEvent::VerificationErrored { .. } => verification_cells(&rec.event)?,
+        | WardEvent::VerificationErrored { .. }
+        | WardEvent::VerificationAttemptStarted { .. }
+        | WardEvent::VerificationCancelled { .. }
+        | WardEvent::VerificationInterrupted { .. } => verification_cells(&rec.event)?,
         WardEvent::PolicyDecision {
             subject,
             decision,
@@ -576,7 +580,41 @@ fn verification_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)>
                 short_hex(&candidate.to_string())
             ),
         ),
+        WardEvent::VerificationAttemptStarted {
+            attempt,
+            requested_by,
+        } => (
+            "VERIFY",
+            Tone::Accent,
+            format!("{attempt} allocated · requested by {requested_by:?}"),
+        ),
+        WardEvent::VerificationCancelled { attempt, candidate } => (
+            "CANCEL",
+            Tone::Deny,
+            format!("{attempt} cancelled{}", candidate_suffix(*candidate)),
+        ),
+        WardEvent::VerificationInterrupted {
+            attempt,
+            candidate,
+            reason,
+        } => (
+            "INTERRUPTED",
+            Tone::Deny,
+            format!(
+                "{attempt} interrupted{} · {}",
+                candidate_suffix(*candidate),
+                reason.as_str()
+            ),
+        ),
         _ => return None,
+    })
+}
+
+/// ` · candidate <hex>` when a verification-attempt record names a candidate, empty
+/// when it does not (the attempt ended before capture succeeded, #139).
+fn candidate_suffix(candidate: Option<ward_events::SnapshotId>) -> String {
+    candidate.map_or_else(String::new, |c| {
+        format!(" · candidate {}", short_hex(&c.to_string()))
     })
 }
 

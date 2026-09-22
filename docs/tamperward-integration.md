@@ -155,15 +155,28 @@ scratch tree, overwrites every `protected.tests` path with its entry-snapshot by
 under that directory in either snapshot, so an edited, deleted or newly planted test is
 undone alike), and runs `verify.command` in a bare sandbox with no egress
 and the host Rust toolchain bound read-only, killed past `verify.budget_secs` (default
-600). The log records `VerificationRequested`
-(origin User), `VerificationStarted` with pristine, candidate and config hash, one
+600). Before any of that, `VerificationAttemptStarted { attempt, requested_by }`
+records the attempt id the whole run is tracked under — allocated, and on the log,
+before the (possibly slow) candidate capture even begins, so a subscriber sees
+progress from the first action (#139). The log then records `VerificationRequested`
+(origin User) once capture has actually succeeded — never inventing a candidate for
+one that failed — `VerificationStarted` with pristine, candidate and config hash, one
 `VerificationProgress` per restored path and one for the command, and
 `VerificationPassed` / `VerificationFailed` with the parsed counts and the BLAKE3 of
 the output (origin Verifier). If the verifier command cannot even be run — the sandbox
 runtime fails to launch, or a step between `VerificationStarted` and the verdict errors
 out — the log gets `VerificationErrored { candidate, reason }` instead, so a
 subscriber never sees `VerificationStarted` as the last verification record for a
-candidate and never confuses "could not run" with "ran and failed" (#139). The hook
+candidate and never confuses "could not run" with "ran and failed" (#139). A
+preparation failure with no candidate yet (missing `.tamperward/config.yml`, for
+instance) instead ends the attempt in `VerificationInterrupted { attempt, candidate:
+None, reason }`, the same record a *reconciliation* pass appends for an attempt whose
+own process died before it could write any terminal record at all — run whenever a
+session's log changes hands (a daemon's own startup, `Session::open_current`, or the
+start of a fresh `verify()`), so a crash never leaves an attempt reading as "running"
+forever. A user-requested cancel between an attempt's steps (never pre-empting a
+verifier command already running, which stays bounded by `verify.budget_secs` as
+before) produces `VerificationCancelled { attempt, candidate }` instead. The hook
 layer denies `Write`/`Edit` tool calls on
 protected paths with `protected by TamperWard policy: tests`. The end-to-end test runs
 the scenario above on `examples/ward-demo`: the bug fails, a weakened protected test

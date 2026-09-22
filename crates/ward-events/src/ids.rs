@@ -515,6 +515,47 @@ impl FromStr for Pid {
 }
 
 // ---------------------------------------------------------------------------------------
+// AttemptId
+// ---------------------------------------------------------------------------------------
+
+/// Identifies one verification attempt within a session (#139).
+///
+/// Allocated before any expensive preparation begins (candidate capture, sandbox
+/// launch), so the earliest record of an attempt — [`crate::event::WardEvent::VerificationAttemptStarted`]
+/// — can be written before a candidate is even known. Monotonically increasing per
+/// session, starting at 1 and never reused, so a later attempt's records can never be
+/// confused with an earlier, superseded one even if the earlier one's own terminal
+/// record arrives late (or never, if the process serving the session died first).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AttemptId(u64);
+
+impl AttemptId {
+    /// Wraps a raw attempt number.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for AttemptId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "attempt-{}", self.0)
+    }
+}
+
+impl fmt::Debug for AttemptId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AttemptId({})", self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // RuleRef, ServiceId
 // ---------------------------------------------------------------------------------------
 

@@ -28,7 +28,14 @@ use crate::origin::{Origin, OriginSet};
 /// Frame magic.
 pub const MAGIC: [u8; 2] = *b"WE";
 /// Current wire version.
-pub const WIRE_VERSION: u8 = 1;
+///
+/// Bumped from 1 to 2 in #139: [`EventKindSet`] (carried in [`Filter`]/[`Subscribe`]
+/// frames) widened from a `u32` to a `u64` bitmask because the catalogue had already
+/// reached `u32`'s 31-kind ceiling. Appending a new [`crate::event::WardEvent`] variant
+/// on its own has never needed a bump (see `event.rs`'s own top-of-file doc comment) —
+/// this bump is for the `Filter`/`Subscribe` frame *type* changing, not for the new
+/// variants by themselves.
+pub const WIRE_VERSION: u8 = 2;
 /// Header length in bytes.
 pub const HEADER_LEN: usize = 8;
 /// Hard maximum frame size including the header.
@@ -380,6 +387,8 @@ impl Filter {
                 .with(EventKind::VerificationPassed)
                 .with(EventKind::VerificationFailed)
                 .with(EventKind::VerificationErrored)
+                .with(EventKind::VerificationCancelled)
+                .with(EventKind::VerificationInterrupted)
                 .with(EventKind::SessionPaused)
                 .with(EventKind::SessionResumed)
                 .with(EventKind::EntryRestored)

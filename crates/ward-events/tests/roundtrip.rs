@@ -17,7 +17,7 @@ use ward_events::event::{
     VerifySummary, WardEvent,
 };
 use ward_events::ids::{
-    Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
+    AttemptId, Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
 };
 use ward_events::log::{FsyncPolicy, LogReader, LogWriter};
 use ward_events::origin::Origin;
@@ -221,7 +221,7 @@ proptest! {
     }
 
     #[test]
-    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u32..(1 << 27), notes in any::<bool>()) {
+    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u64..(1 << 27), notes in any::<bool>()) {
         let sub = Subscribe {
             session: SessionId::from_u128(session),
             from_seq,
@@ -568,6 +568,30 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Wardd,
+            WardEvent::VerificationAttemptStarted {
+                attempt: AttemptId::new(1),
+                requested_by: VerifyRequester::User,
+            },
+        ),
+        (
+            Origin::Verifier,
+            WardEvent::VerificationCancelled {
+                attempt: AttemptId::new(2),
+                candidate: Some(snap(b"cand4")),
+            },
+        ),
+        (
+            Origin::Wardd,
+            WardEvent::VerificationInterrupted {
+                attempt: AttemptId::new(3),
+                candidate: None,
+                reason: text(
+                    "the process serving this session ended before the attempt reached a terminal result",
+                ),
+            },
+        ),
+        (
             Origin::TamperWard,
             WardEvent::StateAccepted {
                 snapshot: snap(b"cand2"),
@@ -704,9 +728,12 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
         .filter(|r| Filter::quiet().matches(r))
         .count();
     // The nine of Quiet mode plus the three host interventions (ADR-0019 §3), plus
-    // `VerificationErrored` (#139), plus `CapabilityDecided` appearing twice in the
-    // fixture above (once granted, once denied).
-    assert_eq!(quiet, 13);
+    // `VerificationErrored`, `VerificationCancelled` and `VerificationInterrupted`
+    // (#139), plus `CapabilityDecided` appearing twice in the fixture above (once
+    // granted, once denied). `VerificationAttemptStarted` is a progress marker, not
+    // a terminal outcome, and is deliberately not in Quiet mode (like
+    // `VerificationRequested`/`VerificationStarted` before it).
+    assert_eq!(quiet, 15);
 }
 
 #[test]

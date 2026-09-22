@@ -68,6 +68,17 @@ pub enum Verification {
     /// property of the `VerificationErrored` record, shown on its observer row,
     /// not of this aggregated state.
     Errored(SnapshotId),
+    /// The last attempt was cancelled by the user before it reached a pass/fail
+    /// result (#139) — distinct from [`Self::Errored`] (an infrastructure
+    /// failure) and from [`Self::Failed`] (the trusted command ran and exited
+    /// non-zero). `None` when the attempt was cancelled before a candidate was
+    /// even captured.
+    Cancelled(Option<SnapshotId>),
+    /// The last attempt was reconciled as interrupted: the process that had been
+    /// running it (a session daemon, or a daemonless `ward` invocation) ended —
+    /// crashed, was killed, or was restarted — before the attempt reached a
+    /// terminal result (#139). `None` when no candidate had been captured yet.
+    Interrupted(Option<SnapshotId>),
 }
 
 impl Verification {
@@ -78,6 +89,7 @@ impl Verification {
             Self::NotRun => None,
             Self::Running(c) | Self::Errored(c) => Some(*c),
             Self::Passed(v) | Self::Failed(v) => Some(v.candidate),
+            Self::Cancelled(c) | Self::Interrupted(c) => *c,
         }
     }
 }
@@ -185,6 +197,12 @@ impl SessionState {
             } => self.verification = Verification::Failed(self.verdict(rec, *candidate, *summary)),
             WardEvent::VerificationErrored { candidate, .. } => {
                 self.verification = Verification::Errored(*candidate);
+            }
+            WardEvent::VerificationCancelled { candidate, .. } => {
+                self.verification = Verification::Cancelled(*candidate);
+            }
+            WardEvent::VerificationInterrupted { candidate, .. } => {
+                self.verification = Verification::Interrupted(*candidate);
             }
             WardEvent::TamperDetected { .. } => self.tamperward = TamperWard::Tampered,
             _ => {}
@@ -564,6 +582,37 @@ pub(crate) mod fixtures {
         }
     }
 
+    pub fn verify_attempt_started() -> WardEvent {
+        WardEvent::VerificationAttemptStarted {
+            attempt: ward_events::AttemptId::new(1),
+            requested_by: VerifyRequester::User,
+        }
+    }
+
+    pub fn verify_cancelled() -> WardEvent {
+        WardEvent::VerificationCancelled {
+            attempt: ward_events::AttemptId::new(1),
+            candidate: Some(snapshot()),
+        }
+    }
+
+    pub fn verify_cancelled_before_capture() -> WardEvent {
+        WardEvent::VerificationCancelled {
+            attempt: ward_events::AttemptId::new(1),
+            candidate: None,
+        }
+    }
+
+    pub fn verify_interrupted() -> WardEvent {
+        WardEvent::VerificationInterrupted {
+            attempt: ward_events::AttemptId::new(1),
+            candidate: Some(snapshot()),
+            reason: ward_events::ShortText::new(
+                "the process serving this session ended before the attempt reached a terminal result",
+            ),
+        }
+    }
+
     pub fn denied() -> WardEvent {
         WardEvent::PolicyDenied {
             subject: PolicySubject::ProtectedTests,
@@ -827,5 +876,66 @@ mod tests {
             panic!("{:?}", model.state.verification);
         };
         assert_eq!(passed.candidate, snapshot());
+    }
+
+    /// #139: a user-cancelled attempt reads as its own state, neither running,
+    /// failed, nor errored — and `VerificationAttemptStarted` on its own does not
+    /// move the phase out of whatever it already was (the earlier, pre-candidate
+    /// signal is not surfaced as its own UI state in this change).
+    #[test]
+    fn a_cancelled_attempt_is_its_own_state_not_running_failed_or_errored() {
+        let mut model = Model::new(false);
+        assert_eq!(model.state.verification, Verification::NotRun);
+
+        model.apply(wardd(&[verify_attempt_started()]).remove(0));
+        assert_eq!(
+            model.state.verification,
+            Verification::NotRun,
+            "the earliest attempt signal alone does not move the phase"
+        );
+
+        for rec in wardd(&[verify_requested()]) {
+            model.apply(rec);
+        }
+        model.apply(wardd(&[verify_cancelled()]).remove(0));
+        assert_eq!(
+            model.state.verification,
+            Verification::Cancelled(Some(snapshot()))
+        );
+        assert_eq!(model.state.verification.candidate(), Some(snapshot()));
+        assert_ne!(model.state.verification, Verification::Running(snapshot()));
+        assert!(!matches!(model.state.verification, Verification::Failed(_)));
+        assert!(!matches!(
+            model.state.verification,
+            Verification::Errored(_)
+        ));
+
+        // Cancelled before a candidate was even captured: no candidate to show.
+        model.apply(wardd(&[verify_attempt_started()]).remove(0));
+        model.apply(wardd(&[verify_cancelled_before_capture()]).remove(0));
+        assert_eq!(model.state.verification, Verification::Cancelled(None));
+        assert_eq!(model.state.verification.candidate(), None);
+
+        // A retry after a cancel runs and can still pass: the cancel does not stick.
+        for rec in wardd(&[verify_requested(), verify_passed()]) {
+            model.apply(rec);
+        }
+        assert!(matches!(model.state.verification, Verification::Passed(_)));
+    }
+
+    /// #139: a reconciled, interrupted attempt (the daemon or process that had
+    /// been running it disappeared) reads as its own state too — never as a
+    /// silent "still running".
+    #[test]
+    fn an_interrupted_attempt_is_its_own_state_not_running() {
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested(), verify_interrupted()]) {
+            model.apply(rec);
+        }
+        assert_eq!(
+            model.state.verification,
+            Verification::Interrupted(Some(snapshot()))
+        );
+        assert_ne!(model.state.verification, Verification::Running(snapshot()));
     }
 }

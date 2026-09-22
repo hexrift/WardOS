@@ -370,6 +370,7 @@ fn short_snapshot(id: &SnapshotId) -> String {
 }
 
 /// A compact, secret-free one-line description of an event for `--json`.
+#[allow(clippy::too_many_lines)]
 fn summary(event: &WardEvent) -> String {
     match event {
         WardEvent::SessionStarted {
@@ -428,6 +429,28 @@ fn summary(event: &WardEvent) -> String {
         WardEvent::VerificationErrored { candidate, reason } => {
             format!("candidate {} · {reason}", short_snapshot(candidate))
         }
+        WardEvent::VerificationAttemptStarted {
+            attempt,
+            requested_by,
+        } => format!("{attempt} by {requested_by:?}"),
+        WardEvent::VerificationCancelled { attempt, candidate } => format!(
+            "{attempt}{}",
+            candidate.map_or_else(String::new, |c| format!(
+                " · candidate {}",
+                short_snapshot(&c)
+            ))
+        ),
+        WardEvent::VerificationInterrupted {
+            attempt,
+            candidate,
+            reason,
+        } => format!(
+            "{attempt}{} · {reason}",
+            candidate.map_or_else(String::new, |c| format!(
+                " · candidate {}",
+                short_snapshot(&c)
+            ))
+        ),
         WardEvent::StateAccepted { snapshot, .. } => {
             format!("snapshot {}", short_snapshot(snapshot))
         }

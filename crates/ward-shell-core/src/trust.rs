@@ -152,7 +152,7 @@ pub const fn agent_tone(state: AgentState) -> Tone {
     }
 }
 
-/// The verify segment's six states (ADR-0019 decision 1; #139): what the stream
+/// The verify segment's eight states (ADR-0019 decision 1; #139): what the stream
 /// has said about verification, held against what the worktree digests to now.
 /// The bar shows exactly one, and green appears only while the tree is the
 /// verified candidate, byte for byte.
@@ -190,6 +190,15 @@ pub enum VerifyState {
     /// trusted command ran and exited non-zero): an unexecuted suite is never
     /// shown as a test failure, and never as a pass.
     Errored(SnapshotId),
+    /// `VERIFY ! CANCELLED`: the last attempt was cancelled by the user before it
+    /// reached a pass/fail result (#139). `None` when it was cancelled before a
+    /// candidate was even captured.
+    Cancelled(Option<SnapshotId>),
+    /// `VERIFY ! INTERRUPTED`: the last attempt was reconciled as interrupted —
+    /// the process running it (a session daemon, or a daemonless `ward`
+    /// invocation) ended before it reached a terminal result (#139). `None` when
+    /// no candidate had been captured yet.
+    Interrupted(Option<SnapshotId>),
 }
 
 impl VerifyState {
@@ -211,6 +220,8 @@ impl VerifyState {
             (Verification::Running(candidate), _) => Self::Verifying(candidate),
             (Verification::Failed(v), _) => Self::Failed(v.candidate),
             (Verification::Errored(candidate), _) => Self::Errored(candidate),
+            (Verification::Cancelled(candidate), _) => Self::Cancelled(candidate),
+            (Verification::Interrupted(candidate), _) => Self::Interrupted(candidate),
             (Verification::Passed(v), Freshness::Unavailable) => Self::Unknown {
                 candidate: v.candidate,
             },
@@ -237,7 +248,9 @@ impl VerifyState {
             Self::Verifying(_) => Tone::Accent,
             Self::Verified(_) => Tone::Ok,
             Self::Stale { .. } | Self::Unknown { .. } => Tone::Warn,
-            Self::Failed(_) | Self::Errored(_) => Tone::Deny,
+            Self::Failed(_) | Self::Errored(_) | Self::Cancelled(_) | Self::Interrupted(_) => {
+                Tone::Deny
+            }
         }
     }
 
@@ -252,6 +265,8 @@ impl VerifyState {
             Self::Unknown { .. } => "unknown",
             Self::Failed(_) => "failed",
             Self::Errored(_) => "errored",
+            Self::Cancelled(_) => "cancelled",
+            Self::Interrupted(_) => "interrupted",
         }
     }
 
@@ -267,6 +282,8 @@ impl VerifyState {
             Self::Unknown { candidate } => format!("VERIFY ? {}", short_hex(candidate)),
             Self::Failed(_) => "VERIFY ✗".to_owned(),
             Self::Errored(_) => "VERIFY ! ERROR".to_owned(),
+            Self::Cancelled(_) => "VERIFY ! CANCELLED".to_owned(),
+            Self::Interrupted(_) => "VERIFY ! INTERRUPTED".to_owned(),
         };
         Segment::new(text, self.tone())
     }
@@ -662,7 +679,8 @@ mod tests {
     use super::*;
     use crate::feed::fixtures::{
         agent, denied, edited, ended, model_with, paused, records, resumed, sequence, snapshot,
-        tamper, verify_errored, verify_failed, verify_passed, verify_requested, wardd,
+        tamper, verify_cancelled, verify_errored, verify_failed, verify_interrupted, verify_passed,
+        verify_requested, wardd,
     };
     use ward_events::{Origin, WardEvent};
     use ward_policy::merge;
@@ -797,7 +815,8 @@ mod tests {
     }
 
     #[test]
-    fn the_verify_segment_is_a_six_state_machine_over_the_stream_and_the_worktree() {
+    #[allow(clippy::too_many_lines)]
+    fn the_verify_segment_is_an_eight_state_machine_over_the_stream_and_the_worktree() {
         use VerifyState as V;
         let h = header(NetworkCapability::Development);
         let mut model = Model::new(false);
@@ -831,6 +850,27 @@ mod tests {
         assert_ne!(state(&model), V::Verifying(snapshot()));
         assert_ne!(state(&model), V::Failed(snapshot()));
         assert_eq!(seg(&model), Segment::new("VERIFY ! ERROR", Tone::Deny));
+
+        // ! CANCELLED : the user cancelled the retry before it reached a
+        // pass/fail result — its own state, not shown as running or as an
+        // infrastructure error (#139).
+        for rec in wardd(&[verify_requested(), verify_cancelled()]) {
+            model.apply(rec);
+        }
+        assert_eq!(state(&model), V::Cancelled(Some(snapshot())));
+        assert_ne!(state(&model), V::Errored(snapshot()));
+        assert_eq!(seg(&model), Segment::new("VERIFY ! CANCELLED", Tone::Deny));
+
+        // ! INTERRUPTED : the process running the retry disappeared before it
+        // reached a terminal result, and reconciliation recorded that.
+        for rec in wardd(&[verify_requested(), verify_interrupted()]) {
+            model.apply(rec);
+        }
+        assert_eq!(state(&model), V::Interrupted(Some(snapshot())));
+        assert_eq!(
+            seg(&model),
+            Segment::new("VERIFY ! INTERRUPTED", Tone::Deny)
+        );
 
         // ✓ : passed, and the worktree is the candidate. A pass after an error
         // clears it, like any other retry.
@@ -906,6 +946,10 @@ mod tests {
             ),
             (V::Failed(snapshot()), Tone::Deny, "failed"),
             (V::Errored(snapshot()), Tone::Deny, "errored"),
+            (V::Cancelled(Some(snapshot())), Tone::Deny, "cancelled"),
+            (V::Cancelled(None), Tone::Deny, "cancelled"),
+            (V::Interrupted(Some(snapshot())), Tone::Deny, "interrupted"),
+            (V::Interrupted(None), Tone::Deny, "interrupted"),
         ];
         for (state, tone, word) in cases {
             assert_eq!(state.tone(), tone, "{word}");

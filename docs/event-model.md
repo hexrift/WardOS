@@ -87,6 +87,12 @@ pub enum WardEvent {
     VerificationErrored   { candidate: SnapshotId, reason: BoundedText },   // infra failure, not a test failure
     StateAccepted         { snapshot: SnapshotId, by: TamperWard },
 
+    // verification attempts, continued (origin: Wardd / Verifier; #139) — also
+    // appended at the end, after StateAccepted, for the same reason.
+    VerificationAttemptStarted { attempt: AttemptId, requested_by: Agent | User | TamperWard },
+    VerificationCancelled      { attempt: AttemptId, candidate: Option<SnapshotId> },
+    VerificationInterrupted    { attempt: AttemptId, candidate: Option<SnapshotId>, reason: BoundedText },
+
     // agent claims (origin: Agent) — never enforcement facts
     AgentClaim { kind: ToolUse | Note | Plan, payload: BoundedText },
 
@@ -142,7 +148,7 @@ source of truth, not the socket. Latency budget from kernel event to subscriber 
 
 | Mode | Shows | Blocks? |
 | --- | --- | --- |
-| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed,Errored}`, `SessionEnded` | Only on `Ask` |
+| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed,Errored,Cancelled,Interrupted}`, `SessionEnded` | Only on `Ask` |
 | Live | Everything except `AgentClaim{Note}` | Only on `Ask` |
 | Step-through | Everything; additionally the manifest's `step_policy` marks actions (`FileModified` under given globs, `CommandStarted` matching patterns, any `NetworkRequested`) as `Ask` | Yes, on configured actions |
 

@@ -18,6 +18,7 @@
 
 pub mod agents;
 pub mod approvals;
+pub mod attempt;
 pub mod client;
 pub mod control;
 pub mod daemon;

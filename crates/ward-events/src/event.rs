@@ -11,7 +11,9 @@ use core::time::Duration;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-use crate::ids::{Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SnapshotId};
+use crate::ids::{
+    AttemptId, Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SnapshotId,
+};
 use crate::text::{BoundedArgv, BoundedText, HostName, SandboxPath};
 
 /// Short free text (reasons, targets, subjects).
@@ -835,6 +837,50 @@ pub enum WardEvent {
         /// (bwrap) is not installed"). Never a secret; drawn from the daemon's own error text.
         reason: ShortText,
     },
+
+    // -- verification attempts (origin: Wardd / Verifier; #139) --
+    /// A verification attempt was allocated: the earliest record of an attempt, written
+    /// before any expensive preparation (candidate capture, sandbox launch) begins, so a
+    /// subscriber sees progress from the very first action rather than only once capture
+    /// has already succeeded. No candidate is known yet — [`WardEvent::VerificationRequested`]
+    /// follows once capture succeeds; nothing does if it fails, exactly as before #139, since
+    /// there is then no candidate for a subscriber to be told about.
+    VerificationAttemptStarted {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Who asked.
+        requested_by: VerifyRequester,
+    },
+    /// A verification attempt was cancelled by the user before it reached a pass/fail
+    /// result (#139) — a distinct terminal outcome from `VerificationErrored` (an
+    /// infrastructure failure) and from `VerificationFailed` (the trusted command ran and
+    /// exited non-zero). `candidate` is `Some` once capture had already succeeded by the
+    /// time the cancellation took effect, `None` if it was cancelled before that. Cancelling
+    /// is cooperative, checked between the attempt's steps: a cancel requested while the
+    /// verifier command itself is running takes effect only once that command returns.
+    VerificationCancelled {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Candidate snapshot, when capture had already succeeded.
+        candidate: Option<SnapshotId>,
+    },
+    /// A verification attempt was reconciled as interrupted: when this process (re)took
+    /// ownership of the session's log, the attempt's own record was the last
+    /// verification-kind record for it, with no `Passed`/`Failed`/`Errored`/`Cancelled`
+    /// following — most often because the process that had been running it (the session
+    /// daemon, or a daemonless `ward` invocation) died, was killed, or was restarted
+    /// mid-attempt (#139). Never emitted by the code that runs an attempt itself; only by
+    /// the reconciliation pass a session/daemon runs against its own log whenever it opens
+    /// or reopens it, so a dangling attempt is never left showing "running" forever.
+    VerificationInterrupted {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Candidate snapshot, when known.
+        candidate: Option<SnapshotId>,
+        /// Sanitised, bounded description of what was found (e.g. "the process serving
+        /// this session ended before the attempt reached a terminal result").
+        reason: ShortText,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -875,11 +921,14 @@ pub enum EventKind {
     SessionResumed = 28,
     EntryRestored = 29,
     VerificationErrored = 30,
+    VerificationAttemptStarted = 31,
+    VerificationCancelled = 32,
+    VerificationInterrupted = 33,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 31] = [
+    pub const ALL: [EventKind; 34] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -911,11 +960,14 @@ impl EventKind {
         EventKind::SessionResumed,
         EventKind::EntryRestored,
         EventKind::VerificationErrored,
+        EventKind::VerificationAttemptStarted,
+        EventKind::VerificationCancelled,
+        EventKind::VerificationInterrupted,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
     #[must_use]
-    pub const fn bit(self) -> u32 {
+    pub const fn bit(self) -> u64 {
         1 << (self as u8)
     }
 
@@ -954,6 +1006,9 @@ impl EventKind {
             EventKind::SessionResumed => "session_resumed",
             EventKind::EntryRestored => "entry_restored",
             EventKind::VerificationErrored => "verification_errored",
+            EventKind::VerificationAttemptStarted => "verification_attempt_started",
+            EventKind::VerificationCancelled => "verification_cancelled",
+            EventKind::VerificationInterrupted => "verification_interrupted",
         }
     }
 
@@ -975,6 +1030,9 @@ impl EventKind {
                 | EventKind::VerificationPassed
                 | EventKind::VerificationFailed
                 | EventKind::VerificationErrored
+                | EventKind::VerificationAttemptStarted
+                | EventKind::VerificationCancelled
+                | EventKind::VerificationInterrupted
                 | EventKind::StateAccepted
                 | EventKind::TamperDetected
                 | EventKind::Anchor
@@ -993,16 +1051,21 @@ impl fmt::Display for EventKind {
 
 /// Error returned when an [`EventKindSet`] bitmask contains unknown bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("event kind set contains unknown bits: {0:#010x}")]
-pub struct UnknownKindBits(pub u32);
+#[error("event kind set contains unknown bits: {0:#018x}")]
+pub struct UnknownKindBits(pub u64);
 
 /// A set of [`EventKind`]s as a bitmask.
+///
+/// Backed by `u64` (widened from `u32` in #139, [`crate::wire::WIRE_VERSION`] bumped
+/// to 2 for it): the catalogue had already reached `u32`'s 31-kind ceiling (a 32nd bit
+/// does not fit a `1u32 << 32` shift) once `VerificationErrored` (#194) landed, so
+/// #139's three new verification-attempt kinds needed more room than `u32` had left.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(into = "u32")]
-pub struct EventKindSet(u32);
+#[serde(into = "u64")]
+pub struct EventKindSet(u64);
 
 impl EventKindSet {
-    const MASK: u32 = (1 << EventKind::ALL.len()) - 1;
+    const MASK: u64 = (1 << EventKind::ALL.len()) - 1;
 
     /// The empty set.
     pub const EMPTY: Self = Self(0);
@@ -1041,7 +1104,7 @@ impl EventKindSet {
 
     /// Raw bitmask.
     #[must_use]
-    pub const fn bits(self) -> u32 {
+    pub const fn bits(self) -> u64 {
         self.0
     }
 
@@ -1059,9 +1122,9 @@ impl fmt::Debug for EventKindSet {
     }
 }
 
-impl TryFrom<u32> for EventKindSet {
+impl TryFrom<u64> for EventKindSet {
     type Error = UnknownKindBits;
-    fn try_from(bits: u32) -> Result<Self, UnknownKindBits> {
+    fn try_from(bits: u64) -> Result<Self, UnknownKindBits> {
         if bits & !Self::MASK != 0 {
             return Err(UnknownKindBits(bits));
         }
@@ -1069,15 +1132,15 @@ impl TryFrom<u32> for EventKindSet {
     }
 }
 
-impl From<EventKindSet> for u32 {
-    fn from(set: EventKindSet) -> u32 {
+impl From<EventKindSet> for u64 {
+    fn from(set: EventKindSet) -> u64 {
         set.0
     }
 }
 
 impl<'de> Deserialize<'de> for EventKindSet {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bits = u32::deserialize(deserializer)?;
+        let bits = u64::deserialize(deserializer)?;
         Self::try_from(bits).map_err(serde::de::Error::custom)
     }
 }
@@ -1124,6 +1187,9 @@ impl WardEvent {
             WardEvent::SessionResumed { .. } => EventKind::SessionResumed,
             WardEvent::EntryRestored { .. } => EventKind::EntryRestored,
             WardEvent::VerificationErrored { .. } => EventKind::VerificationErrored,
+            WardEvent::VerificationAttemptStarted { .. } => EventKind::VerificationAttemptStarted,
+            WardEvent::VerificationCancelled { .. } => EventKind::VerificationCancelled,
+            WardEvent::VerificationInterrupted { .. } => EventKind::VerificationInterrupted,
         }
     }
 
@@ -1152,12 +1218,12 @@ mod tests {
     #[test]
     fn kind_bits_are_dense_and_cover_the_mask() {
         for (i, k) in EventKind::ALL.iter().enumerate() {
-            assert_eq!(k.bit(), 1u32 << i, "{k}");
+            assert_eq!(k.bit(), 1u64 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
         assert!(EventKindSet::try_from(EventKindSet::ALL.bits() << 1).is_err());
         assert!(
-            postcard::from_bytes::<EventKindSet>(&postcard::to_allocvec(&u32::MAX).unwrap())
+            postcard::from_bytes::<EventKindSet>(&postcard::to_allocvec(&u64::MAX).unwrap())
                 .is_err()
         );
         let set = EventKindSet::only(EventKind::Anchor).with(EventKind::FileRead);

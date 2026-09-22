@@ -123,7 +123,17 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
     let dir = session_dir(state, session);
     let log_path = dir.join("events.log");
     let started = UNIX_EPOCH + Duration::from_millis(meta.started_unix_ms);
-    let log = LocalLog::open(&log_path, started)?;
+    let mut log = LocalLog::open(&log_path, started)?;
+    // #139 item 5, the literal ask: a daemon starting up is taking ownership of a
+    // log a previous process (an earlier `wardd`, or a daemonless `ward` command)
+    // may have left mid-verification-attempt — most often because that process
+    // died or was killed. Reconcile any such dangling attempt into
+    // `VerificationInterrupted` before serving a single connection, so a
+    // subscriber never sees the eternal "running" spinner this issue is about,
+    // even across a daemon restart. Best-effort: a failure here (a corrupt marker
+    // aside, already handled inside) must not stop the daemon from serving the
+    // session at all.
+    let _ = crate::attempt::reconcile_dangling_attempts(&mut log, &dir);
     let description = serde_json::to_value(meta.describe())
         .map_err(|e| Error::Daemon(format!("describe {session}: {e}")))?;
     // What an approval's authority is derived from: the manifest, the
@@ -1483,5 +1493,123 @@ mod tests {
             RemoteSink::connect(&socket).is_none(),
             "nothing answers after exit"
         );
+    }
+
+    /// #139 item 5, the literal ask: a session left mid-verification-attempt by
+    /// whatever had been running it before — a crashed `wardd`, or a daemonless
+    /// `ward verify` that was killed — must not still read as "running" once a
+    /// fresh daemon takes the log over. `serve`'s own startup reconciles it before
+    /// a single connection is served.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn serve_reconciles_a_dangling_verification_attempt_at_startup() {
+        let state = tempfile::tempdir().unwrap();
+        let id = "sess_daemon_reconcile";
+        let dir = session_dir(state.path(), id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = merge(
+            &Policy::default(),
+            &Policy::default(),
+            &Policy::default(),
+            ward_policy::SessionId(id.to_owned()),
+            ward_policy::ProjectId("proj_unit".to_owned()),
+        );
+        let meta = SessionMeta {
+            id: id.to_owned(),
+            project: PathBuf::from("/tmp/demo"),
+            project_id: "proj_unit".to_owned(),
+            entry_snapshot: "blake3:abc".to_owned(),
+            manifest,
+            started_unix_ms: control::unix_ms(SystemTime::now()),
+            agent: None,
+        };
+        std::fs::write(
+            dir.join("session.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        let log_path = dir.join("events.log");
+        let attempt = ward_events::AttemptId::new(1);
+        {
+            let mut log = LocalLog::create(
+                &log_path,
+                SessionId::from_u128(21),
+                Blake3Hash::from_bytes([4; 32]),
+                SystemTime::now(),
+            )
+            .unwrap();
+            control::Sink::append(
+                &mut log,
+                Origin::Wardd,
+                WardEvent::VerificationAttemptStarted {
+                    attempt,
+                    requested_by: ward_events::VerifyRequester::User,
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+        }
+        // The marker a real attempt's `AttemptGuard` would have left, as if the
+        // process running it died right here — never `finish()`ed.
+        let marker = dir.join("attempts").join("1.json");
+        drop(
+            crate::attempt::AttemptGuard::start(&dir, attempt, ward_events::VerifyRequester::User)
+                .unwrap(),
+        );
+        assert!(marker.exists(), "the guard leaves its marker behind");
+
+        let (state_path, session) = (state.path().to_path_buf(), id.to_owned());
+        let daemon = std::thread::spawn(move || serve(&state_path, &session));
+        assert!(wait_until(STARTUP_TIMEOUT, || serving(state.path(), id)));
+
+        let socket = socket_path(state.path(), id);
+        let mut client = RemoteSink::connect(&socket).unwrap();
+        assert!(matches!(
+            client
+                .call(&Request::Stop {
+                    reason: EndReason::UserStop,
+                })
+                .unwrap(),
+            Response::Sealed { .. }
+        ));
+        daemon
+            .join()
+            .unwrap()
+            .expect("serve returns Ok after the seal");
+
+        assert!(
+            !marker.exists(),
+            "the marker is consumed by the daemon's own startup reconciliation"
+        );
+        let records: Vec<_> = LogReader::open(&log_path)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let kinds: Vec<&str> = records
+            .iter()
+            .filter_map(|r| match &r.event {
+                WardEvent::VerificationAttemptStarted { .. } => Some("AttemptStarted"),
+                WardEvent::VerificationInterrupted { .. } => Some("Interrupted"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["AttemptStarted", "Interrupted"],
+            "the dangling attempt is reconciled before any client could have \
+             connected and asked for it"
+        );
+        match &records[1].event {
+            WardEvent::VerificationInterrupted {
+                attempt: got,
+                candidate,
+                reason,
+            } => {
+                assert_eq!(*got, attempt);
+                assert_eq!(*candidate, None, "capture never even started");
+                assert!(!reason.as_str().is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

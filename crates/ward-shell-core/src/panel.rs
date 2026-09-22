@@ -66,6 +66,8 @@ pub fn session_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) ->
         VerifyState::Unknown { .. } => "pass · freshness unavailable",
         VerifyState::Failed(_) => "fail",
         VerifyState::Errored(_) => "error",
+        VerifyState::Cancelled(_) => "cancelled",
+        VerifyState::Interrupted(_) => "interrupted",
     };
     let verify_tone = verify_state.tone();
     let (evidence, evidence_tone) = match model.state.tamperward {
@@ -136,7 +138,11 @@ pub fn verify_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) -> 
     let tone = state.tone();
     let (verdict, at) = match model.state.verification {
         Verification::Passed(v) | Verification::Failed(v) => (Some(v), Some(v.at)),
-        Verification::NotRun | Verification::Running(_) | Verification::Errored(_) => (None, None),
+        Verification::NotRun
+        | Verification::Running(_)
+        | Verification::Errored(_)
+        | Verification::Cancelled(_)
+        | Verification::Interrupted(_) => (None, None),
     };
     let candidate = match state {
         VerifyState::Never => Row::new("Verified candidate", "none", Tone::Dim),
@@ -158,6 +164,16 @@ pub fn verify_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) -> 
         VerifyState::Errored(c) => Row::new(
             "Verified candidate",
             format!("{} · error", short_hex(c)),
+            tone,
+        ),
+        VerifyState::Cancelled(c) => Row::new(
+            "Verified candidate",
+            candidate_or_none(c, "cancelled"),
+            tone,
+        ),
+        VerifyState::Interrupted(c) => Row::new(
+            "Verified candidate",
+            candidate_or_none(c, "interrupted"),
             tone,
         ),
     };
@@ -213,6 +229,16 @@ pub fn verify_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) -> 
             integrity,
         ],
     }]
+}
+
+/// `<hex> · <word>` when a candidate was captured before the attempt ended,
+/// `none · <word>` when it was not (#139: cancelled or interrupted before
+/// capture ever succeeded — never an invented candidate).
+fn candidate_or_none(candidate: Option<ward_events::SnapshotId>, word: &str) -> String {
+    match candidate {
+        Some(c) => format!("{} · {word}", short_hex(c)),
+        None => format!("none · {word}"),
+    }
 }
 
 /// `12:43`: minutes and seconds into the session, as the observer's time column.
