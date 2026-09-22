@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ward_events::{EventRecord, LogReader, Origin, Pid, ShortText, WardEvent};
+use ward_events::{EventRecord, LogReader, Origin, ShortText, WardEvent};
 
 use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
@@ -171,15 +171,7 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
         let socket = socket.clone();
         workers.push(std::thread::spawn(move || {
             let sealed = serve_stream(stream, &served, peer);
-            {
-                let mut served = lock(&served);
-                served.peers.retain(|(id, _)| *id != peer);
-                // The connection is gone; nothing can ever supply a real
-                // terminal record for a launch it never finished reporting
-                // (PR #197 review, finding 3). A no-op when `peer` has no
-                // open launches — the common case.
-                served.abort_open_launches_for(peer);
-            }
+            lock(&served).peers.retain(|(id, _)| *id != peer);
             if sealed {
                 finished.store(true, Ordering::SeqCst);
                 // Wake the acceptor so it sees `finished`; the connection itself is
@@ -384,14 +376,22 @@ struct Served {
     /// or let one launch's end retire the other's grant (PR #197 review,
     /// finding 2).
     ///
-    /// Also carries the launch's own `pid` (from its `CommandStarted`), so a
-    /// connection that closes — client process killed, crashed, or the
-    /// control socket otherwise severed — without ever appending a terminal
-    /// record for it can still be closed out with a `LaunchAborted` naming
-    /// the right process, instead of leaving the entry (and the credential
-    /// it scopes) open forever (PR #197 review, finding 3; see
-    /// `abort_open_launches_for`).
-    open_launches: Vec<(u64, u64, Pid)>,
+    /// An entry here is removed only by that launch's own terminal record —
+    /// `CommandFinished`, or a `LaunchAborted` raised from inside
+    /// `Session::launch` itself for an ordinary Rust error. If the control
+    /// connection is severed before either ever arrives (the client process
+    /// is killed, crashes, or the socket is otherwise cut mid-launch), the
+    /// entry — and the grant it scopes — is left open: `wardd` has no handle
+    /// onto the client-side sandbox/egress proxy (`Egress::start` runs
+    /// inside the client's own `Session::run_launch`, not the daemon), so a
+    /// bare connection close cannot establish that the process or its
+    /// credential route has actually ended. Reporting the grant retired on
+    /// EOF alone would be an unsupported claim in the other direction;
+    /// conservatively-visible authority here is deliberate, not an
+    /// oversight (PR #197 review round 3). #140 stays open for a properly
+    /// designed disconnected/outcome-unknown lifecycle state — or a
+    /// host-owned teardown capability that could make EOF trustworthy.
+    open_launches: Vec<(u64, u64)>,
 }
 
 impl Served {
@@ -509,8 +509,8 @@ impl Served {
                 self.open_launches
                     .iter()
                     .rev()
-                    .find(|(c, _, _)| *c == conn)
-                    .map(|(_, key, _)| *key),
+                    .find(|(c, _)| *c == conn)
+                    .map(|(_, key)| *key),
             )),
             _ => None,
         };
@@ -546,23 +546,18 @@ impl Served {
                     control::unix_ms(SystemTime::now()),
                 );
             }
-            if launch_started && let WardEvent::CommandStarted { pid, .. } = &record.event {
-                let pid = *pid;
+            if launch_started {
                 // The record's own sequence number is unique and monotonic by
                 // construction (the log assigns it), unlike the client-chosen
                 // `Pid` inside the event: pairing it with `conn` is what makes
                 // this launch's key collision-free even when two connections
-                // pick the same `Pid` (PR #197 review, finding 2). `pid` is
-                // kept alongside so a connection that closes without ever
-                // reporting a terminal record can still be closed out with a
-                // `LaunchAborted` that names the right process (see
-                // `abort_open_launches_for`).
-                self.open_launches.push((conn, record.seq, pid));
+                // pick the same `Pid` (PR #197 review, finding 2).
+                self.open_launches.push((conn, record.seq));
             }
             if launch_finished
-                && let Some(pos) = self.open_launches.iter().rposition(|(c, _, _)| *c == conn)
+                && let Some(pos) = self.open_launches.iter().rposition(|(c, _)| *c == conn)
             {
-                let (_, key, _) = self.open_launches.remove(pos);
+                let (_, key) = self.open_launches.remove(pos);
                 // The route this launch's credentials were scoped to is torn
                 // down with it: they are no longer active authority, whether
                 // the launch ran to completion, failed, was killed over
@@ -580,53 +575,6 @@ impl Served {
             self.approvals.close();
         }
         (response, done)
-    }
-
-    /// Close out every launch still open on `conn` when that connection ends
-    /// without ever appending a terminal record for it — the client process
-    /// was killed, crashed, or the control socket was otherwise severed
-    /// mid-launch (PR #197 review, finding 3).
-    ///
-    /// `RemoteSink` is one connection, one request at a time, over a Unix
-    /// domain socket local to this host: there is no transient-network case
-    /// where the peer comes back and finishes the request on a *different*
-    /// connection, so a connection that has ended can never supply this
-    /// launch's real terminal record. This retires the launch's grant the
-    /// same way a real `LaunchAborted` does, and best-effort appends a
-    /// synthetic `LaunchAborted` record so the log itself reflects why (the
-    /// grant retirement happens regardless of whether that append succeeds —
-    /// e.g. the log may already be sealed — since the grant is meaningless
-    /// authority either way once nothing can ever report otherwise for it
-    /// again). This does not, and cannot, know whether the sandboxed process
-    /// itself is actually still running; it only stops the daemon from
-    /// reporting a credential as active authority once this connection can
-    /// never speak for it again.
-    ///
-    /// A no-op when `conn` has no open launches (the common case: most
-    /// connections never start one, or already finished it cleanly before
-    /// closing). Closes out every one of `conn`'s open launches, not just
-    /// one, since nothing about the protocol forbids a connection starting
-    /// more than one launch before closing.
-    fn abort_open_launches_for(&mut self, conn: u64) {
-        let mine: Vec<(u64, Pid)> = {
-            let mut mine = Vec::new();
-            self.open_launches.retain(|&(c, key, pid)| {
-                if c == conn {
-                    mine.push((key, pid));
-                    false
-                } else {
-                    true
-                }
-            });
-            mine
-        };
-        for (key, pid) in mine {
-            let reason = ShortText::new(
-                "the control connection closed before the launch reported a terminal outcome",
-            );
-            let _ = self.append(WardEvent::LaunchAborted { pid, reason });
-            self.approvals.retire_launch(key);
-        }
     }
 
     /// Append one `wardd`-origin record now, fanned out like any other.
@@ -1889,161 +1837,6 @@ mod tests {
                 reason: EndReason::UserStop,
             })
             .unwrap();
-        daemon.join().unwrap().unwrap();
-    }
-
-    /// PR #197 review, finding 3: `Session::launch`'s own abort path only
-    /// catches an ordinary `Err` — `SIGKILL`, a crash, or the client process
-    /// otherwise disappearing mid-launch never runs it, so before this fix
-    /// the daemon's `open_launches` kept that connection's grant open
-    /// forever once the connection itself was gone and could never report a
-    /// terminal record for it. This drives the exact reproduction the review
-    /// gave: append `CommandStarted` and a launch-scoped `CredentialGranted`
-    /// over one real connection, drop that connection without ever sending
-    /// `CommandFinished`/`LaunchAborted`, then query `Grants` over a second,
-    /// unrelated connection and confirm the grant did not survive.
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn a_connection_that_closes_without_a_terminal_record_does_not_leave_its_grant_open() {
-        use ward_events::{
-            BoundedArgv, CredentialDelivery, NameText, Pid, SandboxPath, SandboxRoot, Scope,
-            ServiceId,
-        };
-
-        let state = tempfile::tempdir().unwrap();
-        let id = "sess_disconnect_unit";
-        let dir = session_dir(state.path(), id);
-        std::fs::create_dir_all(&dir).unwrap();
-        let manifest = merge(
-            &Policy::default(),
-            &Policy::default(),
-            &Policy::default(),
-            ward_policy::SessionId(id.to_owned()),
-            ward_policy::ProjectId("proj_disconnect".to_owned()),
-        );
-        let meta = SessionMeta {
-            id: id.to_owned(),
-            project: PathBuf::from("/tmp/demo"),
-            project_id: "proj_disconnect".to_owned(),
-            entry_snapshot: "blake3:abc".to_owned(),
-            manifest,
-            started_unix_ms: control::unix_ms(SystemTime::now()),
-            agent: None,
-        };
-        std::fs::write(
-            dir.join("session.json"),
-            serde_json::to_vec_pretty(&meta).unwrap(),
-        )
-        .unwrap();
-        let log_path = dir.join("events.log");
-        {
-            let mut log = LocalLog::create(
-                &log_path,
-                SessionId::from_u128(12),
-                Blake3Hash::from_bytes([4; 32]),
-                SystemTime::now(),
-            )
-            .unwrap();
-            control::Sink::append(&mut log, Origin::Wardd, working(), SystemTime::now()).unwrap();
-        }
-
-        let (state_path, session) = (state.path().to_path_buf(), id.to_owned());
-        let daemon = std::thread::spawn(move || serve(&state_path, &session));
-        let socket = socket_path(state.path(), id);
-        assert!(wait_until(STARTUP_TIMEOUT, || serving(state.path(), id)));
-
-        let pid = Pid::new(2).unwrap();
-        {
-            // Connection A: starts a launch and is granted a launch-scoped
-            // credential, then closes (drops) without ever finishing it.
-            let mut a = RemoteSink::connect(&socket).unwrap();
-            assert!(matches!(
-                a.call(&Request::Append {
-                    origin: Origin::Kernel,
-                    event: WardEvent::CommandStarted {
-                        pid,
-                        parent: Pid::new(1).unwrap(),
-                        argv: BoundedArgv::from_bytes([b"true".as_slice()]),
-                        cwd: SandboxPath::new(SandboxRoot::Work, ".").unwrap(),
-                        exe_digest: None,
-                    },
-                    at_unix_ms: control::unix_ms(SystemTime::now()),
-                })
-                .unwrap(),
-                Response::Record(_)
-            ));
-            assert!(matches!(
-                a.call(&Request::Append {
-                    origin: Origin::Kernel,
-                    event: WardEvent::CredentialGranted {
-                        service: ServiceId::new("github").unwrap(),
-                        scope: Scope {
-                            subject: ShortText::new("api.github.com:443"),
-                            permissions: vec![NameText::new("contents:read")],
-                        },
-                        expires: Duration::from_secs(60),
-                        delivery: CredentialDelivery::ProxyInjected,
-                    },
-                    at_unix_ms: control::unix_ms(SystemTime::now()),
-                })
-                .unwrap(),
-                Response::Record(_)
-            ));
-            // `a` drops here: the connection closes with no terminal record
-            // ever sent for the launch it started.
-        }
-
-        // Give the daemon's per-connection worker thread a bounded window to
-        // notice the close and run its cleanup before asserting on it.
-        let socket_for_wait = socket.clone();
-        assert!(wait_until(Duration::from_secs(5), || {
-            let Some(mut b) = RemoteSink::connect(&socket_for_wait) else {
-                return false;
-            };
-            matches!(b.call(&Request::Grants), Ok(Response::Grants(g)) if g.is_empty())
-        }));
-
-        // Over a second, unrelated connection: the grant must be gone, and
-        // the log itself must show the launch was closed out with
-        // `LaunchAborted`, not left dangling at a bare `CommandStarted`.
-        let mut b = RemoteSink::connect(&socket).unwrap();
-        match b.call(&Request::Grants).unwrap() {
-            Response::Grants(grants) => assert!(
-                grants.is_empty(),
-                "a grant from a connection that closed without a terminal record must \
-                 not survive: {grants:?}"
-            ),
-            other => panic!("{other:?}"),
-        }
-        let records: Vec<_> = LogReader::open(&log_path)
-            .unwrap()
-            .map(std::result::Result::unwrap)
-            .collect();
-        let last_launch_record = records
-            .iter()
-            .rev()
-            .find(|r| {
-                matches!(
-                    r.event,
-                    WardEvent::CommandStarted { .. }
-                        | WardEvent::CommandFinished { .. }
-                        | WardEvent::LaunchAborted { .. }
-                )
-            })
-            .expect("the launch appended at least CommandStarted");
-        assert!(
-            matches!(
-                last_launch_record.event,
-                WardEvent::LaunchAborted { pid: p, .. } if p == pid
-            ),
-            "expected LaunchAborted for pid {pid} last, got {:?}",
-            last_launch_record.event
-        );
-
-        b.call(&Request::Stop {
-            reason: EndReason::UserStop,
-        })
-        .unwrap();
         daemon.join().unwrap().unwrap();
     }
 }
