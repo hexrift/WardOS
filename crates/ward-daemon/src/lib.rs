@@ -35,6 +35,7 @@ pub mod sandbox;
 pub mod selftest;
 pub mod session;
 pub mod snapshot;
+pub mod usage;
 pub mod verify;
 pub mod watch;
 

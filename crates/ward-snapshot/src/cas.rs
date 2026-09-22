@@ -7,10 +7,51 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Result, SnapshotError};
 use crate::id::{Digest, SnapshotId, SnapshotRole};
 use crate::manifest::Manifest;
 use crate::meta::SnapshotMeta;
+
+/// Object count and byte total of one on-disk CAS category, read straight from
+/// the filesystem (no hashing, no parsing): how many files [`Cas::usage`] found
+/// under that category's directory and how many bytes they hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CategoryUsage {
+    /// Regular files found.
+    pub objects: u64,
+    /// Their combined size in bytes.
+    pub bytes: u64,
+}
+
+impl CategoryUsage {
+    fn add_file(&mut self, len: u64) {
+        self.objects += 1;
+        self.bytes += len;
+    }
+}
+
+/// Disk usage of the three CAS categories (`ward snapshot usage`, #151). Blobs
+/// are content-addressed and deduplicated, so their total is the store's real
+/// footprint for file content — not the sum of what any one snapshot captured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CasUsage {
+    /// `blobs/`: deduplicated file and symlink-target content.
+    pub blobs: CategoryUsage,
+    /// `manifests/`: one file per stored snapshot manifest.
+    pub manifests: CategoryUsage,
+    /// `meta/`: one file per stored `(snapshot, role)` metadata record.
+    pub meta: CategoryUsage,
+}
+
+impl CasUsage {
+    /// The three categories' combined bytes.
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        self.blobs.bytes + self.manifests.bytes + self.meta.bytes
+    }
+}
 
 /// A CAS rooted at a caller-provided directory (e.g. `/var/lib/ward/cas`).
 #[derive(Clone, Debug)]
@@ -131,6 +172,68 @@ impl Cas {
         serde_json::from_slice(&bytes)
             .map_err(|e| SnapshotError::Manifest(format!("meta parse: {e}")))
     }
+
+    /// Disk usage of `blobs`, `manifests` and `meta`: an object count and a byte
+    /// total per category, read from directory metadata alone (#151). This is a
+    /// read-only report — it never opens, hashes or deletes anything, and a blob
+    /// shared by many snapshots is still counted exactly once.
+    ///
+    /// A blob or manifest write in progress elsewhere leaves a short-lived
+    /// `.tmp-<pid>-<seq>` sibling ([`write_atomic`]) before its rename; a usage
+    /// call that races it may count that temp file once, for the duration of
+    /// that one write. This is a benign, transient overcount, not a correctness
+    /// issue: the temp file holds real bytes on disk either way, and the count
+    /// self-corrects on the next call once the rename (or its cleanup) lands.
+    pub fn usage(&self) -> Result<CasUsage> {
+        Ok(CasUsage {
+            blobs: dir_usage(&self.root.join("blobs"))?,
+            manifests: dir_usage(&self.root.join("manifests"))?,
+            meta: dir_usage(&self.root.join("meta"))?,
+        })
+    }
+}
+
+/// Sum of regular-file sizes under `dir`, recursing into subdirectories (the
+/// two-hex-character shards under `blobs/`). A missing `dir` counts as empty
+/// rather than an error, so a CAS that has never stored a category reports zero
+/// for it instead of failing the whole report. Symlinks are skipped; the CAS
+/// itself never writes one.
+fn dir_usage(dir: &Path) -> Result<CategoryUsage> {
+    let mut usage = CategoryUsage::default();
+    walk_dir_usage(dir, &mut usage)?;
+    Ok(usage)
+}
+
+fn walk_dir_usage(dir: &Path, usage: &mut CategoryUsage) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(SnapshotError::io(dir, e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| SnapshotError::io(dir, e))?;
+        // An entry this `read_dir` just listed can still vanish before it is
+        // `stat`ed — a concurrent capture or (once #151's follow-up GC lands) a
+        // reclaim can legitimately remove it between the two calls. A read-only
+        // report tolerates that as "gone, so nothing to count", not a hard
+        // error; anything other than `NotFound` still fails the report.
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(SnapshotError::io(dir, e)),
+        };
+        if file_type.is_dir() {
+            walk_dir_usage(&entry.path(), usage)?;
+        } else if file_type.is_file() {
+            let len = match entry.metadata() {
+                Ok(m) => m.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(SnapshotError::io(dir, e)),
+            };
+            usage.add_file(len);
+        }
+    }
+    Ok(())
 }
 
 /// Write `bytes` to `path` atomically via a sibling temp file and rename.
@@ -194,5 +297,84 @@ mod integrity_tests {
             matches!(cas.get_manifest(id), Err(SnapshotError::Integrity(_))),
             "a manifest that does not hash to its requested id must be refused"
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::manifest::{Entry, EntryType};
+
+    #[test]
+    fn an_empty_cas_reports_zero_everywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(dir.path()).unwrap();
+        let usage = cas.usage().unwrap();
+        assert_eq!(usage, CasUsage::default());
+        assert_eq!(usage.total_bytes(), 0);
+    }
+
+    #[test]
+    fn a_shared_blob_is_counted_once_not_once_per_referrer() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(dir.path()).unwrap();
+        // The same bytes stored twice (as two different manifests might reference
+        // it) must land on disk, and be counted, exactly once — that is the whole
+        // point of content addressing.
+        let d1 = cas.put_blob(b"shared content").unwrap();
+        let d2 = cas.put_blob(b"shared content").unwrap();
+        assert_eq!(d1, d2);
+        let usage = cas.usage().unwrap();
+        assert_eq!(usage.blobs.objects, 1);
+        assert_eq!(usage.blobs.bytes, b"shared content".len() as u64);
+    }
+
+    #[test]
+    fn each_category_counts_only_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(dir.path()).unwrap();
+        cas.put_blob(b"one blob, 8 bytes").unwrap();
+        let manifest = Manifest::from_entries(vec![Entry {
+            path: b"a".to_vec(),
+            kind: EntryType::Dir,
+            mode: 0o755,
+            size: 0,
+            content: None,
+        }])
+        .unwrap();
+        let id = cas.put_manifest(&manifest).unwrap();
+        cas.put_meta(&SnapshotMeta {
+            id,
+            role: SnapshotRole::Entry,
+            entries: 1,
+            bytes: 0,
+            capture_mode: crate::meta::CaptureMode::FrozenCopy,
+            git_context: None,
+        })
+        .unwrap();
+
+        let usage = cas.usage().unwrap();
+        assert_eq!(usage.blobs.objects, 1);
+        assert_eq!(usage.manifests.objects, 1);
+        assert_eq!(usage.meta.objects, 1);
+        assert!(usage.manifests.bytes > 0);
+        assert!(usage.meta.bytes > 0);
+        assert_eq!(
+            usage.total_bytes(),
+            usage.blobs.bytes + usage.manifests.bytes + usage.meta.bytes
+        );
+    }
+
+    #[test]
+    fn a_cas_that_has_never_written_one_category_reports_zero_for_it_not_an_error() {
+        // `Cas::open` creates all three directories, so this also covers the case
+        // of a category directory being absent entirely (a store from before this
+        // feature, or a category never used).
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(dir.path()).unwrap();
+        std::fs::remove_dir_all(dir.path().join("meta")).unwrap();
+        let usage = cas.usage().unwrap();
+        assert_eq!(usage.meta, CategoryUsage::default());
     }
 }
