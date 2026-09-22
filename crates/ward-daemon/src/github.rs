@@ -3,7 +3,7 @@
 //! and the manifest's `credentials.github` rule decides whether, and for which
 //! repository, the grant is made.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ward_policy::{CapabilityManifest, CredentialRule, CredentialScope, RepoSelector, ServiceId};
 
@@ -78,13 +78,13 @@ pub enum Grant {
     /// No token on the host.
     NoKey,
     /// The scope names the current repository but the session has no pinned
-    /// GitHub remote for it (see [`pinned_origin_repo`]).
+    /// GitHub remote for it (see [`resolve_origin_repo`]).
     NoRemote,
 }
 
 /// Decide the grant for this launch: the manifest's rule, the user's explicit
 /// request (`--grant github`), the repository pinned for the session
-/// (`current_repo`, see [`pinned_origin_repo`]), and the host token.
+/// (`current_repo`, see [`resolve_origin_repo`]), and the host token.
 ///
 /// `current_repo` is never re-derived from the live worktree here — it is
 /// whatever the caller fixed at session start, so a `.git/config` edit made
@@ -140,30 +140,85 @@ fn repositories(scope: &CredentialScope, current_repo: Option<&str>) -> Option<V
         .collect()
 }
 
-/// `owner/repo` of `origin`, read from the *entry* snapshot's captured
-/// `.git/config` under `state`'s CAS rather than from the live worktree
-/// (issue #196).
+/// `owner/repo` of `origin`, resolved once against the worktree when the
+/// session starts (`Session::start_in`) and carried from then on in
+/// [`SessionMeta::origin_repo`](crate::session::SessionMeta::origin_repo) —
+/// never re-derived from the live worktree at grant time (issue #196).
 ///
-/// The entry snapshot is written once by the host, before the sandbox
-/// exists, and — like every snapshot — is immutable and unreachable from it
-/// (security-model G5). Reading `remote.origin.url` from it instead of
-/// shelling out to `git -C <worktree> config --get remote.origin.url`
-/// against the live, agent-writable worktree means a `git remote set-url
-/// origin …` (or a hand edit of `.git/config`) the agent makes after the
-/// session starts cannot change what `RepoSelector::CurrentRepository`
-/// resolves to for the rest of the session — the same trust boundary the
-/// snapshot capturer already draws around a tampered `.git/HEAD`
-/// (`ward-snapshot/src/capture.rs`, `read_git_context`). `None` when the
-/// CAS, the snapshot id, the file, or the `[remote "origin"]` stanza is
-/// missing — callers treat that as "no remote", never fall back to the live
-/// worktree.
+/// This runs before the sandbox exists, the same trust window the entry
+/// snapshot capture itself relies on, so a `git remote set-url origin …`
+/// (or a hand edit of `.git/config`) the agent makes after the session
+/// starts cannot change what `RepoSelector::CurrentRepository` resolves to
+/// for the rest of the session: nothing after this one call ever looks at
+/// `.git` again.
+///
+/// Resolves `.git` the way git itself does, not just the ordinary-repository
+/// case: a plain directory for a normal clone, or the `gitdir: <path>`
+/// pointer file git writes for a linked worktree (`git worktree add`) or a
+/// submodule checkout, in which case `remote.origin.url` typically lives in
+/// the *common* directory shared with the main working tree, found via that
+/// directory's own `commondir` file (see [`resolve_git_dir`],
+/// [`resolve_common_dir`]). `None` when `.git`, the resolved `config`, or
+/// the `[remote "origin"]` stanza is missing — callers treat that as "no
+/// remote", never fall back to a guess.
 #[must_use]
-pub fn pinned_origin_repo(state: &Path, entry_snapshot: &str) -> Option<String> {
-    let store = ward_snapshot::SnapshotStore::open(state.join("cas")).ok()?;
-    let id: ward_snapshot::SnapshotId = entry_snapshot.parse().ok()?;
-    let bytes = store.cat(id, Path::new(".git/config")).ok()?;
-    let url = origin_url_from_gitconfig(&String::from_utf8_lossy(&bytes))?;
+pub fn resolve_origin_repo(worktree: &Path) -> Option<String> {
+    let git_dir = resolve_git_dir(worktree)?;
+    let common_dir = resolve_common_dir(&git_dir);
+    let text = std::fs::read_to_string(common_dir.join("config")).ok()?;
+    let url = origin_url_from_gitconfig(&text)?;
     repo_from_remote(url.trim())
+}
+
+/// `.git` resolved to the directory it actually names: itself when it is a
+/// directory (an ordinary clone or bare checkout), or the target of the
+/// `gitdir: <path>` pointer file git writes in place of `.git` for a linked
+/// worktree or a submodule checkout. `None` for anything else, including a
+/// `.git` that does not exist, an empty or malformed pointer file, or a
+/// pointer with no `gitdir:` prefix.
+fn resolve_git_dir(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    if meta.is_dir() {
+        return Some(dot_git);
+    }
+    if !meta.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let target = text.trim().strip_prefix("gitdir:")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let target = Path::new(target);
+    Some(if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        worktree.join(target)
+    })
+}
+
+/// The directory `config` (and `refs`) actually live in: `git_dir` itself,
+/// or the directory its own `commondir` file names. A linked worktree's
+/// private git directory (`resolve_git_dir`'s result for one) keeps its own
+/// `HEAD` but shares `config` — and so `remote.origin.url` — with the main
+/// working tree through this file. An ordinary repository, and a
+/// submodule's own private git directory, has no `commondir` file, so
+/// `git_dir` is already the directory `config` lives in.
+fn resolve_common_dir(git_dir: &Path) -> PathBuf {
+    let Ok(text) = std::fs::read_to_string(git_dir.join("commondir")) else {
+        return git_dir.to_path_buf();
+    };
+    let target = text.trim();
+    if target.is_empty() {
+        return git_dir.to_path_buf();
+    }
+    let target = Path::new(target);
+    if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        git_dir.join(target)
+    }
 }
 
 /// The `url` value of the `[remote "origin"]` stanza in `.git/config` text.
@@ -381,10 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_origin_repo_reads_the_entry_snapshots_config_not_the_live_worktree() {
-        use ward_snapshot::{CaptureOptions, SnapshotRole, SnapshotStore};
-
-        let state = tempfile::tempdir().unwrap();
+    fn resolve_origin_repo_reads_an_ordinary_git_config() {
         let worktree = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(worktree.path().join(".git")).unwrap();
         std::fs::write(
@@ -392,61 +444,110 @@ mod tests {
             "[remote \"origin\"]\n\turl = https://github.com/hexrift/WardOS.git\n",
         )
         .unwrap();
-
-        let store = SnapshotStore::open(state.path().join("cas")).unwrap();
-        let entry = store
-            .store_snapshot(
-                worktree.path(),
-                SnapshotRole::Entry,
-                CaptureOptions::default(),
-            )
-            .unwrap();
-
-        // The pinned value matches what was true at capture time.
         assert_eq!(
-            pinned_origin_repo(state.path(), &entry.to_string()).as_deref(),
+            resolve_origin_repo(worktree.path()).as_deref(),
             Some("hexrift/WardOS")
-        );
-
-        // An agent-style tamper of the *live* worktree after the snapshot was
-        // taken — exactly `git remote set-url origin <attacker-repo>` — must not
-        // change what the already-captured entry snapshot resolves to.
-        std::fs::write(
-            worktree.path().join(".git/config"),
-            "[remote \"origin\"]\n\turl = https://github.com/attacker/evil.git\n",
-        )
-        .unwrap();
-        assert_eq!(
-            pinned_origin_repo(state.path(), &entry.to_string()).as_deref(),
-            Some("hexrift/WardOS"),
-            "a live .git/config edit redirected a repo pinned at session start"
         );
     }
 
     #[test]
-    fn pinned_origin_repo_is_none_when_the_snapshot_has_no_git_config() {
-        use ward_snapshot::{CaptureOptions, SnapshotRole, SnapshotStore};
-
-        let state = tempfile::tempdir().unwrap();
+    fn resolve_origin_repo_is_none_without_a_resolvable_git_config() {
+        // No `.git` at all.
         let worktree = tempfile::tempdir().unwrap();
         std::fs::write(worktree.path().join("README.md"), "demo\n").unwrap();
+        assert_eq!(resolve_origin_repo(worktree.path()), None);
 
-        let store = SnapshotStore::open(state.path().join("cas")).unwrap();
-        let entry = store
-            .store_snapshot(
-                worktree.path(),
-                SnapshotRole::Entry,
-                CaptureOptions::default(),
-            )
-            .unwrap();
-        assert_eq!(pinned_origin_repo(state.path(), &entry.to_string()), None);
-        // A nonsense snapshot id, or an empty/uninitialised CAS, is also `None`,
-        // never a panic or a fallback to something else.
-        assert_eq!(pinned_origin_repo(state.path(), "not-a-snapshot-id"), None);
-        let empty_state = tempfile::tempdir().unwrap();
+        // `.git` is a directory, but has no `config`.
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".git")).unwrap();
+        assert_eq!(resolve_origin_repo(worktree.path()), None);
+
+        // `.git` is a directory with a `config` that has no `[remote "origin"]`.
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".git")).unwrap();
+        std::fs::write(worktree.path().join(".git/config"), "[core]\n").unwrap();
+        assert_eq!(resolve_origin_repo(worktree.path()), None);
+    }
+
+    #[test]
+    fn resolve_origin_repo_follows_a_linked_worktrees_gitdir_pointer_via_commondir() {
+        // `git worktree add` layout: the main repo keeps `origin` in its own
+        // `.git/config`; the linked worktree's `.git` is a `gitdir: <path>`
+        // pointer file naming a private directory under the main repo's
+        // `.git/worktrees/<name>`, whose own `commondir` file points back at
+        // the main repo's `.git` for `config`.
+        let main_repo = tempfile::tempdir().unwrap();
+        let main_git = main_repo.path().join(".git");
+        std::fs::create_dir_all(&main_git).unwrap();
+        std::fs::write(
+            main_git.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/hexrift/WardOS.git\n",
+        )
+        .unwrap();
+        let private_git_dir = main_git.join("worktrees").join("feature-x");
+        std::fs::create_dir_all(&private_git_dir).unwrap();
+        std::fs::write(private_git_dir.join("HEAD"), "ref: refs/heads/feature-x\n").unwrap();
+        std::fs::write(private_git_dir.join("commondir"), "../..\n").unwrap();
+
+        let linked_worktree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            linked_worktree.path().join(".git"),
+            format!("gitdir: {}\n", private_git_dir.display()),
+        )
+        .unwrap();
+
         assert_eq!(
-            pinned_origin_repo(empty_state.path(), &entry.to_string()),
-            None
+            resolve_origin_repo(linked_worktree.path()).as_deref(),
+            Some("hexrift/WardOS")
         );
+    }
+
+    #[test]
+    fn resolve_origin_repo_follows_a_submodules_gitdir_pointer_with_no_commondir() {
+        // A submodule's private git directory (under the superproject's
+        // `.git/modules/<name>`) keeps `config` directly — no `commondir`
+        // indirection, unlike a linked worktree.
+        let superproject = tempfile::tempdir().unwrap();
+        let module_git_dir = superproject
+            .path()
+            .join(".git")
+            .join("modules")
+            .join("libfoo");
+        std::fs::create_dir_all(&module_git_dir).unwrap();
+        std::fs::write(
+            module_git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = https://github.com/hexrift/libfoo.git\n",
+        )
+        .unwrap();
+
+        let submodule_checkout = tempfile::tempdir().unwrap();
+        std::fs::write(
+            submodule_checkout.path().join(".git"),
+            format!("gitdir: {}\n", module_git_dir.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_origin_repo(submodule_checkout.path()).as_deref(),
+            Some("hexrift/libfoo")
+        );
+    }
+
+    #[test]
+    fn resolve_origin_repo_rejects_a_malformed_gitdir_pointer() {
+        let worktree = tempfile::tempdir().unwrap();
+        // No `gitdir:` prefix at all.
+        std::fs::write(worktree.path().join(".git"), "not a pointer\n").unwrap();
+        assert_eq!(resolve_origin_repo(worktree.path()), None);
+
+        let worktree = tempfile::tempdir().unwrap();
+        // `gitdir:` present but empty.
+        std::fs::write(worktree.path().join(".git"), "gitdir: \n").unwrap();
+        assert_eq!(resolve_origin_repo(worktree.path()), None);
+
+        let worktree = tempfile::tempdir().unwrap();
+        // `gitdir:` naming a directory that does not exist.
+        std::fs::write(worktree.path().join(".git"), "gitdir: /no/such/dir\n").unwrap();
+        assert_eq!(resolve_origin_repo(worktree.path()), None);
     }
 }

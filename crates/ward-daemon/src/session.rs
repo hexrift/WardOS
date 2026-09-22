@@ -40,6 +40,7 @@ pub struct Session {
     manifest: CapabilityManifest,
     worktree: PathBuf,
     entry_snapshot: String,
+    origin_repo: Option<String>,
     sink: Box<dyn Sink>,
     started: SystemTime,
     agent: AgentIdentity,
@@ -62,6 +63,14 @@ pub struct SessionMeta {
     pub project_id: String,
     /// Entry snapshot id (`blake3:…`).
     pub entry_snapshot: String,
+    /// `owner/repo` of the worktree's `origin` remote, resolved once when
+    /// the session started (see [`github::resolve_origin_repo`]) and never
+    /// re-read afterward — the value `RepoSelector::CurrentRepository`
+    /// grants use for the rest of the session (issue #196). `None` when
+    /// there was no resolvable origin at session start. Absent (defaults to
+    /// `None`) in records written before this field was persisted.
+    #[serde(default)]
+    pub origin_repo: Option<String>,
     /// The effective capability manifest.
     pub manifest: CapabilityManifest,
     /// Session start time, milliseconds since the Unix epoch.
@@ -275,6 +284,10 @@ impl Session {
         let entry = store
             .store_snapshot(&worktree, SnapshotRole::Entry, CaptureOptions::default())
             .map_err(|e| Error::Snapshot(e.to_string()))?;
+        // Resolved once, here, against the live worktree — before the sandbox
+        // exists, the same trust window the entry snapshot capture above
+        // relies on — and never again for the rest of the session (issue #196).
+        let origin_repo = github::resolve_origin_repo(&worktree);
 
         let session_dir = session_dir(state, &session_str);
         std::fs::create_dir_all(&session_dir).map_err(|e| Error::io(&session_dir, e))?;
@@ -298,6 +311,7 @@ impl Session {
             manifest,
             worktree,
             entry_snapshot: entry.to_string(),
+            origin_repo,
             sink,
             started,
             agent: agent.clone(),
@@ -344,6 +358,9 @@ impl Session {
             manifest: meta.manifest,
             worktree,
             entry_snapshot: meta.entry_snapshot,
+            // Carried over from the record written at session start, never
+            // recomputed from the (possibly since-reopened) live worktree.
+            origin_repo: meta.origin_repo,
             sink,
             started,
             agent: meta.agent.unwrap_or_else(unknown_agent),
@@ -364,6 +381,7 @@ impl Session {
             project: self.worktree.clone(),
             project_id: self.project_id.clone(),
             entry_snapshot: self.entry_snapshot.clone(),
+            origin_repo: self.origin_repo.clone(),
             manifest: self.manifest.clone(),
             started_unix_ms: unix_ms(self.started),
             agent: Some(self.agent.clone()),
@@ -541,12 +559,16 @@ impl Session {
         let mut refusals = Vec::new();
         let mut notes = Vec::new();
         let requested = grants.iter().any(|g| g == github::SERVICE);
-        // Fixed once, from the entry snapshot's captured `.git/config`, never
-        // from the live worktree at grant time (issue #196): a `.git/config`
-        // edit the agent makes mid-session cannot redirect where a
+        // Fixed once, at session start (`self.origin_repo`), never re-read from
+        // the live worktree at grant time (issue #196): a `.git/config` edit
+        // the agent makes mid-session cannot redirect where a
         // `RepoSelector::CurrentRepository` credential grant points.
-        let current_repo = github::pinned_origin_repo(&self.state, &self.entry_snapshot);
-        match github::grant(&self.manifest, current_repo.as_deref(), &self.state, requested)? {
+        match github::grant(
+            &self.manifest,
+            self.origin_repo.as_deref(),
+            &self.state,
+            requested,
+        )? {
             github::Grant::Granted {
                 gateways: routes,
                 repos,
@@ -1386,6 +1408,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: "proj_test".to_owned(),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest,
             started_unix_ms: 1_700_000_000_000,
             agent: None,
