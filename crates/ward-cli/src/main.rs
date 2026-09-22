@@ -941,6 +941,7 @@ fn cmd_agent(
         eprintln!("ward: {note}");
     }
     let report = session.launch(&command, &opts)?;
+    warn_if_observer_degraded(&report);
     if throwaway {
         session.stop(EndReason::UserStop)?;
     } else {
@@ -949,6 +950,17 @@ fn cmd_agent(
     println!();
     render_log(&log);
     Ok(exit_code(report.code))
+}
+
+/// Tell the user when a run's activity log may be incomplete: the inotify
+/// watch lost coverage of some directory (see [`ward_daemon::RunReport::observer_degraded`]).
+fn warn_if_observer_degraded(report: &ward_daemon::RunReport) {
+    if report.observer_degraded {
+        eprintln!(
+            "ward: file observation degraded during this run — a directory could not be \
+             watched, so changes under it may be missing from the log above"
+        );
+    }
 }
 
 fn cmd_run(dir: &Path, argv: &[String]) -> ward_daemon::Result<ExitCode> {
@@ -961,6 +973,7 @@ fn cmd_run(dir: &Path, argv: &[String]) -> ward_daemon::Result<ExitCode> {
     };
     let log = session.log_path();
     let report = session.run(argv)?;
+    warn_if_observer_degraded(&report);
     let code = report.code;
     if throwaway {
         session.stop(EndReason::UserStop)?;

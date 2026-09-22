@@ -138,6 +138,11 @@ pub struct RunReport {
     pub duration: Duration,
     /// Which capture source produced the file events.
     pub capture: CaptureMode,
+    /// Whether the inotify watch lost coverage of some part of the worktree
+    /// during this run (a nested directory could not be, or could not be
+    /// re-, registered). Always `false` for [`CaptureMode::Scan`], which has
+    /// no notion of partial coverage. See #144.
+    pub observer_degraded: bool,
     /// Captured stdout.
     pub stdout: String,
     /// Captured stderr.
@@ -652,14 +657,8 @@ impl Session {
         let launch = self.prepare(argv, opts, &run_dir, &egress, &hooks)?;
         let outcome = launch.run()?;
 
-        let (captured, capture) = match (watcher, before) {
-            (Some(w), _) => (w.finish(), CaptureMode::Inotify),
-            (None, Some(before)) => {
-                let after = scan(&self.worktree);
-                (scan_changes(&before, &after), CaptureMode::Scan)
-            }
-            (None, None) => (Vec::new(), CaptureMode::Scan),
-        };
+        let (captured, capture, observer_degraded) =
+            collect_captured(watcher, before, &self.worktree);
 
         let comm = comm(argv);
         let changed_paths = self.emit_captured(&captured, pid, comm.as_ref())?;
@@ -699,6 +698,7 @@ impl Session {
             files_changed: changed_paths.len(),
             duration: outcome.duration,
             capture,
+            observer_degraded,
             stdout: outcome.stdout,
             stderr: outcome.stderr,
         })
@@ -1210,6 +1210,29 @@ fn clear_current(state: &Path, project_id: &str, id: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve which file events a run produced: the live inotify watch when one
+/// started, or a before/after scan otherwise. Returns the events, which
+/// source produced them, and whether the watch lost coverage of part of the
+/// worktree (always `false` for a scan, which has no notion of partial
+/// coverage).
+fn collect_captured(
+    watcher: Option<Watcher>,
+    before: Option<BTreeMap<String, (u128, u64)>>,
+    worktree: &Path,
+) -> (Vec<Captured>, CaptureMode, bool) {
+    match (watcher, before) {
+        (Some(w), _) => {
+            let watch = w.finish();
+            (watch.captured, CaptureMode::Inotify, watch.degraded)
+        }
+        (None, Some(before)) => {
+            let after = scan(worktree);
+            (scan_changes(&before, &after), CaptureMode::Scan, false)
+        }
+        (None, None) => (Vec::new(), CaptureMode::Scan, false),
+    }
 }
 
 /// Map relative worktree paths to (mtime, size), skipping `.git` and `target`.

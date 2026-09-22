@@ -86,11 +86,32 @@ const POLL_CAP_MS: u16 = 500;
 /// Debounce window: repeats of the same (path, kind) within it are dropped.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// What a finished [`Watcher`] observed.
+#[derive(Default)]
+pub struct WatchOutcome {
+    /// Captured accesses, in observed order.
+    pub captured: Vec<Captured>,
+    /// Whether at least one directory under the worktree could not be (or could
+    /// not be re-) registered — a create/move-in raced the watch, a nested
+    /// directory disappeared before it could be added, or a permission denied
+    /// it. That subtree's future changes are not guaranteed to be captured.
+    pub degraded: bool,
+}
+
+/// Registered watch descriptors, plus whether registering one of them has
+/// ever failed (bundled together so the functions that thread both through
+/// the watch loop stay under the lint's argument-count limit).
+#[derive(Default)]
+struct WatchState {
+    wds: HashMap<WatchDescriptor, PathBuf>,
+    degraded: bool,
+}
+
 /// A running inotify watch over one worktree.
 pub struct Watcher {
     stop: Arc<AtomicBool>,
     wake: UnixStream,
-    handle: JoinHandle<Vec<Captured>>,
+    handle: JoinHandle<WatchOutcome>,
 }
 
 impl Watcher {
@@ -99,7 +120,9 @@ impl Watcher {
     ///
     /// # Errors
     /// [`Errno`] if the inotify instance cannot be created or the root cannot be
-    /// watched; the caller should fall back to a directory scan.
+    /// watched; the caller should fall back to a directory scan. A nested
+    /// directory that cannot be watched does not fail this call: it is instead
+    /// reported through [`WatchOutcome::degraded`] once the watch finishes.
     pub fn start(worktree: &Path, watch_reads: bool) -> Result<Self, Errno> {
         let inotify = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC)?;
         let mut flags = AddWatchFlags::IN_CREATE
@@ -116,22 +139,22 @@ impl Watcher {
         }
 
         let root = worktree.to_path_buf();
-        let mut wds: HashMap<WatchDescriptor, PathBuf> = HashMap::new();
-        add_watch_recursive(&inotify, flags, &root, &mut wds)?;
+        let mut state = WatchState::default();
+        add_watch_recursive(&inotify, flags, &root, &mut state)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let (wake, wake_rx) =
             UnixStream::pair().map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(0)))?;
         let handle = std::thread::spawn(move || {
-            watch_loop(&inotify, flags, &root, &mut wds, &stop_thread, &wake_rx)
+            watch_loop(&inotify, flags, &root, state, &stop_thread, &wake_rx)
         });
         Ok(Self { stop, wake, handle })
     }
 
-    /// Stop watching and return the captured events in observed order.
+    /// Stop watching and return what was observed.
     #[must_use]
-    pub fn finish(mut self) -> Vec<Captured> {
+    pub fn finish(mut self) -> WatchOutcome {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.wake.write_all(&[1]);
         self.handle.join().unwrap_or_default()
@@ -145,15 +168,23 @@ fn watch_loop(
     inotify: &Inotify,
     flags: AddWatchFlags,
     root: &Path,
-    wds: &mut HashMap<WatchDescriptor, PathBuf>,
+    mut state: WatchState,
     stop: &AtomicBool,
     wake: &UnixStream,
-) -> Vec<Captured> {
+) -> WatchOutcome {
     let started = Instant::now();
     let mut debouncer = Debouncer::new(DEBOUNCE);
     let mut out = Vec::new();
     loop {
-        let drained = drain(inotify, flags, root, wds, &mut debouncer, started, &mut out);
+        let drained = drain(
+            inotify,
+            flags,
+            root,
+            &mut state,
+            &mut debouncer,
+            started,
+            &mut out,
+        );
         if stop.load(Ordering::Relaxed) {
             // One final pass catches events queued just before the command exited.
             if !drained {
@@ -169,7 +200,10 @@ fn watch_loop(
             }
         }
     }
-    out
+    WatchOutcome {
+        captured: out,
+        degraded: state.degraded,
+    }
 }
 
 /// Read and translate one batch of events. Returns whether any were read.
@@ -177,7 +211,7 @@ fn drain(
     inotify: &Inotify,
     flags: AddWatchFlags,
     root: &Path,
-    wds: &mut HashMap<WatchDescriptor, PathBuf>,
+    state: &mut WatchState,
     debouncer: &mut Debouncer,
     started: Instant,
     out: &mut Vec<Captured>,
@@ -193,7 +227,7 @@ fn drain(
     let now = started.elapsed();
     let at = SystemTime::now();
     for ev in events {
-        let Some(dir) = wds.get(&ev.wd).cloned() else {
+        let Some(dir) = state.wds.get(&ev.wd).cloned() else {
             continue;
         };
         let Some(name) = ev.name.as_deref() else {
@@ -204,8 +238,15 @@ fn drain(
         }
         let full = dir.join(name);
         let is_dir = ev.mask.contains(AddWatchFlags::IN_ISDIR);
-        if is_dir && ev.mask.contains(AddWatchFlags::IN_CREATE) {
-            let _ = add_watch_recursive(inotify, flags, &full, wds);
+        // A directory can become part of the tree either by being created in
+        // place or by being moved in from elsewhere; either way its own subtree
+        // needs the same recursive registration or its future changes are
+        // silently uncaptured.
+        let entered = ev
+            .mask
+            .intersects(AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO);
+        if is_dir && entered && add_watch_recursive(inotify, flags, &full, state).is_err() {
+            state.degraded = true;
         }
         let Some(rel) = relative(root, &full) else {
             continue;
@@ -263,22 +304,28 @@ pub fn change_kind(mask: AddWatchFlags) -> Option<FileChangeKind> {
 }
 
 /// Add a watch for `dir` and, recursively, its non-skipped subdirectories.
+/// `dir` itself failing to register is returned to the caller (the top-level
+/// call fails the whole watch this way); a nested subdirectory failing instead
+/// sets `state.degraded` and is otherwise skipped, so one unwatchable child
+/// does not stop its siblings from being registered.
 fn add_watch_recursive(
     inotify: &Inotify,
     flags: AddWatchFlags,
     dir: &Path,
-    wds: &mut HashMap<WatchDescriptor, PathBuf>,
+    state: &mut WatchState,
 ) -> Result<(), Errno> {
     let wd = inotify.add_watch(dir, flags)?;
-    wds.insert(wd, dir.to_path_buf());
+    state.wds.insert(wd, dir.to_path_buf());
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             if SKIP.contains(&&*name.to_string_lossy()) {
                 continue;
             }
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                let _ = add_watch_recursive(inotify, flags, &entry.path(), wds);
+            if entry.file_type().is_ok_and(|t| t.is_dir())
+                && add_watch_recursive(inotify, flags, &entry.path(), state).is_err()
+            {
+                state.degraded = true;
             }
         }
     }
@@ -322,6 +369,7 @@ impl Debouncer {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
     #[test]
@@ -384,6 +432,61 @@ mod tests {
         assert!(d.allow("b.txt", Some(FileChangeKind::Write), now));
         // A read on a.txt is distinct from any modification.
         assert!(d.allow("a.txt", None, now));
+    }
+
+    #[test]
+    fn vanished_directory_failure_is_recorded_not_discarded() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // A path that never existed always fails `inotify_add_watch` with ENOENT,
+        // deterministically and without needing root or a permission trick. This
+        // is exactly what `drain` calls into when a directory it just saw
+        // `IN_CREATE`/`IN_MOVED_TO` for has already vanished (a fast create+
+        // delete, or a second move) by the time it tries to watch it.
+        let missing = root.path().join("never-created");
+        let inotify =
+            Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).expect("inotify init");
+        let flags = AddWatchFlags::IN_CREATE | AddWatchFlags::IN_CLOSE_WRITE;
+        let mut state = WatchState::default();
+        let result = add_watch_recursive(&inotify, flags, &missing, &mut state);
+        assert!(result.is_err(), "watching a vanished directory must fail");
+        assert!(state.wds.is_empty());
+        // `add_watch_recursive`'s own return only reports its own directory; it
+        // is the caller (`Watcher::start`'s initial walk, `drain`'s create/move
+        // handling) that turns that `Err` into `degraded = true` — exercised by
+        // `drain`/`add_watch_recursive`'s `.is_err()` checks, not by this helper
+        // itself, so `degraded` is untouched here.
+        assert!(!state.degraded);
+    }
+
+    #[test]
+    fn moved_in_directory_is_watched() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let worktree = tempfile::tempdir().expect("tempdir");
+        let moved_subdir = outside.path().join("moved");
+        std::fs::create_dir_all(&moved_subdir).expect("mkdir");
+
+        let watcher = Watcher::start(worktree.path(), false).expect("watcher start");
+
+        // Move a whole directory tree into the watched worktree.
+        let dest = worktree.path().join("moved");
+        std::fs::rename(&moved_subdir, &dest).expect("move dir into worktree");
+        // Give the watcher thread time to see the move and register the new
+        // subtree *before* writing into it — otherwise the write could land
+        // before the recursive watch does, which would make this a test of
+        // scheduling luck rather than of the moved-in-directory fix.
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(dest.join("inside.txt"), b"hello").expect("write inside moved dir");
+        std::thread::sleep(Duration::from_millis(300));
+
+        let outcome = watcher.finish();
+        assert!(
+            outcome.captured.iter().any(|c| matches!(
+                c,
+                Captured::Modified { rel, .. } if rel == "moved/inside.txt"
+            )),
+            "a write inside a moved-in directory must be captured: {:?}",
+            outcome.captured
+        );
     }
 
     #[test]
