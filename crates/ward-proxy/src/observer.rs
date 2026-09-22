@@ -35,9 +35,13 @@ pub enum Decision {
 ///
 /// That pairing is what lets an observer being shut down distinguish "this
 /// connection's verdict is already in" from "this connection may still produce
-/// one": the accept loop stops before [`crate::Handle::shutdown`] returns, so
-/// once it has, the set of announced-but-not-yet-retired connections can only
-/// shrink, and whatever is in it is exactly what may still be decided.
+/// one": announcing a connection and [`crate::Handle::shutdown`] are mutually
+/// exclusive, so once `shutdown` has returned the set of
+/// announced-but-not-yet-retired connections can only shrink, and whatever is in
+/// it is exactly what may still be decided. Mutual exclusion is the whole of it —
+/// the acceptor may well still be parked in `accept`, but it cannot announce
+/// anything, and a shutdown cannot land between an announcement's last look at the
+/// shutdown flag and the announcement itself.
 ///
 /// The three default implementations make this invisible to an observer that
 /// does not care: it only implements [`decision`](Observer::decision), and every

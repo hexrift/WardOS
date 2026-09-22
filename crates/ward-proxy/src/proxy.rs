@@ -200,6 +200,10 @@ struct Shared {
     idle_timeout: Duration,
     active: AtomicUsize,
     shutdown: AtomicBool,
+    /// The gate that makes "stop accepting" and "announce one accepted
+    /// connection" mutually exclusive; see [`Shared::close`] and
+    /// [`Shared::announce`].
+    announcing: Mutex<()>,
     paused: AtomicBool,
 }
 
@@ -210,6 +214,53 @@ impl Shared {
 
     fn paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
+    }
+
+    /// Stop accepting — atomically with respect to announcing a connection.
+    ///
+    /// Raising the flag on its own is not enough for the invariant
+    /// [`Handle::shutdown`] owes an observer. The acceptor reads the flag and then
+    /// announces, and between those two steps it can be descheduled for arbitrarily
+    /// long; a flag raised in that window is read too late, and the connection joins
+    /// the observer's outstanding set after the observer was told nothing more could.
+    /// Nothing else closed that window: the synthetic wake connection is a *latency*
+    /// device, not a correctness one, and it does not even reach the acceptor once
+    /// the socket file is gone.
+    ///
+    /// Raising it under the same gate the announcement holds leaves exactly two
+    /// orders, and both are safe. Either the announcement got the gate first, in
+    /// which case it has completed — the connection is in the observer's outstanding
+    /// set — before this call can return; or this call got the gate first, in which
+    /// case the announcement re-reads the flag under the gate, sees it set, and is
+    /// abandoned with the connection it would have announced. There is no longer any
+    /// interval in which the acceptor is past its last shutdown check and has not yet
+    /// announced.
+    ///
+    /// The wait this can impose is bounded by the [`Observer`] contract, not by the
+    /// network: the gate is held across one [`Observer::deciding`] call and nothing
+    /// else — no I/O, no connection being served, no relay — and that call is
+    /// required to be cheap and non-blocking.
+    fn close(&self) {
+        let _gate = self
+            .announcing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Announce one accepted connection to the observer, unless [`Shared::close`]
+    /// got to the gate first — in which case this connection is not announced and
+    /// not served, because its verdict would be one no observer is still listening
+    /// for.
+    fn announce(&self) -> Option<Pending> {
+        let _gate = self
+            .announcing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.shutting_down() {
+            return None;
+        }
+        Some(Pending::take(&self.observer))
     }
 }
 
@@ -239,6 +290,7 @@ impl Proxy {
             idle_timeout: config.idle_timeout,
             active: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            announcing: Mutex::new(()),
             paused: AtomicBool::new(false),
         });
         let (bound, acceptor) = match config.listen {
@@ -342,10 +394,28 @@ impl Handle {
         self.shared.paused()
     }
 
-    /// Stop accepting, ask every relay to wind down, join the acceptor and
-    /// (for a Unix listener) unlink the socket file. Idempotent.
+    /// Stop accepting, ask every relay to wind down, join the acceptor when it can
+    /// be woken, and (for a Unix listener) unlink the socket file. Idempotent.
+    ///
+    /// **When this returns, no further connection can be announced** to the
+    /// observer through [`Observer::deciding`]. That is the invariant an observer
+    /// accounting for gaps seals on: whatever it still has outstanding when
+    /// `shutdown` has returned is exactly what may still be decided, and it can
+    /// charge the rest as a gap without a later connection sneaking into the set
+    /// behind it.
+    ///
+    /// The guarantee is [`Shared::close`]'s, taken before anything below runs, and
+    /// it holds unconditionally. The wake connection and the join are latency, not
+    /// correctness: the wake gets the acceptor out of a blocking `accept` promptly
+    /// when it lands, but it needs the listening socket to still be reachable — a
+    /// Unix socket file unlinked behind us is not — so neither it nor the join it
+    /// enables can be what the invariant rests on. An acceptor that could not be
+    /// woken is left parked in `accept`; it holds nothing but the listener, it can
+    /// no longer announce anything, and it ends with the process.
     pub fn shutdown(&self) {
-        self.shared.shutdown.store(true, Ordering::Release);
+        // Atomic against the acceptor's announcement, so there is no window in
+        // which a connection is announced after this has been observed.
+        self.shared.close();
         let acceptor = self
             .acceptor
             .lock()
@@ -353,9 +423,7 @@ impl Handle {
             .take();
         let Some(acceptor) = acceptor else { return };
         // Wake the acceptor so it observes the flag now: both listeners block
-        // in `accept`. If the wake cannot reach it (the socket file was removed
-        // behind our back) the thread is left parked rather than joined; it
-        // holds nothing but the listener and ends with the process.
+        // in `accept`.
         let woken = match &self.bound {
             Listen::Tcp(addr) => TcpStream::connect_timeout(addr, Duration::from_secs(1)).is_ok(),
             Listen::Unix(path) => UnixStream::connect(path).is_ok(),
@@ -544,11 +612,19 @@ fn accept_loop<L: Acceptor>(listener: &L, shared: &Arc<Shared>) {
             respond(&mut client, 503, "Service Unavailable", "proxy at capacity");
             continue;
         };
-        // Announced here, on the acceptor thread, rather than on the connection
-        // thread: `Handle::shutdown` joins this loop, so an observer that has seen
-        // `shutdown` return knows no further connection can be announced, and what
-        // it still has outstanding is exactly what may still be decided.
-        let pending = Pending::take(&shared.observer);
+        // Announced here, on the acceptor thread rather than on the connection
+        // thread, and under the gate `Handle::shutdown` closes: an observer that has
+        // seen `shutdown` return knows no further connection can be announced, so
+        // what it still has outstanding is exactly what may still be decided. The
+        // check above is only a fast path — this is the one that decides, and it
+        // cannot be overtaken by a shutdown, whatever the acceptor was descheduled
+        // for in between.
+        let Some(pending) = shared.announce() else {
+            // The shutdown won the gate. Nothing was announced, so there is no
+            // verdict owed for this connection; the slot and the stream go back.
+            drop(slot);
+            continue;
+        };
         let shared = Arc::clone(shared);
         let spawned = thread::Builder::new()
             .name("ward-proxy-conn".into())
