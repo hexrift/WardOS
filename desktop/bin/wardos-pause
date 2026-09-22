@@ -34,7 +34,10 @@ session_flag=()
 [[ -n ${WARDOS_SESSION:-} ]] && session_flag=(--session "$WARDOS_SESSION")
 
 # paused, running or none: the daemon's marker, read by `ward pause --status`.
-status() { ward pause --status "$project" 2>/dev/null || echo none; }
+# WARDOS_SESSION pins which session's state this reads, same as every other
+# subcommand here (#141 finding 3: a no-argument toggle pinned to one session
+# must never inspect a different one just because they disagree).
+status() { ward pause --status "${session_flag[@]}" "$project" 2>/dev/null || echo none; }
 
 # The one notification of a pause (ADR-0019 §3), critical so it stays until read.
 do_pause() {
@@ -51,10 +54,18 @@ do_resume() {
 
 # "Pause all sessions" (#141 item 5): every live session, not just this one, each its own
 # result line, so the notification is a per-session summary rather than one verdict.
+# `ward pause --all` exits non-zero when any one session failed to pause (#141 finding 4):
+# that status is carried into the title, so a partial failure is never announced as
+# "ALL SESSIONS PAUSED" — the per-session lines already say which one, but the title is
+# what a glance actually reads.
 do_pause_all() {
-  local out
-  out=$(ward pause --all --reason "${WARDOS_PAUSE_REASON:-host requested: pause all}") || true
-  wardos_notify "ALL SESSIONS PAUSED" "$out" -u critical
+  local out status=0
+  out=$(ward pause --all --reason "${WARDOS_PAUSE_REASON:-host requested: pause all}") || status=$?
+  if [[ $status -eq 0 ]]; then
+    wardos_notify "ALL SESSIONS PAUSED" "$out" -u critical
+  else
+    wardos_notify "SOME SESSIONS NOT PAUSED" "$out" -u critical
+  fi
 }
 
 # The exits of a pause. Cancelling is an answer too: everything stays held.
