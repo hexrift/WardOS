@@ -4,8 +4,10 @@
 # the "image lint" CI job alongside the shellcheck/dry-run checks, not just inside the
 # docker-backed "image packages"/"hyprland config" jobs where the real dnf calls live.
 set -euo pipefail
+here=$(dirname "$0")
+lib="$here/dnf-retry.sh"
 # shellcheck source=image/dnf-retry.sh
-source "$(dirname "$0")/dnf-retry.sh"
+source "$lib"
 
 fail() {
   echo "FAIL: $1" >&2
@@ -72,6 +74,21 @@ no_marker_log="$tmp/no-marker.log"
 printf 'one\ntwo\nthree\n' >"$no_marker_log"
 [[ "$(last_step_tail "$no_marker_log")" == "$(cat "$no_marker_log")" ]] \
   || fail "with no marker, last_step_tail should return the whole file"
+
+# last_step_tail: called as a bare standalone command under `set -euo pipefail` -- exactly
+# how check-packages.sh/check-hyprland.sh actually call it (`last_step_tail FILE >OUT`),
+# never inside a `[[ ... ]]` or other errexit-suppressing context. A log with no marker
+# must not abort the caller (review on #201: grep finding nothing makes the internal
+# `grep | tail | cut` pipeline exit non-zero under pipefail, and a plain assignment
+# statement is not otherwise exempt from errexit). Run in a nested bash so a regression
+# here aborts only that nested process, not this whole test script, and reports cleanly.
+standalone_out="$tmp/standalone-out"
+if ! bash -euo pipefail -c 'source "$1"; last_step_tail "$2" >"$3"' \
+  _ "$lib" "$no_marker_log" "$standalone_out"; then
+  fail "last_step_tail as a standalone command under set -e must not abort the caller when the file has no marker"
+fi
+[[ "$(cat "$standalone_out")" == "$(cat "$no_marker_log")" ]] \
+  || fail "the standalone call's fallback output should be the whole file"
 
 # last_step_tail: returns only what follows the LAST marker, discarding earlier steps.
 multi_step_log="$tmp/multi-step.log"
