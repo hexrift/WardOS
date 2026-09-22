@@ -425,6 +425,9 @@ fn summary(event: &WardEvent) -> String {
             "{}/{} steps · {} tests · {} failed",
             summary.steps_passed, summary.steps_total, summary.tests_run, summary.tests_failed
         ),
+        WardEvent::VerificationErrored { candidate, reason } => {
+            format!("candidate {} · {reason}", short_snapshot(candidate))
+        }
         WardEvent::StateAccepted { snapshot, .. } => {
             format!("snapshot {}", short_snapshot(snapshot))
         }

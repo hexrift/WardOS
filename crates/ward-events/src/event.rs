@@ -860,6 +860,22 @@ pub enum WardEvent {
         backup: ShortText,
     },
 
+    // -- verification, continued (origin: Wardd; #139) --
+    /// Verification could not run to a pass/fail result: the verifier failed to launch, a
+    /// preparation step failed, or the run was otherwise cut short by an infrastructure
+    /// error rather than by the trusted command exiting non-zero. Recorded so a
+    /// `VerificationStarted` is never the last verification-kind record for a candidate —
+    /// every attempt gets a terminal record, distinct from a test failure. Appended at the
+    /// end of the catalogue, not grouped with `VerificationFailed` above, because postcard
+    /// identifies variants by declaration index and existing indices must never move.
+    VerificationErrored {
+        /// Candidate snapshot the attempt concerned.
+        candidate: SnapshotId,
+        /// Sanitised, bounded description of what stopped the run (e.g. "sandbox: bubblewrap
+        /// (bwrap) is not installed"). Never a secret; drawn from the daemon's own error text.
+        reason: ShortText,
+    },
+
     // -- observer health (origin: Wardd; `event-model.md` §9) --
     /// A live observer could not hand every observation to the log: the bounded
     /// queue between it and the single writer was full, so `dropped` observations
@@ -918,12 +934,13 @@ pub enum EventKind {
     SessionPaused = 27,
     SessionResumed = 28,
     EntryRestored = 29,
-    ObservationsDropped = 30,
+    VerificationErrored = 30,
+    ObservationsDropped = 31,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 31] = [
+    pub const ALL: [EventKind; 32] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -954,6 +971,7 @@ impl EventKind {
         EventKind::SessionPaused,
         EventKind::SessionResumed,
         EventKind::EntryRestored,
+        EventKind::VerificationErrored,
         EventKind::ObservationsDropped,
     ];
 
@@ -997,6 +1015,7 @@ impl EventKind {
             EventKind::SessionPaused => "session_paused",
             EventKind::SessionResumed => "session_resumed",
             EventKind::EntryRestored => "entry_restored",
+            EventKind::VerificationErrored => "verification_errored",
             EventKind::ObservationsDropped => "observations_dropped",
         }
     }
@@ -1018,6 +1037,7 @@ impl EventKind {
                 | EventKind::VerificationStarted
                 | EventKind::VerificationPassed
                 | EventKind::VerificationFailed
+                | EventKind::VerificationErrored
                 | EventKind::StateAccepted
                 | EventKind::TamperDetected
                 | EventKind::Anchor
@@ -1167,6 +1187,7 @@ impl WardEvent {
             WardEvent::SessionPaused { .. } => EventKind::SessionPaused,
             WardEvent::SessionResumed { .. } => EventKind::SessionResumed,
             WardEvent::EntryRestored { .. } => EventKind::EntryRestored,
+            WardEvent::VerificationErrored { .. } => EventKind::VerificationErrored,
             WardEvent::ObservationsDropped { .. } => EventKind::ObservationsDropped,
         }
     }

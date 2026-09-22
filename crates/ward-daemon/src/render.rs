@@ -435,7 +435,8 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
         | WardEvent::VerificationStarted { .. }
         | WardEvent::VerificationProgress { .. }
         | WardEvent::VerificationPassed { .. }
-        | WardEvent::VerificationFailed { .. } => verification_cells(&rec.event)?,
+        | WardEvent::VerificationFailed { .. }
+        | WardEvent::VerificationErrored { .. } => verification_cells(&rec.event)?,
         WardEvent::PolicyDecision {
             subject,
             decision,
@@ -586,6 +587,15 @@ fn verification_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)>
                 "verification failed · {}/{} tests failed · candidate {}",
                 summary.tests_failed,
                 summary.tests_run,
+                short_hex(&candidate.to_string())
+            ),
+        ),
+        WardEvent::VerificationErrored { candidate, reason } => (
+            "ERROR",
+            Tone::Deny,
+            format!(
+                "verifier could not run · {} · candidate {}",
+                reason.as_str(),
                 short_hex(&candidate.to_string())
             ),
         ),
@@ -1132,5 +1142,53 @@ mod tests {
         }
         assert!(out.contains("work read & write"));
         assert!(out.contains("github ask"));
+    }
+
+    /// #139: a verifier that could not run gets its own row, distinct in verb and
+    /// colour from a passed or a failed run — never a bare drop-out after `VERIFY`.
+    #[test]
+    fn verification_errored_gets_its_own_row_distinct_from_pass_and_fail() {
+        use ward_events::{Blake3Hash, Chain, Origin, SessionId, ShortText, SnapshotId, Timestamp};
+        let candidate = SnapshotId::new(Blake3Hash::from_bytes([0xab; 32]));
+        let mut chain = Chain::genesis(SessionId::from_u128(1), Blake3Hash::ZERO);
+        let rec = chain
+            .append(
+                Origin::Verifier,
+                WardEvent::VerificationErrored {
+                    candidate,
+                    reason: ShortText::new("sandbox: bubblewrap (bwrap) is not installed"),
+                },
+                Timestamp::mono(std::time::Duration::from_secs(5)),
+            )
+            .unwrap();
+        let row = plain(&observer_row(&rec).unwrap());
+        assert_eq!(
+            row,
+            "00:05  ERROR verifier could not run · sandbox: bubblewrap (bwrap) is not installed \
+             · candidate abababababab"
+        );
+        assert!(observer_row(&rec).unwrap().contains(DENY));
+        assert_ne!(
+            cells_verb(&rec),
+            cells_verb_of(&WardEvent::VerificationFailed {
+                candidate,
+                summary: ward_events::VerifySummary::default(),
+                result_hash: Blake3Hash::ZERO,
+            }),
+            "an infra error must not render with the same verb as a test failure"
+        );
+    }
+
+    fn cells_verb(rec: &EventRecord) -> &'static str {
+        observer_cells(rec).unwrap().verb
+    }
+
+    fn cells_verb_of(event: &WardEvent) -> &'static str {
+        use ward_events::{Blake3Hash, Chain, Origin, SessionId, Timestamp};
+        let mut chain = Chain::genesis(SessionId::from_u128(2), Blake3Hash::ZERO);
+        let rec = chain
+            .append(Origin::Verifier, event.clone(), Timestamp::default())
+            .unwrap();
+        cells_verb(&rec)
     }
 }

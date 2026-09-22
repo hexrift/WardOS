@@ -384,6 +384,7 @@ impl Filter {
                 .with(EventKind::CapabilityDecided)
                 .with(EventKind::VerificationPassed)
                 .with(EventKind::VerificationFailed)
+                .with(EventKind::VerificationErrored)
                 .with(EventKind::SessionPaused)
                 .with(EventKind::SessionResumed)
                 .with(EventKind::EntryRestored)

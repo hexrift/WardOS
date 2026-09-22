@@ -561,6 +561,13 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Verifier,
+            WardEvent::VerificationErrored {
+                candidate: snap(b"cand3"),
+                reason: text("sandbox: bubblewrap (bwrap) is not installed"),
+            },
+        ),
+        (
             Origin::TamperWard,
             WardEvent::StateAccepted {
                 snapshot: snap(b"cand2"),
@@ -715,10 +722,12 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
         .iter()
         .filter(|r| Filter::quiet().matches(r))
         .count();
-    // The nine of Quiet mode, the three host interventions (ADR-0019 §3) and the
-    // observer's own "this record is incomplete" markers — one per source, the
-    // hook broker included (#137).
-    assert_eq!(quiet, 14);
+    // The nine of Quiet mode plus the three host interventions (ADR-0019 §3), plus
+    // `VerificationErrored` (#139), plus `CapabilityDecided` appearing twice in the
+    // fixture above (once granted, once denied), plus the observer's own "this
+    // record is incomplete" markers — one per source, the hook broker included
+    // (#137).
+    assert_eq!(quiet, 15);
 }
 
 #[test]
