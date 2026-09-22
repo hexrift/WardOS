@@ -604,13 +604,20 @@ impl Session {
     /// Refused while the session is paused: a sandbox started then would run
     /// unfrozen behind a closed proxy, which is neither state the user chose.
     ///
-    /// File and network observations reach the log *while the command is still
-    /// running* (#137), not in one batch after it exits: the watch, the proxy's
-    /// recorder and the hook broker each hand what they see to a bounded queue, and
-    /// this thread — the session's single log writer — drains those queues between
-    /// waits on the child and appends what it takes through the same
-    /// [`Sink`](crate::control::Sink) every other record goes through. The producers
-    /// never touch the log, so there is still exactly one writer.
+    /// Once `CommandStarted` (and any credential grant `opts.gateways` makes) is on
+    /// the log, every exit path leaves exactly one terminal record behind it —
+    /// `CommandFinished`, or, when the launch could not be carried that far (the
+    /// sandbox or hook socket failed to bind, the child failed to spawn, …),
+    /// `LaunchAborted` (#140, PR #197 review). Without this, a credential granted
+    /// above could outlive a launch that never even started: the daemon's
+    /// `open_launches` would keep the pid open forever, exactly the staleness #140
+    /// exists to prevent, just reached through a different exit path than an
+    /// ordinary `CommandFinished`. The real error is still returned to the caller
+    /// unchanged either way — the terminal record is additive, never a substitute
+    /// (the same discipline `VerificationErrored` (#139) uses for `Session::verify`).
+    /// If the terminal record's own append also fails (sink gone, disk full, …),
+    /// that failure is folded into the returned error rather than discarded, so the
+    /// caller learns the log may still end at `CommandStarted`.
     pub fn launch(&mut self, argv: &[String], opts: &LaunchOpts) -> Result<RunReport> {
         self.refuse_while_paused()?;
         self.emit(
@@ -639,17 +646,64 @@ impl Session {
         for g in &opts.gateways {
             self.emit(Origin::Wardd, g.granted(GATEWAY_TTL)?)?;
         }
-        self.run_launch(pid, argv, opts)
+
+        // From here on `CommandStarted` (and any grant just above) is already on the
+        // log, so the `match` below never lets an error skip past leaving a terminal
+        // record for it.
+        let result = self.run_launch(pid, argv, opts);
+        let outcome = match result {
+            Ok(report) => Ok(report),
+            Err(e) => {
+                let reason = ShortText::new(&e.to_string());
+                Err(
+                    match self.emit(Origin::Kernel, WardEvent::LaunchAborted { pid, reason }) {
+                        Ok(()) => e,
+                        // The fallback terminal record's own append failed too: never
+                        // silently discard that (the exact gap #140/#139 both exist to
+                        // close). Fold both failures into what the caller sees, so this
+                        // is distinguishable from an ordinary abort whose record landed.
+                        Err(emit_err) => Error::Events(format!(
+                            "launch failed ({e}), and the terminal record for it could \
+                             not be written ({emit_err}); the log may still end at \
+                             CommandStarted"
+                        )),
+                    },
+                )
+            }
+        };
+        // The agent is idle either way: the launch finished, or it never got off the
+        // ground. Best-effort — a failure here is secondary to `outcome` above, and
+        // before this fix a failed launch left the agent reporting `Working` forever,
+        // since the function returned early without ever reaching this point.
+        let _ = self.emit(
+            Origin::Wardd,
+            WardEvent::AgentStateChanged {
+                state: AgentState::Idle,
+            },
+        );
+        outcome
     }
 
-    /// The launch itself, from starting the observers to the child's own exit.
+    /// The launch's fallible span, from starting the observers and the sandbox/hook
+    /// setup through the child's own exit and its `CommandFinished`: everything that
+    /// can fail with `CommandStarted` (and any credential grant above it) already on
+    /// the log. An `Err` here means the launch never reached `CommandFinished`;
+    /// [`launch`](Self::launch) turns that into a `LaunchAborted` terminal record
+    /// instead (#140, PR #197 review).
     ///
-    /// Split out of [`launch`](Self::launch) so the observers live in one scope that
-    /// owns their shutdown: [`Observers`] stops every producer it holds when it
+    /// Split out of [`launch`](Self::launch) so the observers also live in one scope
+    /// that owns their shutdown: [`Observers`] stops every producer it holds when it
     /// drops, whichever way this function is left, and the final flush below runs on
     /// the failure paths too — a sandbox that could not be prepared, a child that
     /// could not be spawned — so what the producers had already recorded still
-    /// reaches the log instead of dying with the thread that held it.
+    /// reaches the log instead of dying with the thread that held it. File and
+    /// network observations reach the log *while the command is still running*
+    /// (#137), not in one batch after it exits: the watch, the proxy's recorder and
+    /// the hook broker each hand what they see to a bounded queue, and this thread —
+    /// the session's single log writer — drains those queues between waits on the
+    /// child and appends what it takes through the same [`Sink`](crate::control::Sink)
+    /// every other record goes through. The producers never touch the log, so there
+    /// is still exactly one writer.
     fn run_launch(&mut self, pid: Pid, argv: &[String], opts: &LaunchOpts) -> Result<RunReport> {
         let watch_reads = matches!(
             self.manifest.observer,
@@ -727,12 +781,6 @@ impl Session {
                 pid,
                 exit: exit_status(outcome.code),
                 duration: outcome.duration,
-            },
-        )?;
-        self.emit(
-            Origin::Wardd,
-            WardEvent::AgentStateChanged {
-                state: AgentState::Idle,
             },
         )?;
 

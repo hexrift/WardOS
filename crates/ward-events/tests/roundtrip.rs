@@ -615,6 +615,13 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Kernel,
+            WardEvent::LaunchAborted {
+                pid: Pid::new(4).unwrap(),
+                reason: text("egress proxy: address already in use"),
+            },
+        ),
+        (
             Origin::Wardd,
             WardEvent::ObservationsDropped {
                 source: ObserverSource::Network,

@@ -412,6 +412,9 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
         WardEvent::SessionStarted { .. } => ("START", Tone::Accent, "session".to_string()),
         WardEvent::CommandStarted { argv, .. } => ("RUN", Tone::Ink, argv_text(argv)),
         WardEvent::CommandFinished { exit, .. } => ("EXIT", exit_color(*exit), exit_text(*exit)),
+        WardEvent::LaunchAborted { reason, .. } => {
+            ("ABORT", Tone::Deny, format!("launch aborted · {reason}"))
+        }
         WardEvent::FileModified { path, kind, .. } => {
             (change_verb(*kind), Tone::Ink, path.to_string())
         }
