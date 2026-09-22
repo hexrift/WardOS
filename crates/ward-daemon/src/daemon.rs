@@ -1937,6 +1937,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: "proj_disconnect".to_owned(),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest,
             started_unix_ms: control::unix_ms(SystemTime::now()),
             agent: None,
