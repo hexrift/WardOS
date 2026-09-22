@@ -349,7 +349,7 @@ live in `~/.local/share/wardos/themes/`.
 [`image/packages.txt`](../image/packages.txt) lists every package the desktop needs, one
 per line with a comment naming what it is for, exact Fedora package names (`fd-find`,
 `pipewire-pulseaudio`). What Fedora does not carry (the Hyprland ecosystem beyond the
-compositor, lazygit) comes from the COPRs of [`image/coprs.txt`](../image/coprs.txt),
+compositor) comes from the COPRs of [`image/coprs.txt`](../image/coprs.txt),
 part of the image's trust set (`image/README.md`, "COPRs"). The `Containerfile` enables
 the COPRs and installs from the manifest, and `desktop/install.sh` layers the same with
 `dnf` or `rpm-ostree`; CI checks every name exists in the Fedora release the image pins
@@ -427,7 +427,7 @@ command, key and test exist on `main`.
 | Docker + lazydocker | podman, podman-compose, podman-tui | |
 | Terminal (Alacritty/Ghostty), bash, prompt, aliases | foot default, alacritty shipped, `config/bash` | ✔ `config/foot`, `config/alacritty`, `config/bash` (prompt tested in `configs.test.sh`) |
 | Neovim (LazyVim) | neovim with a WardOS config and per-theme colours | ✔ config: `config/nvim` (self-contained, `lua/plugins.lua` hook) |
-| btop, fastfetch, lazygit, fzf, ripgrep, fd, bat, eza, zoxide | shipped, configured, themed | ✔ config: `config/btop`, `config/fastfetch`, aliases and fzf/zoxide hooks in `config/bash` |
+| btop, fastfetch, fzf, ripgrep, fd, bat, eza, zoxide | shipped, configured, themed | ✔ config: `config/btop`, `config/fastfetch`, aliases and fzf/zoxide hooks in `config/bash` |
 | Chromium default browser, theme colour | chromium, `chromium.json` fragment | ✔ config: `config/chromium/chromium-flags.conf`, `BROWSER=chromium` |
 | Nautilus | nautilus | |
 | Plymouth boot splash | WardOS Plymouth theme | ✔ `image/rootfs/usr/share/plymouth/themes/wardos/` (WARD on the ground, 2 px progress, passphrase prompt), selected in the `Containerfile` and in the initramfs (the image build proves it); its look at boot is E-09's |
