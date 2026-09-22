@@ -446,6 +446,39 @@ pub enum ClaimKind {
     Plan,
 }
 
+/// Which live observer lost observations on the way to the log
+/// (`ObservationsDropped`, `event-model.md` §9).
+///
+/// The observer is the *producer* side of the bounded hand-off queue the daemon's
+/// single log writer drains while a command runs; it is not the enforcement path.
+/// A full queue never changes a decision — the proxy keeps allowing and denying in
+/// real time — it only means the daemon's record of that window is incomplete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ObserverSource {
+    /// The live filesystem watch over the worktree (`FileModified` / `FileRead`).
+    Filesystem,
+    /// The session egress proxy's decision recorder (`NetworkRequested` /
+    /// `NetworkDenied`).
+    Network,
+}
+
+impl ObserverSource {
+    /// Stable lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Filesystem => "filesystem",
+            Self::Network => "network",
+        }
+    }
+}
+
+impl fmt::Display for ObserverSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Error for over-long signature bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("signature must be 1–{max} bytes, found {found}")]
@@ -819,6 +852,26 @@ pub enum WardEvent {
         /// empty when nothing differed.
         backup: ShortText,
     },
+
+    // -- observer health (origin: Wardd; `event-model.md` §9) --
+    /// A live observer could not hand every observation to the log: the bounded
+    /// queue between it and the single writer was full, so `dropped` observations
+    /// were refused rather than silently lost.
+    ///
+    /// Appended immediately after the batch the same drain did take, so the
+    /// incomplete window is bounded by its neighbours in the log. Enforcement is
+    /// unaffected: the proxy keeps deciding in real time whether or not this
+    /// queue is backed up, and a refused observation is a lost *record*, never a
+    /// changed decision.
+    ObservationsDropped {
+        /// Which observer lost them.
+        source: ObserverSource,
+        /// How many observations this marker accounts for.
+        dropped: u64,
+        /// Capacity of the queue that refused them, so a reader can tell a tight
+        /// bound from a genuine burst.
+        capacity: u64,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -858,11 +911,12 @@ pub enum EventKind {
     SessionPaused = 27,
     SessionResumed = 28,
     EntryRestored = 29,
+    ObservationsDropped = 30,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 30] = [
+    pub const ALL: [EventKind; 31] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -893,6 +947,7 @@ impl EventKind {
         EventKind::SessionPaused,
         EventKind::SessionResumed,
         EventKind::EntryRestored,
+        EventKind::ObservationsDropped,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
@@ -935,6 +990,7 @@ impl EventKind {
             EventKind::SessionPaused => "session_paused",
             EventKind::SessionResumed => "session_resumed",
             EventKind::EntryRestored => "entry_restored",
+            EventKind::ObservationsDropped => "observations_dropped",
         }
     }
 
@@ -961,6 +1017,7 @@ impl EventKind {
                 | EventKind::SessionPaused
                 | EventKind::SessionResumed
                 | EventKind::EntryRestored
+                | EventKind::ObservationsDropped
         )
     }
 }
@@ -1103,6 +1160,7 @@ impl WardEvent {
             WardEvent::SessionPaused { .. } => EventKind::SessionPaused,
             WardEvent::SessionResumed { .. } => EventKind::SessionResumed,
             WardEvent::EntryRestored { .. } => EventKind::EntryRestored,
+            WardEvent::ObservationsDropped { .. } => EventKind::ObservationsDropped,
         }
     }
 

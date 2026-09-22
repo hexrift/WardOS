@@ -12,9 +12,9 @@ use ward_events::chain::{Chain, Timestamp, verify};
 use ward_events::event::{
     Acceptor, AgentIdentity, AgentKind, AgentState, CapabilityKind, CapabilityRequest, CaptureMode,
     ClaimKind, CredentialDelivery, Decision, DecisionSource, DeniedDst, DenyReason, EndReason,
-    EventKind, ExitStatus, FileChangeKind, GrantScope, PauseMethod, PolicySubject, ProcessRef,
-    RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus, TamperWardSig, VerifyRequester,
-    VerifySummary, WardEvent,
+    EventKind, ExitStatus, FileChangeKind, GrantScope, ObserverSource, PauseMethod, PolicySubject,
+    ProcessRef, RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus, TamperWardSig,
+    VerifyRequester, VerifySummary, WardEvent,
 };
 use ward_events::ids::{
     Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
@@ -608,6 +608,14 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Wardd,
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Network,
+                dropped: 9,
+                capacity: 4096,
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -696,8 +704,9 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
         .iter()
         .filter(|r| Filter::quiet().matches(r))
         .count();
-    // The nine of Quiet mode plus the three host interventions (ADR-0019 §3).
-    assert_eq!(quiet, 12);
+    // The nine of Quiet mode, the three host interventions (ADR-0019 §3) and the
+    // observer's own "this record is incomplete" marker (#137).
+    assert_eq!(quiet, 13);
 }
 
 #[test]

@@ -439,6 +439,11 @@ fn summary(event: &WardEvent) -> String {
             "entry {} · {files} paths · backup {backup}",
             short_snapshot(snapshot)
         ),
+        WardEvent::ObservationsDropped {
+            source,
+            dropped,
+            capacity,
+        } => format!("{source} · {dropped} dropped · queue {capacity}"),
         WardEvent::Anchor {
             chain_head,
             seq,
