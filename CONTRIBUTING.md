@@ -57,10 +57,14 @@ the same script runs in CI, so a green run locally is a green run there.
   comment carrying a session link is a separate GitHub object squash-merge never touches, so
   it persists exactly as written whatever happens to the branch's commits — which is exactly
   why it must not be added in the first place, on any of the three surfaces, rather than
-  relying on cleanup after the fact. A session link already published in a PR body or
-  comment from before this rule existed is left as-is: it names an ephemeral, inert session
-  URL, not a secret or an ongoing liability, so there is nothing to retroactively edit or
-  scrub — but a new one is a review finding like any other, and if one slips onto a branch's
+  relying on cleanup after the fact. A search of this repository's issues, pull requests and
+  comments at the time this rule was written found no published session link to grandfather
+  — there is nothing currently live to clean up, not an assumption that cleanup is
+  unnecessary in general. If one is found in the future: edit it out of a PR/issue body or a
+  still-editable comment (both are ordinary editable GitHub objects, not append-only), and
+  where GitHub does not allow editing or deleting the surface it is on, use whatever
+  redaction the platform offers and record the limitation rather than leaving it unaddressed.
+  A new session link is a review finding like any other, and if one slips onto a branch's
   own commit message it is removed by the same merge-time edit as the trailer above.
 
 ## Versioning

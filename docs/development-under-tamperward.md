@@ -204,33 +204,53 @@ can never grant itself the sign-off it needs. Concretely:
   skip, guard removal, or assertion weakening in the protected diff as a hold: those need
   the same scrutiny as a suppression, and are grounds to withhold sign-off even if the
   visible suite and the stated intent look reasonable.
-* **How** — apply the label `tamperward:allow:verify@<sha-prefix>` to the pull request.
-  **GitHub label names are capped at 50 characters**; `tamperward:allow:verify@` alone is 24,
-  leaving 26 for the SHA, so a full 40-character SHA (64 characters total) is rejected by
-  GitHub outright — this was hit and confirmed in practice against this repository (see
-  #203) before this note was added. `tamperward`'s own OOB-signoff matcher (`oobToken` in
-  the CLI) accepts any *prefix* of the head SHA that is at least 7 hex characters
-  (`sha.length >= 7 && head.startsWith(sha)`) — it is a prefix match, not an equality check
-  against the full object id, so treat the label as authorizing "a commit whose id starts
-  with this prefix," not literally "this exact commit and no other." **Use the longest
-  prefix that fits the cap, not the shortest one that works**: `tamperward:allow:verify@` +
-  a 26-character abbreviation (`git rev-parse --short=26 <head-sha>`, exactly 50 characters,
-  the full budget) rather than a short one like 12. A short prefix is not wrong — `git`'s own
-  unambiguous-object convention starts around 7–12 hex characters, and nothing about a
-  normal push can retroactively produce a colliding commit — but a *stale* label left
-  attached to a PR is only as strong as its prefix against a future commit deliberately
-  ground to share it: 12 hex characters is 48 bits, an expensive but not infeasible target
-  for a well-resourced adversary picking their own commit content to match a prefix they can
-  already see labeled on the PR; 26 hex characters (104 bits) is not a realistic target for
-  anyone. There is no reason to spend fewer than the 26 characters the label-length budget
-  actually allows. The gate reads labels from the triggering event (`labeled`/`unlabeled`
-  are both in the workflow's `on.pull_request.types`), so applying it re-runs the check
-  rather than requiring a new push. The prefix binding means a later push invalidates the
-  sign-off and needs a fresh label bound to the new head — this is intentional
-  (§ci-tampering's whole point is that a sign-off can't quietly outlive the diff it was read
-  against) — and, per the paragraph above, is also why the label should be removed (not just
-  left to be superseded) once the PR it was granted on merges or its head changes, rather
-  than trusted to become harmless on its own.
+* **How, today — a non-authoritative fallback, not a closed control.** Until the mechanism
+  in the next paragraph is adopted, apply the label `tamperward:allow:verify@<sha-prefix>`
+  to the pull request. **GitHub label names are capped at 50 characters**;
+  `tamperward:allow:verify@` alone is 24, leaving 26 for the SHA, so a full 40-character SHA
+  (64 characters total) is rejected by GitHub outright — this was hit and confirmed in
+  practice against this repository (see #203) before this note was added. `tamperward`'s own
+  OOB-signoff matcher (`oobToken` in the CLI) accepts any *prefix* of the head SHA that is at
+  least 7 hex characters (`sha.length >= 7 && head.startsWith(sha)`) — it is a prefix match,
+  not an equality check against the full object id, so treat the label as authorizing "a
+  commit whose id starts with this prefix," not "this exact commit and no other." Use the
+  longest prefix the cap allows — `tamperward:allow:verify@` + a 26-character abbreviation
+  (`git rev-parse --short=26 <head-sha>`, exactly 50 characters) — rather than a shorter one;
+  there is no reason to spend less of the budget than the cap allows. But do not read a
+  longer prefix as closing the risk: a naive preimage-search framing (fix the approved head,
+  brute-force a colliding successor) would put a 104-bit prefix out of reach, but that is the
+  wrong model here. The party this label is meant to constrain can typically influence *both*
+  sides of the match — the head that gets reviewed and labeled, and the successor pushed
+  afterward — which makes this a **chosen-prefix / birthday-style search**, not a plain
+  preimage search: with freedom to vary superficial bits of a candidate on both ends (commit
+  timestamps, trailing whitespace, blank lines, other content a reviewer would not weigh),
+  the generic cost of finding *some* pair that shares a target prefix scales with the square
+  root of the prefix's bit length, roughly 2^52 work for a 104-bit prefix rather than 2^104 —
+  the same order of magnitude publicly demonstrated for full chosen-prefix SHA-1 collisions
+  (e.g. the 2017 SHAttered attack, since improved on). That is a real, if expensive, budget
+  for a well-resourced adversary, not a theoretical one — so the 26-character prefix is a
+  meaningfully stronger fallback than the 12-character guidance it replaces, but it is a
+  **temporary, non-authoritative compatibility fallback**, not a resolution of the underlying
+  gap: it does not by itself close #203, and should not be cited as though it does. The gate
+  reads labels from the triggering event (`labeled`/`unlabeled` are both in the workflow's
+  `on.pull_request.types`), so applying it re-runs the check rather than requiring a new
+  push. The prefix binding means a later push invalidates the sign-off and needs a fresh
+  label bound to the new head — intentional (§ci-tampering's whole point is that a sign-off
+  can't quietly outlive the diff it was read against) — and is also why the label should be
+  removed once the PR it was granted on merges or its head changes, rather than trusted to
+  become harmless on its own.
+* **How, once available — the actual resolution.** A full-object-id sign-off mechanism that
+  fits GitHub's label-length cap without relying on a display-SHA prefix at all (e.g. a
+  versioned, hashed token binding the rule, optional file, and the complete head object id)
+  closes the gap the paragraph above only narrows. Adopting one is *not* something this
+  documentation PR can do from inside this repository: it depends on that mechanism actually
+  being released by the `tamperward` project this repo consumes from the npm registry (see
+  `.github/workflows/tamperward.yml`'s pinned `tamperward@2.10.3`), which is out of this
+  repository's control and outside what this session can independently verify. Once a
+  release is confirmed to exist and to do what it claims, adopting it is: bump the pinned
+  version in `tamperward.yml`, update this section with its actual label/token format and
+  CLI invocation, and replace the fallback above rather than keep it as a second path. Track
+  that adoption as its own follow-up rather than assuming it here.
 * **What it does not clear** — a red *visible* suite, a run that could not execute, or any
   other failing rule. `tamperward:allow:verify@<sha>` clears only a masked failure on the
   `verify` rule for that one SHA; nothing else.
