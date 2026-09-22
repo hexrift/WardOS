@@ -11,11 +11,12 @@
 //! falling back to a local writer, because a producer that opened the log itself
 //! would fork the chain the daemon owns.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use ward_events::{EventKind, EventRecord, WardEvent};
 
@@ -361,6 +362,21 @@ pub struct SessionApproval {
 /// session it already knows about stays perfectly quiet.
 pub const REDISCOVER: Duration = Duration::from_secs(30);
 
+/// How one of [`follow_pending_all`]'s watcher threads ended, as reported
+/// through its `done_tx`.
+enum WatcherEnd {
+    /// It got as far as `describe` succeeding (whether or not `follow_pending`
+    /// itself then ran into trouble): a normal end, retried on the usual
+    /// `rediscover` cadence with no extra delay.
+    Ended(Result<()>),
+    /// Its very first `describe` failed: this session answered `Ping` (or
+    /// `live_sessions` would never have named it) but is not actually
+    /// reachable. Kept apart from [`Self::Ended`] so [`follow_pending_all`]
+    /// can back a session like this off instead of respawning it immediately
+    /// (review 5284361040 of #210, finding 2).
+    Unreachable(Error),
+}
+
 /// `ward session pending --all --follow` (#141 items 4 and 6): every live
 /// session's approvals, multiplexed, independently of which one the desktop
 /// has selected — an approval in a second session must never be invisible
@@ -378,40 +394,169 @@ pub const REDISCOVER: Duration = Duration::from_secs(30);
 /// session sealed, or its `describe` failed and it never got to follow at all
 /// — is dropped from the watched set, so a session that comes back (or a
 /// transient `describe` failure) is retried at the next rediscovery instead
-/// of staying silently forgotten (#141 finding 5). This returns once nothing
-/// is being watched and one more look at `live_sessions` still finds nothing
-/// to pick up.
+/// of staying silently forgotten (#141 finding 5).
+///
+/// Every watcher's [`JoinHandle`] is tracked, not just its session id (review
+/// 5284361040 of #210, finding 2): on *every* exit path — the ordinary one
+/// below, or an early return on a `live_sessions` failure — every handle
+/// still outstanding is joined before this actually returns, so a caller's
+/// next call can never overlap with a straggler thread from this one still
+/// holding the shared `emit`. `follow_pending`'s own blocking read only stays
+/// unbounded once a session has gone quiet after its backlog (`idle` bounds
+/// the backlog phase); joining it therefore waits, at most, for that
+/// session's own daemon to next speak or close the stream — the same bound
+/// this function's own `rediscover` wait already accepts elsewhere in this
+/// loop, not a new unbounded wait introduced here.
+///
+/// A session that is `Ping`-live but whose `describe` never succeeds is
+/// backed off, not respawned the instant it is the only session watched: the
+/// previous shape emptied `watched` and immediately rediscovered, which for a
+/// persistently unreachable session was a tight reconnect loop that also
+/// never reported the failure anywhere (finding 2). Every describe failure is
+/// now both logged and folded into this call's own returned error, and the
+/// session is not retried again until [`REDISCOVER`]-scale time has passed
+/// (see `backoff` below) — the same cadence a quiet, healthy session is
+/// already rechecked on, just applied to one that keeps failing instead of
+/// one that keeps succeeding quietly.
+///
+/// This returns once nothing is being watched, nothing is under a cooldown
+/// either, and one more look at `live_sessions` still finds nothing live at
+/// all to pick up.
 pub fn follow_pending_all(
     state: &Path,
     idle: Duration,
     rediscover: Duration,
     emit: impl FnMut(SessionApproval) + Send + 'static,
 ) -> Result<()> {
-    let emit = Arc::new(Mutex::new(emit));
+    let emit: Emit = Arc::new(Mutex::new(emit));
     // Each watcher thread reports its own end (session id, outcome) here
     // instead of being `join`ed in a batch, so this can react to whichever
     // happens first: a watcher finishing, or `rediscover` passing with none
-    // finishing — never blocked on one without a bound from the other.
-    let (done_tx, done_rx) = mpsc::channel::<(String, Result<()>)>();
-    let discover = |watched: &mut HashSet<String>| -> Result<()> {
-        for meta in crate::daemon::live_sessions(state)? {
-            if !watched.insert(meta.id.clone()) {
-                continue;
+    // finishing — never blocked on one without a bound from the other. The
+    // `JoinHandle`s themselves live in `watched` below, so a thread reporting
+    // here is not yet the same as it actually having returned.
+    let (done_tx, done_rx) = mpsc::channel::<(String, WatcherEnd)>();
+    // Per session id: when its watcher last ended in `WatcherEnd::Unreachable`
+    // — read, never written, by `spawn_new_watchers` to skip respawning it
+    // too soon (review 5284361040 of #210, finding 2).
+    let mut backoff: HashMap<String, Instant> = HashMap::new();
+    let mut watched: HashMap<String, JoinHandle<()>> = HashMap::new();
+
+    let mut anything_live = match spawn_new_watchers(
+        state,
+        idle,
+        rediscover,
+        &emit,
+        &done_tx,
+        &mut watched,
+        &mut backoff,
+    ) {
+        Ok(any_live) => any_live,
+        Err(e) => {
+            join_watchers(watched);
+            return Err(e);
+        }
+    };
+    let mut first_err = None;
+    loop {
+        if watched.is_empty() && !anything_live {
+            break;
+        }
+        let rediscover_now = match done_rx.recv_timeout(rediscover) {
+            Ok((session, end)) => {
+                record_watcher_end(
+                    session,
+                    end,
+                    rediscover,
+                    &mut watched,
+                    &mut backoff,
+                    &mut first_err,
+                );
+                // One more look right away when that was the last watcher: a
+                // session that started in the instant this one ended must not
+                // lose out just because it lost the race with this check.
+                watched.is_empty()
             }
-            let socket = session_dir(state, &meta.id).join(SOCKET_NAME);
-            let session_id = meta.id.clone();
-            let emit = Arc::clone(&emit);
-            let done_tx = done_tx.clone();
-            std::thread::spawn(move || {
-                let result = (|| -> Result<()> {
-                    let (project, agent) =
-                        match connect(&socket).and_then(|mut sink| describe(&mut sink)) {
-                            Ok(d) => (d.project, d.agent.map(|a| a.name)),
-                            // Gone before we could ask it anything: nothing to
-                            // follow this round; retried at the next rediscovery.
-                            Err(_) => return Ok(()),
-                        };
-                    follow_pending(&socket, idle, |approval| {
+            // Nothing finished within `rediscover`: every session watched so
+            // far is still quietly live (or, when `watched` is empty and
+            // `anything_live` is true, everything live is under a backoff
+            // cooldown with no thread running yet) — either way, this is
+            // exactly when to look again.
+            Err(RecvTimeoutError::Timeout) => true,
+            // Cannot happen while `watched` is non-empty: every watcher holds
+            // its own clone of `done_tx`, and so does this scope. Treated as
+            // "nothing left to wait for" rather than panicking.
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if rediscover_now {
+            anything_live = match spawn_new_watchers(
+                state,
+                idle,
+                rediscover,
+                &emit,
+                &done_tx,
+                &mut watched,
+                &mut backoff,
+            ) {
+                Ok(any_live) => any_live,
+                Err(e) => {
+                    join_watchers(watched);
+                    return Err(e);
+                }
+            };
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// [`follow_pending_all`]'s shared `emit`, boxed as a trait object so the
+/// helper functions below can take it as an ordinary parameter instead of
+/// each needing to be generic over `follow_pending_all`'s own `impl FnMut`.
+type Emit = Arc<Mutex<dyn FnMut(SessionApproval) + Send>>;
+
+/// [`follow_pending_all`]'s `discover`: list what `live_sessions` reports
+/// live, and spawn a watcher thread for anything not already in `watched` and
+/// not still under a `backoff` cooldown (review 5284361040 of #210,
+/// finding 2). Returns whether `live_sessions` found anything live at all,
+/// spawned or not — [`follow_pending_all`] uses that, not `watched` alone, to
+/// decide whether it is really done: everything live can be backed off with
+/// `watched` empty, and that must keep this waiting, not end it.
+#[allow(clippy::too_many_arguments)]
+fn spawn_new_watchers(
+    state: &Path,
+    idle: Duration,
+    rediscover: Duration,
+    emit: &Emit,
+    done_tx: &mpsc::Sender<(String, WatcherEnd)>,
+    watched: &mut HashMap<String, JoinHandle<()>>,
+    backoff: &mut HashMap<String, Instant>,
+) -> Result<bool> {
+    let live = crate::daemon::live_sessions(state)?;
+    let mut any_live = false;
+    for meta in live {
+        any_live = true;
+        if watched.contains_key(&meta.id) {
+            continue;
+        }
+        if backoff
+            .get(&meta.id)
+            .is_some_and(|last| last.elapsed() < rediscover)
+        {
+            continue;
+        }
+        backoff.remove(&meta.id);
+        let socket = session_dir(state, &meta.id).join(SOCKET_NAME);
+        let session_id = meta.id.clone();
+        let emit = Arc::clone(emit);
+        let done_tx = done_tx.clone();
+        let handle = std::thread::spawn(move || {
+            let end = match connect(&socket).and_then(|mut sink| describe(&mut sink)) {
+                Ok(d) => {
+                    let (project, agent) = (d.project, d.agent.map(|a| a.name));
+                    let result = follow_pending(&socket, idle, |approval| {
                         if let Ok(mut emit) = emit.lock() {
                             emit(SessionApproval {
                                 session: session_id.clone(),
@@ -420,48 +565,68 @@ pub fn follow_pending_all(
                                 approval,
                             });
                         }
-                    })?;
-                    Ok(())
-                })();
-                let _ = done_tx.send((session_id, result));
-            });
-        }
-        Ok(())
-    };
+                    })
+                    .map(|_| ());
+                    WatcherEnd::Ended(result)
+                }
+                // Gone, or never reachable, before we could ask it anything:
+                // this is what `WatcherEnd::Unreachable` backs off, rather
+                // than being retried immediately.
+                Err(e) => WatcherEnd::Unreachable(e),
+            };
+            let _ = done_tx.send((session_id, end));
+        });
+        watched.insert(meta.id.clone(), handle);
+    }
+    Ok(any_live)
+}
 
-    let mut watched = HashSet::new();
-    discover(&mut watched)?;
-    let mut first_err = None;
-    loop {
-        if watched.is_empty() {
-            break;
+/// Fold one watcher's end into [`follow_pending_all`]'s bookkeeping: join its
+/// handle (it already sent on `done_tx`, so this does not block indefinitely
+/// waiting for a thread that has not finished), record any error as this
+/// call's `first_err`, and, for an unreachable session, log it and start its
+/// backoff cooldown (review 5284361040 of #210, finding 2).
+fn record_watcher_end(
+    session: String,
+    end: WatcherEnd,
+    rediscover: Duration,
+    watched: &mut HashMap<String, JoinHandle<()>>,
+    backoff: &mut HashMap<String, Instant>,
+    first_err: &mut Option<Error>,
+) {
+    if let Some(handle) = watched.remove(&session) {
+        let _ = handle.join();
+    }
+    match end {
+        WatcherEnd::Ended(Ok(())) => {}
+        WatcherEnd::Ended(Err(e)) => {
+            first_err.get_or_insert(e);
         }
-        match done_rx.recv_timeout(rediscover) {
-            Ok((session, result)) => {
-                watched.remove(&session);
-                if let Err(e) = result {
-                    first_err.get_or_insert(e);
-                }
-                // One more look right away when that was the last watcher: a
-                // session that started in the instant this one ended must not
-                // lose out just because it lost the race with this check.
-                if watched.is_empty() {
-                    discover(&mut watched)?;
-                }
-            }
-            // Nothing finished within `rediscover`: every session watched so
-            // far is still quietly live, which is exactly when a new session
-            // would otherwise stay invisible — so this is when to look again.
-            Err(RecvTimeoutError::Timeout) => discover(&mut watched)?,
-            // Cannot happen while `watched` is non-empty: every watcher holds
-            // its own clone of `done_tx`, and so does this scope. Treated as
-            // "nothing left to wait for" rather than panicking.
-            Err(RecvTimeoutError::Disconnected) => break,
+        WatcherEnd::Unreachable(e) => {
+            // Visible here even though it is not fatal to this call as a
+            // whole (finding 2: "the failure is never reported anywhere"
+            // before this) — mirrors how `pending_all`'s non-follow path
+            // (finding 5) reports an unreachable session instead of hiding
+            // it.
+            eprintln!(
+                "ward: session {session} is live but not reachable, retrying in \
+                 at most {rediscover:?}: {e}"
+            );
+            backoff.insert(session, Instant::now());
+            first_err.get_or_insert(e);
         }
     }
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
+}
+
+/// Join every watcher thread still tracked in `watched`, discarding their
+/// results (a caller returning early already has the error it is about to
+/// propagate): the cleanup every exit path of [`follow_pending_all`] runs
+/// before actually returning, so no watcher is ever left running — and still
+/// holding the shared `emit` — after the function that owns it has returned
+/// (review 5284361040 of #210, finding 2).
+fn join_watchers(watched: HashMap<String, JoinHandle<()>>) {
+    for (_, handle) in watched {
+        let _ = handle.join();
     }
 }
 
@@ -1224,6 +1389,52 @@ mod tests {
         pause_outcome: Option<std::result::Result<EventRecord, String>>,
         hold: Duration,
     ) {
+        spawn_pool_session_inner(
+            state,
+            id,
+            started_unix_ms,
+            pending,
+            pause_outcome,
+            hold,
+            None,
+        );
+    }
+
+    /// [`spawn_pool_session`], but sending on `on_connect` every time a
+    /// connection is accepted — used to deterministically confirm that
+    /// `follow_pending_all`'s discovery has actually reached this session
+    /// (its `describe` connection lands) before a test goes on to act,
+    /// without guessing at timing via a sleep.
+    fn spawn_pool_session_signaling(
+        state: &Path,
+        id: &str,
+        started_unix_ms: u64,
+        pending: Vec<Approval>,
+        pause_outcome: Option<std::result::Result<EventRecord, String>>,
+        hold: Duration,
+        on_connect: mpsc::Sender<()>,
+    ) {
+        spawn_pool_session_inner(
+            state,
+            id,
+            started_unix_ms,
+            pending,
+            pause_outcome,
+            hold,
+            Some(on_connect),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_pool_session_inner(
+        state: &Path,
+        id: &str,
+        started_unix_ms: u64,
+        pending: Vec<Approval>,
+        pause_outcome: Option<std::result::Result<EventRecord, String>>,
+        hold: Duration,
+        on_connect: Option<mpsc::Sender<()>>,
+    ) {
         let meta = SessionMeta {
             id: id.to_owned(),
             project: PathBuf::from("/tmp/demo"),
@@ -1250,6 +1461,9 @@ mod tests {
                 if ended.load(std::sync::atomic::Ordering::Acquire) {
                     // Sealed: behave like nothing is listening any more.
                     continue;
+                }
+                if let Some(tx) = &on_connect {
+                    let _ = tx.send(());
                 }
                 let description = description.clone();
                 let pending = pending.clone();
@@ -1642,6 +1856,211 @@ mod tests {
             "events: daemon refused describe: not ready",
             "an unreachable session is reported, never indistinguishable from \
              one reachable with nothing pending"
+        );
+    }
+
+    /// A session that answers `Ping` (so `live_sessions` reports it as live)
+    /// but whose `Describe` always refuses, counting every attempt in
+    /// `attempts`. Stops accepting connections entirely once `alive_for` has
+    /// elapsed — the same "once sealed, stay sealed" idea `spawn_pool_session`
+    /// uses, so `live_sessions` eventually and correctly stops counting this
+    /// session too, letting a `follow_pending_all` watching only this one
+    /// terminate on its own once it is done being live, instead of the test
+    /// having to cut it off externally.
+    fn spawn_describe_broken_session(
+        state: &Path,
+        id: &str,
+        attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        alive_for: Duration,
+    ) {
+        let meta = SessionMeta {
+            id: id.to_owned(),
+            project: PathBuf::from("/tmp/demo"),
+            project_id: format!("proj_{id}"),
+            entry_snapshot: "blake3:abc".to_owned(),
+            manifest: ward_policy::merge(
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                ward_policy::SessionId(id.to_owned()),
+                ward_policy::ProjectId(format!("proj_{id}")),
+            ),
+            started_unix_ms: 1,
+            agent: None,
+        };
+        let dir = session_dir(state, id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let listener = UnixListener::bind(dir.join(SOCKET_NAME)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + alive_for;
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let attempts = std::sync::Arc::clone(&attempts);
+                        std::thread::spawn(move || {
+                            let mut writer = stream.try_clone().unwrap();
+                            for line in BufReader::new(stream)
+                                .lines()
+                                .map_while(std::result::Result::ok)
+                            {
+                                let Ok(request) = serde_json::from_str::<Request>(&line) else {
+                                    continue;
+                                };
+                                let reply = match request {
+                                    Request::Ping => Response::Ok,
+                                    Request::Describe => {
+                                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        Response::Error("not ready".into())
+                                    }
+                                    other => panic!("unexpected request {other:?}"),
+                                };
+                                let mut b = serde_json::to_vec(&reply).unwrap();
+                                b.push(b'\n');
+                                let _ = writer.write_all(&b);
+                            }
+                        });
+                    }
+                    // Nothing pending: a short, bounded wait before checking
+                    // the deadline again rather than busy-spinning the CPU —
+                    // this governs only how promptly the stand-in notices a
+                    // new connection, never what the test asserts on.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Past `alive_for`: stop accepting so `serving`/`live_sessions`
+            // correctly see this session as gone, the same as a real `wardd`
+            // that has exited.
+            drop(listener);
+        });
+    }
+
+    /// Review 5284361040 of #210, finding 2: no watcher thread may outlive
+    /// `follow_pending_all` itself, including on the early return an
+    /// unrelated `live_sessions` failure now takes. `sess_a`'s watcher is
+    /// still genuinely mid-`Subscribe` (its connection is held open) when the
+    /// `sessions` directory is corrupted out from under a later `discover`
+    /// call; the fix joins every outstanding watcher before propagating that
+    /// error, so this asserts the call does not return until `sess_a`'s
+    /// watcher has actually finished (its `hold` has elapsed) — returning
+    /// any earlier would mean the thread was abandoned, not joined, and would
+    /// still be running (and still calling the shared `emit`) after the
+    /// caller had already moved on.
+    #[test]
+    fn follow_pending_all_joins_an_active_watcher_before_returning_a_discovery_error() {
+        let state = tempfile::tempdir().unwrap();
+        let (connected_tx, connected_rx) = mpsc::channel();
+        let hold = Duration::from_millis(300);
+        spawn_pool_session_signaling(state.path(), "sess_a", 1, vec![], None, hold, connected_tx);
+
+        let state_path = state.path().to_path_buf();
+        let started = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            follow_pending_all(
+                &state_path,
+                // Longer than `hold`: `sess_a`'s single `Subscribe` connection
+                // stays open (never timing out into a re-list, which would
+                // need a fresh connection of its own) until the fake daemon
+                // closes it, so this watcher makes no connection after its
+                // third and can only end when that hold elapses.
+                Duration::from_millis(400),
+                Duration::from_millis(30),
+                |_| {},
+            )
+        });
+
+        // Wait for three connections to `sess_a`'s socket before corrupting
+        // `sessions`: `live_sessions`'s own `serving()` probe (inside
+        // `discover`, before it even spawns anything) is the first, the
+        // watcher thread's `describe` the second, and `follow_pending`'s own
+        // `Subscribe` (opened on a fresh connection once `describe` succeeds)
+        // the third. Only once that third connection is itself accepted is
+        // the watcher genuinely settled into its long `Subscribe` hold and
+        // done making new connections on this path — corrupting any earlier
+        // risks the watcher's own *next* connect attempt (still to come)
+        // failing instead of the intended later `discover` call, which would
+        // end the watcher quickly and not be testing "while a watcher is
+        // active" at all. An already-accepted connection is unaffected by
+        // the directory entry it was reached through being removed
+        // afterwards.
+        for _ in 0..3 {
+            connected_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("sess_a's watcher connects");
+        }
+
+        // A discovery failure distinct from "nothing live": the sessions
+        // directory itself becomes unreadable as a directory (`ENOTDIR`), so
+        // the next `live_sessions` call — driven by the 30ms rediscover
+        // timeout — errors instead of just finding nothing new. `sess_a`'s
+        // own already-open `Subscribe` connection is unaffected: removing the
+        // directory entry does not close a socket already connected on it.
+        std::fs::remove_dir_all(state.path().join("sessions")).unwrap();
+        std::fs::write(state.path().join("sessions"), b"not a directory").unwrap();
+
+        let result = handle.join().expect("follow_pending_all does not panic");
+        let elapsed = started.elapsed();
+        assert!(
+            result.is_err(),
+            "the corrupted sessions directory must surface as an error"
+        );
+        assert!(
+            elapsed >= hold,
+            "returned in {elapsed:?}, before sess_a's {hold:?} hold elapsed: its \
+             watcher was abandoned, not actually joined"
+        );
+    }
+
+    /// Review 5284361040 of #210, finding 2: a session that answers `Ping`
+    /// (so `live_sessions` keeps reporting it as live) but whose `Describe`
+    /// always refuses must not be retried in a tight reconnect loop — the
+    /// previous shape dropped it from `watched` on every failure, found
+    /// `watched` empty, and immediately rediscovered with nothing slowing it
+    /// down. `sess_broken` here stops answering `Ping` at all after
+    /// `alive_for`, so `follow_pending_all` eventually sees nothing live and
+    /// returns on its own, letting this assert on the attempts made during
+    /// the bounded window it really was live: with backoff, that count is
+    /// bounded by roughly `alive_for / rediscover`, not by how fast a
+    /// reconnect loop can spin.
+    #[test]
+    fn follow_pending_all_backs_off_a_ping_live_describe_failing_session() {
+        let state = tempfile::tempdir().unwrap();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let alive_for = Duration::from_millis(200);
+        spawn_describe_broken_session(
+            state.path(),
+            "sess_broken",
+            std::sync::Arc::clone(&attempts),
+            alive_for,
+        );
+
+        let state_path = state.path().to_path_buf();
+        let rediscover = Duration::from_millis(30);
+        let handle = std::thread::spawn(move || {
+            follow_pending_all(&state_path, Duration::from_millis(20), rediscover, |_| {})
+        });
+        let result = handle.join().expect("follow_pending_all does not panic");
+
+        let seen = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(seen >= 1, "the broken session was never even tried");
+        // A tight reconnect loop would attempt this hundreds or thousands of
+        // times over `alive_for`; bounded backoff keeps it to roughly one
+        // attempt per `rediscover` interval.
+        let generous_bound = (alive_for.as_millis() / rediscover.as_millis()) as usize + 5;
+        assert!(
+            seen <= generous_bound,
+            "{seen} describe attempts in {alive_for:?} at a {rediscover:?} cooldown \
+             looks like a tight reconnect loop, not bounded backoff"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("not ready"),
+            "a persistent describe failure must be visible in the result, not \
+             silently retried forever: {err}"
         );
     }
 }
