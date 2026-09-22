@@ -133,12 +133,14 @@ pub struct ScratchEntry {
     pub path: PathBuf,
     /// The full session id recorded in its owner marker, when legible.
     pub owner: Option<String>,
-    /// Total bytes found under `path`, or `0` if some part of it could not
-    /// be read (a subdirectory this process lacks permission for, most
-    /// sharply). `0` here is never a claim that the entry is actually
-    /// empty — see [`ScratchStatus::Unknown`], which always accompanies it
-    /// in that case, for the honest "not established" signal.
-    pub bytes: u64,
+    /// Total bytes found under `path`, or `None` if some part of it could
+    /// not be read (a subdirectory this process lacks permission for, most
+    /// sharply) — deliberately not `0`, which would be indistinguishable
+    /// from a fully-inspected, genuinely empty entry. A `None` here always
+    /// accompanies [`ScratchStatus::Unknown`], but the reverse isn't true:
+    /// `Unknown` alone (an absent or unparseable owner marker on an
+    /// otherwise fully readable entry) still carries a real `Some` count.
+    pub bytes: Option<u64>,
     /// What the scan could establish about its liveness.
     pub status: ScratchStatus,
 }
@@ -234,12 +236,11 @@ fn scan_one_entry(
     owner: Option<String>,
     sum: impl FnOnce(&Path, &mut u64) -> Result<()>,
 ) -> ScratchEntry {
-    let mut bytes = 0u64;
-    let status = if sum(&path, &mut bytes).is_ok() {
-        classify(state, owner.as_deref())
+    let mut summed = 0u64;
+    let (bytes, status) = if sum(&path, &mut summed).is_ok() {
+        (Some(summed), classify(state, owner.as_deref()))
     } else {
-        bytes = 0;
-        ScratchStatus::Unknown
+        (None, ScratchStatus::Unknown)
     };
     ScratchEntry {
         path,
@@ -382,13 +383,17 @@ fn classify(state: &Path, owner: Option<&str>) -> ScratchStatus {
     }
 }
 
-/// Total bytes of every entry classified [`ScratchStatus::Orphaned`].
+/// Total bytes of every entry classified [`ScratchStatus::Orphaned`]. An
+/// `Orphaned` entry always has a `Some` byte count in practice (the status
+/// itself is only ever reached once the entry has been fully summed — see
+/// [`scan_one_entry`]), but this sums only the `Some` values regardless,
+/// rather than assuming that invariant here too.
 #[must_use]
 pub fn orphaned_bytes(entries: &[ScratchEntry]) -> u64 {
     entries
         .iter()
         .filter(|e| e.status == ScratchStatus::Orphaned)
-        .map(|e| e.bytes)
+        .filter_map(|e| e.bytes)
         .sum()
 }
 
@@ -468,7 +473,12 @@ mod tests {
         let entry = entries.iter().find(|e| e.path == dir).unwrap();
         assert_eq!(entry.owner, None);
         assert_eq!(entry.status, ScratchStatus::Unknown);
-        assert_eq!(entry.bytes, 10);
+        assert_eq!(
+            entry.bytes,
+            Some(10),
+            "fully readable, just unrecorded: a real byte count, not None — \
+             None is reserved for an entry that could not be inspected at all"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -628,8 +638,9 @@ mod tests {
 
         assert_eq!(entry.path, path);
         assert_eq!(
-            entry.bytes, 0,
-            "a partial sum from before the failure must never be reported as exact"
+            entry.bytes, None,
+            "a partial sum from before the failure must never be reported as an \
+             exact (and, worse, indistinguishable-from-genuinely-empty) 0"
         );
         assert_eq!(
             entry.status,
@@ -678,9 +689,15 @@ mod tests {
         let entries = result.unwrap();
         let denied_entry = entries.iter().find(|e| e.path == denied).unwrap();
         assert_eq!(denied_entry.status, ScratchStatus::Unknown);
+        assert_eq!(
+            denied_entry.bytes, None,
+            "the unreadable entry's own size must be reported as unavailable, \
+             never as 0"
+        );
         let healthy_entry = entries.iter().find(|e| e.path == healthy).unwrap();
         assert_eq!(
-            healthy_entry.bytes, 9,
+            healthy_entry.bytes,
+            Some(9),
             "an unrelated unreadable entry elsewhere in the temp dir must not \
              degrade a healthy entry's own report"
         );
@@ -744,7 +761,7 @@ mod tests {
         let entries = scan_scratch(state.path()).unwrap();
         let entry = entries.iter().find(|e| e.path == dir).unwrap();
         assert_eq!(entry.status, ScratchStatus::Orphaned);
-        assert_eq!(entry.bytes, expected_bytes);
+        assert_eq!(entry.bytes, Some(expected_bytes));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -755,32 +772,80 @@ mod tests {
             ScratchEntry {
                 path: PathBuf::from("/tmp/ward-a"),
                 owner: Some("sess_a".to_owned()),
-                bytes: 10,
+                bytes: Some(10),
                 status: ScratchStatus::Orphaned,
             },
             ScratchEntry {
                 path: PathBuf::from("/tmp/ward-b"),
                 owner: Some("sess_b".to_owned()),
-                bytes: 1000,
+                bytes: Some(1000),
                 status: ScratchStatus::Active,
             },
             ScratchEntry {
                 path: PathBuf::from("/tmp/ward-c"),
                 owner: None,
-                bytes: 5000,
+                bytes: Some(5000),
                 status: ScratchStatus::Unknown,
             },
             ScratchEntry {
                 path: PathBuf::from("/tmp/ward-d"),
                 owner: Some("sess_d".to_owned()),
-                bytes: 20,
+                bytes: Some(20),
                 status: ScratchStatus::Orphaned,
+            },
+            // An unreadable entry must never contribute to the orphaned
+            // total, even hypothetically: it's never Orphaned in practice
+            // (scan_one_entry always pairs `None` with `Unknown`), but
+            // `orphaned_bytes` filters on `Some` regardless of that
+            // invariant — see its own doc comment.
+            ScratchEntry {
+                path: PathBuf::from("/tmp/ward-e"),
+                owner: None,
+                bytes: None,
+                status: ScratchStatus::Unknown,
             },
         ];
         assert_eq!(
             orphaned_bytes(&entries),
             30,
             "only the two Orphaned entries (10 + 20) count; Active and Unknown never do"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_byte_count_serializes_as_json_null_never_as_zero() {
+        // The `--json` CLI output serializes `ScratchEntry` directly (see
+        // `ward-cli`'s `cmd_snapshot_usage`), so this is the same shape a
+        // JSON consumer of `ward snapshot usage --json` actually receives.
+        let unreadable = ScratchEntry {
+            path: PathBuf::from("/tmp/ward-unreadable"),
+            owner: None,
+            bytes: None,
+            status: ScratchStatus::Unknown,
+        };
+        let readable_empty = ScratchEntry {
+            path: PathBuf::from("/tmp/ward-empty"),
+            owner: None,
+            bytes: Some(0),
+            status: ScratchStatus::Unknown,
+        };
+
+        let unreadable_json = serde_json::to_value(&unreadable).unwrap();
+        assert_eq!(
+            unreadable_json["bytes"],
+            serde_json::Value::Null,
+            "an uninspectable entry must serialize its size as JSON null, \
+             never as the number 0 — a JSON consumer must be able to tell \
+             it apart from a genuinely empty entry: {unreadable_json}"
+        );
+
+        let readable_empty_json = serde_json::to_value(&readable_empty).unwrap();
+        assert_eq!(
+            readable_empty_json["bytes"],
+            serde_json::json!(0),
+            "a fully inspected, genuinely empty entry must still serialize \
+             as the real number 0, not be conflated with the unavailable \
+             case above: {readable_empty_json}"
         );
     }
 

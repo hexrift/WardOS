@@ -795,10 +795,12 @@ pub fn usage_panel(state_root: &Path, usage: &StorageUsage, scratch: &[ScratchEn
             .path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let size = entry
+            .bytes
+            .map_or_else(|| "unavailable".to_owned(), human_bytes);
         let _ = writeln!(
             s,
-            "  {INK}{name:<28}{RESET}{DIM}{owner:<26}{RESET}{color}{word:<10}{RESET}{INK}{:>10}{RESET}",
-            human_bytes(entry.bytes)
+            "  {INK}{name:<28}{RESET}{DIM}{owner:<26}{RESET}{color}{word:<10}{RESET}{INK}{size:>11}{RESET}"
         );
     }
     let orphaned_count = scratch
@@ -1262,19 +1264,30 @@ mod tests {
             ScratchEntry {
                 path: "/tmp/ward-active1".into(),
                 owner: Some("sess_a".to_owned()),
-                bytes: 10,
+                bytes: Some(10),
                 status: ScratchStatus::Active,
             },
             ScratchEntry {
                 path: "/tmp/ward-orphan1".into(),
                 owner: Some("sess_b".to_owned()),
-                bytes: 40,
+                bytes: Some(40),
                 status: ScratchStatus::Orphaned,
             },
             ScratchEntry {
                 path: "/tmp/ward-mystery1".into(),
                 owner: None,
-                bytes: 5,
+                bytes: Some(5),
+                status: ScratchStatus::Unknown,
+            },
+            // Fully distinct from ward-mystery1 above: same Unknown status
+            // and no owner marker, but this one is genuinely unreadable
+            // rather than merely unrecorded — the two must not render or
+            // serialize identically (see the review on #200 that named this
+            // exact ambiguity).
+            ScratchEntry {
+                path: "/tmp/ward-unreadable1".into(),
+                owner: None,
+                bytes: None,
                 status: ScratchStatus::Unknown,
             },
         ];
@@ -1290,6 +1303,24 @@ mod tests {
         assert!(out.contains("UNKNOWN"));
         assert!(out.contains("(no owner marker)"));
         assert!(out.contains("1 orphaned"), "one entry is Orphaned:\n{out}");
+        assert!(
+            out.contains("ward-unreadable1"),
+            "an unreadable entry must still be listed, not dropped:\n{out}"
+        );
+        assert!(
+            out.contains("unavailable"),
+            "an unreadable entry's size must render as unavailable, never as 0 B \
+             (indistinguishable from a genuinely empty entry):\n{out}"
+        );
+        let unreadable_row = out
+            .lines()
+            .find(|l| l.contains("ward-unreadable1"))
+            .unwrap();
+        assert!(
+            unreadable_row.trim_end().ends_with("unavailable"),
+            "the unreadable entry's own size column must read 'unavailable', \
+             never a byte figure:\n{unreadable_row}"
+        );
     }
 
     #[test]
