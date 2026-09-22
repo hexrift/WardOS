@@ -174,4 +174,20 @@ wardos-calibrate
 assert_logged '^timedatectl set-timezone Europe/Paris$'
 assert_file "$marker"
 
+# --- a failed password step (wardos-launch run propagating a real child failure, #142)
+# does not abort the guided review; the rest of the review still applies and completes -------
+# `wardos-calibrate` with no arguments already happens to tolerate this (bash suspends
+# `set -e` for the whole call tree under the `if guided; then` at the bottom of this script),
+# but `wardos-calibrate run` — guided()'s other, unwrapped entry point — does not: reproduce
+# the regression through that path, which crashed outright (no output at all, script killed
+# by `set -e`) before the caller-side guard.
+mock wardos-launch 'exit 9' # stands in for a real failure the fixed wrapper now propagates
+: >"$MOCK_LOG"
+reset_menu "de_DE.UTF-8" "de" "Europe" "Paris" "Set a login password" "Apply and continue"
+# `run`, like the other non-interactive steps, reports whether every requested apply
+# succeeded; the earlier password failure must not be why this one fails.
+wardos-calibrate run || fail "a failed password step must not crash or fail the guided review"
+assert_logged '^wardos-launch run wardos-passwd passwd$'
+assert_logged '^timedatectl set-timezone Europe/Paris$'
+
 echo "ok   calibrate.test.sh internal assertions"
