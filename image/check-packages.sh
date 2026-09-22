@@ -22,6 +22,8 @@ usage() {
 }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=image/dnf-retry.sh
+source "$repo_root/image/dnf-retry.sh"
 file=$repo_root/image/packages.txt
 coprs_file=$repo_root/image/coprs.txt
 # The release comes from the Containerfile's FROM line, so the check and the build
@@ -49,50 +51,6 @@ done
 
 strip() { sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$1"; }
 
-if [[ ! "$release" =~ ^[0-9]+$ ]]; then
-  echo "check-packages.sh: no fedora-bootc:<release> FROM line in image/Containerfile; pass --release" >&2
-  exit 1
-fi
-
-# --- --discover: what COPR offers for a name, and for which releases ---------------------
-copr_api=${COPR_API:-https://copr.fedorainfracloud.org/api_3}
-# Known projects worth a direct look whatever the search says.
-known_projects=(solopasha/hyprland solopasha/hyprland-git erikreider/SwayNotificationCenter
-  dejan/lazygit atim/lazygit yalter/niri)
-chroot_filter="fedora-(${release}|$((release - 1)))-${arch}"
-
-# describe_project JSON: one line "full_name: chroots matching the filter (or none)".
-describe_project() {
-  jq -r --arg re "$chroot_filter" '
-    "  " + .full_name + ": " +
-    ((.chroot_repos // {}) | keys | map(select(test($re))) | if length == 0 then "no " + $re + " chroot" else join(" ") end)'     2>/dev/null || echo "  (unreadable answer)"
-}
-
-if [[ ${#discover[@]} -gt 0 ]]; then
-  echo "check-packages.sh: COPR discovery for release ${release} (chroots matching ${chroot_filter})"
-  for name in "${discover[@]}"; do
-    echo "search: $name"
-    if answer=$(curl -fsSL "${copr_api}/project/search?query=${name}"); then
-      count=$(printf '%s' "$answer" | jq '.items | length' 2>/dev/null || echo 0)
-      if [[ "$count" == 0 ]]; then
-        echo "  no project mentions $name"
-      else
-        printf '%s' "$answer" | jq -c '.items[]' | while read -r item; do printf '%s' "$item" | describe_project; done
-      fi
-    else
-      echo "  search failed (network or API)"
-    fi
-  done
-  echo "known projects:"
-  for project in "${known_projects[@]}"; do
-    if answer=$(curl -fsSL "${copr_api}/project?ownername=${project%%/*}&projectname=${project#*/}"); then
-      printf '%s' "$answer" | describe_project
-    else
-      echo "  $project: not found"
-    fi
-  done
-  exit 0
-fi
 if [[ ! "$release" =~ ^[0-9]+$ ]]; then
   echo "check-packages.sh: no fedora-bootc:<release> FROM line in image/Containerfile; pass --release" >&2
   exit 1
@@ -166,8 +124,34 @@ fi
 # never interpolated. Everything but the repoquery result goes to stderr so stdout is
 # exactly the resolved names. `%{name}\n` is what dnf5 (Fedora 41+) wants; dnf4 adds
 # its own newline, hence the blank-line filter below.
+#
+# COPR enable and the metadata dnf5-plugins install each get a bounded, backed-off retry
+# (issue #198: `retry`, kept identical to image/dnf-retry.sh's, which is what
+# image/dnf-retry.test.sh actually exercises -- this copy runs inside an ephemeral
+# container that can't source a host file without a bind mount) so a transient upstream
+# COPR/mirror hiccup self-heals within the one job run instead of failing it outright.
 # shellcheck disable=SC2016  # the $1/$@ are for the inner bash, expanded in the container
-inner='set -e; n=$1; shift; if [ "$n" -gt 0 ]; then dnf -y -q install dnf5-plugins >&2; fi; while [ "$n" -gt 0 ]; do echo "copr enable $1" >&2; dnf -y -q copr enable "$1" >&2; shift; n=$((n - 1)); done; dnf -q repoquery --qf "%{name}\n" "$@"'
+inner='set -e
+retry() {
+  local max=$1 delay=$2 n=1 rc=0
+  shift 2
+  until "$@"; do
+    rc=$?
+    if [ "$n" -ge "$max" ]; then return "$rc"; fi
+    echo "retry: attempt $n/$max failed (exit $rc), retrying in ${delay}s: $*" >&2
+    sleep "$delay"
+    delay=$((delay * 2))
+    n=$((n + 1))
+  done
+}
+n=$1; shift
+if [ "$n" -gt 0 ]; then retry 3 5 dnf -y -q install dnf5-plugins >&2; fi
+while [ "$n" -gt 0 ]; do
+  echo "copr enable $1" >&2
+  retry 3 5 dnf -y -q copr enable "$1" >&2
+  shift; n=$((n - 1))
+done
+retry 3 5 dnf -q repoquery --qf "%{name}\n" "$@"'
 cmd=("$runtime" run --rm "quay.io/fedora/fedora:${release}"
   bash -c "$inner" -- "${#coprs[@]}")
 if [[ ${#coprs[@]} -gt 0 ]]; then cmd+=("${coprs[@]}"); fi
@@ -195,13 +179,26 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   printf '  %s\n' "${missing[@]}" >&2
   echo "fix the names in $file or add a COPR to $coprs_file (image/README.md, \"Packages\")" >&2
   if [[ $status -ne 0 ]]; then
-    echo "dnf exited with $status; its stderr:" >&2
+    # issue #198: classify before printing, so a red check reads as one or the other
+    # instead of requiring someone to re-derive it from the raw dnf log each time.
+    if [[ $(classify_dnf_failure "$errlog") == transient ]]; then
+      echo "dnf exited with $status after exhausting its retries, and this looks like an" \
+        "upstream COPR/mirror/network outage, not a real package problem -- the names above" \
+        "may not actually be missing. Its stderr:" >&2
+    else
+      echo "dnf exited with $status; its stderr:" >&2
+    fi
     cat "$errlog" >&2
   fi
   exit 1
 fi
 if [[ $status -ne 0 ]]; then
-  echo "check-packages.sh: every name resolved but dnf exited with $status:" >&2
+  if [[ $(classify_dnf_failure "$errlog") == transient ]]; then
+    echo "check-packages.sh: every name resolved, but dnf exited with $status after exhausting" \
+      "its retries -- this looks like an upstream COPR/mirror/network outage (issue #198):" >&2
+  else
+    echo "check-packages.sh: every name resolved but dnf exited with $status:" >&2
+  fi
   cat "$errlog" >&2
   exit "$status"
 fi

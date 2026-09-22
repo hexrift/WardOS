@@ -14,6 +14,8 @@ usage() {
 }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=image/dnf-retry.sh
+source "$repo_root/image/dnf-retry.sh"
 release=$(sed -n 's|^FROM quay.io/fedora/fedora-bootc:\([0-9][0-9]*\)$|\1|p' "$repo_root/image/Containerfile" | head -n 1)
 dry_run=0
 while [[ $# -gt 0 ]]; do
@@ -38,11 +40,28 @@ mapfile -t coprs < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$repo_r
 # as the image does (/etc/xdg/hypr → the tree), render the theme fragment the last
 # `source` line wants (the fragment's shape is what matters, so a stand-in with the
 # same keys is enough), then verify.
+#
+# COPR enable and both dnf installs get a bounded, backed-off retry (issue #198: `retry`,
+# kept identical to image/dnf-retry.sh's -- this copy runs inside an ephemeral container
+# that can't source a host file without a bind mount) so a transient upstream COPR/mirror
+# hiccup self-heals within the one job run instead of failing it outright.
 # shellcheck disable=SC2016  # $@ and $HOME expand inside the container's bash
 inner='set -e
-dnf -y -q install dnf5-plugins >/dev/null
-for c in "$@"; do dnf -y -q copr enable "$c" >/dev/null; done
-dnf -y -q --setopt=install_weak_deps=False install hyprland util-linux >/dev/null
+retry() {
+  local max=$1 delay=$2 n=1 rc=0
+  shift 2
+  until "$@"; do
+    rc=$?
+    if [ "$n" -ge "$max" ]; then return "$rc"; fi
+    echo "retry: attempt $n/$max failed (exit $rc), retrying in ${delay}s: $*" >&2
+    sleep "$delay"
+    delay=$((delay * 2))
+    n=$((n + 1))
+  done
+}
+retry 3 5 dnf -y -q install dnf5-plugins >/dev/null
+for c in "$@"; do retry 3 5 dnf -y -q copr enable "$c" >/dev/null; done
+retry 3 5 dnf -y -q --setopt=install_weak_deps=False install hyprland util-linux >/dev/null
 mkdir -p /etc/xdg && ln -sfn /desktop/hyprland /etc/xdg/hypr
 # Hyprland refuses to run as root, so a plain user does the parsing.
 useradd -m check
@@ -60,4 +79,19 @@ cmd=("$runtime" run --rm
 echo "check-hyprland.sh: Fedora ${release}, COPRs: ${coprs[*]:-none}; would run:"
 printf '  %q' "${cmd[@]}"; printf '\n'
 if [[ $dry_run -eq 1 ]]; then exit 0; fi
-exec "${cmd[@]}"
+
+# Not exec'd: the combined output is tee'd to a log too, so a failure after the inner
+# retries are exhausted can be classified (issue #198) before this script exits with the
+# container's own status. `set +e`/`PIPESTATUS[0]` capture the container's exit code, not
+# `tee`'s.
+logfile=$(mktemp)
+trap 'rm -f "$logfile"' EXIT
+set +e
+"${cmd[@]}" 2>&1 | tee "$logfile"
+status=${PIPESTATUS[0]}
+set -e
+if [[ $status -ne 0 ]] && [[ $(classify_dnf_failure "$logfile") == transient ]]; then
+  echo "check-hyprland.sh: exited $status after exhausting its dnf/copr retries -- this looks" \
+    "like an upstream COPR/mirror/network outage (issue #198), not a Hyprland config regression." >&2
+fi
+exit "$status"
