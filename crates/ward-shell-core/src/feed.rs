@@ -60,6 +60,14 @@ pub enum Verification {
     Passed(Verdict),
     /// The last verification failed.
     Failed(Verdict),
+    /// The last attempt on this candidate could not run to a pass/fail result: an
+    /// infrastructure error (the sandbox runtime failed to launch, a preparation
+    /// step failed, …), never the trusted command itself exiting non-zero (#139).
+    /// Carries only the candidate, like [`Verification::Failed`]'s bar segment
+    /// does not carry its `Verdict`'s summary either — the reason text is a
+    /// property of the `VerificationErrored` record, shown on its observer row,
+    /// not of this aggregated state.
+    Errored(SnapshotId),
 }
 
 impl Verification {
@@ -68,7 +76,7 @@ impl Verification {
     pub const fn candidate(&self) -> Option<SnapshotId> {
         match self {
             Self::NotRun => None,
-            Self::Running(c) => Some(*c),
+            Self::Running(c) | Self::Errored(c) => Some(*c),
             Self::Passed(v) | Self::Failed(v) => Some(v.candidate),
         }
     }
@@ -158,6 +166,9 @@ impl SessionState {
             WardEvent::VerificationFailed {
                 candidate, summary, ..
             } => self.verification = Verification::Failed(self.verdict(rec, *candidate, *summary)),
+            WardEvent::VerificationErrored { candidate, .. } => {
+                self.verification = Verification::Errored(*candidate);
+            }
             WardEvent::TamperDetected { .. } => self.tamperward = TamperWard::Tampered,
             _ => {}
         }
@@ -477,6 +488,13 @@ pub(crate) mod fixtures {
         }
     }
 
+    pub fn verify_errored() -> WardEvent {
+        WardEvent::VerificationErrored {
+            candidate: snapshot(),
+            reason: ward_events::ShortText::new("sandbox: bubblewrap (bwrap) is not installed"),
+        }
+    }
+
     pub fn denied() -> WardEvent {
         WardEvent::PolicyDenied {
             subject: PolicySubject::ProtectedTests,
@@ -702,5 +720,43 @@ mod tests {
         assert!(!model.sealed);
         model.seal();
         assert!(model.sealed);
+    }
+
+    /// #139: a verification attempt that could not run to a pass/fail result (an
+    /// infrastructure error after `VerificationStarted`) must land in a state that
+    /// is neither "still running" nor "tests failed".
+    #[test]
+    fn an_errored_attempt_is_neither_running_nor_failed() {
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested()]) {
+            model.apply(rec);
+        }
+        assert_eq!(model.state.verification, Verification::Running(snapshot()));
+
+        model.apply(wardd(&[verify_errored()]).remove(0));
+        assert_eq!(model.state.verification, Verification::Errored(snapshot()));
+        assert_eq!(model.state.verification.candidate(), Some(snapshot()));
+        assert_ne!(
+            model.state.verification,
+            Verification::Running(snapshot()),
+            "an errored attempt must not still read as running"
+        );
+        assert!(
+            !matches!(model.state.verification, Verification::Failed(_)),
+            "an infra error must not be presented as a test failure"
+        );
+        assert!(
+            !matches!(model.state.verification, Verification::Passed(_)),
+            "an infra error must never be presented as a pass"
+        );
+
+        // A retry after an error runs and can still pass: the error does not stick.
+        for rec in wardd(&[verify_requested(), verify_passed()]) {
+            model.apply(rec);
+        }
+        let Verification::Passed(passed) = model.state.verification else {
+            panic!("{:?}", model.state.verification);
+        };
+        assert_eq!(passed.candidate, snapshot());
     }
 }

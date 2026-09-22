@@ -64,6 +64,7 @@ pub fn session_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) ->
         VerifyState::Verified(_) => "pass",
         VerifyState::Stale { .. } => "pass · stale",
         VerifyState::Failed(_) => "fail",
+        VerifyState::Errored(_) => "error",
     };
     let verify_tone = verify_state.tone();
     let (evidence, evidence_tone) = match model.state.tamperward {
@@ -98,24 +99,9 @@ pub fn verify_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) -> 
     let tone = state.tone();
     let (verdict, at) = match model.state.verification {
         Verification::Passed(v) | Verification::Failed(v) => (Some(v), Some(v.at)),
-        Verification::NotRun | Verification::Running(_) => (None, None),
+        Verification::NotRun | Verification::Running(_) | Verification::Errored(_) => (None, None),
     };
-    let candidate = match state {
-        VerifyState::Never => Row::new("Verified candidate", "none", Tone::Dim),
-        VerifyState::Verifying(c) => Row::new(
-            "Verified candidate",
-            format!("{} · verifying", short_hex(c)),
-            tone,
-        ),
-        VerifyState::Verified(c) | VerifyState::Stale { candidate: c, .. } => {
-            Row::new("Verified candidate", short_hex(c), tone)
-        }
-        VerifyState::Failed(c) => Row::new(
-            "Verified candidate",
-            format!("{} · failed", short_hex(c)),
-            tone,
-        ),
-    };
+    let candidate = candidate_row(state, tone);
     let time = at.map_or_else(
         || Row::new("Verified time", "—", Tone::Dim),
         |at| {
@@ -194,6 +180,31 @@ pub fn verify_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) -> 
     }]
 }
 
+/// The verify panel's "Verified candidate" row for `state`, in its tone.
+fn candidate_row(state: VerifyState, tone: Tone) -> Row {
+    match state {
+        VerifyState::Never => Row::new("Verified candidate", "none", Tone::Dim),
+        VerifyState::Verifying(c) => Row::new(
+            "Verified candidate",
+            format!("{} · verifying", short_hex(c)),
+            tone,
+        ),
+        VerifyState::Verified(c) | VerifyState::Stale { candidate: c, .. } => {
+            Row::new("Verified candidate", short_hex(c), tone)
+        }
+        VerifyState::Failed(c) => Row::new(
+            "Verified candidate",
+            format!("{} · failed", short_hex(c)),
+            tone,
+        ),
+        VerifyState::Errored(c) => Row::new(
+            "Verified candidate",
+            format!("{} · error", short_hex(c)),
+            tone,
+        ),
+    }
+}
+
 /// `12:43`: minutes and seconds into the session, as the observer's time column.
 fn session_time(at: std::time::Duration) -> String {
     let t = at.as_secs();
@@ -234,8 +245,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::feed::fixtures::{
-        denied, edited, records, snapshot, verify_failed, verify_passed, verify_progress,
-        verify_requested, wardd,
+        denied, edited, records, snapshot, verify_errored, verify_failed, verify_passed,
+        verify_progress, verify_requested, wardd,
     };
     use crate::trust::fixtures::description;
     use ward_events::Origin;
@@ -419,5 +430,33 @@ mod tests {
             text.starts_with("Verify\n────────────────────────\nVerified candidate   abababab\n"),
             "{text}"
         );
+    }
+
+    /// #139: a verification attempt that errored out (infrastructure failure, not a
+    /// test failure) must read as neither "running" nor "fail" in either panel.
+    #[test]
+    fn an_errored_attempt_reads_as_its_own_row_not_running_or_failed() {
+        let d = description(NetworkCapability::Development);
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested(), verify_errored()]) {
+            model.apply(rec);
+        }
+
+        let groups = session_panel(&d, &model, d.started_unix_ms);
+        let verify = value(&groups, "TamperWard", "Last verify");
+        assert_eq!((verify.value.as_str(), verify.tone), ("error", Tone::Deny));
+        assert_ne!(verify.value, "running");
+        assert_ne!(verify.value, "fail");
+
+        let groups = verify_panel(&d, &model, d.started_unix_ms);
+        let candidate = value(&groups, "Verify", "Verified candidate");
+        assert_eq!(
+            (candidate.value.as_str(), candidate.tone),
+            ("abababab · error", Tone::Deny)
+        );
+        // No verdict was ever recorded for this attempt: the test/integrity rows
+        // stay unset rather than showing zeros a suite never produced.
+        assert_eq!(value(&groups, "Verify", "Tests").value, "—");
+        assert_eq!(value(&groups, "Verify", "Integrity").value, "—");
     }
 }

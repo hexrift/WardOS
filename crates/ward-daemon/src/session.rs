@@ -751,6 +751,16 @@ impl Session {
     /// the candidate snapshot, the start with the pristine id and config hash, one
     /// progress step per restored protected path and one for the command, then the
     /// pass or fail with the parsed summary and the output hash.
+    ///
+    /// Once `VerificationStarted` is on the log, every exit path is guaranteed exactly
+    /// one terminal verification record before this returns — `VerificationPassed`,
+    /// `VerificationFailed`, or, when the run could not be carried to either of those
+    /// (the sandbox runtime failed to launch, a step in between errored, …),
+    /// `VerificationErrored` (#139). A subscriber watching the log therefore never sees
+    /// a `VerificationStarted` with nothing after it: an unexecuted suite is recorded
+    /// as neither a pass nor a failure. The real error is still returned to the caller
+    /// either way — the terminal record does not replace it, only ensures the log
+    /// itself carries a definite outcome.
     pub fn verify(&mut self) -> Result<VerifyReport> {
         let store = SnapshotStore::open(self.state.join("cas"))
             .map_err(|e| Error::Snapshot(e.to_string()))?;
@@ -760,11 +770,30 @@ impl Session {
             .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
         let scratch_root = run_dir(&self.session_str)?;
         // Freeze the agent only for the candidate capture inside `prepare`; the
-        // verifier itself runs from the CAS, not the worktree (ST-018, G5/G9).
+        // verifier itself runs from the CAS, not the worktree (ST-018, G5/G9). A
+        // failure here (missing config, a hostile candidate symlink, …) happens
+        // before any verification-kind record exists, so there is nothing yet for a
+        // terminal record to follow; the caller sees the real error directly, as
+        // before #139.
         let prepared = {
             let _freeze = self.freeze_for_capture();
             verify::prepare(&store, &self.worktree, entry, &scratch_root)?
         };
+        self.verify_prepared(&prepared, entry, &scratch_root)
+    }
+
+    /// Records and runs a verification that has already been prepared: the request
+    /// and start, then a guaranteed terminal record (#139), then cleanup. Split out
+    /// of [`verify`](Self::verify) so it can be exercised directly with a hand-built
+    /// [`verify::Verification`], without needing a real `.tamperward/config.yml` or a
+    /// working sandbox runtime, to prove that a `verify::execute` failure still ends
+    /// the log in `VerificationErrored` rather than a bare `VerificationStarted`.
+    fn verify_prepared(
+        &mut self,
+        prepared: &verify::Verification,
+        entry: ward_snapshot::SnapshotId,
+        scratch_root: &Path,
+    ) -> Result<VerifyReport> {
         let candidate = ev_snapshot(prepared.candidate);
         self.emit(
             Origin::User,
@@ -782,6 +811,33 @@ impl Session {
                 manifest_hash: ev_hash(prepared.manifest_hash),
             },
         )?;
+
+        // From here on `VerificationStarted` is already on the log, so every path out
+        // of this function must leave a terminal verification record behind it.
+        let result = self.run_prepared_verification(prepared, candidate);
+        let _ = std::fs::remove_dir_all(&prepared.scratch);
+        let _ = std::fs::remove_dir(scratch_root);
+        result.inspect_err(|e| {
+            // Best effort: emitting the terminal record can itself fail (e.g. the sink
+            // is gone), but that never changes what the caller sees below — the real
+            // error always propagates, this only tries to leave the log honest.
+            let reason = ShortText::new(&e.to_string());
+            let _ = self.emit(
+                Origin::Verifier,
+                WardEvent::VerificationErrored { candidate, reason },
+            );
+        })
+    }
+
+    /// The steps of a prepared verification once `VerificationStarted` is recorded:
+    /// the restore progress, the command's progress step, then its verdict. An `Err`
+    /// here means none of those reached a terminal verification record; the caller
+    /// ([`verify`](Self::verify)) turns it into `VerificationErrored` (#139).
+    fn run_prepared_verification(
+        &mut self,
+        prepared: &verify::Verification,
+        candidate: ward_events::SnapshotId,
+    ) -> Result<VerifyReport> {
         for rel in &prepared.restored {
             self.emit(
                 Origin::Verifier,
@@ -791,10 +847,7 @@ impl Session {
                 },
             )?;
         }
-        let outcome = verify::execute(&prepared);
-        let _ = std::fs::remove_dir_all(&prepared.scratch);
-        let _ = std::fs::remove_dir(&scratch_root);
-        let outcome = outcome?;
+        let outcome = verify::execute(prepared)?;
         let status = if outcome.passed {
             StepStatus::Pass
         } else {
@@ -826,7 +879,7 @@ impl Session {
             candidate: candidate.to_string(),
             passed: outcome.passed,
             summary: outcome.summary,
-            restored: prepared.restored,
+            restored: prepared.restored.clone(),
             output: outcome.output,
         })
     }
@@ -1269,7 +1322,7 @@ fn scan_changes(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
     fn sample_meta(id: &str) -> SessionMeta {
@@ -1431,5 +1484,81 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded, meta);
+    }
+
+    /// #139: once `VerificationStarted` is on the log, a `verify::execute` failure
+    /// (the verifier could not even run) must still end the attempt in exactly one
+    /// terminal record — `VerificationErrored` — never leaving `VerificationStarted`
+    /// as the last verification-kind record.
+    ///
+    /// `verify::execute` is made to fail deterministically, on every host with or
+    /// without bubblewrap installed: `Launch::run` canonicalises its worktree — here
+    /// the verifier's own scratch tree — before it spawns anything, so handing it a
+    /// `Verification` whose `scratch` does not exist fails at that first step, every
+    /// time. This exercises [`Session::verify_prepared`], the exact code
+    /// [`Session::verify`] runs once `verify::prepare` has produced a candidate.
+    #[test]
+    fn verify_execute_failure_ends_the_log_in_verification_errored() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+
+        let entry: ward_snapshot::SnapshotId = session.entry_snapshot.parse().unwrap();
+        let candidate = ward_snapshot::SnapshotId(ward_snapshot::Digest::from_bytes([0xab; 32]));
+        let scratch_root = state.path().join("scratch-root");
+        let prepared = verify::Verification {
+            candidate,
+            config: verify::Config {
+                protected: verify::Protected::default(),
+                verify: verify::VerifyCommand {
+                    command: "true".to_owned(),
+                    budget_secs: 5,
+                },
+            },
+            manifest_hash: [7u8; 32],
+            restored: Vec::new(),
+            scratch: scratch_root.join("does-not-exist"),
+        };
+
+        let err = session
+            .verify_prepared(&prepared, entry, &scratch_root)
+            .expect_err("execute must fail on a missing scratch tree");
+        assert!(
+            !err.to_string().is_empty(),
+            "the real error still propagates to the caller"
+        );
+        session.sync().unwrap();
+
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let verification_kinds: Vec<&str> = records
+            .iter()
+            .filter_map(|r| match &r.event {
+                WardEvent::VerificationRequested { .. } => Some("Requested"),
+                WardEvent::VerificationStarted { .. } => Some("Started"),
+                WardEvent::VerificationProgress { .. } => Some("Progress"),
+                WardEvent::VerificationPassed { .. } => Some("Passed"),
+                WardEvent::VerificationFailed { .. } => Some("Failed"),
+                WardEvent::VerificationErrored { .. } => Some("Errored"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            verification_kinds,
+            vec!["Requested", "Started", "Errored"],
+            "the stream must end the attempt in VerificationErrored, not a bare Started"
+        );
+        match &records.last().unwrap().event {
+            WardEvent::VerificationErrored {
+                candidate: logged,
+                reason,
+            } => {
+                assert_eq!(logged, &ev_snapshot(candidate));
+                assert!(!reason.as_str().is_empty(), "the reason is never blank");
+            }
+            other => panic!("expected VerificationErrored last, got {other:?}"),
+        }
     }
 }

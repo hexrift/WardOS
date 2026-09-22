@@ -152,8 +152,8 @@ pub const fn agent_tone(state: AgentState) -> Tone {
     }
 }
 
-/// The verify segment's five states (ADR-0019 decision 1): what the stream has
-/// said about verification, held against what the worktree digests to now.
+/// The verify segment's six states (ADR-0019 decision 1; #139): what the stream
+/// has said about verification, held against what the worktree digests to now.
 /// The bar shows exactly one, and green appears only while the tree is the
 /// verified candidate, byte for byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,8 +173,16 @@ pub enum VerifyState {
         /// What the worktree digests to now.
         worktree: SnapshotId,
     },
-    /// `VERIFY ✗`: the candidate failed.
+    /// `VERIFY ✗`: the candidate failed. The trusted command ran to completion
+    /// and exited non-zero (or its output said so).
     Failed(SnapshotId),
+    /// `VERIFY ! ERROR`: the attempt on this candidate could not run to a
+    /// pass/fail result at all — an infrastructure error (the sandbox runtime
+    /// failed to launch, a preparation step failed, …) after `VerificationStarted`
+    /// (#139). Distinct from both `Verifying` (still running) and `Failed` (the
+    /// trusted command ran and exited non-zero): an unexecuted suite is never
+    /// shown as a test failure, and never as a pass.
+    Errored(SnapshotId),
 }
 
 impl VerifyState {
@@ -187,6 +195,7 @@ impl VerifyState {
             (Verification::NotRun, _) => Self::Never,
             (Verification::Running(candidate), _) => Self::Verifying(candidate),
             (Verification::Failed(v), _) => Self::Failed(v.candidate),
+            (Verification::Errored(candidate), _) => Self::Errored(candidate),
             (Verification::Passed(v), Some(worktree)) if !same_id(&v.candidate, &worktree) => {
                 Self::Stale {
                     candidate: v.candidate,
@@ -198,8 +207,9 @@ impl VerifyState {
     }
 
     /// The colour role: green only for a verdict that describes the tree,
-    /// amber once the tree has moved on, red for a failure, accent while the
-    /// verifier runs, dim before anything was verified.
+    /// amber once the tree has moved on, red for a failure or an errored
+    /// attempt, accent while the verifier runs, dim before anything was
+    /// verified.
     #[must_use]
     pub const fn tone(self) -> Tone {
         match self {
@@ -207,7 +217,7 @@ impl VerifyState {
             Self::Verifying(_) => Tone::Accent,
             Self::Verified(_) => Tone::Ok,
             Self::Stale { .. } => Tone::Warn,
-            Self::Failed(_) => Tone::Deny,
+            Self::Failed(_) | Self::Errored(_) => Tone::Deny,
         }
     }
 
@@ -220,6 +230,7 @@ impl VerifyState {
             Self::Verified(_) => "verified",
             Self::Stale { .. } => "stale",
             Self::Failed(_) => "failed",
+            Self::Errored(_) => "errored",
         }
     }
 
@@ -233,6 +244,7 @@ impl VerifyState {
             Self::Verified(c) => format!("VERIFY ✓ {}", short_hex(c)),
             Self::Stale { .. } => "VERIFY ~ STALE".to_owned(),
             Self::Failed(_) => "VERIFY ✗".to_owned(),
+            Self::Errored(_) => "VERIFY ! ERROR".to_owned(),
         };
         Segment::new(text, self.tone())
     }
@@ -628,7 +640,7 @@ mod tests {
     use super::*;
     use crate::feed::fixtures::{
         agent, denied, edited, ended, model_with, paused, records, resumed, sequence, snapshot,
-        tamper, verify_failed, verify_passed, verify_requested, wardd,
+        tamper, verify_errored, verify_failed, verify_passed, verify_requested, wardd,
     };
     use ward_events::{Origin, WardEvent};
     use ward_policy::merge;
@@ -763,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn the_verify_segment_is_a_five_state_machine_over_the_stream_and_the_worktree() {
+    fn the_verify_segment_is_a_six_state_machine_over_the_stream_and_the_worktree() {
         use VerifyState as V;
         let h = header(NetworkCapability::Development);
         let mut model = Model::new(false);
@@ -788,7 +800,18 @@ mod tests {
         model.observe_worktree(snapshot(), Some(0));
         assert_eq!(state(&model), V::Failed(snapshot()));
 
-        // ✓ : passed, and the worktree is the candidate.
+        // ! : a retry that could not even run — an infrastructure error, never
+        // shown as "running" or as a test failure (#139).
+        for rec in wardd(&[verify_requested(), verify_errored()]) {
+            model.apply(rec);
+        }
+        assert_eq!(state(&model), V::Errored(snapshot()));
+        assert_ne!(state(&model), V::Verifying(snapshot()));
+        assert_ne!(state(&model), V::Failed(snapshot()));
+        assert_eq!(seg(&model), Segment::new("VERIFY ! ERROR", Tone::Deny));
+
+        // ✓ : passed, and the worktree is the candidate. A pass after an error
+        // clears it, like any other retry.
         for rec in wardd(&[verify_requested(), verify_passed()]) {
             model.apply(rec);
         }
@@ -853,6 +876,7 @@ mod tests {
                 "stale",
             ),
             (V::Failed(snapshot()), Tone::Deny, "failed"),
+            (V::Errored(snapshot()), Tone::Deny, "errored"),
         ];
         for (state, tone, word) in cases {
             assert_eq!(state.tone(), tone, "{word}");
