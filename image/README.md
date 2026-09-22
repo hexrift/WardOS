@@ -701,6 +701,15 @@ CI runs, on every pull request and push (`verify.yml`):
 | `hyprland config` | `image/check-hyprland.sh`: `Hyprland --verify-config` on `desktop/hyprland/` inside a `fedora:<release>` container with the COPRs, so the tree matches the compositor the image ships |
 | `desktop scripts` | `desktop/tests/run.sh`, which includes `install.test.sh` (install-desktop, desktop/install.sh, wardos-flathub, check-packages.sh, disk.sh) |
 
+`copr-canary.yml` runs `check-packages.sh` and `check-hyprland.sh` again on their own
+schedule (every 3 hours) and on manual dispatch, unpaired from any pull request. A
+failure there rules out a PR's own diff as the cause, since none is involved — it is
+not by itself proof the COPRs are at fault (the runner, the registry pull, or a
+pre-existing bug on main could equally produce a red run); read the failing step's
+own output for which package/COPR/command actually failed. When it does point at a
+COPR/package resolution gap, see [issue #198](https://github.com/hexrift/WardOS/issues/198)
+— a legible, standing signal instead of every PR re-deriving it from raw dnf logs.
+
 and, in `image.yml` on `main` and on pull requests that touch `image/`, `desktop/`, the
 crates or `Cargo.lock`: `image build` and `image build (aarch64)`, the real `docker
 build` with the checkout's binaries on a runner of each architecture, the image's size
