@@ -89,10 +89,11 @@ impl Recorder {
     /// Counting open connections here instead is what produced the false gaps.
     ///
     /// Because the proxy announces a connection on its acceptor thread, and
-    /// `Handle::shutdown` — which [`Egress::quiesce`] runs first — joins that
-    /// thread, no connection can join the set after the shutdown returns. So what
-    /// the seal sees really is everything that may still be decided, and charging
-    /// it here, synchronously, is what puts the gap in the batch the caller's one
+    /// `Handle::shutdown` — which [`Egress::quiesce`] runs first — is mutually
+    /// exclusive with that announcement, no connection can join the set after the
+    /// shutdown returns, whether or not the acceptor thread has stopped. So what the
+    /// seal sees really is everything that may still be decided, and charging it
+    /// here, synchronously, is what puts the gap in the batch the caller's one
     /// terminal drain is about to take. A late verdict that arrives after this adds
     /// nothing: its loss has already been reported for it.
     pub fn seal(&self) -> usize {
@@ -133,9 +134,9 @@ impl Observer for Recorder {
     }
 
     /// One accepted connection joins the set of verdicts still to come, so the
-    /// terminal [`seal`](Recorder::seal) can charge it as a gap if it does not
-    /// reach one in time. Called on the proxy's acceptor thread, which
-    /// `Handle::shutdown` joins — so once the caller's quiesce has shut the proxy
+    /// terminal [`seal`](Recorder::seal) can charge it as a gap if it does not reach
+    /// one in time. Called on the proxy's acceptor thread, and mutually exclusive
+    /// with `Handle::shutdown` — so once the caller's quiesce has shut the proxy
     /// down, this set only shrinks.
     ///
     /// There is no cap of the recorder's own: the proxy already bounds how many
@@ -327,8 +328,10 @@ impl Egress {
     /// in an `ObservationsDropped` marker beside it: a connection still being
     /// served has, by then, already recorded the decision it was served for.
     ///
-    /// The three steps are in this order for a reason. `shutdown` joins the
-    /// acceptor, so after it no connection can join the set at all; the wait then
+    /// The three steps are in this order for a reason. `shutdown` closes the proxy's
+    /// announcement gate, so after it no connection can join the set at all — the
+    /// acceptor may still be parked in `accept`, and a connection may still arrive,
+    /// but neither can be announced any more, so neither is served; the wait then
     /// gives the ones already in it their bounded chance to decide; and the seal
     /// charges whatever is left **before this returns**. That is what makes the
     /// caller's single terminal [`drain_observations`](Self::drain_observations)
@@ -338,9 +341,10 @@ impl Egress {
     /// Returns how many connections were still in flight when the wait ran out,
     /// which is a report on the proxy, not an accounting of the record.
     pub fn quiesce(&self, timeout: Duration) -> usize {
-        // Stops accepting, asks every relay to wind down and joins the acceptor;
-        // idempotent, so the later `stop` is still safe. Joining the acceptor is
-        // what closes the set of connections that may still be decided.
+        // Stops accepting and asks every relay to wind down; idempotent, so the
+        // later `stop` is still safe. Its returning is what closes the set of
+        // connections that may still be decided — unconditionally, without relying
+        // on the wake connection that gets the acceptor out of `accept`.
         self.handle.shutdown();
         // An open connection is a superset of an undecided one, so this waits out
         // the relays too; the seal below is what distinguishes the two.
@@ -776,6 +780,148 @@ mod tests {
                 .iter()
                 .any(|o| o.origin == Origin::Wardd && o.origin.is_enforcement_fact())
         );
+    }
+
+    /// Parks the proxy's acceptor at the exact point the announcement is made, and
+    /// lets the test decide when it may proceed.
+    ///
+    /// `deciding` is the announcement: it is the call through which an accepted
+    /// connection joins the recorder's outstanding set, and the accept loop makes it
+    /// after its last look at the shutdown flag. Blocking the first one therefore
+    /// holds the acceptor still in precisely the window a shutdown must not be able
+    /// to slip through — past the flag check, not yet in the set. Everything else is
+    /// the real [`Recorder`]'s.
+    struct ParkedAnnouncement {
+        inner: Arc<Recorder>,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+        parked: AtomicBool,
+    }
+
+    impl Observer for ParkedAnnouncement {
+        fn decision(&self, req: &Request, decision: Decision, reason: &str) {
+            self.inner.decision(req, decision, reason);
+        }
+
+        fn deciding(&self) -> bool {
+            if !self.parked.swap(true, Ordering::AcqRel) {
+                self.entered.wait();
+                self.release.wait();
+            }
+            self.inner.deciding()
+        }
+
+        fn decided(&self, req: &Request, decision: Decision, reason: &str) {
+            self.inner.decided(req, decision, reason);
+        }
+
+        fn undecided(&self) {
+            self.inner.undecided();
+        }
+    }
+
+    /// #137, round 5: the cutover may not depend on the proxy's wake connection.
+    ///
+    /// `Handle::shutdown` used to join its acceptor only when the synthetic
+    /// connection it makes to wake that acceptor out of `accept` succeeded, and to
+    /// leave the thread running when it did not. The seal, though, relies on the
+    /// stronger statement — *after `shutdown` returns, nothing more can join the
+    /// outstanding-decision set* — and a wake that cannot land (the Unix socket file
+    /// is gone) left an acceptor free to announce a connection after the seal had
+    /// already decided there was nothing left to account for. Its verdict then
+    /// arrived untracked, was refused by the sealed queue, and raised a `dropped`
+    /// count in an epoch no drain would ever emit: a genuine gap, silently.
+    ///
+    /// The five steps of that interleaving, forced here rather than waited for:
+    /// the acceptor is parked at its announcement (1); the socket file is unlinked
+    /// so the wake provably fails (2); `quiesce` and the session's single terminal
+    /// drain run (3); only then is the acceptor released and its verdict produced
+    /// (4, 5). The batch the drain already returned has to account for that verdict
+    /// exactly once — not zero times, which is the silent loss, and not twice.
+    #[test]
+    fn a_connection_announced_while_the_wake_fails_is_accounted_for_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("proxy.sock");
+        let recorder = Arc::new(Recorder::with_capacity(8));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let observer: Arc<dyn Observer> = Arc::new(ParkedAnnouncement {
+            inner: Arc::clone(&recorder),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            parked: AtomicBool::new(false),
+        });
+        let config = Config::new(NetworkCapability::Offline).listen_unix(&socket);
+        let handle = Proxy::spawn(config, observer).unwrap();
+        let egress = Egress {
+            handle: Arc::new(handle),
+            socket: socket.clone(),
+            recorder,
+            watcher: None,
+        };
+
+        let asking = {
+            let socket = socket.clone();
+            std::thread::spawn(move || ask_proxy(&socket, "example.com"))
+        };
+
+        // (1) The acceptor has accepted, has looked at the shutdown flag, and has
+        // not yet joined the outstanding-decision set.
+        entered.wait();
+        // (2) The socket file goes, so the wake connection `shutdown` makes cannot
+        // reach the acceptor. Nothing about the cutover may depend on it.
+        std::fs::remove_file(&socket).unwrap();
+
+        let drained = Arc::new(AtomicBool::new(false));
+        let releaser = {
+            let (release, drained) = (Arc::clone(&release), Arc::clone(&drained));
+            std::thread::spawn(move || {
+                // Without the gate, `quiesce` never waits for the parked
+                // announcement: the terminal drain is taken immediately and this
+                // returns at once, which is the interleaving under test. With it,
+                // `quiesce` cannot complete until the release below, so this waits
+                // the bound out and then lets the acceptor through.
+                crate::daemon::wait_until(Duration::from_millis(250), || {
+                    drained.load(Ordering::Acquire)
+                });
+                release.wait();
+            })
+        };
+
+        // (3) The terminal sequence, exactly as the session runs it: quiesce, then
+        // the one drain, with nothing joining the proxy in between.
+        egress.quiesce(Duration::ZERO);
+        let terminal = egress.drain_observations(&by());
+        drained.store(true, Ordering::Release);
+
+        // (4, 5) Only now is the acceptor released, so the verdict is produced
+        // strictly after the batch above was returned.
+        releaser.join().unwrap();
+        drop(asking.join());
+
+        let (decisions, dropped) = tally(&terminal);
+        assert_eq!(
+            decisions as u64 + dropped,
+            1,
+            "the connection was accepted, so its one verdict has to be accounted for \
+             in the batch the terminal drain already took — a wake connection that \
+             could not land must not be able to turn it into a silent gap: {terminal:?}"
+        );
+        assert_eq!(
+            decisions, 0,
+            "the verdict came after the cutover, so it cannot be in the batch: \
+             {terminal:?}"
+        );
+        assert_eq!(
+            dropped, 1,
+            "and the gap is reported exactly once: {terminal:?}"
+        );
+
+        // Nothing is left over for a drain that never happens, and nothing counted
+        // the same loss a second time when the verdict finally arrived.
+        let after = egress.drain_observations(&by());
+        egress.stop();
+        assert!(after.is_empty(), "{after:?}");
     }
 
     /// The set the seal charges is "not decided yet", never "still connected".
