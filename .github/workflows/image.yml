@@ -163,7 +163,10 @@ jobs:
   #    a newer commit's already-promoted `latest`. The per-commit `<sha>` tag is still
   #    written either way, so every complete build stays individually addressable.
   # Also serialized across runs (`concurrency` below, not relying on cancellation) so
-  # two manifest jobs can never interleave their promotion of the same tag.
+  # two manifest jobs can never interleave their promotion of the same tag. The
+  # staleness check reads `main`'s tip over git (not the registry), so this job also
+  # needs `contents: read` alongside `packages: write` — every other job here that
+  # touches repository content already carries it.
   manifest:
     name: multi-arch manifest
     needs: [build, build-aarch64]
@@ -171,6 +174,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
+      contents: read
       packages: write
     concurrency:
       group: wardos-image-manifest-${{ github.ref }}
