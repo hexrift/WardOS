@@ -671,6 +671,102 @@ assert_logged '^ward session approve --session sess_a 12 allow$'
 assert_logged '^ward session approve --session sess_a 18 allow$'
 assert_not_logged '^ward session approve --session sess_a 17'
 
+# --- --watch: a same-key duplicate arriving while a just-resolved generation's
+# popup is still being closed gets its own new popup, never silently dropped
+# against a generation whose membership resolve_notification has already emptied
+# (#228 review, round 3, item 1: key.current was left naming the closed-out
+# generation until notify_one's own eventual close_generation got around to
+# clearing it — a same-key arrival in that gap joined a membership file that no
+# longer existed and was never answered by anyone). Forced, not hoped for: a
+# barrier on finish_notification's own notify-send replace call (its only external
+# command) holds it open for a real 0.3s window after resolve_notification's own
+# locked section — which now clears key.current itself — has already completed,
+# and the duplicate is not written until that barrier confirms the window has
+# started -----------------------------------------------------------------------
+: >"$MOCK_LOG"
+mock tail 'command -p tail "$@"'
+mock grep 'command -p grep "$@"'
+rm -f "$TMP/fin_setup_done" "$TMP/finish_notification_started" "$TMP/first_popup_seen"
+fin_a=$line12
+fin_b=${line12/\"id\":12/\"id\":19}
+export FIN_A=$fin_a FIN_B=$fin_b
+decided12='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export DECIDED12=$decided12
+# The first --print-id call is this generation's own popup: it never itself
+# answers (killed only by finish_notification below, once the resolver decides its
+# sole member elsewhere), so the only way id 12 could be relayed is a bug. The
+# second is the duplicate's own new popup, answered normally.
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*)
+    if [[ -f "$TMP/first_popup_seen" ]]; then
+      echo allow
+    else
+      : >"$TMP/first_popup_seen"
+      echo 9191
+      exec sleep 30
+    fi
+    ;;
+  *"-t 4000"*) : >"$TMP/finish_notification_started"; sleep 0.3; exit 0 ;;
+  *) exit 0 ;;
+esac'
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow")
+    printf "%s\n" "$FIN_A"
+    # A settle delay, not a race of its own (see the earlier .ids race test):
+    # comfortably more than local pipe/jq/read latency, so notifier_loop has
+    # certainly opened 12'"'"'s own generation (marker and .ids both published,
+    # atomically, by open_new_generation) before this signals the resolver below.
+    sleep 0.2
+    : >"$TMP/fin_setup_done"
+    for _ in $(seq 1 300); do [[ -f "$TMP/finish_notification_started" ]] && break; sleep 0.01; done
+    printf "%s\n" "$FIN_B"
+    ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 200); do [[ -f "$TMP/fin_setup_done" ]] && break; sleep 0.01; done
+    printf "%s\n" "$DECIDED12"
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 2 ]] ||
+  fail "a same-key duplicate arriving while the resolved generation's popup is still closing must get its own popup: $(cat "$MOCK_LOG")"
+assert_logged '^ward session approve --session sess_a 19 allow$'
+assert_not_logged '^ward session approve --session sess_a 12'
+
+# --- --watch: a resolver's terminal event for a brand-new id and notifier_loop's
+# own first arrival of that id, delivered with no settle between them at all, never
+# answer the id more than once (#228 review, round 3, item 2: join_open_generation
+# and open_new_generation used to publish an id's own membership marker only after
+# releasing key.lock, so a resolver arriving in that gap found no marker, did
+# nothing, and this worker later relayed an answer for an id the daemon had already
+# decided elsewhere). The marker is now published under the same lock, and by the
+# same subshell, as the membership write itself — the two are never two events for
+# a barrier to land between, so unlike the other tests here this one is not a forced
+# reproduction of a specific interleaving; it is a standing invariant check under
+# realistic adversarial timing (no settle delay at all, both sides going as fast as
+# they can) that this worker still never answers an id more than once ------------
+: >"$MOCK_LOG"
+mock tail 'command -p tail "$@"'
+mock grep 'command -p grep "$@"'
+new_a=$line12
+export NEW_A=$new_a
+decided12_fast='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export DECIDED12_FAST=$decided12_fast
+mock notify-send 'case "$*" in *--print-id*) echo 4242; sleep 0.3; echo allow ;; *) exit 0 ;; esac'
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$NEW_A" ;;
+  "session approvals --json --follow --session sess_a") printf "%s\n" "$DECIDED12_FAST" ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+[[ $(grep -c -- '^ward session approve --session sess_a 12' "$MOCK_LOG") -le 1 ]] ||
+  fail "id 12 must never be answered by this worker more than once, whatever order the resolver and the first arrival land in: $(cat "$MOCK_LOG")"
+
 # --- shellcheck-clean, usage block, strict mode -----------------------------------
 head -1 "$approve" | grep -q '^#!/usr/bin/env bash$' || fail "shebang"
 grep -q '^set -euo pipefail$' "$approve" || fail "strict mode"

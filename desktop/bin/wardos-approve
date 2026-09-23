@@ -422,39 +422,52 @@ active_notifiers() {
 # substitution's own subshell, and the flock it holds is released the moment that
 # subshell exits — there is deliberately no matching "exec {fd}>&-" below.
 
-# id joins key's currently-open generation, if it has one: echoes the gkey it joined
-# ("key.gen.<gen>"), or nothing if key has no open generation right now (the caller
-# must then open one itself, via open_new_generation).
+# id (session's own) joins key's currently-open generation, if it has one: writes
+# id's own "id-<session, id>.group" marker naming that gkey under the very same lock
+# hold as the ids append, so a resolver checking for the marker right after this can
+# never observe the append without it (#228 review, round 2 — publishing the marker
+# only after releasing the lock left exactly that gap: a terminal event for id
+# delivered in it found no marker, returned having done nothing, and this generation
+# went on to answer an id that was already decided elsewhere). Echoes the gkey
+# joined ("key.gen.<gen>"), or nothing if key has no open generation right now (the
+# caller must then open one itself, via open_new_generation).
 join_open_generation() {
-  local key=$1 id=$2 lk cur
+  local key=$1 id=$2 session=$3 lk cur marker
+  marker=$run_dir/id-$(notif_key "$session" "$id").group
   exec {lk}>"$run_dir/$key.lock"
   flock -x "$lk"
   cur=$(cat "$run_dir/$key.current" 2>/dev/null || true)
   if [[ -n $cur ]]; then
     printf '%s\n' "$id" >>"$run_dir/$key.gen.$cur.ids"
+    printf '%s\n' "$key.gen.$cur" >"$marker"
     printf '%s\n' "$key.gen.$cur"
   fi
 }
 
 # Open a brand new generation for key, seeded with id as its first (only) member,
-# and make it key's current one. Always echoes the gkey id ends up in: ordinarily a
-# freshly minted one, but if key somehow already has a current generation by the time
-# this actually takes the lock — nothing here can cause that (notifier_loop is this
-# script's only opener, and it calls this at most once per pending line, never
-# concurrently with itself) — id joins that one instead rather than this leaking a
-# second live generation for the same key.
+# make it key's current one, and publish id's own marker — all under the same lock,
+# for the same reason join_open_generation does (#228 review, round 2). Always
+# echoes the gkey id ends up in: ordinarily a freshly minted one, but if key somehow
+# already has a current generation by the time this actually takes the lock —
+# nothing here can cause that (notifier_loop is this script's only opener, and it
+# calls this at most once per pending line, never concurrently with itself) — id
+# joins that one instead rather than this leaking a second live generation for the
+# same key.
 open_new_generation() {
-  local key=$1 id=$2 lk cur gen
+  local key=$1 id=$2 session=$3 lk cur gen marker
+  marker=$run_dir/id-$(notif_key "$session" "$id").group
   gen=$(date +%s%N)-$$-$RANDOM
   exec {lk}>"$run_dir/$key.lock"
   flock -x "$lk"
   cur=$(cat "$run_dir/$key.current" 2>/dev/null || true)
   if [[ -n $cur ]]; then
     printf '%s\n' "$id" >>"$run_dir/$key.gen.$cur.ids"
+    printf '%s\n' "$key.gen.$cur" >"$marker"
     printf '%s\n' "$key.gen.$cur"
   else
     printf '%s\n' "$gen" >"$run_dir/$key.current"
     printf '%s\n' "$id" >"$run_dir/$key.gen.$gen.ids"
+    printf '%s\n' "$key.gen.$gen" >"$marker"
     printf '%s\n' "$key.gen.$gen"
   fi
 }
@@ -683,19 +696,28 @@ resolve_notification() {
   local gkey; gkey=$(cat "$marker" 2>/dev/null || true)
   rm -f "$marker"
   [[ -n $gkey ]] || return 0
-  local key=${gkey%.gen.*}
+  local key=${gkey%.gen.*} gen=${gkey##*.gen.}
   local ids_file=$run_dir/$gkey.ids lk emptied
   [[ -f $ids_file ]] || return 0
   # Reads and, if needed, rewrites ids_file inside one hold of key.lock — the same
   # lock notifier_loop's append and notify_one's own close_generation use — so this
   # can never read a membership list a concurrent append hasn't landed in yet and
-  # then overwrite that append out of existence (#228 review).
+  # then overwrite that append out of existence (#228 review). When id was the last
+  # member, this also clears key.current here and now, in the same lock hold, if it
+  # still names this exact generation — not left for notify_one's own eventual
+  # close_generation to do once finish_notification below gets around to actually
+  # killing the popup: a same-key request arriving in that gap would otherwise still
+  # see this generation as open, join a membership file this function has already
+  # deleted, and never be answered by a worker that is only moments away from
+  # closing out with nothing left to relay it to (#228 review, round 3).
   emptied=$(
     exec {lk}>"$run_dir/$key.lock"
     flock -x "$lk"
     remaining=$(grep -vFx "$id" "$ids_file" 2>/dev/null || true)
     if [[ -z $remaining ]]; then
       rm -f "$ids_file"
+      cur=$(cat "$run_dir/$key.current" 2>/dev/null || true)
+      [[ $cur == "$gen" ]] && rm -f "$run_dir/$key.current"
       printf '1\n'
     else
       printf '%s\n' "$remaining" >"$ids_file"
@@ -747,7 +769,7 @@ ensure_resolver() {
 # against that bound at all: it joins the group instead (#146 item 7).
 notifier_loop() {
   local id session agent tool claim destination network method credential repository lifetime project countdown
-  local body title key gkey held progress marker
+  local body title key gkey held progress
   while IFS=$'\t' read -r id session agent tool claim destination network method credential repository lifetime project countdown; do
     [[ -n $id ]] || continue
     ensure_resolver "$session"
@@ -761,15 +783,15 @@ notifier_loop() {
     body=$(blocks 1 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime" "$held")
     title="${agent^} requests · ${project}"
     key=$(group_key "$session" "$title" "$body")
-    marker=$run_dir/id-$(notif_key "$session" "$id").group
-    # join_open_generation takes key.lock to check-and-append atomically, so this can
-    # never land in a generation notify_one's own close_generation has already
-    # snapshotted, and never lose an id to that same race (#228 review): a gkey it
-    # echoes back is always one whose .pid/.worker already exist, from an earlier
-    # iteration or an earlier round of this same key never having fully closed yet.
-    gkey=$(join_open_generation "$key" "$id")
+    # join_open_generation/open_new_generation take key.lock to check-and-append and
+    # publish id's own marker atomically, so this can never land in a generation
+    # notify_one's own close_generation (or resolve_notification's own empty-out) has
+    # already snapshotted, and a resolver can never observe id's membership without
+    # its marker already published (#228 review, rounds 1-2). A gkey either echoes
+    # back is always one whose .pid/.worker already exist, from an earlier iteration
+    # or an earlier round of this same key never having fully closed yet.
+    gkey=$(join_open_generation "$key" "$id" "$session")
     if [[ -n $gkey ]]; then
-      printf '%s\n' "$gkey" >"$marker"
       continue
     fi
     if [[ $(active_notifiers) -ge $max_notifiers ]]; then
@@ -782,8 +804,7 @@ notifier_loop() {
     # so in practice that recheck only ever confirms what join_open_generation just
     # found, but it is what keeps the two calls' combined effect atomic rather than
     # this loop's own two separate lock acquisitions racing anything else.
-    gkey=$(open_new_generation "$key" "$id")
-    printf '%s\n' "$gkey" >"$marker"
+    gkey=$(open_new_generation "$key" "$id" "$session")
     if [[ ! -f $run_dir/$gkey.worker ]]; then
       # Reserved here, synchronously, so the next iteration's active_notifiers
       # count is correct even before notify_one — started in the background right
