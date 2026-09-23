@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use ward_events::{EventKind, EventRecord, WardEvent};
 
-use crate::approvals::{Approval, ApprovalDecision, Grant};
+use crate::approvals::{Approval, ApprovalDecision, ApprovalRecord, Grant};
 use crate::control::{Next, RemoteSink, Request, Response, SOCKET_NAME, is_evidence};
 use crate::describe::SessionDescription;
 use crate::error::{Error, Result};
@@ -198,6 +198,18 @@ pub fn pending(sink: &mut RemoteSink) -> Result<Vec<Approval>> {
     match sink.call(&Request::Pending)? {
         Response::Pending(approvals) => Ok(approvals),
         Response::Error(e) => Err(Error::Daemon(format!("daemon refused pending: {e}"))),
+        other => Err(Error::Events(format!("unexpected response {other:?}"))),
+    }
+}
+
+/// Every approval the session has asked, pending or decided, oldest asked
+/// first (`ward session approvals`, #146 item 1): the daemon's own
+/// authoritative account, still readable after a client missed or dismissed
+/// whatever first announced a request.
+pub fn approvals(sink: &mut RemoteSink) -> Result<Vec<ApprovalRecord>> {
+    match sink.call(&Request::Approvals)? {
+        Response::Approvals(records) => Ok(records),
+        Response::Error(e) => Err(Error::Daemon(format!("daemon refused approvals: {e}"))),
         other => Err(Error::Events(format!("unexpected response {other:?}"))),
     }
 }
@@ -581,6 +593,20 @@ mod tests {
                             0,
                         )]),
                     ),
+                    Request::Approvals => reply(
+                        &mut writer,
+                        &Response::Approvals(vec![crate::approvals::ApprovalRecord {
+                            approval: Approval::new(
+                                4,
+                                "Write",
+                                "/work/a.rs",
+                                crate::approvals::Authority::none("r", "/work/a.rs"),
+                                0,
+                            ),
+                            outcome: None,
+                            decided_at_unix_ms: None,
+                        }]),
+                    ),
                     Request::Grants => reply(
                         &mut writer,
                         &Response::Grants(vec![Grant {
@@ -796,6 +822,10 @@ mod tests {
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].label, "Write /work/a.rs");
         assert_eq!(held[0].lifetime, crate::approvals::Lifetime::Session);
+        let records = approvals(&mut sink).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].approval.id, 4);
+        assert_eq!(records[0].outcome, None);
         drop(sink);
         let seen = server.join().unwrap();
         assert_eq!(seen[1], Request::Pending);
@@ -807,6 +837,7 @@ mod tests {
             }
         );
         assert_eq!(seen[4], Request::Grants);
+        assert_eq!(seen[5], Request::Approvals);
     }
 
     #[test]

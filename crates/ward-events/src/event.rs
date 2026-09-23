@@ -262,6 +262,10 @@ pub enum DecisionSource {
     TamperWard,
     /// No answer arrived in time; the request was denied.
     Timeout,
+    /// The session ended with the question still open; nothing ever answered
+    /// it (#146). Appended at the end: postcard identifies enum variants by
+    /// declaration index, so an existing one must never move.
+    SessionEnded,
 }
 
 /// How long a granted capability remains valid.
