@@ -125,6 +125,54 @@ mock notify-send 'echo deny'
 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
 assert_file "$TMP/answered"
 
+# --- --watch: a `ward session approve` call still running past wait_for_notifiers'
+# own grace window is stopped, not left to outlive run_dir (#226 review) -----------
+# The previous case only proves the *ordinary* path (answered inside the grace
+# window); this proves the boundary itself: a mock slow enough to still be running
+# once the grace window (2s) has elapsed must never be allowed to finish on its
+# own afterwards — sweep_run_dir has to stop it by its own real pid before run_dir
+# is removed below it, or this is the exact #224 orphan again, one layer in.
+: >"$MOCK_LOG"
+rm -f "$TMP/late-answer"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) sleep 4; touch "$TMP/late-answer"; exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'echo deny'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Give the killed mock a beat past its own sleep: this must still never appear,
+# not merely be absent immediately at return.
+sleep 4.5
+[[ ! -f "$TMP/late-answer" ]] ||
+  fail "a slow ward session approve call survived past run_dir's own teardown"
+
+# --- --watch: notifier_loop's own .worker reservation never races notify_one's
+# RETURN trap into recreating a stale marker for an already-finished pid (#226
+# review) --------------------------------------------------------------------------
+# An instant return (no notify-send at all, the fastest path through notify_one) is
+# the worst case for this race: looped, to give the scheduler a chance to hit it,
+# rather than asserted as a single run. This does not prove the ordering by timing
+# alone (see notify_one's own comment for the actual argument: notify_one writes
+# its own $BASHPID as its first action, strictly before its own later removal of
+# the same file, instead of notifier_loop writing $! from a second, racing process)
+# — it only proves nothing observably hangs, crashes, or leaves an unpicked-up
+# approval behind across many fast rounds.
+: >"$MOCK_LOG"
+rm -f "$MOCK_DIR/notify-send"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+for _ in $(seq 1 50); do
+  WARDOS_PROJECT=/home/dev/payments-api timeout 5 "$approve" --watch --once
+done
+assert_not_logged '^ward session approve'
+
 # --- --watch: a notification still showing is replaced when decided elsewhere -----
 # notify-send blocks (simulating --wait on an unanswered critical notification) until
 # it is killed; the session's own resolver, reading a decided record for the same id,
