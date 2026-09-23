@@ -172,26 +172,29 @@ impl Report {
 
 /// Run the project-scoped checks against `dir` (a `ward init`-style project root).
 /// Does not touch the network and runs no project command — only reads the two
-/// config files `ward init` writes and probes `PATH` for the runtime the
-/// *configured* command actually needs.
+/// config files `ward init` writes and probes, for the `runtime` row, the same
+/// directories `ward verify` itself would actually search inside the verifier
+/// sandbox (see [`verify::Toolchains::search_dirs`]) — not the calling
+/// process's own `PATH`, which the verifier does not use.
 #[must_use]
 pub fn check(dir: &Path) -> Report {
-    check_with_path(dir, std::env::var_os("PATH").as_deref())
+    check_with_dirs(dir, &verify::Toolchains::detect().search_dirs())
 }
 
-/// [`check`], with `PATH` given explicitly instead of read from the process
-/// environment — what `check` itself does, via a fixed value rather than the
-/// live environment, so a test can exercise the `runtime` row's `PATH` search
-/// with a controlled directory instead of mutating the process-global `PATH`
-/// (unsafe to do from a test that might run in parallel with others).
-fn check_with_path(dir: &Path, path_var: Option<&std::ffi::OsStr>) -> Report {
+/// [`check`], with the verifier's search directories given explicitly instead
+/// of detected from the host — what `check` itself does, via a fixed list
+/// rather than a live `Toolchains::detect()`, so a test can exercise the
+/// `runtime` row's search with controlled directories instead of depending on
+/// whatever Rust toolchain happens to be installed on the machine running the
+/// test.
+fn check_with_dirs(dir: &Path, search_dirs: &[PathBuf]) -> Report {
     let ecosystem = Ecosystem::detect(dir);
     let mut rows = vec![policy_row(dir)];
     let (verify_row, config) = verify_row(dir);
     let unavailable = config.is_none();
     rows.push(verify_row);
     if let Some(config) = &config {
-        rows.push(runtime_row(dir, &config.verify.command, path_var));
+        rows.push(runtime_row(dir, &config.verify.command, search_dirs));
         rows.push(protected_row(dir, config));
     }
     Report {
@@ -348,12 +351,19 @@ fn is_executable(path: &Path) -> bool {
 /// shell, and a quoted token like `"cargo"` must not be probed as the literal
 /// (quote-included) name it splits to. A path candidate (containing `/`, e.g.
 /// `./scripts/verify.sh`) is resolved against `dir` — the verifier's own working
-/// directory, not the process's `PATH` — and must itself be executable, the same
-/// precondition `/bin/sh -c` enforces. A bare candidate is searched on `path_var`
-/// the same way, and must be executable there too — `doctor::which` alone is not
-/// enough here, since it reports a `PATH` entry present without checking that it
-/// can actually be executed.
-fn runtime_row(dir: &Path, command: &str, path_var: Option<&std::ffi::OsStr>) -> Row {
+/// directory, not `search_dirs` — and must itself be executable, the same
+/// precondition `/bin/sh -c` enforces. A bare candidate is searched in
+/// `search_dirs` the same way, and must be executable there too.
+///
+/// `search_dirs` is the verifier's own search directories
+/// ([`verify::Toolchains::search_dirs`]), never the calling process's `PATH`:
+/// `ward verify` runs the command in a sandbox whose `PATH` is replaced with
+/// the mounted Cargo toolchain (if any) and the base system directories, not
+/// inherited from whoever ran `ward ready`. A program on the caller's own
+/// `PATH` that isn't in one of these directories would not be found inside the
+/// verifier either, and a Cargo toolchain that *is* mounted there is available
+/// to the verifier even when `$CARGO_HOME/bin` is not on the caller's `PATH`.
+fn runtime_row(dir: &Path, command: &str, search_dirs: &[PathBuf]) -> Row {
     if let Some(op) = SHELL_METACHARACTERS.iter().find(|op| command.contains(*op)) {
         return Row::new(
             "runtime",
@@ -407,25 +417,36 @@ fn runtime_row(dir: &Path, command: &str, path_var: Option<&std::ffi::OsStr>) ->
             )
         };
     }
-    match resolve_on_path(candidate, path_var) {
-        PathLookup::Executable => Row::new("runtime", Status::Ok, format!("{candidate} on PATH")),
+    match resolve_in_dirs(candidate, search_dirs) {
+        PathLookup::Executable => Row::new(
+            "runtime",
+            Status::Ok,
+            format!("{candidate} available to the verifier"),
+        ),
         PathLookup::NotExecutable => Row::new(
             "runtime",
             Status::Fail,
             format!(
-                "{candidate} found on PATH but is not executable; fix its permissions before `ward verify` can run"
+                "{candidate} found but not executable in the verifier's environment; fix its permissions before `ward verify` can run"
             ),
         ),
         PathLookup::Missing => Row::new(
             "runtime",
             Status::Fail,
-            format!("{candidate} not found on PATH; install it before `ward verify` can run"),
+            format!(
+                "{candidate} not found in the verifier's environment ({}); install it where the verifier can reach it before `ward verify` can run",
+                search_dirs
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(":")
+            ),
         ),
     }
 }
 
-/// The outcome of searching `PATH` for a candidate: present and runnable,
-/// present but not executable, or not found at all in any directory.
+/// The outcome of searching `search_dirs` for a candidate: present and
+/// runnable, present but not executable, or not found at all in any directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PathLookup {
     Missing,
@@ -433,16 +454,12 @@ enum PathLookup {
     Executable,
 }
 
-/// Search `path_var`'s directories for an executable file named `candidate` —
-/// the same directory list `doctor::which` walks, plus the executable-bit check
-/// it does not do. Distinguishes "not found anywhere" from "found, but not
-/// executable" so [`runtime_row`] can name the real problem.
-fn resolve_on_path(candidate: &str, path_var: Option<&std::ffi::OsStr>) -> PathLookup {
-    let Some(path_var) = path_var else {
-        return PathLookup::Missing;
-    };
+/// Search `search_dirs`, in order, for an executable file named `candidate`.
+/// Distinguishes "not found anywhere" from "found, but not executable" so
+/// [`runtime_row`] can name the real problem.
+fn resolve_in_dirs(candidate: &str, search_dirs: &[PathBuf]) -> PathLookup {
     let mut found_non_executable = false;
-    for dir in std::env::split_paths(path_var) {
+    for dir in search_dirs {
         let candidate_path = dir.join(candidate);
         if !candidate_path.is_file() {
             continue;
@@ -517,9 +534,9 @@ mod tests {
         std::fs::create_dir(dir.path().join("tests")).unwrap();
         let report = check(dir.path());
         assert_eq!(report.ecosystem, Ecosystem::Cargo);
-        // `cargo` may or may not be on this machine's PATH; either way the verdict
-        // must never be `Unavailable` (a command *is* configured) and never silently
-        // skip a row.
+        // `cargo` may or may not be in the verifier's search dirs on this machine;
+        // either way the verdict must never be `Unavailable` (a command *is*
+        // configured) and never silently skip a row.
         assert_ne!(report.verdict(), Verdict::Unavailable);
         assert!(report.rows.iter().any(|r| r.name == "policy"));
         assert!(report.rows.iter().any(|r| r.name == "verify config"));
@@ -629,11 +646,13 @@ mod tests {
             ".tamperward/config.yml",
             "verify:\n  command: npm test\n",
         );
-        let report = check(dir.path());
+        // An empty, controlled search list: deterministic regardless of whatever
+        // toolchain the machine running this test happens to have, and proves the
+        // row names the real candidate even when unresolved.
+        let report = check_with_dirs(dir.path(), &[]);
         assert_eq!(report.ecosystem, Ecosystem::Cargo);
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
-        assert!(row.detail.contains("npm"), "{}", row.detail);
-        assert!(!row.detail.contains("cargo"), "{}", row.detail);
+        assert!(row.detail.starts_with("npm"), "{}", row.detail);
     }
 
     #[test]
@@ -645,10 +664,9 @@ mod tests {
             ".tamperward/config.yml",
             "verify:\n  command: bash scripts/verify.sh\n",
         );
-        let report = check(dir.path());
+        let report = check_with_dirs(dir.path(), &[]);
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
-        assert!(row.detail.contains("bash"), "{}", row.detail);
-        assert!(!row.detail.contains("cargo"), "{}", row.detail);
+        assert!(row.detail.starts_with("bash"), "{}", row.detail);
     }
 
     #[test]
@@ -659,11 +677,18 @@ mod tests {
             ".tamperward/config.yml",
             "verify:\n  command: FOO=bar cargo test\n",
         );
-        let report = check(dir.path());
+        let search_dir = tempfile::tempdir().unwrap();
+        let cargo_bin = search_dir.path().join("cargo");
+        std::fs::write(&cargo_bin, "not a real binary").unwrap();
+        make_executable(&cargo_bin);
+
+        // A controlled search dir containing `cargo`, not the real environment's:
+        // deterministic regardless of the machine running this test. A correct
+        // implementation resolves past `FOO=bar` to a real Ok against `cargo`,
+        // not a Fail against the literal token `FOO=bar`.
+        let dirs = [search_dir.path().to_path_buf()];
+        let report = check_with_dirs(dir.path(), &dirs);
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
-        // `cargo` is genuinely on PATH in this build's own environment (it is what
-        // ran this test), so a correct implementation resolves past `FOO=bar` to a
-        // real Ok, not a Fail against the literal token `FOO=bar`.
         assert_eq!(row.status, Status::Ok, "{}", row.detail);
         assert!(row.detail.contains("cargo"), "{}", row.detail);
         assert!(!row.detail.contains("FOO"), "{}", row.detail);
@@ -676,31 +701,94 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_command_found_on_path_but_not_executable_is_setup_required() {
-        // A controlled PATH, not the process's real one: a mode-0644 regular file
-        // named `cargo` sits where a real `PATH` search would find it, but
+    fn a_bare_command_found_in_a_search_dir_but_not_executable_is_setup_required() {
+        // A controlled search directory, not the process's real PATH: a mode-0644
+        // regular file named `cargo` sits where a real search would find it, but
         // `/bin/sh -c 'cargo test'` cannot execute it — the same false-ready class
         // the project-relative branch's executable check already prevents. Passed
-        // explicitly to check_with_path rather than mutating the process-global
-        // `PATH`, which would be unsound alongside tests running in parallel.
+        // explicitly to check_with_dirs rather than mutating the process-global
+        // environment, which would be unsound alongside tests running in parallel.
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
             ".tamperward/config.yml",
             "verify:\n  command: cargo test\n",
         );
-        let path_dir = tempfile::tempdir().unwrap();
-        std::fs::write(path_dir.path().join("cargo"), "not a real binary").unwrap();
+        let search_dir = tempfile::tempdir().unwrap();
+        std::fs::write(search_dir.path().join("cargo"), "not a real binary").unwrap();
 
-        let report = check_with_path(dir.path(), Some(path_dir.path().as_os_str()));
+        let dirs = [search_dir.path().to_path_buf()];
+        let report = check_with_dirs(dir.path(), &dirs);
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Fail, "{}", row.detail);
         assert!(row.detail.contains("not executable"), "{}", row.detail);
         assert_eq!(report.verdict(), Verdict::SetupRequired);
 
-        // The same controlled PATH with the file actually made executable: Ok.
-        make_executable(&path_dir.path().join("cargo"));
-        let report = check_with_path(dir.path(), Some(path_dir.path().as_os_str()));
+        // The same controlled directory with the file actually made executable: Ok.
+        make_executable(&search_dir.path().join("cargo"));
+        let report = check_with_dirs(dir.path(), &dirs);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_ignores_a_program_that_exists_only_outside_the_verifiers_search_dirs() {
+        // `ward verify` runs in a sandbox whose PATH is the verifier's own
+        // (Toolchains::search_dirs), never the calling process's — a program
+        // sitting anywhere else on disk (an NVM directory, a user-local bin, …)
+        // is invisible to the verifier even though it genuinely exists and is
+        // executable right here.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: mytool\n",
+        );
+        let caller_only = tempfile::tempdir().unwrap();
+        let tool = caller_only.path().join("mytool");
+        std::fs::write(&tool, "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&tool);
+
+        // Not one of the verifier's search dirs: Fail, despite the program
+        // existing and being executable right there.
+        let report = check_with_dirs(dir.path(), &[]);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+
+        // The very same directory, once it *is* a verifier search dir: Ok. The
+        // only thing that changed is search_dirs, never the filesystem state.
+        let dirs = [caller_only.path().to_path_buf()];
+        let report = check_with_dirs(dir.path(), &dirs);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_finds_a_toolchain_style_bin_directory_nowhere_on_a_conventional_path() {
+        // Mirrors verify::Toolchains::search_dirs()'s own shape: a mounted
+        // Cargo `bin/` is checked directly, at whatever host path the toolchain
+        // actually lives at — not /usr/bin, not /usr/local/bin, not anything a
+        // caller's own PATH would conventionally contain — because that mounted
+        // directory is genuinely what the verifier searches, regardless of the
+        // calling process's own PATH.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cargo test\n",
+        );
+        let toolchain_home = tempfile::tempdir().unwrap();
+        let bin = toolchain_home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cargo_bin = bin.join("cargo");
+        std::fs::write(&cargo_bin, "not a real binary").unwrap();
+        make_executable(&cargo_bin);
+
+        let dirs = [bin];
+        let report = check_with_dirs(dir.path(), &dirs);
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Ok, "{}", row.detail);
         assert_ne!(report.verdict(), Verdict::SetupRequired);

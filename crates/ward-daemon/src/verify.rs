@@ -517,6 +517,37 @@ impl Toolchains {
         self.rustup.is_some() && self.cargo.is_some()
     }
 
+    /// The host-side directories the verifier's own `PATH` resolves against, in
+    /// the same precedence [`Toolchains::env`]'s `PATH` value does (the mounted
+    /// Cargo `bin/` first, when detected, then the base system directories) —
+    /// but as real, checkable host paths, not the sandbox-internal
+    /// `/run/verifier/…` mount points `env` uses once *inside* the sandbox.
+    /// `/usr/local/bin`, `/usr/bin` and `/bin` are checkable directly because the
+    /// sandbox `ro_bind`s the host's own `/usr`, `/bin` (and `/lib`, `/lib64`) at
+    /// those same paths (`sandbox.rs`'s base mounts); the Cargo directory is
+    /// checkable directly because it is the exact host directory the mount's
+    /// *source* is, before the sandbox renames it to `/run/verifier/cargo/bin`.
+    ///
+    /// This is what `ward ready`'s `runtime` row judges a configured command's
+    /// program against, precisely because the calling process's own `PATH`
+    /// (an interactive shell's, an agent's, a CI job's — anything, with anything
+    /// on it) is not what the verifier itself will search: an executable on a
+    /// host path outside this list is invisible inside the verifier sandbox
+    /// even if it is on the caller's `PATH`, and a Cargo toolchain mounted here
+    /// is available inside the verifier even if `$CARGO_HOME/bin` is not on the
+    /// caller's own `PATH` at all.
+    #[must_use]
+    pub fn search_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Some(cargo) = &self.cargo {
+            dirs.push(cargo.join("bin"));
+        }
+        for base in ["/usr/local/bin", "/usr/bin", "/bin"] {
+            dirs.push(PathBuf::from(base));
+        }
+        dirs
+    }
+
     /// Environment inside the verifier.
     #[must_use]
     pub fn env(&self) -> Vec<(String, String)> {
@@ -638,6 +669,36 @@ mod tests {
         assert!(path.1.starts_with("/run/verifier/cargo/bin:"));
         assert!(!path.1.contains("/root"));
         assert_eq!(Toolchains::default().env().len(), 2, "HOME and PATH only");
+    }
+
+    #[test]
+    fn search_dirs_puts_the_real_cargo_bin_directory_first() {
+        let t = Toolchains {
+            rustup: Some("/root/.rustup".into()),
+            cargo: Some("/root/.cargo".into()),
+        };
+        // The real host path (`env()`'s PATH carries the sandbox-internal one
+        // instead, asserted above never to leak `/root`), because this is what a
+        // preflight check running on the host, not inside the sandbox, can
+        // actually stat.
+        assert_eq!(
+            t.search_dirs(),
+            vec![
+                PathBuf::from("/root/.cargo/bin"),
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+            ]
+        );
+        assert_eq!(
+            Toolchains::default().search_dirs(),
+            vec![
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+            ],
+            "no cargo detected: no toolchain entry"
+        );
     }
 
     #[test]
