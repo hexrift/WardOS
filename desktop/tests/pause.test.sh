@@ -30,8 +30,18 @@ mock ward 'case "$*" in
       exit 1
     fi
     ;;
-  "pause --session "*) echo paused >"$WARD_STATE_FILE" ;;
-  "pause "*) echo paused >"$WARD_STATE_FILE" ;;
+  "pause --session "*)
+    echo paused >"$WARD_STATE_FILE"
+    if [[ -f "$TMP/pause-unsettled" ]]; then
+      printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
+    fi
+    ;;
+  "pause "*)
+    echo paused >"$WARD_STATE_FILE"
+    if [[ -f "$TMP/pause-unsettled" ]]; then
+      printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
+    fi
+    ;;
   "resume --session "*) echo running >"$WARD_STATE_FILE" ;;
   "resume "*) echo running >"$WARD_STATE_FILE" ;;
   "stop "*) echo none >"$WARD_STATE_FILE" ;;
@@ -49,6 +59,19 @@ assert_logged '^ward pause /home/dev/payments-api$'
 assert_logged '^notify-send -a WardOS -u critical AGENTS PAUSED network closed · credential grants suspended · processes frozen · workspace retained$'
 assert_logged '^ward resume /home/dev/payments-api$'
 assert_logged '^notify-send -a WardOS -t 2000 Agents resumed $'
+assert_eq "$(cat "$WARD_STATE_FILE")" running
+
+# --- an unsettled freeze gets a distinct, still-critical notification (#233): the
+# fixed "processes frozen" text must not be shown when `ward pause` itself reports
+# some processes not yet confirmed stopped ---
+: >"$MOCK_LOG"
+echo running >"$WARD_STATE_FILE"
+touch "$TMP/pause-unsettled"
+WARDOS_MENU_CHOICE=Resume "$pause"
+assert_logged '^ward pause /home/dev/payments-api$'
+assert_logged '^notify-send -a WardOS -u critical AGENTS PAUSING network closed · credential grants suspended · 2 processes not yet confirmed stopped · workspace retained$'
+assert_not_logged 'AGENTS PAUSED network closed'
+rm -f "$TMP/pause-unsettled"
 assert_eq "$(cat "$WARD_STATE_FILE")" running
 
 # --- already paused: the menu alone; Stop & preserve keeps the workspace -------
