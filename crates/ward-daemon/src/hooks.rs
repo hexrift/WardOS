@@ -1431,15 +1431,27 @@ mod tests {
 
         // An excess connection is refused at once with the overload Deny, not held: the
         // accept loop stays responsive while the two handlers are saturated.
+        //
+        // `overload_reject` never reads anything from the connection before writing its
+        // Deny and dropping the stream — the earlier version of this test raced that
+        // unsolicited write with its own `write_all(WRITE)`, occasionally seeing a
+        // BrokenPipe/ConnectionReset instead of the reply under load (#220). Since the
+        // server never needs the client to send anything first, the fix is to not send
+        // anything: connect and read the unsolicited response directly. A Unix domain
+        // stream socket still delivers everything the peer wrote before it closed —
+        // closing after writing doesn't discard already-sent, unread bytes — so this
+        // has no race left to lose, and the full Deny payload is asserted every time.
         let started = std::time::Instant::now();
-        let reply = roundtrip(hooks.socket(), WRITE);
+        let stream = UnixStream::connect(hooks.socket()).unwrap();
+        let mut reply = String::new();
+        BufReader::new(&stream).read_line(&mut reply).unwrap();
+        let resp: HookResponse = serde_json::from_str(&reply).unwrap();
+        assert_eq!(resp.decision, HookDecision::Deny);
+        assert_eq!(resp.reason, "hook broker overloaded");
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the overload reply is prompt, not blocked on a held approval"
         );
-        let resp: HookResponse = serde_json::from_str(&reply).unwrap();
-        assert_eq!(resp.decision, HookDecision::Deny);
-        assert_eq!(resp.reason, "hook broker overloaded");
 
         // The two genuinely held asks are still answerable.
         for p in approvals.pending() {

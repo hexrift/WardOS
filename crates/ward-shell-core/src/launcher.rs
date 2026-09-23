@@ -70,6 +70,11 @@ pub enum Command {
     VerifyProject,
     /// Open the semantic settings (§14) for the current session.
     ReviewPermissions,
+    /// The persistent approval inbox (`wardos-approve-inbox`, #146 items 2-3):
+    /// every approval any live session has asked, pending or decided,
+    /// reachable even when a notification was missed, dismissed, or never
+    /// shown.
+    ApprovalInbox,
     /// `ward pause --all` (#141 item 5): pause every live session, the
     /// explicit scope distinct from pausing the one selected session
     /// (`Super + Shift + P`, `wardos-pause`).
@@ -125,6 +130,9 @@ impl Command {
             Self::ResumeSession { worktree, .. } => terminal(worktree, false, "ward watch"),
             Self::VerifyProject => terminal(ctx.worktree, true, "ward verify"),
             Self::ReviewPermissions => terminal(ctx.worktree, true, "ward-shell settings"),
+            // A fuzzel dmenu of its own, like the command centre itself (Self::Settings
+            // below): not a terminal command, so it is run directly.
+            Self::ApprovalInbox => "wardos-approve-inbox".to_owned(),
             Self::PauseAll => "wardos-pause pause-all".to_owned(),
             Self::ReplaySession { session } => {
                 let log = ctx.state.join("sessions").join(session).join("events.log");
@@ -318,6 +326,11 @@ impl Launcher {
             Section::Security,
             "Review permissions",
             Command::ReviewPermissions,
+        ));
+        entries.push(Entry::fixed(
+            Section::Security,
+            "Approval inbox",
+            Command::ApprovalInbox,
         ));
         if sessions.iter().any(|c| !c.sealed) {
             entries.push(Entry::fixed(
@@ -544,17 +557,19 @@ mod tests {
             [
                 "Verify current project",
                 "Review permissions",
+                "Approval inbox",
                 "Pause all sessions",
                 "Replay last session"
             ]
         );
+        assert_eq!(sections[2].1[2].command, Command::ApprovalInbox);
         assert_eq!(
-            sections[2].1[2].command,
+            sections[2].1[3].command,
             Command::PauseAll,
             "#141 item 5: a distinct, explicit scope from pausing one session"
         );
         assert_eq!(
-            sections[2].1[3].command,
+            sections[2].1[4].command,
             Command::ReplaySession {
                 session: "sess_old".to_owned()
             },
@@ -563,7 +578,7 @@ mod tests {
 
         let system: Vec<&str> = sections[3].1.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(system, ["Terminal", "Browser", "Settings"]);
-        assert_eq!(launcher.entries().len(), 12);
+        assert_eq!(launcher.entries().len(), 13);
         assert!(
             launcher
                 .text()
@@ -593,6 +608,7 @@ mod tests {
                 "AGENTS\tResume session   payments-api · ● working\tfoot -D /home/dev/payments-api -- ward watch",
                 "SECURITY\tVerify current project\tfoot --hold -D /home/dev/payments-api -- ward verify",
                 "SECURITY\tReview permissions\tfoot --hold -D /home/dev/payments-api -- ward-shell settings",
+                "SECURITY\tApproval inbox\twardos-approve-inbox",
                 "SECURITY\tPause all sessions\twardos-pause pause-all",
                 "SECURITY\tReplay last session   tamperward\tfoot --hold -D /home/dev/payments-api -- ward replay /home/dev/.local/state/ward/sessions/sess_old/events.log",
                 "SYSTEM\tTerminal\tfoot",
@@ -703,6 +719,7 @@ mod tests {
             [
                 "Verify current project",
                 "Review permissions",
+                "Approval inbox",
                 "Pause all sessions"
             ]
         );
