@@ -1247,11 +1247,32 @@ impl Approvals {
     /// a second answer to the same open question is too, and so is an
     /// answer to a question whose decision clock has already run out.
     pub fn answer(&self, id: u64, decision: ApprovalDecision) -> Result<()> {
-        self.answer_at(id, decision, Instant::now())
+        // The clock is read only once the lock is held (review of #225,
+        // second round, finding 1): an answer that blocks on this lock
+        // across the deadline — behind the timed-out waiter, or any other
+        // caller — is judged at the moment it can actually take effect,
+        // not by a timestamp taken before it queued for the lock.
+        self.answer_with(id, decision, Instant::now)
     }
 
+    /// [`answer`](Self::answer) judged at a fixed `now`: the deterministic
+    /// seam the clock tests drive.
+    #[cfg(test)]
     fn answer_at(&self, id: u64, decision: ApprovalDecision, now: Instant) -> Result<()> {
+        self.answer_with(id, decision, || now)
+    }
+
+    /// `now` is called under the approvals lock, never before it, so the
+    /// expiry check below compares the clock with the time at which this
+    /// answer is actually serialised against `wait`.
+    fn answer_with(
+        &self,
+        id: u64,
+        decision: ApprovalDecision,
+        now: impl FnOnce() -> Instant,
+    ) -> Result<()> {
         let mut state = self.lock();
+        let now = now();
         if state.paused {
             return Err(Error::Daemon(format!(
                 "approval {id}: paused by ward; resume the session to answer"
@@ -2343,6 +2364,76 @@ mod tests {
         // Gone now: a late answer is the ordinary `not pending`.
         let err = approvals.answer(1, ApprovalDecision::Allow).unwrap_err();
         assert_eq!(err.to_string(), "daemon: approval 1: not pending");
+    }
+
+    /// Review of #225, second round, finding 1: the lock ordering, not the
+    /// deadline value `an_answer_racing_the_timeout_at_the_deadline_cannot_win`
+    /// pins. The public `answer` used to read `Instant::now()` *before*
+    /// taking the approvals lock, so an answer entered before the deadline
+    /// that then blocked on that lock (behind the timed-out waiter, or any
+    /// other caller) until after the deadline was still judged by its stale,
+    /// pre-lock timestamp and accepted. Here the test itself holds the lock
+    /// across the deadline while the public `answer` is blocked on it; once
+    /// released, the answer must be refused and `wait` must time out.
+    ///
+    /// The refusal does not depend on scheduling: with the clock read under
+    /// the lock, an answer that only gets the lock after the test has seen the
+    /// deadline pass is always refused. The barrier (the pattern of
+    /// `attempt.rs`'s reconcile race test) makes the answerer call `answer`
+    /// as the lock is taken, long before the deadline, so the buggy pre-lock
+    /// read would land before the deadline and be accepted.
+    #[test]
+    fn an_answer_blocked_on_the_lock_across_the_deadline_is_refused() {
+        // Plenty of margin for the answerer to enter `answer` (and, before
+        // the fix, take its timestamp) after the barrier and before the
+        // deadline; it only bounds how long the test holds the lock.
+        let timeout = Duration::from_millis(300);
+        let approvals = Arc::new(Approvals::new());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let answerer = {
+            let approvals = Arc::clone(&approvals);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let entered = Instant::now();
+                (entered, approvals.answer(1, ApprovalDecision::Allow))
+            })
+        };
+
+        let t0 = Instant::now();
+        approvals
+            .register_at(approval(1), Some(timeout), t0)
+            .unwrap();
+        let deadline = t0 + timeout;
+        // Hold the serialisation lock `answer` and `wait` both need, then let
+        // the answerer go: it can only block on this lock.
+        let held = approvals.lock();
+        barrier.wait();
+        // Keep holding it until the deadline has actually passed.
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(left);
+        }
+        assert!(Instant::now() >= deadline);
+        drop(held);
+
+        let (entered, verdict) = answerer.join().unwrap();
+        assert!(
+            entered < deadline,
+            "precondition: `answer` was entered before the deadline"
+        );
+        let err = verdict.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "daemon: approval 1: timed out; its decision time ran out"
+        );
+        // Refused, not recorded: its own `wait` settles it once, as the
+        // timeout it is.
+        assert_eq!(approvals.wait(1, timeout), Outcome::TimedOut);
+        let view = approvals.approvals();
+        assert_eq!(view.len(), 1, "one terminal record, no more");
+        assert_eq!(view[0].outcome, Some(Outcome::TimedOut));
+        assert!(!approvals.take_recorded(1));
+        assert!(approvals.close().is_empty());
     }
 
     #[test]
