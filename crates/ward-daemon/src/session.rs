@@ -2033,6 +2033,33 @@ mod tests {
         );
     }
 
+    /// #139 acceptance: the plain success case, at this level. The two tests
+    /// above already cover `VerificationFailed`/`VerificationTimedOut`; this is
+    /// their control for an ordinary passing run — a command that exits zero
+    /// within its budget ends the attempt in exactly one terminal record,
+    /// `VerificationPassed`, naming the candidate. Before this test the only
+    /// coverage of `VerificationPassed` at all was the heavier, protected e2e
+    /// suite's `verify_ignores_a_weakened_protected_test_and_passes_the_real_fix`
+    /// (`crates/ward-daemon/tests/e2e.rs`), which exercises the whole
+    /// `ward init`-style project and the hostile-corpus harness around it; this
+    /// one isolates the success path the same way its sibling failure/timeout
+    /// tests already do, through `verify_prepared` directly.
+    #[test]
+    fn a_verifier_that_exits_zero_ends_in_verification_passed() {
+        if !ward_sandbox::ci::isolation_ready(crate::sandbox::available(), "bubblewrap") {
+            return;
+        }
+        let (report, events) = verify_command("exit 0", 30);
+        assert!(report.passed, "{}", report.output);
+        assert_eq!(report.timed_out, None, "{}", report.output);
+        match events.as_slice() {
+            [WardEvent::VerificationPassed { candidate, .. }] => {
+                assert_eq!(*candidate, ev_snapshot(report.candidate.parse().unwrap()));
+            }
+            other => panic!("expected exactly one VerificationPassed, got {other:?}"),
+        }
+    }
+
     /// #139: once `VerificationStarted` is on the log, a `verify::execute` failure
     /// (the verifier could not even run) must still end the attempt in exactly one
     /// terminal record — `VerificationErrored` — never leaving `VerificationStarted`
