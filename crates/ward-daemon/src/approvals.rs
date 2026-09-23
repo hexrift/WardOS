@@ -13,7 +13,11 @@
 //! `allow-session` memory, the credentials the launch granted, and the wait.
 //! While the session is paused (ADR-0019 §3, [`Approvals::set_paused`]) the
 //! hold is held in turn: no timeout runs, no answer is taken, and a question
-//! that arrives waits like the rest. It knows nothing about sockets or the
+//! that arrives waits like the rest. Each question's decision time is one
+//! clock (#146 item 4) that the timeout is enforced from and that
+//! [`Approvals::pending`] / [`Approvals::approvals`] report as its
+//! [`Countdown`], held while paused, so the desktop shows the daemon's own
+//! figure rather than guessing one. It knows nothing about sockets or the
 //! log; the daemon appends the `CapabilityRequested` / `CapabilityDecided`
 //! records around it ([`requested_event`], [`decided_event`]), which is how
 //! the log, a subscriber and `ward replay` see the same question and the same
@@ -68,6 +72,16 @@ pub struct Approval {
     pub authority: Authority,
     /// When, milliseconds since the Unix epoch.
     pub requested_at_unix_ms: u64,
+    /// Its decision clock, as the daemon's own copy has it at the moment
+    /// the daemon answers (#146 item 4): filled in only on the copies
+    /// [`Approvals::pending`] and [`Approvals::approvals`] hand out for a
+    /// question that is still open and whose clock is armed; `None`
+    /// everywhere else (a decided question, a record in the history, a
+    /// question built by [`Approval::new`]). Absent from the JSON when
+    /// `None`, and read as `None` when absent, so a client and a daemon on
+    /// either side of this field still understand each other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub countdown: Option<Countdown>,
 }
 
 impl Approval {
@@ -88,6 +102,7 @@ impl Approval {
             claim: format!("{tool} {summary}"),
             authority,
             requested_at_unix_ms,
+            countdown: None,
         }
     }
 
@@ -711,11 +726,125 @@ impl Outcome {
     }
 }
 
+/// How much decision time an open approval has left before the daemon denies
+/// it (#146 item 4), read from the same [`Clock`] [`Approvals::wait`]
+/// enforces — never a figure a client derives from when it first saw the
+/// question. A snapshot: true at the moment the daemon answered; a client
+/// that shows it later shows it as of then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Countdown {
+    /// Decision time left, milliseconds. Stands still while `held`.
+    pub remaining_ms: u64,
+    /// The whole decision time the question was given, milliseconds: what a
+    /// progress line measures `remaining_ms` against.
+    pub timeout_ms: u64,
+    /// The clock is held: the session is paused (ADR-0019 §3), no time
+    /// counts against the question, and no answer is taken until resume.
+    pub held: bool,
+}
+
+impl Countdown {
+    /// The remaining time in words, for a terminal, `ward session pending`
+    /// and the inbox, which have no progress line to draw: `42 s left,
+    /// then denied`, or `held while paused · 42 s left once resumed`. Whole
+    /// seconds, rounded up, so `0 s` is only ever said when none is left.
+    #[must_use]
+    pub fn text(&self) -> String {
+        let secs = self.remaining_ms.div_ceil(1000);
+        if self.held {
+            format!("held while paused · {secs} s left once resumed")
+        } else {
+            format!("{secs} s left, then denied")
+        }
+    }
+}
+
+/// One question's decision clock (#146 item 4): the time it has left, and
+/// since when that has been running down. The single account of an
+/// approval's remaining time — [`Approvals::wait`] times out on it and
+/// [`Countdown`] reports it — so what the desktop shows is what the daemon
+/// enforces. Pure: every method takes `now`, so it is tested without
+/// sleeping.
+#[derive(Clone, Copy, Debug)]
+struct Clock {
+    /// The whole decision time the question was given.
+    timeout: Duration,
+    /// Time left as of `running_since` (or, while held, simply time left).
+    left: Duration,
+    /// When the clock last started running down; `None` while held.
+    running_since: Option<Instant>,
+}
+
+impl Clock {
+    /// A clock of `timeout`, started at `now` — or held from the start, when
+    /// the session is already paused.
+    fn start(timeout: Duration, now: Instant, paused: bool) -> Self {
+        Self {
+            timeout,
+            left: timeout,
+            running_since: (!paused).then_some(now),
+        }
+    }
+
+    /// Time left at `now`.
+    fn remaining(&self, now: Instant) -> Duration {
+        match self.running_since {
+            Some(since) => self
+                .left
+                .saturating_sub(now.saturating_duration_since(since)),
+            None => self.left,
+        }
+    }
+
+    /// Stop the clock at `now`, keeping what is left. Idempotent.
+    fn hold(&mut self, now: Instant) {
+        if self.running_since.is_some() {
+            self.left = self.remaining(now);
+            self.running_since = None;
+        }
+    }
+
+    /// Start the clock again at `now` from what was left. Idempotent.
+    fn run(&mut self, now: Instant) {
+        if self.running_since.is_none() {
+            self.running_since = Some(now);
+        }
+    }
+
+    /// The wire form at `now`.
+    fn countdown(&self, now: Instant) -> Countdown {
+        Countdown {
+            remaining_ms: millis(self.remaining(now)),
+            timeout_ms: millis(self.timeout),
+            held: self.running_since.is_none(),
+        }
+    }
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// One held question and its answer, once there is one.
 #[derive(Debug)]
 struct Held {
     approval: Approval,
     answer: Option<ApprovalDecision>,
+    /// Its decision clock: armed by [`Approvals::register_with_timeout`],
+    /// or else by the first [`Approvals::wait`] on it; `None` until then.
+    clock: Option<Clock>,
+}
+
+impl Held {
+    /// A copy of the question with its countdown at `now` filled in, when it
+    /// is still open and its clock is armed.
+    fn shown(&self, now: Instant) -> Approval {
+        let mut approval = self.approval.clone();
+        if self.answer.is_none() {
+            approval.countdown = self.clock.map(|c| c.countdown(now));
+        }
+        approval
+    }
 }
 
 /// One approval as `ward session approvals` shows it (#146 item 1): the
@@ -753,16 +882,21 @@ impl ApprovalRecord {
     }
 
     /// One line: state, id, tool, destination — `ward session approvals`'s
-    /// plain-text row.
+    /// plain-text row — then, for an open question, its remaining decision
+    /// time ([`Countdown::text`], #146 item 4).
     #[must_use]
     pub fn line(&self) -> String {
-        format!(
+        let line = format!(
             "{:<15} {:>4}  {}  {}",
             self.state_word(),
             self.approval.id,
             self.approval.tool,
             self.approval.authority.destination,
-        )
+        );
+        match self.approval.countdown {
+            Some(countdown) => format!("{line}  ({})", countdown.text()),
+            None => line,
+        }
     }
 }
 
@@ -982,27 +1116,51 @@ impl Approvals {
         grants
     }
 
-    /// Register a question. Refused once the session has ended.
+    /// Register a question. Refused once the session has ended. Its decision
+    /// clock is armed by the first [`wait`](Self::wait) on it; until then it
+    /// reports no [`Countdown`].
     pub fn register(&self, approval: Approval) -> Result<()> {
+        self.register_at(approval, None, Instant::now())
+    }
+
+    /// Register a question with its decision clock of `timeout` armed at
+    /// once (#146 item 4), so a client listing it the moment it is asked —
+    /// before its hold connection has reached [`wait`](Self::wait) — already
+    /// sees its countdown. What the daemon's own `Request::Hold` uses.
+    pub fn register_with_timeout(&self, approval: Approval, timeout: Duration) -> Result<()> {
+        self.register_at(approval, Some(timeout), Instant::now())
+    }
+
+    fn register_at(
+        &self,
+        approval: Approval,
+        timeout: Option<Duration>,
+        now: Instant,
+    ) -> Result<()> {
         let mut state = self.lock();
         if state.closed {
             return Err(Error::Daemon("approval: session ended".into()));
         }
+        let paused = state.paused;
         state.held.push(Held {
             approval,
             answer: None,
+            clock: timeout.map(|t| Clock::start(t, now, paused)),
         });
         drop(state);
         self.changed.notify_all();
         Ok(())
     }
 
-    /// Wait up to `timeout` for the answer to `id`, then forget the question.
-    /// The answer stays remembered when it was `allow-session`. Time spent
-    /// paused does not count against the timeout.
+    /// Wait for the answer to `id` until its decision clock runs out, then
+    /// forget the question. The clock is the one
+    /// [`register_with_timeout`](Self::register_with_timeout) armed, or else
+    /// one of `timeout` armed here. The answer stays remembered when it was
+    /// `allow-session`. Time spent paused does not count against the
+    /// timeout: [`set_paused`](Self::set_paused) holds the clock where it
+    /// stood and resume runs it on from there (#146 item 4), so a pause
+    /// neither spends nor refunds decision time.
     pub fn wait(&self, id: u64, timeout: Duration) -> Outcome {
-        let mut remaining = timeout;
-        let mut last = Instant::now();
         let mut state = self.lock();
         loop {
             let Some(index) = state.held.iter().position(|h| h.approval.id == id) else {
@@ -1044,18 +1202,27 @@ impl Approvals {
                     .insert(held.approval.id, (held.approval, outcome));
                 return outcome;
             }
-            if state.paused {
-                // Held in turn: wake on any change, and count none of this time.
+            // The question's own clock (#146 item 4), shared with what
+            // `pending`/`approvals` report. Before it existed this loop kept
+            // its own `remaining`, charged only when it woke while running:
+            // a pause woke it into the branch below without charging the
+            // time run since its previous wake, so a pause and resume handed
+            // that time back. `set_paused` now holds the clock itself, under
+            // this same lock, at the instant the pause lands.
+            let now = Instant::now();
+            let paused = state.paused;
+            let clock = *state.held[index]
+                .clock
+                .get_or_insert_with(|| Clock::start(timeout, now, paused));
+            if paused {
+                // Held in turn: wake on any change; the clock stands still.
                 state = self
                     .changed
                     .wait(state)
                     .unwrap_or_else(PoisonError::into_inner);
-                last = Instant::now();
                 continue;
             }
-            let now = Instant::now();
-            remaining = remaining.saturating_sub(now - last);
-            last = now;
+            let remaining = clock.remaining(now);
             if remaining.is_zero() {
                 let held = state.held.remove(index);
                 let now = now_unix_ms();
@@ -1077,9 +1244,35 @@ impl Approvals {
     }
 
     /// Answer `id`. Unknown ids (never asked, already released) are an error;
-    /// a second answer to the same open question is too.
+    /// a second answer to the same open question is too, and so is an
+    /// answer to a question whose decision clock has already run out.
     pub fn answer(&self, id: u64, decision: ApprovalDecision) -> Result<()> {
+        // The clock is read only once the lock is held (review of #225,
+        // second round, finding 1): an answer that blocks on this lock
+        // across the deadline — behind the timed-out waiter, or any other
+        // caller — is judged at the moment it can actually take effect,
+        // not by a timestamp taken before it queued for the lock.
+        self.answer_with(id, decision, Instant::now)
+    }
+
+    /// [`answer`](Self::answer) judged at a fixed `now`: the deterministic
+    /// seam the clock tests drive.
+    #[cfg(test)]
+    fn answer_at(&self, id: u64, decision: ApprovalDecision, now: Instant) -> Result<()> {
+        self.answer_with(id, decision, || now)
+    }
+
+    /// `now` is called under the approvals lock, never before it, so the
+    /// expiry check below compares the clock with the time at which this
+    /// answer is actually serialised against `wait`.
+    fn answer_with(
+        &self,
+        id: u64,
+        decision: ApprovalDecision,
+        now: impl FnOnce() -> Instant,
+    ) -> Result<()> {
         let mut state = self.lock();
+        let now = now();
         if state.paused {
             return Err(Error::Daemon(format!(
                 "approval {id}: paused by ward; resume the session to answer"
@@ -1093,20 +1286,39 @@ impl Approvals {
         if held.answer.is_some() {
             return Err(Error::Daemon(format!("approval {id}: already answered")));
         }
+        // Its decision time is spent: the question is already denied, even
+        // if its `wait` has not woken to say so yet (it only wakes once it
+        // wins this same lock back, which an answering connection can beat
+        // it to; or, for a clock armed at registration, it may not have
+        // started waiting at all). Refused here, under the lock `wait`
+        // settles under, so an answer can never overtake an expired clock.
+        // Nothing is recorded: the question stays in `held` untouched, and
+        // its own `wait` settles it as `TimedOut` exactly once, through the
+        // same `history`/`unclaimed` path as any other timeout (#218).
+        if held.clock.is_some_and(|c| c.remaining(now).is_zero()) {
+            return Err(Error::Daemon(format!(
+                "approval {id}: timed out; its decision time ran out"
+            )));
+        }
         held.answer = Some(decision);
         drop(state);
         self.changed.notify_all();
         Ok(())
     }
 
-    /// The open questions, oldest first.
+    /// The open questions, oldest first, each with its [`Countdown`] once its
+    /// clock is armed.
     #[must_use]
     pub fn pending(&self) -> Vec<Approval> {
+        self.pending_at(Instant::now())
+    }
+
+    fn pending_at(&self, now: Instant) -> Vec<Approval> {
         self.lock()
             .held
             .iter()
             .filter(|h| h.answer.is_none())
-            .map(|h| h.approval.clone())
+            .map(|h| h.shown(now))
             .collect()
     }
 
@@ -1131,14 +1343,22 @@ impl Approvals {
     /// it — is assigned in true request order regardless, so it is the
     /// exact tie-breaker a plain sort by timestamp alone is missing (review
     /// of #218, finding 2).
+    ///
+    /// A still-open question carries its [`Countdown`] (#146 item 4) once its
+    /// clock is armed; one already answered but not yet collected does not,
+    /// since its clock no longer decides anything.
     #[must_use]
     pub fn approvals(&self) -> Vec<ApprovalRecord> {
+        self.approvals_at(Instant::now())
+    }
+
+    fn approvals_at(&self, now: Instant) -> Vec<ApprovalRecord> {
         let state = self.lock();
         let mut records: Vec<ApprovalRecord> = state
             .held
             .iter()
             .map(|h| ApprovalRecord {
-                approval: h.approval.clone(),
+                approval: h.shown(now),
                 outcome: None,
                 decided_at_unix_ms: None,
             })
@@ -1266,9 +1486,25 @@ impl Approvals {
 
     /// Pause or resume the hold (ADR-0019 §3): paused, pending questions stay
     /// pending with their timeouts stopped, answers are refused, and new
-    /// questions wait like the rest.
+    /// questions wait like the rest. Every armed clock is held where it
+    /// stands the instant the pause lands, and runs on from there on resume
+    /// (#146 item 4), so the [`Countdown`] a client reads while paused says
+    /// `held` and does not move.
     pub fn set_paused(&self, paused: bool) {
-        self.lock().paused = paused;
+        self.set_paused_at(paused, Instant::now());
+    }
+
+    fn set_paused_at(&self, paused: bool, now: Instant) {
+        let mut state = self.lock();
+        state.paused = paused;
+        for clock in state.held.iter_mut().filter_map(|h| h.clock.as_mut()) {
+            if paused {
+                clock.hold(now);
+            } else {
+                clock.run(now);
+            }
+        }
+        drop(state);
         self.changed.notify_all();
     }
 
@@ -1901,7 +2137,15 @@ mod tests {
         // does not count.
         std::thread::sleep(Duration::from_millis(200));
         assert!(!waiter.is_finished());
-        assert_eq!(approvals.pending(), [approval(1)]);
+        // Armed by `wait` while already paused, the clock has never run: it
+        // reports its whole decision time, held (#146 item 4).
+        let mut held = approval(1);
+        held.countdown = Some(Countdown {
+            remaining_ms: 80,
+            timeout_ms: 80,
+            held: true,
+        });
+        assert_eq!(approvals.pending(), [held]);
         let err = approvals.answer(1, ApprovalDecision::Allow).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -1923,6 +2167,349 @@ mod tests {
             Outcome::TimedOut
         );
         assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+
+    /// The countdown the daemon reports (#146 item 4), driven entirely through
+    /// the `_at` seams with instants made up from one base: nothing here
+    /// sleeps or depends on how fast the machine is.
+    #[test]
+    fn a_countdown_runs_down_is_held_while_paused_and_runs_on_from_where_it_stood() {
+        let approvals = Approvals::new();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let countdown = |approvals: &Approvals, now: Instant| {
+            let pending = approvals.pending_at(now);
+            let view = approvals.approvals_at(now);
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                view[0].approval.countdown, pending[0].countdown,
+                "the inbox and the notification read the same clock"
+            );
+            pending[0].countdown.expect("armed")
+        };
+        approvals
+            .register_at(approval(1), Some(Duration::from_secs(60)), t0)
+            .unwrap();
+        let running = |remaining_ms| Countdown {
+            remaining_ms,
+            timeout_ms: 60_000,
+            held: false,
+        };
+        let held = |remaining_ms| Countdown {
+            remaining_ms,
+            timeout_ms: 60_000,
+            held: true,
+        };
+        assert_eq!(countdown(&approvals, t0), running(60_000));
+        assert_eq!(countdown(&approvals, at(10)), running(50_000));
+        // Paused 15 s in: held at 45 s, however long the pause lasts.
+        approvals.set_paused_at(true, at(15));
+        assert_eq!(countdown(&approvals, at(15)), held(45_000));
+        assert_eq!(countdown(&approvals, at(500)), held(45_000));
+        // A second pause signal changes nothing (idempotent hold).
+        approvals.set_paused_at(true, at(600));
+        assert_eq!(countdown(&approvals, at(700)), held(45_000));
+        // Resumed at 1000 s: runs on from 45 s, not from 60 s.
+        approvals.set_paused_at(false, at(1000));
+        assert_eq!(countdown(&approvals, at(1000)), running(45_000));
+        assert_eq!(countdown(&approvals, at(1040)), running(5_000));
+        assert_eq!(countdown(&approvals, at(1045)), running(0));
+        assert_eq!(
+            countdown(&approvals, at(9999)),
+            running(0),
+            "never below zero"
+        );
+
+        // A question asked while paused starts held, with its whole time.
+        let approvals = Approvals::new();
+        approvals.set_paused_at(true, t0);
+        approvals
+            .register_at(approval(2), Some(Duration::from_secs(60)), at(5))
+            .unwrap();
+        assert_eq!(countdown(&approvals, at(100)), held(60_000));
+        approvals.set_paused_at(false, at(200));
+        assert_eq!(countdown(&approvals, at(230)), running(30_000));
+    }
+
+    /// The countdown is what `wait` enforces, not a separate estimate: a
+    /// pause and resume after a question's time has all run out does not
+    /// hand any of it back. Before #146 item 4, `wait` kept its own
+    /// `remaining` and never charged the time run between its last wake and
+    /// a pause, so a pause refilled it. No sleep: the clock is spent through
+    /// the seams, so `wait` finds nothing left the moment it looks.
+    #[test]
+    fn a_pause_neither_spends_nor_refunds_the_time_wait_enforces() {
+        let approvals = Approvals::new();
+        let t0 = Instant::now();
+        approvals
+            .register_at(approval(1), Some(Duration::from_secs(60)), t0)
+            .unwrap();
+        // All 60 s ran before the pause landed; the resume refunds nothing.
+        approvals.set_paused_at(true, t0 + Duration::from_secs(60));
+        approvals.set_paused_at(false, t0 + Duration::from_secs(60));
+        let started = Instant::now();
+        assert_eq!(
+            approvals.wait(1, Duration::from_secs(60)),
+            Outcome::TimedOut,
+            "the armed clock decides, not wait's own `timeout`"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "denied at once, not after a fresh 60 s"
+        );
+        assert_eq!(approvals.approvals()[0].outcome, Some(Outcome::TimedOut));
+    }
+
+    /// Review of #225, finding 1: a question whose clock is already spent
+    /// before its `wait` ever runs cannot be approved in that gap. Before the
+    /// fix `answer` never looked at the clock, so this was accepted and
+    /// `wait` then returned `Answered(Allow)` for a question the daemon's own
+    /// countdown already read as zero. No sleep: a zero-length clock is spent
+    /// the instant it is armed.
+    #[test]
+    fn an_answer_to_a_question_whose_clock_ran_out_before_wait_is_refused() {
+        let approvals = Approvals::new();
+        approvals
+            .register_with_timeout(approval(1), Duration::ZERO)
+            .unwrap();
+        let err = approvals.answer(1, ApprovalDecision::Allow).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "daemon: approval 1: timed out; its decision time ran out"
+        );
+        // Refused, not recorded: `wait` settles it as the timeout it is,
+        // through the one ordinary path, exactly once.
+        assert_eq!(
+            approvals.wait(1, Duration::from_secs(60)),
+            Outcome::TimedOut
+        );
+        let view = approvals.approvals();
+        assert_eq!(view.len(), 1, "one terminal record, no more");
+        assert_eq!(view[0].outcome, Some(Outcome::TimedOut));
+        assert!(!approvals.take_recorded(1), "its own caller appends it");
+        assert!(approvals.close().is_empty(), "nothing left for close");
+        assert!(!approvals.remembered("Write", "/work/src/lib.rs"));
+    }
+
+    /// Review of #225, finding 1, the deadline race: at a real (non-zero)
+    /// deadline, the connection answering can win the approvals lock before
+    /// the timed-out waiter wakes and takes it back. Modelled
+    /// deterministically: the answer lands, through the `_at` seam, exactly
+    /// at the clock's deadline, while the waiter has not yet run. It must
+    /// lose: `wait` then denies it as timed out. One tick before the
+    /// deadline, the same answer is still accepted, so the line is drawn at
+    /// the deadline itself and not before it.
+    #[test]
+    fn an_answer_racing_the_timeout_at_the_deadline_cannot_win() {
+        let timeout = Duration::from_secs(60);
+        // Asked a whole timeout ago, so the deadline is now: the real clock
+        // `wait` reads is already at or past it, and it settles at once.
+        let t0 = Instant::now()
+            .checked_sub(timeout)
+            .expect("the monotonic clock is past one minute");
+        let deadline = t0 + timeout;
+        let approvals = Approvals::new();
+        approvals
+            .register_at(approval(1), Some(timeout), t0)
+            .unwrap();
+        approvals
+            .register_at(approval(2), Some(timeout), t0)
+            .unwrap();
+
+        // At the deadline: refused, however the lock race falls.
+        let err = approvals
+            .answer_at(1, ApprovalDecision::AllowSession, deadline)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "daemon: approval 1: timed out; its decision time ran out"
+        );
+        // One millisecond before it: still answerable.
+        approvals
+            .answer_at(
+                2,
+                ApprovalDecision::Allow,
+                t0 + Duration::from_millis(59_999),
+            )
+            .unwrap();
+
+        let started = Instant::now();
+        assert_eq!(approvals.wait(1, timeout), Outcome::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the waiter finds the clock spent, not a fresh minute"
+        );
+        assert_eq!(
+            approvals.wait(2, timeout),
+            Outcome::Answered(ApprovalDecision::Allow)
+        );
+        // The refused allow-session left no grant behind.
+        assert!(!approvals.remembered("Write", "/work/src/lib.rs"));
+        // Exactly one terminal record each, handed to their own callers.
+        let outcomes: Vec<_> = approvals
+            .approvals()
+            .into_iter()
+            .map(|r| (r.approval.id, r.outcome))
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                (1, Some(Outcome::TimedOut)),
+                (2, Some(Outcome::Answered(ApprovalDecision::Allow))),
+            ]
+        );
+        assert!(!approvals.take_recorded(1));
+        assert!(!approvals.take_recorded(2));
+        assert!(approvals.close().is_empty());
+        // Gone now: a late answer is the ordinary `not pending`.
+        let err = approvals.answer(1, ApprovalDecision::Allow).unwrap_err();
+        assert_eq!(err.to_string(), "daemon: approval 1: not pending");
+    }
+
+    /// Review of #225, second round, finding 1: the lock ordering, not the
+    /// deadline value `an_answer_racing_the_timeout_at_the_deadline_cannot_win`
+    /// pins. The public `answer` used to read `Instant::now()` *before*
+    /// taking the approvals lock, so an answer entered before the deadline
+    /// that then blocked on that lock (behind the timed-out waiter, or any
+    /// other caller) until after the deadline was still judged by its stale,
+    /// pre-lock timestamp and accepted.
+    ///
+    /// Review of #225, fifth round, finding 1: the fourth round's version of
+    /// this test still spawned a thread and raced a 500 ms `recv_timeout`
+    /// against it — generous, but still a scheduling assumption, so a
+    /// reverted implementation could in principle send before the lock and
+    /// still have the outer thread not observe it in time. This drops
+    /// threading entirely. `answer_with` takes the approvals lock *before*
+    /// calling its clock closure, so a closure that runs on this same test
+    /// thread, mid-call, can prove the lock is already held by calling
+    /// `try_lock` on the same `Mutex` — `std::sync::Mutex` has no concept of
+    /// same-thread reentrancy, so `try_lock` from the thread already holding
+    /// it deterministically reports `WouldBlock`, never `Ok`. A regression
+    /// that read the clock before locking would let this same `try_lock`
+    /// succeed, catching it immediately with no thread, channel, or timeout
+    /// involved.
+    #[test]
+    fn answer_with_reads_its_clock_only_once_the_lock_is_held() {
+        let timeout = Duration::from_secs(60);
+        // Asked a whole timeout ago (the trick `an_answer_racing_the_timeout_
+        // at_the_deadline_cannot_win` already uses): the real clock is
+        // already past its deadline from this point on, so `wait` below
+        // settles at once instead of genuinely blocking for 60 s, and the
+        // closure can just report the real `Instant::now()` whenever it
+        // happens to run rather than a fabricated value.
+        let t0 = Instant::now()
+            .checked_sub(timeout)
+            .expect("the monotonic clock is past one minute");
+        let approvals = Approvals::new();
+        approvals
+            .register_at(approval(1), Some(timeout), t0)
+            .unwrap();
+
+        let err = approvals
+            .answer_with(1, ApprovalDecision::Allow, || {
+                assert!(
+                    matches!(
+                        approvals.state.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "the clock must not be read before the lock is acquired"
+                );
+                Instant::now()
+            })
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "daemon: approval 1: timed out; its decision time ran out"
+        );
+        // Refused, not recorded: its own `wait` settles it once, as the
+        // timeout it is.
+        assert_eq!(approvals.wait(1, timeout), Outcome::TimedOut);
+        let view = approvals.approvals();
+        assert_eq!(view.len(), 1, "one terminal record, no more");
+        assert_eq!(view[0].outcome, Some(Outcome::TimedOut));
+        assert!(!approvals.take_recorded(1));
+        assert!(approvals.close().is_empty());
+    }
+
+    #[test]
+    fn only_an_open_question_with_an_armed_clock_carries_a_countdown() {
+        let approvals = Approvals::new();
+        let t0 = Instant::now();
+        // Registered without a clock: nothing to report until `wait` arms one.
+        approvals.register_at(approval(1), None, t0).unwrap();
+        assert_eq!(approvals.pending_at(t0)[0].countdown, None);
+        // Armed, then answered but not yet collected: still listed as
+        // pending in the view, but its clock no longer decides anything.
+        approvals
+            .register_at(approval(2), Some(Duration::from_secs(60)), t0)
+            .unwrap();
+        approvals.answer(2, ApprovalDecision::Deny).unwrap();
+        let view = approvals.approvals_at(t0);
+        let two = view.iter().find(|r| r.approval.id == 2).unwrap();
+        assert_eq!(two.outcome, None);
+        assert_eq!(two.approval.countdown, None);
+        // Collected: the history keeps the question, never a countdown.
+        assert_eq!(
+            approvals.wait(2, Duration::from_secs(60)),
+            Outcome::Answered(ApprovalDecision::Deny)
+        );
+        let view = approvals.approvals_at(t0);
+        let two = view.iter().find(|r| r.approval.id == 2).unwrap();
+        assert!(two.outcome.is_some());
+        assert_eq!(two.approval.countdown, None);
+        assert_eq!(
+            two.approval,
+            approval(2),
+            "the stored question is untouched"
+        );
+    }
+
+    #[test]
+    fn a_countdown_travels_as_json_only_when_there_is_one_and_reads_as_words() {
+        let mut open = approval(1);
+        let json = serde_json::to_string(&open).unwrap();
+        assert!(!json.contains("countdown"), "absent when None: {json}");
+        assert_eq!(serde_json::from_str::<Approval>(&json).unwrap(), open);
+        open.countdown = Some(Countdown {
+            remaining_ms: 41_001,
+            timeout_ms: 60_000,
+            held: false,
+        });
+        let json = serde_json::to_string(&open).unwrap();
+        assert!(
+            json.ends_with(
+                r#","countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}"#
+            ),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Approval>(&json).unwrap(), open);
+        // Whole seconds, rounded up: `0 s` only when none is left.
+        let words = |remaining_ms, held| {
+            Countdown {
+                remaining_ms,
+                timeout_ms: 60_000,
+                held,
+            }
+            .text()
+        };
+        assert_eq!(words(41_001, false), "42 s left, then denied");
+        assert_eq!(words(1, false), "1 s left, then denied");
+        assert_eq!(words(0, false), "0 s left, then denied");
+        assert_eq!(
+            words(45_000, true),
+            "held while paused · 45 s left once resumed"
+        );
+        // The inbox's plain-text row carries it after the destination.
+        let record = ApprovalRecord {
+            approval: open,
+            outcome: None,
+            decided_at_unix_ms: None,
+        };
+        assert!(
+            record.line().ends_with("  (42 s left, then denied)"),
+            "{}",
+            record.line()
+        );
     }
 
     #[test]

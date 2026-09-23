@@ -230,7 +230,16 @@ agent's text: the proxy's own verdict on the destination (`reachable · restrict
 the repository the rule scopes it to, and the lifetime, which the answer chooses. The
 three actions carry their keys. Rendered by the shell as a layer-shell surface with a
 single shadow level; keyboard-first (`y` / `s` / `n`). Timeout is shown as a thin
-progress line, not a countdown number.
+progress line, not a countdown number. The line is drawn from the daemon's own clock,
+the one the deny-on-timeout runs on, never one the surface keeps for itself: it is the
+time the daemon reported left at the moment the surface was rendered. A surface
+rendered while its session is paused finds that clock held, and says so in words
+(`held while paused`), since an answer is refused until resume. A surface with no line
+to draw (a terminal, the approval inbox) gives the same figure as text: `42 s left,
+then denied`. As built, that figure is a snapshot, not a live timer: a notification
+already showing does not run its line down as time passes, and does not learn of a
+pause or resume that happens after it opened; the inbox and the terminal re-read the
+daemon each time they are opened.
 
 With more than one live session, the title also names which one is asking (`Claude
 requests · payments-api`, #141): approvals are multiplexed across every live session,
@@ -448,9 +457,14 @@ paths, and mako shows it as a notification in the `ward-approval` category:
 `REQUESTED BY AGENT` with the agent's words escaped, `WARD WILL ALLOW` with its five
 rows), then the three actions with their keys, answered from the keyboard (`y` / `s`
 / `n`) through `wardos-approve`; the timeout is the daemon's (60 s, deny), and the
-notification shows it as mako's progress line, not a number. The `Lifetime` row reads
-`once (y) · session (s)` while the question is open, since the answer chooses it; the
-daemon fills it in the grant. Temporary authority stays visible (§10, last
+notification shows the time the daemon reports left (`countdown`, #146 item 4) as it
+opens, as mako's progress line (the `value` hint), not a number, adding a `DECISION
+TIME` block that says `held while paused` when the session is paused as it opens. That
+line and block are a snapshot taken when the notification is sent: an already-open
+notification is not redrawn as the clock runs, nor when its session is paused or
+resumed afterwards (the daemon still refuses its actions while paused). The `Lifetime`
+row reads `once (y) · session (s)` while the question is open, since the answer
+chooses it; the daemon fills it in the grant. Temporary authority stays visible (§10, last
 paragraph): the `network` module reads `NET restricted · github+` and a `grants`
 module `GRANTS n` while an `allow-session` or a `--grant` credential is live, both
 open the authority panel (`ward-shell authority-panel`) on click, and `ward session

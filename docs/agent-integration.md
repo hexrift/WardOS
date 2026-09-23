@@ -169,7 +169,13 @@ agent ◄── {decision: allow|deny, reason} ◄── Response::Decision ◄�
    that is open stays open with its timeout stopped, `Request::Approve` is refused
    with `paused by ward` until `ward resume`, and a `Hold` that arrives while paused
    waits like the rest. Nothing is denied by the pause itself; the clock simply does
-   not run.
+   not run. Each question has one decision clock (#146 item 4), armed with the
+   `Hold`'s `timeout_secs` as it is registered: the timeout is enforced from it, a
+   pause holds it where it stands, and resume runs it on from there, so a pause
+   neither spends nor refunds decision time. `Request::Pending` and
+   `Request::Approvals` report it on every still-open question as `countdown {
+   remaining_ms, timeout_ms, held }`, true as of the answer, so the desktop shows the
+   daemon's figure rather than working one out from when a request arrived.
 
 The approval record separates the agent's claim from Ward's authority (ADR-0019,
 decision 2). What the daemon holds, lists and prints:
@@ -190,7 +196,12 @@ Approval {
     repository,                the rule's repositories, current_repository resolved from origin
     lifetime,                  null while open (the answer chooses); once | session in the grant
   },
-  requested_at_unix_ms
+  requested_at_unix_ms,
+  countdown?: {                open questions only, as the daemon answered (#146 item 4); absent otherwise
+    remaining_ms,              decision time left before deny-on-timeout; stands still while held
+    timeout_ms,                the whole decision time the Hold asked for
+    held                       true while the session is paused: the clock does not run
+  }
 }
 ```
 
