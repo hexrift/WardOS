@@ -1433,35 +1433,21 @@ mod tests {
         // accept loop stays responsive while the two handlers are saturated.
         //
         // `overload_reject` never reads anything from the connection before writing its
-        // Deny and dropping the stream — so under CPU load, a client write can race the
-        // server's close and see a BrokenPipe/ConnectionReset instead of the reply. That
-        // race is itself proof the connection was refused promptly (the server had already
-        // finished with it and gone), so it's accepted as an equally valid "denied fast"
-        // outcome here, alongside reading the reply back when the race doesn't happen.
+        // Deny and dropping the stream — the earlier version of this test raced that
+        // unsolicited write with its own `write_all(WRITE)`, occasionally seeing a
+        // BrokenPipe/ConnectionReset instead of the reply under load (#220). Since the
+        // server never needs the client to send anything first, the fix is to not send
+        // anything: connect and read the unsolicited response directly. A Unix domain
+        // stream socket still delivers everything the peer wrote before it closed —
+        // closing after writing doesn't discard already-sent, unread bytes — so this
+        // has no race left to lose, and the full Deny payload is asserted every time.
         let started = std::time::Instant::now();
-        let mut stream = UnixStream::connect(hooks.socket()).unwrap();
-        match stream.write_all(WRITE.as_bytes()) {
-            Ok(()) => {
-                let mut reply = String::new();
-                match BufReader::new(&stream).read_line(&mut reply) {
-                    Ok(n) if n > 0 => {
-                        let resp: HookResponse = serde_json::from_str(&reply).unwrap();
-                        assert_eq!(resp.decision, HookDecision::Deny);
-                        assert_eq!(resp.reason, "hook broker overloaded");
-                    }
-                    // EOF or a read error here means the server wrote nothing before
-                    // closing — the same "refused before we could see a reply" race as
-                    // the write-side BrokenPipe case below.
-                    _ => {}
-                }
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                ) => {}
-            Err(e) => panic!("unexpected error writing to the hook socket: {e}"),
-        }
+        let stream = UnixStream::connect(hooks.socket()).unwrap();
+        let mut reply = String::new();
+        BufReader::new(&stream).read_line(&mut reply).unwrap();
+        let resp: HookResponse = serde_json::from_str(&reply).unwrap();
+        assert_eq!(resp.decision, HookDecision::Deny);
+        assert_eq!(resp.reason, "hook broker overloaded");
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the overload reply is prompt, not blocked on a held approval"
