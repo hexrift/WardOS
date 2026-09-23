@@ -62,6 +62,13 @@ pub struct Session {
     /// never-cancelled token by default; [`Session::begin_verify_cancel`] replaces
     /// it with one the caller can hold onto and cancel from elsewhere.
     cancel: CancelToken,
+    /// The low-space preflight's configured minimum (#151 item 6), read once
+    /// at open time from [`crate::space::min_free_bytes`]. Kept on `Session`
+    /// (rather than re-read from the environment at every call) so a test can
+    /// set it directly to force the guard to trip or clear without needing to
+    /// mutate process-global environment state — see `crate::space`'s own
+    /// tests for why that would be undesirable even just for tests.
+    min_free_bytes: u64,
 }
 
 /// The on-disk record of a session, written to `sessions/<id>/session.json`.
@@ -339,6 +346,7 @@ impl Session {
             // A brand-new log has no attempts to have left dangling.
             next_attempt: AttemptId::new(1),
             cancel: CancelToken::new(),
+            min_free_bytes: crate::space::min_free_bytes(),
         };
         s.emit(
             Origin::Wardd,
@@ -405,6 +413,7 @@ impl Session {
             project_id: meta.project_id,
             state: state.to_path_buf(),
             log_path,
+            min_free_bytes: crate::space::min_free_bytes(),
         }))
     }
 
@@ -454,6 +463,10 @@ impl Session {
     /// agent write can interleave with it; the recorded stall is how long the
     /// capture held the tree still.
     pub fn snapshot(&mut self, role: SnapshotRole) -> Result<SnapshotMeta> {
+        // Low-space preflight (#151 item 6): refuse before the walk starts,
+        // not partway through it. Never deletes anything on a trip — see
+        // `crate::space`'s own doc comment.
+        crate::space::check(&self.state, self.min_free_bytes)?;
         let store = crate::snapshot::open_store(&self.state)?;
         let guard = self.freeze_for_capture();
         let started = Instant::now();
@@ -998,6 +1011,13 @@ impl Session {
         // recompute them (and, for `run_dir`, risk a second, needless directory
         // allocation).
         let prep = (|| -> Result<(ward_snapshot::SnapshotId, PathBuf, verify::Verification)> {
+            // Low-space preflight (#151 item 6): refuse before `verify::prepare`'s
+            // own candidate capture (the worktree-walk-and-hash step) starts, not
+            // partway through it. A trip here is folded into the same
+            // `VerificationInterrupted { candidate: None, .. }` handling as any
+            // other prep failure below — it never deletes anything, and the
+            // pristine entry snapshot and its evidence are untouched either way.
+            crate::space::check(&self.state, self.min_free_bytes)?;
             let store = SnapshotStore::open(self.state.join("cas"))
                 .map_err(|e| Error::Snapshot(e.to_string()))?;
             let entry: ward_snapshot::SnapshotId = self
@@ -2311,6 +2331,104 @@ mod tests {
             }
             other => panic!("expected VerificationInterrupted, got {other:?}"),
         }
+    }
+
+    /// #151 item 6: the low-space preflight runs before `verify::prepare`'s own
+    /// candidate capture (the worktree-walk-and-hash step), exactly like any other
+    /// prep-step failure above — the attempt still ends in exactly one terminal
+    /// record, `VerificationInterrupted` with no candidate (the capture that would
+    /// have produced one never ran), and the error surfaced to the caller is the
+    /// actionable `Error::LowSpace`, not folded into some other kind.
+    #[test]
+    fn verify_refuses_to_prepare_a_candidate_when_space_is_low() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        // No real disk clears an exabyte minimum: deterministic without mocking
+        // `statvfs` or actually filling a filesystem.
+        session.min_free_bytes = u64::MAX;
+
+        let err = session
+            .verify()
+            .expect_err("the low-space preflight must refuse before any candidate capture");
+        assert!(
+            matches!(err, Error::LowSpace { .. }),
+            "expected Error::LowSpace, got {err:?}"
+        );
+
+        assert_eq!(
+            verification_kinds(&mut session),
+            vec!["AttemptStarted", "Interrupted"],
+            "a low-space refusal must not leave the log stuck at AttemptStarted"
+        );
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        match &records.last().unwrap().event {
+            WardEvent::VerificationInterrupted { candidate, .. } => {
+                assert_eq!(*candidate, None, "the refused capture never produced one");
+            }
+            other => panic!("expected VerificationInterrupted, got {other:?}"),
+        }
+    }
+
+    /// The negative case the test above needs: with the minimum cleared (`0`),
+    /// the preflight never trips, so `verify()` proceeds past it to the project's
+    /// next real problem — the same missing `.tamperward/config.yml` that
+    /// `verify_prepare_failure_ends_the_log_in_verification_interrupted_with_no_candidate`
+    /// exercises — rather than ever returning `Error::LowSpace`. Proof the guard
+    /// only trips when it is actually supposed to, not on every call.
+    #[test]
+    fn verify_does_not_trip_the_low_space_guard_when_space_is_fine() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        session.min_free_bytes = 0;
+
+        let err = session.verify().expect_err(
+            "prepare must still fail on its own terms: no .tamperward/config.yml in the entry snapshot",
+        );
+        assert!(
+            !matches!(err, Error::LowSpace { .. }),
+            "the low-space guard must not have tripped with a 0-byte minimum: {err}"
+        );
+    }
+
+    /// #151 item 6: `ward snapshot create`'s own capture (`Session::snapshot`) is
+    /// refused up front when the low-space preflight trips, before
+    /// `store.capture` ever runs — never discovered partway through the walk.
+    #[test]
+    fn snapshot_refuses_to_capture_when_space_is_low() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        session.min_free_bytes = u64::MAX;
+
+        let err = session
+            .snapshot(SnapshotRole::Candidate)
+            .expect_err("the low-space preflight must refuse before the capture starts");
+        assert!(
+            matches!(err, Error::LowSpace { .. }),
+            "expected Error::LowSpace, got {err:?}"
+        );
+    }
+
+    /// The negative case: with the minimum cleared, `ward snapshot create`'s
+    /// capture proceeds exactly as it did before this guard existed, and records
+    /// `SnapshotCreated` as normal.
+    #[test]
+    fn snapshot_captures_normally_when_space_is_fine() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        session.min_free_bytes = 0;
+        std::fs::write(project.path().join("f"), b"content").unwrap();
+
+        let meta = session
+            .snapshot(SnapshotRole::Candidate)
+            .expect("space is fine, so the capture must proceed");
+        assert!(meta.entries > 0, "the project's own files were captured");
     }
 
     /// Review of #208, finding 4, class 2: the entry snapshot id failing to parse

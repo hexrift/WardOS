@@ -37,6 +37,27 @@ pub enum Error {
     /// cancelled this" apart from "something went wrong".
     #[error("verification cancelled: {0}")]
     Cancelled(String),
+    /// The filesystem backing `<state>/cas` has less free space than
+    /// [`crate::space`]'s configured minimum, so an expensive CAS-writing
+    /// operation (a worktree capture) was refused before it started rather than
+    /// left to fail partway through (#151 item 6). Pure preflight: this is never
+    /// produced by, and never itself triggers, any deletion — the previous valid
+    /// snapshot and its receipt are untouched either way.
+    #[error(
+        "not enough free disk space at {path} to start: {} free, {} needed — \
+         run `ward snapshot gc` to reclaim reachable-but-unneeded snapshots, or \
+         `ward snapshot usage` to see what is using the space",
+        crate::render::human_bytes(*available),
+        crate::render::human_bytes(*required)
+    )]
+    LowSpace {
+        /// The CAS root whose backing filesystem was checked.
+        path: PathBuf,
+        /// Free space at check time, in bytes.
+        available: u64,
+        /// The configured minimum required to proceed, in bytes.
+        required: u64,
+    },
 }
 
 /// Daemon result alias.

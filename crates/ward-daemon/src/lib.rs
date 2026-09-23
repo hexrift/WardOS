@@ -40,6 +40,7 @@ pub mod selection;
 pub mod selftest;
 pub mod session;
 pub mod snapshot;
+pub mod space;
 pub mod usage;
 pub mod verify;
 pub mod watch;
