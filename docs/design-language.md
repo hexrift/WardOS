@@ -230,7 +230,12 @@ agent's text: the proxy's own verdict on the destination (`reachable · restrict
 the repository the rule scopes it to, and the lifetime, which the answer chooses. The
 three actions carry their keys. Rendered by the shell as a layer-shell surface with a
 single shadow level; keyboard-first (`y` / `s` / `n`). Timeout is shown as a thin
-progress line, not a countdown number.
+progress line, not a countdown number. The line is the daemon's own clock, the one
+the deny-on-timeout runs on, never one the surface keeps for itself; while the
+session is paused the clock is held, the line stands still, and the surface says so in
+words (`held while paused`), since an answer is refused until resume. A surface with
+no line to draw (a terminal, the approval inbox) gives the same figure as text:
+`42 s left, then denied`.
 
 With more than one live session, the title also names which one is asking (`Claude
 requests · payments-api`, #141): approvals are multiplexed across every live session,
@@ -448,7 +453,9 @@ paths, and mako shows it as a notification in the `ward-approval` category:
 `REQUESTED BY AGENT` with the agent's words escaped, `WARD WILL ALLOW` with its five
 rows), then the three actions with their keys, answered from the keyboard (`y` / `s`
 / `n`) through `wardos-approve`; the timeout is the daemon's (60 s, deny), and the
-notification shows it as mako's progress line, not a number. The `Lifetime` row reads
+notification shows the time the daemon reports left (`countdown`, #146 item 4) as
+mako's progress line (the `value` hint), not a number, adding a `DECISION TIME` block
+that says `held while paused` when the session is paused. The `Lifetime` row reads
 `once (y) · session (s)` while the question is open, since the answer chooses it; the
 daemon fills it in the grant. Temporary authority stays visible (§10, last
 paragraph): the `network` module reads `NET restricted · github+` and a `grants`

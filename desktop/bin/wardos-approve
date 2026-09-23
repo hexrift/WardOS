@@ -25,7 +25,10 @@
 #                                   action, rather than left offering one that no longer does
 #                                   anything. Without --once the listener waits for the next
 #                                   round of live sessions when they all end (this is what
-#                                   wardos-approve.service runs).
+#                                   wardos-approve.service runs). The decision time left is
+#                                   mako's thin progress line (§10: not a number), the
+#                                   daemon's own figure as the popup opens; a question whose
+#                                   session is paused says its clock is held instead.
 #   wardos-approve --help
 #
 # The interactive path (no --watch) is reached through `ward session pending --json` and
@@ -69,12 +72,18 @@ session_flag=()
 
 # One line per pending approval: id, session, agent, tool, the agent's claim, then
 # what Ward derived: destination, network, method, credential, repository, lifetime,
-# then the project it belongs to (#141: --watch multiplexes every live session).
+# then the project it belongs to (#141: --watch multiplexes every live session), then
+# the daemon's countdown for it (#146 item 4) as "run:<remaining_ms>:<timeout_ms>" or
+# "held:<remaining_ms>:<timeout_ms>", or "-" when the daemon reports none (a daemon
+# that predates it). Never empty: `read` with a tab IFS would collapse an empty field.
 # The lifetime is unset while the question is open: the answer chooses it.
 fields='[.id, .session, .agent, .tool, .claim,
          .authority.destination, .authority.network, .authority.method,
          .authority.credential, (.authority.repository // "none"),
-         (.authority.lifetime // "once (y) · session (s)"), .project] | @tsv'
+         (.authority.lifetime // "once (y) · session (s)"), .project,
+         (.countdown | if . == null then "-"
+                       elif .held then "held:\(.remaining_ms):\(.timeout_ms)"
+                       else "run:\(.remaining_ms):\(.timeout_ms)" end)] | @tsv'
 
 # One line per approval `ward session approvals --json --follow` reports (#146 items
 # 2-3): id, its state word (mirroring ApprovalRecord::state_word — pending, allowed,
@@ -104,6 +113,34 @@ decision_of() {
     n|deny) echo deny ;;
     *) echo "wardos-approve: unknown answer '$1' (y, s or n)" >&2; return 1 ;;
   esac
+}
+
+# The daemon's countdown (a `fields` countdown column) in words, for the terminal,
+# mirroring Countdown::text: whole seconds, rounded up. Nothing for "-". Only ever the
+# daemon's own figure — nothing here derives a deadline from when a request arrived.
+decision_words() {
+  local countdown=$1 kind rest remaining secs
+  [[ $countdown == run:* || $countdown == held:* ]] || return 0
+  kind=${countdown%%:*} rest=${countdown#*:}
+  remaining=${rest%%:*}
+  secs=$(((remaining + 999) / 1000))
+  if [[ $kind == held ]]; then
+    printf 'held while paused · %s s left once resumed' "$secs"
+  else
+    printf '%s s left, then denied' "$secs"
+  fi
+}
+
+# The same countdown as mako's progress line (§10: a thin line, not a number): the
+# share of decision time left, in percent, rounded up so a question with any time left
+# never shows an empty line. Nothing for "-" or a zero timeout.
+progress_value() {
+  local countdown=$1 rest remaining timeout
+  [[ $countdown == run:* || $countdown == held:* ]] || return 0
+  rest=${countdown#*:}
+  remaining=${rest%%:*} timeout=${rest#*:}
+  ((timeout > 0)) || return 0
+  printf '%s' $(((remaining * 100 + timeout - 1) / timeout))
 }
 
 # Pick one line from stdin: wardos-menu-select when it exists, else the stdin
@@ -141,24 +178,30 @@ esc() {
 
 # The three blocks of §10 from the fields of one approval. Markup (1) is the
 # notification: dim headers, the destination in <tt>, everything escaped. Plain (0)
-# is the terminal: the same blocks, indented.
+# is the terminal: the same blocks, indented. An optional ninth argument is the
+# decision time (#146 item 4) in words, shown as a DECISION TIME block after them.
 blocks() {
   local markup=$1 claim=$2 destination=$3 network=$4 method=$5 credential=$6 repository=$7 lifetime=$8
-  local h1=DESTINATION h2='REQUESTED BY AGENT' h3='WARD WILL ALLOW' pad='  ' target
+  local decision=${9:-}
+  local h1=DESTINATION h2='REQUESTED BY AGENT' h3='WARD WILL ALLOW' h4='DECISION TIME' pad='  ' target
   if [[ $markup == 1 ]]; then
     h1="<span alpha=\"39322\">$h1</span>"
     h2="<span alpha=\"39322\">$h2</span>"
     h3="<span alpha=\"39322\">$h3</span>"
+    h4="<span alpha=\"39322\">$h4</span>"
     pad=''
     target="<tt>$(esc "$destination")</tt>"
     claim=$(esc "$claim") network=$(esc "$network") method=$(esc "$method")
     credential=$(esc "$credential") repository=$(esc "$repository") lifetime=$(esc "$lifetime")
+    decision=$(esc "$decision")
   else
     target=$destination
   fi
   printf '%s\n%s%s\n\n%s\n%s%s\n\n%s\n' "$h1" "$pad" "$target" "$h2" "$pad" "$claim" "$h3"
   printf "${pad}%-12s %s\n" Network "$network" Method "$method" Credential "$credential" \
     Repository "$repository" Lifetime "$lifetime"
+  [[ -n $decision ]] && printf '\n%s\n%s%s\n' "$h4" "$pad" "$decision"
+  return 0
 }
 
 # Ask for the answer with the menu: y / s / n.
@@ -192,11 +235,12 @@ interactive() {
   if [[ -n $given ]]; then
     decision=$(decision_of "$given")
   else
-    local agent tool claim destination network method credential repository lifetime
+    local agent tool claim destination network method credential repository lifetime countdown
     IFS=$'\t' read -r _ _ agent tool claim destination network method credential repository lifetime _ \
-      <<<"$chosen"
+      countdown <<<"$chosen"
     printf '%s requests · %s\n' "${agent^}" "$tool"
-    blocks 0 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime"
+    blocks 0 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime" \
+      "$(decision_words "$countdown")"
     decision=$(ask_decision) || return 1
   fi
   answer "$id" "$session" "$decision"
@@ -258,8 +302,11 @@ active_notifiers() {
 # and `ward session approve` — the reservation is released so it does not count
 # against the bound forever.
 notify_one() {
-  local id=$1 session=$2 key=$3 agent=$4 project=$5 body=$6
-  local pid_file=$run_dir/$key.pid
+  local id=$1 session=$2 key=$3 agent=$4 project=$5 body=$6 progress=${7:-}
+  local pid_file=$run_dir/$key.pid hint=()
+  # The decision time left, as mako's progress line (#146 item 4): the standard
+  # `value` hint, from the daemon's own countdown as this popup opens.
+  [[ -n $progress ]] && hint=(-h "int:value:$progress")
   if ! command -v notify-send >/dev/null 2>&1; then
     rm -f "$pid_file"
     return 0
@@ -270,7 +317,7 @@ notify_one() {
   # own pid, not a wrapper subshell's, so a resolve elsewhere's kill (below) reaches
   # the process actually holding the notification open, not a shell that already
   # has nothing left to do and exits on its own regardless of the kill.
-  notify-send -a WardOS -c ward-approval -u critical --wait --print-id \
+  notify-send -a WardOS -c ward-approval -u critical --wait --print-id "${hint[@]}" \
     -A allow="Allow once" -A session="Allow session" -A deny="Deny" \
     "${agent^} requests · ${project}" "$body" >"$out" 2>/dev/null &
   ns_pid=$!
@@ -382,8 +429,9 @@ ensure_resolver() {
 # Bounded: past max_notifiers still showing, a new one is left to the inbox and the
 # interactive path rather than adding a worker that might wait forever.
 notifier_loop() {
-  local id session agent tool claim destination network method credential repository lifetime project body key
-  while IFS=$'\t' read -r id session agent tool claim destination network method credential repository lifetime project; do
+  local id session agent tool claim destination network method credential repository lifetime project countdown
+  local body key held progress
+  while IFS=$'\t' read -r id session agent tool claim destination network method credential repository lifetime project countdown; do
     [[ -n $id ]] || continue
     ensure_resolver "$session"
     if [[ $(active_notifiers) -ge $max_notifiers ]]; then
@@ -401,8 +449,18 @@ notifier_loop() {
     # a resolve elsewhere to find.
     key=$(notif_key "$session" "$id")
     : >"$run_dir/$key.pid"
-    body=$(blocks 1 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime")
-    notify_one "$id" "$session" "$key" "$agent" "$project" "$body" &
+    # A running clock is the progress line alone (§10: not a number); a held one
+    # also says so in words, since a line that stands still reads the same as one
+    # that has not been redrawn — and an answer is refused until resume.
+    held=""
+    [[ $countdown == held:* ]] && held="held while paused · resume the session to answer"
+    body=$(blocks 1 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime" "$held")
+    # Here too, not as a `$(…)` argument of the backgrounded call below: bash expands
+    # an asynchronous command's words in the forked child, so that would put one more
+    # fork on notify_one's own timeline before its real pid reaches disk — the same
+    # reason key is computed above.
+    progress=$(progress_value "$countdown")
+    notify_one "$id" "$session" "$key" "$agent" "$project" "$body" "$progress" &
   done < <(ward session pending --json --all --follow | jq --unbuffered -r "$fields")
 }
 

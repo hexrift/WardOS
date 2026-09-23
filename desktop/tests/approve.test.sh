@@ -26,11 +26,16 @@ noop_approvals_case='"session approvals --json --follow --session "*) : ;;'
 export NOOP_APPROVALS_CASE=$noop_approvals_case
 
 # --- --help --------------------------------------------------------------------
-"$approve" --help | grep -q '^Usage:' || fail "--help prints the usage block"
-"$approve" --help | grep -q 'wardos-approve --watch' || fail "--help names --watch"
-"$approve" --help | grep -q 'WARD WILL ALLOW' || fail "--help names the three blocks"
-"$approve" --help | grep -q 'wardos-approve-inbox' || fail "--help names the persistent inbox"
-"$approve" --help | grep -q 'WARDOS_APPROVE_MAX_NOTIFIERS' || fail "--help names the worker bound"
+# Read once, then searched: the usage block is past one 4 KiB stdio block, so under
+# pipefail `--help | grep -q` could fail on SIGPIPE whenever grep matched in the first
+# block and exited before the second was written.
+help=$("$approve" --help)
+grep -q '^Usage:' <<<"$help" || fail "--help prints the usage block"
+grep -q 'wardos-approve --watch' <<<"$help" || fail "--help names --watch"
+grep -q 'WARD WILL ALLOW' <<<"$help" || fail "--help names the three blocks"
+grep -q 'wardos-approve-inbox' <<<"$help" || fail "--help names the persistent inbox"
+grep -q 'WARDOS_APPROVE_MAX_NOTIFIERS' <<<"$help" || fail "--help names the worker bound"
+grep -q 'progress line' <<<"$help" || fail "--help names the decision-time progress line"
 
 # --- --watch: one notification per pending approval, from every live session, the
 # action relayed (#141: not just $project's session) --------------------------------
@@ -200,6 +205,36 @@ WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
 assert_not_logged '^notify-send'
 assert_not_logged '^ward session approve'
 
+# --- --watch: the daemon's countdown is mako's progress line; a held one says so in
+# words too (#146 item 4) -----------------------------------------------------------
+# The same lines as above, plus the countdown the daemon reports: 12 running with
+# 41.001 s of 60 s left, 20 held (its session paused) with 45 s of 60 s left. Every
+# other --watch case above carries no countdown, and their exact `--print-id -A allow=`
+# lines already pin that no progress hint is sent without one.
+running12=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+held20=${line20%\}}',"countdown":{"remaining_ms":45000,"timeout_ms":60000,"held":true}}'
+export RUNNING12=$running12 HELD20=$held20
+: >"$MOCK_LOG"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$RUNNING12" "$HELD20" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'exit 0'
+WARDOS_PROJECT=/home/dev/payments-api "$approve" --watch --once
+# The share left, rounded up (41001 / 60000 → 69 %), as the standard `value` hint.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait --print-id -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait --print-id -h int:value:75 -A allow=Allow once -A session=Allow session -A deny=Deny Codex requests · other-service <span alpha="39322">DESTINATION</span>$'
+# A running clock is the line alone — §10: not a countdown number.
+assert_not_logged 's left'
+# The held one also says so, once, after the three blocks.
+assert_logged '^<span alpha="39322">DECISION TIME</span>$'
+assert_logged '^held while paused · resume the session to answer$'
+[[ $(grep -c 'DECISION TIME' "$MOCK_LOG") == 1 ]] ||
+  fail "only the held approval carries a DECISION TIME block: $(cat "$MOCK_LOG")"
+
 # --- interactive: one pending approval is picked, shown, the menu answers y / s / n ---
 : >"$MOCK_LOG"
 # shellcheck disable=SC2016
@@ -218,6 +253,37 @@ printf '%s\n' "$out" | grep -q '^  /work/src/lib.rs$' || fail "the destination, 
 printf '%s\n' "$out" | grep -q '^REQUESTED BY AGENT$' || fail "the claim is labelled: $out"
 printf '%s\n' "$out" | grep -q '^  Method       write$' || fail "the authority rows: $out"
 printf '%s\n' "$out" | grep -q '<tt>' && fail "no markup in the terminal: $out"
+printf '%s\n' "$out" | grep -q 'DECISION TIME' && fail "no countdown reported, none shown: $out"
+
+# With the daemon's countdown (#146 item 4) the terminal has no progress line to draw,
+# so it says the time in words, after the blocks: running, then held.
+: >"$MOCK_LOG"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json "*) printf "%s\n" "$RUNNING12" ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+out=$(WARDOS_MENU_CHOICE=y "$approve")
+printf '%s\n' "$out" | grep -q '^DECISION TIME$' || fail "the decision time is a block: $out"
+printf '%s\n' "$out" | grep -q '^  42 s left, then denied$' || fail "whole seconds, rounded up: $out"
+assert_logged '^ward session approve --session sess_a 12 allow$'
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json "*) printf "%s\n" "$HELD20" ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+out=$(WARDOS_MENU_CHOICE=y "$approve")
+printf '%s\n' "$out" | grep -q '^  held while paused · 45 s left once resumed$' ||
+  fail "a paused session's clock is held: $out"
+# Back to the one plain pending approval the cases below expect.
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json "*) printf "%s\n" "$LINE12" ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
 
 # The menu is wardos-menu-select when it exists; s is the session grant.
 : >"$MOCK_LOG"

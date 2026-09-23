@@ -921,10 +921,14 @@ fn cmd_pending(
     Ok(ExitCode::SUCCESS)
 }
 
-/// One approval as text: who asks, the three blocks, and how to answer.
+/// One approval as text: who asks, the three blocks, the decision time the
+/// daemon reports for it (#146 item 4) when it has one, and how to answer.
 fn pending_text(approval: &ward_daemon::approvals::Approval, agent: &str) -> String {
+    let decision = approval.countdown.map_or_else(String::new, |c| {
+        format!("\nDECISION TIME\n  {}\n", c.text())
+    });
     format!(
-        "Approval {id} · {agent} · {tool}\n{blocks}\nward session approve {id} allow | allow-session | deny\n\n",
+        "Approval {id} · {agent} · {tool}\n{blocks}{decision}\nward session approve {id} allow | allow-session | deny\n\n",
         id = approval.id,
         tool = approval.tool,
         blocks = approval.blocks(),
@@ -1922,6 +1926,34 @@ mod tests {
         };
         assert_eq!(decided.state_word(), "timed-out");
         assert!(decided.line().contains("timed-out"), "{}", decided.line());
+    }
+
+    /// `ward session pending`'s text gives the daemon's decision time (#146
+    /// item 4) between the blocks and how to answer — held while paused too
+    /// — and nothing at all when the daemon reports none.
+    #[test]
+    fn session_pending_text_shows_the_daemons_decision_time_when_it_has_one() {
+        let mut approval = ward_daemon::approvals::Approval::new(
+            12,
+            "Write",
+            "/work/src/lib.rs",
+            ward_daemon::approvals::Authority::none("r", "/work/src/lib.rs"),
+            0,
+        );
+        let text = pending_text(&approval, "claude");
+        assert!(!text.contains("DECISION TIME"), "no clock, no line: {text}");
+        approval.countdown = Some(ward_daemon::approvals::Countdown {
+            remaining_ms: 45_000,
+            timeout_ms: 60_000,
+            held: true,
+        });
+        let text = pending_text(&approval, "claude");
+        assert!(
+            text.ends_with(
+                "\nDECISION TIME\n  held while paused · 45 s left once resumed\n\nward session approve 12 allow | allow-session | deny\n\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

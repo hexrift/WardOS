@@ -749,8 +749,16 @@ impl Served {
     /// its seq becomes the approval's id, in one step under the mutex so a
     /// subscriber that sees the record can already answer it. A standing
     /// `allow-session` answers it at once. The approval's authority is derived
-    /// here, from the manifest and the credentials granted so far.
-    fn hold(&mut self, tool: &str, summary: &str, reason: &str) -> Result<(u64, Option<Outcome>)> {
+    /// here, from the manifest and the credentials granted so far, and its
+    /// decision clock of `timeout` is armed in the same step (#146 item 4),
+    /// so the same subscriber already sees how long it has to answer.
+    fn hold(
+        &mut self,
+        tool: &str,
+        summary: &str,
+        reason: &str,
+        timeout: Duration,
+    ) -> Result<(u64, Option<Outcome>)> {
         let record = self.append(approvals::requested_event(tool, summary, reason))?;
         if self.approvals.remembered(tool, summary) {
             return Ok((record.seq, Some(Outcome::Remembered)));
@@ -758,13 +766,16 @@ impl Served {
         let authority = self
             .deriver
             .derive(tool, summary, reason, &self.approvals.credentials());
-        self.approvals.register(Approval::new(
-            record.seq,
-            tool,
-            summary,
-            authority,
-            control::unix_ms(SystemTime::now()),
-        ))?;
+        self.approvals.register_with_timeout(
+            Approval::new(
+                record.seq,
+                tool,
+                summary,
+                authority,
+                control::unix_ms(SystemTime::now()),
+            ),
+            timeout,
+        )?;
         Ok((record.seq, None))
     }
 
@@ -1025,15 +1036,15 @@ fn hold(
     reason: &str,
     timeout_secs: u64,
 ) -> Response {
+    let timeout = Duration::from_secs(timeout_secs);
     let (id, approvals, remembered) = {
         let mut s = lock(served);
-        match s.hold(tool, summary, reason) {
+        match s.hold(tool, summary, reason, timeout) {
             Ok((id, remembered)) => (id, Arc::clone(&s.approvals), remembered),
             Err(e) => return Response::Error(refusal(e)),
         }
     };
-    let outcome =
-        remembered.unwrap_or_else(|| approvals.wait(id, Duration::from_secs(timeout_secs)));
+    let outcome = remembered.unwrap_or_else(|| approvals.wait(id, timeout));
     // `Approvals::take_recorded` is true exactly when a concurrent `close`
     // (`Served::close_pending_approvals`, running for a `Stop`/`Seal` on
     // another connection) already claimed this id itself and appended its
@@ -1249,10 +1260,22 @@ mod tests {
             lock(&served).handle(Request::Pause { reason: String::new() }).0,
             Response::Error(e) if e == "already paused"
         ));
+        // The daemon says so (#146 item 4): the question's countdown is
+        // held, and does not move while the pause lasts.
+        let countdown = |served: &Arc<Mutex<Served>>| match lock(served).handle(Request::Pending).0
+        {
+            Response::Pending(p) => p[0].countdown.expect("an armed clock"),
+            other => panic!("{other:?}"),
+        };
+        let before = countdown(&served);
+        assert!(before.held, "{before:?}");
+        assert_eq!(before.timeout_ms, 1000);
+        assert!(before.remaining_ms <= 1000, "{before:?}");
         // The open question stays open past its own timeout, and cannot be
         // answered while paused.
         std::thread::sleep(Duration::from_millis(1200));
         assert!(!holding.is_finished(), "held in turn");
+        assert_eq!(countdown(&served), before, "the clock stands still");
         assert!(matches!(
             lock(&served).handle(Request::Approve { id: 0, decision: ApprovalDecision::Allow }).0,
             Response::Error(e) if e.contains("paused by ward")
@@ -1268,6 +1291,14 @@ mod tests {
         ));
         assert!(!marker.exists(), "the marker is gone");
         assert!(!lock(&served).approvals.paused());
+        // Resumed, the countdown runs on from where it stood — the question
+        // may already have timed out by the time this looks, never refilled.
+        if let Response::Pending(p) = lock(&served).handle(Request::Pending).0
+            && let Some(after) = p.first().and_then(|a| a.countdown)
+        {
+            assert!(!after.held, "{after:?}");
+            assert!(after.remaining_ms <= before.remaining_ms, "{after:?}");
+        }
         assert!(matches!(
             lock(&served).handle(Request::Resume).0,
             Response::Error(e) if e == "not paused"
@@ -1579,6 +1610,12 @@ mod tests {
         );
         assert_eq!(pending[0].authority.destination, "/work/src/lib.rs");
         assert_eq!(pending[0].authority.method, "write");
+        // Its decision clock is the hold's own `timeout_secs`, armed as it
+        // was registered and running (#146 item 4).
+        let countdown = pending[0].countdown.expect("armed at registration");
+        assert_eq!(countdown.timeout_ms, 5000);
+        assert!(!countdown.held);
+        assert!(countdown.remaining_ms <= 5000, "{countdown:?}");
         assert_eq!(
             pending[0].authority.rule,
             "step-through: pause before writes"
@@ -1733,7 +1770,7 @@ mod tests {
         // Register the question — what `Request::Hold` does before it
         // blocks in `wait` — synchronously, so the test controls exactly
         // when the collecting side is allowed to run.
-        let id = match lock(&served).hold("Write", "/work/race.rs", "r") {
+        let id = match lock(&served).hold("Write", "/work/race.rs", "r", Duration::ZERO) {
             Ok((id, None)) => id,
             other => panic!("{other:?}"),
         };
@@ -1878,7 +1915,7 @@ mod tests {
         let sub = lock(&served).subscribe(0).unwrap();
         let (rx, _hangup) = sub.live.unwrap();
 
-        let id = match lock(&served).hold("Write", "/work/race2.rs", "r") {
+        let id = match lock(&served).hold("Write", "/work/race2.rs", "r", Duration::ZERO) {
             Ok((id, None)) => id,
             other => panic!("{other:?}"),
         };
@@ -1992,7 +2029,7 @@ mod tests {
         let sub = lock(&served).subscribe(0).unwrap();
         let (rx, _hangup) = sub.live.unwrap();
 
-        let id = match lock(&served).hold("Write", "/work/race3.rs", "r") {
+        let id = match lock(&served).hold("Write", "/work/race3.rs", "r", Duration::ZERO) {
             Ok((id, None)) => id,
             other => panic!("{other:?}"),
         };

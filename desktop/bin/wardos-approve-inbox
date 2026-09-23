@@ -10,7 +10,10 @@
 #                          approval's own session (WARDOS_SESSION, mirroring
 #                          wardos-pause) — the same three blocks and y/s/n decision a
 #                          notification would have shown; choosing a decided one shows
-#                          how it was decided (read-only: there is nothing left to answer)
+#                          how it was decided (read-only: there is nothing left to answer);
+#                          a pending row ends with the decision time the daemon reports
+#                          for it (#146 item 4): "42 s left, then denied", or "held while
+#                          paused · 42 s left once resumed" while its session is paused
 #   wardos-approve-inbox --help
 #
 # A missed or dismissed notification, or one wardos-approve --watch left unshown past
@@ -28,8 +31,19 @@ wardos_help "$@"
 # project, agent, tool, destination — every live session's approvals, `ward session
 # approvals --all` already carrying which session and project each belongs to
 # (mirroring `ward session pending --all`), so no per-approval round trip is needed
-# to say whose request this is.
+# to say whose request this is — then, for display only, the decision time in words
+# (mirroring Countdown::text: whole seconds rounded up), or "-" when the daemon
+# reports none (decided, or a daemon that predates #146 item 4). The daemon's own
+# figure as of this listing; nothing here computes a deadline of its own.
 fields='
+  def decision_time:
+    if .outcome != null or .approval.countdown == null then "-"
+    else .approval.countdown as $c
+      | ((($c.remaining_ms + 999) / 1000) | floor) as $s
+      | if $c.held then "held while paused · \($s) s left once resumed"
+        else "\($s) s left, then denied"
+        end
+    end;
   def state_word:
     if .outcome == null then "pending"
     elif (.outcome | type) == "string" then
@@ -43,7 +57,7 @@ fields='
     else "denied"
     end;
   [.approval.id, state_word, .session, .project, .agent, .approval.tool,
-   .approval.authority.destination] | @tsv'
+   .approval.authority.destination, decision_time] | @tsv'
 
 rows=$(ward session approvals --json --all | jq -r "$fields")
 if [[ -z $rows ]]; then
@@ -67,10 +81,11 @@ ordered=$(
 # then return both of them — state, session and the target session for the
 # opened terminal would no longer be a single, consistent record. Parsing the
 # exact line the person picked, instead of looking it up again by bare id, keeps
-# that record intact regardless of what else in $ordered shares its id.
+# that record intact regardless of what else in $ordered shares its id. The decision
+# time (field 8) only ever joins the display column, never the parsed fields.
 menu_lines=$(printf '%s\n' "$ordered" \
-  | awk -F'\t' '{ printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%-15s %s · %s · %s · %s · %s\n", \
-      $1, $2, $3, $4, $5, $6, $7, $2, $3, $4, $5, $6, $7 }')
+  | awk -F'\t' '{ printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%-15s %s · %s · %s · %s · %s%s\n", \
+      $1, $2, $3, $4, $5, $6, $7, $2, $3, $4, $5, $6, $7, ($8 == "-" || $8 == "" ? "" : " · " $8) }')
 chosen=$(printf '%s\n' "$menu_lines" | wardos_menu "Approvals") || exit 0
 id=$(printf '%s\n' "$chosen" | cut -f1)
 state=$(printf '%s\n' "$chosen" | cut -f2)

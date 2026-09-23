@@ -58,6 +58,28 @@ assert_logged '^foot --app-id ward-approval -e wardos-approve 12$'
 WARDOS_MENU_CHOICE=20 "$inbox"
 assert_logged '^foot --app-id ward-approval -e wardos-approve 20$'
 
+# --- a pending row ends with the daemon's decision time (#146 item 4) -------------
+# 12 running with 41.001 s left, 20 held because its session is paused; the decided
+# row, and a pending row from a daemon that reports no countdown, carry none. The
+# menu mock copies what it was shown into the log.
+: >"$MOCK_LOG"
+running12='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"r","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":null},"requested_at_unix_ms":1,"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}},"outcome":null,"decided_at_unix_ms":null,"agent":"claude","session":"sess_a","project":"payments-api"}'
+held20='{"approval":{"id":20,"tool":"Write","summary":"/work/other/db.rs","claim":"Write /work/other/db.rs","authority":{"rule":"r","destination":"/work/other/db.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":null},"requested_at_unix_ms":2,"countdown":{"remaining_ms":45000,"timeout_ms":60000,"held":true}},"outcome":null,"decided_at_unix_ms":null,"agent":"codex","session":"sess_b","project":"other-service"}'
+export RUNNING12=$running12 HELD20=$held20
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session approvals --json --all") printf "%s\n%s\n%s\n" "$DECIDED7" "$RUNNING12" "$HELD20" ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# shellcheck disable=SC2016
+mock wardos-menu-select 'tee -a "$MOCK_LOG" | grep -m1 "^${WARDOS_MENU_CHOICE}$(printf "\t")"'
+WARDOS_MENU_CHOICE=12 "$inbox"
+assert_logged 'pending         sess_a · payments-api · claude · Write · /work/src/lib.rs · 42 s left, then denied$'
+assert_logged 'pending         sess_b · other-service · codex · Write · /work/other/db.rs · held while paused · 45 s left once resumed$'
+assert_logged 'timed-out       sess_a · payments-api · claude · WebFetch · api.github.com$'
+# The countdown is display only: the chosen row still parses to its own session.
+assert_logged '^foot --app-id ward-approval -e wardos-approve 12$'
+
 # --- a decided choice shows a read-only summary, no terminal ----------------------
 : >"$MOCK_LOG"
 : >"$TMP/info.txt"
