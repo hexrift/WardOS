@@ -2374,23 +2374,20 @@ mod tests {
     /// other caller) until after the deadline was still judged by its stale,
     /// pre-lock timestamp and accepted.
     ///
-    /// Review of #225, fourth round, finding 1: both the single- and
-    /// two-barrier versions of this test that used to follow only
-    /// approximated "the lock is acquired before the clock is read" by
-    /// racing a real wall-clock deadline against thread scheduling — a
-    /// thread can be descheduled at any instruction, not just between two
-    /// barrier waits, so no amount of extra synchronization around a real
-    /// sleep actually closes that window, only narrows it. This drives the
-    /// private `answer_with` seam (the injectable-clock seam `answer` itself
-    /// uses) directly with a closure that signals the instant it is called,
-    /// so the property under test — the lock is held before `now()` is ever
-    /// invoked, not merely "usually invoked early enough" — is observed
-    /// directly rather than inferred from timing. The approval is registered
-    /// already past its deadline (the backdating trick
-    /// `an_answer_racing_the_timeout_at_the_deadline_cannot_win` already
-    /// uses), so the outcome (refused, `TimedOut`) holds however long the
-    /// closure takes to actually run, and nothing here depends on
-    /// scheduling.
+    /// Review of #225, fifth round, finding 1: the fourth round's version of
+    /// this test still spawned a thread and raced a 500 ms `recv_timeout`
+    /// against it — generous, but still a scheduling assumption, so a
+    /// reverted implementation could in principle send before the lock and
+    /// still have the outer thread not observe it in time. This drops
+    /// threading entirely. `answer_with` takes the approvals lock *before*
+    /// calling its clock closure, so a closure that runs on this same test
+    /// thread, mid-call, can prove the lock is already held by calling
+    /// `try_lock` on the same `Mutex` — `std::sync::Mutex` has no concept of
+    /// same-thread reentrancy, so `try_lock` from the thread already holding
+    /// it deterministically reports `WouldBlock`, never `Ok`. A regression
+    /// that read the clock before locking would let this same `try_lock`
+    /// succeed, catching it immediately with no thread, channel, or timeout
+    /// involved.
     #[test]
     fn answer_with_reads_its_clock_only_once_the_lock_is_held() {
         let timeout = Duration::from_secs(60);
@@ -2403,42 +2400,23 @@ mod tests {
         let t0 = Instant::now()
             .checked_sub(timeout)
             .expect("the monotonic clock is past one minute");
-        let approvals = Arc::new(Approvals::new());
+        let approvals = Approvals::new();
         approvals
             .register_at(approval(1), Some(timeout), t0)
             .unwrap();
-        let (clock_called_tx, clock_called_rx) = std::sync::mpsc::channel::<()>();
 
-        let held = approvals.lock();
-        let answerer = {
-            let approvals = Arc::clone(&approvals);
-            std::thread::spawn(move || {
-                approvals.answer_with(1, ApprovalDecision::Allow, move || {
-                    clock_called_tx.send(()).unwrap();
-                    Instant::now()
-                })
+        let err = approvals
+            .answer_with(1, ApprovalDecision::Allow, || {
+                assert!(
+                    matches!(
+                        approvals.state.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "the clock must not be read before the lock is acquired"
+                );
+                Instant::now()
             })
-        };
-
-        // While this thread still holds the lock, `answer_with` cannot have
-        // called the closure yet: it can only be blocked trying to acquire
-        // the lock. A generous window, not a race — a regression that reads
-        // the clock before locking sends immediately, well inside it; a
-        // correct implementation cannot send at all until the lock below is
-        // released, so this can never flake in the passing direction.
-        assert_eq!(
-            clock_called_rx.recv_timeout(Duration::from_millis(500)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
-            "the clock must not be read before the lock is acquired"
-        );
-        drop(held);
-
-        // Released: the closure now runs and reports the real, current
-        // instant — already past the backdated deadline either way.
-        clock_called_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the clock is read once the lock is acquired");
-        let err = answerer.join().unwrap().unwrap_err();
+            .unwrap_err();
         assert_eq!(
             err.to_string(),
             "daemon: approval 1: timed out; its decision time ran out"
