@@ -147,12 +147,19 @@ jobs:
           retention-days: 1
 
   # The image everyone else uses (image/README.md, "The published image"): a merge to
-  # main that built and linted is what gets published, never a pull request. `latest`
-  # and `<sha>` are pushed from here as x86_64 images, so they exist even when the
-  # aarch64 publish fails; the manifest job below turns them into two-architecture
-  # lists once both publishes are in. Loads the tarball `build` already produced
-  # instead of rebuilding, so this is the only job in the workflow that ever holds a
-  # live `packages: write` token (#164 finding 2).
+  # main that built and linted is what gets published, never a pull request. Loads the
+  # tarball `build` already produced instead of rebuilding, so this is one of only two
+  # jobs in the workflow that ever hold a live `packages: write` token (#164 finding 2).
+  # Only ever writes its own architecture-suffixed tags (`latest-x86_64`, `<sha>-x86_64`)
+  # — never unqualified `latest`/`<sha>` (#149): those name a *two*-architecture image,
+  # and this job only ever has one architecture to offer. The `manifest` job below is
+  # the only place that writes `latest`/`<sha>`, and only once it has verified both
+  # architectures are actually present, so the shared tag can never be observed pointing
+  # at an x86_64-only image, even transiently. Also exposes the digest ghcr.io actually
+  # assigned this push as a job output, so `manifest` can assemble the two-architecture
+  # index from immutable digests instead of these mutable tag names (issue #149's
+  # suggested implementation: architecture jobs record their own digest for the manifest
+  # job to assemble and validate from).
   publish:
     name: publish to ghcr.io (x86_64)
     needs: [build]
@@ -161,6 +168,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -169,16 +178,21 @@ jobs:
       - name: docker load
         run: gunzip -c /tmp/wardos-x86_64.tar.gz | docker load
       - name: Publish to ghcr.io
+        id: publish
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
-          for tag in latest "${GITHUB_SHA::7}" latest-x86_64 "${GITHUB_SHA::7}-x86_64"; do
+          sha="${GITHUB_SHA::7}"
+          for tag in "latest-x86_64" "$sha-x86_64"; do
             docker tag wardos:ci "$repo:$tag"
             docker push "$repo:$tag"
           done
+          digest="$(docker buildx imagetools inspect "$repo:$sha-x86_64" | awk '/^Digest:/{print $2}')"
+          [ -n "$digest" ] || { echo "publish: could not read the digest of $repo:$sha-x86_64" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
   # Same as `publish` above, for the aarch64 tarball `build-aarch64` produced.
   publish-aarch64:
@@ -189,6 +203,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -197,32 +213,7 @@ jobs:
       - name: docker load
         run: gunzip -c /tmp/wardos-aarch64.tar.gz | docker load
       - name: Publish to ghcr.io
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
-          for tag in latest-aarch64 "${GITHUB_SHA::7}-aarch64"; do
-            docker tag wardos:ci "$repo:$tag"
-            docker push "$repo:$tag"
-          done
-
-  # One `latest` (and one `<sha>`) for both: a manifest list that points at the two
-  # per-architecture images, so `bootc switch ghcr.io/hexrift/wardos:latest` and
-  # `podman pull` resolve to the right one on either machine. `docker buildx imagetools
-  # create` only writes manifests to the registry (no image data moves), which the
-  # workflow token's packages:write allows. Runs only when both publishes succeeded;
-  # otherwise `latest` stays the x86_64 image the first job pushed.
-  manifest:
-    name: multi-arch manifest
-    needs: [publish, publish-aarch64]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    steps:
-      - name: Join latest-x86_64 and latest-aarch64 under latest
+        id: publish
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -230,6 +221,117 @@ jobs:
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
           sha="${GITHUB_SHA::7}"
-          docker buildx imagetools create -t "$repo:latest" -t "$repo:$sha" \
-            "$repo:$sha-x86_64" "$repo:$sha-aarch64"
-          docker buildx imagetools inspect "$repo:latest"
+          for tag in "latest-aarch64" "$sha-aarch64"; do
+            docker tag wardos:ci "$repo:$tag"
+            docker push "$repo:$tag"
+          done
+          digest="$(docker buildx imagetools inspect "$repo:$sha-aarch64" | awk '/^Digest:/{print $2}')"
+          [ -n "$digest" ] || { echo "publish: could not read the digest of $repo:$sha-aarch64" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  # One `latest` (and one `<sha>`) for both: a manifest list that points at the two
+  # per-architecture images, so `bootc switch ghcr.io/hexrift/wardos:latest` and
+  # `podman pull` resolve to the right one on either machine. `docker buildx imagetools
+  # create` only writes manifests to the registry (no image data moves), which the
+  # workflow token's packages:write allows. Runs only when both publishes succeeded, and
+  # is the *only* job that ever writes unqualified `latest`/`<sha>` (#149) — never
+  # x86_64-only, not even transiently. Assembles the index from the immutable digests
+  # `publish`/`publish-aarch64` captured above, not their (mutable-for-as-long-as-the-
+  # registry-keeps-them) tag names — so what gets validated below is guaranteed to be
+  # what those jobs actually pushed, unaffected by anything that republishes those tags
+  # afterward. Two more things this job does before and after that promotion, both from
+  # #149's "never an intermediate image, never an out-of-order overwrite":
+  #  - it inspects the index it just built and fails the job unless both linux/amd64
+  #    and linux/arm64 are actually present, instead of trusting `needs:` alone;
+  #  - it re-checks main's tip immediately before promoting `latest`, and skips that
+  #    step (leaving `latest` alone) if a newer commit has already landed — so a run
+  #    for an older commit that happens to finish its builds later can never clobber
+  #    a newer commit's already-promoted `latest`. The per-commit `<sha>` tag is still
+  #    written either way, so every complete build stays individually addressable.
+  # `latest` itself is promoted by DIGEST (`repo@sha256:...`, the assembled index's own
+  # digest captured right after building it), for the same reason: a retry that reruns
+  # `publish`/`publish-aarch64` and republishes their tags (possibly with different
+  # bytes, if an upstream input moved) can never make a later promotion pick up a
+  # different index than the one this run actually validated.
+  # `concurrency` below serializes this job's own runs so two can't interleave a
+  # promotion, but GitHub keeps at most one *pending* run per group (a third queued
+  # run replaces the second, it does not queue behind it) — this bounds concurrent
+  # writers to one, it does not guarantee every triggering commit gets its own run.
+  # The staleness check reads `main`'s tip over git (not the registry), so this job
+  # needs `contents: read` alongside `packages: write`, and checks the repo out to
+  # reach the decision logic at scripts/release/*.sh.
+  manifest:
+    name: multi-arch manifest
+    needs: [publish, publish-aarch64]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: wardos-image-manifest-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Assemble the per-commit two-architecture index from immutable child digests
+        id: build_index
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          X86_64_DIGEST: ${{ needs.publish.outputs.digest }}
+          AARCH64_DIGEST: ${{ needs.publish-aarch64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha="${GITHUB_SHA::7}"
+          docker buildx imagetools create -t "$repo:$sha" \
+            "$repo@$X86_64_DIGEST" "$repo@$AARCH64_DIGEST"
+          docker buildx imagetools inspect "$repo:$sha" --raw | tee /tmp/index.json
+          # Captured now, right after the index is built, so promotion later can target
+          # exactly this content by digest instead of whatever `<sha>` resolves to by then.
+          digest="$(docker buildx imagetools inspect "$repo:$sha" | awk '/^Digest:/{print $2}')"
+          [ -n "$digest" ] || { echo "build_index: could not read the digest of $repo:$sha" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # scripts/release/check-multiarch-index.test.sh covers one architecture's
+      # manifest missing from the index (#149's first acceptance case).
+      - name: Validate both architectures are present before promoting
+        id: validate
+        run: bash scripts/release/check-multiarch-index.sh /tmp/index.json
+
+      # scripts/release/promote-latest.test.sh covers: staying-current promotes exactly
+      # the digest captured above and nothing else; a run superseded by a newer commit
+      # (out-of-order completion, #149's second acceptance case) never invokes docker at
+      # all; a run interrupted strictly before the write also never invokes docker
+      # (#149's cancellation acceptance case); and a retry re-promotes whatever digest
+      # it is given, faithfully.
+      - name: Promote latest, unless a newer commit has already landed on main
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          head_sha="$(git ls-remote "https://x-access-token:${GHCR_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | cut -f1)"
+          bash scripts/release/promote-latest.sh "$repo" "${{ steps.build_index.outputs.digest }}" "$GITHUB_SHA" "$head_sha"
+
+      # #149's suggested implementation asks for the promoted index digest, its
+      # children, the source commit and the validation result to be recorded
+      # alongside the release; the job summary is that record; signing/provenance
+      # proper (attesting to it) is #148.
+      - name: Record promotion provenance in the job summary
+        if: always()
+        env:
+          X86_64_DIGEST: ${{ needs.publish.outputs.digest }}
+          AARCH64_DIGEST: ${{ needs.publish-aarch64.outputs.digest }}
+        run: |
+          {
+            echo "### Image promotion for \`${GITHUB_SHA::7}\`"
+            echo "- source commit: \`$GITHUB_SHA\`"
+            echo "- index digest: \`${{ steps.build_index.outputs.digest }}\`"
+            echo "- x86_64 child digest: \`$X86_64_DIGEST\`"
+            echo "- aarch64 child digest: \`$AARCH64_DIGEST\`"
+            echo "- platform validation: \`${{ steps.validate.outcome }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -838,6 +838,24 @@ pub enum WardEvent {
         reason: ShortText,
     },
 
+    // -- processes, continued (origin: Kernel; #140 / PR #197 review) --
+    /// A launch could not be carried through to a `CommandFinished`: the sandbox or hook
+    /// setup failed, or the child failed to spawn, after `CommandStarted` (and any credential
+    /// grant scoped to it) was already on the log. Recorded so `CommandStarted` is never the
+    /// last record for a pid — every launch gets a terminal record, and a launch-scoped grant
+    /// does not outlive a launch that never even started, not just one that ran and exited.
+    /// Appended at the end of the catalogue, not grouped with `CommandFinished` above, because
+    /// postcard identifies variants by declaration index and existing indices must never move
+    /// (see the module doc comment); the same discipline `VerificationErrored` follows for an
+    /// unrunnable verification attempt.
+    LaunchAborted {
+        /// The process this closes out (`CommandStarted`'s own pid).
+        pid: Pid,
+        /// Sanitised, bounded description of what stopped the launch (e.g. "egress proxy:
+        /// address already in use"). Never a secret; drawn from the daemon's own error text.
+        reason: ShortText,
+    },
+
     // -- verification attempts (origin: Wardd / Verifier; #139) --
     /// A verification attempt was allocated: the earliest record of an attempt, written
     /// before any expensive preparation (candidate capture, sandbox launch) begins, so a
@@ -921,14 +939,15 @@ pub enum EventKind {
     SessionResumed = 28,
     EntryRestored = 29,
     VerificationErrored = 30,
-    VerificationAttemptStarted = 31,
-    VerificationCancelled = 32,
-    VerificationInterrupted = 33,
+    LaunchAborted = 31,
+    VerificationAttemptStarted = 32,
+    VerificationCancelled = 33,
+    VerificationInterrupted = 34,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 34] = [
+    pub const ALL: [EventKind; 35] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -960,6 +979,7 @@ impl EventKind {
         EventKind::SessionResumed,
         EventKind::EntryRestored,
         EventKind::VerificationErrored,
+        EventKind::LaunchAborted,
         EventKind::VerificationAttemptStarted,
         EventKind::VerificationCancelled,
         EventKind::VerificationInterrupted,
@@ -1006,6 +1026,7 @@ impl EventKind {
             EventKind::SessionResumed => "session_resumed",
             EventKind::EntryRestored => "entry_restored",
             EventKind::VerificationErrored => "verification_errored",
+            EventKind::LaunchAborted => "launch_aborted",
             EventKind::VerificationAttemptStarted => "verification_attempt_started",
             EventKind::VerificationCancelled => "verification_cancelled",
             EventKind::VerificationInterrupted => "verification_interrupted",
@@ -1187,6 +1208,7 @@ impl WardEvent {
             WardEvent::SessionResumed { .. } => EventKind::SessionResumed,
             WardEvent::EntryRestored { .. } => EventKind::EntryRestored,
             WardEvent::VerificationErrored { .. } => EventKind::VerificationErrored,
+            WardEvent::LaunchAborted { .. } => EventKind::LaunchAborted,
             WardEvent::VerificationAttemptStarted { .. } => EventKind::VerificationAttemptStarted,
             WardEvent::VerificationCancelled { .. } => EventKind::VerificationCancelled,
             WardEvent::VerificationInterrupted { .. } => EventKind::VerificationInterrupted,

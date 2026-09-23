@@ -393,6 +393,7 @@ fn summary(event: &WardEvent) -> String {
             ExitStatus::Exited { code } => format!("pid {pid} exit {code}"),
             ExitStatus::Signaled { signal, .. } => format!("pid {pid} signal {signal}"),
         },
+        WardEvent::LaunchAborted { pid, reason } => format!("pid {pid} aborted · {reason}"),
         WardEvent::SnapshotCreated {
             role,
             id,

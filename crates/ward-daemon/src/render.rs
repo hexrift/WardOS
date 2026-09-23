@@ -413,6 +413,9 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
         WardEvent::SessionStarted { .. } => ("START", Tone::Accent, "session".to_string()),
         WardEvent::CommandStarted { argv, .. } => ("RUN", Tone::Ink, argv_text(argv)),
         WardEvent::CommandFinished { exit, .. } => ("EXIT", exit_color(*exit), exit_text(*exit)),
+        WardEvent::LaunchAborted { reason, .. } => {
+            ("ABORT", Tone::Deny, format!("launch aborted · {reason}"))
+        }
         WardEvent::FileModified { path, kind, .. } => {
             (change_verb(*kind), Tone::Ink, path.to_string())
         }
@@ -467,6 +470,25 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
             Tone::Ok,
             format!("snapshot {}", short_hex(&snapshot.to_string())),
         ),
+        ev @ (WardEvent::SessionPaused { .. }
+        | WardEvent::SessionResumed { .. }
+        | WardEvent::EntryRestored { .. }) => intervention_cells(ev),
+        WardEvent::SessionEnded { .. } => ("END", Tone::Dim, "session".to_string()),
+        _ => return None,
+    };
+    Some(ObserverCells {
+        time: mono_time(rec),
+        verb,
+        tone,
+        subject,
+    })
+}
+
+/// The `(verb, tone, subject)` triple for the host-intervention records
+/// (`SessionPaused`/`SessionResumed`/`EntryRestored`), split out of
+/// [`observer_cells`] purely to keep that function under the line limit.
+fn intervention_cells(ev: &WardEvent) -> (&'static str, Tone, String) {
+    match ev {
         WardEvent::SessionPaused { method, reason } => (
             "PAUSE",
             Tone::Deny,
@@ -501,15 +523,8 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
                 )
             },
         ),
-        WardEvent::SessionEnded { .. } => ("END", Tone::Dim, "session".to_string()),
-        _ => return None,
-    };
-    Some(ObserverCells {
-        time: mono_time(rec),
-        verb,
-        tone,
-        subject,
-    })
+        _ => unreachable!("intervention_cells is only called for the three arms matched above"),
+    }
 }
 
 /// A duration as the observer says it: `12s`, `3m 05s`, `1h 02m`.
