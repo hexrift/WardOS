@@ -764,6 +764,38 @@ pub fn doctor_panel(checks: &[crate::doctor::Check]) -> String {
     s
 }
 
+/// The `ward ready` panel: one row per project-readiness check, then the overall
+/// verdict (#147). Unlike `ward doctor`'s host report, a `Fail`/`Warn` row here is
+/// about *this project*, not the machine.
+#[must_use]
+pub fn readiness_panel(report: &crate::readiness::Report) -> String {
+    use crate::doctor::Status;
+    let mut s = format!(
+        "{ACCENT}WARD{RESET} {INK}ready{RESET}  {DIM}{} project{RESET}\n\n",
+        report.ecosystem
+    );
+    for r in &report.rows {
+        let (color, word) = match r.status {
+            Status::Ok => (OK, "OK"),
+            Status::Warn => (WARN, "WARN"),
+            Status::Fail => (DENY, "FAIL"),
+        };
+        let _ = writeln!(
+            s,
+            "  {INK}{:<16}{RESET}{color}{word:<5}{RESET} {DIM}{}{RESET}",
+            r.name, r.detail
+        );
+    }
+    let verdict = report.verdict();
+    let color = if verdict.blocks() { DENY } else { OK };
+    let _ = write!(
+        s,
+        "\n  {INK}Overall{RESET}  {color}{}{RESET}\n",
+        verdict.word()
+    );
+    s
+}
+
 /// The `ward doctor` hardware baseline block (Hardware Baseline 1): what this machine
 /// gives a session and how fast, with an overall verdict. A report — a degraded row is
 /// a dot, never a blocker.
