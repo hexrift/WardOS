@@ -266,7 +266,7 @@ integrity pass
 
 `✓ VERIFIED` should become recognisable as a WardOS/TamperWard state. It is always
 rendered the same way, in the same place, in the verified colour, and it is bound to
-the snapshot it judged (ADR-0019): the bar's `VERIFY` segment has six states and shows
+the snapshot it judged (ADR-0019): the bar's `VERIFY` segment has eight states and shows
 exactly one, decided by content, not by time or heuristics. The shell digests the
 worktree with the snapshot crate's incremental hash cache and compares the id with the
 candidate the last `VerificationPassed` record names; green disappears the moment the
@@ -280,6 +280,8 @@ tree differs from that candidate.
 | stale | `VERIFY ~ STALE` | restricted amber | `7c01…` passed, but the worktree has changed since; the verdict is history |
 | failed | `VERIFY ✗` | denied red | the trusted command ran and the candidate failed |
 | errored | `VERIFY ! ERROR` | denied red | the attempt could not run to a pass/fail result at all (sandbox runtime failed to launch, a preparation step failed, …); never shown as running or as a failed test (#139) |
+| cancelled | `VERIFY ! CANCELLED` | denied red | the user cancelled the attempt before it reached a pass/fail result (#139) |
+| interrupted | `VERIFY ! INTERRUPTED` | denied red | the process running the attempt (a session daemon, or a daemonless `ward` invocation) ended before it reached a terminal result, and a later reconciliation pass recorded that (#139) |
 
 A failed verdict stays red whatever the tree does next: only a new run changes it. A
 sealed log keeps its verdict; the tree can still make it stale. Clicking the segment
@@ -388,9 +390,9 @@ surface named here from two inputs only, the session's `SessionDescription` and 
 denied) on each element and no graphics dependency: the trust bar (§6) as segments
 `session · project · agent · network · credentials · observer · TamperWard · verified ·
 daemon`, where the agent (`CLAUDE ● working`, §7 glyphs and words) and `TW ✓`/`TW ■`
-appear only once the stream has said so, the verify segment is the five-state machine of
-§11 (`VERIFY —` from the first frame, `◐`, `✓`, `~ STALE`, `✗`; `VerifyState` in
-`trust.rs`, fed by the stream's verdict and the worktree digest the shell observes
+appear only once the stream has said so, the verify segment is the eight-state machine of
+§11 (`VERIFY —` from the first frame, `◐`, `✓`, `~ STALE`, `✗`, `! ERROR`, `! CANCELLED`,
+`! INTERRUPTED`; `VerifyState` in `trust.rs`, fed by the stream's verdict and the worktree digest the shell observes
 through `Model::observe_worktree`), and a sealed log dims the state marker, the network
 word, the daemon word and the agent but never a verdict; the session panel (§6) as
 `Session` and `TamperWard` rows and the verify panel (§11) as `Verify` rows; the observer feed

@@ -17,10 +17,11 @@ use ward_events::event::{
     TamperWardSig, VerifyRequester, VerifySummary, WardEvent,
 };
 use ward_events::ids::{
-    Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
+    AttemptId, Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
 };
 use ward_events::log::{FsyncPolicy, LogReader, LogWriter};
 use ward_events::origin::Origin;
+use ward_events::origin::OriginSet;
 use ward_events::text::{BoundedArgv, BoundedText, FSI, HostName, PDI, SandboxPath, SandboxRoot};
 use ward_events::wire::{
     Filter, Subscribe, decode_record, decode_subscribe, encode_record, encode_subscribe,
@@ -236,6 +237,99 @@ proptest! {
         prop_assert_eq!(n, bytes.len());
         prop_assert_eq!(back, sub);
     }
+}
+
+/// Deterministic regression for the `Filter`/`Subscribe` wire path at bit positions
+/// `>= 32` — the range `subscribe_roundtrips` above generates was widened to the full
+/// `EventKindSet` capacity specifically to reach these, but a fixed, targeted case is
+/// kept too so a future narrowing of that proptest range can't silently stop covering
+/// the exact kinds (`ObservationsDropped`, #202; `SessionPauseUnsettled`, #145;
+/// `VerificationAttemptStarted`, `VerificationCancelled`, `VerificationInterrupted`,
+/// #139) that motivated widening
+/// `EventKindSet` from `u32` to `u64` in the first place. Exercises every layer this
+/// needs: the raw bit position, a bare `EventKindSet` through postcard, the real
+/// `Subscribe`/`Filter` wire type, and `Filter::quiet()` admitting the terminal
+/// outcomes (but not the progress marker) directly through `EventKindSet::contains`,
+/// not just indirectly through `full_catalogue`'s record counts.
+#[test]
+fn subscribe_roundtrips_high_bit_kinds() {
+    assert_eq!(
+        EventKind::ObservationsDropped.bit(),
+        1u64 << 32,
+        "sanity: ObservationsDropped is the first kind past u32's 32-bit capacity"
+    );
+
+    // Exactly the five kinds at or past bit 32: nothing below it, so a regression in
+    // masking/shifting the high bits can't hide behind low bits also being set.
+    let high_bits = EventKindSet::EMPTY
+        .with(EventKind::ObservationsDropped) // bit 32
+        .with(EventKind::SessionPauseUnsettled) // bit 33
+        .with(EventKind::VerificationAttemptStarted) // bit 34
+        .with(EventKind::VerificationCancelled) // bit 35
+        .with(EventKind::VerificationInterrupted); // bit 36
+    assert_eq!(high_bits.bits(), 0b1_1111 << 32);
+
+    // Postcard, directly on the bitmask type.
+    let bytes = postcard::to_allocvec(&high_bits).unwrap();
+    assert_eq!(
+        postcard::from_bytes::<EventKindSet>(&bytes).unwrap(),
+        high_bits
+    );
+
+    let sub = Subscribe {
+        session: SessionId::from_u128(0x5e55),
+        from_seq: 0,
+        filter: Filter {
+            origins: OriginSet::ALL,
+            kinds: high_bits,
+            exclude_agent_notes: false,
+        },
+    };
+    let bytes = encode_subscribe(&sub).unwrap();
+    let (back, n) = decode_subscribe(&bytes).unwrap();
+    assert_eq!(n, bytes.len());
+    assert_eq!(back, sub);
+    assert_eq!(back.filter.kinds, high_bits);
+    assert!(back.filter.kinds.contains(EventKind::ObservationsDropped));
+
+    // `Filter::quiet()` must admit ObservationsDropped, SessionPauseUnsettled and the
+    // two terminal verification-attempt outcomes; VerificationAttemptStarted (a
+    // progress marker, not a terminal outcome) must not be admitted.
+    let quiet = Filter::quiet();
+    assert!(quiet.kinds.contains(EventKind::ObservationsDropped));
+    assert!(quiet.kinds.contains(EventKind::SessionPauseUnsettled));
+    assert!(quiet.kinds.contains(EventKind::VerificationCancelled));
+    assert!(quiet.kinds.contains(EventKind::VerificationInterrupted));
+    assert!(!quiet.kinds.contains(EventKind::VerificationAttemptStarted));
+
+    // And the full mask, including every high bit alongside every low one, still
+    // round-trips: a wire path that only special-cased the low 32 bits would fail
+    // here even if the isolated high-bit-only case above passed.
+    let sub_all = Subscribe {
+        session: SessionId::from_u128(1),
+        from_seq: 9,
+        filter: Filter::ALL,
+    };
+    let bytes = encode_subscribe(&sub_all).unwrap();
+    let (back, n) = decode_subscribe(&bytes).unwrap();
+    assert_eq!(n, bytes.len());
+    assert_eq!(back, sub_all);
+    assert_eq!(back.filter.kinds, EventKindSet::ALL);
+}
+
+/// `EventKindSet` bits produced under the pre-#202 `u32` representation (every kind
+/// index `0..32`) still decode correctly when the value additionally carries a bit
+/// `>= 32` that only the widened `u64` type can represent — proving the widening is
+/// purely additive for the wire, not just for values that stay inside the old range.
+#[test]
+fn a_high_bit_survives_alongside_bits_valid_under_the_old_u32_range() {
+    let mixed = EventKindSet::EMPTY
+        .with(EventKind::SessionStarted) // bit 0, valid pre-#202
+        .with(EventKind::LaunchAborted) // bit 31, the old ceiling
+        .with(EventKind::VerificationInterrupted); // bit 35, only valid post-widening
+    let bytes = postcard::to_allocvec(&mixed).unwrap();
+    let back: EventKindSet = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(back, mixed);
 }
 
 fn any_origin() -> impl Strategy<Value = Origin> {
@@ -568,6 +662,30 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Wardd,
+            WardEvent::VerificationAttemptStarted {
+                attempt: AttemptId::new(1),
+                requested_by: VerifyRequester::User,
+            },
+        ),
+        (
+            Origin::Verifier,
+            WardEvent::VerificationCancelled {
+                attempt: AttemptId::new(2),
+                candidate: Some(snap(b"cand4")),
+            },
+        ),
+        (
+            Origin::Wardd,
+            WardEvent::VerificationInterrupted {
+                attempt: AttemptId::new(3),
+                candidate: None,
+                reason: text(
+                    "the process serving this session ended before the attempt reached a terminal result",
+                ),
+            },
+        ),
+        (
             Origin::TamperWard,
             WardEvent::StateAccepted {
                 snapshot: snap(b"cand2"),
@@ -738,13 +856,17 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
         .filter(|r| Filter::quiet().matches(r))
         .count();
     // The nine of Quiet mode plus the three host interventions (ADR-0019 §3), plus
-    // `VerificationErrored` (#139), plus `CapabilityDecided` appearing twice in the
-    // fixture above (once granted, once denied), plus the observer's own "this
-    // record is incomplete" markers — one per source, the hook broker included
-    // (#137) — plus `SessionPauseUnsettled` (#145 items 3-4): a pause the daemon
-    // could not confirm settled must be just as visible in Quiet mode as the pause
-    // itself.
-    assert_eq!(quiet, 16);
+    // `VerificationErrored`, `VerificationCancelled` and `VerificationInterrupted`
+    // (#139), plus the observer's own "this record is incomplete" markers — one per
+    // source, the hook broker included (#137) — plus `CapabilityDecided` and
+    // `ObservationsDropped` each appearing twice in the fixture above (granted and
+    // denied; two different observer sources), plus `SessionPauseUnsettled` (#145
+    // items 3-4): a pause the daemon could not confirm settled must be just as visible
+    // in Quiet mode as the pause itself. `VerificationAttemptStarted` is a progress
+    // marker, not a terminal outcome, and is deliberately not in Quiet mode (like
+    // `VerificationRequested`/`VerificationStarted` before it) -- neither is
+    // `LaunchAborted`, matching its siblings `CommandStarted`/`CommandFinished`.
+    assert_eq!(quiet, 18);
 }
 
 #[test]

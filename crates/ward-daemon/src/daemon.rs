@@ -137,7 +137,19 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
     let dir = session_dir(state, session);
     let log_path = dir.join("events.log");
     let started = UNIX_EPOCH + Duration::from_millis(meta.started_unix_ms);
-    let log = LocalLog::open(&log_path, started)?;
+    let mut log = LocalLog::open(&log_path, started)?;
+    // #139 item 5, the literal ask: a daemon starting up is taking ownership of a
+    // log a previous process (an earlier `wardd`, or a daemonless `ward` command)
+    // may have left mid-verification-attempt — most often because that process
+    // died or was killed. Reconcile any such dangling attempt into
+    // `VerificationInterrupted` before serving a single connection, so a
+    // subscriber never sees the eternal "running" spinner this issue is about,
+    // even across a daemon restart. Fail closed (review of #208, finding 3): a
+    // daemon that could not confirm a dangling attempt was actually closed out
+    // must not start serving the session as though it had been — a client asking
+    // for `Describe`/`Subscribe` right after would otherwise see whatever
+    // half-reconciled state this left behind with nothing to say it is suspect.
+    crate::attempt::reconcile_dangling_attempts(&mut log, &dir)?;
     let description = serde_json::to_value(meta.describe())
         .map_err(|e| Error::Daemon(format!("describe {session}: {e}")))?;
     // What an approval's authority is derived from: the manifest, the
@@ -2606,109 +2618,123 @@ mod tests {
         );
     }
 
-    /// PR #197 review, finding 1: `Session::launch` grants `opts.gateways`
-    /// (`CredentialGranted`) before `Egress::start`/`Hooks::start_with`/
-    /// `prepare`/`launch.run`, any of which can fail via `?` before
-    /// `CommandFinished` is ever appended. Without a fix, the daemon's
-    /// `open_launches` would keep that pid open forever and the credential
-    /// would never be retired, even though the route it was scoped to is
-    /// gone. This drives the *real* `Session::launch` (not a hand-built event
-    /// sequence) against a *real* served daemon end to end, and forces the
-    /// first fallible step in that span — `run_dir()` — to fail
-    /// deterministically without bubblewrap or root: its path is fixed and
-    /// predictable per session id, so planting it as a directory the launch
-    /// does not privately own (mode 0o755, not 0o700) makes `run_dir()`
-    /// refuse it exactly the way a co-resident user's own pre-planted
-    /// directory would (see `Session`'s `run_dir_refuses_a_planted_symlink`).
+    /// #139 item 5, the literal ask: a session left mid-verification-attempt by
+    /// whatever had been running it before — a crashed `wardd`, or a daemonless
+    /// `ward verify` that was killed — must not still read as "running" once a
+    /// fresh daemon takes the log over. `serve`'s own startup reconciles it before
+    /// a single connection is served.
     #[test]
-    fn a_launch_that_aborts_after_a_credential_grant_still_retires_it_end_to_end() {
-        use crate::agents::profile;
-        use crate::gateway::Gateway;
-        use crate::session::{LaunchOpts, Session, run_dir_path};
-
+    #[allow(clippy::too_many_lines)]
+    fn serve_reconciles_a_dangling_verification_attempt_at_startup() {
         let state = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let session = Session::start_in(project.path(), state.path()).unwrap();
-        session.persist_current().unwrap();
-        let id = session.id().to_owned();
-        drop(session);
-
-        let (state_path, session_id) = (state.path().to_path_buf(), id.clone());
-        let daemon = std::thread::spawn(move || serve(&state_path, &session_id));
-        assert!(wait_until(STARTUP_TIMEOUT, || serving(state.path(), &id)));
-
-        let mut session = Session::open_current(project.path(), state.path())
-            .unwrap()
-            .expect("the session just persisted is current");
-
-        // Force `run_dir()` to fail: plant its fixed path as a directory this
-        // launch does not own privately.
-        let run_dir = run_dir_path(session.id());
-        let _ = std::fs::remove_dir_all(&run_dir);
-        std::fs::create_dir(&run_dir).unwrap();
-        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let spec = profile("claude")
-            .and_then(|p| p.gateway)
-            .expect("claude has a gateway");
-        let gateway = Gateway::from_key(&spec, "test-key-value").unwrap();
-        let opts = LaunchOpts {
-            gateways: vec![gateway],
-            ..Default::default()
+        let id = "sess_daemon_reconcile";
+        let dir = session_dir(state.path(), id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = merge(
+            &Policy::default(),
+            &Policy::default(),
+            &Policy::default(),
+            ward_policy::SessionId(id.to_owned()),
+            ward_policy::ProjectId("proj_unit".to_owned()),
+        );
+        let meta = SessionMeta {
+            id: id.to_owned(),
+            project: PathBuf::from("/tmp/demo"),
+            project_id: "proj_unit".to_owned(),
+            entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
+            manifest,
+            started_unix_ms: control::unix_ms(SystemTime::now()),
+            agent: None,
         };
+        std::fs::write(
+            dir.join("session.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        let log_path = dir.join("events.log");
+        let attempt = ward_events::AttemptId::new(1);
+        {
+            let mut log = LocalLog::create(
+                &log_path,
+                SessionId::from_u128(21),
+                Blake3Hash::from_bytes([4; 32]),
+                SystemTime::now(),
+            )
+            .unwrap();
+            control::Sink::append(
+                &mut log,
+                Origin::Wardd,
+                WardEvent::VerificationAttemptStarted {
+                    attempt,
+                    requested_by: ward_events::VerifyRequester::User,
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+        }
+        // The marker a real attempt's `AttemptGuard` would have left, as if the
+        // process running it died right here — never `finish()`ed.
+        let marker = dir.join("attempts").join("1.json");
+        drop(
+            crate::attempt::AttemptGuard::start(&dir, attempt, ward_events::VerifyRequester::User)
+                .unwrap(),
+        );
+        assert!(marker.exists(), "the guard leaves its marker behind");
 
-        let Err(err) = session.launch(&["true".to_owned()], &opts) else {
-            panic!("the planted run_dir must be refused")
-        };
-        assert!(!err.to_string().is_empty());
+        let (state_path, session) = (state.path().to_path_buf(), id.to_owned());
+        let daemon = std::thread::spawn(move || serve(&state_path, &session));
+        assert!(wait_until(STARTUP_TIMEOUT, || serving(state.path(), id)));
 
-        let socket = socket_path(state.path(), &id);
+        let socket = socket_path(state.path(), id);
         let mut client = RemoteSink::connect(&socket).unwrap();
-        match client.call(&Request::Grants).unwrap() {
-            Response::Grants(grants) => assert!(
-                grants.is_empty(),
-                "the credential granted before the abort must not survive it: {grants:?}"
-            ),
+        assert!(matches!(
+            client
+                .call(&Request::Stop {
+                    reason: EndReason::UserStop,
+                })
+                .unwrap(),
+            Response::Sealed { .. }
+        ));
+        daemon
+            .join()
+            .unwrap()
+            .expect("serve returns Ok after the seal");
+
+        assert!(
+            !marker.exists(),
+            "the marker is consumed by the daemon's own startup reconciliation"
+        );
+        let records: Vec<_> = LogReader::open(&log_path)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let kinds: Vec<&str> = records
+            .iter()
+            .filter_map(|r| match &r.event {
+                WardEvent::VerificationAttemptStarted { .. } => Some("AttemptStarted"),
+                WardEvent::VerificationInterrupted { .. } => Some("Interrupted"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["AttemptStarted", "Interrupted"],
+            "the dangling attempt is reconciled before any client could have \
+             connected and asked for it"
+        );
+        match &records[1].event {
+            WardEvent::VerificationInterrupted {
+                attempt: got,
+                candidate,
+                reason,
+            } => {
+                assert_eq!(*got, attempt);
+                assert_eq!(*candidate, None, "capture never even started");
+                assert!(!reason.as_str().is_empty());
+            }
             other => panic!("{other:?}"),
         }
-
-        // The log itself ends the launch in `LaunchAborted`, never a bare
-        // `CommandStarted` with nothing after it.
-        let records: Vec<_> = LogReader::open(session.log_path())
-            .unwrap()
-            .map(std::result::Result::unwrap)
-            .collect();
-        assert!(
-            records
-                .iter()
-                .any(|r| matches!(r.event, WardEvent::CredentialGranted { .. })),
-            "the grant was recorded before the abort"
-        );
-        let last_launch_record = records
-            .iter()
-            .rev()
-            .find(|r| {
-                matches!(
-                    r.event,
-                    WardEvent::CommandStarted { .. }
-                        | WardEvent::CommandFinished { .. }
-                        | WardEvent::LaunchAborted { .. }
-                )
-            })
-            .expect("the launch appended at least CommandStarted");
-        assert!(
-            matches!(last_launch_record.event, WardEvent::LaunchAborted { .. }),
-            "expected LaunchAborted last, got {:?}",
-            last_launch_record.event
-        );
-
-        std::fs::remove_dir_all(&run_dir).ok();
-        client
-            .call(&Request::Stop {
-                reason: EndReason::UserStop,
-            })
-            .unwrap();
-        daemon.join().unwrap().unwrap();
     }
 
     /// #140, PR #197 review round 3: a connection that closes without ever

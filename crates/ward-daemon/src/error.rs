@@ -31,6 +31,12 @@ pub enum Error {
     /// The session daemon (`wardd`) could not be started, bound, or reached.
     #[error("daemon: {0}")]
     Daemon(String),
+    /// A verification attempt was cancelled before it reached a pass/fail result
+    /// (#139): a distinct outcome from every other variant here, so a caller (and
+    /// `Session::verify`'s own terminal-record finalisation) can tell "the user
+    /// cancelled this" apart from "something went wrong".
+    #[error("verification cancelled: {0}")]
+    Cancelled(String),
 }
 
 /// Daemon result alias.

@@ -11,7 +11,9 @@ use core::time::Duration;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-use crate::ids::{Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SnapshotId};
+use crate::ids::{
+    AttemptId, Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SnapshotId,
+};
 use crate::text::{BoundedArgv, BoundedText, HostName, SandboxPath};
 
 /// Short free text (reasons, targets, subjects).
@@ -982,6 +984,55 @@ pub enum WardEvent {
         /// `None` for exactly this reason).
         pending: u32,
     },
+
+    // -- verification attempts (origin: Wardd / Verifier; #139) --
+    /// A verification attempt was allocated: the earliest record of an attempt, written
+    /// before any expensive preparation (candidate capture, sandbox launch) begins, so a
+    /// subscriber sees progress from the very first action rather than only once capture
+    /// has already succeeded. No candidate is known yet — [`WardEvent::VerificationRequested`]
+    /// follows once capture succeeds; [`WardEvent::VerificationInterrupted`] follows instead,
+    /// with no candidate, if a step before capture succeeds fails (preparation, opening the
+    /// snapshot store, allocating scratch, …) — the attempt still ends in exactly one
+    /// terminal record even though it never reached a candidate for a subscriber to be told
+    /// about.
+    VerificationAttemptStarted {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Who asked.
+        requested_by: VerifyRequester,
+    },
+    /// A verification attempt was cancelled by the user before it reached a pass/fail
+    /// result (#139) — a distinct terminal outcome from `VerificationErrored` (an
+    /// infrastructure failure) and from `VerificationFailed` (the trusted command ran and
+    /// exited non-zero). `candidate` is `Some` once capture had already succeeded by the
+    /// time the cancellation took effect, `None` if it was cancelled before that. Cancelling
+    /// is cooperative, checked between the attempt's steps: a cancel requested while the
+    /// verifier command itself is running takes effect only once that command returns.
+    VerificationCancelled {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Candidate snapshot, when capture had already succeeded.
+        candidate: Option<SnapshotId>,
+    },
+    /// A verification attempt ended without reaching a candidate-bearing terminal result
+    /// (`Passed`/`Failed`/`Errored`/`Cancelled`), for either of two reasons (#139): the
+    /// attempt's own `verify()` call reached a step before capture succeeds that failed —
+    /// emitted directly by that same call, as its own terminal record, with `candidate:
+    /// None`; or the process that had been running an earlier attempt (the session daemon,
+    /// or a daemonless `ward` invocation) died, was killed, or was restarted mid-attempt,
+    /// leaving the attempt's own record as the last verification-kind record for it —
+    /// emitted by the reconciliation pass a session/daemon runs against its own log
+    /// whenever it opens or reopens it, so a dangling attempt is never left showing
+    /// "running" forever.
+    VerificationInterrupted {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Candidate snapshot, when known.
+        candidate: Option<SnapshotId>,
+        /// Sanitised, bounded description of what was found (e.g. "the process serving
+        /// this session ended before the attempt reached a terminal result").
+        reason: ShortText,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -1025,11 +1076,14 @@ pub enum EventKind {
     LaunchAborted = 31,
     ObservationsDropped = 32,
     SessionPauseUnsettled = 33,
+    VerificationAttemptStarted = 34,
+    VerificationCancelled = 35,
+    VerificationInterrupted = 36,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 34] = [
+    pub const ALL: [EventKind; 37] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -1064,6 +1118,9 @@ impl EventKind {
         EventKind::LaunchAborted,
         EventKind::ObservationsDropped,
         EventKind::SessionPauseUnsettled,
+        EventKind::VerificationAttemptStarted,
+        EventKind::VerificationCancelled,
+        EventKind::VerificationInterrupted,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
@@ -1110,6 +1167,9 @@ impl EventKind {
             EventKind::LaunchAborted => "launch_aborted",
             EventKind::ObservationsDropped => "observations_dropped",
             EventKind::SessionPauseUnsettled => "session_pause_unsettled",
+            EventKind::VerificationAttemptStarted => "verification_attempt_started",
+            EventKind::VerificationCancelled => "verification_cancelled",
+            EventKind::VerificationInterrupted => "verification_interrupted",
         }
     }
 
@@ -1131,6 +1191,9 @@ impl EventKind {
                 | EventKind::VerificationPassed
                 | EventKind::VerificationFailed
                 | EventKind::VerificationErrored
+                | EventKind::VerificationAttemptStarted
+                | EventKind::VerificationCancelled
+                | EventKind::VerificationInterrupted
                 | EventKind::StateAccepted
                 | EventKind::TamperDetected
                 | EventKind::Anchor
@@ -1156,11 +1219,12 @@ pub struct UnknownKindBits(pub u64);
 
 /// A set of [`EventKind`]s as a bitmask. Backed by a `u64` (not the `u32` a 32-kind
 /// catalogue would technically still fit in): the catalogue reached the full 32-kind
-/// capacity of a `u32` backing in the same merge that widened this, and every kind
-/// added since has needed the headroom immediately, not eventually. Widening past
-/// `u64` in turn needs the same treatment this commit gives `u32`: a wider backing
-/// type, `bit()`'s shift, `MASK`, and this wire-compatibility contract all revisited
-/// together, not just the shift arithmetic in isolation.
+/// capacity of a `u32` backing once `ObservationsDropped` (#202) landed, and #139's
+/// three verification-attempt kinds appended after it need that same headroom
+/// immediately, not eventually.  Widening past `u64` in turn needs the same treatment
+/// this commit gives `u32`: a wider backing type, `bit()`'s shift, `MASK`, and this
+/// wire-compatibility contract all revisited together, not just the shift arithmetic
+/// in isolation.
 ///
 /// Wire compatibility: postcard's integer encoding is a plain unsigned varint with no
 /// width tag, so a value that previously fit in the `u32` backing (every kind index
@@ -1170,7 +1234,8 @@ pub struct UnknownKindBits(pub u64);
 /// this against real postcard bytes rather than asserting it from the format's docs.
 /// No `WIRE_VERSION` bump: this is the same kind of pure-capacity change the crate's
 /// own append-only `WardEvent` convention already treats as backwards compatible, not
-/// a change to what any existing bit means.
+/// a change to what any existing bit means. #139's three new kinds are additive on top
+/// of that same already-widened `u64` catalogue and need no `WIRE_VERSION` bump either.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(into = "u64")]
 pub struct EventKindSet(u64);
@@ -1318,6 +1383,9 @@ impl WardEvent {
             WardEvent::LaunchAborted { .. } => EventKind::LaunchAborted,
             WardEvent::ObservationsDropped { .. } => EventKind::ObservationsDropped,
             WardEvent::SessionPauseUnsettled { .. } => EventKind::SessionPauseUnsettled,
+            WardEvent::VerificationAttemptStarted { .. } => EventKind::VerificationAttemptStarted,
+            WardEvent::VerificationCancelled { .. } => EventKind::VerificationCancelled,
+            WardEvent::VerificationInterrupted { .. } => EventKind::VerificationInterrupted,
         }
     }
 
@@ -1349,9 +1417,9 @@ mod tests {
             assert_eq!(k.bit(), 1u64 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
-        // The catalogue is currently 34 kinds wide, well inside the `u64` backing's
+        // The catalogue is currently 37 kinds wide, well inside the `u64` backing's
         // 64-bit capacity -- so, unlike when the backing type was exactly saturated
-        // at `u32`, there IS a first unused bit right now (bit 34), and a value that
+        // at `u32`, there IS a first unused bit right now (bit 37), and a value that
         // sets it must be rejected as an unknown kind rather than silently accepted.
         // This is the same "no room past the known kinds to smuggle a bit through"
         // property `kind_bits_are_dense...`'s name promises, just checked against
@@ -1361,6 +1429,10 @@ mod tests {
             Err(UnknownKindBits(
                 EventKindSet::ALL.bits() | (1 << EventKind::ALL.len())
             ))
+        );
+        assert!(
+            postcard::from_bytes::<EventKindSet>(&postcard::to_allocvec(&u64::MAX).unwrap())
+                .is_err()
         );
         let set = EventKindSet::only(EventKind::Anchor).with(EventKind::FileRead);
         let bytes = postcard::to_allocvec(&set).unwrap();
@@ -1377,12 +1449,13 @@ mod tests {
     /// not asserted from the varint format's spec.
     ///
     /// Deliberately does not use `EventKindSet::ALL` (grows with the catalogue) or
-    /// `EventKind::SessionPauseUnsettled` (this PR's own newest kind): a
-    /// wire-compatibility fixture has to stay meaningful after a future rebase, not
-    /// just against today's exact catalogue size. Uses only kinds declared long
-    /// before this PR instead — `EventKind::bit()`'s own contract (never reorder,
-    /// only append) is what guarantees their bit positions are fixed forever,
-    /// independent of how many more kinds get appended after them.
+    /// any of the recently-appended kinds (`ObservationsDropped`, `SessionPauseUnsettled`,
+    /// and this branch's own three verification-attempt kinds): a wire-compatibility fixture has to stay
+    /// meaningful as the catalogue keeps growing, not just against today's exact
+    /// size. Uses only kinds declared long before any of that instead --
+    /// `EventKind::bit()`'s own contract (never reorder, only append) is what
+    /// guarantees their bit positions are fixed forever, independent of how many
+    /// more kinds get appended after them.
     #[test]
     fn a_u32_encoded_set_decodes_identically_as_the_widened_u64_type() {
         let session_started = EventKind::SessionStarted; // bit 0

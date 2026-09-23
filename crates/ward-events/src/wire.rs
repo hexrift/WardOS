@@ -28,6 +28,14 @@ use crate::origin::{Origin, OriginSet};
 /// Frame magic.
 pub const MAGIC: [u8; 2] = *b"WE";
 /// Current wire version.
+///
+/// The `EventKindSet` bitmask carried in [`Filter`]/[`Subscribe`] frames widened from
+/// `u32` to `u64` (landed on `main` via #202) without a bump: postcard encodes integers
+/// as width-tagless varints, so a set using only bits `0..=31` serializes byte-for-byte
+/// identically at either width (`a_u32_encoded_set_decodes_identically_as_the_widened_u64_type`),
+/// and appending [`crate::event::WardEvent`] variants is the crate's existing append-only,
+/// no-bump convention. This branch's three new verification-attempt kinds are that same
+/// additive change, so the version stays 1.
 pub const WIRE_VERSION: u8 = 1;
 /// Header length in bytes.
 pub const HEADER_LEN: usize = 8;
@@ -387,6 +395,8 @@ impl Filter {
                 .with(EventKind::VerificationPassed)
                 .with(EventKind::VerificationFailed)
                 .with(EventKind::VerificationErrored)
+                .with(EventKind::VerificationCancelled)
+                .with(EventKind::VerificationInterrupted)
                 .with(EventKind::SessionPaused)
                 .with(EventKind::SessionPauseUnsettled)
                 .with(EventKind::SessionResumed)

@@ -14,14 +14,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use ward_events::{
-    AgentIdentity, AgentKind, AgentState, BoundedArgv, BoundedText, DenyReason, EndReason,
-    ExitStatus, FileChangeKind, ImageDigest, NameText, Origin, Pid, ProcessRef, RuleRef,
+    AgentIdentity, AgentKind, AgentState, AttemptId, BoundedArgv, BoundedText, DenyReason,
+    EndReason, ExitStatus, FileChangeKind, ImageDigest, NameText, Origin, Pid, ProcessRef, RuleRef,
     SandboxPath, SandboxRoot, Scope, ServiceId, ShortText, StepStatus, VerifyRequester,
     VerifySummary, WardEvent,
 };
 use ward_policy::{CapabilityManifest, NetworkCapability, ObserverMode, Policy, merge};
 use ward_snapshot::{CaptureOptions, SnapshotMeta, SnapshotRole, SnapshotStore};
 
+use crate::attempt::{
+    AttemptGuard, CancelToken, finalize_interrupted, lock_session_verification, next_attempt_id,
+};
 use crate::control::{LocalLog, RemoteSink, SOCKET_NAME, Sink, unix_ms};
 use crate::describe::SessionDescription;
 use crate::egress::Egress;
@@ -51,6 +54,14 @@ pub struct Session {
     project_id: String,
     state: PathBuf,
     log_path: PathBuf,
+    /// The next verification attempt id this session will allocate (#139):
+    /// recomputed from the log at open time ([`crate::attempt::next_attempt_id`]),
+    /// so it stays correct across process restarts without its own counter file.
+    next_attempt: AttemptId,
+    /// Cancellation handle for the next/current `verify()` call (#139). A fresh,
+    /// never-cancelled token by default; [`Session::begin_verify_cancel`] replaces
+    /// it with one the caller can hold onto and cancel from elsewhere.
+    cancel: CancelToken,
 }
 
 /// The on-disk record of a session, written to `sessions/<id>/session.json`.
@@ -322,6 +333,9 @@ impl Session {
             project_id: project_id_str,
             state: state.to_path_buf(),
             log_path,
+            // A brand-new log has no attempts to have left dangling.
+            next_attempt: AttemptId::new(1),
+            cancel: CancelToken::new(),
         };
         s.emit(
             Origin::Wardd,
@@ -350,15 +364,32 @@ impl Session {
         let dir = session_dir(state, &meta.id);
         let log_path = dir.join("events.log");
         let started = UNIX_EPOCH + Duration::from_millis(meta.started_unix_ms);
-        // A running daemon (ADR-0015) is the writer; otherwise this process is.
-        let sink: Box<dyn Sink> = match RemoteSink::connect(&dir.join(SOCKET_NAME)) {
+        // A running daemon (ADR-0015) is the writer; otherwise this process is. Either
+        // way, this is a process (re)taking ownership of the log — exactly when #139
+        // says a dangling verification attempt (one whose own process died before it
+        // reached a terminal record) should be reconciled, so it is closed out here
+        // before anything else reads or writes through `sink`. Idempotent: a daemon
+        // that had already reconciled at its own `serve` startup just finds nothing
+        // left to do.
+        let mut sink: Box<dyn Sink> = match RemoteSink::connect(&dir.join(SOCKET_NAME)) {
             Some(remote) => Box::new(remote),
             None => Box::new(LocalLog::open(&log_path, started)?),
         };
+        // Fail closed (review of #208, finding 3): a reconciliation failure here
+        // means this process cannot say whether a dangling attempt was actually
+        // closed out, so it must not hand back a `Session` that looks fully caught
+        // up when it might not be. Safe to call unconditionally, including through
+        // a `RemoteSink` onto a daemon that may be mid-verification (finding 1):
+        // `reconcile_dangling_attempts` never interrupts a marker whose owning
+        // process is still verifiably alive, so a second `ward` command merely
+        // opening this session can no longer ever cut a live attempt short.
+        crate::attempt::reconcile_dangling_attempts(&mut *sink, &dir)?;
         Ok(Some(Self {
             manifest: meta.manifest,
             worktree,
             entry_snapshot: meta.entry_snapshot,
+            next_attempt: next_attempt_id(&log_path),
+            cancel: CancelToken::new(),
             // Carried over from the record written at session start, never
             // recomputed from the (possibly since-reopened) live worktree.
             origin_repo: meta.origin_repo,
@@ -870,41 +901,172 @@ impl Session {
     }
 
     /// Verify the worktree in a disposable verifier (`verify.rs`) and record the run:
-    /// the candidate snapshot, the start with the pristine id and config hash, one
-    /// progress step per restored protected path and one for the command, then the
-    /// pass or fail with the parsed summary and the output hash.
+    /// an attempt id allocated before anything expensive starts, the candidate
+    /// snapshot, the start with the pristine id and config hash, one progress step
+    /// per restored protected path and one for the command, then the pass or fail
+    /// with the parsed summary and the output hash.
     ///
-    /// Once `VerificationStarted` is on the log, every exit path leaves exactly one
-    /// terminal verification record behind it — `VerificationPassed`,
-    /// `VerificationFailed`, or, when the run could not be carried to either of those
-    /// (the sandbox runtime failed to launch, a step in between errored, …),
-    /// `VerificationErrored` (#139). A subscriber watching the log therefore never
-    /// *silently* sees a `VerificationStarted` with nothing after it: an unexecuted
-    /// suite is recorded as neither a pass nor a failure. The real error is still
-    /// returned to the caller either way — the terminal record does not replace it,
-    /// only ensures the log itself carries a definite outcome. If appending that
-    /// terminal record itself fails (the sink is gone, disk full, …), the caller's
-    /// error says so explicitly instead of quietly discarding it — see
-    /// [`verify_prepared`](Self::verify_prepared).
+    /// #139: every exit path from here leaves exactly one terminal record behind
+    /// the attempt it concerns — `VerificationPassed`, `VerificationFailed`,
+    /// `VerificationErrored` (the run could not be carried to either of those:
+    /// the sandbox runtime failed to launch, a step in between errored, …),
+    /// `VerificationCancelled` (a cooperative cancel, see
+    /// [`begin_verify_cancel`](Self::begin_verify_cancel), took effect between
+    /// steps), or `VerificationInterrupted` (this attempt, or an earlier one this
+    /// session left dangling, is reconciled because the process that had been
+    /// running it is gone — this call's own opening reconciliation, or the next
+    /// one, since a preparation failure with no candidate yet leaves this shape
+    /// too). A subscriber watching the log therefore never *silently* sees a
+    /// non-terminal verification record with nothing after it. The real error is
+    /// still returned to the caller either way — a terminal record on the log does
+    /// not replace it. If appending that terminal record itself also fails (the
+    /// sink is gone, disk full, …), the caller's error says so explicitly instead
+    /// of quietly discarding it.
+    ///
+    /// One attempt at a time, across every handle (review 5284360930 of #208,
+    /// finding 1): two `Session` handles for this same session — two threads in one
+    /// process, or two entirely separate `ward`/`wardd` processes — can each call this
+    /// concurrently, so the whole body below runs under
+    /// [`lock_session_verification`], acquired before attempt-id allocation and held
+    /// until this call returns on every exit path. See that function's own doc
+    /// comment for the full reasoning, including why it is a lock distinct from
+    /// reconciliation's own.
     pub fn verify(&mut self) -> Result<VerifyReport> {
-        let store = SnapshotStore::open(self.state.join("cas"))
-            .map_err(|e| Error::Snapshot(e.to_string()))?;
-        let entry: ward_snapshot::SnapshotId = self
-            .entry_snapshot
-            .parse()
-            .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
-        let scratch_root = run_dir(&self.session_str)?;
-        // Freeze the agent only for the candidate capture inside `prepare`; the
-        // verifier itself runs from the CAS, not the worktree (ST-018, G5/G9). A
-        // failure here (missing config, a hostile candidate symlink, …) happens
-        // before any verification-kind record exists, so there is nothing yet for a
-        // terminal record to follow; the caller sees the real error directly, as
-        // before #139.
-        let prepared = {
-            let _freeze = self.freeze_for_capture();
-            verify::prepare(&store, &self.worktree, entry, &scratch_root)?
+        let dir = session_dir(&self.state, &self.session_str);
+        // Exclusive and session-scoped for this call's entire lifetime — see the doc
+        // comment above and `lock_session_verification`'s own. An ordinary local
+        // binding, so it releases on every exit path below (an early `?` return, a
+        // panic, or falling off the end) exactly as reliably as it would on success.
+        let _verify_lock = lock_session_verification(&dir)?;
+
+        // Close out anything a previous attempt in this session left dangling
+        // before allocating a new one. The daemon's own startup and
+        // `Session::open_current` already reconcile whenever they (re)take
+        // ownership of the log; this additionally covers a same-process leftover —
+        // a prior `verify()` call whose `AttemptGuard` dropped without
+        // finishing — without needing a process restart to notice it. Fail closed
+        // (review of #208, finding 3): starting a fresh attempt on top of one this
+        // process could not confirm was reconciled would risk exactly the
+        // contradictory-history problem #139 exists to prevent. Also refreshes
+        // `self.sink`'s own cached view of the log via `Sink::resync` (review
+        // 5283028228 of #208, finding 4) — now done under `_verify_lock`, so nothing
+        // else can append between that refresh and this attempt's own first append.
+        crate::attempt::reconcile_dangling_attempts(&mut *self.sink, &dir)?;
+
+        // Allocated fresh from the log, under the lock, rather than from this
+        // `Session`'s own cached `next_attempt` field (review 5284360930 of #208,
+        // finding 1): two `Session` handles opened before either had started
+        // verifying would otherwise both cache the very same result from
+        // `open_current`/`start_in` and collide. Safe now that `_verify_lock` above
+        // rules out a second, concurrent allocator for this session — the log
+        // already reflects every attempt any earlier lock holder finished. Still
+        // kept in sync on `self.next_attempt` afterward so `alloc_attempt` (used
+        // directly by tests exercising `verify_prepared` in isolation, and as a
+        // plain in-memory counter with no locking of its own) stays consistent with
+        // what a fresh `verify()` call on this same `Session` would allocate next.
+        let attempt = next_attempt_id(&self.log_path);
+        self.next_attempt = AttemptId::new(attempt.get().saturating_add(1));
+        // Allocated, and recorded, before any expensive preparation begins (#139
+        // item 2): a subscriber sees this attempt exists, and a reconciliation pass
+        // can find and close it out if this process disappears, before candidate
+        // capture — which can itself take real time over a large worktree.
+        let guard = AttemptGuard::start(&dir, attempt, VerifyRequester::User)?;
+        self.emit(
+            Origin::Wardd,
+            WardEvent::VerificationAttemptStarted {
+                attempt,
+                requested_by: VerifyRequester::User,
+            },
+        )?;
+        if self.cancel.is_cancelled() {
+            return self.finalize_cancelled(guard, attempt, None);
+        }
+
+        // #139 item 4 (review of #208, finding 4): every fallible step between
+        // `VerificationAttemptStarted` and a bound candidate — opening the CAS,
+        // parsing the entry snapshot id, allocating the scratch `run_dir`, and
+        // `verify::prepare` itself — shares one finalizer below. Before this fix
+        // only `verify::prepare`'s own failure went through it; a `SnapshotStore`,
+        // parse, or `run_dir` failure returned bare, leaving the log stuck at
+        // `VerificationAttemptStarted` until some future reopen's reconciliation
+        // pass happened to notice. The closure returns the entry id and scratch
+        // root alongside the prepared verification so nothing after it has to
+        // recompute them (and, for `run_dir`, risk a second, needless directory
+        // allocation).
+        let prep = (|| -> Result<(ward_snapshot::SnapshotId, PathBuf, verify::Verification)> {
+            let store = SnapshotStore::open(self.state.join("cas"))
+                .map_err(|e| Error::Snapshot(e.to_string()))?;
+            let entry: ward_snapshot::SnapshotId = self
+                .entry_snapshot
+                .parse()
+                .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
+            let scratch_root = run_dir(&self.session_str)?;
+            // Freeze the agent only for the candidate capture inside `prepare`; the
+            // verifier itself runs from the CAS, not the worktree (ST-018, G5/G9).
+            let prepared = {
+                let _freeze = self.freeze_for_capture();
+                verify::prepare(&store, &self.worktree, entry, &scratch_root)?
+            };
+            Ok((entry, scratch_root, prepared))
+        })();
+        let (entry, scratch_root, prepared) = match prep {
+            Ok(prep) => prep,
+            Err(e) => {
+                // Unlike a `verify::execute` failure, there is no candidate yet for
+                // a `VerificationErrored` record to name — that field is mandatory,
+                // and #139 item 3 never invents one for a failed capture. The
+                // attempt itself already exists on the log
+                // (`VerificationAttemptStarted` above), so it still gets its own
+                // terminal record: `VerificationInterrupted { candidate: None, .. }`.
+                let reason = ShortText::new(&e.to_string());
+                return match finalize_interrupted(&mut *self.sink, guard, attempt, None, reason) {
+                    Ok(()) => Err(e),
+                    Err(finalize_err) => Err(Error::Events(format!(
+                        "verification could not be prepared ({e}), and the terminal \
+                         record for it could not be written ({finalize_err}); the log \
+                         may still end at VerificationAttemptStarted"
+                    ))),
+                };
+            }
         };
-        self.verify_prepared(&prepared, entry, &scratch_root)
+        // Capture succeeded: bind the candidate to the attempt now, never earlier
+        // (#139 item 3).
+        guard.bind_candidate(ev_snapshot(prepared.candidate));
+        if self.cancel.is_cancelled() {
+            let _ = std::fs::remove_dir_all(&prepared.scratch);
+            let _ = std::fs::remove_dir(&scratch_root);
+            return self.finalize_cancelled(guard, attempt, Some(ev_snapshot(prepared.candidate)));
+        }
+        self.verify_prepared(&prepared, entry, &scratch_root, attempt, guard)
+    }
+
+    /// Finalize `attempt` as cancelled (#139 item 6): append `VerificationCancelled`,
+    /// finish `guard`, and return the distinguishable [`Error::Cancelled`] instead of
+    /// a generic failure. Shared by every checkpoint in [`verify`](Self::verify) and
+    /// [`verify_prepared`](Self::verify_prepared) that finds
+    /// [`Session::cancel`](Self) already set.
+    fn finalize_cancelled(
+        &mut self,
+        guard: AttemptGuard,
+        attempt: AttemptId,
+        candidate: Option<ward_events::SnapshotId>,
+    ) -> Result<VerifyReport> {
+        match self.emit(
+            Origin::User,
+            WardEvent::VerificationCancelled { attempt, candidate },
+        ) {
+            Ok(()) => {
+                guard.finish();
+                Err(Error::Cancelled(
+                    "verification was cancelled before it reached a pass/fail result".to_owned(),
+                ))
+            }
+            Err(emit_err) => Err(Error::Events(format!(
+                "verification was cancelled, and the terminal record for it could not \
+                 be written ({emit_err}); the log may still end at a non-terminal \
+                 verification record"
+            ))),
+        }
     }
 
     /// Records and runs a verification that has already been prepared: the request
@@ -918,6 +1080,8 @@ impl Session {
         prepared: &verify::Verification,
         entry: ward_snapshot::SnapshotId,
         scratch_root: &Path,
+        attempt: AttemptId,
+        guard: AttemptGuard,
     ) -> Result<VerifyReport> {
         let candidate = ev_snapshot(prepared.candidate);
         self.emit(
@@ -945,7 +1109,14 @@ impl Session {
         let _ = std::fs::remove_dir_all(&prepared.scratch);
         let _ = std::fs::remove_dir(scratch_root);
         match result {
-            Ok(report) => Ok(report),
+            Ok(report) => {
+                guard.finish();
+                Ok(report)
+            }
+            // Cancelled between steps (checked inside `run_prepared_verification`),
+            // not merely errored: a distinct terminal outcome (#139 item 6), never
+            // `VerificationErrored`.
+            Err(Error::Cancelled(_)) => self.finalize_cancelled(guard, attempt, Some(candidate)),
             Err(e) => {
                 let reason = ShortText::new(&e.to_string());
                 match self.emit(
@@ -954,13 +1125,19 @@ impl Session {
                 ) {
                     // The terminal record is on the log; the caller still sees the
                     // real failure that produced it.
-                    Ok(()) => Err(e),
+                    Ok(()) => {
+                        guard.finish();
+                        Err(e)
+                    }
                     // The append itself failed too, so the log may still end at
                     // `VerificationStarted` — exactly the silent gap this function
                     // exists to close. Never discard that: fold both failures into
                     // what the caller sees, so this case is distinguishable from an
                     // ordinary verification error whose terminal record was written
-                    // successfully.
+                    // successfully. The guard is deliberately left unfinished: its
+                    // marker survives so the next reconciliation pass still catches
+                    // this attempt even though a live terminal record could not be
+                    // written just now.
                     Err(emit_err) => Err(Error::Events(format!(
                         "verification failed ({e}), and the terminal record for it \
                          could not be written ({emit_err}); the log may still end at \
@@ -972,9 +1149,11 @@ impl Session {
     }
 
     /// The steps of a prepared verification once `VerificationStarted` is recorded:
-    /// the restore progress, the command's progress step, then its verdict. An `Err`
-    /// here means none of those reached a terminal verification record; the caller
-    /// ([`verify`](Self::verify)) turns it into `VerificationErrored` (#139).
+    /// the restore progress, a cancellation checkpoint, the command's progress step,
+    /// then its verdict. An `Err` here means none of those reached a terminal
+    /// verification record; the caller ([`verify_prepared`](Self::verify_prepared))
+    /// turns a plain error into `VerificationErrored` and an
+    /// [`Error::Cancelled`] into `VerificationCancelled` (#139).
     fn run_prepared_verification(
         &mut self,
         prepared: &verify::Verification,
@@ -988,6 +1167,17 @@ impl Session {
                     status: StepStatus::Pass,
                 },
             )?;
+        }
+        // The last checkpoint before the verifier subprocess itself runs: a cancel
+        // requested any time up to here takes effect. One requested once `execute`
+        // has actually started is honoured only at the *next* attempt's checkpoints
+        // — the running subprocess is bounded by its own `verify.budget_secs`
+        // timeout as before this change, not pre-emptively killed (#139: cooperative
+        // cancellation, not full preemption; see the pull request description).
+        if self.cancel.is_cancelled() {
+            return Err(Error::Cancelled(
+                "verification was cancelled before the verifier command started".to_owned(),
+            ));
         }
         let outcome = verify::execute(prepared)?;
         let status = if outcome.passed {
@@ -1153,6 +1343,37 @@ impl Session {
     fn alloc_pid(&mut self) -> Pid {
         self.next_pid = self.next_pid.wrapping_add(1).max(2);
         Pid::new(self.next_pid).unwrap_or(self.root_pid)
+    }
+
+    /// Allocate the next verification attempt id (#139): monotonic for the life of
+    /// this `Session`, and never repeats one [`next_attempt_id`] would also hand out
+    /// to a fresh `Session` reopened on the same log.
+    ///
+    /// [`Self::verify`] no longer calls this directly (review 5284360930 of #208,
+    /// finding 1): it allocates under [`lock_session_verification`] straight from a
+    /// fresh [`next_attempt_id`] read instead, since this method's cached
+    /// `self.next_attempt` field is exactly what let two separately-opened `Session`
+    /// handles collide on the same id before that fix. Kept as a plain, unlocked
+    /// counter for the tests below that exercise [`Self::verify_prepared`] directly,
+    /// without needing a real `.tamperward/config.yml` for `verify()`'s own
+    /// preparation step to succeed.
+    #[cfg(test)]
+    fn alloc_attempt(&mut self) -> AttemptId {
+        let attempt = self.next_attempt;
+        self.next_attempt = AttemptId::new(attempt.get().saturating_add(1));
+        attempt
+    }
+
+    /// A fresh cancellation handle for the next `verify()` call (#139): replaces
+    /// whatever token is current, so an old cancel from an earlier attempt cannot
+    /// leak into a new one, and returns a clone the caller keeps to cancel it from
+    /// elsewhere — typically another thread, since `verify()` blocks the one that
+    /// calls it. `verify()` checks whatever token is current at points between its
+    /// steps (never while the verifier subprocess itself is running); a caller who
+    /// never calls this leaves verification uncancellable, exactly as before #139.
+    pub fn begin_verify_cancel(&mut self) -> CancelToken {
+        self.cancel = CancelToken::new();
+        self.cancel.clone()
     }
 
     fn emit(&mut self, origin: Origin, event: WardEvent) -> Result<()> {
@@ -1728,8 +1949,11 @@ mod tests {
             scratch: scratch_root.join("does-not-exist"),
         };
 
+        let dir = session_dir(state.path(), session.id());
+        let attempt = session.alloc_attempt();
+        let guard = AttemptGuard::start(&dir, attempt, VerifyRequester::User).unwrap();
         let err = session
-            .verify_prepared(&prepared, entry, &scratch_root)
+            .verify_prepared(&prepared, entry, &scratch_root, attempt, guard)
             .expect_err("execute must fail on a missing scratch tree");
         assert!(
             !err.to_string().is_empty(),
@@ -1841,8 +2065,11 @@ mod tests {
             scratch: scratch_root.join("does-not-exist"),
         };
 
+        let dir = session_dir(state.path(), session.id());
+        let attempt = session.alloc_attempt();
+        let guard = AttemptGuard::start(&dir, attempt, VerifyRequester::User).unwrap();
         let err = session
-            .verify_prepared(&prepared, entry, &scratch_root)
+            .verify_prepared(&prepared, entry, &scratch_root, attempt, guard)
             .expect_err("execute must fail on a missing scratch tree");
         let msg = err.to_string();
         assert!(
@@ -1881,5 +2108,592 @@ mod tests {
         fn stop(self: Box<Self>, _reason: EndReason) -> Result<()> {
             unreachable!("NullSink is replaced before any use")
         }
+    }
+
+    /// The verification-kind records of a log, by their short names, in order —
+    /// shared by the `#139` tests below so each one asserts the exact shape of the
+    /// attempt's records rather than just their last entry.
+    fn verification_kinds(session: &mut Session) -> Vec<&'static str> {
+        session.sync().unwrap();
+        ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .filter_map(|r| {
+                Some(match r.event {
+                    WardEvent::VerificationAttemptStarted { .. } => "AttemptStarted",
+                    WardEvent::VerificationRequested { .. } => "Requested",
+                    WardEvent::VerificationStarted { .. } => "Started",
+                    WardEvent::VerificationProgress { .. } => "Progress",
+                    WardEvent::VerificationPassed { .. } => "Passed",
+                    WardEvent::VerificationFailed { .. } => "Failed",
+                    WardEvent::VerificationErrored { .. } => "Errored",
+                    WardEvent::VerificationCancelled { .. } => "Cancelled",
+                    WardEvent::VerificationInterrupted { .. } => "Interrupted",
+                    _ => return None,
+                })
+            })
+            .collect()
+    }
+
+    /// #139 item 3 + the "preparation failure" acceptance case: a `verify::prepare`
+    /// failure (here: a project with no `.tamperward/config.yml`, so the candidate
+    /// is captured but its config cannot be read) happens before any candidate is
+    /// bound. The attempt still ends in a terminal record — `VerificationInterrupted`
+    /// with no candidate, never an invented one, and never `VerificationErrored`
+    /// (which requires a candidate this attempt never reached).
+    #[test]
+    fn verify_prepare_failure_ends_the_log_in_verification_interrupted_with_no_candidate() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+
+        let err = session
+            .verify()
+            .expect_err("prepare must fail: no .tamperward/config.yml in the entry snapshot");
+        assert!(!err.to_string().is_empty());
+
+        assert_eq!(
+            verification_kinds(&mut session),
+            vec!["AttemptStarted", "Interrupted"],
+            "no VerificationRequested/Started ever ran (no candidate existed for one), \
+             and VerificationErrored never applies without a candidate to name"
+        );
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        match &records.last().unwrap().event {
+            WardEvent::VerificationInterrupted {
+                candidate, reason, ..
+            } => {
+                assert_eq!(*candidate, None, "capture never succeeded");
+                assert!(!reason.as_str().is_empty());
+            }
+            other => panic!("expected VerificationInterrupted, got {other:?}"),
+        }
+        assert!(
+            !session_dir(state.path(), session.id())
+                .join("attempts")
+                .join("1.json")
+                .exists(),
+            "the marker is removed once its terminal record is written"
+        );
+    }
+
+    /// Review of #208, finding 4, class 1: `SnapshotStore::open` failing (here: its
+    /// `cas` root exists as a plain file, so `create_dir_all` under it cannot
+    /// succeed) after `VerificationAttemptStarted` is already on the log must still
+    /// leave the attempt with exactly one terminal record — `VerificationInterrupted`
+    /// with no candidate — not a bare `AttemptStarted` until some future reopen's
+    /// reconciliation happens to notice.
+    #[test]
+    fn a_snapshot_store_open_failure_after_attempt_started_still_ends_in_interrupted() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        std::fs::remove_dir_all(state.path().join("cas")).unwrap();
+        std::fs::write(state.path().join("cas"), b"not a directory").unwrap();
+
+        let err = session
+            .verify()
+            .expect_err("SnapshotStore::open must fail on a non-directory cas root");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            verification_kinds(&mut session),
+            vec!["AttemptStarted", "Interrupted"],
+            "a SnapshotStore::open failure must not leave the log stuck at AttemptStarted"
+        );
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        match &records.last().unwrap().event {
+            WardEvent::VerificationInterrupted { candidate, .. } => {
+                assert_eq!(*candidate, None, "capture never even started");
+            }
+            other => panic!("expected VerificationInterrupted, got {other:?}"),
+        }
+    }
+
+    /// Review of #208, finding 4, class 2: the entry snapshot id failing to parse
+    /// after `VerificationAttemptStarted` — corrupted `session.json`, in practice —
+    /// must likewise still end the attempt in exactly one terminal record.
+    #[test]
+    fn an_entry_snapshot_parse_failure_after_attempt_started_still_ends_in_interrupted() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        session.entry_snapshot = "not-a-valid-snapshot-id".to_owned();
+
+        let err = session
+            .verify()
+            .expect_err("an unparseable entry snapshot id must fail verify()");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            verification_kinds(&mut session),
+            vec!["AttemptStarted", "Interrupted"],
+            "an entry-snapshot parse failure must not leave the log stuck at AttemptStarted"
+        );
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        match &records.last().unwrap().event {
+            WardEvent::VerificationInterrupted { candidate, .. } => {
+                assert_eq!(*candidate, None);
+            }
+            other => panic!("expected VerificationInterrupted, got {other:?}"),
+        }
+    }
+
+    /// Review of #208, finding 4, class 3: `run_dir` failing (here: a planted
+    /// symlink at its fixed path, ST-023 — see `run_dir_refuses_a_planted_symlink`)
+    /// after `VerificationAttemptStarted` must likewise still end the attempt in
+    /// exactly one terminal record instead of returning bare.
+    #[test]
+    fn a_run_dir_failure_after_attempt_started_still_ends_in_interrupted() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        let planted = run_dir_path(session.id());
+        let _ = std::fs::remove_dir_all(&planted);
+        let _ = std::fs::remove_file(&planted);
+        let attacker_dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(attacker_dir.path(), &planted).unwrap();
+
+        let err = session
+            .verify()
+            .expect_err("run_dir must refuse a planted symlink at its fixed path");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            verification_kinds(&mut session),
+            vec!["AttemptStarted", "Interrupted"],
+            "a run_dir failure must not leave the log stuck at AttemptStarted"
+        );
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        match &records.last().unwrap().event {
+            WardEvent::VerificationInterrupted { candidate, .. } => {
+                assert_eq!(*candidate, None);
+            }
+            other => panic!("expected VerificationInterrupted, got {other:?}"),
+        }
+        // The symlink itself must be left alone (never followed/removed), matching
+        // `run_dir_refuses_a_planted_symlink`'s own assertion.
+        assert!(std::fs::symlink_metadata(&planted).unwrap().is_symlink());
+        std::fs::remove_file(&planted).unwrap();
+    }
+
+    /// #139 item 6: a cancel requested before `verify()` even starts preparing
+    /// takes effect at the very first checkpoint, before any candidate is
+    /// captured — a distinct terminal outcome, `VerificationCancelled`, never
+    /// `VerificationErrored` or a silent nothing.
+    #[test]
+    fn a_cancel_requested_before_verify_ends_in_verification_cancelled_with_no_candidate() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+
+        let token = session.begin_verify_cancel();
+        token.cancel();
+
+        let err = session
+            .verify()
+            .expect_err("a cancelled attempt is an error");
+        assert!(
+            matches!(err, Error::Cancelled(_)),
+            "the caller can tell a cancel apart from an ordinary failure: {err}"
+        );
+
+        assert_eq!(
+            verification_kinds(&mut session),
+            vec!["AttemptStarted", "Cancelled"]
+        );
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        match &records.last().unwrap().event {
+            WardEvent::VerificationCancelled { candidate, .. } => assert_eq!(*candidate, None),
+            other => panic!("expected VerificationCancelled, got {other:?}"),
+        }
+    }
+
+    /// #139 item 6, the other checkpoint: a cancel that takes effect once the
+    /// candidate is already known (after `verify::prepare` succeeded) still
+    /// produces `VerificationCancelled`, now carrying that candidate — and never
+    /// runs the verifier command at all (this test's hand-built `Verification`
+    /// would fail `verify::execute` deterministically if it were ever reached, so
+    /// reaching `Ok` here would also prove the checkpoint didn't fire).
+    #[test]
+    fn a_cancel_requested_after_capture_ends_in_verification_cancelled_with_the_candidate() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+
+        let entry: ward_snapshot::SnapshotId = session.entry_snapshot.parse().unwrap();
+        let candidate = ward_snapshot::SnapshotId(ward_snapshot::Digest::from_bytes([0x55; 32]));
+        let scratch_root = state.path().join("scratch-root");
+        let prepared = verify::Verification {
+            candidate,
+            config: verify::Config {
+                protected: verify::Protected::default(),
+                verify: verify::VerifyCommand {
+                    command: "true".to_owned(),
+                    budget_secs: 5,
+                },
+            },
+            manifest_hash: [3u8; 32],
+            restored: Vec::new(),
+            scratch: scratch_root.join("does-not-exist"),
+        };
+
+        let dir = session_dir(state.path(), session.id());
+        let attempt = session.alloc_attempt();
+        let guard = AttemptGuard::start(&dir, attempt, VerifyRequester::User).unwrap();
+        guard.bind_candidate(ev_snapshot(candidate));
+        session.begin_verify_cancel().cancel();
+
+        let err = session
+            .verify_prepared(&prepared, entry, &scratch_root, attempt, guard)
+            .expect_err("a cancelled attempt is an error");
+        assert!(matches!(err, Error::Cancelled(_)), "{err}");
+
+        assert_eq!(
+            verification_kinds(&mut session),
+            vec!["Requested", "Started", "Cancelled"],
+            "the command itself never ran: no Progress record for it"
+        );
+        let records: Vec<_> = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        match &records.last().unwrap().event {
+            WardEvent::VerificationCancelled { candidate: got, .. } => {
+                assert_eq!(*got, Some(ev_snapshot(candidate)));
+            }
+            other => panic!("expected VerificationCancelled, got {other:?}"),
+        }
+    }
+
+    /// #139 item 5: a dangling attempt marker left by a process that ended without
+    /// finishing it (a crash, or simply forgetting) is reconciled the moment
+    /// another process reopens the session — here, `Session::open_current`,
+    /// without any daemon involved (the `daemon` module has the equivalent test
+    /// for `wardd`'s own startup).
+    #[test]
+    fn open_current_reconciles_a_dangling_attempt_left_by_a_previous_process() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        session.persist_current().unwrap();
+        let dir = session_dir(state.path(), session.id());
+
+        // Simulate a crash mid-attempt: `VerificationAttemptStarted` is on the log
+        // and the marker exists, but nothing ever finishes it — the same shape an
+        // `AttemptGuard` dropped without `finish()` leaves, or a hard process kill.
+        let attempt = AttemptId::new(1);
+        let marker = dir.join("attempts").join("1.json");
+        {
+            let mut session = session;
+            session
+                .emit(
+                    Origin::Wardd,
+                    WardEvent::VerificationAttemptStarted {
+                        attempt,
+                        requested_by: VerifyRequester::User,
+                    },
+                )
+                .unwrap();
+            session.sync().unwrap();
+            drop(AttemptGuard::start(&dir, attempt, VerifyRequester::User).unwrap());
+            // `session` (and its sink) drops here without ever calling `stop` —
+            // the process is gone, exactly like a real crash.
+        }
+        assert!(marker.exists());
+
+        let mut reopened = Session::open_current(project.path(), state.path())
+            .unwrap()
+            .expect("the persisted session is found");
+        assert!(
+            !marker.exists(),
+            "open_current's own reconciliation consumes the marker"
+        );
+        assert_eq!(
+            verification_kinds(&mut reopened),
+            vec!["AttemptStarted", "Interrupted"]
+        );
+        // The next attempt this (or any) process allocates for the session does
+        // not collide with the reconciled one.
+        assert_eq!(reopened.alloc_attempt().get(), 2);
+    }
+
+    /// Review of #208, finding 1: a marker is not, by itself, evidence its owner
+    /// died — it is equally present for a healthy in-flight verification. A second
+    /// `ward` invocation that merely opens the same session (`open_current`) while
+    /// a first one's `verify()` is genuinely still running elsewhere must never
+    /// interrupt it. `LiveChild` stands in for that first, still-running process:
+    /// a real, independently-alive pid the marker names as its owner.
+    #[test]
+    fn open_current_never_interrupts_an_attempt_a_live_process_still_owns() {
+        use std::process::{Child, Command, Stdio};
+
+        struct LiveChild(Child);
+        impl LiveChild {
+            fn spawn() -> Self {
+                Self(
+                    Command::new("sh")
+                        .args(["-c", "while :; do :; done"])
+                        .stdout(Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                )
+            }
+        }
+        impl Drop for LiveChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        session.persist_current().unwrap();
+        let dir = session_dir(state.path(), session.id());
+
+        let attempt = AttemptId::new(1);
+        let marker = dir.join("attempts").join("1.json");
+        let owner = LiveChild::spawn();
+        {
+            let mut session = session;
+            session
+                .emit(
+                    Origin::Wardd,
+                    WardEvent::VerificationAttemptStarted {
+                        attempt,
+                        requested_by: VerifyRequester::User,
+                    },
+                )
+                .unwrap();
+            session.sync().unwrap();
+            // A marker naming the still-running `owner` child as this attempt's
+            // owner — the same shape a real `verify()` call leaves while it is
+            // genuinely in flight — never a dead process's leftover.
+            crate::attempt::test_marker_owned_by(&dir, attempt, owner.0.id()).unwrap();
+        }
+        assert!(marker.exists());
+
+        // A second, independent `open_current` — exactly what a concurrent `ward`
+        // command does — must find the attempt still live and leave it alone.
+        let mut reopened = Session::open_current(project.path(), state.path())
+            .unwrap()
+            .expect("the persisted session is found");
+        assert!(
+            marker.exists(),
+            "a live owner's marker must survive a second client's open_current"
+        );
+        assert_eq!(
+            verification_kinds(&mut reopened),
+            vec!["AttemptStarted"],
+            "no VerificationInterrupted was ever emitted for the still-running attempt"
+        );
+    }
+
+    /// Review 5284360930 of #208, finding 1 — the deterministic barrier regression the
+    /// review asked for: two independent `Session` handles on the very same session
+    /// (`open_current`, the shape two separate `ward verify` client processes take),
+    /// both opened — and so both caching a `next_attempt` from the very same,
+    /// still-empty log — before either ever calls `verify()`, exactly the ordering the
+    /// finding describes. Racing them to call `verify()` at the same instant must not
+    /// collide: the new session-scoped verify lock must serialize the two calls
+    /// completely, so the log ends up with two distinct attempts, each one's own
+    /// `AttemptStarted`/terminal pair fully written before the other's `AttemptStarted`
+    /// ever appears, and neither ever clobbers the other's marker file.
+    #[test]
+    fn concurrent_verify_calls_on_two_session_handles_are_strictly_serialized() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        session.persist_current().unwrap();
+        let dir = session_dir(state.path(), session.id());
+        drop(session);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let project = project.path().to_path_buf();
+                let state = state.path().to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Both handles open the session — caching the same
+                    // `next_attempt` from the same, still-empty log — before either
+                    // ever calls `verify()`.
+                    let mut session = Session::open_current(&project, &state)
+                        .unwrap()
+                        .expect("the persisted session is found");
+                    barrier.wait();
+                    // Deterministically fails at `verify::prepare` (no
+                    // `.tamperward/config.yml` in a bare `start_in` project), which
+                    // still leaves the attempt with exactly one terminal record —
+                    // `VerificationInterrupted` — the same shape
+                    // `verify_prepare_failure_ends_the_log_in_verification_interrupted_with_no_candidate`
+                    // above already relies on.
+                    session.verify().expect_err("no .tamperward/config.yml")
+                })
+            })
+            .collect();
+        for handle in handles {
+            let err = handle.join().unwrap();
+            assert!(!err.to_string().is_empty());
+        }
+
+        let records: Vec<_> = ward_events::LogReader::open(dir.join("events.log"))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let attempts: Vec<(&str, u64)> = records
+            .iter()
+            .filter_map(|r| match &r.event {
+                WardEvent::VerificationAttemptStarted { attempt, .. } => {
+                    Some(("AttemptStarted", attempt.get()))
+                }
+                WardEvent::VerificationInterrupted { attempt, .. } => {
+                    Some(("Interrupted", attempt.get()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attempts,
+            vec![
+                ("AttemptStarted", 1),
+                ("Interrupted", 1),
+                ("AttemptStarted", 2),
+                ("Interrupted", 2),
+            ],
+            "the two verify() calls must be strictly serialized by the verify lock — \
+             distinct attempt ids, never interleaved: {attempts:?}"
+        );
+        assert!(
+            !dir.join("attempts").join("1.json").exists()
+                && !dir.join("attempts").join("2.json").exists(),
+            "both attempts finish cleanly; neither marker is left dangling or was ever \
+             clobbered by the other"
+        );
+    }
+
+    /// Review 5284360930 of #208, finding 2 — the deterministic barrier regression for
+    /// the other half of the finding: attempt 1's `AttemptGuard` is held (its marker
+    /// genuinely live, `VerificationAttemptStarted` already durably on the log, nothing
+    /// terminal yet) exactly as a real `verify()` call in flight would leave things,
+    /// while a concurrent reconciliation pass runs and this test probes whether the
+    /// verify lock is genuinely still held. Both must find attempt 1 still in flight:
+    /// reconciliation must never remove its marker or treat it as terminal (the
+    /// pid/`LIVE_PATHS` liveness checks this composes with, unchanged by this fix — see
+    /// `lock_session_verification`'s own doc comment), and a non-blocking probe on the
+    /// exact same lock file — deterministic proof, never a timing assumption — must
+    /// fail while attempt 1's holder thread has not yet released it, then succeed once
+    /// it has, at which point the next allocation correctly sees attempt 1 as done.
+    #[test]
+    fn a_still_running_attempt_survives_reconciliation_and_holds_its_lock() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        session.persist_current().unwrap();
+        let dir = session_dir(state.path(), session.id());
+        let project_path = project.path().to_path_buf();
+        let state_path = state.path().to_path_buf();
+        drop(session);
+
+        let attempt = AttemptId::new(1);
+        let marker = dir.join("attempts").join("1.json");
+
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held_dir = dir.clone();
+        let holder = std::thread::spawn(move || {
+            // Stands in for a `verify()` call genuinely still in flight: the verify
+            // lock held for the attempt's whole lifetime — exactly as `Session::verify`
+            // itself now holds it — its `AttemptGuard` alive, and
+            // `VerificationAttemptStarted` already durably on the log, but nothing
+            // terminal yet.
+            let _verify_lock = crate::attempt::lock_session_verification(&held_dir).unwrap();
+            let mut log = LocalLog::open(&held_dir.join("events.log"), SystemTime::now()).unwrap();
+            log.append(
+                Origin::Wardd,
+                WardEvent::VerificationAttemptStarted {
+                    attempt,
+                    requested_by: VerifyRequester::User,
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+            log.sync().unwrap();
+            let guard = AttemptGuard::start(&held_dir, attempt, VerifyRequester::User).unwrap();
+            holding_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            guard.finish();
+            // `_verify_lock` releases only once this closure returns, below.
+        });
+
+        holding_rx.recv().unwrap();
+        assert!(marker.exists());
+
+        // A non-blocking probe on the exact same lock file: it must fail while the
+        // holder thread above has not yet released it, deterministically proving the
+        // lock is genuinely held rather than merely assumed to be from timing.
+        let probe_path = crate::attempt::verify_lock_path(&dir);
+        let probe_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&probe_path)
+            .unwrap();
+        assert!(
+            nix::fcntl::Flock::lock(probe_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .is_err(),
+            "the verify lock must still be held while attempt 1 is in flight"
+        );
+
+        // A reconciliation pass — the same one `Session::open_current` runs — must
+        // leave the still-live marker completely alone.
+        let mut reopened = Session::open_current(&project_path, &state_path)
+            .unwrap()
+            .expect("the persisted session is found");
+        assert!(
+            marker.exists(),
+            "reconciliation must never remove attempt 1's marker while its guard is still live"
+        );
+        assert_eq!(
+            verification_kinds(&mut reopened),
+            vec!["AttemptStarted"],
+            "no VerificationInterrupted for the still-running attempt"
+        );
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            !marker.exists(),
+            "attempt 1's marker is cleanly removed once it actually finishes"
+        );
+
+        // The lock is free now that `verify()` (simulated by the holder thread above)
+        // has fully returned, and the next allocation correctly sees attempt 1's own
+        // `AttemptStarted` already on the log.
+        let probe_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&probe_path)
+            .unwrap();
+        let probe =
+            nix::fcntl::Flock::lock(probe_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .expect("the lock is released once the holder's verify() call returns");
+        drop(probe);
+        assert_eq!(next_attempt_id(&dir.join("events.log")).get(), 2);
     }
 }
