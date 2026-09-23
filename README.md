@@ -17,6 +17,7 @@ trusted state **outside the agent's authority**.
 
 ```bash
 ward init            # policy, verifier config and TamperWard wiring for this directory
+ward ready           # is this project verifiable yet? policy, verifier config, runtime, key
 ward claude          # Claude Code in the sandbox; keys stay on the host
 ward verify          # the protected tests, in a disposable verifier, from the entry snapshot
 ```
@@ -52,6 +53,7 @@ Then, in any project, five commands and about five minutes
 ward doctor                        # what this host can give a session, with a fix per gap
 ward vault set ANTHROPIC_API_KEY   # the model key, typed without echo, kept on the host
 ward init                          # policy, verifier config, TamperWard wiring; never overwrites yours
+ward ready                         # is this project verifiable yet? policy, runtime, key, protected paths
 ward claude                        # Claude Code in the sandbox; the proxy injects the key
 ward verify                        # the protected tests, from the entry snapshot, offline
 ```
@@ -104,6 +106,7 @@ an explicit `GAP` row (`ObservationsDropped`) beside the batch it belongs to.
 ```bash
 # the binaries: the release tarball (Get started), install.sh, or cargo build --release
 ward doctor                         # what this host can give a session, with a fix per gap
+ward ready    examples/ward-demo    # is this project verifiable yet? policy, runtime, key, protected paths
 ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
 ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live observer
 ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stays on the host
