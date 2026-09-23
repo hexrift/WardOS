@@ -148,6 +148,12 @@ listed — the sweep keeps the object rather than delete it.
 
 `ward snapshot gc` defaults to printing a plan and deleting nothing; `--apply` performs
 it, one object at a time, so an interrupted sweep leaves the store in a valid state and
-a re-run recomputes safely from what is left on disk. Startup reconciliation of
-abandoned scratch, a low-space preflight, and `doctor`/`status` integration are
-follow-up work, not part of this mechanism.
+a re-run recomputes safely from what is left on disk.
+
+`ward doctor` reports the same numbers read-only, as one more host-readiness row: total
+usage across the CAS and session logs, and what a `ward snapshot gc` dry run would
+reclaim right now (or that a capture's lease currently makes that unknown). It never
+sweeps anything itself — same computation, surfaced where a host report is the first
+thing read (#151 item 7, partial). Startup reconciliation of abandoned scratch and a
+low-space preflight remain follow-up work; `ward status`'s per-session panel is
+unchanged, since storage usage is a property of the whole state root, not one session.
