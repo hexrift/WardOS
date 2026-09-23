@@ -1101,14 +1101,32 @@ fn stream_subscription(
             return;
         }
     };
+    let mut next_seq = from_seq;
     for record in subscription.replay {
+        next_seq = record.seq + 1;
         if write_line(&mut writer, &Response::Record(Box::new(record))).is_err() {
             return;
         }
     }
+    // A replay-only subscription (the log was already sealed when `subscribe`
+    // ran) has nothing live to mark a boundary against: the connection
+    // closing right behind the last record already says "that was everything,
+    // unambiguously and immediately" — sending a marker here would only give
+    // a client one more line to read before learning the same thing.
     let Some((live, hangup)) = subscription.live else {
         return;
     };
+    // The replay set was fixed atomically under the same mutex as every
+    // append, in `Served::subscribe` above, so this marker is an exact
+    // boundary, not a guess: everything before it is the replay this live
+    // subscription started with, everything after is live (#138 item 1). A
+    // client that waits for this instead of a silence timeout gets its first
+    // render, or its initial pending-approval listing, as soon as the
+    // backlog it asked for is actually delivered — regardless of how much
+    // live traffic follows right behind it.
+    if write_line(&mut writer, &Response::CaughtUp { next_seq }).is_err() {
+        return;
+    }
     // A subscriber sends nothing more, so its next read completing is its
     // disconnect: end the stream then.
     let watcher = std::thread::spawn(move || {
@@ -2648,9 +2666,16 @@ mod tests {
         );
 
         // The subscriber got every live record in order, then the stream closed.
+        // The replay-complete marker (#138 item 1) lands right behind the
+        // replay it started with — before any live record — and is skipped,
+        // not counted.
         let mut seen = vec![0];
-        while let Ok(Response::Record(r)) = subscriber.read_response() {
-            seen.push(r.seq);
+        loop {
+            match subscriber.read_response() {
+                Ok(Response::Record(r)) => seen.push(r.seq),
+                Ok(Response::CaughtUp { next_seq }) => assert_eq!(next_seq, 1),
+                _ => break,
+            }
         }
         assert_eq!(seen, [0, 1, 2, 3]);
         let head = LogReader::open(&log_path).unwrap().verify_all().unwrap();
