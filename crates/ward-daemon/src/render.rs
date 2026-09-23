@@ -1040,7 +1040,11 @@ fn gc_objects(s: &mut String, objects: &[ward_snapshot::gc::PlannedObject]) {
 /// `bytes` as a human-scaled binary size (`B`/`KiB`/`MiB`/`GiB`), one decimal
 /// place once it has scaled past whole bytes. Pure integer arithmetic (no
 /// float cast) so precision is exact at the one-decimal resolution shown.
-fn human_bytes(bytes: u64) -> String {
+///
+/// `pub(crate)` so `doctor`'s storage check can format the same numbers the
+/// same way `ward snapshot usage`/`gc` already do, rather than a second
+/// formatter drifting from this one.
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut whole = bytes;
     let mut tenths = 0u64;

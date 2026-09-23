@@ -5,9 +5,11 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use crate::{daemon, sandbox, session, verify};
+use ward_snapshot::gc::GcOptions;
+
+use crate::{daemon, render, retention, sandbox, session, usage, verify};
 
 /// Outcome of one check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +93,7 @@ pub fn run() -> Vec<Check> {
         tool("curl", false),
         state_dir(&state),
         socket_path(&state),
+        storage(&state),
         node(probe("node", &["--version"]).as_deref()),
         agents(&agent_versions()),
         keys(&key_sources(&state), &state),
@@ -454,6 +457,48 @@ fn state_dir(state: &Path) -> Check {
             ),
         ),
     }
+}
+
+/// Storage usage of `<state>/cas` and session logs, plus what a `ward snapshot gc`
+/// dry run would reclaim right now (#151 item 7). Never a `Fail` — an over-full CAS
+/// does not stop a session from running, it is just worth surfacing where a host
+/// report is the first thing read — and never sweeps or deletes anything itself: it
+/// runs the exact same read-only [`usage::compute`]/[`retention::plan`] `ward
+/// snapshot usage`/`ward snapshot gc` (without `--apply`) already use, so a fresh
+/// host with no state root yet reports zero usage rather than failing.
+fn storage(state: &Path) -> Check {
+    let total = match usage::compute(state) {
+        Ok(u) => u.total_bytes(),
+        Err(e) => return Check::new("storage", Status::Warn, format!("usage unavailable: {e}")),
+    };
+    let plan = match retention::plan(state, SystemTime::now(), &GcOptions::default()) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return Check::new(
+                "storage",
+                Status::Warn,
+                format!(
+                    "{} used, gc plan unavailable: {e}",
+                    render::human_bytes(total)
+                ),
+            );
+        }
+    };
+    let detail = if plan.lease_active {
+        format!(
+            "{} used, reclaimable unknown (a capture holds the store's lease)",
+            render::human_bytes(total)
+        )
+    } else if plan.is_empty() {
+        format!("{} used, nothing reclaimable", render::human_bytes(total))
+    } else {
+        format!(
+            "{} used, {} reclaimable (`ward snapshot gc`)",
+            render::human_bytes(total),
+            render::human_bytes(plan.reclaimable_bytes())
+        )
+    };
+    Check::new("storage", Status::Ok, detail)
 }
 
 /// A control socket path must fit `sockaddr_un`; the session id is 31 bytes.
@@ -908,6 +953,52 @@ mod tests {
         assert_eq!(inotify(Some("524288")).status, Status::Ok);
         assert_eq!(inotify(Some("8192")).status, Status::Warn);
         assert_eq!(inotify(None).status, Status::Warn);
+    }
+
+    #[test]
+    fn storage_reports_a_fresh_state_root_as_empty() {
+        let state = tempfile::tempdir().unwrap();
+        let c = storage(state.path());
+        assert_eq!(c.status, Status::Ok);
+        assert!(c.detail.contains("0 B used"), "{}", c.detail);
+        assert!(c.detail.contains("nothing reclaimable"), "{}", c.detail);
+    }
+
+    #[test]
+    fn storage_counts_a_kept_snapshots_bytes_as_used_but_not_reclaimable() {
+        let state = tempfile::tempdir().unwrap();
+        let cas = state.path().join("cas");
+        let store = ward_snapshot::SnapshotStore::open(&cas).unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join("f"), "content").unwrap();
+        let id = store
+            .store_snapshot(
+                worktree.path(),
+                ward_snapshot::SnapshotRole::Entry,
+                ward_snapshot::CaptureOptions::default(),
+            )
+            .unwrap();
+        // Rooted via the explicit "keep" marker, the same one `ward_snapshot::gc`
+        // gives user-kept restore backups — the simplest way to root a snapshot
+        // without standing up a full session/event-log fixture.
+        ward_snapshot::gc::mark_kept(&cas, id).unwrap();
+
+        let c = storage(state.path());
+        assert_eq!(c.status, Status::Ok);
+        assert!(!c.detail.contains("0 B used"), "{}", c.detail);
+        assert!(c.detail.contains("nothing reclaimable"), "{}", c.detail);
+    }
+
+    #[test]
+    fn storage_reports_reclaimable_unknown_while_a_capture_lease_is_held() {
+        let state = tempfile::tempdir().unwrap();
+        let cas = state.path().join("cas");
+        let _lease = ward_snapshot::gc::LeaseGuard::acquire_capture(&cas).unwrap();
+
+        let c = storage(state.path());
+        assert_eq!(c.status, Status::Ok);
+        assert!(c.detail.contains("reclaimable unknown"), "{}", c.detail);
+        assert!(c.detail.contains("a capture holds"), "{}", c.detail);
     }
 
     #[test]
