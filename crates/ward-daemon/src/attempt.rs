@@ -1241,6 +1241,44 @@ pub fn reconcile_dangling_attempts(sink: &mut dyn Sink, session_dir: &Path) -> R
     Ok(reconciled)
 }
 
+/// Every candidate snapshot id recorded by an attempt marker currently present under
+/// `session_dir`'s `attempts/` directory — the "in-flight verification" retention root
+/// #151 items 2–3 ask for.
+///
+/// Deliberately does not distinguish a marker whose owning process is still genuinely
+/// running from one [`reconcile_dangling_attempts`] has simply not yet closed out:
+/// either way, the marker is the only durable record connecting that candidate id to
+/// this session, and dropping it here — even for a marker about to be reconciled a
+/// moment later — is exactly the false-positive risk a retention root must never take.
+/// Once reconciliation (or [`AttemptGuard::finish`]) removes the marker, this stops
+/// naming that candidate on the very next call — no separate expiry of its own.
+///
+/// A marker with no `candidate` yet (capture still running, or it failed before
+/// producing one) contributes nothing here; that gap is covered instead by
+/// `ward_snapshot`'s own capture lease, held for the capture's whole duration. A marker
+/// this process cannot read or parse is skipped, not guessed at — recovering a corrupt
+/// marker's content is [`reconcile_dangling_attempts`]'s job (it quarantines rather than
+/// destroys one), not this read-only listing's.
+pub fn candidate_snapshot_ids(session_dir: &Path) -> Vec<ward_snapshot::SnapshotId> {
+    let dir = attempts_dir(session_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+            continue;
+        }
+        if let MarkerRead::Ok(marker) = read_marker(&path)
+            && let Some(id) = marker.candidate.as_deref().and_then(|s| s.parse().ok())
+        {
+            out.push(id);
+        }
+    }
+    out
+}
+
 /// Test-only: write a marker for `attempt` naming `pid` as its owner, exactly as
 /// [`AttemptGuard::start`] would for *this* process's own pid — used by
 /// `session::tests` to prove `Session::open_current` never interrupts a live

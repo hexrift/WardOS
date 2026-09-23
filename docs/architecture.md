@@ -306,6 +306,12 @@ Detailed in [`snapshots-and-git.md`](snapshots-and-git.md). Summary:
   (post-verification, if TamperWard accepts), `final` (session end).
 * Materialisation for the verifier is a fresh checkout from the CAS, never a bind mount of
   the agent's worktree.
+* `ward snapshot usage` reports CAS and scratch disk usage; `ward snapshot gc` reclaims
+  what a conservative mark-and-sweep finds unreachable from every retention root (active
+  session entries/candidates, in-flight verification, `StateAccepted` evidence, explicitly
+  kept snapshots), never running while a capture's lease is held, and prints a plan rather
+  than deleting unless run with `--apply` (#151 items 2–3;
+  [`ward_snapshot::gc`](../crates/ward-snapshot/src/gc.rs)).
 
 ---
 

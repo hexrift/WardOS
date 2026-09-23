@@ -70,6 +70,15 @@ impl Cas {
         Ok(Self { root })
     }
 
+    /// The CAS root directory — needed by [`crate::gc`] to address the
+    /// `leases/` and `kept/` directories, which sit alongside `blobs/`,
+    /// `manifests/` and `meta/` but are never created by [`Self::open`]
+    /// itself (mirroring how those three are the only directories `open`
+    /// promises; `gc` creates its own on first use).
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn blob_path(&self, d: Digest) -> PathBuf {
         let hex = d.to_hex();
         self.root.join("blobs").join(&hex[..2]).join(&hex)
@@ -114,11 +123,19 @@ impl Cas {
         self.root.join("manifests").join(id.digest().to_hex())
     }
 
-    /// Store a manifest, returning its id.
+    /// Store a manifest, returning its id. A manifest already present is not
+    /// rewritten, but its mtime is refreshed: `gc::plan`'s grace period is judged
+    /// from a manifest's mtime, so a capture that deduplicates onto an old manifest
+    /// must restart that clock, or the snapshot it just produced would be
+    /// reclaimable before its caller records a root for it.
     pub fn put_manifest(&self, m: &Manifest) -> Result<SnapshotId> {
         let id = m.id();
         let path = self.manifest_path(id);
-        if !path.exists() {
+        if path.exists() {
+            fs::File::open(&path)
+                .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                .map_err(|e| SnapshotError::io(&path, e))?;
+        } else {
             write_atomic(&path, &m.serialize())?;
         }
         Ok(id)
@@ -254,7 +271,12 @@ fn walk_dir_usage(dir: &Path, usage: &mut CategoryUsage) -> Result<()> {
 }
 
 /// Write `bytes` to `path` atomically via a sibling temp file and rename.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+///
+/// `pub(crate)` (not private) so [`crate::gc`]'s lease and "kept" markers can
+/// reuse the exact same atomic write-temp-then-rename scheme the CAS itself
+/// uses for blobs, manifests and meta, rather than a second, subtly different
+/// implementation of the same durability property.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));

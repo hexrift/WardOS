@@ -26,7 +26,8 @@ mod tui;
 mod vault;
 use ward_daemon::approvals::ApprovalDecision;
 use ward_daemon::{
-    Session, SessionMeta, SnapshotRole, client, daemon, render, selftest, snapshot, usage,
+    GcOptions, Session, SessionMeta, SnapshotRole, client, daemon, render, retention, selftest,
+    snapshot, usage,
 };
 use ward_events::{EndReason, LogReader};
 
@@ -469,6 +470,19 @@ enum SnapshotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Conservative mark-and-sweep reclamation of blobs, manifests and meta records
+    /// unreachable from any retention root (#151 items 2–3): active session
+    /// entry/candidate snapshots, in-flight verification, pinned evidence (TamperWard's
+    /// `StateAccepted` records) and explicitly kept snapshots. Prints a plan and deletes
+    /// nothing unless `--apply` is given; never sweeps while a capture's lease is held.
+    Gc {
+        /// Actually delete the planned objects. Without this, only a plan is printed.
+        #[arg(long)]
+        apply: bool,
+        /// Emit the plan or report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The roles a snapshot may be created with from the command line.
@@ -565,6 +579,7 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Snapshot(SnapshotCmd::Diff { a, b, json }) => cmd_snapshot_diff(&a, &b, json),
         Command::Snapshot(SnapshotCmd::Cat { id, path }) => cmd_snapshot_cat(&id, &path),
         Command::Snapshot(SnapshotCmd::Usage { json }) => cmd_snapshot_usage(json),
+        Command::Snapshot(SnapshotCmd::Gc { apply, json }) => cmd_snapshot_gc(apply, json),
         Command::Evidence(EvidenceCmd::Append { dir, json }) => {
             cmd_evidence_append(&dir.unwrap_or_else(cwd), &json)
         }
@@ -1330,6 +1345,29 @@ fn cmd_snapshot_usage(json: bool) -> ward_daemon::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `ward snapshot gc [--apply] [--json]`: conservative mark-and-sweep reclamation
+/// (#151 items 2–3). Without `--apply`, only prints what [`retention::plan`] found —
+/// nothing is ever deleted by default, matching `ward snapshot usage`'s own
+/// read-only-by-default posture but for a command that *can* mutate the store.
+fn cmd_snapshot_gc(apply: bool, json: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let now = std::time::SystemTime::now();
+    let plan = retention::plan(&state, now, &GcOptions::default())?;
+    if apply {
+        let report = retention::apply(&state, &plan, now)?;
+        if json {
+            println!("{}", to_json(&report)?);
+        } else {
+            print!("{}", render::gc_report_panel(&state, &report));
+        }
+    } else if json {
+        println!("{}", to_json(&plan)?);
+    } else {
+        print!("{}", render::gc_plan_panel(&state, &plan));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn to_json<T: serde::Serialize>(value: &T) -> ward_daemon::Result<String> {
     serde_json::to_string_pretty(value).map_err(|e| ward_daemon::Error::Project(e.to_string()))
 }
@@ -2050,6 +2088,26 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Snapshot(SnapshotCmd::Usage { json: true })
+        ));
+    }
+
+    #[test]
+    fn snapshot_gc_defaults_to_a_dry_run_and_apply_must_be_explicit() {
+        let cli = Cli::try_parse_from(["ward", "snapshot", "gc"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Gc {
+                apply: false,
+                json: false
+            })
+        ));
+        let cli = Cli::try_parse_from(["ward", "snapshot", "gc", "--apply", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Gc {
+                apply: true,
+                json: true
+            })
         ));
     }
 
