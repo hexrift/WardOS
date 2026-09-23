@@ -308,6 +308,25 @@ enum SessionCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Every approval this session has asked, pending or decided (#146 item
+    /// 1): unlike `pending`, a request stays visible here after it is
+    /// answered, times out, or the session ends with it still open — the
+    /// daemon's own authoritative account, so missing or dismissing whatever
+    /// first announced it does not lose it from view for the rest of the
+    /// session. Oldest asked first; the daemon keeps a bounded history of
+    /// decided ones, so a very long session's oldest entries eventually age
+    /// out (see `ward replay` for the durable, unbounded record).
+    Approvals {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+        /// The session id, instead of looking one up.
+        #[arg(long)]
+        session: Option<String>,
+        /// One JSON object per approval: `{approval: {…, as in `pending`},
+        /// outcome, decided_at_unix_ms}`.
+        #[arg(long)]
+        json: bool,
+    },
     /// The temporary authority the session holds (ADR-0019): every
     /// `allow-session` answer and every credential the proxy injects, with its
     /// scope and lifetime.
@@ -455,6 +474,9 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             follow,
             json,
         }) => cmd_pending(&dir.unwrap_or_else(cwd), session.as_deref(), follow, json),
+        Command::Session(SessionCmd::Approvals { dir, session, json }) => {
+            cmd_approvals(&dir.unwrap_or_else(cwd), session.as_deref(), json)
+        }
         Command::Session(SessionCmd::Grants { dir, session, json }) => {
             cmd_grants(&dir.unwrap_or_else(cwd), session.as_deref(), json)
         }
@@ -744,6 +766,29 @@ fn pending_text(approval: &ward_daemon::approvals::Approval, agent: &str) -> Str
         tool = approval.tool,
         blocks = approval.blocks(),
     )
+}
+
+/// `ward session approvals [--json]` (#146 item 1): every approval the
+/// session has asked, pending or decided — the daemon's own authoritative
+/// account, so a request that missed its notification is still findable
+/// here for the rest of the session.
+fn cmd_approvals(dir: &Path, session: Option<&str>, json: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
+    let records = client::approvals(&mut sink)?;
+    let mut out = std::io::stdout();
+    if records.is_empty() && !json {
+        println!("  no approvals yet");
+    }
+    for record in &records {
+        let line = if json {
+            serde_json::to_string(record).unwrap_or_default()
+        } else {
+            record.line()
+        };
+        let _ = writeln!(out, "{line}").and_then(|()| out.flush());
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `ward session grants [--json]`: the temporary authority the session holds.
@@ -1260,6 +1305,12 @@ mod tests {
                 ..
             })
         ));
+        let cli = Cli::parse_from(["ward", "session", "approvals", "--json", "--session", "s1"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCmd::Approvals { json: true, session: Some(s), .. })
+                if s == "s1"
+        ));
         let cli = Cli::parse_from(["ward", "session", "grants", "--json"]);
         assert!(matches!(
             cli.command,
@@ -1286,6 +1337,22 @@ mod tests {
             text.ends_with("\nward session approve 12 allow | allow-session | deny\n\n"),
             "{text}"
         );
+        // `ward session approvals`'s plain-text row, pending and decided.
+        let pending = ward_daemon::approvals::ApprovalRecord {
+            approval: approval.clone(),
+            outcome: None,
+            decided_at_unix_ms: None,
+        };
+        assert_eq!(pending.state_word(), "pending");
+        assert!(pending.line().contains("pending"), "{}", pending.line());
+        assert!(pending.line().contains("/work/src/lib.rs"));
+        let decided = ward_daemon::approvals::ApprovalRecord {
+            approval,
+            outcome: Some(ward_daemon::approvals::Outcome::TimedOut),
+            decided_at_unix_ms: Some(9),
+        };
+        assert_eq!(decided.state_word(), "timed-out");
+        assert!(decided.line().contains("timed-out"), "{}", decided.line());
     }
 
     #[test]
