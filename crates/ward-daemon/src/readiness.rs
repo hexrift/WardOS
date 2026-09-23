@@ -178,7 +178,8 @@ impl Report {
 /// process's own `PATH`, which the verifier does not use.
 #[must_use]
 pub fn check(dir: &Path) -> Report {
-    check_with_dirs(dir, &verify::Toolchains::detect().search_dirs())
+    let toolchains = verify::Toolchains::detect();
+    check_with_dirs_and_roots(dir, &toolchains.search_dirs(), &toolchains.mount_roots())
 }
 
 /// [`check`], with the verifier's search directories given explicitly instead
@@ -186,15 +187,56 @@ pub fn check(dir: &Path) -> Report {
 /// rather than a live `Toolchains::detect()`, so a test can exercise the
 /// `runtime` row's search with controlled directories instead of depending on
 /// whatever Rust toolchain happens to be installed on the machine running the
-/// test.
+/// test. `search_dirs` doubles as the symlink-containment boundary here
+/// (see [`check_with_dirs_and_roots`]) — correct for every existing caller,
+/// each of which controls a search dir that *is* its own whole boundary; a
+/// caller that needs the two to differ (a search dir that is only one of
+/// several sibling directories actually mounted, as `bin`/`registry` are
+/// under a real `$CARGO_HOME`) uses [`check_with_dirs_and_roots`] directly.
+/// Test-only: every non-test caller either needs that distinction (`check`)
+/// or controls both directly.
+#[cfg(test)]
 fn check_with_dirs(dir: &Path, search_dirs: &[PathBuf]) -> Report {
+    check_with_dirs_and_roots(dir, search_dirs, search_dirs)
+}
+
+/// [`check`]'s real implementation: `search_dirs` is where a bare candidate is
+/// looked up (mirroring [`verify::Toolchains::search_dirs`]); `mount_roots` is
+/// the separate, broader set of host directories a resolved symlink's
+/// destination is allowed to land in without being judged broken.
+///
+/// The two differ for a real Cargo toolchain: `search_dirs` is just
+/// `$CARGO_HOME/bin` (where the configured command is actually looked up —
+/// `verify::Toolchains::mount` also binds `registry`, but nothing ever
+/// searches there for an executable), while the sandbox's own mount layout
+/// binds `bin` and `registry` as *siblings* under one shared private tmpfs
+/// (`Toolchains`' own doc: "binaries and registry only; the cargo home itself
+/// is a private tmpfs") — so a relative symlink from `bin/` to `../registry/…`
+/// resolves inside the real sandbox exactly as it does on the host, even
+/// though its destination sits outside the narrower `search_dirs` entry that
+/// found it. Judging containment against `search_dirs` alone (as an earlier
+/// version of this check did) would reject that legitimate case; judging it
+/// against the whole `$CARGO_HOME` would accept a relative symlink to
+/// anywhere else under it (e.g. a hypothetical `libexec/`) that the sandbox's
+/// private tmpfs never actually mounts — `mount_roots` is the accurate
+/// boundary in between.
+fn check_with_dirs_and_roots(
+    dir: &Path,
+    search_dirs: &[PathBuf],
+    mount_roots: &[PathBuf],
+) -> Report {
     let ecosystem = Ecosystem::detect(dir);
     let mut rows = vec![policy_row(dir)];
     let (verify_row, config) = verify_row(dir);
     let unavailable = config.is_none();
     rows.push(verify_row);
     if let Some(config) = &config {
-        rows.push(runtime_row(dir, &config.verify.command, search_dirs));
+        rows.push(runtime_row(
+            dir,
+            &config.verify.command,
+            search_dirs,
+            mount_roots,
+        ));
         rows.push(protected_row(dir, config));
     }
     Report {
@@ -498,7 +540,7 @@ fn resolve_symlinks_conservatively(path: PathBuf) -> LinkResolution {
 /// `PATH` that isn't in one of these directories would not be found inside the
 /// verifier either, and a Cargo toolchain that *is* mounted there is available
 /// to the verifier even when `$CARGO_HOME/bin` is not on the caller's `PATH`.
-fn runtime_row(dir: &Path, command: &str, search_dirs: &[PathBuf]) -> Row {
+fn runtime_row(dir: &Path, command: &str, search_dirs: &[PathBuf], mount_roots: &[PathBuf]) -> Row {
     if let Some(op) = SHELL_METACHARACTERS.iter().find(|op| command.contains(*op)) {
         return Row::new(
             "runtime",
@@ -525,7 +567,7 @@ fn runtime_row(dir: &Path, command: &str, search_dirs: &[PathBuf]) -> Row {
     if candidate.contains('/') {
         return path_candidate_row(dir, candidate);
     }
-    match resolve_in_dirs(candidate, search_dirs) {
+    match resolve_in_dirs(candidate, search_dirs, mount_roots) {
         PathLookup::Executable => Row::new(
             "runtime",
             Status::Ok,
@@ -660,24 +702,35 @@ enum PathLookup {
 /// executable" from "found, but only through a symlink the verifier's mount
 /// set guarantees is broken" so [`runtime_row`] can name the real problem.
 ///
-/// Each `dir` is trusted only for *its own* contents: a relative symlink
-/// hop the walk follows can still carry the final destination out of `dir`
-/// (`<home>/bin/cargo -> ../../outside/cargo`) without ever pointing through
-/// an absolute target — nothing the hop-by-hop walk itself checks catches
-/// that, since a relative target is, correctly, allowed to resolve wherever
-/// its own containing directory ends up mounted. `dir` is the specific mount
-/// source that makes this candidate visible at all, so the destination must
-/// stay inside it, or land inside a [`crate::sandbox::is_system_ro`] root
-/// mounted at the same path either way (a search dir can itself be a base
-/// system directory).
-fn resolve_in_dirs(candidate: &str, search_dirs: &[PathBuf]) -> PathLookup {
+/// A relative symlink hop the walk follows can carry the final destination
+/// out of the specific `dir` that found it (`<home>/bin/cargo ->
+/// ../../outside/cargo`) without ever pointing through an absolute target —
+/// nothing the hop-by-hop walk itself checks catches that, since a relative
+/// target is, correctly, allowed to resolve wherever its own containing
+/// directory ends up mounted. The destination is accepted when it lands
+/// inside any of `mount_roots` — not just the one `dir` that happened to
+/// find this candidate — since a real toolchain mount can bind more than
+/// `search_dirs` alone searches (see [`check_with_dirs_and_roots`]: Cargo's
+/// `bin` and `registry` are sibling mounts under one shared tmpfs) — or
+/// inside a [`crate::sandbox::is_system_ro`] root (a search dir can itself
+/// be a base system directory, whose full real mount extent `mount_roots`
+/// doesn't need to separately enumerate).
+fn resolve_in_dirs(
+    candidate: &str,
+    search_dirs: &[PathBuf],
+    mount_roots: &[PathBuf],
+) -> PathLookup {
     let mut found_non_executable = false;
     for dir in search_dirs {
         let candidate_path = dir.join(candidate);
         match resolve_symlinks_conservatively(candidate_path.clone()) {
             LinkResolution::Broken => return PathLookup::Broken,
             LinkResolution::Resolved(resolved) if resolved.is_file() => {
-                if escapes_root(dir, &resolved) && !crate::sandbox::is_system_ro(&resolved) {
+                let contained = crate::sandbox::is_system_ro(&resolved)
+                    || mount_roots
+                        .iter()
+                        .any(|root| !escapes_root(root, &resolved));
+                if !contained {
                     return PathLookup::Broken;
                 }
                 if is_executable(&candidate_path) {
@@ -1129,6 +1182,75 @@ mod tests {
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Ok, "{}", row.detail);
         assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_allows_a_relative_symlink_from_a_cargo_bin_into_its_sibling_registry_mount() {
+        // Review finding on #219: `search_dirs` for a real Cargo toolchain is
+        // just `$CARGO_HOME/bin` (nothing else is ever searched for the
+        // command), but `Toolchains::mount` binds `bin` *and* `registry` as
+        // siblings under one shared private tmpfs — so a relative symlink
+        // from `bin/` to `../registry/…` resolves inside the real sandbox
+        // exactly as it does on the host, even though its destination sits
+        // outside the narrower `search_dirs` entry that found it. Judging
+        // containment against `search_dirs` alone (the bug this test would
+        // have caught) rejects this legitimate case; `mount_roots` — passed
+        // separately here via `check_with_dirs_and_roots`, exactly as `check`
+        // derives both from one real `Toolchains` — must not.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cargo test\n",
+        );
+        let cargo_home = tempfile::tempdir().unwrap();
+        let bin = cargo_home.path().join("bin");
+        let registry = cargo_home.path().join("registry");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::write(registry.join("cargo"), "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&registry.join("cargo"));
+        std::os::unix::fs::symlink("../registry/cargo", bin.join("cargo")).unwrap();
+
+        let search_dirs = [bin.clone()];
+        let mount_roots = [bin, registry];
+        let report = check_with_dirs_and_roots(dir.path(), &search_dirs, &mount_roots);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_still_rejects_a_relative_symlink_escaping_every_mount_root_not_just_search_dirs() {
+        // The other half of the same fix: broadening containment to
+        // `mount_roots` must not become "anything under $CARGO_HOME" — only
+        // the specific subdirectories the sandbox actually mounts. A symlink
+        // to a third, unmounted sibling (`libexec/`, mirroring the review's
+        // own hypothetical) stays Fail even though it's still nominally
+        // "under" the same cargo home on the host.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cargo test\n",
+        );
+        let cargo_home = tempfile::tempdir().unwrap();
+        let bin = cargo_home.path().join("bin");
+        let registry = cargo_home.path().join("registry");
+        let libexec = cargo_home.path().join("libexec");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::create_dir_all(&libexec).unwrap();
+        std::fs::write(libexec.join("cargo"), "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&libexec.join("cargo"));
+        std::os::unix::fs::symlink("../libexec/cargo", bin.join("cargo")).unwrap();
+
+        let search_dirs = [bin.clone()];
+        let mount_roots = [bin, registry];
+        let report = check_with_dirs_and_roots(dir.path(), &search_dirs, &mount_roots);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
     }
 
     #[test]

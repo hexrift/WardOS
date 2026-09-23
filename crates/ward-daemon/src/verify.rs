@@ -548,6 +548,31 @@ impl Toolchains {
         dirs
     }
 
+    /// The host directories individually, actually bind-mounted into the
+    /// verifier sandbox for this toolchain — distinct from
+    /// [`Toolchains::search_dirs`] (where a bare command is *looked up*),
+    /// this is the real containment boundary a resolved symlink target is
+    /// judged against ([`crate::readiness::check`]'s `runtime` row): `mount`
+    /// binds `bin` and `registry` as **siblings** under one shared, otherwise
+    /// empty private tmpfs — never the whole `$CARGO_HOME` (this struct's own
+    /// doc: "binaries and registry only; the cargo home itself is a private
+    /// tmpfs") — so a relative symlink from `bin/` can legitimately resolve
+    /// into `registry/` (both hang off that same sandboxed parent) but
+    /// nowhere else under the host's `$CARGO_HOME`. Only a subdirectory that
+    /// actually exists on the host is included, matching [`Toolchains::mount`]'s
+    /// own `is_dir()` gate — an absent one is never bind-mounted either.
+    #[must_use]
+    pub fn mount_roots(&self) -> Vec<PathBuf> {
+        let Some(cargo) = &self.cargo else {
+            return Vec::new();
+        };
+        ["bin", "registry"]
+            .into_iter()
+            .map(|sub| cargo.join(sub))
+            .filter(|dir| dir.is_dir())
+            .collect()
+    }
+
     /// Environment inside the verifier.
     #[must_use]
     pub fn env(&self) -> Vec<(String, String)> {
