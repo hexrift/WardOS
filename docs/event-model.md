@@ -92,6 +92,7 @@ pub enum WardEvent {
     VerificationAttemptStarted { attempt: AttemptId, requested_by: Agent | User | TamperWard },
     VerificationCancelled      { attempt: AttemptId, candidate: Option<SnapshotId> },
     VerificationInterrupted    { attempt: AttemptId, candidate: Option<SnapshotId>, reason: BoundedText },
+    VerificationTimedOut       { attempt: AttemptId, candidate: SnapshotId, summary: VerifySummary, result_hash: Blake3Hash, budget_secs: u64 },   // killed at the budget, not a test failure
 
     // agent claims (origin: Agent) — never enforcement facts
     AgentClaim { kind: ToolUse | Note | Plan, payload: BoundedText },
