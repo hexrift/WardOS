@@ -1808,6 +1808,7 @@ mod tests {
             project: project.to_path_buf(),
             project_id: "proj_demo".to_owned(),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest: ward_policy::merge(
                 &ward_policy::Policy::default(),
                 &ward_policy::Policy::default(),

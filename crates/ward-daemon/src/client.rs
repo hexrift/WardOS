@@ -1582,6 +1582,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: format!("proj_{id}"),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest: ward_policy::merge(
                 &ward_policy::Policy::default(),
                 &ward_policy::Policy::default(),
@@ -1948,6 +1949,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: "proj_sess_broken".to_owned(),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest: ward_policy::merge(
                 &ward_policy::Policy::default(),
                 &ward_policy::Policy::default(),
@@ -2017,6 +2019,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: format!("proj_{id}"),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest: ward_policy::merge(
                 &ward_policy::Policy::default(),
                 &ward_policy::Policy::default(),
@@ -2097,6 +2100,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: format!("proj_{id}"),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest: ward_policy::merge(
                 &ward_policy::Policy::default(),
                 &ward_policy::Policy::default(),
