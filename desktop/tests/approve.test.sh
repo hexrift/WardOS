@@ -126,6 +126,45 @@ assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait --prin
 assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 4242 Timed out — denied <tt>/work/src/lib.rs</tt>$'
 assert_not_logged '^ward session approve --session sess_a 12'
 
+# --- --watch: two live sessions sharing the same numeric approval id are resolved
+# independently (#222 review: Approval::id is only that session's own sequence
+# number, so two live sessions can legitimately both have a pending approval
+# numbered 12 at once — id alone must never be the identity a notification's
+# files, or its resolve, are keyed by) --------------------------------------------
+: >"$MOCK_LOG"
+line12c='{"id":12,"tool":"Write","summary":"/work/other/db.rs","claim":"Write /work/other/db.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/other/db.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":null},"requested_at_unix_ms":1,"agent":"codex","session":"sess_c","project":"other-service"}'
+export LINE12C=$line12c
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$LINE12" "$LINE12C" ;;
+  "session approvals --json --follow --session sess_a") sleep 0.3; printf "%s\n" "$DECIDED12" ;;
+  "session approvals --json --follow --session sess_c") : ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*"/work/src/lib.rs"*) echo 1001; exec sleep 30 ;;
+  *--print-id*"/work/other/db.rs"*) echo 2002; exec sleep 30 ;;
+  *) exit 0 ;;
+esac'
+WARDOS_APPROVE_MAX_NOTIFIERS=2 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Both sessions' id-12 approvals get their own worker — sharing a numeric id never
+# lets one reuse or clobber the other's reservation, so both count as separate
+# occupants of the bound even though it has no spare room for a third.
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 2 ]] ||
+  fail "both sessions' id-12 approvals must each get their own worker: $(cat "$MOCK_LOG")"
+# sess_a's approval times out: its own popup (notif id 1001) is replaced with the
+# outcome — sess_c's (2002), still pending, must not be touched by it.
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 1001 Timed out — denied <tt>/work/src/lib.rs</tt>$'
+assert_not_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 2002 Timed out — denied <tt>/work/other/db.rs</tt>$'
+assert_not_logged '^ward session approve --session sess_c 12'
+# The round ends with sess_c's own popup still open (its own stream never decided
+# it): the end-of-round sweep replaces THAT one (2002) as session-ended, never
+# sess_a's already-resolved one (1001, already gone by then — its pid file was
+# removed the moment it was replaced above).
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 2002 Session ended — denied <tt></tt>$'
+assert_not_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 1001 Session ended — denied$'
+
 # --- --watch: bounded workers — past the cap, a new approval gets no popup ---------
 : >"$MOCK_LOG"
 # shellcheck disable=SC2016

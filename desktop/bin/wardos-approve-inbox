@@ -58,18 +58,34 @@ ordered=$(
   printf '%s\n' "$rows" | awk -F'\t' '$2 != "pending"'
 )
 
+# Every menu line carries its own row's full fields ahead of the human-readable
+# text (id, state, session, project, agent, tool, destination, then the display
+# column) rather than just id: id alone is only unique within one session
+# (Approval::id is a per-session sequence number, #222 review), so two live
+# sessions can show the same numeric id in this same menu at once. Re-deriving
+# the chosen row with a second `awk '$1 == id'` lookup against $ordered would
+# then return both of them — state, session and the target session for the
+# opened terminal would no longer be a single, consistent record. Parsing the
+# exact line the person picked, instead of looking it up again by bare id, keeps
+# that record intact regardless of what else in $ordered shares its id.
 menu_lines=$(printf '%s\n' "$ordered" \
-  | awk -F'\t' '{ printf "%s\t%-15s %s · %s · %s · %s · %s\n", $1, $2, $3, $4, $5, $6, $7 }')
+  | awk -F'\t' '{ printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%-15s %s · %s · %s · %s · %s\n", \
+      $1, $2, $3, $4, $5, $6, $7, $2, $3, $4, $5, $6, $7 }')
 chosen=$(printf '%s\n' "$menu_lines" | wardos_menu "Approvals") || exit 0
-id=${chosen%%$'\t'*}
-row=$(printf '%s\n' "$ordered" | awk -F'\t' -v id="$id" '$1 == id')
-state=$(printf '%s\n' "$row" | cut -f2)
+id=$(printf '%s\n' "$chosen" | cut -f1)
+state=$(printf '%s\n' "$chosen" | cut -f2)
+session=$(printf '%s\n' "$chosen" | cut -f3)
+project=$(printf '%s\n' "$chosen" | cut -f4)
+agent=$(printf '%s\n' "$chosen" | cut -f5)
+tool=$(printf '%s\n' "$chosen" | cut -f6)
+destination=$(printf '%s\n' "$chosen" | cut -f7)
 
 if [[ $state == pending ]]; then
-  session=$(printf '%s\n' "$row" | cut -f3)
   # Pin the terminal wardos-approve opens to this exact session (WARDOS_SESSION,
   # mirroring wardos-pause's own pinned target): the approval may belong to a
-  # different session than $WARDOS_PROJECT's/the desktop's current selection.
+  # different session than $WARDOS_PROJECT's/the desktop's current selection, and
+  # is always this row's own session, never one recovered by a second, ambiguous
+  # lookup on id alone.
   WARDOS_SESSION=$session wardos_terminal_exec ward-approval wardos-approve "$id"
   exit 0
 fi
@@ -77,10 +93,6 @@ fi
 # Decided: nothing left to answer, so this is read-only — a second, informational
 # dmenu (any choice, or Escape, just closes it) rather than a terminal, since there
 # is nothing here that benefits from staying open.
-project=$(printf '%s\n' "$row" | cut -f4)
-agent=$(printf '%s\n' "$row" | cut -f5)
-tool=$(printf '%s\n' "$row" | cut -f6)
-destination=$(printf '%s\n' "$row" | cut -f7)
 info=$(printf 'State        %s\nProject      %s\nAgent        %s\nTool         %s\nDestination  %s' \
   "$state" "$project" "$agent" "$tool" "$destination")
 printf '%s\n' "$info" | wardos_menu "Approval $id · decided" >/dev/null || true

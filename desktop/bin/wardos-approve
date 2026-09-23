@@ -205,16 +205,38 @@ interactive() {
 # --- --watch: notification lifecycle (#146 items 2-3) --------------------------
 #
 # run_dir, set by follow_once for this round of live sessions, holds two files per
-# approval id still showing a notification: "<id>.pid" the pid of the notify-send
-# process showing it, and "<id>.out" that process's stdout — the notification's own
-# id, as soon as the server assigns one (`--print-id`), then the chosen action once
-# it closes. Both are removed the moment nothing more needs them, so "a *.pid file
-# exists for this id" is exactly "a notification for it is still showing"; that is
+# (session, approval id) pair still showing a notification: a pid file the pid of
+# the notify-send process showing it, and a matching .out file that process's
+# stdout — the notification's own id, as soon as the server assigns one
+# (`--print-id`), then the chosen action once it closes. Both are named from
+# notif_key(): Approval::id is only that *session's* sequence number, not a global
+# one, so two live sessions can legitimately hold a pending approval with the same
+# numeric id at once (#222 review) — keying files by id alone would let one
+# session's file overwrite the other's the moment both have a notification open.
+# Both files are removed the moment nothing more needs them, so "a *.pid file
+# exists for this key" is exactly "a notification for it is still showing"; that is
 # what bounds active_notifiers and what a resolve elsewhere below checks before it
 # acts, so it never touches a notification that already closed on its own. It also
-# holds one "session-<id>.resolver" marker per live session that has (or had) an
+# holds one "session-<key>.resolver" marker per live session that has (or had) an
 # open notification, holding that session's own resolver's pid.
 run_dir=""
+
+# A short, fixed-shape, filesystem-safe stand-in for an opaque session id
+# (ward_policy::SessionId is an untyped string — nothing here assumes it is
+# ASCII, alnum, or free of "/"), the same way wardos-launch keys a cache entry
+# off a hash of a path rather than a sanitised copy of the path itself.
+session_key() {
+  printf '%s' "$1" | sha256sum | cut -c1-16
+}
+
+# The composite identity a notification's files are named from: session_key is
+# always exactly 16 lowercase hex chars, so "__" can never appear inside it,
+# which makes it an unambiguous separator from id (always digits — Approval::id
+# is a plain sequence number) even though nothing here needs to split it back
+# apart again.
+notif_key() {
+  printf '%s__%s' "$(session_key "$1")" "$2"
+}
 
 active_notifiers() {
   # A glob that matches nothing expands to itself; -f screens that out.
@@ -226,20 +248,23 @@ active_notifiers() {
 # One notification, waited on; the action chosen is the answer, relayed to the
 # session it was asked from (never re-resolved), so it cannot land on a different
 # session even if the desktop's selection changes while it is open. Runs in the
-# background (from follow_once's notifier loop, which has already reserved id's
-# place against max_notifiers by creating its pid file before this starts) so a
-# second approval — from this session or another live one — is not queued behind
-# the first. notify-send absent is not an error: nothing is shown or tracked and
-# nothing is answered from here, but the approval is still open to
-# wardos-approve-inbox, `wardos-approve <id>` and `ward session approve` — the
-# reservation is released so it does not count against the bound forever.
+# background (from follow_once's notifier loop, which has already reserved (session,
+# id)'s place against max_notifiers by creating its pid file before this starts, and
+# hands its own already-computed key straight through here rather than making this
+# recompute it) so a second approval — from this session or another live one, even
+# one sharing the same numeric id — is not queued behind the first. notify-send
+# absent is not an error: nothing is shown or tracked and nothing is answered from
+# here, but the approval is still open to wardos-approve-inbox, `wardos-approve <id>`
+# and `ward session approve` — the reservation is released so it does not count
+# against the bound forever.
 notify_one() {
-  local id=$1 session=$2 agent=$3 project=$4 body=$5
+  local id=$1 session=$2 key=$3 agent=$4 project=$5 body=$6
+  local pid_file=$run_dir/$key.pid
   if ! command -v notify-send >/dev/null 2>&1; then
-    rm -f "$run_dir/$id.pid"
+    rm -f "$pid_file"
     return 0
   fi
-  local out=$run_dir/$id.out action decision ns_pid
+  local out=$run_dir/$key.out action decision ns_pid
   : >"$out"
   # Backgrounded directly, not inside a `{ ...; }` group: $! must be notify-send's
   # own pid, not a wrapper subshell's, so a resolve elsewhere's kill (below) reaches
@@ -249,9 +274,9 @@ notify_one() {
     -A allow="Allow once" -A session="Allow session" -A deny="Deny" \
     "${agent^} requests · ${project}" "$body" >"$out" 2>/dev/null &
   ns_pid=$!
-  printf '%s\n' "$ns_pid" >"$run_dir/$id.pid"
+  printf '%s\n' "$ns_pid" >"$pid_file"
   wait "$ns_pid" 2>/dev/null || true
-  rm -f "$run_dir/$id.pid"
+  rm -f "$pid_file"
   action=$(tail -n1 "$out" 2>/dev/null || true)
   rm -f "$out"
   [[ -n $action ]] || return 0
@@ -271,23 +296,26 @@ resolved_title() {
   esac
 }
 
-# id became terminal (state, one of ApprovalRecord::state_word's words) with
-# destination: if a notification for it is still showing (its pid file exists),
-# replace it in place with the outcome (`notify-send -r`, the standard-library
+# The shared tail of resolve_notification and sweep_run_dir: replace pid_file's
+# notification in place with the outcome (`notify-send -r`, the standard-library
 # `replaces_id`) so it stops offering an action nothing will honour any more, and
-# reap the worker that was waiting on it. A no-op when nothing is tracked for id
-# (no popup was ever shown for it, or its own action already resolved it — that
-# path removes the pid file itself, so there is nothing here to race).
-resolve_notification() {
-  local id=$1 state=$2 destination=$3
-  local pid_file=$run_dir/$id.pid out_file=$run_dir/$id.out
+# reap the worker that was waiting on it. Operates on the exact files it is
+# handed rather than reconstructing their names, so it never needs to know which
+# (session, id) they belong to. A no-op when nothing is tracked at pid_file (no
+# popup was ever shown, or its own action already resolved it — that path
+# removes the pid file itself, so there is nothing here to race).
+finish_notification() {
+  local pid_file=$1 out_file=$2 state=$3 destination=$4
   local notif_id pid i
-  # notifier_loop reserves id's pid file (empty, then the real pid once notify_one
-  # has backgrounded notify-send) as soon as it sees id pending; deciding it takes
-  # real time after that (a timeout, or a person acting), so in practice this
-  # loop never actually finds anything to wait for. The bounded retry is defence
-  # in depth against that ordering assumption, not reliance on it.
-  for ((i = 0; i < 20; i++)); do
+  # notifier_loop reserves the pid file (empty, then the real pid once notify_one
+  # has backgrounded notify-send) as soon as it sees the approval pending; deciding
+  # it takes real time after that (a timeout, or a person acting), so in practice
+  # this loop never actually finds anything to wait for. The bounded retry (up to
+  # 2s, matching wait_for_notifiers' own grace window below) is defence in depth
+  # against that ordering assumption — including a slow, contended host where
+  # notify_one's own fork/exec of notify-send is not yet scheduled — not reliance
+  # on it.
+  for ((i = 0; i < 100; i++)); do
     if [[ -f $pid_file ]]; then
       pid=$(cat "$pid_file" 2>/dev/null || true)
       [[ -n $pid ]] && break
@@ -304,6 +332,18 @@ resolve_notification() {
   kill "$pid" 2>/dev/null || true
 }
 
+# id, *in session*, became terminal (state, one of ApprovalRecord::state_word's
+# words) with destination: resolve that session's own notification for id, never
+# another live session's, even if it happens to have a pending approval with the
+# same numeric id right now (#222 review: Approval::id is only unique within one
+# session). notif_key(session, id) is exactly the file pair notify_one/notifier_loop
+# named for this (session, id), so this can never touch a different session's file.
+resolve_notification() {
+  local id=$1 session=$2 state=$3 destination=$4
+  local key; key=$(notif_key "$session" "$id")
+  finish_notification "$run_dir/$key.pid" "$run_dir/$key.out" "$state" "$destination"
+}
+
 # One live session's own decided feed: resolves any of its still-showing
 # notifications the moment they become terminal. Runs until this session's own
 # `ward session approvals --follow` stream ends (sealed, or the daemon is gone),
@@ -314,7 +354,7 @@ resolver_for_session() {
   while IFS=$'\t' read -r id state destination; do
     [[ -n $id ]] || continue
     [[ $state == pending ]] && continue
-    resolve_notification "$id" "$state" "$destination"
+    resolve_notification "$id" "$session" "$state" "$destination"
   done < <(ward session approvals --json --follow --session "$session" | jq --unbuffered -r "$approvals_fields")
 }
 
@@ -326,7 +366,8 @@ resolver_for_session() {
 # multiplexed pending stream itself).
 ensure_resolver() {
   local session=$1
-  local marker=$run_dir/session-$session.resolver
+  local marker
+  marker=$run_dir/session-$(session_key "$session").resolver
   [[ -f $marker ]] && return 0
   : >"$marker"
   resolver_for_session "$session" &
@@ -341,7 +382,7 @@ ensure_resolver() {
 # Bounded: past max_notifiers still showing, a new one is left to the inbox and the
 # interactive path rather than adding a worker that might wait forever.
 notifier_loop() {
-  local id session agent tool claim destination network method credential repository lifetime project body
+  local id session agent tool claim destination network method credential repository lifetime project body key
   while IFS=$'\t' read -r id session agent tool claim destination network method credential repository lifetime project; do
     [[ -n $id ]] || continue
     ensure_resolver "$session"
@@ -352,10 +393,16 @@ notifier_loop() {
     # Reserved here, synchronously, so the next iteration's active_notifiers count
     # is correct even before notify_one — started in the background right below,
     # racing this loop rather than following it — has itself gotten as far as
-    # deciding whether there is even a notify-send to show anything with.
-    : >"$run_dir/$id.pid"
+    # deciding whether there is even a notify-send to show anything with. Keyed by
+    # (session, id): a second live session with the same numeric id reserves its
+    # own file rather than colliding with this one's. Computed once here, not
+    # again inside notify_one's own background timeline, so a slow fork (hashing
+    # session) never delays how quickly notify_one gets its real pid on disk for
+    # a resolve elsewhere to find.
+    key=$(notif_key "$session" "$id")
+    : >"$run_dir/$key.pid"
     body=$(blocks 1 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime")
-    notify_one "$id" "$session" "$agent" "$project" "$body" &
+    notify_one "$id" "$session" "$key" "$agent" "$project" "$body" &
   done < <(ward session pending --json --all --follow | jq --unbuffered -r "$fields")
 }
 
@@ -397,11 +444,10 @@ wait_for_notifiers() {
 # into a resolve within the same window). Clear it anyway so nothing lingers into
 # the next round.
 sweep_run_dir() {
-  local pid_file id
+  local pid_file
   for pid_file in "$run_dir"/*.pid; do
     [[ -f $pid_file ]] || continue
-    id=$(basename "$pid_file" .pid)
-    resolve_notification "$id" "session-ended" ""
+    finish_notification "$pid_file" "${pid_file%.pid}.out" "session-ended" ""
   done
 }
 

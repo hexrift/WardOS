@@ -74,6 +74,40 @@ grep -q '^Project      payments-api$' "$TMP/info.txt" || fail "the summary names
 grep -q '^Destination  api.github.com$' "$TMP/info.txt" || fail "the summary names the destination: $(cat "$TMP/info.txt")"
 grep -q '^Tool         WebFetch$' "$TMP/info.txt" || fail "the summary names the tool: $(cat "$TMP/info.txt")"
 
+# --- two live sessions sharing the same numeric approval id (#222 review):
+# Approval::id is only that session's own sequence number, so both can legitimately
+# show id 12 in this same listing at once. Recovering the chosen row with a second
+# `awk '$1 == id'` lookup would return both of them; selecting either row must
+# still open wardos-approve 12 pinned to that row's own WARDOS_SESSION -------------
+: >"$MOCK_LOG"
+dup12_a='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"r","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":null},"requested_at_unix_ms":1},"outcome":null,"decided_at_unix_ms":null,"agent":"claude","session":"sess_a","project":"payments-api"}'
+dup12_c='{"approval":{"id":12,"tool":"Write","summary":"/work/other/db.rs","claim":"Write /work/other/db.rs","authority":{"rule":"r","destination":"/work/other/db.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":null},"requested_at_unix_ms":2},"outcome":null,"decided_at_unix_ms":null,"agent":"codex","session":"sess_c","project":"other-service"}'
+export DUP12_A=$dup12_a DUP12_C=$dup12_c
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session approvals --json --all") printf "%s\n%s\n" "$DUP12_A" "$DUP12_C" ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# The mock foot records the WARDOS_SESSION it was actually opened with, so a row
+# picked by session, not by the (here, shared) id, can be checked precisely.
+# shellcheck disable=SC2016
+mock foot 'printf "%s\n" "${WARDOS_SESSION:-}" >>"$TMP/opened_sessions"'
+: >"$TMP/opened_sessions"
+# Selecting by a substring unique to one row (its session), never by the shared
+# id "12" — a lookup keyed on bare id would match both of these lines.
+# shellcheck disable=SC2016
+mock wardos-menu-select 'grep -m1 -F -- "$WARDOS_MENU_CHOICE"'
+WARDOS_MENU_CHOICE=sess_a "$inbox"
+assert_logged '^foot --app-id ward-approval -e wardos-approve 12$'
+assert_eq "$(cat "$TMP/opened_sessions")" "sess_a"
+
+: >"$MOCK_LOG"
+: >"$TMP/opened_sessions"
+WARDOS_MENU_CHOICE=sess_c "$inbox"
+assert_logged '^foot --app-id ward-approval -e wardos-approve 12$'
+assert_eq "$(cat "$TMP/opened_sessions")" "sess_c"
+mock foot
+
 # --- a cancelled listing does nothing, quietly ------------------------------------
 : >"$MOCK_LOG"
 # shellcheck disable=SC2016
