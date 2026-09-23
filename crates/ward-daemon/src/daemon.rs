@@ -41,7 +41,6 @@ use ward_events::{EventRecord, LogReader, Origin, ShortText, WardEvent};
 use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
 use crate::error::{Error, Result};
-use crate::github;
 use crate::pause::{self, Frozen};
 use crate::session::{SessionMeta, protected_paths, session_dir};
 
@@ -84,32 +83,41 @@ pub fn serving(state: &Path, session: &str) -> bool {
     RemoteSink::connect(&socket_path(state, session)).is_some()
 }
 
-/// The newest session under `state` whose daemon answers: the desktop's
-/// session when it is asked from somewhere that is not a project (the bar,
-/// the approval listener). Sessions whose record cannot be read are skipped.
-pub fn newest_live(state: &Path) -> Result<Option<SessionMeta>> {
+/// Every session under `state` whose daemon answers, newest first: the pool a
+/// desktop-wide surface (the bar, the switcher, `wardos-approve --watch`
+/// multiplexing every live session's approvals, #141) draws from when it is
+/// not asking about one particular project. Sessions whose record cannot be
+/// read are skipped. Ties (equal `started_unix_ms`) keep directory-listing
+/// order rather than being resorted, so which one counts "newest" among them
+/// is at least stable within one process.
+pub fn live_sessions(state: &Path) -> Result<Vec<SessionMeta>> {
     let sessions = state.join("sessions");
     let entries = match std::fs::read_dir(&sessions) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(Error::io(&sessions, e)),
     };
-    let mut newest: Option<SessionMeta> = None;
+    let mut live = Vec::new();
     for entry in entries.flatten() {
         let id = entry.file_name().to_string_lossy().into_owned();
         let Ok(meta) = SessionMeta::load(state, &id) else {
             continue;
         };
-        if newest
-            .as_ref()
-            .is_some_and(|n| n.started_unix_ms >= meta.started_unix_ms)
-            || !serving(state, &id)
-        {
-            continue;
+        if serving(state, &id) {
+            live.push(meta);
         }
-        newest = Some(meta);
     }
-    Ok(newest)
+    live.sort_by(|a, b| b.started_unix_ms.cmp(&a.started_unix_ms));
+    Ok(live)
+}
+
+/// The newest session under `state` whose daemon answers: the desktop's
+/// session when it is asked from somewhere that is not a project (the bar,
+/// the approval listener), before #141's shared selection narrowed most of
+/// those callers to [`live_sessions`] instead. Sessions whose record cannot be
+/// read are skipped.
+pub fn newest_live(state: &Path) -> Result<Option<SessionMeta>> {
+    Ok(live_sessions(state)?.into_iter().next())
 }
 
 /// Serve `session`'s log on its control socket until a request seals it.
@@ -128,10 +136,13 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
         .map_err(|e| Error::Daemon(format!("describe {session}: {e}")))?;
     // What an approval's authority is derived from: the manifest, the
     // repository a `current_repository` credential scope means, and the paths
-    // TamperWard protects, all fixed at the session's start.
+    // TamperWard protects, all fixed at the session's start. The repository
+    // is `meta.origin_repo`, resolved once when the session started and never
+    // re-read from the live worktree (issue #196) — see
+    // `github::resolve_origin_repo`.
     let deriver = Deriver::new(
         meta.manifest.clone(),
-        github::origin_repo(&meta.project),
+        meta.origin_repo.clone(),
         protected_paths(state, &meta.entry_snapshot),
     );
 
@@ -2087,6 +2098,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: "proj_unit".to_owned(),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest: merge(
                 &Policy::default(),
                 &Policy::default(),
@@ -2225,6 +2237,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: "proj_unit".to_owned(),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest,
             started_unix_ms: control::unix_ms(SystemTime::now()),
             agent: None,
@@ -2453,6 +2466,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: "proj_disconnect".to_owned(),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest,
             started_unix_ms: control::unix_ms(SystemTime::now()),
             agent: None,

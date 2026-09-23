@@ -195,7 +195,9 @@ Approval {
 ```
 
 `Deriver` (`approvals.rs`) is built once per daemon from the session's manifest, the
-worktree's GitHub remote and the entry snapshot's protected paths; `network` is
+GitHub remote resolved once from the worktree at session start and persisted in
+`SessionMeta::origin_repo` (not re-read from the live worktree at any later point —
+issue #196) and the entry snapshot's protected paths; `network` is
 `ward_proxy::Policy::check_host` on the destination, exactly what the proxy will do,
 and `credential` is read from the `CredentialGranted` records the daemon itself
 appends (a `--grant github` launch), else from the manifest's rule. A denied write
