@@ -25,7 +25,9 @@ mod replay;
 mod tui;
 mod vault;
 use ward_daemon::approvals::ApprovalDecision;
-use ward_daemon::{Session, SessionMeta, SnapshotRole, client, daemon, render, selftest, snapshot};
+use ward_daemon::{
+    Session, SessionMeta, SnapshotRole, client, daemon, render, selftest, snapshot, usage,
+};
 use ward_events::{EndReason, LogReader};
 
 #[derive(Parser)]
@@ -387,6 +389,15 @@ enum SnapshotCmd {
         /// Worktree-relative path.
         path: PathBuf,
     },
+    /// Storage usage by category (shared blobs, manifests, snapshot metadata,
+    /// session logs), plus any leftover scratch under the OS temp dir and
+    /// whether it looks abandoned (#151). Read-only: reports only, never
+    /// deletes anything.
+    Usage {
+        /// Emit `{blobs, manifests, meta, session_logs, scratch}` as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The roles a snapshot may be created with from the command line.
@@ -491,6 +502,7 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         }
         Command::Snapshot(SnapshotCmd::Diff { a, b, json }) => cmd_snapshot_diff(&a, &b, json),
         Command::Snapshot(SnapshotCmd::Cat { id, path }) => cmd_snapshot_cat(&id, &path),
+        Command::Snapshot(SnapshotCmd::Usage { json }) => cmd_snapshot_usage(json),
         Command::Evidence(EvidenceCmd::Append { dir, json }) => {
             cmd_evidence_append(&dir.unwrap_or_else(cwd), &json)
         }
@@ -888,6 +900,37 @@ fn cmd_snapshot_cat(id: &str, path: &Path) -> ward_daemon::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `ward snapshot usage [--json]`: storage usage by category plus leftover
+/// scratch (#151). Read-only from the caller's point of view, as `--json`'s
+/// own field names say: `total_bytes` and `scratch`, flattened alongside the
+/// four [`usage::StorageUsage`] categories.
+fn cmd_snapshot_usage(json: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let report = usage::compute(&state)?;
+    let scratch = usage::scan_scratch(&state)?;
+    if json {
+        #[derive(serde::Serialize)]
+        struct UsageJson<'a> {
+            #[serde(flatten)]
+            usage: &'a usage::StorageUsage,
+            total_bytes: u64,
+            scratch: &'a [usage::ScratchEntry],
+        }
+        let total_bytes = report.total_bytes();
+        println!(
+            "{}",
+            to_json(&UsageJson {
+                usage: &report,
+                total_bytes,
+                scratch: &scratch,
+            })?
+        );
+    } else {
+        print!("{}", render::usage_panel(&state, &report, &scratch));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn to_json<T: serde::Serialize>(value: &T) -> ward_daemon::Result<String> {
     serde_json::to_string_pretty(value).map_err(|e| ward_daemon::Error::Project(e.to_string()))
 }
@@ -1221,8 +1264,8 @@ fn cwd() -> PathBuf {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
-        Cli, Command, SessionCmd, WatchMode, desktop_command, observer_degraded_warning,
-        on_path_in, pending_text, verb_program,
+        Cli, Command, SessionCmd, SnapshotCmd, WatchMode, desktop_command,
+        observer_degraded_warning, on_path_in, pending_text, verb_program,
     };
     use clap::Parser as _;
     use std::time::Duration;
@@ -1353,6 +1396,20 @@ mod tests {
         };
         assert_eq!(decided.state_word(), "timed-out");
         assert!(decided.line().contains("timed-out"), "{}", decided.line());
+    }
+
+    #[test]
+    fn snapshot_usage_parses_with_and_without_json() {
+        let cli = Cli::try_parse_from(["ward", "snapshot", "usage"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Usage { json: false })
+        ));
+        let cli = Cli::try_parse_from(["ward", "snapshot", "usage", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Usage { json: true })
+        ));
     }
 
     #[test]

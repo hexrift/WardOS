@@ -34,6 +34,7 @@ All available over the TamperWard-only Unix socket `/run/ward/tamperward.sock`
 | `ward snapshot attest <id>` | Statement signed by `wardd` (Phase 7: TPM key) that `<id>` exists in the CAS with the recorded manifest hash | `Attestation` |
 | `ward snapshot diff <a> <b>` | Manifest-level diff computed from the CAS, not from the worktree | `ManifestDiff` |
 | `ward snapshot cat <id> <path>` | Pristine bytes for a path | bytes |
+| `ward snapshot usage` | Storage usage by category (shared blobs, manifests, meta, session logs), plus leftover scratch and whether it looks abandoned; read-only, see §5 | `StorageUsage` + scratch entries |
 | `ward verifier spawn <manifest>` | Spawn a Zone 2 verifier with the given pristine/candidate IDs, verifier image digest, trusted test bundle (supplied by TamperWard, hashed into evidence), network policy (default none), budget | `VerificationId` |
 | `ward verifier submit <verification-id>` / stream | Result and progress records | `VerifyResult` |
 | `ward evidence append <record>` | Append a `PolicyDecision` / `TamperDetected` / `StateAccepted` record with `origin=TamperWard` | `seq` |
@@ -46,8 +47,10 @@ above; image digests are the manifest's placeholders until 0.1 pins images),
 `ward snapshot create [DIR] --role candidate|final` (recorded in the session log as
 `SnapshotCreated`), `ward snapshot diff <a> <b> [--json]` and `ward snapshot cat <id> <path>`
 exist today and answer from the session CAS, never from the worktree. Ids are given in full
-(`blake3:<hex>` or bare hex); the store has no prefix lookup. The socket form, `attest`, the
-verifier and evidence primitives, and `capability check` are still to come.
+(`blake3:<hex>` or bare hex); the store has no prefix lookup. `ward snapshot usage [--json]`
+(§9) answers from `$WARD_STATE_DIR` as a whole — the CAS plus session logs and scratch — since
+storage accounting is inherently a whole-store question, not a per-snapshot one. The socket
+form, `attest`, the verifier and evidence primitives, and `capability check` are still to come.
 
 ## 3. What TamperWard obtains that it could not before
 
@@ -226,3 +229,25 @@ What uses it:
   inside the session judges the same tree from inside; agreement between the two is
   the acceptance ("`ward verify` and `tamperward verify` agree on what is protected"),
   and where they differ the Zone 2 result is the one in evidence.
+
+## 9. Storage usage and scratch (issue #151)
+
+`ward snapshot usage` answers two read-only questions about `$WARD_STATE_DIR`: how big is it,
+broken down by category (`blobs` — deduplicated content, shared across every snapshot that
+references it; `manifests`; `meta`; `session logs`); and which leftover `ward-*` scratch
+directories under the OS temp dir (egress/hook sockets, a verifier's materialised candidate)
+belong to an operation that has definitely finished, versus one that might still be running.
+
+Scratch liveness is never inferred from a process id or a filesystem timestamp: each scratch
+directory records its owning session id in a marker file when it is created
+(`ward_daemon::session::OWNER_MARKER`), and a usage scan classifies it from recorded state
+only — a daemon currently answering for that session (`Active`), that session's event log
+already sealed (`Orphaned` — the one `ward` invocation that created the scratch has certainly
+finished, so anything left behind was never cleaned up, most likely because that process was
+interrupted), or neither (`Unknown` — honestly unestablished, e.g. a still-running foreground
+command with no daemon behind it; never treated as reclaimable).
+
+This is a read-only report. It never deletes anything. Actual reclamation — mark-and-sweep
+garbage collection with leases for concurrent capture/verification, a dry-run deletion plan,
+explicit retention roots, a low-space preflight, and `doctor`/`status` wiring — is the rest of
+issue #151 and is deliberately left to a follow-up change.

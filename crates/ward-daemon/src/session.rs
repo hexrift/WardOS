@@ -1497,11 +1497,25 @@ pub fn run_dir_path(session_id: &str) -> PathBuf {
 /// CWE-377). `mkdir` fails on an existing symlink without following it, so on
 /// `AlreadyExists` we `lstat` the node ourselves and refuse to reuse anything
 /// that isn't a real, non-symlink directory we own at exactly mode 0700.
+/// Name of the marker [`run_dir`] writes recording which session owns it: the
+/// "recorded operation ownership" a storage-usage scan
+/// ([`crate::usage::scan_scratch`]) reads to tell a leftover run dir's owning
+/// session apart, so it can classify abandoned scratch without inferring
+/// liveness from a PID or an mtime (#151, issue's own explicit constraint).
+/// Never trusted for anything security-relevant — `run_dir`'s own reuse check
+/// above is what actually gates a symlink or foreign-owned directory; this is
+/// purely an accounting breadcrumb, always written last, after that check
+/// passes.
+pub(crate) const OWNER_MARKER: &str = ".ward-owner";
+
 fn run_dir(session_id: &str) -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let dir = run_dir_path(session_id);
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-        Ok(()) => Ok(dir),
+        Ok(()) => {
+            write_owner_marker(&dir, session_id)?;
+            Ok(dir)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let meta = std::fs::symlink_metadata(&dir).map_err(|e| Error::io(&dir, e))?;
             let owned_private_dir = !meta.is_symlink()
@@ -1509,6 +1523,7 @@ fn run_dir(session_id: &str) -> Result<PathBuf> {
                 && meta.uid() == nix::unistd::getuid().as_raw()
                 && meta.permissions().mode() & 0o777 == 0o700;
             if owned_private_dir {
+                write_owner_marker(&dir, session_id)?;
                 Ok(dir)
             } else {
                 Err(Error::io(
@@ -1521,6 +1536,18 @@ fn run_dir(session_id: &str) -> Result<PathBuf> {
         }
         Err(e) => Err(Error::io(&dir, e)),
     }
+}
+
+/// Record `session_id` as the owner of `dir` (see [`OWNER_MARKER`]). Best-effort
+/// in the sense that any write failure is a real error for the caller — a run
+/// dir a usage scan cannot attribute is left as `Unknown`, never reported as
+/// reclaimable, so a marker write that somehow failed silently would only ever
+/// make accounting more conservative, not less — but there is no legitimate way
+/// for this write to fail against a directory we just created or verified we
+/// own, so it is propagated rather than swallowed.
+fn write_owner_marker(dir: &Path, session_id: &str) -> Result<()> {
+    let path = dir.join(OWNER_MARKER);
+    std::fs::write(&path, session_id).map_err(|e| Error::io(&path, e))
 }
 
 /// `<state>/sessions/<id>`: where a session keeps its log, metadata and control
@@ -1767,6 +1794,26 @@ mod tests {
         let second = run_dir(id).unwrap();
         assert_eq!(first, second);
         std::fs::remove_dir_all(&first).unwrap();
+    }
+
+    /// #151: a storage-usage scan tells a leftover run dir's owning session
+    /// apart by this marker, not by parsing the truncated tail in its path or
+    /// by any PID/mtime heuristic — so the marker must actually carry the full
+    /// session id, on both a fresh directory and a reused one.
+    #[test]
+    fn run_dir_records_the_full_session_id_as_owner() {
+        let id = "run_dir_test_owner_marker_sess";
+        let dir = run_dir_path(id);
+        let _ = std::fs::remove_dir_all(&dir);
+        let created = run_dir(id).unwrap();
+        let owner = std::fs::read_to_string(created.join(OWNER_MARKER)).unwrap();
+        assert_eq!(owner, id);
+        // Reusing the same dir (a second call within the same session) refreshes
+        // the same marker rather than leaving it stale or duplicating it.
+        run_dir(id).unwrap();
+        let owner_again = std::fs::read_to_string(created.join(OWNER_MARKER)).unwrap();
+        assert_eq!(owner_again, id);
+        std::fs::remove_dir_all(&created).unwrap();
     }
 
     /// #155: a co-resident local user who wins the race between this session's
