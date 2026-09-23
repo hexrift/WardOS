@@ -87,11 +87,15 @@
 //!
 //! [`GcOptions::grace_period`] bounds the window instead of closing it: [`plan`] only ever
 //! plans an object for deletion once it has gone unreferenced/untouched for at least this
-//! long, judged from the object's own filesystem mtime (every object this crate writes —
-//! a blob, a manifest, a meta record — is content-addressed and immutable, written exactly
-//! once, so its mtime already *is* "when this object was born", with no separate tracking
-//! needed). A freshly-captured object is by construction younger than any reasonable grace
-//! period, which is what makes the same mechanism also cover the much narrower gap
+//! long, judged from the object's own filesystem mtime. Content addressing means a
+//! capture can produce an object that already exists, so "born" is not "last produced":
+//! `Cas::put_manifest` refreshes an existing manifest's mtime when a capture lands on it
+//! again, and a manifest held by the grace period holds every blob it references (its
+//! unchanged files are old blobs shared with earlier snapshots, which by their own mtime
+//! alone would look reclaimable). A meta record is rewritten on every capture. So a
+//! freshly-captured snapshot — manifest, meta and content — is by construction younger
+//! than any reasonable grace period, which is what makes the same mechanism also cover the
+//! much narrower gap
 //! `SnapshotStore::capture_with`'s own doc comment already calls out (its lease is released
 //! before the *caller* durably records the resulting id as a root — a handful of syscalls,
 //! not an external process, but the same shape of gap). A candidate born right before a
@@ -649,6 +653,16 @@ pub fn plan(
             continue;
         }
         if !is_old_enough(modified, now, options.grace_period) {
+            // Held by the grace period, so its blobs are held with it: a young
+            // snapshot's unchanged files are old blobs it shares with earlier
+            // snapshots, and reclaiming those would leave it unmaterializable.
+            // Resolved like a root — a failure aborts the plan rather than
+            // under-marking.
+            for entry in load_root_manifest(cas_root, id)?.entries() {
+                if let Some(d) = entry.content {
+                    live_blobs.insert(d);
+                }
+            }
             out.held_by_grace_period += 1;
             continue;
         }
@@ -1097,6 +1111,77 @@ mod tests {
         assert_eq!(after_grace.objects.len(), 1);
         let report = apply(&root, &after_grace, later).unwrap();
         assert_eq!(report.deleted.len(), 1);
+    }
+
+    /// Back-date `path`'s mtime by `age`, so a test can build an old object next to a
+    /// young one without sleeping.
+    fn age_by(path: &Path, age: Duration) {
+        let then = SystemTime::now() - age;
+        fs::File::open(path).unwrap().set_modified(then).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_held_by_the_grace_period_keeps_its_old_blobs() {
+        // A young, unrooted snapshot (a verification candidate just after its attempt
+        // marker is removed) whose file content is an old blob it shares with an
+        // earlier snapshot that is no longer rooted: holding the manifest without its
+        // blob would leave the candidate unmaterializable.
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, root) = cas_at(dir.path());
+        let options = GcOptions {
+            grace_period: Duration::from_secs(30 * 60),
+        };
+        let shared = cas.put_blob(b"unchanged since long ago").unwrap();
+        age_by(
+            &root
+                .join("blobs")
+                .join(&shared.to_hex()[..2])
+                .join(shared.to_hex()),
+            options.grace_period * 2,
+        );
+        let manifest = Manifest::from_entries(vec![Entry {
+            path: b"lib.rs".to_vec(),
+            kind: EntryType::File,
+            mode: 0o644,
+            size: 24,
+            content: Some(shared),
+        }])
+        .unwrap();
+        cas.put_manifest(&manifest).unwrap();
+
+        let planned = plan(&root, &RootSet::new(), SystemTime::now(), &options).unwrap();
+        assert!(
+            planned.is_empty(),
+            "a grace-held manifest's blobs must not be planned: {planned:?}"
+        );
+        assert_eq!(planned.held_by_grace_period, 1, "the manifest itself");
+        assert!(cas.has_blob(shared));
+    }
+
+    #[test]
+    fn a_capture_that_deduplicates_onto_an_old_manifest_restarts_its_grace_period() {
+        // `ward up` on an unchanged tree, long after an earlier session sealed: the
+        // entry snapshot's manifest already exists and is old. Storing it again must
+        // restart its grace period, or it is reclaimable before the new session
+        // records it as a root.
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, root) = cas_at(dir.path());
+        let options = GcOptions {
+            grace_period: Duration::from_secs(30 * 60),
+        };
+        let manifest = Manifest::from_entries(Vec::new()).unwrap();
+        let id = cas.put_manifest(&manifest).unwrap();
+        age_by(
+            &root.join("manifests").join(id.digest().to_hex()),
+            options.grace_period * 2,
+        );
+        let stale = plan(&root, &RootSet::new(), SystemTime::now(), &options).unwrap();
+        assert_eq!(stale.objects.len(), 1, "old and unrooted: {stale:?}");
+
+        assert_eq!(cas.put_manifest(&manifest).unwrap(), id);
+        let fresh = plan(&root, &RootSet::new(), SystemTime::now(), &options).unwrap();
+        assert!(fresh.is_empty(), "stored again just now: {fresh:?}");
+        assert_eq!(fresh.held_by_grace_period, 1);
     }
 
     #[test]

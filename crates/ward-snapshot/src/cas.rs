@@ -123,11 +123,19 @@ impl Cas {
         self.root.join("manifests").join(id.digest().to_hex())
     }
 
-    /// Store a manifest, returning its id.
+    /// Store a manifest, returning its id. A manifest already present is not
+    /// rewritten, but its mtime is refreshed: `gc::plan`'s grace period is judged
+    /// from a manifest's mtime, so a capture that deduplicates onto an old manifest
+    /// must restart that clock, or the snapshot it just produced would be
+    /// reclaimable before its caller records a root for it.
     pub fn put_manifest(&self, m: &Manifest) -> Result<SnapshotId> {
         let id = m.id();
         let path = self.manifest_path(id);
-        if !path.exists() {
+        if path.exists() {
+            fs::File::open(&path)
+                .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                .map_err(|e| SnapshotError::io(&path, e))?;
+        } else {
             write_atomic(&path, &m.serialize())?;
         }
         Ok(id)
