@@ -1546,10 +1546,26 @@ fn cmd_pause(
         let mut failed = false;
         for result in &results {
             match &result.outcome {
-                Ok(record) => match render::observer_row(record) {
-                    Some(row) => println!("  {} · {row}", result.session),
-                    None => println!("  {} · paused", result.session),
-                },
+                Ok(outcome) => {
+                    match render::observer_row(&outcome.record) {
+                        Some(row) => println!("  {} · {row}", result.session),
+                        None => println!("  {} · paused", result.session),
+                    }
+                    // #145 items 3-4: `--all` reports each session's own
+                    // pause independently, so an unsettled freeze on one
+                    // session must not read as a clean success for that
+                    // session just because its line printed alongside others
+                    // that did settle.
+                    if let Some(pending) = outcome.unsettled {
+                        println!(
+                            "    paused, but {pending} process{} had not confirmed stopped \
+                             within {}s — the marker is held and approvals stay frozen \
+                             regardless",
+                            if pending == 1 { "" } else { "es" },
+                            ward_daemon::pause::FREEZE_SETTLE.as_secs(),
+                        );
+                    }
+                }
                 Err(e) => {
                     failed = true;
                     println!("  {} · not paused: {e}", result.session);
@@ -1563,9 +1579,21 @@ fn cmd_pause(
         });
     }
     let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
-    let record = client::pause(&mut sink, reason.unwrap_or_default())?;
-    if let Some(row) = render::observer_row(&record) {
+    let outcome = client::pause(&mut sink, reason.unwrap_or_default())?;
+    if let Some(row) = render::observer_row(&outcome.record) {
         println!("{row}");
+    }
+    // #145 items 3-4: never let an unconfirmed freeze read as the same clean
+    // success as a confirmed one. The marker and held approvals stand either way
+    // (the safest achievable state) — what's uncertain is only whether every
+    // sandboxed process has actually stopped yet.
+    if let Some(pending) = outcome.unsettled {
+        println!(
+            "  paused, but {pending} process{} had not confirmed stopped within {}s \
+             — the marker is held and approvals stay frozen regardless",
+            if pending == 1 { "" } else { "es" },
+            ward_daemon::pause::FREEZE_SETTLE.as_secs(),
+        );
     }
     println!(
         "  `ward resume` continues; `ward stop` keeps the workspace; `ward stop --restore-entry` restores the entry state"

@@ -37,8 +37,11 @@ use crate::session::{run_dir_path, session_dir};
 pub const MARKER: &str = "paused";
 /// Where cgroup v2 is mounted.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
-/// How long a cgroup freeze is given to settle before it is trusted.
-const FREEZE_SETTLE: Duration = Duration::from_secs(1);
+/// How long a freeze is given to settle before it is trusted (or, for the signal path,
+/// before `Served::pause` records it as unconfirmed rather than waiting longer — #145
+/// items 3-4). Public so a caller reporting an unsettled pause (the CLI, `ward-cli`'s
+/// `cmd_pause`) can name the actual bound instead of a copy of this number.
+pub const FREEZE_SETTLE: Duration = Duration::from_secs(1);
 
 /// The marker the session's proxies watch: present while paused.
 #[must_use]
@@ -100,6 +103,52 @@ pub fn wait_settled(frozen: &Frozen) -> bool {
     crate::daemon::wait_until(FREEZE_SETTLE, || {
         frozen.pids.iter().all(|&pid| stopped_or_gone(proc, pid))
     })
+}
+
+/// Whether a freeze settled within [`FREEZE_SETTLE`], and how many pids had not when
+/// the bound expired: `None` once every pid is confirmed stopped or gone (always true
+/// for [`PauseMethod::CgroupFreezer`], which is synchronous by construction, and also
+/// true whenever the immediate recount below finds nothing pending — see below);
+/// `Some(n)` (`n` always nonzero) otherwise, checked once, immediately, with no further
+/// waiting — [`wait_settled`] already spent the bound.
+///
+/// This is what [`crate::daemon::Served::pause_with`] (ADR-0019 §3, #145 items 3-4, PR
+/// #207 review finding 3) calls to decide whether the pause it is about to record can
+/// be shown as confirmed, and, if not, how many processes a `SessionPauseUnsettled`
+/// record should name.
+///
+/// `wait_settled` timing out is not itself proof anything is still pending: it can
+/// return `false` and, by the time this function's own recount runs a moment later,
+/// every pid has since actually stopped (a genuine race between the bound expiring and
+/// the last `SIGSTOP` landing, not a bug in either function). A recount of zero is
+/// therefore normalized to settled (`None`), never `Some(0)` — `Some(0)` would be
+/// self-contradictory: an outcome the daemon reports as "unsettled" but that names no
+/// process actually pending.
+#[must_use]
+pub fn settle_outcome(frozen: &Frozen) -> Option<u32> {
+    let proc = Path::new("/proc");
+    settle_outcome_with(frozen, wait_settled(frozen), |pid| {
+        stopped_or_gone(proc, pid)
+    })
+}
+
+/// [`settle_outcome`] with both of its real dependencies — whether the bound-limited
+/// wait itself settled, and the per-pid proc-state check it would recount against —
+/// taken as parameters instead of read from `/proc` and the real clock. The seam a test
+/// uses to exercise the `Some(0)`-normalization edge and a genuine nonzero pending
+/// count deterministically: `SIGSTOP` cannot be resisted by a real process for a test
+/// to race against, and the recount itself must not depend on a real, unbounded wait.
+fn settle_outcome_with(
+    frozen: &Frozen,
+    settled: bool,
+    stopped: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    if settled {
+        return None;
+    }
+    let pending =
+        u32::try_from(frozen.pids.iter().filter(|&&pid| !stopped(pid)).count()).unwrap_or(u32::MAX);
+    if pending == 0 { None } else { Some(pending) }
 }
 
 /// Whether `pid` is stopped (`SIGSTOP` took hold) or no longer exists.
@@ -641,6 +690,84 @@ mod tests {
             pids: vec![],
             cgroup: None,
         }));
+    }
+
+    /// #145 items 3-4: `settle_outcome` mirrors `wait_settled` when a freeze
+    /// settles, is always `None` for the cgroup freezer (synchronous by
+    /// construction, even with a pid a real freeze could never actually hold —
+    /// [`freeze_cgroup`]'s own wait is what makes this true, not a re-check
+    /// against `/proc`), and, on the signal path, counts exactly the pids still
+    /// not stopped or gone once the bound has expired.
+    #[test]
+    fn settle_outcome_counts_only_what_is_still_not_stopped_after_the_bound() {
+        assert_eq!(
+            settle_outcome(&Frozen {
+                method: PauseMethod::CgroupFreezer,
+                pids: vec![999_999],
+                cgroup: Some(PathBuf::from("/does/not/matter")),
+            }),
+            None
+        );
+        assert_eq!(
+            settle_outcome(&Frozen {
+                method: PauseMethod::Sigstop,
+                pids: vec![],
+                cgroup: None,
+            }),
+            None,
+            "nothing to wait for"
+        );
+        // A pid that never existed reads as `stopped_or_gone` (its tree ended by
+        // itself), so a `Frozen` naming only such pids settles even though nothing
+        // was ever really frozen — `wait_settled`'s existing, intentional behaviour
+        // (`freeze`'s own doc comment: "a pid gone since the scan is not a
+        // failure"); `settle_outcome` must not report it as pending.
+        assert_eq!(
+            settle_outcome(&Frozen {
+                method: PauseMethod::Sigstop,
+                pids: vec![999_999, 999_998],
+                cgroup: None,
+            }),
+            None
+        );
+    }
+
+    /// PR #207 review finding 3: `wait_settled` timing out is not itself proof
+    /// anything is still pending — it can return `false` and, by the time the
+    /// immediate recount runs a moment later, every pid has since actually
+    /// stopped. `settle_outcome_with` must normalize that recount-of-zero to
+    /// `None` (settled), never the self-contradictory `Some(0)` ("unsettled: 0
+    /// pending"). Deterministic: `settled` and `stopped` are both injected, no
+    /// real sleep and no real process.
+    #[test]
+    fn a_timeout_whose_immediate_recount_finds_nothing_pending_normalizes_to_settled() {
+        let frozen = Frozen {
+            method: PauseMethod::Sigstop,
+            pids: vec![111, 222, 333],
+            cgroup: None,
+        };
+        assert_eq!(
+            settle_outcome_with(&frozen, false, |_pid| true),
+            None,
+            "wait_settled timed out, but every pid reads as stopped on the recount: \
+             settled, not `Some(0)`"
+        );
+    }
+
+    /// The companion case finding 3 asks for: a timeout whose recount finds a real,
+    /// nonzero number still pending reports that count, unchanged, deterministically.
+    #[test]
+    fn a_timeout_with_a_genuinely_nonzero_recount_reports_it() {
+        let frozen = Frozen {
+            method: PauseMethod::Sigstop,
+            pids: vec![111, 222, 333, 444],
+            cgroup: None,
+        };
+        assert_eq!(
+            settle_outcome_with(&frozen, false, |pid| pid == 111 || pid == 444),
+            Some(2),
+            "222 and 333 read as still not stopped"
+        );
     }
 
     /// A session the user has already paused is already frozen; the capture

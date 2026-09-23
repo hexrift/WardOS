@@ -12,9 +12,9 @@ use ward_events::chain::{Chain, Timestamp, verify};
 use ward_events::event::{
     Acceptor, AgentIdentity, AgentKind, AgentState, CapabilityKind, CapabilityRequest, CaptureMode,
     ClaimKind, CredentialDelivery, Decision, DecisionSource, DeniedDst, DenyReason, EndReason,
-    EventKind, ExitStatus, FileChangeKind, GrantScope, ObserverSource, PauseMethod, PolicySubject,
-    ProcessRef, RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus, TamperWardSig,
-    VerifyRequester, VerifySummary, WardEvent,
+    EventKind, EventKindSet, ExitStatus, FileChangeKind, GrantScope, ObserverSource, PauseMethod,
+    PolicySubject, ProcessRef, RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus,
+    TamperWardSig, VerifyRequester, VerifySummary, WardEvent,
 };
 use ward_events::ids::{
     Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
@@ -221,7 +221,7 @@ proptest! {
     }
 
     #[test]
-    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u64..(1 << 27), notes in any::<bool>()) {
+    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u64..(1u64 << EventKind::ALL.len()), notes in any::<bool>()) {
         let sub = Subscribe {
             session: SessionId::from_u128(session),
             from_seq,
@@ -641,6 +641,14 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Wardd,
+            WardEvent::SessionPauseUnsettled {
+                method: PauseMethod::Sigstop,
+                reason: text("ward pause"),
+                pending: 2,
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -733,8 +741,10 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
     // `VerificationErrored` (#139), plus `CapabilityDecided` appearing twice in the
     // fixture above (once granted, once denied), plus the observer's own "this
     // record is incomplete" markers — one per source, the hook broker included
-    // (#137).
-    assert_eq!(quiet, 15);
+    // (#137) — plus `SessionPauseUnsettled` (#145 items 3-4): a pause the daemon
+    // could not confirm settled must be just as visible in Quiet mode as the pause
+    // itself.
+    assert_eq!(quiet, 16);
 }
 
 #[test]
@@ -753,4 +763,48 @@ fn credential_granted_has_no_secret_bearing_field() {
             "{rendered}"
         );
     }
+}
+
+/// `subscribe_roundtrips` above now draws `kinds` from the full width of the
+/// (post-#202, post-#207) catalogue, but proptest's random sampling is not
+/// guaranteed to ever land on the two newest, highest bits -- `ObservationsDropped`
+/// (32) and `SessionPauseUnsettled` (33). This deterministic regression exercises
+/// them directly: a `Subscribe` frame whose `Filter.kinds` sets exactly those two
+/// bits (and nothing else) must encode and decode byte-for-byte, proving the wire
+/// path handles the high end of the now-widened `u64` mask, not just the low bits
+/// every long-declared kind already covered.
+#[test]
+fn subscribe_filter_round_trips_the_two_highest_catalogue_bits() {
+    let kinds =
+        EventKindSet::only(EventKind::ObservationsDropped).with(EventKind::SessionPauseUnsettled);
+    let sub = Subscribe {
+        session: SessionId::from_u128(0x5eed),
+        from_seq: 0,
+        filter: Filter {
+            origins: ward_events::origin::OriginSet::ALL,
+            kinds,
+            exclude_agent_notes: false,
+        },
+    };
+    let bytes = encode_subscribe(&sub).unwrap();
+    let (back, n) = decode_subscribe(&bytes).unwrap();
+    assert_eq!(n, bytes.len());
+    assert_eq!(back, sub);
+    assert!(back.filter.kinds.contains(EventKind::ObservationsDropped));
+    assert!(back.filter.kinds.contains(EventKind::SessionPauseUnsettled));
+}
+
+/// Per #145 item 4, `SessionPauseUnsettled` must be exactly as visible in the
+/// Quiet observer mode as `SessionPaused` itself -- a reader that only sees Quiet
+/// must never be able to tell a pause happened without also being told, just as
+/// loudly, that it was never confirmed. Checked directly against `Filter::quiet()`
+/// rather than only implied by the fixture-count assertion above.
+#[test]
+fn session_pause_unsettled_is_quiet_visible() {
+    assert!(
+        Filter::quiet()
+            .kinds
+            .contains(EventKind::SessionPauseUnsettled)
+    );
+    assert!(Filter::quiet().kinds.contains(EventKind::SessionPaused));
 }

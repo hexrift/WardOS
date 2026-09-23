@@ -469,6 +469,7 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
             format!("snapshot {}", short_hex(&snapshot.to_string())),
         ),
         WardEvent::SessionPaused { .. }
+        | WardEvent::SessionPauseUnsettled { .. }
         | WardEvent::SessionResumed { .. }
         | WardEvent::EntryRestored { .. }
         | WardEvent::ObservationsDropped { .. } => intervention_cells(&rec.event)?,
@@ -492,6 +493,21 @@ fn intervention_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)>
             Tone::Deny,
             format!(
                 "agents paused · network closed · grants suspended · processes frozen ({}) · {}",
+                method.as_str(),
+                reason.as_str()
+            ),
+        ),
+        WardEvent::SessionPauseUnsettled {
+            method,
+            reason,
+            pending,
+        } => (
+            "PAUSE?",
+            Tone::Warn,
+            format!(
+                "{pending} process{} not confirmed stopped ({}) · marker and grants held \
+                 regardless · {}",
+                if *pending == 1 { "" } else { "es" },
                 method.as_str(),
                 reason.as_str()
             ),
@@ -1443,6 +1459,43 @@ mod tests {
                 result_hash: Blake3Hash::ZERO,
             }),
             "an infra error must not render with the same verb as a test failure"
+        );
+    }
+
+    /// #145 items 3-4: an unsettled pause gets its own row, distinct in verb and
+    /// tone from a clean `SessionPaused`, naming exactly what remains uncertain.
+    #[test]
+    fn session_pause_unsettled_gets_its_own_row_distinct_from_a_clean_pause() {
+        use ward_events::{Blake3Hash, Chain, Origin, SessionId, Timestamp};
+        let mut chain = Chain::genesis(SessionId::from_u128(3), Blake3Hash::ZERO);
+        let rec = chain
+            .append(
+                Origin::Wardd,
+                WardEvent::SessionPauseUnsettled {
+                    method: ward_events::PauseMethod::Sigstop,
+                    reason: ward_events::ShortText::new("looks wrong"),
+                    pending: 2,
+                },
+                Timestamp::mono(std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+        let row = plain(&observer_row(&rec).unwrap());
+        assert_eq!(
+            row,
+            "00:01  PAUSE? 2 processes not confirmed stopped (sigstop) · marker and grants \
+             held regardless · looks wrong"
+        );
+        assert!(
+            observer_row(&rec).unwrap().contains(WARN),
+            "uncertain, not denied: amber, not the pause row's own red"
+        );
+        assert_ne!(
+            cells_verb(&rec),
+            cells_verb_of(&WardEvent::SessionPaused {
+                method: ward_events::PauseMethod::Sigstop,
+                reason: ward_events::ShortText::new("ward pause"),
+            }),
+            "an unconfirmed freeze must not render with the same verb as a clean pause"
         );
     }
 

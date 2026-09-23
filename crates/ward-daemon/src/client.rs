@@ -106,12 +106,47 @@ pub fn connect(socket: &Path) -> Result<RemoteSink> {
     RemoteSink::connect(socket).ok_or_else(|| Error::Project(NO_DAEMON.to_owned()))
 }
 
+/// What `ward pause` gets back: the `SessionPaused` record, and — only when the
+/// daemon could not confirm the freeze settled within `pause::FREEZE_SETTLE` (#145
+/// items 3-4) — how many of the session's sandboxed processes had not yet
+/// confirmed stopped.
+#[derive(Debug)]
+pub struct PauseResult {
+    /// The `SessionPaused` record.
+    pub record: EventRecord,
+    /// `Some(pending)` when the freeze could not be confirmed within the bound.
+    pub unsettled: Option<u32>,
+}
+
+/// Before this type existed, `ward_daemon::client::pause` returned a bare
+/// [`EventRecord`] directly — callers (including this crate's own bubblewrap-gated
+/// `e2e.rs`, a TamperWard-protected fixture under `crates/**/tests/**`) read its
+/// fields straight off the result (`paused.event`). This lets that field access
+/// keep working unchanged through autoderef, so wrapping the record to carry
+/// `unsettled` alongside it is a purely additive change to every existing caller,
+/// not a breaking one.
+impl std::ops::Deref for PauseResult {
+    type Target = EventRecord;
+
+    fn deref(&self) -> &EventRecord {
+        &self.record
+    }
+}
+
 /// `ward pause`: the daemon pauses the session as one operation (ADR-0019 §3)
-/// and answers with the `SessionPaused` record.
-pub fn pause(sink: &mut RemoteSink, reason: &str) -> Result<EventRecord> {
-    expect_record(sink.call(&Request::Pause {
+/// and answers with the `SessionPaused` record, plus whether the freeze itself
+/// was confirmed.
+pub fn pause(sink: &mut RemoteSink, reason: &str) -> Result<PauseResult> {
+    match sink.call(&Request::Pause {
         reason: reason.to_owned(),
-    })?)
+    })? {
+        Response::Paused { record, unsettled } => Ok(PauseResult {
+            record: *record,
+            unsettled,
+        }),
+        Response::Error(e) => Err(Error::Project(e)),
+        other => Err(Error::Project(format!("unexpected response {other:?}"))),
+    }
 }
 
 /// `ward resume`: the daemon reverses the pause and answers with the
@@ -125,9 +160,13 @@ pub fn resume(sink: &mut RemoteSink) -> Result<EventRecord> {
 pub struct SessionPauseResult {
     /// The session's id.
     pub session: String,
-    /// The `SessionPaused` record, or why this session could not be paused
-    /// (already paused, or gone between listing and asking).
-    pub outcome: Result<EventRecord>,
+    /// The `SessionPaused` record and whether the freeze settled, or why this
+    /// session could not be paused (already paused, or gone between listing
+    /// and asking). Carries [`PauseResult`], not a bare [`EventRecord`], so
+    /// `--all` is bound by the same #145 items 3-4 rule as a single-session
+    /// pause: one session's line in a multi-session report must not read as
+    /// an unqualified success when its own freeze never confirmed settled.
+    pub outcome: Result<PauseResult>,
 }
 
 /// `ward pause --all` (#141 item 5): "Pause all sessions", distinct from
@@ -1877,7 +1916,13 @@ mod tests {
                             }
                             Request::Pause { .. } => match &pause_outcome {
                                 Some(Ok(rec)) => {
-                                    reply(&mut writer, &Response::Record(Box::new(rec.clone())));
+                                    reply(
+                                        &mut writer,
+                                        &Response::Paused {
+                                            record: Box::new(rec.clone()),
+                                            unsettled: None,
+                                        },
+                                    );
                                 }
                                 Some(Err(e)) => reply(&mut writer, &Response::Error(e.clone())),
                                 None => reply(

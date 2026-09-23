@@ -93,8 +93,23 @@ pub enum WardEvent {
     // integrity
     Anchor { chain_head: Blake3Hash, seq: u64, countersigned_by: Option<TamperWardSig> },
 
+    // host intervention (origin: Wardd; ADR-0019 §3)
+    SessionPaused   { method: CgroupFreezer | Sigstop, reason: BoundedText },
+    SessionResumed  { paused_for: Duration },
+    EntryRestored   { snapshot: SnapshotId, files: u64, backup: BoundedText },
+
     // observer health (origin: Wardd) — see §9
     ObservationsDropped { source: Filesystem | Network | Hook, dropped: u64, capacity: u64 },
+
+    // Appended at the end of the catalogue, same reason as VerificationErrored above
+    // (#145 items 3-4, PR #207): the daemon decides whether a pause's freeze settled
+    // *before* appending anything, so a pause attempt is recorded as exactly one of
+    // SessionPaused xor SessionPauseUnsettled, never both and never the confirmed one
+    // first — this is the terminal record for an unsettled SIGSTOP-fallback pause,
+    // carrying the same fields SessionPaused would have (so it never depends on a
+    // prior SessionPaused record to make sense of it), plus how many processes were
+    // still not confirmed stopped when the daemon's settle bound expired.
+    SessionPauseUnsettled { method: CgroupFreezer | Sigstop, reason: BoundedText, pending: u32 },
 }
 ```
 
@@ -145,7 +160,7 @@ source of truth, not the socket. Latency budget from kernel event to subscriber 
 
 | Mode | Shows | Blocks? |
 | --- | --- | --- |
-| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed,Errored}`, `ObservationsDropped`, `SessionEnded` | Only on `Ask` |
+| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed,Errored}`, the host's interventions (`SessionPaused`, `SessionPauseUnsettled`, `SessionResumed`, `EntryRestored`), `ObservationsDropped`, `SessionEnded` | Only on `Ask` |
 | Live | Everything except `AgentClaim{Note}` | Only on `Ask` |
 | Step-through | Everything; additionally the manifest's `step_policy` marks actions (`FileModified` under given globs, `CommandStarted` matching patterns, any `NetworkRequested`) as `Ask` | Yes, on configured actions |
 
