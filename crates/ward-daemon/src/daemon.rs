@@ -47,7 +47,6 @@ use ward_events::{EventRecord, LogReader, Origin, ShortText, WardEvent};
 use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
 use crate::error::{Error, Result};
-use crate::github;
 use crate::pause::{self, Frozen};
 use crate::session::{SessionMeta, protected_paths, session_dir};
 
@@ -134,10 +133,13 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
         .map_err(|e| Error::Daemon(format!("describe {session}: {e}")))?;
     // What an approval's authority is derived from: the manifest, the
     // repository a `current_repository` credential scope means, and the paths
-    // TamperWard protects, all fixed at the session's start.
+    // TamperWard protects, all fixed at the session's start. The repository
+    // is `meta.origin_repo`, resolved once when the session started and never
+    // re-read from the live worktree (issue #196) — see
+    // `github::resolve_origin_repo`.
     let deriver = Deriver::new(
         meta.manifest.clone(),
-        github::origin_repo(&meta.project),
+        meta.origin_repo.clone(),
         protected_paths(state, &meta.entry_snapshot),
     );
 
@@ -2370,6 +2372,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: "proj_unit".to_owned(),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest: merge(
                 &Policy::default(),
                 &Policy::default(),
@@ -2508,6 +2511,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: "proj_unit".to_owned(),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest,
             started_unix_ms: control::unix_ms(SystemTime::now()),
             agent: None,
@@ -2736,6 +2740,7 @@ mod tests {
             project: PathBuf::from("/tmp/demo"),
             project_id: "proj_disconnect".to_owned(),
             entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
             manifest,
             started_unix_ms: control::unix_ms(SystemTime::now()),
             agent: None,
