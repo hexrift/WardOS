@@ -90,6 +90,15 @@ appends its decisions as `origin=tamperward` evidence, and `ward watch` follows 
 live from another terminal, as a full-screen observer (trust bar, activity stream,
 counters) or as plain rows on a pipe. Without a daemon, every command still works in-process.
 
+File and network observations reach that log *while a command is still running*, not in
+one batch when it exits: the file watch, the session proxy's decision recorder and the
+agent hook broker each hand what they see to a bounded per-source queue, and the single
+writer drains them every 250 ms — or every 256 observations, whichever comes first —
+then flushes once more before the command's terminal record. The bound never gates
+enforcement (the proxy keeps deciding in real time however far behind the log is) and
+never hides a gap: an observation a full queue had to refuse is counted and appended as
+an explicit `GAP` row (`ObservationsDropped`) beside the batch it belongs to.
+
 ![A daemon-backed session: ward up spawns wardd, a producer and a TamperWard evidence record write through the control socket, and ward watch streams every row live until the session ends](assets/ward-watch.png)
 
 ```bash

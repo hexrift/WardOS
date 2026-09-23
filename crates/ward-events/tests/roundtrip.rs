@@ -12,9 +12,9 @@ use ward_events::chain::{Chain, Timestamp, verify};
 use ward_events::event::{
     Acceptor, AgentIdentity, AgentKind, AgentState, CapabilityKind, CapabilityRequest, CaptureMode,
     ClaimKind, CredentialDelivery, Decision, DecisionSource, DeniedDst, DenyReason, EndReason,
-    EventKind, ExitStatus, FileChangeKind, GrantScope, PauseMethod, PolicySubject, ProcessRef,
-    RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus, TamperWardSig, VerifyRequester,
-    VerifySummary, WardEvent,
+    EventKind, EventKindSet, ExitStatus, FileChangeKind, GrantScope, ObserverSource, PauseMethod,
+    PolicySubject, ProcessRef, RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus,
+    TamperWardSig, VerifyRequester, VerifySummary, WardEvent,
 };
 use ward_events::ids::{
     AttemptId, Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
@@ -221,7 +221,7 @@ proptest! {
     }
 
     #[test]
-    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u64..(1 << 27), notes in any::<bool>()) {
+    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u64..(1 << EventKind::ALL.len()), notes in any::<bool>()) {
         let sub = Subscribe {
             session: SessionId::from_u128(session),
             from_seq,
@@ -236,6 +236,65 @@ proptest! {
         prop_assert_eq!(n, bytes.len());
         prop_assert_eq!(back, sub);
     }
+}
+
+/// Post-`u64`-stack integration evidence for a kind at bit 32 or higher, requested on
+/// review: `subscribe_roundtrips` above generated masks only up to `1 << 27` until this
+/// commit, so it never actually exercised a kind past the old `u32` boundary even after
+/// `EventKindSet` was widened to `u64` (#137/#139) -- proptest choosing a small `kinds`
+/// value by chance is not the same as a fixed, deliberate regression pinned to the exact
+/// boundary. `ObservationsDropped` (bit 32, the first kind that didn't fit in a `u32`) is
+/// exercised at every layer this needs: its raw bit position, a bare `EventKindSet`
+/// through postcard, the real `Subscribe`/`Filter` wire type `subscribe_roundtrips`
+/// covers only with small random masks, and `Filter::quiet()` — which must admit it
+/// alongside the two kinds `full_catalogue`'s `quiet` assertion already covers only
+/// indirectly through record counts, not through `EventKindSet::contains` directly.
+#[test]
+fn a_kind_past_the_old_u32_boundary_round_trips_through_every_layer() {
+    assert_eq!(
+        EventKind::ObservationsDropped.bit(),
+        1u64 << 32,
+        "sanity: ObservationsDropped is the first kind past u32's 32-bit capacity"
+    );
+
+    let set = EventKindSet::only(EventKind::ObservationsDropped)
+        .with(EventKind::VerificationAttemptStarted)
+        .with(EventKind::VerificationCancelled)
+        .with(EventKind::VerificationInterrupted);
+    assert_eq!(
+        set.bits(),
+        (1u64 << 32) | (1u64 << 33) | (1u64 << 34) | (1u64 << 35)
+    );
+
+    // Postcard, directly on the bitmask type.
+    let bytes = postcard::to_allocvec(&set).unwrap();
+    assert_eq!(postcard::from_bytes::<EventKindSet>(&bytes).unwrap(), set);
+
+    // The real wire type a subscriber actually sends: `Subscribe`, carrying this set as
+    // its filter's `kinds`, not a bare `EventKindSet` in isolation.
+    let sub = Subscribe {
+        session: SessionId::from_u128(0x5e55),
+        from_seq: 0,
+        filter: Filter {
+            origins: ward_events::origin::OriginSet::ALL,
+            kinds: set,
+            exclude_agent_notes: false,
+        },
+    };
+    let bytes = encode_subscribe(&sub).unwrap();
+    let (back, n) = decode_subscribe(&bytes).unwrap();
+    assert_eq!(n, bytes.len());
+    assert_eq!(back, sub);
+    assert!(back.filter.kinds.contains(EventKind::ObservationsDropped));
+
+    // `Filter::quiet()` must admit ObservationsDropped and the two terminal
+    // verification-attempt outcomes; VerificationAttemptStarted (a progress marker,
+    // not a terminal outcome) must not be admitted.
+    let quiet = Filter::quiet();
+    assert!(quiet.kinds.contains(EventKind::ObservationsDropped));
+    assert!(quiet.kinds.contains(EventKind::VerificationCancelled));
+    assert!(quiet.kinds.contains(EventKind::VerificationInterrupted));
+    assert!(!quiet.kinds.contains(EventKind::VerificationAttemptStarted));
 }
 
 fn any_origin() -> impl Strategy<Value = Origin> {
@@ -646,6 +705,25 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Wardd,
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Network,
+                dropped: 9,
+                capacity: 4096,
+            },
+        ),
+        (
+            Origin::Wardd,
+            // Every `ObserverSource` is carried over the wire and through the
+            // log, the hook broker included: a hook claim the broker had to
+            // refuse is an observer gap, not an agent note.
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Hook,
+                dropped: 2,
+                capacity: 4096,
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -736,11 +814,14 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
         .count();
     // The nine of Quiet mode plus the three host interventions (ADR-0019 §3), plus
     // `VerificationErrored`, `VerificationCancelled` and `VerificationInterrupted`
-    // (#139), plus `CapabilityDecided` appearing twice in the fixture above (once
-    // granted, once denied). `VerificationAttemptStarted` is a progress marker, not
-    // a terminal outcome, and is deliberately not in Quiet mode (like
-    // `VerificationRequested`/`VerificationStarted` before it).
-    assert_eq!(quiet, 15);
+    // (#139), plus the observer's own "this record is incomplete" markers — one per
+    // source, the hook broker included (#137) — plus `CapabilityDecided` and
+    // `ObservationsDropped` each appearing twice in the fixture above (granted and
+    // denied; two different observer sources). `VerificationAttemptStarted` is a
+    // progress marker, not a terminal outcome, and is deliberately not in Quiet mode
+    // (like `VerificationRequested`/`VerificationStarted` before it) -- neither is
+    // `LaunchAborted`, matching its siblings `CommandStarted`/`CommandFinished`.
+    assert_eq!(quiet, 17);
 }
 
 #[test]

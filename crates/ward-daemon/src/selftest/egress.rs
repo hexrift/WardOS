@@ -377,7 +377,7 @@ fn probe_surfaces(
             control,
         ],
     )?;
-    let claims = rig.hooks.drain_events().len();
+    let claims = rig.hooks.drain_observations().len();
     rig.egress.drain_decisions();
     Ok(judge(
         run,

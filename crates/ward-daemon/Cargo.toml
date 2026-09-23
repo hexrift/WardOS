@@ -16,12 +16,12 @@ name = "wardd"
 path = "src/main.rs"
 
 [dependencies]
-ward-events = { path = "../ward-events", version = "0.7.25" }
-ward-policy = { path = "../ward-policy", version = "0.7.25" }
-ward-snapshot = { path = "../ward-snapshot", version = "0.7.25" }
-ward-sandbox = { path = "../ward-sandbox", version = "0.7.25" }
-ward-proxy = { path = "../ward-proxy", version = "0.7.25" }
-ward-agent = { path = "../ward-agent", version = "0.7.25" }
+ward-events = { path = "../ward-events", version = "0.7.27" }
+ward-policy = { path = "../ward-policy", version = "0.7.27" }
+ward-snapshot = { path = "../ward-snapshot", version = "0.7.27" }
+ward-sandbox = { path = "../ward-sandbox", version = "0.7.27" }
+ward-proxy = { path = "../ward-proxy", version = "0.7.27" }
+ward-agent = { path = "../ward-agent", version = "0.7.27" }
 blake3 = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
@@ -36,7 +36,7 @@ getrandom = "0.3"
 [dev-dependencies]
 tempfile = { workspace = true }
 # Lets the e2e gateway test run its upstream on loopback without TLS.
-ward-proxy = { path = "../ward-proxy", version = "0.7.25", features = ["test-loopback"] }
+ward-proxy = { path = "../ward-proxy", version = "0.7.27", features = ["test-loopback"] }
 
 [lints]
 workspace = true

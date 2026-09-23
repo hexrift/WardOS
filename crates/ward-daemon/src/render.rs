@@ -470,9 +470,10 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
             Tone::Ok,
             format!("snapshot {}", short_hex(&snapshot.to_string())),
         ),
-        ev @ (WardEvent::SessionPaused { .. }
+        WardEvent::SessionPaused { .. }
         | WardEvent::SessionResumed { .. }
-        | WardEvent::EntryRestored { .. }) => intervention_cells(ev),
+        | WardEvent::EntryRestored { .. }
+        | WardEvent::ObservationsDropped { .. } => intervention_cells(&rec.event)?,
         WardEvent::SessionEnded { .. } => ("END", Tone::Dim, "session".to_string()),
         _ => return None,
     };
@@ -484,11 +485,10 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
     })
 }
 
-/// The `(verb, tone, subject)` triple for the host-intervention records
-/// (`SessionPaused`/`SessionResumed`/`EntryRestored`), split out of
-/// [`observer_cells`] purely to keep that function under the line limit.
-fn intervention_cells(ev: &WardEvent) -> (&'static str, Tone, String) {
-    match ev {
+/// Rows for the host's own interventions (ADR-0019 §3) and for the observer's
+/// admission that its record of a window is incomplete (#137).
+fn intervention_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)> {
+    Some(match event {
         WardEvent::SessionPaused { method, reason } => (
             "PAUSE",
             Tone::Deny,
@@ -523,8 +523,19 @@ fn intervention_cells(ev: &WardEvent) -> (&'static str, Tone, String) {
                 )
             },
         ),
-        _ => unreachable!("intervention_cells is only called for the three arms matched above"),
-    }
+        WardEvent::ObservationsDropped {
+            source,
+            dropped,
+            capacity,
+        } => (
+            "GAP",
+            Tone::Deny,
+            format!(
+                "{source} observer dropped {dropped} · queue of {capacity} full · this window is incomplete"
+            ),
+        ),
+        _ => return None,
+    })
 }
 
 /// A duration as the observer says it: `12s`, `3m 05s`, `1h 02m`.
