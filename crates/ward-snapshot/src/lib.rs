@@ -48,6 +48,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 pub use capture::{CaptureOptions, CaptureStats, HashCache};
+pub use cas::{CasUsage, CategoryUsage, usage_at as cas_usage_at};
 pub use error::{Result, SnapshotError};
 pub use id::{Digest, SnapshotId, SnapshotRole};
 pub use manifest::{Entry, EntryType, Manifest, ManifestDiff};
@@ -188,5 +189,12 @@ impl SnapshotStore {
     pub fn materialize(&self, id: SnapshotId, dest_dir: impl AsRef<Path>) -> Result<()> {
         let manifest = self.cas.get_manifest(id)?;
         materialize::materialize(&self.cas, &manifest, dest_dir.as_ref())
+    }
+
+    /// Disk usage of the store's `blobs`, `manifests` and `meta` categories
+    /// (`ward snapshot usage`, #151): a read-only report, computed from
+    /// directory metadata alone.
+    pub fn usage(&self) -> Result<CasUsage> {
+        self.cas.usage()
     }
 }
