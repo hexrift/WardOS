@@ -1351,6 +1351,10 @@ mod tests {
                 EventKindSet::ALL.bits() | (1 << EventKind::ALL.len())
             ))
         );
+        assert!(
+            postcard::from_bytes::<EventKindSet>(&postcard::to_allocvec(&u64::MAX).unwrap())
+                .is_err()
+        );
         let set = EventKindSet::only(EventKind::Anchor).with(EventKind::FileRead);
         let bytes = postcard::to_allocvec(&set).unwrap();
         assert_eq!(postcard::from_bytes::<EventKindSet>(&bytes).unwrap(), set);

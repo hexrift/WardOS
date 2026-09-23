@@ -245,9 +245,19 @@ proptest! {
 /// kept too so a future narrowing of that proptest range can't silently stop covering
 /// the exact kinds (`ObservationsDropped`, #202; `VerificationAttemptStarted`,
 /// `VerificationCancelled`, `VerificationInterrupted`, #139) that motivated widening
-/// `EventKindSet` from `u32` to `u64` in the first place.
+/// `EventKindSet` from `u32` to `u64` in the first place. Exercises every layer this
+/// needs: the raw bit position, a bare `EventKindSet` through postcard, the real
+/// `Subscribe`/`Filter` wire type, and `Filter::quiet()` admitting the terminal
+/// outcomes (but not the progress marker) directly through `EventKindSet::contains`,
+/// not just indirectly through `full_catalogue`'s record counts.
 #[test]
 fn subscribe_roundtrips_high_bit_kinds() {
+    assert_eq!(
+        EventKind::ObservationsDropped.bit(),
+        1u64 << 32,
+        "sanity: ObservationsDropped is the first kind past u32's 32-bit capacity"
+    );
+
     // Exactly the four kinds at or past bit 32: nothing below it, so a regression in
     // masking/shifting the high bits can't hide behind low bits also being set.
     let high_bits = EventKindSet::EMPTY
@@ -256,6 +266,13 @@ fn subscribe_roundtrips_high_bit_kinds() {
         .with(EventKind::VerificationCancelled) // bit 34
         .with(EventKind::VerificationInterrupted); // bit 35
     assert_eq!(high_bits.bits(), 0b1111 << 32);
+
+    // Postcard, directly on the bitmask type.
+    let bytes = postcard::to_allocvec(&high_bits).unwrap();
+    assert_eq!(
+        postcard::from_bytes::<EventKindSet>(&bytes).unwrap(),
+        high_bits
+    );
 
     let sub = Subscribe {
         session: SessionId::from_u128(0x5e55),
@@ -271,6 +288,16 @@ fn subscribe_roundtrips_high_bit_kinds() {
     assert_eq!(n, bytes.len());
     assert_eq!(back, sub);
     assert_eq!(back.filter.kinds, high_bits);
+    assert!(back.filter.kinds.contains(EventKind::ObservationsDropped));
+
+    // `Filter::quiet()` must admit ObservationsDropped and the two terminal
+    // verification-attempt outcomes; VerificationAttemptStarted (a progress marker,
+    // not a terminal outcome) must not be admitted.
+    let quiet = Filter::quiet();
+    assert!(quiet.kinds.contains(EventKind::ObservationsDropped));
+    assert!(quiet.kinds.contains(EventKind::VerificationCancelled));
+    assert!(quiet.kinds.contains(EventKind::VerificationInterrupted));
+    assert!(!quiet.kinds.contains(EventKind::VerificationAttemptStarted));
 
     // And the full mask, including every high bit alongside every low one, still
     // round-trips: a wire path that only special-cased the low 32 bits would fail
@@ -819,12 +846,13 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
         .count();
     // The nine of Quiet mode plus the three host interventions (ADR-0019 §3), plus
     // `VerificationErrored`, `VerificationCancelled` and `VerificationInterrupted`
-    // (#139), plus `CapabilityDecided` appearing twice in the fixture above (once
-    // granted, once denied), plus the observer's own "this record is incomplete"
-    // markers — one per source, the hook broker included (#137), appearing twice
-    // in the fixture above (`Network`, `Hook`). `VerificationAttemptStarted` is a
-    // progress marker, not a terminal outcome, and is deliberately not in Quiet
-    // mode (like `VerificationRequested`/`VerificationStarted` before it).
+    // (#139), plus the observer's own "this record is incomplete" markers — one per
+    // source, the hook broker included (#137) — plus `CapabilityDecided` and
+    // `ObservationsDropped` each appearing twice in the fixture above (granted and
+    // denied; two different observer sources). `VerificationAttemptStarted` is a
+    // progress marker, not a terminal outcome, and is deliberately not in Quiet mode
+    // (like `VerificationRequested`/`VerificationStarted` before it) -- neither is
+    // `LaunchAborted`, matching its siblings `CommandStarted`/`CommandFinished`.
     assert_eq!(quiet, 17);
 }
 
