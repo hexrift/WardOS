@@ -117,8 +117,9 @@ ward stop     examples/ward-demo    # seal the log (from paused: the frozen proc
 ward stop     examples/ward-demo --restore-entry   # …after writing the entry snapshot back over the worktree (.ward/restore-<ts>/ keeps what it replaced)
 ward replay   <events.log>          # replay any sealed session (--verify, --json)
 ward session describe examples/ward-demo   # the session's immutable facts for TamperWard (--json)
-ward session pending  examples/ward-demo   # held approvals: destination · requested by agent · Ward will allow (--json)
-ward session grants   examples/ward-demo   # the temporary authority the agent holds: allow-session answers, --grant credentials (--json)
+ward session pending   examples/ward-demo  # held approvals: destination · requested by agent · Ward will allow (--json)
+ward session approvals examples/ward-demo  # every approval asked, pending or decided (state, id, tool, destination; --json)
+ward session grants    examples/ward-demo  # the temporary authority the agent holds: allow-session answers, --grant credentials (--json)
 ward snapshot create  examples/ward-demo   # capture the worktree into the CAS (--role candidate|final)
 ward snapshot diff    <a> <b>              # manifest-level diff from the CAS, not the worktree (--json)
 ward snapshot cat     <id> <path>          # pristine bytes of a path in a snapshot
