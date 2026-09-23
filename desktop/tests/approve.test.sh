@@ -573,6 +573,92 @@ out=$("$approve")
 assert_eq "$out" "  no pending approvals"
 assert_not_logged '^ward session approve'
 
+# --- group membership: a duplicate delivered after the first popup's notify-send
+# has already exited, but before its worker has finished answering, still joins the
+# same group rather than starting a second one under the same key (#146 item 7
+# review, round 1: .pid alone said "still live" but was released before notify_one
+# had read group membership, not after — a duplicate landing in that gap started a
+# fresh generation under the same content-addressed key, corrupting or losing the
+# first generation's own members). Drives notifier_loop's own duplicate-check and
+# notify_one's own membership read directly, in a controlled sequence, rather than
+# racing a real background worker against a real pending-stream delivery: the two
+# events this proves can land in either order are separated in real life by only a
+# few lines of pure bash (no forked command in between to hang a mock off of), so
+# only a manually-forced ordering proves the invariant deterministically rather
+# than hoping a loop happens to hit the same interleaving.
+: >"$MOCK_LOG"
+eval "$(sed -n '/^session_key() {$/,/^}$/p; /^notif_key() {$/,/^}$/p; /^group_key() {$/,/^}$/p; /^group_members() {$/,/^}$/p; /^sweep_group_markers() {$/,/^}$/p' "$approve")"
+run_dir=$(mktemp -d "$TMP/members.XXXXXX")
+session=sess_a
+title="Claude requests · payments-api"
+body=$'<span alpha="39322">DESTINATION</span>\n<tt>/work/src/lib.rs</tt>'
+key=$(group_key "$session" "$title" "$body")
+# id 12's own reservation, exactly as notifier_loop makes it for the first of a
+# group: .pid and .worker both created, then its own marker written.
+: >"$run_dir/$key.pid"
+: >"$run_dir/$key.worker"
+printf '%s\n' "$key" >"$run_dir/id-$(notif_key "$session" 12).group"
+# The moment notify_one's own popup closes (notify-send exited, someone clicked
+# something): .pid is released, .worker is not — group bookkeeping is not done yet.
+rm -f "$run_dir/$key.pid"
+# A second, byte-identical approval (id 14) is now delivered — landing squarely in
+# the gap between those two events. This is notifier_loop's own duplicate-check,
+# run exactly as it appears in the real loop.
+if [[ -f "$run_dir/$key.worker" ]]; then
+  printf '%s\n' "$key" >"$run_dir/id-$(notif_key "$session" 14).group"
+else
+  fail "a duplicate delivered after .pid was released, but before .worker was, must still see the group as live"
+fi
+# The duplicate must not have started a second reservation of its own: .pid stays
+# gone (the popup itself is genuinely closed by now, same as the single-id case
+# always had it), and there is still exactly one .worker — a second one is exactly
+# what a mistaken "new group" path would have created.
+[[ -f "$run_dir/$key.pid" ]] && fail "the duplicate must not have recreated .pid for the same key"
+[[ $(find "$run_dir" -maxdepth 1 -name "$key.worker" | wc -l) -eq 1 ]] ||
+  fail "the duplicate must not have created a second .worker for the same key"
+# notify_one's own post-click membership read (the real code path, after this same
+# .pid release) must now see both 12 and 14 — neither lost nor answered under a
+# generation that isn't theirs.
+members=$(group_members "$key" | sort)
+assert_eq "$members" "$(printf '12\n14')"
+rm -rf "$run_dir"
+
+# --- group membership: an id resolved elsewhere (a resolver's own removal of its
+# marker) and a duplicate still joining the same group are two independent,
+# single-writer-per-file operations, never a shared list the two could tear
+# (#146 item 7 review, round 1, point 2) -----------------------------------------
+: >"$MOCK_LOG"
+run_dir=$(mktemp -d "$TMP/members.XXXXXX")
+: >"$run_dir/$key.pid"
+: >"$run_dir/$key.worker"
+printf '%s\n' "$key" >"$run_dir/id-$(notif_key "$session" 12).group"
+printf '%s\n' "$key" >"$run_dir/id-$(notif_key "$session" 13).group"
+# A third, identical approval (id 15) is delivered — folds in the same way as above.
+printf '%s\n' "$key" >"$run_dir/id-$(notif_key "$session" 15).group"
+# Interleaved with that: 12 is decided elsewhere (a resolver's own job) — exactly
+# resolve_notification's own steps, run directly: remove its own marker, then read
+# membership to decide whether to close the popup.
+rm -f "$run_dir/id-$(notif_key "$session" 12).group"
+remaining_for_12=$(group_members "$key" | sort)
+assert_eq "$remaining_for_12" "$(printf '13\n15')"
+# 13 is answered directly (mirrors notify_one's own per-id removal as it dispatches).
+rm -f "$run_dir/id-$(notif_key "$session" 13).group"
+# What is left is exactly what the group's own worker would still relay an answer
+# to if it read membership only now, after both of those — 15, and only 15; not 12
+# or 13 (already gone), not a corrupted or partial read of any marker file (each
+# id's membership lives in its own file, so removing one is never a partial write
+# to a file the others' state also lives in).
+final_members=$(group_members "$key")
+assert_eq "$final_members" "15"
+# sweep_group_markers, notify_one's own end-of-function cleanup, must remove
+# exactly that last marker and leave nothing else behind for a future generation
+# of this same key to inherit.
+sweep_group_markers "$key" "$session"
+assert_eq "$(group_members "$key")" ""
+[[ -f "$run_dir/id-$(notif_key "$session" 15).group" ]] && fail "sweep_group_markers left a marker behind"
+rm -rf "$run_dir"
+unset -v run_dir session title body key members remaining_for_12 final_members
+
 # --- shellcheck-clean, usage block, strict mode -----------------------------------
 head -1 "$approve" | grep -q '^#!/usr/bin/env bash$' || fail "shebang"
 grep -q '^set -euo pipefail$' "$approve" || fail "strict mode"
