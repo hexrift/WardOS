@@ -288,8 +288,16 @@ interactive() {
 # guarantee, so a `ward` call slow enough to still be running once it lapses would
 # otherwise be exactly the same orphan again, one layer in (#226 review). It is
 # sweep_run_dir's own last-resort target: past the grace period, a worker is no
-# longer given the benefit of the doubt, and both what it could still be running
-# and its own wrapper are stopped before run_dir is removed.
+# longer given the benefit of the doubt, and sweep_run_dir does not merely signal
+# it and hope — a killed pid routinely still answers `kill -0` immediately
+# afterwards, so a bare `kill` proves nothing (#226 review) — it gives it a
+# bounded grace to exit on its own, escalates to KILL if that lapses, then
+# actually joins it (`wait`) before run_dir is removed below. The answer call
+# itself is this shell's *grandchild*, reached only through the worker, so it can
+# only be signalled this way, never joined directly; the worker is joined for
+# real, which is also what gives it its own chance to notice its answer child die
+# and unwind through its ordinary RETURN path rather than needing the same
+# escalation itself.
 #
 # It also holds one "session-<key>.resolver" marker per live session that has (or
 # had) an open notification, holding that session's own resolver's pid.
@@ -585,18 +593,47 @@ sweep_run_dir() {
   # guarantee that nothing is still running once it elapses (#226 review): a
   # `ward session approve` call slow enough to still be going is exactly the same
   # orphan #224 was, one layer in, if left running past run_dir's removal below.
-  # Stop it directly by its own real pid — first the specific `ward` call, since
-  # that is by far the likeliest thing a worker still has in flight, then its
-  # wrapper for defense in depth against being stuck anywhere else — rather than
-  # trust it to stop on its own the way the rest of this function still can for a
-  # merely-slow-to-notice notification.
-  local marker_file pid
-  for marker_file in "$run_dir"/*.answer "$run_dir"/*.worker; do
-    [[ -f $marker_file ]] || continue
-    pid=$(cat "$marker_file" 2>/dev/null || true)
+  # `kill` alone does not establish that, either (#226 review: signal delivery is
+  # asynchronous — a killed pid routinely still answers `kill -0` immediately
+  # afterwards) — this has to actually confirm each one is gone before returning,
+  # not just have asked.
+  local answer_file worker_file pid
+  # The answer call, if any, is this shell's *grandchild* through the worker, not
+  # a direct child of the shell running this function — bash can only wait() on
+  # its own children, so this cannot join it directly, only signal it and trust
+  # the worker (its real parent, joined below) to notice and unwind. Signalled
+  # first, before the worker: giving it a head start on dying makes it more likely
+  # the worker's own `wait "$answer_pid"` below unblocks on its own rather than
+  # needing to be killed itself.
+  for answer_file in "$run_dir"/*.answer; do
+    [[ -f $answer_file ]] || continue
+    pid=$(cat "$answer_file" 2>/dev/null || true)
+    rm -f "$answer_file"
     [[ -n $pid ]] || continue
     kill "$pid" 2>/dev/null || true
-    rm -f "$marker_file"
+    wait_deadline "$pid" 1
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+  # The worker itself *is* this shell's own direct child (notifier_loop backgrounds
+  # it in this same process), so this can — and, unlike the answer call above,
+  # must — actually wait() on it: that both reaps it for real (kill -0 alone can
+  # keep reporting a signalled-but-unreaped process as present) and is what gives
+  # the worker itself, if it is only blocked on the answer call above having just
+  # been signalled, its own chance to notice, run its RETURN trap, and exit
+  # cleanly before being escalated against.
+  for worker_file in "$run_dir"/*.worker; do
+    [[ -f $worker_file ]] || continue
+    pid=$(cat "$worker_file" 2>/dev/null || true)
+    rm -f "$worker_file"
+    [[ -n $pid ]] || continue
+    kill "$pid" 2>/dev/null || true
+    wait_deadline "$pid" 1
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
   done
 }
 

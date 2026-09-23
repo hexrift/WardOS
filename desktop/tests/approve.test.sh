@@ -125,29 +125,44 @@ mock notify-send 'echo deny'
 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
 assert_file "$TMP/answered"
 
-# --- --watch: a `ward session approve` call still running past wait_for_notifiers'
-# own grace window is stopped, not left to outlive run_dir (#226 review) -----------
+# --- --watch: a `ward session approve` call, and its own worker, still running
+# past wait_for_notifiers' own grace window are both actually stopped — not just
+# signalled — before run_dir is removed (#226 review) -----------------------------
 # The previous case only proves the *ordinary* path (answered inside the grace
-# window); this proves the boundary itself: a mock slow enough to still be running
-# once the grace window (2s) has elapsed must never be allowed to finish on its
-# own afterwards — sweep_run_dir has to stop it by its own real pid before run_dir
-# is removed below it, or this is the exact #224 orphan again, one layer in.
+# window). This proves the boundary itself, the way the review specifically asked:
+# by confirming neither the `ward` call's own pid nor its worker's (notify_one's
+# own $BASHPID, observable from inside the mock as its $PPID — notify_one
+# backgrounds `ward session approve` directly) still exists the instant
+# "--watch --once" returns. The mock ignores TERM so only sweep_run_dir's KILL
+# escalation, not the natural scheduling gap between a `kill` call and this check
+# a few function returns later, can be what closes this — a bare `kill` alone does
+# not prove termination (a killed pid routinely still answers `kill -0` right
+# after), and checking only after an unforced delay would let that same gap paper
+# over a sweep that never actually escalates or joins.
 : >"$MOCK_LOG"
-rm -f "$TMP/late-answer"
+rm -f "$TMP/answer-pid" "$TMP/worker-pid"
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
   '"$NOOP_APPROVALS_CASE"'
-  "session approve "*) sleep 4; touch "$TMP/late-answer"; exit 0 ;;
+  "session approve "*)
+    trap "" TERM
+    printf "%s\n" "$$" >"$TMP/answer-pid"
+    printf "%s\n" "$PPID" >"$TMP/worker-pid"
+    sleep 20
+    exit 0 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
 mock notify-send 'echo deny'
 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
-# Give the killed mock a beat past its own sleep: this must still never appear,
-# not merely be absent immediately at return.
-sleep 4.5
-[[ ! -f "$TMP/late-answer" ]] ||
-  fail "a slow ward session approve call survived past run_dir's own teardown"
+assert_file "$TMP/answer-pid"
+assert_file "$TMP/worker-pid"
+if kill -0 "$(cat "$TMP/answer-pid")" 2>/dev/null; then
+  fail "the ward session approve call was still alive when --watch --once returned"
+fi
+if kill -0 "$(cat "$TMP/worker-pid")" 2>/dev/null; then
+  fail "the worker was still alive when --watch --once returned"
+fi
 
 # --- --watch: notifier_loop's own .worker reservation never races notify_one's
 # RETURN trap into recreating a stale marker for an already-finished pid (#226
