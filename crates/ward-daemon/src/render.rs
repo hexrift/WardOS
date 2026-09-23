@@ -4,6 +4,7 @@
 //! the active agent, green for verified, amber for restricted, red for denied.
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use ward_events::{EventRecord, WardEvent};
 use ward_policy::{
@@ -14,6 +15,7 @@ use ward_policy::{
 use crate::describe::SessionDescription;
 use crate::selftest::Verdict;
 use crate::snapshot::DiffReport;
+use crate::usage::{ScratchEntry, ScratchStatus, StorageUsage};
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[38;5;245m";
@@ -788,6 +790,111 @@ pub fn hardware_panel(checks: &[crate::doctor::Check]) -> String {
     s
 }
 
+/// The `ward snapshot usage` panel: storage usage by category, then any
+/// leftover scratch and what the scan could tell about each entry's owner
+/// (#151). Read-only — see [`crate::usage`]'s module docs for what this
+/// deliberately does not do (remove anything, or infer liveness from a PID or
+/// an mtime).
+#[must_use]
+pub fn usage_panel(state_root: &Path, usage: &StorageUsage, scratch: &[ScratchEntry]) -> String {
+    let mut s = format!(
+        "{ACCENT}WARD{RESET} {INK}snapshot usage{RESET}  {DIM}{}{RESET}\n\n",
+        state_root.display()
+    );
+    let categories: [(&str, u64, u64); 4] = [
+        (
+            "blobs (shared, deduplicated)",
+            usage.blobs.objects,
+            usage.blobs.bytes,
+        ),
+        ("manifests", usage.manifests.objects, usage.manifests.bytes),
+        ("meta", usage.meta.objects, usage.meta.bytes),
+        (
+            "session logs",
+            usage.session_logs.objects,
+            usage.session_logs.bytes,
+        ),
+    ];
+    for (name, objects, bytes) in categories {
+        let _ = writeln!(
+            s,
+            "  {INK}{name:<30}{RESET}{DIM}{objects:>6} objects{RESET}  {INK}{:>10}{RESET}",
+            human_bytes(bytes)
+        );
+    }
+    let _ = writeln!(
+        s,
+        "  {BOLD}{INK}{:<30}{RESET}{DIM}{:>14}{RESET}  {BOLD}{INK}{:>10}{RESET}",
+        "total",
+        "",
+        human_bytes(usage.total_bytes())
+    );
+
+    if scratch.is_empty() {
+        let _ = write!(
+            s,
+            "\n  {DIM}no leftover scratch under the OS temp dir{RESET}\n"
+        );
+        return s;
+    }
+
+    let _ = write!(
+        s,
+        "\n{ACCENT}SCRATCH{RESET} {DIM}leftover run directories under the OS temp dir{RESET}\n\n"
+    );
+    for entry in scratch {
+        let (color, word) = match entry.status {
+            ScratchStatus::Active => (OK, "ACTIVE"),
+            ScratchStatus::Orphaned => (WARN, "ORPHANED"),
+            ScratchStatus::Unknown => (DIM, "UNKNOWN"),
+        };
+        let owner = entry.owner.as_deref().unwrap_or("(no owner marker)");
+        let name = entry
+            .path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let size = entry
+            .bytes
+            .map_or_else(|| "unavailable".to_owned(), human_bytes);
+        let _ = writeln!(
+            s,
+            "  {INK}{name:<28}{RESET}{DIM}{owner:<26}{RESET}{color}{word:<10}{RESET}{INK}{size:>11}{RESET}"
+        );
+    }
+    let orphaned_count = scratch
+        .iter()
+        .filter(|e| e.status == ScratchStatus::Orphaned)
+        .count();
+    if orphaned_count > 0 {
+        let _ = writeln!(
+            s,
+            "\n  {WARN}{orphaned_count} orphaned{RESET} {DIM}· {} · not removed — reclamation is a follow-up to #151{RESET}",
+            human_bytes(crate::usage::orphaned_bytes(scratch))
+        );
+    }
+    s
+}
+
+/// `bytes` as a human-scaled binary size (`B`/`KiB`/`MiB`/`GiB`), one decimal
+/// place once it has scaled past whole bytes. Pure integer arithmetic (no
+/// float cast) so precision is exact at the one-decimal resolution shown.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut whole = bytes;
+    let mut tenths = 0u64;
+    let mut unit = 0usize;
+    while whole >= 1024 && unit < UNITS.len() - 1 {
+        tenths = (whole % 1024) * 10 / 1024;
+        whole /= 1024;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{whole} B")
+    } else {
+        format!("{whole}.{tenths} {}", UNITS[unit])
+    }
+}
+
 /// The `ward verify` summary block: what was restored, the verdict, and on failure
 /// the tail of the verifier's output.
 #[must_use]
@@ -1177,6 +1284,131 @@ mod tests {
         }
         assert!(out.contains("work read & write"));
         assert!(out.contains("github ask"));
+    }
+
+    #[test]
+    fn human_bytes_scales_binary_units_with_one_decimal() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        // Past GiB there is no larger unit to scale into further.
+        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
+    }
+
+    #[test]
+    fn usage_panel_lists_every_category_and_the_scratch_verdicts() {
+        let usage = StorageUsage {
+            blobs: ward_snapshot::CategoryUsage {
+                objects: 3,
+                bytes: 300,
+            },
+            manifests: ward_snapshot::CategoryUsage {
+                objects: 1,
+                bytes: 50,
+            },
+            meta: ward_snapshot::CategoryUsage {
+                objects: 1,
+                bytes: 20,
+            },
+            session_logs: ward_snapshot::CategoryUsage {
+                objects: 2,
+                bytes: 130,
+            },
+        };
+        let scratch = vec![
+            ScratchEntry {
+                path: "/tmp/ward-active1".into(),
+                owner: Some("sess_a".to_owned()),
+                bytes: Some(10),
+                status: ScratchStatus::Active,
+            },
+            ScratchEntry {
+                path: "/tmp/ward-orphan1".into(),
+                owner: Some("sess_b".to_owned()),
+                bytes: Some(40),
+                status: ScratchStatus::Orphaned,
+            },
+            ScratchEntry {
+                path: "/tmp/ward-mystery1".into(),
+                owner: None,
+                bytes: Some(5),
+                status: ScratchStatus::Unknown,
+            },
+            // Fully distinct from ward-mystery1 above: same Unknown status
+            // and no owner marker, but this one is genuinely unreadable
+            // rather than merely unrecorded — the two must not render or
+            // serialize identically (see the review on #200 that named this
+            // exact ambiguity).
+            ScratchEntry {
+                path: "/tmp/ward-unreadable1".into(),
+                owner: None,
+                bytes: None,
+                status: ScratchStatus::Unknown,
+            },
+            // The other side of that same ambiguity: a fully readable
+            // directory that just happens to be genuinely empty. Same
+            // Unknown status as the unreadable entry above, but a real
+            // `Some(0)` — its row must render the actual figure `0 B`, not
+            // fall into the `unavailable` bucket alongside a directory this
+            // process couldn't even inspect.
+            ScratchEntry {
+                path: "/tmp/ward-empty1".into(),
+                owner: None,
+                bytes: Some(0),
+                status: ScratchStatus::Unknown,
+            },
+        ];
+        let out = plain(&usage_panel(Path::new("/state"), &usage, &scratch));
+        assert!(out.contains("/state"));
+        assert!(out.contains("blobs (shared, deduplicated)"));
+        assert!(out.contains("500 B"), "300+50+20+130 = 500 total:\n{out}");
+        assert!(out.contains("ward-active1"));
+        assert!(out.contains("ACTIVE"));
+        assert!(out.contains("ward-orphan1"));
+        assert!(out.contains("ORPHANED"));
+        assert!(out.contains("ward-mystery1"));
+        assert!(out.contains("UNKNOWN"));
+        assert!(out.contains("(no owner marker)"));
+        assert!(out.contains("1 orphaned"), "one entry is Orphaned:\n{out}");
+        assert!(
+            out.contains("ward-unreadable1"),
+            "an unreadable entry must still be listed, not dropped:\n{out}"
+        );
+        assert!(
+            out.contains("unavailable"),
+            "an unreadable entry's size must render as unavailable, never as 0 B \
+             (indistinguishable from a genuinely empty entry):\n{out}"
+        );
+        let unreadable_row = out
+            .lines()
+            .find(|l| l.contains("ward-unreadable1"))
+            .unwrap();
+        assert!(
+            unreadable_row.trim_end().ends_with("unavailable"),
+            "the unreadable entry's own size column must read 'unavailable', \
+             never a byte figure:\n{unreadable_row}"
+        );
+        let empty_row = out.lines().find(|l| l.contains("ward-empty1")).unwrap();
+        assert!(
+            empty_row.trim_end().ends_with("0 B"),
+            "a fully readable, genuinely empty entry's own row must render \
+             the real figure 0 B, never fall into the same 'unavailable' \
+             bucket as an entry that couldn't be inspected at all:\n{empty_row}"
+        );
+    }
+
+    #[test]
+    fn usage_panel_says_so_when_there_is_no_scratch() {
+        let out = plain(&usage_panel(
+            Path::new("/state"),
+            &StorageUsage::default(),
+            &[],
+        ));
+        assert!(out.contains("no leftover scratch"));
+        assert!(!out.contains("SCRATCH"));
     }
 
     /// #139: a verifier that could not run gets its own row, distinct in verb and

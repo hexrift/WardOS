@@ -126,6 +126,7 @@ ward session grants    examples/ward-demo  # the temporary authority the agent h
 ward snapshot create  examples/ward-demo   # capture the worktree into the CAS (--role candidate|final)
 ward snapshot diff    <a> <b>              # manifest-level diff from the CAS, not the worktree (--json)
 ward snapshot cat     <id> <path>          # pristine bytes of a path in a snapshot
+ward snapshot usage                        # storage usage by category, plus leftover scratch and its owner (--json)
 ward watch            examples/ward-demo   # full-screen observer on a terminal (--tui; q quits), one row per line on a pipe or with --plain (--from <seq>, --all)
 ward evidence append  examples/ward-demo --json '{"TamperDetected":{"subject":"VerifyConfig","detail":".tamperward/config.yml"}}'
                                            # append a TamperWard-origin record through the daemon (--json - reads stdin)
