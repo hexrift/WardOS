@@ -105,6 +105,158 @@ WARDOS_PROJECT=/home/dev/payments-api "$approve" --watch --once
 assert_logged '^ward session approve --session sess_a 12 deny$'
 assert_not_logged '^ward session approve --session sess_a 13'
 
+# --- --watch: "--once" does not return until every worker has actually relayed its
+# answer, not merely until its notify-send child has exited (#224) -----------------
+# notify_one still has to read $out, decide and call `ward session approve` after
+# notify-send itself is gone; a mock `ward` slow enough to still be running when
+# "--once" returns would prove the race the issue reported — an answer landing, as
+# an orphan, after this round's run_dir (and in the real bug, the whole mock dir)
+# was already torn down.
+: >"$MOCK_LOG"
+rm -f "$TMP/answered"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) sleep 0.3; touch "$TMP/answered"; exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'echo deny'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+assert_file "$TMP/answered"
+
+# --- --watch: a `ward session approve` call, and its own worker, still running
+# past wait_for_notifiers' own grace window are both actually stopped — not just
+# signalled — before run_dir is removed (#226 review) -----------------------------
+# The previous case only proves the *ordinary* path (answered inside the grace
+# window). This proves the boundary itself, the way the review specifically asked:
+# by confirming neither the `ward` call's own pid nor its worker's (notify_one's
+# own $BASHPID, observable from inside the mock as its $PPID — notify_one
+# backgrounds `ward session approve` directly) still exists the instant
+# "--watch --once" returns. The mock ignores TERM so only sweep_run_dir's KILL
+# escalation, not the natural scheduling gap between a `kill` call and this check
+# a few function returns later, can be what closes this — a bare `kill` alone does
+# not prove termination (a killed pid routinely still answers `kill -0` right
+# after), and checking only after an unforced delay would let that same gap paper
+# over a sweep that never actually escalates or joins.
+: >"$MOCK_LOG"
+rm -f "$TMP/answer-pid" "$TMP/worker-pid"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*)
+    trap "" TERM
+    printf "%s\n" "$$" >"$TMP/answer-pid"
+    printf "%s\n" "$PPID" >"$TMP/worker-pid"
+    sleep 20
+    exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'echo deny'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+assert_file "$TMP/answer-pid"
+assert_file "$TMP/worker-pid"
+if kill -0 "$(cat "$TMP/answer-pid")" 2>/dev/null; then
+  fail "the ward session approve call was still alive when --watch --once returned"
+fi
+if kill -0 "$(cat "$TMP/worker-pid")" 2>/dev/null; then
+  fail "the worker was still alive when --watch --once returned"
+fi
+
+# --- sweep_run_dir: a killed answer is reaped before its worker is stopped, so
+# neither is alive the instant sweep_run_dir returns (#226 review, exact-head
+# 1a5865f) ------------------------------------------------------------------------
+# The --watch --once case above checks only after the whole command has unwound,
+# by which point the system reaper has usually collected an orphaned answer — it
+# passed against the racy ordering. This checks at the exact return of the real
+# sweep_run_dir (loaded from the script itself, not a copy), repeated because the
+# race is a scheduling one: KILL the answer, then stop its worker before the
+# worker's own `wait "$answer_pid"` has reaped it, and the answer is orphaned
+# still alive. The answer ignores TERM so every round goes through the KILL
+# escalation, the path the race lives on.
+eval "$(sed -n '/^wait_deadline() {$/,/^}$/p; /^stop_answer() {$/,/^}$/p; /^stop_answers() {$/,/^}$/p; /^sweep_run_dir() {$/,/^}$/p' "$approve")"
+# Two kinds of round: the worker resumes on its own mid-teardown (1.4s, inside the
+# answer's escalation), and the worker is held stopped for the whole teardown —
+# through both answer waits and the worker's own escalation boundary — so only
+# sweep_run_dir making it runnable again can get the answer reaped (#226 review,
+# exact-head 07f9525).
+for round in resume-1 resume-2 held-1 held-2; do
+  run_dir=$(mktemp -d "$TMP/sweep.XXXXXX")
+  sweep_worker() {
+    local worker_file=$run_dir/k.worker answer_file=$run_dir/k.answer answer_pid=""
+    trap 'rm -f "$worker_file" "$answer_file"' RETURN
+    # The same TERM handling notify_one itself has: stop and reap its own answer.
+    trap '
+      if [[ -n ${answer_pid:-} ]]; then
+        kill "$answer_pid" 2>/dev/null || true
+        wait_deadline "$answer_pid" 1
+        kill -0 "$answer_pid" 2>/dev/null && kill -KILL "$answer_pid" 2>/dev/null
+        wait "$answer_pid" 2>/dev/null || true
+      fi
+      exit 143
+    ' TERM
+    printf '%s\n' "$BASHPID" >"$worker_file"
+    bash -c 'trap "" TERM; exec sleep 20' &
+    answer_pid=$!
+    printf '%s\n' "$answer_pid" >"$answer_file"
+    wait "$answer_pid" 2>/dev/null || true
+  }
+  sweep_worker &
+  for _ in $(seq 100); do [[ -s $run_dir/k.answer ]] && break; sleep 0.02; done
+  answer_pid=$(cat "$run_dir/k.answer")
+  worker_pid=$(cat "$run_dir/k.worker")
+  # Model a worker that has not yet resumed from its own `wait` when its answer is
+  # killed (the reviewer's scenario — descheduled, not merely busy: bash reaps a
+  # finished child from its SIGCHLD handling whenever it runs at all). Hold the
+  # worker stopped across the answer's TERM grace and KILL, and let it run again
+  # shortly after. Stopping the worker in that gap (the old ordering) leaves a
+  # TERM pending that kills it the instant it resumes, before it can reap, so the
+  # answer is orphaned; waiting for the reap first (stop_answers) lets the resumed
+  # worker reap it normally.
+  kill -STOP "$worker_pid"
+  resume_pid=""
+  if [[ $round == resume-* ]]; then
+    ( sleep 1.4; kill -CONT "$worker_pid" 2>/dev/null ) &
+    resume_pid=$!
+  fi
+  sweep_run_dir
+  if [[ -n $resume_pid ]]; then wait "$resume_pid" 2>/dev/null || true; fi
+  if kill -0 "$answer_pid" 2>/dev/null; then
+    kill -KILL "$answer_pid" 2>/dev/null || true
+    fail "round $round: the answer was still alive when sweep_run_dir returned"
+  fi
+  if kill -0 "$worker_pid" 2>/dev/null; then
+    fail "round $round: the worker was still alive when sweep_run_dir returned"
+  fi
+  rm -rf "$run_dir"
+done
+unset -v run_dir answer_pid worker_pid resume_pid
+
+# --- --watch: notifier_loop's own .worker reservation never races notify_one's
+# RETURN trap into recreating a stale marker for an already-finished pid (#226
+# review) --------------------------------------------------------------------------
+# An instant return (no notify-send at all, the fastest path through notify_one) is
+# the worst case for this race: looped, to give the scheduler a chance to hit it,
+# rather than asserted as a single run. This does not prove the ordering by timing
+# alone (see notify_one's own comment for the actual argument: notify_one writes
+# its own $BASHPID as its first action, strictly before its own later removal of
+# the same file, instead of notifier_loop writing $! from a second, racing process)
+# — it only proves nothing observably hangs, crashes, or leaves an unpicked-up
+# approval behind across many fast rounds.
+: >"$MOCK_LOG"
+rm -f "$MOCK_DIR/notify-send"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+for _ in $(seq 1 50); do
+  WARDOS_PROJECT=/home/dev/payments-api timeout 5 "$approve" --watch --once
+done
+assert_not_logged '^ward session approve'
+
 # --- --watch: a notification still showing is replaced when decided elsewhere -----
 # notify-send blocks (simulating --wait on an unanswered critical notification) until
 # it is killed; the session's own resolver, reading a decided record for the same id,

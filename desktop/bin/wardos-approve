@@ -248,21 +248,63 @@ interactive() {
 
 # --- --watch: notification lifecycle (#146 items 2-3) --------------------------
 #
-# run_dir, set by follow_once for this round of live sessions, holds two files per
-# (session, approval id) pair still showing a notification: a pid file the pid of
-# the notify-send process showing it, and a matching .out file that process's
-# stdout — the notification's own id, as soon as the server assigns one
-# (`--print-id`), then the chosen action once it closes. Both are named from
-# notif_key(): Approval::id is only that *session's* sequence number, not a global
-# one, so two live sessions can legitimately hold a pending approval with the same
-# numeric id at once (#222 review) — keying files by id alone would let one
-# session's file overwrite the other's the moment both have a notification open.
-# Both files are removed the moment nothing more needs them, so "a *.pid file
+# run_dir, set by follow_once for this round of live sessions, holds up to four
+# files per (session, approval id) pair still showing a notification or still
+# relaying its answer: a pid file the pid of the notify-send process showing it, a
+# matching .out file that process's stdout — the notification's own id, as soon as
+# the server assigns one (`--print-id`), then the chosen action once it closes —
+# a .worker file the pid of notify_one's own background job, and a .answer file
+# the pid of the `ward session approve` call it makes at the very end. All four
+# are named from notif_key(): Approval::id is only that *session's* sequence
+# number, not a global one, so two live sessions can legitimately hold a pending
+# approval with the same numeric id at once (#222 review) — keying files by id
+# alone would let one session's file overwrite the other's the moment both have a
+# notification open.
+#
+# .pid and .out are removed the moment nothing more needs them, so "a *.pid file
 # exists for this key" is exactly "a notification for it is still showing"; that is
 # what bounds active_notifiers and what a resolve elsewhere below checks before it
-# acts, so it never touches a notification that already closed on its own. It also
-# holds one "session-<key>.resolver" marker per live session that has (or had) an
-# open notification, holding that session's own resolver's pid.
+# acts, so it never touches a notification that already closed on its own.
+#
+# .worker outlives .pid — notify_one still has to read .out, decide, and relay the
+# answer with `ward session approve` after the notify-send process behind .pid has
+# already exited — and is what wait_for_notifiers below actually waits on for the
+# ordinary case (#224: waiting on .pid's notify-send process alone let notify_one's
+# own tail end race follow_once returning and outlive it as an orphan). It is
+# reserved empty by notifier_loop, like .pid, before notify_one starts, but *filled
+# in by notify_one itself* with its own $BASHPID as its very first action, not by
+# notifier_loop after backgrounding it: notifier_loop backgrounding notify_one and
+# then writing $! is a second process racing notify_one's own RETURN trap, which
+# can remove the file first (an instant return — notify-send missing, say) and
+# leave notifier_loop to recreate it moments later holding a pid that has already
+# exited and will now never be cleaned up by anything but sweep_run_dir (#226
+# review: reproduced independently, 10 stale markers in 10,000 runs). Writing it
+# from inside notify_one keeps the write and its own later removal strictly
+# ordered, the same way .pid's real value is filled in by notify_one itself rather
+# than by notifier_loop.
+#
+# .answer holds the pid of the `ward session approve` call notify_one backgrounds
+# for exactly this reason — wait_for_notifiers' own bound is a grace period, not a
+# guarantee, so a `ward` call slow enough to still be running once it lapses would
+# otherwise be exactly the same orphan again, one layer in (#226 review). Past the
+# grace period, a worker is no longer given the benefit of the doubt: sweep_run_dir
+# stops it directly, and does not merely signal it and hope — a killed pid
+# routinely still answers `kill -0` immediately afterwards, so a bare `kill`
+# proves nothing (#226 review) — it gives it a bounded grace to exit on its own,
+# escalates to KILL if that lapses, then actually joins it (`wait`) before
+# run_dir is removed below. It never signals the answer call directly for this,
+# though: that call is this shell's *grandchild*, reached only through the
+# worker, so this could only ever signal it, never actually join it, and doing
+# that as an operation of its own — independent of, and before, stopping the
+# worker itself — is exactly how an already-killed answer call can still outlive
+# a worker simply terminated out from under it before its own reap of that
+# answer call had completed (#226 review, again). notify_one's own TERM trap is
+# what reaps its answer call, if it has one in flight, before it can itself die
+# from being signalled this way — the worker is its real parent, the only thing
+# that can wait() on it, so it has to be the one to do this, not sweep_run_dir.
+#
+# It also holds one "session-<key>.resolver" marker per live session that has (or
+# had) an open notification, holding that session's own resolver's pid.
 run_dir=""
 
 # A short, fixed-shape, filesystem-safe stand-in for an opaque session id
@@ -303,7 +345,42 @@ active_notifiers() {
 # against the bound forever.
 notify_one() {
   local id=$1 session=$2 key=$3 agent=$4 project=$5 body=$6 progress=${7:-}
-  local pid_file=$run_dir/$key.pid hint=()
+  local pid_file=$run_dir/$key.pid worker_file=$run_dir/$key.worker \
+    answer_file=$run_dir/$key.answer answer_pid="" hint=()
+  # Remove both markers on every return path (notify-send missing, no action, an
+  # unrecognised action, or a relayed answer) so wait_for_notifiers' wait, and
+  # sweep_run_dir's own force-stop, never outlast this function actually finishing
+  # (#224, #226 review).
+  trap 'rm -f "$worker_file" "$answer_file"' RETURN
+  # sweep_run_dir may have to stop this worker directly, past its own grace
+  # period — but only ever by signalling *this*, never the answer call directly:
+  # this is that call's real parent, the only thing that can wait() on it, so
+  # this reaps it, if one is in flight, before dying itself. Terminating the
+  # worker without that would just relocate the exact orphan #224 was one
+  # process up — an already-killed answer call that nothing ever reaps (#226
+  # review: confirmed independently, an isolated repro of sweep_run_dir killing
+  # the answer directly and the worker right after, as two ordering-independent
+  # operations, left the answer pid still alive after the worker had already
+  # been joined). Bounded the same way sweep_run_dir's own escalation is.
+  trap '
+    if [[ -n ${answer_pid:-} ]]; then
+      kill "$answer_pid" 2>/dev/null || true
+      wait_deadline "$answer_pid" 1
+      if kill -0 "$answer_pid" 2>/dev/null; then
+        kill -KILL "$answer_pid" 2>/dev/null || true
+      fi
+      wait "$answer_pid" 2>/dev/null || true
+    fi
+    exit 143
+  ' TERM
+  # notifier_loop already reserved $worker_file, empty, before backgrounding this;
+  # filling in the real value here, as this job's own very first action, keeps the
+  # write strictly ordered before this same function's later removal of it above —
+  # notifier_loop writing $! itself, after backgrounding, would instead be a second
+  # process racing this trap, which can fire (an instant return below) before that
+  # write ever lands (#226 review). $BASHPID, not $$, which stays the top-level
+  # shell's pid even inside a backgrounded function call.
+  printf '%s\n' "$BASHPID" >"$worker_file"
   # The decision time left, as mako's progress line (#146 item 4): the standard
   # `value` hint, from the daemon's own countdown as this popup opens.
   [[ -n $progress ]] && hint=(-h "int:value:$progress")
@@ -328,7 +405,14 @@ notify_one() {
   rm -f "$out"
   [[ -n $action ]] || return 0
   decision=$(decision_of "$action") || return 0
-  answer "$id" "$session" "$decision" || true
+  # Backgrounded directly, the same reason and the same way as notify-send above
+  # (a wrapper subshell's pid would not be the one actually still running if the
+  # TERM trap above needs to stop it), rather than going through the shared
+  # `answer` helper the interactive path uses as-is.
+  ward session approve --session "$session" "$id" "$decision" &
+  answer_pid=$!
+  printf '%s\n' "$answer_pid" >"$answer_file"
+  wait "$answer_pid" 2>/dev/null || true
 }
 
 # The short, non-actionable title a resolved notification is replaced with.
@@ -449,6 +533,11 @@ notifier_loop() {
     # a resolve elsewhere to find.
     key=$(notif_key "$session" "$id")
     : >"$run_dir/$key.pid"
+    # Reserved empty too, for wait_for_notifiers below to always find an entry to
+    # wait on — notify_one itself fills in its own real pid, as its very first
+    # action, not this loop after backgrounding it (#226 review; see the run_dir
+    # comment above notify_one for why the write has to happen there instead).
+    : >"$run_dir/$key.worker"
     # A running clock is the progress line alone (§10: not a number); a held one
     # also says so in words, since a line that stands still reads the same as one
     # that has not been redrawn — and an answer is refused until resume.
@@ -479,11 +568,27 @@ wait_deadline() {
 # not that a popup notifier_loop *just* started is abandoned — an instant answer
 # (this round's mock, or a real fast click) racing the round's own end must win
 # that race, not be swept as though nothing was ever going to answer it.
+#
+# Joins each worker's own .worker pid, not its notify-send child's .pid — the
+# latter is reaped by notify_one's own `wait "$ns_pid"` well before notify_one has
+# read $out, decided, and relayed the answer with `ward session approve`, so
+# polling .pid alone declares a worker done while it can still be mid-flight
+# (#224: the tail end of one round's worker landing a `ward` call after the next
+# round, or the whole process, had already moved on and torn down its run_dir).
 wait_for_notifiers() {
-  local seconds=$1 pid_file pid waiters=()
-  for pid_file in "$run_dir"/*.pid; do
-    [[ -f $pid_file ]] || continue
-    pid=$(cat "$pid_file" 2>/dev/null || true)
+  local seconds=$1 worker_file pid waiters=()
+  for worker_file in "$run_dir"/*.worker; do
+    [[ -f $worker_file ]] || continue
+    # notifier_loop reserves this file empty before notify_one starts; notify_one
+    # fills in its own real pid as its very first action, so a brief empty read
+    # here is the ordinary case, not a missing worker (mirrors finish_notification's
+    # own retry below for .pid, and the comment on run_dir above notify_one).
+    local i
+    for ((i = 0; i < 100; i++)); do
+      pid=$(cat "$worker_file" 2>/dev/null || true)
+      [[ -n $pid ]] && break
+      sleep 0.02
+    done
     [[ -n $pid ]] || continue
     wait_deadline "$pid" "$seconds" &
     waiters+=("$!")
@@ -493,6 +598,42 @@ wait_for_notifiers() {
     [[ -n $w ]] && wait "$w" 2>/dev/null
   done
   return 0
+}
+
+# Stop one `ward session approve` call and establish it is gone: TERM, a bounded
+# grace, then KILL, and after each a bounded wait until the pid no longer exists —
+# not merely signalled. The answer is this shell's *grandchild* through its
+# worker, so this cannot wait() on it; a signalled answer stays visible to
+# `kill -0` until that worker reaps it from its own `wait "$answer_pid"`. So the
+# worker is made runnable first (SIGCONT is a no-op for a running process, and
+# lets a stopped one reap), and the .answer marker — the only record of this pid —
+# is removed only once the pid is confirmed gone. A survivor keeps its marker so
+# sweep_run_dir will not stop its worker, and a later pass can still find it.
+stop_answer() {
+  local answer_file=$1 worker_file=${1%.answer}.worker pid worker=""
+  pid=$(cat "$answer_file" 2>/dev/null || true)
+  if [[ -z $pid ]]; then
+    rm -f "$answer_file"
+    return 0
+  fi
+  [[ -f $worker_file ]] && worker=$(cat "$worker_file" 2>/dev/null || true)
+  if [[ -n $worker ]]; then kill -CONT "$worker" 2>/dev/null || true; fi
+  kill "$pid" 2>/dev/null || true
+  wait_deadline "$pid" 1
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    if [[ -n $worker ]]; then kill -CONT "$worker" 2>/dev/null || true; fi
+    wait_deadline "$pid" 2
+  fi
+  kill -0 "$pid" 2>/dev/null || rm -f "$answer_file"
+}
+
+stop_answers() {
+  local answer_file
+  for answer_file in "$run_dir"/*.answer; do
+    [[ -f $answer_file ]] || continue
+    stop_answer "$answer_file"
+  done
 }
 
 # Whatever is still tracked once that grace window has passed did not get a
@@ -507,6 +648,59 @@ sweep_run_dir() {
     [[ -f $pid_file ]] || continue
     finish_notification "$pid_file" "${pid_file%.pid}.out" "session-ended" ""
   done
+  # wait_for_notifiers' own grace period is a bound on how long it waits, not a
+  # guarantee that nothing is still running once it elapses (#226 review): a
+  # `ward session approve` call slow enough to still be going is exactly the same
+  # orphan #224 was, one layer in, if left running past run_dir's removal below.
+  # `kill` alone does not establish that, either (#226 review: signal delivery is
+  # asynchronous — a killed pid routinely still answers `kill -0` immediately
+  # afterwards) — this has to actually confirm each one is gone before returning,
+  # not just have asked.
+  #
+  # Answers first, and completely first: stop_answers returns only once each
+  # answer is actually gone — reaped by its own worker's `wait "$answer_pid"` —
+  # so no worker is ever stopped while its killed answer is still unreaped.
+  # Stopping a worker in that gap, or escalating it to KILL while its own TERM
+  # trap (notify_one, above) is still reaping, orphans the answer alive past this
+  # function's return (#226 review; reproduced by approve.test.sh with a worker
+  # held descheduled across the answer's escalation).
+  stop_answers
+  local worker_file answer_file pid
+  for worker_file in "$run_dir"/*.worker; do
+    [[ -f $worker_file ]] || continue
+    pid=$(cat "$worker_file" 2>/dev/null || true)
+    # notify_one's own TERM trap exits past its RETURN trap, so its marker is
+    # removed here instead.
+    [[ -n $pid ]] || { rm -f "$worker_file"; continue; }
+    # Its answer, if stop_answers could not yet confirm it gone, is still listed:
+    # only this worker can reap it, so keep the worker runnable and give it that
+    # chance before stopping it — stopping the worker first would orphan the
+    # answer alive (#226 review, exact-head 07f9525).
+    answer_file=${worker_file%.worker}.answer
+    if [[ -f $answer_file ]]; then
+      kill -CONT "$pid" 2>/dev/null || true
+      stop_answer "$answer_file"
+    fi
+    rm -f "$worker_file"
+    kill "$pid" 2>/dev/null || true
+    # Its answer is already gone (stop_answers, above), so notify_one's TERM trap
+    # has nothing left to reap and exits at once; the bound is generous only as a
+    # backstop for a worker that is itself descheduled.
+    wait_deadline "$pid" 2
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -CONT "$pid" 2>/dev/null || true
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    # The worker *is* this shell's direct child (notifier_loop backgrounds it in
+    # this same process), so it can — and must — actually be joined: that reaps it
+    # for real rather than leaving a signalled-but-unreaped pid behind.
+    wait "$pid" 2>/dev/null || true
+  done
+  # Anything still listed now has no worker left to reap it — an answer recorded
+  # after the first pass by a worker stopped above, or one whose worker could not
+  # be made to reap in time: stop it and wait (bounded) for the system's reaper.
+  stop_answers
+  rm -f "$run_dir"/*.answer
 }
 
 follow_once() {
