@@ -562,7 +562,7 @@ finish_notification() {
 # the eventual decision only to what remains when it reads ids_file at answer time.
 resolve_notification() {
   local id=$1 session=$2 state=$3 destination=$4
-  local marker=$run_dir/id-$(notif_key "$session" "$id").group
+  local marker; marker=$run_dir/id-$(notif_key "$session" "$id").group
   [[ -f $marker ]] || return 0
   local key; key=$(cat "$marker" 2>/dev/null || true)
   rm -f "$marker"
