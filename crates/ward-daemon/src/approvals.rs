@@ -2378,10 +2378,24 @@ mod tests {
     ///
     /// The refusal does not depend on scheduling: with the clock read under
     /// the lock, an answer that only gets the lock after the test has seen the
-    /// deadline pass is always refused. The barrier (the pattern of
-    /// `attempt.rs`'s reconcile race test) makes the answerer call `answer`
+    /// deadline pass is always refused. The barriers (the pattern of
+    /// `attempt.rs`'s reconcile race test) make the answerer call `answer`
     /// as the lock is taken, long before the deadline, so the buggy pre-lock
     /// read would land before the deadline and be accepted.
+    ///
+    /// Two barriers, not one: after the first releases both threads, nothing
+    /// orders "the answerer thread actually gets scheduled and reaches
+    /// `answer`" against "the main thread starts timing the real 300 ms
+    /// deadline" — a starved answerer thread could still be sitting between
+    /// the two, unscheduled, when the deadline passes, which would fail the
+    /// `entered < deadline` precondition even though the implementation is
+    /// correct. The second barrier removes that: the answerer signals it,
+    /// immediately before calling `answer`, and the main thread waits for
+    /// that signal before it starts holding the lock through the timed
+    /// deadline — so the only unordered window left is the handful of
+    /// instructions between the answerer's second `barrier.wait()` returning
+    /// and its `answer` call actually blocking on the lock, not however long
+    /// the scheduler takes to run the thread at all.
     #[test]
     fn an_answer_blocked_on_the_lock_across_the_deadline_is_refused() {
         // Plenty of margin for the answerer to enter `answer` (and, before
@@ -2389,13 +2403,16 @@ mod tests {
         // deadline; it only bounds how long the test holds the lock.
         let timeout = Duration::from_millis(300);
         let approvals = Arc::new(Approvals::new());
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let about_to_answer = Arc::new(std::sync::Barrier::new(2));
         let answerer = {
             let approvals = Arc::clone(&approvals);
-            let barrier = Arc::clone(&barrier);
+            let ready = Arc::clone(&ready);
+            let about_to_answer = Arc::clone(&about_to_answer);
             std::thread::spawn(move || {
-                barrier.wait();
+                ready.wait();
                 let entered = Instant::now();
+                about_to_answer.wait();
                 (entered, approvals.answer(1, ApprovalDecision::Allow))
             })
         };
@@ -2408,7 +2425,11 @@ mod tests {
         // Hold the serialisation lock `answer` and `wait` both need, then let
         // the answerer go: it can only block on this lock.
         let held = approvals.lock();
-        barrier.wait();
+        ready.wait();
+        // Wait for the answerer to signal it is about to call `answer` before
+        // starting to time the deadline, so a merely-slow-to-schedule
+        // answerer thread cannot fail the precondition below.
+        about_to_answer.wait();
         // Keep holding it until the deadline has actually passed.
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             std::thread::sleep(left);
