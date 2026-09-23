@@ -45,7 +45,7 @@ impl Agent {
     }
 
     /// The host variable (and vault file) holding its model-API key.
-    const fn key_env(self) -> &'static str {
+    pub(crate) const fn key_env(self) -> &'static str {
         match self {
             Self::Claude => "ANTHROPIC_API_KEY",
             Self::Codex => "OPENAI_API_KEY",

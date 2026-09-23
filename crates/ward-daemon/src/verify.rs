@@ -485,6 +485,27 @@ pub fn parse_summary(output: &str) -> VerifySummary {
     summary
 }
 
+/// A directory the verifier binds into its sandbox, named in both
+/// coordinate spaces: `host` is where a preflight check running outside the
+/// sandbox can actually stat it, `sandbox` is where the *verifier itself*
+/// sees it once bubblewrap remaps the filesystem. [`crate::readiness`] needs
+/// both: a relative symlink hop's cumulative `..`s are followed by the
+/// kernel in *sandbox* coordinates once the candidate is actually looked up
+/// inside the verifier, and the two namespaces don't share the same
+/// directory hierarchy above the bind points themselves — a host-only
+/// containment check (comparing only `host` paths) can be fooled by a
+/// relative chain that coincidentally reaches a real file on the host's own
+/// unrelated ancestry, even though the identical `..`s starting from
+/// `sandbox` land nowhere the verifier provides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mount {
+    /// Where a preflight check can stat this directory on the host.
+    pub host: PathBuf,
+    /// Where the verifier itself sees it, once bubblewrap remaps the
+    /// filesystem.
+    pub sandbox: PathBuf,
+}
+
 /// Host toolchains the verifier gets read-only, the 0.1 stand-in for a verifier
 /// image: a Rust toolchain from `$RUSTUP_HOME`/`~/.rustup` and `$CARGO_HOME`/`~/.cargo`
 /// (binaries and registry only; the cargo home itself is a private tmpfs).
@@ -517,6 +538,103 @@ impl Toolchains {
         self.rustup.is_some() && self.cargo.is_some()
     }
 
+    /// The host-side directories the verifier's own `PATH` resolves against, in
+    /// the same precedence [`Toolchains::env`]'s `PATH` value does (the mounted
+    /// Cargo `bin/` first, when detected, then the base system directories) —
+    /// but as real, checkable host paths, not the sandbox-internal
+    /// `/run/verifier/…` mount points `env` uses once *inside* the sandbox.
+    /// `/usr/local/bin`, `/usr/bin` and `/bin` are checkable directly because the
+    /// sandbox `ro_bind`s the host's own `/usr`, `/bin` (and `/lib`, `/lib64`) at
+    /// those same paths (`sandbox.rs`'s base mounts); the Cargo directory is
+    /// checkable directly because it is the exact host directory the mount's
+    /// *source* is, before the sandbox renames it to `/run/verifier/cargo/bin`.
+    ///
+    /// This is what `ward ready`'s `runtime` row judges a configured command's
+    /// program against, precisely because the calling process's own `PATH`
+    /// (an interactive shell's, an agent's, a CI job's — anything, with anything
+    /// on it) is not what the verifier itself will search: an executable on a
+    /// host path outside this list is invisible inside the verifier sandbox
+    /// even if it is on the caller's `PATH`, and a Cargo toolchain mounted here
+    /// is available inside the verifier even if `$CARGO_HOME/bin` is not on the
+    /// caller's own `PATH` at all.
+    #[must_use]
+    pub fn search_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Some(cargo) = &self.cargo {
+            dirs.push(cargo.join("bin"));
+        }
+        for base in ["/usr/local/bin", "/usr/bin", "/bin"] {
+            dirs.push(PathBuf::from(base));
+        }
+        dirs
+    }
+
+    /// The host directories individually, actually bind-mounted into the
+    /// verifier sandbox for this toolchain, each paired with the *sandbox*
+    /// path the verifier itself sees it at — distinct from
+    /// [`Toolchains::search_dirs`] (where a bare command is *looked up*, as
+    /// real host paths only), this is what a resolved symlink target, or a
+    /// literal absolute candidate, is judged against
+    /// ([`crate::readiness::check`]'s `runtime` row, via
+    /// [`crate::readiness::resolve_in_dirs`] and
+    /// [`crate::readiness::absolute_target_mount`]). Two independent binds,
+    /// both derived from the exact same mapping [`Toolchains::mount`] itself
+    /// applies, so this can never drift from what's actually bound:
+    ///
+    /// - The whole Rustup tree, read-only, at `{TOOLCHAIN_ROOT}/rustup` — a
+    ///   single directory, not narrowed the way Cargo's is below, since
+    ///   `mount` binds it in full.
+    /// - `bin` and `registry` as **siblings** under one shared, otherwise
+    ///   empty private tmpfs at `{TOOLCHAIN_ROOT}/cargo` — never the whole
+    ///   `$CARGO_HOME` (this struct's own doc: "binaries and registry only;
+    ///   the cargo home itself is a private tmpfs") — so a relative symlink
+    ///   from `bin/` can legitimately resolve into `registry/` (both hang
+    ///   off that same sandboxed parent) but nowhere else under the host's
+    ///   `$CARGO_HOME`, and *not* by however many `..`s it takes to reach
+    ///   some real system binary on the host's own, unrelated directory
+    ///   hierarchy (the two namespaces share no common ancestry above the
+    ///   bind points themselves — see
+    ///   [`crate::readiness::resolve_in_dirs`]'s doc for the concrete
+    ///   false-ready this exists to catch). Only a subdirectory that
+    ///   actually exists on the host is included, matching
+    ///   [`Toolchains::mount`]'s own `is_dir()` gate — an absent one is
+    ///   never bind-mounted either.
+    #[must_use]
+    pub fn mounts(&self) -> Vec<Mount> {
+        self.rustup_mount()
+            .into_iter()
+            .chain(self.cargo_mounts())
+            .collect()
+    }
+
+    /// The whole Rustup tree, read-only bound at its sandbox mount point —
+    /// [`Toolchains::mount`]'s own rustup bind, expressed as a [`Mount`] so
+    /// [`Toolchains::mounts`] can never drift from what's actually bound.
+    fn rustup_mount(&self) -> Option<Mount> {
+        self.rustup.as_ref().map(|rustup| Mount {
+            host: rustup.clone(),
+            sandbox: PathBuf::from(format!("{TOOLCHAIN_ROOT}/rustup")),
+        })
+    }
+
+    /// Cargo's `bin`/`registry` siblings, read-only bound inside the private
+    /// `{TOOLCHAIN_ROOT}/cargo` tmpfs — [`Toolchains::mount`]'s own cargo
+    /// binds, expressed as [`Mount`]s so [`Toolchains::mounts`] can never
+    /// drift from what's actually bound.
+    fn cargo_mounts(&self) -> Vec<Mount> {
+        let Some(cargo) = &self.cargo else {
+            return Vec::new();
+        };
+        ["bin", "registry"]
+            .into_iter()
+            .map(|sub| Mount {
+                host: cargo.join(sub),
+                sandbox: PathBuf::from(format!("{TOOLCHAIN_ROOT}/cargo/{sub}")),
+            })
+            .filter(|m| m.host.is_dir())
+            .collect()
+    }
+
     /// Environment inside the verifier.
     #[must_use]
     pub fn env(&self) -> Vec<(String, String)> {
@@ -538,16 +656,17 @@ impl Toolchains {
     /// Add the mounts to `launch`.
     #[must_use]
     pub fn mount(&self, mut launch: Launch) -> Launch {
-        if let Some(rustup) = &self.rustup {
-            launch = launch.ro_bind(rustup, format!("{TOOLCHAIN_ROOT}/rustup"));
+        if let Some(rustup_mount) = self.rustup_mount() {
+            launch = launch.ro_bind(
+                rustup_mount.host,
+                rustup_mount.sandbox.to_string_lossy().into_owned(),
+            );
         }
-        if let Some(cargo) = &self.cargo {
+        let cargo_mounts = self.cargo_mounts();
+        if self.cargo.is_some() {
             launch = launch.tmpfs(format!("{TOOLCHAIN_ROOT}/cargo"));
-            for sub in ["bin", "registry"] {
-                let dir = cargo.join(sub);
-                if dir.is_dir() {
-                    launch = launch.ro_bind(dir, format!("{TOOLCHAIN_ROOT}/cargo/{sub}"));
-                }
+            for m in cargo_mounts {
+                launch = launch.ro_bind(m.host, m.sandbox.to_string_lossy().into_owned());
             }
         }
         launch
@@ -638,6 +757,132 @@ mod tests {
         assert!(path.1.starts_with("/run/verifier/cargo/bin:"));
         assert!(!path.1.contains("/root"));
         assert_eq!(Toolchains::default().env().len(), 2, "HOME and PATH only");
+    }
+
+    #[test]
+    fn search_dirs_puts_the_real_cargo_bin_directory_first() {
+        let t = Toolchains {
+            rustup: Some("/root/.rustup".into()),
+            cargo: Some("/root/.cargo".into()),
+        };
+        // The real host path (`env()`'s PATH carries the sandbox-internal one
+        // instead, asserted above never to leak `/root`), because this is what a
+        // preflight check running on the host, not inside the sandbox, can
+        // actually stat.
+        assert_eq!(
+            t.search_dirs(),
+            vec![
+                PathBuf::from("/root/.cargo/bin"),
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+            ]
+        );
+        assert_eq!(
+            Toolchains::default().search_dirs(),
+            vec![
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+            ],
+            "no cargo detected: no toolchain entry"
+        );
+    }
+
+    #[test]
+    fn mounts_pairs_the_real_cargo_bin_and_registry_directories_with_their_sandbox_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        let registry = home.path().join("registry");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        let t = Toolchains {
+            rustup: None,
+            cargo: Some(home.path().to_path_buf()),
+        };
+        // Both host directories that actually exist are paired with the
+        // sandbox path `Toolchains::mount` binds them at — siblings under
+        // one shared toolchain root, never the whole (private, otherwise
+        // empty) `$CARGO_HOME` tmpfs.
+        assert_eq!(
+            t.mounts(),
+            vec![
+                Mount {
+                    host: bin,
+                    sandbox: PathBuf::from("/run/verifier/cargo/bin"),
+                },
+                Mount {
+                    host: registry,
+                    sandbox: PathBuf::from("/run/verifier/cargo/registry"),
+                },
+            ]
+        );
+        // A subdirectory that doesn't exist on the host is never bind-mounted
+        // (`Toolchains::mount`'s own `is_dir()` gate), so it's excluded here too.
+        let sparse = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(sparse.path().join("bin")).unwrap();
+        let t = Toolchains {
+            rustup: None,
+            cargo: Some(sparse.path().to_path_buf()),
+        };
+        assert_eq!(
+            t.mounts(),
+            vec![Mount {
+                host: sparse.path().join("bin"),
+                sandbox: PathBuf::from("/run/verifier/cargo/bin"),
+            }]
+        );
+        assert_eq!(
+            Toolchains::default().mounts(),
+            Vec::new(),
+            "no cargo detected"
+        );
+    }
+
+    #[test]
+    fn mounts_includes_the_whole_rustup_tree_whenever_mount_binds_it() {
+        // Review finding on #219 (head 61469b5): `Toolchains::mount` binds the
+        // whole Rustup tree at `/run/verifier/rustup` whenever `rustup` is
+        // `Some`, but `mounts()` previously returned only Cargo's `bin`/
+        // `registry` pair — so `readiness::check`'s `sandbox_to_host` and
+        // `absolute_target_mount` had no way to translate a candidate under
+        // `/run/verifier/rustup/...`, a real, executable destination once
+        // `ward verify` actually runs, and rejected it as outside every
+        // known mount. `rustup_mount` and `cargo_mounts` are the same
+        // helpers `mount()` itself now calls, so this can't drift again.
+        let rustup = tempfile::tempdir().unwrap();
+        let t = Toolchains {
+            rustup: Some(rustup.path().to_path_buf()),
+            cargo: None,
+        };
+        assert_eq!(
+            t.mounts(),
+            vec![Mount {
+                host: rustup.path().to_path_buf(),
+                sandbox: PathBuf::from("/run/verifier/rustup"),
+            }]
+        );
+        // Both toolchains present: Rustup first, then Cargo's siblings,
+        // matching the order `mount()` itself binds them in.
+        let cargo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cargo.path().join("bin")).unwrap();
+        let t = Toolchains {
+            rustup: Some(rustup.path().to_path_buf()),
+            cargo: Some(cargo.path().to_path_buf()),
+        };
+        assert_eq!(
+            t.mounts(),
+            vec![
+                Mount {
+                    host: rustup.path().to_path_buf(),
+                    sandbox: PathBuf::from("/run/verifier/rustup"),
+                },
+                Mount {
+                    host: cargo.path().join("bin"),
+                    sandbox: PathBuf::from("/run/verifier/cargo/bin"),
+                },
+            ]
+        );
     }
 
     #[test]
