@@ -36,6 +36,7 @@ grep -q 'WARD WILL ALLOW' <<<"$help" || fail "--help names the three blocks"
 grep -q 'wardos-approve-inbox' <<<"$help" || fail "--help names the persistent inbox"
 grep -q 'WARDOS_APPROVE_MAX_NOTIFIERS' <<<"$help" || fail "--help names the worker bound"
 grep -q 'progress line' <<<"$help" || fail "--help names the decision-time progress line"
+grep -q '(×N)' <<<"$help" || fail "--help names duplicate-notice grouping"
 
 # --- --watch: one notification per pending approval, from every live session, the
 # action relayed (#141: not just $project's session) --------------------------------
@@ -387,6 +388,86 @@ assert_logged '^held while paused · resume the session to answer$'
 [[ $(grep -c 'DECISION TIME' "$MOCK_LOG") == 1 ]] ||
   fail "only the held approval carries a DECISION TIME block: $(cat "$MOCK_LOG")"
 
+# --- --watch: exact duplicates share one notification; answering it answers every id
+# gathered under it (#146 item 7) — an agent that fires the same tool call twice
+# before the first is answered, say, must not open two identical popups -----------
+: >"$MOCK_LOG"
+dup_a=$line12
+dup_b=${line12/\"id\":12/\"id\":14}
+export DUP_A=$dup_a DUP_B=$dup_b
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$DUP_A" "$DUP_B" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# A brief, realistic delay before answering (mirroring a person's reaction time, not
+# an instant auto-dismiss): the second line's read is near-instant, but still a real
+# race against this worker's own background startup, so this is what actually gives
+# it room to land in ids_file before the popup is asked to show anything.
+mock notify-send 'case "$*" in *--print-id*) echo 6161; sleep 0.2; echo session ;; *) exit 0 ;; esac'
+# The count in the title is a snapshot taken shortly after the group's coalescing
+# window (notify_one's own comment on it), racing the main loop's read of the second
+# line the same way #224/#226 raced notify_one's startup against wait_for_notifiers —
+# widened here well past that jitter so the assertion below tests the intended
+# behaviour, not this environment's scheduling noise on any given run.
+WARDOS_APPROVE_COALESCE_S=0.5 WARDOS_PROJECT=/home/dev/payments-api "$approve" --watch --once
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 1 ]] ||
+  fail "two exact duplicates must share one popup, not open two: $(cat "$MOCK_LOG")"
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait --print-id -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api \(×2\) <span alpha="39322">DESTINATION</span>$'
+assert_not_logged 'payments-api <span'
+assert_logged '^ward session approve --session sess_a 12 allow-session$'
+assert_logged '^ward session approve --session sess_a 14 allow-session$'
+
+# --- --watch: identical requests from two different live sessions are never grouped
+# (#146 item 7: grouping never crosses sessions, even when title and body would
+# otherwise read the same) ----------------------------------------------------------
+: >"$MOCK_LOG"
+dup_other_session='{"id":21,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":null},"requested_at_unix_ms":1,"agent":"claude","session":"sess_d","project":"payments-api"}'
+export DUP_OTHER_SESSION=$dup_other_session
+noop_sess_d='"session approvals --json --follow --session sess_d") : ;;'
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$LINE12" "$DUP_OTHER_SESSION" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  '"$noop_sess_d"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'echo allow'
+WARDOS_APPROVE_MAX_NOTIFIERS=2 WARDOS_PROJECT=/home/dev/payments-api "$approve" --watch --once
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 2 ]] ||
+  fail "the same request from two different sessions must not be grouped: $(cat "$MOCK_LOG")"
+assert_not_logged '×2'
+assert_logged '^ward session approve --session sess_d 21 allow$'
+assert_logged '^ward session approve --session sess_a 12 allow$'
+
+# --- --watch: one of two duplicates is decided elsewhere while the group's popup is
+# still open — it is left open for the other one, not replaced or re-answered, and the
+# eventual sweep answers only what is left (#146 item 7) ----------------------------
+: >"$MOCK_LOG"
+dup_x=$line12
+dup_y=${line12/\"id\":12/\"id\":16}
+export DUP_X=$dup_x DUP_Y=$dup_y
+decided16='{"approval":{"id":16,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export DECIDED16=$decided16
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$DUP_X" "$DUP_Y" ;;
+  "session approvals --json --follow --session sess_a") sleep 0.3; printf "%s\n" "$DECIDED16" ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# Never itself answers: stays open (--wait, killed only by the round's own sweep) so
+# the only way id16 becomes terminal here is the resolver's decided record above.
+mock notify-send 'case "$*" in *--print-id*) echo 5151; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+assert_not_logged '^notify-send .* -r 5151 Timed out — denied'
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 5151 Session ended — denied <tt></tt>$'
+assert_not_logged '^ward session approve --session sess_a 16'
+assert_not_logged '^ward session approve --session sess_a 12'
+
 # --- interactive: one pending approval is picked, shown, the menu answers y / s / n ---
 : >"$MOCK_LOG"
 # shellcheck disable=SC2016
@@ -491,6 +572,200 @@ mock ward 'case "$*" in "session pending --json "*) : ;; *) exit 1 ;; esac'
 out=$("$approve")
 assert_eq "$out" "  no pending approvals"
 assert_not_logged '^ward session approve'
+
+# --- --watch: a second identical pending record delivered after the first popup
+# exits (its notify-send child is gone) but before its worker actually finishes
+# reading its own membership must join that same still-open generation, not reuse
+# its files for a second one and misdirect or lose the first's ids (#228 review,
+# round 2: round 1's own fix still let this happen, because releasing .worker and
+# then sweeping every marker naming key were two separate, unsynchronised steps —
+# a new generation could claim key the instant .worker was gone, and the old
+# generation's own sweep, still running, could delete that brand new generation's
+# marker right back out, since it too matched key). Forced, not hoped for: a
+# barrier on notify_one's own `tail -n1 "$out"` — the one external command between
+# the popup closing and this worker reading its own .ids — holds it open for a
+# real 0.3s window, and the third pending line is not even written until that
+# barrier confirms the window has started -------------------------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/notify_one_past_action"
+gen_a=$line12
+gen_b=${line12/\"id\":12/\"id\":15}
+export GEN_A=$gen_a GEN_B=$gen_b
+# tail is called exactly once in wardos-approve, as notify_one's own "$out" read;
+# every other call in this test file is real tail. Computes the true answer at once,
+# signals it is about to hand it back, then sits on it — reproducing exactly the
+# window #228 found unprotected, not a guess at when it might occur.
+# shellcheck disable=SC2016
+mock tail 'out=$(command -p tail "$@"); : >"$TMP/notify_one_past_action"; sleep 0.3; printf "%s\n" "$out"'
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow")
+    printf "%s\n" "$GEN_A"
+    for _ in $(seq 1 200); do [[ -f "$TMP/notify_one_past_action" ]] && break; sleep 0.01; done
+    printf "%s\n" "$GEN_B"
+    ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'echo allow'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 1 ]] ||
+  fail "a duplicate arriving in this exact window must join the one open popup, never a second: $(cat "$MOCK_LOG")"
+assert_logged '^ward session approve --session sess_a 12 allow$'
+assert_logged '^ward session approve --session sess_a 15 allow$'
+
+# --- --watch: a resolver removing one id from a group and notifier_loop appending
+# another to the very same still-open .ids file must not lose either write (#228
+# review, round 2). Forced, not hoped for: a barrier on resolve_notification's own
+# `grep -vFx` — its only external command, and the one place it reads .ids —
+# computes the true (pre-append) filtered result at once, signals it, then sits on
+# it for 0.3s; the append is not even attempted until that signal fires, so it
+# always lands while the resolver's read is stale and its write has not happened
+# yet — exactly the interleaving that loses the append without key.lock ----------
+: >"$MOCK_LOG"
+mock tail 'command -p tail "$@"'
+rm -f "$TMP/race_setup_done" "$TMP/resolver_past_read"
+race_a=$line12
+race_b=${line12/\"id\":12/\"id\":17}
+race_c=${line12/\"id\":12/\"id\":18}
+export RACE_A=$race_a RACE_B=$race_b RACE_C=$race_c
+decided17='{"approval":{"id":17,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export DECIDED17=$decided17
+# grep -vFx 17 is resolve_notification's only call, for this id only; every other
+# grep in this test file (including assert_logged's own) passes straight through.
+# shellcheck disable=SC2016
+mock grep 'if [[ "$*" == "-vFx 17 "* ]]; then
+  out=$(command -p grep "$@")
+  : >"$TMP/resolver_past_read"
+  sleep 0.3
+  printf "%s\n" "$out"
+else
+  command -p grep "$@"
+fi'
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow")
+    printf "%s\n%s\n" "$RACE_A" "$RACE_B"
+    # A settle delay, not a race of its own: comfortably more than local pipe/jq/read
+    # latency for two lines, so notifier_loop has certainly joined 17 into the group
+    # (its own id marker written) before this signals the resolver below to act on
+    # it — the race under test is only the one the grep barrier forces, next.
+    sleep 0.2
+    : >"$TMP/race_setup_done"
+    for _ in $(seq 1 200); do [[ -f "$TMP/resolver_past_read" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_C"
+    ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 200); do [[ -f "$TMP/race_setup_done" ]] && break; sleep 0.01; done
+    printf "%s\n" "$DECIDED17"
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 7171; sleep 0.6; echo allow ;; *) exit 0 ;; esac'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 1 ]] ||
+  fail "17, 18 and 12 are one key: only one popup, whatever races land on its .ids: $(cat "$MOCK_LOG")"
+assert_logged '^ward session approve --session sess_a 12 allow$'
+assert_logged '^ward session approve --session sess_a 18 allow$'
+assert_not_logged '^ward session approve --session sess_a 17'
+
+# --- --watch: a same-key duplicate arriving while a just-resolved generation's
+# popup is still being closed gets its own new popup, never silently dropped
+# against a generation whose membership resolve_notification has already emptied
+# (#228 review, round 3, item 1: key.current was left naming the closed-out
+# generation until notify_one's own eventual close_generation got around to
+# clearing it — a same-key arrival in that gap joined a membership file that no
+# longer existed and was never answered by anyone). Forced, not hoped for: a
+# barrier on finish_notification's own notify-send replace call (its only external
+# command) holds it open for a real 0.3s window after resolve_notification's own
+# locked section — which now clears key.current itself — has already completed,
+# and the duplicate is not written until that barrier confirms the window has
+# started -----------------------------------------------------------------------
+: >"$MOCK_LOG"
+mock tail 'command -p tail "$@"'
+mock grep 'command -p grep "$@"'
+rm -f "$TMP/fin_setup_done" "$TMP/finish_notification_started" "$TMP/first_popup_seen"
+fin_a=$line12
+fin_b=${line12/\"id\":12/\"id\":19}
+export FIN_A=$fin_a FIN_B=$fin_b
+decided12='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export DECIDED12=$decided12
+# The first --print-id call is this generation's own popup: it never itself
+# answers (killed only by finish_notification below, once the resolver decides its
+# sole member elsewhere), so the only way id 12 could be relayed is a bug. The
+# second is the duplicate's own new popup, answered normally.
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*)
+    if [[ -f "$TMP/first_popup_seen" ]]; then
+      echo allow
+    else
+      : >"$TMP/first_popup_seen"
+      echo 9191
+      exec sleep 30
+    fi
+    ;;
+  *"-t 4000"*) : >"$TMP/finish_notification_started"; sleep 0.3; exit 0 ;;
+  *) exit 0 ;;
+esac'
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow")
+    printf "%s\n" "$FIN_A"
+    # A settle delay, not a race of its own (see the earlier .ids race test):
+    # comfortably more than local pipe/jq/read latency, so notifier_loop has
+    # certainly opened 12'"'"'s own generation (marker and .ids both published,
+    # atomically, by open_new_generation) before this signals the resolver below.
+    sleep 0.2
+    : >"$TMP/fin_setup_done"
+    for _ in $(seq 1 300); do [[ -f "$TMP/finish_notification_started" ]] && break; sleep 0.01; done
+    printf "%s\n" "$FIN_B"
+    ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 200); do [[ -f "$TMP/fin_setup_done" ]] && break; sleep 0.01; done
+    printf "%s\n" "$DECIDED12"
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 2 ]] ||
+  fail "a same-key duplicate arriving while the resolved generation's popup is still closing must get its own popup: $(cat "$MOCK_LOG")"
+assert_logged '^ward session approve --session sess_a 19 allow$'
+assert_not_logged '^ward session approve --session sess_a 12'
+
+# --- --watch: a resolver's terminal event for a brand-new id and notifier_loop's
+# own first arrival of that id, delivered with no settle between them at all, never
+# answer the id more than once (#228 review, round 3, item 2: join_open_generation
+# and open_new_generation used to publish an id's own membership marker only after
+# releasing key.lock, so a resolver arriving in that gap found no marker, did
+# nothing, and this worker later relayed an answer for an id the daemon had already
+# decided elsewhere). The marker is now published under the same lock, and by the
+# same subshell, as the membership write itself — the two are never two events for
+# a barrier to land between, so unlike the other tests here this one is not a forced
+# reproduction of a specific interleaving; it is a standing invariant check under
+# realistic adversarial timing (no settle delay at all, both sides going as fast as
+# they can) that this worker still never answers an id more than once ------------
+: >"$MOCK_LOG"
+mock tail 'command -p tail "$@"'
+mock grep 'command -p grep "$@"'
+new_a=$line12
+export NEW_A=$new_a
+decided12_fast='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export DECIDED12_FAST=$decided12_fast
+mock notify-send 'case "$*" in *--print-id*) echo 4242; sleep 0.3; echo allow ;; *) exit 0 ;; esac'
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$NEW_A" ;;
+  "session approvals --json --follow --session sess_a") printf "%s\n" "$DECIDED12_FAST" ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+[[ $(grep -c -- '^ward session approve --session sess_a 12' "$MOCK_LOG") -le 1 ]] ||
+  fail "id 12 must never be answered by this worker more than once, whatever order the resolver and the first arrival land in: $(cat "$MOCK_LOG")"
 
 # --- shellcheck-clean, usage block, strict mode -----------------------------------
 head -1 "$approve" | grep -q '^#!/usr/bin/env bash$' || fail "shebang"
