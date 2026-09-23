@@ -265,7 +265,12 @@ fn surface_text(snapshot: Option<&Snapshot>, surface: Surface) -> String {
 /// `tick`, so the verify segment answers for the tree as it is without
 /// silently dropping a real change: [`DigestGate`] guarantees every
 /// invalidation is either covered by the scan it lands before or earns a
-/// follow-up scan.
+/// follow-up scan. A record withdraws freshness the instant it lands
+/// ([`Model::invalidate_freshness`]), even though its digest may still be
+/// waiting out the debounce interval, so the trust bar never keeps showing a
+/// confirmed match with evidence the tree may already differ; the socket is
+/// polled at least as often as that interval so the deadline itself gets a
+/// digest without needing another record.
 fn waybar(
     dir: &Path,
     settle: Duration,
@@ -296,15 +301,34 @@ fn waybar(
     let from_seq = snapshot.model.records.last().map_or(0, |r| r.seq + 1);
     let subscriber = client::connect(&socket)?;
     let mut failed = None;
-    client::watch_records_ticking(subscriber, from_seq, tick, |rec| {
-        observe_event(
+    // While a segment digests, poll the socket at least as often as the
+    // debounce interval, so a pending dirty gate is rescanned at its own
+    // deadline rather than only when the next record happens to arrive or
+    // the much longer quiet-tick safety net (`tick`) elapses. `force` stays
+    // reserved for that safety net (an edit made outside the sandbox, which
+    // leaves no record to debounce) and is decided against wall-clock time
+    // since the last real scan, independent of this finer polling grain.
+    let poll_tick = if needs_freshness {
+        tick.min(DIGEST_DEBOUNCE)
+    } else {
+        tick
+    };
+    let mut last_force = Instant::now();
+    client::watch_records_ticking(subscriber, from_seq, poll_tick, |rec| {
+        let at = Instant::now();
+        let force = rec.is_none() && at.duration_since(last_force) >= tick;
+        let scanned = observe_event(
             &mut snapshot,
             digester.as_mut(),
             &mut gate,
             rec,
-            Instant::now(),
+            at,
             DIGEST_DEBOUNCE,
+            force,
         );
+        if scanned {
+            last_force = at;
+        }
         let now = module(&snapshot, segment);
         if now != last {
             if let Err(e) = emit(&now) {
@@ -325,13 +349,19 @@ fn waybar(
 }
 
 /// One step of the follow loop: apply `event` (a record, or `None` for a
-/// quiet tick) to `snapshot`, then — only when `digester` is `Some`, i.e. the
-/// segment being rendered needs freshness — decide through `gate` whether to
-/// digest the worktree now. A record only starts a scan once `interval` has
-/// passed since the last one began, coalescing a burst; a tick (`event` is
-/// `None`) always scans, the safety net for an edit made outside the sandbox
-/// that leaves no record. Returns whether a scan actually ran, for tests.
-/// Factored out of the `--follow` closure so it is testable without a socket.
+/// wake-up with nothing new) to `snapshot`, then — only when `digester` is
+/// `Some`, i.e. the segment being rendered needs freshness — decide through
+/// `gate` whether to digest the worktree now. A record marks the gate dirty
+/// and withdraws freshness at once (`Model::invalidate_freshness`): the
+/// digest itself may be debounced, but the trust bar must never keep
+/// claiming a confirmed match with evidence the tree may already differ,
+/// even for the interval before that debounced digest runs. `force` is the
+/// caller's decision that the quiet-tick safety net is due (an edit made
+/// outside the sandbox, which leaves no record to debounce) — independent of
+/// how often this function is called, which may be much more often than
+/// that, so the debounce deadline itself still gets serviced. Returns
+/// whether a scan actually ran, for tests. Factored out of the `--follow`
+/// closure so it is testable without a socket.
 fn observe_event(
     snapshot: &mut Snapshot,
     digester: Option<&mut Digester>,
@@ -339,18 +369,20 @@ fn observe_event(
     event: Option<EventRecord>,
     now: Instant,
     interval: Duration,
+    force: bool,
 ) -> bool {
-    let is_tick = event.is_none();
+    let had_record = event.is_some();
     if let Some(rec) = event {
         snapshot.model.apply(rec);
     }
     let Some(digester) = digester else {
         return false;
     };
-    if !is_tick {
+    if had_record {
         gate.mark_dirty();
+        snapshot.model.invalidate_freshness();
     }
-    if gate.poll(now, interval, is_tick) == Decision::Scan {
+    if gate.poll(now, interval, force) == Decision::Scan {
         digester.observe(snapshot);
         gate.finish();
         true
@@ -780,6 +812,7 @@ mod tests {
             } else {
                 None
             };
+            let force = event.is_none();
             let scanned = observe_event(
                 &mut s,
                 None,
@@ -787,6 +820,7 @@ mod tests {
                 event,
                 t0 + Duration::from_secs(i),
                 DIGEST_DEBOUNCE,
+                force,
             );
             assert!(!scanned, "no digester means no scan, ever (i={i})");
         }
@@ -824,6 +858,7 @@ mod tests {
                 Some(rec),
                 t0 + Duration::from_millis(i),
                 DIGEST_DEBOUNCE,
+                false,
             ) {
                 scans += 1;
             }
@@ -844,6 +879,7 @@ mod tests {
             Some(rec),
             t0 + DIGEST_DEBOUNCE,
             DIGEST_DEBOUNCE,
+            false,
         );
         assert!(scanned, "a record past the debounce interval scans again");
         assert_eq!(scans + u32::from(scanned), 2);
@@ -872,6 +908,7 @@ mod tests {
             None,
             t0,
             DIGEST_DEBOUNCE,
+            true,
         ));
         assert!(
             observe_event(
@@ -881,8 +918,115 @@ mod tests {
                 None,
                 t0,
                 DIGEST_DEBOUNCE,
+                true,
             ),
-            "a tick scans unconditionally, not just the first one"
+            "a forced tick scans unconditionally, not just the first one"
+        );
+    }
+
+    /// Review finding on #213: debouncing the digest must never let the trust
+    /// bar keep claiming a confirmed match once a record gives explicit
+    /// evidence the tree may have changed, and the debounce deadline itself —
+    /// not only another record or the unrelated quiet-tick safety net — must
+    /// still get the deferred digest run.
+    #[test]
+    fn a_dirty_trigger_withdraws_green_immediately_and_is_rescanned_by_its_own_deadline() {
+        #![allow(clippy::unwrap_used)]
+        use ward_events::{Blake3Hash, Chain, SessionId};
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let cas = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(cas.path().join("cas")).unwrap();
+        let candidate = store
+            .store_snapshot(
+                work.path(),
+                ward_snapshot::SnapshotRole::Candidate,
+                candidate_options(),
+            )
+            .unwrap();
+        let mut digester = Digester {
+            cache: HashCache::new(),
+            store: Some(store),
+        };
+        let mut gate = DigestGate::new();
+        let mut s = snapshot_on(work.path(), &[passed(candidate)]);
+        let mut chain = Chain::genesis(SessionId::from_u128(9), Blake3Hash::from_bytes([3; 32]));
+        let t0 = Instant::now();
+
+        // A first record-triggered scan while the tree still matches: green,
+        // and the gate now has a real last-scan baseline for the interval
+        // below (mirroring the real bar's pre-loop digest plus at least one
+        // record already having gone through the gate).
+        assert!(observe_event(
+            &mut s,
+            Some(&mut digester),
+            &mut gate,
+            Some(note(&mut chain, 0)),
+            t0,
+            DIGEST_DEBOUNCE,
+            false,
+        ));
+        assert!(
+            TrustBar::new(&s.header, &s.model)
+                .segment(SegmentName::Verify)
+                .unwrap()
+                .text
+                .starts_with("VERIFY \u{2713} "),
+            "setup: must start green"
+        );
+
+        // Edit the tree, then feed a record inside the debounce interval:
+        // the digest itself is deferred...
+        std::fs::write(work.path().join("a.rs"), "fn a() { changed() }\n").unwrap();
+        let scanned = observe_event(
+            &mut s,
+            Some(&mut digester),
+            &mut gate,
+            Some(note(&mut chain, 1)),
+            t0 + Duration::from_millis(1),
+            DIGEST_DEBOUNCE,
+            false,
+        );
+        assert!(
+            !scanned,
+            "the digest itself is debounced, still inside the interval"
+        );
+        // ...but green must already be withdrawn: the trust bar must not
+        // keep asserting a confirmed match with evidence the tree may have
+        // changed, before that debounced digest ever runs.
+        assert_ne!(
+            TrustBar::new(&s.header, &s.model)
+                .segment(SegmentName::Verify)
+                .unwrap()
+                .tone,
+            ward_shell_core::Tone::Ok,
+            "green must be withdrawn the instant a change might have landed"
+        );
+
+        // At the debounce deadline, with no further record — a fine-grained
+        // wake-up, not a record and not the unrelated quiet-tick safety net
+        // (force stays false) — the pending dirty generation must still be
+        // rescanned.
+        let scanned = observe_event(
+            &mut s,
+            Some(&mut digester),
+            &mut gate,
+            None,
+            t0 + DIGEST_DEBOUNCE,
+            DIGEST_DEBOUNCE,
+            false,
+        );
+        assert!(
+            scanned,
+            "the debounce deadline itself must be scanned, not only another record or a forced tick"
+        );
+        assert_eq!(
+            TrustBar::new(&s.header, &s.model)
+                .segment(SegmentName::Verify)
+                .unwrap()
+                .text,
+            "VERIFY ~ STALE",
+            "the deferred digest must now reflect the real edit"
         );
     }
 

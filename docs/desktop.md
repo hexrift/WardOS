@@ -249,7 +249,13 @@ longer re-digests immediately every time: record-triggered digests are debounced
 most one per 250 ms (`DIGEST_DEBOUNCE`), so a burst of records collapses into a bounded
 number of scans instead of one per record, while `DigestGate` guarantees a change that
 lands is still always either covered by the scan running when it lands or picked up by a
-follow-up scan — never silently dropped. Cost on `examples/ward-demo` (9 files), measured
+follow-up scan — never silently dropped. A record withdraws `VERIFY ✓`'s green the
+instant it lands, before its (possibly still-debounced) digest ever runs, so the bar
+never keeps asserting a confirmed match against a tree that already has evidence against
+it; the daemon socket is itself polled at least as often as `DIGEST_DEBOUNCE` while a
+segment needs freshness, so the debounce deadline is serviced on its own rather than
+only when the next record happens to arrive or the much longer quiet tick elapses. Cost
+on `examples/ward-demo` (9 files), measured
 by `ward-shell`'s
 `a_warm_digest_of_the_demo_is_within_the_bar_budget` (release build, 4-vCPU host): cold
 0.24 ms, warm 0.05 ms; on this repository's own checkout (364 files, `WARD_DIGEST_DIR`)
