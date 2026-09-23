@@ -1033,6 +1033,27 @@ pub enum WardEvent {
         /// this session ended before the attempt reached a terminal result").
         reason: ShortText,
     },
+    /// The trusted verifier command was started but did not finish within the configured
+    /// `verify.budget_secs`, so it was killed (#139 item 1). A distinct terminal outcome
+    /// from `VerificationFailed` (the command ran to completion and exited non-zero): an
+    /// exhausted budget says nothing about whether the tests pass, so it is never shown as
+    /// a test failure. `summary` holds whatever the runner reported before it was killed
+    /// (usually partial), and `result_hash` covers the retained output exactly as it does
+    /// for `VerificationFailed`. Appended at the end of the catalogue, not grouped with
+    /// `VerificationFailed` above, because postcard identifies variants by declaration
+    /// index and existing indices must never move.
+    VerificationTimedOut {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Candidate snapshot.
+        candidate: SnapshotId,
+        /// Counts the runner reported before it was killed.
+        summary: VerifySummary,
+        /// Hash of the retained result document.
+        result_hash: Blake3Hash,
+        /// The budget, in seconds, the command exceeded.
+        budget_secs: u64,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -1079,11 +1100,12 @@ pub enum EventKind {
     VerificationAttemptStarted = 34,
     VerificationCancelled = 35,
     VerificationInterrupted = 36,
+    VerificationTimedOut = 37,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 37] = [
+    pub const ALL: [EventKind; 38] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -1121,6 +1143,7 @@ impl EventKind {
         EventKind::VerificationAttemptStarted,
         EventKind::VerificationCancelled,
         EventKind::VerificationInterrupted,
+        EventKind::VerificationTimedOut,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
@@ -1170,6 +1193,7 @@ impl EventKind {
             EventKind::VerificationAttemptStarted => "verification_attempt_started",
             EventKind::VerificationCancelled => "verification_cancelled",
             EventKind::VerificationInterrupted => "verification_interrupted",
+            EventKind::VerificationTimedOut => "verification_timed_out",
         }
     }
 
@@ -1194,6 +1218,7 @@ impl EventKind {
                 | EventKind::VerificationAttemptStarted
                 | EventKind::VerificationCancelled
                 | EventKind::VerificationInterrupted
+                | EventKind::VerificationTimedOut
                 | EventKind::StateAccepted
                 | EventKind::TamperDetected
                 | EventKind::Anchor
@@ -1386,6 +1411,7 @@ impl WardEvent {
             WardEvent::VerificationAttemptStarted { .. } => EventKind::VerificationAttemptStarted,
             WardEvent::VerificationCancelled { .. } => EventKind::VerificationCancelled,
             WardEvent::VerificationInterrupted { .. } => EventKind::VerificationInterrupted,
+            WardEvent::VerificationTimedOut { .. } => EventKind::VerificationTimedOut,
         }
     }
 
@@ -1417,9 +1443,9 @@ mod tests {
             assert_eq!(k.bit(), 1u64 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
-        // The catalogue is currently 37 kinds wide, well inside the `u64` backing's
+        // The catalogue is currently 38 kinds wide, well inside the `u64` backing's
         // 64-bit capacity -- so, unlike when the backing type was exactly saturated
-        // at `u32`, there IS a first unused bit right now (bit 37), and a value that
+        // at `u32`, there IS a first unused bit right now (bit 38), and a value that
         // sets it must be rejected as an unknown kind rather than silently accepted.
         // This is the same "no room past the known kinds to smuggle a bit through"
         // property `kind_bits_are_dense...`'s name promises, just checked against

@@ -284,10 +284,12 @@ tree differs from that candidate.
 | State | Segment | Colour | Meaning |
 | --- | --- | --- | --- |
 | never | `VERIFY —` | muted | nothing has been verified in this session |
+| preparing | `VERIFY ◐ PREPARING` | accent | an attempt was allocated and is capturing its candidate; no candidate yet (#139) |
 | verifying | `VERIFY ◐ 7c01a2b3` | accent | the trusted verifier is running on candidate `7c01…` |
 | verified | `VERIFY ✓ 7c01a2b3` | verified green | candidate `7c01…` passed, and the worktree is `7c01…` byte for byte |
 | stale | `VERIFY ~ STALE` | restricted amber | `7c01…` passed, but the worktree has changed since; the verdict is history |
 | failed | `VERIFY ✗` | denied red | the trusted command ran and the candidate failed |
+| timedout | `VERIFY ! TIMEOUT` | denied red | the trusted command was killed at `verify.budget_secs` before it finished; not a test failure, and its partial counts are never shown green (#139) |
 | errored | `VERIFY ! ERROR` | denied red | the attempt could not run to a pass/fail result at all (sandbox runtime failed to launch, a preparation step failed, …); never shown as running or as a failed test (#139) |
 | cancelled | `VERIFY ! CANCELLED` | denied red | the user cancelled the attempt before it reached a pass/fail result (#139) |
 | interrupted | `VERIFY ! INTERRUPTED` | denied red | the process running the attempt (a session daemon, or a daemonless `ward` invocation) ended before it reached a terminal result, and a later reconciliation pass recorded that (#139) |

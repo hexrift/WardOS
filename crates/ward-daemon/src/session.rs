@@ -189,6 +189,9 @@ pub struct VerifyReport {
     pub candidate: String,
     /// Whether the trusted verifier passed.
     pub passed: bool,
+    /// The budget, in seconds, when the verifier was killed for exceeding it instead
+    /// of exiting on its own (`VerificationTimedOut`, #139). `None` when it exited.
+    pub timed_out: Option<u64>,
     /// Parsed counts.
     pub summary: VerifySummary,
     /// Protected paths the verifier took from the entry snapshot instead of the worktree.
@@ -908,6 +911,7 @@ impl Session {
     ///
     /// #139: every exit path from here leaves exactly one terminal record behind
     /// the attempt it concerns — `VerificationPassed`, `VerificationFailed`,
+    /// `VerificationTimedOut` (the command was killed at `verify.budget_secs`),
     /// `VerificationErrored` (the run could not be carried to either of those:
     /// the sandbox runtime failed to launch, a step in between errored, …),
     /// `VerificationCancelled` (a cooperative cancel, see
@@ -1105,7 +1109,7 @@ impl Session {
         // of this function attempts to leave a terminal verification record behind
         // it. If that append itself fails too, the log may still end at
         // `VerificationStarted` — the `match` below never hides that from the caller.
-        let result = self.run_prepared_verification(prepared, candidate);
+        let result = self.run_prepared_verification(prepared, attempt, candidate);
         let _ = std::fs::remove_dir_all(&prepared.scratch);
         let _ = std::fs::remove_dir(scratch_root);
         match result {
@@ -1157,6 +1161,7 @@ impl Session {
     fn run_prepared_verification(
         &mut self,
         prepared: &verify::Verification,
+        attempt: AttemptId,
         candidate: ward_events::SnapshotId,
     ) -> Result<VerifyReport> {
         for rel in &prepared.restored {
@@ -1193,11 +1198,22 @@ impl Session {
             },
         )?;
         let result_hash = ev_hash(outcome.result_hash);
+        let budget_secs = prepared.config.verify.budget_secs;
         let event = if outcome.passed {
             WardEvent::VerificationPassed {
                 candidate,
                 summary: outcome.summary,
                 result_hash,
+            }
+        } else if outcome.timed_out {
+            // Killed at the budget, not a verdict on the tests: its own terminal
+            // outcome, never `VerificationFailed` (#139 item 1).
+            WardEvent::VerificationTimedOut {
+                attempt,
+                candidate,
+                summary: outcome.summary,
+                result_hash,
+                budget_secs,
             }
         } else {
             WardEvent::VerificationFailed {
@@ -1210,6 +1226,7 @@ impl Session {
         Ok(VerifyReport {
             candidate: candidate.to_string(),
             passed: outcome.passed,
+            timed_out: outcome.timed_out.then_some(budget_secs),
             summary: outcome.summary,
             restored: prepared.restored.clone(),
             output: outcome.output,
@@ -1913,6 +1930,87 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded, meta);
+    }
+
+    /// Run `command` under `budget_secs` through [`Session::verify_prepared`] on an
+    /// empty scratch tree, and return the report with the verification-kind records
+    /// the attempt appended, in order.
+    fn verify_command(command: &str, budget_secs: u64) -> (VerifyReport, Vec<WardEvent>) {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        let entry: ward_snapshot::SnapshotId = session.entry_snapshot.parse().unwrap();
+        let candidate = ward_snapshot::SnapshotId(ward_snapshot::Digest::from_bytes([0xcd; 32]));
+        let scratch_root = state.path().join("scratch-root");
+        let scratch = scratch_root.join("tree");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let prepared = verify::Verification {
+            candidate,
+            config: verify::Config {
+                protected: verify::Protected::default(),
+                verify: verify::VerifyCommand {
+                    command: command.to_owned(),
+                    budget_secs,
+                },
+            },
+            manifest_hash: [7u8; 32],
+            restored: Vec::new(),
+            scratch,
+        };
+        let dir = session_dir(state.path(), session.id());
+        let attempt = session.alloc_attempt();
+        let guard = AttemptGuard::start(&dir, attempt, VerifyRequester::User).unwrap();
+        let report = session
+            .verify_prepared(&prepared, entry, &scratch_root, attempt, guard)
+            .expect("the verifier ran");
+        session.sync().unwrap();
+        let events = ward_events::LogReader::open(session.log_path())
+            .unwrap()
+            .map(|r| r.unwrap().event)
+            .filter(|e| {
+                matches!(
+                    e.kind(),
+                    ward_events::EventKind::VerificationPassed
+                        | ward_events::EventKind::VerificationFailed
+                        | ward_events::EventKind::VerificationTimedOut
+                        | ward_events::EventKind::VerificationErrored
+                )
+            })
+            .collect();
+        (report, events)
+    }
+
+    /// #139 item 1: a verifier killed at its budget ends the attempt in
+    /// `VerificationTimedOut` naming the attempt and the budget — never
+    /// `VerificationFailed`, which means the command ran and exited non-zero.
+    #[test]
+    fn a_verifier_killed_at_its_budget_ends_in_verification_timed_out() {
+        if !ward_sandbox::ci::isolation_ready(crate::sandbox::available(), "bubblewrap") {
+            return;
+        }
+        let (report, events) = verify_command("sleep 30", 1);
+        assert!(!report.passed);
+        assert_eq!(report.timed_out, Some(1), "{}", report.output);
+        match events.as_slice() {
+            [WardEvent::VerificationTimedOut { budget_secs, .. }] => assert_eq!(*budget_secs, 1),
+            other => panic!("expected exactly one VerificationTimedOut, got {other:?}"),
+        }
+    }
+
+    /// The control for the test above: a command that exits non-zero within its
+    /// budget is still `VerificationFailed`, with no timeout reported.
+    #[test]
+    fn a_verifier_that_exits_nonzero_in_budget_ends_in_verification_failed() {
+        if !ward_sandbox::ci::isolation_ready(crate::sandbox::available(), "bubblewrap") {
+            return;
+        }
+        let (report, events) = verify_command("exit 1", 30);
+        assert!(!report.passed);
+        assert_eq!(report.timed_out, None, "{}", report.output);
+        assert!(
+            matches!(events.as_slice(), [WardEvent::VerificationFailed { .. }]),
+            "{events:?}"
+        );
     }
 
     /// #139: once `VerificationStarted` is on the log, a `verify::execute` failure

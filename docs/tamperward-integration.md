@@ -166,7 +166,10 @@ progress from the first action (#139). The log then records `VerificationRequest
 one that failed — `VerificationStarted` with pristine, candidate and config hash, one
 `VerificationProgress` per restored path and one for the command, and
 `VerificationPassed` / `VerificationFailed` with the parsed counts and the BLAKE3 of
-the output (origin Verifier). If the verifier command cannot even be run — the sandbox
+the output (origin Verifier). A command killed at `verify.budget_secs` instead ends in
+`VerificationTimedOut { attempt, candidate, summary, result_hash, budget_secs }`, with
+whatever counts the runner reported before then: an exhausted budget says nothing about
+whether the tests pass, so it is never recorded as `VerificationFailed` (#139). If the verifier command cannot even be run — the sandbox
 runtime fails to launch, or a step between `VerificationStarted` and the verdict errors
 out — the log gets `VerificationErrored { candidate, reason }` instead, so a
 subscriber never sees `VerificationStarted` as the last verification record for a

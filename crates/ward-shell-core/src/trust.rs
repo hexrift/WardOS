@@ -165,6 +165,9 @@ pub const fn agent_tone(state: AgentState) -> Tone {
 pub enum VerifyState {
     /// `VERIFY —`: nothing has been verified in this session.
     Never,
+    /// `VERIFY ◐ PREPARING`: an attempt was allocated and is preparing; no
+    /// candidate has been captured yet (#139).
+    Preparing,
     /// `VERIFY ◐ 7c01a2b3`: the trusted verifier is running on this candidate.
     Verifying(SnapshotId),
     /// `VERIFY ✓ 7c01a2b3`: the candidate passed, and the worktree still is it
@@ -188,6 +191,10 @@ pub enum VerifyState {
     /// `VERIFY ✗`: the candidate failed. The trusted command ran to completion
     /// and exited non-zero (or its output said so).
     Failed(SnapshotId),
+    /// `VERIFY ! TIMEOUT`: the trusted command was killed at its budget before it
+    /// finished (#139). Not a test failure: an exhausted budget says nothing
+    /// about whether the tests pass.
+    TimedOut(SnapshotId),
     /// `VERIFY ! ERROR`: the attempt on this candidate could not run to a
     /// pass/fail result at all — an infrastructure error (the sandbox runtime
     /// failed to launch, a preparation step failed, …) after `VerificationStarted`
@@ -222,8 +229,10 @@ impl VerifyState {
     ) -> Self {
         match (*verification, freshness) {
             (Verification::NotRun, _) => Self::Never,
+            (Verification::Preparing, _) => Self::Preparing,
             (Verification::Running(candidate), _) => Self::Verifying(candidate),
             (Verification::Failed(v), _) => Self::Failed(v.candidate),
+            (Verification::TimedOut(v), _) => Self::TimedOut(v.candidate),
             (Verification::Errored(candidate), _) => Self::Errored(candidate),
             (Verification::Cancelled(candidate), _) => Self::Cancelled(candidate),
             (Verification::Interrupted(candidate), _) => Self::Interrupted(candidate),
@@ -250,12 +259,14 @@ impl VerifyState {
     pub const fn tone(self) -> Tone {
         match self {
             Self::Never => Tone::Dim,
-            Self::Verifying(_) => Tone::Accent,
+            Self::Preparing | Self::Verifying(_) => Tone::Accent,
             Self::Verified(_) => Tone::Ok,
             Self::Stale { .. } | Self::Unknown { .. } => Tone::Warn,
-            Self::Failed(_) | Self::Errored(_) | Self::Cancelled(_) | Self::Interrupted(_) => {
-                Tone::Deny
-            }
+            Self::Failed(_)
+            | Self::TimedOut(_)
+            | Self::Errored(_)
+            | Self::Cancelled(_)
+            | Self::Interrupted(_) => Tone::Deny,
         }
     }
 
@@ -264,11 +275,13 @@ impl VerifyState {
     pub const fn word(self) -> &'static str {
         match self {
             Self::Never => "never",
+            Self::Preparing => "preparing",
             Self::Verifying(_) => "verifying",
             Self::Verified(_) => "verified",
             Self::Stale { .. } => "stale",
             Self::Unknown { .. } => "unknown",
             Self::Failed(_) => "failed",
+            Self::TimedOut(_) => "timedout",
             Self::Errored(_) => "errored",
             Self::Cancelled(_) => "cancelled",
             Self::Interrupted(_) => "interrupted",
@@ -281,11 +294,13 @@ impl VerifyState {
     pub fn segment(self) -> Segment {
         let text = match self {
             Self::Never => "VERIFY —".to_owned(),
+            Self::Preparing => "VERIFY ◐ PREPARING".to_owned(),
             Self::Verifying(c) => format!("VERIFY ◐ {}", short_hex(c)),
             Self::Verified(c) => format!("VERIFY ✓ {}", short_hex(c)),
             Self::Stale { .. } => "VERIFY ~ STALE".to_owned(),
             Self::Unknown { candidate } => format!("VERIFY ? {}", short_hex(candidate)),
             Self::Failed(_) => "VERIFY ✗".to_owned(),
+            Self::TimedOut(_) => "VERIFY ! TIMEOUT".to_owned(),
             Self::Errored(_) => "VERIFY ! ERROR".to_owned(),
             Self::Cancelled(_) => "VERIFY ! CANCELLED".to_owned(),
             Self::Interrupted(_) => "VERIFY ! INTERRUPTED".to_owned(),
@@ -698,8 +713,9 @@ mod tests {
     use super::*;
     use crate::feed::fixtures::{
         agent, denied, edited, ended, model_with, pause_unsettled, paused, records, resumed,
-        sequence, snapshot, tamper, verify_cancelled, verify_errored, verify_failed,
-        verify_interrupted, verify_passed, verify_requested, wardd,
+        sequence, snapshot, tamper, verify_attempt_started, verify_cancelled, verify_errored,
+        verify_failed, verify_interrupted, verify_passed, verify_requested, verify_timed_out,
+        wardd,
     };
     use ward_events::{Origin, WardEvent};
     use ward_policy::merge;
@@ -891,6 +907,23 @@ mod tests {
             seg(&model),
             Segment::new("VERIFY ! INTERRUPTED", Tone::Deny)
         );
+
+        // ◐ PREPARING : a new attempt was allocated; no candidate yet (#139).
+        model.apply(wardd(&[verify_attempt_started()]).remove(0));
+        assert_eq!(state(&model), V::Preparing);
+        assert_eq!(
+            seg(&model),
+            Segment::new("VERIFY ◐ PREPARING", Tone::Accent)
+        );
+
+        // ! TIMEOUT : the verifier was killed at its budget — not a test failure
+        // (#139 item 1).
+        for rec in wardd(&[verify_requested(), verify_timed_out()]) {
+            model.apply(rec);
+        }
+        assert_eq!(state(&model), V::TimedOut(snapshot()));
+        assert_ne!(state(&model), V::Failed(snapshot()));
+        assert_eq!(seg(&model), Segment::new("VERIFY ! TIMEOUT", Tone::Deny));
 
         // ✓ : passed, and the worktree is the candidate. A pass after an error
         // clears it, like any other retry.

@@ -397,6 +397,7 @@ impl Filter {
                 .with(EventKind::VerificationErrored)
                 .with(EventKind::VerificationCancelled)
                 .with(EventKind::VerificationInterrupted)
+                .with(EventKind::VerificationTimedOut)
                 .with(EventKind::SessionPaused)
                 .with(EventKind::SessionPauseUnsettled)
                 .with(EventKind::SessionResumed)

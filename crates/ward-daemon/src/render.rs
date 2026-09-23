@@ -445,7 +445,8 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
         | WardEvent::VerificationErrored { .. }
         | WardEvent::VerificationAttemptStarted { .. }
         | WardEvent::VerificationCancelled { .. }
-        | WardEvent::VerificationInterrupted { .. } => verification_cells(&rec.event)?,
+        | WardEvent::VerificationInterrupted { .. }
+        | WardEvent::VerificationTimedOut { .. } => verification_cells(&rec.event)?,
         WardEvent::PolicyDecision {
             subject,
             decision,
@@ -648,6 +649,20 @@ fn verification_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)>
                 "{attempt} interrupted{} · {}",
                 candidate_suffix(*candidate),
                 reason.as_str()
+            ),
+        ),
+        WardEvent::VerificationTimedOut {
+            candidate,
+            summary,
+            budget_secs,
+            ..
+        } => (
+            "TIMEOUT",
+            Tone::Deny,
+            format!(
+                "verifier exceeded its {budget_secs}s budget and was killed · {} tests reported · candidate {}",
+                summary.tests_run,
+                short_hex(&candidate.to_string())
             ),
         ),
         _ => return None,
@@ -971,13 +986,25 @@ pub fn verify_report(r: &crate::session::VerifyReport) -> String {
             r.summary.duration.as_secs_f64()
         );
     } else {
-        let _ = writeln!(
-            s,
-            "  {DENY}✗ VERIFICATION FAILED{RESET} {DIM}· {}/{} tests failed · {:.1}s{RESET}",
-            r.summary.tests_failed,
-            r.summary.tests_run,
-            r.summary.duration.as_secs_f64()
-        );
+        match r.timed_out {
+            // Killed at the budget: not a test failure, so never labelled as one (#139).
+            Some(budget) => {
+                let _ = writeln!(
+                    s,
+                    "  {DENY}! VERIFIER TIMED OUT{RESET} {DIM}· exceeded its {budget}s budget and was killed · {} tests reported before then{RESET}",
+                    r.summary.tests_run
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    s,
+                    "  {DENY}✗ VERIFICATION FAILED{RESET} {DIM}· {}/{} tests failed · {:.1}s{RESET}",
+                    r.summary.tests_failed,
+                    r.summary.tests_run,
+                    r.summary.duration.as_secs_f64()
+                );
+            }
+        }
         let tail: Vec<&str> = r.output.lines().rev().take(12).collect();
         for line in tail.iter().rev() {
             let _ = writeln!(s, "    {DIM}{line}{RESET}");
@@ -1498,6 +1525,69 @@ mod tests {
             }),
             "an infra error must not render with the same verb as a test failure"
         );
+    }
+
+    /// #139 item 1: a verifier killed at its budget gets its own row naming the
+    /// budget, never the verb a test failure renders with.
+    #[test]
+    fn verification_timed_out_gets_its_own_row_distinct_from_fail() {
+        use ward_events::{AttemptId, Blake3Hash, Chain, Origin, SessionId, SnapshotId, Timestamp};
+        let candidate = SnapshotId::new(Blake3Hash::from_bytes([0xab; 32]));
+        let mut chain = Chain::genesis(SessionId::from_u128(4), Blake3Hash::ZERO);
+        let summary = ward_events::VerifySummary {
+            tests_run: 12,
+            ..ward_events::VerifySummary::default()
+        };
+        let rec = chain
+            .append(
+                Origin::Verifier,
+                WardEvent::VerificationTimedOut {
+                    attempt: AttemptId::new(3),
+                    candidate,
+                    summary,
+                    result_hash: Blake3Hash::ZERO,
+                    budget_secs: 600,
+                },
+                Timestamp::mono(std::time::Duration::from_secs(5)),
+            )
+            .unwrap();
+        let row = plain(&observer_row(&rec).unwrap());
+        assert_eq!(
+            row,
+            "00:05  TIMEOUT verifier exceeded its 600s budget and was killed · 12 tests reported \
+             · candidate abababababab"
+        );
+        assert!(observer_row(&rec).unwrap().contains(DENY));
+        assert_ne!(
+            cells_verb(&rec),
+            cells_verb_of(&WardEvent::VerificationFailed {
+                candidate,
+                summary,
+                result_hash: Blake3Hash::ZERO,
+            }),
+            "a timeout must not render with the same verb as a test failure"
+        );
+    }
+
+    /// #139 item 1: `ward verify`'s own report says the verifier timed out, not
+    /// that the verification failed.
+    #[test]
+    fn verify_report_names_a_timeout_not_a_failure() {
+        let mut report = crate::session::VerifyReport {
+            candidate: "abababababababab".to_owned(),
+            passed: false,
+            timed_out: Some(600),
+            summary: ward_events::VerifySummary::default(),
+            restored: Vec::new(),
+            output: "verifier budget of 600s exceeded; killed\n".to_owned(),
+        };
+        let text = plain(&verify_report(&report));
+        assert!(text.contains("! VERIFIER TIMED OUT"), "{text}");
+        assert!(text.contains("600s budget"), "{text}");
+        assert!(!text.contains("VERIFICATION FAILED"), "{text}");
+        report.timed_out = None;
+        let text = plain(&verify_report(&report));
+        assert!(text.contains("✗ VERIFICATION FAILED"), "{text}");
     }
 
     /// #145 items 3-4: an unsettled pause gets its own row, distinct in verb and
