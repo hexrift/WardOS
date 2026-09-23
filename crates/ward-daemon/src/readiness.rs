@@ -2062,6 +2062,40 @@ mod tests {
     }
 
     #[test]
+    fn runtime_allows_a_literal_absolute_command_naming_the_rustup_mount() {
+        // Review finding on #219 (head 61469b5): `Toolchains::mount` binds
+        // the *whole* Rustup tree read-only at `/run/verifier/rustup`
+        // whenever Rustup is detected, but `Toolchains::mounts()` — the
+        // list `check()` passes into readiness — only ever returned
+        // Cargo's `bin`/`registry` pair. `absolute_target_mount` (and so
+        // `sandbox_to_host`) had no entry to match a literal absolute
+        // `verify.command` under `/run/verifier/rustup/...` against, and
+        // rejected a real, executable destination `ward verify` can reach.
+        // `verify::Toolchains::mounts` now derives from the same
+        // `rustup_mount` helper `mount()` itself calls, so this can't
+        // drift back out of sync.
+        let dir = tempfile::tempdir().unwrap();
+        let rustup = tempfile::tempdir().unwrap();
+        let rustc = rustup.path().join("toolchains/stable-x86_64/bin/rustc");
+        std::fs::create_dir_all(rustc.parent().unwrap()).unwrap();
+        std::fs::write(&rustc, "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&rustc);
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: /run/verifier/rustup/toolchains/stable-x86_64/bin/rustc --version\n",
+        );
+        let mounts = [verify::Mount {
+            host: rustup.path().to_path_buf(),
+            sandbox: PathBuf::from("/run/verifier/rustup"),
+        }];
+        let report = check_with_dirs_and_roots(dir.path(), &[], &mounts);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
     fn runtime_reports_an_absolute_path_outside_system_mounts_as_setup_required() {
         // /tmp is replaced with an empty, private tmpfs inside the verifier
         // sandbox (sandbox.rs's Launch::args); a real, executable file at an

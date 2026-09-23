@@ -573,25 +573,55 @@ impl Toolchains {
     /// verifier sandbox for this toolchain, each paired with the *sandbox*
     /// path the verifier itself sees it at — distinct from
     /// [`Toolchains::search_dirs`] (where a bare command is *looked up*, as
-    /// real host paths only), this is what a resolved symlink target is
-    /// judged against ([`crate::readiness::check`]'s `runtime` row, via
-    /// [`crate::readiness::resolve_in_dirs`]): `mount` binds `bin` and
-    /// `registry` as **siblings** under one shared, otherwise empty private
-    /// tmpfs at `{TOOLCHAIN_ROOT}/cargo` — never the whole `$CARGO_HOME`
-    /// (this struct's own doc: "binaries and registry only; the cargo home
-    /// itself is a private tmpfs") — so a relative symlink from `bin/` can
-    /// legitimately resolve into `registry/` (both hang off that same
-    /// sandboxed parent) but nowhere else under the host's `$CARGO_HOME`,
-    /// and *not* by however many `..`s it takes to reach some real system
-    /// binary on the host's own, unrelated directory hierarchy (the two
-    /// namespaces share no common ancestry above the bind points
-    /// themselves — see [`crate::readiness::resolve_in_dirs`]'s doc for the
-    /// concrete false-ready this exists to catch). Only a subdirectory that
-    /// actually exists on the host is included, matching
-    /// [`Toolchains::mount`]'s own `is_dir()` gate — an absent one is never
-    /// bind-mounted either.
+    /// real host paths only), this is what a resolved symlink target, or a
+    /// literal absolute candidate, is judged against
+    /// ([`crate::readiness::check`]'s `runtime` row, via
+    /// [`crate::readiness::resolve_in_dirs`] and
+    /// [`crate::readiness::absolute_target_mount`]). Two independent binds,
+    /// both derived from the exact same mapping [`Toolchains::mount`] itself
+    /// applies, so this can never drift from what's actually bound:
+    ///
+    /// - The whole Rustup tree, read-only, at `{TOOLCHAIN_ROOT}/rustup` — a
+    ///   single directory, not narrowed the way Cargo's is below, since
+    ///   `mount` binds it in full.
+    /// - `bin` and `registry` as **siblings** under one shared, otherwise
+    ///   empty private tmpfs at `{TOOLCHAIN_ROOT}/cargo` — never the whole
+    ///   `$CARGO_HOME` (this struct's own doc: "binaries and registry only;
+    ///   the cargo home itself is a private tmpfs") — so a relative symlink
+    ///   from `bin/` can legitimately resolve into `registry/` (both hang
+    ///   off that same sandboxed parent) but nowhere else under the host's
+    ///   `$CARGO_HOME`, and *not* by however many `..`s it takes to reach
+    ///   some real system binary on the host's own, unrelated directory
+    ///   hierarchy (the two namespaces share no common ancestry above the
+    ///   bind points themselves — see
+    ///   [`crate::readiness::resolve_in_dirs`]'s doc for the concrete
+    ///   false-ready this exists to catch). Only a subdirectory that
+    ///   actually exists on the host is included, matching
+    ///   [`Toolchains::mount`]'s own `is_dir()` gate — an absent one is
+    ///   never bind-mounted either.
     #[must_use]
     pub fn mounts(&self) -> Vec<Mount> {
+        self.rustup_mount()
+            .into_iter()
+            .chain(self.cargo_mounts())
+            .collect()
+    }
+
+    /// The whole Rustup tree, read-only bound at its sandbox mount point —
+    /// [`Toolchains::mount`]'s own rustup bind, expressed as a [`Mount`] so
+    /// [`Toolchains::mounts`] can never drift from what's actually bound.
+    fn rustup_mount(&self) -> Option<Mount> {
+        self.rustup.as_ref().map(|rustup| Mount {
+            host: rustup.clone(),
+            sandbox: PathBuf::from(format!("{TOOLCHAIN_ROOT}/rustup")),
+        })
+    }
+
+    /// Cargo's `bin`/`registry` siblings, read-only bound inside the private
+    /// `{TOOLCHAIN_ROOT}/cargo` tmpfs — [`Toolchains::mount`]'s own cargo
+    /// binds, expressed as [`Mount`]s so [`Toolchains::mounts`] can never
+    /// drift from what's actually bound.
+    fn cargo_mounts(&self) -> Vec<Mount> {
         let Some(cargo) = &self.cargo else {
             return Vec::new();
         };
@@ -626,16 +656,17 @@ impl Toolchains {
     /// Add the mounts to `launch`.
     #[must_use]
     pub fn mount(&self, mut launch: Launch) -> Launch {
-        if let Some(rustup) = &self.rustup {
-            launch = launch.ro_bind(rustup, format!("{TOOLCHAIN_ROOT}/rustup"));
+        if let Some(rustup_mount) = self.rustup_mount() {
+            launch = launch.ro_bind(
+                rustup_mount.host,
+                rustup_mount.sandbox.to_string_lossy().into_owned(),
+            );
         }
-        if let Some(cargo) = &self.cargo {
+        let cargo_mounts = self.cargo_mounts();
+        if self.cargo.is_some() {
             launch = launch.tmpfs(format!("{TOOLCHAIN_ROOT}/cargo"));
-            for sub in ["bin", "registry"] {
-                let dir = cargo.join(sub);
-                if dir.is_dir() {
-                    launch = launch.ro_bind(dir, format!("{TOOLCHAIN_ROOT}/cargo/{sub}"));
-                }
+            for m in cargo_mounts {
+                launch = launch.ro_bind(m.host, m.sandbox.to_string_lossy().into_owned());
             }
         }
         launch
@@ -805,6 +836,52 @@ mod tests {
             Toolchains::default().mounts(),
             Vec::new(),
             "no cargo detected"
+        );
+    }
+
+    #[test]
+    fn mounts_includes_the_whole_rustup_tree_whenever_mount_binds_it() {
+        // Review finding on #219 (head 61469b5): `Toolchains::mount` binds the
+        // whole Rustup tree at `/run/verifier/rustup` whenever `rustup` is
+        // `Some`, but `mounts()` previously returned only Cargo's `bin`/
+        // `registry` pair — so `readiness::check`'s `sandbox_to_host` and
+        // `absolute_target_mount` had no way to translate a candidate under
+        // `/run/verifier/rustup/...`, a real, executable destination once
+        // `ward verify` actually runs, and rejected it as outside every
+        // known mount. `rustup_mount` and `cargo_mounts` are the same
+        // helpers `mount()` itself now calls, so this can't drift again.
+        let rustup = tempfile::tempdir().unwrap();
+        let t = Toolchains {
+            rustup: Some(rustup.path().to_path_buf()),
+            cargo: None,
+        };
+        assert_eq!(
+            t.mounts(),
+            vec![Mount {
+                host: rustup.path().to_path_buf(),
+                sandbox: PathBuf::from("/run/verifier/rustup"),
+            }]
+        );
+        // Both toolchains present: Rustup first, then Cargo's siblings,
+        // matching the order `mount()` itself binds them in.
+        let cargo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cargo.path().join("bin")).unwrap();
+        let t = Toolchains {
+            rustup: Some(rustup.path().to_path_buf()),
+            cargo: Some(cargo.path().to_path_buf()),
+        };
+        assert_eq!(
+            t.mounts(),
+            vec![
+                Mount {
+                    host: rustup.path().to_path_buf(),
+                    sandbox: PathBuf::from("/run/verifier/rustup"),
+                },
+                Mount {
+                    host: cargo.path().join("bin"),
+                    sandbox: PathBuf::from("/run/verifier/cargo/bin"),
+                },
+            ]
         );
     }
 
