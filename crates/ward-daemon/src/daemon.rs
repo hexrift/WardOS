@@ -477,6 +477,7 @@ impl Served {
                 false,
             ),
             Request::Pending => (Response::Pending(self.approvals.pending()), false),
+            Request::Approvals => (Response::Approvals(self.approvals.approvals()), false),
             Request::Grants => (Response::Grants(self.approvals.grants()), false),
             Request::Pause { reason } => (
                 self.pause(&reason)
@@ -496,6 +497,18 @@ impl Served {
                     let _ = pause::clear_marker(&self.state, &self.session);
                 }
                 self.handle_conn(conn, request)
+            }
+            // Give every approval still open a terminal record before anything
+            // that follows can seal the log (#146): once sealed, no record can
+            // follow it, so this must happen first, not from inside
+            // `handle_appendable`'s `done` handling below.
+            Request::Stop { reason } => {
+                self.close_pending_approvals();
+                self.handle_appendable(conn, Request::Stop { reason })
+            }
+            Request::Seal => {
+                self.close_pending_approvals();
+                self.handle_appendable(conn, Request::Seal)
             }
             other => self.handle_appendable(conn, other),
         }
@@ -586,9 +599,10 @@ impl Served {
             for s in self.subscribers.drain(..) {
                 let _ = s.send(Delivery::End);
             }
-            // A question still open when the log seals is released as
-            // denied; no record of it can follow the seal.
-            self.approvals.close();
+            // Any approval still open at this point was already given its
+            // terminal record and released by `close_pending_approvals`
+            // before this request was allowed to reach here and seal the log
+            // (#146) — nothing left to do for approvals here.
         }
         (response, done)
     }
@@ -629,6 +643,41 @@ impl Served {
         });
         for key in keys {
             self.approvals.mark_launch_unknown(key);
+        }
+    }
+
+    /// Give every approval still held a terminal `CapabilityDecided` record
+    /// — its real answer if it had one, `Outcome::Closed`
+    /// (`DecisionSource::SessionEnded`) if it did not — while the log can
+    /// still take one. Called from [`Self::handle_conn`] right before a
+    /// `Stop` or `Seal` request is allowed to reach [`Self::handle_appendable`]
+    /// and seal the log.
+    ///
+    /// Before #146 the daemon released these approvals (waking every
+    /// `Request::Hold` connection waiting on one, so the agent still got its
+    /// `deny`) but appended nothing for them, because by the time `close`
+    /// ran the log had already sealed. #146 fixed the genuinely-still-open
+    /// case by appending here, but left an approval that was already
+    /// answered — just not yet collected by its own `Request::Hold`
+    /// connection — for that connection to record later through the
+    /// ordinary path in [`hold`]. The review of #218 (finding 1) found that
+    /// handoff itself raced this same Stop/Seal: nothing made "the hold
+    /// connection notices and appends" and "the log seals" mutually
+    /// exclusive, so an answered-but-uncollected approval could still reach
+    /// the seal with no terminal record at all. `Approvals::close` now
+    /// drains and returns *every* held entry with its real outcome --
+    /// answered or not — so this appends the true record for that case too,
+    /// here, before the seal; [`hold`] checks `Approvals::take_recorded` to
+    /// know not to append a second one once its own `wait` collects the
+    /// same entry.
+    fn close_pending_approvals(&mut self) {
+        for (approval, outcome) in self.approvals.close() {
+            let event = approvals::decided_event(&approval.tool, &approval.summary, outcome);
+            // Best-effort: a request line arriving after some earlier failure
+            // already sealed the log (a pathological double-seal) leaves this
+            // a no-op rather than a panic; the approval was released either
+            // way and the agent already got its answer from `Approvals::wait`.
+            let _ = self.append(event);
         }
     }
 
@@ -832,10 +881,39 @@ fn hold(
     };
     let outcome =
         remembered.unwrap_or_else(|| approvals.wait(id, Duration::from_secs(timeout_secs)));
-    if let Some(event) = approvals::decided_event(tool, summary, outcome) {
-        // The log may have sealed meanwhile; the agent still gets its answer.
-        let _ = lock(served).append(event);
+    // `Approvals::take_recorded` is true exactly when a concurrent `close`
+    // (`Served::close_pending_approvals`, running for a `Stop`/`Seal` on
+    // another connection) already claimed this id itself and appended its
+    // terminal record before the log could seal — whether that record was
+    // `Outcome::Closed` (#146), this same real answer collected straight out
+    // of `held` a moment too late to record it here (review of #218, finding
+    // 1), or this same real answer collected by `wait` above but not yet
+    // appended when `close` ran (finding 2). Appending again here would
+    // duplicate that record, so this skips it; every other outcome still
+    // records here, same as before #146.
+    //
+    // The check and the append it guards must happen under one acquisition
+    // of `Served`'s lock, not two: `close_pending_approvals` needs that same
+    // lock for its own claim-then-append-then-seal, entirely inside one
+    // acquisition of its own. Checking `take_recorded` before taking this
+    // lock (as this used to) leaves a gap between "decide to append" and
+    // "actually append" during which a concurrent Stop/Seal can find nothing
+    // left in `held` for `wait` to have collected, conclude there is nothing
+    // to do, and seal the log before this call ever gets back here to append
+    // — dropping the record entirely even though `wait` already returned the
+    // real outcome above (finding 2). Taking the lock first, and holding it
+    // across both the check and the append, makes this call's
+    // check-then-append and `close_pending_approvals`'s own
+    // claim-then-append-then-seal mutually exclusive: whichever of the two
+    // reaches this lock first is the one that appends `id`'s real terminal
+    // record, and the other one's own check then correctly finds it already
+    // done.
+    let mut s = lock(served);
+    if !s.approvals.take_recorded(id) {
+        let event = approvals::decided_event(tool, summary, outcome);
+        let _ = s.append(event);
     }
+    drop(s);
     let response = outcome.response();
     Response::Decision {
         id,
@@ -1273,7 +1351,9 @@ mod tests {
             }
         ));
 
-        // Sealing releases an open question as denied and records nothing more.
+        // Sealing releases an open question as denied and — since #146 —
+        // gives it its own terminal record before `SessionEnded` seals the
+        // log, rather than dropping it with no record at all.
         let holding = {
             let served = Arc::clone(&served);
             std::thread::spawn(move || hold(&served, "Write", "/work/x.rs", "r", 5))
@@ -1281,6 +1361,7 @@ mod tests {
         assert!(wait_until(Duration::from_secs(2), || {
             !lock(&served).approvals.pending().is_empty()
         }));
+        drain(&rx); // this hold's own CapabilityRequested; not what this section checks
         let (response, done) = lock(&served).handle(Request::Stop {
             reason: EndReason::UserStop,
         });
@@ -1290,10 +1371,449 @@ mod tests {
             Response::Decision { decision: HookDecision::Deny, reason, .. }
                 if reason == "approval: session ended"
         ));
+        let (live, ended) = drain(&rx);
+        let kinds: Vec<_> = live
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            ["CapabilityDecided", "SessionEnded"],
+            "the still-open question's terminal record precedes the seal, not just the hook's own answer"
+        );
+        assert!(matches!(
+            &live[0].event,
+            WardEvent::CapabilityDecided {
+                cap,
+                decision: Decision::Deny,
+                by: DecisionSource::SessionEnded,
+                grant: None,
+            } if cap.target.as_str() == "Write /work/x.rs"
+        ));
+        assert!(ended);
         assert!(matches!(
             hold(&served, "Write", "/work/y.rs", "r", 5),
             Response::Error(e) if e == "log is sealed"
         ));
+    }
+
+    /// Review of PR #218, finding 1: an approval already answered, but not
+    /// yet collected by its own `Request::Hold` connection, must still get
+    /// exactly one real terminal record, appended before `SessionEnded` --
+    /// even when `Stop`/`Seal` runs in between the answer landing and that
+    /// connection collecting it.
+    ///
+    /// Forces the exact interleaving deterministically with an `mpsc`
+    /// channel (this module's own convention — see `wait_until` elsewhere
+    /// in this file — never a `sleep`), rather than hoping to win a real
+    /// race against `wait`'s own condvar wakeup: `Approve` and `Stop` are
+    /// both driven to completion, in that order, strictly before the
+    /// collecting thread is ever released to call `wait` at all. Since
+    /// `Approvals::wait` returns immediately (without blocking) once its id
+    /// is no longer in `held`, calling it only after `close` has already
+    /// drained that id exercises precisely the same code path a genuinely
+    /// preempted, still-blocked `wait` call would hit on waking — with no
+    /// dependency on OS thread-scheduling timing either way.
+    #[test]
+    fn an_answer_that_lands_just_before_stop_still_gets_exactly_one_real_record() {
+        use crate::approvals::ApprovalDecision;
+        use ward_events::{Decision, DecisionSource, GrantScope};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let sub = lock(&served).subscribe(0).unwrap();
+        let (rx, _hangup) = sub.live.unwrap();
+
+        // Register the question — what `Request::Hold` does before it
+        // blocks in `wait` — synchronously, so the test controls exactly
+        // when the collecting side is allowed to run.
+        let id = match lock(&served).hold("Write", "/work/race.rs", "r") {
+            Ok((id, None)) => id,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(lock(&served).approvals.pending().len(), 1);
+        drain(&rx); // this hold's own CapabilityRequested; not what this test checks
+        // Right after registering: pending, not decided.
+        let view = lock(&served).approvals.approvals();
+        assert_eq!(view.len(), 1, "{view:?}");
+        assert_eq!(view[0].approval.id, id);
+        assert_eq!(view[0].outcome, None);
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let collector = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || {
+                // Blocks here until the main thread has driven Approve and
+                // Stop to completion below — this is the connection that
+                // registered the hold, finally reacquiring the lock to
+                // collect its answer, exactly as `Request::Hold`'s own
+                // connection would once its own thread was scheduled again.
+                release_rx.recv().unwrap();
+                // Released before calling `wait`, exactly like the real
+                // `hold` free function: `wait` only ever needs `Approvals`'
+                // own lock, never `Served`'s.
+                let approvals = Arc::clone(&lock(&served).approvals);
+                approvals.wait(id, Duration::ZERO)
+            })
+        };
+
+        // Approve lands first...
+        assert!(matches!(
+            lock(&served)
+                .handle(Request::Approve {
+                    id,
+                    decision: ApprovalDecision::Allow
+                })
+                .0,
+            Response::Ok
+        ));
+        // ...and the question is still visible — as pending, since nothing
+        // has turned the answer into a terminal record yet — never
+        // vanished from the view (review of #218, finding 1's second half).
+        let view = lock(&served).approvals.approvals();
+        assert_eq!(view.len(), 1, "{view:?}");
+        assert_eq!(view[0].outcome, None, "answered but not yet collected");
+
+        // ...then Stop/Seal runs, before the hold connection ever
+        // reacquires the lock to notice its answer.
+        let (response, done) = lock(&served).handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        assert!(done, "{response:?}");
+
+        // The listing already carries the real answer, the moment Stop's
+        // own `close_pending_approvals` drained it — decided, not pending,
+        // and not a fabricated session-ended.
+        let view = lock(&served).approvals.approvals();
+        assert_eq!(
+            view.iter().find(|r| r.approval.id == id).unwrap().outcome,
+            Some(Outcome::Answered(ApprovalDecision::Allow))
+        );
+
+        // The log already carries this approval's real answer, not a
+        // fabricated session-ended, and it precedes the seal — exactly
+        // one `CapabilityDecided` for it, never zero.
+        let (live, ended) = drain(&rx);
+        let kinds: Vec<_> = live
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(kinds, ["CapabilityDecided", "SessionEnded"], "{live:?}");
+        assert!(matches!(
+            &live[0].event,
+            WardEvent::CapabilityDecided {
+                decision: Decision::Allow,
+                by: DecisionSource::User,
+                grant: Some(GrantScope::Once),
+                ..
+            }
+        ));
+        assert!(ended);
+
+        // Only now let the collecting connection proceed: it still gets the
+        // real answer, not `Outcome::Closed`.
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            collector.join().unwrap(),
+            Outcome::Answered(ApprovalDecision::Allow),
+            "the hold connection still receives the real answer, not a \
+             fabricated session-ended"
+        );
+
+        // `hold`'s own check, exercised directly here: `take_recorded`
+        // says `close` already appended this id's terminal record, so the
+        // collecting connection must not append a second one — and, sure
+        // enough, the subscriber saw nothing more.
+        assert!(
+            lock(&served).approvals.take_recorded(id),
+            "close already recorded id {id}'s terminal record"
+        );
+        assert!(
+            !lock(&served).approvals.take_recorded(id),
+            "consulted once: a second check finds nothing left to take"
+        );
+        let (live, _) = drain(&rx);
+        assert!(
+            live.is_empty(),
+            "no second record for the same approval: {live:?}"
+        );
+    }
+
+    /// Re-review of PR #218, finding 2: an approval whose own `wait` call
+    /// already settled it — removed it from `held`, recorded its real
+    /// outcome in `history` — but whose terminal record has not yet been
+    /// appended (its collecting connection has not yet won back the
+    /// `Served` lock to do so), must still get exactly one real terminal
+    /// record, appended before `SessionEnded`, even when `Stop`/`Seal` runs
+    /// in that exact gap.
+    ///
+    /// This is a different interleaving from
+    /// `an_answer_that_lands_just_before_stop_still_gets_exactly_one_real_record`
+    /// above, which forces `close` to win the race to a still-`held` entry
+    /// (releasing the collector to call `wait` only *after* Stop has already
+    /// run, so `wait` finds nothing in `held` and falls back to `close`'s own
+    /// `handoff`). Here `wait` itself is what settles the entry — deterministically
+    /// driven to completion, with the id already recorded in `history` and
+    /// removed from `held`, strictly *before* `Stop`/`Seal` ever runs —
+    /// and only the collecting connection's own belated check-and-append
+    /// (what `hold` does once it wins back the `Served` lock) is held back,
+    /// with an `mpsc` channel, until after `Stop`/`Seal` has completed. Before
+    /// the fix for finding 2, `close` had nothing in `held` to look at for
+    /// this id and nothing else to consult either, so it concluded there was
+    /// nothing to do and sealed the log with no terminal record for an
+    /// approval that, in truth, `wait` had already decided.
+    #[test]
+    fn an_answer_settled_by_wait_just_before_stop_still_gets_exactly_one_real_record() {
+        use crate::approvals::ApprovalDecision;
+        use ward_events::{Decision, DecisionSource, GrantScope};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let sub = lock(&served).subscribe(0).unwrap();
+        let (rx, _hangup) = sub.live.unwrap();
+
+        let id = match lock(&served).hold("Write", "/work/race2.rs", "r") {
+            Ok((id, None)) => id,
+            other => panic!("{other:?}"),
+        };
+        drain(&rx); // this hold's own CapabilityRequested; not what this test checks
+
+        assert!(matches!(
+            lock(&served)
+                .handle(Request::Approve {
+                    id,
+                    decision: ApprovalDecision::Allow
+                })
+                .0,
+            Response::Ok
+        ));
+
+        let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let collector = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || {
+                // `wait` only ever needs `Approvals`' own lock: it settles
+                // the outcome and removes the entry from `held` right here
+                // — before Stop ever runs — exactly the "wait before
+                // terminal append" window (review of #218, finding 2). The
+                // real outcome is already decided at this point; only its
+                // terminal-record append is still outstanding.
+                let approvals = Arc::clone(&lock(&served).approvals);
+                let outcome = approvals.wait(id, Duration::ZERO);
+                settled_tx.send(()).unwrap();
+                // Blocks here — exactly like the free `hold` function's own
+                // gap between `wait` returning and it reacquiring
+                // `Served`'s lock — until the main thread has driven
+                // Stop/Seal to completion below.
+                release_rx.recv().unwrap();
+                let mut s = lock(&served);
+                if !s.approvals.take_recorded(id) {
+                    let event = crate::approvals::decided_event("Write", "/work/race2.rs", outcome);
+                    let _ = s.append(event);
+                }
+                outcome
+            })
+        };
+
+        settled_rx.recv().unwrap();
+        // `wait` already recorded the real answer in `history` the moment
+        // it settled, before Stop ever ran.
+        let view = lock(&served).approvals.approvals();
+        assert_eq!(
+            view.iter().find(|r| r.approval.id == id).unwrap().outcome,
+            Some(Outcome::Answered(ApprovalDecision::Allow))
+        );
+
+        // Stop/Seal runs to completion here, entirely before the collecting
+        // connection ever reacquires `Served`'s lock.
+        let (response, done) = lock(&served).handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        assert!(done, "{response:?}");
+
+        // The real record already landed, before the seal — `close`
+        // claimed it out of `Approvals`' `unclaimed` bookkeeping, even
+        // though `wait`, not `close`, is what actually settled this
+        // outcome. Exactly one `CapabilityDecided`, never zero.
+        let (live, ended) = drain(&rx);
+        let kinds: Vec<_> = live
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(kinds, ["CapabilityDecided", "SessionEnded"], "{live:?}");
+        assert!(matches!(
+            &live[0].event,
+            WardEvent::CapabilityDecided {
+                decision: Decision::Allow,
+                by: DecisionSource::User,
+                grant: Some(GrantScope::Once),
+                ..
+            }
+        ));
+        assert!(ended);
+
+        // Only now let the collecting connection try its own belated
+        // append: it must find the record already claimed, and append
+        // nothing more.
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            collector.join().unwrap(),
+            Outcome::Answered(ApprovalDecision::Allow),
+            "the collecting connection still receives the real answer"
+        );
+        let (live, _) = drain(&rx);
+        assert!(
+            live.is_empty(),
+            "no second record for the same approval: {live:?}"
+        );
+    }
+
+    /// The timeout half of the same finding 2: `Approvals::wait`'s timeout
+    /// branch settles an id (removes it from `held`, records `TimedOut` in
+    /// `history`) through the exact same not-yet-appended gap as the
+    /// answered branch above, so it is exposed to the identical race. Same
+    /// structure as
+    /// `an_answer_settled_by_wait_just_before_stop_still_gets_exactly_one_real_record`,
+    /// with no `Approve` at all and `wait` given a zero timeout so it settles
+    /// as `TimedOut` on its very first check rather than actually blocking.
+    #[test]
+    fn a_timeout_settled_by_wait_just_before_stop_still_gets_exactly_one_real_record() {
+        use ward_events::{Decision, DecisionSource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let sub = lock(&served).subscribe(0).unwrap();
+        let (rx, _hangup) = sub.live.unwrap();
+
+        let id = match lock(&served).hold("Write", "/work/race3.rs", "r") {
+            Ok((id, None)) => id,
+            other => panic!("{other:?}"),
+        };
+        drain(&rx);
+
+        let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let collector = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || {
+                let approvals = Arc::clone(&lock(&served).approvals);
+                let outcome = approvals.wait(id, Duration::ZERO);
+                settled_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                let mut s = lock(&served);
+                if !s.approvals.take_recorded(id) {
+                    let event = crate::approvals::decided_event("Write", "/work/race3.rs", outcome);
+                    let _ = s.append(event);
+                }
+                outcome
+            })
+        };
+
+        settled_rx.recv().unwrap();
+        let view = lock(&served).approvals.approvals();
+        assert_eq!(
+            view.iter().find(|r| r.approval.id == id).unwrap().outcome,
+            Some(Outcome::TimedOut)
+        );
+
+        let (response, done) = lock(&served).handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        assert!(done, "{response:?}");
+
+        let (live, ended) = drain(&rx);
+        let kinds: Vec<_> = live
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(kinds, ["CapabilityDecided", "SessionEnded"], "{live:?}");
+        assert!(matches!(
+            &live[0].event,
+            WardEvent::CapabilityDecided {
+                decision: Decision::Deny,
+                by: DecisionSource::Timeout,
+                grant: None,
+                ..
+            }
+        ));
+        assert!(ended);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(collector.join().unwrap(), Outcome::TimedOut);
+        let (live, _) = drain(&rx);
+        assert!(
+            live.is_empty(),
+            "no second record for the same approval: {live:?}"
+        );
+    }
+
+    /// `ward session approvals` (#146 item 1): unlike `Pending`, it still
+    /// shows a request once it has been decided, so missing or dismissing
+    /// whatever first announced it does not lose it from view for the rest
+    /// of the session.
+    #[test]
+    fn request_approvals_lists_pending_and_decided_oldest_asked_first() {
+        use crate::approvals::{ApprovalDecision, Outcome};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        assert!(matches!(
+            lock(&served).handle(Request::Approvals).0,
+            Response::Approvals(a) if a.is_empty()
+        ));
+
+        // Asked first, answered.
+        let answered = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || hold(&served, "Write", "/work/a.rs", "r", 5))
+        };
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&served).approvals.pending().is_empty()
+        }));
+        lock(&served).handle(Request::Approve {
+            id: 0,
+            decision: ApprovalDecision::Deny,
+        });
+        answered.join().unwrap();
+
+        // Asked second, still open.
+        let pending = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || hold(&served, "Write", "/work/b.rs", "r", 5))
+        };
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&served).approvals.pending().is_empty()
+        }));
+
+        let records = match lock(&served).handle(Request::Approvals).0 {
+            Response::Approvals(records) => records,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0].approval.id, 0, "decided, but asked first");
+        assert_eq!(
+            records[0].outcome,
+            Some(Outcome::Answered(ApprovalDecision::Deny))
+        );
+        assert!(records[0].decided_at_unix_ms.is_some());
+        // id 1 is the first question's own `CapabilityDecided` record (the
+        // log's seq counter is shared across every event, not per-approval).
+        assert_eq!(records[1].approval.id, 2, "still open");
+        assert_eq!(records[1].outcome, None);
+        assert!(records[1].decided_at_unix_ms.is_none());
+
+        // Sealing decides the still-open one too, and it joins the same view.
+        lock(&served).handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        pending.join().unwrap();
+        let records = match lock(&served).handle(Request::Approvals).0 {
+            Response::Approvals(records) => records,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(records[1].approval.id, 2);
+        assert_eq!(records[1].outcome, Some(Outcome::Closed));
     }
 
     #[test]
