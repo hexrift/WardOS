@@ -21,9 +21,10 @@ use std::path::Path;
 use crate::doctor::Status;
 use crate::verify;
 
-/// The build system a directory shows: decides the guessed verify command and the
-/// runtime binary that command needs on `PATH`. The same detection `ward init` uses
-/// to write `.tamperward/config.yml`'s guessed command.
+/// The build system a directory shows: decides the guessed verify command `ward
+/// init` writes into `.tamperward/config.yml`. Only used for that guess and for the
+/// report's header line — the `runtime` row below checks the *configured* command,
+/// not this detection, so a project that overrides the guess is checked correctly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ecosystem {
     /// `Cargo.toml` at the root.
@@ -57,16 +58,6 @@ impl Ecosystem {
         match self {
             Self::Cargo => Some("cargo test"),
             Self::Npm => Some("npm test"),
-            Self::Python => Some("pytest"),
-            Self::Unknown => None,
-        }
-    }
-
-    /// The binary that guessed command needs on `PATH`.
-    const fn runtime(self) -> Option<&'static str> {
-        match self {
-            Self::Cargo => Some("cargo"),
-            Self::Npm => Some("npm"),
             Self::Python => Some("pytest"),
             Self::Unknown => None,
         }
@@ -181,21 +172,18 @@ impl Report {
 
 /// Run the project-scoped checks against `dir` (a `ward init`-style project root).
 /// Does not touch the network and runs no project command — only reads the two
-/// config files `ward init` writes and probes `PATH` for the runtime they need.
+/// config files `ward init` writes and probes `PATH` for the runtime the
+/// *configured* command actually needs.
 #[must_use]
 pub fn check(dir: &Path) -> Report {
     let ecosystem = Ecosystem::detect(dir);
     let mut rows = vec![policy_row(dir)];
-    let (verify_row, unavailable) = verify_row(dir);
-    let protected = if unavailable {
-        None
-    } else {
-        Some(protected_row(dir, &verify_row))
-    };
+    let (verify_row, config) = verify_row(dir);
+    let unavailable = config.is_none();
     rows.push(verify_row);
-    rows.push(runtime_row(ecosystem));
-    if let Some(row) = protected {
-        rows.push(row);
+    if let Some(config) = &config {
+        rows.push(runtime_row(&config.verify.command));
+        rows.push(protected_row(dir, config));
     }
     Report {
         ecosystem,
@@ -215,41 +203,63 @@ fn policy_row(dir: &Path) -> Row {
                 format!(".ward/policy.yaml: {e}; a session cannot resolve its policy"),
             ),
         },
-        Err(_) => Row::new(
+        // Absent is the ordinary pre-`ward init` state; any other I/O failure (the
+        // path is a directory, permission denied, …) means the policy genuinely
+        // cannot be read and must not be reported as a harmless "not written yet".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Row::new(
             "policy",
             Status::Warn,
             "not written yet; `ward init` writes secure defaults",
         ),
+        Err(e) => Row::new(
+            "policy",
+            Status::Fail,
+            format!(".ward/policy.yaml: {e}; a session cannot resolve its policy"),
+        ),
     }
 }
 
-/// The verify-config row, and whether no command is configured at all (the
-/// `Verdict::Unavailable` trigger, tracked separately from a merely failing row so
-/// the two stay distinguishable in the overall verdict).
-fn verify_row(dir: &Path) -> (Row, bool) {
+/// The verify-config row, and the parsed config when one could be read — `None`
+/// triggers `Verdict::Unavailable` and skips the rows that need a real command
+/// (`runtime`, `protected paths`), tracked separately from a merely failing row so
+/// the two stay distinguishable in the overall verdict.
+fn verify_row(dir: &Path) -> (Row, Option<verify::Config>) {
     let path = dir.join(verify::CONFIG_PATH);
-    let Ok(yaml) = std::fs::read_to_string(&path) else {
-        return (
-            Row::new(
-                "verify config",
-                Status::Fail,
-                format!(
-                    "{} not written yet; `ward init` writes a guess",
-                    verify::CONFIG_PATH
+    let yaml = match std::fs::read_to_string(&path) {
+        Ok(y) => y,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (
+                Row::new(
+                    "verify config",
+                    Status::Fail,
+                    format!(
+                        "{} not written yet; `ward init` writes a guess",
+                        verify::CONFIG_PATH
+                    ),
                 ),
-            ),
-            true,
-        );
+                None,
+            );
+        }
+        Err(e) => {
+            return (
+                Row::new(
+                    "verify config",
+                    Status::Fail,
+                    format!("{}: {e}", verify::CONFIG_PATH),
+                ),
+                None,
+            );
+        }
     };
     match verify::Config::parse(&yaml) {
-        Ok(config) => (
-            Row::new(
+        Ok(config) => {
+            let row = Row::new(
                 "verify config",
                 Status::Ok,
                 format!("command: {}", config.verify.command),
-            ),
-            false,
-        ),
+            );
+            (row, Some(config))
+        }
         Err(_) => (
             Row::new(
                 "verify config",
@@ -259,40 +269,43 @@ fn verify_row(dir: &Path) -> (Row, bool) {
                     verify::CONFIG_PATH
                 ),
             ),
-            true,
+            None,
         ),
     }
 }
 
-fn runtime_row(ecosystem: Ecosystem) -> Row {
-    let Some(bin) = ecosystem.runtime() else {
+/// Whether the binary the *configured* `verify.command` would actually invoke —
+/// its first whitespace-separated token, the same word a shell resolves against
+/// `PATH` to start it — is on `PATH`. Checked against the real command, not
+/// guessed from the project manifest: a Cargo project configured to run `npm
+/// test` is checked against `npm`, and one running a custom `bash scripts/…` is
+/// checked against `bash`, not against `cargo` either way.
+///
+/// A command whose first token is a shell builtin or keyword (`cd`, `if`, …) has
+/// no `PATH` entry to find; this reports it as a plain, potentially misleading
+/// "not found" rather than trying to special-case shell grammar. `ward init`
+/// never writes a command shaped like that, so it does not affect the common
+/// path this preflight is for.
+fn runtime_row(command: &str) -> Row {
+    let Some(first) = command.split_whitespace().next() else {
         return Row::new(
             "runtime",
             Status::Warn,
-            "no recognised build manifest; cannot confirm a runtime for the configured command",
+            "verify.command is blank; cannot determine a runtime",
         );
     };
-    if crate::doctor::which(bin).is_some() {
-        Row::new("runtime", Status::Ok, format!("{bin} on PATH"))
+    if crate::doctor::which(first).is_some() {
+        Row::new("runtime", Status::Ok, format!("{first} on PATH"))
     } else {
         Row::new(
             "runtime",
             Status::Fail,
-            format!("{bin} not found on PATH; install it before `ward verify` can run"),
+            format!("{first} not found on PATH; install it before `ward verify` can run"),
         )
     }
 }
 
-fn protected_row(dir: &Path, verify_row: &Row) -> Row {
-    // Only reachable once `verify_row` parsed the config successfully.
-    let path = dir.join(verify::CONFIG_PATH);
-    let config = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|y| verify::Config::parse(&y).ok())
-        .unwrap_or_else(|| {
-            debug_assert!(verify_row.status == Status::Ok, "{verify_row:?}");
-            verify::Config::default()
-        });
+fn protected_row(dir: &Path, config: &verify::Config) -> Row {
     if config.protected.tests.is_empty() {
         return Row::new(
             "protected paths",
@@ -432,6 +445,56 @@ mod tests {
         assert_eq!(report.verdict(), Verdict::SetupRequired);
         let row = report.rows.iter().find(|r| r.name == "policy").unwrap();
         assert_eq!(row.status, Status::Fail);
+    }
+
+    #[test]
+    fn an_unreadable_policy_is_setup_required_not_a_harmless_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory sitting at the policy's path is not "not written yet" — it is
+        // unreadable, and must not be reported as the same harmless absence.
+        std::fs::create_dir_all(dir.path().join(".ward/policy.yaml")).unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: echo ok\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "policy").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_checks_the_configured_command_not_the_manifest_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        // A Cargo project can still configure a different verifier command; the
+        // runtime row must judge that command, not assume `cargo` from Cargo.toml.
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: npm test\n",
+        );
+        let report = check(dir.path());
+        assert_eq!(report.ecosystem, Ecosystem::Cargo);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert!(row.detail.contains("npm"), "{}", row.detail);
+        assert!(!row.detail.contains("cargo"), "{}", row.detail);
+    }
+
+    #[test]
+    fn runtime_checks_a_custom_shell_commands_own_first_token() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: bash scripts/verify.sh\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert!(row.detail.contains("bash"), "{}", row.detail);
+        assert!(!row.detail.contains("cargo"), "{}", row.detail);
     }
 
     #[test]
