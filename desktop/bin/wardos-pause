@@ -40,11 +40,25 @@ session_flag=()
 status() { ward pause --status "${session_flag[@]}" "$project" 2>/dev/null || echo none; }
 
 # The one notification of a pause (ADR-0019 §3), critical so it stays until read.
+# `ward pause` can legitimately end in an *unsettled* freeze (the marker is held and
+# approvals stay suspended, but not every sandboxed process is confirmed stopped yet —
+# `ward-daemon::pause::FREEZE_SETTLE`): #233's fix is to say so here rather than show
+# the same "processes frozen" text either way, since this is the one notification most
+# users actually see for a keybind-triggered pause with no terminal visible.
 do_pause() {
-  ward pause "${session_flag[@]}" "$project"
-  wardos_notify "AGENTS PAUSED" \
-    "network closed · credential grants suspended · processes frozen · workspace retained" \
-    -u critical
+  local out
+  out=$(ward pause "${session_flag[@]}" "$project")
+  if [[ $out =~ ([0-9]+)\ process(es)?\ had\ not\ confirmed\ stopped ]]; then
+    local pending=${BASH_REMATCH[1]} plural=""
+    [[ $pending != 1 ]] && plural="es"
+    wardos_notify "AGENTS PAUSING" \
+      "network closed · credential grants suspended · $pending process$plural not yet confirmed stopped · workspace retained" \
+      -u critical
+  else
+    wardos_notify "AGENTS PAUSED" \
+      "network closed · credential grants suspended · processes frozen · workspace retained" \
+      -u critical
+  fi
 }
 
 do_resume() {
