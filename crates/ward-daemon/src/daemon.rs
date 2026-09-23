@@ -842,6 +842,10 @@ impl Served {
             return Err(Error::Daemon("already paused".into()));
         }
         let reason = pause::reason_text(reason);
+        // #234: the same lock `CaptureFreeze::acquire`/`Drop` take, held across the
+        // freeze and the marker write so a capture's own marker check or thaw can
+        // never straddle this pause taking hold.
+        let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
         let frozen = pause::freeze(&self.session);
         if let Err(e) = pause::write_marker(&self.state, &self.session, &reason) {
             pause::thaw(&frozen);
@@ -929,6 +933,10 @@ impl Served {
         let Some(paused) = self.paused.as_ref() else {
             return Err(Error::Daemon("not paused".into()));
         };
+        // #234: the same lock `pause`/`CaptureFreeze` take, so a capture's own
+        // marker check or thaw can never straddle this resume's marker clear and
+        // thaw.
+        let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
         // Clear the on-disk pause marker FIRST. The session proxies read it to refuse
         // egress, so it is the load-bearing part of a resume: if it fails we must leave
         // the session fully paused (marker present, approvals held, processes frozen)

@@ -125,6 +125,49 @@ the CAS.
 
 ## 7. Retention
 
-CAS entries are reference-counted by session records. `ward gc` removes unreferenced
-content older than the retention window (default 30 days) except `accepted` snapshots
-referenced by evidence, which are retained with the evidence.
+`ward snapshot usage` reports CAS and scratch disk usage, read-only (#151 item 1).
+
+`ward snapshot gc` reclaims storage with a conservative mark-and-sweep, never a
+time-based retention window and never a reference count derived from a process id or a
+file's mtime (#151 items 2–3). A blob, manifest, or meta record is live when it is
+reachable from at least one retention root:
+
+* an active session's `entry_snapshot`, for as long as its log is not yet sealed;
+* any snapshot an in-flight verification attempt currently names as its candidate;
+* any snapshot `TamperWard` has recorded as accepted evidence (`StateAccepted`),
+  regardless of whether the session that produced it has since ended;
+* any snapshot explicitly marked kept (`ward_snapshot::gc::mark_kept`) — the minimal
+  marker user-kept restore backups use today, pending a fuller policy.
+
+Separately, a capture in progress holds a lease over the whole store for its duration,
+so a sweep running concurrently with a capture never reclaims a blob or manifest the
+capture is still writing, even before anything durably references it. Roots and leases
+are both explicit, disk-recorded facts, never inferred from a pid or an mtime. When in
+doubt — a lease is ambiguous, a root cannot be fully resolved, or a category cannot be
+listed — the sweep keeps the object rather than delete it.
+
+`ward snapshot gc` defaults to printing a plan and deleting nothing; `--apply` performs
+it, one object at a time, so an interrupted sweep leaves the store in a valid state and
+a re-run recomputes safely from what is left on disk.
+
+`ward doctor` reports the same numbers read-only, as one more host-readiness row: total
+usage across the CAS and session logs, and what a `ward snapshot gc` dry run would
+reclaim right now (or that a capture's lease currently makes that unknown). It never
+sweeps anything itself — same computation, surfaced where a host report is the first
+thing read (#151 item 7, partial). Startup reconciliation of abandoned scratch remains
+follow-up work; `ward status`'s per-session panel is unchanged, since storage usage is
+a property of the whole state root, not one session.
+
+Before `ward snapshot create`'s capture, and before `ward verify`'s own candidate
+capture (the worktree-walk-and-hash step inside `verify::prepare`), a low-space
+preflight checks free space on the filesystem backing `<state>/cas` (#151 item 6). It is
+a pure guard — `statvfs(2)`, a comparison, nothing else — never a cleanup trigger: it
+never deletes anything, never runs `ward snapshot gc` itself, and the previous valid
+snapshot and its receipt are untouched whether it trips or not. Below the configured
+minimum (`$WARD_MIN_FREE_BYTES`, else 512 MiB), the capture is refused up front with
+`Error::LowSpace` naming how much is free versus needed and pointing at `ward snapshot
+gc`/`ward snapshot usage` as the way out, instead of starting an expensive walk that
+would fail — possibly leaving a partial write — partway through on a full disk. It is a
+coarse floor on available space, not a predictive estimate of what any one capture will
+write: sizing that in advance would itself require the same expensive walk the guard
+exists to avoid paying for first. See `crates/ward-daemon/src/space.rs`.

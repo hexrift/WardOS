@@ -38,6 +38,7 @@ pub mod backend;
 mod capture;
 mod cas;
 mod error;
+pub mod gc;
 mod id;
 mod ignore;
 mod manifest;
@@ -135,6 +136,25 @@ impl SnapshotStore {
     }
 
     /// Capture using an explicit [`Backend`] (the seam for a future Btrfs path).
+    ///
+    /// Holds a [`gc::LeaseGuard`] for the whole span of the capture (#151 item 3): from
+    /// before the first blob is written to after the manifest and its metadata are
+    /// stored. Nothing durable references any of it yet at that point — the caller only
+    /// gets to record the resulting id, as a retention root, once this call returns — so
+    /// without the lease a concurrent sweep computing its plan in that exact window would
+    /// see an ordinary unreferenced blob and correctly, but wrongly, plan to reclaim it.
+    ///
+    /// The lease is released below, inside this call, *before* the caller ever gets the
+    /// returned id back — so there is still a narrow handoff gap (a handful of syscalls)
+    /// between that release and whatever durable root the caller goes on to record for it
+    /// (review of #229, finding 2). Every caller of `capture_with` (directly or through
+    /// [`Self::store_snapshot`]/[`Self::capture`]/[`Self::capture_with_cache`]) relies on
+    /// [`gc::plan`]'s own grace period — see that module's doc comment — to cover exactly
+    /// this gap: a freshly-captured object is, by construction, younger than any reasonable
+    /// grace period, so a sweep can never observe it as both unrooted and old enough to
+    /// reclaim in that window. This is not a separate guarantee from the one finding 1's
+    /// review names; it is the same mechanism, and this is deliberately the only place that
+    /// needs to say so.
     pub fn capture_with(
         &self,
         backend: &dyn Backend,
@@ -144,6 +164,7 @@ impl SnapshotStore {
         cache: &mut HashCache,
         stats: &mut CaptureStats,
     ) -> Result<SnapshotMeta> {
+        let lease = gc::LeaseGuard::acquire_capture(self.cas.root())?;
         let cap = capture::capture(&self.cas, backend, root_dir, opts, cache, stats)?;
         let id = self.cas.put_manifest(&cap.manifest)?;
         let meta = SnapshotMeta {
@@ -155,6 +176,7 @@ impl SnapshotStore {
             git_context: cap.git_context,
         };
         self.cas.put_meta(&meta)?;
+        lease.release();
         Ok(meta)
     }
 

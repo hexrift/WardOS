@@ -944,10 +944,107 @@ pub fn usage_panel(state_root: &Path, usage: &StorageUsage, scratch: &[ScratchEn
     s
 }
 
+/// The `ward snapshot gc` panel, dry-run form: what [`crate::retention::plan`] found,
+/// never what it did (#151 items 2–3). `--apply` renders [`gc_report_panel`] instead.
+#[must_use]
+pub fn gc_plan_panel(state_root: &Path, plan: &ward_snapshot::gc::SweepPlan) -> String {
+    let mut s = format!(
+        "{ACCENT}WARD{RESET} {INK}snapshot gc{RESET} {DIM}(dry run){RESET}  {DIM}{}{RESET}\n\n",
+        state_root.display()
+    );
+    if plan.lease_active {
+        let _ = writeln!(
+            s,
+            "  {WARN}a capture is in progress{RESET} {DIM}— nothing planned while its lease is held; re-run once it finishes{RESET}"
+        );
+        return s;
+    }
+    let _ = writeln!(
+        s,
+        "  {DIM}{} retention root(s) considered live{RESET}",
+        plan.roots
+    );
+    if plan.held_by_grace_period > 0 {
+        let _ = writeln!(
+            s,
+            "  {DIM}{} object(s) unreachable but within the grace period — left alone for now{RESET}",
+            plan.held_by_grace_period
+        );
+    }
+    if plan.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n  {DIM}nothing unreachable — nothing to reclaim{RESET}"
+        );
+        return s;
+    }
+    gc_objects(&mut s, &plan.objects);
+    let _ = writeln!(
+        s,
+        "\n  {BOLD}{INK}{} object(s), {}{RESET} {DIM}would be reclaimed — re-run with --apply to delete them{RESET}",
+        plan.objects.len(),
+        human_bytes(plan.reclaimable_bytes())
+    );
+    s
+}
+
+/// The `ward snapshot gc --apply` panel: what was actually deleted, and anything a
+/// lease acquired mid-sweep left alone instead (#151 item 3's interruption/lease
+/// safety — see [`crate::retention::apply`]).
+#[must_use]
+pub fn gc_report_panel(state_root: &Path, report: &ward_snapshot::gc::SweepReport) -> String {
+    let mut s = format!(
+        "{ACCENT}WARD{RESET} {INK}snapshot gc{RESET} {DIM}(applied){RESET}  {DIM}{}{RESET}\n\n",
+        state_root.display()
+    );
+    if report.deleted.is_empty() && report.skipped_due_to_lease.is_empty() {
+        let _ = writeln!(s, "  {DIM}nothing to reclaim{RESET}");
+        return s;
+    }
+    if !report.deleted.is_empty() {
+        gc_objects(&mut s, &report.deleted);
+        let _ = writeln!(
+            s,
+            "\n  {OK}{} object(s), {} reclaimed{RESET}",
+            report.deleted.len(),
+            human_bytes(report.reclaimed_bytes())
+        );
+    }
+    if !report.skipped_due_to_lease.is_empty() {
+        let _ = writeln!(
+            s,
+            "  {WARN}{} object(s) left alone{RESET} {DIM}— a capture's lease became active during this sweep{RESET}",
+            report.skipped_due_to_lease.len()
+        );
+    }
+    s
+}
+
+fn gc_objects(s: &mut String, objects: &[ward_snapshot::gc::PlannedObject]) {
+    use ward_snapshot::gc::Category;
+    for obj in objects {
+        let kind = match obj.category {
+            Category::Blob => "blob",
+            Category::Manifest => "manifest",
+            Category::Meta => "meta",
+        };
+        let _ = writeln!(
+            s,
+            "  {DIM}{kind:<9}{RESET}{INK}{:<75}{RESET}{DIM}{:>10}{RESET}",
+            obj.label,
+            human_bytes(obj.bytes)
+        );
+    }
+}
+
 /// `bytes` as a human-scaled binary size (`B`/`KiB`/`MiB`/`GiB`), one decimal
 /// place once it has scaled past whole bytes. Pure integer arithmetic (no
 /// float cast) so precision is exact at the one-decimal resolution shown.
-fn human_bytes(bytes: u64) -> String {
+///
+/// `pub(crate)` so `doctor`'s storage check can format the same numbers the
+/// same way `ward snapshot usage`/`gc` already do, rather than a second
+/// formatter drifting from this one.
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut whole = bytes;
     let mut tenths = 0u64;
