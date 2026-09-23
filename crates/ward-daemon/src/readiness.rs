@@ -319,14 +319,19 @@ fn is_assignment(token: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Whether `meta` has any executable bit set (owner, group or other) — the
-/// coarse check `/bin/sh -c` needs before it can start a project-relative
-/// script. Does not attempt to match the invoking user against the owner/group
-/// bit specifically; a narrower check would need the verifier's actual runtime
-/// identity, which this preflight does not have.
-fn is_executable(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    meta.permissions().mode() & 0o111 != 0
+/// Whether `path` is a regular file the *invoking process* can actually
+/// execute — what `/bin/sh -c` itself needs before it can start it. Delegates
+/// to the kernel's own `access(2)` (`X_OK`) rather than testing permission bits
+/// directly: a coarse `mode & 0o111 != 0` is wrong on both sides — a directory
+/// commonly has every execute ("search") bit set without being a runnable
+/// program, and a file whose *matching* owner/group/other class has no execute
+/// bit is not executable by this process even if some other class's bit is set
+/// (e.g. group-execute-only when the process is not in that group). `access(2)`
+/// resolves the correct class (and, on Linux, root's own "any class" rule) the
+/// same way the shell's own exec will.
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file())
+        && nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
 }
 
 /// Whether the binary the *configured* `verify.command` would actually invoke is
@@ -378,26 +383,28 @@ fn runtime_row(dir: &Path, command: &str, path_var: Option<&std::ffi::OsStr>) ->
         } else {
             dir.join(candidate)
         };
-        return match std::fs::metadata(&path) {
-            Ok(meta) if is_executable(&meta) => Row::new(
+        return if is_executable(&path) {
+            Row::new(
                 "runtime",
                 Status::Ok,
                 format!("{candidate} present and executable"),
-            ),
-            Ok(_) => Row::new(
+            )
+        } else if path.exists() {
+            Row::new(
                 "runtime",
                 Status::Fail,
                 format!(
-                    "{candidate} exists but is not executable; chmod +x it before `ward verify` can run"
+                    "{candidate} exists but is not executable (or is a directory); chmod +x it, or name a program inside it, before `ward verify` can run"
                 ),
-            ),
-            Err(_) => Row::new(
+            )
+        } else {
+            Row::new(
                 "runtime",
                 Status::Fail,
                 format!(
                     "{candidate} not found relative to the project; fix the path before `ward verify` can run"
                 ),
-            ),
+            )
         };
     }
     match resolve_on_path(candidate, path_var) {
@@ -436,15 +443,14 @@ fn resolve_on_path(candidate: &str, path_var: Option<&std::ffi::OsStr>) -> PathL
     };
     let mut found_non_executable = false;
     for dir in std::env::split_paths(path_var) {
-        if let Ok(meta) = std::fs::metadata(dir.join(candidate)) {
-            if !meta.is_file() {
-                continue;
-            }
-            if is_executable(&meta) {
-                return PathLookup::Executable;
-            }
-            found_non_executable = true;
+        let candidate_path = dir.join(candidate);
+        if !candidate_path.is_file() {
+            continue;
         }
+        if is_executable(&candidate_path) {
+            return PathLookup::Executable;
+        }
+        found_non_executable = true;
     }
     if found_non_executable {
         PathLookup::NotExecutable
@@ -744,6 +750,25 @@ mod tests {
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Fail, "{}", row.detail);
         assert!(row.detail.contains("not executable"), "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_a_directory_candidate_as_setup_required_not_ok() {
+        // A directory commonly has every execute ("search") bit set — mode 0755,
+        // same as std::fs::create_dir_all's default — which a coarse
+        // `mode & 0o111 != 0` check would misread as "executable". It is not a
+        // runnable program: `/bin/sh -c './scripts'` fails with exit 126.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: ./scripts\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
         assert_eq!(report.verdict(), Verdict::SetupRequired);
     }
 
