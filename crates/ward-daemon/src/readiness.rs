@@ -179,7 +179,7 @@ impl Report {
 #[must_use]
 pub fn check(dir: &Path) -> Report {
     let toolchains = verify::Toolchains::detect();
-    check_with_dirs_and_roots(dir, &toolchains.search_dirs(), &toolchains.mount_roots())
+    check_with_dirs_and_roots(dir, &toolchains.search_dirs(), &toolchains.mounts())
 }
 
 /// [`check`], with the verifier's search directories given explicitly instead
@@ -187,43 +187,29 @@ pub fn check(dir: &Path) -> Report {
 /// rather than a live `Toolchains::detect()`, so a test can exercise the
 /// `runtime` row's search with controlled directories instead of depending on
 /// whatever Rust toolchain happens to be installed on the machine running the
-/// test. `search_dirs` doubles as the symlink-containment boundary here
-/// (see [`check_with_dirs_and_roots`]) — correct for every existing caller,
-/// each of which controls a search dir that *is* its own whole boundary; a
-/// caller that needs the two to differ (a search dir that is only one of
-/// several sibling directories actually mounted, as `bin`/`registry` are
-/// under a real `$CARGO_HOME`) uses [`check_with_dirs_and_roots`] directly.
-/// Test-only: every non-test caller either needs that distinction (`check`)
-/// or controls both directly.
+/// test. No explicit [`verify::Mount`]s: every search dir here is judged as
+/// its own boundary (see [`resolve_in_dirs`]'s doc for what that means) —
+/// correct for every caller that doesn't need a search dir's real mount
+/// picture to differ from the directory itself; a caller that does (a search
+/// dir that is only one of several sibling directories actually mounted, as
+/// `bin`/`registry` are under a real `$CARGO_HOME`) uses
+/// [`check_with_dirs_and_roots`] directly.
 #[cfg(test)]
 fn check_with_dirs(dir: &Path, search_dirs: &[PathBuf]) -> Report {
-    check_with_dirs_and_roots(dir, search_dirs, search_dirs)
+    check_with_dirs_and_roots(dir, search_dirs, &[])
 }
 
 /// [`check`]'s real implementation: `search_dirs` is where a bare candidate is
-/// looked up (mirroring [`verify::Toolchains::search_dirs`]); `mount_roots` is
-/// the separate, broader set of host directories a resolved symlink's
-/// destination is allowed to land in without being judged broken.
-///
-/// The two differ for a real Cargo toolchain: `search_dirs` is just
-/// `$CARGO_HOME/bin` (where the configured command is actually looked up —
-/// `verify::Toolchains::mount` also binds `registry`, but nothing ever
-/// searches there for an executable), while the sandbox's own mount layout
-/// binds `bin` and `registry` as *siblings* under one shared private tmpfs
-/// (`Toolchains`' own doc: "binaries and registry only; the cargo home itself
-/// is a private tmpfs") — so a relative symlink from `bin/` to `../registry/…`
-/// resolves inside the real sandbox exactly as it does on the host, even
-/// though its destination sits outside the narrower `search_dirs` entry that
-/// found it. Judging containment against `search_dirs` alone (as an earlier
-/// version of this check did) would reject that legitimate case; judging it
-/// against the whole `$CARGO_HOME` would accept a relative symlink to
-/// anywhere else under it (e.g. a hypothetical `libexec/`) that the sandbox's
-/// private tmpfs never actually mounts — `mount_roots` is the accurate
-/// boundary in between.
+/// looked up (mirroring [`verify::Toolchains::search_dirs`]); `mounts` names
+/// the real host-to-sandbox mapping for whichever of those search dirs the
+/// verifier actually binds as part of a larger, multi-directory mount (a
+/// search dir with no matching entry here is judged as its own, self-mapped
+/// boundary instead — see [`resolve_in_dirs`]'s doc for the full reasoning
+/// [`resolve_in_dirs`] uses this for).
 fn check_with_dirs_and_roots(
     dir: &Path,
     search_dirs: &[PathBuf],
-    mount_roots: &[PathBuf],
+    mounts: &[verify::Mount],
 ) -> Report {
     let ecosystem = Ecosystem::detect(dir);
     let mut rows = vec![policy_row(dir)];
@@ -235,7 +221,7 @@ fn check_with_dirs_and_roots(
             dir,
             &config.verify.command,
             search_dirs,
-            mount_roots,
+            mounts,
         ));
         rows.push(protected_row(dir, config));
     }
@@ -540,7 +526,12 @@ fn resolve_symlinks_conservatively(path: PathBuf) -> LinkResolution {
 /// `PATH` that isn't in one of these directories would not be found inside the
 /// verifier either, and a Cargo toolchain that *is* mounted there is available
 /// to the verifier even when `$CARGO_HOME/bin` is not on the caller's `PATH`.
-fn runtime_row(dir: &Path, command: &str, search_dirs: &[PathBuf], mount_roots: &[PathBuf]) -> Row {
+fn runtime_row(
+    dir: &Path,
+    command: &str,
+    search_dirs: &[PathBuf],
+    mounts: &[verify::Mount],
+) -> Row {
     if let Some(op) = SHELL_METACHARACTERS.iter().find(|op| command.contains(*op)) {
         return Row::new(
             "runtime",
@@ -567,7 +558,7 @@ fn runtime_row(dir: &Path, command: &str, search_dirs: &[PathBuf], mount_roots: 
     if candidate.contains('/') {
         return path_candidate_row(dir, candidate);
     }
-    match resolve_in_dirs(candidate, search_dirs, mount_roots) {
+    match resolve_in_dirs(candidate, search_dirs, mounts) {
         PathLookup::Executable => Row::new(
             "runtime",
             Status::Ok,
@@ -707,18 +698,18 @@ enum PathLookup {
 /// ../../outside/cargo`) without ever pointing through an absolute target —
 /// nothing the hop-by-hop walk itself checks catches that, since a relative
 /// target is, correctly, allowed to resolve wherever its own containing
-/// directory ends up mounted. The destination is accepted when it lands
-/// inside any of `mount_roots` — not just the one `dir` that happened to
-/// find this candidate — since a real toolchain mount can bind more than
-/// `search_dirs` alone searches (see [`check_with_dirs_and_roots`]: Cargo's
-/// `bin` and `registry` are sibling mounts under one shared tmpfs) — or
-/// inside a [`crate::sandbox::is_system_ro`] root (a search dir can itself
-/// be a base system directory, whose full real mount extent `mount_roots`
-/// doesn't need to separately enumerate).
+/// directory ends up mounted. Whether the destination is legitimate is
+/// decided by [`resolved_is_mounted`] in **sandbox** coordinates, not by
+/// whether the resolved *host* path merely sits under some other host
+/// directory the verifier separately mounts — see that function's doc for
+/// why a flat host-side check is unsound (a relative chain can climb enough
+/// `..`s to reach a real system binary on the host's own, unrelated
+/// ancestry, while the identical `..`s starting from where the verifier
+/// actually mounts `dir` land nowhere real).
 fn resolve_in_dirs(
     candidate: &str,
     search_dirs: &[PathBuf],
-    mount_roots: &[PathBuf],
+    mounts: &[verify::Mount],
 ) -> PathLookup {
     let mut found_non_executable = false;
     for dir in search_dirs {
@@ -726,11 +717,7 @@ fn resolve_in_dirs(
         match resolve_symlinks_conservatively(candidate_path.clone()) {
             LinkResolution::Broken => return PathLookup::Broken,
             LinkResolution::Resolved(resolved) if resolved.is_file() => {
-                let contained = crate::sandbox::is_system_ro(&resolved)
-                    || mount_roots
-                        .iter()
-                        .any(|root| !escapes_root(root, &resolved));
-                if !contained {
+                if !resolved_is_mounted(dir, &resolved, mounts) {
                     return PathLookup::Broken;
                 }
                 if is_executable(&candidate_path) {
@@ -746,6 +733,95 @@ fn resolve_in_dirs(
     } else {
         PathLookup::Missing
     }
+}
+
+/// Whether `resolved` — the real, symlink-free destination
+/// [`resolve_symlinks_conservatively`] already walked to, starting from
+/// `dir.join(candidate)` — is somewhere the verifier's own mount namespace
+/// actually provides, given that `dir` is either one of `mounts`' own host
+/// directories or, when it isn't (a base system directory, or a directory a
+/// test controls directly), its own identity mapping (the verifier sees it
+/// at the same path it has on the host — true for every fixed `SYSTEM_RO`
+/// root, and for any search dir a caller hasn't given an explicit `Mount`
+/// for).
+///
+/// A flat "is `resolved` under some host root the verifier also mounts
+/// somewhere" check (an earlier version of this function) judges
+/// containment in *host* coordinates — but a relative symlink chain's
+/// cumulative `..`s are followed by the *kernel*, inside the verifier, in
+/// *sandbox* coordinates: `$CARGO_HOME/bin/tool -> ../../../usr/bin/true`
+/// resolves, on the host, to the real `/usr/bin/true` (three `..`s from a
+/// typical `$CARGO_HOME/bin` reach the host's own root), which is
+/// `is_system_ro` and genuinely executable there — a host-side check alone
+/// accepts it. Inside the verifier, though, that same relative target is
+/// followed from `/run/verifier/cargo/bin`, and three `..`s from there reach
+/// only `/run` (one level short of the sandbox's own root, since Cargo's
+/// mount sits four components deep) — the walk lands on `/run/usr/bin/true`,
+/// which nothing binds. The two namespaces don't share the same directory
+/// hierarchy above the bind points themselves, so containment has to be
+/// judged from `dir`'s *sandbox* position, not its host one.
+///
+/// This re-expresses `resolved` as the number of directory levels **up**
+/// from `dir`, and the components **down** from there ([`translate`]:
+/// diffing `dir`'s and `resolved`'s canonicalized component sequences —
+/// exactly what the kernel's own relative-`..` resolution computed, since
+/// `resolve_symlinks_conservatively` only ever reached `resolved` via that
+/// same textual navigation), then applies that identical delta to `dir`'s
+/// own *sandbox* directory and checks whether the resulting sandbox path is
+/// real: `is_system_ro`, under one of `mounts`' own `sandbox` directories
+/// (a real sibling mount, e.g. Cargo's `registry` reached from `bin`), or
+/// still under `dir`'s own sandbox mapping (the ordinary case: the link
+/// never left `dir` at all).
+fn resolved_is_mounted(dir: &Path, resolved: &Path, mounts: &[verify::Mount]) -> bool {
+    let dir_sandbox = mounts
+        .iter()
+        .find(|m| m.host == dir)
+        .map_or_else(|| dir.to_path_buf(), |m| m.sandbox.clone());
+    let Some(sandbox_candidate) = translate(dir, &dir_sandbox, resolved) else {
+        return false;
+    };
+    crate::sandbox::is_system_ro(&sandbox_candidate)
+        || sandbox_candidate.starts_with(&dir_sandbox)
+        || mounts
+            .iter()
+            .any(|m| sandbox_candidate.starts_with(&m.sandbox))
+}
+
+/// Re-expresses `resolved` (a real, symlink-free host path) as the
+/// equivalent path in `dir`'s own coordinate space: pops `dir_sandbox` back
+/// to the common ancestor `dir` and `resolved` share on the host, then
+/// pushes `resolved`'s own remaining components on top — the same "N levels
+/// up, M names down" the kernel's own relative-symlink resolution actually
+/// walked to reach `resolved` from `dir` in the first place, just replayed
+/// against `dir`'s sandbox position instead of its host one. A pop past the
+/// sandbox path's own root is a no-op, exactly like a real `..` at `/` —
+/// which is what makes the difference legible: an escape that only reaches
+/// as far "up" as the verifier's own mount nesting (e.g. out of a Cargo
+/// `bin/` into its `registry/` sibling) still lands somewhere real, while
+/// one that would need to climb *past* the sandbox's actual root to reach
+/// the same nominal depth a host path allows does not.
+///
+/// `None` when either side fails to canonicalize — unreachable in practice
+/// by the time a caller has a `resolved` path in hand (both already proved
+/// they exist), kept only so this stays a plain, non-panicking query.
+fn translate(dir: &Path, dir_sandbox: &Path, resolved: &Path) -> Option<PathBuf> {
+    let dir_real = dir.canonicalize().ok()?;
+    let resolved_real = resolved.canonicalize().ok()?;
+    let dir_components: Vec<_> = dir_real.components().collect();
+    let resolved_components: Vec<_> = resolved_real.components().collect();
+    let common = dir_components
+        .iter()
+        .zip(resolved_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut sandbox_path = dir_sandbox.to_path_buf();
+    for _ in common..dir_components.len() {
+        sandbox_path.pop();
+    }
+    for component in &resolved_components[common..] {
+        sandbox_path.push(component.as_os_str());
+    }
+    Some(sandbox_path)
 }
 
 fn protected_row(dir: &Path, config: &verify::Config) -> Row {
@@ -1184,6 +1260,26 @@ mod tests {
         assert_ne!(report.verdict(), Verdict::SetupRequired);
     }
 
+    /// The real sandbox destinations `Toolchains::mounts()` pairs a detected
+    /// Cargo `bin`/`registry` with (`{TOOLCHAIN_ROOT}/cargo/{bin,registry}`)
+    /// — used directly, not a shorter synthetic stand-in, so a test's `..`
+    /// count is exercised against the sandbox's *real* nesting depth. A
+    /// shallower fake path would let a pop that should stop short of the
+    /// sandbox's own root instead bottom out there, silently hiding exactly
+    /// the class of bug these tests exist to catch.
+    fn cargo_mounts(bin: PathBuf, registry: PathBuf) -> [verify::Mount; 2] {
+        [
+            verify::Mount {
+                host: bin,
+                sandbox: PathBuf::from("/run/verifier/cargo/bin"),
+            },
+            verify::Mount {
+                host: registry,
+                sandbox: PathBuf::from("/run/verifier/cargo/registry"),
+            },
+        ]
+    }
+
     #[test]
     fn runtime_allows_a_relative_symlink_from_a_cargo_bin_into_its_sibling_registry_mount() {
         // Review finding on #219: `search_dirs` for a real Cargo toolchain is
@@ -1194,9 +1290,9 @@ mod tests {
         // exactly as it does on the host, even though its destination sits
         // outside the narrower `search_dirs` entry that found it. Judging
         // containment against `search_dirs` alone (the bug this test would
-        // have caught) rejects this legitimate case; `mount_roots` — passed
-        // separately here via `check_with_dirs_and_roots`, exactly as `check`
-        // derives both from one real `Toolchains` — must not.
+        // have caught) rejects this legitimate case; the real mount picture
+        // — passed separately here via `check_with_dirs_and_roots`, exactly
+        // as `check` derives both from one real `Toolchains` — must not.
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
@@ -1213,17 +1309,17 @@ mod tests {
         std::os::unix::fs::symlink("../registry/cargo", bin.join("cargo")).unwrap();
 
         let search_dirs = [bin.clone()];
-        let mount_roots = [bin, registry];
-        let report = check_with_dirs_and_roots(dir.path(), &search_dirs, &mount_roots);
+        let mounts = cargo_mounts(bin, registry);
+        let report = check_with_dirs_and_roots(dir.path(), &search_dirs, &mounts);
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Ok, "{}", row.detail);
         assert_ne!(report.verdict(), Verdict::SetupRequired);
     }
 
     #[test]
-    fn runtime_still_rejects_a_relative_symlink_escaping_every_mount_root_not_just_search_dirs() {
-        // The other half of the same fix: broadening containment to
-        // `mount_roots` must not become "anything under $CARGO_HOME" — only
+    fn runtime_still_rejects_a_relative_symlink_escaping_every_mount_not_just_search_dirs() {
+        // The other half of the same fix: broadening containment to the real
+        // mount picture must not become "anything under $CARGO_HOME" — only
         // the specific subdirectories the sandbox actually mounts. A symlink
         // to a third, unmounted sibling (`libexec/`, mirroring the review's
         // own hypothetical) stays Fail even though it's still nominally
@@ -1246,8 +1342,116 @@ mod tests {
         std::os::unix::fs::symlink("../libexec/cargo", bin.join("cargo")).unwrap();
 
         let search_dirs = [bin.clone()];
-        let mount_roots = [bin, registry];
-        let report = check_with_dirs_and_roots(dir.path(), &search_dirs, &mount_roots);
+        let mounts = cargo_mounts(bin, registry);
+        let report = check_with_dirs_and_roots(dir.path(), &search_dirs, &mounts);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_a_cargo_bin_relative_symlink_reaching_a_host_system_binary_as_setup_required()
+     {
+        // Review finding on #219 (the deeper gap in the mount-picture fix
+        // above): the earlier fix judged containment in *host* coordinates —
+        // "does the resolved destination sit under some host root the
+        // verifier also mounts somewhere" — which a relative chain can
+        // satisfy by pure host-filesystem coincidence, without the identical
+        // navigation being valid inside the verifier at all.
+        //
+        // `$CARGO_HOME/bin/tool -> ../../../usr/bin/true`: on the host,
+        // three `..`s from a typical `$CARGO_HOME/bin` (two directories
+        // below root) reach the host's own `/`, and descending into
+        // `usr/bin/true` finds the real, `is_system_ro`, executable system
+        // binary — a host-only check accepts this. Inside the verifier,
+        // though, `bin/` is mounted at `/run/verifier/cargo/bin` (four
+        // components deep); the *same* three `..`s only reach `/run`, one
+        // level short of the sandbox's own root, and `/run/usr/bin/true` is
+        // not bound to anything. This must be Fail, not Ok.
+        let real_true = Path::new("/usr/bin/true");
+        if !real_true.is_file() {
+            return; // not present on this machine; the mechanism is covered
+            // by the other absolute-system-ro fixtures elsewhere in this
+            // file (e.g. resolve_symlinks_conservatively's own /usr/bin/bash
+            // case), which use the identical environment-conditional shape.
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cargo test\n",
+        );
+        let cargo_home = tempfile::tempdir().unwrap();
+        let bin = cargo_home.path().join("bin");
+        let registry = cargo_home.path().join("registry");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink("../../../usr/bin/true", bin.join("cargo")).unwrap();
+
+        let search_dirs = [bin.clone()];
+        let mounts = cargo_mounts(bin, registry);
+        let report = check_with_dirs_and_roots(dir.path(), &search_dirs, &mounts);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_a_system_dir_relative_symlink_reaching_a_cargo_mount_host_directory_as_setup_required()
+     {
+        // The inverse shape: a relative link that starts in a real,
+        // identity-mapped system search directory and, purely by host
+        // filesystem coincidence, reaches a file that lives under a
+        // directory `Toolchains` also separately mounts for Cargo. That
+        // host-side coincidence proves nothing about the sandbox — `/opt`
+        // and `/run/verifier/cargo` are unrelated namespaces there — so this
+        // must stay Fail even though the exact same physical file is, from
+        // Cargo's own `bin/`, legitimately reachable.
+        let probe_root = Path::new("/opt");
+        let marker = probe_root.join(format!("ward-readiness-mount-test-{}", std::process::id()));
+        if std::fs::create_dir(&marker).is_err() {
+            return; // no write access here; the mechanism is covered by the
+            // Cargo-bin case above either way.
+        }
+        let _cleanup = RemoveDirOnDrop(marker.clone());
+        assert!(
+            crate::sandbox::is_system_ro(&marker),
+            "/opt is unconditionally in SYSTEM_RO"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cargo test\n",
+        );
+        let cargo_home = tempfile::tempdir().unwrap();
+        let bin = cargo_home.path().join("bin");
+        let registry = cargo_home.path().join("registry");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::write(registry.join("cargo"), "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&registry.join("cargo"));
+        // marker/cargo -> a relative path out of `marker` (under real
+        // SYSTEM_RO /opt) into cargo_home/registry — built the same way the
+        // existing absolute-candidate escape test elsewhere in this file
+        // builds its relative target.
+        let mut relative_escape = PathBuf::new();
+        for _ in marker
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            relative_escape.push("..");
+        }
+        for c in registry.join("cargo").components() {
+            if let std::path::Component::Normal(part) = c {
+                relative_escape.push(part);
+            }
+        }
+        std::os::unix::fs::symlink(&relative_escape, marker.join("cargo")).unwrap();
+
+        let search_dirs = [marker.clone()];
+        let mounts = cargo_mounts(bin, registry);
+        let report = check_with_dirs_and_roots(dir.path(), &search_dirs, &mounts);
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Fail, "{}", row.detail);
         assert_eq!(report.verdict(), Verdict::SetupRequired);

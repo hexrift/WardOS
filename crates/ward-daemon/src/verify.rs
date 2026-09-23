@@ -485,6 +485,27 @@ pub fn parse_summary(output: &str) -> VerifySummary {
     summary
 }
 
+/// A directory the verifier binds into its sandbox, named in both
+/// coordinate spaces: `host` is where a preflight check running outside the
+/// sandbox can actually stat it, `sandbox` is where the *verifier itself*
+/// sees it once bubblewrap remaps the filesystem. [`crate::readiness`] needs
+/// both: a relative symlink hop's cumulative `..`s are followed by the
+/// kernel in *sandbox* coordinates once the candidate is actually looked up
+/// inside the verifier, and the two namespaces don't share the same
+/// directory hierarchy above the bind points themselves — a host-only
+/// containment check (comparing only `host` paths) can be fooled by a
+/// relative chain that coincidentally reaches a real file on the host's own
+/// unrelated ancestry, even though the identical `..`s starting from
+/// `sandbox` land nowhere the verifier provides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mount {
+    /// Where a preflight check can stat this directory on the host.
+    pub host: PathBuf,
+    /// Where the verifier itself sees it, once bubblewrap remaps the
+    /// filesystem.
+    pub sandbox: PathBuf,
+}
+
 /// Host toolchains the verifier gets read-only, the 0.1 stand-in for a verifier
 /// image: a Rust toolchain from `$RUSTUP_HOME`/`~/.rustup` and `$CARGO_HOME`/`~/.cargo`
 /// (binaries and registry only; the cargo home itself is a private tmpfs).
@@ -549,27 +570,38 @@ impl Toolchains {
     }
 
     /// The host directories individually, actually bind-mounted into the
-    /// verifier sandbox for this toolchain — distinct from
-    /// [`Toolchains::search_dirs`] (where a bare command is *looked up*),
-    /// this is the real containment boundary a resolved symlink target is
-    /// judged against ([`crate::readiness::check`]'s `runtime` row): `mount`
-    /// binds `bin` and `registry` as **siblings** under one shared, otherwise
-    /// empty private tmpfs — never the whole `$CARGO_HOME` (this struct's own
-    /// doc: "binaries and registry only; the cargo home itself is a private
-    /// tmpfs") — so a relative symlink from `bin/` can legitimately resolve
-    /// into `registry/` (both hang off that same sandboxed parent) but
-    /// nowhere else under the host's `$CARGO_HOME`. Only a subdirectory that
-    /// actually exists on the host is included, matching [`Toolchains::mount`]'s
-    /// own `is_dir()` gate — an absent one is never bind-mounted either.
+    /// verifier sandbox for this toolchain, each paired with the *sandbox*
+    /// path the verifier itself sees it at — distinct from
+    /// [`Toolchains::search_dirs`] (where a bare command is *looked up*, as
+    /// real host paths only), this is what a resolved symlink target is
+    /// judged against ([`crate::readiness::check`]'s `runtime` row, via
+    /// [`crate::readiness::resolve_in_dirs`]): `mount` binds `bin` and
+    /// `registry` as **siblings** under one shared, otherwise empty private
+    /// tmpfs at `{TOOLCHAIN_ROOT}/cargo` — never the whole `$CARGO_HOME`
+    /// (this struct's own doc: "binaries and registry only; the cargo home
+    /// itself is a private tmpfs") — so a relative symlink from `bin/` can
+    /// legitimately resolve into `registry/` (both hang off that same
+    /// sandboxed parent) but nowhere else under the host's `$CARGO_HOME`,
+    /// and *not* by however many `..`s it takes to reach some real system
+    /// binary on the host's own, unrelated directory hierarchy (the two
+    /// namespaces share no common ancestry above the bind points
+    /// themselves — see [`crate::readiness::resolve_in_dirs`]'s doc for the
+    /// concrete false-ready this exists to catch). Only a subdirectory that
+    /// actually exists on the host is included, matching
+    /// [`Toolchains::mount`]'s own `is_dir()` gate — an absent one is never
+    /// bind-mounted either.
     #[must_use]
-    pub fn mount_roots(&self) -> Vec<PathBuf> {
+    pub fn mounts(&self) -> Vec<Mount> {
         let Some(cargo) = &self.cargo else {
             return Vec::new();
         };
         ["bin", "registry"]
             .into_iter()
-            .map(|sub| cargo.join(sub))
-            .filter(|dir| dir.is_dir())
+            .map(|sub| Mount {
+                host: cargo.join(sub),
+                sandbox: PathBuf::from(format!("{TOOLCHAIN_ROOT}/cargo/{sub}")),
+            })
+            .filter(|m| m.host.is_dir())
             .collect()
     }
 
@@ -723,6 +755,56 @@ mod tests {
                 PathBuf::from("/bin"),
             ],
             "no cargo detected: no toolchain entry"
+        );
+    }
+
+    #[test]
+    fn mounts_pairs_the_real_cargo_bin_and_registry_directories_with_their_sandbox_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        let registry = home.path().join("registry");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        let t = Toolchains {
+            rustup: None,
+            cargo: Some(home.path().to_path_buf()),
+        };
+        // Both host directories that actually exist are paired with the
+        // sandbox path `Toolchains::mount` binds them at — siblings under
+        // one shared toolchain root, never the whole (private, otherwise
+        // empty) `$CARGO_HOME` tmpfs.
+        assert_eq!(
+            t.mounts(),
+            vec![
+                Mount {
+                    host: bin,
+                    sandbox: PathBuf::from("/run/verifier/cargo/bin"),
+                },
+                Mount {
+                    host: registry,
+                    sandbox: PathBuf::from("/run/verifier/cargo/registry"),
+                },
+            ]
+        );
+        // A subdirectory that doesn't exist on the host is never bind-mounted
+        // (`Toolchains::mount`'s own `is_dir()` gate), so it's excluded here too.
+        let sparse = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(sparse.path().join("bin")).unwrap();
+        let t = Toolchains {
+            rustup: None,
+            cargo: Some(sparse.path().to_path_buf()),
+        };
+        assert_eq!(
+            t.mounts(),
+            vec![Mount {
+                host: sparse.path().join("bin"),
+                sandbox: PathBuf::from("/run/verifier/cargo/bin"),
+            }]
+        );
+        assert_eq!(
+            Toolchains::default().mounts(),
+            Vec::new(),
+            "no cargo detected"
         );
     }
 
