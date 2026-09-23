@@ -39,7 +39,7 @@ use ward_policy::NetworkCapability;
 
 use crate::error::Error;
 use crate::gateway::{GatewayRoute, Upstream};
-use crate::http::{self, ChunkTracker, Framing, Method, Parsed};
+use crate::http::{self, ChunkTracker, Framing, Method, Parsed, Request};
 use crate::observer::{Decision, Observer};
 use crate::policy::{Pinned, Policy};
 use crate::resolve::{Resolver, SystemResolver};
@@ -200,6 +200,10 @@ struct Shared {
     idle_timeout: Duration,
     active: AtomicUsize,
     shutdown: AtomicBool,
+    /// The gate that makes "stop accepting" and "announce one accepted
+    /// connection" mutually exclusive; see [`Shared::close`] and
+    /// [`Shared::announce`].
+    announcing: Mutex<()>,
     paused: AtomicBool,
 }
 
@@ -210,6 +214,53 @@ impl Shared {
 
     fn paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
+    }
+
+    /// Stop accepting — atomically with respect to announcing a connection.
+    ///
+    /// Raising the flag on its own is not enough for the invariant
+    /// [`Handle::shutdown`] owes an observer. The acceptor reads the flag and then
+    /// announces, and between those two steps it can be descheduled for arbitrarily
+    /// long; a flag raised in that window is read too late, and the connection joins
+    /// the observer's outstanding set after the observer was told nothing more could.
+    /// Nothing else closed that window: the synthetic wake connection is a *latency*
+    /// device, not a correctness one, and it does not even reach the acceptor once
+    /// the socket file is gone.
+    ///
+    /// Raising it under the same gate the announcement holds leaves exactly two
+    /// orders, and both are safe. Either the announcement got the gate first, in
+    /// which case it has completed — the connection is in the observer's outstanding
+    /// set — before this call can return; or this call got the gate first, in which
+    /// case the announcement re-reads the flag under the gate, sees it set, and is
+    /// abandoned with the connection it would have announced. There is no longer any
+    /// interval in which the acceptor is past its last shutdown check and has not yet
+    /// announced.
+    ///
+    /// The wait this can impose is bounded by the [`Observer`] contract, not by the
+    /// network: the gate is held across one [`Observer::deciding`] call and nothing
+    /// else — no I/O, no connection being served, no relay — and that call is
+    /// required to be cheap and non-blocking.
+    fn close(&self) {
+        let _gate = self
+            .announcing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Announce one accepted connection to the observer, unless [`Shared::close`]
+    /// got to the gate first — in which case this connection is not announced and
+    /// not served, because its verdict would be one no observer is still listening
+    /// for.
+    fn announce(&self) -> Option<Pending> {
+        let _gate = self
+            .announcing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.shutting_down() {
+            return None;
+        }
+        Some(Pending::take(&self.observer))
     }
 }
 
@@ -239,6 +290,7 @@ impl Proxy {
             idle_timeout: config.idle_timeout,
             active: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            announcing: Mutex::new(()),
             paused: AtomicBool::new(false),
         });
         let (bound, acceptor) = match config.listen {
@@ -342,10 +394,28 @@ impl Handle {
         self.shared.paused()
     }
 
-    /// Stop accepting, ask every relay to wind down, join the acceptor and
-    /// (for a Unix listener) unlink the socket file. Idempotent.
+    /// Stop accepting, ask every relay to wind down, join the acceptor when it can
+    /// be woken, and (for a Unix listener) unlink the socket file. Idempotent.
+    ///
+    /// **When this returns, no further connection can be announced** to the
+    /// observer through [`Observer::deciding`]. That is the invariant an observer
+    /// accounting for gaps seals on: whatever it still has outstanding when
+    /// `shutdown` has returned is exactly what may still be decided, and it can
+    /// charge the rest as a gap without a later connection sneaking into the set
+    /// behind it.
+    ///
+    /// The guarantee is [`Shared::close`]'s, taken before anything below runs, and
+    /// it holds unconditionally. The wake connection and the join are latency, not
+    /// correctness: the wake gets the acceptor out of a blocking `accept` promptly
+    /// when it lands, but it needs the listening socket to still be reachable — a
+    /// Unix socket file unlinked behind us is not — so neither it nor the join it
+    /// enables can be what the invariant rests on. An acceptor that could not be
+    /// woken is left parked in `accept`; it holds nothing but the listener, it can
+    /// no longer announce anything, and it ends with the process.
     pub fn shutdown(&self) {
-        self.shared.shutdown.store(true, Ordering::Release);
+        // Atomic against the acceptor's announcement, so there is no window in
+        // which a connection is announced after this has been observed.
+        self.shared.close();
         let acceptor = self
             .acceptor
             .lock()
@@ -353,9 +423,7 @@ impl Handle {
             .take();
         let Some(acceptor) = acceptor else { return };
         // Wake the acceptor so it observes the flag now: both listeners block
-        // in `accept`. If the wake cannot reach it (the socket file was removed
-        // behind our back) the thread is left parked rather than joined; it
-        // holds nothing but the listener and ends with the process.
+        // in `accept`.
         let woken = match &self.bound {
             Listen::Tcp(addr) => TcpStream::connect_timeout(addr, Duration::from_secs(1)).is_ok(),
             Listen::Unix(path) => UnixStream::connect(path).is_ok(),
@@ -410,6 +478,56 @@ impl Slot {
 impl Drop for Slot {
     fn drop(&mut self) {
         self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// One accepted connection's outstanding verdict.
+///
+/// Taken on the acceptor thread before the connection is served and retired
+/// exactly once — by [`report`](Pending::report) when the connection reached a
+/// verdict, and by the drop otherwise, whatever path serving it left by
+/// (an unparsable head, a paused proxy, a thread that could not be spawned, an
+/// unwind).
+///
+/// It is deliberately **not** the connection's lifetime: it ends at the verdict,
+/// so a tunnel that goes on relaying for minutes after being allowed is not an
+/// outstanding decision. An observer accounting for gaps needs "not decided
+/// yet", not "still connected" — reading the latter for the former reports a
+/// connection whose decision is already recorded as if it had been lost.
+struct Pending {
+    observer: Arc<dyn Observer>,
+    /// Whether the observer asked to be told how this one ends.
+    tracked: bool,
+    /// Whether the verdict has been reported, so the drop does not retire it twice.
+    reported: bool,
+}
+
+impl Pending {
+    /// Announce one accepted connection to `observer`.
+    fn take(observer: &Arc<dyn Observer>) -> Self {
+        Self {
+            observer: Arc::clone(observer),
+            tracked: observer.deciding(),
+            reported: false,
+        }
+    }
+
+    /// Report this connection's one verdict and retire it.
+    fn report(&mut self, req: &Request, decision: Decision, reason: &str) {
+        self.reported = true;
+        if self.tracked {
+            self.observer.decided(req, decision, reason);
+        } else {
+            self.observer.decision(req, decision, reason);
+        }
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if self.tracked && !self.reported {
+            self.observer.undecided();
+        }
     }
 }
 
@@ -478,6 +596,14 @@ fn accept_loop<L: Acceptor>(listener: &L, shared: &Arc<Shared>) {
         let Ok(mut client) = listener.accept() else {
             continue;
         };
+        // The shutdown flag is set before the connect that wakes this loop out of
+        // `accept`, so a connection that arrives with it already set is either that
+        // wake or a client that missed the close by a hair. Neither is served: the
+        // wake is not a request at all, and serving one here would announce a
+        // verdict that will never come to an observer that is winding down.
+        if shared.shutting_down() {
+            continue;
+        }
         if shared.paused() {
             refuse_paused(&mut client);
             continue;
@@ -486,21 +612,38 @@ fn accept_loop<L: Acceptor>(listener: &L, shared: &Arc<Shared>) {
             respond(&mut client, 503, "Service Unavailable", "proxy at capacity");
             continue;
         };
+        // Announced here, on the acceptor thread rather than on the connection
+        // thread, and under the gate `Handle::shutdown` closes: an observer that has
+        // seen `shutdown` return knows no further connection can be announced, so
+        // what it still has outstanding is exactly what may still be decided. The
+        // check above is only a fast path — this is the one that decides, and it
+        // cannot be overtaken by a shutdown, whatever the acceptor was descheduled
+        // for in between.
+        let Some(pending) = shared.announce() else {
+            // The shutdown won the gate. Nothing was announced, so there is no
+            // verdict owed for this connection; the slot and the stream go back.
+            drop(slot);
+            continue;
+        };
         let shared = Arc::clone(shared);
         let spawned = thread::Builder::new()
             .name("ward-proxy-conn".into())
             .spawn(move || {
                 let _slot = slot;
-                serve(client, &shared);
+                serve(client, &shared, pending);
             });
-        // On spawn failure the closure — and with it the stream and slot — is
-        // dropped, which closes the connection and frees the slot.
+        // On spawn failure the closure — and with it the stream, the slot and the
+        // outstanding verdict — is dropped, which closes the connection, frees the
+        // slot and retires the connection as undecided.
         drop(spawned);
     }
 }
 
 /// Serve exactly one request on `client`.
-fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
+///
+/// `pending` is this connection's outstanding verdict: every return below either
+/// reports one through it or drops it, which retires the connection as undecided.
+fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>, mut pending: Pending) {
     let _ = client.set_read_timeout(Some(shared.request_timeout));
     let head = match http::read_head(&mut client) {
         Ok(Ok(head)) => head,
@@ -540,7 +683,7 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
         && let Err(denial) = route.permits(verb, path)
     {
         let reason = format!("gateway {}: {denial}", route.prefix());
-        shared.observer.decision(req, Decision::Deny, &reason);
+        pending.report(req, Decision::Deny, &reason);
         return respond(
             &mut client,
             403,
@@ -555,9 +698,7 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
     ) {
         Ok(pinned) => pinned,
         Err(denial) => {
-            shared
-                .observer
-                .decision(req, Decision::Deny, &denial.to_string());
+            pending.report(req, Decision::Deny, &denial.to_string());
             return respond(
                 &mut client,
                 403,
@@ -570,7 +711,11 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>) {
         || format!("pinned {}", pinned_list(&pinned)),
         |g| format!("gateway {}", g.prefix()),
     );
-    shared.observer.decision(req, Decision::Allow, &reason);
+    pending.report(req, Decision::Allow, &reason);
+    // The verdict is in, so this connection is no longer outstanding: everything
+    // below is the relay, which may run for as long as the tunnel lives without
+    // that ever being a decision still to be made.
+    drop(pending);
     let Some(mut upstream) = connect_pinned(&pinned, shared.connect_timeout) else {
         return respond(
             &mut client,

@@ -12,15 +12,16 @@ use ward_events::chain::{Chain, Timestamp, verify};
 use ward_events::event::{
     Acceptor, AgentIdentity, AgentKind, AgentState, CapabilityKind, CapabilityRequest, CaptureMode,
     ClaimKind, CredentialDelivery, Decision, DecisionSource, DeniedDst, DenyReason, EndReason,
-    EventKind, ExitStatus, FileChangeKind, GrantScope, PauseMethod, PolicySubject, ProcessRef,
-    RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus, TamperWardSig, VerifyRequester,
-    VerifySummary, WardEvent,
+    EventKind, EventKindSet, ExitStatus, FileChangeKind, GrantScope, ObserverSource, PauseMethod,
+    PolicySubject, ProcessRef, RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus,
+    TamperWardSig, VerifyRequester, VerifySummary, WardEvent,
 };
 use ward_events::ids::{
     AttemptId, Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
 };
 use ward_events::log::{FsyncPolicy, LogReader, LogWriter};
 use ward_events::origin::Origin;
+use ward_events::origin::OriginSet;
 use ward_events::text::{BoundedArgv, BoundedText, FSI, HostName, PDI, SandboxPath, SandboxRoot};
 use ward_events::wire::{
     Filter, Subscribe, decode_record, decode_subscribe, encode_record, encode_subscribe,
@@ -221,7 +222,7 @@ proptest! {
     }
 
     #[test]
-    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u64..(1 << 27), notes in any::<bool>()) {
+    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u64..(1u64 << EventKind::ALL.len()), notes in any::<bool>()) {
         let sub = Subscribe {
             session: SessionId::from_u128(session),
             from_seq,
@@ -236,6 +237,69 @@ proptest! {
         prop_assert_eq!(n, bytes.len());
         prop_assert_eq!(back, sub);
     }
+}
+
+/// Deterministic regression for the `Filter`/`Subscribe` wire path at bit positions
+/// `>= 32` — the range `subscribe_roundtrips` above generates was widened to the full
+/// `EventKindSet` capacity specifically to reach these, but a fixed, targeted case is
+/// kept too so a future narrowing of that proptest range can't silently stop covering
+/// the exact kinds (`ObservationsDropped`, #202; `VerificationAttemptStarted`,
+/// `VerificationCancelled`, `VerificationInterrupted`, #139) that motivated widening
+/// `EventKindSet` from `u32` to `u64` in the first place.
+#[test]
+fn subscribe_roundtrips_high_bit_kinds() {
+    // Exactly the four kinds at or past bit 32: nothing below it, so a regression in
+    // masking/shifting the high bits can't hide behind low bits also being set.
+    let high_bits = EventKindSet::EMPTY
+        .with(EventKind::ObservationsDropped) // bit 32
+        .with(EventKind::VerificationAttemptStarted) // bit 33
+        .with(EventKind::VerificationCancelled) // bit 34
+        .with(EventKind::VerificationInterrupted); // bit 35
+    assert_eq!(high_bits.bits(), 0b1111 << 32);
+
+    let sub = Subscribe {
+        session: SessionId::from_u128(0x5e55),
+        from_seq: 0,
+        filter: Filter {
+            origins: OriginSet::ALL,
+            kinds: high_bits,
+            exclude_agent_notes: false,
+        },
+    };
+    let bytes = encode_subscribe(&sub).unwrap();
+    let (back, n) = decode_subscribe(&bytes).unwrap();
+    assert_eq!(n, bytes.len());
+    assert_eq!(back, sub);
+    assert_eq!(back.filter.kinds, high_bits);
+
+    // And the full mask, including every high bit alongside every low one, still
+    // round-trips: a wire path that only special-cased the low 32 bits would fail
+    // here even if the isolated high-bit-only case above passed.
+    let sub_all = Subscribe {
+        session: SessionId::from_u128(1),
+        from_seq: 9,
+        filter: Filter::ALL,
+    };
+    let bytes = encode_subscribe(&sub_all).unwrap();
+    let (back, n) = decode_subscribe(&bytes).unwrap();
+    assert_eq!(n, bytes.len());
+    assert_eq!(back, sub_all);
+    assert_eq!(back.filter.kinds, EventKindSet::ALL);
+}
+
+/// `EventKindSet` bits produced under the pre-#202 `u32` representation (every kind
+/// index `0..32`) still decode correctly when the value additionally carries a bit
+/// `>= 32` that only the widened `u64` type can represent — proving the widening is
+/// purely additive for the wire, not just for values that stay inside the old range.
+#[test]
+fn a_high_bit_survives_alongside_bits_valid_under_the_old_u32_range() {
+    let mixed = EventKindSet::EMPTY
+        .with(EventKind::SessionStarted) // bit 0, valid pre-#202
+        .with(EventKind::LaunchAborted) // bit 31, the old ceiling
+        .with(EventKind::VerificationInterrupted); // bit 35, only valid post-widening
+    let bytes = postcard::to_allocvec(&mixed).unwrap();
+    let back: EventKindSet = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(back, mixed);
 }
 
 fn any_origin() -> impl Strategy<Value = Origin> {
@@ -646,6 +710,25 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Wardd,
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Network,
+                dropped: 9,
+                capacity: 4096,
+            },
+        ),
+        (
+            Origin::Wardd,
+            // Every `ObserverSource` is carried over the wire and through the
+            // log, the hook broker included: a hook claim the broker had to
+            // refuse is an observer gap, not an agent note.
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Hook,
+                dropped: 2,
+                capacity: 4096,
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -737,10 +820,12 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
     // The nine of Quiet mode plus the three host interventions (ADR-0019 §3), plus
     // `VerificationErrored`, `VerificationCancelled` and `VerificationInterrupted`
     // (#139), plus `CapabilityDecided` appearing twice in the fixture above (once
-    // granted, once denied). `VerificationAttemptStarted` is a progress marker, not
-    // a terminal outcome, and is deliberately not in Quiet mode (like
-    // `VerificationRequested`/`VerificationStarted` before it).
-    assert_eq!(quiet, 15);
+    // granted, once denied), plus the observer's own "this record is incomplete"
+    // markers — one per source, the hook broker included (#137), appearing twice
+    // in the fixture above (`Network`, `Hook`). `VerificationAttemptStarted` is a
+    // progress marker, not a terminal outcome, and is deliberately not in Quiet
+    // mode (like `VerificationRequested`/`VerificationStarted` before it).
+    assert_eq!(quiet, 17);
 }
 
 #[test]

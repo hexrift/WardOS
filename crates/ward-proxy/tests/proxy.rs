@@ -894,3 +894,125 @@ fn an_established_tunnel_is_pinned_and_a_rebinding_answer_refuses_the_next() {
     assert_eq!(&echoed, b"still pinned");
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
 }
+
+/// Counts the calls that bracket every accepted connection: announced once
+/// before it is served, retired once by a verdict or by the lack of one.
+#[derive(Default)]
+struct Lifecycle {
+    announced: AtomicUsize,
+    decided: AtomicUsize,
+    undecided: AtomicUsize,
+    untracked: AtomicUsize,
+}
+
+impl Observer for Lifecycle {
+    fn decision(&self, _req: &Request, _decision: Decision, _reason: &str) {
+        // A connection this observer took note of must report through `decided`;
+        // counted rather than asserted so a proxy thread is never unwound here.
+        self.untracked.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn deciding(&self) -> bool {
+        self.announced.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn decided(&self, _req: &Request, _decision: Decision, _reason: &str) {
+        self.decided.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn undecided(&self) {
+        self.undecided.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Lifecycle {
+    /// Announced, decided, undecided, and verdicts that arrived untracked.
+    fn counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.announced.load(Ordering::SeqCst),
+            self.decided.load(Ordering::SeqCst),
+            self.undecided.load(Ordering::SeqCst),
+            self.untracked.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Connections announced and not yet retired: what may still be decided.
+    fn outstanding(&self) -> usize {
+        let (announced, decided, undecided, _) = self.counts();
+        announced - decided - undecided
+    }
+}
+
+/// Wait for every connection thread to finish. A thread retires its connection
+/// before it releases its slot, so no live connections means nothing outstanding.
+fn settle(proxy: &Handle) {
+    for _ in 0..500 {
+        if proxy.active_connections() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        proxy.active_connections(),
+        0,
+        "connections did not wind down"
+    );
+}
+
+/// Every accepted connection is announced before it is served and retired
+/// exactly once — and the window it is outstanding for ends at its verdict, not
+/// at the end of its relay.
+///
+/// That boundary is the point of the announcement. An observer that has to
+/// account for every decision needs to know what may *still* be decided when it
+/// stops listening; a tunnel busy streaming a response has already been decided,
+/// so counting it as outstanding reports a loss that never happened, while
+/// ignoring the window before a verdict loses one that did.
+#[test]
+fn every_accepted_connection_is_announced_before_it_is_served_and_retired_once() {
+    let echo = spawn_echo();
+    let lifecycle = Arc::new(Lifecycle::default());
+    let proxy = Proxy::spawn(custom_localhost(), lifecycle.clone()).expect("proxy starts");
+
+    let target = format!("127.0.0.1:{}", echo.port());
+    let mut tunnel = client(&proxy);
+    tunnel
+        .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+        .unwrap();
+    assert!(read_head(&mut tunnel).starts_with("HTTP/1.1 200"));
+    tunnel.write_all(b"still relaying").unwrap();
+    let mut echoed = [0u8; 14];
+    tunnel.read_exact(&mut echoed).unwrap();
+
+    // The tunnel is open and moving bytes, and its verdict is already reported.
+    assert_eq!(proxy.active_connections(), 1, "the relay is live");
+    assert_eq!(lifecycle.counts(), (1, 1, 0, 0));
+    assert_eq!(
+        lifecycle.outstanding(),
+        0,
+        "a relay that has been allowed is not a decision still to be made"
+    );
+    drop(tunnel);
+    settle(&proxy);
+
+    // A connection that never becomes a proxy request reaches no verdict, and is
+    // retired as undecided rather than left outstanding for ever.
+    let mut junk = client(&proxy);
+    junk.write_all(b"GET /relative HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    assert!(read_all(&mut junk).starts_with("HTTP/1.1 400"));
+    settle(&proxy);
+    assert_eq!(lifecycle.counts(), (2, 1, 1, 0));
+    assert_eq!(lifecycle.outstanding(), 0);
+
+    // The connect that wakes the acceptor out of `accept` is not a request and is
+    // never announced: an observer that seals the moment `shutdown` returns must
+    // not be left expecting a verdict that cannot come.
+    proxy.shutdown();
+    assert_eq!(
+        lifecycle.counts(),
+        (2, 1, 1, 0),
+        "the shutdown wake is not a connection to be decided"
+    );
+}
