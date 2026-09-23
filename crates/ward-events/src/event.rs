@@ -921,8 +921,11 @@ pub enum WardEvent {
     /// before any expensive preparation (candidate capture, sandbox launch) begins, so a
     /// subscriber sees progress from the very first action rather than only once capture
     /// has already succeeded. No candidate is known yet — [`WardEvent::VerificationRequested`]
-    /// follows once capture succeeds; nothing does if it fails, exactly as before #139, since
-    /// there is then no candidate for a subscriber to be told about.
+    /// follows once capture succeeds; [`WardEvent::VerificationInterrupted`] follows instead,
+    /// with no candidate, if a step before capture succeeds fails (preparation, opening the
+    /// snapshot store, allocating scratch, …) — the attempt still ends in exactly one
+    /// terminal record even though it never reached a candidate for a subscriber to be told
+    /// about.
     VerificationAttemptStarted {
         /// The attempt.
         attempt: AttemptId,
@@ -942,14 +945,16 @@ pub enum WardEvent {
         /// Candidate snapshot, when capture had already succeeded.
         candidate: Option<SnapshotId>,
     },
-    /// A verification attempt was reconciled as interrupted: when this process (re)took
-    /// ownership of the session's log, the attempt's own record was the last
-    /// verification-kind record for it, with no `Passed`/`Failed`/`Errored`/`Cancelled`
-    /// following — most often because the process that had been running it (the session
-    /// daemon, or a daemonless `ward` invocation) died, was killed, or was restarted
-    /// mid-attempt (#139). Never emitted by the code that runs an attempt itself; only by
-    /// the reconciliation pass a session/daemon runs against its own log whenever it opens
-    /// or reopens it, so a dangling attempt is never left showing "running" forever.
+    /// A verification attempt ended without reaching a candidate-bearing terminal result
+    /// (`Passed`/`Failed`/`Errored`/`Cancelled`), for either of two reasons (#139): the
+    /// attempt's own `verify()` call reached a step before capture succeeds that failed —
+    /// emitted directly by that same call, as its own terminal record, with `candidate:
+    /// None`; or the process that had been running an earlier attempt (the session daemon,
+    /// or a daemonless `ward` invocation) died, was killed, or was restarted mid-attempt,
+    /// leaving the attempt's own record as the last verification-kind record for it —
+    /// emitted by the reconciliation pass a session/daemon runs against its own log
+    /// whenever it opens or reopens it, so a dangling attempt is never left showing
+    /// "running" forever.
     VerificationInterrupted {
         /// The attempt.
         attempt: AttemptId,
