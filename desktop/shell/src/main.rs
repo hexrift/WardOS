@@ -41,8 +41,10 @@ use ward_snapshot::{
     CaptureOptions, CaptureStats, HashCache, Manifest, ManifestDiff, SnapshotStore,
 };
 
-/// How long the catch-up waits for one more record before calling the log
-/// caught up with.
+/// The catch-up's defensive fallback: how long to wait for the daemon's
+/// replay-complete marker (#138 item 1) before falling back to the old
+/// silence rule. The marker is expected on every real subscription, so this
+/// is generous headroom for a wedged connection, not the common path.
 const SETTLE_MS: u64 = 250;
 
 /// How often `bar --follow` re-reads the worktree when the stream is quiet:
@@ -68,7 +70,8 @@ struct Cli {
     /// Project directory whose current session to show (default: current).
     #[arg(long, global = true)]
     dir: Option<PathBuf>,
-    /// Milliseconds of silence after which the stream counts as caught up with.
+    /// Milliseconds to wait for the daemon's replay-complete marker before
+    /// falling back to silence (#138 item 1).
     #[arg(long, global = true, default_value_t = SETTLE_MS)]
     settle_ms: u64,
     #[command(subcommand)]
@@ -548,7 +551,7 @@ fn load_from(socket: &Path, settle: Duration) -> ward_daemon::Result<Option<Snap
     let subscriber = client::connect(socket)?;
     let mut model = Model::new(false);
     let end = client::catch_up(subscriber, 0, settle, |rec| model.apply(rec))?;
-    if !matches!(end, WatchEnd::Quiet { .. }) {
+    if !matches!(end, WatchEnd::CaughtUp { .. }) {
         model.seal();
     }
     Ok(Some(Snapshot {

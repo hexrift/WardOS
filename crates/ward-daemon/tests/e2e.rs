@@ -874,6 +874,10 @@ fn subscribe_from_zero(socket: &std::path::Path) -> std::thread::JoinHandle<Vec<
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
             match serde_json::from_str::<Response>(&line).expect("a response line") {
                 Response::Record(r) => seen.push(*r),
+                // The replay-complete marker (#138 item 1): sent once, after
+                // the backlog and before any live record, carrying no record
+                // of its own for this collector to keep.
+                Response::CaughtUp { .. } => {}
                 other => panic!("unexpected on a subscription: {other:?}"),
             }
         }

@@ -144,6 +144,20 @@ pub enum Response {
         /// Why (`approval: timed out`).
         reason: String,
     },
+    /// A `Subscribe` stream's replay-complete marker (#138 item 1): every
+    /// record up to (not including) `next_seq` has now been sent on this
+    /// connection. Sent exactly once per subscription, right after the last
+    /// replay record (or immediately, if the replay set was empty) and
+    /// before any live record — the boundary the daemon itself fixed
+    /// atomically when the subscription began, alongside the mutex that
+    /// serializes every append (`daemon::Served::subscribe`). A client waits
+    /// for this instead of a silence timeout, so continuous live traffic
+    /// can no longer delay it indefinitely.
+    CaughtUp {
+        /// The sequence the next record delivered on this connection — replay
+        /// or live — will have.
+        next_seq: u64,
+    },
     /// The open approvals, oldest first.
     Pending(Vec<Approval>),
     /// Every approval `Request::Approvals` asked for, oldest requested first.

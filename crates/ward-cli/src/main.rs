@@ -1237,8 +1237,9 @@ fn cmd_grants(dir: &Path, session: Option<&str>, json: bool) -> ward_daemon::Res
     Ok(ExitCode::SUCCESS)
 }
 
-/// How long `ward session pending --follow` lets the stream go quiet before
-/// it counts the backlog as read.
+/// `ward session pending --follow`'s defensive fallback: how long to wait
+/// for the daemon's replay-complete marker (#138 items 1 and 6) before
+/// falling back to the old silence rule.
 const FOLLOW_SETTLE: Duration = Duration::from_millis(250);
 
 /// `ward session approve <id> <decision>`.

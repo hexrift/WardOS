@@ -427,16 +427,19 @@ pub fn follow_approvals(
         }
         Ok(())
     };
-    // The backlog: read until the stream goes quiet, or ends.
+    // The backlog: read until the daemon's replay-complete marker says it is
+    // covered (#138 items 1 and 6 — the same watermark protocol `catch_up`
+    // uses, so a busy session cannot starve this listing either), or the
+    // stream ends first. `idle` silence remains only a defensive fallback.
     loop {
         match subscriber.next_within(idle)? {
             Next::Quiet => break,
             Next::Closed => return Ok(WatchEnd::Closed { records }),
-            Next::Response(response) => {
-                if let Some(end) = step(Some(response), &mut records, &mut |_| {})? {
-                    return Ok(end);
-                }
-            }
+            Next::Response(response) => match step(Some(response), &mut records, &mut |_| {})? {
+                Step::End(end) => return Ok(end),
+                Step::CaughtUp { .. } => break,
+                Step::Continue => {}
+            },
         }
     }
     list(&mut pending_seen, &mut decided_seen, &mut emit)?;
@@ -451,8 +454,9 @@ pub fn follow_approvals(
                     WardEvent::CapabilityRequested { .. } | WardEvent::CapabilityDecided { .. }
                 )
         );
-        if let Some(end) = step(response, &mut records, &mut |_| {})? {
-            return Ok(end);
+        match step(response, &mut records, &mut |_| {})? {
+            Step::End(end) => return Ok(end),
+            Step::CaughtUp { .. } | Step::Continue => {}
         }
         if capability {
             list(&mut pending_seen, &mut decided_seen, &mut emit)?;
@@ -462,10 +466,11 @@ pub fn follow_approvals(
 
 /// `ward session pending --follow`: hand `emit` every approval as it becomes
 /// pending, until the daemon closes the stream. The backlog is skipped with
-/// [`catch_up`]'s rule (`idle` of silence), then what is pending now is
-/// emitted, then each live `CapabilityRequested` record prompts a fresh
-/// listing so an approval is emitted once, with its id and reason, and an
-/// approval already answered by then is not emitted at all.
+/// [`catch_up`]'s rule — the daemon's replay-complete marker, not silence
+/// (#138 items 1 and 6) — then what is pending now is emitted, then each live
+/// `CapabilityRequested` record prompts a fresh listing so an approval is
+/// emitted once, with its id and reason, and an approval already answered by
+/// then is not emitted at all.
 ///
 /// This call itself is never cancelled from inside this process — `ward
 /// session pending --follow` (its only direct caller) runs until the daemon
@@ -511,16 +516,18 @@ fn follow_pending_cancellable(
         }
         Ok(())
     };
-    // The backlog: read until the stream goes quiet, or ends.
+    // The backlog: read until the daemon's replay-complete marker says it is
+    // covered (#138 items 1 and 6), or the stream ends first. `idle` silence
+    // remains only a defensive fallback.
     loop {
         match subscriber.next_within(idle)? {
             Next::Quiet => break,
             Next::Closed => return Ok(WatchEnd::Closed { records }),
-            Next::Response(response) => {
-                if let Some(end) = step(Some(response), &mut records, &mut |_| {})? {
-                    return Ok(end);
-                }
-            }
+            Next::Response(response) => match step(Some(response), &mut records, &mut |_| {})? {
+                Step::End(end) => return Ok(end),
+                Step::CaughtUp { .. } => break,
+                Step::Continue => {}
+            },
         }
     }
     list(&mut emitted, &mut emit)?;
@@ -531,8 +538,9 @@ fn follow_pending_cancellable(
             &response,
             Some(Response::Record(rec)) if matches!(rec.event, WardEvent::CapabilityRequested { .. })
         );
-        if let Some(end) = step(response, &mut records, &mut |_| {})? {
-            return Ok(end);
+        match step(response, &mut records, &mut |_| {})? {
+            Step::End(end) => return Ok(end),
+            Step::CaughtUp { .. } | Step::Continue => {}
         }
         if asked {
             list(&mut emitted, &mut emit)?;
@@ -983,9 +991,13 @@ pub enum WatchEnd {
         /// Records received.
         records: u64,
     },
-    /// The stream is still open but nothing more arrived within [`catch_up`]'s
-    /// wait: the log is caught up with, the session is live.
-    Quiet {
+    /// The stream is still open, and the daemon's replay-complete marker
+    /// (#138 item 1) says every record the subscription started with has now
+    /// been delivered: the log is caught up with, the session is live. This
+    /// no longer depends on the stream falling silent — it fires exactly
+    /// once, right after the backlog, no matter how much live traffic
+    /// follows it.
+    CaughtUp {
         /// Records received.
         records: u64,
     },
@@ -996,7 +1008,7 @@ impl WatchEnd {
     #[must_use]
     pub const fn records(&self) -> u64 {
         match self {
-            Self::Closed { records } | Self::Sealed { records } | Self::Quiet { records } => {
+            Self::Closed { records } | Self::Sealed { records } | Self::CaughtUp { records } => {
                 *records
             }
         }
@@ -1037,8 +1049,9 @@ pub fn watch_records(
     sink.send(&Request::Subscribe { from_seq })?;
     let mut records = 0;
     loop {
-        if let Some(end) = step(sink.next_response()?, &mut records, &mut emit)? {
-            return Ok(end);
+        match step(sink.next_response()?, &mut records, &mut emit)? {
+            Step::End(end) => return Ok(end),
+            Step::CaughtUp { .. } | Step::Continue => {}
         }
     }
 }
@@ -1064,16 +1077,23 @@ pub fn watch_records_ticking(
             Next::Closed => None,
             Next::Response(response) => Some(response),
         };
-        if let Some(end) = step(response, &mut records, &mut |rec| emit(Some(rec)))? {
-            return Ok(end);
+        match step(response, &mut records, &mut |rec| emit(Some(rec)))? {
+            Step::End(end) => return Ok(end),
+            Step::CaughtUp { .. } | Step::Continue => {}
         }
     }
 }
 
 /// Subscribe from `from_seq` and hand `emit` the records the daemon has now:
-/// returns [`WatchEnd::Quiet`] once nothing more has arrived for `idle`, or the
-/// end of the stream if that comes first. A shell surface draws its first frame
-/// from this and then follows with [`watch_records`] on a fresh connection.
+/// returns [`WatchEnd::CaughtUp`] as soon as the daemon's replay-complete
+/// marker says the backlog it started with has all been delivered (#138 item
+/// 1), or the end of the stream if that comes first. This no longer waits for
+/// the stream to fall silent, so a session under continuous benign event
+/// traffic still draws its first frame promptly: `idle` remains only as a
+/// defensive fallback (a daemon too old to send the marker, or one lost in
+/// transit) and is not expected to fire against this binary's own daemon. A
+/// shell surface draws its first frame from this and then follows with
+/// [`watch_records`] on a fresh connection.
 pub fn catch_up(
     mut sink: RemoteSink,
     from_seq: u64,
@@ -1084,34 +1104,53 @@ pub fn catch_up(
     let mut records = 0;
     loop {
         let response = match sink.next_within(idle)? {
-            Next::Quiet => return Ok(WatchEnd::Quiet { records }),
+            Next::Quiet => return Ok(WatchEnd::CaughtUp { records }),
             Next::Closed => None,
             Next::Response(response) => Some(response),
         };
-        if let Some(end) = step(response, &mut records, &mut emit)? {
-            return Ok(end);
+        match step(response, &mut records, &mut emit)? {
+            Step::End(end) => return Ok(end),
+            Step::CaughtUp { .. } => return Ok(WatchEnd::CaughtUp { records }),
+            Step::Continue => {}
         }
     }
 }
 
-/// One step of a subscription: count and emit a record, or report how the
-/// stream ended (`None` is the daemon hanging up).
+/// What one [`step`] found.
+enum Step {
+    /// A record was counted and handed to the caller's `emit`; nothing terminal.
+    Continue,
+    /// The daemon's replay-complete marker (#138 item 1): every record up to
+    /// `next_seq` has now been delivered on this connection.
+    CaughtUp {
+        /// The watermark the daemon reported.
+        #[allow(dead_code)]
+        next_seq: u64,
+    },
+    /// The stream ended.
+    End(WatchEnd),
+}
+
+/// One step of a subscription: count and emit a record, report the daemon's
+/// replay-complete marker, or report how the stream ended (`None` is the
+/// daemon hanging up).
 fn step(
     response: Option<Response>,
     records: &mut u64,
     emit: &mut impl FnMut(EventRecord),
-) -> Result<Option<WatchEnd>> {
+) -> Result<Step> {
     match response {
         Some(Response::Record(rec)) => {
             *records += 1;
             emit(*rec);
-            Ok(None)
+            Ok(Step::Continue)
         }
-        Some(Response::Ok) => Ok(None),
-        Some(Response::Sealed { .. }) => Ok(Some(WatchEnd::Sealed { records: *records })),
+        Some(Response::CaughtUp { next_seq }) => Ok(Step::CaughtUp { next_seq }),
+        Some(Response::Ok) => Ok(Step::Continue),
+        Some(Response::Sealed { .. }) => Ok(Step::End(WatchEnd::Sealed { records: *records })),
         Some(Response::Error(e)) => Err(Error::Events(format!("daemon refused subscribe: {e}"))),
         Some(other) => Err(Error::Events(format!("unexpected response {other:?}"))),
-        None => Ok(Some(WatchEnd::Closed { records: *records })),
+        None => Ok(Step::End(WatchEnd::Closed { records: *records })),
     }
 }
 
@@ -1249,10 +1288,18 @@ mod tests {
                         if let Some(e) = refuse {
                             reply(&mut writer, &Response::Error(e.into()));
                         }
+                        let mut next_seq = from_seq;
                         for rec in log.iter().filter(|r| r.seq >= from_seq) {
+                            next_seq = rec.seq + 1;
                             reply(&mut writer, &Response::Record(Box::new(rec.clone())));
                         }
                         if let Some(hold) = hold {
+                            // A live session: the real daemon's replay-complete
+                            // marker (#138 item 1) right after the backlog, then
+                            // quiet for `hold` — mirrors `stream_subscription`,
+                            // which only ever sends this when a live channel
+                            // follows the replay.
+                            reply(&mut writer, &Response::CaughtUp { next_seq });
                             std::thread::sleep(hold);
                         }
                         break;
@@ -1355,21 +1402,26 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_returns_quiet_on_a_live_session_and_closed_on_a_sealed_one() {
+    fn catch_up_returns_caught_up_on_a_live_session_and_closed_on_a_sealed_one() {
         let events = [(Origin::TamperWard, denied()), (Origin::Wardd, working())];
-        // Live: the daemon streams the backlog and then says nothing for a while.
+        // Live: the daemon streams the backlog, marks it caught up, then says
+        // nothing for a while. `idle` is generous (5s) and unused on this
+        // path — the marker, not silence, is what ends it (#138 item 1).
         let (chain, log) = records(&events);
         let (_dir, socket, _) =
-            fake_daemon_holding(chain, log, None, Some(Duration::from_millis(400)));
+            fake_daemon_holding(chain, log, None, Some(Duration::from_millis(50)));
         let sink = connect(&socket).unwrap();
         let mut seen = Vec::new();
-        let end = catch_up(sink, 0, Duration::from_millis(50), |rec| seen.push(rec)).unwrap();
-        assert_eq!(end, WatchEnd::Quiet { records: 2 });
+        let end = catch_up(sink, 0, Duration::from_secs(5), |rec| seen.push(rec)).unwrap();
+        assert_eq!(end, WatchEnd::CaughtUp { records: 2 });
         assert_eq!(end.records(), 2);
         assert_eq!(seen[0].event, denied());
         assert_eq!(seen[1].event, working());
 
-        // Sealed: the daemon hangs up right after the backlog.
+        // Sealed: the daemon hangs up right after the backlog, with no marker
+        // at all — a replay-only subscription has nothing live to mark a
+        // boundary against, so the connection closing already says "that was
+        // everything" unambiguously.
         let (chain, log) = records(&events);
         let (_dir, socket, _) = fake_daemon(chain, log, None);
         let sink = connect(&socket).unwrap();
@@ -1385,6 +1437,83 @@ mod tests {
             err.to_string(),
             "events: daemon refused subscribe: log is sealed"
         );
+    }
+
+    /// The acceptance criterion #138 sets out directly: continuous benign
+    /// event traffic must not delay first render. A daemon that keeps
+    /// sending live records with no gap at all, right behind its
+    /// replay-complete marker, must still let `catch_up` return the instant
+    /// that marker arrives — not after draining whatever traffic queued up
+    /// behind it, and not after `idle`, which is set far longer than this
+    /// test can possibly take if the marker is honoured. Deterministic: the
+    /// daemon thread is fully synchronous (write backlog, write marker,
+    /// write burst, park), no sleep stands between `catch_up` and its answer.
+    #[test]
+    fn catch_up_is_not_delayed_by_live_traffic_queued_behind_the_marker() {
+        let backlog_events = [(Origin::TamperWard, denied()), (Origin::Wardd, working())];
+        let (mut chain, backlog) = records(&backlog_events);
+        let burst: Vec<EventRecord> = {
+            (0..200)
+                .map(|_| {
+                    chain
+                        .append(
+                            Origin::Wardd,
+                            tamper(),
+                            Timestamp::mono(Duration::from_secs(9)),
+                        )
+                        .unwrap()
+                })
+                .collect()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            // `catch_up` is expected to disconnect right after the marker,
+            // well before this burst is fully written — so a write past that
+            // point failing (broken pipe) is the success case, not a bug:
+            // errors are ignored rather than unwrapped.
+            let reply = |writer: &mut std::os::unix::net::UnixStream, r: &Response| {
+                let mut b = serde_json::to_vec(r).unwrap();
+                b.push(b'\n');
+                let _ = writer.write_all(&b);
+            };
+            reader.read_line(&mut line).unwrap(); // Ping
+            reply(&mut writer, &Response::Ok);
+            line.clear();
+            reader.read_line(&mut line).unwrap(); // Subscribe
+            for rec in &backlog {
+                reply(&mut writer, &Response::Record(Box::new(rec.clone())));
+            }
+            reply(
+                &mut writer,
+                &Response::CaughtUp {
+                    next_seq: backlog.last().unwrap().seq + 1,
+                },
+            );
+            // A continuously busy session: 200 more records with no gap.
+            for rec in &burst {
+                reply(&mut writer, &Response::Record(Box::new(rec.clone())));
+            }
+            // Held open, never going quiet — a broken, silence-based
+            // `catch_up` would block here for the full `idle` below.
+            std::thread::park();
+        });
+        let sink = connect(&socket).unwrap();
+        let mut seen = Vec::new();
+        let end = catch_up(sink, 0, Duration::from_secs(3600), |rec| seen.push(rec)).unwrap();
+        assert_eq!(
+            end,
+            WatchEnd::CaughtUp { records: 2 },
+            "must return at the marker, before any of the 200 queued live records"
+        );
+        assert_eq!(seen.len(), 2, "only the backlog was emitted, not the burst");
+        server.thread().unpark();
+        server.join().unwrap();
     }
 
     #[test]
@@ -1516,9 +1645,10 @@ mod tests {
 
     #[test]
     fn follow_pending_emits_what_is_pending_after_the_backlog_then_on_each_request() {
-        // A daemon whose subscription streams a backlog, goes quiet, then sends
-        // a `CapabilityRequested` record; `Pending` answers one approval, the
-        // same one each time, so it is emitted once.
+        // A daemon whose subscription streams a backlog, marks it caught up
+        // (#138 items 1 and 6 — no silence needed), then sends a
+        // `CapabilityRequested` record with no gap at all; `Pending` answers
+        // one approval, the same one each time, so it is emitted once.
         let asked = crate::approvals::requested_event("Write", "/work/a.rs", "r");
         let (_, backlog) = records(&[(Origin::Wardd, working()), (Origin::Wardd, asked.clone())]);
         let dir = tempfile::tempdir().unwrap();
@@ -1555,14 +1685,19 @@ mod tests {
                                 )]),
                             );
                         }
-                        Request::Subscribe { .. } => {
+                        Request::Subscribe { from_seq } => {
+                            let mut next_seq = from_seq;
                             for rec in &backlog {
+                                next_seq = rec.seq + 1;
                                 reply(&mut writer, &Response::Record(Box::new(rec.clone())));
                             }
-                            std::thread::sleep(Duration::from_millis(300));
+                            // The replay-complete marker, immediately — no
+                            // silence, no sleep: this is exactly the shape a
+                            // busy session has, and #138 item 1 says that
+                            // must not delay the listing that follows.
+                            reply(&mut writer, &Response::CaughtUp { next_seq });
                             let (_, fresh) = records(&[(Origin::Wardd, asked.clone())]);
                             reply(&mut writer, &Response::Record(Box::new(fresh[0].clone())));
-                            std::thread::sleep(Duration::from_millis(100));
                             done = true;
                             break;
                         }
@@ -1577,7 +1712,9 @@ mod tests {
             pending_calls
         });
         let mut seen = Vec::new();
-        let end = follow_pending(&socket, Duration::from_millis(50), |a| seen.push(a)).unwrap();
+        // `idle` is generous and unused on the happy path: the marker, not
+        // silence, is what ends the backlog phase now.
+        let end = follow_pending(&socket, Duration::from_secs(30), |a| seen.push(a)).unwrap();
         assert_eq!(end, WatchEnd::Closed { records: 3 });
         assert_eq!(seen.len(), 1, "listed twice, emitted once");
         assert_eq!(seen[0].id, 1);
@@ -1585,11 +1722,17 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn follow_approvals_emits_pending_once_then_its_outcome_once() {
-        // A daemon whose subscription streams a `CapabilityRequested` backlog, goes
-        // quiet, then sends the matching `CapabilityDecided` record. `Request::Approvals`
-        // answers the same id as pending until the decided record has been sent, then
-        // as decided — mirroring what `Approvals::approvals` actually does when a real
+        // A daemon whose subscription streams a `CapabilityRequested` backlog,
+        // marks it caught up (#138 items 1 and 6), then sends the matching
+        // `CapabilityDecided` record only once the listing that marker
+        // unblocked has actually happened — an explicit condition, not a
+        // sleep, since the subscriber and the listing run on separate
+        // threads here and a fixed delay would just be a guess at how long
+        // that takes. `Request::Approvals` answers the same id as pending
+        // until the decided record has been sent, then as decided —
+        // mirroring what `Approvals::approvals` actually does when a real
         // answer moves the id from `held` into `history` between two listings. Each
         // connection is served on its own thread (as the real daemon serves connections
         // concurrently, `daemon.rs` module docs): a `Request::Approvals` list made while
@@ -1631,7 +1774,15 @@ mod tests {
                             match serde_json::from_str::<Request>(&line).unwrap() {
                                 Request::Ping => reply(&mut writer, &Response::Ok),
                                 Request::Approvals => {
-                                    approvals_calls.fetch_add(1, Ordering::SeqCst);
+                                    // Read `is_decided` (and build the reply
+                                    // from it) *before* counting this listing:
+                                    // the subscriber thread's spin-wait treats
+                                    // that count as "the first listing has
+                                    // already seen the pre-decision state, safe
+                                    // to decide now" — reversing the order
+                                    // would let it flip `is_decided` between
+                                    // this read and the count, so this listing
+                                    // could race its own answer.
                                     let approval = Approval::new(
                                         1,
                                         "Write",
@@ -1654,20 +1805,28 @@ mod tests {
                                             decided_at_unix_ms: None,
                                         }
                                     };
+                                    approvals_calls.fetch_add(1, Ordering::SeqCst);
                                     reply(&mut writer, &Response::Approvals(vec![record]));
                                     return;
                                 }
-                                Request::Subscribe { .. } => {
+                                Request::Subscribe { from_seq } => {
+                                    let mut next_seq = from_seq;
                                     for rec in &backlog {
+                                        next_seq = rec.seq + 1;
                                         reply(
                                             &mut writer,
                                             &Response::Record(Box::new(rec.clone())),
                                         );
                                     }
-                                    std::thread::sleep(Duration::from_millis(150));
+                                    reply(&mut writer, &Response::CaughtUp { next_seq });
+                                    // Wait for the listing this marker unblocks to
+                                    // actually land before the decided outcome
+                                    // exists to race it.
+                                    while approvals_calls.load(Ordering::SeqCst) < 1 {
+                                        std::thread::yield_now();
+                                    }
                                     is_decided.store(true, Ordering::SeqCst);
                                     reply(&mut writer, &Response::Record(Box::new(decided_record)));
-                                    std::thread::sleep(Duration::from_millis(150));
                                     return;
                                 }
                                 other => panic!("{other:?}"),
