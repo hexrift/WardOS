@@ -274,13 +274,17 @@ fn verify_row(dir: &Path) -> (Row, Option<verify::Config>) {
     }
 }
 
-/// Shell metacharacters whose presence means `verify.command` is not a single
-/// simple command: pipelines and lists (`|`, `&`, `;`), substitution (`` ` ``,
-/// `$(`), and redirection (`<`, `>`). A command containing any of these has no
-/// single "the program" this check can name with confidence, so [`runtime_row`]
-/// reports it indeterminate rather than guessing at a piece of it — `cd subdir &&
-/// cargo test` must not be judged runnable or not by probing `cd`.
-const SHELL_METACHARACTERS: &[&str] = &["|", "&", ";", "`", "$("];
+/// Shell syntax whose presence means `verify.command` is outside the narrow
+/// simple-command grammar [`runtime_row`] resolves: pipelines and lists (`|`,
+/// `&`, `;`), redirection (`<`, `>`), substitution and parameter expansion
+/// (`` ` ``, `$`), and quoting or escaping (`"`, `'`, `\`) — the last because a
+/// quoted token like `"cargo"` is not the literal program name `"cargo"` (quotes
+/// included) that whitespace-splitting alone would produce. A command containing
+/// any of these has no single "the program" this check can name with confidence,
+/// so `runtime_row` reports it indeterminate rather than guessing at or
+/// mis-splitting it — `cd subdir && cargo test` must not be judged runnable or
+/// not by probing the literal token `cd`.
+const SHELL_METACHARACTERS: &[&str] = &["|", "&", ";", "<", ">", "`", "$", "\"", "'", "\\"];
 
 /// Builtins and keywords a shell resolves itself, never via `PATH`, so `which`
 /// would wrongly report them absent. Deliberately small: only ones in common use
@@ -306,6 +310,16 @@ fn is_assignment(token: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Whether `meta` has any executable bit set (owner, group or other) — the
+/// coarse check `/bin/sh -c` needs before it can start a project-relative
+/// script. Does not attempt to match the invoking user against the owner/group
+/// bit specifically; a narrower check would need the verifier's actual runtime
+/// identity, which this preflight does not have.
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    meta.permissions().mode() & 0o111 != 0
+}
+
 /// Whether the binary the *configured* `verify.command` would actually invoke is
 /// available — checked against the real command, not guessed from the project
 /// manifest, so a Cargo project configured to run `npm test` is checked against
@@ -314,13 +328,14 @@ fn is_assignment(token: &str) -> bool {
 ///
 /// Deliberately narrow: only a single simple command — optionally prefixed with
 /// `NAME=value` assignments, as `FOO=bar cargo test` is — is resolved. A command
-/// containing shell metacharacters ([`SHELL_METACHARACTERS`]: pipelines, lists,
-/// substitution, redirection) or led by a shell builtin ([`SHELL_BUILTINS`]) is
-/// reported indeterminate rather than misjudged: no PATH search can tell whether
-/// `cd subdir && cargo test` is runnable without a real shell. A path candidate
-/// (containing `/`, e.g. `./scripts/verify.sh`) is resolved against `dir` — the
-/// verifier's own working directory — not against the process's `PATH`, matching
-/// where the verifier actually looks for it.
+/// containing any [`SHELL_METACHARACTERS`] or led by a shell builtin
+/// ([`SHELL_BUILTINS`]) is reported indeterminate rather than misjudged: no PATH
+/// search can tell whether `cd subdir && cargo test` is runnable without a real
+/// shell, and a quoted token like `"cargo"` must not be probed as the literal
+/// (quote-included) name it splits to. A path candidate (containing `/`, e.g.
+/// `./scripts/verify.sh`) is resolved against `dir` — the verifier's own working
+/// directory, not the process's `PATH` — and must itself be executable, the same
+/// precondition `/bin/sh -c` enforces.
 fn runtime_row(dir: &Path, command: &str) -> Row {
     if let Some(op) = SHELL_METACHARACTERS.iter().find(|op| command.contains(*op)) {
         return Row::new(
@@ -351,16 +366,26 @@ fn runtime_row(dir: &Path, command: &str) -> Row {
         } else {
             dir.join(candidate)
         };
-        return if path.is_file() {
-            Row::new("runtime", Status::Ok, format!("{candidate} present"))
-        } else {
-            Row::new(
+        return match std::fs::metadata(&path) {
+            Ok(meta) if is_executable(&meta) => Row::new(
+                "runtime",
+                Status::Ok,
+                format!("{candidate} present and executable"),
+            ),
+            Ok(_) => Row::new(
+                "runtime",
+                Status::Fail,
+                format!(
+                    "{candidate} exists but is not executable; chmod +x it before `ward verify` can run"
+                ),
+            ),
+            Err(_) => Row::new(
                 "runtime",
                 Status::Fail,
                 format!(
                     "{candidate} not found relative to the project; fix the path before `ward verify` can run"
                 ),
-            )
+            ),
         };
     }
     if crate::doctor::which(candidate).is_some() {
@@ -585,10 +610,17 @@ mod tests {
         assert_ne!(report.verdict(), Verdict::SetupRequired);
     }
 
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[test]
     fn runtime_resolves_a_project_relative_executable_against_the_project_not_path() {
         let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("scripts/verify.sh");
         write(dir.path(), "scripts/verify.sh", "#!/bin/sh\ntrue\n");
+        make_executable(&script);
         write(
             dir.path(),
             ".tamperward/config.yml",
@@ -610,6 +642,41 @@ mod tests {
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Fail, "{}", row.detail);
         assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_a_present_but_non_executable_project_file_as_setup_required() {
+        // A regular file with no execute bit exists at the path but `/bin/sh -c`
+        // cannot start it (permission denied, exit 126) — this must not be Ok.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "scripts/verify.sh", "#!/bin/sh\ntrue\n");
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: ./scripts/verify.sh\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert!(row.detail.contains("not executable"), "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_a_quoted_command_indeterminate_not_setup_required() {
+        // Whitespace-splitting `"cargo" test` produces the literal token `"cargo"`
+        // (quotes included), not the program name `cargo` a real shell would run;
+        // this must not be probed on PATH as that literal string.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: '\"cargo\" test'\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Warn, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
     }
 
     #[test]
