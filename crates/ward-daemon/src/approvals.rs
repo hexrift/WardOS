@@ -2372,77 +2372,73 @@ mod tests {
     /// taking the approvals lock, so an answer entered before the deadline
     /// that then blocked on that lock (behind the timed-out waiter, or any
     /// other caller) until after the deadline was still judged by its stale,
-    /// pre-lock timestamp and accepted. Here the test itself holds the lock
-    /// across the deadline while the public `answer` is blocked on it; once
-    /// released, the answer must be refused and `wait` must time out.
+    /// pre-lock timestamp and accepted.
     ///
-    /// The refusal does not depend on scheduling: with the clock read under
-    /// the lock, an answer that only gets the lock after the test has seen the
-    /// deadline pass is always refused. The barriers (the pattern of
-    /// `attempt.rs`'s reconcile race test) make the answerer call `answer`
-    /// as the lock is taken, long before the deadline, so the buggy pre-lock
-    /// read would land before the deadline and be accepted.
-    ///
-    /// Two barriers, not one: after the first releases both threads, nothing
-    /// orders "the answerer thread actually gets scheduled and reaches
-    /// `answer`" against "the main thread starts timing the real 300 ms
-    /// deadline" — a starved answerer thread could still be sitting between
-    /// the two, unscheduled, when the deadline passes, which would fail the
-    /// `entered < deadline` precondition even though the implementation is
-    /// correct. The second barrier removes that: the answerer signals it,
-    /// immediately before calling `answer`, and the main thread waits for
-    /// that signal before it starts holding the lock through the timed
-    /// deadline — so the only unordered window left is the handful of
-    /// instructions between the answerer's second `barrier.wait()` returning
-    /// and its `answer` call actually blocking on the lock, not however long
-    /// the scheduler takes to run the thread at all.
+    /// Review of #225, fourth round, finding 1: both the single- and
+    /// two-barrier versions of this test that used to follow only
+    /// approximated "the lock is acquired before the clock is read" by
+    /// racing a real wall-clock deadline against thread scheduling — a
+    /// thread can be descheduled at any instruction, not just between two
+    /// barrier waits, so no amount of extra synchronization around a real
+    /// sleep actually closes that window, only narrows it. This drives the
+    /// private `answer_with` seam (the injectable-clock seam `answer` itself
+    /// uses) directly with a closure that signals the instant it is called,
+    /// so the property under test — the lock is held before `now()` is ever
+    /// invoked, not merely "usually invoked early enough" — is observed
+    /// directly rather than inferred from timing. The approval is registered
+    /// already past its deadline (the backdating trick
+    /// `an_answer_racing_the_timeout_at_the_deadline_cannot_win` already
+    /// uses), so the outcome (refused, `TimedOut`) holds however long the
+    /// closure takes to actually run, and nothing here depends on
+    /// scheduling.
     #[test]
-    fn an_answer_blocked_on_the_lock_across_the_deadline_is_refused() {
-        // Plenty of margin for the answerer to enter `answer` (and, before
-        // the fix, take its timestamp) after the barrier and before the
-        // deadline; it only bounds how long the test holds the lock.
-        let timeout = Duration::from_millis(300);
+    fn answer_with_reads_its_clock_only_once_the_lock_is_held() {
+        let timeout = Duration::from_secs(60);
+        // Asked a whole timeout ago (the trick `an_answer_racing_the_timeout_
+        // at_the_deadline_cannot_win` already uses): the real clock is
+        // already past its deadline from this point on, so `wait` below
+        // settles at once instead of genuinely blocking for 60 s, and the
+        // closure can just report the real `Instant::now()` whenever it
+        // happens to run rather than a fabricated value.
+        let t0 = Instant::now()
+            .checked_sub(timeout)
+            .expect("the monotonic clock is past one minute");
         let approvals = Arc::new(Approvals::new());
-        let ready = Arc::new(std::sync::Barrier::new(2));
-        let about_to_answer = Arc::new(std::sync::Barrier::new(2));
-        let answerer = {
-            let approvals = Arc::clone(&approvals);
-            let ready = Arc::clone(&ready);
-            let about_to_answer = Arc::clone(&about_to_answer);
-            std::thread::spawn(move || {
-                ready.wait();
-                let entered = Instant::now();
-                about_to_answer.wait();
-                (entered, approvals.answer(1, ApprovalDecision::Allow))
-            })
-        };
-
-        let t0 = Instant::now();
         approvals
             .register_at(approval(1), Some(timeout), t0)
             .unwrap();
-        let deadline = t0 + timeout;
-        // Hold the serialisation lock `answer` and `wait` both need, then let
-        // the answerer go: it can only block on this lock.
+        let (clock_called_tx, clock_called_rx) = std::sync::mpsc::channel::<()>();
+
         let held = approvals.lock();
-        ready.wait();
-        // Wait for the answerer to signal it is about to call `answer` before
-        // starting to time the deadline, so a merely-slow-to-schedule
-        // answerer thread cannot fail the precondition below.
-        about_to_answer.wait();
-        // Keep holding it until the deadline has actually passed.
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            std::thread::sleep(left);
-        }
-        assert!(Instant::now() >= deadline);
+        let answerer = {
+            let approvals = Arc::clone(&approvals);
+            std::thread::spawn(move || {
+                approvals.answer_with(1, ApprovalDecision::Allow, move || {
+                    clock_called_tx.send(()).unwrap();
+                    Instant::now()
+                })
+            })
+        };
+
+        // While this thread still holds the lock, `answer_with` cannot have
+        // called the closure yet: it can only be blocked trying to acquire
+        // the lock. A generous window, not a race — a regression that reads
+        // the clock before locking sends immediately, well inside it; a
+        // correct implementation cannot send at all until the lock below is
+        // released, so this can never flake in the passing direction.
+        assert_eq!(
+            clock_called_rx.recv_timeout(Duration::from_millis(500)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "the clock must not be read before the lock is acquired"
+        );
         drop(held);
 
-        let (entered, verdict) = answerer.join().unwrap();
-        assert!(
-            entered < deadline,
-            "precondition: `answer` was entered before the deadline"
-        );
-        let err = verdict.unwrap_err();
+        // Released: the closure now runs and reports the real, current
+        // instant — already past the backdated deadline either way.
+        clock_called_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the clock is read once the lock is acquired");
+        let err = answerer.join().unwrap().unwrap_err();
         assert_eq!(
             err.to_string(),
             "daemon: approval 1: timed out; its decision time ran out"
