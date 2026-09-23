@@ -883,21 +883,37 @@ fn hold(
         remembered.unwrap_or_else(|| approvals.wait(id, Duration::from_secs(timeout_secs)));
     // `Approvals::take_recorded` is true exactly when a concurrent `close`
     // (`Served::close_pending_approvals`, running for a `Stop`/`Seal` on
-    // another connection) already drained this id itself and appended its
+    // another connection) already claimed this id itself and appended its
     // terminal record before the log could seal — whether that record was
-    // `Outcome::Closed` (#146) or this same real answer, collected here a
-    // moment too late to record it itself (review of #218, finding 1:
-    // before this check existed, that race could drop the record entirely,
-    // since `wait` still correctly returned the real answer but the append
-    // below then hit an already-sealed log and was silently dropped).
-    // Appending again here would duplicate that record, so this skips it;
-    // every other outcome still records here, same as before #146 — the
-    // log may have sealed meanwhile for one of those too, in which case the
-    // append is a no-op but the agent still gets its answer below.
-    if !approvals.take_recorded(id) {
+    // `Outcome::Closed` (#146), this same real answer collected straight out
+    // of `held` a moment too late to record it here (review of #218, finding
+    // 1), or this same real answer collected by `wait` above but not yet
+    // appended when `close` ran (finding 2). Appending again here would
+    // duplicate that record, so this skips it; every other outcome still
+    // records here, same as before #146.
+    //
+    // The check and the append it guards must happen under one acquisition
+    // of `Served`'s lock, not two: `close_pending_approvals` needs that same
+    // lock for its own claim-then-append-then-seal, entirely inside one
+    // acquisition of its own. Checking `take_recorded` before taking this
+    // lock (as this used to) leaves a gap between "decide to append" and
+    // "actually append" during which a concurrent Stop/Seal can find nothing
+    // left in `held` for `wait` to have collected, conclude there is nothing
+    // to do, and seal the log before this call ever gets back here to append
+    // — dropping the record entirely even though `wait` already returned the
+    // real outcome above (finding 2). Taking the lock first, and holding it
+    // across both the check and the append, makes this call's
+    // check-then-append and `close_pending_approvals`'s own
+    // claim-then-append-then-seal mutually exclusive: whichever of the two
+    // reaches this lock first is the one that appends `id`'s real terminal
+    // record, and the other one's own check then correctly finds it already
+    // done.
+    let mut s = lock(served);
+    if !s.approvals.take_recorded(id) {
         let event = approvals::decided_event(tool, summary, outcome);
-        let _ = lock(served).append(event);
+        let _ = s.append(event);
     }
+    drop(s);
     let response = outcome.response();
     Response::Decision {
         id,
@@ -1516,6 +1532,215 @@ mod tests {
             !lock(&served).approvals.take_recorded(id),
             "consulted once: a second check finds nothing left to take"
         );
+        let (live, _) = drain(&rx);
+        assert!(
+            live.is_empty(),
+            "no second record for the same approval: {live:?}"
+        );
+    }
+
+    /// Re-review of PR #218, finding 2: an approval whose own `wait` call
+    /// already settled it — removed it from `held`, recorded its real
+    /// outcome in `history` — but whose terminal record has not yet been
+    /// appended (its collecting connection has not yet won back the
+    /// `Served` lock to do so), must still get exactly one real terminal
+    /// record, appended before `SessionEnded`, even when `Stop`/`Seal` runs
+    /// in that exact gap.
+    ///
+    /// This is a different interleaving from
+    /// `an_answer_that_lands_just_before_stop_still_gets_exactly_one_real_record`
+    /// above, which forces `close` to win the race to a still-`held` entry
+    /// (releasing the collector to call `wait` only *after* Stop has already
+    /// run, so `wait` finds nothing in `held` and falls back to `close`'s own
+    /// `handoff`). Here `wait` itself is what settles the entry — deterministically
+    /// driven to completion, with the id already recorded in `history` and
+    /// removed from `held`, strictly *before* `Stop`/`Seal` ever runs —
+    /// and only the collecting connection's own belated check-and-append
+    /// (what `hold` does once it wins back the `Served` lock) is held back,
+    /// with an `mpsc` channel, until after `Stop`/`Seal` has completed. Before
+    /// the fix for finding 2, `close` had nothing in `held` to look at for
+    /// this id and nothing else to consult either, so it concluded there was
+    /// nothing to do and sealed the log with no terminal record for an
+    /// approval that, in truth, `wait` had already decided.
+    #[test]
+    fn an_answer_settled_by_wait_just_before_stop_still_gets_exactly_one_real_record() {
+        use crate::approvals::ApprovalDecision;
+        use ward_events::{Decision, DecisionSource, GrantScope};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let sub = lock(&served).subscribe(0).unwrap();
+        let (rx, _hangup) = sub.live.unwrap();
+
+        let id = match lock(&served).hold("Write", "/work/race2.rs", "r") {
+            Ok((id, None)) => id,
+            other => panic!("{other:?}"),
+        };
+        drain(&rx); // this hold's own CapabilityRequested; not what this test checks
+
+        assert!(matches!(
+            lock(&served)
+                .handle(Request::Approve {
+                    id,
+                    decision: ApprovalDecision::Allow
+                })
+                .0,
+            Response::Ok
+        ));
+
+        let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let collector = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || {
+                // `wait` only ever needs `Approvals`' own lock: it settles
+                // the outcome and removes the entry from `held` right here
+                // — before Stop ever runs — exactly the "wait before
+                // terminal append" window (review of #218, finding 2). The
+                // real outcome is already decided at this point; only its
+                // terminal-record append is still outstanding.
+                let approvals = Arc::clone(&lock(&served).approvals);
+                let outcome = approvals.wait(id, Duration::ZERO);
+                settled_tx.send(()).unwrap();
+                // Blocks here — exactly like the free `hold` function's own
+                // gap between `wait` returning and it reacquiring
+                // `Served`'s lock — until the main thread has driven
+                // Stop/Seal to completion below.
+                release_rx.recv().unwrap();
+                let mut s = lock(&served);
+                if !s.approvals.take_recorded(id) {
+                    let event = crate::approvals::decided_event("Write", "/work/race2.rs", outcome);
+                    let _ = s.append(event);
+                }
+                outcome
+            })
+        };
+
+        settled_rx.recv().unwrap();
+        // `wait` already recorded the real answer in `history` the moment
+        // it settled, before Stop ever ran.
+        let view = lock(&served).approvals.approvals();
+        assert_eq!(
+            view.iter().find(|r| r.approval.id == id).unwrap().outcome,
+            Some(Outcome::Answered(ApprovalDecision::Allow))
+        );
+
+        // Stop/Seal runs to completion here, entirely before the collecting
+        // connection ever reacquires `Served`'s lock.
+        let (response, done) = lock(&served).handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        assert!(done, "{response:?}");
+
+        // The real record already landed, before the seal — `close`
+        // claimed it out of `Approvals`' `unclaimed` bookkeeping, even
+        // though `wait`, not `close`, is what actually settled this
+        // outcome. Exactly one `CapabilityDecided`, never zero.
+        let (live, ended) = drain(&rx);
+        let kinds: Vec<_> = live
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(kinds, ["CapabilityDecided", "SessionEnded"], "{live:?}");
+        assert!(matches!(
+            &live[0].event,
+            WardEvent::CapabilityDecided {
+                decision: Decision::Allow,
+                by: DecisionSource::User,
+                grant: Some(GrantScope::Once),
+                ..
+            }
+        ));
+        assert!(ended);
+
+        // Only now let the collecting connection try its own belated
+        // append: it must find the record already claimed, and append
+        // nothing more.
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            collector.join().unwrap(),
+            Outcome::Answered(ApprovalDecision::Allow),
+            "the collecting connection still receives the real answer"
+        );
+        let (live, _) = drain(&rx);
+        assert!(
+            live.is_empty(),
+            "no second record for the same approval: {live:?}"
+        );
+    }
+
+    /// The timeout half of the same finding 2: `Approvals::wait`'s timeout
+    /// branch settles an id (removes it from `held`, records `TimedOut` in
+    /// `history`) through the exact same not-yet-appended gap as the
+    /// answered branch above, so it is exposed to the identical race. Same
+    /// structure as
+    /// `an_answer_settled_by_wait_just_before_stop_still_gets_exactly_one_real_record`,
+    /// with no `Approve` at all and `wait` given a zero timeout so it settles
+    /// as `TimedOut` on its very first check rather than actually blocking.
+    #[test]
+    fn a_timeout_settled_by_wait_just_before_stop_still_gets_exactly_one_real_record() {
+        use ward_events::{Decision, DecisionSource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let sub = lock(&served).subscribe(0).unwrap();
+        let (rx, _hangup) = sub.live.unwrap();
+
+        let id = match lock(&served).hold("Write", "/work/race3.rs", "r") {
+            Ok((id, None)) => id,
+            other => panic!("{other:?}"),
+        };
+        drain(&rx);
+
+        let (settled_tx, settled_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let collector = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || {
+                let approvals = Arc::clone(&lock(&served).approvals);
+                let outcome = approvals.wait(id, Duration::ZERO);
+                settled_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                let mut s = lock(&served);
+                if !s.approvals.take_recorded(id) {
+                    let event = crate::approvals::decided_event("Write", "/work/race3.rs", outcome);
+                    let _ = s.append(event);
+                }
+                outcome
+            })
+        };
+
+        settled_rx.recv().unwrap();
+        let view = lock(&served).approvals.approvals();
+        assert_eq!(
+            view.iter().find(|r| r.approval.id == id).unwrap().outcome,
+            Some(Outcome::TimedOut)
+        );
+
+        let (response, done) = lock(&served).handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        assert!(done, "{response:?}");
+
+        let (live, ended) = drain(&rx);
+        let kinds: Vec<_> = live
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(kinds, ["CapabilityDecided", "SessionEnded"], "{live:?}");
+        assert!(matches!(
+            &live[0].event,
+            WardEvent::CapabilityDecided {
+                decision: Decision::Deny,
+                by: DecisionSource::Timeout,
+                grant: None,
+                ..
+            }
+        ));
+        assert!(ended);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(collector.join().unwrap(), Outcome::TimedOut);
         let (live, _) = drain(&rx);
         assert!(
             live.is_empty(),

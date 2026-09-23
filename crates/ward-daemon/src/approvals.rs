@@ -793,20 +793,50 @@ struct State {
     /// answers it before registering a question at all — see `ward session
     /// grants` for that authority instead) so it never appears here either.
     history: VecDeque<ApprovalRecord>,
-    /// The real outcome [`Approvals::close`] gave an id it drained, held
-    /// here for that id's own still-in-flight [`Approvals::wait`] call to
-    /// hand back — so a hold connection that was about to collect a genuine
-    /// answer, but lost the race to a concurrent `close`, still learns its
-    /// real answer instead of a fabricated [`Outcome::Closed`] (review of
-    /// #218, finding 1). [`Approvals::take_recorded`] separately checks and
-    /// clears the same entry to tell that same caller whether `close`
-    /// already appended this id's terminal record for it, so it is never
-    /// appended a second time. Never populated any other way, so a `wait`
-    /// on an id this map has nothing for still falls back to
-    /// [`Outcome::Closed`] exactly as before this map existed (an id
-    /// already collected earlier, or one that was never registered at
-    /// all).
+    /// The real outcome [`Approvals::close`] gave an id it drained straight
+    /// from `held`, held here for that id's own still-in-flight
+    /// [`Approvals::wait`] call to hand back — so a hold connection that was
+    /// about to collect a genuine answer, but lost the race to a concurrent
+    /// `close`, still learns its real answer instead of a fabricated
+    /// [`Outcome::Closed`] (review of #218, finding 1). [`Approvals::take_recorded`]
+    /// separately checks and clears the same entry to tell that same caller
+    /// whether `close` already appended this id's terminal record for it, so
+    /// it is never appended a second time. Also where `close` leaves a
+    /// tombstone for an id it instead claimed out of `unclaimed` (below) —
+    /// same contract either way: present means someone else already has (or,
+    /// since that someone is always still holding the one lock that can seal
+    /// the log at the time, is about to have) appended this id's terminal
+    /// record. An id neither map has anything for was either never
+    /// registered, was already collected by an earlier call to `wait`, or is
+    /// `Outcome::Remembered` (which never enters `held` at all): `take_recorded`
+    /// returning `false` there matches this method's behaviour from before
+    /// either map existed.
     handoff: BTreeMap<u64, Outcome>,
+    /// An id `wait` itself just settled — removed from `held`, recorded in
+    /// `history` — but whose terminal record has not yet been appended,
+    /// because the caller (`hold` in `daemon.rs`) has not yet reacquired the
+    /// `Served` lock needed to append anything. Before this existed, that gap
+    /// was invisible to a concurrent `close` (`Served::close_pending_approvals`,
+    /// run for a `Stop`/`Seal` on another connection): `close` only ever
+    /// looked at `held`, which `wait` had already emptied for this id, so
+    /// `close` correctly concluded "nothing to do here" and let the log seal
+    /// with no terminal record for an approval that had, in truth, already
+    /// been decided (review of #218, finding 2 — the "wait before terminal
+    /// append" window; finding 1's `close`-before-`wait` window above is a
+    /// different interleaving of the same two operations). `close` now also
+    /// claims every entry left here — under the same lock that flips
+    /// `closed` — and appends it itself before the log can seal, leaving a
+    /// tombstone in `handoff` exactly as it does for an id it drains straight
+    /// from `held`; [`Approvals::take_recorded`] removes an entry here on the
+    /// ordinary, non-racing path (nothing else has touched this id) to claim
+    /// it for its own caller's append instead. Whichever of the two —
+    /// `take_recorded`'s caller or `close` — reaches the one lock relevant to
+    /// each (respectively `Served`'s, held for the whole check-then-append;
+    /// and `Served`'s again, held for `close_pending_approvals`'s whole
+    /// claim-then-append-then-seal) first is the one that actually appends;
+    /// the other finds its entry already gone (or a tombstone already in
+    /// `handoff`) and does nothing further.
+    unclaimed: BTreeMap<u64, (Approval, Outcome)>,
 }
 
 impl State {
@@ -1002,7 +1032,16 @@ impl Approvals {
                         grant,
                     );
                 }
-                state.record_history(held.approval, outcome, now_unix_ms());
+                let now = now_unix_ms();
+                state.record_history(held.approval.clone(), outcome, now);
+                // Settled, but not yet appended (review of #218, finding 2):
+                // left here for `close` to claim and append itself if a
+                // concurrent `Stop`/`Seal` reaches the log-sealing lock
+                // before this call's own caller does — see `unclaimed`'s doc
+                // comment.
+                state
+                    .unclaimed
+                    .insert(held.approval.id, (held.approval, outcome));
                 return outcome;
             }
             if state.paused {
@@ -1019,7 +1058,14 @@ impl Approvals {
             last = now;
             if remaining.is_zero() {
                 let held = state.held.remove(index);
-                state.record_history(held.approval, Outcome::TimedOut, now_unix_ms());
+                let now = now_unix_ms();
+                state.record_history(held.approval.clone(), Outcome::TimedOut, now);
+                // Same settled-but-not-yet-appended gap as the answered
+                // branch above; the timeout path is exposed to exactly the
+                // same #218 finding-2 window.
+                state
+                    .unclaimed
+                    .insert(held.approval.id, (held.approval, Outcome::TimedOut));
                 return Outcome::TimedOut;
             }
             state = self
@@ -1128,6 +1174,25 @@ impl Approvals {
     /// `Outcome::Closed` for a question that was genuinely answered — and
     /// `take_recorded` tells whichever caller collects it not to append the
     /// terminal record a second time.
+    ///
+    /// That closed finding 1's race (`close` beats a still-blocked `wait` to
+    /// a given entry) but left a second, narrower one open (finding 2): a
+    /// `wait` that had *already* settled an id — removed it from `held`,
+    /// recorded its real outcome in `history` — before this call ever ran,
+    /// so it was never in `held` for this call to drain in the first place.
+    /// Nothing here saw that id at all, so it could conclude "nothing left
+    /// to do" and let the log seal while that id's terminal record was still
+    /// unappended, if its own caller (`hold` in `daemon.rs`) had not yet won
+    /// back the lock it needs to append it. This call now also claims every
+    /// entry `wait` left in `unclaimed` (see its own doc comment) — id and
+    /// all, no `held` involved — and returns those alongside the ones just
+    /// drained from `held`, so the caller appends them too, here, before the
+    /// seal. `record_history` is *not* called again for these: `wait`
+    /// already recorded the real outcome the moment it settled; only the
+    /// append was still outstanding. A tombstone goes into `handoff` for
+    /// each all the same, so a `take_recorded` call that reaches its own
+    /// entry after this one already claimed it correctly finds it already
+    /// spoken for.
     pub fn close(&self) -> Vec<(Approval, Outcome)> {
         let mut state = self.lock();
         state.closed = true;
@@ -1150,20 +1215,53 @@ impl Approvals {
             state.handoff.insert(held.approval.id, outcome);
             released.push((held.approval, outcome));
         }
+        // Claim every id a concurrent `wait` had already settled but not yet
+        // appended (review of #218, finding 2) — the "wait before terminal
+        // append" window `held` alone cannot reveal, since `wait` already
+        // removed the entry from there before this call ever ran.
+        for (id, (approval, outcome)) in std::mem::take(&mut state.unclaimed) {
+            state.handoff.insert(id, outcome);
+            released.push((approval, outcome));
+        }
         drop(state);
         self.changed.notify_all();
         released
     }
 
     /// Whether `id`'s terminal record was already appended by a concurrent
-    /// `close` (review of #218, finding 1): checked, and cleared so it is
-    /// consulted at most once, right after collecting an outcome from
-    /// `wait` — by the caller that would otherwise go on to append its own
-    /// `CapabilityDecided` for it (`Served::hold`). `false` for any id
-    /// `close` never touched (the ordinary case: the caller's own `wait`
-    /// collected the answer itself, and must still record it).
+    /// `close` (review of #218, findings 1 and 2): checked, and cleared so
+    /// it is consulted at most once. Must be called by its caller
+    /// (`hold` in `daemon.rs`) only while already holding the `Served` lock,
+    /// with the resulting append (when this returns `false`) performed
+    /// before that same lock is released — the same lock `close_pending_approvals`
+    /// needs for its own claim-then-append-then-seal — so this check and
+    /// `close`'s own claiming are mutually exclusive with each other and
+    /// with the seal that follows: whichever of the two reaches the lock
+    /// first is the one that actually appends `id`'s terminal record, and
+    /// the log can never seal having appended neither (finding 2; calling
+    /// this before acquiring that lock, as `hold` did before the review of
+    /// #218's second round, reopens exactly that gap even with `unclaimed`
+    /// in place, since `close` would still see nothing to claim).
+    ///
+    /// `true` when a tombstone is already in `handoff` — a concurrent
+    /// `close` drained this id straight from `held` (finding 1) or claimed
+    /// it out of `unclaimed` after `wait` had already settled it (finding
+    /// 2); either way its terminal record is already appended (or, since
+    /// `close` always finishes appending everything it claims before
+    /// releasing the very lock this method is called under, is about to be,
+    /// strictly before any seal that follows). `false` otherwise: this also
+    /// claims (removes) any `unclaimed` entry for `id`, so a `close` that
+    /// runs after this returns finds nothing left to claim — the caller
+    /// must append it now, same as before either map existed for any id
+    /// neither ever had anything for (`Outcome::Remembered`, which never
+    /// enters `held` or `unclaimed` at all).
     pub fn take_recorded(&self, id: u64) -> bool {
-        self.lock().handoff.remove(&id).is_some()
+        let mut state = self.lock();
+        if state.handoff.remove(&id).is_some() {
+            return true;
+        }
+        state.unclaimed.remove(&id);
+        false
     }
 
     /// Pause or resume the hold (ADR-0019 §3): paused, pending questions stay
