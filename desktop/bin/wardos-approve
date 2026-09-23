@@ -259,17 +259,19 @@ interactive() {
 # --- --watch: notification lifecycle (#146 items 2-3) --------------------------
 #
 # run_dir, set by follow_once for this round of live sessions, holds up to four
-# files per (session, approval id) pair still showing a notification or still
-# relaying its answer: a pid file the pid of the notify-send process showing it, a
-# matching .out file that process's stdout — the notification's own id, as soon as
-# the server assigns one (`--print-id`), then the chosen action once it closes —
-# a .worker file the pid of notify_one's own background job, and a .answer file
-# the pid of the `ward session approve` call it makes at the very end. All four
-# are named from notif_key(): Approval::id is only that *session's* sequence
-# number, not a global one, so two live sessions can legitimately hold a pending
-# approval with the same numeric id at once (#222 review) — keying files by id
-# alone would let one session's file overwrite the other's the moment both have a
-# notification open.
+# files per notification still showing or still relaying its answer (one
+# notification may be answering for more than one approval id at once, #146 item
+# 7): a pid file the pid of the notify-send process showing it, a matching .out
+# file that process's stdout — the notification's own id, as soon as the server
+# assigns one (`--print-id`), then the chosen action once it closes — a .worker
+# file the pid of notify_one's own background job, and a .answer file the pid of
+# the `ward session approve` call(s) it makes at the very end. All four are named
+# from gkey (see below, by the .ids/.current paragraph): two live sessions can
+# legitimately hold a pending approval with the same numeric Approval::id at once
+# (#222 review — it is only that *session's* sequence number, not a global one),
+# and two overlapping generations of the very same key can legitimately exist at
+# once too (#228 review) — keying these files from anything less specific than
+# gkey would let one overwrite another's still-live files.
 #
 # .pid and .out are removed the moment nothing more needs them, so "a *.pid file
 # exists for this key" is exactly "a notification for it is still showing"; that is
@@ -313,31 +315,48 @@ interactive() {
 # from being signalled this way — the worker is its real parent, the only thing
 # that can wait() on it, so it has to be the one to do this, not sweep_run_dir.
 #
-# A fifth kind, per id, is "id-<session, id>.group" — the id's own membership
-# record: which key (if any) it was folded into (#146 item 7: exact duplicates
-# share one notification), named from notif_key. It is the *only* record of
-# group membership: group_members (below) finds every id in a group by scanning
-# for markers naming that key, rather than a second, shared list something else
-# also has to keep in sync with these — each marker is written exactly once, by
-# notifier_loop, when id joins a group, and removed exactly once, by whichever of
-# notify_one (id answered) or resolve_notification (id decided elsewhere) gets to
-# it first, so there is never a shared file for two writers to race a
-# read-modify-write over (#146 item 7 review, round 1: an .ids file every id's
-# join appended to, and notify_one's own answer both truncated and read, let a
-# duplicate that arrived in the narrow window after notify-send closed but before
-# notify_one finished reading it start a *second* generation under the same
-# key — .pid alone said "still live" but was released before that read, not
-# after — overwriting the first generation's membership out from under it: the
-# first generation could answer the new id instead of its own, lose its own ids
-# entirely, or delete the second generation's membership file). .worker, not
-# .pid, is what notifier_loop now checks to fold a duplicate into an existing
-# group rather than start a new one: .pid signals only "the popup itself is
-# still showing" and is released as soon as notify-send exits, well before the
-# group's own bookkeeping (reading every member, dispatching every answer) is
-# done, where .worker is held by notify_one for the group's entire lifetime,
-# removed only by its own RETURN trap once that bookkeeping has actually
-# finished — so a key can never be reserved fresh while a previous generation
-# under it is still being answered.
+# A fifth, .ids, holds the id (or ids: #146 item 7 folds exact duplicates into one
+# notification, so more than one line is the common case for it, not an edge case)
+# a given notification is currently answering for; a sixth, per id, an
+# "id-<session, id>.group" marker naming which notification (if any) that id was
+# folded into, for resolve_notification to find and update without scanning every
+# group's .ids file.
+#
+# .pid, .out, .worker, .answer and .ids are all named from gkey, not from the bare
+# group_key (a hash of the exact title and body notify_one renders, unique to a
+# byte-identical ask in one session, same as before #228) — gkey is group_key with
+# a further ".gen.<gen>" suffix, minted fresh by open_new_generation every time a
+# key with no currently-open generation gets a new one. A key's generations never
+# share a filename, however their lifetimes happen to overlap: the review on #228
+# found two real designs here still broken this way. The first (.ids, a single
+# file notifier_loop appended to, notify_one read-then-truncated, and
+# resolve_notification read-filtered-rewrote) let a concurrent append and removal
+# lose one or the other, and let a duplicate arriving in the gap between
+# notify-send exiting (releasing .pid) and notify_one actually consuming .ids
+# start a second generation under the same key, corrupting the first's
+# bookkeeping out from under it. The second, round-1 fix (per-id "id-*.group"
+# markers as the sole membership record, .worker instead of .pid as the "still
+# live" signal, sweep_group_markers cleaning up whatever a RETURN trap's own
+# answer loop did not) closed that specific .pid/.worker gap, but the closing
+# itself — .worker removed, then sweep_group_markers scanning and deleting every
+# marker still naming key — was two separate, unsynchronised steps: a new
+# generation could open (see .worker gone, reserve key afresh, write a fresh
+# marker) in the instant between them, and the old generation's own sweep, still
+# running, could delete that brand new marker right back out, because it too
+# named key — no lock anywhere made "is a generation for key still accepting
+# members" and "record this id as one of them" atomic with each other, on any
+# actor's side.
+#
+# key.current holds the gen of the one generation, if any, still open to a new id
+# joining it — cleared by notify_one the instant it snapshots that generation's ids
+# (see notify_one), which is also the instant a same-key request that arrives after
+# must start a fresh generation of its own rather than being folded into one that
+# has already fixed its membership. Every read-and-maybe-mutate of key.current or a
+# generation's .ids file — here, in notify_one's close-out, and in
+# resolve_notification — holds key.lock for the whole operation, so an append
+# (this loop), a snapshot-and-clear (notify_one) and a remove (resolve_notification)
+# can never interleave and lose one another's write. Both key.current and key.lock
+# live for as long as run_dir does, same as everything else here.
 #
 # It also holds one "session-<key>.resolver" marker per live session that has (or
 # had) an open notification, holding that session's own resolver's pid.
@@ -377,53 +396,86 @@ group_key() {
   printf '%s__%s' "$(session_key "$session")" "$content"
 }
 
-# Every id currently marked as belonging to key (#146 item 7 review, round 1: no
-# shared, mutated-in-place membership list — each id's own membership record is
-# its own file, written once by notifier_loop and removed once, by whichever of
-# notify_one or resolve_notification processes it first, so there is nothing here
-# for two writers to race over the same bytes of). A read-only scan of every
-# id-*.group marker in run_dir, kept to the ones naming key: id-<session,
-# id>.group's own filename carries the id (everything after the last "__",
-# session_key always being exactly 16 hex chars so that separator can never
-# appear inside either half); its content is the key it was folded into. A
-# marker written after this scan started, or removed by the other side before it
-# got here, simply isn't in the snapshot — the same "a duplicate that arrives
-# after this cannot retroactively join" semantics notify_one's own coalescing
-# window already documents, never a torn read of a value two writers touched at
-# once.
-group_members() {
-  local key=$1 f content id
-  for f in "$run_dir"/id-*.group; do
-    [[ -f $f ]] || continue
-    content=$(cat "$f" 2>/dev/null || true)
-    [[ $content == "$key" ]] || continue
-    id=${f##*__}
-    printf '%s\n' "${id%.group}"
-  done
-}
-
-# Remove every group marker still pointing to key: whatever an answer loop
-# didn't already remove as it went — no action, an unrecognised one, or
-# notify-send absent, none of which answer anyone — must not survive into a
-# future, textually-identical generation of this same content-addressed key
-# (#146 item 7 review, round 1). Its own function, not inline trap code: a
-# `local`/`read`/`for` only ShellCheck ever sees inside a single-quoted trap
-# string reads as "referenced but never assigned" (SC2154) — it does not parse
-# a trap's body as it does ordinary code — where a named function called from
-# the trap is ordinary code like any other.
-sweep_group_markers() {
-  local key=$1 session=$2 id
-  while IFS= read -r id; do
-    [[ -n $id ]] || continue
-    rm -f "$run_dir/id-$(notif_key "$session" "$id").group"
-  done < <(group_members "$key")
-}
-
 active_notifiers() {
   # A glob that matches nothing expands to itself; -f screens that out.
   local n=0 f
   for f in "$run_dir"/*.pid; do [[ -f $f ]] && ((++n)); done
   printf '%s\n' "$n"
+}
+
+# --- group membership: one live *generation* per key, never reused -----------------
+#
+# group_key alone is not enough to name a live generation's files (#228 review): a
+# key's notification can be answered and its worker can still be relaying decisions
+# well after the popup itself is gone, and a later, unrelated request that happens to
+# hash to the same key must never be folded into, or overwrite the still-in-flight
+# bookkeeping of, that finished-but-not-yet-reaped generation. Every generation this
+# loop opens for a key therefore gets its own unique suffix (gen: wall-clock
+# nanoseconds, this process's pid and $RANDOM — collision-free within one run_dir's
+# lifetime), and every one of its files is named from the composite gkey =
+# "key.gen.<gen>", never from key alone — so two generations of the same key can
+# never collide on a filename, however their lifetimes overlap, and there is no
+# shared, cross-generation state (a sweep, a single .worker) for two actors to race
+# transitioning at once.
+#
+# Bash's "exec {fd}>file" inside a command substitution only ever affects that
+# substitution's own subshell, and the flock it holds is released the moment that
+# subshell exits — there is deliberately no matching "exec {fd}>&-" below.
+
+# id joins key's currently-open generation, if it has one: echoes the gkey it joined
+# ("key.gen.<gen>"), or nothing if key has no open generation right now (the caller
+# must then open one itself, via open_new_generation).
+join_open_generation() {
+  local key=$1 id=$2 lk cur
+  exec {lk}>"$run_dir/$key.lock"
+  flock -x "$lk"
+  cur=$(cat "$run_dir/$key.current" 2>/dev/null || true)
+  if [[ -n $cur ]]; then
+    printf '%s\n' "$id" >>"$run_dir/$key.gen.$cur.ids"
+    printf '%s\n' "$key.gen.$cur"
+  fi
+}
+
+# Open a brand new generation for key, seeded with id as its first (only) member,
+# and make it key's current one. Always echoes the gkey id ends up in: ordinarily a
+# freshly minted one, but if key somehow already has a current generation by the time
+# this actually takes the lock — nothing here can cause that (notifier_loop is this
+# script's only opener, and it calls this at most once per pending line, never
+# concurrently with itself) — id joins that one instead rather than this leaking a
+# second live generation for the same key.
+open_new_generation() {
+  local key=$1 id=$2 lk cur gen
+  gen=$(date +%s%N)-$$-$RANDOM
+  exec {lk}>"$run_dir/$key.lock"
+  flock -x "$lk"
+  cur=$(cat "$run_dir/$key.current" 2>/dev/null || true)
+  if [[ -n $cur ]]; then
+    printf '%s\n' "$id" >>"$run_dir/$key.gen.$cur.ids"
+    printf '%s\n' "$key.gen.$cur"
+  else
+    printf '%s\n' "$gen" >"$run_dir/$key.current"
+    printf '%s\n' "$id" >"$run_dir/$key.gen.$gen.ids"
+    printf '%s\n' "$key.gen.$gen"
+  fi
+}
+
+# gkey (of key) is done reading its own membership — notify-send returned, or was
+# never available at all: echo whichever ids are in gkey's .ids file at the instant
+# this takes key.lock, remove that file, and — only if key.current still names this
+# exact generation, never unconditionally — clear it, so a request arriving after
+# this point starts a new generation of its own rather than joining one that has
+# already fixed its membership (#228 review) or silently missing one that joined in
+# the last instant before this locked (the append and this run under the same lock,
+# so neither can happen "half-way" through the other).
+close_generation() {
+  local key=$1 gkey=$2 lk gen cur
+  gen=${gkey##*.gen.}
+  exec {lk}>"$run_dir/$key.lock"
+  flock -x "$lk"
+  cat "$run_dir/$gkey.ids" 2>/dev/null || true
+  rm -f "$run_dir/$gkey.ids"
+  cur=$(cat "$run_dir/$key.current" 2>/dev/null || true)
+  [[ $cur == "$gen" ]] && rm -f "$run_dir/$key.current"
 }
 
 # One notification, waited on; the action chosen is the answer, relayed to every id
@@ -441,21 +493,16 @@ active_notifiers() {
 # and `ward session approve` — the reservation is released so it does not count
 # against the bound forever.
 notify_one() {
-  local session=$1 key=$2 agent=$3 project=$4 body=$5 progress=${6:-}
-  local pid_file=$run_dir/$key.pid worker_file=$run_dir/$key.worker \
-    answer_file=$run_dir/$key.answer hint=()
+  local session=$1 gkey=$2 agent=$3 project=$4 body=$5 progress=${6:-}
+  local key=${gkey%.gen.*}
+  local pid_file=$run_dir/$gkey.pid worker_file=$run_dir/$gkey.worker \
+    answer_file=$run_dir/$gkey.answer ids_file=$run_dir/$gkey.ids hint=()
   local answer_pids=()
-  # Remove the worker/answer markers, and sweep whatever group markers are still
-  # left pointing to key, on every return path (notify-send missing, no action, an
-  # unrecognised action, or every relayed answer already removing its own as it
-  # goes) — a leftover would otherwise survive into a future, textually-identical
-  # generation of this same content-addressed key once .worker's own removal
-  # (also here) lets notifier_loop treat it as free again (#146 item 7 review,
-  # round 1). Not reached from the TERM trap below (`exit` from a trap does not
-  # run RETURN) — sweep_run_dir, the only thing that signals TERM, already reaps
-  # `.worker`/`.answer` itself when it does, and removes run_dir entirely shortly
-  # after, so nothing is left for a future generation to inherit from that path.
-  trap 'rm -f "$worker_file" "$answer_file"; sweep_group_markers "$key" "$session"' RETURN
+  # Remove both markers on every return path (notify-send missing, no action, an
+  # unrecognised action, or a relayed answer) so wait_for_notifiers' wait, and
+  # sweep_run_dir's own force-stop, never outlast this function actually finishing
+  # (#224, #226 review).
+  trap 'rm -f "$worker_file" "$answer_file"' RETURN
   # sweep_run_dir may have to stop this worker directly, past its own grace
   # period — but only ever by signalling *this*, never an answer call directly:
   # this is every one of those calls' real parent, the only thing that can wait()
@@ -492,19 +539,24 @@ notify_one() {
   # only just reserved by notifier_loop's own synchronous write, backgrounding this
   # function immediately after — an exact duplicate the daemon reports a moment later,
   # from the very same batch an agent fired at once, is still being read and folded
-  # in (its own marker written) by that same loop, racing this one rather than
-  # following it. This gives that race a fair, bounded chance to settle in the
-  # group's favour before the count is fixed for the title, without meaningfully
-  # delaying the notification itself. A duplicate that still arrives after this
-  # cannot retroactively grow the title — the same snapshot semantics
-  # design-language.md §10 already gives the decision-time figure — but is still
-  # answered along with the rest (notify_one re-scans group_members after the
-  # answer, not this count). Configurable (WARDOS_APPROVE_COALESCE_S) so a test
-  # asserting an exact count can widen it well past real scheduling jitter instead
-  # of chasing a race against the main loop's own timing.
+  # into ids_file by that same loop, racing this one rather than following it. This
+  # gives that race a fair, bounded chance to settle in the group's favour before the
+  # count is fixed for the title, without meaningfully delaying the notification
+  # itself. A duplicate that still arrives after this cannot retroactively grow the
+  # title — the same snapshot semantics design-language.md §10 already gives the
+  # decision-time figure — but is still answered along with the rest (notify_one
+  # re-reads ids_file after the answer, not this count). Configurable
+  # (WARDOS_APPROVE_COALESCE_S) so a test asserting an exact count can widen it well
+  # past real scheduling jitter instead of chasing a race against the main loop's
+  # own timing.
   sleep "$coalesce"
-  local count=0 title
-  count=$(group_members "$key" | grep -c .) || true
+  # Counted with a builtin `read` loop, not `wc -l` (a fork and an exec of an
+  # external binary): every extra process this function forks before pid_file holds
+  # notify-send's real pid widens the exact race #224/#226 fixed by joining .worker
+  # instead of .pid — harmless now that wait_for_notifiers waits on .worker, but
+  # still needless latency on the common, non-grouped path.
+  local count=0 title _line
+  while IFS= read -r _line; do ((++count)); done <"$ids_file" 2>/dev/null || true
   ((count > 0)) || count=1
   title="${agent^} requests · ${project}"
   ((count > 1)) && title="$title (×$count)"
@@ -513,9 +565,10 @@ notify_one() {
   [[ -n $progress ]] && hint=(-h "int:value:$progress")
   if ! command -v notify-send >/dev/null 2>&1; then
     rm -f "$pid_file"
+    close_generation "$key" "$gkey" >/dev/null
     return 0
   fi
-  local out=$run_dir/$key.out action decision ns_pid ids
+  local out=$run_dir/$gkey.out action decision ns_pid ids
   : >"$out"
   # Backgrounded directly, not inside a `{ ...; }` group: $! must be notify-send's
   # own pid, not a wrapper subshell's, so a resolve elsewhere's kill (below) reaches
@@ -530,17 +583,17 @@ notify_one() {
   rm -f "$pid_file"
   action=$(tail -n1 "$out" 2>/dev/null || true)
   rm -f "$out"
+  # Whichever ids are still in the group now: one may have been answered from
+  # another terminal, the inbox, or timed out while this was open (resolve_notification
+  # removes it from ids_file as that happens) — never relayed to twice, and never to
+  # one that was never part of this group. close_generation takes key.lock for the
+  # whole snapshot-and-clear, so this can never lose an id notifier_loop is
+  # concurrently folding in, or race resolve_notification's own removal (#228
+  # review), and it is the instant key becomes free to open a fresh generation of
+  # its own — gkey's own files are never reused, only key's *next* gen may now start.
+  ids=$(close_generation "$key" "$gkey")
   [[ -n $action ]] || return 0
   decision=$(decision_of "$action") || return 0
-  # Whichever ids are still in the group now, read fresh, right before answering
-  # them, not the earlier coalescing-window snapshot: one may have been answered
-  # from another terminal, the inbox, or timed out while this was open
-  # (resolve_notification removes its own marker as that happens) — never relayed
-  # to twice, and never to one that was never part of this group. Each id's own
-  # marker is removed here, as it is answered, so a straggler that joins between
-  # this read and the loop below finishing is the only thing the RETURN trap's
-  # own sweep still needs to catch.
-  ids=$(group_members "$key")
   # Each backgrounded directly, the same reason and the same way as notify-send
   # above (a wrapper subshell's pid would not be the one actually still running if
   # the TERM trap above needs to stop it), rather than going through the shared
@@ -550,7 +603,6 @@ notify_one() {
   local id
   while IFS= read -r id; do
     [[ -n $id ]] || continue
-    rm -f "$run_dir/id-$(notif_key "$session" "$id").group"
     ward session approve --session "$session" "$id" "$decision" &
     answer_pids+=("$!")
   done <<<"$ids"
@@ -618,25 +670,39 @@ finish_notification() {
 # never folded into an open notification (no popup, or already resolved from here).
 #
 # id is only one member of a notification that may be showing more than one (#146
-# item 7: exact duplicates share one popup) — its own marker is removed, not
-# assumed to be the group's only one. Only when group_members then finds no one
-# else still marked for key (id was the last one still open — a group of one, the
-# common case, behaves exactly as before) is the notification itself replaced
-# with the outcome; otherwise the popup is left showing, still accurate for
-# whatever it still represents, and notify_one relays the eventual decision only
-# to whoever group_members still finds at answer time. A pure read-only check
-# after removing id's own marker — nothing here mutates a shared list another
-# writer could be mutating at the same moment (#146 item 7 review, round 1).
+# item 7: exact duplicates share one popup) — removed from the group's ids file, not
+# assumed to be its only member. Only when that empties (id was the last one still
+# open — a group of one, the common case, behaves exactly as before) is the
+# notification itself replaced with the outcome; otherwise the popup is left
+# showing, still accurate for whatever it still represents, and notify_one relays
+# the eventual decision only to what remains when it reads ids_file at answer time.
 resolve_notification() {
   local id=$1 session=$2 state=$3 destination=$4
   local marker; marker=$run_dir/id-$(notif_key "$session" "$id").group
   [[ -f $marker ]] || return 0
-  local key; key=$(cat "$marker" 2>/dev/null || true)
+  local gkey; gkey=$(cat "$marker" 2>/dev/null || true)
   rm -f "$marker"
-  [[ -n $key ]] || return 0
-  [[ -z $(group_members "$key") ]] &&
-    finish_notification "$run_dir/$key.pid" "$run_dir/$key.out" "$state" "$destination"
-  return 0
+  [[ -n $gkey ]] || return 0
+  local key=${gkey%.gen.*}
+  local ids_file=$run_dir/$gkey.ids lk emptied
+  [[ -f $ids_file ]] || return 0
+  # Reads and, if needed, rewrites ids_file inside one hold of key.lock — the same
+  # lock notifier_loop's append and notify_one's own close_generation use — so this
+  # can never read a membership list a concurrent append hasn't landed in yet and
+  # then overwrite that append out of existence (#228 review).
+  emptied=$(
+    exec {lk}>"$run_dir/$key.lock"
+    flock -x "$lk"
+    remaining=$(grep -vFx "$id" "$ids_file" 2>/dev/null || true)
+    if [[ -z $remaining ]]; then
+      rm -f "$ids_file"
+      printf '1\n'
+    else
+      printf '%s\n' "$remaining" >"$ids_file"
+      printf '0\n'
+    fi
+  )
+  [[ $emptied == 1 ]] && finish_notification "$run_dir/$gkey.pid" "$run_dir/$gkey.out" "$state" "$destination"
 }
 
 # One live session's own decided feed: resolves any of its still-showing
@@ -681,7 +747,7 @@ ensure_resolver() {
 # against that bound at all: it joins the group instead (#146 item 7).
 notifier_loop() {
   local id session agent tool claim destination network method credential repository lifetime project countdown
-  local body title key held progress marker
+  local body title key gkey held progress marker
   while IFS=$'\t' read -r id session agent tool claim destination network method credential repository lifetime project countdown; do
     [[ -n $id ]] || continue
     ensure_resolver "$session"
@@ -696,53 +762,48 @@ notifier_loop() {
     title="${agent^} requests · ${project}"
     key=$(group_key "$session" "$title" "$body")
     marker=$run_dir/id-$(notif_key "$session" "$id").group
-    # .worker, not .pid: .pid tracks only whether the popup itself is still
-    # showing, released by notify_one as soon as notify-send exits — well before
-    # its own group bookkeeping (reading every member, dispatching every answer)
-    # is done. Checking that alone let a duplicate delivered in the gap between
-    # those two moments start a *second* generation under the same
-    # content-addressed key while the first was still mid-answer (#146 item 7
-    # review, round 1). .worker is held by notify_one for that entire lifetime,
-    # released only by its own RETURN trap once every member has been answered
-    # or swept — so a key can never look free while a previous generation under
-    # it is still being processed.
-    if [[ -f $run_dir/$key.worker ]]; then
-      # Byte-identical to a notification this same round already opened or
-      # reserved: fold id in — its own marker, written once, is the entire
-      # membership record (group_members) — rather than opening a second popup
-      # for it.
-      printf '%s\n' "$key" >"$marker"
+    # join_open_generation takes key.lock to check-and-append atomically, so this can
+    # never land in a generation notify_one's own close_generation has already
+    # snapshotted, and never lose an id to that same race (#228 review): a gkey it
+    # echoes back is always one whose .pid/.worker already exist, from an earlier
+    # iteration or an earlier round of this same key never having fully closed yet.
+    gkey=$(join_open_generation "$key" "$id")
+    if [[ -n $gkey ]]; then
+      printf '%s\n' "$gkey" >"$marker"
       continue
     fi
     if [[ $(active_notifiers) -ge $max_notifiers ]]; then
       echo "wardos-approve: $max_notifiers notification(s) already open; approval $id is answerable from wardos-approve-inbox or ward session approve" >&2
       continue
     fi
-    # Reserved here, synchronously, so the next iteration's active_notifiers count,
-    # and the "-f $run_dir/$key.worker" duplicate check above, are both correct
-    # even before notify_one — started in the background right below — has itself
-    # gotten as far as deciding whether there is even a notify-send to show
-    # anything with. Computed once here, not again inside notify_one's own
-    # background timeline, so a slow fork (hashing, sha256summing the body) never
-    # delays how quickly notify_one gets its real pid on disk for a resolve
-    # elsewhere, or a duplicate a moment later, to find.
-    : >"$run_dir/$key.pid"
-    # Reserved empty too, for wait_for_notifiers below to always find an entry to
-    # wait on — notify_one itself fills in its own real pid, as its very first
-    # action, not this loop after backgrounding it (#226 review; see the run_dir
-    # comment above notify_one for why the write has to happen there instead).
-    # It is also, now, the sole signal notifier_loop's own duplicate check above
-    # reads: reserving it here, before notify_one has been backgrounded, is what
-    # makes that check race-free against a duplicate a line or two later in this
-    # same read.
-    : >"$run_dir/$key.worker"
-    printf '%s\n' "$key" >"$marker"
-    # Here too, not as a `$(…)` argument of the backgrounded call below: bash expands
-    # an asynchronous command's words in the forked child, so that would put one more
-    # fork on notify_one's own timeline before its real pid reaches disk — the same
-    # reason key is computed above.
-    progress=$(progress_value "$countdown")
-    notify_one "$session" "$key" "$agent" "$project" "$body" "$progress" &
+    # No generation of key is currently open: mint a new one. open_new_generation
+    # re-checks key.current under the same lock before doing so (see its own
+    # comment) — this loop never calls it more than once for the same pending line,
+    # so in practice that recheck only ever confirms what join_open_generation just
+    # found, but it is what keeps the two calls' combined effect atomic rather than
+    # this loop's own two separate lock acquisitions racing anything else.
+    gkey=$(open_new_generation "$key" "$id")
+    printf '%s\n' "$gkey" >"$marker"
+    if [[ ! -f $run_dir/$gkey.worker ]]; then
+      # Reserved here, synchronously, so the next iteration's active_notifiers
+      # count is correct even before notify_one — started in the background right
+      # below — has itself gotten as far as deciding whether there is even a
+      # notify-send to show anything with. gkey's own gen makes its filenames
+      # unique for good, so unlike the key-only names this reserved before #228,
+      # nothing still live can ever have already claimed them.
+      : >"$run_dir/$gkey.pid"
+      # Reserved empty too, for wait_for_notifiers below to always find an entry to
+      # wait on — notify_one itself fills in its own real pid, as its very first
+      # action, not this loop after backgrounding it (#226 review; see the run_dir
+      # comment above notify_one for why the write has to happen there instead).
+      : >"$run_dir/$gkey.worker"
+      # Here too, not as a `$(…)` argument of the backgrounded call below: bash
+      # expands an asynchronous command's words in the forked child, so that would
+      # put one more fork on notify_one's own timeline before its real pid reaches
+      # disk — the same reason key/gkey are computed above.
+      progress=$(progress_value "$countdown")
+      notify_one "$session" "$gkey" "$agent" "$project" "$body" "$progress" &
+    fi
   done < <(ward session pending --json --all --follow | jq --unbuffered -r "$fields")
 }
 

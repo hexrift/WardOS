@@ -573,91 +573,103 @@ out=$("$approve")
 assert_eq "$out" "  no pending approvals"
 assert_not_logged '^ward session approve'
 
-# --- group membership: a duplicate delivered after the first popup's notify-send
-# has already exited, but before its worker has finished answering, still joins the
-# same group rather than starting a second one under the same key (#146 item 7
-# review, round 1: .pid alone said "still live" but was released before notify_one
-# had read group membership, not after — a duplicate landing in that gap started a
-# fresh generation under the same content-addressed key, corrupting or losing the
-# first generation's own members). Drives notifier_loop's own duplicate-check and
-# notify_one's own membership read directly, in a controlled sequence, rather than
-# racing a real background worker against a real pending-stream delivery: the two
-# events this proves can land in either order are separated in real life by only a
-# few lines of pure bash (no forked command in between to hang a mock off of), so
-# only a manually-forced ordering proves the invariant deterministically rather
-# than hoping a loop happens to hit the same interleaving.
+# --- --watch: a second identical pending record delivered after the first popup
+# exits (its notify-send child is gone) but before its worker actually finishes
+# reading its own membership must join that same still-open generation, not reuse
+# its files for a second one and misdirect or lose the first's ids (#228 review,
+# round 2: round 1's own fix still let this happen, because releasing .worker and
+# then sweeping every marker naming key were two separate, unsynchronised steps —
+# a new generation could claim key the instant .worker was gone, and the old
+# generation's own sweep, still running, could delete that brand new generation's
+# marker right back out, since it too matched key). Forced, not hoped for: a
+# barrier on notify_one's own `tail -n1 "$out"` — the one external command between
+# the popup closing and this worker reading its own .ids — holds it open for a
+# real 0.3s window, and the third pending line is not even written until that
+# barrier confirms the window has started -------------------------------------
 : >"$MOCK_LOG"
-eval "$(sed -n '/^session_key() {$/,/^}$/p; /^notif_key() {$/,/^}$/p; /^group_key() {$/,/^}$/p; /^group_members() {$/,/^}$/p; /^sweep_group_markers() {$/,/^}$/p' "$approve")"
-run_dir=$(mktemp -d "$TMP/members.XXXXXX")
-session=sess_a
-title="Claude requests · payments-api"
-body=$'<span alpha="39322">DESTINATION</span>\n<tt>/work/src/lib.rs</tt>'
-key=$(group_key "$session" "$title" "$body")
-# id 12's own reservation, exactly as notifier_loop makes it for the first of a
-# group: .pid and .worker both created, then its own marker written.
-: >"$run_dir/$key.pid"
-: >"$run_dir/$key.worker"
-printf '%s\n' "$key" >"$run_dir/id-$(notif_key "$session" 12).group"
-# The moment notify_one's own popup closes (notify-send exited, someone clicked
-# something): .pid is released, .worker is not — group bookkeeping is not done yet.
-rm -f "$run_dir/$key.pid"
-# A second, byte-identical approval (id 14) is now delivered — landing squarely in
-# the gap between those two events. This is notifier_loop's own duplicate-check,
-# run exactly as it appears in the real loop.
-if [[ -f "$run_dir/$key.worker" ]]; then
-  printf '%s\n' "$key" >"$run_dir/id-$(notif_key "$session" 14).group"
-else
-  fail "a duplicate delivered after .pid was released, but before .worker was, must still see the group as live"
-fi
-# The duplicate must not have started a second reservation of its own: .pid stays
-# gone (the popup itself is genuinely closed by now, same as the single-id case
-# always had it), and there is still exactly one .worker — a second one is exactly
-# what a mistaken "new group" path would have created.
-[[ -f "$run_dir/$key.pid" ]] && fail "the duplicate must not have recreated .pid for the same key"
-[[ $(find "$run_dir" -maxdepth 1 -name "$key.worker" | wc -l) -eq 1 ]] ||
-  fail "the duplicate must not have created a second .worker for the same key"
-# notify_one's own post-click membership read (the real code path, after this same
-# .pid release) must now see both 12 and 14 — neither lost nor answered under a
-# generation that isn't theirs.
-members=$(group_members "$key" | sort)
-assert_eq "$members" "$(printf '12\n14')"
-rm -rf "$run_dir"
+rm -f "$TMP/notify_one_past_action"
+gen_a=$line12
+gen_b=${line12/\"id\":12/\"id\":15}
+export GEN_A=$gen_a GEN_B=$gen_b
+# tail is called exactly once in wardos-approve, as notify_one's own "$out" read;
+# every other call in this test file is real tail. Computes the true answer at once,
+# signals it is about to hand it back, then sits on it — reproducing exactly the
+# window #228 found unprotected, not a guess at when it might occur.
+# shellcheck disable=SC2016
+mock tail 'out=$(command -p tail "$@"); : >"$TMP/notify_one_past_action"; sleep 0.3; printf "%s\n" "$out"'
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow")
+    printf "%s\n" "$GEN_A"
+    for _ in $(seq 1 200); do [[ -f "$TMP/notify_one_past_action" ]] && break; sleep 0.01; done
+    printf "%s\n" "$GEN_B"
+    ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'echo allow'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 1 ]] ||
+  fail "a duplicate arriving in this exact window must join the one open popup, never a second: $(cat "$MOCK_LOG")"
+assert_logged '^ward session approve --session sess_a 12 allow$'
+assert_logged '^ward session approve --session sess_a 15 allow$'
 
-# --- group membership: an id resolved elsewhere (a resolver's own removal of its
-# marker) and a duplicate still joining the same group are two independent,
-# single-writer-per-file operations, never a shared list the two could tear
-# (#146 item 7 review, round 1, point 2) -----------------------------------------
+# --- --watch: a resolver removing one id from a group and notifier_loop appending
+# another to the very same still-open .ids file must not lose either write (#228
+# review, round 2). Forced, not hoped for: a barrier on resolve_notification's own
+# `grep -vFx` — its only external command, and the one place it reads .ids —
+# computes the true (pre-append) filtered result at once, signals it, then sits on
+# it for 0.3s; the append is not even attempted until that signal fires, so it
+# always lands while the resolver's read is stale and its write has not happened
+# yet — exactly the interleaving that loses the append without key.lock ----------
 : >"$MOCK_LOG"
-run_dir=$(mktemp -d "$TMP/members.XXXXXX")
-: >"$run_dir/$key.pid"
-: >"$run_dir/$key.worker"
-printf '%s\n' "$key" >"$run_dir/id-$(notif_key "$session" 12).group"
-printf '%s\n' "$key" >"$run_dir/id-$(notif_key "$session" 13).group"
-# A third, identical approval (id 15) is delivered — folds in the same way as above.
-printf '%s\n' "$key" >"$run_dir/id-$(notif_key "$session" 15).group"
-# Interleaved with that: 12 is decided elsewhere (a resolver's own job) — exactly
-# resolve_notification's own steps, run directly: remove its own marker, then read
-# membership to decide whether to close the popup.
-rm -f "$run_dir/id-$(notif_key "$session" 12).group"
-remaining_for_12=$(group_members "$key" | sort)
-assert_eq "$remaining_for_12" "$(printf '13\n15')"
-# 13 is answered directly (mirrors notify_one's own per-id removal as it dispatches).
-rm -f "$run_dir/id-$(notif_key "$session" 13).group"
-# What is left is exactly what the group's own worker would still relay an answer
-# to if it read membership only now, after both of those — 15, and only 15; not 12
-# or 13 (already gone), not a corrupted or partial read of any marker file (each
-# id's membership lives in its own file, so removing one is never a partial write
-# to a file the others' state also lives in).
-final_members=$(group_members "$key")
-assert_eq "$final_members" "15"
-# sweep_group_markers, notify_one's own end-of-function cleanup, must remove
-# exactly that last marker and leave nothing else behind for a future generation
-# of this same key to inherit.
-sweep_group_markers "$key" "$session"
-assert_eq "$(group_members "$key")" ""
-[[ -f "$run_dir/id-$(notif_key "$session" 15).group" ]] && fail "sweep_group_markers left a marker behind"
-rm -rf "$run_dir"
-unset -v run_dir session title body key members remaining_for_12 final_members
+mock tail 'command -p tail "$@"'
+rm -f "$TMP/race_setup_done" "$TMP/resolver_past_read"
+race_a=$line12
+race_b=${line12/\"id\":12/\"id\":17}
+race_c=${line12/\"id\":12/\"id\":18}
+export RACE_A=$race_a RACE_B=$race_b RACE_C=$race_c
+decided17='{"approval":{"id":17,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export DECIDED17=$decided17
+# grep -vFx 17 is resolve_notification's only call, for this id only; every other
+# grep in this test file (including assert_logged's own) passes straight through.
+# shellcheck disable=SC2016
+mock grep 'if [[ "$*" == "-vFx 17 "* ]]; then
+  out=$(command -p grep "$@")
+  : >"$TMP/resolver_past_read"
+  sleep 0.3
+  printf "%s\n" "$out"
+else
+  command -p grep "$@"
+fi'
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow")
+    printf "%s\n%s\n" "$RACE_A" "$RACE_B"
+    # A settle delay, not a race of its own: comfortably more than local pipe/jq/read
+    # latency for two lines, so notifier_loop has certainly joined 17 into the group
+    # (its own id marker written) before this signals the resolver below to act on
+    # it — the race under test is only the one the grep barrier forces, next.
+    sleep 0.2
+    : >"$TMP/race_setup_done"
+    for _ in $(seq 1 200); do [[ -f "$TMP/resolver_past_read" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_C"
+    ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 200); do [[ -f "$TMP/race_setup_done" ]] && break; sleep 0.01; done
+    printf "%s\n" "$DECIDED17"
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 7171; sleep 0.6; echo allow ;; *) exit 0 ;; esac'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 1 ]] ||
+  fail "17, 18 and 12 are one key: only one popup, whatever races land on its .ids: $(cat "$MOCK_LOG")"
+assert_logged '^ward session approve --session sess_a 12 allow$'
+assert_logged '^ward session approve --session sess_a 18 allow$'
+assert_not_logged '^ward session approve --session sess_a 17'
 
 # --- shellcheck-clean, usage block, strict mode -----------------------------------
 head -1 "$approve" | grep -q '^#!/usr/bin/env bash$' || fail "shebang"
