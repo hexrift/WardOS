@@ -231,15 +231,32 @@ claude in a terminal.` while `bar --waybar` stays the dim mark. Until
 PROJECTS row) opens on `WELCOME  Start here`, which runs `wardos-welcome`.
 
 The bar's verify segment is bound to the snapshot it judged (ADR-0019 decision 1,
-`design-language.md` §11). Before rendering `bar` (text or `--waybar`, the whole bar or
-`--segment verify`) the shell digests the worktree with `ward-snapshot`'s digest-only
-walk and incremental hash cache, using the capture options `ward verify` captures a
-candidate with, and compares the id with the candidate the last `VerificationPassed`
-record names: `VERIFY —` never, `VERIFY ◐ 7c01a2b3` verifying, `VERIFY ✓ 7c01a2b3` the
-tree is that candidate, `VERIFY ~ STALE` it no longer is, `VERIFY ✗` it failed. In
-`--follow` mode the digest is repeated on every record and on every quiet tick
-(`--tick-ms`, 2000 by default), since an edit made outside the sandbox is a change the
-stream never reports. Cost on `examples/ward-demo` (9 files), measured by `ward-shell`'s
+`design-language.md` §11). Before rendering `bar` (text or `--waybar`) the shell digests
+the worktree with `ward-snapshot`'s digest-only walk and incremental hash cache, using
+the capture options `ward verify` captures a candidate with, and compares the id with the
+candidate the last `VerificationPassed` record names: `VERIFY —` never, `VERIFY ◐
+7c01a2b3` verifying, `VERIFY ✓ 7c01a2b3` the tree is that candidate, `VERIFY ~ STALE` it
+no longer is, `VERIFY ✗` it failed — but only when what is being rendered actually shows
+that state (`SegmentName::needs_freshness`, true only for the whole bar and `--segment
+verify`; #138 item 3). Five of the six `ward-shell bar --waybar --segment … --follow`
+processes `config/waybar/config.jsonc` launches — `project`, `agent`, `network`,
+`grants` and `tamperward` — never touch the worktree at all; their text and tone come
+from the event stream alone. Only the sixth, `--segment verify`, does. In `--follow`
+mode, for a segment that does need it, the digest
+still runs unconditionally on every quiet tick (`--tick-ms`, 2000 by default), since an
+edit made outside the sandbox is a change the stream never reports — but a record no
+longer re-digests immediately every time: record-triggered digests are debounced to at
+most one per 250 ms (`DIGEST_DEBOUNCE`), so a burst of records collapses into a bounded
+number of scans instead of one per record, while `DigestGate` guarantees a change that
+lands is still always either covered by the scan running when it lands or picked up by a
+follow-up scan — never silently dropped. A record withdraws `VERIFY ✓`'s green the
+instant it lands, before its (possibly still-debounced) digest ever runs, so the bar
+never keeps asserting a confirmed match against a tree that already has evidence against
+it; the daemon socket is itself polled at least as often as `DIGEST_DEBOUNCE` while a
+segment needs freshness, so the debounce deadline is serviced on its own rather than
+only when the next record happens to arrive or the much longer quiet tick elapses. Cost
+on `examples/ward-demo` (9 files), measured
+by `ward-shell`'s
 `a_warm_digest_of_the_demo_is_within_the_bar_budget` (release build, 4-vCPU host): cold
 0.24 ms, warm 0.05 ms; on this repository's own checkout (364 files, `WARD_DIGEST_DIR`)
 cold 8.9 ms, warm 2.1 ms. The test fails above 50 ms warm. `ward-shell verify-panel` prints the segment's click panel (the
