@@ -172,14 +172,20 @@ question and the answer as it shows every other decision:
 | Record | Origin | Fields |
 | --- | --- | --- |
 | `CapabilityRequested` | `Wardd` | `cap.kind` from the tool (`FileWrite` for `Write`/`Edit`/`MultiEdit`/`NotebookEdit`, `Network` for `WebFetch`/`WebSearch`, `Exec` for `Bash`, `FileRead` for `Read`/`Grep`/`Glob`, else `Other`); `cap.target` = `<tool> <summary>`; `reason` = the hook's reason (`step-through: pause before writes`) |
-| `CapabilityDecided` | `Wardd` | the same `cap`; `decision` `Allow`/`Deny`; `by` `User` for an answer (grant `Once` for `allow`, `Session` for `allow-session` and for a request a standing `allow-session` covered) or `Timeout` (deny, no grant) |
+| `CapabilityDecided` | `Wardd` | the same `cap`; `decision` `Allow`/`Deny`; `by` `User` for an answer (grant `Once` for `allow`, `Session` for `allow-session` and for a request a standing `allow-session` covered), `Timeout` (deny, no grant), or `SessionEnded` (deny, no grant — #146) |
 
 The approval's id is the `seq` of its `CapabilityRequested` record: a subscriber
 that sees the record can answer it (`Request::Approve { id, decision }`) without a
 second lookup, and `Request::Pending` lists what is still open. A question the
-session's end releases is denied to the agent but has no `CapabilityDecided`: the log
-is sealed by then, and the seal itself is the record of why. Without a daemon the
-agent's own permission prompt remains the hold, and only the `AgentClaim` is written.
+session's end releases is denied to the agent, and (#146) is given its own
+`CapabilityDecided` record — `by: SessionEnded` — *before* `SessionEnded` and the seal
+itself, so it is never silently dropped from the persistent record the way it was
+before #146. `Request::Approvals` (`ward session approvals`) lists every approval the
+session has asked, pending or decided, not only what is still open — the daemon's own
+bounded in-memory history, so a request survives a client missing or dismissing
+whatever first announced it, for the rest of the session (the event log itself, via
+`ward replay`, is the durable, unbounded record). Without a daemon the agent's own
+permission prompt remains the hold, and only the `AgentClaim` is written.
 
 ## 8. Replay
 
