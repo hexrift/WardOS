@@ -392,6 +392,7 @@ fn summary(event: &WardEvent) -> String {
             ExitStatus::Exited { code } => format!("pid {pid} exit {code}"),
             ExitStatus::Signaled { signal, .. } => format!("pid {pid} signal {signal}"),
         },
+        WardEvent::LaunchAborted { pid, reason } => format!("pid {pid} aborted · {reason}"),
         WardEvent::SnapshotCreated {
             role,
             id,
@@ -432,21 +433,10 @@ fn summary(event: &WardEvent) -> String {
             format!("snapshot {}", short_snapshot(snapshot))
         }
         WardEvent::AgentClaim { kind, .. } => format!("{kind:?}"),
-        WardEvent::SessionPaused { method, reason } => format!("{} · {reason}", method.as_str()),
-        WardEvent::SessionPauseUnsettled {
-            method,
-            reason,
-            pending,
-        } => format!("{} · {reason} · {pending} pending", method.as_str()),
-        WardEvent::SessionResumed { paused_for } => format!("paused {}s", paused_for.as_secs()),
-        WardEvent::EntryRestored {
-            snapshot,
-            files,
-            backup,
-        } => format!(
-            "entry {} · {files} paths · backup {backup}",
-            short_snapshot(snapshot)
-        ),
+        ev @ (WardEvent::SessionPaused { .. }
+        | WardEvent::SessionPauseUnsettled { .. }
+        | WardEvent::SessionResumed { .. }
+        | WardEvent::EntryRestored { .. }) => intervention_summary(ev),
         WardEvent::Anchor {
             chain_head,
             seq,
@@ -470,6 +460,30 @@ fn summary(event: &WardEvent) -> String {
         | WardEvent::CredentialGranted { .. }
         | WardEvent::CredentialDenied { .. }
         | WardEvent::CredentialRevoked { .. } => access_summary(event).unwrap_or_default(),
+    }
+}
+
+/// Summaries for the host-intervention variants (`SessionPaused`/
+/// `SessionPauseUnsettled`/`SessionResumed`/`EntryRestored`), split out of
+/// [`summary`] purely to keep that function under the line limit.
+fn intervention_summary(event: &WardEvent) -> String {
+    match event {
+        WardEvent::SessionPaused { method, reason } => format!("{} · {reason}", method.as_str()),
+        WardEvent::SessionPauseUnsettled {
+            method,
+            reason,
+            pending,
+        } => format!("{} · {reason} · {pending} pending", method.as_str()),
+        WardEvent::SessionResumed { paused_for } => format!("paused {}s", paused_for.as_secs()),
+        WardEvent::EntryRestored {
+            snapshot,
+            files,
+            backup,
+        } => format!(
+            "entry {} · {files} paths · backup {backup}",
+            short_snapshot(snapshot)
+        ),
+        _ => unreachable!("intervention_summary is only called for the four arms matched above"),
     }
 }
 

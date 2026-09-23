@@ -412,6 +412,9 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
         WardEvent::SessionStarted { .. } => ("START", Tone::Accent, "session".to_string()),
         WardEvent::CommandStarted { argv, .. } => ("RUN", Tone::Ink, argv_text(argv)),
         WardEvent::CommandFinished { exit, .. } => ("EXIT", exit_color(*exit), exit_text(*exit)),
+        WardEvent::LaunchAborted { reason, .. } => {
+            ("ABORT", Tone::Deny, format!("launch aborted · {reason}"))
+        }
         WardEvent::FileModified { path, kind, .. } => {
             (change_verb(*kind), Tone::Ink, path.to_string())
         }
@@ -463,10 +466,10 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
             Tone::Ok,
             format!("snapshot {}", short_hex(&snapshot.to_string())),
         ),
-        WardEvent::SessionPaused { .. }
+        ev @ (WardEvent::SessionPaused { .. }
         | WardEvent::SessionPauseUnsettled { .. }
         | WardEvent::SessionResumed { .. }
-        | WardEvent::EntryRestored { .. } => intervention_cells(&rec.event)?,
+        | WardEvent::EntryRestored { .. }) => intervention_cells(ev),
         WardEvent::SessionEnded { .. } => ("END", Tone::Dim, "session".to_string()),
         _ => return None,
     };
@@ -476,6 +479,65 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
         tone,
         subject,
     })
+}
+
+/// The `(verb, tone, subject)` triple for the host-intervention records
+/// (`SessionPaused`/`SessionPauseUnsettled`/`SessionResumed`/`EntryRestored`),
+/// split out of [`observer_cells`] purely to keep that function under the line
+/// limit.
+fn intervention_cells(ev: &WardEvent) -> (&'static str, Tone, String) {
+    match ev {
+        WardEvent::SessionPaused { method, reason } => (
+            "PAUSE",
+            Tone::Deny,
+            format!(
+                "agents paused · network closed · grants suspended · processes frozen ({}) · {}",
+                method.as_str(),
+                reason.as_str()
+            ),
+        ),
+        WardEvent::SessionPauseUnsettled {
+            method,
+            reason,
+            pending,
+        } => (
+            "PAUSE?",
+            Tone::Warn,
+            format!(
+                "{pending} process{} not confirmed stopped ({}) · marker and grants held \
+                 regardless · {}",
+                if *pending == 1 { "" } else { "es" },
+                method.as_str(),
+                reason.as_str()
+            ),
+        ),
+        WardEvent::SessionResumed { paused_for } => (
+            "RESUME",
+            Tone::Accent,
+            format!("agents resumed · paused {}", duration_text(*paused_for)),
+        ),
+        WardEvent::EntryRestored {
+            snapshot,
+            files,
+            backup,
+        } => (
+            "RESTORE",
+            Tone::Accent,
+            if backup.as_str().is_empty() {
+                format!(
+                    "entry {} · worktree already matched",
+                    short_hex(&snapshot.to_string())
+                )
+            } else {
+                format!(
+                    "entry {} · {files} paths · replaced files in {}",
+                    short_hex(&snapshot.to_string()),
+                    backup.as_str()
+                )
+            },
+        ),
+        _ => unreachable!("intervention_cells is only called for the four arms matched above"),
+    }
 }
 
 /// A duration as the observer says it: `12s`, `3m 05s`, `1h 02m`.
@@ -545,66 +607,6 @@ fn verification_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)>
                 reason.as_str(),
                 short_hex(&candidate.to_string())
             ),
-        ),
-        _ => return None,
-    })
-}
-
-/// The host intervention rows (ADR-0019 §3, #145 items 3-4): `PAUSE` red for a
-/// confirmed freeze, `PAUSE?` amber for one the daemon could not confirm settled,
-/// `RESUME` and `RESTORE` in accent. Split out from [`observer_cells`] so that
-/// function stays within the line limit, the same reason [`verification_cells`]
-/// above already is its own function.
-fn intervention_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)> {
-    Some(match event {
-        WardEvent::SessionPaused { method, reason } => (
-            "PAUSE",
-            Tone::Deny,
-            format!(
-                "agents paused · network closed · grants suspended · processes frozen ({}) · {}",
-                method.as_str(),
-                reason.as_str()
-            ),
-        ),
-        WardEvent::SessionPauseUnsettled {
-            method,
-            reason,
-            pending,
-        } => (
-            "PAUSE?",
-            Tone::Warn,
-            format!(
-                "{pending} process{} not confirmed stopped ({}) · marker and grants held \
-                 regardless · {}",
-                if *pending == 1 { "" } else { "es" },
-                method.as_str(),
-                reason.as_str()
-            ),
-        ),
-        WardEvent::SessionResumed { paused_for } => (
-            "RESUME",
-            Tone::Accent,
-            format!("agents resumed · paused {}", duration_text(*paused_for)),
-        ),
-        WardEvent::EntryRestored {
-            snapshot,
-            files,
-            backup,
-        } => (
-            "RESTORE",
-            Tone::Accent,
-            if backup.as_str().is_empty() {
-                format!(
-                    "entry {} · worktree already matched",
-                    short_hex(&snapshot.to_string())
-                )
-            } else {
-                format!(
-                    "entry {} · {files} paths · replaced files in {}",
-                    short_hex(&snapshot.to_string()),
-                    backup.as_str()
-                )
-            },
         ),
         _ => return None,
     })

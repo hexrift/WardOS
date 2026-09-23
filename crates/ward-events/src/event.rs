@@ -847,6 +847,24 @@ pub enum WardEvent {
         reason: ShortText,
     },
 
+    // -- processes, continued (origin: Kernel; #140 / PR #197 review) --
+    /// A launch could not be carried through to a `CommandFinished`: the sandbox or hook
+    /// setup failed, or the child failed to spawn, after `CommandStarted` (and any credential
+    /// grant scoped to it) was already on the log. Recorded so `CommandStarted` is never the
+    /// last record for a pid — every launch gets a terminal record, and a launch-scoped grant
+    /// does not outlive a launch that never even started, not just one that ran and exited.
+    /// Appended at the end of the catalogue, not grouped with `CommandFinished` above, because
+    /// postcard identifies variants by declaration index and existing indices must never move
+    /// (see the module doc comment); the same discipline `VerificationErrored` follows for an
+    /// unrunnable verification attempt.
+    LaunchAborted {
+        /// The process this closes out (`CommandStarted`'s own pid).
+        pid: Pid,
+        /// Sanitised, bounded description of what stopped the launch (e.g. "egress proxy:
+        /// address already in use"). Never a secret; drawn from the daemon's own error text.
+        reason: ShortText,
+    },
+
     // -- intervention, continued (origin: Wardd; #145 items 3-4) --
     /// The host paused the session (ADR-0019 §3, same operation `SessionPaused`
     /// records), but could not confirm the freeze settled within the bound the
@@ -940,12 +958,13 @@ pub enum EventKind {
     SessionResumed = 28,
     EntryRestored = 29,
     VerificationErrored = 30,
-    SessionPauseUnsettled = 31,
+    LaunchAborted = 31,
+    SessionPauseUnsettled = 32,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 32] = [
+    pub const ALL: [EventKind; 33] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -977,6 +996,7 @@ impl EventKind {
         EventKind::SessionResumed,
         EventKind::EntryRestored,
         EventKind::VerificationErrored,
+        EventKind::LaunchAborted,
         EventKind::SessionPauseUnsettled,
     ];
 
@@ -1021,6 +1041,7 @@ impl EventKind {
             EventKind::SessionResumed => "session_resumed",
             EventKind::EntryRestored => "entry_restored",
             EventKind::VerificationErrored => "verification_errored",
+            EventKind::LaunchAborted => "launch_aborted",
             EventKind::SessionPauseUnsettled => "session_pause_unsettled",
         }
     }
@@ -1227,6 +1248,7 @@ impl WardEvent {
             WardEvent::SessionResumed { .. } => EventKind::SessionResumed,
             WardEvent::EntryRestored { .. } => EventKind::EntryRestored,
             WardEvent::VerificationErrored { .. } => EventKind::VerificationErrored,
+            WardEvent::LaunchAborted { .. } => EventKind::LaunchAborted,
             WardEvent::SessionPauseUnsettled { .. } => EventKind::SessionPauseUnsettled,
         }
     }
@@ -1259,10 +1281,10 @@ mod tests {
             assert_eq!(k.bit(), 1u64 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
-        // The catalogue is currently 32 kinds wide, well inside the `u64` backing's
+        // The catalogue is currently 33 kinds wide, well inside the `u64` backing's
         // 64-bit capacity — so, unlike a `u32` backing sitting at its exact 32-kind
         // capacity (where every bit is a real kind and there is no room left to mark
-        // anything as unknown), there IS a first unused bit right now (bit 32), and a
+        // anything as unknown), there IS a first unused bit right now (bit 33), and a
         // value that sets it must still be rejected as an unknown kind rather than
         // silently accepted.
         assert_eq!(

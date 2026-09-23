@@ -145,15 +145,19 @@ COPY image/coprs.txt image/packages.txt /tmp/
 # dependency. The dnf cache is a cache mount too: downloaded RPMs and metadata are
 # reused by the next build and never enter the image, which is why there is no `dnf
 # clean all` (hadolint DL3040 asks for one; the mount makes it moot). `sharing=locked`
-# serialises concurrent builds on the same cache.
+# serialises concurrent builds on the same cache. `retry` (issue #198, kept identical to
+# image/dnf-retry.sh's and image/check-packages.sh's/check-hyprland.sh's own copies) gives
+# the dnf5-plugins install, each COPR enable, and the package install a bounded, backed-off
+# retry, so a transient upstream COPR/mirror hiccup does not fail the whole image build.
 # hadolint ignore=DL3040
 RUN --mount=type=cache,target=/var/cache/libdnf5,sharing=locked \
     echo '%_install_langs en_US:en' >/etc/rpm/macros.image-language-conf \
-    && dnf -y install dnf5-plugins \
+    && retry() { local max=$1 delay=$2 n=1 rc=0; shift 2; until "$@"; do rc=$?; if [ "$n" -ge "$max" ]; then return "$rc"; fi; echo "retry: attempt $n/$max failed (exit $rc), retrying in ${delay}s: $*" >&2; sleep "$delay"; delay=$((delay * 2)); n=$((n + 1)); done; } \
+    && retry 3 5 dnf -y install dnf5-plugins \
     && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/coprs.txt \
-       | while read -r copr; do echo "copr enable $copr"; dnf -y copr enable "$copr" || exit 1; done \
-    && sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/packages.txt \
-       | xargs dnf -y --setopt=install_weak_deps=False --setopt=keepcache=True install \
+       | while read -r copr; do echo "copr enable $copr"; retry 3 5 dnf -y copr enable "$copr" || exit 1; done \
+    && mapfile -t pkgs < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' /tmp/packages.txt) \
+    && retry 3 5 dnf -y --setopt=install_weak_deps=False --setopt=keepcache=True install "${pkgs[@]}" \
     && if rpm -q glibc-all-langpacks >/dev/null 2>&1; then \
          dnf -y --setopt=clean_requirements_on_remove=False remove glibc-all-langpacks; \
        fi \
