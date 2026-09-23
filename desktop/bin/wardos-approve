@@ -8,20 +8,23 @@
 #                                   y / s / n
 #   wardos-approve <id> [y|s|n]     answer approval <id>: y allow once, s allow for the
 #                                   session, n deny; without the answer, ask for it
-#   wardos-approve --watch [--once] follow the live session's approvals and show each as
-#                                   a notification: DESTINATION (sanitised by the daemon),
-#                                   REQUESTED BY AGENT (the agent's words, labelled as
-#                                   such), WARD WILL ALLOW (network, method, credential,
-#                                   repository, lifetime), then Allow once / Allow session
-#                                   / Deny with their keys; the chosen action is relayed
-#                                   to the daemon. Without --once the listener waits for
-#                                   the next session when one ends (this is what
-#                                   wardos-approve.service runs).
+#   wardos-approve --watch [--once] follow every live session's approvals (#141: not just
+#                                   one project) and show each as a notification, titled
+#                                   with the agent and the project it is asking for: DESTINATION
+#                                   (sanitised by the daemon), REQUESTED BY AGENT (the agent's
+#                                   words, labelled as such), WARD WILL ALLOW (network, method,
+#                                   credential, repository, lifetime), then Allow once / Allow
+#                                   session / Deny with their keys; the chosen action is relayed
+#                                   to the daemon, on the socket of the session it asked from —
+#                                   never the desktop's selected one, so switching the selection
+#                                   while a notification is open cannot retarget it. Without
+#                                   --once the listener waits for the next round of live sessions
+#                                   when they all end (this is what wardos-approve.service runs).
 #   wardos-approve --help
 #
-# The daemon is reached through `ward session pending --json` and `ward session approve`
-# for WARDOS_PROJECT (default: the current directory; from home that is the newest
-# live session). Menus go through wardos-menu-select (WARDOS_MENU_BACKEND=fuzzel|stdin,
+# The interactive path (no --watch) is reached through `ward session pending --json` and
+# `ward session approve` for WARDOS_PROJECT (default: the current directory; from home that
+# is the desktop's selected session). Menus go through wardos-menu-select (WARDOS_MENU_BACKEND=fuzzel|stdin,
 # WARDOS_MENU_CHOICE answers the stdin backend); when that command is absent the stdin
 # backend is built in. Deny is the daemon's default on timeout, so an unanswered
 # notification denies. The notification body is Pango markup: every value is escaped,
@@ -40,7 +43,7 @@ retry=${WARDOS_APPROVE_RETRY:-2}
 fields='[.id, .session, .agent, .tool, .claim,
          .authority.destination, .authority.network, .authority.method,
          .authority.credential, (.authority.repository // "none"),
-         (.authority.lifetime // "once (y) · session (s)")] | @tsv'
+         (.authority.lifetime // "once (y) · session (s)"), .project] | @tsv'
 
 # The words the design uses for the three answers.
 decision_of() {
@@ -139,7 +142,7 @@ interactive() {
     decision=$(decision_of "$given")
   else
     local agent tool claim destination network method credential repository lifetime
-    IFS=$'\t' read -r _ _ agent tool claim destination network method credential repository lifetime \
+    IFS=$'\t' read -r _ _ agent tool claim destination network method credential repository lifetime _ \
       <<<"$chosen"
     printf '%s requests · %s\n' "${agent^}" "$tool"
     blocks 0 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime"
@@ -148,25 +151,33 @@ interactive() {
   answer "$id" "$session" "$decision"
 }
 
-# One notification, waited on; the action chosen is the answer. Runs in the
-# background so a second approval is not queued behind the first.
+# One notification, waited on; the action chosen is the answer, relayed to the
+# session it was asked from (never re-resolved), so it cannot land on a
+# different session even if the desktop's selection changes while it is open.
+# Runs in the background so a second approval — from this session or another
+# live one — is not queued behind the first.
 notify_one() {
-  local id=$1 session=$2 agent=$3 body=$4 action decision
+  local id=$1 session=$2 agent=$3 project=$4 body=$5 action decision
   action=$(notify-send -a WardOS -c ward-approval -u critical --wait \
     -A allow="Allow once" -A session="Allow session" -A deny="Deny" \
-    "${agent^} requests" "$body") || action=
+    "${agent^} requests · ${project}" "$body") || action=
   [[ -n $action ]] || return 0
   decision=$(decision_of "$action") || return 0
   answer "$id" "$session" "$decision" || true
 }
 
+# Every live session's approvals, multiplexed (#141 item 4): `ward session pending
+# --all --follow` fans out to every session live when it starts, not just $project's,
+# so an approval in a second session is never invisible just because the bar shows the
+# first. A session that starts after this round began is picked up on the next one
+# (watch()'s retry loop below), the same as a session ending mid-round already is.
 follow_once() {
-  local id session agent tool claim destination network method credential repository lifetime body
-  while IFS=$'\t' read -r id session agent tool claim destination network method credential repository lifetime; do
+  local id session agent tool claim destination network method credential repository lifetime project body
+  while IFS=$'\t' read -r id session agent tool claim destination network method credential repository lifetime project; do
     [[ -n $id ]] || continue
     body=$(blocks 1 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime")
-    notify_one "$id" "$session" "$agent" "$body" &
-  done < <(ward session pending --json --follow "$project" | jq --unbuffered -r "$fields")
+    notify_one "$id" "$session" "$agent" "$project" "$body" &
+  done < <(ward session pending --json --all --follow | jq --unbuffered -r "$fields")
   wait
 }
 

@@ -35,7 +35,7 @@ use ward_events::EventRecord;
 use ward_shell_core::{
     Authority, Decision, DigestGate, Header, Launcher, LineContext, Model, Module, SegmentName,
     SessionCard, SessionDescription, Settings, TrustBar, authority_panel, counters_text,
-    panel_text, session_panel, verify_panel,
+    panel_text, quote, session_panel, verify_panel,
 };
 use ward_snapshot::{
     CaptureOptions, CaptureStats, HashCache, Manifest, ManifestDiff, SnapshotStore,
@@ -122,6 +122,17 @@ enum Surface {
     },
     /// Agent Access and Advanced, read-only.
     Settings,
+    /// The keyboard-first session switcher (#141 item 3): every live session,
+    /// each with its project, agent state (paused included), pending
+    /// approvals and verification freshness, so a keyboard user can identify
+    /// a session before switching to it. Each line's command is bound to that
+    /// one session's immutable id (`ward session select <id>`), never to
+    /// "whichever session is selected at the time you press enter".
+    Switcher {
+        /// dmenu lines, `SECTION<TAB>label<TAB>command`, for fuzzel.
+        #[arg(long)]
+        lines: bool,
+    },
 }
 
 /// A session as the shell sees it: its facts and its stream so far.
@@ -217,6 +228,7 @@ fn main() -> ExitCode {
             Duration::from_millis(tick_ms),
         ),
         Surface::Launcher { query, lines: true } => launcher_lines(&dir, settle, &query),
+        Surface::Switcher { lines } => switcher(settle, lines),
         surface => text(&dir, settle, surface),
     };
     match result {
@@ -440,6 +452,66 @@ fn launcher_lines(dir: &Path, settle: Duration, query: &str) -> ward_daemon::Res
     Ok(())
 }
 
+/// `ward-shell switcher [--lines]` (#141 item 3): every live session, digested
+/// so its verify segment is current, each on its own line. `●` marks the
+/// desktop's current shared selection; every other line's command is bound to
+/// that line's own session id (`ward session select <id>`, quoted), so
+/// choosing one always selects the session you read, never whichever session
+/// happens to be selected — or newest, or gone — by the time you press enter.
+fn switcher(settle: Duration, lines: bool) -> ward_daemon::Result<()> {
+    let state = state_root();
+    let selected = ward_daemon::selection::current(&state).session;
+    let live = ward_daemon::daemon::live_sessions(&state)?;
+    if live.is_empty() {
+        if !lines {
+            print!("{NO_SESSION}");
+        }
+        return Ok(());
+    }
+    let mut digester = Digester::new();
+    for meta in &live {
+        let socket = ward_daemon::session::session_dir(&state, &meta.id)
+            .join(ward_daemon::control::SOCKET_NAME);
+        let Some(mut snapshot) = load_from(&socket, settle)? else {
+            continue;
+        };
+        digester.observe(&mut snapshot);
+        let pending = client::connect(&socket)
+            .and_then(|mut sink| client::pending(&mut sink))
+            .map_or(0, |p| p.len());
+        let is_selected = selected.as_deref() == Some(meta.id.as_str());
+        let label = switcher_label(&snapshot, pending, is_selected);
+        if lines {
+            println!("SESSIONS\t{label}\tward session select {}", quote(&meta.id));
+        } else {
+            println!("{label}");
+        }
+    }
+    Ok(())
+}
+
+/// One switcher line: the project, the agent segment's text (which already
+/// reads `PAUSED` in its own tone when the session is paused), how many
+/// approvals are pending, and the verify segment's text — the same facts the
+/// bar shows for the selected session, just for every live one at once.
+fn switcher_label(snapshot: &Snapshot, pending: usize, selected: bool) -> String {
+    let bar = TrustBar::new(&snapshot.header, &snapshot.model);
+    let agent = bar
+        .segment(SegmentName::Agent)
+        .map_or_else(String::new, |s| s.text);
+    let verify = bar
+        .segment(SegmentName::Verify)
+        .map_or_else(String::new, |s| s.text);
+    let project = SessionCard::new(&snapshot.description, &snapshot.model).project;
+    let mark = if selected { "●" } else { " " };
+    let pending = match pending {
+        0 => "no approvals pending".to_owned(),
+        1 => "1 approval pending".to_owned(),
+        n => format!("{n} approvals pending"),
+    };
+    format!("{mark} {project}  {agent}  {pending}  {verify}")
+}
+
 /// The control socket of the session the shell shows: `dir`'s current one,
 /// else the newest one a daemon serves (the bar runs from home, not a
 /// project); `None` when there is neither (the reason goes to stderr).
@@ -523,6 +595,12 @@ fn render(s: &Snapshot, surface: Surface) -> String {
             text
         }
         Surface::Settings => Settings::from_description(&s.description).text(),
+        // Multi-session, so it never goes through the single-session `load`
+        // this function's caller (`text`) is built on; `main` dispatches it
+        // to `switcher` directly instead.
+        Surface::Switcher { .. } => {
+            unreachable!("Surface::Switcher is dispatched in main(), not through text()/render()")
+        }
     }
 }
 
@@ -553,6 +631,16 @@ mod tests {
         assert!(matches!(
             cli.surface,
             Some(Surface::Launcher { lines: true, .. })
+        ));
+        let cli = Cli::parse_from(["ward-shell", "switcher"]);
+        assert!(matches!(
+            cli.surface,
+            Some(Surface::Switcher { lines: false })
+        ));
+        let cli = Cli::parse_from(["ward-shell", "switcher", "--lines"]);
+        assert!(matches!(
+            cli.surface,
+            Some(Surface::Switcher { lines: true })
         ));
     }
 
@@ -634,6 +722,21 @@ mod tests {
             );
             assert!(!text.contains("no session"));
         }
+    }
+
+    #[test]
+    fn switcher_label_names_the_project_agent_state_pending_count_and_marks_the_selection() {
+        let s = snapshot_on(Path::new("/home/dev/payments-api"), &[]);
+        let label = switcher_label(&s, 0, false);
+        assert!(label.starts_with("  payments-api  "), "{label}");
+        assert!(label.contains("no approvals pending"), "{label}");
+
+        let selected = switcher_label(&s, 1, true);
+        assert!(selected.starts_with("● payments-api  "), "{selected}");
+        assert!(selected.contains("1 approval pending"), "{selected}");
+
+        let many = switcher_label(&s, 3, false);
+        assert!(many.contains("3 approvals pending"), "{many}");
     }
 
     /// A described session on a worktree, with its stream so far.

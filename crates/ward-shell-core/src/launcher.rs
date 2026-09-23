@@ -70,6 +70,10 @@ pub enum Command {
     VerifyProject,
     /// Open the semantic settings (§14) for the current session.
     ReviewPermissions,
+    /// `ward pause --all` (#141 item 5): pause every live session, the
+    /// explicit scope distinct from pausing the one selected session
+    /// (`Super + Shift + P`, `wardos-pause`).
+    PauseAll,
     /// `ward replay` of a sealed session.
     ReplaySession {
         /// Session id.
@@ -121,6 +125,7 @@ impl Command {
             Self::ResumeSession { worktree, .. } => terminal(worktree, false, "ward watch"),
             Self::VerifyProject => terminal(ctx.worktree, true, "ward verify"),
             Self::ReviewPermissions => terminal(ctx.worktree, true, "ward-shell settings"),
+            Self::PauseAll => "wardos-pause pause-all".to_owned(),
             Self::ReplaySession { session } => {
                 let log = ctx.state.join("sessions").join(session).join("events.log");
                 terminal(
@@ -314,6 +319,13 @@ impl Launcher {
             "Review permissions",
             Command::ReviewPermissions,
         ));
+        if sessions.iter().any(|c| !c.sealed) {
+            entries.push(Entry::fixed(
+                Section::Security,
+                "Pause all sessions",
+                Command::PauseAll,
+            ));
+        }
         if let Some(card) = sessions.iter().find(|c| c.sealed) {
             entries.push(Entry {
                 section: Section::Security,
@@ -532,11 +544,17 @@ mod tests {
             [
                 "Verify current project",
                 "Review permissions",
+                "Pause all sessions",
                 "Replay last session"
             ]
         );
         assert_eq!(
             sections[2].1[2].command,
+            Command::PauseAll,
+            "#141 item 5: a distinct, explicit scope from pausing one session"
+        );
+        assert_eq!(
+            sections[2].1[3].command,
             Command::ReplaySession {
                 session: "sess_old".to_owned()
             },
@@ -545,7 +563,7 @@ mod tests {
 
         let system: Vec<&str> = sections[3].1.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(system, ["Terminal", "Browser", "Settings"]);
-        assert_eq!(launcher.entries().len(), 11);
+        assert_eq!(launcher.entries().len(), 12);
         assert!(
             launcher
                 .text()
@@ -575,6 +593,7 @@ mod tests {
                 "AGENTS\tResume session   payments-api · ● working\tfoot -D /home/dev/payments-api -- ward watch",
                 "SECURITY\tVerify current project\tfoot --hold -D /home/dev/payments-api -- ward verify",
                 "SECURITY\tReview permissions\tfoot --hold -D /home/dev/payments-api -- ward-shell settings",
+                "SECURITY\tPause all sessions\twardos-pause pause-all",
                 "SECURITY\tReplay last session   tamperward\tfoot --hold -D /home/dev/payments-api -- ward replay /home/dev/.local/state/ward/sessions/sess_old/events.log",
                 "SYSTEM\tTerminal\tfoot",
                 "SYSTEM\tBrowser\tchromium",
@@ -638,6 +657,13 @@ mod tests {
                 .iter()
                 .all(|e| e.label != "Replay last session")
         );
+        assert!(
+            launcher
+                .entries()
+                .iter()
+                .all(|e| e.command != Command::PauseAll),
+            "nothing live to pause"
+        );
     }
 
     #[test]
@@ -672,7 +698,14 @@ mod tests {
             .iter()
             .map(|e| e.label.as_str())
             .collect();
-        assert_eq!(labels, ["Verify current project", "Review permissions"]);
+        assert_eq!(
+            labels,
+            [
+                "Verify current project",
+                "Review permissions",
+                "Pause all sessions"
+            ]
+        );
         assert_eq!(launcher.sections().len(), 1);
         assert_eq!(launcher.sections()[0].0, Section::Security);
 

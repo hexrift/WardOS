@@ -34,6 +34,7 @@ pub mod pause;
 pub mod readiness;
 pub mod render;
 pub mod sandbox;
+pub mod selection;
 pub mod selftest;
 pub mod session;
 pub mod snapshot;
