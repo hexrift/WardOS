@@ -154,9 +154,8 @@ pub fn version_in(text: &str) -> Option<&str> {
         .find(|t| t.starts_with(|c: char| c.is_ascii_digit()) && t.contains('.'))
 }
 
-/// The first `name` on `PATH`. Shared with [`crate::readiness`], which probes for a
-/// project's runtime the same way this module probes for the host's.
-pub(crate) fn which(name: &str) -> Option<PathBuf> {
+/// The first `name` on `PATH`.
+fn which(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
             .map(|dir| dir.join(name))

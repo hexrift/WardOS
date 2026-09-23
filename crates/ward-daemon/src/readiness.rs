@@ -176,13 +176,22 @@ impl Report {
 /// *configured* command actually needs.
 #[must_use]
 pub fn check(dir: &Path) -> Report {
+    check_with_path(dir, std::env::var_os("PATH").as_deref())
+}
+
+/// [`check`], with `PATH` given explicitly instead of read from the process
+/// environment — what `check` itself does, via a fixed value rather than the
+/// live environment, so a test can exercise the `runtime` row's `PATH` search
+/// with a controlled directory instead of mutating the process-global `PATH`
+/// (unsafe to do from a test that might run in parallel with others).
+fn check_with_path(dir: &Path, path_var: Option<&std::ffi::OsStr>) -> Report {
     let ecosystem = Ecosystem::detect(dir);
     let mut rows = vec![policy_row(dir)];
     let (verify_row, config) = verify_row(dir);
     let unavailable = config.is_none();
     rows.push(verify_row);
     if let Some(config) = &config {
-        rows.push(runtime_row(dir, &config.verify.command));
+        rows.push(runtime_row(dir, &config.verify.command, path_var));
         rows.push(protected_row(dir, config));
     }
     Report {
@@ -335,8 +344,11 @@ fn is_executable(meta: &std::fs::Metadata) -> bool {
 /// (quote-included) name it splits to. A path candidate (containing `/`, e.g.
 /// `./scripts/verify.sh`) is resolved against `dir` — the verifier's own working
 /// directory, not the process's `PATH` — and must itself be executable, the same
-/// precondition `/bin/sh -c` enforces.
-fn runtime_row(dir: &Path, command: &str) -> Row {
+/// precondition `/bin/sh -c` enforces. A bare candidate is searched on `path_var`
+/// the same way, and must be executable there too — `doctor::which` alone is not
+/// enough here, since it reports a `PATH` entry present without checking that it
+/// can actually be executed.
+fn runtime_row(dir: &Path, command: &str, path_var: Option<&std::ffi::OsStr>) -> Row {
     if let Some(op) = SHELL_METACHARACTERS.iter().find(|op| command.contains(*op)) {
         return Row::new(
             "runtime",
@@ -388,14 +400,56 @@ fn runtime_row(dir: &Path, command: &str) -> Row {
             ),
         };
     }
-    if crate::doctor::which(candidate).is_some() {
-        Row::new("runtime", Status::Ok, format!("{candidate} on PATH"))
-    } else {
-        Row::new(
+    match resolve_on_path(candidate, path_var) {
+        PathLookup::Executable => Row::new("runtime", Status::Ok, format!("{candidate} on PATH")),
+        PathLookup::NotExecutable => Row::new(
+            "runtime",
+            Status::Fail,
+            format!(
+                "{candidate} found on PATH but is not executable; fix its permissions before `ward verify` can run"
+            ),
+        ),
+        PathLookup::Missing => Row::new(
             "runtime",
             Status::Fail,
             format!("{candidate} not found on PATH; install it before `ward verify` can run"),
-        )
+        ),
+    }
+}
+
+/// The outcome of searching `PATH` for a candidate: present and runnable,
+/// present but not executable, or not found at all in any directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathLookup {
+    Missing,
+    NotExecutable,
+    Executable,
+}
+
+/// Search `path_var`'s directories for an executable file named `candidate` —
+/// the same directory list `doctor::which` walks, plus the executable-bit check
+/// it does not do. Distinguishes "not found anywhere" from "found, but not
+/// executable" so [`runtime_row`] can name the real problem.
+fn resolve_on_path(candidate: &str, path_var: Option<&std::ffi::OsStr>) -> PathLookup {
+    let Some(path_var) = path_var else {
+        return PathLookup::Missing;
+    };
+    let mut found_non_executable = false;
+    for dir in std::env::split_paths(path_var) {
+        if let Ok(meta) = std::fs::metadata(dir.join(candidate)) {
+            if !meta.is_file() {
+                continue;
+            }
+            if is_executable(&meta) {
+                return PathLookup::Executable;
+            }
+            found_non_executable = true;
+        }
+    }
+    if found_non_executable {
+        PathLookup::NotExecutable
+    } else {
+        PathLookup::Missing
     }
 }
 
@@ -613,6 +667,37 @@ mod tests {
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_bare_command_found_on_path_but_not_executable_is_setup_required() {
+        // A controlled PATH, not the process's real one: a mode-0644 regular file
+        // named `cargo` sits where a real `PATH` search would find it, but
+        // `/bin/sh -c 'cargo test'` cannot execute it — the same false-ready class
+        // the project-relative branch's executable check already prevents. Passed
+        // explicitly to check_with_path rather than mutating the process-global
+        // `PATH`, which would be unsound alongside tests running in parallel.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cargo test\n",
+        );
+        let path_dir = tempfile::tempdir().unwrap();
+        std::fs::write(path_dir.path().join("cargo"), "not a real binary").unwrap();
+
+        let report = check_with_path(dir.path(), Some(path_dir.path().as_os_str()));
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert!(row.detail.contains("not executable"), "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+
+        // The same controlled PATH with the file actually made executable: Ok.
+        make_executable(&path_dir.path().join("cargo"));
+        let report = check_with_path(dir.path(), Some(path_dir.path().as_os_str()));
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
     }
 
     #[test]
