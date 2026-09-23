@@ -88,6 +88,11 @@ pub fn available() -> bool {
 pub const PROXY_SOCKET: &str = "/run/ward/proxy.sock";
 /// Mount point of the `ward-agent` shim inside the sandbox.
 pub const AGENT_SHIM: &str = "/run/ward/ward-agent";
+/// Mount point of the worktree itself inside the sandbox — an ordinary
+/// read-write `--bind`, so (unlike [`SYSTEM_RO`]) it is never at the same
+/// path on the host. `ward ready`'s `runtime` row (`crate::readiness`) needs
+/// this same literal to recognise an absolute symlink target that names it.
+pub(crate) const WORK_ROOT: &str = "/work";
 /// Read-only system directories bound into the sandbox: the toolchains the agent
 /// needs (`/opt` carries vendor installs such as Node and Claude Code). The host
 /// home, `/etc` beyond trust roots, and everything else are never bound.
@@ -317,9 +322,9 @@ impl Launch {
             &[
                 "--bind",
                 &worktree.to_string_lossy(),
-                "/work",
+                WORK_ROOT,
                 "--chdir",
-                "/work",
+                WORK_ROOT,
             ],
         );
         push(&mut a, &["--hostname", "ward-sandbox"]);
