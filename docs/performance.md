@@ -70,10 +70,16 @@ runs: 20 (3 warm-up discarded)
 tool: ward-bench 0.1.0
 ```
 
-## 5. Tooling
+## 5. Tooling (planned, not yet implemented — #150)
 
-`ward benchmark` (crate `ward-bench`, `benchmarks/`) runs the suite and emits JSON plus
-the human table:
+**Status: none of this exists in the workspace or CI today.** There is no `ward-bench`
+crate, no `benchmarks/` directory, no `ward benchmark` subcommand, and no CI job that
+measures or gates on any of the budgets in §2. `ward status` and the reproducibility
+record in §4 are real; a runnable, repeatable suite tying the two together is not.
+
+The design intent, once built: `ward benchmark` (crate `ward-bench`, `benchmarks/`) would
+run the suite and emit JSON plus a human table shaped roughly like this illustrative
+mockup — **not measured output, not a shipped format**:
 
 ```text
 Install                  31.8s
@@ -87,9 +93,11 @@ Idle CPU                  0.4%
 Idle RAM                  690MB
 ```
 
-CI runs the subset that is meaningful in a VM (sandbox start, snapshot, event latency,
-`ward status`, verifier spawn) on every PR and stores results as artifacts; the hardware
-subset runs on the certification rig per release.
+The plan is for CI to run the subset that is meaningful in a VM (sandbox start, snapshot,
+event latency, `ward status`, verifier spawn) on every PR and store results as artifacts,
+with the hardware subset run on the certification rig per release — none of that is wired
+up yet. Until `ward-bench` lands, §"Measured so far" below is the only source of real
+numbers, and each one carries its own reproducibility record rather than a suite run.
 
 ## 6. Installer performance plan (Phase 8, after correctness)
 
