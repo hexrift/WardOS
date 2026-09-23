@@ -337,18 +337,24 @@ fn is_executable(path: &Path) -> bool {
         && nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
 }
 
-/// Whether `path` (already joined under `dir`) resolves to somewhere *outside*
-/// `dir` — checked lexically after symlinks are already accounted for by
-/// [`resolve_symlinks_conservatively`], so this only catches a literal `..`
-/// escape in the configured path itself (`verify.command: ../../etc/passwd`,
-/// no symlink involved at all). The verifier only ever binds the worktree
-/// itself into the sandbox (at `/work`), so anything that nets outside `dir`
-/// resolves to nothing there. `false` when either side fails to canonicalize
-/// (typically: `path` does not exist) — a plain absence, for the caller's own
-/// not-found handling, not an escape.
-fn escapes_worktree(dir: &Path, path: &Path) -> bool {
-    match (dir.canonicalize(), path.canonicalize()) {
-        (Ok(dir_real), Ok(path_real)) => !path_real.starts_with(&dir_real),
+/// Whether `path` resolves to somewhere *outside* `root` — checked lexically
+/// after symlinks are already accounted for by
+/// [`resolve_symlinks_conservatively`], so this only catches what's left once
+/// every hop has already been individually vetted: a literal `..` escape in
+/// the configured path itself (`verify.command: ../../etc/passwd`, no
+/// symlink involved at all), or a chain of *relative* symlink hops that,
+/// hop by hop, each looked legitimate (resolved against its own containing
+/// directory, exactly what a bind mount preserves) but whose cumulative
+/// destination walked straight out of the one root the verifier actually
+/// mounts at this path — a root the caller is responsible for choosing:
+/// the project worktree for a project-relative candidate, or a single
+/// search directory for a bare one resolved against
+/// [`verify::Toolchains::search_dirs`]. `false` when either side fails to
+/// canonicalize (typically: `path` does not exist) — a plain absence, for
+/// the caller's own not-found handling, not an escape.
+fn escapes_root(root: &Path, path: &Path) -> bool {
+    match (root.canonicalize(), path.canonicalize()) {
+        (Ok(root_real), Ok(path_real)) => !path_real.starts_with(&root_real),
         _ => false,
     }
 }
@@ -596,12 +602,27 @@ fn path_candidate_row(dir: &Path, candidate: &str) -> Row {
             return Row::new("runtime", Status::Fail, message);
         }
     };
-    if !absolute && escapes_worktree(dir, &resolved) {
+    if !absolute && escapes_root(dir, &resolved) {
         return Row::new(
             "runtime",
             Status::Fail,
             format!(
                 "{candidate} resolves outside the project; it will not exist inside the verifier, which only sees the worktree itself"
+            ),
+        );
+    }
+    // The initial-candidate `is_system_ro` check above only proves *this*
+    // path starts inside a mounted root — a relative symlink hop the walk
+    // just followed can still have carried it back out (e.g. `/usr/local/bin/x
+    // -> ../../../home/evil`), landing somewhere the sandbox never mounts even
+    // though the literal candidate looked safe. The fully resolved
+    // destination needs the same guarantee the candidate itself just got.
+    if absolute && !crate::sandbox::is_system_ro(&resolved) {
+        return Row::new(
+            "runtime",
+            Status::Fail,
+            format!(
+                "{candidate} is a symlink pointing somewhere the verifier does not mount; it will not exist inside the sandbox"
             ),
         );
     }
@@ -638,6 +659,17 @@ enum PathLookup {
 /// along the way. Distinguishes "not found anywhere" from "found, but not
 /// executable" from "found, but only through a symlink the verifier's mount
 /// set guarantees is broken" so [`runtime_row`] can name the real problem.
+///
+/// Each `dir` is trusted only for *its own* contents: a relative symlink
+/// hop the walk follows can still carry the final destination out of `dir`
+/// (`<home>/bin/cargo -> ../../outside/cargo`) without ever pointing through
+/// an absolute target — nothing the hop-by-hop walk itself checks catches
+/// that, since a relative target is, correctly, allowed to resolve wherever
+/// its own containing directory ends up mounted. `dir` is the specific mount
+/// source that makes this candidate visible at all, so the destination must
+/// stay inside it, or land inside a [`crate::sandbox::is_system_ro`] root
+/// mounted at the same path either way (a search dir can itself be a base
+/// system directory).
 fn resolve_in_dirs(candidate: &str, search_dirs: &[PathBuf]) -> PathLookup {
     let mut found_non_executable = false;
     for dir in search_dirs {
@@ -645,6 +677,9 @@ fn resolve_in_dirs(candidate: &str, search_dirs: &[PathBuf]) -> PathLookup {
         match resolve_symlinks_conservatively(candidate_path.clone()) {
             LinkResolution::Broken => return PathLookup::Broken,
             LinkResolution::Resolved(resolved) if resolved.is_file() => {
+                if escapes_root(dir, &resolved) && !crate::sandbox::is_system_ro(&resolved) {
+                    return PathLookup::Broken;
+                }
                 if is_executable(&candidate_path) {
                     return PathLookup::Executable;
                 }
@@ -915,6 +950,15 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// `rm -rf` on drop, for a fixture directory a test plants outside its own
+    /// `tempfile::tempdir()` (e.g. under a real `SYSTEM_RO` root it doesn't own).
+    struct RemoveDirOnDrop(PathBuf);
+    impl Drop for RemoveDirOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn a_bare_command_found_in_a_search_dir_but_not_executable_is_setup_required() {
         // A controlled search directory, not the process's real PATH: a mode-0644
@@ -1021,6 +1065,124 @@ mod tests {
 
         let dirs = [search_bin];
         let report = check_with_dirs(dir.path(), &dirs);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_a_relative_symlink_escaping_its_search_dir_as_setup_required() {
+        // `cargo` itself (the leaf, not an ancestor) is a *relative* symlink
+        // whose target, resolved against its own containing directory (the
+        // search dir — exactly what a bind mount of that directory would
+        // preserve), still walks straight out of it via `..`. The earlier
+        // ancestor-symlink test above covers a *directory* hop redirecting the
+        // walk; this covers the leaf link itself netting outside the one root
+        // that makes it visible at all — nothing about it is an absolute
+        // target, so the hop-by-hop walk's own `is_system_ro` check never
+        // sees it, and it isn't under any real SYSTEM_RO root either.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cargo test\n",
+        );
+        let real_elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(real_elsewhere.path().join("cargo"), "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&real_elsewhere.path().join("cargo"));
+        let search_dir = tempfile::tempdir().unwrap();
+        // search_dir/cargo -> ../<real_elsewhere's basename>/cargo: one level
+        // up from search_dir reaches the shared base temp directory, then back
+        // down into real_elsewhere — a relative chain, never an absolute hop.
+        let relative_escape = PathBuf::from("..")
+            .join(real_elsewhere.path().file_name().unwrap())
+            .join("cargo");
+        std::os::unix::fs::symlink(&relative_escape, search_dir.path().join("cargo")).unwrap();
+
+        let dirs = [search_dir.path().to_path_buf()];
+        let report = check_with_dirs(dir.path(), &dirs);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_allows_a_relative_symlink_that_stays_within_its_search_dir() {
+        // Mirrors runtime_allows_a_project_relative_symlink_that_stays_within_the_worktree
+        // for the search-dir branch: a relative target resolved against its
+        // own containing directory, landing back inside that same search dir,
+        // is exactly what a bind mount of the toolchain directory preserves —
+        // this one must stay Ok, not get caught by the new containment check.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cargo test\n",
+        );
+        let search_dir = tempfile::tempdir().unwrap();
+        write(search_dir.path(), "real/cargo", "#!/bin/sh\ntrue\n");
+        make_executable(&search_dir.path().join("real/cargo"));
+        std::os::unix::fs::symlink("real/cargo", search_dir.path().join("cargo")).unwrap();
+
+        let dirs = [search_dir.path().to_path_buf()];
+        let report = check_with_dirs(dir.path(), &dirs);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_an_absolute_candidates_relative_symlink_escaping_system_mounts_as_setup_required()
+     {
+        // The initial-candidate `is_system_ro` check only proves the literal
+        // configured path starts inside a mounted root; it says nothing about
+        // where a *relative* symlink hop the walk then follows ends up. Needs
+        // a real writable location under a SYSTEM_RO root (the check is a
+        // literal path-prefix match, not mockable) — skipped, not failed,
+        // wherever this process can't write there (an unprivileged CI runner),
+        // the same environment-conditional shape already used above for the
+        // real-/usr/bin/bash fixture.
+        let probe_root = Path::new("/opt");
+        let marker = probe_root.join(format!("ward-readiness-test-{}", std::process::id()));
+        if std::fs::create_dir(&marker).is_err() {
+            return; // no write access here; the mechanism is covered by the
+            // project-relative and search-dir variants above either way.
+        }
+        let _cleanup = RemoveDirOnDrop(marker.clone());
+        assert!(
+            crate::sandbox::is_system_ro(&marker),
+            "/opt is unconditionally in SYSTEM_RO"
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("tool"), "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&outside.path().join("tool"));
+        // marker/tool -> a relative path out of `marker` (under the SYSTEM_RO
+        // root) into `outside` (a plain /tmp tempdir, mounted nowhere): built
+        // by counting marker's own components back to `/`, then descending
+        // into outside's — never an absolute target, so only a
+        // post-resolution containment check catches it.
+        let mut relative_escape = PathBuf::new();
+        for _ in marker
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            relative_escape.push("..");
+        }
+        for c in outside.path().join("tool").components() {
+            if let std::path::Component::Normal(part) = c {
+                relative_escape.push(part);
+            }
+        }
+        std::os::unix::fs::symlink(&relative_escape, marker.join("tool")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            &format!("verify:\n  command: {}\n", marker.join("tool").display()),
+        );
+        let report = check(dir.path());
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Fail, "{}", row.detail);
         assert_eq!(report.verdict(), Verdict::SetupRequired);
