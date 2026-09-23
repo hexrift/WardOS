@@ -964,6 +964,13 @@ pub fn gc_plan_panel(state_root: &Path, plan: &ward_snapshot::gc::SweepPlan) -> 
         "  {DIM}{} retention root(s) considered live{RESET}",
         plan.roots
     );
+    if plan.held_by_grace_period > 0 {
+        let _ = writeln!(
+            s,
+            "  {DIM}{} object(s) unreachable but within the grace period — left alone for now{RESET}",
+            plan.held_by_grace_period
+        );
+    }
     if plan.is_empty() {
         let _ = writeln!(
             s,

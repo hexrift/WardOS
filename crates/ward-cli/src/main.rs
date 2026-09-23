@@ -26,8 +26,8 @@ mod tui;
 mod vault;
 use ward_daemon::approvals::ApprovalDecision;
 use ward_daemon::{
-    Session, SessionMeta, SnapshotRole, client, daemon, render, retention, selftest, snapshot,
-    usage,
+    GcOptions, Session, SessionMeta, SnapshotRole, client, daemon, render, retention, selftest,
+    snapshot, usage,
 };
 use ward_events::{EndReason, LogReader};
 
@@ -1352,7 +1352,7 @@ fn cmd_snapshot_usage(json: bool) -> ward_daemon::Result<ExitCode> {
 fn cmd_snapshot_gc(apply: bool, json: bool) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     let now = std::time::SystemTime::now();
-    let plan = retention::plan(&state, now)?;
+    let plan = retention::plan(&state, now, &GcOptions::default())?;
     if apply {
         let report = retention::apply(&state, &plan, now)?;
         if json {

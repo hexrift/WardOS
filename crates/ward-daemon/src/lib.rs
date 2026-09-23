@@ -52,4 +52,5 @@ pub use selftest::{
 };
 pub use session::{RestoreReport, RunReport, Session, SessionMeta, VerifyReport};
 pub use ward_snapshot::SnapshotRole;
+pub use ward_snapshot::gc::GcOptions;
 pub use watch::CaptureMode;

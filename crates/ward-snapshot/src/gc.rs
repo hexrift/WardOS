@@ -68,6 +68,45 @@
 //! ([`apply_with_hook`] exposes the check point between deletions for deterministic
 //! tests), so a lease acquired after [`plan`] ran — even mid-`apply` — stops the rest of
 //! the sweep rather than racing a capture that starts partway through.
+//!
+//! # Grace period (review of #229, finding 1) — a mitigation, not a guarantee
+//!
+//! A lease and a root together are not the whole story: there is a real gap between "a
+//! caller stopped holding a lease on an object" and "a caller has durably recorded a root
+//! that will protect it from here on", and this crate has no way to see into that gap from
+//! either end. The sharpest instance (`ward-daemon`'s own retention roots, not this crate,
+//! but the shape belongs here since this is where the mitigation has to live): a
+//! verification attempt's marker is the *only* root protecting its candidate snapshot,
+//! removed synchronously the instant verification finishes; the *replacement* root —
+//! `TamperWard`'s own `StateAccepted` evidence — is only ever written later, by a separate,
+//! out-of-process `ward evidence append` invocation (see `docs/snapshots-and-git.md`). A
+//! sweep landing in that window would see no lease, no root, nothing — and correctly, by
+//! [`plan`]'s own reachability logic alone, "correctly" delete evidence `TamperWard` is about
+//! to accept. Closing this durably would mean touching that external evidence-append flow,
+//! which is `TamperWard`'s own separate process, not this crate's or `ward-daemon`'s to change.
+//!
+//! [`GcOptions::grace_period`] bounds the window instead of closing it: [`plan`] only ever
+//! plans an object for deletion once it has gone unreferenced/untouched for at least this
+//! long, judged from the object's own filesystem mtime (every object this crate writes —
+//! a blob, a manifest, a meta record — is content-addressed and immutable, written exactly
+//! once, so its mtime already *is* "when this object was born", with no separate tracking
+//! needed). A freshly-captured object is by construction younger than any reasonable grace
+//! period, which is what makes the same mechanism also cover the much narrower gap
+//! `SnapshotStore::capture_with`'s own doc comment already calls out (its lease is released
+//! before the *caller* durably records the resulting id as a root — a handful of syscalls,
+//! not an external process, but the same shape of gap). A candidate born right before a
+//! verification attempt starts is, by the same reasoning, no older than that attempt's own
+//! run time when its marker is removed — bounded by `verify.budget_secs` — so a default
+//! comfortably larger than any reasonable verification budget keeps it protected for the
+//! whole of the actual gap this section opened with, too.
+//!
+//! This is a mitigation, explicitly, not an absolute guarantee: it bounds a previously
+//! *unbounded* window down to "however long the grace period is", nothing more. A
+//! pathologically slow external evidence-append step — one that takes longer than the
+//! configured grace period to run — is not protected against. Operators relying on this
+//! must ensure `ward evidence append` typically completes well within the configured grace
+//! period; raising [`DEFAULT_GC_GRACE_PERIOD`] via [`GcOptions`] is the knob for an
+//! environment where that step is known to be slower than the default assumes.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -89,6 +128,34 @@ use crate::manifest::Manifest;
 /// loop for this first cut (see the module doc comment on lease granularity for the
 /// same "start conservative, narrow later" reasoning).
 pub const DEFAULT_CAPTURE_LEASE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// The default [`GcOptions::grace_period`] — see the module doc comment's "grace period"
+/// section for what this protects and why. Comfortably larger than `ward-daemon`'s own
+/// default verification budget (`verify.budget_secs`, 600s) plus the handful of syscalls a
+/// capture's own caller needs to durably record a fresh root, and generous enough that an
+/// external `ward evidence append` invocation run promptly after verification passes has
+/// ample time to land before this elapses.
+pub const DEFAULT_GC_GRACE_PERIOD: Duration = Duration::from_secs(30 * 60);
+
+/// Configuration for [`plan`]'s conservatism — currently just the grace period (review of
+/// #229, finding 1), kept as its own struct rather than a bare `Duration` parameter so a
+/// future knob (e.g. a per-category override) can be added without another breaking
+/// signature change. See the module doc comment's "grace period" section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GcOptions {
+    /// How long an object with no live root and no active lease must have gone
+    /// unreferenced/untouched — judged from its own filesystem mtime — before [`plan`]
+    /// will actually plan it for deletion.
+    pub grace_period: Duration,
+}
+
+impl Default for GcOptions {
+    fn default() -> Self {
+        Self {
+            grace_period: DEFAULT_GC_GRACE_PERIOD,
+        }
+    }
+}
 
 fn unix_ms(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
@@ -217,7 +284,12 @@ impl Drop for LeaseGuard {
 /// under its real name, which reads as a benign "gone" below, not a parse failure — but an
 /// unreadable *published* lease is different: this function has no way to tell "definitely
 /// expired garbage" apart from "a lease this process merely could not read", and only the
-/// former is safe to ignore).
+/// former is safe to ignore). The same conservatism applies to a `read_dir` iteration error
+/// on one directory entry (review of #229, finding 3): unlike [`list_flat`]'s own listing,
+/// which only ever under-reports what *could* be reclaimed when an entry is unreadable, an
+/// entry this function cannot even inspect might be exactly the lease that matters, so it is
+/// never simply skipped past — this function's whole contract is "any I/O failure here is
+/// treated as an active lease", and a directory-entry error is an I/O failure like any other.
 fn any_lease_active(cas_root: &Path, now: SystemTime) -> Result<bool> {
     let dir = leases_dir(cas_root);
     let entries = match fs::read_dir(&dir) {
@@ -226,7 +298,11 @@ fn any_lease_active(cas_root: &Path, now: SystemTime) -> Result<bool> {
         Err(e) => return Err(SnapshotError::io(&dir, e)),
     };
     for entry in entries {
-        let Ok(entry) = entry else { continue };
+        // Cannot even tell what this entry is: assume active rather than skip past it
+        // (finding 3) — see this function's own doc comment.
+        let Ok(entry) = entry else {
+            return Ok(true);
+        };
         let path = entry.path();
         if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
             continue;
@@ -408,6 +484,13 @@ pub struct SweepPlan {
     pub lease_active: bool,
     /// How many roots the plan was computed against, for the human summary.
     pub roots: usize,
+    /// How many otherwise-unreachable objects the grace period alone is holding back
+    /// right now (see the module doc comment's "grace period" section) — objects that
+    /// would appear in [`objects`](Self::objects) if [`plan`] were run again once each
+    /// has gone unreferenced/untouched for long enough. Surfaced explicitly, the same
+    /// way `lease_active` is, so `ward snapshot gc` can report "N object(s) held back by
+    /// the grace period" rather than a plan that merely looks smaller than expected.
+    pub held_by_grace_period: usize,
 }
 
 impl SweepPlan {
@@ -447,7 +530,11 @@ impl SweepReport {
 /// empty and skipping any single entry this process cannot fully inspect — see the
 /// module doc comment's "conservative by construction" section for why a listing
 /// failure degrades to "found nothing new here" rather than aborting the whole plan.
-fn list_flat(dir: &Path) -> Vec<(PathBuf, String, u64)> {
+/// The fourth element is the file's own last-modified time, an object's own birth
+/// (every category this crate writes is content-addressed and written exactly once) —
+/// see the module doc comment's "grace period" section for what [`plan`] uses it for;
+/// an entry whose mtime cannot be read is skipped exactly like one whose size cannot.
+fn list_flat(dir: &Path) -> Vec<(PathBuf, String, u64, SystemTime)> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(dir) else {
         return out;
@@ -464,13 +551,16 @@ fn list_flat(dir: &Path) -> Vec<(PathBuf, String, u64)> {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
-        out.push((entry.path(), name, meta.len()));
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        out.push((entry.path(), name, meta.len(), modified));
     }
     out
 }
 
 /// [`list_flat`] over `blobs/`'s two-level hex-prefix sharding.
-fn list_blobs(blobs_dir: &Path) -> Vec<(PathBuf, String, u64)> {
+fn list_blobs(blobs_dir: &Path) -> Vec<(PathBuf, String, u64, SystemTime)> {
     let mut out = Vec::new();
     let Ok(shards) = fs::read_dir(blobs_dir) else {
         return out;
@@ -486,6 +576,16 @@ fn list_blobs(blobs_dir: &Path) -> Vec<(PathBuf, String, u64)> {
         out.extend(list_flat(&shard.path()));
     }
     out
+}
+
+/// Whether `modified` is far enough in the past, relative to `now`, to have cleared
+/// `grace_period` (see the module doc comment's "grace period" section). `now` not
+/// actually being after `modified` — real clock skew, or a test deliberately passing an
+/// earlier `now` — is never treated as "old enough": whenever the arithmetic itself is
+/// in doubt, the conservative default is to protect the object, not reclaim it.
+fn is_old_enough(modified: SystemTime, now: SystemTime, grace_period: Duration) -> bool {
+    now.duration_since(modified)
+        .is_ok_and(|age| age >= grace_period)
 }
 
 /// Load the manifest for root `id`, as a `Result` rather than an `Option`: unlike a
@@ -505,16 +605,23 @@ fn load_root_manifest(cas_root: &Path, id: SnapshotId) -> Result<Manifest> {
     Ok(manifest)
 }
 
-/// Compute what a sweep of `cas_root` would reclaim, given `roots` and `now`. Never
+/// Compute what a sweep of `cas_root` would reclaim, given `roots` and `now`, subject to
+/// `options`'s grace period (see the module doc comment's "grace period" section). Never
 /// deletes anything itself — see [`apply`] for that. Fails only when the roots
 /// themselves could not be fully resolved (see the module doc comment); anything less
 /// than that degrades the plan rather than refusing it outright.
-pub fn plan(cas_root: &Path, roots: &RootSet, now: SystemTime) -> Result<SweepPlan> {
+pub fn plan(
+    cas_root: &Path,
+    roots: &RootSet,
+    now: SystemTime,
+    options: &GcOptions,
+) -> Result<SweepPlan> {
     let lease_active = any_lease_active(cas_root, now)?;
     let mut out = SweepPlan {
         objects: Vec::new(),
         lease_active,
         roots: roots.len(),
+        held_by_grace_period: 0,
     };
     if lease_active {
         return Ok(out);
@@ -533,22 +640,27 @@ pub fn plan(cas_root: &Path, roots: &RootSet, now: SystemTime) -> Result<SweepPl
         }
     }
 
-    for (path, name, bytes) in list_flat(&cas_root.join("manifests")) {
+    for (path, name, bytes, modified) in list_flat(&cas_root.join("manifests")) {
         let Ok(digest) = Digest::from_hex(&name) else {
             continue; // not one of our manifest files; leave it alone
         };
         let id = SnapshotId(digest);
-        if !roots.contains(&id) {
-            out.objects.push(PlannedObject {
-                path,
-                bytes,
-                category: Category::Manifest,
-                label: id.to_string(),
-            });
+        if roots.contains(&id) {
+            continue;
         }
+        if !is_old_enough(modified, now, options.grace_period) {
+            out.held_by_grace_period += 1;
+            continue;
+        }
+        out.objects.push(PlannedObject {
+            path,
+            bytes,
+            category: Category::Manifest,
+            label: id.to_string(),
+        });
     }
 
-    for (path, name, bytes) in list_flat(&cas_root.join("meta")) {
+    for (path, name, bytes, modified) in list_flat(&cas_root.join("meta")) {
         // `<hex>.<role>.json`; only the id half decides liveness (see the module doc
         // comment: keep every role recorded for a live id, not just the role a
         // particular root happens to remember).
@@ -559,28 +671,38 @@ pub fn plan(cas_root: &Path, roots: &RootSet, now: SystemTime) -> Result<SweepPl
             continue;
         };
         let id = SnapshotId(digest);
-        if !roots.contains(&id) {
-            out.objects.push(PlannedObject {
-                path,
-                bytes,
-                category: Category::Meta,
-                label: name,
-            });
+        if roots.contains(&id) {
+            continue;
         }
+        if !is_old_enough(modified, now, options.grace_period) {
+            out.held_by_grace_period += 1;
+            continue;
+        }
+        out.objects.push(PlannedObject {
+            path,
+            bytes,
+            category: Category::Meta,
+            label: name,
+        });
     }
 
-    for (path, name, bytes) in list_blobs(&cas_root.join("blobs")) {
+    for (path, name, bytes, modified) in list_blobs(&cas_root.join("blobs")) {
         let Ok(digest) = Digest::from_hex(&name) else {
             continue;
         };
-        if !live_blobs.contains(&digest) {
-            out.objects.push(PlannedObject {
-                path,
-                bytes,
-                category: Category::Blob,
-                label: digest.to_string(),
-            });
+        if live_blobs.contains(&digest) {
+            continue;
         }
+        if !is_old_enough(modified, now, options.grace_period) {
+            out.held_by_grace_period += 1;
+            continue;
+        }
+        out.objects.push(PlannedObject {
+            path,
+            bytes,
+            category: Category::Blob,
+            label: digest.to_string(),
+        });
     }
 
     Ok(out)
@@ -642,6 +764,18 @@ mod tests {
         (cas, dir.to_path_buf())
     }
 
+    /// [`GcOptions`] with no grace period at all: every test above this section is about
+    /// reachability/lease behavior, not the grace period itself, and was written before
+    /// the grace period existed against objects created moments before `plan` runs — with
+    /// the real default grace period, every one of those objects would still be "too
+    /// young" by the time the test calls `plan`. This keeps them exercising exactly what
+    /// they always did; the grace period itself gets its own dedicated tests below.
+    fn no_grace() -> GcOptions {
+        GcOptions {
+            grace_period: Duration::ZERO,
+        }
+    }
+
     #[test]
     fn a_blob_unreferenced_by_any_root_is_planned_and_swept() {
         let dir = tempfile::tempdir().unwrap();
@@ -661,7 +795,7 @@ mod tests {
         let mut roots = RootSet::new();
         roots.insert(id);
         let now = SystemTime::now();
-        let p = plan(&root, &roots, now).unwrap();
+        let p = plan(&root, &roots, now, &no_grace()).unwrap();
         assert!(!p.lease_active);
         assert_eq!(p.objects.len(), 1, "only the unreferenced blob: {p:?}");
         assert_eq!(p.objects[0].category, Category::Blob);
@@ -684,7 +818,7 @@ mod tests {
         let now = SystemTime::now();
         let _lease = LeaseGuard::acquire_capture_at(&root, now, DEFAULT_CAPTURE_LEASE_TTL).unwrap();
 
-        let p = plan(&root, &RootSet::new(), now).unwrap();
+        let p = plan(&root, &RootSet::new(), now, &no_grace()).unwrap();
         assert!(p.lease_active);
         assert!(p.is_empty());
         assert!(cas.has_blob(d));
@@ -701,7 +835,7 @@ mod tests {
         let d = cas.put_blob(b"about to be protected").unwrap();
         let now = SystemTime::now();
 
-        let p = plan(&root, &RootSet::new(), now).unwrap();
+        let p = plan(&root, &RootSet::new(), now, &no_grace()).unwrap();
         assert!(!p.lease_active);
         assert_eq!(
             p.objects.len(),
@@ -727,7 +861,7 @@ mod tests {
         let a = cas.put_blob(b"first dead blob").unwrap();
         let b = cas.put_blob(b"second dead blob").unwrap();
         let now = SystemTime::now();
-        let p = plan(&root, &RootSet::new(), now).unwrap();
+        let p = plan(&root, &RootSet::new(), now, &no_grace()).unwrap();
         assert_eq!(p.objects.len(), 2);
 
         // Deterministic interleaving via the hook, not a thread or a sleep: acquire a
@@ -760,13 +894,13 @@ mod tests {
         let lease = LeaseGuard::acquire_capture_at(&root, t0, ttl).unwrap();
 
         // At t0 the lease is active: plan must be empty.
-        let still_active = plan(&root, &RootSet::new(), t0).unwrap();
+        let still_active = plan(&root, &RootSet::new(), t0, &no_grace()).unwrap();
         assert!(still_active.lease_active);
 
         // At t0 + 2*ttl the very same on-disk lease has expired — judged purely from
         // its own recorded expiry against the `now` passed in, never a real sleep.
         let later = t0 + ttl * 2;
-        let after_expiry = plan(&root, &RootSet::new(), later).unwrap();
+        let after_expiry = plan(&root, &RootSet::new(), later, &no_grace()).unwrap();
         assert!(!after_expiry.lease_active);
         assert_eq!(after_expiry.objects.len(), 1);
 
@@ -790,7 +924,7 @@ mod tests {
         let mut roots = RootSet::new();
         roots.insert(phantom);
 
-        let result = plan(&root, &roots, SystemTime::now());
+        let result = plan(&root, &roots, SystemTime::now(), &no_grace());
         assert!(
             result.is_err(),
             "an unresolvable root must refuse the whole plan, not silently drop it"
@@ -815,7 +949,7 @@ mod tests {
         .unwrap();
 
         let now = SystemTime::now();
-        let empty_roots = plan(&root, &RootSet::new(), now).unwrap();
+        let empty_roots = plan(&root, &RootSet::new(), now, &no_grace()).unwrap();
         assert_eq!(
             empty_roots.objects.len(),
             2,
@@ -824,7 +958,7 @@ mod tests {
 
         let mut roots = RootSet::new();
         roots.insert(id);
-        let rooted = plan(&root, &roots, now).unwrap();
+        let rooted = plan(&root, &roots, now, &no_grace()).unwrap();
         assert!(
             rooted.is_empty(),
             "rooted, so neither is planned: {rooted:?}"
@@ -844,7 +978,7 @@ mod tests {
         assert!(kept.contains(&id));
         assert_eq!(kept.len(), 1);
 
-        let p = plan(&root, &kept, SystemTime::now()).unwrap();
+        let p = plan(&root, &kept, SystemTime::now(), &no_grace()).unwrap();
         assert!(p.is_empty(), "a kept id must be treated as a root: {p:?}");
 
         unmark_kept(&root, id).unwrap();
@@ -863,8 +997,145 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let before: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert!(before.is_empty(), "fixture must start empty");
-        let p = plan(dir.path(), &RootSet::new(), SystemTime::now()).unwrap();
+        let p = plan(dir.path(), &RootSet::new(), SystemTime::now(), &no_grace()).unwrap();
         assert!(p.is_empty());
         assert!(!p.lease_active);
+    }
+
+    // -----------------------------------------------------------------------------
+    // Grace period (review of #229, finding 1; also covers finding 2 for free)
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn default_gc_options_use_the_documented_default_grace_period() {
+        assert_eq!(GcOptions::default().grace_period, DEFAULT_GC_GRACE_PERIOD);
+    }
+
+    #[test]
+    fn a_freshly_unrooted_blob_survives_within_the_grace_period_but_is_reclaimed_once_it_elapses() {
+        // The finding 1 shape: an object with no root and no lease, but young — exactly
+        // what a verification attempt's candidate looks like the instant
+        // `AttemptGuard::finish()` removes its marker, before an external `ward evidence
+        // append` has had a chance to run. `now` here plays the role of the caller-supplied
+        // clock the rest of this module already threads through everywhere; nothing here
+        // sleeps for real.
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, root) = cas_at(dir.path());
+        let dead = cas.put_blob(b"just lost its only root").unwrap();
+        let t0 = SystemTime::now(); // ~ the blob's own real mtime, set at put_blob above
+        let options = GcOptions {
+            grace_period: Duration::from_secs(30 * 60),
+        };
+
+        let still_young = plan(&root, &RootSet::new(), t0, &options).unwrap();
+        assert!(
+            still_young.is_empty(),
+            "too young to reclaim yet: {still_young:?}"
+        );
+        assert_eq!(
+            still_young.held_by_grace_period, 1,
+            "held back by the grace period, not by a root or a lease"
+        );
+
+        // Applying the still-too-young plan must delete nothing (it is empty), and the
+        // blob must still be there for a later `plan` to find once the grace period has
+        // actually elapsed.
+        let report = apply(&root, &still_young, t0).unwrap();
+        assert!(report.deleted.is_empty());
+        assert!(
+            cas.has_blob(dead),
+            "must survive while still within the grace period"
+        );
+
+        // Well past the grace period, judged purely against the `now` passed in — the
+        // same "no real sleep needed" shape every other time-based scenario in this
+        // module already uses.
+        let later = t0 + options.grace_period + Duration::from_secs(1);
+        let now_old_enough = plan(&root, &RootSet::new(), later, &options).unwrap();
+        assert_eq!(now_old_enough.objects.len(), 1, "{now_old_enough:?}");
+        assert_eq!(now_old_enough.held_by_grace_period, 0);
+
+        let report = apply(&root, &now_old_enough, later).unwrap();
+        assert_eq!(report.deleted.len(), 1);
+        assert!(!cas.has_blob(dead));
+    }
+
+    #[test]
+    fn a_manifest_that_just_lost_its_root_is_protected_by_the_grace_period() {
+        // The same mitigation, for the manifest category rather than a blob — a
+        // verification candidate's own manifest is exactly what stops being rooted the
+        // instant an attempt marker is removed.
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, root) = cas_at(dir.path());
+        let manifest = Manifest::from_entries(Vec::new()).unwrap();
+        let id = cas.put_manifest(&manifest).unwrap();
+        let t0 = SystemTime::now();
+        let options = GcOptions {
+            grace_period: Duration::from_secs(30 * 60),
+        };
+
+        // Rooted: not planned regardless of age.
+        let mut roots = RootSet::new();
+        roots.insert(id);
+        let rooted = plan(&root, &roots, t0, &options).unwrap();
+        assert!(rooted.is_empty());
+
+        // The root is dropped (e.g. `AttemptGuard::finish()` removed the only marker
+        // naming this candidate) — immediately after, at the very same `now`, the grace
+        // period alone must still protect it.
+        let just_unrooted = plan(&root, &RootSet::new(), t0, &options).unwrap();
+        assert!(
+            just_unrooted.is_empty(),
+            "just unrooted, still within the grace period: {just_unrooted:?}"
+        );
+        assert_eq!(just_unrooted.held_by_grace_period, 1);
+
+        // Once the grace period has elapsed with no root having reappeared, it is
+        // reclaimed exactly as before this fix.
+        let later = t0 + options.grace_period + Duration::from_secs(1);
+        let after_grace = plan(&root, &RootSet::new(), later, &options).unwrap();
+        assert_eq!(after_grace.objects.len(), 1);
+        let report = apply(&root, &after_grace, later).unwrap();
+        assert_eq!(report.deleted.len(), 1);
+    }
+
+    #[test]
+    fn a_root_reappearing_within_the_grace_period_protects_the_object_from_then_on() {
+        // The intended happy path this mitigation exists for: an external `ward evidence
+        // append` (or, for finding 2, the capture's own caller durably recording its
+        // fresh root) lands well within the grace period, and the object is never even
+        // momentarily eligible for deletion once that root is in place.
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, root) = cas_at(dir.path());
+        let manifest = Manifest::from_entries(Vec::new()).unwrap();
+        let id = cas.put_manifest(&manifest).unwrap();
+        let t0 = SystemTime::now();
+        let options = GcOptions {
+            grace_period: Duration::from_secs(30 * 60),
+        };
+
+        // Briefly unrooted (protected by the grace period)...
+        let unrooted = plan(&root, &RootSet::new(), t0, &options).unwrap();
+        assert!(unrooted.is_empty());
+
+        // ...then re-rooted (the evidence-append landed) well before the grace period
+        // would otherwise have elapsed.
+        let mut roots = RootSet::new();
+        roots.insert(id);
+        let later = t0 + options.grace_period + Duration::from_secs(1);
+        let rooted_again = plan(&root, &roots, later, &options).unwrap();
+        assert!(
+            rooted_again.is_empty(),
+            "a root recorded in time protects the object regardless of its age: {rooted_again:?}"
+        );
+    }
+
+    #[test]
+    fn zero_grace_period_reproduces_the_pre_mitigation_immediate_reclaim_behavior() {
+        // `no_grace()` is exactly this — documented here explicitly so the equivalence
+        // this whole test module leans on (every pre-existing test above still exercises
+        // the original reachability/lease logic unchanged) is itself asserted, not just
+        // assumed.
+        assert_eq!(no_grace().grace_period, Duration::ZERO);
     }
 }

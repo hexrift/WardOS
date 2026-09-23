@@ -143,6 +143,18 @@ impl SnapshotStore {
     /// gets to record the resulting id, as a retention root, once this call returns — so
     /// without the lease a concurrent sweep computing its plan in that exact window would
     /// see an ordinary unreferenced blob and correctly, but wrongly, plan to reclaim it.
+    ///
+    /// The lease is released below, inside this call, *before* the caller ever gets the
+    /// returned id back — so there is still a narrow handoff gap (a handful of syscalls)
+    /// between that release and whatever durable root the caller goes on to record for it
+    /// (review of #229, finding 2). Every caller of `capture_with` (directly or through
+    /// [`Self::store_snapshot`]/[`Self::capture`]/[`Self::capture_with_cache`]) relies on
+    /// [`gc::plan`]'s own grace period — see that module's doc comment — to cover exactly
+    /// this gap: a freshly-captured object is, by construction, younger than any reasonable
+    /// grace period, so a sweep can never observe it as both unrooted and old enough to
+    /// reclaim in that window. This is not a separate guarantee from the one finding 1's
+    /// review names; it is the same mechanism, and this is deliberately the only place that
+    /// needs to say so.
     pub fn capture_with(
         &self,
         backend: &dyn Backend,

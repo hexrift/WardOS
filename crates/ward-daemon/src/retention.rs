@@ -29,7 +29,7 @@
 use std::path::Path;
 
 use ward_events::{LogReader, WardEvent};
-use ward_snapshot::gc::{RootSet, SweepPlan, SweepReport};
+use ward_snapshot::gc::{GcOptions, RootSet, SweepPlan, SweepReport};
 
 use crate::attempt::candidate_snapshot_ids;
 use crate::error::{Error, Result};
@@ -150,10 +150,11 @@ pub fn roots(state: &Path) -> Result<RootSet> {
 }
 
 /// Compute what a sweep of `<state>/cas` would reclaim right now, against the roots
-/// [`roots`] builds. Never deletes anything — see [`apply`].
-pub fn plan(state: &Path, now: std::time::SystemTime) -> Result<SweepPlan> {
+/// [`roots`] builds, subject to `options`'s grace period (`ward_snapshot::gc`'s own module
+/// doc comment — review of #229, finding 1). Never deletes anything — see [`apply`].
+pub fn plan(state: &Path, now: std::time::SystemTime, options: &GcOptions) -> Result<SweepPlan> {
     let roots = roots(state)?;
-    ward_snapshot::gc::plan(&cas_root(state), &roots, now)
+    ward_snapshot::gc::plan(&cas_root(state), &roots, now, options)
         .map_err(|e| Error::Snapshot(e.to_string()))
 }
 
@@ -306,6 +307,61 @@ mod tests {
     }
 
     #[test]
+    fn a_candidate_whose_attempt_just_finished_survives_a_sweep_within_the_grace_period() {
+        // The exact scenario review of #229's finding 1 describes end to end: a
+        // verification attempt finishes, `AttemptGuard::finish()` removes the only root
+        // that protected its candidate, and nothing has appended `StateAccepted` evidence
+        // for it yet (that is TamperWard's own separate, external `ward evidence append`
+        // step, entirely out of process here). Before the grace-period mitigation this
+        // would be immediately eligible for a sweep; now it must survive at least the
+        // grace period regardless.
+        let state = tempfile::tempdir().unwrap();
+        let entry = store_snapshot(state.path());
+        let candidate = store_snapshot(state.path());
+        write_session(state.path(), "sess_attempt_grace", entry);
+        let dir = session_dir(state.path(), "sess_attempt_grace");
+        let guard = crate::attempt::AttemptGuard::start(
+            &dir,
+            ward_events::AttemptId::new(1),
+            ward_events::VerifyRequester::User,
+        )
+        .unwrap();
+        guard.bind_candidate(candidate.to_string().parse().unwrap());
+        guard.finish(); // the marker — the candidate's only root — is now gone
+
+        assert!(
+            !roots(state.path()).unwrap().contains(&candidate),
+            "sanity: the candidate really is unrooted now"
+        );
+
+        let now = SystemTime::now();
+        let options = GcOptions {
+            grace_period: std::time::Duration::from_secs(30 * 60),
+        };
+        let plan_immediately = plan(state.path(), now, &options).unwrap();
+        assert!(
+            !plan_immediately
+                .objects
+                .iter()
+                .any(|o| o.label == candidate.to_string()),
+            "the grace period must protect the just-unrooted candidate: {plan_immediately:?}"
+        );
+
+        // Well past the grace period, with no evidence ever having been appended for it,
+        // the candidate is finally reclaimable — the mitigation bounds the window, it
+        // does not hold the object forever.
+        let later = now + options.grace_period + std::time::Duration::from_secs(1);
+        let plan_later = plan(state.path(), later, &options).unwrap();
+        assert!(
+            plan_later
+                .objects
+                .iter()
+                .any(|o| o.label == candidate.to_string()),
+            "past the grace period with no replacement root, it is reclaimable again: {plan_later:?}"
+        );
+    }
+
+    #[test]
     fn kept_ids_are_included() {
         let state = tempfile::tempdir().unwrap();
         let id = store_snapshot(state.path());
@@ -327,10 +383,16 @@ mod tests {
             ward_snapshot::CaptureOptions::default(),
         )
         .unwrap();
-        // No session references it at all: fully reclaimable.
-
+        // No session references it at all: fully reclaimable — once past the grace
+        // period `ward_snapshot::gc::plan` now applies (review of #229, finding 1); a
+        // zero grace period here reproduces this test's original immediate-reclaim
+        // expectation, since it is about the daemon's root-building wrapper, not the
+        // grace period itself (which has its own dedicated tests in `ward_snapshot::gc`).
         let now = SystemTime::now();
-        let p = plan(state.path(), now).unwrap();
+        let options = GcOptions {
+            grace_period: std::time::Duration::ZERO,
+        };
+        let p = plan(state.path(), now, &options).unwrap();
         assert!(!p.is_empty(), "the unreferenced snapshot must be planned");
         let report = apply(state.path(), &p, now).unwrap();
         assert_eq!(report.deleted.len(), p.objects.len());
