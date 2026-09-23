@@ -16,7 +16,7 @@
 //! substantial follow-ups of their own (the second needs the same disposable-sandbox
 //! machinery `ward verify` already owns) and are left for later PRs against #147.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::doctor::Status;
 use crate::verify;
@@ -182,7 +182,7 @@ pub fn check(dir: &Path) -> Report {
     let unavailable = config.is_none();
     rows.push(verify_row);
     if let Some(config) = &config {
-        rows.push(runtime_row(&config.verify.command));
+        rows.push(runtime_row(dir, &config.verify.command));
         rows.push(protected_row(dir, config));
     }
     Report {
@@ -274,33 +274,102 @@ fn verify_row(dir: &Path) -> (Row, Option<verify::Config>) {
     }
 }
 
-/// Whether the binary the *configured* `verify.command` would actually invoke —
-/// its first whitespace-separated token, the same word a shell resolves against
-/// `PATH` to start it — is on `PATH`. Checked against the real command, not
-/// guessed from the project manifest: a Cargo project configured to run `npm
-/// test` is checked against `npm`, and one running a custom `bash scripts/…` is
-/// checked against `bash`, not against `cargo` either way.
+/// Shell metacharacters whose presence means `verify.command` is not a single
+/// simple command: pipelines and lists (`|`, `&`, `;`), substitution (`` ` ``,
+/// `$(`), and redirection (`<`, `>`). A command containing any of these has no
+/// single "the program" this check can name with confidence, so [`runtime_row`]
+/// reports it indeterminate rather than guessing at a piece of it — `cd subdir &&
+/// cargo test` must not be judged runnable or not by probing `cd`.
+const SHELL_METACHARACTERS: &[&str] = &["|", "&", ";", "`", "$("];
+
+/// Builtins and keywords a shell resolves itself, never via `PATH`, so `which`
+/// would wrongly report them absent. Deliberately small: only ones in common use
+/// at the start of a verify command that do not also exist as a real binary on a
+/// typical system (`true`, `test`, `[` usually do and are left to the `PATH`
+/// check, which finds them correctly either way).
+const SHELL_BUILTINS: &[&str] = &[
+    "cd", "exec", "eval", "export", "unset", "set", "shift", "source", ".", ":", "type", "alias",
+    "unalias", "trap", "wait", "return",
+];
+
+/// Whether `token` is a POSIX environment-variable assignment prefix (`NAME=value`,
+/// e.g. `FOO=bar` in `FOO=bar cargo test`) rather than the command itself.
+fn is_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether the binary the *configured* `verify.command` would actually invoke is
+/// available — checked against the real command, not guessed from the project
+/// manifest, so a Cargo project configured to run `npm test` is checked against
+/// `npm`, and one running a custom `bash scripts/…` is checked against `bash`, not
+/// against `cargo` either way.
 ///
-/// A command whose first token is a shell builtin or keyword (`cd`, `if`, …) has
-/// no `PATH` entry to find; this reports it as a plain, potentially misleading
-/// "not found" rather than trying to special-case shell grammar. `ward init`
-/// never writes a command shaped like that, so it does not affect the common
-/// path this preflight is for.
-fn runtime_row(command: &str) -> Row {
-    let Some(first) = command.split_whitespace().next() else {
+/// Deliberately narrow: only a single simple command — optionally prefixed with
+/// `NAME=value` assignments, as `FOO=bar cargo test` is — is resolved. A command
+/// containing shell metacharacters ([`SHELL_METACHARACTERS`]: pipelines, lists,
+/// substitution, redirection) or led by a shell builtin ([`SHELL_BUILTINS`]) is
+/// reported indeterminate rather than misjudged: no PATH search can tell whether
+/// `cd subdir && cargo test` is runnable without a real shell. A path candidate
+/// (containing `/`, e.g. `./scripts/verify.sh`) is resolved against `dir` — the
+/// verifier's own working directory — not against the process's `PATH`, matching
+/// where the verifier actually looks for it.
+fn runtime_row(dir: &Path, command: &str) -> Row {
+    if let Some(op) = SHELL_METACHARACTERS.iter().find(|op| command.contains(*op)) {
         return Row::new(
             "runtime",
             Status::Warn,
-            "verify.command is blank; cannot determine a runtime",
+            format!("verify.command contains `{op}`; runtime availability not verified"),
+        );
+    }
+    let Some(candidate) = command.split_whitespace().find(|t| !is_assignment(t)) else {
+        return Row::new(
+            "runtime",
+            Status::Warn,
+            "verify.command is blank or only environment assignments; cannot determine a runtime",
         );
     };
-    if crate::doctor::which(first).is_some() {
-        Row::new("runtime", Status::Ok, format!("{first} on PATH"))
+    if SHELL_BUILTINS.contains(&candidate) {
+        return Row::new(
+            "runtime",
+            Status::Warn,
+            format!(
+                "verify.command starts with the shell builtin `{candidate}`; runtime availability not verified"
+            ),
+        );
+    }
+    if candidate.contains('/') {
+        let path = if Path::new(candidate).is_absolute() {
+            PathBuf::from(candidate)
+        } else {
+            dir.join(candidate)
+        };
+        return if path.is_file() {
+            Row::new("runtime", Status::Ok, format!("{candidate} present"))
+        } else {
+            Row::new(
+                "runtime",
+                Status::Fail,
+                format!(
+                    "{candidate} not found relative to the project; fix the path before `ward verify` can run"
+                ),
+            )
+        };
+    }
+    if crate::doctor::which(candidate).is_some() {
+        Row::new("runtime", Status::Ok, format!("{candidate} on PATH"))
     } else {
         Row::new(
             "runtime",
             Status::Fail,
-            format!("{first} not found on PATH; install it before `ward verify` can run"),
+            format!("{candidate} not found on PATH; install it before `ward verify` can run"),
         )
     }
 }
@@ -495,6 +564,81 @@ mod tests {
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert!(row.detail.contains("bash"), "{}", row.detail);
         assert!(!row.detail.contains("cargo"), "{}", row.detail);
+    }
+
+    #[test]
+    fn runtime_skips_a_leading_environment_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: FOO=bar cargo test\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        // `cargo` is genuinely on PATH in this build's own environment (it is what
+        // ran this test), so a correct implementation resolves past `FOO=bar` to a
+        // real Ok, not a Fail against the literal token `FOO=bar`.
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert!(row.detail.contains("cargo"), "{}", row.detail);
+        assert!(!row.detail.contains("FOO"), "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_resolves_a_project_relative_executable_against_the_project_not_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "scripts/verify.sh", "#!/bin/sh\ntrue\n");
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: ./scripts/verify.sh\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+
+        // The same relative path, absent, is a real Fail — not silently ignored.
+        let missing = tempfile::tempdir().unwrap();
+        write(
+            missing.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: ./scripts/verify.sh\n",
+        );
+        let report = check(missing.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_a_compound_command_indeterminate_rather_than_probing_a_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cd subdir && cargo test\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        // Neither a false Ok nor a false Fail: `cd` is a shell builtin with no PATH
+        // entry, and the command as a whole is a list (`&&`), not a single program.
+        assert_eq!(row.status, Status::Warn, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_a_bare_assignment_indeterminate() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: FOO=bar\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Warn, "{}", row.detail);
     }
 
     #[test]
