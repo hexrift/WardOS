@@ -164,6 +164,67 @@ if kill -0 "$(cat "$TMP/worker-pid")" 2>/dev/null; then
   fail "the worker was still alive when --watch --once returned"
 fi
 
+# --- sweep_run_dir: a killed answer is reaped before its worker is stopped, so
+# neither is alive the instant sweep_run_dir returns (#226 review, exact-head
+# 1a5865f) ------------------------------------------------------------------------
+# The --watch --once case above checks only after the whole command has unwound,
+# by which point the system reaper has usually collected an orphaned answer — it
+# passed against the racy ordering. This checks at the exact return of the real
+# sweep_run_dir (loaded from the script itself, not a copy), repeated because the
+# race is a scheduling one: KILL the answer, then stop its worker before the
+# worker's own `wait "$answer_pid"` has reaped it, and the answer is orphaned
+# still alive. The answer ignores TERM so every round goes through the KILL
+# escalation, the path the race lives on.
+eval "$(sed -n '/^wait_deadline() {$/,/^}$/p; /^stop_answers() {$/,/^}$/p; /^sweep_run_dir() {$/,/^}$/p' "$approve")"
+for round in 1 2 3; do
+  run_dir=$(mktemp -d "$TMP/sweep.XXXXXX")
+  sweep_worker() {
+    local worker_file=$run_dir/k.worker answer_file=$run_dir/k.answer answer_pid=""
+    trap 'rm -f "$worker_file" "$answer_file"' RETURN
+    # The same TERM handling notify_one itself has: stop and reap its own answer.
+    trap '
+      if [[ -n ${answer_pid:-} ]]; then
+        kill "$answer_pid" 2>/dev/null || true
+        wait_deadline "$answer_pid" 1
+        kill -0 "$answer_pid" 2>/dev/null && kill -KILL "$answer_pid" 2>/dev/null
+        wait "$answer_pid" 2>/dev/null || true
+      fi
+      exit 143
+    ' TERM
+    printf '%s\n' "$BASHPID" >"$worker_file"
+    bash -c 'trap "" TERM; exec sleep 20' &
+    answer_pid=$!
+    printf '%s\n' "$answer_pid" >"$answer_file"
+    wait "$answer_pid" 2>/dev/null || true
+  }
+  sweep_worker &
+  for _ in $(seq 100); do [[ -s $run_dir/k.answer ]] && break; sleep 0.02; done
+  answer_pid=$(cat "$run_dir/k.answer")
+  worker_pid=$(cat "$run_dir/k.worker")
+  # Model a worker that has not yet resumed from its own `wait` when its answer is
+  # killed (the reviewer's scenario — descheduled, not merely busy: bash reaps a
+  # finished child from its SIGCHLD handling whenever it runs at all). Hold the
+  # worker stopped across the answer's TERM grace and KILL, and let it run again
+  # shortly after. Stopping the worker in that gap (the old ordering) leaves a
+  # TERM pending that kills it the instant it resumes, before it can reap, so the
+  # answer is orphaned; waiting for the reap first (stop_answers) lets the resumed
+  # worker reap it normally.
+  kill -STOP "$worker_pid"
+  ( sleep 1.4; kill -CONT "$worker_pid" 2>/dev/null ) &
+  resume_pid=$!
+  sweep_run_dir
+  wait "$resume_pid" 2>/dev/null || true
+  if kill -0 "$answer_pid" 2>/dev/null; then
+    kill -KILL "$answer_pid" 2>/dev/null || true
+    fail "round $round: the answer was still alive when sweep_run_dir returned"
+  fi
+  if kill -0 "$worker_pid" 2>/dev/null; then
+    fail "round $round: the worker was still alive when sweep_run_dir returned"
+  fi
+  rm -rf "$run_dir"
+done
+unset -v run_dir answer_pid worker_pid resume_pid
+
 # --- --watch: notifier_loop's own .worker reservation never races notify_one's
 # RETURN trap into recreating a stale marker for an already-finished pid (#226
 # review) --------------------------------------------------------------------------

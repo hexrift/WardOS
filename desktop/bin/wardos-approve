@@ -600,6 +600,29 @@ wait_for_notifiers() {
   return 0
 }
 
+# Stop every still-tracked `ward session approve` call: TERM, a bounded grace, then
+# KILL — and after each, wait (bounded) until the pid is actually gone, not merely
+# signalled. The answer is this shell's *grandchild* through its worker, so this
+# cannot wait() on it directly; a signalled answer stays visible to `kill -0` until
+# its worker reaps it from its own `wait "$answer_pid"`, and wait_deadline polls for
+# exactly that. sweep_run_dir leaves the workers alone until this returns, so each
+# worker is still there to do the reaping.
+stop_answers() {
+  local answer_file pid
+  for answer_file in "$run_dir"/*.answer; do
+    [[ -f $answer_file ]] || continue
+    pid=$(cat "$answer_file" 2>/dev/null || true)
+    rm -f "$answer_file"
+    [[ -n $pid ]] || continue
+    kill "$pid" 2>/dev/null || true
+    wait_deadline "$pid" 1
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+      wait_deadline "$pid" 1
+    fi
+  done
+}
+
 # Whatever is still tracked once that grace window has passed did not get a
 # terminal record through the ordinary path (the daemon crashed or the connection
 # dropped mid-stream, not a clean seal — a clean seal gives every still-open
@@ -621,56 +644,39 @@ sweep_run_dir() {
   # afterwards) — this has to actually confirm each one is gone before returning,
   # not just have asked.
   #
-  # A worker still tracked here is only ever signalled directly, never its answer
-  # call: the answer call is this shell's *grandchild* through the worker, not a
-  # direct child of the shell running this function — bash can only wait() on its
-  # own children, so this could only ever signal it, never actually join it, and
-  # doing that as an operation independent of (and, worse, ordered before) the
-  # worker's own termination is exactly how an already-killed answer call can
-  # still outlive a worker that was simply terminated out from under it before
-  # its own reap of that answer call had actually completed (#226 review,
-  # confirmed independently: an isolated repro of that exact ordering — kill the
-  # answer, then separately kill-and-join the worker right after — left the
-  # answer pid still alive after the worker had already been joined). The
-  # worker's own TERM trap (notify_one, above) is what reaps its answer call, if
-  # it has one in flight, before it can itself die from this signal; this only
-  # has to actually confirm the worker itself is gone.
-  local worker_file answer_file pid
+  # Answers first, and completely first: stop_answers returns only once each
+  # answer is actually gone — reaped by its own worker's `wait "$answer_pid"` —
+  # so no worker is ever stopped while its killed answer is still unreaped.
+  # Stopping a worker in that gap, or escalating it to KILL while its own TERM
+  # trap (notify_one, above) is still reaping, orphans the answer alive past this
+  # function's return (#226 review; reproduced by approve.test.sh with a worker
+  # held descheduled across the answer's escalation).
+  stop_answers
+  local worker_file pid
   for worker_file in "$run_dir"/*.worker; do
     [[ -f $worker_file ]] || continue
     pid=$(cat "$worker_file" 2>/dev/null || true)
-    # notify_one's own TERM trap does not remove these — it calls `exit`
-    # directly, past the RETURN trap that ordinarily would — so this removes
-    # both, the same pair notify_one's own RETURN trap would have.
-    rm -f "$worker_file" "${worker_file%.worker}.answer"
+    # notify_one's own TERM trap exits past its RETURN trap, so its marker is
+    # removed here instead.
+    rm -f "$worker_file"
     [[ -n $pid ]] || continue
     kill "$pid" 2>/dev/null || true
-    # Bounded generously past the worker's own internal answer-reaping budget
-    # (2s here against notify_one's own ~1s trap budget above): escalating to
-    # KILL on the worker before ITS OWN reap of its answer call has finished
-    # would just be the exact same problem this whole design exists to avoid,
-    # one level up.
+    # Its answer is already gone (stop_answers, above), so notify_one's TERM trap
+    # has nothing left to reap and exits at once; the bound is generous only as a
+    # backstop for a worker that is itself descheduled.
     wait_deadline "$pid" 2
     if kill -0 "$pid" 2>/dev/null; then
       kill -KILL "$pid" 2>/dev/null || true
     fi
+    # The worker *is* this shell's direct child (notifier_loop backgrounds it in
+    # this same process), so it can — and must — actually be joined: that reaps it
+    # for real rather than leaving a signalled-but-unreaped pid behind.
     wait "$pid" 2>/dev/null || true
   done
-  # Defense in depth only: reached when an answer call's own worker died some
-  # other way without ever reaching the loop above to delegate to (so nothing
-  # else was ever going to reap this) — an ordinary round never leaves one of
-  # these behind on its own.
-  for answer_file in "$run_dir"/*.answer; do
-    [[ -f $answer_file ]] || continue
-    pid=$(cat "$answer_file" 2>/dev/null || true)
-    rm -f "$answer_file"
-    [[ -n $pid ]] || continue
-    kill "$pid" 2>/dev/null || true
-    wait_deadline "$pid" 1
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -KILL "$pid" 2>/dev/null || true
-    fi
-  done
+  # A worker that recorded an answer only after stop_answers ran, and was then
+  # stopped above before its own traps finished, leaves that answer listed: stop
+  # it too (the system's reaper collects it now that its worker is gone).
+  stop_answers
 }
 
 follow_once() {
