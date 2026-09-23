@@ -83,6 +83,21 @@ pub struct PauseResult {
     pub unsettled: Option<u32>,
 }
 
+/// Before this type existed, `ward_daemon::client::pause` returned a bare
+/// [`EventRecord`] directly — callers (including this crate's own bubblewrap-gated
+/// `e2e.rs`, a TamperWard-protected fixture under `crates/**/tests/**`) read its
+/// fields straight off the result (`paused.event`). This lets that field access
+/// keep working unchanged through autoderef, so wrapping the record to carry
+/// `unsettled` alongside it is a purely additive change to every existing caller,
+/// not a breaking one.
+impl std::ops::Deref for PauseResult {
+    type Target = EventRecord;
+
+    fn deref(&self) -> &EventRecord {
+        &self.record
+    }
+}
+
 /// `ward pause`: the daemon pauses the session as one operation (ADR-0019 §3)
 /// and answers with the `SessionPaused` record, plus whether the freeze itself
 /// was confirmed.
