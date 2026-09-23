@@ -38,6 +38,7 @@ pub mod backend;
 mod capture;
 mod cas;
 mod error;
+pub mod gc;
 mod id;
 mod ignore;
 mod manifest;
@@ -135,6 +136,13 @@ impl SnapshotStore {
     }
 
     /// Capture using an explicit [`Backend`] (the seam for a future Btrfs path).
+    ///
+    /// Holds a [`gc::LeaseGuard`] for the whole span of the capture (#151 item 3): from
+    /// before the first blob is written to after the manifest and its metadata are
+    /// stored. Nothing durable references any of it yet at that point — the caller only
+    /// gets to record the resulting id, as a retention root, once this call returns — so
+    /// without the lease a concurrent sweep computing its plan in that exact window would
+    /// see an ordinary unreferenced blob and correctly, but wrongly, plan to reclaim it.
     pub fn capture_with(
         &self,
         backend: &dyn Backend,
@@ -144,6 +152,7 @@ impl SnapshotStore {
         cache: &mut HashCache,
         stats: &mut CaptureStats,
     ) -> Result<SnapshotMeta> {
+        let lease = gc::LeaseGuard::acquire_capture(self.cas.root())?;
         let cap = capture::capture(&self.cas, backend, root_dir, opts, cache, stats)?;
         let id = self.cas.put_manifest(&cap.manifest)?;
         let meta = SnapshotMeta {
@@ -155,6 +164,7 @@ impl SnapshotStore {
             git_context: cap.git_context,
         };
         self.cas.put_meta(&meta)?;
+        lease.release();
         Ok(meta)
     }
 

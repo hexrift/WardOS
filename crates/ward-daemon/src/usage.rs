@@ -5,10 +5,12 @@
 //! (broken down by category — shared blobs, manifests, snapshot metadata,
 //! session logs), and which leftover `ward-*` scratch directories under the OS
 //! temp dir belong to an operation that has definitely finished. It never
-//! deletes, renames, or truncates anything; actual reclamation (mark-and-sweep
-//! GC, leases, a low-space preflight) is out of scope here — see the crate's
-//! CHANGELOG / the pull request that introduced this module for what #151
-//! still asks for beyond it.
+//! deletes, renames, or truncates anything. Actual reclamation of the CAS
+//! categories this module reports on — conservative mark-and-sweep with leases
+//! (#151 items 2–3) — lives in [`crate::retention`] and `ward_snapshot::gc`
+//! instead (`ward snapshot gc`); reclaiming the leftover scratch directories
+//! this module also reports on (startup reconciliation, #151 item 5) and a
+//! low-space preflight (item 6) remain out of scope everywhere in this crate.
 //!
 //! Scratch liveness is deliberately never inferred from a process id or a
 //! filesystem timestamp (the issue's own explicit constraint): only from

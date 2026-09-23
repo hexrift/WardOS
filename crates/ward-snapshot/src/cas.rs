@@ -70,6 +70,15 @@ impl Cas {
         Ok(Self { root })
     }
 
+    /// The CAS root directory — needed by [`crate::gc`] to address the
+    /// `leases/` and `kept/` directories, which sit alongside `blobs/`,
+    /// `manifests/` and `meta/` but are never created by [`Self::open`]
+    /// itself (mirroring how those three are the only directories `open`
+    /// promises; `gc` creates its own on first use).
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn blob_path(&self, d: Digest) -> PathBuf {
         let hex = d.to_hex();
         self.root.join("blobs").join(&hex[..2]).join(&hex)
@@ -254,7 +263,12 @@ fn walk_dir_usage(dir: &Path, usage: &mut CategoryUsage) -> Result<()> {
 }
 
 /// Write `bytes` to `path` atomically via a sibling temp file and rename.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+///
+/// `pub(crate)` (not private) so [`crate::gc`]'s lease and "kept" markers can
+/// reuse the exact same atomic write-temp-then-rename scheme the CAS itself
+/// uses for blobs, manifests and meta, rather than a second, subtly different
+/// implementation of the same durability property.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
