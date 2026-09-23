@@ -377,6 +377,9 @@ fn protected_files(
 pub struct Outcome {
     /// Whether the command succeeded.
     pub passed: bool,
+    /// Whether the command was killed for exceeding `verify.budget_secs` rather than
+    /// exiting on its own. Never true together with `passed` (#139).
+    pub timed_out: bool,
     /// Counts parsed from the output.
     pub summary: VerifySummary,
     /// Combined stdout and stderr, bounded to a head and tail (see [`MAX_OUTPUT_BYTES`]).
@@ -437,6 +440,7 @@ pub fn execute(v: &Verification) -> Result<Outcome> {
     }
     Ok(Outcome {
         passed,
+        timed_out: out.timed_out,
         summary,
         result_hash: *blake3::hash(output.as_bytes()).as_bytes(),
         output,

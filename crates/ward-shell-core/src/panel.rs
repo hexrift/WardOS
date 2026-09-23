@@ -60,11 +60,13 @@ pub fn session_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) ->
     let verify_state = model.verify_state();
     let verify = match verify_state {
         VerifyState::Never => "none",
+        VerifyState::Preparing => "preparing",
         VerifyState::Verifying(_) => "running",
         VerifyState::Verified(_) => "pass",
         VerifyState::Stale { .. } => "pass · stale",
         VerifyState::Unknown { .. } => "pass · freshness unavailable",
         VerifyState::Failed(_) => "fail",
+        VerifyState::TimedOut(_) => "timed out",
         VerifyState::Errored(_) => "error",
         VerifyState::Cancelled(_) => "cancelled",
         VerifyState::Interrupted(_) => "interrupted",
@@ -137,46 +139,17 @@ pub fn verify_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) -> 
     let state = model.verify_state();
     let tone = state.tone();
     let (verdict, at) = match model.state.verification {
-        Verification::Passed(v) | Verification::Failed(v) => (Some(v), Some(v.at)),
+        Verification::Passed(v) | Verification::Failed(v) | Verification::TimedOut(v) => {
+            (Some(v), Some(v.at))
+        }
         Verification::NotRun
+        | Verification::Preparing
         | Verification::Running(_)
         | Verification::Errored(_)
         | Verification::Cancelled(_)
         | Verification::Interrupted(_) => (None, None),
     };
-    let candidate = match state {
-        VerifyState::Never => Row::new("Verified candidate", "none", Tone::Dim),
-        VerifyState::Verifying(c) => Row::new(
-            "Verified candidate",
-            format!("{} · verifying", short_hex(c)),
-            tone,
-        ),
-        VerifyState::Verified(c)
-        | VerifyState::Stale { candidate: c, .. }
-        | VerifyState::Unknown { candidate: c } => {
-            Row::new("Verified candidate", short_hex(c), tone)
-        }
-        VerifyState::Failed(c) => Row::new(
-            "Verified candidate",
-            format!("{} · failed", short_hex(c)),
-            tone,
-        ),
-        VerifyState::Errored(c) => Row::new(
-            "Verified candidate",
-            format!("{} · error", short_hex(c)),
-            tone,
-        ),
-        VerifyState::Cancelled(c) => Row::new(
-            "Verified candidate",
-            candidate_or_none(c, "cancelled"),
-            tone,
-        ),
-        VerifyState::Interrupted(c) => Row::new(
-            "Verified candidate",
-            candidate_or_none(c, "interrupted"),
-            tone,
-        ),
-    };
+    let candidate = candidate_row(state, tone);
     let time = at.map_or_else(
         || Row::new("Verified time", "—", Tone::Dim),
         |at| {
@@ -197,18 +170,9 @@ pub fn verify_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) -> 
         TamperWard::Clean => ("clean", Tone::Ok),
         TamperWard::Tampered => ("tamper detected", Tone::Deny),
     };
-    let tests = verdict.map_or_else(
-        || Row::new("Tests", "—", Tone::Dim),
-        |v| {
-            let s = v.summary;
-            let passed = s.tests_run.saturating_sub(s.tests_failed);
-            let tone = if s.tests_failed == 0 {
-                Tone::Ok
-            } else {
-                Tone::Deny
-            };
-            Row::new("Tests", format!("{passed}/{}", s.tests_run), tone)
-        },
+    let tests = tests_row(
+        verdict,
+        matches!(model.state.verification, Verification::TimedOut(_)),
     );
     let integrity = verdict.map_or_else(
         || Row::new("Integrity", "—", Tone::Dim),
@@ -229,6 +193,70 @@ pub fn verify_panel(d: &SessionDescription, model: &Model, now_unix_ms: u64) -> 
             integrity,
         ],
     }]
+}
+
+/// The verify panel's "Verified candidate" row: the candidate the state names,
+/// and what became of it.
+fn candidate_row(state: VerifyState, tone: Tone) -> Row {
+    match state {
+        VerifyState::Never => Row::new("Verified candidate", "none", Tone::Dim),
+        VerifyState::Preparing => Row::new("Verified candidate", "none · preparing", tone),
+        VerifyState::Verifying(c) => Row::new(
+            "Verified candidate",
+            format!("{} · verifying", short_hex(c)),
+            tone,
+        ),
+        VerifyState::Verified(c)
+        | VerifyState::Stale { candidate: c, .. }
+        | VerifyState::Unknown { candidate: c } => {
+            Row::new("Verified candidate", short_hex(c), tone)
+        }
+        VerifyState::Failed(c) => Row::new(
+            "Verified candidate",
+            format!("{} · failed", short_hex(c)),
+            tone,
+        ),
+        VerifyState::TimedOut(c) => Row::new(
+            "Verified candidate",
+            format!("{} · timed out", short_hex(c)),
+            tone,
+        ),
+        VerifyState::Errored(c) => Row::new(
+            "Verified candidate",
+            format!("{} · error", short_hex(c)),
+            tone,
+        ),
+        VerifyState::Cancelled(c) => Row::new(
+            "Verified candidate",
+            candidate_or_none(c, "cancelled"),
+            tone,
+        ),
+        VerifyState::Interrupted(c) => Row::new(
+            "Verified candidate",
+            candidate_or_none(c, "interrupted"),
+            tone,
+        ),
+    }
+}
+
+/// The verify panel's "Tests" row: the verdict's counts, red when any failed.
+/// Counts from a run killed at its budget (`timed_out`) are partial, so they
+/// are marked as such and never green (#139).
+fn tests_row(verdict: Option<crate::feed::Verdict>, timed_out: bool) -> Row {
+    let Some(v) = verdict else {
+        return Row::new("Tests", "—", Tone::Dim);
+    };
+    let s = v.summary;
+    let passed = s.tests_run.saturating_sub(s.tests_failed);
+    let tone = if s.tests_failed != 0 {
+        Tone::Deny
+    } else if timed_out {
+        Tone::Warn
+    } else {
+        Tone::Ok
+    };
+    let suffix = if timed_out { " before timeout" } else { "" };
+    Row::new("Tests", format!("{passed}/{}{suffix}", s.tests_run), tone)
 }
 
 /// `<hex> · <word>` when a candidate was captured before the attempt ended,
@@ -281,8 +309,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::feed::fixtures::{
-        denied, edited, records, snapshot, verify_errored, verify_failed, verify_passed,
-        verify_progress, verify_requested, wardd,
+        denied, edited, records, snapshot, verify_attempt_started, verify_errored, verify_failed,
+        verify_passed, verify_progress, verify_requested, verify_timed_out, wardd,
     };
     use crate::trust::fixtures::description;
     use ward_events::Origin;
@@ -494,6 +522,58 @@ mod tests {
         // stay unset rather than showing zeros a suite never produced.
         assert_eq!(value(&groups, "Verify", "Tests").value, "—");
         assert_eq!(value(&groups, "Verify", "Integrity").value, "—");
+    }
+
+    /// #139 item 1: a verifier killed at its budget reads as its own row, and its
+    /// partial counts are shown as partial, never green.
+    #[test]
+    fn a_timed_out_attempt_reads_as_its_own_row_with_partial_counts() {
+        let d = description(NetworkCapability::Development);
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested(), verify_timed_out()]) {
+            model.apply(rec);
+        }
+
+        let groups = session_panel(&d, &model, d.started_unix_ms);
+        let verify = value(&groups, "TamperWard", "Last verify");
+        assert_eq!(
+            (verify.value.as_str(), verify.tone),
+            ("timed out", Tone::Deny)
+        );
+
+        let groups = verify_panel(&d, &model, d.started_unix_ms);
+        let candidate = value(&groups, "Verify", "Verified candidate");
+        assert_eq!(
+            (candidate.value.as_str(), candidate.tone),
+            ("abababab · timed out", Tone::Deny)
+        );
+        let tests = value(&groups, "Verify", "Tests");
+        assert_eq!(
+            (tests.value.as_str(), tests.tone),
+            ("40/40 before timeout", Tone::Warn)
+        );
+    }
+
+    /// #139: an allocated attempt with no candidate yet reads as preparing.
+    #[test]
+    fn a_preparing_attempt_reads_as_preparing_with_no_candidate() {
+        let d = description(NetworkCapability::Development);
+        let mut model = Model::new(false);
+        model.apply(wardd(&[verify_attempt_started()]).remove(0));
+
+        let groups = session_panel(&d, &model, d.started_unix_ms);
+        let verify = value(&groups, "TamperWard", "Last verify");
+        assert_eq!(
+            (verify.value.as_str(), verify.tone),
+            ("preparing", Tone::Accent)
+        );
+        let groups = verify_panel(&d, &model, d.started_unix_ms);
+        let candidate = value(&groups, "Verify", "Verified candidate");
+        assert_eq!(
+            (candidate.value.as_str(), candidate.tone),
+            ("none · preparing", Tone::Accent)
+        );
+        assert_eq!(value(&groups, "Verify", "Tests").value, "—");
     }
 
     #[test]

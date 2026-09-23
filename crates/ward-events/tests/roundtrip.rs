@@ -245,7 +245,7 @@ proptest! {
 /// kept too so a future narrowing of that proptest range can't silently stop covering
 /// the exact kinds (`ObservationsDropped`, #202; `SessionPauseUnsettled`, #145;
 /// `VerificationAttemptStarted`, `VerificationCancelled`, `VerificationInterrupted`,
-/// #139) that motivated widening
+/// `VerificationTimedOut`, #139) that motivated widening
 /// `EventKindSet` from `u32` to `u64` in the first place. Exercises every layer this
 /// needs: the raw bit position, a bare `EventKindSet` through postcard, the real
 /// `Subscribe`/`Filter` wire type, and `Filter::quiet()` admitting the terminal
@@ -259,15 +259,16 @@ fn subscribe_roundtrips_high_bit_kinds() {
         "sanity: ObservationsDropped is the first kind past u32's 32-bit capacity"
     );
 
-    // Exactly the five kinds at or past bit 32: nothing below it, so a regression in
+    // Exactly the six kinds at or past bit 32: nothing below it, so a regression in
     // masking/shifting the high bits can't hide behind low bits also being set.
     let high_bits = EventKindSet::EMPTY
         .with(EventKind::ObservationsDropped) // bit 32
         .with(EventKind::SessionPauseUnsettled) // bit 33
         .with(EventKind::VerificationAttemptStarted) // bit 34
         .with(EventKind::VerificationCancelled) // bit 35
-        .with(EventKind::VerificationInterrupted); // bit 36
-    assert_eq!(high_bits.bits(), 0b1_1111 << 32);
+        .with(EventKind::VerificationInterrupted) // bit 36
+        .with(EventKind::VerificationTimedOut); // bit 37
+    assert_eq!(high_bits.bits(), 0b11_1111 << 32);
 
     // Postcard, directly on the bitmask type.
     let bytes = postcard::to_allocvec(&high_bits).unwrap();
@@ -293,13 +294,14 @@ fn subscribe_roundtrips_high_bit_kinds() {
     assert!(back.filter.kinds.contains(EventKind::ObservationsDropped));
 
     // `Filter::quiet()` must admit ObservationsDropped, SessionPauseUnsettled and the
-    // two terminal verification-attempt outcomes; VerificationAttemptStarted (a
+    // three terminal verification-attempt outcomes; VerificationAttemptStarted (a
     // progress marker, not a terminal outcome) must not be admitted.
     let quiet = Filter::quiet();
     assert!(quiet.kinds.contains(EventKind::ObservationsDropped));
     assert!(quiet.kinds.contains(EventKind::SessionPauseUnsettled));
     assert!(quiet.kinds.contains(EventKind::VerificationCancelled));
     assert!(quiet.kinds.contains(EventKind::VerificationInterrupted));
+    assert!(quiet.kinds.contains(EventKind::VerificationTimedOut));
     assert!(!quiet.kinds.contains(EventKind::VerificationAttemptStarted));
 
     // And the full mask, including every high bit alongside every low one, still
@@ -686,6 +688,16 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Verifier,
+            WardEvent::VerificationTimedOut {
+                attempt: AttemptId::new(4),
+                candidate: snap(b"cand5"),
+                summary,
+                result_hash: Blake3Hash::hash(b"r5"),
+                budget_secs: 600,
+            },
+        ),
+        (
             Origin::TamperWard,
             WardEvent::StateAccepted {
                 snapshot: snap(b"cand2"),
@@ -856,8 +868,8 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
         .filter(|r| Filter::quiet().matches(r))
         .count();
     // The nine of Quiet mode plus the three host interventions (ADR-0019 §3), plus
-    // `VerificationErrored`, `VerificationCancelled` and `VerificationInterrupted`
-    // (#139), plus the observer's own "this record is incomplete" markers — one per
+    // `VerificationErrored`, `VerificationCancelled`, `VerificationInterrupted` and
+    // `VerificationTimedOut` (#139), plus the observer's own "this record is incomplete" markers — one per
     // source, the hook broker included (#137) — plus `CapabilityDecided` and
     // `ObservationsDropped` each appearing twice in the fixture above (granted and
     // denied; two different observer sources), plus `SessionPauseUnsettled` (#145
@@ -866,7 +878,7 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
     // marker, not a terminal outcome, and is deliberately not in Quiet mode (like
     // `VerificationRequested`/`VerificationStarted` before it) -- neither is
     // `LaunchAborted`, matching its siblings `CommandStarted`/`CommandFinished`.
-    assert_eq!(quiet, 18);
+    assert_eq!(quiet, 19);
 }
 
 #[test]

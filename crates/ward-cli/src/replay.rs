@@ -452,6 +452,17 @@ fn summary(event: &WardEvent) -> String {
                 short_snapshot(&c)
             ))
         ),
+        WardEvent::VerificationTimedOut {
+            attempt,
+            candidate,
+            summary,
+            budget_secs,
+            ..
+        } => format!(
+            "{attempt} · candidate {} · killed at {budget_secs}s budget · {} tests reported",
+            short_snapshot(candidate),
+            summary.tests_run
+        ),
         WardEvent::StateAccepted { snapshot, .. } => {
             format!("snapshot {}", short_snapshot(snapshot))
         }

@@ -624,6 +624,7 @@ fn attempt_already_terminal(log_path: &Path, attempt: AttemptId) -> bool {
             }
             WardEvent::VerificationCancelled { attempt: a, .. }
             | WardEvent::VerificationInterrupted { attempt: a, .. }
+            | WardEvent::VerificationTimedOut { attempt: a, .. }
                 if seen_start && a == attempt =>
             {
                 return true;

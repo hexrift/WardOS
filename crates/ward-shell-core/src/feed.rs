@@ -54,12 +54,21 @@ pub enum Verification {
     /// No verification has been requested in this session.
     #[default]
     NotRun,
+    /// An attempt was allocated (`VerificationAttemptStarted`) and is preparing:
+    /// no candidate has been captured yet (#139). Moves to [`Self::Running`] once
+    /// capture succeeds, or straight to a terminal state if preparation ends it.
+    Preparing,
     /// Requested or started; the trusted verifier is running on this candidate.
     Running(SnapshotId),
     /// The last verification passed: `✓ VERIFIED`.
     Passed(Verdict),
     /// The last verification failed.
     Failed(Verdict),
+    /// The trusted command was killed at its `verify.budget_secs` before it
+    /// finished (#139): no verdict on the tests either way, so distinct from
+    /// [`Self::Failed`]. Its `Verdict` holds whatever the runner reported
+    /// before it was killed.
+    TimedOut(Verdict),
     /// The last attempt on this candidate could not run to a pass/fail result: an
     /// infrastructure error (the sandbox runtime failed to launch, a preparation
     /// step failed, …), never the trusted command itself exiting non-zero (#139).
@@ -86,9 +95,9 @@ impl Verification {
     #[must_use]
     pub const fn candidate(&self) -> Option<SnapshotId> {
         match self {
-            Self::NotRun => None,
+            Self::NotRun | Self::Preparing => None,
             Self::Running(c) | Self::Errored(c) => Some(*c),
-            Self::Passed(v) | Self::Failed(v) => Some(v.candidate),
+            Self::Passed(v) | Self::Failed(v) | Self::TimedOut(v) => Some(v.candidate),
             Self::Cancelled(c) | Self::Interrupted(c) => *c,
         }
     }
@@ -193,6 +202,10 @@ impl SessionState {
                 self.agent = self.before_pause;
                 self.before_pause = None;
             }
+            WardEvent::VerificationAttemptStarted { .. } => {
+                self.verification = Verification::Preparing;
+                self.restored = 0;
+            }
             WardEvent::VerificationRequested { candidate, .. }
             | WardEvent::VerificationStarted { candidate, .. } => {
                 self.verification = Verification::Running(*candidate);
@@ -209,6 +222,11 @@ impl SessionState {
             WardEvent::VerificationFailed {
                 candidate, summary, ..
             } => self.verification = Verification::Failed(self.verdict(rec, *candidate, *summary)),
+            WardEvent::VerificationTimedOut {
+                candidate, summary, ..
+            } => {
+                self.verification = Verification::TimedOut(self.verdict(rec, *candidate, *summary));
+            }
             WardEvent::VerificationErrored { candidate, .. } => {
                 self.verification = Verification::Errored(*candidate);
             }
@@ -604,6 +622,23 @@ pub(crate) mod fixtures {
         }
     }
 
+    pub fn verify_timed_out() -> WardEvent {
+        WardEvent::VerificationTimedOut {
+            attempt: ward_events::AttemptId::new(1),
+            candidate: snapshot(),
+            summary: VerifySummary {
+                steps_total: 1,
+                steps_passed: 0,
+                steps_failed: 1,
+                tests_run: 40,
+                tests_failed: 0,
+                duration: Duration::from_secs(600),
+            },
+            result_hash: Blake3Hash::from_bytes([0x33; 32]),
+            budget_secs: 600,
+        }
+    }
+
     pub fn verify_attempt_started() -> WardEvent {
         WardEvent::VerificationAttemptStarted {
             attempt: ward_events::AttemptId::new(1),
@@ -901,9 +936,9 @@ mod tests {
     }
 
     /// #139: a user-cancelled attempt reads as its own state, neither running,
-    /// failed, nor errored — and `VerificationAttemptStarted` on its own does not
-    /// move the phase out of whatever it already was (the earlier, pre-candidate
-    /// signal is not surfaced as its own UI state in this change).
+    /// failed, nor errored. `VerificationAttemptStarted` on its own moves the
+    /// phase to `Preparing` — progress from the attempt's first action, with no
+    /// candidate yet.
     #[test]
     fn a_cancelled_attempt_is_its_own_state_not_running_failed_or_errored() {
         let mut model = Model::new(false);
@@ -912,9 +947,10 @@ mod tests {
         model.apply(wardd(&[verify_attempt_started()]).remove(0));
         assert_eq!(
             model.state.verification,
-            Verification::NotRun,
-            "the earliest attempt signal alone does not move the phase"
+            Verification::Preparing,
+            "the earliest attempt signal shows the attempt preparing"
         );
+        assert_eq!(model.state.verification.candidate(), None);
 
         for rec in wardd(&[verify_requested()]) {
             model.apply(rec);
@@ -959,6 +995,43 @@ mod tests {
             Verification::Interrupted(Some(snapshot()))
         );
         assert_ne!(model.state.verification, Verification::Running(snapshot()));
+    }
+
+    /// #139: an attempt allocated after an earlier pass shows `Preparing`, not the
+    /// earlier verdict, until its own candidate is captured.
+    #[test]
+    fn a_new_attempt_leaves_the_previous_verdict_while_preparing() {
+        let mut model = Model::new(false);
+        for rec in wardd(&[verify_requested(), verify_passed()]) {
+            model.apply(rec);
+        }
+        assert!(matches!(model.state.verification, Verification::Passed(_)));
+        model.apply(wardd(&[verify_attempt_started()]).remove(0));
+        assert_eq!(model.state.verification, Verification::Preparing);
+        model.apply(wardd(&[verify_requested()]).remove(0));
+        assert_eq!(model.state.verification, Verification::Running(snapshot()));
+    }
+
+    /// #139 item 1: a verifier killed at its budget reads as its own state,
+    /// carrying the partial counts, and is never a test failure or a pass.
+    #[test]
+    fn a_timed_out_attempt_is_its_own_state_not_failed() {
+        let mut model = Model::new(false);
+        for rec in wardd(&[
+            verify_attempt_started(),
+            verify_requested(),
+            verify_timed_out(),
+        ]) {
+            model.apply(rec);
+        }
+        let Verification::TimedOut(verdict) = model.state.verification else {
+            panic!("expected TimedOut, got {:?}", model.state.verification);
+        };
+        assert_eq!(verdict.candidate, snapshot());
+        assert_eq!(verdict.summary.tests_run, 40);
+        assert_eq!(model.state.verification.candidate(), Some(snapshot()));
+        assert!(!matches!(model.state.verification, Verification::Failed(_)));
+        assert!(!matches!(model.state.verification, Verification::Passed(_)));
     }
 
     /// #145 items 3-4, PR #207 review finding 1: the daemon now appends
