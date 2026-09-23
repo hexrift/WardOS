@@ -26,6 +26,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use ward_events::PauseMethod;
@@ -215,22 +216,45 @@ pub fn kill_frozen(frozen: &Frozen) {
 /// and thaws nothing, so a capture can never lift a user's pause — `ward resume`
 /// stays the only thaw. When no sandbox of the session is running the guard also
 /// holds nothing, so an idle `ward snapshot` costs nothing.
+///
+/// That invariant covers a pause already in place before [`acquire`](Self::acquire)
+/// runs; a pause that instead lands *while* this guard is already held (#234) is
+/// covered separately: [`acquire`](Self::acquire) and this guard's own [`Drop`] both
+/// take [`lock_pause_freeze`], the same lock `pause`/`resume` take, and `Drop`
+/// re-checks the marker under it immediately before thawing — so a pause that
+/// arrives mid-capture is never silently undone by this guard's own release.
 #[derive(Debug)]
 #[must_use = "the freeze lasts only while the guard is held"]
 pub struct CaptureFreeze {
+    state: PathBuf,
+    session: String,
     frozen: Option<Frozen>,
 }
 
 impl CaptureFreeze {
     /// Freeze `session`'s sandbox for a capture, unless it is already paused by
     /// the user (whose freeze must outlive the capture).
+    ///
+    /// The marker check and the freeze both happen under [`lock_pause_freeze`]
+    /// (#234), so a `ward pause` that would otherwise land in the gap between
+    /// them can no longer be missed. If the lock itself cannot be taken (best
+    /// effort — e.g. the session directory has since been removed), this falls
+    /// back to the plain, unlocked check rather than refusing to capture.
     pub fn acquire(state: &Path, session: &str) -> Self {
+        let dir = session_dir(state, session);
+        let _lock = lock_pause_freeze(&dir);
         if marker_path(state, session).exists() {
-            return Self { frozen: None };
+            return Self {
+                state: state.to_path_buf(),
+                session: session.to_owned(),
+                frozen: None,
+            };
         }
         let frozen = freeze(session);
         let _ = wait_settled(&frozen);
         Self {
+            state: state.to_path_buf(),
+            session: session.to_owned(),
             frozen: Some(frozen),
         }
     }
@@ -245,10 +269,64 @@ impl CaptureFreeze {
 
 impl Drop for CaptureFreeze {
     fn drop(&mut self) {
-        if let Some(frozen) = &self.frozen {
-            thaw(frozen);
+        let Some(frozen) = self.frozen.take() else {
+            return;
+        };
+        // #234: re-take the lock and re-check the marker immediately before
+        // thawing. A `ward pause` that landed while this guard's capture was in
+        // progress writes the marker under this same lock; if it got there
+        // first, only `ward resume` may thaw this tree now.
+        //
+        // A lock that cannot be taken at all still leaves the marker as the
+        // record of a user pause, so it is checked either way. Leaving the tree
+        // frozen with no marker would be unrecoverable: the daemon does not
+        // consider the session paused, so `ward resume` answers "not paused" and
+        // nothing ever thaws it. The lock only narrows the window against a
+        // concurrent pause; the marker decides.
+        let dir = session_dir(&self.state, &self.session);
+        let _lock = lock_pause_freeze(&dir).ok();
+        if marker_path(&self.state, &self.session).exists() {
+            return;
         }
+        thaw(&frozen);
     }
+}
+
+/// `<session_dir>/.pause-freeze.lock`: an empty file [`lock_pause_freeze`] takes an
+/// exclusive, OS-enforced `flock` on for the marker-check-then-freeze/thaw critical
+/// section [`CaptureFreeze::acquire`], its own [`Drop`], and `ward pause`/`ward
+/// resume` (`Served::pause_with_appending`/`Served::resume` in `daemon.rs`) all
+/// perform (#234). Same idiom as `attempt.rs`'s `lock_session_reconciliation`/
+/// `lock_session_verification` and `selection.rs`'s `lock_selection`: only this
+/// file's existence matters, and an OS `flock` on an open file description needs no
+/// staleness recovery, since the kernel releases it the instant the holder's last
+/// reference closes, including on a crash.
+fn pause_freeze_lock_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(".pause-freeze.lock")
+}
+
+/// Acquire the exclusive, session-scoped lock [`CaptureFreeze::acquire`]/[`Drop`]
+/// and `ward pause`/`ward resume` share (#234), blocking until whichever of them —
+/// another thread, or an entirely separate `ward`/`wardd` process — currently holds
+/// it releases theirs. Without this, a `CaptureFreeze` in progress and a `ward
+/// pause` landing at the same moment have no shared serialization at all: a pause
+/// could write its marker between `CaptureFreeze::acquire`'s check and its own
+/// freeze, or land entirely within the span `CaptureFreeze` holds its guard, and
+/// either way the guard's own `Drop` would thaw over it with nothing left to show a
+/// pause had ever intervened.
+pub(crate) fn lock_pause_freeze(session_dir: &Path) -> Result<Flock<std::fs::File>> {
+    let path = pause_freeze_lock_path(session_dir);
+    // Only this file's *existence* matters — it is never read or written — so an
+    // already-present lock file (from an earlier acquire/pause/resume) is opened
+    // as-is rather than truncated, exactly as the other lock files in this crate.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| Error::io(&path, e))?;
+    Flock::lock(file, FlockArg::LockExclusive)
+        .map_err(|(_, errno)| Error::io(&path, std::io::Error::from(errno)))
 }
 
 /// Every process of `session`'s sandboxes under `proc`, children before their
@@ -824,6 +902,129 @@ mod tests {
         assert!(
             crate::daemon::wait_until(Duration::from_secs(2), || state(root) != Some('T')),
             "running again after the guard releases it",
+        );
+    }
+
+    /// #234: a pause landing while a `CaptureFreeze`'s capture is still in progress
+    /// must never be silently undone by that guard's own `Drop` — only `ward resume`
+    /// may thaw it once the marker is present. Exercised on a real, signal-stopped
+    /// process so the assertion is that nothing actually resumed, not merely that
+    /// some function was or wasn't called; the marker is written before the guard
+    /// drops, so no real timing race is needed to make the scenario deterministic.
+    #[test]
+    fn a_guard_that_cannot_take_the_lock_still_thaws_when_no_pause_is_recorded() {
+        use std::process::{Child, Command, Stdio};
+        struct Reap(Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let reap = Reap(
+            Command::new("sh")
+                .args(["-c", "while :; do :; done"])
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let root = reap.0.id();
+        let pids = tree(Path::new("/proc"), root);
+        freeze_signals(&pids);
+        let frozen = Frozen {
+            method: PauseMethod::Sigstop,
+            pids,
+            cgroup: None,
+        };
+        assert!(wait_settled(&frozen), "the tree settles into `stopped`");
+
+        // No session directory at all: the lock file cannot be created, so the
+        // lock cannot be taken — and no pause marker exists either.
+        let state = tempfile::tempdir().unwrap();
+        let session = "sess_no_lock";
+        assert!(lock_pause_freeze(&session_dir(state.path(), session)).is_err());
+        let guard = CaptureFreeze {
+            state: state.path().to_path_buf(),
+            session: session.to_owned(),
+            frozen: Some(frozen),
+        };
+
+        drop(guard);
+
+        // Thawed: left stopped, nothing could ever resume it.
+        let running = (0..100).any(|_| {
+            let state = fs::read_to_string(format!("/proc/{root}/stat"))
+                .ok()
+                .and_then(|s| proc_state(&s));
+            if state.is_some_and(|c| c != 'T') {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        });
+        assert!(
+            running,
+            "no pause recorded: the guard must thaw what it froze"
+        );
+    }
+
+    #[test]
+    fn a_pause_that_lands_during_a_capture_is_not_undone_by_the_guards_drop() {
+        use std::process::{Child, Command, Stdio};
+        struct Reap(Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let reap = Reap(
+            Command::new("sh")
+                .args(["-c", "while :; do :; done"])
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let root = reap.0.id();
+        let pids = tree(Path::new("/proc"), root);
+        freeze_signals(&pids);
+        let frozen = Frozen {
+            method: PauseMethod::Sigstop,
+            pids: pids.clone(),
+            cgroup: None,
+        };
+        assert!(wait_settled(&frozen), "the tree settles into `stopped`");
+
+        let state = tempfile::tempdir().unwrap();
+        let session = "sess_race_234";
+        fs::create_dir_all(session_dir(state.path(), session)).unwrap();
+        // Constructed directly rather than through `acquire`, exactly as
+        // `capture_freeze_stops_a_real_tree_and_releases_it_on_drop` above builds
+        // its own `Frozen` directly: what's under test is `Drop`'s own re-check,
+        // not `acquire`'s freezing (already covered by that test and by
+        // `capture_freeze_leaves_a_user_pause_alone`).
+        let guard = CaptureFreeze {
+            state: state.path().to_path_buf(),
+            session: session.to_owned(),
+            frozen: Some(frozen),
+        };
+
+        // A pause lands (writes the marker) while the capture this guard
+        // represents is still in progress, exactly as `pause_with_appending`
+        // would under `lock_pause_freeze` before this guard's own drop runs.
+        write_marker(state.path(), session, "held by the user").unwrap();
+
+        drop(guard);
+
+        let proc_state_of = |pid: u32| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| proc_state(&s))
+        };
+        assert_eq!(
+            proc_state_of(root),
+            Some('T'),
+            "the pause landed first: the guard's drop must not have thawed it"
         );
     }
 }
