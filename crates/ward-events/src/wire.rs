@@ -377,9 +377,11 @@ impl Filter {
     /// decisions, verification outcomes, the host's interventions, an observer that
     /// had to drop observations, session end.
     ///
-    /// `ObservationsDropped` is in Quiet for the same reason `TamperDetected` is:
-    /// it says the record the user is being shown is knowingly incomplete, which
-    /// no observer mode may hide.
+    /// `ObservationsDropped` is in Quiet for the same reason `TamperDetected` is: it
+    /// says the record the user is being shown is knowingly incomplete, which no
+    /// observer mode may hide. `SessionPauseUnsettled` is in Quiet for the same
+    /// reason: it says the pause the user is being shown is knowingly unconfirmed
+    /// (#145 item 4).
     #[must_use]
     pub const fn quiet() -> Self {
         Self {
@@ -396,6 +398,7 @@ impl Filter {
                 .with(EventKind::VerificationCancelled)
                 .with(EventKind::VerificationInterrupted)
                 .with(EventKind::SessionPaused)
+                .with(EventKind::SessionPauseUnsettled)
                 .with(EventKind::SessionResumed)
                 .with(EventKind::EntryRestored)
                 .with(EventKind::ObservationsDropped)

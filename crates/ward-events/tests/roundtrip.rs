@@ -243,8 +243,9 @@ proptest! {
 /// `>= 32` — the range `subscribe_roundtrips` above generates was widened to the full
 /// `EventKindSet` capacity specifically to reach these, but a fixed, targeted case is
 /// kept too so a future narrowing of that proptest range can't silently stop covering
-/// the exact kinds (`ObservationsDropped`, #202; `VerificationAttemptStarted`,
-/// `VerificationCancelled`, `VerificationInterrupted`, #139) that motivated widening
+/// the exact kinds (`ObservationsDropped`, #202; `SessionPauseUnsettled`, #145;
+/// `VerificationAttemptStarted`, `VerificationCancelled`, `VerificationInterrupted`,
+/// #139) that motivated widening
 /// `EventKindSet` from `u32` to `u64` in the first place. Exercises every layer this
 /// needs: the raw bit position, a bare `EventKindSet` through postcard, the real
 /// `Subscribe`/`Filter` wire type, and `Filter::quiet()` admitting the terminal
@@ -258,14 +259,15 @@ fn subscribe_roundtrips_high_bit_kinds() {
         "sanity: ObservationsDropped is the first kind past u32's 32-bit capacity"
     );
 
-    // Exactly the four kinds at or past bit 32: nothing below it, so a regression in
+    // Exactly the five kinds at or past bit 32: nothing below it, so a regression in
     // masking/shifting the high bits can't hide behind low bits also being set.
     let high_bits = EventKindSet::EMPTY
         .with(EventKind::ObservationsDropped) // bit 32
-        .with(EventKind::VerificationAttemptStarted) // bit 33
-        .with(EventKind::VerificationCancelled) // bit 34
-        .with(EventKind::VerificationInterrupted); // bit 35
-    assert_eq!(high_bits.bits(), 0b1111 << 32);
+        .with(EventKind::SessionPauseUnsettled) // bit 33
+        .with(EventKind::VerificationAttemptStarted) // bit 34
+        .with(EventKind::VerificationCancelled) // bit 35
+        .with(EventKind::VerificationInterrupted); // bit 36
+    assert_eq!(high_bits.bits(), 0b1_1111 << 32);
 
     // Postcard, directly on the bitmask type.
     let bytes = postcard::to_allocvec(&high_bits).unwrap();
@@ -290,11 +292,12 @@ fn subscribe_roundtrips_high_bit_kinds() {
     assert_eq!(back.filter.kinds, high_bits);
     assert!(back.filter.kinds.contains(EventKind::ObservationsDropped));
 
-    // `Filter::quiet()` must admit ObservationsDropped and the two terminal
-    // verification-attempt outcomes; VerificationAttemptStarted (a progress marker,
-    // not a terminal outcome) must not be admitted.
+    // `Filter::quiet()` must admit ObservationsDropped, SessionPauseUnsettled and the
+    // two terminal verification-attempt outcomes; VerificationAttemptStarted (a
+    // progress marker, not a terminal outcome) must not be admitted.
     let quiet = Filter::quiet();
     assert!(quiet.kinds.contains(EventKind::ObservationsDropped));
+    assert!(quiet.kinds.contains(EventKind::SessionPauseUnsettled));
     assert!(quiet.kinds.contains(EventKind::VerificationCancelled));
     assert!(quiet.kinds.contains(EventKind::VerificationInterrupted));
     assert!(!quiet.kinds.contains(EventKind::VerificationAttemptStarted));
@@ -756,6 +759,14 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Wardd,
+            WardEvent::SessionPauseUnsettled {
+                method: PauseMethod::Sigstop,
+                reason: text("ward pause"),
+                pending: 2,
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -849,11 +860,13 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
     // (#139), plus the observer's own "this record is incomplete" markers — one per
     // source, the hook broker included (#137) — plus `CapabilityDecided` and
     // `ObservationsDropped` each appearing twice in the fixture above (granted and
-    // denied; two different observer sources). `VerificationAttemptStarted` is a
-    // progress marker, not a terminal outcome, and is deliberately not in Quiet mode
-    // (like `VerificationRequested`/`VerificationStarted` before it) -- neither is
+    // denied; two different observer sources), plus `SessionPauseUnsettled` (#145
+    // items 3-4): a pause the daemon could not confirm settled must be just as visible
+    // in Quiet mode as the pause itself. `VerificationAttemptStarted` is a progress
+    // marker, not a terminal outcome, and is deliberately not in Quiet mode (like
+    // `VerificationRequested`/`VerificationStarted` before it) -- neither is
     // `LaunchAborted`, matching its siblings `CommandStarted`/`CommandFinished`.
-    assert_eq!(quiet, 17);
+    assert_eq!(quiet, 18);
 }
 
 #[test]
@@ -872,4 +885,48 @@ fn credential_granted_has_no_secret_bearing_field() {
             "{rendered}"
         );
     }
+}
+
+/// `subscribe_roundtrips` above now draws `kinds` from the full width of the
+/// (post-#202, post-#207) catalogue, but proptest's random sampling is not
+/// guaranteed to ever land on the two newest, highest bits -- `ObservationsDropped`
+/// (32) and `SessionPauseUnsettled` (33). This deterministic regression exercises
+/// them directly: a `Subscribe` frame whose `Filter.kinds` sets exactly those two
+/// bits (and nothing else) must encode and decode byte-for-byte, proving the wire
+/// path handles the high end of the now-widened `u64` mask, not just the low bits
+/// every long-declared kind already covered.
+#[test]
+fn subscribe_filter_round_trips_the_two_highest_catalogue_bits() {
+    let kinds =
+        EventKindSet::only(EventKind::ObservationsDropped).with(EventKind::SessionPauseUnsettled);
+    let sub = Subscribe {
+        session: SessionId::from_u128(0x5eed),
+        from_seq: 0,
+        filter: Filter {
+            origins: ward_events::origin::OriginSet::ALL,
+            kinds,
+            exclude_agent_notes: false,
+        },
+    };
+    let bytes = encode_subscribe(&sub).unwrap();
+    let (back, n) = decode_subscribe(&bytes).unwrap();
+    assert_eq!(n, bytes.len());
+    assert_eq!(back, sub);
+    assert!(back.filter.kinds.contains(EventKind::ObservationsDropped));
+    assert!(back.filter.kinds.contains(EventKind::SessionPauseUnsettled));
+}
+
+/// Per #145 item 4, `SessionPauseUnsettled` must be exactly as visible in the
+/// Quiet observer mode as `SessionPaused` itself -- a reader that only sees Quiet
+/// must never be able to tell a pause happened without also being told, just as
+/// loudly, that it was never confirmed. Checked directly against `Filter::quiet()`
+/// rather than only implied by the fixture-count assertion above.
+#[test]
+fn session_pause_unsettled_is_quiet_visible() {
+    assert!(
+        Filter::quiet()
+            .kinds
+            .contains(EventKind::SessionPauseUnsettled)
+    );
+    assert!(Filter::quiet().kinds.contains(EventKind::SessionPaused));
 }

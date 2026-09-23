@@ -110,6 +110,20 @@ pub enum Request {
 pub enum Response {
     /// The appended (or streamed) record.
     Record(Box<EventRecord>),
+    /// A `Pause` request answered: the `SessionPaused` record, and — only when the
+    /// freeze could not be confirmed settled within `pause::FREEZE_SETTLE` (the
+    /// `SIGSTOP` fallback path; the cgroup freezer is synchronous) — how many
+    /// processes had not yet confirmed stopped. A `Response::Record` on the same
+    /// request would read identically whether or not the freeze was confirmed,
+    /// which is exactly the unqualified-success shape #145 item 4 asks not to show.
+    Paused {
+        /// The `SessionPaused` record.
+        record: Box<EventRecord>,
+        /// `Some(pending)` when the freeze could not be confirmed within the bound;
+        /// `None` on a clean, confirmed pause (today's only outcome for the cgroup
+        /// freezer, and the common case for the signal path).
+        unsettled: Option<u32>,
+    },
     /// Nothing to return.
     Ok,
     /// The sealed head.

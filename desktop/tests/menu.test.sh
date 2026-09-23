@@ -4,7 +4,8 @@
 source "$(dirname "$0")/lib.sh"
 setup_env
 for c in wardos-capture wardos-toggle wardos-power wardos-setup wardos-install wardos-remove \
-  wardos-update wardos-keys wardos-launch wardos-theme wardos-font gtk-launch foot; do
+  wardos-update wardos-keys wardos-launch wardos-theme wardos-font wardos-approve-inbox \
+  gtk-launch foot; do
   mock "$c"
 done
 # Real ward-shell output (Command::shell, crates/ward-shell-core/src/launcher.rs): the command
@@ -94,6 +95,9 @@ grep -q "^SECURITY *Verify current project$" <<<"$top" || fail "static SECURITY"
 grep -q "^PROJECTS" <<<"$top" && fail "no PROJECTS without ward-shell"
 wardos-menu security "Verify current project"
 assert_logged '^wardos-launch terminal ward verify$'
+grep -q "^SECURITY *Approval inbox$" <<<"$top" || fail "static SECURITY lists the approval inbox"
+wardos-menu security "Approval inbox"
+assert_logged '^wardos-approve-inbox $'
 
 # A fresh desktop: no live session, the walkthrough not done → "Start here" comes first.
 mock wardos-welcome

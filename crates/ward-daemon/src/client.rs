@@ -11,7 +11,7 @@
 //! falling back to a local writer, because a producer that opened the log itself
 //! would fork the chain the daemon owns.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -106,12 +106,47 @@ pub fn connect(socket: &Path) -> Result<RemoteSink> {
     RemoteSink::connect(socket).ok_or_else(|| Error::Project(NO_DAEMON.to_owned()))
 }
 
+/// What `ward pause` gets back: the `SessionPaused` record, and — only when the
+/// daemon could not confirm the freeze settled within `pause::FREEZE_SETTLE` (#145
+/// items 3-4) — how many of the session's sandboxed processes had not yet
+/// confirmed stopped.
+#[derive(Debug)]
+pub struct PauseResult {
+    /// The `SessionPaused` record.
+    pub record: EventRecord,
+    /// `Some(pending)` when the freeze could not be confirmed within the bound.
+    pub unsettled: Option<u32>,
+}
+
+/// Before this type existed, `ward_daemon::client::pause` returned a bare
+/// [`EventRecord`] directly — callers (including this crate's own bubblewrap-gated
+/// `e2e.rs`, a TamperWard-protected fixture under `crates/**/tests/**`) read its
+/// fields straight off the result (`paused.event`). This lets that field access
+/// keep working unchanged through autoderef, so wrapping the record to carry
+/// `unsettled` alongside it is a purely additive change to every existing caller,
+/// not a breaking one.
+impl std::ops::Deref for PauseResult {
+    type Target = EventRecord;
+
+    fn deref(&self) -> &EventRecord {
+        &self.record
+    }
+}
+
 /// `ward pause`: the daemon pauses the session as one operation (ADR-0019 §3)
-/// and answers with the `SessionPaused` record.
-pub fn pause(sink: &mut RemoteSink, reason: &str) -> Result<EventRecord> {
-    expect_record(sink.call(&Request::Pause {
+/// and answers with the `SessionPaused` record, plus whether the freeze itself
+/// was confirmed.
+pub fn pause(sink: &mut RemoteSink, reason: &str) -> Result<PauseResult> {
+    match sink.call(&Request::Pause {
         reason: reason.to_owned(),
-    })?)
+    })? {
+        Response::Paused { record, unsettled } => Ok(PauseResult {
+            record: *record,
+            unsettled,
+        }),
+        Response::Error(e) => Err(Error::Project(e)),
+        other => Err(Error::Project(format!("unexpected response {other:?}"))),
+    }
 }
 
 /// `ward resume`: the daemon reverses the pause and answers with the
@@ -125,9 +160,13 @@ pub fn resume(sink: &mut RemoteSink) -> Result<EventRecord> {
 pub struct SessionPauseResult {
     /// The session's id.
     pub session: String,
-    /// The `SessionPaused` record, or why this session could not be paused
-    /// (already paused, or gone between listing and asking).
-    pub outcome: Result<EventRecord>,
+    /// The `SessionPaused` record and whether the freeze settled, or why this
+    /// session could not be paused (already paused, or gone between listing
+    /// and asking). Carries [`PauseResult`], not a bare [`EventRecord`], so
+    /// `--all` is bound by the same #145 items 3-4 rule as a single-session
+    /// pause: one session's line in a multi-session report must not read as
+    /// an unqualified success when its own freeze never confirmed settled.
+    pub outcome: Result<PauseResult>,
 }
 
 /// `ward pause --all` (#141 item 5): "Pause all sessions", distinct from
@@ -295,6 +334,129 @@ pub fn approve(sink: &mut RemoteSink, id: u64, decision: ApprovalDecision) -> Re
         Response::Ok => Ok(()),
         Response::Error(e) => Err(Error::Daemon(e)),
         other => Err(Error::Events(format!("unexpected response {other:?}"))),
+    }
+}
+
+/// One session's approvals from [`approvals_all`], or why they could not be
+/// listed.
+#[derive(Debug)]
+pub struct SessionApprovalsResult {
+    /// The session's id.
+    pub session: String,
+    /// Its description and every approval it has asked, pending or decided,
+    /// or the connect/describe/approvals failure that stopped this session
+    /// from being inspected at all.
+    pub outcome: Result<(SessionDescription, Vec<ApprovalRecord>)>,
+}
+
+/// `ward session approvals --all` (#146 items 2-3, #141): every live
+/// session's approvals, pending or decided, one connection each, on its own
+/// line — mirroring [`pending_all`]'s shape (a plain sequential listing, not
+/// [`follow_pending_all`]'s watcher pool: this has no `--follow` counterpart,
+/// see that flag's own doc comment). A session whose connect, describe or
+/// approvals call fails is reported with that failure rather than silently
+/// dropped, the same as [`pending_all`] (#141 finding 5): before that, a
+/// session skipped here would be indistinguishable from one reachable and
+/// genuinely empty. What the desktop's persistent inbox
+/// (`wardos-approve-inbox`) reads.
+pub fn approvals_all(state: &Path) -> Result<Vec<SessionApprovalsResult>> {
+    let live = crate::daemon::live_sessions(state)?;
+    let mut results = Vec::with_capacity(live.len());
+    for meta in live {
+        let socket = session_dir(state, &meta.id).join(SOCKET_NAME);
+        let outcome = connect(&socket).and_then(|mut sink| {
+            let description = describe(&mut sink)?;
+            let records = approvals(&mut sink)?;
+            Ok((description, records))
+        });
+        results.push(SessionApprovalsResult {
+            session: meta.id,
+            outcome,
+        });
+    }
+    Ok(results)
+}
+
+/// `ward session approvals --follow` (#146 items 2-3): hand `emit` every
+/// approval this session asks, once as soon as it is first known pending and
+/// again the first time it is known decided — from the daemon's own
+/// authoritative account ([`approvals`]), the same one `ward session
+/// approvals` reads, not from the event stream's `CapabilityRequested` /
+/// `CapabilityDecided` records directly, so an id is reported at most twice
+/// (pending, then its outcome) regardless of how many capability records
+/// happen to land while nothing about that id has actually changed.
+///
+/// This is what lets a desktop notifier learn that an approval it is still
+/// showing a notification for has become terminal — answered from another
+/// terminal, timed out, or released because the session ended with it still
+/// open — and update or close that notification, instead of only ever
+/// reacting to the request that first announced it ([`follow_pending`]).
+/// Single-session only, deliberately: `wardos-approve --watch` follows each
+/// live session that has an open notification individually (its own
+/// `--session <id>` connection), rather than this needing a
+/// [`follow_pending_all`]-style watcher pool of its own — see `ward session
+/// approvals --all`'s doc comment for why that combination is not offered.
+/// Mirrors [`follow_pending`]'s backlog/settle/re-list structure exactly,
+/// triggering a fresh listing on either capability record kind rather than
+/// only `CapabilityRequested`.
+pub fn follow_approvals(
+    socket: &Path,
+    idle: Duration,
+    mut emit: impl FnMut(ApprovalRecord),
+) -> Result<WatchEnd> {
+    let mut subscriber = connect(socket)?;
+    subscriber.send(&Request::Subscribe { from_seq: 0 })?;
+    let mut records = 0;
+    let mut pending_seen: BTreeSet<u64> = BTreeSet::new();
+    let mut decided_seen: BTreeSet<u64> = BTreeSet::new();
+    let list = |pending_seen: &mut BTreeSet<u64>,
+                decided_seen: &mut BTreeSet<u64>,
+                emit: &mut dyn FnMut(ApprovalRecord)|
+     -> Result<()> {
+        let mut sink = connect(socket)?;
+        for record in approvals(&mut sink)? {
+            let id = record.approval.id;
+            let first_time = if record.outcome.is_some() {
+                decided_seen.insert(id)
+            } else {
+                pending_seen.insert(id)
+            };
+            if first_time {
+                emit(record);
+            }
+        }
+        Ok(())
+    };
+    // The backlog: read until the stream goes quiet, or ends.
+    loop {
+        match subscriber.next_within(idle)? {
+            Next::Quiet => break,
+            Next::Closed => return Ok(WatchEnd::Closed { records }),
+            Next::Response(response) => {
+                if let Some(end) = step(Some(response), &mut records, &mut |_| {})? {
+                    return Ok(end);
+                }
+            }
+        }
+    }
+    list(&mut pending_seen, &mut decided_seen, &mut emit)?;
+    subscriber.set_read_timeout(None)?;
+    loop {
+        let response = subscriber.next_response()?;
+        let capability = matches!(
+            &response,
+            Some(Response::Record(rec))
+                if matches!(
+                    rec.event,
+                    WardEvent::CapabilityRequested { .. } | WardEvent::CapabilityDecided { .. }
+                )
+        );
+        if let Some(end) = step(response, &mut records, &mut |_| {})? {
+            return Ok(end);
+        }
+        if capability {
+            list(&mut pending_seen, &mut decided_seen, &mut emit)?;
+        }
     }
 }
 
@@ -1423,6 +1585,121 @@ mod tests {
     }
 
     #[test]
+    fn follow_approvals_emits_pending_once_then_its_outcome_once() {
+        // A daemon whose subscription streams a `CapabilityRequested` backlog, goes
+        // quiet, then sends the matching `CapabilityDecided` record. `Request::Approvals`
+        // answers the same id as pending until the decided record has been sent, then
+        // as decided — mirroring what `Approvals::approvals` actually does when a real
+        // answer moves the id from `held` into `history` between two listings. Each
+        // connection is served on its own thread (as the real daemon serves connections
+        // concurrently, `daemon.rs` module docs): a `Request::Approvals` list made while
+        // the subscriber connection is mid-stream must not queue behind it.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let asked = crate::approvals::requested_event("Write", "/work/a.rs", "r");
+        let decided = crate::approvals::decided_event(
+            "Write",
+            "/work/a.rs",
+            crate::approvals::Outcome::Answered(crate::approvals::ApprovalDecision::Allow),
+        );
+        let (_, backlog) = records(&[(Origin::Wardd, asked)]);
+        let (_, decided_record) = records(&[(Origin::Wardd, decided)]);
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let is_decided = Arc::new(AtomicBool::new(false));
+        let approvals_calls = Arc::new(AtomicUsize::new(0));
+        let acceptor = std::thread::spawn({
+            let is_decided = is_decided.clone();
+            let approvals_calls = approvals_calls.clone();
+            move || {
+                for stream in listener.incoming().flatten() {
+                    let is_decided = is_decided.clone();
+                    let approvals_calls = approvals_calls.clone();
+                    let backlog = backlog.clone();
+                    let decided_record = decided_record[0].clone();
+                    std::thread::spawn(move || {
+                        let mut writer = stream.try_clone().unwrap();
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        let reply = |writer: &mut std::os::unix::net::UnixStream, r: &Response| {
+                            let mut b = serde_json::to_vec(r).unwrap();
+                            b.push(b'\n');
+                            writer.write_all(&b).unwrap();
+                        };
+                        while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                            match serde_json::from_str::<Request>(&line).unwrap() {
+                                Request::Ping => reply(&mut writer, &Response::Ok),
+                                Request::Approvals => {
+                                    approvals_calls.fetch_add(1, Ordering::SeqCst);
+                                    let approval = Approval::new(
+                                        1,
+                                        "Write",
+                                        "/work/a.rs",
+                                        crate::approvals::Authority::none("r", "/work/a.rs"),
+                                        0,
+                                    );
+                                    let record = if is_decided.load(Ordering::SeqCst) {
+                                        crate::approvals::ApprovalRecord {
+                                            approval,
+                                            outcome: Some(crate::approvals::Outcome::Answered(
+                                                crate::approvals::ApprovalDecision::Allow,
+                                            )),
+                                            decided_at_unix_ms: Some(9),
+                                        }
+                                    } else {
+                                        crate::approvals::ApprovalRecord {
+                                            approval,
+                                            outcome: None,
+                                            decided_at_unix_ms: None,
+                                        }
+                                    };
+                                    reply(&mut writer, &Response::Approvals(vec![record]));
+                                    return;
+                                }
+                                Request::Subscribe { .. } => {
+                                    for rec in &backlog {
+                                        reply(
+                                            &mut writer,
+                                            &Response::Record(Box::new(rec.clone())),
+                                        );
+                                    }
+                                    std::thread::sleep(Duration::from_millis(150));
+                                    is_decided.store(true, Ordering::SeqCst);
+                                    reply(&mut writer, &Response::Record(Box::new(decided_record)));
+                                    std::thread::sleep(Duration::from_millis(150));
+                                    return;
+                                }
+                                other => panic!("{other:?}"),
+                            }
+                            line.clear();
+                        }
+                    });
+                }
+            }
+        });
+        let mut seen = Vec::new();
+        let end = follow_approvals(&socket, Duration::from_millis(50), |r| seen.push(r)).unwrap();
+        assert_eq!(end, WatchEnd::Closed { records: 2 });
+        assert_eq!(seen.len(), 2, "pending once, decided once");
+        assert_eq!(seen[0].approval.id, 1);
+        assert_eq!(seen[0].outcome, None, "the first emission is still pending");
+        assert_eq!(
+            seen[1].outcome,
+            Some(crate::approvals::Outcome::Answered(
+                crate::approvals::ApprovalDecision::Allow
+            )),
+            "the second is its outcome, not a repeat of the same pending row"
+        );
+        assert_eq!(seen[1].approval.id, 1);
+        assert!(approvals_calls.load(Ordering::SeqCst) >= 2);
+        // The acceptor thread blocks in `accept()` with nothing left to connect; it is
+        // left to exit with the process rather than joined (there is no clean way to
+        // interrupt a blocking `accept()` here, and nothing it holds needs a barrier).
+        let _ = acceptor;
+    }
+
+    #[test]
     fn watch_yields_the_rows_in_order_and_ends_when_the_stream_closes() {
         let (chain, log) = records(&[
             (Origin::TamperWard, denied()),
@@ -1639,7 +1916,13 @@ mod tests {
                             }
                             Request::Pause { .. } => match &pause_outcome {
                                 Some(Ok(rec)) => {
-                                    reply(&mut writer, &Response::Record(Box::new(rec.clone())));
+                                    reply(
+                                        &mut writer,
+                                        &Response::Paused {
+                                            record: Box::new(rec.clone()),
+                                            unsettled: None,
+                                        },
+                                    );
                                 }
                                 Some(Err(e)) => reply(&mut writer, &Response::Error(e.clone())),
                                 None => reply(
@@ -1997,6 +2280,165 @@ mod tests {
             "events: daemon refused describe: not ready",
             "an unreachable session is reported, never indistinguishable from \
              one reachable with nothing pending"
+        );
+    }
+
+    /// A session whose socket answers `Ping`, `Describe` and `Approvals` (not
+    /// `Pending`), for [`approvals_all`]'s own test — `spawn_pool_session`
+    /// above answers `Pending`, not `Approvals`.
+    fn spawn_approvals_session(state: &Path, id: &str, records: Vec<ApprovalRecord>) {
+        let meta = SessionMeta {
+            id: id.to_owned(),
+            project: PathBuf::from("/tmp/demo"),
+            project_id: format!("proj_{id}"),
+            entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
+            manifest: ward_policy::merge(
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                ward_policy::SessionId(id.to_owned()),
+                ward_policy::ProjectId(format!("proj_{id}")),
+            ),
+            started_unix_ms: 1,
+            agent: None,
+        };
+        let dir = session_dir(state, id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let description = meta.describe();
+        let listener = UnixListener::bind(dir.join(SOCKET_NAME)).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let description = description.clone();
+                let records = records.clone();
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let reply = |writer: &mut std::os::unix::net::UnixStream, r: &Response| {
+                        let mut b = serde_json::to_vec(r).unwrap();
+                        b.push(b'\n');
+                        let _ = writer.write_all(&b);
+                    };
+                    for line in BufReader::new(stream)
+                        .lines()
+                        .map_while(std::result::Result::ok)
+                    {
+                        let Ok(request) = serde_json::from_str::<Request>(&line) else {
+                            continue;
+                        };
+                        match request {
+                            Request::Ping => reply(&mut writer, &Response::Ok),
+                            Request::Describe => reply(
+                                &mut writer,
+                                &Response::Description(serde_json::to_value(&description).unwrap()),
+                            ),
+                            Request::Approvals => {
+                                reply(&mut writer, &Response::Approvals(records.clone()));
+                            }
+                            other => panic!("unexpected request {other:?}"),
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn approvals_all_reports_a_per_session_outcome_and_never_hides_an_unreachable_one() {
+        let state = tempfile::tempdir().unwrap();
+        // A working session with one still-pending and one already-decided approval.
+        spawn_approvals_session(
+            state.path(),
+            "sess_a",
+            vec![
+                crate::approvals::ApprovalRecord {
+                    approval: Approval::new(
+                        1,
+                        "Write",
+                        "/work/a.rs",
+                        crate::approvals::Authority::none("r", "/work/a.rs"),
+                        0,
+                    ),
+                    outcome: None,
+                    decided_at_unix_ms: None,
+                },
+                crate::approvals::ApprovalRecord {
+                    approval: Approval::new(
+                        2,
+                        "Bash",
+                        "ls",
+                        crate::approvals::Authority::none("r", "ls"),
+                        0,
+                    ),
+                    outcome: Some(crate::approvals::Outcome::TimedOut),
+                    decided_at_unix_ms: Some(5),
+                },
+            ],
+        );
+        // A "live" session (its socket exists and answers `Ping`, so `live_sessions`
+        // lists it) whose `Describe` refuses: the failure a connect/describe/approvals
+        // skip must surface instead of silently dropping (mirroring #141 finding 5 for
+        // `pending_all`, above).
+        let dir = session_dir(state.path(), "sess_broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = SessionMeta {
+            id: "sess_broken".to_owned(),
+            project: PathBuf::from("/tmp/demo"),
+            project_id: "proj_sess_broken".to_owned(),
+            entry_snapshot: "blake3:abc".to_owned(),
+            origin_repo: None,
+            manifest: ward_policy::merge(
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                &ward_policy::Policy::default(),
+                ward_policy::SessionId("sess_broken".to_owned()),
+                ward_policy::ProjectId("proj_sess_broken".to_owned()),
+            ),
+            started_unix_ms: 2,
+            agent: None,
+        };
+        std::fs::write(dir.join("session.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let listener = UnixListener::bind(dir.join(SOCKET_NAME)).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    for line in BufReader::new(stream)
+                        .lines()
+                        .map_while(std::result::Result::ok)
+                    {
+                        let request: Request = serde_json::from_str(&line).unwrap();
+                        let reply = match request {
+                            Request::Ping => Response::Ok,
+                            Request::Describe => Response::Error("not ready".into()),
+                            other => panic!("unexpected request {other:?}"),
+                        };
+                        let mut b = serde_json::to_vec(&reply).unwrap();
+                        b.push(b'\n');
+                        let _ = writer.write_all(&b);
+                    }
+                });
+            }
+        });
+
+        let mut results = approvals_all(state.path()).unwrap();
+        results.sort_by(|a, b| a.session.cmp(&b.session));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].session, "sess_a");
+        let (description, records) = results[0].outcome.as_ref().unwrap();
+        assert_eq!(description.session, "sess_a");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].outcome, None);
+        assert_eq!(
+            records[1].outcome,
+            Some(crate::approvals::Outcome::TimedOut)
+        );
+        assert_eq!(results[1].session, "sess_broken");
+        assert_eq!(
+            results[1].outcome.as_ref().unwrap_err().to_string(),
+            "events: daemon refused describe: not ready",
+            "an unreachable session is reported, never indistinguishable from \
+             one reachable with nothing to show"
         );
     }
 

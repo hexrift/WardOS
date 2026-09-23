@@ -154,7 +154,9 @@ pub enum TamperWard {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionState {
     /// The agent's last reported coarse state, once it has reported one; `Paused`
-    /// while the host holds the session (ADR-0019 §3).
+    /// while the host holds the session (ADR-0019 §3), or `PauseUnsettled` while
+    /// held by a freeze the host could not yet confirm settled (#145 items 3-4,
+    /// PR #207 review finding 1) — the two are never conflated.
     pub agent: Option<AgentState>,
     /// The verification phase.
     pub verification: Verification,
@@ -174,6 +176,18 @@ impl SessionState {
             WardEvent::SessionPaused { .. } => {
                 self.before_pause = self.agent;
                 self.agent = Some(AgentState::Paused);
+            }
+            // PR #207 review finding 1: the daemon now appends this *instead of*
+            // `SessionPaused` whenever the freeze could not be confirmed settled —
+            // never both — so the trust bar must derive a state distinct from a
+            // confirmed `Paused` here too, not just at the log/render/replay layer.
+            // Deriving `Paused` from this record (as an earlier revision of this
+            // fix did, by leaving it unhandled and falling through to `_ => {}`,
+            // which simply kept whatever `self.agent` already was) is exactly the
+            // false-confirmation bug #145 is about.
+            WardEvent::SessionPauseUnsettled { .. } => {
+                self.before_pause = self.agent;
+                self.agent = Some(AgentState::PauseUnsettled);
             }
             WardEvent::SessionResumed { .. } => {
                 self.agent = self.before_pause;
@@ -516,6 +530,14 @@ pub(crate) mod fixtures {
         WardEvent::SessionPaused {
             method: ward_events::PauseMethod::Sigstop,
             reason: ward_events::ShortText::new("looks wrong"),
+        }
+    }
+
+    pub fn pause_unsettled() -> WardEvent {
+        WardEvent::SessionPauseUnsettled {
+            method: ward_events::PauseMethod::Sigstop,
+            reason: ward_events::ShortText::new("looks wrong"),
+            pending: 2,
         }
     }
 
@@ -937,5 +959,38 @@ mod tests {
             Verification::Interrupted(Some(snapshot()))
         );
         assert_ne!(model.state.verification, Verification::Running(snapshot()));
+    }
+
+    /// #145 items 3-4, PR #207 review finding 1: the daemon now appends
+    /// `SessionPauseUnsettled` *instead of* `SessionPaused` whenever the freeze
+    /// could not be confirmed settled, so `SessionState::apply` must derive a
+    /// state distinct from a confirmed `Paused` for it too — an earlier revision
+    /// of this fix left the record unhandled here, which simply kept whatever
+    /// `self.agent` already was and let the trust bar keep showing a stale,
+    /// unrelated state (or nothing at all) rather than the actual, uncertain
+    /// pause — the same false-confirmation gap #145 is about, just moved one
+    /// layer up from the log to the desktop's own consumer of it.
+    #[test]
+    fn an_unsettled_pause_is_distinct_from_a_confirmed_one_and_resume_restores_the_prior_state() {
+        let mut model = Model::new(false);
+        for rec in wardd(&[agent(AgentState::Working)]) {
+            model.apply(rec);
+        }
+        assert_eq!(model.state.agent, Some(AgentState::Working));
+
+        model.apply(wardd(&[pause_unsettled()]).remove(0));
+        assert_eq!(
+            model.state.agent,
+            Some(AgentState::PauseUnsettled),
+            "never `Paused` — that would be the exact false confirmation #145 is about"
+        );
+        assert_ne!(model.state.agent, Some(AgentState::Paused));
+
+        model.apply(wardd(&[resumed()]).remove(0));
+        assert_eq!(
+            model.state.agent,
+            Some(AgentState::Working),
+            "resume restores what the agent said last before the (unsettled) pause"
+        );
     }
 }
