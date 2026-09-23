@@ -18,7 +18,7 @@ use ward_events::{
     WardEvent,
 };
 
-use crate::approvals::{Approval, ApprovalDecision, Grant};
+use crate::approvals::{Approval, ApprovalDecision, ApprovalRecord, Grant};
 use crate::error::{Error, Result};
 use crate::hooks::HookDecision;
 
@@ -85,6 +85,11 @@ pub enum Request {
     },
     /// The approvals waiting for an answer.
     Pending,
+    /// Every approval this session has asked, pending or decided, within the
+    /// daemon's bounded history (`ward session approvals`, #146 item 1): the
+    /// authoritative account a client can still read after missing or
+    /// dismissing whatever first announced a request.
+    Approvals,
     /// The temporary authority the session holds (ADR-0019): every
     /// `allow-session` answer and every credential the proxy injects.
     Grants,
@@ -127,6 +132,8 @@ pub enum Response {
     },
     /// The open approvals, oldest first.
     Pending(Vec<Approval>),
+    /// Every approval `Request::Approvals` asked for, oldest requested first.
+    Approvals(Vec<ApprovalRecord>),
     /// The session's temporary grants, oldest first.
     Grants(Vec<Grant>),
 }
@@ -467,6 +474,7 @@ pub fn handle_with(
         | Request::Hold { .. }
         | Request::Approve { .. }
         | Request::Pending
+        | Request::Approvals
         | Request::Grants
         | Request::Pause { .. }
         | Request::Resume => (
@@ -601,6 +609,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn approval_requests_and_responses_round_trip_with_their_words() {
         let hold = Request::Hold {
             tool: "Write".into(),
@@ -658,6 +667,39 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), pending);
         assert_eq!(
+            serde_json::to_string(&Request::Approvals).unwrap(),
+            r#"{"req":"approvals"}"#
+        );
+        let approvals = Response::Approvals(vec![
+            crate::approvals::ApprovalRecord {
+                approval: Approval::new(
+                    7,
+                    "Write",
+                    "/work/src/lib.rs",
+                    crate::approvals::Authority::none("r", "/work/src/lib.rs"),
+                    5,
+                ),
+                outcome: None,
+                decided_at_unix_ms: None,
+            },
+            crate::approvals::ApprovalRecord {
+                approval: Approval::new(
+                    8,
+                    "WebFetch",
+                    "example.org",
+                    crate::approvals::Authority::none("r", "example.org"),
+                    6,
+                ),
+                outcome: Some(crate::approvals::Outcome::TimedOut),
+                decided_at_unix_ms: Some(66),
+            },
+        ]);
+        let json = serde_json::to_string(&approvals).unwrap();
+        assert!(json.contains(r#""outcome":null"#), "{json}");
+        assert!(json.contains(r#""outcome":"timed-out""#), "{json}");
+        assert!(json.contains(r#""decided_at_unix_ms":66"#), "{json}");
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), approvals);
+        assert_eq!(
             serde_json::to_string(&Request::Grants).unwrap(),
             r#"{"req":"grants"}"#
         );
@@ -693,6 +735,7 @@ mod tests {
             hold,
             approve,
             Request::Pending,
+            Request::Approvals,
             Request::Grants,
             pause,
             Request::Resume,

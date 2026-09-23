@@ -30,7 +30,7 @@
 //! answer and every credential the proxy injects, for `ward session grants`
 //! and the shell's authority panel.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::str::FromStr;
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -671,7 +671,8 @@ impl std::fmt::Display for ApprovalDecision {
 }
 
 /// How a held approval was released.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Outcome {
     /// The user answered.
     Answered(ApprovalDecision),
@@ -679,7 +680,11 @@ pub enum Outcome {
     Remembered,
     /// Nobody answered in time.
     TimedOut,
-    /// The session ended with the question open.
+    /// The session ended with the question still open (#146): released as
+    /// denied, and — unlike before #146 — given its own terminal
+    /// `CapabilityDecided` record ([`decided_event`]) before anything that
+    /// follows can seal the log, so the request is never silently dropped
+    /// from the persistent record.
     Closed,
 }
 
@@ -713,6 +718,61 @@ struct Held {
     answer: Option<ApprovalDecision>,
 }
 
+/// One approval as `ward session approvals` shows it (#146 item 1): the
+/// question, and either still open (`outcome: None`) or how it was finally
+/// released. The daemon's own authoritative account — independent of
+/// whether a desktop notification for it was ever seen, answered from,
+/// or dismissed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRecord {
+    /// The question.
+    pub approval: Approval,
+    /// `None` while it is still pending.
+    pub outcome: Option<Outcome>,
+    /// When the outcome was reached, milliseconds since the Unix epoch;
+    /// `None` while it is still pending.
+    pub decided_at_unix_ms: Option<u64>,
+}
+
+impl ApprovalRecord {
+    /// This approval's current state, one word, for `ward session approvals`
+    /// and a persistent inbox panel: `pending`, `allowed`, `allowed-session`,
+    /// `denied`, `timed-out`, or `session-ended`.
+    #[must_use]
+    pub const fn state_word(&self) -> &'static str {
+        match self.outcome {
+            None => "pending",
+            Some(Outcome::Answered(ApprovalDecision::Allow)) => "allowed",
+            Some(Outcome::Answered(ApprovalDecision::AllowSession) | Outcome::Remembered) => {
+                "allowed-session"
+            }
+            Some(Outcome::Answered(ApprovalDecision::Deny)) => "denied",
+            Some(Outcome::TimedOut) => "timed-out",
+            Some(Outcome::Closed) => "session-ended",
+        }
+    }
+
+    /// One line: state, id, tool, destination — `ward session approvals`'s
+    /// plain-text row.
+    #[must_use]
+    pub fn line(&self) -> String {
+        format!(
+            "{:<15} {:>4}  {}  {}",
+            self.state_word(),
+            self.approval.id,
+            self.approval.tool,
+            self.approval.authority.destination,
+        )
+    }
+}
+
+/// How many decided approvals [`Approvals::approvals`] keeps once they leave
+/// `held`, oldest dropped first. Bounds an otherwise-unbounded long session's
+/// memory; the event log is the durable, unbounded record (`ward replay`) —
+/// this is only the daemon's own live view for a client that missed or
+/// dismissed a notification and asks later, while the session is still up.
+pub const HISTORY_CAP: usize = 200;
+
 #[derive(Debug, Default)]
 struct State {
     held: Vec<Held>,
@@ -728,6 +788,70 @@ struct State {
     closed: bool,
     /// The session is paused: timeouts stand still and answers are refused.
     paused: bool,
+    /// Every approval that left `held` with an outcome, oldest first, capped
+    /// at [`HISTORY_CAP`]. `Outcome::Remembered` never enters `held` (`hold`
+    /// answers it before registering a question at all — see `ward session
+    /// grants` for that authority instead) so it never appears here either.
+    history: VecDeque<ApprovalRecord>,
+    /// The real outcome [`Approvals::close`] gave an id it drained straight
+    /// from `held`, held here for that id's own still-in-flight
+    /// [`Approvals::wait`] call to hand back — so a hold connection that was
+    /// about to collect a genuine answer, but lost the race to a concurrent
+    /// `close`, still learns its real answer instead of a fabricated
+    /// [`Outcome::Closed`] (review of #218, finding 1). [`Approvals::take_recorded`]
+    /// separately checks and clears the same entry to tell that same caller
+    /// whether `close` already appended this id's terminal record for it, so
+    /// it is never appended a second time. Also where `close` leaves a
+    /// tombstone for an id it instead claimed out of `unclaimed` (below) —
+    /// same contract either way: present means someone else already has (or,
+    /// since that someone is always still holding the one lock that can seal
+    /// the log at the time, is about to have) appended this id's terminal
+    /// record. An id neither map has anything for was either never
+    /// registered, was already collected by an earlier call to `wait`, or is
+    /// `Outcome::Remembered` (which never enters `held` at all): `take_recorded`
+    /// returning `false` there matches this method's behaviour from before
+    /// either map existed.
+    handoff: BTreeMap<u64, Outcome>,
+    /// An id `wait` itself just settled — removed from `held`, recorded in
+    /// `history` — but whose terminal record has not yet been appended,
+    /// because the caller (`hold` in `daemon.rs`) has not yet reacquired the
+    /// `Served` lock needed to append anything. Before this existed, that gap
+    /// was invisible to a concurrent `close` (`Served::close_pending_approvals`,
+    /// run for a `Stop`/`Seal` on another connection): `close` only ever
+    /// looked at `held`, which `wait` had already emptied for this id, so
+    /// `close` correctly concluded "nothing to do here" and let the log seal
+    /// with no terminal record for an approval that had, in truth, already
+    /// been decided (review of #218, finding 2 — the "wait before terminal
+    /// append" window; finding 1's `close`-before-`wait` window above is a
+    /// different interleaving of the same two operations). `close` now also
+    /// claims every entry left here — under the same lock that flips
+    /// `closed` — and appends it itself before the log can seal, leaving a
+    /// tombstone in `handoff` exactly as it does for an id it drains straight
+    /// from `held`; [`Approvals::take_recorded`] removes an entry here on the
+    /// ordinary, non-racing path (nothing else has touched this id) to claim
+    /// it for its own caller's append instead. Whichever of the two —
+    /// `take_recorded`'s caller or `close` — reaches the one lock relevant to
+    /// each (respectively `Served`'s, held for the whole check-then-append;
+    /// and `Served`'s again, held for `close_pending_approvals`'s whole
+    /// claim-then-append-then-seal) first is the one that actually appends;
+    /// the other finds its entry already gone (or a tombstone already in
+    /// `handoff`) and does nothing further.
+    unclaimed: BTreeMap<u64, (Approval, Outcome)>,
+}
+
+impl State {
+    /// Record `approval`'s outcome in the bounded history, evicting the
+    /// oldest entry first when full.
+    fn record_history(&mut self, approval: Approval, outcome: Outcome, at_unix_ms: u64) {
+        if self.history.len() >= HISTORY_CAP {
+            self.history.pop_front();
+        }
+        self.history.push_back(ApprovalRecord {
+            approval,
+            outcome: Some(outcome),
+            decided_at_unix_ms: Some(at_unix_ms),
+        });
+    }
 }
 
 /// The daemon's hold: what is pending, what was answered, what is remembered,
@@ -882,21 +1006,43 @@ impl Approvals {
         let mut state = self.lock();
         loop {
             let Some(index) = state.held.iter().position(|h| h.approval.id == id) else {
-                return Outcome::Closed;
+                // Not (or no longer) held. `close` drains every entry it
+                // finds still in `held` — answered or not — under the same
+                // lock that flips `closed` (review of #218, finding 1), so
+                // by the time anything observes `id` missing from `held`,
+                // `close` (if it is what took it) has already recorded its
+                // real outcome in `handoff` and appended its terminal
+                // record. Hand that same real outcome back rather than a
+                // fabricated `Closed`, so the caller (and, through it, the
+                // agent) learns what actually happened to its question. An
+                // id `handoff` has nothing for was either never registered
+                // or was already collected by an earlier call to this
+                // method (exercised directly by tests): `Closed` there
+                // matches this method's behaviour from before `handoff`
+                // existed.
+                return state.handoff.get(&id).copied().unwrap_or(Outcome::Closed);
             };
             if let Some(answer) = state.held[index].answer {
                 let held = state.held.remove(index);
+                let outcome = Outcome::Answered(answer);
                 if answer == ApprovalDecision::AllowSession {
                     let grant = held.approval.session_grant(now_unix_ms());
-                    state
-                        .remembered
-                        .insert((held.approval.tool, held.approval.summary), grant);
+                    state.remembered.insert(
+                        (held.approval.tool.clone(), held.approval.summary.clone()),
+                        grant,
+                    );
                 }
-                return Outcome::Answered(answer);
-            }
-            if state.closed {
-                state.held.remove(index);
-                return Outcome::Closed;
+                let now = now_unix_ms();
+                state.record_history(held.approval.clone(), outcome, now);
+                // Settled, but not yet appended (review of #218, finding 2):
+                // left here for `close` to claim and append itself if a
+                // concurrent `Stop`/`Seal` reaches the log-sealing lock
+                // before this call's own caller does — see `unclaimed`'s doc
+                // comment.
+                state
+                    .unclaimed
+                    .insert(held.approval.id, (held.approval, outcome));
+                return outcome;
             }
             if state.paused {
                 // Held in turn: wake on any change, and count none of this time.
@@ -911,7 +1057,15 @@ impl Approvals {
             remaining = remaining.saturating_sub(now - last);
             last = now;
             if remaining.is_zero() {
-                state.held.remove(index);
+                let held = state.held.remove(index);
+                let now = now_unix_ms();
+                state.record_history(held.approval.clone(), Outcome::TimedOut, now);
+                // Same settled-but-not-yet-appended gap as the answered
+                // branch above; the timeout path is exposed to exactly the
+                // same #218 finding-2 window.
+                state
+                    .unclaimed
+                    .insert(held.approval.id, (held.approval, Outcome::TimedOut));
                 return Outcome::TimedOut;
             }
             state = self
@@ -956,11 +1110,158 @@ impl Approvals {
             .collect()
     }
 
-    /// The session ended: every open question is released as denied, and no
-    /// new one is taken.
-    pub fn close(&self) {
-        self.lock().closed = true;
+    /// Every approval this session has asked that is either still open,
+    /// still awaiting its own `Request::Hold` connection's collection, or
+    /// still within the bounded history, oldest asked first (#146 item 1):
+    /// `ward session approvals`, and the desktop's persistent inbox, read
+    /// this instead of `pending` so a request is not lost from view the
+    /// moment its notification is missed or dismissed. An approval already
+    /// answered but not yet collected by its own `Request::Hold` connection
+    /// (the narrow, ordinary window between `answer` and that connection's
+    /// `wait` — see `answer`) still shows here, as pending: it is still in
+    /// `held`, and nothing has turned its answer into a terminal record
+    /// yet. It moves to the bounded history, with its real outcome, exactly
+    /// once — whichever of that connection's own `wait` or a concurrent
+    /// `close` collects it first (review of #218, finding 1: there is no
+    /// window in which it is neither pending nor decided).
+    ///
+    /// Sorted by `(requested_at_unix_ms, approval.id)`: two requests can
+    /// legitimately share a millisecond timestamp, and an approval's own id
+    /// — the sequence number of the `CapabilityRequested` record that asked
+    /// it — is assigned in true request order regardless, so it is the
+    /// exact tie-breaker a plain sort by timestamp alone is missing (review
+    /// of #218, finding 2).
+    #[must_use]
+    pub fn approvals(&self) -> Vec<ApprovalRecord> {
+        let state = self.lock();
+        let mut records: Vec<ApprovalRecord> = state
+            .held
+            .iter()
+            .map(|h| ApprovalRecord {
+                approval: h.approval.clone(),
+                outcome: None,
+                decided_at_unix_ms: None,
+            })
+            .chain(state.history.iter().cloned())
+            .collect();
+        records.sort_by_key(|r| (r.approval.requested_at_unix_ms, r.approval.id));
+        records
+    }
+
+    /// The session ended: every question still in `held` — whether still
+    /// open, or already answered but not yet collected by its own
+    /// `Request::Hold` connection — is drained here with its real outcome
+    /// and returned, oldest first, so the caller can give each one its
+    /// terminal record (`decided_event`) before anything that follows can
+    /// seal the log (#146) — once sealed, no record can follow it. No new
+    /// question is taken from here on (`register` already refuses once
+    /// `closed`).
+    ///
+    /// Before the review of #218 this left an already-answered entry in
+    /// `held` for its own connection to record later, on the reasoning that
+    /// `wait` already gives an answer priority over `closed`. That handoff
+    /// raced Stop/Seal sealing the log first: nothing made "the hold
+    /// connection notices and appends" and "the log seals" mutually
+    /// exclusive, so the real record could be dropped on the floor entirely
+    /// (finding 1). Draining and recording *every* entry here instead,
+    /// under the one lock that also flips `closed`, makes settlement atomic
+    /// with respect to a concurrent `wait`: whichever of the two reaches a
+    /// given entry first is the only one that ever will, so there is
+    /// exactly one terminal record, and it is always appended (by the
+    /// caller, from what this returns) before the seal. The drained
+    /// entry's own blocked `wait` call, if there is one, is handed this
+    /// same real outcome back through `handoff` — never a fabricated
+    /// `Outcome::Closed` for a question that was genuinely answered — and
+    /// `take_recorded` tells whichever caller collects it not to append the
+    /// terminal record a second time.
+    ///
+    /// That closed finding 1's race (`close` beats a still-blocked `wait` to
+    /// a given entry) but left a second, narrower one open (finding 2): a
+    /// `wait` that had *already* settled an id — removed it from `held`,
+    /// recorded its real outcome in `history` — before this call ever ran,
+    /// so it was never in `held` for this call to drain in the first place.
+    /// Nothing here saw that id at all, so it could conclude "nothing left
+    /// to do" and let the log seal while that id's terminal record was still
+    /// unappended, if its own caller (`hold` in `daemon.rs`) had not yet won
+    /// back the lock it needs to append it. This call now also claims every
+    /// entry `wait` left in `unclaimed` (see its own doc comment) — id and
+    /// all, no `held` involved — and returns those alongside the ones just
+    /// drained from `held`, so the caller appends them too, here, before the
+    /// seal. `record_history` is *not* called again for these: `wait`
+    /// already recorded the real outcome the moment it settled; only the
+    /// append was still outstanding. A tombstone goes into `handoff` for
+    /// each all the same, so a `take_recorded` call that reaches its own
+    /// entry after this one already claimed it correctly finds it already
+    /// spoken for.
+    pub fn close(&self) -> Vec<(Approval, Outcome)> {
+        let mut state = self.lock();
+        state.closed = true;
+        let now = now_unix_ms();
+        let drained = std::mem::take(&mut state.held);
+        let mut released = Vec::with_capacity(drained.len());
+        for held in drained {
+            let outcome = match held.answer {
+                Some(answer) => Outcome::Answered(answer),
+                None => Outcome::Closed,
+            };
+            if let Outcome::Answered(ApprovalDecision::AllowSession) = outcome {
+                let grant = held.approval.session_grant(now);
+                state.remembered.insert(
+                    (held.approval.tool.clone(), held.approval.summary.clone()),
+                    grant,
+                );
+            }
+            state.record_history(held.approval.clone(), outcome, now);
+            state.handoff.insert(held.approval.id, outcome);
+            released.push((held.approval, outcome));
+        }
+        // Claim every id a concurrent `wait` had already settled but not yet
+        // appended (review of #218, finding 2) — the "wait before terminal
+        // append" window `held` alone cannot reveal, since `wait` already
+        // removed the entry from there before this call ever ran.
+        for (id, (approval, outcome)) in std::mem::take(&mut state.unclaimed) {
+            state.handoff.insert(id, outcome);
+            released.push((approval, outcome));
+        }
+        drop(state);
         self.changed.notify_all();
+        released
+    }
+
+    /// Whether `id`'s terminal record was already appended by a concurrent
+    /// `close` (review of #218, findings 1 and 2): checked, and cleared so
+    /// it is consulted at most once. Must be called by its caller
+    /// (`hold` in `daemon.rs`) only while already holding the `Served` lock,
+    /// with the resulting append (when this returns `false`) performed
+    /// before that same lock is released — the same lock `close_pending_approvals`
+    /// needs for its own claim-then-append-then-seal — so this check and
+    /// `close`'s own claiming are mutually exclusive with each other and
+    /// with the seal that follows: whichever of the two reaches the lock
+    /// first is the one that actually appends `id`'s terminal record, and
+    /// the log can never seal having appended neither (finding 2; calling
+    /// this before acquiring that lock, as `hold` did before the review of
+    /// #218's second round, reopens exactly that gap even with `unclaimed`
+    /// in place, since `close` would still see nothing to claim).
+    ///
+    /// `true` when a tombstone is already in `handoff` — a concurrent
+    /// `close` drained this id straight from `held` (finding 1) or claimed
+    /// it out of `unclaimed` after `wait` had already settled it (finding
+    /// 2); either way its terminal record is already appended (or, since
+    /// `close` always finishes appending everything it claims before
+    /// releasing the very lock this method is called under, is about to be,
+    /// strictly before any seal that follows). `false` otherwise: this also
+    /// claims (removes) any `unclaimed` entry for `id`, so a `close` that
+    /// runs after this returns finds nothing left to claim — the caller
+    /// must append it now, same as before either map existed for any id
+    /// neither ever had anything for (`Outcome::Remembered`, which never
+    /// enters `held` or `unclaimed` at all).
+    pub fn take_recorded(&self, id: u64) -> bool {
+        let mut state = self.lock();
+        if state.handoff.remove(&id).is_some() {
+            return true;
+        }
+        state.unclaimed.remove(&id);
+        false
     }
 
     /// Pause or resume the hold (ADR-0019 §3): paused, pending questions stay
@@ -1016,11 +1317,14 @@ pub fn requested_event(tool: &str, summary: &str, reason: &str) -> WardEvent {
     }
 }
 
-/// The record that answers: `CapabilityDecided` by the user (with the grant's
-/// scope) or by the timeout. A question the session's end released has no
-/// record: the log is sealed by then.
+/// The record that answers: `CapabilityDecided`, by the user (with the
+/// grant's scope), by the timeout, or — since #146 — by the session ending
+/// with the question still open. Every [`Outcome`] now produces one; the
+/// caller for `Outcome::Closed` (`Served::close_pending_approvals`) appends
+/// it before the log can seal, so this is no longer dropped as it was before
+/// #146.
 #[must_use]
-pub fn decided_event(tool: &str, summary: &str, outcome: Outcome) -> Option<WardEvent> {
+pub fn decided_event(tool: &str, summary: &str, outcome: Outcome) -> WardEvent {
     let (decision, by, grant) = match outcome {
         Outcome::Answered(ApprovalDecision::Allow) => (
             Decision::Allow,
@@ -1034,14 +1338,14 @@ pub fn decided_event(tool: &str, summary: &str, outcome: Outcome) -> Option<Ward
         ),
         Outcome::Answered(ApprovalDecision::Deny) => (Decision::Deny, DecisionSource::User, None),
         Outcome::TimedOut => (Decision::Deny, DecisionSource::Timeout, None),
-        Outcome::Closed => return None,
+        Outcome::Closed => (Decision::Deny, DecisionSource::SessionEnded, None),
     };
-    Some(WardEvent::CapabilityDecided {
+    WardEvent::CapabilityDecided {
         cap: capability(tool, summary),
         decision,
         by,
         grant,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1430,11 +1734,157 @@ mod tests {
             std::thread::spawn(move || approvals.wait(1, Duration::from_secs(5)))
         };
         std::thread::sleep(Duration::from_millis(20));
-        approvals.close();
+        // `close` itself hands back what it released, with each one's real
+        // outcome, so the daemon can give each one its own terminal record
+        // before the log can seal (#146) — it does not need to wait for
+        // `wait`'s own thread to notice.
+        assert_eq!(approvals.close(), [(approval(1), Outcome::Closed)]);
         assert_eq!(waiter.join().unwrap(), Outcome::Closed);
         assert!(approvals.pending().is_empty());
         let err = approvals.register(approval(2)).unwrap_err();
         assert_eq!(err.to_string(), "daemon: approval: session ended");
+        // `close` recorded the release in the bounded history too, so a late
+        // `ward session approvals` still shows how it ended.
+        let record = approvals
+            .approvals()
+            .into_iter()
+            .find(|r| r.approval.id == 1)
+            .expect("released approval is in the history");
+        assert_eq!(record.outcome, Some(Outcome::Closed));
+        assert!(record.decided_at_unix_ms.is_some());
+    }
+
+    #[test]
+    fn closing_hands_an_uncollected_answer_its_real_outcome_exactly_once() {
+        // Review of #218, finding 1: a question already answered but not
+        // yet collected by its own `wait` must not be sealed with no
+        // terminal record (the old behaviour here — `close` left it alone
+        // entirely and trusted the hold connection to record it later —
+        // raced Stop/Seal sealing the log first). `close` now drains it
+        // like any other held entry, with its real answer, so the caller
+        // can append the true terminal record before the log seals.
+        let approvals = Approvals::new();
+        approvals.register(approval(1)).unwrap();
+        approvals.answer(1, ApprovalDecision::Allow).unwrap();
+        assert_eq!(
+            approvals.close(),
+            [(approval(1), Outcome::Answered(ApprovalDecision::Allow))],
+            "close hands back the real answer, not Outcome::Closed, so the \
+             caller can append the true terminal record before sealing"
+        );
+        // The listing already shows it decided, correctly, the moment
+        // `close` returns — not still pending, and not vanished.
+        let record = approvals
+            .approvals()
+            .into_iter()
+            .find(|r| r.approval.id == 1)
+            .expect("released approval is in the combined view");
+        assert_eq!(
+            record.outcome,
+            Some(Outcome::Answered(ApprovalDecision::Allow))
+        );
+        // The connection that registered it still gets its real answer when
+        // it finally collects, never a fabricated session-ended.
+        assert_eq!(
+            approvals.wait(1, Duration::ZERO),
+            Outcome::Answered(ApprovalDecision::Allow),
+            "its own wait still discovers the real answer, from the handoff"
+        );
+        // `close` already appended (through its caller) this id's terminal
+        // record: the collecting caller must be told not to append a
+        // second one.
+        assert!(
+            approvals.take_recorded(1),
+            "close already recorded id 1's terminal record"
+        );
+        assert!(
+            !approvals.take_recorded(1),
+            "consulted once: a second check finds nothing left to take"
+        );
+    }
+
+    #[test]
+    fn the_approvals_view_lists_pending_and_bounded_history_by_request_order() {
+        let approvals = Approvals::new();
+        assert!(approvals.approvals().is_empty());
+        // Distinct request times, so the combined view's sort has something
+        // to order by (the shared `approval()` helper below always uses the
+        // same one).
+        let first = Approval::new(1, "Write", "/work/a.rs", authority(), 10);
+        let second = Approval::new(2, "Write", "/work/b.rs", authority(), 20);
+        approvals.register(first).unwrap();
+        approvals.register(second).unwrap();
+        approvals.answer(1, ApprovalDecision::Deny).unwrap();
+        assert_eq!(
+            approvals.wait(1, Duration::ZERO),
+            Outcome::Answered(ApprovalDecision::Deny)
+        );
+        let records = approvals.approvals();
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0].approval.id, 1, "decided, but asked first");
+        assert_eq!(
+            records[0].outcome,
+            Some(Outcome::Answered(ApprovalDecision::Deny))
+        );
+        assert!(records[0].decided_at_unix_ms.is_some());
+        assert_eq!(records[1].approval.id, 2, "still pending");
+        assert_eq!(records[1].outcome, None);
+        assert!(records[1].decided_at_unix_ms.is_none());
+    }
+
+    #[test]
+    fn the_approvals_view_breaks_a_requested_at_tie_by_approval_id() {
+        // Review of #218, finding 2: two requests can legitimately share a
+        // millisecond timestamp. The approval's own id — the sequence
+        // number of the `CapabilityRequested` record that asked it — is
+        // assigned in true request order regardless, and must be the
+        // tie-breaker; a sort on the timestamp alone, with pending entries
+        // built before history entries, would otherwise place a later
+        // pending request ahead of an earlier decided one whenever they
+        // tie.
+        let approvals = Approvals::new();
+        let same_ms = 1_700_000_000_000;
+        let earlier = Approval::new(1, "Write", "/work/a.rs", authority(), same_ms);
+        let later = Approval::new(2, "Write", "/work/b.rs", authority(), same_ms);
+        // Decide the *later* one first and leave the earlier one pending, so
+        // a sort that only looked at `requested_at_unix_ms` (with pending
+        // entries listed before history entries, both at the same
+        // timestamp) would place id 2 ahead of id 1 — the wrong order.
+        approvals.register(later).unwrap();
+        approvals.answer(2, ApprovalDecision::Deny).unwrap();
+        assert_eq!(
+            approvals.wait(2, Duration::ZERO),
+            Outcome::Answered(ApprovalDecision::Deny)
+        );
+        approvals.register(earlier).unwrap();
+        let records = approvals.approvals();
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0].approval.id, 1, "the true, earlier request");
+        assert_eq!(records[1].approval.id, 2, "the true, later request");
+    }
+
+    #[test]
+    fn the_decided_history_is_bounded_oldest_dropped_first() {
+        // A fresh hold: only decided approvals in play, so the count is
+        // exactly the history's, with nothing left pending to add to it.
+        let approvals = Approvals::new();
+        for id in 0..HISTORY_CAP as u64 + 5 {
+            let a = Approval::new(id, "Write", "/work/x.rs", authority(), id);
+            approvals.register(a).unwrap();
+            approvals.answer(id, ApprovalDecision::Deny).unwrap();
+            assert_eq!(
+                approvals.wait(id, Duration::ZERO),
+                Outcome::Answered(ApprovalDecision::Deny)
+            );
+        }
+        let records = approvals.approvals();
+        assert_eq!(records.len(), HISTORY_CAP, "{}", records.len());
+        assert_eq!(
+            records.first().unwrap().approval.id,
+            5,
+            "the oldest five were evicted"
+        );
+        assert_eq!(records.last().unwrap().approval.id, HISTORY_CAP as u64 + 4);
     }
 
     #[test]
@@ -1482,74 +1932,74 @@ mod tests {
                 Outcome::Answered(ApprovalDecision::Allow),
                 HookDecision::Allow,
                 "approval: allowed once",
-                Some((
+                (
                     Decision::Allow,
                     DecisionSource::User,
                     Some(GrantScope::Once),
-                )),
+                ),
             ),
             (
                 Outcome::Answered(ApprovalDecision::AllowSession),
                 HookDecision::Allow,
                 "approval: allowed for the session",
-                Some((
+                (
                     Decision::Allow,
                     DecisionSource::User,
                     Some(GrantScope::Session),
-                )),
+                ),
             ),
             (
                 Outcome::Remembered,
                 HookDecision::Allow,
                 "approval: allowed for the session",
-                Some((
+                (
                     Decision::Allow,
                     DecisionSource::User,
                     Some(GrantScope::Session),
-                )),
+                ),
             ),
             (
                 Outcome::Answered(ApprovalDecision::Deny),
                 HookDecision::Deny,
                 "approval: denied",
-                Some((Decision::Deny, DecisionSource::User, None)),
+                (Decision::Deny, DecisionSource::User, None),
             ),
             (
                 Outcome::TimedOut,
                 HookDecision::Deny,
                 "approval: timed out",
-                Some((Decision::Deny, DecisionSource::Timeout, None)),
+                (Decision::Deny, DecisionSource::Timeout, None),
             ),
             (
+                // Since #146: the session ending with the question open now
+                // gets its own terminal record too, distinguishable from a
+                // timeout by `DecisionSource::SessionEnded` — it used to be
+                // dropped with no record at all (`decided_event` returned
+                // `None`).
                 Outcome::Closed,
                 HookDecision::Deny,
                 "approval: session ended",
-                None,
+                (Decision::Deny, DecisionSource::SessionEnded, None),
             ),
         ];
-        for (outcome, decision, reason, record) in cases {
+        for (outcome, decision, reason, (want_decision, want_by, want_grant)) in cases {
             let response = outcome.response();
             assert_eq!(response.decision, decision, "{outcome:?}");
             assert_eq!(response.reason, reason, "{outcome:?}");
-            let event = decided_event("Write", "/work/src/lib.rs", outcome);
-            match (event, record) {
-                (None, None) => {}
-                (
-                    Some(WardEvent::CapabilityDecided {
-                        cap,
-                        decision,
-                        by,
-                        grant,
-                    }),
-                    Some((want_decision, want_by, want_grant)),
-                ) => {
+            match decided_event("Write", "/work/src/lib.rs", outcome) {
+                WardEvent::CapabilityDecided {
+                    cap,
+                    decision,
+                    by,
+                    grant,
+                } => {
                     assert_eq!(cap.kind, CapabilityKind::FileWrite);
                     assert_eq!(cap.target.as_str(), "Write /work/src/lib.rs");
                     assert_eq!(decision, want_decision, "{outcome:?}");
                     assert_eq!(by, want_by, "{outcome:?}");
                     assert_eq!(grant, want_grant, "{outcome:?}");
                 }
-                (event, record) => panic!("{outcome:?}: {event:?} vs {record:?}"),
+                other => panic!("{outcome:?}: {other:?}"),
             }
         }
         match requested_event(
