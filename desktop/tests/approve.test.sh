@@ -105,6 +105,26 @@ WARDOS_PROJECT=/home/dev/payments-api "$approve" --watch --once
 assert_logged '^ward session approve --session sess_a 12 deny$'
 assert_not_logged '^ward session approve --session sess_a 13'
 
+# --- --watch: "--once" does not return until every worker has actually relayed its
+# answer, not merely until its notify-send child has exited (#224) -----------------
+# notify_one still has to read $out, decide and call `ward session approve` after
+# notify-send itself is gone; a mock `ward` slow enough to still be running when
+# "--once" returns would prove the race the issue reported — an answer landing, as
+# an orphan, after this round's run_dir (and in the real bug, the whole mock dir)
+# was already torn down.
+: >"$MOCK_LOG"
+rm -f "$TMP/answered"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) sleep 0.3; touch "$TMP/answered"; exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'echo deny'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+assert_file "$TMP/answered"
+
 # --- --watch: a notification still showing is replaced when decided elsewhere -----
 # notify-send blocks (simulating --wait on an unanswered critical notification) until
 # it is killed; the session's own resolver, reading a decided record for the same id,
