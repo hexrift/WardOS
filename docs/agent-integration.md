@@ -148,7 +148,17 @@ agent ◄── {decision: allow|deny, reason} ◄── Response::Decision ◄�
    allowed for the session`, `approval: denied`, `approval: timed out`) and records the
    claim with the decision the agent actually heard (`PreToolUse Write /work/src/lib.rs
    → deny`). A session that ends with a question open releases it as `approval:
-   session ended`, denied, and no record follows the seal.
+   session ended`, denied — and (#146) is given its own `CapabilityDecided` record,
+   `by: SessionEnded`, appended *before* `SessionEnded` and the seal, so the request
+   still has a terminal record rather than silently vanishing at the seal the way it
+   did before #146. `Request::Approvals` / `ward session approvals [--json]` lists
+   every approval the session has asked, pending or decided (state `pending`,
+   `allowed`, `allowed-session`, `denied`, `timed-out` or `session-ended`), unlike
+   `Request::Pending` which only ever shows what is still open — so a request that
+   missed its notification, or whose notification was dismissed before it was
+   answered, is still findable for the rest of the session. The daemon keeps this as
+   a bounded in-memory history (oldest dropped first past a cap), not the log itself;
+   `ward replay` remains the durable, unbounded account.
 4. Deny is the default: on timeout, on a daemon lost mid-hold (`approval: lost the
    daemon`), and on a sealed log. Only when there is no daemon at all does `ask` pass
    through to the agent's own prompt as before (§4), because there is nothing to hold

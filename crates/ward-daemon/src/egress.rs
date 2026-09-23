@@ -789,13 +789,29 @@ mod tests {
     /// connection joins the recorder's outstanding set, and the accept loop makes it
     /// after its last look at the shutdown flag. Blocking the first one therefore
     /// holds the acceptor still in precisely the window a shutdown must not be able
-    /// to slip through — past the flag check, not yet in the set. Everything else is
-    /// the real [`Recorder`]'s.
+    /// to slip through — past the flag check, not yet in the set.
+    ///
+    /// `decided` is gated separately, by `verdict_release`, and that gate is the
+    /// load-bearing one for this test: `announce` holds `ward_proxy`'s own
+    /// `announcing` mutex across the whole `deciding` call (see `Shared::announce`),
+    /// so `Handle::shutdown`'s `Shared::close` — which needs that same mutex —
+    /// cannot return until `deciding` does, and that part was never the flaky part.
+    /// What was unsynchronized is everything *after* `deciding` returns: the accept
+    /// loop spawns a brand new `ward-proxy-conn` thread to parse the request,
+    /// evaluate policy and call `decided`, and nothing forced that thread to lose
+    /// its race against the main thread's `seal` + terminal drain, which run
+    /// straight after `deciding` unblocks `shutdown`. Usually the two trivial calls
+    /// on the main thread win; under CI scheduler contention a freshly spawned
+    /// thread occasionally doesn't lose fast enough, and `decided` lands in the
+    /// batch the assertion says it must not (#216). Gating `decided` itself on a
+    /// barrier the test only releases once the terminal drain has already run makes
+    /// that ordering a hard rendezvous instead of a wall-clock bet.
     struct ParkedAnnouncement {
         inner: Arc<Recorder>,
         entered: Arc<std::sync::Barrier>,
         release: Arc<std::sync::Barrier>,
         parked: AtomicBool,
+        verdict_release: Arc<std::sync::Barrier>,
     }
 
     impl Observer for ParkedAnnouncement {
@@ -812,6 +828,10 @@ mod tests {
         }
 
         fn decided(&self, req: &Request, decision: Decision, reason: &str) {
+            // Block until the main thread has taken the terminal drain, so the
+            // verdict cannot beat it into the batch no matter how the scheduler
+            // treats the `ward-proxy-conn` thread that calls this.
+            self.verdict_release.wait();
             self.inner.decided(req, decision, reason);
         }
 
@@ -838,6 +858,17 @@ mod tests {
     /// drain run (3); only then is the acceptor released and its verdict produced
     /// (4, 5). The batch the drain already returned has to account for that verdict
     /// exactly once — not zero times, which is the silent loss, and not twice.
+    ///
+    /// Steps (4) and (5) are each their own barrier rather than one delay covering
+    /// both, because they are two different claims. `release` only has to unblock
+    /// `deciding` — a step production already makes deterministic via
+    /// `Shared::announce`'s mutex, which `shutdown` blocks on regardless of what
+    /// this test does, so releasing it immediately costs nothing. `verdict_release`
+    /// is the one this test is actually about: it is what forces the verdict, made
+    /// on a freshly spawned connection thread, to lose its race against the main
+    /// thread's `seal` and terminal drain on every run instead of on most of them
+    /// (#216 — a fixed-duration poll here previously bet on that thread being slow
+    /// enough, which CI scheduler contention occasionally lost).
     #[test]
     fn a_connection_announced_while_the_wake_fails_is_accounted_for_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -845,11 +876,13 @@ mod tests {
         let recorder = Arc::new(Recorder::with_capacity(8));
         let entered = Arc::new(std::sync::Barrier::new(2));
         let release = Arc::new(std::sync::Barrier::new(2));
+        let verdict_release = Arc::new(std::sync::Barrier::new(2));
         let observer: Arc<dyn Observer> = Arc::new(ParkedAnnouncement {
             inner: Arc::clone(&recorder),
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
             parked: AtomicBool::new(false),
+            verdict_release: Arc::clone(&verdict_release),
         });
         let config = Config::new(NetworkCapability::Offline).listen_unix(&socket);
         let handle = Proxy::spawn(config, observer).unwrap();
@@ -871,32 +904,25 @@ mod tests {
         // (2) The socket file goes, so the wake connection `shutdown` makes cannot
         // reach the acceptor. Nothing about the cutover may depend on it.
         std::fs::remove_file(&socket).unwrap();
-
-        let drained = Arc::new(AtomicBool::new(false));
-        let releaser = {
-            let (release, drained) = (Arc::clone(&release), Arc::clone(&drained));
-            std::thread::spawn(move || {
-                // Without the gate, `quiesce` never waits for the parked
-                // announcement: the terminal drain is taken immediately and this
-                // returns at once, which is the interleaving under test. With it,
-                // `quiesce` cannot complete until the release below, so this waits
-                // the bound out and then lets the acceptor through.
-                crate::daemon::wait_until(Duration::from_millis(250), || {
-                    drained.load(Ordering::Acquire)
-                });
-                release.wait();
-            })
-        };
+        // Let the parked `deciding` call finish. `Handle::shutdown` (which
+        // `quiesce` below calls first) cannot return before this happens anyway —
+        // it blocks on the same `announcing` mutex `deciding` is called under — so
+        // there is nothing to wait for here; `verdict_release` below is the gate
+        // that actually orders this test.
+        release.wait();
 
         // (3) The terminal sequence, exactly as the session runs it: quiesce, then
-        // the one drain, with nothing joining the proxy in between.
+        // the one drain, with nothing joining the proxy in between. The connection's
+        // verdict may already be racing toward `decided` on its own thread by now —
+        // that race is exactly what `verdict_release` rules out below, deterministically,
+        // rather than this relying on the drain winning it.
         egress.quiesce(Duration::ZERO);
         let terminal = egress.drain_observations(&by());
-        drained.store(true, Ordering::Release);
 
-        // (4, 5) Only now is the acceptor released, so the verdict is produced
-        // strictly after the batch above was returned.
-        releaser.join().unwrap();
+        // (4, 5) Only now may the verdict be recorded: a hard rendezvous with the
+        // connection thread parked inside `decided`, not a wall-clock guess about
+        // how long it takes to get there.
+        verdict_release.wait();
         drop(asking.join());
 
         let (decisions, dropped) = tally(&terminal);
