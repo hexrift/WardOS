@@ -337,19 +337,86 @@ fn is_executable(path: &Path) -> bool {
         && nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
 }
 
-/// Whether `path` (already joined under `dir`) resolves, once every symlink is
-/// followed, to somewhere *outside* `dir` — the verifier only ever binds the
-/// worktree itself into the sandbox (at `/work`), so a project-relative
-/// candidate that is, or passes through, a symlink pointing outside it resolves
-/// to nothing inside the verifier even though the host filesystem (which does
-/// have the rest of the tree mounted) can follow it just fine. `false` when
-/// either side fails to canonicalize (typically: `path` does not exist) — that
-/// is a plain absence, for the caller's own not-found handling, not an escape.
+/// Whether `path` (already joined under `dir`) resolves to somewhere *outside*
+/// `dir` — checked lexically after symlinks are already accounted for by
+/// [`resolve_symlinks_conservatively`], so this only catches a literal `..`
+/// escape in the configured path itself (`verify.command: ../../etc/passwd`,
+/// no symlink involved at all). The verifier only ever binds the worktree
+/// itself into the sandbox (at `/work`), so anything that nets outside `dir`
+/// resolves to nothing there. `false` when either side fails to canonicalize
+/// (typically: `path` does not exist) — a plain absence, for the caller's own
+/// not-found handling, not an escape.
 fn escapes_worktree(dir: &Path, path: &Path) -> bool {
     match (dir.canonicalize(), path.canonicalize()) {
         (Ok(dir_real), Ok(path_real)) => !path_real.starts_with(&dir_real),
         _ => false,
     }
+}
+
+/// The kernel's own `ELOOP` hop limit — bounds [`resolve_symlinks_conservatively`]
+/// so a symlink cycle cannot hang it.
+const MAX_SYMLINK_HOPS: u8 = 40;
+
+/// What following `path` through its symlinks (if it is one, or leads through
+/// one) can prove about how it resolves *inside the verifier's own mount
+/// namespace* — not merely on the host, which is a different question once a
+/// symlink is involved (see [`runtime_row`]'s doc for why).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LinkResolution {
+    /// Every hop was safe to reason about, and this is the final, real
+    /// (non-symlink) path — still needs its own existence/executability and,
+    /// for a project-relative candidate, worktree-containment checked.
+    Resolved(PathBuf),
+    /// Some hop does not exist at all (a plain absence, not a broken link).
+    Missing,
+    /// A hop's symlink target was an absolute path outside `SYSTEM_RO`, or the
+    /// chain cycled/ran past [`MAX_SYMLINK_HOPS`] — either way, this is a
+    /// *definite* fact about the verifier's fixed, fully-enumerable mount set,
+    /// not a guess: the target (or the cycle itself, which `/bin/sh -c` would
+    /// hit identically) is guaranteed broken inside the sandbox, the same
+    /// certainty an absolute candidate outside `SYSTEM_RO` already gets.
+    Broken,
+}
+
+/// Follows `path` through every symlink it is, or passes through, applying
+/// only the two hop shapes a bind-mounted worktree or a `SYSTEM_RO` directory
+/// actually preserves: a **relative** symlink target (resolved against its own
+/// containing directory) resolves identically wherever the containing
+/// directory is mounted, exactly like a bind mount of `dir` preserves the
+/// worktree's own internal relative symlinks verbatim; an **absolute** symlink
+/// target only resolves the same way inside the sandbox when that absolute
+/// path is itself [`crate::sandbox::is_system_ro`] (mounted read-only at the
+/// identical path on the host and inside every sandbox). Any other absolute
+/// target — most commonly one carrying the worktree's own host temp-directory
+/// prefix, or a toolchain directory's real host location, neither of which the
+/// sandbox mounts at that literal path — is [`LinkResolution::Broken`]: the
+/// sandbox's mount set is fixed and fully enumerable, so an absolute target
+/// outside it is not merely unverified, it is *guaranteed absent*, exactly
+/// like an absolute candidate outside `SYSTEM_RO` already is.
+fn resolve_symlinks_conservatively(mut path: PathBuf) -> LinkResolution {
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(meta) = path.symlink_metadata() else {
+            return LinkResolution::Missing;
+        };
+        if !meta.file_type().is_symlink() {
+            return LinkResolution::Resolved(path);
+        }
+        let Ok(target) = std::fs::read_link(&path) else {
+            return LinkResolution::Missing;
+        };
+        path = if target.is_absolute() {
+            if !crate::sandbox::is_system_ro(&target) {
+                return LinkResolution::Broken;
+            }
+            target
+        } else {
+            match path.parent() {
+                Some(parent) => parent.join(target),
+                None => return LinkResolution::Missing,
+            }
+        };
+    }
+    LinkResolution::Broken
 }
 
 /// Whether the binary the *configured* `verify.command` would actually invoke is
@@ -403,59 +470,20 @@ fn runtime_row(dir: &Path, command: &str, search_dirs: &[PathBuf]) -> Row {
         );
     }
     if candidate.contains('/') {
-        let path = if Path::new(candidate).is_absolute() {
-            PathBuf::from(candidate)
-        } else {
-            dir.join(candidate)
-        };
-        if Path::new(candidate).is_absolute() {
-            if !crate::sandbox::is_system_ro(&path) {
-                return Row::new(
-                    "runtime",
-                    Status::Fail,
-                    format!(
-                        "{candidate} is outside the verifier's read-only system mounts; it will not exist inside the sandbox (/tmp, /home and /run are private and empty there)"
-                    ),
-                );
-            }
-        } else if escapes_worktree(dir, &path) {
-            return Row::new(
-                "runtime",
-                Status::Fail,
-                format!(
-                    "{candidate} resolves outside the project (a symlink escaping the worktree); it will not exist inside the verifier, which only sees the worktree itself"
-                ),
-            );
-        }
-        return if is_executable(&path) {
-            Row::new(
-                "runtime",
-                Status::Ok,
-                format!("{candidate} present and executable"),
-            )
-        } else if path.exists() {
-            Row::new(
-                "runtime",
-                Status::Fail,
-                format!(
-                    "{candidate} exists but is not executable (or is a directory); chmod +x it, or name a program inside it, before `ward verify` can run"
-                ),
-            )
-        } else {
-            Row::new(
-                "runtime",
-                Status::Fail,
-                format!(
-                    "{candidate} not found relative to the project; fix the path before `ward verify` can run"
-                ),
-            )
-        };
+        return path_candidate_row(dir, candidate);
     }
     match resolve_in_dirs(candidate, search_dirs) {
         PathLookup::Executable => Row::new(
             "runtime",
             Status::Ok,
             format!("{candidate} available to the verifier"),
+        ),
+        PathLookup::Broken => Row::new(
+            "runtime",
+            Status::Fail,
+            format!(
+                "{candidate} is a symlink pointing somewhere the verifier does not mount; it will not exist inside the sandbox"
+            ),
         ),
         PathLookup::NotExecutable => Row::new(
             "runtime",
@@ -479,29 +507,104 @@ fn runtime_row(dir: &Path, command: &str, search_dirs: &[PathBuf]) -> Row {
     }
 }
 
+/// [`runtime_row`]'s path-candidate case (`candidate` contains `/`): resolved
+/// against `dir` when relative, checked against [`crate::sandbox::is_system_ro`]
+/// when absolute, and validated through [`resolve_symlinks_conservatively`]
+/// either way before the final executability check.
+fn path_candidate_row(dir: &Path, candidate: &str) -> Row {
+    let absolute = Path::new(candidate).is_absolute();
+    let path = if absolute {
+        PathBuf::from(candidate)
+    } else {
+        dir.join(candidate)
+    };
+    if absolute && !crate::sandbox::is_system_ro(&path) {
+        return Row::new(
+            "runtime",
+            Status::Fail,
+            format!(
+                "{candidate} is outside the verifier's read-only system mounts; it will not exist inside the sandbox (/tmp, /home and /run are private and empty there)"
+            ),
+        );
+    }
+    let resolved = match resolve_symlinks_conservatively(path.clone()) {
+        LinkResolution::Resolved(p) => p,
+        LinkResolution::Broken => {
+            return Row::new(
+                "runtime",
+                Status::Fail,
+                format!(
+                    "{candidate} is a symlink pointing somewhere the verifier does not mount; it will not exist inside the sandbox"
+                ),
+            );
+        }
+        LinkResolution::Missing => {
+            let message = if absolute {
+                format!("{candidate} not found; fix the path before `ward verify` can run")
+            } else {
+                format!(
+                    "{candidate} not found relative to the project; fix the path before `ward verify` can run"
+                )
+            };
+            return Row::new("runtime", Status::Fail, message);
+        }
+    };
+    if !absolute && escapes_worktree(dir, &resolved) {
+        return Row::new(
+            "runtime",
+            Status::Fail,
+            format!(
+                "{candidate} resolves outside the project; it will not exist inside the verifier, which only sees the worktree itself"
+            ),
+        );
+    }
+    if is_executable(&path) {
+        Row::new(
+            "runtime",
+            Status::Ok,
+            format!("{candidate} present and executable"),
+        )
+    } else {
+        Row::new(
+            "runtime",
+            Status::Fail,
+            format!(
+                "{candidate} exists but is not executable (or is a directory); chmod +x it, or name a program inside it, before `ward verify` can run"
+            ),
+        )
+    }
+}
+
 /// The outcome of searching `search_dirs` for a candidate: present and
-/// runnable, present but not executable, or not found at all in any directory.
+/// runnable, a symlink guaranteed broken inside the verifier's mount
+/// namespace, present but not executable, or not found at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PathLookup {
     Missing,
     NotExecutable,
+    Broken,
     Executable,
 }
 
-/// Search `search_dirs`, in order, for an executable file named `candidate`.
-/// Distinguishes "not found anywhere" from "found, but not executable" so
-/// [`runtime_row`] can name the real problem.
+/// Search `search_dirs`, in order, for an executable file named `candidate`,
+/// following [`resolve_symlinks_conservatively`]'s same rules for any symlink
+/// along the way. Distinguishes "not found anywhere" from "found, but not
+/// executable" from "found, but only through a symlink the verifier's mount
+/// set guarantees is broken" so [`runtime_row`] can name the real problem.
 fn resolve_in_dirs(candidate: &str, search_dirs: &[PathBuf]) -> PathLookup {
     let mut found_non_executable = false;
     for dir in search_dirs {
         let candidate_path = dir.join(candidate);
-        if !candidate_path.is_file() {
-            continue;
+        match resolve_symlinks_conservatively(candidate_path.clone()) {
+            LinkResolution::Broken => return PathLookup::Broken,
+            LinkResolution::Resolved(resolved) if resolved.is_file() => {
+                if is_executable(&candidate_path) {
+                    return PathLookup::Executable;
+                }
+                found_non_executable = true;
+            }
+            LinkResolution::Missing | LinkResolution::Resolved(_) => {}
         }
-        if is_executable(&candidate_path) {
-            return PathLookup::Executable;
-        }
-        found_non_executable = true;
     }
     if found_non_executable {
         PathLookup::NotExecutable
@@ -549,6 +652,37 @@ mod tests {
         let path = dir.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn resolve_symlinks_conservatively_treats_an_absolute_non_system_target_as_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("tool"), "x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(outside.path().join("tool"), &link).unwrap();
+        assert_eq!(
+            resolve_symlinks_conservatively(link),
+            LinkResolution::Broken
+        );
+    }
+
+    #[test]
+    fn resolve_symlinks_conservatively_treats_an_absolute_system_ro_target_as_resolved() {
+        // /usr/bin/bash is as close to universal as a fixture can get, and /usr
+        // is unconditionally in SYSTEM_RO: exactly the "safe absolute hop" case.
+        let real = Path::new("/usr/bin/bash");
+        if !real.is_file() {
+            return; // not present on this machine; the Broken-case test above
+            // already covers the mechanism this one exists to contrast with.
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(real, &link).unwrap();
+        assert_eq!(
+            resolve_symlinks_conservatively(link),
+            LinkResolution::Resolved(real.to_path_buf())
+        );
     }
 
     #[test]
@@ -767,6 +901,33 @@ mod tests {
     }
 
     #[test]
+    fn runtime_reports_a_search_dir_entry_symlinked_to_an_unmounted_target_as_setup_required() {
+        // A `cargo` sitting in a search dir (mirroring a mounted toolchain
+        // bin/) that is itself a symlink to a real, executable file elsewhere
+        // on the host is host-executable, but the verifier's own mounts do not
+        // cover that elsewhere — the same broken-link class an absolute system
+        // candidate or a project-relative one can hit too.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cargo test\n",
+        );
+        let search_dir = tempfile::tempdir().unwrap();
+        let real_elsewhere = tempfile::tempdir().unwrap();
+        let real_cargo = real_elsewhere.path().join("cargo");
+        std::fs::write(&real_cargo, "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&real_cargo);
+        std::os::unix::fs::symlink(&real_cargo, search_dir.path().join("cargo")).unwrap();
+
+        let dirs = [search_dir.path().to_path_buf()];
+        let report = check_with_dirs(dir.path(), &dirs);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
     fn runtime_ignores_a_program_that_exists_only_outside_the_verifiers_search_dirs() {
         // `ward verify` runs in a sandbox whose PATH is the verifier's own
         // (Toolchains::search_dirs), never the calling process's — a program
@@ -917,40 +1078,40 @@ mod tests {
     }
 
     #[test]
-    fn runtime_reports_a_project_relative_symlink_escaping_the_worktree_as_setup_required() {
+    fn runtime_reports_a_project_relative_absolute_symlink_as_setup_required() {
         // The verifier only ever binds the worktree itself into the sandbox (at
-        // /work); a project-relative symlink pointing outside it resolves to
-        // nothing there, even though the host filesystem (which has the rest of
-        // the tree too) follows it just fine.
+        // /work), never at the host's own temp-directory path — so an *absolute*
+        // symlink target is broken inside it even when it points to somewhere
+        // still nominally "under" the worktree on the host (dir.path() is itself
+        // an absolute /tmp/... path; the sandbox does not mount /tmp at all,
+        // let alone at that literal path). Only a *relative* internal symlink
+        // (the next test) survives the sandbox relocating the worktree to /work.
         let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let tool = outside.path().join("ward-test-tool");
-        std::fs::write(&tool, "#!/bin/sh\ntrue\n").unwrap();
-        make_executable(&tool);
-        std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
-        std::os::unix::fs::symlink(&tool, dir.path().join("scripts/verify")).unwrap();
+        let real = dir.path().join("tools/verify.sh");
+        write(dir.path(), "tools/verify.sh", "#!/bin/sh\ntrue\n");
+        make_executable(&real);
+        // An absolute target, even though it resolves under `dir` on this host.
+        std::os::unix::fs::symlink(&real, dir.path().join("verify")).unwrap();
         write(
             dir.path(),
             ".tamperward/config.yml",
-            "verify:\n  command: ./scripts/verify\n",
+            "verify:\n  command: ./verify\n",
         );
         let report = check(dir.path());
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Fail, "{}", row.detail);
-        assert!(row.detail.contains("outside the project"), "{}", row.detail);
         assert_eq!(report.verdict(), Verdict::SetupRequired);
     }
 
     #[test]
     fn runtime_allows_a_project_relative_symlink_that_stays_within_the_worktree() {
-        // Not every symlink is a problem — one that resolves to another file
-        // inside the same worktree is exactly as visible to the verifier as a
-        // plain file would be.
+        // A *relative* symlink target, resolved against its own containing
+        // directory, is exactly what a bind mount of the worktree preserves
+        // verbatim regardless of where it ends up mounted — so this one is Ok.
         let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("tools/verify.sh");
         write(dir.path(), "tools/verify.sh", "#!/bin/sh\ntrue\n");
-        make_executable(&real);
-        std::os::unix::fs::symlink(&real, dir.path().join("verify")).unwrap();
+        make_executable(&dir.path().join("tools/verify.sh"));
+        std::os::unix::fs::symlink("tools/verify.sh", dir.path().join("verify")).unwrap();
         write(
             dir.path(),
             ".tamperward/config.yml",
@@ -960,6 +1121,34 @@ mod tests {
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Ok, "{}", row.detail);
         assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_a_project_relative_symlink_escaping_the_worktree_as_setup_required() {
+        // Even a *relative* symlink chain can still net outside the worktree
+        // through enough `..` components — still a real escape, still Fail,
+        // independent of the absolute-target case above.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("ward-test-tool"), "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&outside.path().join("ward-test-tool"));
+        // dir/scripts/verify -> ../../<outside's basename>/ward-test-tool: two
+        // levels up from dir/scripts reaches the common parent both tempdir()s
+        // share (their base temp directory), then back down into `outside`.
+        let relative_escape = PathBuf::from("../..")
+            .join(outside.path().file_name().unwrap())
+            .join("ward-test-tool");
+        std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        std::os::unix::fs::symlink(&relative_escape, dir.path().join("scripts/verify")).unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: ./scripts/verify\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
     }
 
     #[test]
