@@ -35,6 +35,8 @@ wardos_help "$@"
 # (mirroring Countdown::text: whole seconds rounded up), or "-" when the daemon
 # reports none (decided, or a daemon that predates #146 item 4). The daemon's own
 # figure as of this listing; nothing here computes a deadline of its own.
+# shellcheck disable=SC2016  # this is a jq program; its $-expressions are jq's own
+# interpolation syntax, expanded by jq when it runs, not by this shell now
 fields='
   def decision_time:
     if .outcome != null or .approval.countdown == null then "-"
