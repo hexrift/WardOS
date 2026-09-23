@@ -149,6 +149,15 @@ enum Command {
     },
     /// Check what this host can give a session, with a fix for each gap.
     Doctor,
+    /// Check whether this project can be verified before an agent starts: policy,
+    /// verifier config, its runtime and its protected paths, each with a fix (#147).
+    Ready {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+        /// The agent whose key is checked.
+        #[arg(long, value_enum, default_value_t = init::Agent::Claude)]
+        agent: init::Agent,
+    },
     /// Run the isolation self-tests against a real sandbox.
     Selftest {
         /// Project directory (default: current).
@@ -436,6 +445,7 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Resume { dir } => cmd_resume(&dir.unwrap_or_else(cwd)),
         Command::Verify { dir } => cmd_verify(&dir.unwrap_or_else(cwd)),
         Command::Doctor => Ok(cmd_doctor()),
+        Command::Ready { dir, agent } => Ok(cmd_ready(&dir.unwrap_or_else(cwd), agent)),
         Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
         Command::Replay { log, verify, json } => {
             let report = replay::replay(&log, replay::Options { verify, json })?;
@@ -504,6 +514,47 @@ fn cmd_doctor() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// `ward ready`: project-readiness checks (#147), plus the one row that needs to know
+/// which agent's key to look for — the same vault-then-environment lookup `ward init`
+/// already does for its own "next" block.
+fn cmd_ready(dir: &Path, agent: init::Agent) -> ExitCode {
+    let key_env = agent.key_env();
+    let state = ward_daemon::session::state_root();
+    let mut report = ward_daemon::readiness::check(dir);
+    report.push(credential_row(key_env, &state));
+    print!("{}", render::readiness_panel(&report));
+    if report.verdict().blocks() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Whether `key_env` is set (environment, then `<state>/vault/<key_env>`), the same
+/// lookup `ward init`'s "next" block uses. Never reads the value into the report.
+fn credential_row(key_env: &str, state: &Path) -> ward_daemon::readiness::Row {
+    use ward_daemon::doctor::Status;
+    let in_env = std::env::var(key_env).is_ok_and(|v| !v.trim().is_empty());
+    let in_vault = std::fs::read_to_string(ward_daemon::gateway::vault_file(state, key_env))
+        .is_ok_and(|v| !v.trim().is_empty());
+    if in_env || in_vault {
+        ward_daemon::readiness::Row {
+            name: "credential",
+            status: Status::Ok,
+            detail: format!(
+                "{key_env} ({})",
+                if in_env { "environment" } else { "vault" }
+            ),
+        }
+    } else {
+        ward_daemon::readiness::Row {
+            name: "credential",
+            status: Status::Warn,
+            detail: format!("{key_env} not set; `ward vault set {key_env}`"),
+        }
     }
 }
 
