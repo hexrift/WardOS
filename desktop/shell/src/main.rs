@@ -24,17 +24,18 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use ward_daemon::client::{self, WatchEnd};
 use ward_daemon::ids::{ev_snapshot, snap_snapshot};
 use ward_daemon::session::state_root;
 use ward_daemon::verify::candidate_options;
+use ward_events::EventRecord;
 use ward_shell_core::{
-    Authority, Header, Launcher, LineContext, Model, Module, SegmentName, SessionCard,
-    SessionDescription, Settings, TrustBar, authority_panel, counters_text, panel_text,
-    session_panel, verify_panel,
+    Authority, Decision, DigestGate, Header, Launcher, LineContext, Model, Module, SegmentName,
+    SessionCard, SessionDescription, Settings, TrustBar, authority_panel, counters_text,
+    panel_text, session_panel, verify_panel,
 };
 use ward_snapshot::{
     CaptureOptions, CaptureStats, HashCache, Manifest, ManifestDiff, SnapshotStore,
@@ -48,6 +49,13 @@ const SETTLE_MS: u64 = 250;
 /// an edit made outside the sandbox (the user's editor) is a change no record
 /// reports, and it must turn `VERIFY ✓` into `VERIFY ~ STALE` all the same.
 const TICK_MS: u64 = 2000;
+
+/// The minimum time between two record-triggered digests (#138 item 3): a
+/// burst of records collapses into a bounded number of scans instead of one
+/// per record. A quiet tick always digests regardless of this interval — it
+/// is the safety net that catches an edit made outside the sandbox, which
+/// leaves no record for a burst to coalesce.
+const DIGEST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// What the text surfaces say with no session: calm, and the two ways to get
 /// one (the command centre, or `ward init` then `ward claude` in a terminal),
@@ -245,9 +253,19 @@ fn surface_text(snapshot: Option<&Snapshot>, surface: Surface) -> String {
     }
 }
 
-/// `bar --waybar`: the module's JSON, once or on every change. The worktree is
-/// digested before the first line and, while following, on every record and
-/// on every quiet `tick`, so the verify segment answers for the tree as it is.
+/// `bar --waybar`: the module's JSON, once or on every change. Only a segment
+/// whose text or tone depends on freshness ([`SegmentName::needs_freshness`]:
+/// the whole bar, since it carries the verify segment, or `--segment verify`
+/// itself) ever digests the worktree (#138 item 3) — every other segment is
+/// derived from the event stream alone, so a follower rendering `agent` or
+/// `network` never touches the worktree at all. When one does, the worktree
+/// is digested before the first line and, while following, debounced behind
+/// [`DIGEST_DEBOUNCE`] on each record (a burst collapses into a bounded
+/// number of scans, never one per record) and unconditionally on every quiet
+/// `tick`, so the verify segment answers for the tree as it is without
+/// silently dropping a real change: [`DigestGate`] guarantees every
+/// invalidation is either covered by the scan it lands before or earns a
+/// follow-up scan.
 fn waybar(
     dir: &Path,
     settle: Duration,
@@ -261,8 +279,12 @@ fn waybar(
     let Some(mut snapshot) = load_from(&socket, settle)? else {
         return emit(&Module::none(segment));
     };
-    let mut digester = Digester::new();
-    digester.observe(&mut snapshot);
+    let needs_freshness = segment.is_none_or(SegmentName::needs_freshness);
+    let mut digester = needs_freshness.then(Digester::new);
+    let mut gate = DigestGate::new();
+    if let Some(d) = digester.as_mut() {
+        d.observe(&mut snapshot);
+    }
     let mut last = module(&snapshot, segment);
     emit(&last)?;
     if !follow || snapshot.model.sealed {
@@ -275,10 +297,14 @@ fn waybar(
     let subscriber = client::connect(&socket)?;
     let mut failed = None;
     client::watch_records_ticking(subscriber, from_seq, tick, |rec| {
-        if let Some(rec) = rec {
-            snapshot.model.apply(rec);
-        }
-        digester.observe(&mut snapshot);
+        observe_event(
+            &mut snapshot,
+            digester.as_mut(),
+            &mut gate,
+            rec,
+            Instant::now(),
+            DIGEST_DEBOUNCE,
+        );
         let now = module(&snapshot, segment);
         if now != last {
             if let Err(e) = emit(&now) {
@@ -296,6 +322,41 @@ fn waybar(
         emit(&now)?;
     }
     Ok(())
+}
+
+/// One step of the follow loop: apply `event` (a record, or `None` for a
+/// quiet tick) to `snapshot`, then — only when `digester` is `Some`, i.e. the
+/// segment being rendered needs freshness — decide through `gate` whether to
+/// digest the worktree now. A record only starts a scan once `interval` has
+/// passed since the last one began, coalescing a burst; a tick (`event` is
+/// `None`) always scans, the safety net for an edit made outside the sandbox
+/// that leaves no record. Returns whether a scan actually ran, for tests.
+/// Factored out of the `--follow` closure so it is testable without a socket.
+fn observe_event(
+    snapshot: &mut Snapshot,
+    digester: Option<&mut Digester>,
+    gate: &mut DigestGate,
+    event: Option<EventRecord>,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    let is_tick = event.is_none();
+    if let Some(rec) = event {
+        snapshot.model.apply(rec);
+    }
+    let Some(digester) = digester else {
+        return false;
+    };
+    if !is_tick {
+        gate.mark_dirty();
+    }
+    if gate.poll(now, interval, is_tick) == Decision::Scan {
+        digester.observe(snapshot);
+        gate.finish();
+        true
+    } else {
+        false
+    }
 }
 
 /// The whole bar or one segment of `s`.
@@ -676,6 +737,153 @@ mod tests {
         s.description.worktree = work.path().join("gone");
         digester.observe(&mut s);
         assert_eq!(s.model.worktree, before);
+    }
+
+    /// A harmless record, one per call, so a burst of "dirty" triggers can be
+    /// fed to [`observe_event`] without caring what it says.
+    #[allow(clippy::unwrap_used)]
+    fn note(chain: &mut ward_events::Chain, i: u64) -> ward_events::EventRecord {
+        chain
+            .append(
+                ward_events::Origin::Wardd,
+                ward_events::WardEvent::AgentClaim {
+                    kind: ward_events::ClaimKind::Note,
+                    payload: ward_events::PayloadText::new("tick"),
+                },
+                ward_events::Timestamp::mono(Duration::from_millis(i)),
+            )
+            .unwrap()
+    }
+
+    /// (a) #138 item 3: a segment that does not display freshness (`waybar()`
+    /// passes `digester: None` for it, per [`SegmentName::needs_freshness`])
+    /// must never trigger a worktree digest — not on load, not on a record,
+    /// not on a tick — however many triggers arrive and however much the
+    /// worktree changes underneath.
+    #[test]
+    fn a_non_freshness_segment_never_triggers_a_digest() {
+        #![allow(clippy::unwrap_used)]
+        use ward_events::{Blake3Hash, Chain, SessionId};
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let mut s = snapshot_on(work.path(), &[]);
+        let mut gate = DigestGate::new();
+        let mut chain = Chain::genesis(SessionId::from_u128(7), Blake3Hash::from_bytes([1; 32]));
+        let t0 = Instant::now();
+        // A record, then a tick, alternating, well past any debounce
+        // interval each time — nothing here should ever be enough to scan
+        // when there is no digester at all.
+        for i in 0..6u64 {
+            std::fs::write(work.path().join("a.rs"), format!("fn a() {{ {i} }}\n")).unwrap();
+            let event = if i % 2 == 0 {
+                Some(note(&mut chain, i))
+            } else {
+                None
+            };
+            let scanned = observe_event(
+                &mut s,
+                None,
+                &mut gate,
+                event,
+                t0 + Duration::from_secs(i),
+                DIGEST_DEBOUNCE,
+            );
+            assert!(!scanned, "no digester means no scan, ever (i={i})");
+        }
+        assert!(
+            s.model.worktree.is_none(),
+            "freshness was never observed: no digest ever ran"
+        );
+    }
+
+    /// (b) #138 item 3: a burst of rapid dirty triggers for a segment that
+    /// *does* need freshness collapses into a bounded number of scans, not
+    /// one per record.
+    #[test]
+    fn a_burst_of_rapid_dirty_triggers_coalesces_into_a_bounded_number_of_scans() {
+        #![allow(clippy::unwrap_used)]
+        use ward_events::{Blake3Hash, Chain, SessionId};
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let mut s = snapshot_on(work.path(), &[]);
+        let mut digester = Digester {
+            cache: HashCache::new(),
+            store: None,
+        };
+        let mut gate = DigestGate::new();
+        let mut chain = Chain::genesis(SessionId::from_u128(7), Blake3Hash::from_bytes([1; 32]));
+        let t0 = Instant::now();
+        let mut scans = 0u32;
+        // Thirty records, all inside one debounce interval.
+        for i in 0..30u64 {
+            let rec = note(&mut chain, i);
+            if observe_event(
+                &mut s,
+                Some(&mut digester),
+                &mut gate,
+                Some(rec),
+                t0 + Duration::from_millis(i),
+                DIGEST_DEBOUNCE,
+            ) {
+                scans += 1;
+            }
+        }
+        assert_eq!(
+            scans, 1,
+            "thirty records inside one interval must not be thirty scans"
+        );
+        assert!(s.model.worktree.is_some(), "the burst was still observed");
+
+        // Past the interval, a fresh record scans again: coalescing a burst
+        // must never mean a later, genuine change goes unnoticed forever.
+        let rec = note(&mut chain, 30);
+        let scanned = observe_event(
+            &mut s,
+            Some(&mut digester),
+            &mut gate,
+            Some(rec),
+            t0 + DIGEST_DEBOUNCE,
+            DIGEST_DEBOUNCE,
+        );
+        assert!(scanned, "a record past the debounce interval scans again");
+        assert_eq!(scans + u32::from(scanned), 2);
+    }
+
+    /// A quiet tick always scans (the safety net for an edit made outside the
+    /// sandbox, which leaves no record), even immediately after a
+    /// record-triggered scan already ran — a tick is never itself debounced.
+    #[test]
+    fn a_quiet_tick_always_scans_even_right_after_a_record_scan() {
+        #![allow(clippy::unwrap_used)]
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let mut s = snapshot_on(work.path(), &[]);
+        let mut digester = Digester {
+            cache: HashCache::new(),
+            store: None,
+        };
+        let mut gate = DigestGate::new();
+        let t0 = Instant::now();
+        gate.mark_dirty();
+        assert!(observe_event(
+            &mut s,
+            Some(&mut digester),
+            &mut gate,
+            None,
+            t0,
+            DIGEST_DEBOUNCE,
+        ));
+        assert!(
+            observe_event(
+                &mut s,
+                Some(&mut digester),
+                &mut gate,
+                None,
+                t0,
+                DIGEST_DEBOUNCE,
+            ),
+            "a tick scans unconditionally, not just the first one"
+        );
     }
 
     /// The number `docs/desktop.md` states. `WARD_DIGEST_DIR=<tree>` measures
