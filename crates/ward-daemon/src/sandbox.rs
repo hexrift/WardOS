@@ -102,6 +102,22 @@ const SYSTEM_RO: &[&str] = &[
     "/etc/ssl",
     "/etc/ca-certificates",
 ];
+/// Whether `path` is guaranteed to exist, read-only, at this same path inside
+/// every sandbox `Launch::args` builds — one of the fixed [`SYSTEM_RO`]
+/// `--ro-bind`s, always added when the host has the directory. Never true for a
+/// project's own worktree (bound at `/work`, an unrelated host path) or a
+/// toolchain mount (`verify::Toolchains`, mounted under the sandbox-only
+/// `/run/verifier`, with no fixed host equivalent) — those need their own
+/// reasoning, not this one. `ward ready`'s `runtime` row uses this to judge an
+/// absolute path candidate in `verify.command`: anything outside these roots is
+/// not merely unverified, it is *guaranteed absent* inside the verifier, since
+/// `/tmp`, `/home` and `/run` are replaced with empty private filesystems and
+/// nothing else is bound at all.
+#[must_use]
+pub(crate) fn is_system_ro(path: &Path) -> bool {
+    SYSTEM_RO.iter().any(|root| path.starts_with(root))
+}
+
 /// `PATH` inside the sandbox when the host offers nothing under a bound directory.
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
 /// Mount point of the session's hook socket inside the sandbox (`hooks.rs`).
@@ -688,6 +704,17 @@ mod tests {
         );
         assert_eq!(sandbox_path(""), DEFAULT_PATH);
         assert!(!sandbox_path("/optical/bin").contains("optical"));
+    }
+
+    #[test]
+    fn is_system_ro_matches_only_a_real_bound_root_by_path_component() {
+        assert!(is_system_ro(Path::new("/usr/bin/cargo")));
+        assert!(is_system_ro(Path::new("/opt/node22/bin/npm")));
+        // Component-wise, not a raw string prefix: "/optical" must not match "/opt".
+        assert!(!is_system_ro(Path::new("/optical/bin/tool")));
+        assert!(!is_system_ro(Path::new("/tmp/ward-test-tool")));
+        assert!(!is_system_ro(Path::new("/home/user/bin/tool")));
+        assert!(!is_system_ro(Path::new("/work/scripts/verify.sh")));
     }
 
     #[test]

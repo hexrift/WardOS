@@ -337,6 +337,21 @@ fn is_executable(path: &Path) -> bool {
         && nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
 }
 
+/// Whether `path` (already joined under `dir`) resolves, once every symlink is
+/// followed, to somewhere *outside* `dir` — the verifier only ever binds the
+/// worktree itself into the sandbox (at `/work`), so a project-relative
+/// candidate that is, or passes through, a symlink pointing outside it resolves
+/// to nothing inside the verifier even though the host filesystem (which does
+/// have the rest of the tree mounted) can follow it just fine. `false` when
+/// either side fails to canonicalize (typically: `path` does not exist) — that
+/// is a plain absence, for the caller's own not-found handling, not an escape.
+fn escapes_worktree(dir: &Path, path: &Path) -> bool {
+    match (dir.canonicalize(), path.canonicalize()) {
+        (Ok(dir_real), Ok(path_real)) => !path_real.starts_with(&dir_real),
+        _ => false,
+    }
+}
+
 /// Whether the binary the *configured* `verify.command` would actually invoke is
 /// available — checked against the real command, not guessed from the project
 /// manifest, so a Cargo project configured to run `npm test` is checked against
@@ -393,6 +408,25 @@ fn runtime_row(dir: &Path, command: &str, search_dirs: &[PathBuf]) -> Row {
         } else {
             dir.join(candidate)
         };
+        if Path::new(candidate).is_absolute() {
+            if !crate::sandbox::is_system_ro(&path) {
+                return Row::new(
+                    "runtime",
+                    Status::Fail,
+                    format!(
+                        "{candidate} is outside the verifier's read-only system mounts; it will not exist inside the sandbox (/tmp, /home and /run are private and empty there)"
+                    ),
+                );
+            }
+        } else if escapes_worktree(dir, &path) {
+            return Row::new(
+                "runtime",
+                Status::Fail,
+                format!(
+                    "{candidate} resolves outside the project (a symlink escaping the worktree); it will not exist inside the verifier, which only sees the worktree itself"
+                ),
+            );
+        }
         return if is_executable(&path) {
             Row::new(
                 "runtime",
@@ -858,6 +892,74 @@ mod tests {
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Fail, "{}", row.detail);
         assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_an_absolute_path_outside_system_mounts_as_setup_required() {
+        // /tmp is replaced with an empty, private tmpfs inside the verifier
+        // sandbox (sandbox.rs's Launch::args); a real, executable file at an
+        // absolute /tmp path on the host is still invisible inside it. tempdir()
+        // itself lives under /tmp (or $TMPDIR), so this is exactly that case.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let tool = outside.path().join("ward-test-tool");
+        std::fs::write(&tool, "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&tool);
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            &format!("verify:\n  command: {}\n", tool.display()),
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_a_project_relative_symlink_escaping_the_worktree_as_setup_required() {
+        // The verifier only ever binds the worktree itself into the sandbox (at
+        // /work); a project-relative symlink pointing outside it resolves to
+        // nothing there, even though the host filesystem (which has the rest of
+        // the tree too) follows it just fine.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let tool = outside.path().join("ward-test-tool");
+        std::fs::write(&tool, "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&tool);
+        std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        std::os::unix::fs::symlink(&tool, dir.path().join("scripts/verify")).unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: ./scripts/verify\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert!(row.detail.contains("outside the project"), "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_allows_a_project_relative_symlink_that_stays_within_the_worktree() {
+        // Not every symlink is a problem — one that resolves to another file
+        // inside the same worktree is exactly as visible to the verifier as a
+        // plain file would be.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("tools/verify.sh");
+        write(dir.path(), "tools/verify.sh", "#!/bin/sh\ntrue\n");
+        make_executable(&real);
+        std::os::unix::fs::symlink(&real, dir.path().join("verify")).unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: ./verify\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
     }
 
     #[test]
