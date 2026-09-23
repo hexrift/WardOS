@@ -6,9 +6,11 @@
 //! event-log state to build the root set the issue's own list asks for —
 //!
 //! * **active session entry/candidate snapshots** — [`session_roots`]: a session's
-//!   `entry_snapshot` counts for as long as its log is not yet sealed (`SessionEnded` not
-//!   yet recorded); a sealed session's entry is no longer a root through this rule (its
-//!   pristine state was only ever needed for verification *during* the session).
+//!   `entry_snapshot`, and every snapshot its own event log names (a `ward snapshot
+//!   create`, a verification candidate, a restore), count for as long as its log is not
+//!   yet sealed (`SessionEnded` not yet recorded); a sealed session's snapshots are no
+//!   longer roots through this rule (its pristine and candidate states were only ever
+//!   needed *during* the session — accepted evidence is pinned separately, below).
 //! * **in-flight verification** — [`crate::attempt::candidate_snapshot_ids`]: every
 //!   candidate an attempt marker currently names, for any session, sealed or not.
 //! * **pinned evidence** — [`evidence_roots`]: every `StateAccepted { snapshot, .. }`
@@ -92,8 +94,51 @@ fn session_roots(state: &Path, ids: &[String]) -> RootSet {
         if let Ok(entry) = meta.entry_snapshot.parse() {
             roots.insert(entry);
         }
+        // An active session's candidates too (#151 item 2: "active session
+        // entry/candidate snapshots"): every snapshot its own log names — a
+        // `ward snapshot create`, a verified or failed candidate, a restore — must
+        // stay materializable for as long as the session is live, not only for the
+        // grace period after it stopped being in flight.
+        let log_path = session_dir(state, id).join("events.log");
+        let Ok(reader) = LogReader::open(&log_path) else {
+            continue;
+        };
+        for record in reader.filter_map(std::result::Result::ok) {
+            for named in snapshots_named(&record.event) {
+                if let Ok(snapshot) = named.to_string().parse() {
+                    roots.insert(snapshot);
+                }
+            }
+        }
     }
     roots
+}
+
+/// Every snapshot id `event` names.
+fn snapshots_named(event: &WardEvent) -> Vec<ward_events::SnapshotId> {
+    match event {
+        WardEvent::SessionStarted { entry_snapshot, .. } => vec![*entry_snapshot],
+        WardEvent::SessionEnded { final_snapshot, .. } => final_snapshot.iter().copied().collect(),
+        WardEvent::SnapshotCreated { id, .. } => vec![*id],
+        WardEvent::VerificationStarted {
+            candidate,
+            pristine,
+            ..
+        } => vec![*candidate, *pristine],
+        WardEvent::VerificationRequested { candidate, .. }
+        | WardEvent::VerificationPassed { candidate, .. }
+        | WardEvent::VerificationFailed { candidate, .. }
+        | WardEvent::VerificationErrored { candidate, .. }
+        | WardEvent::VerificationTimedOut { candidate, .. } => vec![*candidate],
+        WardEvent::VerificationCancelled { candidate, .. }
+        | WardEvent::VerificationInterrupted { candidate, .. } => {
+            candidate.iter().copied().collect()
+        }
+        WardEvent::StateAccepted { snapshot, .. } | WardEvent::EntryRestored { snapshot, .. } => {
+            vec![*snapshot]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Every `StateAccepted { snapshot, .. }` id across every session's event log —
@@ -256,6 +301,58 @@ mod tests {
             !roots.contains(&entry),
             "sealed, so the entry-snapshot rule no longer protects it"
         );
+    }
+
+    #[test]
+    fn an_active_sessions_logged_candidates_are_roots_until_it_seals() {
+        // #151 item 2: "active session entry/candidate snapshots". A candidate the
+        // session's own log names — here a verified one and a `ward snapshot create`
+        // — stays a root for as long as the session is live, not only for the grace
+        // period after its attempt finished.
+        let state = tempfile::tempdir().unwrap();
+        let entry = store_snapshot(state.path());
+        let verified = store_snapshot(state.path());
+        let created = store_snapshot(state.path());
+        write_session(state.path(), "sess_live", entry);
+        let mut log = open_log(state.path(), "sess_live");
+        log.append(
+            Origin::Verifier,
+            WardEvent::VerificationPassed {
+                candidate: verified.to_string().parse().unwrap(),
+                summary: ward_events::VerifySummary::default(),
+                result_hash: ward_events::Blake3Hash::ZERO,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+        log.append(
+            Origin::Wardd,
+            WardEvent::SnapshotCreated {
+                role: ward_events::SnapshotRole::Candidate,
+                id: created.to_string().parse().unwrap(),
+                entries: 1,
+                bytes: 1,
+                capture: ward_events::CaptureMode::FrozenCopy,
+                stall: std::time::Duration::ZERO,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        let live = roots(state.path()).unwrap();
+        assert!(
+            live.contains(&verified),
+            "a live session's verified candidate"
+        );
+        assert!(live.contains(&created), "a live session's own snapshot");
+
+        Box::new(log).seal().unwrap();
+        let sealed = roots(state.path()).unwrap();
+        assert!(
+            !sealed.contains(&verified),
+            "sealed: no longer a root by this rule"
+        );
+        assert!(!sealed.contains(&created));
     }
 
     #[test]
