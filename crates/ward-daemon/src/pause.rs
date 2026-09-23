@@ -275,13 +275,16 @@ impl Drop for CaptureFreeze {
         // #234: re-take the lock and re-check the marker immediately before
         // thawing. A `ward pause` that landed while this guard's capture was in
         // progress writes the marker under this same lock; if it got there
-        // first, only `ward resume` may thaw this tree now. A lock we cannot
-        // take at all is treated the same way — fail safe, leave it frozen,
-        // rather than risk thawing over a pause we could not check for.
+        // first, only `ward resume` may thaw this tree now.
+        //
+        // A lock that cannot be taken at all still leaves the marker as the
+        // record of a user pause, so it is checked either way. Leaving the tree
+        // frozen with no marker would be unrecoverable: the daemon does not
+        // consider the session paused, so `ward resume` answers "not paused" and
+        // nothing ever thaws it. The lock only narrows the window against a
+        // concurrent pause; the marker decides.
         let dir = session_dir(&self.state, &self.session);
-        let Ok(_lock) = lock_pause_freeze(&dir) else {
-            return;
-        };
+        let _lock = lock_pause_freeze(&dir).ok();
         if marker_path(&self.state, &self.session).exists() {
             return;
         }
@@ -908,6 +911,63 @@ mod tests {
     /// process so the assertion is that nothing actually resumed, not merely that
     /// some function was or wasn't called; the marker is written before the guard
     /// drops, so no real timing race is needed to make the scenario deterministic.
+    #[test]
+    fn a_guard_that_cannot_take_the_lock_still_thaws_when_no_pause_is_recorded() {
+        use std::process::{Child, Command, Stdio};
+        struct Reap(Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let reap = Reap(
+            Command::new("sh")
+                .args(["-c", "while :; do :; done"])
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let root = reap.0.id();
+        let pids = tree(Path::new("/proc"), root);
+        freeze_signals(&pids);
+        let frozen = Frozen {
+            method: PauseMethod::Sigstop,
+            pids,
+            cgroup: None,
+        };
+        assert!(wait_settled(&frozen), "the tree settles into `stopped`");
+
+        // No session directory at all: the lock file cannot be created, so the
+        // lock cannot be taken — and no pause marker exists either.
+        let state = tempfile::tempdir().unwrap();
+        let session = "sess_no_lock";
+        assert!(lock_pause_freeze(&session_dir(state.path(), session)).is_err());
+        let guard = CaptureFreeze {
+            state: state.path().to_path_buf(),
+            session: session.to_owned(),
+            frozen: Some(frozen),
+        };
+
+        drop(guard);
+
+        // Thawed: left stopped, nothing could ever resume it.
+        let running = (0..100).any(|_| {
+            let state = fs::read_to_string(format!("/proc/{root}/stat"))
+                .ok()
+                .and_then(|s| proc_state(&s));
+            if state.is_some_and(|c| c != 'T') {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        });
+        assert!(
+            running,
+            "no pause recorded: the guard must thaw what it froze"
+        );
+    }
+
     #[test]
     fn a_pause_that_lands_during_a_capture_is_not_undone_by_the_guards_drop() {
         use std::process::{Child, Command, Stdio};
