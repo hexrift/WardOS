@@ -12,9 +12,9 @@ use ward_events::chain::{Chain, Timestamp, verify};
 use ward_events::event::{
     Acceptor, AgentIdentity, AgentKind, AgentState, CapabilityKind, CapabilityRequest, CaptureMode,
     ClaimKind, CredentialDelivery, Decision, DecisionSource, DeniedDst, DenyReason, EndReason,
-    EventKind, ExitStatus, FileChangeKind, GrantScope, PauseMethod, PolicySubject, ProcessRef,
-    RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus, TamperWardSig, VerifyRequester,
-    VerifySummary, WardEvent,
+    EventKind, ExitStatus, FileChangeKind, GrantScope, ObserverSource, PauseMethod, PolicySubject,
+    ProcessRef, RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus, TamperWardSig,
+    VerifyRequester, VerifySummary, WardEvent,
 };
 use ward_events::ids::{
     Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
@@ -615,6 +615,32 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Kernel,
+            WardEvent::LaunchAborted {
+                pid: Pid::new(4).unwrap(),
+                reason: text("egress proxy: address already in use"),
+            },
+        ),
+        (
+            Origin::Wardd,
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Network,
+                dropped: 9,
+                capacity: 4096,
+            },
+        ),
+        (
+            Origin::Wardd,
+            // Every `ObserverSource` is carried over the wire and through the
+            // log, the hook broker included: a hook claim the broker had to
+            // refuse is an observer gap, not an agent note.
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Hook,
+                dropped: 2,
+                capacity: 4096,
+            },
+        ),
+        (
             Origin::Wardd,
             WardEvent::SessionPauseUnsettled {
                 method: PauseMethod::Sigstop,
@@ -713,10 +739,12 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
         .count();
     // The nine of Quiet mode plus the three host interventions (ADR-0019 §3), plus
     // `VerificationErrored` (#139), plus `CapabilityDecided` appearing twice in the
-    // fixture above (once granted, once denied), plus `SessionPauseUnsettled`
-    // (#145 items 3-4): a pause the daemon could not confirm settled must be just
-    // as visible in Quiet mode as the pause itself.
-    assert_eq!(quiet, 14);
+    // fixture above (once granted, once denied), plus the observer's own "this
+    // record is incomplete" markers — one per source, the hook broker included
+    // (#137) — plus `SessionPauseUnsettled` (#145 items 3-4): a pause the daemon
+    // could not confirm settled must be just as visible in Quiet mode as the pause
+    // itself.
+    assert_eq!(quiet, 16);
 }
 
 #[test]

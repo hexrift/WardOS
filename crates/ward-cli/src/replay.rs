@@ -370,6 +370,7 @@ fn short_snapshot(id: &SnapshotId) -> String {
 }
 
 /// A compact, secret-free one-line description of an event for `--json`.
+#[allow(clippy::too_many_lines)]
 fn summary(event: &WardEvent) -> String {
     match event {
         WardEvent::SessionStarted {
@@ -392,6 +393,7 @@ fn summary(event: &WardEvent) -> String {
             ExitStatus::Exited { code } => format!("pid {pid} exit {code}"),
             ExitStatus::Signaled { signal, .. } => format!("pid {pid} signal {signal}"),
         },
+        WardEvent::LaunchAborted { pid, reason } => format!("pid {pid} aborted · {reason}"),
         WardEvent::SnapshotCreated {
             role,
             id,
@@ -447,6 +449,13 @@ fn summary(event: &WardEvent) -> String {
             "entry {} · {files} paths · backup {backup}",
             short_snapshot(snapshot)
         ),
+        WardEvent::ObservationsDropped {
+            source,
+            dropped,
+            capacity,
+        } => {
+            format!("{source} · {dropped} dropped · queue {capacity}")
+        }
         WardEvent::Anchor {
             chain_head,
             seq,

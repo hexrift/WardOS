@@ -30,10 +30,11 @@ use crate::gateway::Gateway;
 use crate::github;
 use crate::hooks::{DaemonHolder, Holder, Hooks};
 use crate::ids::{ev_capture, ev_hash, ev_role, ev_snapshot, new_session_id, project_id_for};
+use crate::observe::{DrainClock, Observation, Observers, file_batch};
 use crate::pause;
 use crate::sandbox::{Launch, RELAY_ADDR, StdioMode, find_shim};
 use crate::verify;
-use crate::watch::{CaptureMode, Captured, WatchOutcome, Watcher};
+use crate::watch::{CaptureMode, Captured, WatchOutcome};
 
 /// A live WardOS session over one project.
 pub struct Session {
@@ -602,6 +603,21 @@ impl Session {
     /// Run a command with explicit options; every run gets the session egress proxy.
     /// Refused while the session is paused: a sandbox started then would run
     /// unfrozen behind a closed proxy, which is neither state the user chose.
+    ///
+    /// Once `CommandStarted` (and any credential grant `opts.gateways` makes) is on
+    /// the log, every exit path leaves exactly one terminal record behind it —
+    /// `CommandFinished`, or, when the launch could not be carried that far (the
+    /// sandbox or hook socket failed to bind, the child failed to spawn, …),
+    /// `LaunchAborted` (#140, PR #197 review). Without this, a credential granted
+    /// above could outlive a launch that never even started: the daemon's
+    /// `open_launches` would keep the pid open forever, exactly the staleness #140
+    /// exists to prevent, just reached through a different exit path than an
+    /// ordinary `CommandFinished`. The real error is still returned to the caller
+    /// unchanged either way — the terminal record is additive, never a substitute
+    /// (the same discipline `VerificationErrored` (#139) uses for `Session::verify`).
+    /// If the terminal record's own append also fails (sink gone, disk full, …),
+    /// that failure is folded into the returned error rather than discarded, so the
+    /// caller learns the log may still end at `CommandStarted`.
     pub fn launch(&mut self, argv: &[String], opts: &LaunchOpts) -> Result<RunReport> {
         self.refuse_while_paused()?;
         self.emit(
@@ -624,59 +640,140 @@ impl Session {
             },
         )?;
 
-        let watch_reads = matches!(
-            self.manifest.observer,
-            ObserverMode::Live | ObserverMode::StepThrough(_)
-        );
-        let watcher = Watcher::start(&self.worktree, watch_reads).ok();
-        let before = if watcher.is_none() {
-            Some(scan(&self.worktree))
-        } else {
-            None
-        };
-
         for refusal in &opts.refusals {
             self.emit(Origin::Wardd, refusal.clone())?;
         }
         for g in &opts.gateways {
             self.emit(Origin::Wardd, g.granted(GATEWAY_TTL)?)?;
         }
+
+        // From here on `CommandStarted` (and any grant just above) is already on the
+        // log, so the `match` below never lets an error skip past leaving a terminal
+        // record for it.
+        let result = self.run_launch(pid, argv, opts);
+        let outcome = match result {
+            Ok(report) => Ok(report),
+            Err(e) => {
+                let reason = ShortText::new(&e.to_string());
+                Err(
+                    match self.emit(Origin::Kernel, WardEvent::LaunchAborted { pid, reason }) {
+                        Ok(()) => e,
+                        // The fallback terminal record's own append failed too: never
+                        // silently discard that (the exact gap #140/#139 both exist to
+                        // close). Fold both failures into what the caller sees, so this
+                        // is distinguishable from an ordinary abort whose record landed.
+                        Err(emit_err) => Error::Events(format!(
+                            "launch failed ({e}), and the terminal record for it could \
+                             not be written ({emit_err}); the log may still end at \
+                             CommandStarted"
+                        )),
+                    },
+                )
+            }
+        };
+        // The agent is idle either way: the launch finished, or it never got off the
+        // ground. Best-effort — a failure here is secondary to `outcome` above, and
+        // before this fix a failed launch left the agent reporting `Working` forever,
+        // since the function returned early without ever reaching this point.
+        let _ = self.emit(
+            Origin::Wardd,
+            WardEvent::AgentStateChanged {
+                state: AgentState::Idle,
+            },
+        );
+        outcome
+    }
+
+    /// The launch's fallible span, from starting the observers and the sandbox/hook
+    /// setup through the child's own exit and its `CommandFinished`: everything that
+    /// can fail with `CommandStarted` (and any credential grant above it) already on
+    /// the log. An `Err` here means the launch never reached `CommandFinished`;
+    /// [`launch`](Self::launch) turns that into a `LaunchAborted` terminal record
+    /// instead (#140, PR #197 review).
+    ///
+    /// Split out of [`launch`](Self::launch) so the observers also live in one scope
+    /// that owns their shutdown: [`Observers`] stops every producer it holds when it
+    /// drops, whichever way this function is left, and the final flush below runs on
+    /// the failure paths too — a sandbox that could not be prepared, a child that
+    /// could not be spawned — so what the producers had already recorded still
+    /// reaches the log instead of dying with the thread that held it. File and
+    /// network observations reach the log *while the command is still running*
+    /// (#137), not in one batch after it exits: the watch, the proxy's recorder and
+    /// the hook broker each hand what they see to a bounded queue, and this thread —
+    /// the session's single log writer — drains those queues between waits on the
+    /// child and appends what it takes through the same [`Sink`](crate::control::Sink)
+    /// every other record goes through. The producers never touch the log, so there
+    /// is still exactly one writer.
+    fn run_launch(&mut self, pid: Pid, argv: &[String], opts: &LaunchOpts) -> Result<RunReport> {
+        let watch_reads = matches!(
+            self.manifest.observer,
+            ObserverMode::Live | ObserverMode::StepThrough(_)
+        );
         let run_dir = run_dir(&self.session_str)?;
+        let mut observers = Observers::new(run_dir.clone());
+        let live_watch = observers.start_watch(&self.worktree, watch_reads);
+        // Without a live watch there is nothing to stream: the fallback can only
+        // diff the tree before against the tree after.
+        let before = (!live_watch).then(|| scan(&self.worktree));
+
         let mut egress = Egress::start(
             &run_dir,
             &self.manifest.network,
             opts.gateways.iter().map(|g| g.route.clone()).collect(),
         )?;
         egress.watch_marker(pause::marker_path(&self.state, &self.session_str));
-        let hooks = Hooks::start_with(
+        observers.set_egress(egress);
+        observers.set_hooks(Hooks::start_with(
             &run_dir,
             self.manifest.observer,
             self.protected_paths(),
             self.holder(),
-        )?;
-        let launch = self.prepare(argv, opts, &run_dir, &egress, &hooks)?;
-        let outcome = launch.run()?;
-
-        let watch = watcher.map(Watcher::finish);
-        let (captured, capture, observer_degraded) =
-            collect_captured(watch, before, &self.worktree);
+        )?);
 
         let comm = comm(argv);
-        let changed_paths = self.emit_captured(&captured, pid, comm.as_ref())?;
-
         let by = ProcessRef {
             pid,
             comm: comm.clone(),
         };
-        for (at, event) in egress.drain_events(&by) {
-            self.emit_at(at, Origin::Proxy, event)?;
+        let mut changed_paths = BTreeSet::new();
+        // A sink failure during a live drain stops further live drains but never
+        // the child: the agent's command is not the log's problem to abort.
+        let mut live_error: Option<Error> = None;
+
+        let run = match self.prepare(argv, opts, &run_dir, &observers) {
+            Ok(launch) => {
+                let mut clock = DrainClock::new();
+                launch.run_observed(&mut || {
+                    if live_error.is_some() || !clock.due(observers.queued()) {
+                        return;
+                    }
+                    let batch = observers.drain(&by);
+                    if let Err(e) = self.ingest(batch, &mut changed_paths) {
+                        live_error = Some(e);
+                    }
+                })
+            }
+            Err(e) => Err(e),
+        };
+
+        // The one and only tail flush: the producers are stopped and handed over
+        // here, so nothing this command observed can be appended twice, and it
+        // happens before the terminal `CommandFinished` record below.
+        let finished = observers.finish(&by);
+        let watch_dropped = finished.watch.as_ref().map_or(0, |w| w.dropped);
+        let (captured, capture, observer_degraded) =
+            collect_captured(finished.watch, before, &self.worktree);
+        let mut tail = file_batch(&captured, &by, watch_dropped, finished.capacity);
+        tail.extend(finished.tail);
+        let flushed = self.ingest(tail, &mut changed_paths);
+
+        // A failed run still flushed what was observed before it failed; only now
+        // does the failure win.
+        let outcome = run?;
+        flushed?;
+        if let Some(e) = live_error {
+            return Err(e);
         }
-        egress.stop();
-        for (at, event) in hooks.drain_events() {
-            self.emit_at(at, Origin::Agent, event)?;
-        }
-        hooks.stop();
-        let _ = std::fs::remove_dir_all(&run_dir);
 
         self.emit(
             Origin::Kernel,
@@ -684,12 +781,6 @@ impl Session {
                 pid,
                 exit: exit_status(outcome.code),
                 duration: outcome.duration,
-            },
-        )?;
-        self.emit(
-            Origin::Wardd,
-            WardEvent::AgentStateChanged {
-                state: AgentState::Idle,
             },
         )?;
 
@@ -715,12 +806,15 @@ impl Session {
         argv: &[String],
         opts: &LaunchOpts,
         run_dir: &Path,
-        egress: &Egress,
-        hooks: &Hooks,
+        observers: &Observers,
     ) -> Result<Launch> {
-        let mut launch = Launch::new(&self.worktree, argv.to_vec())
-            .egress(egress.socket())
-            .hooks(hooks.socket());
+        let mut launch = Launch::new(&self.worktree, argv.to_vec());
+        if let Some(socket) = observers.egress_socket() {
+            launch = launch.egress(socket);
+        }
+        if let Some(socket) = observers.hook_socket() {
+            launch = launch.hooks(socket);
+        }
         for (n, (path, content)) in opts.seeds.iter().enumerate() {
             let file = run_dir.join(format!("seed-{n}"));
             std::fs::write(&file, content).map_err(|e| Error::io(&file, e))?;
@@ -1010,52 +1104,23 @@ impl Session {
         Ok(())
     }
 
-    /// Emit kernel-origin file events for one command and return the changed paths.
-    fn emit_captured(
+    /// Append one batch of drained observations, in the order the batch holds them,
+    /// noting every modified path in `changed_paths`.
+    ///
+    /// Each record keeps the time its source observed it, not the time it reached
+    /// the log, so a live-drained timeline reads exactly as the batched one did.
+    fn ingest(
         &mut self,
-        captured: &[Captured],
-        pid: Pid,
-        comm: Option<&BoundedText<32>>,
-    ) -> Result<BTreeSet<String>> {
-        let mut changed_paths = BTreeSet::new();
-        for item in captured {
-            match item {
-                Captured::Modified { at, rel, kind } => {
-                    if let Ok(path) = SandboxPath::new(SandboxRoot::Work, rel) {
-                        changed_paths.insert(rel.clone());
-                        self.emit_at(
-                            *at,
-                            Origin::Kernel,
-                            WardEvent::FileModified {
-                                path,
-                                by: ProcessRef {
-                                    pid,
-                                    comm: comm.cloned(),
-                                },
-                                kind: *kind,
-                            },
-                        )?;
-                    }
-                }
-                Captured::Read { at, rel } => {
-                    if let Ok(path) = SandboxPath::new(SandboxRoot::Work, rel) {
-                        self.emit_at(
-                            *at,
-                            Origin::Kernel,
-                            WardEvent::FileRead {
-                                path,
-                                by: ProcessRef {
-                                    pid,
-                                    comm: comm.cloned(),
-                                },
-                            },
-                        )?;
-                    }
-                }
+        batch: Vec<Observation>,
+        changed_paths: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        for item in batch {
+            if let WardEvent::FileModified { path, .. } = &item.event {
+                changed_paths.insert(path.to_string());
             }
+            self.emit_at(item.at, item.origin, item.event)?;
         }
-
-        Ok(changed_paths)
+        Ok(())
     }
 
     fn alloc_pid(&mut self) -> Pid {
@@ -1414,6 +1479,7 @@ mod tests {
         let watch = WatchOutcome {
             captured: Vec::new(),
             degraded: true,
+            dropped: 0,
         };
 
         let (_, capture, observer_degraded) = collect_captured(Some(watch), None, worktree.path());

@@ -15,17 +15,18 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
-use ward_events::{ClaimKind, PayloadText, WardEvent};
+use ward_events::{ClaimKind, ObserverSource, Origin, PayloadText, WardEvent};
 use ward_policy::ObserverMode;
 
 use crate::control::{RemoteSink, Request, Response};
 use crate::error::{Error, Result};
+use crate::observe::{Bounded, Observation, overflow_marker};
 
 /// Longest a client may take to send its request line.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -269,11 +270,20 @@ pub fn to_event(claim: &Claim) -> WardEvent {
 /// A running hook listener bound to a Unix socket.
 pub struct Hooks {
     socket: PathBuf,
-    claims: Arc<Mutex<Vec<Claim>>>,
-    /// Claims dropped because the pending buffer was full (#123); surfaced on drain.
-    dropped: Arc<AtomicUsize>,
+    /// Claims recorded but not yet drained, with the refusals that belong to the
+    /// same drain epoch, the handlers still in flight, and the terminal cutover
+    /// itself — all behind that queue's one lock (#123, #137).
+    ///
+    /// The handlers in flight are what the accept loop caps concurrency on
+    /// ([`MAX_HANDLERS`]) and what [`Hooks::quiesce`] waits to reach zero before the
+    /// terminal drain: a handler is in the set from before it is spawned until the
+    /// lock acquisition that records its claim, so an empty set means every claim
+    /// that will ever be recorded already is. Keeping the set in the *same* lock as
+    /// the claims is what makes the cutover exact — see [`Bounded`].
+    claims: Arc<Bounded<Claim>>,
     shutdown: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    /// The accept thread, taken by whichever of `quiesce`/`stop` runs first.
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Hooks {
@@ -320,40 +330,38 @@ impl Hooks {
         let socket = dir.join("hooks.sock");
         let listener = UnixListener::bind(&socket)
             .map_err(|e| Error::Sandbox(format!("hook socket {}: {e}", socket.display())))?;
-        let claims = Arc::new(Mutex::new(Vec::new()));
-        let dropped = Arc::new(AtomicUsize::new(0));
+        let claims = Arc::new(Bounded::new(max_claims));
+        // Handler threads in flight, tracked in the claim queue's own lock. The accept
+        // loop never serves a connection itself: it spawns a handler up to
+        // `max_handlers`, and once that many are live it sends a fast overload reply
+        // and closes the connection instead (#123). So the loop is never occupied by a
+        // held approval — ordinary requests keep being accepted and answered promptly —
+        // the concurrent service count is exactly `max_handlers` (not +1 for the accept
+        // thread), and `stop` never joins a handler blocked on a hold.
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (claims, dropped, shutdown) = (claims.clone(), dropped.clone(), shutdown.clone());
+            let (claims, shutdown) = (claims.clone(), shutdown.clone());
             std::thread::spawn(move || {
                 let protected = Arc::new(protected);
-                // Handler threads in flight. The accept loop never serves a connection
-                // itself: it spawns a handler up to `max_handlers`, and once that many are
-                // live it sends a fast overload reply and closes the connection instead
-                // (#123). So the loop is never occupied by a held approval — ordinary
-                // requests keep being accepted and answered promptly — the concurrent
-                // service count is exactly `max_handlers` (not +1 for the accept thread),
-                // and shutdown never joins a handler blocked on a hold.
-                let live = Arc::new(AtomicUsize::new(0));
                 for stream in listener.incoming().flatten() {
                     if shutdown.load(Ordering::SeqCst) {
                         break;
                     }
-                    if live.load(Ordering::SeqCst) >= max_handlers {
+                    if !claims.enter(max_handlers) {
                         // Defined overload response: refuse and close at once (never block
                         // the accept loop), counted so the drop is surfaced on the next
-                        // drain rather than silently lost.
-                        overload_reject(stream, &dropped);
+                        // drain rather than silently lost. This connection never joined
+                        // the in-flight set, so nothing else will account for it.
+                        overload_reject(stream, &claims);
                         continue;
                     }
-                    live.fetch_add(1, Ordering::SeqCst);
-                    let (protected, claims, dropped, holder, live) = (
-                        Arc::clone(&protected),
-                        Arc::clone(&claims),
-                        Arc::clone(&dropped),
-                        holder.clone(),
-                        Arc::clone(&live),
-                    );
+                    let (protected, claims, holder) =
+                        (Arc::clone(&protected), Arc::clone(&claims), holder.clone());
+                    // `serve` leaves the in-flight set exactly once, in the same lock
+                    // acquisition that records its claim — so a quiesce that sees the
+                    // set empty has seen every claim there will be, and a handler that
+                    // finishes after the cutover sealed finds it sealed rather than
+                    // appending to a batch already accounted for without it.
                     std::thread::spawn(move || {
                         serve(
                             stream,
@@ -361,13 +369,10 @@ impl Hooks {
                                 observer,
                                 protected: &protected,
                                 claims: &claims,
-                                dropped: &dropped,
-                                max_claims,
                                 deadline,
                                 holder: holder.as_deref(),
                             },
                         );
-                        live.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
             })
@@ -375,9 +380,8 @@ impl Hooks {
         Ok(Self {
             socket,
             claims,
-            dropped,
             shutdown,
-            thread: Some(thread),
+            thread: Mutex::new(Some(thread)),
         })
     }
 
@@ -386,69 +390,121 @@ impl Hooks {
         &self.socket
     }
 
-    /// Claims recorded since the last drain, as log events with their arrival
-    /// time, in arrival order. If any requests were dropped under overload — the
-    /// pending-claim buffer full, or a connection refused at the handler cap — a
-    /// final note records how many, so the drained evidence is never presented as
-    /// complete when it is not (#123).
-    pub fn drain_events(&self) -> Vec<(SystemTime, WardEvent)> {
-        let mut events: Vec<(SystemTime, WardEvent)> = self
-            .claims
-            .lock()
-            .map(|mut v| std::mem::take(&mut *v))
-            .unwrap_or_default()
+    /// How many claims are waiting to be drained, so the session's live drain can
+    /// batch on a claim burst as well as on the interval (#137).
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.claims.queued()
+    }
+
+    /// Claims recorded since the last drain, as log-ready observations keeping
+    /// their arrival time, in arrival order.
+    ///
+    /// If any requests were lost — the pending-claim buffer full, a connection
+    /// refused at the handler cap, or a handler still in flight when the terminal
+    /// flush's bounded quiesce ran out — the batch ends with an explicit
+    /// [`WardEvent::ObservationsDropped`] marker for [`ObserverSource::Hook`],
+    /// exactly as the file watch and the proxy recorder report their own gaps
+    /// (#123, #137). It is deliberately *not* an `AgentClaim { kind: Note }`: a
+    /// note is an agent claim, which Quiet excludes, and "this record is
+    /// incomplete" is a fact about the daemon that no observer mode may hide.
+    pub fn drain_observations(&self) -> Vec<Observation> {
+        let drained = self.claims.drain();
+        let mut out: Vec<Observation> = drained
+            .items
             .iter()
-            .map(|c| (c.at, to_event(c)))
+            .map(|c| Observation::new(c.at, Origin::Agent, to_event(c)))
             .collect();
-        let dropped = self.dropped.swap(0, Ordering::SeqCst);
-        if dropped > 0 {
-            events.push((
-                SystemTime::now(),
-                WardEvent::AgentClaim {
-                    kind: ClaimKind::Note,
-                    payload: PayloadText::new(&format!(
-                        "{dropped} hook request(s) dropped under overload (handler cap reached \
-                         or the pending-claim buffer full); this evidence is incomplete"
-                    )),
-                },
+        if drained.dropped > 0 {
+            out.push(overflow_marker(
+                ObserverSource::Hook,
+                drained.dropped,
+                self.claims.capacity(),
             ));
         }
-        events
+        out
+    }
+
+    /// Flag shutdown and unblock and join the accept thread, so no further
+    /// connection is served. Idempotent; the handlers already in flight are not
+    /// touched.
+    fn stop_accepting(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        // Unblock the accept loop; it sees the flag and exits.
+        drop(UnixStream::connect(&self.socket));
+        let thread = self
+            .thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(thread) = thread {
+            drop(thread.join());
+        }
+    }
+
+    /// Quiesce the broker for its final drain: stop accepting, then wait up to
+    /// `timeout` for the handlers already in flight to finish recording their
+    /// claims. Returns how many were still running when the wait ended.
+    ///
+    /// The caller drains *after* this returns, which is the whole point: a handler
+    /// holds the claim buffer for as long as it runs, so draining while one is live
+    /// races the drain against a claim that is about to be recorded and silently
+    /// discards whichever loses ([`stop`](Self::stop) deliberately does not wait for
+    /// handlers, so before this existed there was no later drain to catch it).
+    ///
+    /// The wait is bounded so that a handler wedged on a hold cannot hold the
+    /// daemon's shutdown open; the handlers still running when it ends are counted
+    /// as refused claims, so [`drain_observations`](Self::drain_observations)
+    /// reports the gap as an explicit marker rather than leaving it silent.
+    ///
+    /// Giving up on them is one step, not two: [`Bounded::seal`] reads the final
+    /// in-flight count and commits to it under the very lock a handler has to take
+    /// to record its claim. So a handler that finishes in the instant the wait ran
+    /// out either got its claim into the batch the caller is about to drain — in
+    /// which case the seal never saw it and never counted it — or finds the queue
+    /// sealed and adds nothing, because the seal already counted it. Sampling the
+    /// count first and recording it afterwards is what let one handler be both.
+    pub fn quiesce(&self, timeout: Duration) -> usize {
+        self.stop_accepting();
+        self.claims.wait_idle(timeout);
+        self.claims.seal()
     }
 
     /// Stop the listener and remove the socket. Non-blocking: it flags shutdown, unblocks
     /// and joins only the accept thread — which never serves a request itself — so a handler
     /// blocked on a held approval cannot delay shutdown (#123). In-flight handlers finish on
-    /// their own; each is bounded by its hold timeout.
-    pub fn stop(mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        // Unblock the accept loop; it sees the flag and exits.
-        drop(UnixStream::connect(&self.socket));
-        if let Some(thread) = self.thread.take() {
-            drop(thread.join());
-        }
+    /// their own; each is bounded by its hold timeout. A caller that needs the claims those
+    /// handlers are still recording calls [`quiesce`](Self::quiesce) first.
+    pub fn stop(self) {
+        self.stop_accepting();
         drop(std::fs::remove_file(&self.socket));
     }
 }
 
 /// The shared context a connection is served against: the observer mode, the protected
-/// set, the claim buffer and its cap, the overflow counter, the whole-request deadline and
-/// the optional holder. Bundled so [`serve`] takes one context rather than a long argument
-/// list, and cloned cheaply (borrows) per handler.
+/// set, the bounded claim buffer, the whole-request deadline and the optional holder.
+/// Bundled so [`serve`] takes one context rather than a long argument list, and cloned
+/// cheaply (borrows) per handler.
 struct Serve<'a> {
     observer: ObserverMode,
     protected: &'a [String],
-    claims: &'a Mutex<Vec<Claim>>,
-    dropped: &'a AtomicUsize,
-    max_claims: usize,
+    claims: &'a Bounded<Claim>,
     deadline: Duration,
     holder: Option<&'a dyn Holder>,
 }
 
 /// Handle one connection: read a line, decide, hold an `ask` when there is a
 /// holder, record, reply. Malformed input closes the connection silently.
+///
+/// The handler is in the claim queue's in-flight set on entry (the accept loop put
+/// it there) and leaves it exactly once, on every path out: through
+/// [`Bounded::commit`] when it reached a claim, and through [`Bounded::leave`] when
+/// it did not.
 fn serve(mut stream: UnixStream, cx: &Serve) {
     let Some(req) = read_request(&stream, cx.deadline) else {
+        // No request, so no claim: leave the in-flight set so the broker can still
+        // be seen to go quiet.
+        cx.claims.leave();
         return;
     };
     let mut response = decide(&cx.observer, cx.protected, &req);
@@ -459,20 +515,17 @@ fn serve(mut stream: UnixStream, cx: &Serve) {
             response = held;
         }
     }
-    if let Ok(mut v) = cx.claims.lock() {
-        // Bound the pending buffer: past the cap the claim is dropped and counted (surfaced
-        // on the next drain), so a flood of hook requests cannot grow memory without bound
-        // and the drop is never silently presented as complete evidence (#123).
-        if v.len() < cx.max_claims {
-            v.push(Claim {
-                at: SystemTime::now(),
-                request: req,
-                decision: response.decision,
-            });
-        } else {
-            cx.dropped.fetch_add(1, Ordering::SeqCst);
-        }
-    }
+    // Record the claim and leave the in-flight set in one lock acquisition (#137), so
+    // the terminal cutover cannot write this handler off as lost in the interval
+    // between the two. Bound the pending buffer while we are there: past the cap the
+    // claim is refused and counted under the same lock (surfaced on the next drain), so
+    // a flood of hook requests cannot grow memory without bound and the refusal is
+    // never silently presented as complete evidence (#123).
+    cx.claims.commit(Claim {
+        at: SystemTime::now(),
+        request: req,
+        decision: response.decision,
+    });
     if let Ok(mut json) = serde_json::to_vec(&response) {
         json.push(b'\n');
         drop(stream.write_all(&json));
@@ -541,9 +594,9 @@ fn read_request(stream: &UnixStream, deadline: Duration) -> Option<HookRequest> 
 
 /// The defined overload response (#123): the accept loop is at its handler cap, so refuse
 /// this connection at once with a `Deny` and close — never blocking the loop or spawning
-/// past the cap. Counted as a dropped request so [`Hooks::drain_events`] surfaces it.
-fn overload_reject(mut stream: UnixStream, dropped: &AtomicUsize) {
-    dropped.fetch_add(1, Ordering::SeqCst);
+/// past the cap. Counted as a refused claim so [`Hooks::drain_observations`] surfaces it.
+fn overload_reject(mut stream: UnixStream, claims: &Bounded<Claim>) {
+    claims.record_dropped(1);
     drop(stream.set_write_timeout(Some(READ_TIMEOUT)));
     let response = HookResponse {
         decision: HookDecision::Deny,
@@ -914,21 +967,25 @@ mod tests {
         let resp: HookResponse = serde_json::from_str(&reply).unwrap();
         assert_eq!(resp.decision, HookDecision::Allow);
 
-        let events = hooks.drain_events();
+        let events = hooks.drain_observations();
         assert_eq!(events.len(), 3);
-        assert!(events[0].0 <= events[1].0, "arrival times are kept");
+        assert!(events[0].at <= events[1].at, "arrival times are kept");
+        assert!(
+            events.iter().all(|o| o.origin == Origin::Agent),
+            "a claim is what the agent said, never an enforcement fact"
+        );
         assert_claim(
-            &events[0].1,
+            &events[0].event,
             ClaimKind::ToolUse,
             "PreToolUse Write /work/tests/security_expiry.rs → deny",
         );
         assert_claim(
-            &events[1].1,
+            &events[1].event,
             ClaimKind::ToolUse,
             "PreToolUse Write /work/src/lib.rs → ask",
         );
-        assert_claim(&events[2].1, ClaimKind::Note, "Stop");
-        assert!(hooks.drain_events().is_empty());
+        assert_claim(&events[2].event, ClaimKind::Note, "Stop");
+        assert!(hooks.drain_observations().is_empty());
 
         hooks.stop();
         assert!(!socket.exists());
@@ -1021,14 +1078,14 @@ mod tests {
         let resp: HookResponse = serde_json::from_str(&asking.join().unwrap()).unwrap();
         assert_eq!(resp.decision, HookDecision::Deny);
         assert_eq!(resp.reason, "approval: denied");
-        let events = hooks.drain_events();
+        let events = hooks.drain_observations();
         assert_claim(
-            &events[0].1,
+            &events[0].event,
             ClaimKind::ToolUse,
             "PreToolUse Write /work/src/lib.rs → allow",
         );
         assert_claim(
-            &events[1].1,
+            &events[1].event,
             ClaimKind::ToolUse,
             "PreToolUse Write /work/src/lib.rs → deny",
         );
@@ -1198,7 +1255,7 @@ mod tests {
             serde_json::from_str(&roundtrip(&socket, "{\"hook\":\"Stop\"}\n")).unwrap();
         assert_eq!(resp.decision, HookDecision::Allow);
         // Only the two answered requests were recorded; the oversized one left no claim.
-        assert_eq!(hooks.drain_events().len(), 2);
+        assert_eq!(hooks.drain_observations().len(), 2);
         hooks.stop();
     }
 
@@ -1213,14 +1270,16 @@ mod tests {
         let mut reply = String::new();
         BufReader::new(&stream).read_line(&mut reply).unwrap();
         assert_eq!(reply, "", "a truncated request gets no decision");
-        assert!(hooks.drain_events().is_empty());
+        assert!(hooks.drain_observations().is_empty());
         hooks.stop();
     }
 
     #[test]
     fn a_claim_flood_is_bounded_and_the_overflow_is_surfaced() {
-        // #123: past the pending-claim cap, claims are dropped and counted, and the drop is
-        // surfaced on drain as a final note — never silently folded into the evidence.
+        // #123/#137: past the pending-claim cap, claims are refused and counted, and the
+        // loss is surfaced on drain as an explicit `ObservationsDropped` marker for the
+        // hook source — never silently folded into the evidence, and never as an agent
+        // note, which Quiet would hide.
         let dir = tempfile::tempdir().unwrap();
         let hooks = Hooks::start_inner(
             dir.path(),
@@ -1238,24 +1297,101 @@ mod tests {
                 serde_json::from_str(&roundtrip(&socket, "{\"hook\":\"Stop\"}\n")).unwrap();
             assert_eq!(resp.decision, HookDecision::Allow);
         }
-        let events = hooks.drain_events();
-        assert_eq!(events.len(), 4, "three kept claims plus one overflow note");
+        let events = hooks.drain_observations();
+        assert_eq!(
+            events.len(),
+            4,
+            "three kept claims plus one overflow marker"
+        );
         for e in &events[..3] {
-            assert_claim(&e.1, ClaimKind::Note, "Stop");
+            assert_claim(&e.event, ClaimKind::Note, "Stop");
+            assert_eq!(e.origin, Origin::Agent);
         }
-        match &events[3].1 {
-            WardEvent::AgentClaim { kind, payload } => {
-                assert_eq!(*kind, ClaimKind::Note);
-                assert!(
-                    payload.content().contains("dropped"),
-                    "{}",
-                    payload.content()
-                );
-                assert!(payload.content().starts_with('2'), "{}", payload.content());
-            }
-            other => panic!("unexpected {other:?}"),
-        }
+        assert_eq!(
+            events[3].event,
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Hook,
+                dropped: 2,
+                capacity: 3,
+            },
+            "the two refused claims must be accounted for as an observer gap"
+        );
+        // The marker is the daemon's own statement that the record is incomplete, so
+        // it has to be an enforcement fact rather than something the agent claimed.
+        assert_eq!(events[3].origin, Origin::Wardd);
+        assert!(events[3].origin.is_enforcement_fact());
         hooks.stop();
+    }
+
+    /// One record on a throwaway chain, so a drained observation can be put through
+    /// a real subscriber filter.
+    fn record(obs: &Observation) -> ward_events::EventRecord {
+        let mut chain = ward_events::Chain::genesis(
+            ward_events::SessionId::from_u128(0x137),
+            ward_events::Blake3Hash::hash(b"manifest"),
+        );
+        chain
+            .append(
+                obs.origin,
+                obs.event.clone(),
+                ward_events::Timestamp::mono(Duration::from_millis(1)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_dropped_hook_claim_is_visible_in_quiet() {
+        // G14 puts the hook broker among the bounded sources whose gaps are explicit
+        // and visible in *every* observer mode. Reported as an `AgentClaim { Note }`
+        // it was not: Quiet excludes agent notes, so a lost hook claim was hidden
+        // from exactly the mode that shows least. As an `ObservationsDropped` marker
+        // it survives the filter, beside the ordinary note that does not.
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = Hooks::start_inner(
+            dir.path(),
+            ObserverMode::Quiet,
+            protected(),
+            None,
+            MAX_HANDLERS,
+            1,
+            REQUEST_DEADLINE,
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let resp: HookResponse =
+                serde_json::from_str(&roundtrip(hooks.socket(), "{\"hook\":\"Stop\"}\n")).unwrap();
+            assert_eq!(resp.decision, HookDecision::Allow);
+        }
+        let events = hooks.drain_observations();
+        hooks.stop();
+
+        let marker = events
+            .iter()
+            .find(|o| matches!(o.event, WardEvent::ObservationsDropped { .. }))
+            .expect("the refused claims must be reported as an observer gap");
+        assert!(
+            ward_events::Filter::quiet().matches(&record(marker)),
+            "a dropped hook claim must reach a Quiet subscriber: {:?}",
+            marker.event
+        );
+
+        let note = events
+            .iter()
+            .find(|o| {
+                matches!(
+                    o.event,
+                    WardEvent::AgentClaim {
+                        kind: ClaimKind::Note,
+                        ..
+                    }
+                )
+            })
+            .expect("the kept claim is an agent note");
+        assert!(
+            !ward_events::Filter::quiet().matches(&record(note)),
+            "an ordinary agent note is still excluded by Quiet — which is why the gap \
+             could not keep being reported as one"
+        );
     }
 
     fn held_hooks_capped(dir: &Path, max_handlers: usize) -> (Hooks, Arc<Approvals>) {
@@ -1314,13 +1450,18 @@ mod tests {
             assert_eq!(resp.decision, HookDecision::Allow);
         }
         // The refused connection is surfaced, not silently lost.
-        let events = hooks.drain_events();
+        let events = hooks.drain_observations();
         assert!(
-            events.iter().any(|(_, e)| matches!(
-                e,
-                WardEvent::AgentClaim { payload, .. } if payload.content().contains("dropped")
+            events.iter().any(|o| matches!(
+                o.event,
+                WardEvent::ObservationsDropped {
+                    source: ObserverSource::Hook,
+                    dropped: 1,
+                    ..
+                }
             )),
-            "the overload rejection is surfaced on drain: {events:?}"
+            "the overload rejection is surfaced on drain: {:?}",
+            events.iter().map(|o| &o.event).collect::<Vec<_>>()
         );
         hooks.stop();
     }

@@ -11,6 +11,12 @@
 //! single editor save does not produce dozens of rows, and adding watches for new
 //! directories as they appear. If inotify cannot be initialised the caller falls
 //! back to a before/after directory scan.
+//!
+//! What that thread observes is handed straight to a bounded queue
+//! ([`crate::observe::Bounded`]) rather than accumulated until the command exits, so
+//! the session can append file observations to the log *while* the agent is still
+//! working (#137). The thread never touches the log itself; the session's single
+//! writer drains the queue.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -27,6 +33,8 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify, WatchDescriptor};
 
 use ward_events::FileChangeKind;
+
+use crate::observe::{Bounded, DEFAULT_CAPACITY, Drained};
 
 /// Which capture source produced a run's file events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,15 +94,20 @@ const POLL_CAP_MS: u16 = 500;
 /// Debounce window: repeats of the same (path, kind) within it are dropped.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// What a finished [`Watcher`] observed.
+/// What a finished [`Watcher`] observed *since the last drain*: a watch drained
+/// live while the command ran hands over only its tail here, while the verdict
+/// fields describe the whole run.
 pub struct WatchOutcome {
-    /// Captured accesses, in observed order.
+    /// Captured accesses still queued when the watch stopped, in observed order.
     pub captured: Vec<Captured>,
     /// Whether at least one directory under the worktree could not be (or could
     /// not be re-) registered — a create/move-in raced the watch, a nested
     /// directory disappeared before it could be added, or a permission denied
     /// it. That subtree's future changes are not guaranteed to be captured.
     pub degraded: bool,
+    /// Accesses the watch had to refuse since the last drain because its queue was
+    /// full; the caller turns these into an explicit overflow marker.
+    pub dropped: u64,
 }
 
 /// Registered watch descriptors, plus whether registering one of them has
@@ -110,7 +123,8 @@ struct WatchState {
 pub struct Watcher {
     stop: Arc<AtomicBool>,
     wake: UnixStream,
-    handle: JoinHandle<WatchOutcome>,
+    handle: JoinHandle<bool>,
+    queue: Arc<Bounded<Captured>>,
 }
 
 impl Watcher {
@@ -123,6 +137,21 @@ impl Watcher {
     /// directory that cannot be watched does not fail this call: it is instead
     /// reported through [`WatchOutcome::degraded`] once the watch finishes.
     pub fn start(worktree: &Path, watch_reads: bool) -> Result<Self, Errno> {
+        Self::start_bounded(worktree, watch_reads, DEFAULT_CAPACITY)
+    }
+
+    /// [`Watcher::start`] with an explicit bound on how many observations the watch
+    /// may hold between drains. Past it, further observations are refused and
+    /// counted into [`WatchOutcome::dropped`] rather than growing the queue without
+    /// limit or vanishing unrecorded.
+    ///
+    /// # Errors
+    /// As [`Watcher::start`].
+    pub fn start_bounded(
+        worktree: &Path,
+        watch_reads: bool,
+        capacity: usize,
+    ) -> Result<Self, Errno> {
         let inotify = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC)?;
         let mut flags = AddWatchFlags::IN_CREATE
             | AddWatchFlags::IN_CLOSE_WRITE
@@ -145,35 +174,71 @@ impl Watcher {
         let stop_thread = Arc::clone(&stop);
         let (wake, wake_rx) =
             UnixStream::pair().map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(0)))?;
+        let queue = Arc::new(Bounded::new(capacity));
+        let queue_thread = Arc::clone(&queue);
         let handle = std::thread::spawn(move || {
-            watch_loop(&inotify, flags, &root, state, &stop_thread, &wake_rx)
+            watch_loop(
+                &inotify,
+                flags,
+                &root,
+                state,
+                &stop_thread,
+                &wake_rx,
+                &queue_thread,
+            )
         });
-        Ok(Self { stop, wake, handle })
+        Ok(Self {
+            stop,
+            wake,
+            handle,
+            queue,
+        })
     }
 
-    /// Stop watching and return what was observed.
+    /// Everything observed since the last drain, with the count of accesses the
+    /// queue had to refuse. Safe to call while the watch is running: this is how
+    /// the session streams file observations to the log during a command.
+    #[must_use]
+    pub fn drain(&self) -> Drained<Captured> {
+        self.queue.drain()
+    }
+
+    /// How many observations are waiting to be drained.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.queue.queued()
+    }
+
+    /// Stop watching and return the tail: whatever is still queued, plus the
+    /// verdict on the run as a whole.
     #[must_use]
     pub fn finish(mut self) -> WatchOutcome {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.wake.write_all(&[1]);
-        outcome_from_join(self.handle.join())
+        let joined = self.handle.join();
+        outcome_from_join(joined, self.queue.drain())
     }
 }
 
-/// Turn a joined watcher-thread result into the outcome to report. A thread
-/// that panicked observed nothing further and proved nothing about the rest
-/// of the tree, so it is reported degraded with no captured events — never as
-/// a healthy, empty run, which `unwrap_or_default` would silently produce.
-fn outcome_from_join(joined: std::thread::Result<WatchOutcome>) -> WatchOutcome {
-    joined.unwrap_or(WatchOutcome {
-        captured: Vec::new(),
-        degraded: true,
-    })
+/// Turn a joined watcher-thread result and its final drain into the outcome to
+/// report. A thread that panicked proved nothing about the rest of the tree, so it
+/// is reported degraded — never as a healthy run, which `unwrap_or_default` would
+/// silently produce — while whatever it had already queued is still handed over
+/// rather than thrown away with it.
+fn outcome_from_join(joined: std::thread::Result<bool>, tail: Drained<Captured>) -> WatchOutcome {
+    WatchOutcome {
+        captured: tail.items,
+        degraded: joined.unwrap_or(true),
+        dropped: tail.dropped,
+    }
 }
 
 /// The watcher thread body: drain until told to stop, then drain any tail.
 /// Between drains it parks in `poll(2)` on the inotify descriptor and the wake
-/// pipe, so events and the stop request are both seen at once.
+/// pipe, so events and the stop request are both seen at once. Each translated
+/// access goes straight into `out`, the bounded queue the session drains while the
+/// command is still running; the thread never appends to the log itself. Returns
+/// whether the watch lost coverage of any part of the worktree.
 fn watch_loop(
     inotify: &Inotify,
     flags: AddWatchFlags,
@@ -181,10 +246,10 @@ fn watch_loop(
     mut state: WatchState,
     stop: &AtomicBool,
     wake: &UnixStream,
-) -> WatchOutcome {
+    out: &Bounded<Captured>,
+) -> bool {
     let started = Instant::now();
     let mut debouncer = Debouncer::new(DEBOUNCE);
-    let mut out = Vec::new();
     loop {
         let drained = drain(
             inotify,
@@ -193,7 +258,7 @@ fn watch_loop(
             &mut state,
             &mut debouncer,
             started,
-            &mut out,
+            out,
         );
         if stop.load(Ordering::Relaxed) {
             // One final pass catches events queued just before the command exited.
@@ -210,10 +275,7 @@ fn watch_loop(
             }
         }
     }
-    WatchOutcome {
-        captured: out,
-        degraded: state.degraded,
-    }
+    state.degraded
 }
 
 /// Read and translate one batch of events. Returns whether any were read.
@@ -224,7 +286,7 @@ fn drain(
     state: &mut WatchState,
     debouncer: &mut Debouncer,
     started: Instant,
-    out: &mut Vec<Captured>,
+    out: &Bounded<Captured>,
 ) -> bool {
     // EAGAIN = queue empty (nonblocking); any other error just means nothing to
     // report this pass, so treat every error as "no events".
@@ -262,6 +324,8 @@ fn drain(
             continue;
         };
         if let Some(captured) = translate(ev.mask, rel, debouncer, now, at) {
+            // A refusal is counted inside the queue and surfaced by the next
+            // drain as an explicit marker; it is never silently lost.
             out.push(captured);
         }
     }
@@ -516,17 +580,38 @@ mod tests {
 
     #[test]
     fn a_panicked_watch_thread_is_reported_degraded_not_healthy() {
-        let joined =
-            std::thread::spawn(|| -> WatchOutcome { panic!("simulated watcher crash") }).join();
+        let joined = std::thread::spawn(|| -> bool { panic!("simulated watcher crash") }).join();
         assert!(joined.is_err());
 
-        let outcome = outcome_from_join(joined);
+        let outcome = outcome_from_join(joined, Drained::default());
 
         assert!(
             outcome.degraded,
             "a watcher thread that panicked must never be reported as a healthy, empty run"
         );
         assert!(outcome.captured.is_empty());
+    }
+
+    /// A watcher thread that panicked still had a queue, and whatever it managed
+    /// to put there before dying is real evidence. Reporting the run degraded must
+    /// not also throw that away.
+    #[test]
+    fn a_panicked_watch_thread_still_hands_over_what_it_had_queued() {
+        let joined = std::thread::spawn(|| -> bool { panic!("simulated watcher crash") }).join();
+        let tail = Drained {
+            items: vec![Captured::Modified {
+                at: SystemTime::now(),
+                rel: "queued-before-the-crash.txt".to_owned(),
+                kind: FileChangeKind::Write,
+            }],
+            dropped: 3,
+        };
+
+        let outcome = outcome_from_join(joined, tail);
+
+        assert!(outcome.degraded);
+        assert_eq!(outcome.captured.len(), 1);
+        assert_eq!(outcome.dropped, 3);
     }
 
     #[test]
@@ -556,7 +641,7 @@ mod tests {
         std::fs::remove_dir(&dest).expect("remove before drain can watch it");
 
         let mut debouncer = Debouncer::new(DEBOUNCE);
-        let mut out = Vec::new();
+        let out = Bounded::default();
         let drained = drain(
             &inotify,
             flags,
@@ -564,7 +649,7 @@ mod tests {
             &mut state,
             &mut debouncer,
             Instant::now(),
-            &mut out,
+            &out,
         );
 
         assert!(drained, "the queued move/delete events must be read");
@@ -601,6 +686,40 @@ mod tests {
                 Captured::Modified { rel, .. } if rel == "moved/inside.txt"
             )),
             "a write inside a moved-in directory must be captured: {:?}",
+            outcome.captured
+        );
+    }
+
+    /// #137: the watch hands observations over *while* it runs. A write must be
+    /// drainable before `finish` is ever called — that is what lets the session
+    /// put file activity on the log during a long command instead of only after
+    /// it. If `drain` went back to returning nothing until the watch stopped,
+    /// this would time out.
+    #[test]
+    fn a_write_is_drainable_before_the_watch_is_finished() {
+        let worktree = tempfile::tempdir().expect("tempdir");
+        let watcher = Watcher::start(worktree.path(), false).expect("watcher start");
+
+        std::fs::write(worktree.path().join("live.txt"), b"hello").expect("write");
+
+        let mut seen = Vec::new();
+        let live = crate::daemon::wait_until(Duration::from_secs(5), || {
+            seen.extend(watcher.drain().items);
+            seen.iter()
+                .any(|c| matches!(c, Captured::Modified { rel, .. } if rel == "live.txt"))
+        });
+        assert!(live, "the write must be drainable mid-run, got {seen:?}");
+
+        // And the tail drain does not hand the same observation over a second
+        // time: what a live drain took is gone from the queue.
+        let outcome = watcher.finish();
+        assert!(
+            !outcome
+                .captured
+                .iter()
+                .any(|c| matches!(c, Captured::Modified { rel, kind, .. }
+                    if rel == "live.txt" && *kind == FileChangeKind::Create)),
+            "a live-drained observation must not be handed over again: {:?}",
             outcome.captured
         );
     }

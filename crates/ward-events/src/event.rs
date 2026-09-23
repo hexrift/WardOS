@@ -457,6 +457,46 @@ pub enum ClaimKind {
     Plan,
 }
 
+/// Which live observer lost observations on the way to the log
+/// (`ObservationsDropped`, `event-model.md` §9).
+///
+/// The observer is the *producer* side of the bounded hand-off queue the daemon's
+/// single log writer drains while a command runs; it is not the enforcement path.
+/// A full queue never changes a decision — the proxy keeps allowing and denying in
+/// real time — it only means the daemon's record of that window is incomplete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ObserverSource {
+    /// The live filesystem watch over the worktree (`FileModified` / `FileRead`).
+    Filesystem,
+    /// The session egress proxy's decision recorder (`NetworkRequested` /
+    /// `NetworkDenied`).
+    Network,
+    /// The agent hook broker's claim buffer (`AgentClaim`). A hook request the
+    /// broker could not record — the pending-claim buffer full, a connection
+    /// refused at the handler cap, or a handler still in flight when the final
+    /// flush cut over — is reported here rather than as an agent note, so the
+    /// gap is visible in every observer mode including Quiet.
+    Hook,
+}
+
+impl ObserverSource {
+    /// Stable lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Filesystem => "filesystem",
+            Self::Network => "network",
+            Self::Hook => "hook",
+        }
+    }
+}
+
+impl fmt::Display for ObserverSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Error for over-long signature bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("signature must be 1–{max} bytes, found {found}")]
@@ -847,6 +887,44 @@ pub enum WardEvent {
         reason: ShortText,
     },
 
+    // -- processes, continued (origin: Kernel; #140 / PR #197 review) --
+    /// A launch could not be carried through to a `CommandFinished`: the sandbox or hook
+    /// setup failed, or the child failed to spawn, after `CommandStarted` (and any credential
+    /// grant scoped to it) was already on the log. Recorded so `CommandStarted` is never the
+    /// last record for a pid — every launch gets a terminal record, and a launch-scoped grant
+    /// does not outlive a launch that never even started, not just one that ran and exited.
+    /// Appended at the end of the catalogue, not grouped with `CommandFinished` above, because
+    /// postcard identifies variants by declaration index and existing indices must never move
+    /// (see the module doc comment); the same discipline `VerificationErrored` follows for an
+    /// unrunnable verification attempt.
+    LaunchAborted {
+        /// The process this closes out (`CommandStarted`'s own pid).
+        pid: Pid,
+        /// Sanitised, bounded description of what stopped the launch (e.g. "egress proxy:
+        /// address already in use"). Never a secret; drawn from the daemon's own error text.
+        reason: ShortText,
+    },
+
+    // -- observer health (origin: Wardd; `event-model.md` §9) --
+    /// A live observer could not hand every observation to the log: the bounded
+    /// queue between it and the single writer was full, so `dropped` observations
+    /// were refused rather than silently lost.
+    ///
+    /// Appended immediately after the batch the same drain did take, so the
+    /// incomplete window is bounded by its neighbours in the log. Enforcement is
+    /// unaffected: the proxy keeps deciding in real time whether or not this
+    /// queue is backed up, and a refused observation is a lost *record*, never a
+    /// changed decision.
+    ObservationsDropped {
+        /// Which observer lost them.
+        source: ObserverSource,
+        /// How many observations this marker accounts for.
+        dropped: u64,
+        /// Capacity of the queue that refused them, so a reader can tell a tight
+        /// bound from a genuine burst.
+        capacity: u64,
+    },
+
     // -- intervention, continued (origin: Wardd; #145 items 3-4) --
     /// The host paused the session (ADR-0019 §3, same operation `SessionPaused`
     /// records), but could not confirm the freeze settled within the bound the
@@ -940,12 +1018,14 @@ pub enum EventKind {
     SessionResumed = 28,
     EntryRestored = 29,
     VerificationErrored = 30,
-    SessionPauseUnsettled = 31,
+    LaunchAborted = 31,
+    ObservationsDropped = 32,
+    SessionPauseUnsettled = 33,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 32] = [
+    pub const ALL: [EventKind; 34] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -977,6 +1057,8 @@ impl EventKind {
         EventKind::SessionResumed,
         EventKind::EntryRestored,
         EventKind::VerificationErrored,
+        EventKind::LaunchAborted,
+        EventKind::ObservationsDropped,
         EventKind::SessionPauseUnsettled,
     ];
 
@@ -1021,6 +1103,8 @@ impl EventKind {
             EventKind::SessionResumed => "session_resumed",
             EventKind::EntryRestored => "entry_restored",
             EventKind::VerificationErrored => "verification_errored",
+            EventKind::LaunchAborted => "launch_aborted",
+            EventKind::ObservationsDropped => "observations_dropped",
             EventKind::SessionPauseUnsettled => "session_pause_unsettled",
         }
     }
@@ -1049,6 +1133,7 @@ impl EventKind {
                 | EventKind::SessionPaused
                 | EventKind::SessionResumed
                 | EventKind::EntryRestored
+                | EventKind::ObservationsDropped
                 | EventKind::SessionPauseUnsettled
         )
     }
@@ -1065,36 +1150,36 @@ impl fmt::Display for EventKind {
 #[error("event kind set contains unknown bits: {0:#018x}")]
 pub struct UnknownKindBits(pub u64);
 
-/// A set of [`EventKind`]s as a bitmask. Backed by a `u64`, not the `u32` a 32-kind
-/// catalogue would only just still fit in: this widening lands in the same PR that
-/// takes the catalogue to exactly 32 kinds ([`EventKind::SessionPauseUnsettled`],
-/// the 32nd), the full capacity of a `u32` backing — at exactly 32 kinds a `u32`
-/// mask has no bit left over to reject an out-of-range value with (see
-/// `kind_bits_are_dense_and_cover_the_mask` below), which a genuinely corrupt or
-/// future-daemon-written bitmask must still be rejected for. Widening past `u64` in
-/// turn needs the same treatment this gives `u32`: a wider backing type, `bit()`'s
-/// shift, `MASK`, and this wire-compatibility contract all revisited together.
+/// A set of [`EventKind`]s as a bitmask. Backed by a `u64` (not the `u32` a 32-kind
+/// catalogue would technically still fit in): the catalogue reached the full 32-kind
+/// capacity of a `u32` backing in the same merge that widened this, and every kind
+/// added since has needed the headroom immediately, not eventually. Widening past
+/// `u64` in turn needs the same treatment this commit gives `u32`: a wider backing
+/// type, `bit()`'s shift, `MASK`, and this wire-compatibility contract all revisited
+/// together, not just the shift arithmetic in isolation.
 ///
-/// Wire compatibility: postcard's integer encoding is a plain unsigned varint with
-/// no width tag, so a value that previously fit in the `u32` backing (every kind
-/// index `0..31`, i.e. the entire catalogue as it stood before this widening)
-/// serializes to byte-for-byte the same output whether encoded as a `u32` or a
-/// `u64` — see `a_u32_encoded_set_decodes_identically_as_the_widened_u64_type`
-/// below, which proves this against real postcard bytes rather than asserting it
-/// from the format's docs. No `WIRE_VERSION` bump: this is the same kind of
-/// pure-capacity change the crate's own append-only `WardEvent` convention already
-/// treats as backwards compatible, not a change to what any existing bit means.
+/// Wire compatibility: postcard's integer encoding is a plain unsigned varint with no
+/// width tag, so a value that previously fit in the `u32` backing (every kind index
+/// `0..32`, i.e. the entire catalogue as it stood before this widening) serializes to
+/// byte-for-byte the same output whether encoded as a `u32` or a `u64` -- see
+/// `a_u32_encoded_set_decodes_identically_as_the_widened_u64_type` below, which proves
+/// this against real postcard bytes rather than asserting it from the format's docs.
+/// No `WIRE_VERSION` bump: this is the same kind of pure-capacity change the crate's
+/// own append-only `WardEvent` convention already treats as backwards compatible, not
+/// a change to what any existing bit means.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(into = "u64")]
 pub struct EventKindSet(u64);
 
 impl EventKindSet {
     // `EventKind::ALL.len()` can reach exactly 64 (the full width of the backing
-    // `u64`, one bit per kind), at which point `1u64 << 64` would overflow — checked
+    // `u64`, one bit per kind), at which point `1u64 << 64` would overflow -- checked
     // explicitly rather than computed in a still-wider type (there is no wider
-    // primitive integer to borrow the headroom from this time), so this stays
-    // correct right up to the set's structural capacity rather than panicking one
-    // kind short of it or silently wrapping past it.
+    // primitive integer to borrow the headroom from this time), so this stays correct
+    // right up to the set's structural capacity rather than panicking one kind short
+    // of it or silently wrapping past it.
+    // `EventKind::ALL.len()` is at most a few dozen and known at compile time, so
+    // this narrowing to the `u32` `checked_shl` requires is always exact.
     #[allow(clippy::cast_possible_truncation)]
     const MASK: u64 = match 1u64.checked_shl(EventKind::ALL.len() as u32) {
         Some(one_past) => one_past - 1,
@@ -1162,9 +1247,8 @@ impl TryFrom<u64> for EventKindSet {
         // Written as "masking to the known bits changes the value" rather than
         // "masking to the unknown bits is non-zero" (`bits & !MASK != 0`): if the
         // catalogue is ever at exactly 64 kinds, `MASK` is `u64::MAX` and `!MASK`
-        // is zero — a mask of zero is always `clippy::bad_bit_mask`, even though
-        // the check itself would still be correct (there are no unknown bits left
-        // to have).
+        // is zero -- a mask of zero is always clippy::bad_bit_mask, even though
+        // the check is correct (there are no unknown bits left to have).
         if bits & Self::MASK != bits {
             return Err(UnknownKindBits(bits));
         }
@@ -1227,6 +1311,8 @@ impl WardEvent {
             WardEvent::SessionResumed { .. } => EventKind::SessionResumed,
             WardEvent::EntryRestored { .. } => EventKind::EntryRestored,
             WardEvent::VerificationErrored { .. } => EventKind::VerificationErrored,
+            WardEvent::LaunchAborted { .. } => EventKind::LaunchAborted,
+            WardEvent::ObservationsDropped { .. } => EventKind::ObservationsDropped,
             WardEvent::SessionPauseUnsettled { .. } => EventKind::SessionPauseUnsettled,
         }
     }
@@ -1259,12 +1345,13 @@ mod tests {
             assert_eq!(k.bit(), 1u64 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
-        // The catalogue is currently 32 kinds wide, well inside the `u64` backing's
-        // 64-bit capacity — so, unlike a `u32` backing sitting at its exact 32-kind
-        // capacity (where every bit is a real kind and there is no room left to mark
-        // anything as unknown), there IS a first unused bit right now (bit 32), and a
-        // value that sets it must still be rejected as an unknown kind rather than
-        // silently accepted.
+        // The catalogue is currently 34 kinds wide, well inside the `u64` backing's
+        // 64-bit capacity -- so, unlike when the backing type was exactly saturated
+        // at `u32`, there IS a first unused bit right now (bit 34), and a value that
+        // sets it must be rejected as an unknown kind rather than silently accepted.
+        // This is the same "no room past the known kinds to smuggle a bit through"
+        // property `kind_bits_are_dense...`'s name promises, just checked against
+        // the current headroom instead of an exhausted capacity.
         assert_eq!(
             EventKindSet::try_from(EventKindSet::ALL.bits() | (1 << EventKind::ALL.len())),
             Err(UnknownKindBits(
