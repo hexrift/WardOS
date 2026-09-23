@@ -22,6 +22,7 @@
 )]
 
 pub mod authority;
+pub mod digest;
 pub mod feed;
 pub mod launcher;
 pub mod panel;
@@ -30,6 +31,7 @@ pub mod trust;
 pub mod waybar;
 
 pub use authority::{Authority, authority_panel, grants_segment, network_segment_text};
+pub use digest::{Decision, DigestGate};
 pub use feed::{
     Counters, Model, SessionState, TamperWard, Verdict, Verification, Worktree, counters_text,
 };

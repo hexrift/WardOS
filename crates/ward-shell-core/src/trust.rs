@@ -383,6 +383,16 @@ impl SegmentName {
         Self::Daemon,
     ];
 
+    /// Whether this segment's text or tone depends on the worktree's
+    /// freshness (ADR-0019 decision 1): only the verify segment does —
+    /// `VERIFY ✓` names a tree, not a moment — every other segment is derived
+    /// from the event stream alone. A follower rendering one of those never
+    /// needs to digest the worktree at all (#138 item 3).
+    #[must_use]
+    pub const fn needs_freshness(self) -> bool {
+        matches!(self, Self::Verify)
+    }
+
     /// The name on the command line and in Waybar's module names.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -1136,6 +1146,20 @@ mod tests {
             TrustBar::new(&anon, &model).agent.unwrap().text,
             "AGENT ● working"
         );
+    }
+
+    /// (a) only the verify segment needs freshness: every other segment's
+    /// text and tone come from the event stream alone, so a follower
+    /// rendering one of them never has a reason to digest the worktree.
+    #[test]
+    fn only_the_verify_segment_needs_freshness() {
+        for name in SegmentName::ALL {
+            assert_eq!(
+                name.needs_freshness(),
+                name == SegmentName::Verify,
+                "{name}"
+            );
+        }
     }
 
     #[test]
