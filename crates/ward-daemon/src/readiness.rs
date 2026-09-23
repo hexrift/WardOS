@@ -375,28 +375,6 @@ fn is_executable(path: &Path) -> bool {
         && nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
 }
 
-/// Whether `path` resolves to somewhere *outside* `root` — checked lexically
-/// after symlinks are already accounted for by
-/// [`resolve_symlinks_conservatively`], so this only catches what's left once
-/// every hop has already been individually vetted: a literal `..` escape in
-/// the configured path itself (`verify.command: ../../etc/passwd`, no
-/// symlink involved at all), or a chain of *relative* symlink hops that,
-/// hop by hop, each looked legitimate (resolved against its own containing
-/// directory, exactly what a bind mount preserves) but whose cumulative
-/// destination walked straight out of the one root the verifier actually
-/// mounts at this path — a root the caller is responsible for choosing:
-/// the project worktree for a project-relative candidate, or a single
-/// search directory for a bare one resolved against
-/// [`verify::Toolchains::search_dirs`]. `false` when either side fails to
-/// canonicalize (typically: `path` does not exist) — a plain absence, for
-/// the caller's own not-found handling, not an escape.
-fn escapes_root(root: &Path, path: &Path) -> bool {
-    match (root.canonicalize(), path.canonicalize()) {
-        (Ok(root_real), Ok(path_real)) => !path_real.starts_with(&root_real),
-        _ => false,
-    }
-}
-
 /// The kernel's own `ELOOP` hop limit — bounds [`resolve_symlinks_conservatively`]
 /// so a symlink cycle cannot hang it.
 const MAX_SYMLINK_HOPS: u8 = 40;
@@ -696,45 +674,71 @@ fn runtime_row(
 }
 
 /// [`runtime_row`]'s path-candidate case (`candidate` contains `/`): resolved
-/// against `dir` when relative, checked against [`crate::sandbox::is_system_ro`]
-/// when absolute, and validated through [`resolve_symlinks_conservatively`]
-/// either way before the final executability check.
+/// from its actual sandbox starting coordinate — the matching mount's
+/// `(host, sandbox)` pair for an absolute candidate (via
+/// [`absolute_target_mount`], the same translation a symlink hop uses), or
+/// the worktree's own `(dir, dir's own mount entry)` for a project-relative
+/// one — then walked and judged in sandbox coordinates throughout
+/// ([`resolve_relative_conservatively`]), exactly like [`resolve_in_dirs`].
+/// An earlier version judged an absolute candidate only against
+/// `sandbox::is_system_ro` up front, and a project-relative one only by
+/// whether its *host* destination stayed inside `dir` (`escapes_root`) — both
+/// wrong for the same reason `resolve_in_dirs`'s own host-coordinate
+/// containment was: a literal `verify.command: /work/tools/verify.sh`, or a
+/// project-relative symlink hopping to `/usr/bin/true`, is valid inside the
+/// verifier (the worktree and system mounts are both real, known sandbox
+/// destinations) but was rejected because neither shape is `is_system_ro`
+/// nor stays under `dir` on the host.
 fn path_candidate_row(dir: &Path, candidate: &str, mounts: &[verify::Mount]) -> Row {
     let absolute = Path::new(candidate).is_absolute();
-    let path = if absolute {
-        PathBuf::from(candidate)
+    let resolution = if absolute {
+        let literal = PathBuf::from(candidate);
+        match absolute_target_mount(&literal, mounts) {
+            Some((host_base, sandbox_base, suffix)) => {
+                resolve_relative_conservatively(host_base, Some(sandbox_base), &suffix, mounts)
+            }
+            None => {
+                return Row::new(
+                    "runtime",
+                    Status::Fail,
+                    format!(
+                        "{candidate} is outside the verifier's mounts; it will not exist inside the sandbox (/tmp, /home and /run are private and empty there)"
+                    ),
+                );
+            }
+        }
     } else {
-        dir.join(candidate)
+        // The worktree's own sandbox position — `check_with_dirs_and_roots`
+        // always includes a `Mount{host: dir, sandbox: WORK_ROOT}`, exactly
+        // the entry `resolve_in_dirs` looks up for a search dir's own mount.
+        let dir_sandbox = mounts
+            .iter()
+            .find(|m| m.host == dir)
+            .map_or_else(|| dir.to_path_buf(), |m| m.sandbox.clone());
+        let dir_real = match resolve_symlinks_conservatively(dir.to_path_buf(), None, mounts) {
+            LinkResolution::Resolved(p, _) => p,
+            LinkResolution::Broken => {
+                return Row::new(
+                    "runtime",
+                    Status::Fail,
+                    format!(
+                        "{candidate} is a symlink pointing somewhere the verifier does not mount; it will not exist inside the sandbox"
+                    ),
+                );
+            }
+            LinkResolution::Missing => {
+                return Row::new(
+                    "runtime",
+                    Status::Fail,
+                    format!(
+                        "{candidate} not found relative to the project; fix the path before `ward verify` can run"
+                    ),
+                );
+            }
+        };
+        resolve_relative_conservatively(dir_real, Some(dir_sandbox), Path::new(candidate), mounts)
     };
-    if absolute && !crate::sandbox::is_system_ro(&path) {
-        return Row::new(
-            "runtime",
-            Status::Fail,
-            format!(
-                "{candidate} is outside the verifier's read-only system mounts; it will not exist inside the sandbox (/tmp, /home and /run are private and empty there)"
-            ),
-        );
-    }
-    // An absolute candidate starts as an identity sandbox position (just
-    // proved `is_system_ro` above), tracked through the walk so a later hop
-    // into a *non*-identity mount (`/work`, a toolchain directory) is
-    // judged correctly rather than by the coarse "is the final host path
-    // still `is_system_ro`" check this replaced (which a legitimate jump
-    // into such a mount would fail even though the destination is real).
-    // Starts at `/`, matching `resolved`'s own start inside
-    // `resolve_symlinks_conservatively` (which always walks the *whole*
-    // absolutized `path` from root) — not at `path` itself, which would
-    // double-push every one of `path`'s own components onto `shadow` on
-    // top of a starting point that already included them. A
-    // project-relative candidate doesn't need this: `escapes_root(dir,
-    // ...)` below already judges its containment directly on the (now
-    // correctly translated) host destination.
-    let shadow_start = absolute.then(|| PathBuf::from("/"));
-    let (resolved, shadow) = match resolve_symlinks_conservatively(
-        path.clone(),
-        shadow_start,
-        mounts,
-    ) {
+    let (resolved, shadow) = match resolution {
         LinkResolution::Resolved(p, s) => (p, s),
         LinkResolution::Broken => {
             return Row::new(
@@ -756,42 +760,24 @@ fn path_candidate_row(dir: &Path, candidate: &str, mounts: &[verify::Mount]) -> 
             return Row::new("runtime", Status::Fail, message);
         }
     };
-    if !absolute && escapes_root(dir, &resolved) {
+    // Always `Some`: both branches above always pass a `shadow` start.
+    let contained = shadow.as_ref().is_some_and(|s| {
+        crate::sandbox::is_system_ro(s) || mounts.iter().any(|m| s.starts_with(&m.sandbox))
+    });
+    if !contained {
         return Row::new(
             "runtime",
             Status::Fail,
             format!(
-                "{candidate} resolves outside the project; it will not exist inside the verifier, which only sees the worktree itself"
+                "{candidate} resolves somewhere the verifier does not mount; it will not exist inside the sandbox"
             ),
         );
     }
-    // The initial-candidate `is_system_ro` check above only proves *this*
-    // path starts inside a mounted root — a relative symlink hop the walk
-    // just followed can still have carried it back out (e.g. `/usr/local/bin/x
-    // -> ../../../home/evil`), landing somewhere the sandbox never mounts even
-    // though the literal candidate looked safe. The fully resolved
-    // destination needs the same guarantee the candidate itself just got —
-    // now judged in sandbox coordinates via `shadow`, so a hop that lands in
-    // a known non-identity mount (rather than back in `SYSTEM_RO`) is
-    // correctly accepted too.
-    if absolute {
-        let contained = shadow.as_ref().is_some_and(|s| {
-            crate::sandbox::is_system_ro(s) || mounts.iter().any(|m| s.starts_with(&m.sandbox))
-        });
-        if !contained {
-            return Row::new(
-                "runtime",
-                Status::Fail,
-                format!(
-                    "{candidate} is a symlink pointing somewhere the verifier does not mount; it will not exist inside the sandbox"
-                ),
-            );
-        }
-    }
-    // `resolved`, not the original `path`: a symlink translated through a
-    // known mount (e.g. `./bin/verify.sh -> /work/tools/verify.sh`) can be
+    // `resolved`, not the original candidate path: a symlink (or a literal
+    // candidate) translated through a known mount (e.g.
+    // `/work/tools/verify.sh`, or `./bin/verify -> /usr/bin/true`) can be
     // genuinely executable inside the verifier while the literal host path
-    // is correctly broken outside it (`/work` is a sandbox-only bind).
+    // is correctly broken or nonexistent outside it.
     if is_executable(&resolved) {
         Row::new(
             "runtime",
@@ -1823,6 +1809,90 @@ mod tests {
         make_executable(&registry.join("cargo"));
         std::os::unix::fs::symlink("/run/verifier/cargo/registry/cargo", bin.join("cargo"))
             .unwrap();
+
+        let search_dirs = [bin.clone()];
+        let mounts = cargo_mounts(bin, registry);
+        let report = check_with_dirs_and_roots(dir.path(), &search_dirs, &mounts);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_allows_a_literal_absolute_command_naming_the_work_mount() {
+        // Review finding on #219 (head ea6c1de): `path_candidate_row`
+        // resolved a *symlink hop* into a known mount, but still rejected a
+        // *literal* absolute `verify.command` under one before ever
+        // consulting `mounts` — `/work/tools/verify.sh`, no symlink
+        // involved at all, was still judged solely against
+        // `sandbox::is_system_ro` up front. `ward verify` runs this through
+        // the unconditional worktree bind at `/work` and it works.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "tools/verify.sh", "#!/bin/sh\ntrue\n");
+        make_executable(&dir.path().join("tools/verify.sh"));
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: /work/tools/verify.sh\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_allows_a_project_relative_symlink_jumping_to_a_system_ro_mount() {
+        // The other finding from the same review: a project-relative
+        // candidate whose absolute symlink hop lands in *any* valid mount
+        // (not just `/work`) was rejected by `escapes_root(dir, resolved)`,
+        // which only ever judged containment against the project directory
+        // on the host — even once the hop had already been proven to land
+        // inside `SYSTEM_RO`.
+        let real = Path::new("/usr/bin/true");
+        if !real.is_file() {
+            return; // covered by the identical environment-conditional shape
+            // used elsewhere in this file (e.g. the `/usr/bin/bash` fixture).
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(real, dir.path().join("bin/verify")).unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: ./bin/verify\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_allows_a_project_relative_symlink_jumping_to_a_cargo_mount() {
+        // The same finding's "preferably" case: a project-relative
+        // candidate's absolute hop into a *toolchain* mount (not just the
+        // worktree or a system directory) must be judged in sandbox
+        // coordinates too.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink(
+            "/run/verifier/cargo/registry/tool",
+            dir.path().join("bin/tool"),
+        )
+        .unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: ./bin/tool\n",
+        );
+        let cargo_home = tempfile::tempdir().unwrap();
+        let bin = cargo_home.path().join("bin");
+        let registry = cargo_home.path().join("registry");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::write(registry.join("tool"), "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&registry.join("tool"));
 
         let search_dirs = [bin.clone()];
         let mounts = cargo_mounts(bin, registry);
