@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# wardos-approve-inbox — the persistent approval inbox (#146 items 2-3, #141, docs/desktop.md
+# §Commands, design-language.md §10).
+#
+# Usage:
+#   wardos-approve-inbox   list every approval `ward session approvals --all` knows across
+#                          every live session, pending first (state, agent, project,
+#                          tool, destination), fuzzel-dmenu style; choosing a pending one
+#                          opens a terminal running `wardos-approve <id>` pinned to that
+#                          approval's own session (WARDOS_SESSION, mirroring
+#                          wardos-pause) — the same three blocks and y/s/n decision a
+#                          notification would have shown; choosing a decided one shows
+#                          how it was decided (read-only: there is nothing left to answer)
+#   wardos-approve-inbox --help
+#
+# A missed or dismissed notification, or one wardos-approve --watch left unshown past
+# its WARDOS_APPROVE_MAX_NOTIFIERS bound, is never the only way to find or act on a
+# request: this is the same daemon-held, multiplexed list either way, reachable from
+# the command centre (SECURITY ▸ Approval inbox) and the keyboard (Super + Alt + A), not
+# only from whatever popup first announced a request. Needs jq.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+# One line per approval: id, state (ApprovalRecord::state_word's words), session,
+# project, agent, tool, destination — every live session's approvals, `ward session
+# approvals --all` already carrying which session and project each belongs to
+# (mirroring `ward session pending --all`), so no per-approval round trip is needed
+# to say whose request this is.
+fields='
+  def state_word:
+    if .outcome == null then "pending"
+    elif (.outcome | type) == "string" then
+      if .outcome == "timed-out" then "timed-out"
+      elif .outcome == "closed" then "session-ended"
+      elif .outcome == "remembered" then "allowed-session"
+      else .outcome
+      end
+    elif .outcome.answered == "allow" then "allowed"
+    elif .outcome.answered == "allow-session" then "allowed-session"
+    else "denied"
+    end;
+  [.approval.id, state_word, .session, .project, .agent, .approval.tool,
+   .approval.authority.destination] | @tsv'
+
+rows=$(ward session approvals --json --all | jq -r "$fields")
+if [[ -z $rows ]]; then
+  wardos_notify "No approvals" "nothing pending or recently decided, in any live session" -t 2500
+  exit 0
+fi
+
+# Pending first (it needs a decision), each group in the order the daemon gave it
+# (oldest asked first) — a stable partition, not a re-sort.
+ordered=$(
+  printf '%s\n' "$rows" | awk -F'\t' '$2 == "pending"'
+  printf '%s\n' "$rows" | awk -F'\t' '$2 != "pending"'
+)
+
+# Every menu line carries its own row's full fields ahead of the human-readable
+# text (id, state, session, project, agent, tool, destination, then the display
+# column) rather than just id: id alone is only unique within one session
+# (Approval::id is a per-session sequence number, #222 review), so two live
+# sessions can show the same numeric id in this same menu at once. Re-deriving
+# the chosen row with a second `awk '$1 == id'` lookup against $ordered would
+# then return both of them — state, session and the target session for the
+# opened terminal would no longer be a single, consistent record. Parsing the
+# exact line the person picked, instead of looking it up again by bare id, keeps
+# that record intact regardless of what else in $ordered shares its id.
+menu_lines=$(printf '%s\n' "$ordered" \
+  | awk -F'\t' '{ printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%-15s %s · %s · %s · %s · %s\n", \
+      $1, $2, $3, $4, $5, $6, $7, $2, $3, $4, $5, $6, $7 }')
+chosen=$(printf '%s\n' "$menu_lines" | wardos_menu "Approvals") || exit 0
+id=$(printf '%s\n' "$chosen" | cut -f1)
+state=$(printf '%s\n' "$chosen" | cut -f2)
+session=$(printf '%s\n' "$chosen" | cut -f3)
+project=$(printf '%s\n' "$chosen" | cut -f4)
+agent=$(printf '%s\n' "$chosen" | cut -f5)
+tool=$(printf '%s\n' "$chosen" | cut -f6)
+destination=$(printf '%s\n' "$chosen" | cut -f7)
+
+if [[ $state == pending ]]; then
+  # Pin the terminal wardos-approve opens to this exact session (WARDOS_SESSION,
+  # mirroring wardos-pause's own pinned target): the approval may belong to a
+  # different session than $WARDOS_PROJECT's/the desktop's current selection, and
+  # is always this row's own session, never one recovered by a second, ambiguous
+  # lookup on id alone.
+  WARDOS_SESSION=$session wardos_terminal_exec ward-approval wardos-approve "$id"
+  exit 0
+fi
+
+# Decided: nothing left to answer, so this is read-only — a second, informational
+# dmenu (any choice, or Escape, just closes it) rather than a terminal, since there
+# is nothing here that benefits from staying open.
+info=$(printf 'State        %s\nProject      %s\nAgent        %s\nTool         %s\nDestination  %s' \
+  "$state" "$project" "$agent" "$tool" "$destination")
+printf '%s\n' "$info" | wardos_menu "Approval $id · decided" >/dev/null || true
