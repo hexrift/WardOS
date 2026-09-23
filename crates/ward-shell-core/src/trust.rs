@@ -710,6 +710,7 @@ mod tests {
             project: "/home/dev/payments-api".into(),
             project_id: "proj_x".to_owned(),
             entry_snapshot: format!("blake3:{}", "ab".repeat(32)),
+            origin_repo: None,
             manifest,
             started_unix_ms: 0,
             agent: None,
