@@ -525,6 +525,68 @@ fn absolute_target_mount(
     Some((mount.host.clone(), mount.sandbox.clone(), suffix))
 }
 
+/// The host location a *complete* sandbox path `sandbox_path` actually names
+/// — `is_system_ro` (identity: the same path, verbatim) or under a known
+/// [`verify::Mount`]'s sandbox directory (that mount's `host` directory,
+/// joined with whatever remained past the `sandbox` prefix); `None` when
+/// `sandbox_path` corresponds to nowhere the verifier makes visible.
+///
+/// Unlike [`absolute_target_mount`] (which decomposes an absolute symlink
+/// *target* into a base to reset to plus components still left to re-walk,
+/// since an intermediate one of those may itself be a symlink), this takes
+/// a path that is already fully built up to the exact file
+/// [`walk_symlinks`] is about to `stat` — used to re-derive `resolved` from
+/// the *current* `shadow` at each named-component step, rather than
+/// independently mirroring `..`/pushes onto it. Mirroring alone is only
+/// valid while `shadow` stays inside the mount it started in: a mount like
+/// the worktree's `/work` (sandbox depth 1) has no depth relationship to
+/// its `host` directory (an arbitrary, usually much deeper, temp path), so
+/// a single `..` that logically leaves `/work` in sandbox terms can leave
+/// `resolved`'s independently-mirrored pop still deep inside the host
+/// worktree's own parent — a real, sometimes even coincidentally
+/// *existing*, host location with nothing to do with wherever the sandbox
+/// path actually now points.
+fn sandbox_to_host(sandbox_path: &Path, mounts: &[verify::Mount]) -> Option<PathBuf> {
+    if crate::sandbox::is_system_ro(sandbox_path) {
+        return Some(sandbox_path.to_path_buf());
+    }
+    let mount = mounts
+        .iter()
+        .find(|m| sandbox_path.starts_with(&m.sandbox))?;
+    let suffix = sandbox_path.strip_prefix(&mount.sandbox).ok()?;
+    Some(mount.host.join(suffix))
+}
+
+/// `dir`'s own sandbox coordinate, plus `mounts` extended with a mount entry
+/// for `dir` when none already exists. Every caller that starts a walk from
+/// a directory (`resolve_in_dirs`'s `search_dirs`, `path_candidate_row`'s
+/// project-relative branch) needs `dir` registered as a real `Mount` — not
+/// just known as a local variable — because [`sandbox_to_host`] can only
+/// translate a `shadow` coordinate that lands inside a mount it can look up
+/// in `mounts` itself; a `..` walking `shadow` back out of a search dir that
+/// exists only as an unregistered local fallback has nothing to translate
+/// back to.
+fn mounts_with_dir<'a>(
+    dir: &Path,
+    mounts: &'a [verify::Mount],
+) -> (PathBuf, std::borrow::Cow<'a, [verify::Mount]>) {
+    let dir_sandbox = mounts
+        .iter()
+        .find(|m| m.host == dir)
+        .map_or_else(|| dir.to_path_buf(), |m| m.sandbox.clone());
+    let dir_mounts = if mounts.iter().any(|m| m.host == dir) {
+        std::borrow::Cow::Borrowed(mounts)
+    } else {
+        let mut extended = mounts.to_vec();
+        extended.push(verify::Mount {
+            host: dir.to_path_buf(),
+            sandbox: dir_sandbox.clone(),
+        });
+        std::borrow::Cow::Owned(extended)
+    };
+    (dir_sandbox, dir_mounts)
+}
+
 fn walk_symlinks(
     mut todo: std::collections::VecDeque<PathBuf>,
     mut resolved: PathBuf,
@@ -540,14 +602,27 @@ fn walk_symlinks(
             }
             continue;
         }
-        let candidate = resolved.join(&component);
-        let Ok(meta) = candidate.symlink_metadata() else {
+        // Only *tentative* until confirmed not a symlink, below — `resolved`
+        // and `shadow` must stay at their pre-component values (the
+        // candidate's own containing directory) if this turns out to be a
+        // symlink, so a relative target correctly continues from there, not
+        // from the symlink's own now-superseded path.
+        let (stat_target, prospective_shadow) = if let Some(s) = &shadow {
+            let prospective = s.join(&component);
+            match sandbox_to_host(&prospective, mounts) {
+                Some(host) => (host, Some(prospective)),
+                None => return LinkResolution::Broken,
+            }
+        } else {
+            (resolved.join(&component), None)
+        };
+        let Ok(meta) = stat_target.symlink_metadata() else {
             return LinkResolution::Missing;
         };
         if !meta.file_type().is_symlink() {
-            resolved = candidate;
-            if let Some(s) = shadow.as_mut() {
-                s.push(&component);
+            resolved = stat_target;
+            if let Some(s) = prospective_shadow {
+                shadow = Some(s);
             }
             continue;
         }
@@ -555,7 +630,7 @@ fn walk_symlinks(
         if hops > MAX_SYMLINK_HOPS {
             return LinkResolution::Broken;
         }
-        let Ok(target) = std::fs::read_link(&candidate) else {
+        let Ok(target) = std::fs::read_link(&stat_target) else {
             return LinkResolution::Missing;
         };
         let rest = if target.is_absolute() {
@@ -575,6 +650,17 @@ fn walk_symlinks(
         };
         for c in components_of(&rest).into_iter().rev() {
             todo.push_front(c);
+        }
+    }
+    // The walk may have ended on a bare `..` with no subsequent
+    // named-component push to re-derive `resolved` from `shadow` — bring it
+    // in sync one last time so a caller's final host check always matches
+    // whatever `shadow` (the authoritative sandbox coordinate) actually
+    // says, even then.
+    if let Some(s) = &shadow {
+        match sandbox_to_host(s, mounts) {
+            Some(host) => resolved = host,
+            None => return LinkResolution::Broken,
         }
     }
     LinkResolution::Resolved(resolved, shadow)
@@ -710,12 +796,11 @@ fn path_candidate_row(dir: &Path, candidate: &str, mounts: &[verify::Mount]) -> 
     } else {
         // The worktree's own sandbox position — `check_with_dirs_and_roots`
         // always includes a `Mount{host: dir, sandbox: WORK_ROOT}`, exactly
-        // the entry `resolve_in_dirs` looks up for a search dir's own mount.
-        let dir_sandbox = mounts
-            .iter()
-            .find(|m| m.host == dir)
-            .map_or_else(|| dir.to_path_buf(), |m| m.sandbox.clone());
-        let dir_real = match resolve_symlinks_conservatively(dir.to_path_buf(), None, mounts) {
+        // the entry `mounts_with_dir` looks up (falling back to a synthetic
+        // self-identity entry for a caller bypassing
+        // `check_with_dirs_and_roots`).
+        let (dir_sandbox, dir_mounts) = mounts_with_dir(dir, mounts);
+        let dir_real = match resolve_symlinks_conservatively(dir.to_path_buf(), None, &dir_mounts) {
             LinkResolution::Resolved(p, _) => p,
             LinkResolution::Broken => {
                 return Row::new(
@@ -736,7 +821,12 @@ fn path_candidate_row(dir: &Path, candidate: &str, mounts: &[verify::Mount]) -> 
                 );
             }
         };
-        resolve_relative_conservatively(dir_real, Some(dir_sandbox), Path::new(candidate), mounts)
+        resolve_relative_conservatively(
+            dir_real,
+            Some(dir_sandbox),
+            Path::new(candidate),
+            &dir_mounts,
+        )
     };
     let (resolved, shadow) = match resolution {
         LinkResolution::Resolved(p, s) => (p, s),
@@ -852,11 +942,8 @@ fn resolve_in_dirs(
 ) -> PathLookup {
     let mut found_non_executable = false;
     for dir in search_dirs {
-        let dir_sandbox = mounts
-            .iter()
-            .find(|m| &m.host == dir)
-            .map_or_else(|| dir.clone(), |m| m.sandbox.clone());
-        let dir_real = match resolve_symlinks_conservatively(dir.clone(), None, mounts) {
+        let (dir_sandbox, dir_mounts) = mounts_with_dir(dir, mounts);
+        let dir_real = match resolve_symlinks_conservatively(dir.clone(), None, &dir_mounts) {
             LinkResolution::Resolved(p, _) => p,
             LinkResolution::Broken => return PathLookup::Broken,
             LinkResolution::Missing => continue,
@@ -865,7 +952,7 @@ fn resolve_in_dirs(
             dir_real,
             Some(dir_sandbox.clone()),
             Path::new(candidate),
-            mounts,
+            &dir_mounts,
         );
         match resolution {
             LinkResolution::Broken => return PathLookup::Broken,
@@ -1897,6 +1984,78 @@ mod tests {
         let search_dirs = [bin.clone()];
         let mounts = cargo_mounts(bin, registry);
         let report = check_with_dirs_and_roots(dir.path(), &search_dirs, &mounts);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_a_relative_command_that_lexically_escapes_the_worktree_as_setup_required() {
+        // Review finding on #219 (head e02d9ae): a plain relative
+        // `verify.command` (no symlink at all — `resolve_relative_conservatively`
+        // walks its own literal `..`s the same as a symlink target's) starts
+        // `resolved` at the worktree's real host directory and `shadow` at
+        // `/work`. `/work` is only one sandbox component deep, but the host
+        // worktree directory is usually several real components deep — so a
+        // single `..` leaves `/work` in sandbox terms while `resolved`'s own
+        // independently-mirrored pop lands only one level up from the
+        // worktree, still deep inside its host parent. If that host-parent
+        // location happens to *coincidentally* contain a matching file (as a
+        // sibling `usr/bin/…` next to the project directory would), checking
+        // executability there instead of on the destination `shadow` actually
+        // names is a false `Ready`: `ward verify` cannot see that host
+        // coincidence, only the real, separate `/usr/bin/…`.
+        let outer = tempfile::tempdir().unwrap();
+        let project = outer.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        // The coincidental trap: a real, executable file at exactly the host
+        // path `../usr/bin/ward-test-tool` resolves to from `project` — but
+        // nothing is placed at the real system `/usr/bin/ward-test-tool`.
+        let trap = outer.path().join("usr/bin/ward-test-tool");
+        std::fs::create_dir_all(trap.parent().unwrap()).unwrap();
+        std::fs::write(&trap, "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&trap);
+        assert!(
+            !Path::new("/usr/bin/ward-test-tool").exists(),
+            "fixture name must not collide with a real system binary"
+        );
+        write(
+            &project,
+            ".tamperward/config.yml",
+            "verify:\n  command: ../usr/bin/ward-test-tool\n",
+        );
+        let report = check(&project);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_allows_a_relative_command_that_lexically_reaches_a_real_system_binary() {
+        // The positive mirror of the case above: `../usr/bin/true` reaches a
+        // real, `is_system_ro`, executable system binary once `shadow`
+        // crosses out of `/work` — this must stay Ok even though the
+        // project's own host-parent directory has no matching `usr/bin/true`
+        // sibling at all, proving the check reads the real translated
+        // sandbox destination and not a coincidental host-relative path.
+        let real = Path::new("/usr/bin/true");
+        if !real.is_file() {
+            return; // covered by the identical environment-conditional shape
+            // used elsewhere in this file (e.g. the `/usr/bin/bash` fixture).
+        }
+        let outer = tempfile::tempdir().unwrap();
+        let project = outer.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(
+            !outer.path().join("usr").exists(),
+            "fixture must not coincidentally shadow the real /usr"
+        );
+        write(
+            &project,
+            ".tamperward/config.yml",
+            "verify:\n  command: ../usr/bin/true\n",
+        );
+        let report = check(&project);
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Ok, "{}", row.detail);
         assert_ne!(report.verdict(), Verdict::SetupRequired);
