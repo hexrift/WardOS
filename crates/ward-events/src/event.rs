@@ -446,6 +446,46 @@ pub enum ClaimKind {
     Plan,
 }
 
+/// Which live observer lost observations on the way to the log
+/// (`ObservationsDropped`, `event-model.md` §9).
+///
+/// The observer is the *producer* side of the bounded hand-off queue the daemon's
+/// single log writer drains while a command runs; it is not the enforcement path.
+/// A full queue never changes a decision — the proxy keeps allowing and denying in
+/// real time — it only means the daemon's record of that window is incomplete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ObserverSource {
+    /// The live filesystem watch over the worktree (`FileModified` / `FileRead`).
+    Filesystem,
+    /// The session egress proxy's decision recorder (`NetworkRequested` /
+    /// `NetworkDenied`).
+    Network,
+    /// The agent hook broker's claim buffer (`AgentClaim`). A hook request the
+    /// broker could not record — the pending-claim buffer full, a connection
+    /// refused at the handler cap, or a handler still in flight when the final
+    /// flush cut over — is reported here rather than as an agent note, so the
+    /// gap is visible in every observer mode including Quiet.
+    Hook,
+}
+
+impl ObserverSource {
+    /// Stable lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Filesystem => "filesystem",
+            Self::Network => "network",
+            Self::Hook => "hook",
+        }
+    }
+}
+
+impl fmt::Display for ObserverSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Error for over-long signature bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("signature must be 1–{max} bytes, found {found}")]
@@ -853,6 +893,26 @@ pub enum WardEvent {
         /// address already in use"). Never a secret; drawn from the daemon's own error text.
         reason: ShortText,
     },
+
+    // -- observer health (origin: Wardd; `event-model.md` §9) --
+    /// A live observer could not hand every observation to the log: the bounded
+    /// queue between it and the single writer was full, so `dropped` observations
+    /// were refused rather than silently lost.
+    ///
+    /// Appended immediately after the batch the same drain did take, so the
+    /// incomplete window is bounded by its neighbours in the log. Enforcement is
+    /// unaffected: the proxy keeps deciding in real time whether or not this
+    /// queue is backed up, and a refused observation is a lost *record*, never a
+    /// changed decision.
+    ObservationsDropped {
+        /// Which observer lost them.
+        source: ObserverSource,
+        /// How many observations this marker accounts for.
+        dropped: u64,
+        /// Capacity of the queue that refused them, so a reader can tell a tight
+        /// bound from a genuine burst.
+        capacity: u64,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -894,11 +954,12 @@ pub enum EventKind {
     EntryRestored = 29,
     VerificationErrored = 30,
     LaunchAborted = 31,
+    ObservationsDropped = 32,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 32] = [
+    pub const ALL: [EventKind; 33] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -931,11 +992,12 @@ impl EventKind {
         EventKind::EntryRestored,
         EventKind::VerificationErrored,
         EventKind::LaunchAborted,
+        EventKind::ObservationsDropped,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
     #[must_use]
-    pub const fn bit(self) -> u32 {
+    pub const fn bit(self) -> u64 {
         1 << (self as u8)
     }
 
@@ -975,6 +1037,7 @@ impl EventKind {
             EventKind::EntryRestored => "entry_restored",
             EventKind::VerificationErrored => "verification_errored",
             EventKind::LaunchAborted => "launch_aborted",
+            EventKind::ObservationsDropped => "observations_dropped",
         }
     }
 
@@ -1002,6 +1065,7 @@ impl EventKind {
                 | EventKind::SessionPaused
                 | EventKind::SessionResumed
                 | EventKind::EntryRestored
+                | EventKind::ObservationsDropped
         )
     }
 }
@@ -1014,24 +1078,44 @@ impl fmt::Display for EventKind {
 
 /// Error returned when an [`EventKindSet`] bitmask contains unknown bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("event kind set contains unknown bits: {0:#010x}")]
-pub struct UnknownKindBits(pub u32);
+#[error("event kind set contains unknown bits: {0:#018x}")]
+pub struct UnknownKindBits(pub u64);
 
-/// A set of [`EventKind`]s as a bitmask.
+/// A set of [`EventKind`]s as a bitmask. Backed by a `u64` (not the `u32` a 32-kind
+/// catalogue would technically still fit in): the catalogue reached the full 32-kind
+/// capacity of a `u32` backing in the same merge that widened this, and every kind
+/// added since has needed the headroom immediately, not eventually. Widening past
+/// `u64` in turn needs the same treatment this commit gives `u32`: a wider backing
+/// type, `bit()`'s shift, `MASK`, and this wire-compatibility contract all revisited
+/// together, not just the shift arithmetic in isolation.
+///
+/// Wire compatibility: postcard's integer encoding is a plain unsigned varint with no
+/// width tag, so a value that previously fit in the `u32` backing (every kind index
+/// `0..32`, i.e. the entire catalogue as it stood before this widening) serializes to
+/// byte-for-byte the same output whether encoded as a `u32` or a `u64` -- see
+/// `a_u32_encoded_set_decodes_identically_as_the_widened_u64_type` below, which proves
+/// this against real postcard bytes rather than asserting it from the format's docs.
+/// No `WIRE_VERSION` bump: this is the same kind of pure-capacity change the crate's
+/// own append-only `WardEvent` convention already treats as backwards compatible, not
+/// a change to what any existing bit means.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(into = "u32")]
-pub struct EventKindSet(u32);
+#[serde(into = "u64")]
+pub struct EventKindSet(u64);
 
 impl EventKindSet {
-    // `EventKind::ALL.len()` can be exactly 32 (the full width of the backing `u32`,
-    // one bit per kind), at which point `1u32 << 32` would overflow -- computed in a
-    // wider type instead, so this stays correct right up to the set's structural
-    // capacity rather than one kind short of it. The truncating cast back to `u32`
-    // is exact, never lossy: the value is at most `u32::MAX` for any `ALL.len()` in
-    // `0..=32`, and a catalogue past 32 kinds needs a wider `EventKindSet` backing
-    // type regardless (every `EventKind::bit()` shift would overflow first).
+    // `EventKind::ALL.len()` can reach exactly 64 (the full width of the backing
+    // `u64`, one bit per kind), at which point `1u64 << 64` would overflow -- checked
+    // explicitly rather than computed in a still-wider type (there is no wider
+    // primitive integer to borrow the headroom from this time), so this stays correct
+    // right up to the set's structural capacity rather than panicking one kind short
+    // of it or silently wrapping past it.
+    // `EventKind::ALL.len()` is at most a few dozen and known at compile time, so
+    // this narrowing to the `u32` `checked_shl` requires is always exact.
     #[allow(clippy::cast_possible_truncation)]
-    const MASK: u32 = ((1u64 << EventKind::ALL.len()) - 1) as u32;
+    const MASK: u64 = match 1u64.checked_shl(EventKind::ALL.len() as u32) {
+        Some(one_past) => one_past - 1,
+        None => u64::MAX,
+    };
 
     /// The empty set.
     pub const EMPTY: Self = Self(0);
@@ -1070,7 +1154,7 @@ impl EventKindSet {
 
     /// Raw bitmask.
     #[must_use]
-    pub const fn bits(self) -> u32 {
+    pub const fn bits(self) -> u64 {
         self.0
     }
 
@@ -1088,14 +1172,14 @@ impl fmt::Debug for EventKindSet {
     }
 }
 
-impl TryFrom<u32> for EventKindSet {
+impl TryFrom<u64> for EventKindSet {
     type Error = UnknownKindBits;
-    fn try_from(bits: u32) -> Result<Self, UnknownKindBits> {
+    fn try_from(bits: u64) -> Result<Self, UnknownKindBits> {
         // Written as "masking to the known bits changes the value" rather than
-        // "masking to the unknown bits is non-zero" (`bits & !MASK != 0`): the
-        // catalogue is at exactly 32 kinds right now, so `MASK` is `u32::MAX` and
-        // `!MASK` is zero -- a mask of zero is always clippy::bad_bit_mask, even
-        // though the check is correct (there are no unknown bits left to have).
+        // "masking to the unknown bits is non-zero" (`bits & !MASK != 0`): if the
+        // catalogue is ever at exactly 64 kinds, `MASK` is `u64::MAX` and `!MASK`
+        // is zero -- a mask of zero is always clippy::bad_bit_mask, even though
+        // the check is correct (there are no unknown bits left to have).
         if bits & Self::MASK != bits {
             return Err(UnknownKindBits(bits));
         }
@@ -1103,15 +1187,15 @@ impl TryFrom<u32> for EventKindSet {
     }
 }
 
-impl From<EventKindSet> for u32 {
-    fn from(set: EventKindSet) -> u32 {
+impl From<EventKindSet> for u64 {
+    fn from(set: EventKindSet) -> u64 {
         set.0
     }
 }
 
 impl<'de> Deserialize<'de> for EventKindSet {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bits = u32::deserialize(deserializer)?;
+        let bits = u64::deserialize(deserializer)?;
         Self::try_from(bits).map_err(serde::de::Error::custom)
     }
 }
@@ -1159,6 +1243,7 @@ impl WardEvent {
             WardEvent::EntryRestored { .. } => EventKind::EntryRestored,
             WardEvent::VerificationErrored { .. } => EventKind::VerificationErrored,
             WardEvent::LaunchAborted { .. } => EventKind::LaunchAborted,
+            WardEvent::ObservationsDropped { .. } => EventKind::ObservationsDropped,
         }
     }
 
@@ -1187,28 +1272,21 @@ mod tests {
     #[test]
     fn kind_bits_are_dense_and_cover_the_mask() {
         for (i, k) in EventKind::ALL.iter().enumerate() {
-            assert_eq!(k.bit(), 1u32 << i, "{k}");
+            assert_eq!(k.bit(), 1u64 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
-        // The catalogue is now exactly 32 kinds wide -- the full capacity of the
-        // `u32` `EventKindSet` backs itself with, one bit per kind. At that exact
-        // size there is no unused bit left for an "unknown kind" pattern to occupy:
-        // `ALL.bits() << 1` drops the top bit rather than setting one beyond the
-        // known range (there is no bit 32 in a `u32`), and `u32::MAX` is now simply
-        // `EventKindSet::ALL`'s own representation, not an invalid one. Both used to
-        // be rejected while the catalogue had room to spare; asserting they are
-        // *accepted* now is what proves the set is dense right up to capacity, the
-        // same property the loop above checks bit-by-bit. Adding a 33rd kind needs
-        // a wider backing type before this stops being true (`EventKind::bit()`'s
-        // own `1 << discriminant` shift would itself overflow first).
+        // The catalogue is currently 33 kinds wide, well inside the `u64` backing's
+        // 64-bit capacity -- so, unlike when the backing type was exactly saturated
+        // at `u32`, there IS a first unused bit right now (bit 33), and a value that
+        // sets it must be rejected as an unknown kind rather than silently accepted.
+        // This is the same "no room past the known kinds to smuggle a bit through"
+        // property `kind_bits_are_dense...`'s name promises, just checked against
+        // the current headroom instead of an exhausted capacity.
         assert_eq!(
-            EventKindSet::try_from(EventKindSet::ALL.bits() << 1).unwrap(),
-            EventKindSet::ALL.without(EventKind::ALL[0])
-        );
-        assert_eq!(
-            postcard::from_bytes::<EventKindSet>(&postcard::to_allocvec(&u32::MAX).unwrap())
-                .unwrap(),
-            EventKindSet::ALL
+            EventKindSet::try_from(EventKindSet::ALL.bits() | (1 << EventKind::ALL.len())),
+            Err(UnknownKindBits(
+                EventKindSet::ALL.bits() | (1 << EventKind::ALL.len())
+            ))
         );
         let set = EventKindSet::only(EventKind::Anchor).with(EventKind::FileRead);
         let bytes = postcard::to_allocvec(&set).unwrap();
@@ -1217,6 +1295,52 @@ mod tests {
             set.without(EventKind::Anchor),
             EventKindSet::only(EventKind::FileRead)
         );
+    }
+
+    /// Proves the wire-compatibility claim on `EventKindSet`'s own doc comment:
+    /// data serialized back when the type was backed by `u32` decodes identically
+    /// through the widened `u64` `Deserialize` impl -- checked against real
+    /// postcard bytes, not asserted from the varint format's spec.
+    ///
+    /// Deliberately does not use `EventKindSet::ALL` (grows with the catalogue) or
+    /// `EventKind::ObservationsDropped` (this PR's own newest kind, due to move to
+    /// a higher bit the moment #197 lands ahead of it in the documented merge
+    /// stack): a wire-compatibility fixture has to stay meaningful *after* that
+    /// rebase, not just against today's exact catalogue size. Uses only kinds
+    /// declared long before this PR instead -- `EventKind::bit()`'s own contract
+    /// (never reorder, only append) is what guarantees their bit positions are
+    /// fixed forever, independent of how many more kinds get appended after them.
+    #[test]
+    fn a_u32_encoded_set_decodes_identically_as_the_widened_u64_type() {
+        let session_started = EventKind::SessionStarted; // bit 0
+        let file_read = EventKind::FileRead; // bit 3
+        let anchor = EventKind::Anchor; // bit 26
+
+        // A value spanning the low, middle and high end of that stable range:
+        // postcard-encode it as a bare `u32`, the exact wire shape any
+        // `EventKindSet` produced before this change would have had
+        // (`#[serde(into = "u32")]` at the time), then decode those bytes through
+        // today's `u64`-backed `Deserialize` impl.
+        let pre_widening_bits: u32 =
+            u32::try_from(session_started.bit() | file_read.bit() | anchor.bit()).unwrap();
+        let old_wire_bytes = postcard::to_allocvec(&pre_widening_bits).unwrap();
+        let expected = EventKindSet::EMPTY
+            .with(session_started)
+            .with(file_read)
+            .with(anchor);
+        assert_eq!(
+            postcard::from_bytes::<EventKindSet>(&old_wire_bytes).unwrap(),
+            expected,
+            "a set of long-stable kinds encoded under the old u32 representation \
+             must decode to the same set today, not merely to a numerically equal \
+             but distinct value"
+        );
+
+        // And the reverse direction: a value round-tripped through today's type
+        // produces the same bytes postcard would have produced for the bare integer
+        // under the old representation, proving the wire shape genuinely didn't
+        // change -- not just that both sides happen to parse each other's output.
+        assert_eq!(postcard::to_allocvec(&expected).unwrap(), old_wire_bytes);
     }
 
     #[test]

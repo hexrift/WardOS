@@ -12,9 +12,9 @@ use ward_events::chain::{Chain, Timestamp, verify};
 use ward_events::event::{
     Acceptor, AgentIdentity, AgentKind, AgentState, CapabilityKind, CapabilityRequest, CaptureMode,
     ClaimKind, CredentialDelivery, Decision, DecisionSource, DeniedDst, DenyReason, EndReason,
-    EventKind, ExitStatus, FileChangeKind, GrantScope, PauseMethod, PolicySubject, ProcessRef,
-    RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus, TamperWardSig, VerifyRequester,
-    VerifySummary, WardEvent,
+    EventKind, ExitStatus, FileChangeKind, GrantScope, ObserverSource, PauseMethod, PolicySubject,
+    ProcessRef, RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus, TamperWardSig,
+    VerifyRequester, VerifySummary, WardEvent,
 };
 use ward_events::ids::{
     Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
@@ -221,7 +221,7 @@ proptest! {
     }
 
     #[test]
-    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u32..(1 << 27), notes in any::<bool>()) {
+    fn subscribe_roundtrips(session in any::<u128>(), from_seq in any::<u64>(), bits in 0u8..128, kinds in 0u64..(1 << 27), notes in any::<bool>()) {
         let sub = Subscribe {
             session: SessionId::from_u128(session),
             from_seq,
@@ -622,6 +622,25 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Wardd,
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Network,
+                dropped: 9,
+                capacity: 4096,
+            },
+        ),
+        (
+            Origin::Wardd,
+            // Every `ObserverSource` is carried over the wire and through the
+            // log, the hook broker included: a hook claim the broker had to
+            // refuse is an observer gap, not an agent note.
+            WardEvent::ObservationsDropped {
+                source: ObserverSource::Hook,
+                dropped: 2,
+                capacity: 4096,
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -712,8 +731,10 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
         .count();
     // The nine of Quiet mode plus the three host interventions (ADR-0019 §3), plus
     // `VerificationErrored` (#139), plus `CapabilityDecided` appearing twice in the
-    // fixture above (once granted, once denied).
-    assert_eq!(quiet, 13);
+    // fixture above (once granted, once denied), plus the observer's own "this
+    // record is incomplete" markers — one per source, the hook broker included
+    // (#137).
+    assert_eq!(quiet, 15);
 }
 
 #[test]
