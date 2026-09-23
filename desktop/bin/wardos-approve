@@ -28,7 +28,11 @@
 #                                   wardos-approve.service runs). The decision time left is
 #                                   mako's thin progress line (§10: not a number), the
 #                                   daemon's own figure as the popup opens; a question whose
-#                                   session is paused says its clock is held instead.
+#                                   session is paused says its clock is held instead. Two or
+#                                   more approvals that are exact duplicates — same session,
+#                                   agent, project and authority (#146 item 7) — share one
+#                                   notification, titled with a count (×N); answering it
+#                                   answers every one of them and nothing broader.
 #   wardos-approve --help
 #
 # The interactive path (no --watch) is reached through `ward session pending --json` and
@@ -63,6 +67,12 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 project=${WARDOS_PROJECT:-$PWD}
 retry=${WARDOS_APPROVE_RETRY:-2}
 max_notifiers=${WARDOS_APPROVE_MAX_NOTIFIERS:-10}
+# The #146 item 7 coalescing window (below, notify_one): how long a new
+# notification waits, at most, for an exact duplicate the main loop is still
+# reading to join it before its count is fixed for the title. A `sleep` argument
+# (seconds, fractional), not milliseconds, so tests can widen it past real
+# scheduling jitter without an extra fork to do the arithmetic.
+coalesce=${WARDOS_APPROVE_COALESCE_S:-0.05}
 # WARDOS_SESSION pins the interactive path to one session (mirroring wardos-pause):
 # an immutable, explicitly given id — the persistent inbox's own way of opening a
 # pending approval belonging to a session other than $project's/the desktop's
@@ -303,6 +313,15 @@ interactive() {
 # from being signalled this way — the worker is its real parent, the only thing
 # that can wait() on it, so it has to be the one to do this, not sweep_run_dir.
 #
+# A fifth, .ids, holds the id (or ids: #146 item 7 folds exact duplicates into one
+# notification, so more than one line is the common case for it, not an edge case)
+# a given key's notification is currently answering for; a sixth, per id, an
+# "id-<session, id>.group" marker naming which key (if any) that id was folded
+# into, for resolve_notification to find and update without scanning every key's
+# .ids file. Both are named from group_key, a hash of the exact title and body
+# notify_one renders, not from notif_key: two ids share a notification only when
+# they are byte-identical, in the same session.
+#
 # It also holds one "session-<key>.resolver" marker per live session that has (or
 # had) an open notification, holding that session's own resolver's pid.
 run_dir=""
@@ -324,6 +343,23 @@ notif_key() {
   printf '%s__%s' "$(session_key "$1")" "$2"
 }
 
+# The identity a *notification* is shown under (#146 item 7): a hash of the exact
+# title and body notify_one would render, so two pending approvals fold into the
+# same popup only when they are byte-identical — same session, same agent, same
+# project, same claim, and the same authority the daemon derived (destination,
+# network, method, credential, repository, lifetime; the DECISION TIME wording
+# folded in too, so a held one is never merged with a running one). Deliberately
+# excludes the progress hint (§10: a snapshot that can differ by milliseconds
+# between two otherwise-identical requests) and the id itself. A person answering a
+# grouped notification cannot tell it apart from a single one asking the same
+# thing, because it is: one action then answers every id gathered under this key
+# and nothing else — never a broader grant than what is shown (see notify_one).
+group_key() {
+  local session=$1 title=$2 body=$3 content
+  content=$(printf '%s\n%s' "$title" "$body" | sha256sum | cut -c1-16)
+  printf '%s__%s' "$(session_key "$session")" "$content"
+}
+
 active_notifiers() {
   # A glob that matches nothing expands to itself; -f screens that out.
   local n=0 f
@@ -331,46 +367,52 @@ active_notifiers() {
   printf '%s\n' "$n"
 }
 
-# One notification, waited on; the action chosen is the answer, relayed to the
-# session it was asked from (never re-resolved), so it cannot land on a different
-# session even if the desktop's selection changes while it is open. Runs in the
-# background (from follow_once's notifier loop, which has already reserved (session,
-# id)'s place against max_notifiers by creating its pid file before this starts, and
-# hands its own already-computed key straight through here rather than making this
-# recompute it) so a second approval — from this session or another live one, even
-# one sharing the same numeric id — is not queued behind the first. notify-send
-# absent is not an error: nothing is shown or tracked and nothing is answered from
-# here, but the approval is still open to wardos-approve-inbox, `wardos-approve <id>`
-# and `ward session approve` — the reservation is released so it does not count
-# against the bound forever.
+# One notification, waited on; the action chosen is the answer, relayed to every id
+# gathered under key by the time this reads it (group_key: exact duplicates of the
+# same session, agent, project, claim and authority, #146 item 7) — never re-resolved
+# from the desktop's current selection, and never any id outside the group, however
+# similar (never a broader grant than what is shown). Runs in the background (from
+# follow_once's notifier loop, which has already reserved key's place against
+# max_notifiers by creating its pid and worker files, and appended id to its ids
+# file, before this starts) so a second approval — from this session or another live
+# one, even one sharing the same numeric id, or an exact duplicate that joins this
+# same group — is not queued behind the first. notify-send absent is not an error:
+# nothing is shown or tracked and nothing is answered from here, but every gathered
+# approval is still open to wardos-approve-inbox, `wardos-approve <id>` and `ward
+# session approve` — the reservation is released so it does not count against the
+# bound forever.
 notify_one() {
-  local id=$1 session=$2 key=$3 agent=$4 project=$5 body=$6 progress=${7:-}
+  local session=$1 key=$2 agent=$3 project=$4 body=$5 progress=${6:-}
   local pid_file=$run_dir/$key.pid worker_file=$run_dir/$key.worker \
-    answer_file=$run_dir/$key.answer answer_pid="" hint=()
+    answer_file=$run_dir/$key.answer ids_file=$run_dir/$key.ids hint=()
+  local answer_pids=()
   # Remove both markers on every return path (notify-send missing, no action, an
   # unrecognised action, or a relayed answer) so wait_for_notifiers' wait, and
   # sweep_run_dir's own force-stop, never outlast this function actually finishing
   # (#224, #226 review).
   trap 'rm -f "$worker_file" "$answer_file"' RETURN
   # sweep_run_dir may have to stop this worker directly, past its own grace
-  # period — but only ever by signalling *this*, never the answer call directly:
-  # this is that call's real parent, the only thing that can wait() on it, so
-  # this reaps it, if one is in flight, before dying itself. Terminating the
-  # worker without that would just relocate the exact orphan #224 was one
-  # process up — an already-killed answer call that nothing ever reaps (#226
-  # review: confirmed independently, an isolated repro of sweep_run_dir killing
-  # the answer directly and the worker right after, as two ordering-independent
-  # operations, left the answer pid still alive after the worker had already
-  # been joined). Bounded the same way sweep_run_dir's own escalation is.
+  # period — but only ever by signalling *this*, never an answer call directly:
+  # this is every one of those calls' real parent, the only thing that can wait()
+  # on them, so this reaps whichever are still in flight before dying itself.
+  # Terminating the worker without that would just relocate the exact orphan #224
+  # was one process up — an already-killed answer call that nothing ever reaps
+  # (#226 review). Bounded the same way sweep_run_dir's own escalation is; one id's
+  # answer taking the grace window does not cost the others their own turn at it,
+  # since the signal to every one of them goes out first, in one pass.
   trap '
-    if [[ -n ${answer_pid:-} ]]; then
-      kill "$answer_pid" 2>/dev/null || true
-      wait_deadline "$answer_pid" 1
-      if kill -0 "$answer_pid" 2>/dev/null; then
-        kill -KILL "$answer_pid" 2>/dev/null || true
+    local p
+    for p in "${answer_pids[@]:-}"; do
+      [[ -n $p ]] && kill "$p" 2>/dev/null
+    done
+    for p in "${answer_pids[@]:-}"; do
+      [[ -n $p ]] || continue
+      wait_deadline "$p" 1
+      if kill -0 "$p" 2>/dev/null; then
+        kill -KILL "$p" 2>/dev/null || true
       fi
-      wait "$answer_pid" 2>/dev/null || true
-    fi
+      wait "$p" 2>/dev/null || true
+    done
     exit 143
   ' TERM
   # notifier_loop already reserved $worker_file, empty, before backgrounding this;
@@ -381,14 +423,39 @@ notify_one() {
   # write ever lands (#226 review). $BASHPID, not $$, which stays the top-level
   # shell's pid even inside a backgrounded function call.
   printf '%s\n' "$BASHPID" >"$worker_file"
+  # A brief coalescing window before this group's count is read (#146 item 7): id was
+  # only just reserved by notifier_loop's own synchronous write, backgrounding this
+  # function immediately after — an exact duplicate the daemon reports a moment later,
+  # from the very same batch an agent fired at once, is still being read and folded
+  # into ids_file by that same loop, racing this one rather than following it. This
+  # gives that race a fair, bounded chance to settle in the group's favour before the
+  # count is fixed for the title, without meaningfully delaying the notification
+  # itself. A duplicate that still arrives after this cannot retroactively grow the
+  # title — the same snapshot semantics design-language.md §10 already gives the
+  # decision-time figure — but is still answered along with the rest (notify_one
+  # re-reads ids_file after the answer, not this count). Configurable
+  # (WARDOS_APPROVE_COALESCE_S) so a test asserting an exact count can widen it well
+  # past real scheduling jitter instead of chasing a race against the main loop's
+  # own timing.
+  sleep "$coalesce"
+  # Counted with a builtin `read` loop, not `wc -l` (a fork and an exec of an
+  # external binary): every extra process this function forks before pid_file holds
+  # notify-send's real pid widens the exact race #224/#226 fixed by joining .worker
+  # instead of .pid — harmless now that wait_for_notifiers waits on .worker, but
+  # still needless latency on the common, non-grouped path.
+  local count=0 title _line
+  while IFS= read -r _line; do ((++count)); done <"$ids_file" 2>/dev/null || true
+  ((count > 0)) || count=1
+  title="${agent^} requests · ${project}"
+  ((count > 1)) && title="$title (×$count)"
   # The decision time left, as mako's progress line (#146 item 4): the standard
   # `value` hint, from the daemon's own countdown as this popup opens.
   [[ -n $progress ]] && hint=(-h "int:value:$progress")
   if ! command -v notify-send >/dev/null 2>&1; then
-    rm -f "$pid_file"
+    rm -f "$pid_file" "$ids_file"
     return 0
   fi
-  local out=$run_dir/$key.out action decision ns_pid
+  local out=$run_dir/$key.out action decision ns_pid ids
   : >"$out"
   # Backgrounded directly, not inside a `{ ...; }` group: $! must be notify-send's
   # own pid, not a wrapper subshell's, so a resolve elsewhere's kill (below) reaches
@@ -396,23 +463,38 @@ notify_one() {
   # has nothing left to do and exits on its own regardless of the kill.
   notify-send -a WardOS -c ward-approval -u critical --wait --print-id "${hint[@]}" \
     -A allow="Allow once" -A session="Allow session" -A deny="Deny" \
-    "${agent^} requests · ${project}" "$body" >"$out" 2>/dev/null &
+    "$title" "$body" >"$out" 2>/dev/null &
   ns_pid=$!
   printf '%s\n' "$ns_pid" >"$pid_file"
   wait "$ns_pid" 2>/dev/null || true
   rm -f "$pid_file"
   action=$(tail -n1 "$out" 2>/dev/null || true)
   rm -f "$out"
+  # Whichever ids are still in the group now: one may have been answered from
+  # another terminal, the inbox, or timed out while this was open (resolve_notification
+  # removes it from ids_file as that happens) — never relayed to twice, and never to
+  # one that was never part of this group.
+  ids=$(cat "$ids_file" 2>/dev/null || true)
+  rm -f "$ids_file"
   [[ -n $action ]] || return 0
   decision=$(decision_of "$action") || return 0
-  # Backgrounded directly, the same reason and the same way as notify-send above
-  # (a wrapper subshell's pid would not be the one actually still running if the
-  # TERM trap above needs to stop it), rather than going through the shared
-  # `answer` helper the interactive path uses as-is.
-  ward session approve --session "$session" "$id" "$decision" &
-  answer_pid=$!
-  printf '%s\n' "$answer_pid" >"$answer_file"
-  wait "$answer_pid" 2>/dev/null || true
+  # Each backgrounded directly, the same reason and the same way as notify-send
+  # above (a wrapper subshell's pid would not be the one actually still running if
+  # the TERM trap above needs to stop it), rather than going through the shared
+  # `answer` helper the interactive path uses as-is. Every pid is on disk before any
+  # of them is waited on, so sweep_run_dir/stop_answers can find and stop all of
+  # them even if this worker is itself stopped partway through the loop below.
+  local id
+  while IFS= read -r id; do
+    [[ -n $id ]] || continue
+    ward session approve --session "$session" "$id" "$decision" &
+    answer_pids+=("$!")
+  done <<<"$ids"
+  printf '%s\n' "${answer_pids[@]:-}" >"$answer_file"
+  local p
+  for p in "${answer_pids[@]:-}"; do
+    [[ -n $p ]] && wait "$p" 2>/dev/null
+  done
 }
 
 # The short, non-actionable title a resolved notification is replaced with.
@@ -467,12 +549,33 @@ finish_notification() {
 # words) with destination: resolve that session's own notification for id, never
 # another live session's, even if it happens to have a pending approval with the
 # same numeric id right now (#222 review: Approval::id is only unique within one
-# session). notif_key(session, id) is exactly the file pair notify_one/notifier_loop
-# named for this (session, id), so this can never touch a different session's file.
+# session). The id-<session, id> marker notifier_loop wrote when id joined a group
+# says exactly which notification (if any) is showing it; no marker means id was
+# never folded into an open notification (no popup, or already resolved from here).
+#
+# id is only one member of a notification that may be showing more than one (#146
+# item 7: exact duplicates share one popup) — removed from the group's ids file, not
+# assumed to be its only member. Only when that empties (id was the last one still
+# open — a group of one, the common case, behaves exactly as before) is the
+# notification itself replaced with the outcome; otherwise the popup is left
+# showing, still accurate for whatever it still represents, and notify_one relays
+# the eventual decision only to what remains when it reads ids_file at answer time.
 resolve_notification() {
   local id=$1 session=$2 state=$3 destination=$4
-  local key; key=$(notif_key "$session" "$id")
-  finish_notification "$run_dir/$key.pid" "$run_dir/$key.out" "$state" "$destination"
+  local marker=$run_dir/id-$(notif_key "$session" "$id").group
+  [[ -f $marker ]] || return 0
+  local key; key=$(cat "$marker" 2>/dev/null || true)
+  rm -f "$marker"
+  [[ -n $key ]] || return 0
+  local ids_file=$run_dir/$key.ids remaining
+  [[ -f $ids_file ]] || return 0
+  remaining=$(grep -vFx "$id" "$ids_file" 2>/dev/null || true)
+  if [[ -z $remaining ]]; then
+    finish_notification "$run_dir/$key.pid" "$run_dir/$key.out" "$state" "$destination"
+    rm -f "$ids_file"
+  else
+    printf '%s\n' "$remaining" >"$ids_file"
+  fi
 }
 
 # One live session's own decided feed: resolves any of its still-showing
@@ -511,45 +614,63 @@ ensure_resolver() {
 # first. A session that starts after this round began is picked up on the next one
 # (watch()'s retry loop below), the same as a session ending mid-round already is.
 # Bounded: past max_notifiers still showing, a new one is left to the inbox and the
-# interactive path rather than adding a worker that might wait forever.
+# interactive path rather than adding a worker that might wait forever. An exact
+# duplicate of a notification already open — or already reserved by an earlier line
+# of this same read, still ahead of notify_one in the background — never counts
+# against that bound at all: it joins the group instead (#146 item 7).
 notifier_loop() {
   local id session agent tool claim destination network method credential repository lifetime project countdown
-  local body key held progress
+  local body title key held progress marker
   while IFS=$'\t' read -r id session agent tool claim destination network method credential repository lifetime project countdown; do
     [[ -n $id ]] || continue
     ensure_resolver "$session"
+    # A running clock is the progress line alone (§10: not a number); a held one
+    # also says so in words, since a line that stands still reads the same as one
+    # that has not been redrawn — and an answer is refused until resume. Computed
+    # before key: group_key hashes title and body, so two requests differing only
+    # in a running-vs-held countdown are never folded together.
+    held=""
+    [[ $countdown == held:* ]] && held="held while paused · resume the session to answer"
+    body=$(blocks 1 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime" "$held")
+    title="${agent^} requests · ${project}"
+    key=$(group_key "$session" "$title" "$body")
+    marker=$run_dir/id-$(notif_key "$session" "$id").group
+    if [[ -f $run_dir/$key.pid ]]; then
+      # Byte-identical to a notification this same round already opened or
+      # reserved: fold id in rather than opening a second popup for it. Appending
+      # here, synchronously, is what lets notify_one's own later read of ids_file
+      # (in the background, racing this loop rather than following it) see every
+      # id gathered before it actually asks notify-send to show anything.
+      printf '%s\n' "$id" >>"$run_dir/$key.ids"
+      printf '%s\n' "$key" >"$marker"
+      continue
+    fi
     if [[ $(active_notifiers) -ge $max_notifiers ]]; then
       echo "wardos-approve: $max_notifiers notification(s) already open; approval $id is answerable from wardos-approve-inbox or ward session approve" >&2
       continue
     fi
-    # Reserved here, synchronously, so the next iteration's active_notifiers count
-    # is correct even before notify_one — started in the background right below,
-    # racing this loop rather than following it — has itself gotten as far as
-    # deciding whether there is even a notify-send to show anything with. Keyed by
-    # (session, id): a second live session with the same numeric id reserves its
-    # own file rather than colliding with this one's. Computed once here, not
-    # again inside notify_one's own background timeline, so a slow fork (hashing
-    # session) never delays how quickly notify_one gets its real pid on disk for
-    # a resolve elsewhere to find.
-    key=$(notif_key "$session" "$id")
+    # Reserved here, synchronously, so the next iteration's active_notifiers count,
+    # and the "-f $run_dir/$key.pid" duplicate check above, are both correct even
+    # before notify_one — started in the background right below — has itself
+    # gotten as far as deciding whether there is even a notify-send to show
+    # anything with. Computed once here, not again inside notify_one's own
+    # background timeline, so a slow fork (hashing, sha256summing the body) never
+    # delays how quickly notify_one gets its real pid on disk for a resolve
+    # elsewhere, or a duplicate a moment later, to find.
     : >"$run_dir/$key.pid"
     # Reserved empty too, for wait_for_notifiers below to always find an entry to
     # wait on — notify_one itself fills in its own real pid, as its very first
     # action, not this loop after backgrounding it (#226 review; see the run_dir
     # comment above notify_one for why the write has to happen there instead).
     : >"$run_dir/$key.worker"
-    # A running clock is the progress line alone (§10: not a number); a held one
-    # also says so in words, since a line that stands still reads the same as one
-    # that has not been redrawn — and an answer is refused until resume.
-    held=""
-    [[ $countdown == held:* ]] && held="held while paused · resume the session to answer"
-    body=$(blocks 1 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime" "$held")
+    printf '%s\n' "$id" >"$run_dir/$key.ids"
+    printf '%s\n' "$key" >"$marker"
     # Here too, not as a `$(…)` argument of the backgrounded call below: bash expands
     # an asynchronous command's words in the forked child, so that would put one more
     # fork on notify_one's own timeline before its real pid reaches disk — the same
     # reason key is computed above.
     progress=$(progress_value "$countdown")
-    notify_one "$id" "$session" "$key" "$agent" "$project" "$body" "$progress" &
+    notify_one "$session" "$key" "$agent" "$project" "$body" "$progress" &
   done < <(ward session pending --json --all --follow | jq --unbuffered -r "$fields")
 }
 
@@ -602,24 +723,32 @@ wait_for_notifiers() {
 
 # Stop every still-tracked `ward session approve` call: TERM, a bounded grace, then
 # KILL — and after each, wait (bounded) until the pid is actually gone, not merely
-# signalled. The answer is this shell's *grandchild* through its worker, so this
-# cannot wait() on it directly; a signalled answer stays visible to `kill -0` until
-# its worker reaps it from its own `wait "$answer_pid"`, and wait_deadline polls for
-# exactly that. sweep_run_dir leaves the workers alone until this returns, so each
-# worker is still there to do the reaping.
+# signalled. Each answer is this shell's *grandchild* through its worker, so this
+# cannot wait() on any of them directly; a signalled answer stays visible to
+# `kill -0` until its worker reaps it from its own `wait`, and wait_deadline polls
+# for exactly that. sweep_run_dir leaves the workers alone until this returns, so
+# each worker is still there to do its own reaping. One .answer file can name more
+# than one pid (#146 item 7: a grouped notification relays its decision to every id
+# it gathered) — every one of them is signalled in one pass before any is waited
+# on, so one slow id's grace window is not paid again by the next.
 stop_answers() {
-  local answer_file pid
+  local answer_file pids p
   for answer_file in "$run_dir"/*.answer; do
     [[ -f $answer_file ]] || continue
-    pid=$(cat "$answer_file" 2>/dev/null || true)
+    pids=$(cat "$answer_file" 2>/dev/null || true)
     rm -f "$answer_file"
-    [[ -n $pid ]] || continue
-    kill "$pid" 2>/dev/null || true
-    wait_deadline "$pid" 1
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -KILL "$pid" 2>/dev/null || true
-      wait_deadline "$pid" 1
-    fi
+    [[ -n $pids ]] || continue
+    while IFS= read -r p; do
+      [[ -n $p ]] && kill "$p" 2>/dev/null
+    done <<<"$pids"
+    while IFS= read -r p; do
+      [[ -n $p ]] || continue
+      wait_deadline "$p" 1
+      if kill -0 "$p" 2>/dev/null; then
+        kill -KILL "$p" 2>/dev/null || true
+        wait_deadline "$p" 1
+      fi
+    done <<<"$pids"
   done
 }
 

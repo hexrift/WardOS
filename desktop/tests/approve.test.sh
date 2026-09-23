@@ -36,6 +36,7 @@ grep -q 'WARD WILL ALLOW' <<<"$help" || fail "--help names the three blocks"
 grep -q 'wardos-approve-inbox' <<<"$help" || fail "--help names the persistent inbox"
 grep -q 'WARDOS_APPROVE_MAX_NOTIFIERS' <<<"$help" || fail "--help names the worker bound"
 grep -q 'progress line' <<<"$help" || fail "--help names the decision-time progress line"
+grep -q '(×N)' <<<"$help" || fail "--help names duplicate-notice grouping"
 
 # --- --watch: one notification per pending approval, from every live session, the
 # action relayed (#141: not just $project's session) --------------------------------
@@ -378,6 +379,86 @@ assert_logged '^<span alpha="39322">DECISION TIME</span>$'
 assert_logged '^held while paused · resume the session to answer$'
 [[ $(grep -c 'DECISION TIME' "$MOCK_LOG") == 1 ]] ||
   fail "only the held approval carries a DECISION TIME block: $(cat "$MOCK_LOG")"
+
+# --- --watch: exact duplicates share one notification; answering it answers every id
+# gathered under it (#146 item 7) — an agent that fires the same tool call twice
+# before the first is answered, say, must not open two identical popups -----------
+: >"$MOCK_LOG"
+dup_a=$line12
+dup_b=${line12/\"id\":12/\"id\":14}
+export DUP_A=$dup_a DUP_B=$dup_b
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$DUP_A" "$DUP_B" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# A brief, realistic delay before answering (mirroring a person's reaction time, not
+# an instant auto-dismiss): the second line's read is near-instant, but still a real
+# race against this worker's own background startup, so this is what actually gives
+# it room to land in ids_file before the popup is asked to show anything.
+mock notify-send 'case "$*" in *--print-id*) echo 6161; sleep 0.2; echo session ;; *) exit 0 ;; esac'
+# The count in the title is a snapshot taken shortly after the group's coalescing
+# window (notify_one's own comment on it), racing the main loop's read of the second
+# line the same way #224/#226 raced notify_one's startup against wait_for_notifiers —
+# widened here well past that jitter so the assertion below tests the intended
+# behaviour, not this environment's scheduling noise on any given run.
+WARDOS_APPROVE_COALESCE_S=0.5 WARDOS_PROJECT=/home/dev/payments-api "$approve" --watch --once
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 1 ]] ||
+  fail "two exact duplicates must share one popup, not open two: $(cat "$MOCK_LOG")"
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait --print-id -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api \(×2\) <span alpha="39322">DESTINATION</span>$'
+assert_not_logged 'payments-api <span'
+assert_logged '^ward session approve --session sess_a 12 allow-session$'
+assert_logged '^ward session approve --session sess_a 14 allow-session$'
+
+# --- --watch: identical requests from two different live sessions are never grouped
+# (#146 item 7: grouping never crosses sessions, even when title and body would
+# otherwise read the same) ----------------------------------------------------------
+: >"$MOCK_LOG"
+dup_other_session='{"id":21,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":null},"requested_at_unix_ms":1,"agent":"claude","session":"sess_d","project":"payments-api"}'
+export DUP_OTHER_SESSION=$dup_other_session
+noop_sess_d='"session approvals --json --follow --session sess_d") : ;;'
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$LINE12" "$DUP_OTHER_SESSION" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  '"$noop_sess_d"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'echo allow'
+WARDOS_APPROVE_MAX_NOTIFIERS=2 WARDOS_PROJECT=/home/dev/payments-api "$approve" --watch --once
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 2 ]] ||
+  fail "the same request from two different sessions must not be grouped: $(cat "$MOCK_LOG")"
+assert_not_logged '×2'
+assert_logged '^ward session approve --session sess_d 21 allow$'
+assert_logged '^ward session approve --session sess_a 12 allow$'
+
+# --- --watch: one of two duplicates is decided elsewhere while the group's popup is
+# still open — it is left open for the other one, not replaced or re-answered, and the
+# eventual sweep answers only what is left (#146 item 7) ----------------------------
+: >"$MOCK_LOG"
+dup_x=$line12
+dup_y=${line12/\"id\":12/\"id\":16}
+export DUP_X=$dup_x DUP_Y=$dup_y
+decided16='{"approval":{"id":16,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export DECIDED16=$decided16
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$DUP_X" "$DUP_Y" ;;
+  "session approvals --json --follow --session sess_a") sleep 0.3; printf "%s\n" "$DECIDED16" ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# Never itself answers: stays open (--wait, killed only by the round's own sweep) so
+# the only way id16 becomes terminal here is the resolver's decided record above.
+mock notify-send 'case "$*" in *--print-id*) echo 5151; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+assert_not_logged '^notify-send .* -r 5151 Timed out — denied'
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 5151 Session ended — denied <tt></tt>$'
+assert_not_logged '^ward session approve --session sess_a 16'
+assert_not_logged '^ward session approve --session sess_a 12'
 
 # --- interactive: one pending approval is picked, shown, the menu answers y / s / n ---
 : >"$MOCK_LOG"
