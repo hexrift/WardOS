@@ -600,26 +600,39 @@ wait_for_notifiers() {
   return 0
 }
 
-# Stop every still-tracked `ward session approve` call: TERM, a bounded grace, then
-# KILL — and after each, wait (bounded) until the pid is actually gone, not merely
-# signalled. The answer is this shell's *grandchild* through its worker, so this
-# cannot wait() on it directly; a signalled answer stays visible to `kill -0` until
-# its worker reaps it from its own `wait "$answer_pid"`, and wait_deadline polls for
-# exactly that. sweep_run_dir leaves the workers alone until this returns, so each
-# worker is still there to do the reaping.
+# Stop one `ward session approve` call and establish it is gone: TERM, a bounded
+# grace, then KILL, and after each a bounded wait until the pid no longer exists —
+# not merely signalled. The answer is this shell's *grandchild* through its
+# worker, so this cannot wait() on it; a signalled answer stays visible to
+# `kill -0` until that worker reaps it from its own `wait "$answer_pid"`. So the
+# worker is made runnable first (SIGCONT is a no-op for a running process, and
+# lets a stopped one reap), and the .answer marker — the only record of this pid —
+# is removed only once the pid is confirmed gone. A survivor keeps its marker so
+# sweep_run_dir will not stop its worker, and a later pass can still find it.
+stop_answer() {
+  local answer_file=$1 worker_file=${1%.answer}.worker pid worker=""
+  pid=$(cat "$answer_file" 2>/dev/null || true)
+  if [[ -z $pid ]]; then
+    rm -f "$answer_file"
+    return 0
+  fi
+  [[ -f $worker_file ]] && worker=$(cat "$worker_file" 2>/dev/null || true)
+  if [[ -n $worker ]]; then kill -CONT "$worker" 2>/dev/null || true; fi
+  kill "$pid" 2>/dev/null || true
+  wait_deadline "$pid" 1
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    if [[ -n $worker ]]; then kill -CONT "$worker" 2>/dev/null || true; fi
+    wait_deadline "$pid" 2
+  fi
+  kill -0 "$pid" 2>/dev/null || rm -f "$answer_file"
+}
+
 stop_answers() {
-  local answer_file pid
+  local answer_file
   for answer_file in "$run_dir"/*.answer; do
     [[ -f $answer_file ]] || continue
-    pid=$(cat "$answer_file" 2>/dev/null || true)
-    rm -f "$answer_file"
-    [[ -n $pid ]] || continue
-    kill "$pid" 2>/dev/null || true
-    wait_deadline "$pid" 1
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -KILL "$pid" 2>/dev/null || true
-      wait_deadline "$pid" 1
-    fi
+    stop_answer "$answer_file"
   done
 }
 
@@ -652,20 +665,30 @@ sweep_run_dir() {
   # function's return (#226 review; reproduced by approve.test.sh with a worker
   # held descheduled across the answer's escalation).
   stop_answers
-  local worker_file pid
+  local worker_file answer_file pid
   for worker_file in "$run_dir"/*.worker; do
     [[ -f $worker_file ]] || continue
     pid=$(cat "$worker_file" 2>/dev/null || true)
     # notify_one's own TERM trap exits past its RETURN trap, so its marker is
     # removed here instead.
+    [[ -n $pid ]] || { rm -f "$worker_file"; continue; }
+    # Its answer, if stop_answers could not yet confirm it gone, is still listed:
+    # only this worker can reap it, so keep the worker runnable and give it that
+    # chance before stopping it — stopping the worker first would orphan the
+    # answer alive (#226 review, exact-head 07f9525).
+    answer_file=${worker_file%.worker}.answer
+    if [[ -f $answer_file ]]; then
+      kill -CONT "$pid" 2>/dev/null || true
+      stop_answer "$answer_file"
+    fi
     rm -f "$worker_file"
-    [[ -n $pid ]] || continue
     kill "$pid" 2>/dev/null || true
     # Its answer is already gone (stop_answers, above), so notify_one's TERM trap
     # has nothing left to reap and exits at once; the bound is generous only as a
     # backstop for a worker that is itself descheduled.
     wait_deadline "$pid" 2
     if kill -0 "$pid" 2>/dev/null; then
+      kill -CONT "$pid" 2>/dev/null || true
       kill -KILL "$pid" 2>/dev/null || true
     fi
     # The worker *is* this shell's direct child (notifier_loop backgrounds it in
@@ -673,10 +696,11 @@ sweep_run_dir() {
     # for real rather than leaving a signalled-but-unreaped pid behind.
     wait "$pid" 2>/dev/null || true
   done
-  # A worker that recorded an answer only after stop_answers ran, and was then
-  # stopped above before its own traps finished, leaves that answer listed: stop
-  # it too (the system's reaper collects it now that its worker is gone).
+  # Anything still listed now has no worker left to reap it — an answer recorded
+  # after the first pass by a worker stopped above, or one whose worker could not
+  # be made to reap in time: stop it and wait (bounded) for the system's reaper.
   stop_answers
+  rm -f "$run_dir"/*.answer
 }
 
 follow_once() {

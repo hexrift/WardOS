@@ -175,8 +175,13 @@ fi
 # worker's own `wait "$answer_pid"` has reaped it, and the answer is orphaned
 # still alive. The answer ignores TERM so every round goes through the KILL
 # escalation, the path the race lives on.
-eval "$(sed -n '/^wait_deadline() {$/,/^}$/p; /^stop_answers() {$/,/^}$/p; /^sweep_run_dir() {$/,/^}$/p' "$approve")"
-for round in 1 2 3; do
+eval "$(sed -n '/^wait_deadline() {$/,/^}$/p; /^stop_answer() {$/,/^}$/p; /^stop_answers() {$/,/^}$/p; /^sweep_run_dir() {$/,/^}$/p' "$approve")"
+# Two kinds of round: the worker resumes on its own mid-teardown (1.4s, inside the
+# answer's escalation), and the worker is held stopped for the whole teardown —
+# through both answer waits and the worker's own escalation boundary — so only
+# sweep_run_dir making it runnable again can get the answer reaped (#226 review,
+# exact-head 07f9525).
+for round in resume-1 resume-2 held-1 held-2; do
   run_dir=$(mktemp -d "$TMP/sweep.XXXXXX")
   sweep_worker() {
     local worker_file=$run_dir/k.worker answer_file=$run_dir/k.answer answer_pid=""
@@ -210,10 +215,13 @@ for round in 1 2 3; do
   # answer is orphaned; waiting for the reap first (stop_answers) lets the resumed
   # worker reap it normally.
   kill -STOP "$worker_pid"
-  ( sleep 1.4; kill -CONT "$worker_pid" 2>/dev/null ) &
-  resume_pid=$!
+  resume_pid=""
+  if [[ $round == resume-* ]]; then
+    ( sleep 1.4; kill -CONT "$worker_pid" 2>/dev/null ) &
+    resume_pid=$!
+  fi
   sweep_run_dir
-  wait "$resume_pid" 2>/dev/null || true
+  if [[ -n $resume_pid ]]; then wait "$resume_pid" 2>/dev/null || true; fi
   if kill -0 "$answer_pid" 2>/dev/null; then
     kill -KILL "$answer_pid" 2>/dev/null || true
     fail "round $round: the answer was still alive when sweep_run_dir returned"
