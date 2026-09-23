@@ -793,6 +793,20 @@ struct State {
     /// answers it before registering a question at all — see `ward session
     /// grants` for that authority instead) so it never appears here either.
     history: VecDeque<ApprovalRecord>,
+    /// The real outcome [`Approvals::close`] gave an id it drained, held
+    /// here for that id's own still-in-flight [`Approvals::wait`] call to
+    /// hand back — so a hold connection that was about to collect a genuine
+    /// answer, but lost the race to a concurrent `close`, still learns its
+    /// real answer instead of a fabricated [`Outcome::Closed`] (review of
+    /// #218, finding 1). [`Approvals::take_recorded`] separately checks and
+    /// clears the same entry to tell that same caller whether `close`
+    /// already appended this id's terminal record for it, so it is never
+    /// appended a second time. Never populated any other way, so a `wait`
+    /// on an id this map has nothing for still falls back to
+    /// [`Outcome::Closed`] exactly as before this map existed (an id
+    /// already collected earlier, or one that was never registered at
+    /// all).
+    handoff: BTreeMap<u64, Outcome>,
 }
 
 impl State {
@@ -962,7 +976,21 @@ impl Approvals {
         let mut state = self.lock();
         loop {
             let Some(index) = state.held.iter().position(|h| h.approval.id == id) else {
-                return Outcome::Closed;
+                // Not (or no longer) held. `close` drains every entry it
+                // finds still in `held` — answered or not — under the same
+                // lock that flips `closed` (review of #218, finding 1), so
+                // by the time anything observes `id` missing from `held`,
+                // `close` (if it is what took it) has already recorded its
+                // real outcome in `handoff` and appended its terminal
+                // record. Hand that same real outcome back rather than a
+                // fabricated `Closed`, so the caller (and, through it, the
+                // agent) learns what actually happened to its question. An
+                // id `handoff` has nothing for was either never registered
+                // or was already collected by an earlier call to this
+                // method (exercised directly by tests): `Closed` there
+                // matches this method's behaviour from before `handoff`
+                // existed.
+                return state.handoff.get(&id).copied().unwrap_or(Outcome::Closed);
             };
             if let Some(answer) = state.held[index].answer {
                 let held = state.held.remove(index);
@@ -976,18 +1004,6 @@ impl Approvals {
                 }
                 state.record_history(held.approval, outcome, now_unix_ms());
                 return outcome;
-            }
-            if state.closed {
-                // Defensive only: unreachable in practice. `Approvals::close`
-                // removes every entry with no answer yet (and records its
-                // history) in the same locked step that sets `closed`, so an
-                // entry found here with `answer: None` while `closed` is
-                // true would mean `close` ran without doing that — which
-                // would itself be the bug this guards against, not a path
-                // this method is expected to take.
-                let held = state.held.remove(index);
-                state.record_history(held.approval, Outcome::Closed, now_unix_ms());
-                return Outcome::Closed;
             }
             if state.paused {
                 // Held in turn: wake on any change, and count none of this time.
@@ -1048,23 +1064,33 @@ impl Approvals {
             .collect()
     }
 
-    /// Every approval this session has asked that is either still open or
+    /// Every approval this session has asked that is either still open,
+    /// still awaiting its own `Request::Hold` connection's collection, or
     /// still within the bounded history, oldest asked first (#146 item 1):
     /// `ward session approvals`, and the desktop's persistent inbox, read
     /// this instead of `pending` so a request is not lost from view the
     /// moment its notification is missed or dismissed. An approval already
     /// answered but not yet collected by its own `Request::Hold` connection
-    /// (a narrow race between `answer` and that connection's `wait` — see
-    /// `answer`) is not shown here for the instant that takes: it is still
-    /// in `held` with an answer set, neither pending (it has an answer) nor
-    /// yet in `history` (nothing has collected it).
+    /// (the narrow, ordinary window between `answer` and that connection's
+    /// `wait` — see `answer`) still shows here, as pending: it is still in
+    /// `held`, and nothing has turned its answer into a terminal record
+    /// yet. It moves to the bounded history, with its real outcome, exactly
+    /// once — whichever of that connection's own `wait` or a concurrent
+    /// `close` collects it first (review of #218, finding 1: there is no
+    /// window in which it is neither pending nor decided).
+    ///
+    /// Sorted by `(requested_at_unix_ms, approval.id)`: two requests can
+    /// legitimately share a millisecond timestamp, and an approval's own id
+    /// — the sequence number of the `CapabilityRequested` record that asked
+    /// it — is assigned in true request order regardless, so it is the
+    /// exact tie-breaker a plain sort by timestamp alone is missing (review
+    /// of #218, finding 2).
     #[must_use]
     pub fn approvals(&self) -> Vec<ApprovalRecord> {
         let state = self.lock();
         let mut records: Vec<ApprovalRecord> = state
             .held
             .iter()
-            .filter(|h| h.answer.is_none())
             .map(|h| ApprovalRecord {
                 approval: h.approval.clone(),
                 outcome: None,
@@ -1072,40 +1098,72 @@ impl Approvals {
             })
             .chain(state.history.iter().cloned())
             .collect();
-        records.sort_by_key(|r| r.approval.requested_at_unix_ms);
+        records.sort_by_key(|r| (r.approval.requested_at_unix_ms, r.approval.id));
         records
     }
 
-    /// The session ended: every question still *open* (unanswered) is
-    /// released as denied and returned, oldest first, so the caller can give
-    /// each one a terminal record (`decided_event`, `Outcome::Closed`)
-    /// before anything that follows can seal the log — once sealed, no
-    /// record can follow it (#146). No new question is taken from here on.
+    /// The session ended: every question still in `held` — whether still
+    /// open, or already answered but not yet collected by its own
+    /// `Request::Hold` connection — is drained here with its real outcome
+    /// and returned, oldest first, so the caller can give each one its
+    /// terminal record (`decided_event`) before anything that follows can
+    /// seal the log (#146) — once sealed, no record can follow it. No new
+    /// question is taken from here on (`register` already refuses once
+    /// `closed`).
     ///
-    /// A question that was already answered but whose own `wait` has not
-    /// yet collected it is left in `held`: that caller still discovers and
-    /// records its real answer (see `wait`'s own `closed` branch, which this
-    /// makes unreachable by construction — every entry `close` leaves
-    /// behind already has an answer).
-    pub fn close(&self) -> Vec<Approval> {
+    /// Before the review of #218 this left an already-answered entry in
+    /// `held` for its own connection to record later, on the reasoning that
+    /// `wait` already gives an answer priority over `closed`. That handoff
+    /// raced Stop/Seal sealing the log first: nothing made "the hold
+    /// connection notices and appends" and "the log seals" mutually
+    /// exclusive, so the real record could be dropped on the floor entirely
+    /// (finding 1). Draining and recording *every* entry here instead,
+    /// under the one lock that also flips `closed`, makes settlement atomic
+    /// with respect to a concurrent `wait`: whichever of the two reaches a
+    /// given entry first is the only one that ever will, so there is
+    /// exactly one terminal record, and it is always appended (by the
+    /// caller, from what this returns) before the seal. The drained
+    /// entry's own blocked `wait` call, if there is one, is handed this
+    /// same real outcome back through `handoff` — never a fabricated
+    /// `Outcome::Closed` for a question that was genuinely answered — and
+    /// `take_recorded` tells whichever caller collects it not to append the
+    /// terminal record a second time.
+    pub fn close(&self) -> Vec<(Approval, Outcome)> {
         let mut state = self.lock();
         state.closed = true;
         let now = now_unix_ms();
-        let mut released = Vec::new();
-        state.held.retain(|h| {
-            if h.answer.is_none() {
-                released.push(h.approval.clone());
-                false
-            } else {
-                true
+        let drained = std::mem::take(&mut state.held);
+        let mut released = Vec::with_capacity(drained.len());
+        for held in drained {
+            let outcome = match held.answer {
+                Some(answer) => Outcome::Answered(answer),
+                None => Outcome::Closed,
+            };
+            if let Outcome::Answered(ApprovalDecision::AllowSession) = outcome {
+                let grant = held.approval.session_grant(now);
+                state.remembered.insert(
+                    (held.approval.tool.clone(), held.approval.summary.clone()),
+                    grant,
+                );
             }
-        });
-        for approval in &released {
-            state.record_history(approval.clone(), Outcome::Closed, now);
+            state.record_history(held.approval.clone(), outcome, now);
+            state.handoff.insert(held.approval.id, outcome);
+            released.push((held.approval, outcome));
         }
         drop(state);
         self.changed.notify_all();
         released
+    }
+
+    /// Whether `id`'s terminal record was already appended by a concurrent
+    /// `close` (review of #218, finding 1): checked, and cleared so it is
+    /// consulted at most once, right after collecting an outcome from
+    /// `wait` — by the caller that would otherwise go on to append its own
+    /// `CapabilityDecided` for it (`Served::hold`). `false` for any id
+    /// `close` never touched (the ordinary case: the caller's own `wait`
+    /// collected the answer itself, and must still record it).
+    pub fn take_recorded(&self, id: u64) -> bool {
+        self.lock().handoff.remove(&id).is_some()
     }
 
     /// Pause or resume the hold (ADR-0019 §3): paused, pending questions stay
@@ -1578,10 +1636,11 @@ mod tests {
             std::thread::spawn(move || approvals.wait(1, Duration::from_secs(5)))
         };
         std::thread::sleep(Duration::from_millis(20));
-        // `close` itself hands back what it released, so the daemon can give
-        // each one its own terminal record before the log can seal (#146) —
-        // it does not need to wait for `wait`'s own thread to notice.
-        assert_eq!(approvals.close(), [approval(1)]);
+        // `close` itself hands back what it released, with each one's real
+        // outcome, so the daemon can give each one its own terminal record
+        // before the log can seal (#146) — it does not need to wait for
+        // `wait`'s own thread to notice.
+        assert_eq!(approvals.close(), [(approval(1), Outcome::Closed)]);
         assert_eq!(waiter.join().unwrap(), Outcome::Closed);
         assert!(approvals.pending().is_empty());
         let err = approvals.register(approval(2)).unwrap_err();
@@ -1598,19 +1657,51 @@ mod tests {
     }
 
     #[test]
-    fn closing_leaves_an_uncollected_answer_alone() {
-        // A question already answered, but not yet collected by its own
-        // `wait`, is not misreported as session-ended: `close` only drains
-        // entries with no answer yet (`wait`'s own priority — an answer,
-        // when there is one, always wins over `closed`).
+    fn closing_hands_an_uncollected_answer_its_real_outcome_exactly_once() {
+        // Review of #218, finding 1: a question already answered but not
+        // yet collected by its own `wait` must not be sealed with no
+        // terminal record (the old behaviour here — `close` left it alone
+        // entirely and trusted the hold connection to record it later —
+        // raced Stop/Seal sealing the log first). `close` now drains it
+        // like any other held entry, with its real answer, so the caller
+        // can append the true terminal record before the log seals.
         let approvals = Approvals::new();
         approvals.register(approval(1)).unwrap();
         approvals.answer(1, ApprovalDecision::Allow).unwrap();
-        assert_eq!(approvals.close(), [], "the answered question is untouched");
+        assert_eq!(
+            approvals.close(),
+            [(approval(1), Outcome::Answered(ApprovalDecision::Allow))],
+            "close hands back the real answer, not Outcome::Closed, so the \
+             caller can append the true terminal record before sealing"
+        );
+        // The listing already shows it decided, correctly, the moment
+        // `close` returns — not still pending, and not vanished.
+        let record = approvals
+            .approvals()
+            .into_iter()
+            .find(|r| r.approval.id == 1)
+            .expect("released approval is in the combined view");
+        assert_eq!(
+            record.outcome,
+            Some(Outcome::Answered(ApprovalDecision::Allow))
+        );
+        // The connection that registered it still gets its real answer when
+        // it finally collects, never a fabricated session-ended.
         assert_eq!(
             approvals.wait(1, Duration::ZERO),
             Outcome::Answered(ApprovalDecision::Allow),
-            "its own wait still discovers the real answer"
+            "its own wait still discovers the real answer, from the handoff"
+        );
+        // `close` already appended (through its caller) this id's terminal
+        // record: the collecting caller must be told not to append a
+        // second one.
+        assert!(
+            approvals.take_recorded(1),
+            "close already recorded id 1's terminal record"
+        );
+        assert!(
+            !approvals.take_recorded(1),
+            "consulted once: a second check finds nothing left to take"
         );
     }
 
@@ -1641,6 +1732,37 @@ mod tests {
         assert_eq!(records[1].approval.id, 2, "still pending");
         assert_eq!(records[1].outcome, None);
         assert!(records[1].decided_at_unix_ms.is_none());
+    }
+
+    #[test]
+    fn the_approvals_view_breaks_a_requested_at_tie_by_approval_id() {
+        // Review of #218, finding 2: two requests can legitimately share a
+        // millisecond timestamp. The approval's own id — the sequence
+        // number of the `CapabilityRequested` record that asked it — is
+        // assigned in true request order regardless, and must be the
+        // tie-breaker; a sort on the timestamp alone, with pending entries
+        // built before history entries, would otherwise place a later
+        // pending request ahead of an earlier decided one whenever they
+        // tie.
+        let approvals = Approvals::new();
+        let same_ms = 1_700_000_000_000;
+        let earlier = Approval::new(1, "Write", "/work/a.rs", authority(), same_ms);
+        let later = Approval::new(2, "Write", "/work/b.rs", authority(), same_ms);
+        // Decide the *later* one first and leave the earlier one pending, so
+        // a sort that only looked at `requested_at_unix_ms` (with pending
+        // entries listed before history entries, both at the same
+        // timestamp) would place id 2 ahead of id 1 — the wrong order.
+        approvals.register(later).unwrap();
+        approvals.answer(2, ApprovalDecision::Deny).unwrap();
+        assert_eq!(
+            approvals.wait(2, Duration::ZERO),
+            Outcome::Answered(ApprovalDecision::Deny)
+        );
+        approvals.register(earlier).unwrap();
+        let records = approvals.approvals();
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0].approval.id, 1, "the true, earlier request");
+        assert_eq!(records[1].approval.id, 2, "the true, later request");
     }
 
     #[test]
