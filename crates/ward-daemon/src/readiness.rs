@@ -398,9 +398,14 @@ const MAX_SYMLINK_HOPS: u8 = 40;
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LinkResolution {
     /// Every hop was safe to reason about, and this is the final, real
-    /// (non-symlink) path — still needs its own existence/executability and,
-    /// for a project-relative candidate, worktree-containment checked.
-    Resolved(PathBuf),
+    /// (non-symlink) host path — still needs its own existence/executability
+    /// and, for a project-relative candidate, worktree-containment checked.
+    /// The second field is the same destination re-expressed in **sandbox**
+    /// coordinates, when the caller passed a starting sandbox position (see
+    /// [`resolve_symlinks_conservatively`]'s `shadow` parameter) — `None`
+    /// when it didn't ask for one (project-relative/absolute candidates,
+    /// which don't need it).
+    Resolved(PathBuf, Option<PathBuf>),
     /// Some hop does not exist at all (a plain absence, not a broken link).
     Missing,
     /// A hop's symlink target was an absolute path outside `SYSTEM_RO`, or the
@@ -445,7 +450,21 @@ fn components_of(path: &Path) -> std::collections::VecDeque<PathBuf> {
         .collect()
 }
 
-fn resolve_symlinks_conservatively(path: PathBuf) -> LinkResolution {
+/// `shadow`, when given, is the *sandbox* position that corresponds to
+/// `path`'s own starting directory (e.g. `dir`'s `verify::Mount::sandbox`, or
+/// `dir` itself when the verifier sees it at an identical path) — every pop
+/// and push this walk applies to `resolved` (in host coordinates) is applied
+/// to `shadow` too, in lockstep, so the two accumulators only ever diverge
+/// where the *real* host and sandbox mount layouts do: at an absolute hop
+/// (reset to `/` on both sides, since [`crate::sandbox::is_system_ro`] means
+/// identically-placed) and at root saturation, which each side's own
+/// [`PathBuf::pop`] applies independently. This is deliberately a parallel
+/// walk of the exact textual navigation, not a diff of the two final
+/// destinations after the fact — the destinations alone cannot tell apart a
+/// symlink whose `..`s stop just short of one side's root from one whose
+/// `..`s run past it (see [`resolve_in_dirs`]'s doc for the reproduction
+/// this distinction exists to catch).
+fn resolve_symlinks_conservatively(path: PathBuf, shadow: Option<PathBuf>) -> LinkResolution {
     // The walk below always starts from "/"; a caller-relative `dir` (`ward
     // ready ../other-project`) would otherwise resolve against the wrong
     // root entirely. `std::fs::canonicalize`'s own absolutising behavior is
@@ -459,13 +478,38 @@ fn resolve_symlinks_conservatively(path: PathBuf) -> LinkResolution {
     } else {
         std::env::current_dir().map_or_else(|_| path.clone(), |cwd| cwd.join(&path))
     };
+    walk_symlinks(components_of(&path), PathBuf::from("/"), shadow)
+}
 
-    let mut todo = components_of(&path);
-    let mut resolved = PathBuf::from("/");
+/// Continues the exact same conservative walk [`resolve_symlinks_conservatively`]
+/// performs, but starting from an already-resolved `(base, base_shadow)`
+/// position instead of `/` and `rest`'s own components instead of a whole
+/// path's. [`resolve_in_dirs`] uses this to anchor `shadow` mirroring exactly
+/// at `dir`'s own resolved boundary — found by first resolving `dir` alone,
+/// with no `shadow` — rather than walking `dir`'s own ancestor components a
+/// *second* time under `shadow` from `/`, which would push them onto
+/// `shadow` on top of the `dir_sandbox` position it already starts at,
+/// double-counting `dir`'s own path onto its sandbox counterpart.
+fn resolve_relative_conservatively(
+    base: PathBuf,
+    base_shadow: Option<PathBuf>,
+    rest: &Path,
+) -> LinkResolution {
+    walk_symlinks(components_of(rest), base, base_shadow)
+}
+
+fn walk_symlinks(
+    mut todo: std::collections::VecDeque<PathBuf>,
+    mut resolved: PathBuf,
+    mut shadow: Option<PathBuf>,
+) -> LinkResolution {
     let mut hops = 0u8;
     while let Some(component) = todo.pop_front() {
         if component.as_os_str() == ".." {
             resolved.pop();
+            if let Some(s) = shadow.as_mut() {
+                s.pop();
+            }
             continue;
         }
         let candidate = resolved.join(&component);
@@ -474,6 +518,9 @@ fn resolve_symlinks_conservatively(path: PathBuf) -> LinkResolution {
         };
         if !meta.file_type().is_symlink() {
             resolved = candidate;
+            if let Some(s) = shadow.as_mut() {
+                s.push(&component);
+            }
             continue;
         }
         hops += 1;
@@ -488,16 +535,19 @@ fn resolve_symlinks_conservatively(path: PathBuf) -> LinkResolution {
                 return LinkResolution::Broken;
             }
             resolved = PathBuf::from("/");
+            if let Some(s) = shadow.as_mut() {
+                *s = PathBuf::from("/");
+            }
         }
         // Either shape: what's left to resolve now starts with the target's
         // own components — a relative target continues from `resolved` (its
         // symlink's own containing directory) unchanged; an absolute one
-        // already reset `resolved` to `/` above.
+        // already reset `resolved` (and `shadow`) to `/` above.
         for c in components_of(&target).into_iter().rev() {
             todo.push_front(c);
         }
     }
-    LinkResolution::Resolved(resolved)
+    LinkResolution::Resolved(resolved, shadow)
 }
 
 /// Whether the binary the *configured* `verify.command` would actually invoke is
@@ -613,8 +663,8 @@ fn path_candidate_row(dir: &Path, candidate: &str) -> Row {
             ),
         );
     }
-    let resolved = match resolve_symlinks_conservatively(path.clone()) {
-        LinkResolution::Resolved(p) => p,
+    let resolved = match resolve_symlinks_conservatively(path.clone(), None) {
+        LinkResolution::Resolved(p, _) => p,
         LinkResolution::Broken => {
             return Row::new(
                 "runtime",
@@ -698,14 +748,34 @@ enum PathLookup {
 /// ../../outside/cargo`) without ever pointing through an absolute target —
 /// nothing the hop-by-hop walk itself checks catches that, since a relative
 /// target is, correctly, allowed to resolve wherever its own containing
-/// directory ends up mounted. Whether the destination is legitimate is
-/// decided by [`resolved_is_mounted`] in **sandbox** coordinates, not by
-/// whether the resolved *host* path merely sits under some other host
-/// directory the verifier separately mounts — see that function's doc for
-/// why a flat host-side check is unsound (a relative chain can climb enough
-/// `..`s to reach a real system binary on the host's own, unrelated
-/// ancestry, while the identical `..`s starting from where the verifier
-/// actually mounts `dir` land nowhere real).
+/// directory ends up mounted. Whether the destination is legitimate has to be
+/// judged in **sandbox** coordinates, not by whether the resolved *host* path
+/// merely sits under some other host directory the verifier separately
+/// mounts: `$CARGO_HOME/bin/tool -> ../../../usr/bin/true` resolves, on the
+/// host, to the real `/usr/bin/true` (three `..`s from a typical
+/// `$CARGO_HOME/bin` reach the host's own root) — `is_system_ro` and
+/// genuinely executable there, so a host-only check accepts it. Inside the
+/// verifier, though, that same relative target is followed from
+/// `/run/verifier/cargo/bin`, and three `..`s from there reach only `/run`
+/// (one level short of the sandbox's own root, since Cargo's mount sits four
+/// components deep) — the walk lands on `/run/usr/bin/true`, which nothing
+/// binds. The two namespaces don't share a directory hierarchy above the
+/// bind points themselves, so `dir` is resolved once on its own first (its
+/// own ancestor components may themselves need following — an existing,
+/// separate ancestor-symlink case — but never need `shadow`, since nothing
+/// before `dir` itself changes which mount its *contents* land under), and
+/// only `candidate`'s own components continue the walk from `dir`'s real
+/// host position *and* its sandbox position together
+/// ([`resolve_relative_conservatively`]), carrying both accumulators in
+/// lockstep from that shared anchor. This never reconstructs the sandbox
+/// destination afterward from two final endpoints alone (an earlier version
+/// of this function tried exactly that, diffing `dir`'s and the resolved
+/// candidate's canonicalized components; it silently loses however many
+/// `..`s ran past *either* side's own root before the walk stopped, so a
+/// symlink whose `..` count saturates the host root one hop earlier or later
+/// than it saturates the sandbox root cannot be told apart from one that
+/// doesn't — replaying only the *shortest* endpoint-to-endpoint delta gets
+/// exactly that case wrong).
 fn resolve_in_dirs(
     candidate: &str,
     search_dirs: &[PathBuf],
@@ -714,10 +784,33 @@ fn resolve_in_dirs(
     let mut found_non_executable = false;
     for dir in search_dirs {
         let candidate_path = dir.join(candidate);
-        match resolve_symlinks_conservatively(candidate_path.clone()) {
+        let dir_sandbox = mounts
+            .iter()
+            .find(|m| &m.host == dir)
+            .map_or_else(|| dir.clone(), |m| m.sandbox.clone());
+        let dir_real = match resolve_symlinks_conservatively(dir.clone(), None) {
+            LinkResolution::Resolved(p, _) => p,
             LinkResolution::Broken => return PathLookup::Broken,
-            LinkResolution::Resolved(resolved) if resolved.is_file() => {
-                if !resolved_is_mounted(dir, &resolved, mounts) {
+            LinkResolution::Missing => continue,
+        };
+        let resolution = resolve_relative_conservatively(
+            dir_real,
+            Some(dir_sandbox.clone()),
+            Path::new(candidate),
+        );
+        match resolution {
+            LinkResolution::Broken => return PathLookup::Broken,
+            LinkResolution::Resolved(resolved, shadow) if resolved.is_file() => {
+                // Always `Some`: this call site always passes a `shadow` start.
+                let Some(sandbox_candidate) = shadow else {
+                    return PathLookup::Broken;
+                };
+                let contained = crate::sandbox::is_system_ro(&sandbox_candidate)
+                    || sandbox_candidate.starts_with(&dir_sandbox)
+                    || mounts
+                        .iter()
+                        .any(|m| sandbox_candidate.starts_with(&m.sandbox));
+                if !contained {
                     return PathLookup::Broken;
                 }
                 if is_executable(&candidate_path) {
@@ -725,7 +818,7 @@ fn resolve_in_dirs(
                 }
                 found_non_executable = true;
             }
-            LinkResolution::Missing | LinkResolution::Resolved(_) => {}
+            LinkResolution::Missing | LinkResolution::Resolved(..) => {}
         }
     }
     if found_non_executable {
@@ -733,95 +826,6 @@ fn resolve_in_dirs(
     } else {
         PathLookup::Missing
     }
-}
-
-/// Whether `resolved` — the real, symlink-free destination
-/// [`resolve_symlinks_conservatively`] already walked to, starting from
-/// `dir.join(candidate)` — is somewhere the verifier's own mount namespace
-/// actually provides, given that `dir` is either one of `mounts`' own host
-/// directories or, when it isn't (a base system directory, or a directory a
-/// test controls directly), its own identity mapping (the verifier sees it
-/// at the same path it has on the host — true for every fixed `SYSTEM_RO`
-/// root, and for any search dir a caller hasn't given an explicit `Mount`
-/// for).
-///
-/// A flat "is `resolved` under some host root the verifier also mounts
-/// somewhere" check (an earlier version of this function) judges
-/// containment in *host* coordinates — but a relative symlink chain's
-/// cumulative `..`s are followed by the *kernel*, inside the verifier, in
-/// *sandbox* coordinates: `$CARGO_HOME/bin/tool -> ../../../usr/bin/true`
-/// resolves, on the host, to the real `/usr/bin/true` (three `..`s from a
-/// typical `$CARGO_HOME/bin` reach the host's own root), which is
-/// `is_system_ro` and genuinely executable there — a host-side check alone
-/// accepts it. Inside the verifier, though, that same relative target is
-/// followed from `/run/verifier/cargo/bin`, and three `..`s from there reach
-/// only `/run` (one level short of the sandbox's own root, since Cargo's
-/// mount sits four components deep) — the walk lands on `/run/usr/bin/true`,
-/// which nothing binds. The two namespaces don't share the same directory
-/// hierarchy above the bind points themselves, so containment has to be
-/// judged from `dir`'s *sandbox* position, not its host one.
-///
-/// This re-expresses `resolved` as the number of directory levels **up**
-/// from `dir`, and the components **down** from there ([`translate`]:
-/// diffing `dir`'s and `resolved`'s canonicalized component sequences —
-/// exactly what the kernel's own relative-`..` resolution computed, since
-/// `resolve_symlinks_conservatively` only ever reached `resolved` via that
-/// same textual navigation), then applies that identical delta to `dir`'s
-/// own *sandbox* directory and checks whether the resulting sandbox path is
-/// real: `is_system_ro`, under one of `mounts`' own `sandbox` directories
-/// (a real sibling mount, e.g. Cargo's `registry` reached from `bin`), or
-/// still under `dir`'s own sandbox mapping (the ordinary case: the link
-/// never left `dir` at all).
-fn resolved_is_mounted(dir: &Path, resolved: &Path, mounts: &[verify::Mount]) -> bool {
-    let dir_sandbox = mounts
-        .iter()
-        .find(|m| m.host == dir)
-        .map_or_else(|| dir.to_path_buf(), |m| m.sandbox.clone());
-    let Some(sandbox_candidate) = translate(dir, &dir_sandbox, resolved) else {
-        return false;
-    };
-    crate::sandbox::is_system_ro(&sandbox_candidate)
-        || sandbox_candidate.starts_with(&dir_sandbox)
-        || mounts
-            .iter()
-            .any(|m| sandbox_candidate.starts_with(&m.sandbox))
-}
-
-/// Re-expresses `resolved` (a real, symlink-free host path) as the
-/// equivalent path in `dir`'s own coordinate space: pops `dir_sandbox` back
-/// to the common ancestor `dir` and `resolved` share on the host, then
-/// pushes `resolved`'s own remaining components on top — the same "N levels
-/// up, M names down" the kernel's own relative-symlink resolution actually
-/// walked to reach `resolved` from `dir` in the first place, just replayed
-/// against `dir`'s sandbox position instead of its host one. A pop past the
-/// sandbox path's own root is a no-op, exactly like a real `..` at `/` —
-/// which is what makes the difference legible: an escape that only reaches
-/// as far "up" as the verifier's own mount nesting (e.g. out of a Cargo
-/// `bin/` into its `registry/` sibling) still lands somewhere real, while
-/// one that would need to climb *past* the sandbox's actual root to reach
-/// the same nominal depth a host path allows does not.
-///
-/// `None` when either side fails to canonicalize — unreachable in practice
-/// by the time a caller has a `resolved` path in hand (both already proved
-/// they exist), kept only so this stays a plain, non-panicking query.
-fn translate(dir: &Path, dir_sandbox: &Path, resolved: &Path) -> Option<PathBuf> {
-    let dir_real = dir.canonicalize().ok()?;
-    let resolved_real = resolved.canonicalize().ok()?;
-    let dir_components: Vec<_> = dir_real.components().collect();
-    let resolved_components: Vec<_> = resolved_real.components().collect();
-    let common = dir_components
-        .iter()
-        .zip(resolved_components.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let mut sandbox_path = dir_sandbox.to_path_buf();
-    for _ in common..dir_components.len() {
-        sandbox_path.pop();
-    }
-    for component in &resolved_components[common..] {
-        sandbox_path.push(component.as_os_str());
-    }
-    Some(sandbox_path)
 }
 
 fn protected_row(dir: &Path, config: &verify::Config) -> Row {
@@ -873,7 +877,7 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(outside.path().join("tool"), &link).unwrap();
         assert_eq!(
-            resolve_symlinks_conservatively(link),
+            resolve_symlinks_conservatively(link, None),
             LinkResolution::Broken
         );
     }
@@ -891,8 +895,8 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(real, &link).unwrap();
         assert_eq!(
-            resolve_symlinks_conservatively(link),
-            LinkResolution::Resolved(real.to_path_buf())
+            resolve_symlinks_conservatively(link, None),
+            LinkResolution::Resolved(real.to_path_buf(), None)
         );
     }
 
@@ -1393,6 +1397,48 @@ mod tests {
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Fail, "{}", row.detail);
         assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_allows_a_cargo_bin_relative_symlink_whose_extra_dot_dot_saturates_at_host_root() {
+        // Review finding on #219 (the root-saturation gap in the mount-picture
+        // fix above): an earlier version of this containment check inferred
+        // the sandbox destination by diffing `dir`'s and `resolved`'s
+        // *canonicalized* endpoints, which discards how many `..`s actually
+        // ran past root on either side. A fourth `..` here is a no-op on the
+        // host (three already reach `/` from a typical `$CARGO_HOME/bin`),
+        // but the sandbox's own `/run/verifier/cargo/bin` is one component
+        // deeper — its fourth `..` is the one that first reaches root, so the
+        // *same* symlink is genuinely executable inside the verifier. Judging
+        // this from the endpoints alone (as the earlier fix did) undercounts
+        // the pops and lands one level short of root on the sandbox side,
+        // wrongly reporting `SetupRequired` for a command `ward verify` can
+        // actually run. This must be Ok, the mirror image of the three-`..`
+        // case above staying Fail.
+        let real_true = Path::new("/usr/bin/true");
+        if !real_true.is_file() {
+            return; // covered by the identical environment-conditional shape
+            // used by the three-`..` case above and by
+            // resolve_symlinks_conservatively's own /usr/bin/bash fixture.
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cargo test\n",
+        );
+        let cargo_home = tempfile::tempdir().unwrap();
+        let bin = cargo_home.path().join("bin");
+        let registry = cargo_home.path().join("registry");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink("../../../../usr/bin/true", bin.join("cargo")).unwrap();
+
+        let search_dirs = [bin.clone()];
+        let mounts = cargo_mounts(bin, registry);
+        let report = check_with_dirs_and_roots(dir.path(), &search_dirs, &mounts);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Ok, "{}", row.detail);
+        assert_ne!(report.verdict(), Verdict::SetupRequired);
     }
 
     #[test]
