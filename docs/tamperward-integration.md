@@ -252,5 +252,14 @@ command with no daemon behind it; never treated as reclaimable).
 
 This is a read-only report. It never deletes anything. Actual reclamation — mark-and-sweep
 garbage collection with leases for concurrent capture/verification, a dry-run deletion plan,
-explicit retention roots, a low-space preflight, and `doctor`/`status` wiring — is the rest of
-issue #151 and is deliberately left to a follow-up change.
+explicit retention roots, and `doctor`/`status` wiring — is the rest of issue #151.
+
+A low-space preflight (item 6) now guards `ward snapshot create`'s and `ward verify`'s own
+captures: before either starts writing to the CAS, it checks free space on the filesystem
+backing `<state>/cas` and refuses to start — `Error::LowSpace`, naming `ward snapshot
+gc`/`usage` as the way out — when it is below a configured minimum, rather than beginning an
+expensive worktree walk that a full disk would fail partway through. Like the usage report
+above, it never deletes anything itself and never triggers `ward snapshot gc`; see
+`ward_daemon::space` and [`snapshots-and-git.md`](snapshots-and-git.md#7-retention). A
+dry-run cleanup plan with explicit user-selected retention (item 4) and startup recovery of
+abandoned scratch via recorded ownership (item 5) remain follow-up work.

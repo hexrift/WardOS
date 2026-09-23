@@ -312,6 +312,12 @@ Detailed in [`snapshots-and-git.md`](snapshots-and-git.md). Summary:
   kept snapshots), never running while a capture's lease is held, and prints a plan rather
   than deleting unless run with `--apply` (#151 items 2–3;
   [`ward_snapshot::gc`](../crates/ward-snapshot/src/gc.rs)).
+* A low-space preflight refuses `ward snapshot create`'s and `ward verify`'s own captures
+  up front when the CAS's backing filesystem is below a configured minimum free-space
+  margin (`$WARD_MIN_FREE_BYTES`, else 512 MiB) — a pure guard that never deletes anything
+  or runs GC itself, pointing at `ward snapshot gc`/`usage` as the way out instead of
+  failing partway through an expensive walk on a full disk (#151 item 6;
+  [`ward_daemon::space`](../crates/ward-daemon/src/space.rs)).
 
 ---
 

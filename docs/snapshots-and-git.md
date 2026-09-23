@@ -154,6 +154,20 @@ a re-run recomputes safely from what is left on disk.
 usage across the CAS and session logs, and what a `ward snapshot gc` dry run would
 reclaim right now (or that a capture's lease currently makes that unknown). It never
 sweeps anything itself — same computation, surfaced where a host report is the first
-thing read (#151 item 7, partial). Startup reconciliation of abandoned scratch and a
-low-space preflight remain follow-up work; `ward status`'s per-session panel is
-unchanged, since storage usage is a property of the whole state root, not one session.
+thing read (#151 item 7, partial). Startup reconciliation of abandoned scratch remains
+follow-up work; `ward status`'s per-session panel is unchanged, since storage usage is
+a property of the whole state root, not one session.
+
+Before `ward snapshot create`'s capture, and before `ward verify`'s own candidate
+capture (the worktree-walk-and-hash step inside `verify::prepare`), a low-space
+preflight checks free space on the filesystem backing `<state>/cas` (#151 item 6). It is
+a pure guard — `statvfs(2)`, a comparison, nothing else — never a cleanup trigger: it
+never deletes anything, never runs `ward snapshot gc` itself, and the previous valid
+snapshot and its receipt are untouched whether it trips or not. Below the configured
+minimum (`$WARD_MIN_FREE_BYTES`, else 512 MiB), the capture is refused up front with
+`Error::LowSpace` naming how much is free versus needed and pointing at `ward snapshot
+gc`/`ward snapshot usage` as the way out, instead of starting an expensive walk that
+would fail — possibly leaving a partial write — partway through on a full disk. It is a
+coarse floor on available space, not a predictive estimate of what any one capture will
+write: sizing that in advance would itself require the same expensive walk the guard
+exists to avoid paying for first. See `crates/ward-daemon/src/space.rs`.
