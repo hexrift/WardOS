@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use ward_snapshot::{CasUsage, CategoryUsage, SnapshotStore};
+use ward_snapshot::{CasUsage, CategoryUsage, cas_usage_at};
 
 use crate::daemon;
 use crate::error::{Error, Result};
@@ -53,15 +53,16 @@ impl StorageUsage {
 }
 
 /// Compute [`StorageUsage`] for `state` (`$WARD_STATE_DIR`). Read-only; walks
-/// directory metadata only, never opens or hashes content.
+/// directory metadata only, never opens or hashes content, and never creates
+/// `cas/` or any of its category directories — unlike `SnapshotStore::open`,
+/// which exists to create them and would otherwise turn this report into a
+/// mutation of a fresh or CAS-less state root.
 pub fn compute(state: &Path) -> Result<StorageUsage> {
-    let store =
-        SnapshotStore::open(state.join("cas")).map_err(|e| Error::Snapshot(e.to_string()))?;
     let CasUsage {
         blobs,
         manifests,
         meta,
-    } = store.usage().map_err(|e| Error::Snapshot(e.to_string()))?;
+    } = cas_usage_at(state.join("cas")).map_err(|e| Error::Snapshot(e.to_string()))?;
     let session_logs = session_logs_usage(state)?;
     Ok(StorageUsage {
         blobs,
@@ -196,7 +197,10 @@ pub fn scan_scratch(state: &Path) -> Result<Vec<ScratchEntry>> {
         }
         // `file_type()` does not follow a symlink, so a `ward-*` name planted as
         // a symlink by another local user (shared, world-writable temp dir) is
-        // excluded here rather than traversed into.
+        // excluded here rather than traversed into. It is still only a first
+        // look, not a guarantee about what `open_dir_no_symlink` below finds a
+        // moment later — see that function's own doc comment for the race this
+        // alone cannot close.
         let Ok(file_type) = entry.file_type() else {
             continue; // vanished between readdir and stat; nothing to report
         };
@@ -204,11 +208,52 @@ pub fn scan_scratch(state: &Path) -> Result<Vec<ScratchEntry>> {
             continue;
         }
         let path = entry.path();
-        let owner = read_owner_marker(&path);
-        out.push(scan_one_entry(state, path, owner, sum_dir_bytes));
+        match open_dir_no_symlink(&path) {
+            Ok(dir) => {
+                let owner = read_owner_marker(&dir);
+                out.push(scan_one_entry(state, path, owner, dir, sum_dir_bytes));
+            }
+            Err(_) => {
+                // Vanished, permission-denied, or — the race this guards
+                // against — replaced with a symlink or a non-directory in the
+                // window between the `file_type()` lstat above and this open:
+                // `O_NOFOLLOW | O_DIRECTORY` refuses exactly that atomically,
+                // rather than silently traversing into whatever now sits at
+                // this name. Reported the same way any other uninspectable
+                // entry is: no owner read, no bytes summed, `Unknown`.
+                out.push(ScratchEntry {
+                    path,
+                    owner: None,
+                    bytes: None,
+                    status: ScratchStatus::Unknown,
+                });
+            }
+        }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// Open `dir` for reading, refusing atomically — no separate check-then-open
+/// window for a concurrent replacement to land in — if its final path
+/// component is not, at the instant of the open, a real directory: not a
+/// symlink (`O_NOFOLLOW`), not a plain file, FIFO, socket or device
+/// (`O_DIRECTORY`). The OS temp dir is shared and world-writable, so a
+/// co-resident user can rename the directory an earlier `lstat`/`file_type()`
+/// checked and put a symlink (to, say, another user's private tree) in its
+/// place before a naive second `open`/`read_dir` by path gets to it; the
+/// caller here holds the resulting descriptor for every further read against
+/// this entry ([`read_owner_marker`], [`sum_dir_bytes`]) instead of ever
+/// reopening it by path again.
+fn open_dir_no_symlink(dir: &Path) -> std::result::Result<nix::dir::Dir, nix::Error> {
+    nix::dir::Dir::open(
+        dir,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
 }
 
 /// Build one [`ScratchEntry`], containing any traversal failure to just this
@@ -234,10 +279,11 @@ fn scan_one_entry(
     state: &Path,
     path: PathBuf,
     owner: Option<String>,
-    sum: impl FnOnce(&Path, &mut u64) -> Result<()>,
+    dir: nix::dir::Dir,
+    sum: impl FnOnce(nix::dir::Dir, &mut u64) -> Result<()>,
 ) -> ScratchEntry {
     let mut summed = 0u64;
-    let (bytes, status) = if sum(&path, &mut summed).is_ok() {
+    let (bytes, status) = if sum(dir, &mut summed).is_ok() {
         (Some(summed), classify(state, owner.as_deref()))
     } else {
         (None, ScratchStatus::Unknown)
@@ -283,12 +329,23 @@ const MAX_OWNER_MARKER_LEN: usize = 128;
 ///
 /// Anything that doesn't clear all of the above is treated exactly like a
 /// missing marker.
-fn read_owner_marker(dir: &Path) -> Option<String> {
+///
+/// Takes `dir` as an already-open directory descriptor
+/// ([`open_dir_no_symlink`]), not a path: `O_NOFOLLOW` on opening the marker
+/// itself only refuses a symlinked *final* component, not a directory
+/// component earlier in the path — a co-resident user who renames `dir`'s own
+/// directory out from under a path-based open and puts a symlink in its place
+/// would otherwise still be followed. Resolving the marker with `openat`
+/// against a descriptor obtained before that swap could happen closes that
+/// window: the descriptor keeps referring to the directory it was opened
+/// against regardless of what a later rename does to the name that used to
+/// point at it.
+fn read_owner_marker(dir: &nix::dir::Dir) -> Option<String> {
     use std::io::Read;
 
-    let marker = dir.join(OWNER_MARKER);
-    let fd = nix::fcntl::open(
-        &marker,
+    let fd = nix::fcntl::openat(
+        dir,
+        OWNER_MARKER,
         nix::fcntl::OFlag::O_RDONLY
             | nix::fcntl::OFlag::O_NOFOLLOW
             | nix::fcntl::OFlag::O_NONBLOCK
@@ -314,37 +371,94 @@ fn read_owner_marker(dir: &Path) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
 
-/// Sum every regular file's size under `dir`, recursing into subdirectories.
-/// Iterative (an explicit worklist, not self-recursion): `dir` is under the
-/// shared, world-writable OS temp dir, so another local user can create an
+/// Sum every regular file's size under the already-open directory `dir`
+/// ([`open_dir_no_symlink`]), recursing into subdirectories. Iterative (an
+/// explicit worklist, not self-recursion): `dir` is under the shared,
+/// world-writable OS temp dir, so another local user can create an
 /// arbitrarily deep chain of nested directories there with no filesystem
 /// depth limit low enough to stop them; a call-stack recursion over that
 /// input is a local stack-overflow DoS reachable by any co-resident user.
-fn sum_dir_bytes(dir: &Path, total: &mut u64) -> Result<()> {
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(Error::io(&dir, e)),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|e| Error::io(&dir, e))?;
-            // See the matching comment in `add_dir_files`: an entry can
-            // legitimately vanish between being listed and being `stat`ed.
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(Error::io(&dir, e)),
+///
+/// Every subdirectory is opened `openat`-relative to its own already-open
+/// parent descriptor, with the same `O_NOFOLLOW | O_DIRECTORY` guarantee
+/// `open_dir_no_symlink` documents: the walk only ever descends through real
+/// directories, resolved beneath a descriptor this process already holds,
+/// never by re-resolving a path (`dir_a/dir_b/dir_c`) from the top on every
+/// step. A co-resident user renaming `dir_b` out and putting a symlink in
+/// its place between this walk listing `dir_a` and descending into `dir_b`
+/// therefore cannot redirect the walk anywhere: the `openat` for `dir_b`
+/// checks *its* own final component against *`dir_a`'s* descriptor at the
+/// moment of that call, not against whatever `dir_a/dir_b` resolves to if
+/// walked fresh from the root. Each entry's type and size are read together
+/// via one `fstatat(..., AT_SYMLINK_NOFOLLOW)` — the same object the
+/// subsequent `openat` (for a directory) or byte count (for a regular file)
+/// then acts on, with no separate stat-then-open step for either to race.
+fn sum_dir_bytes(dir: nix::dir::Dir, total: &mut u64) -> Result<()> {
+    // The `PathBuf` alongside each descriptor is display-only, for error
+    // messages; every actual read below goes through the descriptor, never a
+    // re-resolved path.
+    let mut stack = vec![(PathBuf::from("."), dir)];
+    while let Some((path, mut dh)) = stack.pop() {
+        // `Dir::iter` needs `&mut dh`, and the `fstatat`/`openat` calls below
+        // need their own borrow of `dh` too (as `Fd: AsFd`) — so every name
+        // is collected into an owned buffer first, ending the iterator's
+        // mutable borrow, before `dh` is borrowed again (immutably, any
+        // number of times) for the actual per-entry work below.
+        let mut names = Vec::new();
+        for entry in dh.iter() {
+            let entry = entry
+                .map_err(std::io::Error::from)
+                .map_err(|e| Error::io(&path, e))?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            names.push(name.to_owned());
+        }
+        for name in &names {
+            let child_path = path.join(std::str::from_utf8(name.to_bytes()).unwrap_or("?"));
+            let st = match nix::sys::stat::fstatat(
+                &dh,
+                name.as_c_str(),
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(st) => st,
+                // Vanished between readdir and stat (a concurrent remover —
+                // this session's own cleanup, another `ward` process): see
+                // the matching comment in `add_dir_files`.
+                Err(nix::Error::ENOENT) => continue,
+                Err(e) => return Err(Error::io(&child_path, std::io::Error::from(e))),
             };
-            if file_type.is_dir() {
-                stack.push(entry.path());
-            } else if file_type.is_file() {
-                match entry.metadata() {
-                    Ok(m) => *total += m.len(),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(Error::io(&dir, e)),
+            // `st_mode`'s type bits are a field (masked by `S_IFMT`), not
+            // independent flags: `S_IFLNK`'s own bit pattern is a superset of
+            // `S_IFREG`'s, so a bitflags `.contains(S_IFREG)` on the raw mode
+            // would wrongly read true for a symlink too. Masking first and
+            // comparing the extracted type for exact equality is what a
+            // symlink actually needs to fall through both arms below.
+            let file_type = nix::sys::stat::SFlag::from_bits_truncate(
+                st.st_mode & nix::sys::stat::SFlag::S_IFMT.bits(),
+            );
+            if file_type == nix::sys::stat::SFlag::S_IFDIR {
+                match nix::dir::Dir::openat(
+                    &dh,
+                    name.as_c_str(),
+                    nix::fcntl::OFlag::O_RDONLY
+                        | nix::fcntl::OFlag::O_DIRECTORY
+                        | nix::fcntl::OFlag::O_NOFOLLOW
+                        | nix::fcntl::OFlag::O_CLOEXEC,
+                    nix::sys::stat::Mode::empty(),
+                ) {
+                    Ok(sub) => stack.push((child_path, sub)),
+                    // Vanished, or `fstatat` above raced a replacement of this
+                    // exact name with a symlink/non-directory in the instant
+                    // before this `openat` — refused atomically by the same
+                    // `O_NOFOLLOW | O_DIRECTORY` guarantee, rather than ever
+                    // being followed.
+                    Err(nix::Error::ENOENT | nix::Error::ELOOP | nix::Error::ENOTDIR) => {}
+                    Err(e) => return Err(Error::io(&child_path, std::io::Error::from(e))),
                 }
+            } else if file_type == nix::sys::stat::SFlag::S_IFREG {
+                *total += u64::try_from(st.st_size).unwrap_or(0);
             }
         }
     }
@@ -411,9 +525,60 @@ mod tests {
     }
 
     #[test]
+    fn compute_never_creates_anything_under_an_empty_or_cas_less_state_root() {
+        // `ward snapshot usage`'s whole contract is read-only (see the module
+        // doc comment and `compute`'s own doc comment). Before `cas_usage_at`
+        // existed, `compute` reached `SnapshotStore::open`/`Cas::open`, whose
+        // entire purpose is to *create* `cas/{blobs,manifests,meta}` — so a
+        // usage report against an empty state root silently wrote three
+        // directories to it. Snapshotting the state root's own tree before
+        // and after (not just the numeric result, which this bug never
+        // affected) is what actually catches that: an assertion on `usage`
+        // alone regressed silently the first time.
+        let state = tempfile::tempdir().unwrap();
+        let before = list_tree(state.path());
+        assert!(
+            before.is_empty(),
+            "the fixture itself must start truly empty"
+        );
+
+        let usage = compute(state.path()).unwrap();
+        assert_eq!(usage, StorageUsage::default());
+
+        let after = list_tree(state.path());
+        assert_eq!(
+            after, before,
+            "a read-only usage report must never create so much as one \
+             directory under the state root: {after:?}"
+        );
+    }
+
+    /// Every path under `root`, relative to it, sorted — used to assert a
+    /// supposedly read-only call left the tree byte-for-byte/path-for-path
+    /// unchanged.
+    fn list_tree(root: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                out.push(path.strip_prefix(root).unwrap().to_path_buf());
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    walk(&path, root, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
     fn compute_counts_cas_and_session_log_bytes() {
         let state = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(state.path().join("cas")).unwrap();
+        let store = ward_snapshot::SnapshotStore::open(state.path().join("cas")).unwrap();
         let worktree = tempfile::tempdir().unwrap();
         std::fs::write(worktree.path().join("f"), b"some content").unwrap();
         store
@@ -628,8 +793,12 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let path = PathBuf::from("/tmp/ward-synthetic-failure");
         let owner = Some("sess_irrelevant".to_owned());
+        // A real, harmless directory to open — the failure itself is
+        // injected via `sum` below, not by anything about this directory.
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = open_dir_no_symlink(scratch.path()).unwrap();
 
-        let entry = scan_one_entry(state.path(), path.clone(), owner, |_, _| {
+        let entry = scan_one_entry(state.path(), path.clone(), owner, dir, |_, _| {
             Err(Error::io(
                 &path,
                 std::io::Error::other("EACCES (synthetic)"),
@@ -725,7 +894,7 @@ mod tests {
         std::fs::write(dir.join("leaf"), vec![b'z'; 7]).unwrap();
 
         let mut total = 0u64;
-        sum_dir_bytes(&root, &mut total).unwrap();
+        sum_dir_bytes(open_dir_no_symlink(&root).unwrap(), &mut total).unwrap();
         assert_eq!(total, 7);
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -893,5 +1062,56 @@ mod tests {
 
         server.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_dir_no_symlink_refuses_a_symlinked_target() {
+        // The shape a swap race leaves behind at the instant this scan reaches
+        // it: a co-resident user renamed the real directory out and put a
+        // symlink in its place. `open_dir_no_symlink` is what every entry —
+        // top-level `ward-*` and every nested directory `sum_dir_bytes` opens
+        // via the same guarantee — is opened through, so refusing this is
+        // what keeps the whole walk from ever being redirected.
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("secret"), b"do not disclose").unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(
+            open_dir_no_symlink(&link).is_err(),
+            "a symlinked target must never be opened as if it were the real directory"
+        );
+        // The genuine directory underneath is unaffected — this isn't a
+        // blanket refusal of directories, only of the symlink hop itself.
+        assert!(open_dir_no_symlink(&real).is_ok());
+    }
+
+    #[test]
+    fn sum_dir_bytes_does_not_follow_a_symlinked_subdirectory() {
+        // Reproduces the disk state a rename-then-symlink race against a
+        // *nested* directory leaves behind: by the time `sum_dir_bytes`
+        // reaches `top/link`, it is a symlink to a directory with unrelated
+        // content elsewhere on the filesystem, not the plain subdirectory an
+        // earlier, non-atomic check-then-open might have seen.
+        let base = tempfile::tempdir().unwrap();
+        let elsewhere = base.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("f"), vec![b'x'; 999]).unwrap();
+
+        let top = base.path().join("top");
+        std::fs::create_dir(&top).unwrap();
+        std::fs::write(top.join("own_file"), vec![b'y'; 3]).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, top.join("link")).unwrap();
+
+        let dir = open_dir_no_symlink(&top).unwrap();
+        let mut total = 0u64;
+        sum_dir_bytes(dir, &mut total).unwrap();
+        assert_eq!(
+            total, 3,
+            "a symlinked subdirectory must never be descended into or counted, \
+             only this directory's own real file"
+        );
     }
 }

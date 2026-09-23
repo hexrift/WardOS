@@ -48,7 +48,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 pub use capture::{CaptureOptions, CaptureStats, HashCache};
-pub use cas::{CasUsage, CategoryUsage};
+pub use cas::{CasUsage, CategoryUsage, usage_at as cas_usage_at};
 pub use error::{Result, SnapshotError};
 pub use id::{Digest, SnapshotId, SnapshotRole};
 pub use manifest::{Entry, EntryType, Manifest, ManifestDiff};

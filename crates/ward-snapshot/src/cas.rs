@@ -204,6 +204,23 @@ fn dir_usage(dir: &Path) -> Result<CategoryUsage> {
     Ok(usage)
 }
 
+/// Disk usage of the three CAS categories at `root`, exactly as [`Cas::usage`]
+/// reports them, but without ever creating `root` or any category directory
+/// under it — unlike [`Cas::open`], whose whole point is to create them.
+/// `dir_usage`/`walk_dir_usage` already treat a missing directory as empty, so
+/// a state root that has never stored anything reports all zeros here without
+/// this call leaving any trace on disk. For a caller that only wants to
+/// report on a CAS, never to write to one — `ward snapshot usage` (#151) — so
+/// the report stays what its own contract promises: read-only.
+pub fn usage_at(root: impl AsRef<Path>) -> Result<CasUsage> {
+    let root = root.as_ref();
+    Ok(CasUsage {
+        blobs: dir_usage(&root.join("blobs"))?,
+        manifests: dir_usage(&root.join("manifests"))?,
+        meta: dir_usage(&root.join("meta"))?,
+    })
+}
+
 fn walk_dir_usage(dir: &Path, usage: &mut CategoryUsage) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
