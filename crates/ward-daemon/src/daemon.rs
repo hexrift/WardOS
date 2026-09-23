@@ -477,6 +477,7 @@ impl Served {
                 false,
             ),
             Request::Pending => (Response::Pending(self.approvals.pending()), false),
+            Request::Approvals => (Response::Approvals(self.approvals.approvals()), false),
             Request::Grants => (Response::Grants(self.approvals.grants()), false),
             Request::Pause { reason } => (
                 self.pause(&reason)
@@ -496,6 +497,18 @@ impl Served {
                     let _ = pause::clear_marker(&self.state, &self.session);
                 }
                 self.handle_conn(conn, request)
+            }
+            // Give every approval still open a terminal record before anything
+            // that follows can seal the log (#146): once sealed, no record can
+            // follow it, so this must happen first, not from inside
+            // `handle_appendable`'s `done` handling below.
+            Request::Stop { reason } => {
+                self.close_pending_approvals();
+                self.handle_appendable(conn, Request::Stop { reason })
+            }
+            Request::Seal => {
+                self.close_pending_approvals();
+                self.handle_appendable(conn, Request::Seal)
             }
             other => self.handle_appendable(conn, other),
         }
@@ -586,9 +599,10 @@ impl Served {
             for s in self.subscribers.drain(..) {
                 let _ = s.send(Delivery::End);
             }
-            // A question still open when the log seals is released as
-            // denied; no record of it can follow the seal.
-            self.approvals.close();
+            // Any approval still open at this point was already given its
+            // terminal record and released by `close_pending_approvals`
+            // before this request was allowed to reach here and seal the log
+            // (#146) — nothing left to do for approvals here.
         }
         (response, done)
     }
@@ -629,6 +643,30 @@ impl Served {
         });
         for key in keys {
             self.approvals.mark_launch_unknown(key);
+        }
+    }
+
+    /// Give every approval still open a terminal `CapabilityDecided` record
+    /// (`Outcome::Closed`, `DecisionSource::SessionEnded`) while the log can
+    /// still take one. Called from [`Self::handle_conn`] right before a
+    /// `Stop` or `Seal` request is allowed to reach [`Self::handle_appendable`]
+    /// and seal the log — before #146 the daemon released these approvals
+    /// (waking every `Request::Hold` connection waiting on one, so the agent
+    /// still got its `deny`) but appended nothing for them, because by the
+    /// time `close` ran the log had already sealed. `Approvals::close` only
+    /// releases questions that are still genuinely open; one already
+    /// answered but not yet collected by its own connection is left alone;
+    /// that connection still appends its own real answer through the
+    /// ordinary path in [`hold`].
+    fn close_pending_approvals(&mut self) {
+        for approval in self.approvals.close() {
+            let event =
+                approvals::decided_event(&approval.tool, &approval.summary, Outcome::Closed);
+            // Best-effort: a request line arriving after some earlier failure
+            // already sealed the log (a pathological double-seal) leaves this
+            // a no-op rather than a panic; the approval was released either
+            // way and the agent already got its `deny` from `Approvals::wait`.
+            let _ = self.append(event);
         }
     }
 
@@ -832,8 +870,14 @@ fn hold(
     };
     let outcome =
         remembered.unwrap_or_else(|| approvals.wait(id, Duration::from_secs(timeout_secs)));
-    if let Some(event) = approvals::decided_event(tool, summary, outcome) {
-        // The log may have sealed meanwhile; the agent still gets its answer.
+    // `Outcome::Closed` already got its terminal record from
+    // `Served::close_pending_approvals`, appended before the log could seal
+    // (#146) — appending it again here would duplicate that record. Every
+    // other outcome still records here, same as before #146; the log may
+    // have sealed meanwhile for one of those too, in which case the append
+    // is a no-op but the agent still gets its answer below.
+    if !matches!(outcome, Outcome::Closed) {
+        let event = approvals::decided_event(tool, summary, outcome);
         let _ = lock(served).append(event);
     }
     let response = outcome.response();
@@ -1273,7 +1317,9 @@ mod tests {
             }
         ));
 
-        // Sealing releases an open question as denied and records nothing more.
+        // Sealing releases an open question as denied and — since #146 —
+        // gives it its own terminal record before `SessionEnded` seals the
+        // log, rather than dropping it with no record at all.
         let holding = {
             let served = Arc::clone(&served);
             std::thread::spawn(move || hold(&served, "Write", "/work/x.rs", "r", 5))
@@ -1281,6 +1327,7 @@ mod tests {
         assert!(wait_until(Duration::from_secs(2), || {
             !lock(&served).approvals.pending().is_empty()
         }));
+        drain(&rx); // this hold's own CapabilityRequested; not what this section checks
         let (response, done) = lock(&served).handle(Request::Stop {
             reason: EndReason::UserStop,
         });
@@ -1290,10 +1337,98 @@ mod tests {
             Response::Decision { decision: HookDecision::Deny, reason, .. }
                 if reason == "approval: session ended"
         ));
+        let (live, ended) = drain(&rx);
+        let kinds: Vec<_> = live
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            ["CapabilityDecided", "SessionEnded"],
+            "the still-open question's terminal record precedes the seal, not just the hook's own answer"
+        );
+        assert!(matches!(
+            &live[0].event,
+            WardEvent::CapabilityDecided {
+                cap,
+                decision: Decision::Deny,
+                by: DecisionSource::SessionEnded,
+                grant: None,
+            } if cap.target.as_str() == "Write /work/x.rs"
+        ));
+        assert!(ended);
         assert!(matches!(
             hold(&served, "Write", "/work/y.rs", "r", 5),
             Response::Error(e) if e == "log is sealed"
         ));
+    }
+
+    /// `ward session approvals` (#146 item 1): unlike `Pending`, it still
+    /// shows a request once it has been decided, so missing or dismissing
+    /// whatever first announced it does not lose it from view for the rest
+    /// of the session.
+    #[test]
+    fn request_approvals_lists_pending_and_decided_oldest_asked_first() {
+        use crate::approvals::{ApprovalDecision, Outcome};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        assert!(matches!(
+            lock(&served).handle(Request::Approvals).0,
+            Response::Approvals(a) if a.is_empty()
+        ));
+
+        // Asked first, answered.
+        let answered = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || hold(&served, "Write", "/work/a.rs", "r", 5))
+        };
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&served).approvals.pending().is_empty()
+        }));
+        lock(&served).handle(Request::Approve {
+            id: 0,
+            decision: ApprovalDecision::Deny,
+        });
+        answered.join().unwrap();
+
+        // Asked second, still open.
+        let pending = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || hold(&served, "Write", "/work/b.rs", "r", 5))
+        };
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&served).approvals.pending().is_empty()
+        }));
+
+        let records = match lock(&served).handle(Request::Approvals).0 {
+            Response::Approvals(records) => records,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0].approval.id, 0, "decided, but asked first");
+        assert_eq!(
+            records[0].outcome,
+            Some(Outcome::Answered(ApprovalDecision::Deny))
+        );
+        assert!(records[0].decided_at_unix_ms.is_some());
+        // id 1 is the first question's own `CapabilityDecided` record (the
+        // log's seq counter is shared across every event, not per-approval).
+        assert_eq!(records[1].approval.id, 2, "still open");
+        assert_eq!(records[1].outcome, None);
+        assert!(records[1].decided_at_unix_ms.is_none());
+
+        // Sealing decides the still-open one too, and it joins the same view.
+        lock(&served).handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        pending.join().unwrap();
+        let records = match lock(&served).handle(Request::Approvals).0 {
+            Response::Approvals(records) => records,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(records[1].approval.id, 2);
+        assert_eq!(records[1].outcome, Some(Outcome::Closed));
     }
 
     #[test]
