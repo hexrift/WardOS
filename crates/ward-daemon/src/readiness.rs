@@ -378,45 +378,92 @@ enum LinkResolution {
     Broken,
 }
 
-/// Follows `path` through every symlink it is, or passes through, applying
-/// only the two hop shapes a bind-mounted worktree or a `SYSTEM_RO` directory
-/// actually preserves: a **relative** symlink target (resolved against its own
-/// containing directory) resolves identically wherever the containing
-/// directory is mounted, exactly like a bind mount of `dir` preserves the
-/// worktree's own internal relative symlinks verbatim; an **absolute** symlink
-/// target only resolves the same way inside the sandbox when that absolute
-/// path is itself [`crate::sandbox::is_system_ro`] (mounted read-only at the
-/// identical path on the host and inside every sandbox). Any other absolute
+/// Resolves `path` **component by component**, the way the kernel's own path
+/// lookup does — not just the final component, which is all
+/// `Path::symlink_metadata`/`canonicalize` alone can distinguish. A directory
+/// component partway through a path can itself be a symlink (`bin -> ../tools`,
+/// then `./bin/verify.sh`), and the kernel follows that hop exactly as it would
+/// follow one at the very end; checking only the leaf would miss it entirely —
+/// a regular file at the end is not proof that nothing above it redirected the
+/// walk somewhere the verifier does not mount.
+///
+/// At every symlink hop, only the two shapes a bind-mounted worktree or a
+/// `SYSTEM_RO` directory actually preserves are trusted: a **relative** target
+/// (resolved against its own containing directory, then re-walked the same
+/// way) resolves identically wherever the containing directory ends up
+/// mounted, exactly what bind-mounting a directory preserves about its own
+/// internal relative symlinks; an **absolute** target only resolves the same
+/// way inside the sandbox when it is itself [`crate::sandbox::is_system_ro`]
+/// (mounted read-only at the identical path on the host and inside every
+/// sandbox — resolution then continues from that root). Any other absolute
 /// target — most commonly one carrying the worktree's own host temp-directory
 /// prefix, or a toolchain directory's real host location, neither of which the
 /// sandbox mounts at that literal path — is [`LinkResolution::Broken`]: the
 /// sandbox's mount set is fixed and fully enumerable, so an absolute target
-/// outside it is not merely unverified, it is *guaranteed absent*, exactly
-/// like an absolute candidate outside `SYSTEM_RO` already is.
-fn resolve_symlinks_conservatively(mut path: PathBuf) -> LinkResolution {
-    for _ in 0..MAX_SYMLINK_HOPS {
-        let Ok(meta) = path.symlink_metadata() else {
+/// outside it is not merely unverified, it is *guaranteed absent*.
+/// `path`'s components, `.`/`/` dropped — what's left is `..` and real names,
+/// in the order [`resolve_symlinks_conservatively`] needs to consume them.
+fn components_of(path: &Path) -> std::collections::VecDeque<PathBuf> {
+    use std::path::Component;
+    path.components()
+        .filter(|c| !matches!(c, Component::RootDir | Component::CurDir))
+        .map(|c| PathBuf::from(c.as_os_str()))
+        .collect()
+}
+
+fn resolve_symlinks_conservatively(path: PathBuf) -> LinkResolution {
+    // The walk below always starts from "/"; a caller-relative `dir` (`ward
+    // ready ../other-project`) would otherwise resolve against the wrong
+    // root entirely. `std::fs::canonicalize`'s own absolutising behavior is
+    // what every other relative-path std::fs call already does implicitly
+    // (resolve against the process's cwd); a path that does not exist yet
+    // falls through to plain concatenation, deferring to the Missing/Broken
+    // handling below, which `read_link`/`symlink_metadata` on a nonexistent
+    // component reaches on its own.
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().map_or_else(|_| path.clone(), |cwd| cwd.join(&path))
+    };
+
+    let mut todo = components_of(&path);
+    let mut resolved = PathBuf::from("/");
+    let mut hops = 0u8;
+    while let Some(component) = todo.pop_front() {
+        if component.as_os_str() == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&component);
+        let Ok(meta) = candidate.symlink_metadata() else {
             return LinkResolution::Missing;
         };
         if !meta.file_type().is_symlink() {
-            return LinkResolution::Resolved(path);
+            resolved = candidate;
+            continue;
         }
-        let Ok(target) = std::fs::read_link(&path) else {
+        hops += 1;
+        if hops > MAX_SYMLINK_HOPS {
+            return LinkResolution::Broken;
+        }
+        let Ok(target) = std::fs::read_link(&candidate) else {
             return LinkResolution::Missing;
         };
-        path = if target.is_absolute() {
+        if target.is_absolute() {
             if !crate::sandbox::is_system_ro(&target) {
                 return LinkResolution::Broken;
             }
-            target
-        } else {
-            match path.parent() {
-                Some(parent) => parent.join(target),
-                None => return LinkResolution::Missing,
-            }
-        };
+            resolved = PathBuf::from("/");
+        }
+        // Either shape: what's left to resolve now starts with the target's
+        // own components — a relative target continues from `resolved` (its
+        // symlink's own containing directory) unchanged; an absolute one
+        // already reset `resolved` to `/` above.
+        for c in components_of(&target).into_iter().rev() {
+            todo.push_front(c);
+        }
     }
-    LinkResolution::Broken
+    LinkResolution::Resolved(resolved)
 }
 
 /// Whether the binary the *configured* `verify.command` would actually invoke is
@@ -921,6 +968,58 @@ mod tests {
         std::os::unix::fs::symlink(&real_cargo, search_dir.path().join("cargo")).unwrap();
 
         let dirs = [search_dir.path().to_path_buf()];
+        let report = check_with_dirs(dir.path(), &dirs);
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_an_absolute_ancestor_symlink_in_the_worktree_as_setup_required() {
+        // The leaf, `verify.sh`, is a plain executable regular file — a
+        // leaf-only check would stop right there and say Ok. But `bin` itself,
+        // an *ancestor* directory of the configured path, is an absolute
+        // symlink to another directory inside the same project; the kernel's
+        // own path lookup follows that hop exactly as it would follow one at
+        // the very end, and it carries the worktree's own host temp-directory
+        // prefix, which the sandbox never mounts at that literal path.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "tools/verify.sh", "#!/bin/sh\ntrue\n");
+        make_executable(&dir.path().join("tools/verify.sh"));
+        std::os::unix::fs::symlink(dir.path().join("tools"), dir.path().join("bin")).unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: ./bin/verify.sh\n",
+        );
+        let report = check(dir.path());
+        let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
+        assert_eq!(row.status, Status::Fail, "{}", row.detail);
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn runtime_reports_an_ancestor_symlink_in_a_search_dir_targeting_an_unmounted_location_as_setup_required()
+     {
+        // Mirrors a toolchain bin/ (or a directory under /usr/local) whose
+        // *containing* directory, not the binary itself, is a symlink to a
+        // real host location the verifier does not separately mount at that
+        // path — the same ancestor-hop gap, reached through resolve_in_dirs's
+        // own search instead of the project-relative branch.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: cargo test\n",
+        );
+        let real_elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(real_elsewhere.path().join("cargo"), "#!/bin/sh\ntrue\n").unwrap();
+        make_executable(&real_elsewhere.path().join("cargo"));
+        let search_root = tempfile::tempdir().unwrap();
+        let search_bin = search_root.path().join("bin");
+        std::os::unix::fs::symlink(real_elsewhere.path(), &search_bin).unwrap();
+
+        let dirs = [search_bin];
         let report = check_with_dirs(dir.path(), &dirs);
         let row = report.rows.iter().find(|r| r.name == "runtime").unwrap();
         assert_eq!(row.status, Status::Fail, "{}", row.detail);
