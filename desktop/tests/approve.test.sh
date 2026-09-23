@@ -9,9 +9,12 @@ source "$(dirname "$0")/lib.sh"
 setup_env
 
 approve=$WARDOS_ROOT/bin/wardos-approve
-line12='{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":null},"requested_at_unix_ms":1,"agent":"claude","session":"sess_a"}'
+line12='{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":null},"requested_at_unix_ms":1,"agent":"claude","session":"sess_a","project":"payments-api"}'
 # The agent's claim carries markup and a fake row: both must arrive escaped.
-line13='{"id":13,"tool":"WebFetch","summary":"https://api.github.com/x?<b>y</b>","claim":"WebFetch https://api.github.com/x?<b>y</b>\nCredential   root & all","authority":{"rule":"step-through: pause before network","destination":"api.github.com","network":"reachable · restricted (dev)","method":"GET","credential":"GitHub · contents:read, issues:read","repository":"hexrift/WardOS","lifetime":null},"requested_at_unix_ms":2,"agent":"claude","session":"sess_a"}'
+line13='{"id":13,"tool":"WebFetch","summary":"https://api.github.com/x?<b>y</b>","claim":"WebFetch https://api.github.com/x?<b>y</b>\nCredential   root & all","authority":{"rule":"step-through: pause before network","destination":"api.github.com","network":"reachable · restricted (dev)","method":"GET","credential":"GitHub · contents:read, issues:read","repository":"hexrift/WardOS","lifetime":null},"requested_at_unix_ms":2,"agent":"claude","session":"sess_a","project":"payments-api"}'
+# A second, unrelated live session (#141): its approval must surface too.
+line20='{"id":20,"tool":"Write","summary":"/work/other/db.rs","claim":"Write /work/other/db.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/other/db.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":null},"requested_at_unix_ms":3,"agent":"codex","session":"sess_b","project":"other-service"}'
+export LINE20=$line20
 export LINE12=$line12 LINE13=$line13
 
 # --- --help --------------------------------------------------------------------
@@ -19,21 +22,34 @@ export LINE12=$line12 LINE13=$line13
 "$approve" --help | grep -q 'wardos-approve --watch' || fail "--help names --watch"
 "$approve" --help | grep -q 'WARD WILL ALLOW' || fail "--help names the three blocks"
 
-# --- --watch: one notification per pending approval, the action relayed --------
+# --- --watch: one notification per pending approval, from every live session, the
+# action relayed (#141: not just $project's session) --------------------------------
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
-  "session pending --json --follow "*) printf "%s\n%s\n" "$LINE12" "$LINE13" ;;
+  "session pending --json --all --follow") printf "%s\n%s\n%s\n" "$LINE12" "$LINE13" "$LINE20" ;;
   "session approve "*) exit 0 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
-# The first notification is answered with "Allow session", the second is dismissed.
+# The first notification is answered with "Allow session", the third (the other
+# session's) with "Allow once", the second is dismissed.
 # shellcheck disable=SC2016
-mock notify-send 'case "$*" in *"/work/src/lib.rs"*) echo session ;; *) exit 0 ;; esac'
+mock notify-send 'case "$*" in
+  *"/work/src/lib.rs"*) echo session ;;
+  *"/work/other/db.rs"*) echo allow ;;
+  *) exit 0 ;;
+esac'
 WARDOS_PROJECT=/home/dev/payments-api "$approve" --watch --once
-assert_logged '^ward session pending --json --follow /home/dev/payments-api$'
-# The layout of §10: the title, then the three blocks, headers dim, the target in <tt>.
-assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests <span alpha="39322">DESTINATION</span>$'
+assert_logged '^ward session pending --json --all --follow$'
+assert_not_logged 'session pending --json --all --follow /home/dev/payments-api'
+# The layout of §10: the title (agent · project), then the three blocks, headers dim,
+# the target in <tt>.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
 assert_logged '^<tt>/work/src/lib.rs</tt>$'
+# The second, unrelated live session's approval surfaces too, titled with its own
+# agent and project, and is answered on its own session — visibility #141 asks for.
+assert_logged 'Codex requests · other-service <span alpha="39322">DESTINATION</span>'
+assert_logged '^<tt>/work/other/db.rs</tt>$'
+assert_logged '^ward session approve --session sess_b 20 allow$'
 assert_logged '^<span alpha="39322">REQUESTED BY AGENT</span>$'
 assert_logged '^Write /work/src/lib.rs$'
 assert_logged '^<span alpha="39322">WARD WILL ALLOW</span>$'

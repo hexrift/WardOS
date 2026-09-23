@@ -232,6 +232,11 @@ three actions carry their keys. Rendered by the shell as a layer-shell surface w
 single shadow level; keyboard-first (`y` / `s` / `n`). Timeout is shown as a thin
 progress line, not a countdown number.
 
+With more than one live session, the title also names which one is asking (`Claude
+requests · payments-api`, #141): approvals are multiplexed across every live session,
+not just the one selected in the bar, and each answer is relayed to the session it was
+asked from — never re-resolved from whatever is selected by the time it is answered.
+
 Authority that outlives an answer stays visible while it exists (decision 4): an
 `allow-session` and a `--grant` credential put `GRANTS n` on the bar and turn the
 network segment into `NET restricted · github+` until the session ends; the panel
