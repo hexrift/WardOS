@@ -92,6 +92,20 @@ Bumping means: edit the root `[workspace.package]` `version`, update the inter-c
 the pull request merges, the release is cut from the tag (`.github/workflows/release.yml`,
 dispatched with the `vX.Y.Z` version) and `image/Containerfile` is pinned to it.
 
+**A version number is only checked against `main`, never against a sibling pull
+request.** Bump relative to `main`'s current version at the time you last rebased. When
+several pull requests are open at once, more than one may legitimately claim the same
+next number — that is expected, not a defect, and is **not a blocking review finding**:
+nothing enforces cross-PR uniqueness (`scripts/release/check-version.sh` only binds a
+release *tag* to the commit it is cut from), so it costs nothing while every claimant
+stays unmerged. It only needs resolving for the pull request that is *actually about to
+merge*: if `main` has moved since that PR's last rebase, its bump target may already be
+taken. Fixing that is a small, self-contained fixup — re-read `main`'s current version
+and bump from there — not a reason to rebase early, and not grounds by itself to demand
+a re-review or a full CI re-run from a *different*, still-open pull request just because
+it happens to name the same number. Do not treat another open PR's claimed version as a
+merge gate on this one.
+
 ## Reporting a vulnerability
 
 See [`SECURITY.md`](SECURITY.md). Do not open a public issue for an unfixed vulnerability.
