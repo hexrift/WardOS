@@ -48,6 +48,8 @@ status() { ward pause --status "${session_flag[@]}" "$project" 2>/dev/null || ec
 do_pause() {
   local out
   out=$(ward pause "${session_flag[@]}" "$project")
+  # Captured to read the outcome below; still shown to a terminal user as before.
+  [[ -n $out ]] && printf '%s\n' "$out"
   if [[ $out =~ ([0-9]+)\ process(es)?\ had\ not\ confirmed\ stopped ]]; then
     local pending=${BASH_REMATCH[1]} plural=""
     [[ $pending != 1 ]] && plural="es"
