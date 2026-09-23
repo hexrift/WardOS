@@ -21,8 +21,10 @@ ward doctor
 
 The tarball also carries `ward-shell` and `wardos-theme-render` (the desktop's
 binaries, only useful with the desktop of §6) and a copy of `install.sh`. The checksum
-proves the tarball is the one CI attached to the release; releases are not yet signed,
-which is a signing-key decision recorded in [`roadmap.md`](roadmap.md).
+proves the tarball is the one CI attached to the release; releases are not yet signed
+or provenance-verified. The planned trust policy is recorded in
+[`ADR-0028`](decisions/ADR-0028-release-provenance-and-trusted-updates.md); until its
+workflow and verifier land, this install path remains checksum-only.
 
 **The OS image** is the other way in: on a machine of its own, boot it and the tools,
 the agents, TamperWard and the desktop are already there (§6, [`image/README.md`](../image/README.md)).
