@@ -29,6 +29,7 @@ pub mod gateway;
 pub mod github;
 pub mod hooks;
 pub mod ids;
+pub mod observe;
 pub mod pause;
 pub mod render;
 pub mod sandbox;

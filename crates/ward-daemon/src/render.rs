@@ -414,6 +414,9 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
         WardEvent::SessionStarted { .. } => ("START", Tone::Accent, "session".to_string()),
         WardEvent::CommandStarted { argv, .. } => ("RUN", Tone::Ink, argv_text(argv)),
         WardEvent::CommandFinished { exit, .. } => ("EXIT", exit_color(*exit), exit_text(*exit)),
+        WardEvent::LaunchAborted { reason, .. } => {
+            ("ABORT", Tone::Deny, format!("launch aborted · {reason}"))
+        }
         WardEvent::FileModified { path, kind, .. } => {
             (change_verb(*kind), Tone::Ink, path.to_string())
         }
@@ -465,6 +468,25 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
             Tone::Ok,
             format!("snapshot {}", short_hex(&snapshot.to_string())),
         ),
+        WardEvent::SessionPaused { .. }
+        | WardEvent::SessionResumed { .. }
+        | WardEvent::EntryRestored { .. }
+        | WardEvent::ObservationsDropped { .. } => intervention_cells(&rec.event)?,
+        WardEvent::SessionEnded { .. } => ("END", Tone::Dim, "session".to_string()),
+        _ => return None,
+    };
+    Some(ObserverCells {
+        time: mono_time(rec),
+        verb,
+        tone,
+        subject,
+    })
+}
+
+/// Rows for the host's own interventions (ADR-0019 §3) and for the observer's
+/// admission that its record of a window is incomplete (#137).
+fn intervention_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)> {
+    Some(match event {
         WardEvent::SessionPaused { method, reason } => (
             "PAUSE",
             Tone::Deny,
@@ -499,14 +521,18 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
                 )
             },
         ),
-        WardEvent::SessionEnded { .. } => ("END", Tone::Dim, "session".to_string()),
+        WardEvent::ObservationsDropped {
+            source,
+            dropped,
+            capacity,
+        } => (
+            "GAP",
+            Tone::Deny,
+            format!(
+                "{source} observer dropped {dropped} · queue of {capacity} full · this window is incomplete"
+            ),
+        ),
         _ => return None,
-    };
-    Some(ObserverCells {
-        time: mono_time(rec),
-        verb,
-        tone,
-        subject,
     })
 }
 

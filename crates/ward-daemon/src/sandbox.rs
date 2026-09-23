@@ -360,6 +360,19 @@ impl Launch {
 
     /// Execute the launch.
     pub fn run(&self) -> Result<Outcome> {
+        self.run_observed(&mut || {})
+    }
+
+    /// [`run`](Self::run), calling `on_tick` about every [`WAIT_POLL`] while the
+    /// child is still running.
+    ///
+    /// This is what lets the session drain its observers into the event log *during*
+    /// a command instead of only after it (#137): the callback runs on this thread,
+    /// between waits, so the session's single log writer stays the only writer and
+    /// no second thread is introduced to append records. It is never called after
+    /// the child has been reaped, which leaves the final flush unambiguously the
+    /// caller's to do exactly once.
+    pub fn run_observed(&self, on_tick: &mut dyn FnMut()) -> Result<Outcome> {
         if self.argv.is_empty() {
             return Err(Error::Sandbox("empty command".into()));
         }
@@ -385,7 +398,7 @@ impl Launch {
         let keep = self.keep_prefix.clone();
         let stdout = child.stdout.take().map(|r| drain(r, bound, keep.clone()));
         let stderr = child.stderr.take().map(|r| drain(r, bound, keep));
-        let (status, timed_out) = wait_within(&mut child, self.budget)?;
+        let (status, timed_out) = wait_within(&mut child, self.budget, on_tick)?;
         let collect = |h: Option<std::thread::JoinHandle<StreamCapture>>| {
             h.and_then(|h| h.join().ok()).unwrap_or_default()
         };
@@ -554,27 +567,37 @@ fn push_kept_line(line: &[u8], prefix: &str, out: &mut Vec<String>, kept_bytes: 
     }
 }
 
-/// Wait for `child`, killing it once `budget` elapses. Returns the exit status
-/// (`None` when killed) and whether the budget was exceeded.
+/// How long one park between `try_wait` calls lasts; also the rate `on_tick` is
+/// offered to the caller at.
+pub const WAIT_POLL: Duration = Duration::from_millis(20);
+
+/// Wait for `child`, killing it once `budget` elapses, and call `on_tick` between
+/// waits so the caller can make progress (draining observers, #137) while the child
+/// still runs. Returns the exit status (`None` when killed) and whether the budget
+/// was exceeded.
+///
+/// The wait polls even with no budget, where it used to block in `wait(2)`: a
+/// blocking wait cannot offer the caller a turn, and an interactive agent session
+/// is exactly the case where the whole run would otherwise pass with nothing on the
+/// log. `on_tick` never runs after the child has been reaped.
 fn wait_within(
     child: &mut std::process::Child,
     budget: Option<Duration>,
+    on_tick: &mut dyn FnMut(),
 ) -> Result<(Option<std::process::ExitStatus>, bool)> {
     let wait_err = |e: std::io::Error| Error::Sandbox(format!("waiting for bwrap: {e}"));
-    let Some(budget) = budget else {
-        return Ok((Some(child.wait().map_err(wait_err)?), false));
-    };
-    let deadline = Instant::now() + budget;
+    let deadline = budget.map(|b| Instant::now() + b);
     loop {
         if let Some(status) = child.try_wait().map_err(wait_err)? {
             return Ok((Some(status), false));
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
             let _ = child.kill();
             let _ = child.wait();
             return Ok((None, true));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(WAIT_POLL);
+        on_tick();
     }
 }
 

@@ -366,7 +366,12 @@ impl Filter {
     }
 
     /// The Quiet observer mode: state changes, policy denials, capability requests and
-    /// decisions, verification outcomes, the host's interventions, session end.
+    /// decisions, verification outcomes, the host's interventions, an observer that
+    /// had to drop observations, session end.
+    ///
+    /// `ObservationsDropped` is in Quiet for the same reason `TamperDetected` is:
+    /// it says the record the user is being shown is knowingly incomplete, which
+    /// no observer mode may hide.
     #[must_use]
     pub const fn quiet() -> Self {
         Self {
@@ -383,6 +388,7 @@ impl Filter {
                 .with(EventKind::SessionPaused)
                 .with(EventKind::SessionResumed)
                 .with(EventKind::EntryRestored)
+                .with(EventKind::ObservationsDropped)
                 .with(EventKind::SessionEnded),
             exclude_agent_notes: true,
         }
