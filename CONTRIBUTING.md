@@ -98,13 +98,18 @@ several pull requests are open at once, more than one may legitimately claim the
 next number — that is expected, not a defect, and is **not a blocking review finding**:
 nothing enforces cross-PR uniqueness (`scripts/release/check-version.sh` only binds a
 release *tag* to the commit it is cut from), so it costs nothing while every claimant
-stays unmerged. It only needs resolving for the pull request that is *actually about to
-merge*: if `main` has moved since that PR's last rebase, its bump target may already be
-taken. Fixing that is a small, self-contained fixup — re-read `main`'s current version
-and bump from there — not a reason to rebase early, and not grounds by itself to demand
-a re-review or a full CI re-run from a *different*, still-open pull request just because
-it happens to name the same number. Do not treat another open PR's claimed version as a
-merge gate on this one.
+stays unmerged. Do not treat a still-open sibling PR's claimed version as a merge gate
+on this one, and do not rebase early just to dodge a collision that may not even exist
+by the time either PR actually merges.
+
+This does **not** relax anything about the pull request that is *actually about to
+merge*. Immediately before merging, synchronize with current `main`, assign the
+immediate next valid version across every manifest and `Cargo.lock` (the same "Bumping
+means" steps above), and run every required check — Verify, TamperWard, and
+image/build where applicable — on that exact resulting head, same as any other push.
+If `main` moved since the branch's last rebase, its old bump target may already be
+taken; re-picking a free one and revalidating is a normal, expected part of merging,
+not a stale-head shortcut and not optional.
 
 ## Reporting a vulnerability
 
