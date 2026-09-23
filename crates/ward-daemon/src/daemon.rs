@@ -1769,8 +1769,12 @@ mod tests {
 
         // Register the question — what `Request::Hold` does before it
         // blocks in `wait` — synchronously, so the test controls exactly
-        // when the collecting side is allowed to run.
-        let id = match lock(&served).hold("Write", "/work/race.rs", "r", Duration::ZERO) {
+        // when the collecting side is allowed to run. With a real decision
+        // time: `hold` arms the question's clock with it (#146 item 4), and
+        // an answer to a question whose clock has already run out is
+        // refused (review of #225, finding 1), so a zero-length one would
+        // make the `Approve` below fail instead of racing `Stop`.
+        let id = match lock(&served).hold("Write", "/work/race.rs", "r", Duration::from_secs(60)) {
             Ok((id, None)) => id,
             other => panic!("{other:?}"),
         };
@@ -1915,7 +1919,9 @@ mod tests {
         let sub = lock(&served).subscribe(0).unwrap();
         let (rx, _hangup) = sub.live.unwrap();
 
-        let id = match lock(&served).hold("Write", "/work/race2.rs", "r", Duration::ZERO) {
+        // A real decision time, for the same reason as the test above: the
+        // `Approve` below must land on a question whose clock is still running.
+        let id = match lock(&served).hold("Write", "/work/race2.rs", "r", Duration::from_secs(60)) {
             Ok((id, None)) => id,
             other => panic!("{other:?}"),
         };

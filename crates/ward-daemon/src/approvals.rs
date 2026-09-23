@@ -1244,8 +1244,13 @@ impl Approvals {
     }
 
     /// Answer `id`. Unknown ids (never asked, already released) are an error;
-    /// a second answer to the same open question is too.
+    /// a second answer to the same open question is too, and so is an
+    /// answer to a question whose decision clock has already run out.
     pub fn answer(&self, id: u64, decision: ApprovalDecision) -> Result<()> {
+        self.answer_at(id, decision, Instant::now())
+    }
+
+    fn answer_at(&self, id: u64, decision: ApprovalDecision, now: Instant) -> Result<()> {
         let mut state = self.lock();
         if state.paused {
             return Err(Error::Daemon(format!(
@@ -1259,6 +1264,20 @@ impl Approvals {
             .ok_or_else(|| Error::Daemon(format!("approval {id}: not pending")))?;
         if held.answer.is_some() {
             return Err(Error::Daemon(format!("approval {id}: already answered")));
+        }
+        // Its decision time is spent: the question is already denied, even
+        // if its `wait` has not woken to say so yet (it only wakes once it
+        // wins this same lock back, which an answering connection can beat
+        // it to; or, for a clock armed at registration, it may not have
+        // started waiting at all). Refused here, under the lock `wait`
+        // settles under, so an answer can never overtake an expired clock.
+        // Nothing is recorded: the question stays in `held` untouched, and
+        // its own `wait` settles it as `TimedOut` exactly once, through the
+        // same `history`/`unclaimed` path as any other timeout (#218).
+        if held.clock.is_some_and(|c| c.remaining(now).is_zero()) {
+            return Err(Error::Daemon(format!(
+                "approval {id}: timed out; its decision time ran out"
+            )));
         }
         held.answer = Some(decision);
         drop(state);
@@ -2218,6 +2237,112 @@ mod tests {
             "denied at once, not after a fresh 60 s"
         );
         assert_eq!(approvals.approvals()[0].outcome, Some(Outcome::TimedOut));
+    }
+
+    /// Review of #225, finding 1: a question whose clock is already spent
+    /// before its `wait` ever runs cannot be approved in that gap. Before the
+    /// fix `answer` never looked at the clock, so this was accepted and
+    /// `wait` then returned `Answered(Allow)` for a question the daemon's own
+    /// countdown already read as zero. No sleep: a zero-length clock is spent
+    /// the instant it is armed.
+    #[test]
+    fn an_answer_to_a_question_whose_clock_ran_out_before_wait_is_refused() {
+        let approvals = Approvals::new();
+        approvals
+            .register_with_timeout(approval(1), Duration::ZERO)
+            .unwrap();
+        let err = approvals.answer(1, ApprovalDecision::Allow).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "daemon: approval 1: timed out; its decision time ran out"
+        );
+        // Refused, not recorded: `wait` settles it as the timeout it is,
+        // through the one ordinary path, exactly once.
+        assert_eq!(
+            approvals.wait(1, Duration::from_secs(60)),
+            Outcome::TimedOut
+        );
+        let view = approvals.approvals();
+        assert_eq!(view.len(), 1, "one terminal record, no more");
+        assert_eq!(view[0].outcome, Some(Outcome::TimedOut));
+        assert!(!approvals.take_recorded(1), "its own caller appends it");
+        assert!(approvals.close().is_empty(), "nothing left for close");
+        assert!(!approvals.remembered("Write", "/work/src/lib.rs"));
+    }
+
+    /// Review of #225, finding 1, the deadline race: at a real (non-zero)
+    /// deadline, the connection answering can win the approvals lock before
+    /// the timed-out waiter wakes and takes it back. Modelled
+    /// deterministically: the answer lands, through the `_at` seam, exactly
+    /// at the clock's deadline, while the waiter has not yet run. It must
+    /// lose: `wait` then denies it as timed out. One tick before the
+    /// deadline, the same answer is still accepted, so the line is drawn at
+    /// the deadline itself and not before it.
+    #[test]
+    fn an_answer_racing_the_timeout_at_the_deadline_cannot_win() {
+        let timeout = Duration::from_secs(60);
+        // Asked a whole timeout ago, so the deadline is now: the real clock
+        // `wait` reads is already at or past it, and it settles at once.
+        let t0 = Instant::now()
+            .checked_sub(timeout)
+            .expect("the monotonic clock is past one minute");
+        let deadline = t0 + timeout;
+        let approvals = Approvals::new();
+        approvals
+            .register_at(approval(1), Some(timeout), t0)
+            .unwrap();
+        approvals
+            .register_at(approval(2), Some(timeout), t0)
+            .unwrap();
+
+        // At the deadline: refused, however the lock race falls.
+        let err = approvals
+            .answer_at(1, ApprovalDecision::AllowSession, deadline)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "daemon: approval 1: timed out; its decision time ran out"
+        );
+        // One millisecond before it: still answerable.
+        approvals
+            .answer_at(
+                2,
+                ApprovalDecision::Allow,
+                t0 + Duration::from_millis(59_999),
+            )
+            .unwrap();
+
+        let started = Instant::now();
+        assert_eq!(approvals.wait(1, timeout), Outcome::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the waiter finds the clock spent, not a fresh minute"
+        );
+        assert_eq!(
+            approvals.wait(2, timeout),
+            Outcome::Answered(ApprovalDecision::Allow)
+        );
+        // The refused allow-session left no grant behind.
+        assert!(!approvals.remembered("Write", "/work/src/lib.rs"));
+        // Exactly one terminal record each, handed to their own callers.
+        let outcomes: Vec<_> = approvals
+            .approvals()
+            .into_iter()
+            .map(|r| (r.approval.id, r.outcome))
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                (1, Some(Outcome::TimedOut)),
+                (2, Some(Outcome::Answered(ApprovalDecision::Allow))),
+            ]
+        );
+        assert!(!approvals.take_recorded(1));
+        assert!(!approvals.take_recorded(2));
+        assert!(approvals.close().is_empty());
+        // Gone now: a late answer is the ordinary `not pending`.
+        let err = approvals.answer(1, ApprovalDecision::Allow).unwrap_err();
+        assert_eq!(err.to_string(), "daemon: approval 1: not pending");
     }
 
     #[test]
