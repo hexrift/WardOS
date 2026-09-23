@@ -340,15 +340,36 @@ enum SessionCmd {
     /// first announced it does not lose it from view for the rest of the
     /// session. Oldest asked first; the daemon keeps a bounded history of
     /// decided ones, so a very long session's oldest entries eventually age
-    /// out (see `ward replay` for the durable, unbounded record).
+    /// out (see `ward replay` for the durable, unbounded record). What the
+    /// desktop's persistent inbox (`wardos-approve-inbox`, #146 items 2-3)
+    /// reads.
     Approvals {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
         /// The session id, instead of looking one up.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         session: Option<String>,
+        /// Every live session's approvals, multiplexed (#146 items 2-3, #141
+        /// item 4), not just the one `dir`/`--session` would resolve to: what
+        /// the persistent inbox lists, so a request is findable regardless of
+        /// which session the desktop has selected. A one-shot listing, like
+        /// `pending --all` without `--follow`: not combined with `--follow`
+        /// here (a live, multiplexed decided-feed across every session is
+        /// not needed — `wardos-approve --watch` follows each session with
+        /// an open notification individually instead, see its own `--follow
+        /// --session <id>` use).
+        #[arg(long, conflicts_with_all = ["session", "follow"])]
+        all: bool,
+        /// Keep printing each approval as it becomes pending, and again the
+        /// first time it is decided, until the daemon closes the stream
+        /// (exit 0) — #146 items 2-3: what `wardos-approve --watch` follows
+        /// to update or close a still-showing notification the moment its
+        /// approval becomes terminal elsewhere (answered from another
+        /// terminal, timed out, or released by the session ending).
+        #[arg(long)]
+        follow: bool,
         /// One JSON object per approval: `{approval: {…, as in `pending`},
-        /// outcome, decided_at_unix_ms}`.
+        /// outcome, decided_at_unix_ms, agent, session, project}`.
         #[arg(long)]
         json: bool,
     },
@@ -573,8 +594,18 @@ fn cmd_session(cmd: SessionCmd) -> ward_daemon::Result<ExitCode> {
                 cmd_pending(&dir.unwrap_or_else(cwd), session.as_deref(), follow, json)
             }
         }
-        SessionCmd::Approvals { dir, session, json } => {
-            cmd_approvals(&dir.unwrap_or_else(cwd), session.as_deref(), json)
+        SessionCmd::Approvals {
+            dir,
+            session,
+            all,
+            follow,
+            json,
+        } => {
+            if all {
+                cmd_approvals_all(json)
+            } else {
+                cmd_approvals(&dir.unwrap_or_else(cwd), session.as_deref(), follow, json)
+            }
         }
         SessionCmd::Select { id, show, clear } => cmd_session_select(id.as_deref(), show, clear),
         SessionCmd::Grants { dir, session, json } => {
@@ -970,25 +1001,148 @@ fn cmd_session_select(id: Option<&str>, _show: bool, clear: bool) -> ward_daemon
     Ok(ExitCode::SUCCESS)
 }
 
-/// `ward session approvals [--json]` (#146 item 1): every approval the
-/// session has asked, pending or decided — the daemon's own authoritative
-/// account, so a request that missed its notification is still findable
-/// here for the rest of the session.
-fn cmd_approvals(dir: &Path, session: Option<&str>, json: bool) -> ward_daemon::Result<ExitCode> {
+/// One line of `ward session approvals --json`: the record plus who asks and
+/// where, mirroring [`PendingLine`] (#146 items 2-3, #141). The desktop pins
+/// a decision to the exact session it was asked in (`ward session approve
+/// --session <session> <id> <decision>`) rather than whatever session
+/// happens to be newest by the time the answer is submitted, which — unlike
+/// `pending`'s single always-current listing — matters more here: an entry
+/// in a persistent inbox may be acted on long after other sessions have
+/// started.
+#[derive(serde::Serialize)]
+struct ApprovalsLine<'a> {
+    #[serde(flatten)]
+    record: &'a ward_daemon::approvals::ApprovalRecord,
+    /// The agent's product name, for the inbox and the notification title.
+    agent: &'a str,
+    /// The session id.
+    session: &'a str,
+    /// Its project id (`--all` names it prominently, as `pending --all`
+    /// does, so an entry in a second session cannot be mistaken for one in
+    /// the session the bar shows).
+    project: &'a str,
+}
+
+/// `ward session approvals [--follow] [--json]` (#146 items 1-3): every
+/// approval the session has asked, pending or decided — the daemon's own
+/// authoritative account, so a request that missed its notification is
+/// still findable here for the rest of the session. `--follow` streams it
+/// live instead of listing it once (see [`client::follow_approvals`]).
+fn cmd_approvals(
+    dir: &Path,
+    session: Option<&str>,
+    follow: bool,
+    json: bool,
+) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
-    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
-    let records = client::approvals(&mut sink)?;
+    let socket = client::desktop_socket(dir, &state, session)?;
+    let mut sink = client::connect(&socket)?;
+    let description = client::describe(&mut sink)?;
+    let agent = description
+        .agent
+        .as_ref()
+        .map_or("agent", |a| a.name.as_str());
     let mut out = std::io::stdout();
-    if records.is_empty() && !json {
-        println!("  no approvals yet");
-    }
-    for record in &records {
-        let line = if json {
-            serde_json::to_string(record).unwrap_or_default()
+    let mut print = |record: &ward_daemon::approvals::ApprovalRecord| {
+        let text = if json {
+            let line = ApprovalsLine {
+                record,
+                agent,
+                session: &description.session,
+                project: &description.project,
+            };
+            serde_json::to_string(&line).map_or_else(|_| String::new(), |j| format!("{j}\n"))
         } else {
-            record.line()
+            format!("{}\n", record.line())
         };
-        let _ = writeln!(out, "{line}").and_then(|()| out.flush());
+        let _ = write!(out, "{text}").and_then(|()| out.flush());
+    };
+    if follow {
+        client::follow_approvals(&socket, FOLLOW_SETTLE, |record| print(&record))?;
+    } else {
+        let records = client::approvals(&mut sink)?;
+        if records.is_empty() && !json {
+            println!("  no approvals yet");
+        }
+        for record in &records {
+            print(record);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One line of `ward session approvals --all`, JSON or text, tagged with the
+/// session and project it belongs to — mirroring [`pending_all_line`].
+fn approvals_all_line(
+    record: &ward_daemon::approvals::ApprovalRecord,
+    agent: &str,
+    session: &str,
+    project: &str,
+    json: bool,
+) -> String {
+    if json {
+        let line = ApprovalsLine {
+            record,
+            agent,
+            session,
+            project,
+        };
+        serde_json::to_string(&line).map_or_else(|_| String::new(), |j| format!("{j}\n"))
+    } else {
+        format!("{project} · {session}  {}\n", record.line())
+    }
+}
+
+/// `ward session approvals --all [--json]` (#146 items 2-3, #141): every live
+/// session's approvals, pending or decided, multiplexed and each line naming
+/// its session and project — mirroring [`cmd_pending_all`]'s shape, minus
+/// `--follow` (see the flag's own doc comment on why). What the desktop's
+/// persistent inbox (`wardos-approve-inbox`) reads, so a request is
+/// findable regardless of which session the desktop has selected.
+fn cmd_approvals_all(json: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let results = client::approvals_all(&state)?;
+    if results.is_empty() {
+        if !json {
+            println!("  no live sessions");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut any = false;
+    let mut unreachable = false;
+    for result in &results {
+        match &result.outcome {
+            Ok((description, records)) => {
+                let agent = description
+                    .agent
+                    .as_ref()
+                    .map_or("agent", |a| a.name.as_str());
+                for record in records {
+                    any = true;
+                    print!(
+                        "{}",
+                        approvals_all_line(
+                            record,
+                            agent,
+                            &description.session,
+                            &description.project,
+                            json
+                        )
+                    );
+                }
+            }
+            // A session `live_sessions` listed but that could not actually be
+            // asked is reported, not skipped, mirroring `pending --all`
+            // (#141 finding 5): silently dropping it would let "no approvals
+            // yet" claim a session this never actually inspected.
+            Err(e) => {
+                unreachable = true;
+                print!("{}", unreachable_line(&result.session, e, json));
+            }
+        }
+    }
+    if !any && !unreachable && !json {
+        println!("  no approvals yet");
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1521,7 +1675,7 @@ fn cwd() -> PathBuf {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
-        Cli, Command, SessionCmd, SnapshotCmd, WatchMode, desktop_command,
+        Cli, Command, SessionCmd, SnapshotCmd, WatchMode, approvals_all_line, desktop_command,
         observer_degraded_warning, on_path_in, pause_status_word, pending_all_line, pending_text,
         unreachable_line, verb_program,
     };
@@ -1609,9 +1763,44 @@ mod tests {
         let cli = Cli::parse_from(["ward", "session", "approvals", "--json", "--session", "s1"]);
         assert!(matches!(
             cli.command,
-            Command::Session(SessionCmd::Approvals { json: true, session: Some(s), .. })
-                if s == "s1"
+            Command::Session(SessionCmd::Approvals {
+                json: true,
+                follow: false,
+                all: false,
+                session: Some(s),
+                ..
+            }) if s == "s1"
         ));
+        let cli = Cli::parse_from(["ward", "session", "approvals", "--follow", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCmd::Approvals {
+                json: true,
+                follow: true,
+                all: false,
+                session: None,
+                ..
+            })
+        ));
+        let cli = Cli::parse_from(["ward", "session", "approvals", "--all"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCmd::Approvals {
+                all: true,
+                follow: false,
+                session: None,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["ward", "session", "approvals", "--all", "--session", "s1"])
+                .is_err(),
+            "--all and --session are different scopes"
+        );
+        assert!(
+            Cli::try_parse_from(["ward", "session", "approvals", "--all", "--follow"]).is_err(),
+            "--all --follow (a live, multiplexed decided feed) is not offered"
+        );
         let cli = Cli::parse_from(["ward", "session", "grants", "--json"]);
         assert!(matches!(
             cli.command,
@@ -1719,6 +1908,24 @@ mod tests {
         assert_eq!(value["session"], "sess_a");
         assert_eq!(value["project"], "proj_payments");
         assert_eq!(value["id"], 7);
+
+        // `approvals_all_line` mirrors it for `ward session approvals --all` (#146
+        // items 2-3): the session and project on the same row as the state.
+        let record = ward_daemon::approvals::ApprovalRecord {
+            approval,
+            outcome: Some(ward_daemon::approvals::Outcome::TimedOut),
+            decided_at_unix_ms: Some(9),
+        };
+        let text = approvals_all_line(&record, "claude", "sess_a", "proj_payments", false);
+        assert!(text.starts_with("proj_payments · sess_a  "), "{text}");
+        assert!(text.contains("timed-out"), "{text}");
+        let json = approvals_all_line(&record, "claude", "sess_a", "proj_payments", true);
+        let value: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+        assert_eq!(value["session"], "sess_a");
+        assert_eq!(value["project"], "proj_payments");
+        assert_eq!(value["agent"], "claude");
+        assert_eq!(value["approval"]["id"], 7);
+        assert_eq!(value["outcome"], "timed-out");
     }
 
     #[test]

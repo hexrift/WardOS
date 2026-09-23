@@ -54,6 +54,7 @@ upper_items() {
       $'AGENTS\tStart Codex\twardos-launch terminal ward codex' \
       $'AGENTS\tSessions\twardos-launch terminal ward session list' \
       $'SECURITY\tVerify current project\twardos-launch terminal ward verify' \
+      $'SECURITY\tApproval inbox\twardos-approve-inbox' \
       $'SECURITY\tEvidence\twardos-launch terminal ward evidence' \
       $'SECURITY\tSnapshots\twardos-launch terminal ward snapshot list' \
       $'SECURITY\tStatus\twardos-launch terminal ward status'
