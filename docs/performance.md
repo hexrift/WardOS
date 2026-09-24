@@ -121,7 +121,22 @@ typically; those are the reference points, with FDE and verification kept on.
 | `ward run -- true`, daemon-backed, bubblewrap backend, release build | 32 ms | 4 vCPU Xeon 2.8 GHz, `examples/ward-demo` (E-06 record in [`experiments.md`](experiments.md)) |
 | bare `bwrap … -- true` | 6 ms | same host |
 | `ward status` | 3 ms | same host |
+| Observer event propagation (quiet single file write, inotify → drained) | p50 20 ms, p99 20 ms (60 samples over 30 writes; inotify reports two events per write) | 4 vCPU Xeon 2.1 GHz VM, debug build, `ward-daemon::observe::tests::a_quiet_write_is_drained_within_about_one_poll_tick` |
 
 The warm-start budget is 150 ms; the remaining cost is the sandbox itself, the shim,
 the per-launch sockets and the entry checks, not any fixed wait.
+
+The observer row replaces an earlier fixed 250 ms drain interval that had never been
+measured against this budget: it made the interval, not `inotify` or the queue, the
+dominant term for a quiet write, at up to ~10x the 25 ms p99 target regardless of how
+fast the rest of the path was. `DRAIN_INTERVAL` is now tied to the same
+`WAIT_POLL` tick (`crates/ward-daemon/src/sandbox.rs`) that already drives the live
+drain (`crates/ward-daemon/src/session.rs`), so a quiet observation now waits about
+one tick rather than a quarter second. The 20 ms figure is that tick's own floor, not
+an inotify or queue cost — reaching the 8 ms median in §2 would mean tightening
+`WAIT_POLL` itself, which drives every live-drain tick during a launch and is out of
+scope here. Like the other rows in this table, it carries its own reproducibility
+record in the "Where" column rather than a full §4 block — the exception §5 already
+states for this section until `ward-bench` lands — on a debug build and non-reference
+hardware, reproducible via `cargo test -p ward-daemon --lib observe:: -- --nocapture`.
 
