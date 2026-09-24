@@ -385,7 +385,12 @@ enum SessionCmd {
     },
     /// The temporary authority the session holds (ADR-0019): every
     /// `allow-session` answer and every credential the proxy injects, with its
-    /// id, scope and lifetime.
+    /// id, scope and lifetime. A credential mid-revoke shows `revoking` until
+    /// the owning proxy acknowledges withdrawal or `ward session revoke`'s
+    /// wait times out; one that timed out unconfirmed shows `revoke
+    /// unconfirmed` and keeps being listed — #245's acceptance bar is that no
+    /// revoke in progress, and no revoke that failed to confirm, is ever
+    /// shown as though it were either done or not happening at all.
     Grants {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
@@ -393,7 +398,8 @@ enum SessionCmd {
         #[arg(long)]
         session: Option<String>,
         /// One JSON object per grant: `{id, kind, label, scope, lifetime,
-        /// granted_at_unix_ms}`.
+        /// granted_at_unix_ms, revoke_state}`, `revoke_state` one of
+        /// `active`, `revoking` or `unconfirmed`.
         #[arg(long)]
         json: bool,
     },
@@ -411,20 +417,25 @@ enum SessionCmd {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Remove one grant from live authority (#140 items 4-6): a credential
-    /// grant no longer appears in `ward session grants`, the panel or
-    /// `GRANTS n`, and an `allow-session` answer is forgotten, so the same
-    /// tool on the same target asks again. Refused when `id` names no live
+    /// Withdraw one grant, host-confirmed (#140 items 4-6, #245). An
+    /// `allow-session` answer is forgotten at once, so the same tool on the
+    /// same target asks again — it has no proxy route to wait on. A
+    /// credential grant instead instructs the proxy that injects it to stop
+    /// honoring it, and waits (a couple of seconds at most) for that proxy to
+    /// acknowledge before this command returns; `ward session grants` shows
+    /// it as `revoking` in the meantime. Refused when `id` names no live
     /// grant.
     ///
-    /// This removes *future* authority only. For a credential the proxy is
-    /// currently injecting, it does not withdraw an already-established
-    /// route at the proxy or wait for that withdrawal to be confirmed — an
-    /// in-flight or already-open connection using that credential may keep
-    /// working until its own lifecycle ends (the launch finishes, the
-    /// session ends). Host-confirmed teardown of an *active* route, with an
-    /// acknowledged "revoking" state, is tracked separately and not yet
-    /// implemented.
+    /// The proxy's acknowledgement is the honest, three-way answer this
+    /// prints: **revoked** (no new request may use the credential from now
+    /// on); **revoked — N connection(s) already using it are still open**
+    /// (the authority is withdrawn all the same; an already-open connection
+    /// simply cannot be recalled — bytes already sent are already sent); or
+    /// **could not be confirmed** (the proxy did not acknowledge in time —
+    /// its launch may have crashed, or it just has not answered yet — so the
+    /// grant is *not* removed and keeps showing as `revoke unconfirmed`
+    /// rather than being reported as either safely revoked or silently still
+    /// active).
     Revoke {
         /// The grant's id, as `ward session grants` lists it.
         id: u64,
@@ -1304,17 +1315,37 @@ fn cmd_approve(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `ward session revoke <id>` (#140 items 4-6). "removed from authority", not "revoked":
-/// this command's own doc comment (see [`SessionCmd::Revoke`]) is explicit that it never
-/// tears down an already-established proxy route, so the printed result must not claim
-/// more happened than the authority projection changing — the same "no UI-only revoke is
-/// reported as enforced" bar #140's acceptance criteria sets for the panel.
+/// `ward session revoke <id>` (#140 items 4-6, #245): host-confirmed. The printed result
+/// is exactly the daemon's own three-way answer (see [`SessionCmd::Revoke`]'s doc comment)
+/// and never claims more than that confirms — the acceptance criterion "no UI-only revoke
+/// is reported as enforced" extends to this command's own exit code: `Unconfirmed` fails it,
+/// so a script checking the result learns the credential may still be in effect.
 fn cmd_revoke(dir: &Path, session: Option<&str>, id: u64) -> ward_daemon::Result<ExitCode> {
+    use ward_daemon::approvals::RevokeOutcome;
     let state = ward_daemon::session::state_root();
     let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
-    client::revoke(&mut sink, id)?;
-    println!("  grant {id} removed from authority");
-    Ok(ExitCode::SUCCESS)
+    let outcome = client::revoke(&mut sink, id)?;
+    match outcome {
+        RevokeOutcome::Withdrawn => {
+            println!("  grant {id} revoked");
+            Ok(ExitCode::SUCCESS)
+        }
+        RevokeOutcome::WithdrawnInFlight(n) => {
+            println!(
+                "  grant {id} revoked — {n} connection{} already using it \
+                 will finish on their own",
+                if n == 1 { "" } else { "s" }
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        RevokeOutcome::Unconfirmed => {
+            println!(
+                "  grant {id} could not be confirmed revoked; it may still be \
+                 in effect — see `ward session grants`"
+            );
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
 fn cmd_describe(dir: &Path, json: bool) -> ward_daemon::Result<ExitCode> {

@@ -204,6 +204,7 @@ pub struct Egress {
     socket: PathBuf,
     recorder: Arc<Recorder>,
     watcher: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    revoke_watcher: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
 }
 
 impl Egress {
@@ -255,6 +256,7 @@ impl Egress {
             socket,
             recorder,
             watcher: None,
+            revoke_watcher: None,
         })
     }
 
@@ -276,6 +278,58 @@ impl Egress {
             }
         });
         self.watcher = Some((stop, thread));
+    }
+
+    /// Watch `dir` (`crate::revoke::dir_path`) for pending revoke markers,
+    /// checked every [`crate::revoke::POLL`] until the egress stops (#245): a
+    /// marker naming a grant id this proxy holds a gateway route for is
+    /// revoked ([`Handle::revoke_credential`]) and the outcome (re-)written
+    /// back into the same file for `Served::revoke`'s own wait to read, on
+    /// every tick the marker still exists — not once and then remembered
+    /// forever. `revoke_credential` is idempotent (a no-op past the first
+    /// call, `ward-proxy`'s own test coverage), so the repeat writes this
+    /// costs while a marker is outstanding are harmless; not re-processing
+    /// would not be. A review of #248 found the one-shot version of this
+    /// loop wrong: if the daemon's `wait_for_ack` gave up (`Unconfirmed`)
+    /// before this tick ever ran — descheduled, or racing `revoke::clear`
+    /// deleting the marker this tick was about to write to — a
+    /// per-id-forever "already handled" memory would permanently ignore any
+    /// later marker the same id's retried `ward session revoke` writes, even
+    /// though the credential really was revoked at the first call. A marker
+    /// naming an id this proxy holds no route for is left untouched — some
+    /// other launch's egress may own it, or none ever will, which is for the
+    /// daemon's own bound to give up on, not this loop.
+    pub fn watch_revocations(&mut self, dir: PathBuf) {
+        let handle = Arc::clone(&self.handle);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while !flag.load(Ordering::Acquire) {
+                std::thread::sleep(crate::revoke::POLL);
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let Some(id) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|n| n.parse::<u64>().ok())
+                    else {
+                        continue;
+                    };
+                    let Some(in_flight) = handle.revoke_credential(id) else {
+                        continue;
+                    };
+                    let outcome = if in_flight == 0 {
+                        crate::revoke::CONFIRMED.to_owned()
+                    } else {
+                        crate::revoke::in_flight_text(in_flight)
+                    };
+                    let _ = std::fs::write(entry.path(), outcome);
+                }
+            }
+        });
+        self.revoke_watcher = Some((stop, thread));
     }
 
     /// Whether the proxy is refusing traffic as paused.
@@ -356,6 +410,10 @@ impl Egress {
     /// Stop the proxy and remove the socket.
     pub fn stop(self) {
         if let Some((stop, thread)) = self.watcher {
+            stop.store(true, Ordering::Release);
+            let _ = thread.join();
+        }
+        if let Some((stop, thread)) = self.revoke_watcher {
             stop.store(true, Ordering::Release);
             let _ = thread.join();
         }
@@ -475,6 +533,121 @@ mod tests {
         }));
         egress.stop();
         assert!(!dir.path().join("proxy.sock").exists());
+    }
+
+    /// #245, proven where the daemon's marker file actually meets the proxy:
+    /// revoking a gateway route's credential entirely through the filesystem
+    /// — the same mechanism `daemon::revoke` uses over the real control
+    /// socket — stops a real socket request from being honored. Not an
+    /// in-process `Handle::revoke_credential` call, and not an event-log
+    /// assertion: an actual HTTP request over the actual Unix socket, before
+    /// and after.
+    #[test]
+    fn watching_the_revoke_marker_stops_a_real_socket_request_from_being_honored() {
+        use ward_proxy::Secret;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let session = "sess_revoke_e2e";
+        std::fs::create_dir_all(crate::session::session_dir(&state, session)).unwrap();
+
+        let route = GatewayRoute::new(
+            "/anthropic",
+            "127.0.0.1",
+            1,
+            "x-api-key",
+            Secret::from("sk-real-not-injected-here"),
+        )
+        .unwrap()
+        .revocable(42);
+        let mut egress =
+            Egress::start(dir.path(), &NetworkCapability::Offline, vec![route]).unwrap();
+        egress.watch_revocations(crate::revoke::dir_path(&state, session));
+
+        let ask = |socket: &Path| -> String {
+            use std::io::{Read as _, Write as _};
+            let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+            stream
+                .write_all(
+                    b"GET /anthropic/v1/models HTTP/1.1\r\n\
+                      Host: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            let mut reply = String::new();
+            drop(stream.read_to_string(&mut reply));
+            reply
+        };
+
+        // Nothing has revoked this credential yet: whatever the request's
+        // fate, it is never refused *for that reason*.
+        let before = ask(egress.socket());
+        assert!(!before.contains("credential revoked"), "{before}");
+
+        // The daemon's own side of `#245`: write the marker, exactly as
+        // `daemon::revoke` does over the real control socket, and wait for
+        // the owning egress — this one — to acknowledge it.
+        crate::revoke::request(&state, session, 42).unwrap();
+        let ack = crate::revoke::wait_for_ack(&state, session, 42, Duration::from_secs(2));
+        assert_eq!(
+            ack.as_deref(),
+            Some(crate::revoke::CONFIRMED),
+            "the owning egress acknowledged, with nothing in flight"
+        );
+
+        let after = ask(egress.socket());
+        assert!(after.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{after}");
+        assert!(after.contains("credential revoked"), "{after}");
+
+        egress.stop();
+    }
+
+    #[test]
+    fn watching_the_revoke_marker_processes_a_retried_marker_for_the_same_id() {
+        use ward_proxy::Secret;
+
+        // A review of #248 found the previous version of this loop wrong:
+        // once it revoked an id, it remembered that forever and ignored any
+        // later marker for the same id. A retried `ward session revoke`
+        // (the real shape a caller takes after the daemon's first wait
+        // timed out and reported `Unconfirmed`, per `revoke.rs`'s own
+        // module doc) writes a brand new marker for the id it already
+        // revoked once — this proves the egress still answers it.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let session = "sess_revoke_retry";
+        std::fs::create_dir_all(crate::session::session_dir(&state, session)).unwrap();
+
+        let route = GatewayRoute::new(
+            "/anthropic",
+            "127.0.0.1",
+            1,
+            "x-api-key",
+            Secret::from("sk-real-not-injected-here"),
+        )
+        .unwrap()
+        .revocable(43);
+        let mut egress =
+            Egress::start(dir.path(), &NetworkCapability::Offline, vec![route]).unwrap();
+        egress.watch_revocations(crate::revoke::dir_path(&state, session));
+
+        crate::revoke::request(&state, session, 43).unwrap();
+        let first = crate::revoke::wait_for_ack(&state, session, 43, Duration::from_secs(2));
+        assert_eq!(first.as_deref(), Some(crate::revoke::CONFIRMED));
+        // The daemon clears the marker once it has read the outcome,
+        // exactly as `daemon::revoke_bounded` does on every path out —
+        // including, per that function's own doc, a wait that timed out.
+        crate::revoke::clear(&state, session, 43);
+
+        crate::revoke::request(&state, session, 43).unwrap();
+        let second = crate::revoke::wait_for_ack(&state, session, 43, Duration::from_secs(2));
+        assert_eq!(
+            second.as_deref(),
+            Some(crate::revoke::CONFIRMED),
+            "the retried marker must be answered too, not ignored forever \
+             just because this id was already revoked once"
+        );
+
+        egress.stop();
     }
 
     fn req(host: &str) -> Request {
@@ -891,6 +1064,7 @@ mod tests {
             socket: socket.clone(),
             recorder,
             watcher: None,
+            revoke_watcher: None,
         };
 
         let asking = {
