@@ -817,7 +817,17 @@ impl Session {
         let run = match self.prepare(argv, opts, &run_dir, &observers) {
             Ok(launch) => {
                 let mut clock = DrainClock::new();
-                launch.run_observed(&mut || {
+                // Admission is re-decided under the session lock immediately
+                // before the spawn, and held across it (PR #253 review finding
+                // 2): the check at the top of `launch` alone left a window in
+                // which a pause or a stop could scan, find nothing, and seal
+                // before this sandbox existed.
+                let (state, session) = (self.state.clone(), self.session_str.clone());
+                let mut admit = || {
+                    pause::admit_launch(&state, &session)
+                        .map(|guard| Box::new(guard) as Box<dyn std::any::Any>)
+                };
+                launch.run_admitted(&mut admit, &mut || {
                     if live_error.is_some() || !clock.due(observers.queued()) {
                         return;
                     }
@@ -1253,11 +1263,17 @@ impl Session {
         })
     }
 
+    /// The early, unlocked admission check at the top of [`launch`](Self::launch):
+    /// refuses before anything is recorded when the session is paused or a stop
+    /// of it has begun. Not the guarantee — the authoritative check is
+    /// [`pause::admit_launch`], re-run under the session lock immediately before
+    /// the sandbox is spawned — only the cheap, early refusal.
     fn refuse_while_paused(&self) -> Result<()> {
+        if pause::stop_begun(&self.state, &self.session_str) {
+            return Err(Error::Sandbox(pause::STOPPED_REFUSAL.into()));
+        }
         if self.paused() {
-            return Err(Error::Sandbox(
-                "session is paused by ward; `ward resume` before running anything".into(),
-            ));
+            return Err(Error::Sandbox(pause::PAUSED_REFUSAL.into()));
         }
         Ok(())
     }
@@ -1352,21 +1368,31 @@ impl Session {
     /// fails — with the log left unsealed and the project's current pointer kept,
     /// so `ward stop` can simply be run again — when termination could not be
     /// confirmed. Returns how many sandboxed processes were ended.
+    ///
+    /// `AgentStateChanged { Finished }` is recorded only once termination is
+    /// confirmed (PR #253 review finding 5): by the daemon itself, between its
+    /// `WorkloadsTerminated` and `SessionEnded`, when one serves the session —
+    /// this client appends nothing before asking, so a refused stop leaves no
+    /// `Finished` behind — and here, after [`Self::end_workloads_here`]
+    /// succeeded, when none does. A daemon that cannot positively confirm it
+    /// terminates the workloads (an older one, finding 1) is refused before
+    /// anything is sent ([`RemoteSink::require`]).
     pub fn stop(mut self, reason: EndReason) -> Result<u32> {
-        let here = if self.sink.ends_workloads() {
-            0
-        } else {
-            self.end_workloads_here()?
-        };
+        if self.sink.ends_workloads() {
+            let ended = self.sink.stop(reason)?;
+            clear_current(&self.state, &self.project_id, &self.session_str)?;
+            return Ok(ended);
+        }
+        let ended = self.end_workloads_here()?;
         self.emit(
             Origin::Wardd,
             WardEvent::AgentStateChanged {
                 state: AgentState::Finished,
             },
         )?;
-        let there = self.sink.stop(reason)?;
+        self.sink.stop(reason)?;
         clear_current(&self.state, &self.project_id, &self.session_str)?;
-        Ok(here + there)
+        Ok(ended)
     }
 
     /// `ward stop --restore-entry`: restore the entry snapshot over the worktree,
@@ -1377,42 +1403,24 @@ impl Session {
     /// still-running agent would resume in the gap between the restore and the
     /// stop and could write over the restored worktree.
     ///
-    /// With a daemon serving, the session is paused first (`Request::Pause`,
-    /// recorded as usual) unless it already is, so the pause's freeze covers the
-    /// restore and the stop then kills that frozen tree. Without one, the
-    /// workloads are terminated first, in this process. Returns the restore and
-    /// how many sandboxed processes the stop ended.
+    /// With a daemon serving, the whole pause→restore→stop is one operation
+    /// the daemon owns (PR #253 review finding 3): `Request::HoldForStop` is
+    /// always sent — never skipped because a pause marker exists, which a
+    /// daemon restarted since it was written holds nothing for — and the
+    /// daemon freezes the sandboxes itself (or takes over its own pause),
+    /// records `SessionPaused` for a fresh hold, writes the stop marker so no
+    /// launch is admitted, and keeps that hold until the stop: `ward resume`
+    /// from another client cannot release it in between. The restore runs only
+    /// once the daemon confirms the freeze stable; otherwise nothing is
+    /// restored and the session stays held for its stop. A daemon that does
+    /// not serve the hold (an older one) is refused before anything is asked
+    /// of it. Without a daemon, the workloads are terminated first, in this
+    /// process. Returns the restore and how many sandboxed processes the stop
+    /// ended.
     pub fn stop_restoring_entry(mut self, reason: EndReason) -> Result<(RestoreReport, u32)> {
         let mut ended = 0;
         if self.sink.ends_workloads() {
-            if !self.paused() {
-                let socket = session_dir(&self.state, &self.session_str).join(SOCKET_NAME);
-                let mut control = RemoteSink::connect(&socket).ok_or_else(|| {
-                    Error::Daemon(format!(
-                        "{}: the session daemon did not answer; nothing was restored",
-                        socket.display()
-                    ))
-                })?;
-                match control.call(&crate::control::Request::Pause {
-                    reason: "ward stop --restore-entry".into(),
-                })? {
-                    // An unsettled freeze still has the marker and the held
-                    // approvals in place; the stop that follows kills the tree
-                    // whether or not every process confirmed stopped.
-                    crate::control::Response::Paused { .. } => {}
-                    // Paused by someone else in between: just as quiescent.
-                    crate::control::Response::Error(e) if e == "already paused" => {}
-                    crate::control::Response::Error(e) => {
-                        return Err(Error::Daemon(format!(
-                            "could not pause the session before restoring: {e}; nothing \
-                             was restored"
-                        )));
-                    }
-                    other => {
-                        return Err(Error::Daemon(format!("unexpected response {other:?}")));
-                    }
-                }
-            }
+            self.hold_for_stop("ward stop --restore-entry")?;
         } else {
             ended = self.end_workloads_here()?;
         }
@@ -1421,13 +1429,60 @@ impl Session {
         Ok((report, ended))
     }
 
+    /// Ask the session's daemon for a [`Request::HoldForStop`](crate::control::Request::HoldForStop)
+    /// and require it confirmed stable: the precondition of a restore.
+    fn hold_for_stop(&self, reason: &str) -> Result<()> {
+        use crate::control::{FEATURE_STOP_HOLD, Request, Response};
+        let socket = session_dir(&self.state, &self.session_str).join(SOCKET_NAME);
+        let mut control = RemoteSink::connect(&socket).ok_or_else(|| {
+            Error::Daemon(format!(
+                "{}: the session daemon did not answer; nothing was restored",
+                socket.display()
+            ))
+        })?;
+        control.require(FEATURE_STOP_HOLD, "nothing was restored")?;
+        match control.call(&Request::HoldForStop {
+            reason: reason.into(),
+        })? {
+            Response::HeldForStop { unsettled: None } => Ok(()),
+            Response::HeldForStop {
+                unsettled: Some(pending),
+            } => Err(Error::Daemon(format!(
+                "session {} could not be confirmed quiescent before restoring: {pending} \
+                 process(es) not confirmed stopped within {}s. Nothing was restored; the \
+                 session is held for its stop. Run `ward stop --restore-entry` again, or \
+                 `ward stop`",
+                self.session_str,
+                pause::FREEZE_SETTLE.as_secs()
+            ))),
+            Response::Error(e) => Err(Error::Daemon(format!(
+                "could not hold the session for its stop before restoring: {e}; nothing \
+                 was restored"
+            ))),
+            other => Err(Error::Daemon(format!("unexpected response {other:?}"))),
+        }
+    }
+
     /// The daemonless half of [`Self::stop`]: what `Served::stop` does for a
-    /// served session, in this process. With no daemon there is no pause state
-    /// to hold, so an unconfirmed termination writes the marker (every proxy of
-    /// the session refuses) and records `WorkloadsTerminated { pending }`, then
-    /// refuses the stop.
+    /// served session, in this process. The stop marker is written first, and
+    /// the termination runs, under the session lock every launch's admission
+    /// takes (PR #253 review finding 2), so no sandbox can be spawned past the
+    /// scan. With no daemon there is no pause state to hold, so an unconfirmed
+    /// termination writes the marker (every proxy of the session refuses) and
+    /// records `WorkloadsTerminated { pending }`, then refuses the stop.
     fn end_workloads_here(&mut self) -> Result<u32> {
-        let outcome = pause::terminate(&self.session_str, None);
+        let outcome = {
+            let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session_str)).ok();
+            pause::write_stop_marker(&self.state, &self.session_str).map_err(|e| {
+                Error::Daemon(format!(
+                    "stop could not record that session {} is stopping ({e}), so it could \
+                     not keep new launches out; nothing was terminated and the log is not \
+                     sealed",
+                    self.session_str
+                ))
+            })?;
+            pause::terminate(&self.session_str, None)
+        };
         self.record_termination(&outcome)
     }
 
@@ -3097,6 +3152,7 @@ mod tests {
                     pids: vec![999_999],
                     cgroup: None,
                 }),
+                barrier_confirmed: true,
             })
             .unwrap_err()
             .to_string();

@@ -1479,3 +1479,122 @@ fn stop_restore_entry_through_the_daemon_pauses_restores_then_terminates() {
     assert!(at("EntryRestored") < at("WorkloadsTerminated"), "{kinds:?}");
     assert!(at("WorkloadsTerminated") < at("SessionEnded"), "{kinds:?}");
 }
+
+/// A process tree the daemon's scan recognises as `session_id`'s sandbox on
+/// any host (a copy of `sh` named `bwrap`, bound to the session's run
+/// directory), looping forever; its command line carries `marker`. The copy
+/// lives in `bin`, which must outlive the tree.
+fn fake_sandbox(bin: &std::path::Path, session_id: &str, marker: &str) -> std::process::Child {
+    let bwrap = bin.join("bwrap");
+    fs::copy("/bin/sh", &bwrap).unwrap();
+    let tree = std::process::Command::new(&bwrap)
+        .args(["-c", &format!("while :; do sleep 0.05; done # {marker}")])
+        .arg(ward_daemon::session::run_dir_path(session_id).join("proxy.sock"))
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(daemon::wait_until(
+        std::time::Duration::from_secs(5),
+        || ward_daemon::pause::sandbox_pids(std::path::Path::new("/proc"), session_id).len() >= 2
+    ));
+    tree
+}
+
+/// PR #253 review finding 5 through a real daemon: `Session::stop` appends
+/// nothing itself before asking; the daemon records `Finished` exactly once,
+/// after the confirmed `WorkloadsTerminated` and before `SessionEnded` — so a
+/// stop the daemon had refused could never have left a `Finished` behind.
+#[test]
+fn a_stop_through_the_daemon_records_finished_only_after_the_termination() {
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let (session_id, log, served) = serve_new_session(project.path(), state.path());
+    let bin = tempfile::tempdir().unwrap();
+    let marker = format!("ward-stop-finished-{}", std::process::id());
+    let mut tree = fake_sandbox(bin.path(), &session_id, &marker);
+
+    let session = Session::open_current(project.path(), state.path())
+        .unwrap()
+        .unwrap();
+    let ended = session.stop(EndReason::UserStop).expect("stop");
+    assert!(ended >= 2, "{ended}");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&tree.wait().unwrap()),
+        Some(9)
+    );
+    served.join().unwrap().expect("serve returns Ok");
+
+    let records: Vec<EventRecord> = LogReader::open(&log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    let finished: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            matches!(
+                r.event,
+                WardEvent::AgentStateChanged {
+                    state: ward_events::AgentState::Finished
+                }
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let kinds: Vec<String> = records
+        .iter()
+        .map(|r| format!("{:?}", r.event.kind()))
+        .collect();
+    assert_eq!(finished.len(), 1, "exactly one Finished: {kinds:?}");
+    let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
+    assert!(at("WorkloadsTerminated") < finished[0], "{kinds:?}");
+    assert!(finished[0] < at("SessionEnded"), "{kinds:?}");
+    assert_eq!(records[finished[0]].origin, Origin::Wardd);
+}
+
+/// PR #253 review finding 3, stale marker: a pause marker left on disk by a
+/// daemon that has since gone (here: written by hand; this daemon never
+/// paused) must not make `ward stop --restore-entry` skip establishing
+/// quiescence. The daemon freezes the running tree itself for the hold —
+/// `SessionPaused` is recorded before `EntryRestored` — and the stop then
+/// ends it.
+#[test]
+fn stop_restore_entry_does_not_trust_a_stale_pause_marker() {
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let (session_id, log, served) = serve_new_session(project.path(), state.path());
+    fs::write(project.path().join("README.md"), "agent was here\n").unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let marker = format!("ward-stop-stale-{}", std::process::id());
+    let mut tree = fake_sandbox(bin.path(), &session_id, &marker);
+    ward_daemon::pause::write_marker(state.path(), &session_id, "left by a dead wardd").unwrap();
+
+    let session = Session::open_current(project.path(), state.path())
+        .unwrap()
+        .unwrap();
+    assert!(session.paused(), "the stale marker reads as paused");
+    let (report, ended) = session
+        .stop_restoring_entry(EndReason::UserStop)
+        .expect("stop --restore-entry");
+    assert!(ended >= 2, "{ended}");
+    assert_eq!(report.files, 1, "{report:?}");
+    assert_eq!(
+        fs::read_to_string(project.path().join("README.md")).unwrap(),
+        "demo\n"
+    );
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&tree.wait().unwrap()),
+        Some(9)
+    );
+    served.join().unwrap().expect("serve returns Ok");
+    let kinds = kinds_in(&log);
+    let at = |k: &str| {
+        kinds
+            .iter()
+            .position(|x| x == k)
+            .unwrap_or_else(|| panic!("{k} in {kinds:?}"))
+    };
+    assert!(at("SessionPaused") < at("EntryRestored"), "{kinds:?}");
+    assert!(at("EntryRestored") < at("WorkloadsTerminated"), "{kinds:?}");
+    assert!(at("WorkloadsTerminated") < at("SessionEnded"), "{kinds:?}");
+}

@@ -43,7 +43,13 @@ mock ward 'case "$*" in
     fi
     ;;
   "resume --session "*) echo running >"$WARD_STATE_FILE" ;;
-  "resume "*) echo running >"$WARD_STATE_FILE" ;;
+  "resume "*)
+    if [[ -f "$TMP/resume-refused" ]]; then
+      echo "ward: daemon: a stop of session sess_a has begun and not completed: its sandboxed processes are held for that stop (some may already have been killed), so \`ward resume\` cannot release them. Run \`ward stop\` to finish it" >&2
+      exit 1
+    fi
+    echo running >"$WARD_STATE_FILE"
+    ;;
   "stop "*)
     if [[ -f "$TMP/stop-refused" ]]; then
       echo "ward: daemon: stop could not confirm every sandboxed process of session sess_a ended: 2 ended, 1 still present after 2s" >&2
@@ -113,6 +119,19 @@ assert_logged '^ward stop --restore-entry /home/dev/payments-api$'
 assert_logged 'STOP NOT CONFIRMED'
 assert_not_logged 'entry state restored'
 rm -f "$TMP/stop-refused"
+
+# --- after a refused stop, Resume is refused too (PR #253 review finding 5: an
+# incomplete stop is not an ordinary pause): never "Agents resumed", and ward's words
+# say to finish the stop ---
+: >"$MOCK_LOG"
+echo paused >"$WARD_STATE_FILE"
+touch "$TMP/resume-refused"
+WARDOS_MENU_CHOICE=Resume "$pause" 2>/dev/null && fail "a refused resume is an error"
+assert_logged '^ward resume /home/dev/payments-api$'
+assert_logged '^notify-send -a WardOS -u critical RESUME REFUSED ward: daemon: a stop of session sess_a has begun and not completed.*Run `ward stop` to finish it$'
+assert_not_logged 'Agents resumed'
+assert_eq "$(cat "$WARD_STATE_FILE")" paused
+rm -f "$TMP/resume-refused"
 
 # --- Inspect activity opens the observer in a terminal; the session stays paused -
 : >"$MOCK_LOG"

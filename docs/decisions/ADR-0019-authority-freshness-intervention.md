@@ -91,22 +91,49 @@ sandbox running, unobserved: a log-only closure presented as a stop. Now:
 
 * `ward stop` (`Request::Stop`) is termination of the session's workloads followed by
   evidence sealing, from running or from paused. The daemon freezes the session's
-  sandbox trees (or keeps the pause's freeze), kills every process, and confirms each
-  is gone within a bound (`pause::STOP_SETTLE`), rescanning for anything forked
-  meanwhile; `WorkloadsTerminated { ended, pending }` records it when there was
-  anything to end; only then are the approvals closed, `SessionEnded` appended and the
-  log sealed.
+  sandbox trees (or keeps the pause's freeze), confirms the freeze stable, kills every
+  process, and confirms each is gone within a bound (`pause::STOP_SETTLE`), rescanning
+  for anything forked meanwhile; `WorkloadsTerminated { ended, pending }` records it
+  when there was anything to end; only then is the agent recorded `Finished`, the
+  approvals closed, `SessionEnded` appended and the log sealed.
+* **Launch admission and stop are one serialized lifecycle operation** (#145 item 2 as
+  it bears on stop). Every sandbox launch re-checks admission under the session lock
+  the pause/stop path takes (`pause::admit_launch`) and holds it across the `bwrap`
+  spawn; a stop writes a permanent stop marker under that lock before it scans. A
+  launch either exists before the scan (and is ended by it) or is refused.
+* **The fork barrier.** Nothing is killed until the freeze is confirmed stable: every
+  held process stopped, and a rescan taken after that finding nothing new
+  (`pause::stabilize`), so a child forked in the scan-to-`SIGSTOP` window cannot be
+  orphaned by its parent's kill. Membership is the tree of the session's `bwrap` roots
+  *and* the sandbox's own pid namespace, which still holds a reparented child.
 * A stop that cannot confirm termination is refused, never reported as done (#145
-  item 4): the log stays unsealed and the session is held paused over what is left.
-  `ward stop` retries; `ward resume` releases the hold.
+  item 4): the log stays unsealed, no `Finished` is recorded, and the session is held
+  **for the stop** over what is left. That is an incomplete stop, not a pause: its
+  processes may already have taken `SIGKILL`, so `ward resume` refuses it; `ward stop`
+  retries.
 * Log-only closure stays available as its own, explicit operation: `Request::Seal`.
-* `ward stop --restore-entry` makes the session quiescent (paused) before the restore
-  and keeps it so until the workloads are terminated, so nothing can write over the
-  restored worktree.
+* `ward stop --restore-entry` is one daemon-owned pause→restore→stop operation
+  (`Request::HoldForStop`): the daemon freezes the sandboxes itself — never trusting a
+  pause marker a restarted daemon did not write — or takes over its own pause, writes
+  the stop marker, and keeps the hold until the stop; no other client can resume it in
+  between. The restore runs only once the hold is confirmed stable.
+* **Protocol negotiation.** `Request::Stop` exists on 0.18 daemons too, where it only
+  seals. A client asks `Request::Capabilities` first and sends `Stop` (or `HoldForStop`)
+  only to a daemon that names the feature; the answer must also positively acknowledge
+  the termination (`Sealed { ended: Some(n) }`). An older daemon is refused with
+  nothing sent, and the user is told to end it so the client can stop the session
+  itself.
 
-Still open under #145: the persisted `Pausing`/`Stopping`/`Incomplete` lifecycle,
-reconciliation of an interrupted stop across a daemon restart, and per-component
-acknowledgement from the proxy.
+Still open under #145: the persisted `Pausing`/`Stopping`/`Incomplete` lifecycle (the
+stop marker and the in-memory stop hold are its stop-side precursors, not that state
+machine), reconciliation of an interrupted stop across a daemon restart (a restarted
+daemon refuses `resume` once the stop marker exists, but does not rebuild the hold's
+freeze until the next `stop`), and per-component acknowledgement from the proxy. The
+fork barrier is confirmed only when every process takes `SIGSTOP` within
+`pause::FREEZE_SETTLE`; one that does not (an uninterruptible or killable-only wait) is
+killed anyway, and a child it forks outside the sandbox's pid namespace (only possible
+for a tree that shares the host's namespace, which a real `bwrap --unshare-pid` sandbox
+does not) is not covered.
 
 ## What does not change
 No more colour, no shields, no closer resemblance to Omarchy, no custom kernel, no

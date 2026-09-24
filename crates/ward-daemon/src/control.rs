@@ -52,12 +52,18 @@ pub enum Request {
     /// tree is killed rather than left stopped for ever). Ending the session's
     /// workloads is [`Request::Stop`].
     Seal,
-    /// End the session on the caller's behalf (#145 item 5): terminate every
-    /// sandboxed process of the session and confirm it is gone
-    /// (`pause::terminate`, recorded as `WorkloadsTerminated` when there was
-    /// anything to end), give every open approval its terminal record, then
-    /// `SessionEnded` and seal. Refused, with the log left unsealed and the
-    /// session held paused, when termination could not be confirmed.
+    /// End the session on the caller's behalf (#145 item 5): write the stop
+    /// marker (no launch is admitted from here on), terminate every sandboxed
+    /// process of the session and confirm it is gone (`pause::terminate`,
+    /// recorded as `WorkloadsTerminated` when there was anything to end), record
+    /// the agent `Finished` (unless the client already did), give every open
+    /// approval its terminal record, then `SessionEnded` and seal; answered
+    /// `Sealed { ended: Some(n) }`. Refused, with the log left unsealed and the
+    /// session held for the stop, when termination could not be confirmed.
+    ///
+    /// A daemon that predates this (0.18) also accepts `Stop`, but only seals:
+    /// a client checks [`FEATURE_STOP_TERMINATES`] first
+    /// ([`RemoteSink::require`]) and never sends it otherwise.
     Stop {
         /// Why.
         reason: EndReason,
@@ -108,9 +114,37 @@ pub enum Request {
         /// Why, in the user's words (may be empty).
         reason: String,
     },
-    /// Reverse a `Pause` and record `SessionResumed`.
+    /// Reverse a `Pause` and record `SessionResumed`. Refused while the session
+    /// is held for a stop ([`Request::HoldForStop`], or a refused
+    /// [`Request::Stop`]): only a stop (or a log-only `Seal`) ends that hold.
     Resume,
+    /// Which protocol features this daemon implements (PR #253 review finding
+    /// 1): answered with [`Response::Capabilities`]. A daemon that predates the
+    /// request rejects it as a bad request, which a client reads as "none" —
+    /// so a client that needs a feature ([`FEATURE_STOP_TERMINATES`],
+    /// [`FEATURE_STOP_HOLD`]) fails closed instead of trusting an older
+    /// daemon's different semantics for a request of the same name.
+    Capabilities,
+    /// Make the session quiescent for a stop and keep it so until that stop
+    /// (`ward stop --restore-entry`, PR #253 review finding 3): the daemon
+    /// freezes the sandboxes itself — never trusting an on-disk marker a
+    /// restarted daemon did not write — or takes over a pause already in
+    /// force, writes the marker and the stop marker (no launch is admitted
+    /// from here on), holds the approvals, and records `SessionPaused` if it
+    /// was not paused. The hold cannot be released by `Resume`; the stop that
+    /// follows terminates exactly what it holds.
+    HoldForStop {
+        /// Why (recorded on the `SessionPaused` a fresh hold appends).
+        reason: String,
+    },
 }
+
+/// [`Request::Capabilities`] feature: `Request::Stop` terminates the session's
+/// sandboxed workloads and confirms them gone before it seals, and says so in
+/// [`Response::Sealed`]'s `ended` (#145 item 5).
+pub const FEATURE_STOP_TERMINATES: &str = "stop-terminates-workloads";
+/// [`Request::Capabilities`] feature: [`Request::HoldForStop`] is served.
+pub const FEATURE_STOP_HOLD: &str = "stop-hold";
 
 /// What the daemon answers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,11 +172,26 @@ pub enum Response {
     Sealed {
         /// Chain head after sealing.
         head: ChainHead,
-        /// For a `Stop`: how many sandboxed processes it terminated and confirmed
-        /// gone before sealing (#145 item 5). Zero — and absent on the wire — for
-        /// a `Seal`, or a stop with nothing running.
-        #[serde(default, skip_serializing_if = "is_zero")]
-        ended: u32,
+        /// For a `Stop`: the daemon's positive acknowledgement that it
+        /// terminated the session's sandboxed processes and confirmed them gone
+        /// before sealing, and how many there were (`Some(0)` when nothing ran;
+        /// #145 item 5). `None` — absent on the wire — for a `Seal`, and for
+        /// any daemon that predates confirmed stop: a client must never read
+        /// its absence as "zero ended" (PR #253 review finding 1).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended: Option<u32>,
+    },
+    /// A [`Request::Capabilities`] answer: the features this daemon serves.
+    Capabilities {
+        /// Feature names ([`FEATURE_STOP_TERMINATES`], [`FEATURE_STOP_HOLD`]).
+        features: Vec<String>,
+    },
+    /// A [`Request::HoldForStop`] answered: the session is held for its stop.
+    HeldForStop {
+        /// `Some(pending)` when the freeze could not be confirmed stable
+        /// within `pause::FREEZE_SETTLE` (the hold still stands); `None` when
+        /// every process is confirmed stopped and none can fork.
+        unsettled: Option<u32>,
     },
     /// The session description as JSON.
     Description(serde_json::Value),
@@ -190,7 +239,8 @@ pub trait Sink: Send {
     /// End the session: append `SessionEnded { reason }` and seal. Returns how
     /// many sandboxed processes the other end terminated first (#145 item 5):
     /// always 0 from a sink that does not end workloads itself (see
-    /// [`ends_workloads`](Self::ends_workloads)).
+    /// [`ends_workloads`](Self::ends_workloads)). [`RemoteSink`] fails closed
+    /// unless its daemon both advertises and acknowledges the termination.
     fn stop(self: Box<Self>, reason: EndReason) -> Result<u32>;
     /// Whether [`stop`](Self::stop) itself terminates the session's sandboxed
     /// workloads before sealing: true for [`RemoteSink`], whose daemon does it as
@@ -463,9 +513,22 @@ impl Sink for RemoteSink {
         expect_sealed(self.call(&Request::Seal)?)
     }
 
+    /// PR #253 review finding 1: `Request::Stop` exists on older daemons too,
+    /// where it only appends `SessionEnded` and seals. So the daemon is asked
+    /// first ([`RemoteSink::require`]) whether its stop terminates the
+    /// workloads, and nothing is sent unless it says so; and the answer must
+    /// then positively acknowledge the termination (`Sealed { ended: Some }`).
     fn stop(mut self: Box<Self>, reason: EndReason) -> Result<u32> {
+        self.require(FEATURE_STOP_TERMINATES, "nothing was sealed")?;
         match self.call(&Request::Stop { reason })? {
-            Response::Sealed { ended, .. } => Ok(ended),
+            Response::Sealed {
+                ended: Some(ended), ..
+            } => Ok(ended),
+            Response::Sealed { ended: None, .. } => Err(Error::Daemon(
+                "the session daemon sealed the log without confirming the session's \
+                 sandboxed processes were terminated; a sandbox of it may still be running"
+                    .into(),
+            )),
             // The daemon's own words: a refused stop says exactly what it could
             // not confirm and what state it left the session in.
             Response::Error(e) => Err(Error::Daemon(e)),
@@ -478,11 +541,33 @@ impl Sink for RemoteSink {
     }
 }
 
-/// `skip_serializing_if` for [`Response::Sealed`]'s `ended`, so a response with
-/// nothing terminated reads on the wire exactly as it did before the field.
-#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
-const fn is_zero(n: &u32) -> bool {
-    *n == 0
+impl RemoteSink {
+    /// The features the daemon on the other end serves ([`Request::Capabilities`]).
+    /// A daemon that predates the request answers it with an error (it cannot
+    /// parse it) and serves none of them; that is `Ok(vec![])`, not a failure.
+    pub fn capabilities(&mut self) -> Result<Vec<String>> {
+        match self.call(&Request::Capabilities)? {
+            Response::Capabilities { features } => Ok(features),
+            Response::Error(_) => Ok(Vec::new()),
+            other => Err(Error::Events(format!("unexpected response {other:?}"))),
+        }
+    }
+
+    /// Fail closed unless the daemon serves `feature` (PR #253 review finding
+    /// 1). `nothing_done` finishes the refusal: what the caller did not do
+    /// because of it.
+    pub fn require(&mut self, feature: &str, nothing_done: &str) -> Result<()> {
+        if self.capabilities()?.iter().any(|f| f == feature) {
+            return Ok(());
+        }
+        Err(Error::Daemon(format!(
+            "the session daemon does not serve `{feature}` (it predates this ward), so it \
+             cannot confirm the session's sandboxed processes are terminated; {nothing_done}. \
+             End that daemon (its pid is in the session's `{}`) and run the command again: \
+             with no daemon serving, ward terminates the workloads itself",
+            crate::daemon::PID_NAME
+        )))
+    }
 }
 
 fn expect_sealed(response: Response) -> Result<()> {
@@ -583,7 +668,11 @@ pub fn handle_with(
         | Request::Approvals
         | Request::Grants
         | Request::Pause { .. }
-        | Request::Resume => (
+        | Request::Resume
+        // A plain log connection neither terminates workloads on `Stop` nor
+        // holds one: it serves no feature, exactly like an older daemon.
+        | Request::Capabilities
+        | Request::HoldForStop { .. } => (
             Response::Error("not served on this connection".into()),
             false,
         ),
@@ -592,7 +681,7 @@ pub fn handle_with(
 
 fn seal(log: &mut Option<LocalLog>) -> (Response, bool) {
     match log.take().map(LocalLog::seal_head) {
-        Some(Ok(head)) => (Response::Sealed { head, ended: 0 }, true),
+        Some(Ok(head)) => (Response::Sealed { head, ended: None }, true),
         Some(Err(e)) => (Response::Error(e.to_string()), true),
         None => (Response::Error("log is sealed".into()), true),
     }
@@ -881,10 +970,136 @@ mod tests {
             },
         );
         assert!(done);
-        assert!(matches!(r, Response::Sealed { head, ended: 0 } if head.next_seq == 2));
+        assert!(matches!(r, Response::Sealed { head, ended: None } if head.next_seq == 2));
         assert!(matches!(
             handle(&mut log, Request::Ping).0,
             Response::Error(_)
+        ));
+    }
+
+    /// The request tags a 0.18 daemon could parse: anything else it answered
+    /// with serde's own `bad request: unknown variant …`.
+    const V018_REQUESTS: &[&str] = &[
+        "append",
+        "evidence",
+        "sync",
+        "seal",
+        "stop",
+        "describe",
+        "subscribe",
+        "ping",
+        "hold",
+        "approve",
+        "pending",
+        "approvals",
+        "grants",
+        "pause",
+        "resume",
+    ];
+
+    /// A stand-in for a 0.18 `wardd` on one connection: it parses only the
+    /// requests 0.18 knew, and serves them with 0.18's semantics — its `Stop`
+    /// appends `SessionEnded` and seals without touching any workload, and its
+    /// `Sealed` carries no `ended` (the wire shape `control::handle` still
+    /// produces for a plain log connection). `ack_capabilities` makes it lie
+    /// that it serves [`FEATURE_STOP_TERMINATES`], to check the response-side
+    /// acknowledgement on its own. Returns every request tag it received and
+    /// whether its log ended sealed.
+    fn serve_v018(
+        stream: UnixStream,
+        mut log: Option<LocalLog>,
+        ack_capabilities: bool,
+    ) -> (Vec<String>, bool) {
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut seen = Vec::new();
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            let tag = serde_json::from_str::<serde_json::Value>(&line).unwrap()["req"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            seen.push(tag.clone());
+            let (response, done) = if tag == "capabilities" && ack_capabilities {
+                (
+                    Response::Capabilities {
+                        features: vec![FEATURE_STOP_TERMINATES.into()],
+                    },
+                    false,
+                )
+            } else if V018_REQUESTS.contains(&tag.as_str()) {
+                handle(&mut log, serde_json::from_str(&line).unwrap())
+            } else {
+                (
+                    Response::Error(format!("bad request: unknown variant `{tag}`")),
+                    false,
+                )
+            };
+            write_response(&mut writer, &response).unwrap();
+            line.clear();
+            if done {
+                break;
+            }
+        }
+        (seen, log.is_none())
+    }
+
+    /// PR #253 review finding 1, old daemon / new client: `Request::Stop`
+    /// exists on 0.18 too, where it only seals. A 0.19 client attached to a
+    /// still-running 0.18 daemon must not send it and report success with
+    /// `ended = 0`: it asks for the capability first, gets the old daemon's
+    /// "unknown variant", and refuses — with nothing sent that could seal the
+    /// log beside a live sandbox.
+    #[test]
+    fn a_new_client_refuses_to_stop_through_a_daemon_that_predates_confirmed_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let log = Some(fresh(dir.path()));
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_v018(stream, log, false)
+        });
+        let sink: Box<dyn Sink> = Box::new(RemoteSink::connect(&socket).expect("daemon"));
+        assert!(sink.ends_workloads());
+        let err = sink.stop(EndReason::UserStop).unwrap_err().to_string();
+        assert!(
+            err.contains("does not serve `stop-terminates-workloads`"),
+            "{err}"
+        );
+        assert!(err.contains("nothing was sealed"), "{err}");
+        let (seen, sealed) = server.join().unwrap();
+        assert_eq!(seen, ["ping", "capabilities"], "no `stop` was ever sent");
+        assert!(!sealed, "the old daemon's log is still open");
+    }
+
+    /// The response-side half of finding 1: even a daemon that claims the
+    /// capability must positively acknowledge the termination in its answer.
+    /// A `Sealed` without `ended` (0.18's shape) is never read as "0 ended".
+    #[test]
+    fn a_seal_without_a_termination_acknowledgement_is_not_a_successful_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let log = Some(fresh(dir.path()));
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_v018(stream, log, true)
+        });
+        let sink: Box<dyn Sink> = Box::new(RemoteSink::connect(&socket).expect("daemon"));
+        let err = sink.stop(EndReason::UserStop).unwrap_err().to_string();
+        assert!(err.contains("without confirming"), "{err}");
+        let (seen, sealed) = server.join().unwrap();
+        assert_eq!(seen, ["ping", "capabilities", "stop"]);
+        assert!(sealed);
+        // On the wire: 0.18's `Sealed` has no `ended`, and parses as `None`.
+        let head =
+            serde_json::to_value(Chain::genesis(session(), Blake3Hash::from_bytes([1; 32])).head())
+                .unwrap();
+        let old = serde_json::json!({ "resp": "sealed", "body": { "head": head } }).to_string();
+        assert!(matches!(
+            serde_json::from_str::<Response>(&old).unwrap(),
+            Response::Sealed { ended: None, .. }
         ));
     }
 

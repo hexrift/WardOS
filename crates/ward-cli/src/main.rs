@@ -118,8 +118,10 @@ enum Command {
     },
     /// End the current session: every sandboxed process of it is ended and
     /// confirmed gone, then its log is sealed (running or paused). Refused, with
-    /// the log left open and the session held paused, when that cannot be
-    /// confirmed; run it again to retry. The workspace is kept as it is.
+    /// the log left open and the session held for the stop (`ward resume`
+    /// cannot release it), when that cannot be confirmed; run it again to
+    /// retry. Refused up front by a session daemon too old to confirm it. The
+    /// workspace is kept as it is.
     Stop {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
@@ -1661,14 +1663,17 @@ fn cmd_stop(dir: &Path, restore_entry: bool) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     if let Some(session) = Session::open_current(dir, &state)? {
         let id = session.id().to_owned();
-        // With a daemon serving, `stop` is a `Request::Stop`: the daemon ends the
-        // session's sandboxed processes and confirms they are gone (#145 item 5),
-        // writes `SessionEnded`, seals, and exits; otherwise this process does the
-        // same itself. A stop that cannot confirm the processes ended is refused
-        // with the daemon's own account of what is left, and the log stays open.
+        // With a daemon serving, `stop` is a `Request::Stop` — sent only once the
+        // daemon has confirmed it serves confirmed stop (PR #253 review finding
+        // 1): the daemon ends the session's sandboxed processes and confirms they
+        // are gone (#145 item 5), records `Finished` and `SessionEnded`, seals,
+        // and exits; otherwise this process does the same itself. A stop that
+        // cannot confirm the processes ended is refused with the daemon's own
+        // account of what is left, and the log stays open.
         let served = daemon::serving(&state, &id);
         let ended = if restore_entry {
-            // Quiescent first, then the restore, then the stop (see
+            // Held for the stop by the daemon first, then the restore, then the
+            // stop — one hold nothing else can release (see
             // `Session::stop_restoring_entry`).
             let (report, ended) = session.stop_restoring_entry(EndReason::UserStop)?;
             match &report.backup {

@@ -181,21 +181,31 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > injected, established relays hold their bytes); it holds the approvals (timeouts stop,
 > answers are refused, new questions wait); and it appends `SessionPaused { method,
 > reason }`. `resume` reverses the order and appends `SessionResumed`. A launch while
-> paused is refused. `stop` (#145 item 5) is termination of the session's workloads
-> followed by evidence sealing, from running or from paused: the daemon freezes the
-> session's sandbox trees (or keeps the pause's freeze), kills every process, watches
-> until each is confirmed gone (bounded by `pause::STOP_SETTLE`, rescanning for any
-> process forked meanwhile), appends `WorkloadsTerminated { ended, pending: 0 }` when
-> there was anything to end, and only then closes the approvals, appends `SessionEnded`
-> and seals; the worktree is kept. When termination cannot be confirmed, the stop is
-> refused rather than reported done: the log is not sealed, the session is held paused
-> over what is left (marker, held approvals), `WorkloadsTerminated { pending > 0 }`
-> records it, and `ward stop` retries (`ward resume` releases the hold). `seal` stays the
-> separate, log-only closure: it never touches a running sandbox. Without a daemon,
-> `Session::stop` does the same termination in-process. `ward stop --restore-entry`
-> makes the session quiescent first (a `pause`, or in-process termination without a
-> daemon), then writes the entry snapshot over the worktree, keeping what it replaced
-> under `.ward/restore-<ts>/` (`EntryRestored`), and then stops. The desktop's
+> paused is refused — at the start of the launch, and again under the session lock
+> immediately before the `bwrap` spawn (`pause::admit_launch`), which is held across
+> the spawn, so launch admission and pause/stop are one serialized lifecycle operation.
+> `stop` (#145 item 5) is termination of the session's workloads followed by evidence
+> sealing, from running or from paused: under that lock the daemon writes the stop
+> marker (no later launch is admitted), freezes the session's sandbox trees (or keeps
+> the pause's freeze), confirms the freeze stable before anything is killed (the fork
+> barrier: every held process stopped and a rescan — by `bwrap` tree and by the
+> sandbox's pid namespace — finding nothing new), kills every process, watches until
+> each is confirmed gone (bounded by `pause::STOP_SETTLE`), appends `WorkloadsTerminated
+> { ended, pending: 0 }` when there was anything to end, and only then records the agent
+> `Finished`, closes the approvals, appends `SessionEnded` and seals; the worktree is
+> kept. When termination cannot be confirmed, the stop is refused rather than reported
+> done: the log is not sealed, no `Finished` is recorded, the session is held for the
+> stop over what is left (marker, held approvals), `WorkloadsTerminated { pending > 0 }`
+> records it, and `ward stop` retries; `ward resume` refuses an incomplete stop. `seal`
+> stays the separate, log-only closure: it never touches a running sandbox. A client
+> sends `Stop` only to a daemon whose `Request::Capabilities` names confirmed stop, and
+> requires the answer to acknowledge it; an older daemon is refused with nothing sent.
+> Without a daemon, `Session::stop` does the same termination in-process. `ward stop
+> --restore-entry` is one daemon-owned operation: `Request::HoldForStop` freezes the
+> session (never trusting a marker it did not write) and holds it for the stop, then the
+> entry snapshot is written over the worktree, keeping what it replaced under
+> `.ward/restore-<ts>/` (`EntryRestored`), and then the stop ends the held tree; without
+> a daemon the workloads are terminated in-process first. The desktop's
 > `wardos-pause` (`Super + Shift + P`) is that request plus the exits menu; the bar's
 > agent segment reads `PAUSED` in the denied tone while the marker stands. The
 > security model's G13 states what a pause holds and what it cannot recall.
