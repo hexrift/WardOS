@@ -1163,15 +1163,24 @@ impl Approvals {
     /// call on. `None` when no live grant has this id — already revoked,
     /// retired by its launch ending, or never minted.
     ///
+    /// This is authority-projection-only, not host-confirmed enforcement:
+    /// item 4's full ask is "instruct the owning proxy to withdraw the route,
+    /// then await acknowledgement", with an intermediate "revoking" state
+    /// (item 5) until that acknowledgement arrives. Nothing here reaches the
+    /// proxy or the credential-injection boundary — removing a credential
+    /// grant here stops it from being *listed*, but an already-established
+    /// route using it can keep working until its own lifecycle ends (the
+    /// launch finishes, the session ends). Closing that gap is tracked
+    /// separately; this method, and the CLI/panel surface built on it, must
+    /// never be presented as if it already closes it (the acceptance
+    /// criterion "no UI-only revoke is reported as enforced").
+    ///
     /// For a credential the proxy injected, the caller (`Served::revoke` in
     /// `daemon.rs`) still has to record `CredentialRevoked` itself: this
     /// method only owns the in-memory authority view, not the event log, the
     /// same split `retire_launch` and `mark_launch_unknown` already draw. An
     /// `allow-session` answer has no audit event of its own yet — removing it
-    /// from `remembered` is the whole of what revoking it does; a later pass
-    /// can add one if `ward replay` needs to show it (#140's own "Related"
-    /// notes this is UX-shaped follow-up, not a safety gap: the grant is
-    /// gone from live authority the moment this returns either way).
+    /// from `remembered` is the whole of what revoking it does today.
     pub fn revoke(&self, id: u64) -> Option<RevokedGrant> {
         let mut state = self.lock();
         if let Some(pos) = state.credentials.iter().position(|c| c.id == id) {

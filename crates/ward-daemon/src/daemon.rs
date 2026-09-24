@@ -776,6 +776,11 @@ impl Served {
     /// `id` names no live grant. An `allow-session` answer has no revoked
     /// event of its own yet (see [`approvals::Approvals::revoke`]'s doc
     /// comment) — it is simply gone from `Request::Grants` from this call on.
+    ///
+    /// Authority-projection-only — see [`approvals::Approvals::revoke`]'s doc
+    /// comment for what this deliberately does not do (withdraw an
+    /// already-established route at the proxy, or wait for that to be
+    /// acknowledged).
     fn revoke(&mut self, id: u64) -> Result<()> {
         match self.approvals.revoke(id) {
             Some(approvals::RevokedGrant::Credential { service }) => {

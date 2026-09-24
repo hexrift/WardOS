@@ -411,10 +411,20 @@ enum SessionCmd {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Revoke one grant (#140): a credential the proxy injects is removed
-    /// from live authority; an `allow-session` answer is forgotten, so the
-    /// same tool on the same target asks again. Refused when `id` names no
-    /// live grant.
+    /// Remove one grant from live authority (#140 items 4-6): a credential
+    /// grant no longer appears in `ward session grants`, the panel or
+    /// `GRANTS n`, and an `allow-session` answer is forgotten, so the same
+    /// tool on the same target asks again. Refused when `id` names no live
+    /// grant.
+    ///
+    /// This removes *future* authority only. For a credential the proxy is
+    /// currently injecting, it does not withdraw an already-established
+    /// route at the proxy or wait for that withdrawal to be confirmed — an
+    /// in-flight or already-open connection using that credential may keep
+    /// working until its own lifecycle ends (the launch finishes, the
+    /// session ends). Host-confirmed teardown of an *active* route, with an
+    /// acknowledged "revoking" state, is tracked separately and not yet
+    /// implemented.
     Revoke {
         /// The grant's id, as `ward session grants` lists it.
         id: u64,
@@ -1294,12 +1304,16 @@ fn cmd_approve(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `ward session revoke <id>` (#140).
+/// `ward session revoke <id>` (#140 items 4-6). "removed from authority", not "revoked":
+/// this command's own doc comment (see [`SessionCmd::Revoke`]) is explicit that it never
+/// tears down an already-established proxy route, so the printed result must not claim
+/// more happened than the authority projection changing — the same "no UI-only revoke is
+/// reported as enforced" bar #140's acceptance criteria sets for the panel.
 fn cmd_revoke(dir: &Path, session: Option<&str>, id: u64) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
     client::revoke(&mut sink, id)?;
-    println!("  grant {id} revoked");
+    println!("  grant {id} removed from authority");
     Ok(ExitCode::SUCCESS)
 }
 

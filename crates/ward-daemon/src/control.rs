@@ -93,11 +93,17 @@ pub enum Request {
     /// The temporary authority the session holds (ADR-0019): every
     /// `allow-session` answer and every credential the proxy injects.
     Grants,
-    /// Revoke one grant by the id [`Response::Grants`] listed it under
-    /// (#140): a credential the proxy injects is removed from live
-    /// authority and recorded `CredentialRevoked`; an `allow-session`
-    /// answer is forgotten, so the same tool on the same target asks again.
-    /// Refused when `id` names no live grant.
+    /// Remove one grant from live authority, by the id [`Response::Grants`]
+    /// listed it under (#140 items 4-6): a credential grant is removed from
+    /// the authority projection and recorded `CredentialRevoked`; an
+    /// `allow-session` answer is forgotten, so the same tool on the same
+    /// target asks again. Refused when `id` names no live grant.
+    ///
+    /// Never withdraws an already-established route at the proxy, and never
+    /// waits for such a withdrawal to be acknowledged — see
+    /// [`crate::approvals::Approvals::revoke`]'s own doc comment. An
+    /// in-flight or already-open connection using a revoked credential may
+    /// keep working until its own lifecycle ends.
     Revoke {
         /// The grant's id, as `ward session grants` lists it.
         id: u64,
