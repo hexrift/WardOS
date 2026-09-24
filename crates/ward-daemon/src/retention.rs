@@ -214,7 +214,24 @@ pub fn apply(state: &Path, plan: &SweepPlan, now: std::time::SystemTime) -> Resu
 /// policy"): a user-kept restore backup, exempt from a `ward snapshot gc` sweep
 /// regardless of whether any other root in [`roots`] still points at it.
 /// Idempotent. `ward snapshot keep <id>`.
+///
+/// Refused when `id` names no manifest actually stored in this CAS.
+/// `ward_snapshot::gc::plan` resolves every root by reading its manifest and
+/// aborts the *whole* sweep the instant any root fails to resolve (its own doc
+/// comment: "a failure resolving any root aborts the whole plan"). A kept
+/// marker for an id that was never captured — a typo, a truncated hash pasted
+/// from somewhere else — would satisfy [`ward_snapshot::gc::mark_kept`] just
+/// fine on its own (it never touches the manifest store), then poison every
+/// later `roots()`/`plan()` call (dry-run included) with an unresolvable root,
+/// until the same bogus marker is tracked down and removed by hand. Checking
+/// here, before the marker is written, is one read against a fixed set of
+/// existing manifests; the alternative is diagnosing why every `ward snapshot
+/// gc` on this machine started failing, from a bare id string in a marker
+/// file no error message points at.
 pub fn mark_kept(state: &Path, id: SnapshotId) -> Result<()> {
+    ward_snapshot::SnapshotStore::open(cas_root(state))
+        .and_then(|store| store.manifest(id))
+        .map_err(|_| Error::Snapshot(format!("no such snapshot: {id}")))?;
     ward_snapshot::gc::mark_kept(&cas_root(state), id).map_err(|e| Error::Snapshot(e.to_string()))
 }
 
@@ -513,6 +530,32 @@ mod tests {
 
         // Undoing a marker that was never set is not an error either.
         unmark_kept(state.path(), id).unwrap();
+    }
+
+    #[test]
+    fn mark_kept_refuses_an_id_that_names_no_stored_snapshot() {
+        // A bogus id (well-formed hash, never actually captured) must be refused
+        // up front, never merged into `roots()` — see `mark_kept`'s own doc
+        // comment for why: once in, it would abort every future `plan()` call,
+        // not just fail to protect anything.
+        let state = tempfile::tempdir().unwrap();
+        let bogus = crate::snapshot::parse_id(&format!("blake3:{}", "ab".repeat(32))).unwrap();
+
+        let err = mark_kept(state.path(), bogus).unwrap_err();
+        assert!(err.to_string().contains("no such snapshot"), "{err}");
+        assert!(
+            kept_ids(state.path()).unwrap().is_empty(),
+            "a refused mark_kept must not write a marker"
+        );
+
+        // `roots()`/`plan()` still work normally afterward.
+        assert!(!roots(state.path()).unwrap().contains(&bogus));
+        plan(
+            state.path(),
+            std::time::SystemTime::now(),
+            &GcOptions::default(),
+        )
+        .unwrap();
     }
 
     #[test]
