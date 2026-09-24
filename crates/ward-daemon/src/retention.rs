@@ -31,6 +31,7 @@
 use std::path::Path;
 
 use ward_events::{LogReader, WardEvent};
+use ward_snapshot::SnapshotId;
 use ward_snapshot::gc::{GcOptions, RootSet, SweepPlan, SweepReport};
 
 use crate::attempt::candidate_snapshot_ids;
@@ -207,6 +208,25 @@ pub fn plan(state: &Path, now: std::time::SystemTime, options: &GcOptions) -> Re
 pub fn apply(state: &Path, plan: &SweepPlan, now: std::time::SystemTime) -> Result<SweepReport> {
     ward_snapshot::gc::apply(&cas_root(state), plan, now)
         .map_err(|e| Error::Snapshot(e.to_string()))
+}
+
+/// Mark `id` as explicitly kept (#151 item 4 — "explicit user-selected retention
+/// policy"): a user-kept restore backup, exempt from a `ward snapshot gc` sweep
+/// regardless of whether any other root in [`roots`] still points at it.
+/// Idempotent. `ward snapshot keep <id>`.
+pub fn mark_kept(state: &Path, id: SnapshotId) -> Result<()> {
+    ward_snapshot::gc::mark_kept(&cas_root(state), id).map_err(|e| Error::Snapshot(e.to_string()))
+}
+
+/// Undo [`mark_kept`]. Removing a marker that was never set is not an error.
+/// `ward snapshot unkeep <id>`.
+pub fn unmark_kept(state: &Path, id: SnapshotId) -> Result<()> {
+    ward_snapshot::gc::unmark_kept(&cas_root(state), id).map_err(|e| Error::Snapshot(e.to_string()))
+}
+
+/// Every id [`mark_kept`] currently marks. `ward snapshot kept`.
+pub fn kept_ids(state: &Path) -> Result<RootSet> {
+    ward_snapshot::gc::kept_ids(&cas_root(state)).map_err(|e| Error::Snapshot(e.to_string()))
 }
 
 #[cfg(test)]
@@ -466,6 +486,33 @@ mod tests {
 
         let roots = roots(state.path()).unwrap();
         assert!(roots.contains(&id));
+    }
+
+    #[test]
+    fn mark_kept_unmark_kept_and_kept_ids_round_trip_through_the_daemon_wrapper() {
+        // #151 item 4: `ward snapshot keep`/`unkeep`/`kept`'s own daemon-side
+        // wrappers, not the `ward_snapshot::gc` functions they forward to.
+        let state = tempfile::tempdir().unwrap();
+        let id = store_snapshot(state.path());
+        assert!(kept_ids(state.path()).unwrap().is_empty());
+
+        mark_kept(state.path(), id).unwrap();
+        assert!(kept_ids(state.path()).unwrap().contains(&id));
+        assert!(
+            roots(state.path()).unwrap().contains(&id),
+            "a kept id is a root"
+        );
+
+        // Idempotent: marking an already-kept id again is not an error.
+        mark_kept(state.path(), id).unwrap();
+        assert_eq!(kept_ids(state.path()).unwrap().len(), 1);
+
+        unmark_kept(state.path(), id).unwrap();
+        assert!(kept_ids(state.path()).unwrap().is_empty());
+        assert!(!roots(state.path()).unwrap().contains(&id));
+
+        // Undoing a marker that was never set is not an error either.
+        unmark_kept(state.path(), id).unwrap();
     }
 
     #[test]

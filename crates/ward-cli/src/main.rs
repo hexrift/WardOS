@@ -497,6 +497,24 @@ enum SnapshotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Mark a snapshot as explicitly kept (#151 item 4): a user-kept restore
+    /// backup, exempt from `ward snapshot gc` regardless of whether any other
+    /// retention root still points at it. Idempotent.
+    Keep {
+        /// The snapshot.
+        id: String,
+    },
+    /// Undo `keep`. Removing a marker that was never set is not an error.
+    Unkeep {
+        /// The snapshot.
+        id: String,
+    },
+    /// Every snapshot `keep` currently marks (#151 item 4).
+    Kept {
+        /// Emit a JSON array of ids instead of one per line.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The roles a snapshot may be created with from the command line.
@@ -594,6 +612,9 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Snapshot(SnapshotCmd::Cat { id, path }) => cmd_snapshot_cat(&id, &path),
         Command::Snapshot(SnapshotCmd::Usage { json }) => cmd_snapshot_usage(json),
         Command::Snapshot(SnapshotCmd::Gc { apply, json }) => cmd_snapshot_gc(apply, json),
+        Command::Snapshot(SnapshotCmd::Keep { id }) => cmd_snapshot_keep(&id),
+        Command::Snapshot(SnapshotCmd::Unkeep { id }) => cmd_snapshot_unkeep(&id),
+        Command::Snapshot(SnapshotCmd::Kept { json }) => cmd_snapshot_kept(json),
         Command::Evidence(EvidenceCmd::Append { dir, json }) => {
             cmd_evidence_append(&dir.unwrap_or_else(cwd), &json)
         }
@@ -1395,6 +1416,44 @@ fn cmd_snapshot_gc(apply: bool, json: bool) -> ward_daemon::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `ward snapshot keep <id>` (#151 item 4).
+fn cmd_snapshot_keep(id: &str) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let id = snapshot::parse_id(id)?;
+    retention::mark_kept(&state, id)?;
+    println!("  kept {id}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward snapshot unkeep <id>` (#151 item 4).
+fn cmd_snapshot_unkeep(id: &str) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let id = snapshot::parse_id(id)?;
+    retention::unmark_kept(&state, id)?;
+    println!("  unkept {id}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward snapshot kept [--json]` (#151 item 4).
+fn cmd_snapshot_kept(json: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let mut ids: Vec<String> = retention::kept_ids(&state)?
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    ids.sort();
+    if json {
+        println!("{}", to_json(&ids)?);
+    } else if ids.is_empty() {
+        println!("  no kept snapshots");
+    } else {
+        for id in &ids {
+            println!("  {id}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn to_json<T: serde::Serialize>(value: &T) -> ward_daemon::Result<String> {
     serde_json::to_string_pretty(value).map_err(|e| ward_daemon::Error::Project(e.to_string()))
 }
@@ -2135,6 +2194,34 @@ mod tests {
                 apply: true,
                 json: true
             })
+        ));
+    }
+
+    #[test]
+    fn snapshot_keep_unkeep_and_kept_parse() {
+        // #151 item 4: the explicit user-selected retention policy `gc`'s own
+        // retention roots already read back from (`ward_snapshot::gc::kept_ids`),
+        // but had no command that could ever set.
+        let id = "blake3:".to_owned() + &"ab".repeat(32);
+        let cli = Cli::try_parse_from(["ward", "snapshot", "keep", &id]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Keep { id: got }) if got == id
+        ));
+        let cli = Cli::try_parse_from(["ward", "snapshot", "unkeep", &id]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Unkeep { id: got }) if got == id
+        ));
+        let cli = Cli::try_parse_from(["ward", "snapshot", "kept"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Kept { json: false })
+        ));
+        let cli = Cli::try_parse_from(["ward", "snapshot", "kept", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Kept { json: true })
         ));
     }
 
