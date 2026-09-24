@@ -258,10 +258,12 @@ workload ([`security-model.md`](security-model.md) §6):
 resolver and proxy record ([`security-model.md`](security-model.md) §6.1), reproduced
 by CI on every pull request. ST-018 waits on the pause primitive; ST-029 is ahead.
 
-Signed releases are part of this phase's install story and wait on one decision: which
-key signs (a project key held by the maintainer, Sigstore keyless from the release
-workflow, or both), where its public half lives and how it rotates. Until that is
-recorded as a decision, releases carry a checksum only and the README says so.
+Signed releases are part of this phase's install story. The trust policy is recorded
+in [`ADR-0028`](decisions/ADR-0028-release-provenance-and-trusted-updates.md):
+workflow-bound provenance with a pinned repository/workflow identity and portable
+Sigstore evidence where needed, separate from the Secure Boot chain. Until the
+release workflow and verifier land, releases carry a checksum only and the README
+and install guide must continue to say so.
 
 ## Phase 8 — Installer optimisation
 
