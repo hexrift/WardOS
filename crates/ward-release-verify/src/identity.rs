@@ -115,8 +115,21 @@ pub enum IdentityFailure {
 /// Mirrors the tag grammar in `scripts/release/check-version.sh` and
 /// `scripts/release/generate-manifest.sh`:
 /// `^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$`.
-fn is_meta_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '.' || c == '-'
+fn is_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-'
+}
+
+/// A dot-separated identifier list (pre-release or build metadata) is well-formed only
+/// when every `.`-separated segment is non-empty and made up of `is_id_char` bytes —
+/// matching `version::parse`'s own `parse_dotted_identifiers` (`version.rs`) exactly.
+/// Checking the whole substring at once against a character class that also allows `.`
+/// (as an earlier revision of this function did) is not equivalent: it silently accepts
+/// an empty segment — a lone `.` or a doubled `..` — that `parse_dotted_identifiers`
+/// rejects, letting this function's notion of a well-formed tag drift from `version.rs`'s
+/// despite this doc comment's claim that the two mirror each other.
+fn is_dotted_identifier_list(s: &str) -> bool {
+    s.split('.')
+        .all(|part| !part.is_empty() && part.chars().all(is_id_char))
 }
 
 fn is_release_tag(tag: &str) -> bool {
@@ -129,7 +142,7 @@ fn is_release_tag(tag: &str) -> bool {
         None => (rest, None),
     };
     if let Some(build) = build
-        && (build.is_empty() || !build.chars().all(is_meta_char))
+        && (build.is_empty() || !is_dotted_identifier_list(build))
     {
         return false;
     }
@@ -139,7 +152,7 @@ fn is_release_tag(tag: &str) -> bool {
         None => (rest, None),
     };
     if let Some(pre) = pre
-        && (pre.is_empty() || !pre.chars().all(is_meta_char))
+        && (pre.is_empty() || !is_dotted_identifier_list(pre))
     {
         return false;
     }
@@ -324,6 +337,32 @@ mod tests {
             evaluate_identity(&claims),
             Err(IdentityFailure::InvalidSourceRef { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_a_tag_with_an_empty_pre_release_segment() {
+        // Regression for a real divergence from `version::parse`'s own grammar:
+        // `is_release_tag` used to check the whole pre-release/build substring against
+        // a character class that also allowed `.`, so a lone `.` (or a doubled `..`)
+        // slipped through as "well-formed" even though it is an empty dotted-identifier
+        // segment -- exactly what `version::parse`'s `parse_dotted_identifiers` rejects.
+        // `v1.2.3-.` and `v1.2.3-a..b` must be refused here the same way
+        // `version::parse` refuses them, so the two can never silently disagree on what
+        // counts as a release tag.
+        for tag in ["refs/tags/v1.2.3-.", "refs/tags/v1.2.3-a..b"] {
+            let signing_identity =
+                format!("https://github.com/hexrift/WardOS/.github/workflows/release.yml@{tag}");
+            let mut claims = valid_claims();
+            claims.source_ref = tag;
+            claims.signing_identity = &signing_identity;
+            assert!(
+                matches!(
+                    evaluate_identity(&claims),
+                    Err(IdentityFailure::InvalidSourceRef { .. })
+                ),
+                "expected {tag} to be rejected as malformed"
+            );
+        }
     }
 
     #[test]
