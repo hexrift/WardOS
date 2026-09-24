@@ -1411,12 +1411,16 @@ stop_refresh() {
     fi
   fi
 
-  [[ -n $worker ]] && kill -CONT "$worker" 2>/dev/null || true
+  if [[ -n $worker ]]; then
+    kill -CONT "$worker" 2>/dev/null || true
+  fi
   kill "$pid" 2>/dev/null || true
   wait_deadline "$pid" 1
   if kill -0 "$pid" 2>/dev/null; then
     kill -KILL "$pid" 2>/dev/null || true
-    [[ -n $worker ]] && kill -CONT "$worker" 2>/dev/null || true
+    if [[ -n $worker ]]; then
+      kill -CONT "$worker" 2>/dev/null || true
+    fi
     wait_deadline "$pid" 2
   fi
   kill -0 "$pid" 2>/dev/null || rm -f "$refresh_file"
