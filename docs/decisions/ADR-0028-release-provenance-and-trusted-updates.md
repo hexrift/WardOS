@@ -27,21 +27,46 @@ outside the GitHub release UI or API.
 2. The release trust policy will pin the expected repository and release workflow.
    Verification must reject a valid signature from an unexpected repository,
    workflow, ref, or artifact identity; “any valid signature” is not an acceptable
-   policy.
+   policy. Concretely, for GitHub Actions keyless signing the policy pins the OIDC
+   issuer `https://token.actions.githubusercontent.com`, the signing identity (SAN)
+   `https://github.com/hexrift/WardOS/.github/workflows/release.yml@refs/tags/v*`,
+   and a source ref that is a `v*` release tag — never a branch, a pull request, or
+   a workflow other than `release.yml`. These exact claims are what an “identity
+   mismatch” rejection is tested against.
 3. A detached artifact will carry or reference a Sigstore bundle when the GitHub
    attestation cannot be retrieved during verification. The bundle is a transport
    format for the same identity policy, not a second unscoped trust root.
 4. Each release will publish a machine-readable manifest containing at least:
    source commit, immutable tag, artifact name and digest, target architecture,
    image/bootc reference where applicable, builder/toolchain metadata, provenance
-   reference, and compatibility/rollback metadata.
+   reference, and compatibility/rollback metadata. The builder/toolchain metadata
+   is the SLSA provenance predicate itself (or fields derived from it), not a
+   hand-written copy that could disagree with the attestation. The published
+   assets a manifest names are immutable once released: a re-run of the release
+   workflow at the same tag must reproduce byte-identical assets and refuse to
+   overwrite differing bytes (the release workflow already enforces this today
+   via `scripts/release/download-published.sh` + `check-assets.sh`), so the
+   manifest and its attestation cannot be silently repointed at new bytes under a
+   published tag.
 5. The update state machine will expose these distinct results:
-   `downloaded` → `digest-checked` → `provenance-verified` → `staged` → `booted`.
-   A failed or missing provenance check is a visible verification failure and
-   blocks staging; it must never be reported as “no update”.
+   `downloaded` → `digest-checked` → `provenance-verified` → `staged` → `booted`
+   → `health-checked` → `committed`, with `rolled-back` as the terminal state of a
+   boot that failed its health check. A failed or missing provenance check is a
+   visible verification failure and blocks staging; it must never be reported as
+   “no update”. Verification also enforces an anti-rollback floor: an update whose
+   version is lower than the currently committed one is refused even when its
+   signature and identity are valid, unless the user explicitly overrides it — a
+   validly signed older release still carries whatever was fixed since.
 6. Artifact provenance is separate from Secure Boot. A verified release artifact
    does not claim that its UKI, bootloader, TPM policy, or platform key chain is
-   verified. Those controls remain part of the Phase 7 boot-chain work.
+   verified. Those controls remain part of the Phase 7 boot-chain work. For the
+   OCI image and `bootc` update path specifically, verification uses the image's
+   own `/etc/containers/policy.json` sigstore policy (the mechanism already
+   sketched in [`image/keys/README.md`](../../image/keys/README.md) and
+   [`image/boot/README.md`](../../image/boot/README.md)) rather than a second,
+   parallel verifier, and it binds to the resolved image digest, never to a
+   mutable tag such as `:latest` — the two must not describe different trust
+   policies that can drift apart.
 7. The first implementation will not place a long-lived private signing key in
    this repository or on a developer workstation. Keyless workflow identity and
    transparency evidence are preferred; emergency recovery and policy rotation
@@ -55,12 +80,32 @@ The verifier must check, in order:
 2. the cryptographic digest of every artifact;
 3. the provenance signature/bundle and transparency evidence;
 4. the repository, workflow, source commit, release ref, artifact name, and
-   digest against the WardOS trust policy;
-5. compatibility and rollback metadata before staging.
+   digest against the WardOS trust policy — for the OCI path, that the attested
+   digest is the one the tag resolved to, not the tag string;
+5. the anti-rollback floor (§5): the candidate version is not lower than the
+   committed one, absent an explicit override;
+6. compatibility and rollback metadata before staging.
 
 The verifier must make the reason for rejection actionable. In particular,
 missing provenance, an identity mismatch, an expired/invalid bundle, a digest
-mismatch, and an unsupported architecture are separate failure causes.
+mismatch, an unsupported architecture, and a refused downgrade are separate
+failure causes.
+
+### Trust roots and bootstrap
+
+Two roots must exist before any of the checks above can run, and the ADR treats
+their distribution as part of the design, not an implementation detail:
+
+- **The Sigstore trusted root** (the Fulcio and Rekor keys) is what makes an
+  offline check meaningful. It ships on the image, is refreshed through
+  Sigstore's own TUF-based update mechanism, and a stale or missing root is its
+  own distinct, actionable failure — never a silent pass. Offline verification
+  succeeds only against a cached bundle *and* a still-valid trusted root.
+- **The verifier and its policy themselves** reach the user before any release
+  can be checked: they ship on the image, and for the tarball install path
+  (`install.sh`, itself downloaded) the guide documents a first-trust step
+  (`gh attestation verify`, or the shipped verifier) rather than assuming the
+  downloaded script can vouch for itself.
 
 ## Acceptance cases
 
@@ -74,8 +119,11 @@ The implementation is complete only when automated tests cover at least:
 | Valid artifact for another architecture | Compatibility failure; staging blocked |
 | Missing or incomplete artifact set | Completeness failure; staging blocked |
 | Missing bundle/attestation | Provenance failure; staging blocked |
+| Validly signed release older than the committed one | Downgrade refused; staging blocked absent explicit override |
+| OCI tag repointed to a different (unattested) digest | Identity/digest failure; staging blocked |
 | Offline verification with a cached valid bundle | Provenance verified if policy and evidence are valid |
-| Failed boot after a verified update | Existing rollback path remains visible and usable |
+| Offline verification with a stale/absent Sigstore trusted root | Distinct trusted-root failure; not a silent pass |
+| Failed boot after a verified update | Health check fails; state reaches `rolled-back`, existing rollback path visible and usable |
 
 ## Scope of the implementation
 
