@@ -44,7 +44,13 @@ mock ward 'case "$*" in
     ;;
   "resume --session "*) echo running >"$WARD_STATE_FILE" ;;
   "resume "*) echo running >"$WARD_STATE_FILE" ;;
-  "stop "*) echo none >"$WARD_STATE_FILE" ;;
+  "stop "*)
+    if [[ -f "$TMP/stop-refused" ]]; then
+      echo "ward: daemon: stop could not confirm every sandboxed process of session sess_a ended: 2 ended, 1 still present after 2s" >&2
+      exit 1
+    fi
+    echo none >"$WARD_STATE_FILE"
+    ;;
   "watch "*) : ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
@@ -90,6 +96,23 @@ echo paused >"$WARD_STATE_FILE"
 WARDOS_MENU_CHOICE='Stop & restore entry state' "$pause"
 assert_logged '^ward stop --restore-entry /home/dev/payments-api$'
 assert_logged '^notify-send .*entry state restored'
+
+# --- a stop the daemon refuses (#145 item 5: termination not confirmed) is never
+# announced as "Session stopped": its own critical notification carries ward's words ---
+: >"$MOCK_LOG"
+echo paused >"$WARD_STATE_FILE"
+touch "$TMP/stop-refused"
+WARDOS_MENU_CHOICE='Stop & preserve workspace' "$pause" 2>/dev/null && fail "a refused stop is an error"
+assert_logged '^ward stop /home/dev/payments-api$'
+assert_logged '^notify-send -a WardOS -u critical STOP NOT CONFIRMED ward: daemon: stop could not confirm .* 1 still present after 2s$'
+assert_not_logged 'Session stopped'
+assert_eq "$(cat "$WARD_STATE_FILE")" paused
+: >"$MOCK_LOG"
+WARDOS_MENU_CHOICE='Stop & restore entry state' "$pause" 2>/dev/null && fail "a refused stop is an error"
+assert_logged '^ward stop --restore-entry /home/dev/payments-api$'
+assert_logged 'STOP NOT CONFIRMED'
+assert_not_logged 'entry state restored'
+rm -f "$TMP/stop-refused"
 
 # --- Inspect activity opens the observer in a terminal; the session stays paused -
 : >"$MOCK_LOG"

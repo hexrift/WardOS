@@ -1054,6 +1054,39 @@ pub enum WardEvent {
         /// The budget, in seconds, the command exceeded.
         budget_secs: u64,
     },
+
+    // -- intervention, continued (origin: Wardd; #145 item 5) --
+    /// `ward stop` (`Request::Stop`) terminated the session's sandboxed workloads
+    /// before evidence sealing: every process of the session's sandboxes was frozen
+    /// (or already was, from a pause), killed, and then watched for a bounded time
+    /// (`pause::STOP_SETTLE`) until it was confirmed gone. Appended only when there
+    /// was something to terminate — a stop with no sandbox running writes only the
+    /// usual `SessionEnded`, as before.
+    ///
+    /// `pending == 0` is the confirmed outcome: every process the stop found is
+    /// gone, and `SessionEnded` follows immediately. `pending > 0` means the daemon
+    /// could not confirm that many processes ended within the bound (a process
+    /// stuck in uninterruptible sleep, typically). The stop is then *refused*
+    /// rather than reported as done: the log is **not** sealed, the session is held
+    /// paused (marker written, so the proxy refuses; approvals held) as the safest
+    /// state it can preserve, and a later `ward stop` retries. A reader must never
+    /// treat a `pending > 0` record as a completed stop (#145 item 4, "do not
+    /// report a full success after a partial operation").
+    ///
+    /// This is the explicit difference between stopping and log-only closure
+    /// (#145 item 5): `Request::Seal` still seals without touching a running
+    /// sandbox; `Request::Stop` does not seal until this confirmation holds.
+    ///
+    /// Appended at the end of the catalogue for the same reason every other
+    /// late variant is: postcard identifies variants by declaration index.
+    WorkloadsTerminated {
+        /// Processes the stop found and confirmed gone.
+        ended: u32,
+        /// Processes killed but not confirmed gone when the bound expired. Never
+        /// the pid list itself, for the same reason `SessionPauseUnsettled` keeps
+        /// only a count.
+        pending: u32,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -1101,11 +1134,12 @@ pub enum EventKind {
     VerificationCancelled = 35,
     VerificationInterrupted = 36,
     VerificationTimedOut = 37,
+    WorkloadsTerminated = 38,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 38] = [
+    pub const ALL: [EventKind; 39] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -1144,6 +1178,7 @@ impl EventKind {
         EventKind::VerificationCancelled,
         EventKind::VerificationInterrupted,
         EventKind::VerificationTimedOut,
+        EventKind::WorkloadsTerminated,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
@@ -1194,6 +1229,7 @@ impl EventKind {
             EventKind::VerificationCancelled => "verification_cancelled",
             EventKind::VerificationInterrupted => "verification_interrupted",
             EventKind::VerificationTimedOut => "verification_timed_out",
+            EventKind::WorkloadsTerminated => "workloads_terminated",
         }
     }
 
@@ -1227,6 +1263,7 @@ impl EventKind {
                 | EventKind::EntryRestored
                 | EventKind::ObservationsDropped
                 | EventKind::SessionPauseUnsettled
+                | EventKind::WorkloadsTerminated
         )
     }
 }
@@ -1412,6 +1449,7 @@ impl WardEvent {
             WardEvent::VerificationCancelled { .. } => EventKind::VerificationCancelled,
             WardEvent::VerificationInterrupted { .. } => EventKind::VerificationInterrupted,
             WardEvent::VerificationTimedOut { .. } => EventKind::VerificationTimedOut,
+            WardEvent::WorkloadsTerminated { .. } => EventKind::WorkloadsTerminated,
         }
     }
 
@@ -1522,6 +1560,7 @@ mod tests {
         assert!(EventKind::VerificationPassed.is_critical());
         assert!(EventKind::SessionPaused.is_critical());
         assert!(EventKind::SessionPauseUnsettled.is_critical());
+        assert!(EventKind::WorkloadsTerminated.is_critical());
         assert!(!EventKind::FileRead.is_critical());
         assert!(!EventKind::AgentClaim.is_critical());
     }

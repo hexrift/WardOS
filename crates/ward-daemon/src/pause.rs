@@ -20,6 +20,12 @@
 //! Only the sandbox trees are touched: the `ward` client process that owns the
 //! proxy and the hook listener keeps running, which is what lets the proxy
 //! answer `paused by ward` and the desktop show the state.
+//!
+//! **Stop** ([`terminate`], #145 item 5) reaches the same trees the same way:
+//! freeze them (unless a pause already holds them), kill every process, and
+//! watch until each is confirmed gone, bounded by [`STOP_SETTLE`]. `ward stop`
+//! seals the log only after that confirmation; a stop that could not confirm it
+//! is refused and the session is held paused instead.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -199,6 +205,195 @@ pub fn kill_frozen(frozen: &Frozen) {
         while fs::remove_dir(dir).is_err() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+}
+
+/// How long `ward stop` watches a session's killed sandbox processes before it
+/// stops waiting for them to be confirmed gone (#145 item 5). `SIGKILL` cannot be
+/// caught, but a process in uninterruptible sleep only dies once it wakes, so the
+/// wait is bounded; what it could not confirm is reported, never assumed.
+pub const STOP_SETTLE: Duration = Duration::from_secs(2);
+
+/// What [`terminate`] achieved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Termination {
+    /// Processes found (in the freeze, or by a rescan while waiting) and
+    /// confirmed gone — exited, or a zombie waiting only to be reaped.
+    pub ended: u32,
+    /// What was killed but not confirmed gone within [`STOP_SETTLE`]: `None`
+    /// when everything ended (or nothing ran). Its `pids` are only the pending
+    /// ones, so a caller can hold them as a pause and retry.
+    pub remaining: Option<Frozen>,
+}
+
+impl Termination {
+    /// Nothing ran, nothing was touched.
+    #[must_use]
+    pub const fn nothing() -> Self {
+        Self {
+            ended: 0,
+            remaining: None,
+        }
+    }
+
+    /// How many processes were not confirmed gone.
+    #[must_use]
+    pub fn pending(&self) -> u32 {
+        self.remaining
+            .as_ref()
+            .map_or(0, |f| u32::try_from(f.pids.len()).unwrap_or(u32::MAX))
+    }
+
+    /// Whether the stop found anything to terminate at all.
+    #[must_use]
+    pub fn touched_anything(&self) -> bool {
+        self.ended > 0 || self.remaining.is_some()
+    }
+}
+
+/// End every process of `session`'s sandboxes and confirm it is gone (`ward
+/// stop`, #145 item 5): the explicit counterpart of log-only closure.
+///
+/// `held` is the freeze of a pause already in force, if any; otherwise the tree
+/// is frozen first ([`freeze`]), children before parents, so nothing in it can
+/// react to — or fork around — the kill that follows. Every frozen process then
+/// gets `SIGKILL` (a stopped or cgroup-frozen process takes a fatal signal as it
+/// is), and for the freezer path `cgroup.kill` ends whatever the cgroup holds,
+/// including anything forked after the scan. The session is then rescanned and
+/// watched for up to [`STOP_SETTLE`]: any sandbox process that appears in the
+/// meantime is killed too, and the call returns once every process seen is
+/// confirmed gone, or the bound expires with some still present.
+///
+/// A session with no sandbox running (and no held freeze) is not touched at all:
+/// no cgroup is created, nothing is signalled, and [`Termination::nothing`] is
+/// returned.
+#[must_use]
+pub fn terminate(session: &str, held: Option<Frozen>) -> Termination {
+    let proc = Path::new("/proc");
+    let frozen = match held {
+        Some(frozen) => frozen,
+        None if sandbox_pids(proc, session).is_empty() => return Termination::nothing(),
+        None => freeze(session),
+    };
+    if let Some(dir) = &frozen.cgroup {
+        let _ = fs::write(dir.join("cgroup.kill"), "1");
+    }
+    let (ended, pending) = terminate_with(
+        &frozen.pids,
+        STOP_SETTLE,
+        || sandbox_pids(proc, session),
+        |pid| ended_or_gone(proc, pid),
+        |pid| {
+            let _ = kill(Pid::from_raw(as_pid(pid)), Signal::SIGKILL);
+        },
+    );
+    let cgroup = frozen.cgroup.and_then(|dir| {
+        // Nothing left to hold frozen: let the kernel finish reaping and remove
+        // the directory (it stays until every member is gone).
+        let _ = fs::write(dir.join("cgroup.freeze"), "0");
+        if pending.is_empty() {
+            let _ = crate::daemon::wait_until(FREEZE_SETTLE, || fs::remove_dir(&dir).is_ok());
+            None
+        } else {
+            Some(dir)
+        }
+    });
+    Termination {
+        ended,
+        remaining: (!pending.is_empty()).then_some(Frozen {
+            method: frozen.method,
+            pids: pending,
+            cgroup,
+        }),
+    }
+}
+
+/// The pause-marker text a refused stop leaves behind: what the proxy's
+/// `paused by ward` is holding for.
+#[must_use]
+pub fn stop_hold_reason(pending: u32) -> String {
+    format!(
+        "ward stop: {pending} process(es) not confirmed ended within {}s",
+        STOP_SETTLE.as_secs()
+    )
+}
+
+/// The refusal a stop answers with when it could not confirm termination:
+/// what ended, what is still present, what state the session was left in
+/// (`held`), and — never silently dropped — any failure to write the marker
+/// or the record of it.
+#[must_use]
+pub fn stop_refusal(
+    session: &str,
+    ended: u32,
+    pending: u32,
+    held: &str,
+    marker: Option<&Error>,
+    logged: Option<&Error>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut message = format!(
+        "stop could not confirm every sandboxed process of session {session} ended: {ended} \
+         ended, {pending} still present after {}s. The log is not sealed; {held}",
+        STOP_SETTLE.as_secs()
+    );
+    if let Some(e) = marker {
+        let _ = write!(message, "; the pause marker could not be written ({e})");
+    }
+    if let Some(e) = logged {
+        let _ = write!(message, "; the record of this could not be written ({e})");
+    }
+    message
+}
+
+/// [`terminate`]'s kill-and-confirm loop with every real dependency injected:
+/// `rescan` finds the session's sandbox processes now, `gone` says whether a
+/// pid has ended, `kill` sends it `SIGKILL`. Kills every pid in `frozen` and
+/// every pid a rescan finds, then waits (polling every 20 ms, bounded by
+/// `bound`) until everything it has seen is gone. Returns how many ended and
+/// which were still present when the bound expired. The seam a test uses to
+/// exercise a process that never dies, one that appears mid-stop, and a zombie,
+/// deterministically.
+fn terminate_with(
+    frozen: &[u32],
+    bound: Duration,
+    mut rescan: impl FnMut() -> Vec<u32>,
+    gone: impl Fn(u32) -> bool,
+    mut kill_one: impl FnMut(u32),
+) -> (u32, Vec<u32>) {
+    let mut seen: Vec<u32> = Vec::with_capacity(frozen.len());
+    for &pid in frozen {
+        if !seen.contains(&pid) {
+            seen.push(pid);
+        }
+        kill_one(pid);
+    }
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    let deadline = Instant::now() + bound;
+    loop {
+        for pid in rescan() {
+            if !seen.contains(&pid) {
+                seen.push(pid);
+            }
+            // A live sandbox process found again is killed again: harmless for
+            // one already dying, and it catches one forked after the freeze.
+            kill_one(pid);
+        }
+        let pending: Vec<u32> = seen.iter().copied().filter(|&pid| !gone(pid)).collect();
+        if pending.is_empty() || Instant::now() >= deadline {
+            return (count(seen.len() - pending.len()), pending);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether `pid` has ended: no longer in `proc`, or a zombie (`Z`) / dead (`X`)
+/// entry waiting only to be reaped by its parent (for a sandbox root, the `ward`
+/// process that launched it) — it runs no code and holds no file open.
+fn ended_or_gone(proc: &Path, pid: u32) -> bool {
+    match fs::read_to_string(proc.join(pid.to_string()).join("stat")) {
+        Ok(stat) => matches!(proc_state(&stat), Some('Z' | 'X' | 'x')),
+        Err(_) => true,
     }
 }
 
@@ -549,6 +744,82 @@ pub fn clear_marker(state: &Path, session: &str) -> Result<()> {
     }
 }
 
+/// A real process tree the scan recognises as a session's sandbox, for tests of
+/// `ward stop` against real processes where no `bwrap` is installed: a copy of
+/// `sh` named `bwrap` whose arguments bind the session's run directory (exactly
+/// what [`sandbox_roots`] matches), looping a `sleep` child under it. Killed and
+/// reaped on drop whatever the test did.
+#[cfg(test)]
+pub(crate) struct FakeSandbox {
+    /// The session id the tree belongs to (unique per test process).
+    pub session: String,
+    child: std::process::Child,
+    _bin: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl FakeSandbox {
+    /// Start the tree for a session named from `stem` and this test process, and
+    /// wait until the scan finds both the shell and its child.
+    pub(crate) fn spawn(stem: &str) -> Self {
+        // `run_dir_path` keys on the last ten characters: keep them unique per
+        // fixture and per process so parallel tests never see each other's tree.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 10_000;
+        Self::spawn_for(&format!(
+            "{stem}_{n:04}{:06}",
+            std::process::id() % 1_000_000
+        ))
+    }
+
+    /// [`Self::spawn`] for an existing session id (a real `Session`'s own).
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    pub(crate) fn spawn_for(session: &str) -> Self {
+        let session = session.to_owned();
+        let bin = tempfile::tempdir().unwrap();
+        let bwrap = bin.path().join("bwrap");
+        fs::copy("/bin/sh", &bwrap).unwrap();
+        let child = std::process::Command::new(&bwrap)
+            .args(["-c", "while :; do sleep 0.05; done"])
+            .arg(run_dir_path(&session).join("proxy.sock"))
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let sandbox = Self {
+            session,
+            child,
+            _bin: bin,
+        };
+        if !crate::daemon::wait_until(Duration::from_secs(5), || {
+            sandbox_pids(Path::new("/proc"), &sandbox.session).len() >= 2
+        }) {
+            panic!("the fake sandbox never showed up in /proc");
+        }
+        sandbox
+    }
+
+    /// Whether the tree's root died of `SIGKILL` (reaping it).
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn was_killed(&mut self) -> bool {
+        let status = self.child.wait().unwrap();
+        std::os::unix::process::ExitStatusExt::signal(&status) == Some(9)
+    }
+
+    /// Whether the tree's root is still running (not exited, not a zombie).
+    pub(crate) fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+            && !ended_or_gone(Path::new("/proc"), self.child.id())
+    }
+}
+
+#[cfg(test)]
+impl Drop for FakeSandbox {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -846,6 +1117,99 @@ mod tests {
             Some(2),
             "222 and 333 read as still not stopped"
         );
+    }
+
+    /// #145 item 5: every pid of the freeze is killed, a pid a rescan finds
+    /// mid-stop (forked after the freeze) is killed and counted too, and the loop
+    /// returns as soon as everything seen is gone. Deterministic: nothing real is
+    /// signalled and `gone` answers from a shared set the fake `kill` fills.
+    #[test]
+    fn terminate_kills_the_freeze_and_what_a_rescan_finds_then_confirms_gone() {
+        use std::cell::RefCell;
+        let killed = RefCell::new(Vec::new());
+        let mut scans = 0;
+        let (ended, pending) = terminate_with(
+            &[14, 13, 11],
+            Duration::from_secs(5),
+            || {
+                scans += 1;
+                // A child forked between the scan and the kill shows up once.
+                if scans == 1 { vec![11, 15] } else { vec![] }
+            },
+            |pid| killed.borrow().contains(&pid),
+            |pid| killed.borrow_mut().push(pid),
+        );
+        assert_eq!(ended, 4, "14, 13, 11 and the late 15");
+        assert!(pending.is_empty());
+        let killed = killed.into_inner();
+        for pid in [14, 13, 11, 15] {
+            assert!(killed.contains(&pid), "{pid} was killed: {killed:?}");
+        }
+        assert_eq!(
+            &killed[..3],
+            [14, 13, 11],
+            "the freeze's order, children first"
+        );
+    }
+
+    /// A process that does not die within the bound (uninterruptible sleep) is
+    /// reported pending, never counted as ended — the stop must not claim more
+    /// than it could confirm (#145 item 4).
+    #[test]
+    fn terminate_reports_what_is_still_present_when_the_bound_expires() {
+        let (ended, pending) = terminate_with(
+            &[20, 21, 22],
+            Duration::from_millis(60),
+            Vec::new,
+            |pid| pid != 21,
+            |_| {},
+        );
+        assert_eq!(ended, 2);
+        assert_eq!(pending, [21]);
+        // Nothing at all to kill: nothing ended, nothing pending, at once.
+        assert_eq!(
+            terminate_with(&[], Duration::from_secs(5), Vec::new, |_| false, |_| {}),
+            (0, vec![])
+        );
+    }
+
+    #[test]
+    fn a_zombie_or_a_missing_pid_counts_as_ended() {
+        let proc = tempfile::tempdir().unwrap();
+        for (pid, state) in [(30, 'Z'), (31, 'T'), (32, 'R'), (33, 'X')] {
+            let dir = proc.path().join(pid.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("stat"), format!("{pid} (sh) {state} 1 1 1 0 -1")).unwrap();
+        }
+        assert!(ended_or_gone(proc.path(), 30), "a zombie runs no code");
+        assert!(!ended_or_gone(proc.path(), 31), "stopped is not ended");
+        assert!(!ended_or_gone(proc.path(), 32));
+        assert!(ended_or_gone(proc.path(), 33));
+        assert!(ended_or_gone(proc.path(), 99), "gone from /proc");
+    }
+
+    /// A session with nothing running is left untouched: no freeze, no cgroup,
+    /// nothing reported.
+    #[test]
+    fn terminating_a_session_with_nothing_running_touches_nothing() {
+        let t = terminate("sess_nothing_to_stop", None);
+        assert_eq!(t, Termination::nothing());
+        assert!(!t.touched_anything());
+        assert_eq!(t.pending(), 0);
+    }
+
+    /// The whole of [`terminate`] on a real process tree the scan recognises as a
+    /// session sandbox: a copy of `sh` named `bwrap` whose arguments bind the
+    /// session's run directory, with a child looping under it. Every process is
+    /// found, frozen, killed and confirmed gone within the bound.
+    #[test]
+    fn terminate_ends_a_real_sandbox_shaped_tree() {
+        let mut sandbox = FakeSandbox::spawn("sess_stoptree");
+        let t = terminate(&sandbox.session, None);
+        assert_eq!(t.remaining, None, "everything confirmed gone: {t:?}");
+        assert!(t.ended >= 2, "{t:?}");
+        assert!(sandbox.was_killed(), "killed, not merely stopped");
+        assert!(sandbox_pids(Path::new("/proc"), &sandbox.session).is_empty());
     }
 
     /// A session the user has already paused is already frozen; the capture

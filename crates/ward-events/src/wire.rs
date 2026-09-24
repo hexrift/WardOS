@@ -381,7 +381,8 @@ impl Filter {
     /// says the record the user is being shown is knowingly incomplete, which no
     /// observer mode may hide. `SessionPauseUnsettled` is in Quiet for the same
     /// reason: it says the pause the user is being shown is knowingly unconfirmed
-    /// (#145 item 4).
+    /// (#145 item 4). `WorkloadsTerminated` is the host ending the session's
+    /// workloads on `ward stop` (#145 item 5), an intervention like pause.
     #[must_use]
     pub const fn quiet() -> Self {
         Self {
@@ -400,6 +401,7 @@ impl Filter {
                 .with(EventKind::VerificationTimedOut)
                 .with(EventKind::SessionPaused)
                 .with(EventKind::SessionPauseUnsettled)
+                .with(EventKind::WorkloadsTerminated)
                 .with(EventKind::SessionResumed)
                 .with(EventKind::EntryRestored)
                 .with(EventKind::ObservationsDropped)

@@ -473,6 +473,10 @@ fn summary(event: &WardEvent) -> String {
             reason,
             pending,
         } => format!("{} · {reason} · {pending} pending", method.as_str()),
+        WardEvent::WorkloadsTerminated { ended, pending: 0 } => format!("{ended} ended"),
+        WardEvent::WorkloadsTerminated { ended, pending } => {
+            format!("{ended} ended · {pending} not confirmed · stop refused")
+        }
         WardEvent::SessionResumed { paused_for } => format!("paused {}s", paused_for.as_secs()),
         WardEvent::EntryRestored {
             snapshot,

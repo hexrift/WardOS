@@ -475,6 +475,7 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
         ),
         WardEvent::SessionPaused { .. }
         | WardEvent::SessionPauseUnsettled { .. }
+        | WardEvent::WorkloadsTerminated { .. }
         | WardEvent::SessionResumed { .. }
         | WardEvent::EntryRestored { .. }
         | WardEvent::ObservationsDropped { .. } => intervention_cells(&rec.event)?,
@@ -515,6 +516,23 @@ fn intervention_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)>
                 if *pending == 1 { "" } else { "es" },
                 method.as_str(),
                 reason.as_str()
+            ),
+        ),
+        WardEvent::WorkloadsTerminated { ended, pending: 0 } => (
+            "STOP",
+            Tone::Deny,
+            format!(
+                "{ended} sandboxed process{} ended · confirmed gone",
+                if *ended == 1 { "" } else { "es" }
+            ),
+        ),
+        WardEvent::WorkloadsTerminated { ended, pending } => (
+            "STOP?",
+            Tone::Warn,
+            format!(
+                "{pending} process{} not confirmed ended ({ended} did) · stop refused · \
+                 session held paused, log not sealed",
+                if *pending == 1 { "" } else { "es" }
             ),
         ),
         WardEvent::SessionResumed { paused_for } => (
@@ -1722,6 +1740,42 @@ mod tests {
             }),
             "an unconfirmed freeze must not render with the same verb as a clean pause"
         );
+    }
+
+    /// #145 item 5: a stop that ended the session's processes and one that could
+    /// not confirm it get different rows — the refused one amber and saying the
+    /// log is not sealed, never the confirmed row's wording.
+    #[test]
+    fn workloads_terminated_rows_distinguish_a_confirmed_stop_from_a_refused_one() {
+        use ward_events::{Blake3Hash, Chain, Origin, SessionId, Timestamp};
+        let mut chain = Chain::genesis(SessionId::from_u128(4), Blake3Hash::ZERO);
+        let mut row = |ended, pending| {
+            let rec = chain
+                .append(
+                    Origin::Wardd,
+                    WardEvent::WorkloadsTerminated { ended, pending },
+                    Timestamp::mono(std::time::Duration::from_secs(2)),
+                )
+                .unwrap();
+            observer_row(&rec).unwrap()
+        };
+        let done = row(3, 0);
+        assert_eq!(
+            plain(&done),
+            "00:02  STOP  3 sandboxed processes ended · confirmed gone"
+        );
+        assert!(done.contains(DENY), "{done:?}");
+        assert_eq!(
+            plain(&row(1, 0)),
+            "00:02  STOP  1 sandboxed process ended · confirmed gone"
+        );
+        let refused = row(2, 1);
+        assert_eq!(
+            plain(&refused),
+            "00:02  STOP? 1 process not confirmed ended (2 did) · stop refused · session \
+             held paused, log not sealed"
+        );
+        assert!(refused.contains(WARN), "{refused:?}");
     }
 
     fn cells_verb(rec: &EventRecord) -> &'static str {

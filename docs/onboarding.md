@@ -153,7 +153,8 @@ the verified candidate, the current digest and how many entries differ.
 An agent that weakened a protected test changed nothing the verifier reads, so a
 shortcut fails here even when the agent's own run passed.
 
-`ward stop` seals the log (`■ WARD … SEALED`); `ward replay <events.log> --verify`
+`ward stop` ends the agent's sandboxed processes, confirms they are gone, and then
+seals the log (`■ WARD … SEALED`); `ward replay <events.log> --verify`
 checks the chain later, anywhere.
 
 ## What the bar shows at each step

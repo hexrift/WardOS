@@ -198,6 +198,21 @@ impl SessionState {
                 self.before_pause = self.agent;
                 self.agent = Some(AgentState::PauseUnsettled);
             }
+            // #145 item 5: a `ward stop` the daemon refused because it could not
+            // confirm every sandboxed process ended leaves the session held
+            // paused over what is still there — unconfirmed, exactly the state
+            // an unsettled pause is, and never a clean `Paused` or `Finished`.
+            // A confirmed stop (`pending == 0`) changes nothing here: its
+            // `SessionEnded` follows at once.
+            WardEvent::WorkloadsTerminated { pending, .. } if *pending > 0 => {
+                if !matches!(
+                    self.agent,
+                    Some(AgentState::Paused | AgentState::PauseUnsettled)
+                ) {
+                    self.before_pause = self.agent;
+                }
+                self.agent = Some(AgentState::PauseUnsettled);
+            }
             WardEvent::SessionResumed { .. } => {
                 self.agent = self.before_pause;
                 self.before_pause = None;
@@ -1065,5 +1080,44 @@ mod tests {
             Some(AgentState::Working),
             "resume restores what the agent said last before the (unsettled) pause"
         );
+    }
+
+    /// #145 item 5: a refused stop (`WorkloadsTerminated { pending > 0 }`)
+    /// leaves the session held paused and unconfirmed — the bar must say so,
+    /// whether the session was running or already paused, and resume must
+    /// still restore what the agent said before either. A confirmed stop
+    /// changes nothing by itself: its `SessionEnded` follows.
+    #[test]
+    fn a_refused_stop_reads_as_an_unconfirmed_pause_and_a_confirmed_one_changes_nothing() {
+        let refused = || WardEvent::WorkloadsTerminated {
+            ended: 2,
+            pending: 1,
+        };
+        let mut model = Model::new(false);
+        for rec in wardd(&[agent(AgentState::Working)]) {
+            model.apply(rec);
+        }
+        model.apply(
+            wardd(&[WardEvent::WorkloadsTerminated {
+                ended: 3,
+                pending: 0,
+            }])
+            .remove(0),
+        );
+        assert_eq!(model.state.agent, Some(AgentState::Working));
+
+        model.apply(wardd(&[refused()]).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::PauseUnsettled));
+        model.apply(wardd(&[resumed()]).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::Working));
+
+        // From a confirmed pause: the refused stop downgrades it to unconfirmed,
+        // and a resume still restores the state from before the pause, not
+        // `Paused`.
+        model.apply(wardd(&[paused()]).remove(0));
+        model.apply(wardd(&[refused()]).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::PauseUnsettled));
+        model.apply(wardd(&[resumed()]).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::Working));
     }
 }

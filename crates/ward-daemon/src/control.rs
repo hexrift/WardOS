@@ -47,9 +47,17 @@ pub enum Request {
     },
     /// Flush the log to disk.
     Sync,
-    /// Seal the log; the daemon exits afterwards.
+    /// Seal the log; the daemon exits afterwards. Log-only closure: a sandbox of
+    /// the session that is still running is not touched (a paused one's frozen
+    /// tree is killed rather than left stopped for ever). Ending the session's
+    /// workloads is [`Request::Stop`].
     Seal,
-    /// End the session on the caller's behalf: `SessionEnded` then seal.
+    /// End the session on the caller's behalf (#145 item 5): terminate every
+    /// sandboxed process of the session and confirm it is gone
+    /// (`pause::terminate`, recorded as `WorkloadsTerminated` when there was
+    /// anything to end), give every open approval its terminal record, then
+    /// `SessionEnded` and seal. Refused, with the log left unsealed and the
+    /// session held paused, when termination could not be confirmed.
     Stop {
         /// Why.
         reason: EndReason,
@@ -130,6 +138,11 @@ pub enum Response {
     Sealed {
         /// Chain head after sealing.
         head: ChainHead,
+        /// For a `Stop`: how many sandboxed processes it terminated and confirmed
+        /// gone before sealing (#145 item 5). Zero — and absent on the wire — for
+        /// a `Seal`, or a stop with nothing running.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        ended: u32,
     },
     /// The session description as JSON.
     Description(serde_json::Value),
@@ -174,8 +187,19 @@ pub trait Sink: Send {
     fn sync(&mut self) -> Result<()>;
     /// Seal the log.
     fn seal(self: Box<Self>) -> Result<()>;
-    /// End the session: append `SessionEnded { reason }` and seal.
-    fn stop(self: Box<Self>, reason: EndReason) -> Result<()>;
+    /// End the session: append `SessionEnded { reason }` and seal. Returns how
+    /// many sandboxed processes the other end terminated first (#145 item 5):
+    /// always 0 from a sink that does not end workloads itself (see
+    /// [`ends_workloads`](Self::ends_workloads)).
+    fn stop(self: Box<Self>, reason: EndReason) -> Result<u32>;
+    /// Whether [`stop`](Self::stop) itself terminates the session's sandboxed
+    /// workloads before sealing: true for [`RemoteSink`], whose daemon does it as
+    /// part of `Request::Stop` (and holds the pause state it needs); false
+    /// otherwise, where [`Session::stop`](crate::session::Session::stop) does it
+    /// in-process first.
+    fn ends_workloads(&self) -> bool {
+        false
+    }
     /// Re-read this sink's view of the chain from durable storage, discarding any
     /// cached head that may now be behind what is actually on disk (review 5283028228
     /// of #208, finding 4, `crate::attempt::reconcile_dangling_attempts`): a
@@ -260,9 +284,9 @@ impl Sink for LocalLog {
         self.seal_head().map(drop)
     }
 
-    fn stop(mut self: Box<Self>, reason: EndReason) -> Result<()> {
+    fn stop(mut self: Box<Self>, reason: EndReason) -> Result<u32> {
         self.append(Origin::Wardd, session_ended(reason), SystemTime::now())?;
-        self.seal()
+        self.seal().map(|()| 0)
     }
 
     fn resync(&mut self) -> Result<()> {
@@ -439,9 +463,26 @@ impl Sink for RemoteSink {
         expect_sealed(self.call(&Request::Seal)?)
     }
 
-    fn stop(mut self: Box<Self>, reason: EndReason) -> Result<()> {
-        expect_sealed(self.call(&Request::Stop { reason })?)
+    fn stop(mut self: Box<Self>, reason: EndReason) -> Result<u32> {
+        match self.call(&Request::Stop { reason })? {
+            Response::Sealed { ended, .. } => Ok(ended),
+            // The daemon's own words: a refused stop says exactly what it could
+            // not confirm and what state it left the session in.
+            Response::Error(e) => Err(Error::Daemon(e)),
+            other => Err(Error::Events(format!("unexpected response {other:?}"))),
+        }
     }
+
+    fn ends_workloads(&self) -> bool {
+        true
+    }
+}
+
+/// `skip_serializing_if` for [`Response::Sealed`]'s `ended`, so a response with
+/// nothing terminated reads on the wire exactly as it did before the field.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+const fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 fn expect_sealed(response: Response) -> Result<()> {
@@ -551,7 +592,7 @@ pub fn handle_with(
 
 fn seal(log: &mut Option<LocalLog>) -> (Response, bool) {
     match log.take().map(LocalLog::seal_head) {
-        Some(Ok(head)) => (Response::Sealed { head }, true),
+        Some(Ok(head)) => (Response::Sealed { head, ended: 0 }, true),
         Some(Err(e)) => (Response::Error(e.to_string()), true),
         None => (Response::Error("log is sealed".into()), true),
     }
@@ -840,7 +881,7 @@ mod tests {
             },
         );
         assert!(done);
-        assert!(matches!(r, Response::Sealed { head } if head.next_seq == 2));
+        assert!(matches!(r, Response::Sealed { head, ended: 0 } if head.next_seq == 2));
         assert!(matches!(
             handle(&mut log, Request::Ping).0,
             Response::Error(_)

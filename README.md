@@ -116,8 +116,8 @@ ward verify   examples/ward-demo    # trusted verifier: protected tests from the
 ward selftest examples/ward-demo    # prove the isolation (38 hostile probes; none reaches its target)
 ward pause    examples/ward-demo    # freeze the agents as one operation: processes, network, credentials, approvals (--reason, --status)
 ward resume   examples/ward-demo    # let them continue
-ward stop     examples/ward-demo    # seal the log (from paused: the frozen processes end, the workspace stays)
-ward stop     examples/ward-demo --restore-entry   # …after writing the entry snapshot back over the worktree (.ward/restore-<ts>/ keeps what it replaced)
+ward stop     examples/ward-demo    # end every sandboxed process (confirmed gone), then seal the log; the workspace stays
+ward stop     examples/ward-demo --restore-entry   # …pausing first, then writing the entry snapshot back over the worktree (.ward/restore-<ts>/ keeps what it replaced)
 ward replay   <events.log>          # replay any sealed session (--verify, --json)
 ward session describe examples/ward-demo   # the session's immutable facts for TamperWard (--json)
 ward session pending   examples/ward-demo  # held approvals: destination · requested by agent · Ward will allow (--json)

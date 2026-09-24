@@ -1343,19 +1343,132 @@ impl Session {
 
     /// End the session, seal the log, and clear the project's current pointer.
     ///
-    /// The `SessionEnded` record and the seal are one [`Sink::stop`]: a running
-    /// daemon (ADR-0015) writes them on a [`Request::Stop`](crate::control::Request::Stop)
-    /// and exits; without one this process seals the log itself.
-    pub fn stop(mut self, reason: EndReason) -> Result<()> {
+    /// Stop is termination of the session's workloads followed by evidence
+    /// sealing (#145 item 5): every sandboxed process of the session is ended and
+    /// confirmed gone ([`pause::terminate`]) before the log is sealed. A running
+    /// daemon (ADR-0015) does both on a
+    /// [`Request::Stop`](crate::control::Request::Stop) and exits; without one this
+    /// process terminates the workloads itself, then seals. Either way the call
+    /// fails — with the log left unsealed and the project's current pointer kept,
+    /// so `ward stop` can simply be run again — when termination could not be
+    /// confirmed. Returns how many sandboxed processes were ended.
+    pub fn stop(mut self, reason: EndReason) -> Result<u32> {
+        let here = if self.sink.ends_workloads() {
+            0
+        } else {
+            self.end_workloads_here()?
+        };
         self.emit(
             Origin::Wardd,
             WardEvent::AgentStateChanged {
                 state: AgentState::Finished,
             },
         )?;
-        self.sink.stop(reason)?;
+        let there = self.sink.stop(reason)?;
         clear_current(&self.state, &self.project_id, &self.session_str)?;
-        Ok(())
+        Ok(here + there)
+    }
+
+    /// `ward stop --restore-entry`: restore the entry snapshot over the worktree,
+    /// then [`stop`](Self::stop) — with the session's workloads already quiescent
+    /// before the restore begins, and still quiescent until they are terminated
+    /// (#145 acceptance: "stop/restoration must wait for quiescence"). A restore
+    /// holds its own capture freeze only for its own length, so without this a
+    /// still-running agent would resume in the gap between the restore and the
+    /// stop and could write over the restored worktree.
+    ///
+    /// With a daemon serving, the session is paused first (`Request::Pause`,
+    /// recorded as usual) unless it already is, so the pause's freeze covers the
+    /// restore and the stop then kills that frozen tree. Without one, the
+    /// workloads are terminated first, in this process. Returns the restore and
+    /// how many sandboxed processes the stop ended.
+    pub fn stop_restoring_entry(mut self, reason: EndReason) -> Result<(RestoreReport, u32)> {
+        let mut ended = 0;
+        if self.sink.ends_workloads() {
+            if !self.paused() {
+                let socket = session_dir(&self.state, &self.session_str).join(SOCKET_NAME);
+                let mut control = RemoteSink::connect(&socket).ok_or_else(|| {
+                    Error::Daemon(format!(
+                        "{}: the session daemon did not answer; nothing was restored",
+                        socket.display()
+                    ))
+                })?;
+                match control.call(&crate::control::Request::Pause {
+                    reason: "ward stop --restore-entry".into(),
+                })? {
+                    // An unsettled freeze still has the marker and the held
+                    // approvals in place; the stop that follows kills the tree
+                    // whether or not every process confirmed stopped.
+                    crate::control::Response::Paused { .. } => {}
+                    // Paused by someone else in between: just as quiescent.
+                    crate::control::Response::Error(e) if e == "already paused" => {}
+                    crate::control::Response::Error(e) => {
+                        return Err(Error::Daemon(format!(
+                            "could not pause the session before restoring: {e}; nothing \
+                             was restored"
+                        )));
+                    }
+                    other => {
+                        return Err(Error::Daemon(format!("unexpected response {other:?}")));
+                    }
+                }
+            }
+        } else {
+            ended = self.end_workloads_here()?;
+        }
+        let report = self.restore_entry()?;
+        ended += self.stop(reason)?;
+        Ok((report, ended))
+    }
+
+    /// The daemonless half of [`Self::stop`]: what `Served::stop` does for a
+    /// served session, in this process. With no daemon there is no pause state
+    /// to hold, so an unconfirmed termination writes the marker (every proxy of
+    /// the session refuses) and records `WorkloadsTerminated { pending }`, then
+    /// refuses the stop.
+    fn end_workloads_here(&mut self) -> Result<u32> {
+        let outcome = pause::terminate(&self.session_str, None);
+        self.record_termination(&outcome)
+    }
+
+    /// Record `outcome` and decide the stop: `Ok(ended)` once everything is
+    /// gone, the refusal otherwise. Split from [`Self::end_workloads_here`] so
+    /// the refused path is testable without a process that survives `SIGKILL`.
+    fn record_termination(&mut self, outcome: &pause::Termination) -> Result<u32> {
+        let (ended, pending) = (outcome.ended, outcome.pending());
+        if pending == 0 {
+            // Nothing is left for a marker to hold back — including one an
+            // earlier refused stop of this session left behind.
+            let _ = pause::clear_marker(&self.state, &self.session_str);
+            if !outcome.touched_anything() {
+                return Ok(0);
+            }
+            self.emit(
+                Origin::Wardd,
+                WardEvent::WorkloadsTerminated { ended, pending },
+            )?;
+            return Ok(ended);
+        }
+        let marker = pause::write_marker(
+            &self.state,
+            &self.session_str,
+            &pause::stop_hold_reason(pending),
+        )
+        .err();
+        let logged = self
+            .emit(
+                Origin::Wardd,
+                WardEvent::WorkloadsTerminated { ended, pending },
+            )
+            .err();
+        Err(Error::Daemon(pause::stop_refusal(
+            &self.session_str,
+            ended,
+            pending,
+            "the proxy is closed. Run `ward stop` again to retry",
+            marker.as_ref(),
+            logged.as_ref(),
+        )))
     }
 
     /// Append one batch of drained observations, in the order the batch holds them,
@@ -2169,7 +2282,7 @@ mod tests {
             self.inner.seal()
         }
 
-        fn stop(self: Box<Self>, reason: EndReason) -> Result<()> {
+        fn stop(self: Box<Self>, reason: EndReason) -> Result<u32> {
             self.inner.stop(reason)
         }
     }
@@ -2250,7 +2363,7 @@ mod tests {
             unreachable!("NullSink is replaced before any use")
         }
 
-        fn stop(self: Box<Self>, _reason: EndReason) -> Result<()> {
+        fn stop(self: Box<Self>, _reason: EndReason) -> Result<u32> {
             unreachable!("NullSink is replaced before any use")
         }
     }
@@ -2938,5 +3051,96 @@ mod tests {
                 .expect("the lock is released once the holder's verify() call returns");
         drop(probe);
         assert_eq!(next_attempt_id(&dir.join("events.log")).get(), 2);
+    }
+
+    /// The kinds of every record in `log`, by name, in order.
+    fn kinds_in(log: &Path) -> Vec<String> {
+        ward_events::LogReader::open(log)
+            .unwrap()
+            .map(|r| format!("{:?}", r.unwrap().event.kind()))
+            .collect()
+    }
+
+    /// #145 item 5 without a daemon: `Session::stop` itself ends the session's
+    /// running sandbox and confirms it gone before sealing, and says how many
+    /// processes it ended.
+    #[test]
+    fn a_daemonless_stop_ends_a_running_sandbox_before_sealing() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        let log = session.log_path();
+        let mut sandbox = pause::FakeSandbox::spawn_for(session.id());
+        let ended = session.stop(EndReason::UserStop).unwrap();
+        assert!(ended >= 2, "{ended}");
+        assert!(sandbox.was_killed());
+        let kinds = kinds_in(&log);
+        let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
+        assert!(at("WorkloadsTerminated") < at("SessionEnded"), "{kinds:?}");
+    }
+
+    /// Without a daemon, a stop that cannot confirm termination is refused the
+    /// same way: nothing sealed, the marker written so the proxy refuses, the
+    /// partial outcome recorded. The retry, once nothing is left, clears the
+    /// marker and seals.
+    #[test]
+    fn a_daemonless_stop_that_cannot_confirm_termination_is_refused_until_a_retry() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        let log = session.log_path();
+        let err = session
+            .record_termination(&pause::Termination {
+                ended: 1,
+                remaining: Some(pause::Frozen {
+                    method: ward_events::PauseMethod::Sigstop,
+                    pids: vec![999_999],
+                    cgroup: None,
+                }),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1 ended, 1 still present"), "{err}");
+        assert!(err.contains("not sealed"), "{err}");
+        assert!(session.paused(), "the marker holds the proxy closed");
+        let kinds = kinds_in(&log);
+        assert_eq!(
+            kinds.last().map(String::as_str),
+            Some("WorkloadsTerminated")
+        );
+        assert!(!kinds.iter().any(|k| k == "SessionEnded"));
+        let marker = pause::marker_path(state.path(), session.id());
+        assert_eq!(session.stop(EndReason::UserStop).unwrap(), 0);
+        assert!(!marker.exists(), "a confirmed stop clears the hold");
+        assert_eq!(
+            kinds_in(&log).last().map(String::as_str),
+            Some("SessionEnded")
+        );
+    }
+
+    /// `ward stop --restore-entry` without a daemon: the workloads are ended
+    /// *before* the restore (so nothing can write over the restored worktree
+    /// afterwards), then the stop seals.
+    #[test]
+    fn stop_restoring_entry_ends_the_workloads_before_restoring() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("a.txt"), "entry\n").unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        let log = session.log_path();
+        std::fs::write(project.path().join("a.txt"), "agent\n").unwrap();
+        let mut sandbox = pause::FakeSandbox::spawn_for(session.id());
+        let (report, ended) = session.stop_restoring_entry(EndReason::UserStop).unwrap();
+        assert!(ended >= 2, "{ended}");
+        assert!(sandbox.was_killed());
+        assert_eq!(report.files, 1);
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("a.txt")).unwrap(),
+            "entry\n"
+        );
+        let kinds = kinds_in(&log);
+        let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
+        assert!(at("WorkloadsTerminated") < at("EntryRestored"), "{kinds:?}");
+        assert!(at("EntryRestored") < at("SessionEnded"), "{kinds:?}");
     }
 }

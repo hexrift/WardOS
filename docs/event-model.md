@@ -117,6 +117,14 @@ pub enum WardEvent {
     // prior SessionPaused record to make sense of it), plus how many processes were
     // still not confirmed stopped when the daemon's settle bound expired.
     SessionPauseUnsettled { method: CgroupFreezer | Sigstop, reason: BoundedText, pending: u32 },
+
+    // Appended at the end of the catalogue (#145 item 5): `ward stop` terminated the
+    // session's sandboxed workloads before sealing — `ended` confirmed gone, `pending`
+    // killed but not confirmed gone within `pause::STOP_SETTLE`. Written only when
+    // there was anything to end. `pending == 0` is followed at once by SessionEnded;
+    // `pending > 0` means the stop was refused: the log is not sealed and the session
+    // is held paused over what is left, until a later `ward stop` confirms it.
+    WorkloadsTerminated { ended: u32, pending: u32 },
 }
 ```
 
@@ -167,7 +175,7 @@ source of truth, not the socket. Latency budget from kernel event to subscriber 
 
 | Mode | Shows | Blocks? |
 | --- | --- | --- |
-| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed,Errored,Cancelled,Interrupted}`, the host's interventions (`SessionPaused`, `SessionPauseUnsettled`, `SessionResumed`, `EntryRestored`), `ObservationsDropped`, `SessionEnded` | Only on `Ask` |
+| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed,Errored,Cancelled,Interrupted}`, the host's interventions (`SessionPaused`, `SessionPauseUnsettled`, `WorkloadsTerminated`, `SessionResumed`, `EntryRestored`), `ObservationsDropped`, `SessionEnded` | Only on `Ask` |
 | Live | Everything except `AgentClaim{Note}` | Only on `Ask` |
 | Step-through | Everything; additionally the manifest's `step_policy` marks actions (`FileModified` under given globs, `CommandStarted` matching patterns, any `NetworkRequested`) as `Ask` | Yes, on configured actions |
 

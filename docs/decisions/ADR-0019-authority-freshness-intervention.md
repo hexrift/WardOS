@@ -84,6 +84,30 @@ product's real acceptance test.
 * The image-size issues (#67 to #70) proceed in parallel: they are not polish, they
   are the reason a first pull takes ten minutes.
 
+## Amendment — stop is termination, then sealing (#145 item 5)
+Decision 3 names `stop` as one of pause's exits; it did not say what `stop` does to a
+session that is *not* paused. Until #145 item 5 it sealed the log and left a running
+sandbox running, unobserved: a log-only closure presented as a stop. Now:
+
+* `ward stop` (`Request::Stop`) is termination of the session's workloads followed by
+  evidence sealing, from running or from paused. The daemon freezes the session's
+  sandbox trees (or keeps the pause's freeze), kills every process, and confirms each
+  is gone within a bound (`pause::STOP_SETTLE`), rescanning for anything forked
+  meanwhile; `WorkloadsTerminated { ended, pending }` records it when there was
+  anything to end; only then are the approvals closed, `SessionEnded` appended and the
+  log sealed.
+* A stop that cannot confirm termination is refused, never reported as done (#145
+  item 4): the log stays unsealed and the session is held paused over what is left.
+  `ward stop` retries; `ward resume` releases the hold.
+* Log-only closure stays available as its own, explicit operation: `Request::Seal`.
+* `ward stop --restore-entry` makes the session quiescent (paused) before the restore
+  and keeps it so until the workloads are terminated, so nothing can write over the
+  restored worktree.
+
+Still open under #145: the persisted `Pausing`/`Stopping`/`Incomplete` lifecycle,
+reconciliation of an interrupted stop across a daemon restart, and per-component
+acknowledgement from the proxy.
+
 ## What does not change
 No more colour, no shields, no closer resemblance to Omarchy, no custom kernel, no
 departure from the terminal-first workflow, no replacement of the Rust shell model,

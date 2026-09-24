@@ -181,9 +181,21 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > injected, established relays hold their bytes); it holds the approvals (timeouts stop,
 > answers are refused, new questions wait); and it appends `SessionPaused { method,
 > reason }`. `resume` reverses the order and appends `SessionResumed`. A launch while
-> paused is refused, a `stop` from paused ends the frozen tree and keeps the worktree,
-> and `ward stop --restore-entry` first writes the entry snapshot over the worktree,
-> keeping what it replaced under `.ward/restore-<ts>/` (`EntryRestored`). The desktop's
+> paused is refused. `stop` (#145 item 5) is termination of the session's workloads
+> followed by evidence sealing, from running or from paused: the daemon freezes the
+> session's sandbox trees (or keeps the pause's freeze), kills every process, watches
+> until each is confirmed gone (bounded by `pause::STOP_SETTLE`, rescanning for any
+> process forked meanwhile), appends `WorkloadsTerminated { ended, pending: 0 }` when
+> there was anything to end, and only then closes the approvals, appends `SessionEnded`
+> and seals; the worktree is kept. When termination cannot be confirmed, the stop is
+> refused rather than reported done: the log is not sealed, the session is held paused
+> over what is left (marker, held approvals), `WorkloadsTerminated { pending > 0 }`
+> records it, and `ward stop` retries (`ward resume` releases the hold). `seal` stays the
+> separate, log-only closure: it never touches a running sandbox. Without a daemon,
+> `Session::stop` does the same termination in-process. `ward stop --restore-entry`
+> makes the session quiescent first (a `pause`, or in-process termination without a
+> daemon), then writes the entry snapshot over the worktree, keeping what it replaced
+> under `.ward/restore-<ts>/` (`EntryRestored`), and then stops. The desktop's
 > `wardos-pause` (`Super + Shift + P`) is that request plus the exits menu; the bar's
 > agent segment reads `PAUSED` in the denied tone while the marker stands. The
 > security model's G13 states what a pause holds and what it cannot recall.
@@ -273,8 +285,9 @@ a Unix socket. Details in [`event-model.md`](event-model.md).
  10    agent            runs. Events flow. Requests mediated.
  11    agent/user       `ward verify` or TamperWard trigger → CANDIDATE
                         SNAPSHOT → verifier spawn → result → evidence
- 12    user             `ward stop` → freeze cgroup, final snapshot
-                        (optional), teardown, SessionEnded, log sealed
+ 12    user             `ward stop` → freeze the sandbox tree, kill it,
+                        confirm every process gone (WorkloadsTerminated),
+                        final snapshot (optional), SessionEnded, log sealed
 ```
 
 Warm-start budget for steps 1–9: **< 150 ms** ([`performance.md`](performance.md)).

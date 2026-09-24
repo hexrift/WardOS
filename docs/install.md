@@ -109,7 +109,7 @@ ward status                # the security panel
 ward run -- cargo test     # any command, sandboxed, observed
 ward watch --tui           # live observer (second terminal)
 ward selftest              # 29 hostile probes against your host
-ward stop                  # seal the log
+ward stop                  # end the sandboxed processes, then seal the log
 ```
 
 `examples/ward-demo` is a project with a protected test and a tempting shortcut, for
