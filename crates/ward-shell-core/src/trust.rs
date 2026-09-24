@@ -20,7 +20,7 @@ use ward_daemon::render::{self, Tone, network_tone};
 use ward_events::{AgentState, SnapshotId};
 use ward_policy::{CapabilityManifest, NetworkCapability};
 
-use crate::authority::{Authority, grants_segment, network_segment_text};
+use crate::authority::{grants_segment, network_segment_text};
 use crate::feed::{Freshness, Model, TamperWard, Verification};
 
 /// The session facts the trust bar shows. Fixed for the session's lifetime; the
@@ -539,10 +539,13 @@ impl TrustBar {
         let mut bar = Self::from_header(header, model.sealed);
         bar.agent = state.agent.map(|s| agent_segment(header, s, model.sealed));
         // Temporary authority shows while it exists (ADR-0019): on the network
-        // segment's text and as a segment of its own.
-        let authority = Authority::from_records(&model.records);
-        bar.network.text = network_segment_text(&header.network, &authority);
-        bar.grants = grants_segment(&authority, model.sealed);
+        // segment's text and as a segment of its own. Kept incrementally on the
+        // model rather than rescanned here (#138 item 4), so a session-scoped
+        // grant stays visible even once the record that created it has aged
+        // out of `model.records`.
+        let authority = &model.authority;
+        bar.network.text = network_segment_text(&header.network, authority);
+        bar.grants = grants_segment(authority, model.sealed);
         bar.tamperward = match state.tamperward {
             TamperWard::Unknown => None,
             TamperWard::Clean => Some(Segment::new("TW ✓", Tone::Ok)),

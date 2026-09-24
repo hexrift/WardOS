@@ -33,9 +33,9 @@ use ward_daemon::session::state_root;
 use ward_daemon::verify::candidate_options;
 use ward_events::EventRecord;
 use ward_shell_core::{
-    Authority, Decision, DigestGate, Header, Launcher, LineContext, Model, Module, SegmentName,
-    SessionCard, SessionDescription, Settings, TrustBar, authority_panel, counters_text,
-    panel_text, quote, session_panel, verify_panel,
+    Decision, DigestGate, Header, Launcher, LineContext, Model, Module, SegmentName, SessionCard,
+    SessionDescription, Settings, TrustBar, authority_panel, counters_text, panel_text, quote,
+    session_panel, verify_panel,
 };
 use ward_snapshot::{
     CaptureOptions, CaptureStats, HashCache, Manifest, ManifestDiff, SnapshotStore,
@@ -574,13 +574,14 @@ fn render(s: &Snapshot, surface: Surface) -> String {
             let panel = verify_panel(&s.description, &s.model, now_unix_ms());
             format!("{bar}\n\n{}", panel_text(&panel))
         }
-        Surface::AuthorityPanel => {
-            let authority = Authority::from_records(&s.model.records);
-            format!(
-                "{bar}\n\n{}",
-                panel_text(&authority_panel(&s.description, &authority))
-            )
-        }
+        // `model.authority` is kept incrementally rather than rescanned from
+        // `model.records` here (#138 item 4), so a session-scoped grant stays
+        // visible even once the record that created it has aged out of
+        // `model.records`.
+        Surface::AuthorityPanel => format!(
+            "{bar}\n\n{}",
+            panel_text(&authority_panel(&s.description, &s.model.authority))
+        ),
         Surface::Launcher { query, .. } => {
             let card = SessionCard::new(&s.description, &s.model);
             let mut launcher = Launcher::new(&[card]);
