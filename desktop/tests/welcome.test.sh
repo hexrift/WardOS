@@ -7,7 +7,10 @@ source "$(dirname "$0")/lib.sh"
 setup_env
 for c in wardos-launch notify-send git; do mock "$c"; done
 mock wardos-theme 'case "$1" in list) printf "ward-dark\nnord\n" ;; esac'
-mock ward 'case "$*" in "vault list") printf "  ANTHROPIC_API_KEY   not set\n  OPENAI_API_KEY      set · vault\n" ;; esac'
+mock ward 'case "$*" in
+  "vault list") printf "  ANTHROPIC_API_KEY   not set\n  OPENAI_API_KEY      set · vault\n" ;;
+  ready\ *) exit "${WARD_READY_EXIT:-0}" ;;
+esac'
 marker="$XDG_CONFIG_HOME/wardos/welcome-done"
 project_file="$XDG_STATE_HOME/wardos/welcome-project"
 mkdir -p "$HOME/work/app" "$HOME/other"
@@ -23,6 +26,8 @@ assert_logged '^ward vault list$'
 assert_logged '^wardos-launch run wardos-vault ward vault set ANTHROPIC_API_KEY$'
 assert_not_logged 'OPENAI_API_KEY$'
 assert_logged "^wardos-launch run wardos-init ward init $HOME/work/app$"
+assert_logged "^ward ready $HOME/work/app --agent claude$"
+assert_not_logged '^wardos-launch run wardos-ready'
 assert_logged "^wardos-launch run wardos-agent ward claude $HOME/work/app$"
 assert_logged '^notify-send -a WardOS .*trust bar'
 grep -q 'trust bar' <<<"$out" || fail "the trust bar is explained on stdout too; got: $out"
@@ -129,6 +134,37 @@ assert_logged 'ward vault set ANTHROPIC_API_KEY$'
 assert_logged 'ward vault set OPENAI_API_KEY$'
 
 mock wardos-launch # restore the always-succeeding mock for what follows
+rm -f "$project_file"
+
+# Not ready: `ward ready` blocks (setup required, or readiness could not be established at
+# all) before the agent actually starts (#147 item 7). The report is shown in a terminal;
+# backing out (any answer but "Start anyway") never starts the agent.
+mkdir -p "$(dirname "$project_file")"
+printf '%s\n' "$HOME/work/app" >"$project_file"
+export WARD_READY_EXIT=1
+: >"$MOCK_LOG"
+export WARDOS_MENU_CHOICE=$'Start Claude\nFix it first'
+wardos-welcome agent
+assert_logged "^ward ready $HOME/work/app --agent claude$"
+assert_logged "^wardos-launch run wardos-ready ward ready $HOME/work/app --agent claude$"
+assert_not_logged '^wardos-launch run wardos-agent'
+
+# "Ready with limitations" is not a block: `ward ready`'s own exit code is what step_ready
+# goes by, never a specific reported verdict text.
+: >"$MOCK_LOG"
+export WARD_READY_EXIT=0
+export WARDOS_MENU_CHOICE=$'Start Claude'
+wardos-welcome agent
+assert_not_logged '^wardos-launch run wardos-ready'
+assert_logged '^wardos-launch run wardos-agent ward claude'
+
+# Choosing to start anyway after a blocking report does start the agent.
+: >"$MOCK_LOG"
+export WARD_READY_EXIT=1
+export WARDOS_MENU_CHOICE=$'Start Claude\nStart anyway'
+wardos-welcome agent
+assert_logged '^wardos-launch run wardos-agent ward claude'
+unset WARD_READY_EXIT
 rm -f "$project_file"
 
 # Missing tools are skipped, not fatal.

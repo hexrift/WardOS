@@ -42,7 +42,7 @@ and Escape skips too.
 | Theme | lists `wardos-theme list`, applies your pick | `Super + Shift + T` cycles themes; `wardos-menu style theme` |
 | Keys | Anthropic or OpenAI: opens a terminal running `ward vault set NAME`; the key is typed there, never in a menu | `ward vault set NAME` in any terminal |
 | Project | a directory picker over `~` (up, into, a typed path, a new directory) or a repository URL to clone; then `ward init` in a terminal that shows its report | `ward init` in any directory |
-| Agent | `ward claude` (or `ward codex`) in that project, and one line about the trust bar | `Super + Space` → Start Claude |
+| Agent | `ward ready` checks the project first; a blocking gap shows its report and asks before continuing; then `ward claude` (or `ward codex`) there, and one line about the trust bar | `Super + Space` → Start Claude |
 | Done | the card: `Super + Space` is everything, `Super + K` lists the keys, this document | — |
 
 The done step writes `~/.config/wardos/welcome-done`. Until it exists, the command
