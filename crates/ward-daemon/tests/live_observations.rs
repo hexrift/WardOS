@@ -26,7 +26,8 @@ use ward_daemon::{Session, daemon, sandbox};
 use ward_events::{EndReason, EventRecord, FileChangeKind, LogReader, WardEvent};
 
 /// How long the test waits for the live records before giving up. Generous: the
-/// drain runs every 250 ms, so anything approaching this is a real failure.
+/// drain runs about every [`sandbox::WAIT_POLL`], so anything approaching this is a
+/// real failure.
 const LIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The file the sandboxed command writes, watched for on the log.
