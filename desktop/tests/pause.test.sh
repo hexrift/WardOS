@@ -128,6 +128,7 @@ echo paused >"$WARD_STATE_FILE"
 touch "$TMP/resume-refused"
 WARDOS_MENU_CHOICE=Resume "$pause" 2>/dev/null && fail "a refused resume is an error"
 assert_logged '^ward resume /home/dev/payments-api$'
+# shellcheck disable=SC2016
 assert_logged '^notify-send -a WardOS -u critical RESUME REFUSED ward: daemon: a stop of session sess_a has begun and not completed.*Run `ward stop` to finish it$'
 assert_not_logged 'Agents resumed'
 assert_eq "$(cat "$WARD_STATE_FILE")" paused
