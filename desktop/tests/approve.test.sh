@@ -25,6 +25,15 @@ export LINE12=$line12 LINE13=$line13
 noop_approvals_case='"session approvals --json --follow --session "*) : ;;'
 export NOOP_APPROVALS_CASE=$noop_approvals_case
 
+# Most of these do not care about the live-refresh loop (#146 item 4's live-refresh
+# half, below) either: an unanswered "session pending --json --all" (no --follow —
+# notify_one's own refresh tick, never notifier_loop's multiplexed stream) with
+# nothing defined for it here is treated exactly like a decided approval — the
+# refresh loop stops rather than erroring (current_countdown_for) — so this is a
+# safe, explicit no-op for every test that is not itself exercising a refresh tick.
+noop_refresh_case='"session pending --json --all") : ;;'
+export NOOP_REFRESH_CASE=$noop_refresh_case
+
 # --- --help --------------------------------------------------------------------
 # Read once, then searched: the usage block is past one 4 KiB stdio block, so under
 # pipefail `--help | grep -q` could fail on SIGPIPE whenever grep matched in the first
@@ -43,6 +52,7 @@ grep -q '(×N)' <<<"$help" || fail "--help names duplicate-notice grouping"
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n%s\n%s\n" "$LINE12" "$LINE13" "$LINE20" ;;
+  '"$NOOP_REFRESH_CASE"'
   '"$NOOP_APPROVALS_CASE"'
   "session approve "*) exit 0 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -97,6 +107,7 @@ assert_not_logged '^ward session approve --session sess_a 13'
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n%s\n" "$LINE12" "$LINE13" ;;
+  '"$NOOP_REFRESH_CASE"'
   '"$NOOP_APPROVALS_CASE"'
   "session approve "*) exit 0 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -118,6 +129,7 @@ rm -f "$TMP/answered"
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
+  '"$NOOP_REFRESH_CASE"'
   '"$NOOP_APPROVALS_CASE"'
   "session approve "*) sleep 0.3; touch "$TMP/answered"; exit 0 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -145,6 +157,7 @@ rm -f "$TMP/answer-pid" "$TMP/worker-pid"
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
+  '"$NOOP_REFRESH_CASE"'
   '"$NOOP_APPROVALS_CASE"'
   "session approve "*)
     trap "" TERM
@@ -176,7 +189,11 @@ fi
 # worker's own `wait "$answer_pid"` has reaped it, and the answer is orphaned
 # still alive. The answer ignores TERM so every round goes through the KILL
 # escalation, the path the race lives on.
-eval "$(sed -n '/^wait_deadline() {$/,/^}$/p; /^stop_answer() {$/,/^}$/p; /^stop_answers() {$/,/^}$/p; /^sweep_run_dir() {$/,/^}$/p' "$approve")"
+# sweep_run_dir now also calls stop_refresh/stop_refreshes (#146 item 4's
+# live-refresh half) unconditionally, so they must be loaded here too even
+# though this test's own synthetic run_dir holds no .refresh files for them to
+# act on.
+eval "$(sed -n '/^wait_deadline() {$/,/^}$/p; /^stop_answer() {$/,/^}$/p; /^stop_answers() {$/,/^}$/p; /^stop_refresh() {$/,/^}$/p; /^stop_refreshes() {$/,/^}$/p; /^sweep_run_dir() {$/,/^}$/p' "$approve")"
 # Two kinds of round: the worker resumes on its own mid-teardown (1.4s, inside the
 # answer's escalation), and the worker is held stopped for the whole teardown —
 # through both answer waits and the worker's own escalation boundary — so only
@@ -234,6 +251,98 @@ for round in resume-1 resume-2 held-1 held-2; do
 done
 unset -v run_dir answer_pid worker_pid resume_pid
 
+# --- sweep_run_dir: a killed refresh loop is reaped before its worker is stopped,
+# so neither is alive the instant sweep_run_dir returns (#146 item 4 review: the
+# same class of orphan #226 already fixed for a `ward session approve` call —
+# stop_refresh, mirroring stop_answer — now proven for the live-refresh loop) -----
+# The worker is held stopped for the whole teardown, through the refresh loop's own
+# TERM/KILL escalation, mirroring the answer test's own "held" rounds above: only
+# sweep_run_dir making the worker runnable again lets it reap its own refresh loop.
+# The refresh loop ignores TERM so this goes through the KILL escalation, the path
+# the equivalent #226 race for answer_pids lived on.
+run_dir=$(mktemp -d "$TMP/sweep-refresh.XXXXXX")
+refresh_test_worker() {
+  local worker_file=$run_dir/k.worker refresh_file=$run_dir/k.refresh refresh_pid=""
+  trap 'rm -f "$worker_file" "$refresh_file"' RETURN
+  # The same TERM handling notify_one itself now has for its own refresh_pid.
+  trap '
+    if [[ -n ${refresh_pid:-} ]]; then
+      kill "$refresh_pid" 2>/dev/null || true
+      wait "$refresh_pid" 2>/dev/null || true
+    fi
+    exit 143
+  ' TERM
+  printf '%s\n' "$BASHPID" >"$worker_file"
+  bash -c 'trap "" TERM; exec sleep 20' &
+  refresh_pid=$!
+  printf '%s\n' "$refresh_pid" >"$refresh_file"
+  wait "$refresh_pid" 2>/dev/null || true
+}
+refresh_test_worker &
+for _ in $(seq 100); do [[ -s $run_dir/k.refresh ]] && break; sleep 0.02; done
+refresh_pid=$(cat "$run_dir/k.refresh")
+worker_pid=$(cat "$run_dir/k.worker")
+kill -STOP "$worker_pid"
+sweep_run_dir
+if kill -0 "$refresh_pid" 2>/dev/null; then
+  kill -KILL "$refresh_pid" 2>/dev/null || true
+  fail "the refresh loop was still alive when sweep_run_dir returned"
+fi
+if kill -0 "$worker_pid" 2>/dev/null; then
+  fail "the worker was still alive when sweep_run_dir returned"
+fi
+rm -rf "$run_dir"
+unset -v run_dir refresh_pid worker_pid
+
+# --- sweep_run_dir: an empty reserved .refresh marker is an ownership handoff,
+# not a two-second scheduling deadline. A refresh child held before publishing its
+# marker for longer than the old timeout is still reaped through its owning worker,
+# and cannot wake later to recreate state after the sweep returned (#250) ----------
+run_dir=$(mktemp -d "$TMP/sweep-refresh-handoff.XXXXXX")
+rm -f "$TMP/delayed_refresh_pid"
+refresh_handoff_worker() {
+  local worker_file=$run_dir/k.worker refresh_file=$run_dir/k.refresh
+  local refresh_pid="" refresh_spawning=0
+  trap 'rm -f "$worker_file" "$refresh_file"' RETURN
+  trap '
+    if [[ -z $refresh_pid && $refresh_spawning -eq 1 ]]; then refresh_pid=$!; fi
+    if [[ -n $refresh_pid ]]; then
+      kill "$refresh_pid" 2>/dev/null || true
+      wait_deadline "$refresh_pid" 1
+      if kill -0 "$refresh_pid" 2>/dev/null; then
+        kill -KILL "$refresh_pid" 2>/dev/null || true
+      fi
+      wait "$refresh_pid" 2>/dev/null || true
+    fi
+    exit 143
+  ' TERM
+  printf '%s\n' "$BASHPID" >"$worker_file"
+  : >"$refresh_file"
+  refresh_spawning=1
+  bash -c 'printf "%s\n" "$" >"$1"; trap "" TERM; sleep 5; printf "%s\n" "$" >"$2"; exec sleep 20' \
+    _ "$TMP/delayed_refresh_pid" "$refresh_file" &
+  refresh_pid=$!
+  refresh_spawning=0
+  wait "$refresh_pid" 2>/dev/null || true
+}
+refresh_handoff_worker &
+for _ in $(seq 100); do
+  [[ -s $run_dir/k.worker && -f $run_dir/k.refresh && -s $TMP/delayed_refresh_pid ]] && break
+  sleep 0.02
+done
+worker_pid=$(cat "$run_dir/k.worker")
+refresh_pid=$(cat "$TMP/delayed_refresh_pid")
+[[ ! -s $run_dir/k.refresh ]] || fail "handoff marker must still be empty before the delayed child publishes"
+sweep_run_dir
+kill -0 "$worker_pid" 2>/dev/null && fail "handoff owner survived sweep_run_dir"
+kill -0 "$refresh_pid" 2>/dev/null && {
+  kill -KILL "$refresh_pid" 2>/dev/null || true
+  fail "delayed refresh child survived the empty-marker handoff sweep"
+}
+[[ ! -e $run_dir/k.refresh ]] || fail "empty refresh reservation survived teardown"
+rm -rf "$run_dir"
+unset -v run_dir refresh_pid worker_pid
+
 # --- --watch: notifier_loop's own .worker reservation never races notify_one's
 # RETURN trap into recreating a stale marker for an already-finished pid (#226
 # review) --------------------------------------------------------------------------
@@ -250,6 +359,7 @@ rm -f "$MOCK_DIR/notify-send"
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
+  '"$NOOP_REFRESH_CASE"'
   '"$NOOP_APPROVALS_CASE"'
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
@@ -269,6 +379,7 @@ export DECIDED12=$decided12
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
+  '"$NOOP_REFRESH_CASE"'
   "session approvals --json --follow --session sess_a") sleep 0.3; printf "%s\n" "$DECIDED12" ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
@@ -295,6 +406,7 @@ export LINE12C=$line12c
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n%s\n" "$LINE12" "$LINE12C" ;;
+  '"$NOOP_REFRESH_CASE"'
   "session approvals --json --follow --session sess_a") sleep 0.3; printf "%s\n" "$DECIDED12" ;;
   "session approvals --json --follow --session sess_c") : ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -328,6 +440,7 @@ assert_not_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 100
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n%s\n" "$LINE12" "$LINE13" ;;
+  '"$NOOP_REFRESH_CASE"'
   '"$NOOP_APPROVALS_CASE"'
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
@@ -350,6 +463,7 @@ rm -f "$MOCK_DIR/notify-send"
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n" "$LINE12" ;;
+  '"$NOOP_REFRESH_CASE"'
   '"$NOOP_APPROVALS_CASE"'
   "session approve "*) exit 0 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -371,6 +485,7 @@ export RUNNING12=$running12 HELD20=$held20
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n%s\n" "$RUNNING12" "$HELD20" ;;
+  '"$NOOP_REFRESH_CASE"'
   '"$NOOP_APPROVALS_CASE"'
   "session approve "*) exit 0 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -398,6 +513,7 @@ export DUP_A=$dup_a DUP_B=$dup_b
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n%s\n" "$DUP_A" "$DUP_B" ;;
+  '"$NOOP_REFRESH_CASE"'
   '"$NOOP_APPROVALS_CASE"'
   "session approve "*) exit 0 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -430,6 +546,7 @@ noop_sess_d='"session approvals --json --follow --session sess_d") : ;;'
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n%s\n" "$LINE12" "$DUP_OTHER_SESSION" ;;
+  '"$NOOP_REFRESH_CASE"'
   '"$NOOP_APPROVALS_CASE"'
   '"$noop_sess_d"'
   "session approve "*) exit 0 ;;
@@ -455,6 +572,7 @@ export DECIDED16=$decided16
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n%s\n" "$DUP_X" "$DUP_Y" ;;
+  '"$NOOP_REFRESH_CASE"'
   "session approvals --json --follow --session sess_a") sleep 0.3; printf "%s\n" "$DECIDED16" ;;
   "session approve "*) exit 0 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -604,6 +722,7 @@ mock ward 'case "$*" in
     for _ in $(seq 1 200); do [[ -f "$TMP/notify_one_past_action" ]] && break; sleep 0.01; done
     printf "%s\n" "$GEN_B"
     ;;
+  '"$NOOP_REFRESH_CASE"'
   '"$NOOP_APPROVALS_CASE"'
   "session approve "*) exit 0 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -656,6 +775,7 @@ mock ward 'case "$*" in
     for _ in $(seq 1 200); do [[ -f "$TMP/resolver_past_read" ]] && break; sleep 0.01; done
     printf "%s\n" "$RACE_C"
     ;;
+  '"$NOOP_REFRESH_CASE"'
   "session approvals --json --follow --session sess_a")
     for _ in $(seq 1 200); do [[ -f "$TMP/race_setup_done" ]] && break; sleep 0.01; done
     printf "%s\n" "$DECIDED17"
@@ -723,6 +843,7 @@ mock ward 'case "$*" in
     for _ in $(seq 1 300); do [[ -f "$TMP/finish_notification_started" ]] && break; sleep 0.01; done
     printf "%s\n" "$FIN_B"
     ;;
+  '"$NOOP_REFRESH_CASE"'
   "session approvals --json --follow --session sess_a")
     for _ in $(seq 1 200); do [[ -f "$TMP/fin_setup_done" ]] && break; sleep 0.01; done
     printf "%s\n" "$DECIDED12"
@@ -759,6 +880,7 @@ mock notify-send 'case "$*" in *--print-id*) echo 4242; sleep 0.3; echo allow ;;
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session pending --json --all --follow") printf "%s\n" "$NEW_A" ;;
+  '"$NOOP_REFRESH_CASE"'
   "session approvals --json --follow --session sess_a") printf "%s\n" "$DECIDED12_FAST" ;;
   "session approve "*) exit 0 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -766,6 +888,1426 @@ esac'
 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
 [[ $(grep -c -- '^ward session approve --session sess_a 12' "$MOCK_LOG") -le 1 ]] ||
   fail "id 12 must never be answered by this worker more than once, whatever order the resolver and the first arrival land in: $(cat "$MOCK_LOG")"
+
+# --- --watch: if the daemon-backed resolver removes the last group member before
+# this popup's own click is relayed, zero attempted relays are not confirmation of
+# that local click. Hold the resolver exactly after membership removal and before its
+# terminal replacement; notify_one must leave the tracked popup alone until the
+# resolver publishes the authoritative daemon outcome (#250) -----------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/empty_ids_popup_ready" "$TMP/resolve_barrier.reached" "$TMP/resolve_barrier.release"
+empty_ids_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+empty_ids_decided='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export EMPTY_IDS_RUNNING=$empty_ids_running EMPTY_IDS_DECIDED=$empty_ids_decided
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$EMPTY_IDS_RUNNING" ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 300); do [[ -f "$TMP/empty_ids_popup_ready" ]] && break; sleep 0.01; done
+    printf "%s\n" "$EMPTY_IDS_DECIDED"
+    ;;
+  '"$NOOP_REFRESH_CASE"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*)
+    echo 6363
+    : >"$TMP/empty_ids_popup_ready"
+    for _ in $(seq 1 500); do [[ -f "$TMP/resolve_barrier.reached" ]] && break; sleep 0.01; done
+    echo deny
+    ;;
+  *) exit 0 ;;
+esac'
+WARDOS_TESTING=1 WARDOS_TEST_RESOLVE_BARRIER="$TMP/resolve_barrier" \
+  WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once &
+approve_pid=$!
+for _ in $(seq 1 500); do [[ -f "$TMP/resolve_barrier.reached" ]] && break; sleep 0.01; done
+assert_file "$TMP/resolve_barrier.reached"
+# Give notify_one ample time to consume the local click while the resolver is held.
+# The unfixed path writes an authoritative local "Denied" here despite relaying zero
+# ids; the fixed path deliberately leaves pid_file/out_file for the resolver.
+sleep 0.2
+assert_not_logged '^ward session approve --session sess_a 12 deny# place across ticks, from the daemon's own current countdown each time, rather than
+# staying frozen at whatever it was when the popup opened (#146 item 4's live-refresh
+# half) --------------------------------------------------------------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/refresh_ticks"
+tick1=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+tick2=${line12%\}}',"countdown":{"remaining_ms":9001,"timeout_ms":60000,"held":false}}'
+export TICK1=$tick1 TICK2=$tick2
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RUNNING12" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/refresh_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/refresh_ticks"
+    if (( n == 1 )); then printf "%s\n" "$TICK1"; else printf "%s\n" "$TICK2"; fi
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# Never itself answers: stays open (--wait, killed only by the round's own
+# end-of-round sweep) so a small refresh interval gets several ticks in before then.
+mock notify-send 'case "$*" in *--print-id*) echo 3131; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# 41001/60000 -> 69 %, 9001/60000 -> 16 %: the same rounding-up share
+# progress_value already uses elsewhere, now read fresh on two different ticks of
+# the same still-open popup (notify-send -r 3131, never --print-id again) rather
+# than opening — or staying frozen as — one popup for the whole time it is open.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 3131 -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 3131 -h int:value:16 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 1 ]] ||
+  fail "a refresh tick must never open a second popup: $(cat "$MOCK_LOG")"
+
+# --- --watch: a refresh tick that is already mid-flight when its approval becomes
+# terminal elsewhere must not resurrect the notification with stale pending content
+# afterward (#146 item 4 review — the resolved-during-refresh race) ---------------
+# Forced, not hoped for: a barrier on the refresh tick's own daemon query (its
+# only external command between reading a — by then already stale — "still
+# pending" answer and deciding whether to replace the popup with it) holds that
+# query open until the resolver's own terminal replace has already completed, so
+# the tick's own with_notiflock check is guaranteed to find pid_file already gone
+# — proving the lock actually closes the race rather than merely not having lost
+# it by luck on this run.
+: >"$MOCK_LOG"
+rm -f "$TMP/refresh_query_started" "$TMP/finish_done"
+race_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+race_decided='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export RACE_RUNNING=$race_running RACE_DECIDED=$race_decided
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RACE_RUNNING" ;;
+  "session pending --json --all")
+    : >"$TMP/refresh_query_started"
+    for _ in $(seq 1 300); do [[ -f "$TMP/finish_done" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_RUNNING"
+    ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 300); do [[ -f "$TMP/refresh_query_started" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_DECIDED"
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# The finish barrier is on this mock's own "-t 4000" replace call (finish_notification's
+# only external command): it signals the instant that replace has actually happened,
+# which is what the refresh tick above is really waiting to be true before it acts.
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*) echo 8181; exec sleep 30 ;;
+  *"-t 4000"*) : >"$TMP/finish_done" ;;
+  *) exit 0 ;;
+esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Resolved exactly once, with the outcome — never re-shown as pending afterward,
+# and the refresh tick that raced it never got to replace anything at all.
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 8181 Timed out — denied <tt>/work/src/lib.rs</tt>$'
+assert_not_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8181'
+
+# --- --watch: a refresh tick already mid-flight when the popup's own action is
+# answered (the self-decided/timed-out counterpart of the race above, #250 review)
+# must not be able to land more than the one redraw it was already committed to,
+# and the notification's own final content must be the real outcome — never that
+# stale redraw — because notify_one's own cleanup both retires pid_file and
+# corrects the notification in the same locked step, ordered after any in-flight
+# tick (#250 review, second round) ------------------------------------------------
+# Forced the same way as the race above: the tick's own "-u critical -r" call is
+# barriered so it is guaranteed to still be inside with_notiflock, mid-notify-send,
+# the instant notify-send --print-id returns "deny". Confirms three things: the
+# already in-flight tick is still allowed to finish (with_notiflock does not reach
+# into a call already running under the lock — only orders whichever of this and a
+# later tick's own check-then-act runs next), that no later tick ever gets that far
+# again once pid_file is gone, and that the notification's own last write is the
+# real "Denied" outcome, not the tick's stale "still pending" redraw.
+: >"$MOCK_LOG"
+rm -f "$TMP/orphan_refresh_started" "$TMP/orphan_release" "$TMP/orphan_refresh_done"
+orphan_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+export ORPHAN_RUNNING=$orphan_running
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$ORPHAN_RUNNING" ;;
+  "session pending --json --all") printf "%s\n" "$ORPHAN_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*) echo 5252; sleep 0.15; echo deny ;;
+  *"-u critical -r "*)
+    : >"$TMP/orphan_refresh_started"
+    for _ in $(seq 1 500); do [[ -f "$TMP/orphan_release" ]] && break; sleep 0.01; done
+    : >"$TMP/orphan_refresh_done"
+    exit 0 ;;
+  *) exit 0 ;;
+esac'
+# Backgrounded, not run to completion first: notify_one's own fixed cleanup now
+# takes with_notiflock before removing pid_file, so it legitimately blocks for as
+# long as the tick above is still inside that same lock — "--once" itself does not
+# return until every worker has actually finished (#224, the case above), so it
+# cannot be used here to observe the tick mid-flight the way the race above did.
+# refresh_interval (0.02s) is far shorter than the --print-id delay (0.15s) above
+# on purpose: the first tick fires almost immediately and, once it is barriered
+# here, holds with_notiflock for as long as the barrier does — refresh_loop is
+# strictly sequential (it does not start a next tick until this one's own
+# with_notiflock call returns), so nothing else can race in behind it. The
+# foreground side holds the barrier well past the --print-id delay before
+# releasing it, so notify_one's own cleanup has certainly already reached, and
+# is already queued behind, this same lock by the time it opens.
+WARDOS_APPROVE_REFRESH_S=0.02 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once &
+approve_pid=$!
+for _ in $(seq 1 300); do [[ -f "$TMP/orphan_refresh_started" ]] && break; sleep 0.01; done
+assert_file "$TMP/orphan_refresh_started"
+[[ -f "$TMP/orphan_refresh_done" ]] &&
+  fail "the refresh tick's notify-send call must still be an unreleased orphan while notify_one's cleanup waits on it"
+sleep 0.3
+: >"$TMP/orphan_release"
+wait "$approve_pid"
+assert_file "$TMP/orphan_refresh_done"
+assert_logged '^ward session approve --session sess_a 12 deny$'
+# The one already-committed redraw is allowed to land...
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 5252 .*-A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api'
+# ...but with_notiflock's ordering means pid_file is already gone by the time any
+# later tick could check it, so refresh_loop stops itself rather than looping again.
+[[ $(grep -c -- '-u critical -r 5252' "$MOCK_LOG") -le 1 ]] ||
+  fail "at most the one already in-flight redraw may land, never another after cleanup: $(cat "$MOCK_LOG")"
+# ...and notify_one's own cleanup corrects the notification right after — the
+# same lock, requested while the tick above already held it, so this is always
+# the next write and therefore the last thing on screen, never the tick's stale
+# "still pending" content with dead, actionable-looking buttons.
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 5252 Denied <tt>/work/src/lib.rs</tt>$'
+last_pending=$(grep -n -- '-u critical -r 5252' "$MOCK_LOG" | tail -1 | cut -d: -f1)
+corrected=$(grep -n -- '-u low -t 4000 -r 5252 Denied' "$MOCK_LOG" | tail -1 | cut -d: -f1)
+[[ -n $last_pending && -n $corrected && $corrected -gt $last_pending ]] ||
+  fail "the real outcome must be written after every stale redraw, not before: $(cat "$MOCK_LOG")"
+
+# --- --watch: a transient daemon/jq failure on a refresh tick's own query does not
+# permanently stop the live refresh — only that one tick is skipped, the same as
+# every other command in this loop that can fail (#250 review, second round:
+# `current_countdown_for ... || return 0` treated every failure, including a
+# passing daemon hiccup, as "nothing left to refresh", contrary to the "skip a
+# tick" behaviour this file's own comments already claim for the loop) --------------
+: >"$MOCK_LOG"
+rm -f "$TMP/transient_ticks"
+recovers_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+export RECOVERS_RUNNING=$recovers_running
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RECOVERS_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/transient_ticks"
+    if (( n == 1 )); then
+      echo "ward: daemon unreachable" >&2
+      exit 1
+    fi
+    printf "%s\n" "$RECOVERS_RUNNING"
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 7171; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# The first, failing tick must not be the last: a redraw from a later, succeeding
+# tick still lands — the loop survived the one failure instead of exiting on it.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 7171 -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+[[ $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) -ge 2 ]] ||
+  fail "the query must be retried after a transient failure, not abandoned: only $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) attempt(s)"
+
+# --- --watch: a refresh tick whose representative id resolves elsewhere while an
+# exact duplicate is still gathered under the same popup switches to that surviving
+# member instead of stopping the whole live refresh (#250 review, second round:
+# current_countdown_for failing for one id — because the group's daemon-reported
+# membership moved on, not because the daemon or jq failed — must not be read as
+# "nothing left to refresh" when a fresh read of the group's own members, right
+# there in the next two lines, says otherwise) --------------------------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/switch_id12_gone" "$TMP/switch_ready"
+switch_dup_a=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+switch_dup_b=${line12/\"id\":12/\"id\":14}
+switch_dup_b=${switch_dup_b%\}}',"countdown":{"remaining_ms":9001,"timeout_ms":60000,"held":false}}'
+switch_decided_12='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"remembered","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export SWITCH_DUP_A=$switch_dup_a SWITCH_DUP_B=$switch_dup_b SWITCH_DECIDED_12=$switch_decided_12
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$SWITCH_DUP_A" "$SWITCH_DUP_B" ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 300); do [[ -f "$TMP/switch_ready" ]] && break; sleep 0.01; done
+    printf "%s\n" "$SWITCH_DECIDED_12"
+    ;;
+  "session pending --json --all")
+    if [[ -f "$TMP/switch_id12_gone" ]]; then
+      printf "%s\n" "$SWITCH_DUP_B"
+    else
+      printf "%s\n%s\n" "$SWITCH_DUP_A" "$SWITCH_DUP_B"
+    fi
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 8282; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once &
+approve_pid=$!
+# id 12 is the group's representative (inserted first): the first tick(s) show
+# its own countdown (41001/60000 -> 69 %).
+wait_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8282 -h int:value:69 '
+# id 12 becomes terminal — resolve_notification removes it from the group's own
+# ids file, leaving 14 as the sole surviving member — and, from here on, the
+# daemon no longer reports it pending either.
+: >"$TMP/switch_id12_gone"
+: >"$TMP/switch_ready"
+# A later tick must pick up id 14's own countdown (9001/60000 -> 16 %) instead of
+# the loop having stopped the moment id 12 stopped being reported.
+wait_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8282 -h int:value:16 '
+wait "$approve_pid"
+
+# --- --watch: a pause (and resume) that happens after the notification opened is
+# reflected on the next refresh tick — the countdown visibly holds, then resumes
+# counting, from the daemon's own held/remaining_ms accounting (PR #225), with no
+# pause notion of this script's own (#146 item 4's live-refresh half) -------------
+: >"$MOCK_LOG"
+rm -f "$TMP/pause_ticks"
+open_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+after_pause=${line12%\}}',"countdown":{"remaining_ms":20000,"timeout_ms":60000,"held":true}}'
+after_resume=${line12%\}}',"countdown":{"remaining_ms":15000,"timeout_ms":60000,"held":false}}'
+export OPEN_RUNNING=$open_running AFTER_PAUSE=$after_pause AFTER_RESUME=$after_resume
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$OPEN_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/pause_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/pause_ticks"
+    if (( n == 1 )); then printf "%s\n" "$AFTER_PAUSE"; else printf "%s\n" "$AFTER_RESUME"; fi
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 4141; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Opened running: no DECISION TIME block yet, only the progress hint (69 %).
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait --print-id -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+# First refresh tick: paused after opening — the same wording a freshly-opened held
+# popup already uses, now shown on a refresh of one that opened running; the hint
+# holds at the daemon's own reported share (20000/60000 -> 34 %), not still ticking
+# down on its own.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 4141 -h int:value:34 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+# Second refresh tick: resumed — the DECISION TIME block is gone again and the hint
+# moves on from where the pause left it (15000/60000 -> 25 %), not from 69 % as
+# though the pause had never happened.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 4141 -h int:value:25 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+assert_logged '^held while paused · resume the session to answer$'
+[[ $(grep -c 'DECISION TIME' "$MOCK_LOG") == 1 ]] ||
+  fail "only the paused refresh tick carries a DECISION TIME block: $(cat "$MOCK_LOG")"
+
+# --- shellcheck-clean, usage block, strict mode -----------------------------------
+head -1 "$approve" | grep -q '^#!/usr/bin/env bash$' || fail "shebang"
+grep -q '^set -euo pipefail$' "$approve" || fail "strict mode"
+
+assert_not_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 6363 Denied <tt>/work/src/lib.rs</tt># place across ticks, from the daemon's own current countdown each time, rather than
+# staying frozen at whatever it was when the popup opened (#146 item 4's live-refresh
+# half) --------------------------------------------------------------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/refresh_ticks"
+tick1=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+tick2=${line12%\}}',"countdown":{"remaining_ms":9001,"timeout_ms":60000,"held":false}}'
+export TICK1=$tick1 TICK2=$tick2
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RUNNING12" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/refresh_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/refresh_ticks"
+    if (( n == 1 )); then printf "%s\n" "$TICK1"; else printf "%s\n" "$TICK2"; fi
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# Never itself answers: stays open (--wait, killed only by the round's own
+# end-of-round sweep) so a small refresh interval gets several ticks in before then.
+mock notify-send 'case "$*" in *--print-id*) echo 3131; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# 41001/60000 -> 69 %, 9001/60000 -> 16 %: the same rounding-up share
+# progress_value already uses elsewhere, now read fresh on two different ticks of
+# the same still-open popup (notify-send -r 3131, never --print-id again) rather
+# than opening — or staying frozen as — one popup for the whole time it is open.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 3131 -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 3131 -h int:value:16 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 1 ]] ||
+  fail "a refresh tick must never open a second popup: $(cat "$MOCK_LOG")"
+
+# --- --watch: a refresh tick that is already mid-flight when its approval becomes
+# terminal elsewhere must not resurrect the notification with stale pending content
+# afterward (#146 item 4 review — the resolved-during-refresh race) ---------------
+# Forced, not hoped for: a barrier on the refresh tick's own daemon query (its
+# only external command between reading a — by then already stale — "still
+# pending" answer and deciding whether to replace the popup with it) holds that
+# query open until the resolver's own terminal replace has already completed, so
+# the tick's own with_notiflock check is guaranteed to find pid_file already gone
+# — proving the lock actually closes the race rather than merely not having lost
+# it by luck on this run.
+: >"$MOCK_LOG"
+rm -f "$TMP/refresh_query_started" "$TMP/finish_done"
+race_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+race_decided='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export RACE_RUNNING=$race_running RACE_DECIDED=$race_decided
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RACE_RUNNING" ;;
+  "session pending --json --all")
+    : >"$TMP/refresh_query_started"
+    for _ in $(seq 1 300); do [[ -f "$TMP/finish_done" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_RUNNING"
+    ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 300); do [[ -f "$TMP/refresh_query_started" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_DECIDED"
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# The finish barrier is on this mock's own "-t 4000" replace call (finish_notification's
+# only external command): it signals the instant that replace has actually happened,
+# which is what the refresh tick above is really waiting to be true before it acts.
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*) echo 8181; exec sleep 30 ;;
+  *"-t 4000"*) : >"$TMP/finish_done" ;;
+  *) exit 0 ;;
+esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Resolved exactly once, with the outcome — never re-shown as pending afterward,
+# and the refresh tick that raced it never got to replace anything at all.
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 8181 Timed out — denied <tt>/work/src/lib.rs</tt>$'
+assert_not_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8181'
+
+# --- --watch: a refresh tick already mid-flight when the popup's own action is
+# answered (the self-decided/timed-out counterpart of the race above, #250 review)
+# must not be able to land more than the one redraw it was already committed to,
+# and the notification's own final content must be the real outcome — never that
+# stale redraw — because notify_one's own cleanup both retires pid_file and
+# corrects the notification in the same locked step, ordered after any in-flight
+# tick (#250 review, second round) ------------------------------------------------
+# Forced the same way as the race above: the tick's own "-u critical -r" call is
+# barriered so it is guaranteed to still be inside with_notiflock, mid-notify-send,
+# the instant notify-send --print-id returns "deny". Confirms three things: the
+# already in-flight tick is still allowed to finish (with_notiflock does not reach
+# into a call already running under the lock — only orders whichever of this and a
+# later tick's own check-then-act runs next), that no later tick ever gets that far
+# again once pid_file is gone, and that the notification's own last write is the
+# real "Denied" outcome, not the tick's stale "still pending" redraw.
+: >"$MOCK_LOG"
+rm -f "$TMP/orphan_refresh_started" "$TMP/orphan_release" "$TMP/orphan_refresh_done"
+orphan_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+export ORPHAN_RUNNING=$orphan_running
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$ORPHAN_RUNNING" ;;
+  "session pending --json --all") printf "%s\n" "$ORPHAN_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*) echo 5252; sleep 0.15; echo deny ;;
+  *"-u critical -r "*)
+    : >"$TMP/orphan_refresh_started"
+    for _ in $(seq 1 500); do [[ -f "$TMP/orphan_release" ]] && break; sleep 0.01; done
+    : >"$TMP/orphan_refresh_done"
+    exit 0 ;;
+  *) exit 0 ;;
+esac'
+# Backgrounded, not run to completion first: notify_one's own fixed cleanup now
+# takes with_notiflock before removing pid_file, so it legitimately blocks for as
+# long as the tick above is still inside that same lock — "--once" itself does not
+# return until every worker has actually finished (#224, the case above), so it
+# cannot be used here to observe the tick mid-flight the way the race above did.
+# refresh_interval (0.02s) is far shorter than the --print-id delay (0.15s) above
+# on purpose: the first tick fires almost immediately and, once it is barriered
+# here, holds with_notiflock for as long as the barrier does — refresh_loop is
+# strictly sequential (it does not start a next tick until this one's own
+# with_notiflock call returns), so nothing else can race in behind it. The
+# foreground side holds the barrier well past the --print-id delay before
+# releasing it, so notify_one's own cleanup has certainly already reached, and
+# is already queued behind, this same lock by the time it opens.
+WARDOS_APPROVE_REFRESH_S=0.02 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once &
+approve_pid=$!
+for _ in $(seq 1 300); do [[ -f "$TMP/orphan_refresh_started" ]] && break; sleep 0.01; done
+assert_file "$TMP/orphan_refresh_started"
+[[ -f "$TMP/orphan_refresh_done" ]] &&
+  fail "the refresh tick's notify-send call must still be an unreleased orphan while notify_one's cleanup waits on it"
+sleep 0.3
+: >"$TMP/orphan_release"
+wait "$approve_pid"
+assert_file "$TMP/orphan_refresh_done"
+assert_logged '^ward session approve --session sess_a 12 deny$'
+# The one already-committed redraw is allowed to land...
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 5252 .*-A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api'
+# ...but with_notiflock's ordering means pid_file is already gone by the time any
+# later tick could check it, so refresh_loop stops itself rather than looping again.
+[[ $(grep -c -- '-u critical -r 5252' "$MOCK_LOG") -le 1 ]] ||
+  fail "at most the one already in-flight redraw may land, never another after cleanup: $(cat "$MOCK_LOG")"
+# ...and notify_one's own cleanup corrects the notification right after — the
+# same lock, requested while the tick above already held it, so this is always
+# the next write and therefore the last thing on screen, never the tick's stale
+# "still pending" content with dead, actionable-looking buttons.
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 5252 Denied <tt>/work/src/lib.rs</tt>$'
+last_pending=$(grep -n -- '-u critical -r 5252' "$MOCK_LOG" | tail -1 | cut -d: -f1)
+corrected=$(grep -n -- '-u low -t 4000 -r 5252 Denied' "$MOCK_LOG" | tail -1 | cut -d: -f1)
+[[ -n $last_pending && -n $corrected && $corrected -gt $last_pending ]] ||
+  fail "the real outcome must be written after every stale redraw, not before: $(cat "$MOCK_LOG")"
+
+# --- --watch: a transient daemon/jq failure on a refresh tick's own query does not
+# permanently stop the live refresh — only that one tick is skipped, the same as
+# every other command in this loop that can fail (#250 review, second round:
+# `current_countdown_for ... || return 0` treated every failure, including a
+# passing daemon hiccup, as "nothing left to refresh", contrary to the "skip a
+# tick" behaviour this file's own comments already claim for the loop) --------------
+: >"$MOCK_LOG"
+rm -f "$TMP/transient_ticks"
+recovers_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+export RECOVERS_RUNNING=$recovers_running
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RECOVERS_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/transient_ticks"
+    if (( n == 1 )); then
+      echo "ward: daemon unreachable" >&2
+      exit 1
+    fi
+    printf "%s\n" "$RECOVERS_RUNNING"
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 7171; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# The first, failing tick must not be the last: a redraw from a later, succeeding
+# tick still lands — the loop survived the one failure instead of exiting on it.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 7171 -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+[[ $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) -ge 2 ]] ||
+  fail "the query must be retried after a transient failure, not abandoned: only $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) attempt(s)"
+
+# --- --watch: a refresh tick whose representative id resolves elsewhere while an
+# exact duplicate is still gathered under the same popup switches to that surviving
+# member instead of stopping the whole live refresh (#250 review, second round:
+# current_countdown_for failing for one id — because the group's daemon-reported
+# membership moved on, not because the daemon or jq failed — must not be read as
+# "nothing left to refresh" when a fresh read of the group's own members, right
+# there in the next two lines, says otherwise) --------------------------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/switch_id12_gone" "$TMP/switch_ready"
+switch_dup_a=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+switch_dup_b=${line12/\"id\":12/\"id\":14}
+switch_dup_b=${switch_dup_b%\}}',"countdown":{"remaining_ms":9001,"timeout_ms":60000,"held":false}}'
+switch_decided_12='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"remembered","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export SWITCH_DUP_A=$switch_dup_a SWITCH_DUP_B=$switch_dup_b SWITCH_DECIDED_12=$switch_decided_12
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$SWITCH_DUP_A" "$SWITCH_DUP_B" ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 300); do [[ -f "$TMP/switch_ready" ]] && break; sleep 0.01; done
+    printf "%s\n" "$SWITCH_DECIDED_12"
+    ;;
+  "session pending --json --all")
+    if [[ -f "$TMP/switch_id12_gone" ]]; then
+      printf "%s\n" "$SWITCH_DUP_B"
+    else
+      printf "%s\n%s\n" "$SWITCH_DUP_A" "$SWITCH_DUP_B"
+    fi
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 8282; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once &
+approve_pid=$!
+# id 12 is the group's representative (inserted first): the first tick(s) show
+# its own countdown (41001/60000 -> 69 %).
+wait_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8282 -h int:value:69 '
+# id 12 becomes terminal — resolve_notification removes it from the group's own
+# ids file, leaving 14 as the sole surviving member — and, from here on, the
+# daemon no longer reports it pending either.
+: >"$TMP/switch_id12_gone"
+: >"$TMP/switch_ready"
+# A later tick must pick up id 14's own countdown (9001/60000 -> 16 %) instead of
+# the loop having stopped the moment id 12 stopped being reported.
+wait_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8282 -h int:value:16 '
+wait "$approve_pid"
+
+# --- --watch: a pause (and resume) that happens after the notification opened is
+# reflected on the next refresh tick — the countdown visibly holds, then resumes
+# counting, from the daemon's own held/remaining_ms accounting (PR #225), with no
+# pause notion of this script's own (#146 item 4's live-refresh half) -------------
+: >"$MOCK_LOG"
+rm -f "$TMP/pause_ticks"
+open_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+after_pause=${line12%\}}',"countdown":{"remaining_ms":20000,"timeout_ms":60000,"held":true}}'
+after_resume=${line12%\}}',"countdown":{"remaining_ms":15000,"timeout_ms":60000,"held":false}}'
+export OPEN_RUNNING=$open_running AFTER_PAUSE=$after_pause AFTER_RESUME=$after_resume
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$OPEN_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/pause_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/pause_ticks"
+    if (( n == 1 )); then printf "%s\n" "$AFTER_PAUSE"; else printf "%s\n" "$AFTER_RESUME"; fi
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 4141; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Opened running: no DECISION TIME block yet, only the progress hint (69 %).
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait --print-id -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+# First refresh tick: paused after opening — the same wording a freshly-opened held
+# popup already uses, now shown on a refresh of one that opened running; the hint
+# holds at the daemon's own reported share (20000/60000 -> 34 %), not still ticking
+# down on its own.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 4141 -h int:value:34 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+# Second refresh tick: resumed — the DECISION TIME block is gone again and the hint
+# moves on from where the pause left it (15000/60000 -> 25 %), not from 69 % as
+# though the pause had never happened.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 4141 -h int:value:25 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+assert_logged '^held while paused · resume the session to answer$'
+[[ $(grep -c 'DECISION TIME' "$MOCK_LOG") == 1 ]] ||
+  fail "only the paused refresh tick carries a DECISION TIME block: $(cat "$MOCK_LOG")"
+
+# --- shellcheck-clean, usage block, strict mode -----------------------------------
+head -1 "$approve" | grep -q '^#!/usr/bin/env bash$' || fail "shebang"
+grep -q '^set -euo pipefail$' "$approve" || fail "strict mode"
+
+: >"$TMP/resolve_barrier.release"
+wait "$approve_pid"
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 6363 Timed out — denied <tt>/work/src/lib.rs</tt># place across ticks, from the daemon's own current countdown each time, rather than
+# staying frozen at whatever it was when the popup opened (#146 item 4's live-refresh
+# half) --------------------------------------------------------------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/refresh_ticks"
+tick1=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+tick2=${line12%\}}',"countdown":{"remaining_ms":9001,"timeout_ms":60000,"held":false}}'
+export TICK1=$tick1 TICK2=$tick2
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RUNNING12" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/refresh_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/refresh_ticks"
+    if (( n == 1 )); then printf "%s\n" "$TICK1"; else printf "%s\n" "$TICK2"; fi
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# Never itself answers: stays open (--wait, killed only by the round's own
+# end-of-round sweep) so a small refresh interval gets several ticks in before then.
+mock notify-send 'case "$*" in *--print-id*) echo 3131; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# 41001/60000 -> 69 %, 9001/60000 -> 16 %: the same rounding-up share
+# progress_value already uses elsewhere, now read fresh on two different ticks of
+# the same still-open popup (notify-send -r 3131, never --print-id again) rather
+# than opening — or staying frozen as — one popup for the whole time it is open.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 3131 -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 3131 -h int:value:16 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 1 ]] ||
+  fail "a refresh tick must never open a second popup: $(cat "$MOCK_LOG")"
+
+# --- --watch: a refresh tick that is already mid-flight when its approval becomes
+# terminal elsewhere must not resurrect the notification with stale pending content
+# afterward (#146 item 4 review — the resolved-during-refresh race) ---------------
+# Forced, not hoped for: a barrier on the refresh tick's own daemon query (its
+# only external command between reading a — by then already stale — "still
+# pending" answer and deciding whether to replace the popup with it) holds that
+# query open until the resolver's own terminal replace has already completed, so
+# the tick's own with_notiflock check is guaranteed to find pid_file already gone
+# — proving the lock actually closes the race rather than merely not having lost
+# it by luck on this run.
+: >"$MOCK_LOG"
+rm -f "$TMP/refresh_query_started" "$TMP/finish_done"
+race_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+race_decided='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export RACE_RUNNING=$race_running RACE_DECIDED=$race_decided
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RACE_RUNNING" ;;
+  "session pending --json --all")
+    : >"$TMP/refresh_query_started"
+    for _ in $(seq 1 300); do [[ -f "$TMP/finish_done" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_RUNNING"
+    ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 300); do [[ -f "$TMP/refresh_query_started" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_DECIDED"
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# The finish barrier is on this mock's own "-t 4000" replace call (finish_notification's
+# only external command): it signals the instant that replace has actually happened,
+# which is what the refresh tick above is really waiting to be true before it acts.
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*) echo 8181; exec sleep 30 ;;
+  *"-t 4000"*) : >"$TMP/finish_done" ;;
+  *) exit 0 ;;
+esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Resolved exactly once, with the outcome — never re-shown as pending afterward,
+# and the refresh tick that raced it never got to replace anything at all.
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 8181 Timed out — denied <tt>/work/src/lib.rs</tt>$'
+assert_not_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8181'
+
+# --- --watch: a refresh tick already mid-flight when the popup's own action is
+# answered (the self-decided/timed-out counterpart of the race above, #250 review)
+# must not be able to land more than the one redraw it was already committed to,
+# and the notification's own final content must be the real outcome — never that
+# stale redraw — because notify_one's own cleanup both retires pid_file and
+# corrects the notification in the same locked step, ordered after any in-flight
+# tick (#250 review, second round) ------------------------------------------------
+# Forced the same way as the race above: the tick's own "-u critical -r" call is
+# barriered so it is guaranteed to still be inside with_notiflock, mid-notify-send,
+# the instant notify-send --print-id returns "deny". Confirms three things: the
+# already in-flight tick is still allowed to finish (with_notiflock does not reach
+# into a call already running under the lock — only orders whichever of this and a
+# later tick's own check-then-act runs next), that no later tick ever gets that far
+# again once pid_file is gone, and that the notification's own last write is the
+# real "Denied" outcome, not the tick's stale "still pending" redraw.
+: >"$MOCK_LOG"
+rm -f "$TMP/orphan_refresh_started" "$TMP/orphan_release" "$TMP/orphan_refresh_done"
+orphan_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+export ORPHAN_RUNNING=$orphan_running
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$ORPHAN_RUNNING" ;;
+  "session pending --json --all") printf "%s\n" "$ORPHAN_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*) echo 5252; sleep 0.15; echo deny ;;
+  *"-u critical -r "*)
+    : >"$TMP/orphan_refresh_started"
+    for _ in $(seq 1 500); do [[ -f "$TMP/orphan_release" ]] && break; sleep 0.01; done
+    : >"$TMP/orphan_refresh_done"
+    exit 0 ;;
+  *) exit 0 ;;
+esac'
+# Backgrounded, not run to completion first: notify_one's own fixed cleanup now
+# takes with_notiflock before removing pid_file, so it legitimately blocks for as
+# long as the tick above is still inside that same lock — "--once" itself does not
+# return until every worker has actually finished (#224, the case above), so it
+# cannot be used here to observe the tick mid-flight the way the race above did.
+# refresh_interval (0.02s) is far shorter than the --print-id delay (0.15s) above
+# on purpose: the first tick fires almost immediately and, once it is barriered
+# here, holds with_notiflock for as long as the barrier does — refresh_loop is
+# strictly sequential (it does not start a next tick until this one's own
+# with_notiflock call returns), so nothing else can race in behind it. The
+# foreground side holds the barrier well past the --print-id delay before
+# releasing it, so notify_one's own cleanup has certainly already reached, and
+# is already queued behind, this same lock by the time it opens.
+WARDOS_APPROVE_REFRESH_S=0.02 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once &
+approve_pid=$!
+for _ in $(seq 1 300); do [[ -f "$TMP/orphan_refresh_started" ]] && break; sleep 0.01; done
+assert_file "$TMP/orphan_refresh_started"
+[[ -f "$TMP/orphan_refresh_done" ]] &&
+  fail "the refresh tick's notify-send call must still be an unreleased orphan while notify_one's cleanup waits on it"
+sleep 0.3
+: >"$TMP/orphan_release"
+wait "$approve_pid"
+assert_file "$TMP/orphan_refresh_done"
+assert_logged '^ward session approve --session sess_a 12 deny$'
+# The one already-committed redraw is allowed to land...
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 5252 .*-A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api'
+# ...but with_notiflock's ordering means pid_file is already gone by the time any
+# later tick could check it, so refresh_loop stops itself rather than looping again.
+[[ $(grep -c -- '-u critical -r 5252' "$MOCK_LOG") -le 1 ]] ||
+  fail "at most the one already in-flight redraw may land, never another after cleanup: $(cat "$MOCK_LOG")"
+# ...and notify_one's own cleanup corrects the notification right after — the
+# same lock, requested while the tick above already held it, so this is always
+# the next write and therefore the last thing on screen, never the tick's stale
+# "still pending" content with dead, actionable-looking buttons.
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 5252 Denied <tt>/work/src/lib.rs</tt>$'
+last_pending=$(grep -n -- '-u critical -r 5252' "$MOCK_LOG" | tail -1 | cut -d: -f1)
+corrected=$(grep -n -- '-u low -t 4000 -r 5252 Denied' "$MOCK_LOG" | tail -1 | cut -d: -f1)
+[[ -n $last_pending && -n $corrected && $corrected -gt $last_pending ]] ||
+  fail "the real outcome must be written after every stale redraw, not before: $(cat "$MOCK_LOG")"
+
+# --- --watch: a transient daemon/jq failure on a refresh tick's own query does not
+# permanently stop the live refresh — only that one tick is skipped, the same as
+# every other command in this loop that can fail (#250 review, second round:
+# `current_countdown_for ... || return 0` treated every failure, including a
+# passing daemon hiccup, as "nothing left to refresh", contrary to the "skip a
+# tick" behaviour this file's own comments already claim for the loop) --------------
+: >"$MOCK_LOG"
+rm -f "$TMP/transient_ticks"
+recovers_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+export RECOVERS_RUNNING=$recovers_running
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RECOVERS_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/transient_ticks"
+    if (( n == 1 )); then
+      echo "ward: daemon unreachable" >&2
+      exit 1
+    fi
+    printf "%s\n" "$RECOVERS_RUNNING"
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 7171; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# The first, failing tick must not be the last: a redraw from a later, succeeding
+# tick still lands — the loop survived the one failure instead of exiting on it.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 7171 -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+[[ $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) -ge 2 ]] ||
+  fail "the query must be retried after a transient failure, not abandoned: only $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) attempt(s)"
+
+# --- --watch: a refresh tick whose representative id resolves elsewhere while an
+# exact duplicate is still gathered under the same popup switches to that surviving
+# member instead of stopping the whole live refresh (#250 review, second round:
+# current_countdown_for failing for one id — because the group's daemon-reported
+# membership moved on, not because the daemon or jq failed — must not be read as
+# "nothing left to refresh" when a fresh read of the group's own members, right
+# there in the next two lines, says otherwise) --------------------------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/switch_id12_gone" "$TMP/switch_ready"
+switch_dup_a=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+switch_dup_b=${line12/\"id\":12/\"id\":14}
+switch_dup_b=${switch_dup_b%\}}',"countdown":{"remaining_ms":9001,"timeout_ms":60000,"held":false}}'
+switch_decided_12='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"remembered","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export SWITCH_DUP_A=$switch_dup_a SWITCH_DUP_B=$switch_dup_b SWITCH_DECIDED_12=$switch_decided_12
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$SWITCH_DUP_A" "$SWITCH_DUP_B" ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 300); do [[ -f "$TMP/switch_ready" ]] && break; sleep 0.01; done
+    printf "%s\n" "$SWITCH_DECIDED_12"
+    ;;
+  "session pending --json --all")
+    if [[ -f "$TMP/switch_id12_gone" ]]; then
+      printf "%s\n" "$SWITCH_DUP_B"
+    else
+      printf "%s\n%s\n" "$SWITCH_DUP_A" "$SWITCH_DUP_B"
+    fi
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 8282; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once &
+approve_pid=$!
+# id 12 is the group's representative (inserted first): the first tick(s) show
+# its own countdown (41001/60000 -> 69 %).
+wait_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8282 -h int:value:69 '
+# id 12 becomes terminal — resolve_notification removes it from the group's own
+# ids file, leaving 14 as the sole surviving member — and, from here on, the
+# daemon no longer reports it pending either.
+: >"$TMP/switch_id12_gone"
+: >"$TMP/switch_ready"
+# A later tick must pick up id 14's own countdown (9001/60000 -> 16 %) instead of
+# the loop having stopped the moment id 12 stopped being reported.
+wait_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8282 -h int:value:16 '
+wait "$approve_pid"
+
+# --- --watch: a pause (and resume) that happens after the notification opened is
+# reflected on the next refresh tick — the countdown visibly holds, then resumes
+# counting, from the daemon's own held/remaining_ms accounting (PR #225), with no
+# pause notion of this script's own (#146 item 4's live-refresh half) -------------
+: >"$MOCK_LOG"
+rm -f "$TMP/pause_ticks"
+open_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+after_pause=${line12%\}}',"countdown":{"remaining_ms":20000,"timeout_ms":60000,"held":true}}'
+after_resume=${line12%\}}',"countdown":{"remaining_ms":15000,"timeout_ms":60000,"held":false}}'
+export OPEN_RUNNING=$open_running AFTER_PAUSE=$after_pause AFTER_RESUME=$after_resume
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$OPEN_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/pause_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/pause_ticks"
+    if (( n == 1 )); then printf "%s\n" "$AFTER_PAUSE"; else printf "%s\n" "$AFTER_RESUME"; fi
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 4141; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Opened running: no DECISION TIME block yet, only the progress hint (69 %).
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait --print-id -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+# First refresh tick: paused after opening — the same wording a freshly-opened held
+# popup already uses, now shown on a refresh of one that opened running; the hint
+# holds at the daemon's own reported share (20000/60000 -> 34 %), not still ticking
+# down on its own.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 4141 -h int:value:34 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+# Second refresh tick: resumed — the DECISION TIME block is gone again and the hint
+# moves on from where the pause left it (15000/60000 -> 25 %), not from 69 % as
+# though the pause had never happened.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 4141 -h int:value:25 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+assert_logged '^held while paused · resume the session to answer$'
+[[ $(grep -c 'DECISION TIME' "$MOCK_LOG") == 1 ]] ||
+  fail "only the paused refresh tick carries a DECISION TIME block: $(cat "$MOCK_LOG")"
+
+# --- shellcheck-clean, usage block, strict mode -----------------------------------
+head -1 "$approve" | grep -q '^#!/usr/bin/env bash$' || fail "shebang"
+grep -q '^set -euo pipefail$' "$approve" || fail "strict mode"
+
+assert_not_logged '^ward session approve --session sess_a 12 deny# place across ticks, from the daemon's own current countdown each time, rather than
+# staying frozen at whatever it was when the popup opened (#146 item 4's live-refresh
+# half) --------------------------------------------------------------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/refresh_ticks"
+tick1=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+tick2=${line12%\}}',"countdown":{"remaining_ms":9001,"timeout_ms":60000,"held":false}}'
+export TICK1=$tick1 TICK2=$tick2
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RUNNING12" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/refresh_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/refresh_ticks"
+    if (( n == 1 )); then printf "%s\n" "$TICK1"; else printf "%s\n" "$TICK2"; fi
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# Never itself answers: stays open (--wait, killed only by the round's own
+# end-of-round sweep) so a small refresh interval gets several ticks in before then.
+mock notify-send 'case "$*" in *--print-id*) echo 3131; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# 41001/60000 -> 69 %, 9001/60000 -> 16 %: the same rounding-up share
+# progress_value already uses elsewhere, now read fresh on two different ticks of
+# the same still-open popup (notify-send -r 3131, never --print-id again) rather
+# than opening — or staying frozen as — one popup for the whole time it is open.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 3131 -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 3131 -h int:value:16 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 1 ]] ||
+  fail "a refresh tick must never open a second popup: $(cat "$MOCK_LOG")"
+
+# --- --watch: a refresh tick that is already mid-flight when its approval becomes
+# terminal elsewhere must not resurrect the notification with stale pending content
+# afterward (#146 item 4 review — the resolved-during-refresh race) ---------------
+# Forced, not hoped for: a barrier on the refresh tick's own daemon query (its
+# only external command between reading a — by then already stale — "still
+# pending" answer and deciding whether to replace the popup with it) holds that
+# query open until the resolver's own terminal replace has already completed, so
+# the tick's own with_notiflock check is guaranteed to find pid_file already gone
+# — proving the lock actually closes the race rather than merely not having lost
+# it by luck on this run.
+: >"$MOCK_LOG"
+rm -f "$TMP/refresh_query_started" "$TMP/finish_done"
+race_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+race_decided='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export RACE_RUNNING=$race_running RACE_DECIDED=$race_decided
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RACE_RUNNING" ;;
+  "session pending --json --all")
+    : >"$TMP/refresh_query_started"
+    for _ in $(seq 1 300); do [[ -f "$TMP/finish_done" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_RUNNING"
+    ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 300); do [[ -f "$TMP/refresh_query_started" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_DECIDED"
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# The finish barrier is on this mock's own "-t 4000" replace call (finish_notification's
+# only external command): it signals the instant that replace has actually happened,
+# which is what the refresh tick above is really waiting to be true before it acts.
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*) echo 8181; exec sleep 30 ;;
+  *"-t 4000"*) : >"$TMP/finish_done" ;;
+  *) exit 0 ;;
+esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Resolved exactly once, with the outcome — never re-shown as pending afterward,
+# and the refresh tick that raced it never got to replace anything at all.
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 8181 Timed out — denied <tt>/work/src/lib.rs</tt>$'
+assert_not_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8181'
+
+# --- --watch: a refresh tick already mid-flight when the popup's own action is
+# answered (the self-decided/timed-out counterpart of the race above, #250 review)
+# must not be able to land more than the one redraw it was already committed to,
+# and the notification's own final content must be the real outcome — never that
+# stale redraw — because notify_one's own cleanup both retires pid_file and
+# corrects the notification in the same locked step, ordered after any in-flight
+# tick (#250 review, second round) ------------------------------------------------
+# Forced the same way as the race above: the tick's own "-u critical -r" call is
+# barriered so it is guaranteed to still be inside with_notiflock, mid-notify-send,
+# the instant notify-send --print-id returns "deny". Confirms three things: the
+# already in-flight tick is still allowed to finish (with_notiflock does not reach
+# into a call already running under the lock — only orders whichever of this and a
+# later tick's own check-then-act runs next), that no later tick ever gets that far
+# again once pid_file is gone, and that the notification's own last write is the
+# real "Denied" outcome, not the tick's stale "still pending" redraw.
+: >"$MOCK_LOG"
+rm -f "$TMP/orphan_refresh_started" "$TMP/orphan_release" "$TMP/orphan_refresh_done"
+orphan_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+export ORPHAN_RUNNING=$orphan_running
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$ORPHAN_RUNNING" ;;
+  "session pending --json --all") printf "%s\n" "$ORPHAN_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*) echo 5252; sleep 0.15; echo deny ;;
+  *"-u critical -r "*)
+    : >"$TMP/orphan_refresh_started"
+    for _ in $(seq 1 500); do [[ -f "$TMP/orphan_release" ]] && break; sleep 0.01; done
+    : >"$TMP/orphan_refresh_done"
+    exit 0 ;;
+  *) exit 0 ;;
+esac'
+# Backgrounded, not run to completion first: notify_one's own fixed cleanup now
+# takes with_notiflock before removing pid_file, so it legitimately blocks for as
+# long as the tick above is still inside that same lock — "--once" itself does not
+# return until every worker has actually finished (#224, the case above), so it
+# cannot be used here to observe the tick mid-flight the way the race above did.
+# refresh_interval (0.02s) is far shorter than the --print-id delay (0.15s) above
+# on purpose: the first tick fires almost immediately and, once it is barriered
+# here, holds with_notiflock for as long as the barrier does — refresh_loop is
+# strictly sequential (it does not start a next tick until this one's own
+# with_notiflock call returns), so nothing else can race in behind it. The
+# foreground side holds the barrier well past the --print-id delay before
+# releasing it, so notify_one's own cleanup has certainly already reached, and
+# is already queued behind, this same lock by the time it opens.
+WARDOS_APPROVE_REFRESH_S=0.02 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once &
+approve_pid=$!
+for _ in $(seq 1 300); do [[ -f "$TMP/orphan_refresh_started" ]] && break; sleep 0.01; done
+assert_file "$TMP/orphan_refresh_started"
+[[ -f "$TMP/orphan_refresh_done" ]] &&
+  fail "the refresh tick's notify-send call must still be an unreleased orphan while notify_one's cleanup waits on it"
+sleep 0.3
+: >"$TMP/orphan_release"
+wait "$approve_pid"
+assert_file "$TMP/orphan_refresh_done"
+assert_logged '^ward session approve --session sess_a 12 deny$'
+# The one already-committed redraw is allowed to land...
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 5252 .*-A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api'
+# ...but with_notiflock's ordering means pid_file is already gone by the time any
+# later tick could check it, so refresh_loop stops itself rather than looping again.
+[[ $(grep -c -- '-u critical -r 5252' "$MOCK_LOG") -le 1 ]] ||
+  fail "at most the one already in-flight redraw may land, never another after cleanup: $(cat "$MOCK_LOG")"
+# ...and notify_one's own cleanup corrects the notification right after — the
+# same lock, requested while the tick above already held it, so this is always
+# the next write and therefore the last thing on screen, never the tick's stale
+# "still pending" content with dead, actionable-looking buttons.
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 5252 Denied <tt>/work/src/lib.rs</tt>$'
+last_pending=$(grep -n -- '-u critical -r 5252' "$MOCK_LOG" | tail -1 | cut -d: -f1)
+corrected=$(grep -n -- '-u low -t 4000 -r 5252 Denied' "$MOCK_LOG" | tail -1 | cut -d: -f1)
+[[ -n $last_pending && -n $corrected && $corrected -gt $last_pending ]] ||
+  fail "the real outcome must be written after every stale redraw, not before: $(cat "$MOCK_LOG")"
+
+# --- --watch: a transient daemon/jq failure on a refresh tick's own query does not
+# permanently stop the live refresh — only that one tick is skipped, the same as
+# every other command in this loop that can fail (#250 review, second round:
+# `current_countdown_for ... || return 0` treated every failure, including a
+# passing daemon hiccup, as "nothing left to refresh", contrary to the "skip a
+# tick" behaviour this file's own comments already claim for the loop) --------------
+: >"$MOCK_LOG"
+rm -f "$TMP/transient_ticks"
+recovers_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+export RECOVERS_RUNNING=$recovers_running
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RECOVERS_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/transient_ticks"
+    if (( n == 1 )); then
+      echo "ward: daemon unreachable" >&2
+      exit 1
+    fi
+    printf "%s\n" "$RECOVERS_RUNNING"
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 7171; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# The first, failing tick must not be the last: a redraw from a later, succeeding
+# tick still lands — the loop survived the one failure instead of exiting on it.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 7171 -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+[[ $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) -ge 2 ]] ||
+  fail "the query must be retried after a transient failure, not abandoned: only $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) attempt(s)"
+
+# --- --watch: a refresh tick whose representative id resolves elsewhere while an
+# exact duplicate is still gathered under the same popup switches to that surviving
+# member instead of stopping the whole live refresh (#250 review, second round:
+# current_countdown_for failing for one id — because the group's daemon-reported
+# membership moved on, not because the daemon or jq failed — must not be read as
+# "nothing left to refresh" when a fresh read of the group's own members, right
+# there in the next two lines, says otherwise) --------------------------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/switch_id12_gone" "$TMP/switch_ready"
+switch_dup_a=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+switch_dup_b=${line12/\"id\":12/\"id\":14}
+switch_dup_b=${switch_dup_b%\}}',"countdown":{"remaining_ms":9001,"timeout_ms":60000,"held":false}}'
+switch_decided_12='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"remembered","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export SWITCH_DUP_A=$switch_dup_a SWITCH_DUP_B=$switch_dup_b SWITCH_DECIDED_12=$switch_decided_12
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$SWITCH_DUP_A" "$SWITCH_DUP_B" ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 300); do [[ -f "$TMP/switch_ready" ]] && break; sleep 0.01; done
+    printf "%s\n" "$SWITCH_DECIDED_12"
+    ;;
+  "session pending --json --all")
+    if [[ -f "$TMP/switch_id12_gone" ]]; then
+      printf "%s\n" "$SWITCH_DUP_B"
+    else
+      printf "%s\n%s\n" "$SWITCH_DUP_A" "$SWITCH_DUP_B"
+    fi
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 8282; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once &
+approve_pid=$!
+# id 12 is the group's representative (inserted first): the first tick(s) show
+# its own countdown (41001/60000 -> 69 %).
+wait_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8282 -h int:value:69 '
+# id 12 becomes terminal — resolve_notification removes it from the group's own
+# ids file, leaving 14 as the sole surviving member — and, from here on, the
+# daemon no longer reports it pending either.
+: >"$TMP/switch_id12_gone"
+: >"$TMP/switch_ready"
+# A later tick must pick up id 14's own countdown (9001/60000 -> 16 %) instead of
+# the loop having stopped the moment id 12 stopped being reported.
+wait_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8282 -h int:value:16 '
+wait "$approve_pid"
+
+# --- --watch: a pause (and resume) that happens after the notification opened is
+# reflected on the next refresh tick — the countdown visibly holds, then resumes
+# counting, from the daemon's own held/remaining_ms accounting (PR #225), with no
+# pause notion of this script's own (#146 item 4's live-refresh half) -------------
+: >"$MOCK_LOG"
+rm -f "$TMP/pause_ticks"
+open_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+after_pause=${line12%\}}',"countdown":{"remaining_ms":20000,"timeout_ms":60000,"held":true}}'
+after_resume=${line12%\}}',"countdown":{"remaining_ms":15000,"timeout_ms":60000,"held":false}}'
+export OPEN_RUNNING=$open_running AFTER_PAUSE=$after_pause AFTER_RESUME=$after_resume
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$OPEN_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/pause_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/pause_ticks"
+    if (( n == 1 )); then printf "%s\n" "$AFTER_PAUSE"; else printf "%s\n" "$AFTER_RESUME"; fi
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 4141; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Opened running: no DECISION TIME block yet, only the progress hint (69 %).
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait --print-id -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+# First refresh tick: paused after opening — the same wording a freshly-opened held
+# popup already uses, now shown on a refresh of one that opened running; the hint
+# holds at the daemon's own reported share (20000/60000 -> 34 %), not still ticking
+# down on its own.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 4141 -h int:value:34 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+# Second refresh tick: resumed — the DECISION TIME block is gone again and the hint
+# moves on from where the pause left it (15000/60000 -> 25 %), not from 69 % as
+# though the pause had never happened.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 4141 -h int:value:25 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+assert_logged '^held while paused · resume the session to answer$'
+[[ $(grep -c 'DECISION TIME' "$MOCK_LOG") == 1 ]] ||
+  fail "only the paused refresh tick carries a DECISION TIME block: $(cat "$MOCK_LOG")"
+
+# --- shellcheck-clean, usage block, strict mode -----------------------------------
+head -1 "$approve" | grep -q '^#!/usr/bin/env bash$' || fail "shebang"
+grep -q '^set -euo pipefail$' "$approve" || fail "strict mode"
+
+
+# --- --watch: an already-open notification's countdown/progress hint refreshes in
+# place across ticks, from the daemon's own current countdown each time, rather than
+# staying frozen at whatever it was when the popup opened (#146 item 4's live-refresh
+# half) --------------------------------------------------------------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/refresh_ticks"
+tick1=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+tick2=${line12%\}}',"countdown":{"remaining_ms":9001,"timeout_ms":60000,"held":false}}'
+export TICK1=$tick1 TICK2=$tick2
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RUNNING12" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/refresh_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/refresh_ticks"
+    if (( n == 1 )); then printf "%s\n" "$TICK1"; else printf "%s\n" "$TICK2"; fi
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# Never itself answers: stays open (--wait, killed only by the round's own
+# end-of-round sweep) so a small refresh interval gets several ticks in before then.
+mock notify-send 'case "$*" in *--print-id*) echo 3131; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# 41001/60000 -> 69 %, 9001/60000 -> 16 %: the same rounding-up share
+# progress_value already uses elsewhere, now read fresh on two different ticks of
+# the same still-open popup (notify-send -r 3131, never --print-id again) rather
+# than opening — or staying frozen as — one popup for the whole time it is open.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 3131 -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 3131 -h int:value:16 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+[[ $(grep -c -- '--print-id' "$MOCK_LOG") -eq 1 ]] ||
+  fail "a refresh tick must never open a second popup: $(cat "$MOCK_LOG")"
+
+# --- --watch: a refresh tick that is already mid-flight when its approval becomes
+# terminal elsewhere must not resurrect the notification with stale pending content
+# afterward (#146 item 4 review — the resolved-during-refresh race) ---------------
+# Forced, not hoped for: a barrier on the refresh tick's own daemon query (its
+# only external command between reading a — by then already stale — "still
+# pending" answer and deciding whether to replace the popup with it) holds that
+# query open until the resolver's own terminal replace has already completed, so
+# the tick's own with_notiflock check is guaranteed to find pid_file already gone
+# — proving the lock actually closes the race rather than merely not having lost
+# it by luck on this run.
+: >"$MOCK_LOG"
+rm -f "$TMP/refresh_query_started" "$TMP/finish_done"
+race_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+race_decided='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"timed-out","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export RACE_RUNNING=$race_running RACE_DECIDED=$race_decided
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RACE_RUNNING" ;;
+  "session pending --json --all")
+    : >"$TMP/refresh_query_started"
+    for _ in $(seq 1 300); do [[ -f "$TMP/finish_done" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_RUNNING"
+    ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 300); do [[ -f "$TMP/refresh_query_started" ]] && break; sleep 0.01; done
+    printf "%s\n" "$RACE_DECIDED"
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# The finish barrier is on this mock's own "-t 4000" replace call (finish_notification's
+# only external command): it signals the instant that replace has actually happened,
+# which is what the refresh tick above is really waiting to be true before it acts.
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*) echo 8181; exec sleep 30 ;;
+  *"-t 4000"*) : >"$TMP/finish_done" ;;
+  *) exit 0 ;;
+esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Resolved exactly once, with the outcome — never re-shown as pending afterward,
+# and the refresh tick that raced it never got to replace anything at all.
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 8181 Timed out — denied <tt>/work/src/lib.rs</tt>$'
+assert_not_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8181'
+
+# --- --watch: a refresh tick already mid-flight when the popup's own action is
+# answered (the self-decided/timed-out counterpart of the race above, #250 review)
+# must not be able to land more than the one redraw it was already committed to,
+# and the notification's own final content must be the real outcome — never that
+# stale redraw — because notify_one's own cleanup both retires pid_file and
+# corrects the notification in the same locked step, ordered after any in-flight
+# tick (#250 review, second round) ------------------------------------------------
+# Forced the same way as the race above: the tick's own "-u critical -r" call is
+# barriered so it is guaranteed to still be inside with_notiflock, mid-notify-send,
+# the instant notify-send --print-id returns "deny". Confirms three things: the
+# already in-flight tick is still allowed to finish (with_notiflock does not reach
+# into a call already running under the lock — only orders whichever of this and a
+# later tick's own check-then-act runs next), that no later tick ever gets that far
+# again once pid_file is gone, and that the notification's own last write is the
+# real "Denied" outcome, not the tick's stale "still pending" redraw.
+: >"$MOCK_LOG"
+rm -f "$TMP/orphan_refresh_started" "$TMP/orphan_release" "$TMP/orphan_refresh_done"
+orphan_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+export ORPHAN_RUNNING=$orphan_running
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$ORPHAN_RUNNING" ;;
+  "session pending --json --all") printf "%s\n" "$ORPHAN_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# shellcheck disable=SC2016
+mock notify-send 'case "$*" in
+  *--print-id*) echo 5252; sleep 0.15; echo deny ;;
+  *"-u critical -r "*)
+    : >"$TMP/orphan_refresh_started"
+    for _ in $(seq 1 500); do [[ -f "$TMP/orphan_release" ]] && break; sleep 0.01; done
+    : >"$TMP/orphan_refresh_done"
+    exit 0 ;;
+  *) exit 0 ;;
+esac'
+# Backgrounded, not run to completion first: notify_one's own fixed cleanup now
+# takes with_notiflock before removing pid_file, so it legitimately blocks for as
+# long as the tick above is still inside that same lock — "--once" itself does not
+# return until every worker has actually finished (#224, the case above), so it
+# cannot be used here to observe the tick mid-flight the way the race above did.
+# refresh_interval (0.02s) is far shorter than the --print-id delay (0.15s) above
+# on purpose: the first tick fires almost immediately and, once it is barriered
+# here, holds with_notiflock for as long as the barrier does — refresh_loop is
+# strictly sequential (it does not start a next tick until this one's own
+# with_notiflock call returns), so nothing else can race in behind it. The
+# foreground side holds the barrier well past the --print-id delay before
+# releasing it, so notify_one's own cleanup has certainly already reached, and
+# is already queued behind, this same lock by the time it opens.
+WARDOS_APPROVE_REFRESH_S=0.02 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once &
+approve_pid=$!
+for _ in $(seq 1 300); do [[ -f "$TMP/orphan_refresh_started" ]] && break; sleep 0.01; done
+assert_file "$TMP/orphan_refresh_started"
+[[ -f "$TMP/orphan_refresh_done" ]] &&
+  fail "the refresh tick's notify-send call must still be an unreleased orphan while notify_one's cleanup waits on it"
+sleep 0.3
+: >"$TMP/orphan_release"
+wait "$approve_pid"
+assert_file "$TMP/orphan_refresh_done"
+assert_logged '^ward session approve --session sess_a 12 deny$'
+# The one already-committed redraw is allowed to land...
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 5252 .*-A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api'
+# ...but with_notiflock's ordering means pid_file is already gone by the time any
+# later tick could check it, so refresh_loop stops itself rather than looping again.
+[[ $(grep -c -- '-u critical -r 5252' "$MOCK_LOG") -le 1 ]] ||
+  fail "at most the one already in-flight redraw may land, never another after cleanup: $(cat "$MOCK_LOG")"
+# ...and notify_one's own cleanup corrects the notification right after — the
+# same lock, requested while the tick above already held it, so this is always
+# the next write and therefore the last thing on screen, never the tick's stale
+# "still pending" content with dead, actionable-looking buttons.
+assert_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 5252 Denied <tt>/work/src/lib.rs</tt>$'
+last_pending=$(grep -n -- '-u critical -r 5252' "$MOCK_LOG" | tail -1 | cut -d: -f1)
+corrected=$(grep -n -- '-u low -t 4000 -r 5252 Denied' "$MOCK_LOG" | tail -1 | cut -d: -f1)
+[[ -n $last_pending && -n $corrected && $corrected -gt $last_pending ]] ||
+  fail "the real outcome must be written after every stale redraw, not before: $(cat "$MOCK_LOG")"
+
+# --- --watch: a transient daemon/jq failure on a refresh tick's own query does not
+# permanently stop the live refresh — only that one tick is skipped, the same as
+# every other command in this loop that can fail (#250 review, second round:
+# `current_countdown_for ... || return 0` treated every failure, including a
+# passing daemon hiccup, as "nothing left to refresh", contrary to the "skip a
+# tick" behaviour this file's own comments already claim for the loop) --------------
+: >"$MOCK_LOG"
+rm -f "$TMP/transient_ticks"
+recovers_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+export RECOVERS_RUNNING=$recovers_running
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$RECOVERS_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/transient_ticks"
+    if (( n == 1 )); then
+      echo "ward: daemon unreachable" >&2
+      exit 1
+    fi
+    printf "%s\n" "$RECOVERS_RUNNING"
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 7171; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# The first, failing tick must not be the last: a redraw from a later, succeeding
+# tick still lands — the loop survived the one failure instead of exiting on it.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 7171 -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+[[ $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) -ge 2 ]] ||
+  fail "the query must be retried after a transient failure, not abandoned: only $(cat "$TMP/transient_ticks" 2>/dev/null || echo 0) attempt(s)"
+
+# --- --watch: a refresh tick whose representative id resolves elsewhere while an
+# exact duplicate is still gathered under the same popup switches to that surviving
+# member instead of stopping the whole live refresh (#250 review, second round:
+# current_countdown_for failing for one id — because the group's daemon-reported
+# membership moved on, not because the daemon or jq failed — must not be read as
+# "nothing left to refresh" when a fresh read of the group's own members, right
+# there in the next two lines, says otherwise) --------------------------------------
+: >"$MOCK_LOG"
+rm -f "$TMP/switch_id12_gone" "$TMP/switch_ready"
+switch_dup_a=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+switch_dup_b=${line12/\"id\":12/\"id\":14}
+switch_dup_b=${switch_dup_b%\}}',"countdown":{"remaining_ms":9001,"timeout_ms":60000,"held":false}}'
+switch_decided_12='{"approval":{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"step-through: pause before writes","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":"once"},"requested_at_unix_ms":1},"outcome":"remembered","decided_at_unix_ms":9,"agent":"claude","session":"sess_a"}'
+export SWITCH_DUP_A=$switch_dup_a SWITCH_DUP_B=$switch_dup_b SWITCH_DECIDED_12=$switch_decided_12
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n%s\n" "$SWITCH_DUP_A" "$SWITCH_DUP_B" ;;
+  "session approvals --json --follow --session sess_a")
+    for _ in $(seq 1 300); do [[ -f "$TMP/switch_ready" ]] && break; sleep 0.01; done
+    printf "%s\n" "$SWITCH_DECIDED_12"
+    ;;
+  "session pending --json --all")
+    if [[ -f "$TMP/switch_id12_gone" ]]; then
+      printf "%s\n" "$SWITCH_DUP_B"
+    else
+      printf "%s\n%s\n" "$SWITCH_DUP_A" "$SWITCH_DUP_B"
+    fi
+    ;;
+  "session approve "*) exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 8282; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once &
+approve_pid=$!
+# id 12 is the group's representative (inserted first): the first tick(s) show
+# its own countdown (41001/60000 -> 69 %).
+wait_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8282 -h int:value:69 '
+# id 12 becomes terminal — resolve_notification removes it from the group's own
+# ids file, leaving 14 as the sole surviving member — and, from here on, the
+# daemon no longer reports it pending either.
+: >"$TMP/switch_id12_gone"
+: >"$TMP/switch_ready"
+# A later tick must pick up id 14's own countdown (9001/60000 -> 16 %) instead of
+# the loop having stopped the moment id 12 stopped being reported.
+wait_logged '^notify-send -a WardOS -c ward-approval -u critical -r 8282 -h int:value:16 '
+wait "$approve_pid"
+
+# --- --watch: a pause (and resume) that happens after the notification opened is
+# reflected on the next refresh tick — the countdown visibly holds, then resumes
+# counting, from the daemon's own held/remaining_ms accounting (PR #225), with no
+# pause notion of this script's own (#146 item 4's live-refresh half) -------------
+: >"$MOCK_LOG"
+rm -f "$TMP/pause_ticks"
+open_running=${line12%\}}',"countdown":{"remaining_ms":41001,"timeout_ms":60000,"held":false}}'
+after_pause=${line12%\}}',"countdown":{"remaining_ms":20000,"timeout_ms":60000,"held":true}}'
+after_resume=${line12%\}}',"countdown":{"remaining_ms":15000,"timeout_ms":60000,"held":false}}'
+export OPEN_RUNNING=$open_running AFTER_PAUSE=$after_pause AFTER_RESUME=$after_resume
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session pending --json --all --follow") printf "%s\n" "$OPEN_RUNNING" ;;
+  '"$NOOP_APPROVALS_CASE"'
+  "session pending --json --all")
+    n=$(( $(cat "$TMP/pause_ticks" 2>/dev/null || echo 0) + 1 ))
+    printf "%s\n" "$n" >"$TMP/pause_ticks"
+    if (( n == 1 )); then printf "%s\n" "$AFTER_PAUSE"; else printf "%s\n" "$AFTER_RESUME"; fi
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send 'case "$*" in *--print-id*) echo 4141; exec sleep 30 ;; *) exit 0 ;; esac'
+WARDOS_APPROVE_REFRESH_S=0.05 WARDOS_PROJECT=/home/dev/payments-api timeout 10 "$approve" --watch --once
+# Opened running: no DECISION TIME block yet, only the progress hint (69 %).
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical --wait --print-id -h int:value:69 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+# First refresh tick: paused after opening — the same wording a freshly-opened held
+# popup already uses, now shown on a refresh of one that opened running; the hint
+# holds at the daemon's own reported share (20000/60000 -> 34 %), not still ticking
+# down on its own.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 4141 -h int:value:34 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+# Second refresh tick: resumed — the DECISION TIME block is gone again and the hint
+# moves on from where the pause left it (15000/60000 -> 25 %), not from 69 % as
+# though the pause had never happened.
+assert_logged '^notify-send -a WardOS -c ward-approval -u critical -r 4141 -h int:value:25 -A allow=Allow once -A session=Allow session -A deny=Deny Claude requests · payments-api <span alpha="39322">DESTINATION</span>$'
+assert_logged '^held while paused · resume the session to answer$'
+[[ $(grep -c 'DECISION TIME' "$MOCK_LOG") == 1 ]] ||
+  fail "only the paused refresh tick carries a DECISION TIME block: $(cat "$MOCK_LOG")"
 
 # --- shellcheck-clean, usage block, strict mode -----------------------------------
 head -1 "$approve" | grep -q '^#!/usr/bin/env bash$' || fail "shebang"
