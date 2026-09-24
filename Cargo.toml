@@ -8,6 +8,7 @@ members = [
     "crates/ward-proxy",
     "crates/ward-agent",
     "crates/ward-daemon",
+    "crates/ward-release-verify",
     "crates/ward-cli",
     "crates/ward-shell-core",
     "desktop/shell",
