@@ -33,6 +33,7 @@ pub mod ids;
 pub mod observe;
 pub mod pause;
 pub mod readiness;
+pub mod reclaim;
 pub mod render;
 pub mod retention;
 pub mod sandbox;

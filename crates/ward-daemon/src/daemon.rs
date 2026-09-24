@@ -150,6 +150,16 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
     // for `Describe`/`Subscribe` right after would otherwise see whatever
     // half-reconciled state this left behind with nothing to say it is suspect.
     crate::attempt::reconcile_dangling_attempts(&mut log, &dir)?;
+    // #151 item 5: a daemon starting up is also a good, cheap moment to sweep
+    // whatever scratch other, already-finished sessions left behind — most
+    // often because their own process was killed between finishing its work
+    // and its normal `remove_dir_all` cleanup. Unlike the dangling-attempt
+    // reconciliation above, this is disk hygiene, not correctness: a failure
+    // here (or simply finding nothing to do) must never stop this session's
+    // daemon from starting, so the result is deliberately discarded — see
+    // `crate::reclaim`'s own module doc comment for the full safety argument
+    // (never touching anything but a re-verified `Orphaned` entry).
+    let _ = crate::reclaim::reclaim_orphaned_scratch(state);
     let description = serde_json::to_value(meta.describe())
         .map_err(|e| Error::Daemon(format!("describe {session}: {e}")))?;
     // What an approval's authority is derived from: the manifest, the
