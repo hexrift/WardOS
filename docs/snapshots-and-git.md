@@ -136,8 +136,10 @@ reachable from at least one retention root:
 * any snapshot an in-flight verification attempt currently names as its candidate;
 * any snapshot `TamperWard` has recorded as accepted evidence (`StateAccepted`),
   regardless of whether the session that produced it has since ended;
-* any snapshot explicitly marked kept (`ward_snapshot::gc::mark_kept`) — the minimal
-  marker user-kept restore backups use today, pending a fuller policy.
+* any snapshot explicitly marked kept — the minimal marker user-kept restore backups
+  use today, pending a fuller policy. `ward snapshot keep <id>` sets it, `ward snapshot
+  unkeep <id>` clears it (both idempotent), and `ward snapshot kept [--json]` lists
+  every id currently marked (#151 item 4).
 
 Separately, a capture in progress holds a lease over the whole store for its duration,
 so a sweep running concurrently with a capture never reclaims a blob or manifest the

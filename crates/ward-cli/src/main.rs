@@ -385,14 +385,14 @@ enum SessionCmd {
     },
     /// The temporary authority the session holds (ADR-0019): every
     /// `allow-session` answer and every credential the proxy injects, with its
-    /// scope and lifetime.
+    /// id, scope and lifetime.
     Grants {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
         /// The session id, instead of looking one up.
         #[arg(long)]
         session: Option<String>,
-        /// One JSON object per grant: `{kind, label, scope, lifetime,
+        /// One JSON object per grant: `{id, kind, label, scope, lifetime,
         /// granted_at_unix_ms}`.
         #[arg(long)]
         json: bool,
@@ -408,6 +408,30 @@ enum SessionCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
         /// The session id, as `ward session pending` lists it.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Remove one grant from live authority (#140 items 4-6): a credential
+    /// grant no longer appears in `ward session grants`, the panel or
+    /// `GRANTS n`, and an `allow-session` answer is forgotten, so the same
+    /// tool on the same target asks again. Refused when `id` names no live
+    /// grant.
+    ///
+    /// This removes *future* authority only. For a credential the proxy is
+    /// currently injecting, it does not withdraw an already-established
+    /// route at the proxy or wait for that withdrawal to be confirmed — an
+    /// in-flight or already-open connection using that credential may keep
+    /// working until its own lifecycle ends (the launch finishes, the
+    /// session ends). Host-confirmed teardown of an *active* route, with an
+    /// acknowledged "revoking" state, is tracked separately and not yet
+    /// implemented.
+    Revoke {
+        /// The grant's id, as `ward session grants` lists it.
+        id: u64,
+        /// Project directory (default: current).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The session id, as `ward session grants` lists it.
         #[arg(long)]
         session: Option<String>,
     },
@@ -480,6 +504,24 @@ enum SnapshotCmd {
         #[arg(long)]
         apply: bool,
         /// Emit the plan or report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark a snapshot as explicitly kept (#151 item 4): a user-kept restore
+    /// backup, exempt from `ward snapshot gc` regardless of whether any other
+    /// retention root still points at it. Idempotent.
+    Keep {
+        /// The snapshot.
+        id: String,
+    },
+    /// Undo `keep`. Removing a marker that was never set is not an error.
+    Unkeep {
+        /// The snapshot.
+        id: String,
+    },
+    /// Every snapshot `keep` currently marks (#151 item 4).
+    Kept {
+        /// Emit a JSON array of ids instead of one per line.
         #[arg(long)]
         json: bool,
     },
@@ -580,6 +622,9 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Snapshot(SnapshotCmd::Cat { id, path }) => cmd_snapshot_cat(&id, &path),
         Command::Snapshot(SnapshotCmd::Usage { json }) => cmd_snapshot_usage(json),
         Command::Snapshot(SnapshotCmd::Gc { apply, json }) => cmd_snapshot_gc(apply, json),
+        Command::Snapshot(SnapshotCmd::Keep { id }) => cmd_snapshot_keep(&id),
+        Command::Snapshot(SnapshotCmd::Unkeep { id }) => cmd_snapshot_unkeep(&id),
+        Command::Snapshot(SnapshotCmd::Kept { json }) => cmd_snapshot_kept(json),
         Command::Evidence(EvidenceCmd::Append { dir, json }) => {
             cmd_evidence_append(&dir.unwrap_or_else(cwd), &json)
         }
@@ -642,6 +687,9 @@ fn cmd_session(cmd: SessionCmd) -> ward_daemon::Result<ExitCode> {
             dir,
             session,
         } => cmd_approve(&dir.unwrap_or_else(cwd), session.as_deref(), id, decision),
+        SessionCmd::Revoke { id, dir, session } => {
+            cmd_revoke(&dir.unwrap_or_else(cwd), session.as_deref(), id)
+        }
     }
 }
 
@@ -1256,6 +1304,19 @@ fn cmd_approve(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `ward session revoke <id>` (#140 items 4-6). "removed from authority", not "revoked":
+/// this command's own doc comment (see [`SessionCmd::Revoke`]) is explicit that it never
+/// tears down an already-established proxy route, so the printed result must not claim
+/// more happened than the authority projection changing — the same "no UI-only revoke is
+/// reported as enforced" bar #140's acceptance criteria sets for the panel.
+fn cmd_revoke(dir: &Path, session: Option<&str>, id: u64) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
+    client::revoke(&mut sink, id)?;
+    println!("  grant {id} removed from authority");
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_describe(dir: &Path, json: bool) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     let session = Session::open_current(dir, &state)?.ok_or_else(|| {
@@ -1365,6 +1426,44 @@ fn cmd_snapshot_gc(apply: bool, json: bool) -> ward_daemon::Result<ExitCode> {
         println!("{}", to_json(&plan)?);
     } else {
         print!("{}", render::gc_plan_panel(&state, &plan));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward snapshot keep <id>` (#151 item 4).
+fn cmd_snapshot_keep(id: &str) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let id = snapshot::parse_id(id)?;
+    retention::mark_kept(&state, id)?;
+    println!("  kept {id}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward snapshot unkeep <id>` (#151 item 4).
+fn cmd_snapshot_unkeep(id: &str) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let id = snapshot::parse_id(id)?;
+    retention::unmark_kept(&state, id)?;
+    println!("  unkept {id}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward snapshot kept [--json]` (#151 item 4).
+fn cmd_snapshot_kept(json: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let mut ids: Vec<String> = retention::kept_ids(&state)?
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    ids.sort();
+    if json {
+        println!("{}", to_json(&ids)?);
+    } else if ids.is_empty() {
+        println!("  no kept snapshots");
+    } else {
+        for id in &ids {
+            println!("  {id}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -2109,6 +2208,34 @@ mod tests {
                 apply: true,
                 json: true
             })
+        ));
+    }
+
+    #[test]
+    fn snapshot_keep_unkeep_and_kept_parse() {
+        // #151 item 4: the explicit user-selected retention policy `gc`'s own
+        // retention roots already read back from (`ward_snapshot::gc::kept_ids`),
+        // but had no command that could ever set.
+        let id = "blake3:".to_owned() + &"ab".repeat(32);
+        let cli = Cli::try_parse_from(["ward", "snapshot", "keep", &id]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Keep { id: got }) if got == id
+        ));
+        let cli = Cli::try_parse_from(["ward", "snapshot", "unkeep", &id]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Unkeep { id: got }) if got == id
+        ));
+        let cli = Cli::try_parse_from(["ward", "snapshot", "kept"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Kept { json: false })
+        ));
+        let cli = Cli::try_parse_from(["ward", "snapshot", "kept", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Kept { json: true })
         ));
     }
 

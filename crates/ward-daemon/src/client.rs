@@ -337,6 +337,15 @@ pub fn approve(sink: &mut RemoteSink, id: u64, decision: ApprovalDecision) -> Re
     }
 }
 
+/// Revoke a held grant by id (`ward session revoke <id>`, #140).
+pub fn revoke(sink: &mut RemoteSink, id: u64) -> Result<()> {
+    match sink.call(&Request::Revoke { id })? {
+        Response::Ok => Ok(()),
+        Response::Error(e) => Err(Error::Daemon(e)),
+        other => Err(Error::Events(format!("unexpected response {other:?}"))),
+    }
+}
+
 /// One session's approvals from [`approvals_all`], or why they could not be
 /// listed.
 #[derive(Debug)]
@@ -1252,6 +1261,7 @@ mod tests {
     /// [`fake_daemon`], but after streaming a subscription it keeps the
     /// connection open for `hold` (a live session with nothing new to say)
     /// before closing. `Describe` answers [`description`] as JSON.
+    #[allow(clippy::too_many_lines)]
     fn fake_daemon_holding(
         mut chain: Chain,
         log: Vec<EventRecord>,
@@ -1331,6 +1341,7 @@ mod tests {
                     Request::Grants => reply(
                         &mut writer,
                         &Response::Grants(vec![Grant {
+                            id: 1,
                             kind: crate::approvals::GrantKind::Approval,
                             label: "Write /work/a.rs".into(),
                             scope: "write".into(),
@@ -1341,6 +1352,11 @@ mod tests {
                     Request::Approve { id, .. } => reply(
                         &mut writer,
                         &Response::Error(format!("approval {id}: not pending")),
+                    ),
+                    Request::Revoke { id: 1 } => reply(&mut writer, &Response::Ok),
+                    Request::Revoke { id } => reply(
+                        &mut writer,
+                        &Response::Error(format!("revoke: grant {id} not found")),
                     ),
                     Request::Evidence { event } => {
                         let response = match refuse {
@@ -1629,6 +1645,9 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].approval.id, 4);
         assert_eq!(records[0].outcome, None);
+        revoke(&mut sink, held[0].id).unwrap();
+        let err = revoke(&mut sink, 42).unwrap_err();
+        assert_eq!(err.to_string(), "daemon: revoke: grant 42 not found");
         drop(sink);
         let seen = server.join().unwrap();
         assert_eq!(seen[1], Request::Pending);
@@ -1641,6 +1660,8 @@ mod tests {
         );
         assert_eq!(seen[4], Request::Grants);
         assert_eq!(seen[5], Request::Approvals);
+        assert_eq!(seen[6], Request::Revoke { id: 1 });
+        assert_eq!(seen[7], Request::Revoke { id: 42 });
     }
 
     #[test]

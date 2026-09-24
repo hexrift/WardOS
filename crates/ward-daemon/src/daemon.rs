@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ward_events::{EventRecord, LogReader, Origin, ShortText, WardEvent};
+use ward_events::{EventRecord, LogReader, Origin, RevokeReason, ServiceId, ShortText, WardEvent};
 
 use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
@@ -543,6 +543,11 @@ impl Served {
             Request::Pending => (Response::Pending(self.approvals.pending()), false),
             Request::Approvals => (Response::Approvals(self.approvals.approvals()), false),
             Request::Grants => (Response::Grants(self.approvals.grants()), false),
+            Request::Revoke { id } => (
+                self.revoke(id)
+                    .map_or_else(|e| Response::Error(refusal(e)), |()| Response::Ok),
+                false,
+            ),
             Request::Pause { reason } => (
                 self.pause(&reason).map_or_else(
                     |e| Response::Error(refusal(e)),
@@ -761,6 +766,33 @@ impl Served {
             Response::Record(record) => Ok(*record),
             Response::Error(e) => Err(Error::Daemon(e)),
             other => Err(Error::Daemon(format!("unexpected response {other:?}"))),
+        }
+    }
+
+    /// Revoke grant `id` (`ward session revoke <id>`, #140 items 4-6):
+    /// removes it from `self.approvals`' live authority view, and, for a
+    /// credential the proxy had injected, records `CredentialRevoked` so the
+    /// audit trail (`ward replay`) shows why it stopped counting. Errors when
+    /// `id` names no live grant. An `allow-session` answer has no revoked
+    /// event of its own yet (see [`approvals::Approvals::revoke`]'s doc
+    /// comment) — it is simply gone from `Request::Grants` from this call on.
+    ///
+    /// Authority-projection-only — see [`approvals::Approvals::revoke`]'s doc
+    /// comment for what this deliberately does not do (withdraw an
+    /// already-established route at the proxy, or wait for that to be
+    /// acknowledged).
+    fn revoke(&mut self, id: u64) -> Result<()> {
+        match self.approvals.revoke(id) {
+            Some(approvals::RevokedGrant::Credential { service }) => {
+                let service = ServiceId::new(&service).map_err(|e| Error::Daemon(e.to_string()))?;
+                self.append(WardEvent::CredentialRevoked {
+                    service,
+                    reason: RevokeReason::UserRevoked,
+                })?;
+                Ok(())
+            }
+            Some(approvals::RevokedGrant::Approval) => Ok(()),
+            None => Err(Error::Daemon(format!("revoke: grant {id} not found"))),
         }
     }
 
@@ -2331,6 +2363,67 @@ mod tests {
             2,
             "a denial grants nothing"
         );
+    }
+
+    #[test]
+    fn revoking_a_credential_grant_removes_it_and_records_credential_revoked() {
+        use ward_events::{CredentialDelivery, NameText, Scope, ServiceId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+
+        let granted = WardEvent::CredentialGranted {
+            service: ServiceId::new("github").unwrap(),
+            scope: Scope {
+                subject: ShortText::new("github.com:443"),
+                permissions: vec![NameText::new("contents:read")],
+            },
+            expires: Duration::from_secs(60),
+            delivery: CredentialDelivery::ProxyInjected,
+        };
+        assert!(lock(&served).append(granted).is_ok());
+
+        let grants = match lock(&served).handle(Request::Grants).0 {
+            Response::Grants(g) => g,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        let id = grants[0].id;
+
+        assert!(matches!(
+            lock(&served).handle(Request::Revoke { id }).0,
+            Response::Ok
+        ));
+
+        let grants = match lock(&served).handle(Request::Grants).0 {
+            Response::Grants(g) => g,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            grants.is_empty(),
+            "revoked grant no longer listed: {grants:?}"
+        );
+
+        let replay = lock(&served).subscribe(0).unwrap().replay;
+        assert!(
+            matches!(
+                replay.last().map(|r| &r.event),
+                Some(WardEvent::CredentialRevoked { service, reason })
+                    if service.as_str() == "github" && *reason == RevokeReason::UserRevoked
+            ),
+            "{replay:?}"
+        );
+
+        // Already revoked: the same id is refused, not silently accepted again.
+        assert!(matches!(
+            lock(&served).handle(Request::Revoke { id }).0,
+            Response::Error(e) if e.contains("not found")
+        ));
+        // Never minted: same refusal shape.
+        assert!(matches!(
+            lock(&served).handle(Request::Revoke { id: 999_999 }).0,
+            Response::Error(e) if e.contains("not found")
+        ));
     }
 
     #[test]

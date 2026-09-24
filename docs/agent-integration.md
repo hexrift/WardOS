@@ -219,9 +219,28 @@ Temporary authority stays visible while it exists (decision 4): `Request::Grants
 `ward session grants [--json]` lists every `allow-session` answer (`kind: approval`,
 `label: "WebFetch api.github.com"`, `scope`, `lifetime: session`) and every credential
 the proxy injects (`kind: credential`, `label: "GitHub"`, `scope: "contents:read,
-issues:read · github.com, api.github.com"`, `lifetime: launch`), oldest first; the
-shell derives the same list from the stream (`ward-shell-core` `authority.rs`) for
-the bar's `NET restricted · github+` and `GRANTS n` and the authority panel.
+issues:read · github.com, api.github.com"`, `lifetime: launch`), oldest first, each
+with the daemon-minted `id` it was listed under; the shell derives the same list from
+the stream (`ward-shell-core` `authority.rs`) for the bar's `NET restricted · github+`
+and `GRANTS n` and the authority panel.
+
+`Request::Revoke` / `ward session revoke <id>` (#140 items 4-6) removes one grant by
+that id: a credential grant is taken out of live authority and recorded as
+`CredentialRevoked` (the shell drops the matching panel row the same moment); an
+`allow-session` answer is forgotten from `remembered`, so the same tool on the same
+target asks again. Refused when `id` names no live grant — already revoked, retired
+when its launch ended, or never minted. No panel action calls this yet; it is CLI-only.
+
+**This is authority-projection-only, not host-confirmed enforcement.** #140's own item 4
+asks for more than this: "instruct the owning proxy to withdraw the route, then await
+acknowledgement," with an intermediate "revoking" state (item 5) until that
+acknowledgement arrives. `ward session revoke` does neither — it never reaches the proxy
+or the credential-injection boundary. Removing a credential grant here stops it from
+being *listed* in `ward session grants`/the panel/`GRANTS n`; an already-established
+route using that credential can keep working until its own lifecycle ends (the launch
+finishes, or the session ends). Host-confirmed teardown of an *active* route is tracked
+separately and not yet implemented — never present this command as if it already closes
+that gap (#140's own acceptance criterion: "no UI-only revoke is reported as enforced").
 
 The desktop side is `wardos-approve` (`desktop.md` §Commands): `--watch` follows
 `ward session pending --json --follow` (one JSON object per line: the record above
