@@ -93,6 +93,15 @@ pub enum Request {
     /// The temporary authority the session holds (ADR-0019): every
     /// `allow-session` answer and every credential the proxy injects.
     Grants,
+    /// Revoke one grant by the id [`Response::Grants`] listed it under
+    /// (#140): a credential the proxy injects is removed from live
+    /// authority and recorded `CredentialRevoked`; an `allow-session`
+    /// answer is forgotten, so the same tool on the same target asks again.
+    /// Refused when `id` names no live grant.
+    Revoke {
+        /// The grant's id, as `ward session grants` lists it.
+        id: u64,
+    },
     /// Pause the session as one operation (ADR-0019 §3): freeze its sandbox
     /// processes, close the proxy to new traffic, suspend credential
     /// injection, hold the approvals, and record `SessionPaused`.
@@ -541,6 +550,7 @@ pub fn handle_with(
         | Request::Pending
         | Request::Approvals
         | Request::Grants
+        | Request::Revoke { .. }
         | Request::Pause { .. }
         | Request::Resume => (
             Response::Error("not served on this connection".into()),
@@ -769,6 +779,7 @@ mod tests {
             r#"{"req":"grants"}"#
         );
         let grants = Response::Grants(vec![Grant {
+            id: 3,
             kind: crate::approvals::GrantKind::Credential,
             label: "GitHub".into(),
             scope: "contents:read · github.com".into(),
@@ -778,9 +789,18 @@ mod tests {
         let json = serde_json::to_string(&grants).unwrap();
         assert_eq!(
             json,
-            r#"{"resp":"grants","body":[{"kind":"credential","label":"GitHub","scope":"contents:read · github.com","lifetime":"launch","granted_at_unix_ms":9}]}"#
+            r#"{"resp":"grants","body":[{"id":3,"kind":"credential","label":"GitHub","scope":"contents:read · github.com","lifetime":"launch","granted_at_unix_ms":9}]}"#
         );
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), grants);
+        let revoke = Request::Revoke { id: 3 };
+        assert_eq!(
+            serde_json::to_string(&revoke).unwrap(),
+            r#"{"req":"revoke","id":3}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"req":"revoke","id":3}"#).unwrap(),
+            revoke
+        );
         // Pause and resume are the daemon's; they round-trip as their words.
         let pause = Request::Pause {
             reason: "looks wrong".into(),
@@ -793,7 +813,7 @@ mod tests {
             serde_json::to_string(&Request::Resume).unwrap(),
             r#"{"req":"resume"}"#
         );
-        // A plain log connection does not hold or answer approvals, list grants, or pause.
+        // A plain log connection does not hold or answer approvals, list or revoke grants, or pause.
         let dir = tempfile::tempdir().unwrap();
         let mut log = Some(fresh(dir.path()));
         for request in [
@@ -802,6 +822,7 @@ mod tests {
             Request::Pending,
             Request::Approvals,
             Request::Grants,
+            revoke,
             pause,
             Request::Resume,
         ] {

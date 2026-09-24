@@ -122,10 +122,12 @@ impl Approval {
         s
     }
 
-    /// The grant an `allow-session` answer to this question makes.
+    /// The grant an `allow-session` answer to this question makes, with the
+    /// stable id the caller minted for it (`State::next_grant_id`, #140).
     #[must_use]
-    pub fn session_grant(&self, granted_at_unix_ms: u64) -> Grant {
+    pub fn session_grant(&self, granted_at_unix_ms: u64, id: u64) -> Grant {
         Grant {
+            id,
             kind: GrantKind::Approval,
             label: format!("{} {}", self.tool, self.authority.destination),
             scope: self.authority.scope(),
@@ -258,6 +260,11 @@ impl Authority {
 /// A credential the launch granted: the proxy injects it for `hosts`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credential {
+    /// The daemon-minted id this credential's [`Grant`] carries (#140):
+    /// stable for the life of the grant, unique within the session, never
+    /// reused. `ward session revoke <id>` addresses a grant by this value
+    /// alone — never by label, which two simultaneous grants can share.
+    pub id: u64,
     /// The service (`github`).
     pub service: String,
     /// The upstream hosts the routes cover.
@@ -320,6 +327,10 @@ pub enum GrantKind {
 /// One piece of temporary authority the session holds (ADR-0019, decision 4).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
+    /// The daemon-minted id `ward session revoke <id>` addresses this grant
+    /// by (#140): unique within the session, stable until the grant is
+    /// retired, revoked or the session ends. Never reused.
+    pub id: u64,
     /// Which kind.
     pub kind: GrantKind,
     /// `Write /work/src/lib.rs`, `GitHub`.
@@ -334,16 +345,32 @@ pub struct Grant {
 }
 
 impl Grant {
-    /// The grant as one line: label, scope, lifetime.
+    /// The grant as one line: id, label, scope, lifetime.
     #[must_use]
     pub fn line(&self) -> String {
         format!(
-            "{}   {}   {}",
+            "{}   {}   {}   {}",
+            self.id,
             self.label,
             self.scope,
             self.lifetime.as_str()
         )
     }
+}
+
+/// What [`Approvals::revoke`] removed (#140).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevokedGrant {
+    /// A credential the proxy had injected, by its raw service id (`github`
+    /// — not [`service_name`]'s display form, which [`Approvals::grants`]
+    /// shows instead): the caller records `CredentialRevoked` for it.
+    Credential {
+        /// The service id.
+        service: String,
+    },
+    /// An `allow-session` answer, already removed from `remembered`; nothing
+    /// further for the caller to do.
+    Approval,
 }
 
 /// Derives an [`Authority`] for a question: the session's manifest, the
@@ -914,6 +941,11 @@ struct State {
     remembered: BTreeMap<(String, String), Grant>,
     /// The credentials the launches granted, one per service and scope.
     credentials: Vec<Credential>,
+    /// The next id [`State::next_grant_id`] mints (#140): monotonic for the
+    /// life of the session, so a grant id is never reused even after its
+    /// grant is retired or revoked — an id a caller once saw always means
+    /// the one grant it was minted for, or nothing.
+    next_grant_id: u64,
     /// Launch keys whose owning connection closed without ever producing a
     /// terminal record: [`Approvals::grants`] reports every credential
     /// recorded under one of these as [`Lifetime::LaunchUnknown`] rather than
@@ -974,6 +1006,13 @@ struct State {
 }
 
 impl State {
+    /// Mint the next grant id (#140): starts at 1, strictly increasing, never
+    /// reused for the life of the session.
+    fn next_grant_id(&mut self) -> u64 {
+        self.next_grant_id += 1;
+        self.next_grant_id
+    }
+
     /// Record `approval`'s outcome in the bounded history, evicting the
     /// oldest entry first when full.
     fn record_history(&mut self, approval: Approval, outcome: Outcome, at_unix_ms: u64) {
@@ -1033,7 +1072,9 @@ impl Approvals {
             }
             return;
         }
+        let id = state.next_grant_id();
         state.credentials.push(Credential {
+            id,
             service: service.to_owned(),
             hosts: vec![host.to_owned()],
             permissions,
@@ -1092,6 +1133,7 @@ impl Approvals {
             .credentials
             .iter()
             .map(|c| Grant {
+                id: c.id,
                 kind: GrantKind::Credential,
                 label: service_name(&c.service),
                 scope: format!("{} · {}", c.permissions.join(", "), c.hosts.join(", ")),
@@ -1114,6 +1156,40 @@ impl Approvals {
             (g.granted_at_unix_ms, kind_rank)
         });
         grants
+    }
+
+    /// Revoke the grant `id` names (`ward session revoke <id>`, #140 items
+    /// 4-6): removes it from what [`grants`](Self::grants) reports from this
+    /// call on. `None` when no live grant has this id — already revoked,
+    /// retired by its launch ending, or never minted.
+    ///
+    /// For a credential the proxy injected, the caller (`Served::revoke` in
+    /// `daemon.rs`) still has to record `CredentialRevoked` itself: this
+    /// method only owns the in-memory authority view, not the event log, the
+    /// same split `retire_launch` and `mark_launch_unknown` already draw. An
+    /// `allow-session` answer has no audit event of its own yet — removing it
+    /// from `remembered` is the whole of what revoking it does; a later pass
+    /// can add one if `ward replay` needs to show it (#140's own "Related"
+    /// notes this is UX-shaped follow-up, not a safety gap: the grant is
+    /// gone from live authority the moment this returns either way).
+    pub fn revoke(&self, id: u64) -> Option<RevokedGrant> {
+        let mut state = self.lock();
+        if let Some(pos) = state.credentials.iter().position(|c| c.id == id) {
+            let removed = state.credentials.remove(pos);
+            return Some(RevokedGrant::Credential {
+                service: removed.service,
+            });
+        }
+        if let Some(key) = state
+            .remembered
+            .iter()
+            .find(|(_, g)| g.id == id)
+            .map(|(key, _)| key.clone())
+        {
+            state.remembered.remove(&key);
+            return Some(RevokedGrant::Approval);
+        }
+        None
     }
 
     /// Register a question. Refused once the session has ended. Its decision
@@ -1184,7 +1260,8 @@ impl Approvals {
                 let held = state.held.remove(index);
                 let outcome = Outcome::Answered(answer);
                 if answer == ApprovalDecision::AllowSession {
-                    let grant = held.approval.session_grant(now_unix_ms());
+                    let id = state.next_grant_id();
+                    let grant = held.approval.session_grant(now_unix_ms(), id);
                     state.remembered.insert(
                         (held.approval.tool.clone(), held.approval.summary.clone()),
                         grant,
@@ -1425,7 +1502,8 @@ impl Approvals {
                 None => Outcome::Closed,
             };
             if let Outcome::Answered(ApprovalDecision::AllowSession) = outcome {
-                let grant = held.approval.session_grant(now);
+                let id = state.next_grant_id();
+                let grant = held.approval.session_grant(now, id);
                 state.remembered.insert(
                     (held.approval.tool.clone(), held.approval.summary.clone()),
                     grant,
@@ -1625,6 +1703,7 @@ mod tests {
 
     fn github_credential() -> Credential {
         Credential {
+            id: 1,
             service: "github".into(),
             hosts: vec!["github.com".into(), "api.github.com".into()],
             permissions: vec!["contents:read".into(), "issues:read".into()],
@@ -1775,6 +1854,7 @@ mod tests {
         assert_eq!(
             approvals.credentials(),
             [Credential {
+                id: 1,
                 service: "github".into(),
                 hosts: vec!["github.com".into(), "api.github.com".into()],
                 permissions: perms(),
@@ -1800,9 +1880,13 @@ mod tests {
         assert_eq!(grants[1].scope, "write");
         assert_eq!(grants[1].lifetime, Lifetime::Session);
         assert!(grants[1].granted_at_unix_ms >= 1_700_000_000_000);
+        assert_ne!(grants[0].id, grants[1].id, "each grant has its own id");
         assert_eq!(
             grants[0].line(),
-            "GitHub   contents:read, issues:read · github.com, api.github.com   launch"
+            format!(
+                "{}   GitHub   contents:read, issues:read · github.com, api.github.com   launch",
+                grants[0].id
+            )
         );
         assert_eq!(
             serde_json::to_string(&Lifetime::Session).unwrap(),
@@ -1855,12 +1939,66 @@ mod tests {
         assert_eq!(
             approvals.credentials(),
             [Credential {
+                id: 3,
                 service: "npm".into(),
                 hosts: vec!["registry.npmjs.org".into()],
                 permissions: perms(),
                 granted_at_unix_ms: 3,
                 launch_key: None,
             }]
+        );
+    }
+
+    #[test]
+    fn revoke_removes_a_credential_by_id_and_records_nothing_else() {
+        let approvals = Approvals::new();
+        let perms = || vec!["contents:read".to_owned()];
+        approvals.record_credential("github", "github.com", perms(), None, 1);
+        approvals.record_credential("npm", "registry.npmjs.org", perms(), None, 2);
+        let grants = approvals.grants();
+        assert_eq!(grants.len(), 2);
+        let github_id = grants
+            .iter()
+            .find(|g| g.label == "GitHub")
+            .expect("github grant")
+            .id;
+        let npm_id = grants
+            .iter()
+            .find(|g| g.label == "npm")
+            .expect("npm grant")
+            .id;
+        assert_ne!(github_id, npm_id);
+
+        assert_eq!(
+            approvals.revoke(github_id),
+            Some(RevokedGrant::Credential {
+                service: "github".into()
+            })
+        );
+        let remaining = approvals.grants();
+        assert_eq!(remaining.len(), 1, "{remaining:?}");
+        assert_eq!(remaining[0].id, npm_id);
+
+        // Already gone: revoking it again finds nothing.
+        assert_eq!(approvals.revoke(github_id), None);
+        // Never minted: same answer.
+        assert_eq!(approvals.revoke(999), None);
+    }
+
+    #[test]
+    fn revoke_removes_a_remembered_allow_session_grant_by_id() {
+        let approvals = Approvals::new();
+        approvals.register(approval(1)).unwrap();
+        approvals.answer(1, ApprovalDecision::AllowSession).unwrap();
+        approvals.wait(1, Duration::ZERO);
+        assert!(approvals.remembered("Write", "/work/src/lib.rs"));
+        let id = approvals.grants()[0].id;
+
+        assert_eq!(approvals.revoke(id), Some(RevokedGrant::Approval));
+        assert!(approvals.grants().is_empty());
+        assert!(
+            !approvals.remembered("Write", "/work/src/lib.rs"),
+            "revoking the remembered answer stops it from auto-approving again"
         );
     }
 

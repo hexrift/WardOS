@@ -385,14 +385,14 @@ enum SessionCmd {
     },
     /// The temporary authority the session holds (ADR-0019): every
     /// `allow-session` answer and every credential the proxy injects, with its
-    /// scope and lifetime.
+    /// id, scope and lifetime.
     Grants {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
         /// The session id, instead of looking one up.
         #[arg(long)]
         session: Option<String>,
-        /// One JSON object per grant: `{kind, label, scope, lifetime,
+        /// One JSON object per grant: `{id, kind, label, scope, lifetime,
         /// granted_at_unix_ms}`.
         #[arg(long)]
         json: bool,
@@ -408,6 +408,20 @@ enum SessionCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
         /// The session id, as `ward session pending` lists it.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Revoke one grant (#140): a credential the proxy injects is removed
+    /// from live authority; an `allow-session` answer is forgotten, so the
+    /// same tool on the same target asks again. Refused when `id` names no
+    /// live grant.
+    Revoke {
+        /// The grant's id, as `ward session grants` lists it.
+        id: u64,
+        /// Project directory (default: current).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The session id, as `ward session grants` lists it.
         #[arg(long)]
         session: Option<String>,
     },
@@ -642,6 +656,9 @@ fn cmd_session(cmd: SessionCmd) -> ward_daemon::Result<ExitCode> {
             dir,
             session,
         } => cmd_approve(&dir.unwrap_or_else(cwd), session.as_deref(), id, decision),
+        SessionCmd::Revoke { id, dir, session } => {
+            cmd_revoke(&dir.unwrap_or_else(cwd), session.as_deref(), id)
+        }
     }
 }
 
@@ -1253,6 +1270,15 @@ fn cmd_approve(
     let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
     client::approve(&mut sink, id, decision)?;
     println!("  approval {id} {decision}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward session revoke <id>` (#140).
+fn cmd_revoke(dir: &Path, session: Option<&str>, id: u64) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
+    client::revoke(&mut sink, id)?;
+    println!("  grant {id} revoked");
     Ok(ExitCode::SUCCESS)
 }
 
