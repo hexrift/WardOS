@@ -37,18 +37,46 @@
 //! recheck already uses — and skips it, leaving it untouched, the instant
 //! that recheck disagrees.
 //!
+//! This recheck closes the scan-to-recheck window, but a narrower one
+//! remains between the recheck and the deletion it gates: the recheck reads
+//! the marker through its own short-lived directory descriptor and then
+//! drops it, and the deletion below reopens the same path fresh. If
+//! `run_dir`'s reuse path (session.rs, on the `AlreadyExists` branch)
+//! rewrites this exact directory's owner marker for a brand-new live session
+//! in that gap — a `stat`+`open` round trip wide — the deletion still
+//! removes it. Holding the recheck's descriptor open through the deletion
+//! would not close this: the new session's files live in the same physical
+//! directory either way, so whichever process deletes it removes whatever is
+//! there at that instant, fd-relative or not. Actually preventing this needs
+//! `run_dir`'s reuse and this module's deletion to serialize against each
+//! other (a lock, or an atomic rename-to-trash-then-verify step both sides
+//! honor) — a protocol change spanning both sides, out of scope for this
+//! pass. Documented here rather than silently assumed closed, since the
+//! window is real even though it is a `stat`+`open` round trip wide.
+//!
 //! # Deletion itself
 //!
-//! [`std::fs::remove_dir_all`] on this workspace's pinned toolchain already
-//! refuses to follow a symlink at any level of the tree it removes — a
-//! symlink is itself unlinked, never traversed into, whether it is the top
-//! path or nested inside (verified directly against this toolchain, not
-//! merely assumed from general Rust standard-library behaviour). That is
-//! exactly the guarantee [`crate::usage::sum_dir_bytes`]'s own hand-rolled
-//! `openat`-based walk provides for *reading*; reusing the standard library
-//! for deletion here, rather than reimplementing the same walk a second
-//! time, means one guarantee to trust instead of two independently
-//! maintained ones.
+//! [`remove_orphaned_dir`] removes a directory's contents, then its owner
+//! marker, then the (now-empty) directory itself — never
+//! [`std::fs::remove_dir_all`] on the whole tree in one call, whose
+//! traversal order is unspecified and so could unlink the owner marker
+//! before failing partway through the rest. A partial failure would then
+//! leave a marker-less directory that every future scan classifies
+//! `Unknown` rather than `Orphaned` (see [`crate::usage::classify`]) —
+//! permanently invisible to both usage reporting and every later reclaim
+//! pass, instead of retried. Removing the marker last means a partial
+//! failure always leaves it in place, so the next scan still calls the
+//! entry `Orphaned` and this module retries it. `remove_dir_all` is still
+//! used per-entry for a nested subdirectory: on this workspace's pinned
+//! toolchain it already refuses to follow a symlink at any level of the
+//! tree it removes — a symlink is itself unlinked, never traversed into,
+//! whether it is the top path or nested inside (verified directly against
+//! this toolchain, not merely assumed from general Rust standard-library
+//! behaviour). That is exactly the guarantee
+//! [`crate::usage::sum_dir_bytes`]'s own hand-rolled `openat`-based walk
+//! provides for *reading*; reusing the standard library for deletion here,
+//! rather than reimplementing the same walk a second time, means one
+//! guarantee to trust instead of two independently maintained ones.
 //!
 //! # Never fatal to the caller
 //!
@@ -66,7 +94,44 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
+use crate::session::OWNER_MARKER;
 use crate::usage::{ScratchStatus, rescan_entry, scan_scratch};
+
+/// Remove `dir`'s contents, then its owner marker, then `dir` itself — in
+/// that order, never [`std::fs::remove_dir_all`] in one call. Traversal
+/// order inside a single `remove_dir_all` is unspecified, so it can unlink
+/// [`OWNER_MARKER`] before failing partway through the rest (a permission
+/// error, an I/O error on one nested entry); a directory left behind that
+/// way has no owner marker, and every future scan
+/// ([`crate::usage::classify`]) calls an owner-less entry `Unknown`, not
+/// `Orphaned` — so it would silently drop out of both usage reporting and
+/// every future reclaim pass, forever, rather than being retried. Removing
+/// the marker last means a partial failure anywhere in the content removal
+/// leaves the marker in place, so the very next scan still classifies this
+/// entry `Orphaned` and reclaim retries it.
+fn remove_orphaned_dir(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() == OWNER_MARKER {
+            continue;
+        }
+        // `file_type()` reflects the entry itself (readdir `d_type`, or an
+        // `lstat` fallback), never the target of a symlink, so a symlinked
+        // entry always takes the `remove_file` arm below — unlinking the
+        // symlink itself rather than recursing through it.
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    match std::fs::remove_file(dir.join(OWNER_MARKER)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::remove_dir(dir)
+}
 
 /// One scratch directory [`reclaim_orphaned_scratch`] actually removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,7 +204,7 @@ pub fn reclaim_orphaned_scratch_with_hook(
             report.skipped_no_longer_orphaned.push(current.path);
             continue;
         }
-        match std::fs::remove_dir_all(&current.path) {
+        match remove_orphaned_dir(&current.path) {
             Ok(()) => report.reclaimed.push(Reclaimed {
                 path: current.path,
                 bytes: current.bytes,

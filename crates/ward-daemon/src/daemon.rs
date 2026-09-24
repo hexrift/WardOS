@@ -150,16 +150,6 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
     // for `Describe`/`Subscribe` right after would otherwise see whatever
     // half-reconciled state this left behind with nothing to say it is suspect.
     crate::attempt::reconcile_dangling_attempts(&mut log, &dir)?;
-    // #151 item 5: a daemon starting up is also a good, cheap moment to sweep
-    // whatever scratch other, already-finished sessions left behind — most
-    // often because their own process was killed between finishing its work
-    // and its normal `remove_dir_all` cleanup. Unlike the dangling-attempt
-    // reconciliation above, this is disk hygiene, not correctness: a failure
-    // here (or simply finding nothing to do) must never stop this session's
-    // daemon from starting, so the result is deliberately discarded — see
-    // `crate::reclaim`'s own module doc comment for the full safety argument
-    // (never touching anything but a re-verified `Orphaned` entry).
-    let _ = crate::reclaim::reclaim_orphaned_scratch(state);
     let description = serde_json::to_value(meta.describe())
         .map_err(|e| Error::Daemon(format!("describe {session}: {e}")))?;
     // What an approval's authority is derived from: the manifest, the
@@ -180,6 +170,25 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
     let pid_file = dir.join(PID_NAME);
     std::fs::write(&pid_file, format!("{}\n", std::process::id()))
         .map_err(|e| Error::io(&pid_file, e))?;
+
+    // #151 item 5: a daemon starting up is also a good, cheap moment to sweep
+    // whatever scratch other, already-finished sessions left behind — most
+    // often because their own process was killed between finishing its work
+    // and its normal cleanup. Unlike the dangling-attempt reconciliation
+    // above, this is disk hygiene, not correctness, so it runs in its own
+    // background thread rather than on this session's startup path: this
+    // session's control socket is already bound by this point and can start
+    // answering connections immediately, regardless of how large a sweep of
+    // accumulated orphaned scratch elsewhere turns out to be. A failure (or
+    // simply finding nothing to do) is silently discarded either way — see
+    // `crate::reclaim`'s own module doc comment for the full safety argument
+    // (never touching anything but a re-verified `Orphaned` entry).
+    {
+        let state = state.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = crate::reclaim::reclaim_orphaned_scratch(&state);
+        });
+    }
 
     let served = Arc::new(Mutex::new(Served::new(
         log,
