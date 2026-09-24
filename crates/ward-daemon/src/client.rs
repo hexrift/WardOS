@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use ward_events::{EventKind, EventRecord, WardEvent};
 
-use crate::approvals::{Approval, ApprovalDecision, ApprovalRecord, Grant};
+use crate::approvals::{Approval, ApprovalDecision, ApprovalRecord, Grant, RevokeOutcome};
 use crate::control::{Next, RemoteSink, Request, Response, SOCKET_NAME, is_evidence};
 use crate::describe::SessionDescription;
 use crate::error::{Error, Result};
@@ -337,10 +337,15 @@ pub fn approve(sink: &mut RemoteSink, id: u64, decision: ApprovalDecision) -> Re
     }
 }
 
-/// Revoke a held grant by id (`ward session revoke <id>`, #140).
-pub fn revoke(sink: &mut RemoteSink, id: u64) -> Result<()> {
+/// Revoke a held grant by id, host-confirmed (`ward session revoke <id>`,
+/// #140, #245): blocks for up to `crate::revoke::ACK_TIMEOUT` while the
+/// daemon waits on the owning proxy, well inside this connection's own read
+/// timeout (`control::TIMEOUT`, 10 s). The returned [`RevokeOutcome`] is the
+/// daemon's own honest answer, not a bare success — the caller must not
+/// collapse it into one (#245's "no UI-only revoke is reported as enforced").
+pub fn revoke(sink: &mut RemoteSink, id: u64) -> Result<RevokeOutcome> {
     match sink.call(&Request::Revoke { id })? {
-        Response::Ok => Ok(()),
+        Response::Revoked(outcome) => Ok(outcome),
         Response::Error(e) => Err(Error::Daemon(e)),
         other => Err(Error::Events(format!("unexpected response {other:?}"))),
     }
@@ -1347,13 +1352,17 @@ mod tests {
                             scope: "write".into(),
                             lifetime: crate::approvals::Lifetime::Session,
                             granted_at_unix_ms: 1,
+                            revoke_state: crate::approvals::RevokeState::Active,
                         }]),
                     ),
                     Request::Approve { id, .. } => reply(
                         &mut writer,
                         &Response::Error(format!("approval {id}: not pending")),
                     ),
-                    Request::Revoke { id: 1 } => reply(&mut writer, &Response::Ok),
+                    Request::Revoke { id: 1 } => reply(
+                        &mut writer,
+                        &Response::Revoked(crate::approvals::RevokeOutcome::Withdrawn),
+                    ),
                     Request::Revoke { id } => reply(
                         &mut writer,
                         &Response::Error(format!("revoke: grant {id} not found")),
@@ -1645,7 +1654,10 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].approval.id, 4);
         assert_eq!(records[0].outcome, None);
-        revoke(&mut sink, held[0].id).unwrap();
+        assert_eq!(
+            revoke(&mut sink, held[0].id).unwrap(),
+            crate::approvals::RevokeOutcome::Withdrawn
+        );
         let err = revoke(&mut sink, 42).unwrap_err();
         assert_eq!(err.to_string(), "daemon: revoke: grant 42 not found");
         drop(sink);

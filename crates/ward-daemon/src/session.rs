@@ -717,14 +717,20 @@ impl Session {
         for refusal in &opts.refusals {
             self.emit(Origin::Wardd, refusal.clone())?;
         }
+        // Each grant's own id (#245), when a daemon minted one: threaded
+        // through to `run_launch` so the `GatewayRoute` built from the same
+        // `Gateway` can be tagged with it before the proxy ever starts —
+        // otherwise `ward session revoke` would have no way to reach this
+        // exact route once the launch is running.
+        let mut grant_ids: Vec<Option<u64>> = Vec::with_capacity(opts.gateways.len());
         for g in &opts.gateways {
-            self.emit(Origin::Wardd, g.granted(GATEWAY_TTL)?)?;
+            grant_ids.push(self.emit_credential(Origin::Wardd, g.granted(GATEWAY_TTL)?)?);
         }
 
         // From here on `CommandStarted` (and any grant just above) is already on the
         // log, so the `match` below never lets an error skip past leaving a terminal
         // record for it.
-        let result = self.run_launch(pid, argv, opts);
+        let result = self.run_launch(pid, argv, opts, &grant_ids);
         let outcome = match result {
             Ok(report) => Ok(report),
             Err(e) => {
@@ -778,7 +784,13 @@ impl Session {
     /// child and appends what it takes through the same [`Sink`](crate::control::Sink)
     /// every other record goes through. The producers never touch the log, so there
     /// is still exactly one writer.
-    fn run_launch(&mut self, pid: Pid, argv: &[String], opts: &LaunchOpts) -> Result<RunReport> {
+    fn run_launch(
+        &mut self,
+        pid: Pid,
+        argv: &[String],
+        opts: &LaunchOpts,
+        grant_ids: &[Option<u64>],
+    ) -> Result<RunReport> {
         let watch_reads = matches!(
             self.manifest.observer,
             ObserverMode::Live | ObserverMode::StepThrough(_)
@@ -790,12 +802,23 @@ impl Session {
         // diff the tree before against the tree after.
         let before = (!live_watch).then(|| scan(&self.worktree));
 
-        let mut egress = Egress::start(
-            &run_dir,
-            &self.manifest.network,
-            opts.gateways.iter().map(|g| g.route.clone()).collect(),
-        )?;
+        // Tagged with each grant's own id (#245), when one was minted, so a
+        // later `ward session revoke <id>` can reach exactly this route
+        // (`GatewayRoute::revocable`); a gateway with no id (no daemon, or
+        // an unrecognised event) builds an untagged, unrevokable route,
+        // exactly as it always did before #245.
+        let routes = opts
+            .gateways
+            .iter()
+            .zip(grant_ids)
+            .map(|(g, id)| match id {
+                Some(id) => g.route.clone().revocable(*id),
+                None => g.route.clone(),
+            })
+            .collect();
+        let mut egress = Egress::start(&run_dir, &self.manifest.network, routes)?;
         egress.watch_marker(pause::marker_path(&self.state, &self.session_str));
+        egress.watch_revocations(crate::revoke::dir_path(&self.state, &self.session_str));
         observers.set_egress(egress);
         observers.set_hooks(Hooks::start_with(
             &run_dir,
@@ -1422,6 +1445,18 @@ impl Session {
     /// own time, so the observer timeline is truthful.
     fn emit_at(&mut self, at: SystemTime, origin: Origin, event: WardEvent) -> Result<()> {
         self.sink.append(origin, event, at).map(drop)
+    }
+
+    /// [`emit`](Self::emit) a `CredentialGranted` event, also returning the
+    /// grant id a daemon minted for it, when there is one to mint it (#245):
+    /// see [`control::Sink::append_credential`]. The caller
+    /// ([`launch`](Self::launch)) tags the `GatewayRoute` it built for this
+    /// exact grant with that id (`GatewayRoute::revocable`) — without it,
+    /// `ward session revoke` has no way to reach this route at all.
+    fn emit_credential(&mut self, origin: Origin, event: WardEvent) -> Result<Option<u64>> {
+        self.sink
+            .append_credential(origin, event, SystemTime::now())
+            .map(|(_record, grant_id)| grant_id)
     }
 }
 

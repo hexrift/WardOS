@@ -36,6 +36,7 @@ pub mod readiness;
 pub mod reclaim;
 pub mod render;
 pub mod retention;
+pub mod revoke;
 pub mod sandbox;
 pub mod selection;
 pub mod selftest;

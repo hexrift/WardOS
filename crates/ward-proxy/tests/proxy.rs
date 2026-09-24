@@ -746,6 +746,123 @@ fn gateway_scope_read_only_refuses_a_push_that_a_write_route_forwards() {
     assert!(text.ends_with("\r\n\r\npack"));
 }
 
+/// #245: a credential revoked before any request ever uses it must refuse
+/// every one from then on, without ever letting the secret reach the
+/// upstream — the same "refused before any upstream contact" bar the scope
+/// checks above already hold `serve` to.
+#[test]
+fn a_revoked_credential_is_refused_before_it_ever_reaches_upstream() {
+    let (upstream, seen) = spawn_gateway_upstream(Duration::ZERO);
+    let route = gateway_route(upstream).revocable(77);
+    let (proxy, recorder) = start(custom_localhost().gateway(route));
+
+    assert!(
+        !proxy.has_credential_route(999),
+        "no route on this proxy carries an id nobody tagged it with"
+    );
+    assert_eq!(
+        proxy.revoke_credential(999),
+        None,
+        "revoking an id this proxy holds no route for reports nothing to act on"
+    );
+    assert!(proxy.has_credential_route(77));
+    assert_eq!(
+        proxy.revoke_credential(77),
+        Some(0),
+        "nothing was relaying yet"
+    );
+    // Idempotent: revoking an already-revoked credential is not an error.
+    assert_eq!(proxy.revoke_credential(77), Some(0));
+
+    let response = send(
+        &proxy,
+        "POST /anthropic/v1/messages HTTP/1.1\r\n\
+         Host: 127.0.0.1:3128\r\n\
+         X-Api-Key: placeholder\r\n\
+         Content-Length: 0\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("credential revoked"), "{response}");
+    assert!(!response.contains(REAL_KEY), "{response}");
+
+    let (_, decision, reason) = recorder.last();
+    assert_eq!(decision, Decision::Deny);
+    assert_eq!(reason, "gateway /anthropic: credential revoked");
+
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the secret must never reach the upstream for a revoked credential"
+    );
+}
+
+/// #245's honest partial-failure shape, proven at the proxy itself rather
+/// than asserted about: a connection already relaying with the credential
+/// injected when the revoke lands is not, and cannot be, recalled (bytes
+/// already handed to a socket are not — `docs/security-model.md`), but the
+/// very next new request over a fresh connection is refused. The revoke
+/// call reports the one still-relaying connection rather than silently
+/// treating it as already gone.
+#[test]
+fn revoking_mid_flight_reports_the_in_flight_connection_but_lets_it_finish() {
+    let gap = Duration::from_millis(400);
+    let (upstream, seen) = spawn_gateway_upstream(gap);
+    let route = gateway_route(upstream).revocable(11);
+    let (proxy, _recorder) = start(custom_localhost().gateway(route));
+
+    let mut relaying = client(&proxy);
+    relaying
+        .write_all(
+            b"POST /anthropic/v1/messages HTTP/1.1\r\n\
+              Host: 127.0.0.1:3128\r\n\
+              Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+    let head = read_head(&mut relaying);
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    let mut first = [0u8; 64];
+    let n = relaying.read(&mut first).unwrap();
+    assert_eq!(&first[..n], b"data: part1\n\n", "mid-relay, before the gap");
+
+    // The revoke lands while that connection is still relaying (it is past
+    // the credential check and already holding the upstream open) and
+    // before a byte of `part2` exists.
+    assert_eq!(
+        proxy.revoke_credential(11),
+        Some(1),
+        "one connection was already relaying with this credential injected"
+    );
+
+    // A brand new connection is refused: no new use of the credential is
+    // honored from the instant of revocation.
+    let refused = send(
+        &proxy,
+        "POST /anthropic/v1/messages HTTP/1.1\r\n\
+         Host: 127.0.0.1:3128\r\n\
+         Content-Length: 0\r\n\r\n",
+    );
+    assert!(
+        refused.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+        "{refused}"
+    );
+
+    // The connection already relaying is not recalled: its bytes, already
+    // handed to a socket before the revoke landed, still arrive.
+    let rest = read_all(&mut relaying);
+    assert_eq!(
+        rest, "data: part2\n\n",
+        "an in-flight exchange finishes on its own; it is not killed"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the refused request never reached the upstream at all"
+    );
+}
+
 #[test]
 fn config_debug_never_reveals_the_secret() {
     let config = Config::new(NetworkCapability::Development).gateway(

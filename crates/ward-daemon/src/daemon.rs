@@ -48,6 +48,7 @@ use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
 use crate::error::{Error, Result};
 use crate::pause::{self, Frozen};
+use crate::revoke;
 use crate::session::{SessionMeta, protected_paths, session_dir};
 
 /// File name of the daemon's pid file inside `sessions/<id>/`.
@@ -543,9 +544,11 @@ impl Served {
             Request::Pending => (Response::Pending(self.approvals.pending()), false),
             Request::Approvals => (Response::Approvals(self.approvals.approvals()), false),
             Request::Grants => (Response::Grants(self.approvals.grants()), false),
-            Request::Revoke { id } => (
-                self.revoke(id)
-                    .map_or_else(|e| Response::Error(refusal(e)), |()| Response::Ok),
+            // Can block on the owning proxy's acknowledgement (#245): served
+            // on its own connection, exactly like `Hold`, so this never holds
+            // the whole daemon's lock across that wait.
+            Request::Revoke { .. } => (
+                Response::Error("revoke is served on its own connection".into()),
                 false,
             ),
             Request::Pause { reason } => (
@@ -635,19 +638,26 @@ impl Served {
         let (response, done) = control::handle_with(&mut self.log, other, |record| {
             subscribers.retain(|s| s.send(Delivery::Record(Box::new(record.clone()))).is_ok());
         });
+        // Set only for a `CredentialGranted` append, once it lands: the
+        // client learns this same id back through `Response::Granted` (#245)
+        // so the `GatewayRoute` it built for this exact grant can be tagged
+        // with it (`GatewayRoute::revocable`) — the one thing that lets a
+        // later `ward session revoke` reach that route in a different
+        // process at all.
+        let mut grant_id = None;
         if let Response::Record(record) = &response {
             if let Some((service, subject, permissions, launch_key)) = credential {
                 // The subject is the route's upstream, `host:port`.
                 let host = subject
                     .rsplit_once(':')
                     .map_or(subject.as_str(), |(h, _)| h);
-                self.approvals.record_credential(
+                grant_id = Some(self.approvals.record_credential(
                     &service,
                     host,
                     permissions,
                     launch_key,
                     control::unix_ms(SystemTime::now()),
-                );
+                ));
             }
             if launch_started {
                 // The record's own sequence number is unique and monotonic by
@@ -678,6 +688,10 @@ impl Served {
             // before this request was allowed to reach here and seal the log
             // (#146) — nothing left to do for approvals here.
         }
+        let response = match (response, grant_id) {
+            (Response::Record(record), Some(grant_id)) => Response::Granted { record, grant_id },
+            (response, _) => response,
+        };
         (response, done)
     }
 
@@ -763,36 +777,12 @@ impl Served {
             at_unix_ms: control::unix_ms(SystemTime::now()),
         };
         match self.handle(request).0 {
-            Response::Record(record) => Ok(*record),
+            // A `CredentialGranted` append also answers with the grant id
+            // (#245) — this internal helper's callers have no route to tag
+            // with it, so only the record itself is of interest here.
+            Response::Record(record) | Response::Granted { record, .. } => Ok(*record),
             Response::Error(e) => Err(Error::Daemon(e)),
             other => Err(Error::Daemon(format!("unexpected response {other:?}"))),
-        }
-    }
-
-    /// Revoke grant `id` (`ward session revoke <id>`, #140 items 4-6):
-    /// removes it from `self.approvals`' live authority view, and, for a
-    /// credential the proxy had injected, records `CredentialRevoked` so the
-    /// audit trail (`ward replay`) shows why it stopped counting. Errors when
-    /// `id` names no live grant. An `allow-session` answer has no revoked
-    /// event of its own yet (see [`approvals::Approvals::revoke`]'s doc
-    /// comment) — it is simply gone from `Request::Grants` from this call on.
-    ///
-    /// Authority-projection-only — see [`approvals::Approvals::revoke`]'s doc
-    /// comment for what this deliberately does not do (withdraw an
-    /// already-established route at the proxy, or wait for that to be
-    /// acknowledged).
-    fn revoke(&mut self, id: u64) -> Result<()> {
-        match self.approvals.revoke(id) {
-            Some(approvals::RevokedGrant::Credential { service }) => {
-                let service = ServiceId::new(&service).map_err(|e| Error::Daemon(e.to_string()))?;
-                self.append(WardEvent::CredentialRevoked {
-                    service,
-                    reason: RevokeReason::UserRevoked,
-                })?;
-                Ok(())
-            }
-            Some(approvals::RevokedGrant::Approval) => Ok(()),
-            None => Err(Error::Daemon(format!("revoke: grant {id} not found"))),
         }
     }
 
@@ -1077,6 +1067,7 @@ fn serve_stream(stream: UnixStream, served: &Arc<Mutex<Served>>, conn: u64) -> b
                 reason,
                 timeout_secs,
             }) => (hold(served, &tool, &summary, &reason, timeout_secs), false),
+            Ok(Request::Revoke { id }) => (revoke(served, id), false),
             Ok(request) => lock(served).handle_conn(conn, request),
             Err(e) => (Response::Error(format!("bad request: {e}")), false),
         };
@@ -1142,6 +1133,152 @@ fn hold(
         id,
         decision: response.decision,
         reason: response.reason,
+    }
+}
+
+/// Revoke grant `id` (`ward session revoke <id>`, #245, closing the gap #243
+/// left open in #140 items 4-5): mark it revoking with the mutex released
+/// before any wait — exactly like [`hold`]'s own wait — so a `ward session
+/// grants` or `ward session approve` on another connection is never blocked
+/// behind this one's proxy round trip.
+fn revoke(served: &Arc<Mutex<Served>>, id: u64) -> Response {
+    revoke_bounded(served, id, revoke::ACK_TIMEOUT)
+}
+
+/// [`revoke`] with an explicit wait bound: the seam the daemon's own tests
+/// use to exercise an unconfirmed revoke without spending
+/// [`revoke::ACK_TIMEOUT`] on it.
+fn revoke_bounded(served: &Arc<Mutex<Served>>, id: u64, ack_timeout: Duration) -> Response {
+    revoke_bounded_inner(served, id, ack_timeout, || {})
+}
+
+/// [`revoke_bounded`] with a hook run, still holding `served`'s lock,
+/// between the leader publishing its outcome and the same call's
+/// `finish_revoke` transition — the seam a test uses to pause exactly there
+/// and prove a concurrent revoke of the same id cannot make progress during
+/// that window (#248 review). A no-op in production ([`revoke_bounded`]).
+#[cfg(test)]
+fn revoke_bounded_with_hook(
+    served: &Arc<Mutex<Served>>,
+    id: u64,
+    ack_timeout: Duration,
+    after_publish_before_finish: impl FnOnce(),
+) -> Response {
+    revoke_bounded_inner(served, id, ack_timeout, after_publish_before_finish)
+}
+
+fn revoke_bounded_inner(
+    served: &Arc<Mutex<Served>>,
+    id: u64,
+    ack_timeout: Duration,
+    after_publish_before_finish: impl FnOnce(),
+) -> Response {
+    // The credential lookup and the leader/joiner decision for its
+    // proxy-facing wait happen as one atomic step (#248 review):
+    // `begin_revoke_wait` and the wait-slot claim used to be two separate
+    // `served` lock acquisitions, which left a window where a connection's
+    // credential check could see the grant still `Revoking`, but by the
+    // time it went to claim the wait slot, another connection had already
+    // finished revoking it (grant gone, slot gone) — and this connection
+    // would then create a fresh slot and lead an independent second wait
+    // for an id whose revoke had already concluded.
+    let begin = lock(served).approvals.begin_revoke_wait(id);
+    match begin {
+        None => Response::Error(format!("revoke: grant {id} not found")),
+        // An `allow-session` answer has no proxy route to wait on: it was
+        // already removed by `begin_revoke_wait` itself.
+        Some(approvals::RevokeStart::Approval) => {
+            Response::Revoked(approvals::RevokeOutcome::Withdrawn)
+        }
+        Some(approvals::RevokeStart::Credential {
+            service,
+            slot,
+            leader,
+        }) => {
+            let (state, session) = {
+                let s = lock(served);
+                (s.state.clone(), s.session.clone())
+            };
+            // Only the leader — the first connection to reach this id's
+            // wait — ever touches `crate::revoke`'s marker file. A racing
+            // connection for the same id joins the leader's shared slot
+            // instead (#248 review): both independently writing, waiting on
+            // and clearing the same marker let whichever one observed
+            // `CONFIRMED` first delete it out from under the other, which
+            // then timed out and reported `Unconfirmed` for an operation
+            // that had already succeeded.
+            let outcome = if leader {
+                if let Err(e) = revoke::request(&state, &session, id) {
+                    // The marker itself could not even be written (disk
+                    // full, a vanished state dir): nothing can possibly
+                    // acknowledge a request that was never made. Reported
+                    // the same honest way as a wait that simply ran out —
+                    // the grant stays, flagged, rather than either silently
+                    // succeeding or handing back a bare, undifferentiated
+                    // error #245's acceptance criteria rule out.
+                    let _ = e;
+                    approvals::RevokeOutcome::Unconfirmed
+                } else {
+                    let ack = revoke::wait_for_ack(&state, &session, id, ack_timeout);
+                    revoke::clear(&state, &session, id);
+                    match ack.as_deref() {
+                        Some(revoke::CONFIRMED) => approvals::RevokeOutcome::Withdrawn,
+                        // A marker body that is neither `CONFIRMED` nor a
+                        // well-formed in-flight count (a torn write, a
+                        // future format from a version-skewed egress) must
+                        // fail toward the least confident outcome, not the
+                        // most: treating unparsed text as a clean
+                        // `Withdrawn` would report a revoke as fully
+                        // enforced on data this daemon cannot actually
+                        // read, exactly the "silently succeeded" shape this
+                        // whole three-way outcome exists to rule out.
+                        Some(text) => revoke::parse_in_flight(text).map_or(
+                            approvals::RevokeOutcome::Unconfirmed,
+                            approvals::RevokeOutcome::WithdrawnInFlight,
+                        ),
+                        None => approvals::RevokeOutcome::Unconfirmed,
+                    }
+                }
+            } else {
+                approvals::Approvals::join_revoke_wait(&slot, ack_timeout)
+            };
+            // Publishing the leader's outcome (which removes `id`'s shared
+            // slot) and the Revoking→terminal `finish_revoke` transition it
+            // implies must happen as one step with respect to `served`'s
+            // lock, held continuously across both (#248 review): releasing
+            // it in between would let a brand new connection's
+            // `begin_revoke_wait` find the grant still `Revoking` and join a
+            // slot this call is about to remove, or — worse, since that
+            // check and claim are themselves one atomic step now — run
+            // entirely between this call's publish and its own
+            // `finish_revoke`, finding the grant already gone from a revoke
+            // it never joined.
+            let mut s = lock(served);
+            if leader {
+                s.approvals.publish_revoke_wait(id, &slot, outcome.clone());
+            }
+            after_publish_before_finish();
+            let performed = s.approvals.finish_revoke(id, &outcome);
+            // Only the connection whose `finish_revoke` actually performed
+            // the Revoking→terminal transition records the audit event: two
+            // connections racing a revoke of the same id both reach this
+            // point with the same outcome (see `finish_revoke`'s doc
+            // comment), and without this guard both would append a
+            // `CredentialRevoked` record for one logical revoke.
+            if performed && !matches!(outcome, approvals::RevokeOutcome::Unconfirmed) {
+                match ServiceId::new(&service) {
+                    Ok(service) => {
+                        let _ = s.append(WardEvent::CredentialRevoked {
+                            service,
+                            reason: RevokeReason::UserRevoked,
+                        });
+                    }
+                    Err(e) => return Response::Error(e.to_string()),
+                }
+            }
+            drop(s);
+            Response::Revoked(outcome)
+        }
     }
 }
 
@@ -2365,13 +2502,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn revoking_a_credential_grant_removes_it_and_records_credential_revoked() {
+    /// A credential's grant id in a fresh `Served`, with a `CredentialGranted`
+    /// already on the log (#245's test fixture, shared by the revoke tests
+    /// below).
+    fn granted_credential(served: &Arc<Mutex<Served>>) -> u64 {
         use ward_events::{CredentialDelivery, NameText, Scope, ServiceId};
-
-        let dir = tempfile::tempdir().unwrap();
-        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
-
         let granted = WardEvent::CredentialGranted {
             service: ServiceId::new("github").unwrap(),
             scope: Scope {
@@ -2381,19 +2516,44 @@ mod tests {
             expires: Duration::from_secs(60),
             delivery: CredentialDelivery::ProxyInjected,
         };
-        assert!(lock(&served).append(granted).is_ok());
-
-        let grants = match lock(&served).handle(Request::Grants).0 {
-            Response::Grants(g) => g,
+        assert!(lock(served).append(granted).is_ok());
+        match lock(served).handle(Request::Grants).0 {
+            Response::Grants(g) if g.len() == 1 => g[0].id,
             other => panic!("{other:?}"),
-        };
-        assert_eq!(grants.len(), 1, "{grants:?}");
-        let id = grants[0].id;
+        }
+    }
 
-        assert!(matches!(
-            lock(&served).handle(Request::Revoke { id }).0,
-            Response::Ok
-        ));
+    /// This session's `state`/`session` fields, the two things a test needs
+    /// to reach into the same proxy-facing marker directory `daemon::revoke`
+    /// itself writes to and polls (#245).
+    fn state_and_session(served: &Arc<Mutex<Served>>) -> (PathBuf, String) {
+        let s = lock(served);
+        (s.state.clone(), s.session.clone())
+    }
+
+    #[test]
+    fn revoking_a_credential_grant_waits_for_the_marker_then_removes_it_and_records_credential_revoked()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let id = granted_credential(&served);
+
+        // Simulate the owning egress: by the time `daemon::revoke` writes
+        // the marker (`revoke::request`, a no-op once the file exists), a
+        // proxy that already confirmed leaves this content in place for the
+        // wait to find immediately.
+        let (state, session) = state_and_session(&served);
+        std::fs::create_dir_all(revoke::dir_path(&state, &session)).unwrap();
+        std::fs::write(revoke::marker_path(&state, &session, id), revoke::CONFIRMED).unwrap();
+
+        assert_eq!(
+            revoke_bounded(&served, id, Duration::from_millis(500)),
+            Response::Revoked(approvals::RevokeOutcome::Withdrawn)
+        );
+        assert!(
+            !revoke::marker_path(&state, &session, id).exists(),
+            "the marker is cleared once its outcome is read"
+        );
 
         let grants = match lock(&served).handle(Request::Grants).0 {
             Response::Grants(g) => g,
@@ -2416,14 +2576,375 @@ mod tests {
 
         // Already revoked: the same id is refused, not silently accepted again.
         assert!(matches!(
-            lock(&served).handle(Request::Revoke { id }).0,
+            revoke_bounded(&served, id, Duration::from_millis(50)),
             Response::Error(e) if e.contains("not found")
         ));
         // Never minted: same refusal shape.
         assert!(matches!(
-            lock(&served).handle(Request::Revoke { id: 999_999 }).0,
+            revoke_bounded(&served, 999_999, Duration::from_millis(50)),
             Response::Error(e) if e.contains("not found")
         ));
+    }
+
+    #[test]
+    fn revoke_reports_withdrawn_in_flight_and_still_removes_the_grant() {
+        // #245's honest partial-failure shape: a proxy that confirmed but
+        // still has a connection relaying with the credential is not a
+        // failure — the authority is withdrawn either way — but it is a
+        // distinct, named outcome, never silently folded into a bare
+        // `Withdrawn`.
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let id = granted_credential(&served);
+
+        let (state, session) = state_and_session(&served);
+        std::fs::create_dir_all(revoke::dir_path(&state, &session)).unwrap();
+        std::fs::write(
+            revoke::marker_path(&state, &session, id),
+            revoke::in_flight_text(3),
+        )
+        .unwrap();
+
+        assert_eq!(
+            revoke_bounded(&served, id, Duration::from_millis(500)),
+            Response::Revoked(approvals::RevokeOutcome::WithdrawnInFlight(3))
+        );
+        assert!(matches!(
+            lock(&served).handle(Request::Grants).0,
+            Response::Grants(g) if g.is_empty()
+        ));
+    }
+
+    #[test]
+    fn revoke_reports_unconfirmed_and_keeps_the_grant_when_nothing_acknowledges() {
+        // The other honest outcome #245 asks for: a proxy that is
+        // unreachable (or simply has not polled yet) must never be reported
+        // as though the revoke succeeded.
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let id = granted_credential(&served);
+
+        let response = revoke_bounded(&served, id, Duration::from_millis(80));
+        assert_eq!(
+            response,
+            Response::Revoked(approvals::RevokeOutcome::Unconfirmed)
+        );
+
+        let grants = match lock(&served).handle(Request::Grants).0 {
+            Response::Grants(g) => g,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(grants.len(), 1, "never silently dropped: {grants:?}");
+        assert_eq!(grants[0].revoke_state, approvals::RevokeState::Unconfirmed);
+
+        // No `CredentialRevoked` for a revoke nothing ever confirmed: the
+        // audit trail must not claim an enforcement fact that never happened.
+        let replay = lock(&served).subscribe(0).unwrap().replay;
+        assert!(
+            !replay
+                .iter()
+                .any(|r| matches!(r.event, WardEvent::CredentialRevoked { .. })),
+            "{replay:?}"
+        );
+    }
+
+    #[test]
+    fn revoke_reports_unconfirmed_when_the_marker_holds_unparseable_text() {
+        // A review of #248 found this had the failure direction backwards: a
+        // marker body that is neither `CONFIRMED` nor a well-formed
+        // in-flight count (a torn write, a future format from a
+        // version-skewed egress) must fail toward the least confident
+        // outcome, `Unconfirmed`, not toward the most confident one,
+        // `Withdrawn` — the opposite of every other honest-failure case this
+        // module documents.
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let id = granted_credential(&served);
+        let (state, session) = state_and_session(&served);
+
+        std::fs::create_dir_all(revoke::dir_path(&state, &session)).unwrap();
+        std::fs::write(revoke::marker_path(&state, &session, id), "garbage").unwrap();
+
+        assert_eq!(
+            revoke_bounded(&served, id, Duration::from_millis(500)),
+            Response::Revoked(approvals::RevokeOutcome::Unconfirmed)
+        );
+
+        let grants = match lock(&served).handle(Request::Grants).0 {
+            Response::Grants(g) => g,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(grants.len(), 1, "never silently dropped: {grants:?}");
+        assert_eq!(grants[0].revoke_state, approvals::RevokeState::Unconfirmed);
+
+        let replay = lock(&served).subscribe(0).unwrap().replay;
+        assert!(
+            !replay
+                .iter()
+                .any(|r| matches!(r.event, WardEvent::CredentialRevoked { .. })),
+            "an outcome nothing confirmed must never be recorded as one that did: {replay:?}"
+        );
+    }
+
+    #[test]
+    fn ward_session_grants_shows_revoking_while_a_revoke_waits_for_acknowledgement() {
+        // #245 item 5: the intermediate state must be visible through the
+        // exact surface a user reads, `ward session grants`, for the whole
+        // window between the revoke starting and its acknowledgement — not
+        // only in `Approvals`' own internal state.
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let id = granted_credential(&served);
+        let (state, session) = state_and_session(&served);
+
+        let waiting = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || revoke_bounded(&served, id, Duration::from_secs(2)))
+        };
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                matches!(
+                    lock(&served).handle(Request::Grants).0,
+                    Response::Grants(g)
+                        if g.first().is_some_and(|g| g.revoke_state == approvals::RevokeState::Revoking)
+                )
+            }),
+            "revoking must be visible in `ward session grants` while the wait is pending"
+        );
+
+        // The owning proxy answers, mid-wait.
+        std::fs::create_dir_all(revoke::dir_path(&state, &session)).unwrap();
+        std::fs::write(revoke::marker_path(&state, &session, id), revoke::CONFIRMED).unwrap();
+        assert_eq!(
+            waiting.join().unwrap(),
+            Response::Revoked(approvals::RevokeOutcome::Withdrawn)
+        );
+        assert!(matches!(
+            lock(&served).handle(Request::Grants).0,
+            Response::Grants(g) if g.is_empty()
+        ));
+    }
+
+    #[test]
+    fn revoke_never_holds_the_daemon_lock_across_its_wait() {
+        // The whole point of serving `Revoke` on its own connection, exactly
+        // like `Hold` (#245): a `ward session grants` on another connection
+        // must not be blocked behind this one's proxy round trip.
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let id = granted_credential(&served);
+        let (state, session) = state_and_session(&served);
+
+        let waiting = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || revoke_bounded(&served, id, Duration::from_secs(2)))
+        };
+        // If `revoke_bounded` held the lock across its wait, this would never
+        // observe `revoking` and would instead time out at 2 s; bounded well
+        // under that so a regression fails loudly instead of just being slow.
+        assert!(
+            wait_until(Duration::from_millis(500), || {
+                matches!(
+                    lock(&served).handle(Request::Grants).0,
+                    Response::Grants(g)
+                        if g.first().is_some_and(|g| g.revoke_state == approvals::RevokeState::Revoking)
+                )
+            }),
+            "a concurrent `ward session grants` must see `revoking`, not block behind the wait"
+        );
+
+        std::fs::create_dir_all(revoke::dir_path(&state, &session)).unwrap();
+        std::fs::write(revoke::marker_path(&state, &session, id), revoke::CONFIRMED).unwrap();
+        drop(waiting.join());
+    }
+
+    #[test]
+    fn revoke_bounded_only_records_credential_revoked_once_the_racing_caller_it_deferred_to_reports_it()
+     {
+        // #248's review: `begin_revoke` is a harmless no-op on a credential
+        // already `Revoking`, so two connections racing `Request::Revoke`
+        // for the same id both reach this point with the same confirmed
+        // outcome. Before `finish_revoke` reported which caller actually
+        // performed the Revoking→terminal transition, both would append
+        // `CredentialRevoked` for one logical revoke. This drives the same
+        // `performed` guard `revoke_bounded` uses, standing in for the
+        // second racer directly rather than depending on real thread
+        // scheduling to land both callers inside the same window.
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let id = granted_credential(&served);
+        let (state, session) = state_and_session(&served);
+
+        std::fs::create_dir_all(revoke::dir_path(&state, &session)).unwrap();
+        std::fs::write(revoke::marker_path(&state, &session, id), revoke::CONFIRMED).unwrap();
+
+        assert_eq!(
+            revoke_bounded(&served, id, Duration::from_millis(500)),
+            Response::Revoked(approvals::RevokeOutcome::Withdrawn)
+        );
+
+        // The second racer: `begin_revoke` already ran for it too (a
+        // harmless no-op, per its own doc comment) before the first racer's
+        // `finish_revoke` won the race, so it reaches `finish_revoke` with
+        // the same outcome and must not record a second audit event.
+        let performed = lock(&served)
+            .approvals
+            .finish_revoke(id, &approvals::RevokeOutcome::Withdrawn);
+        assert!(!performed, "the grant is already gone");
+
+        let replay = lock(&served).subscribe(0).unwrap().replay;
+        let revoked_events = replay
+            .iter()
+            .filter(|r| matches!(r.event, WardEvent::CredentialRevoked { .. }))
+            .count();
+        assert_eq!(
+            revoked_events, 1,
+            "one logical revoke must record exactly one audit event: {replay:?}"
+        );
+    }
+
+    #[test]
+    fn two_concurrent_revokes_of_the_same_id_agree_on_the_outcome_and_record_one_event() {
+        // #248's review: before `approvals::begin_revoke_wait`/
+        // `join_revoke_wait` existed, real connections racing
+        // `revoke_bounded` for the same id each independently waited on and
+        // cleared `crate::revoke`'s marker file — whichever observed the
+        // confirmed ack first deleted the marker before another's poll
+        // could read it, so the loser timed out and reported `Unconfirmed`
+        // for an operation that had already succeeded. This drives several
+        // real racing callers (not a simulated second racer) end to end;
+        // more than two, since `begin_revoke_wait`'s own atomicity (the
+        // credential check and the leader/joiner decision as one step under
+        // one lock — a later review round's finding) is what keeps every
+        // one of them consistent regardless of how many race in, not just
+        // a specific pair.
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let id = granted_credential(&served);
+        let (state, session) = state_and_session(&served);
+
+        let racers: Vec<_> = (0..5)
+            .map(|_| {
+                let served = Arc::clone(&served);
+                std::thread::spawn(move || revoke_bounded(&served, id, Duration::from_secs(2)))
+            })
+            .collect();
+
+        // Whichever of the racers wins leadership is the one that writes
+        // the marker (every other one only ever joins its shared slot, and
+        // never touches the marker file at all).
+        assert!(
+            wait_until(Duration::from_secs(2), || revoke::marker_path(
+                &state, &session, id
+            )
+            .exists()),
+            "the leading racer's revoke::request must have written the marker"
+        );
+        std::fs::write(revoke::marker_path(&state, &session, id), revoke::CONFIRMED).unwrap();
+
+        let outcomes: Vec<_> = racers.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(
+            outcomes
+                .iter()
+                .all(|r| *r == Response::Revoked(approvals::RevokeOutcome::Withdrawn)),
+            "every racer must agree on the same confirmed outcome: {outcomes:?}"
+        );
+
+        let replay = lock(&served).subscribe(0).unwrap().replay;
+        let revoked_events = replay
+            .iter()
+            .filter(|r| matches!(r.event, WardEvent::CredentialRevoked { .. }))
+            .count();
+        assert_eq!(
+            revoked_events, 1,
+            "one logical revoke must record exactly one audit event: {replay:?}"
+        );
+    }
+
+    #[test]
+    fn a_concurrent_revoke_cannot_start_a_second_marker_wait_between_publish_and_the_terminal_transition()
+     {
+        // #248's review: publishing the leader's outcome (which removes the
+        // id's shared slot) and the Revoking→terminal `finish_revoke`
+        // transition it implies must happen as one step with respect to
+        // `served`'s lock — otherwise a brand new connection's
+        // `begin_revoke` could find the grant still `Revoking` while
+        // `claim_revoke_wait` finds no slot left to join, and start an
+        // independent second marker wait for what is actually the same,
+        // already-settled logical revoke. This pauses the leader in
+        // exactly that window (via `revoke_bounded_with_hook`, a test-only
+        // seam) and proves a concurrent revoke of the same id cannot make
+        // any progress until the leader has fully finished.
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let id = granted_credential(&served);
+        let (state, session) = state_and_session(&served);
+        std::fs::create_dir_all(revoke::dir_path(&state, &session)).unwrap();
+        std::fs::write(revoke::marker_path(&state, &session, id), revoke::CONFIRMED).unwrap();
+
+        let (reached_hook_tx, reached_hook_rx) = std::sync::mpsc::channel::<()>();
+        let (release_hook_tx, release_hook_rx) = std::sync::mpsc::channel::<()>();
+        let leader = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || {
+                revoke_bounded_with_hook(&served, id, Duration::from_secs(2), move || {
+                    reached_hook_tx.send(()).unwrap();
+                    release_hook_rx.recv().unwrap();
+                })
+            })
+        };
+
+        reached_hook_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        // A brand new connection racing a revoke of the same id right now
+        // must not be able to make any progress: `served`'s lock is still
+        // held by the leader, paused in the hook, so this blocks on it
+        // rather than becoming a second leader with a marker wait of its
+        // own.
+        let late = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || revoke_bounded(&served, id, Duration::from_secs(2)))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !late.is_finished(),
+            "a concurrent revoke must block on the daemon lock during this window, not race ahead"
+        );
+
+        release_hook_tx.send(()).unwrap();
+        let leader_outcome = leader.join().unwrap();
+        let late_outcome = late.join().unwrap();
+
+        assert_eq!(
+            leader_outcome,
+            Response::Revoked(approvals::RevokeOutcome::Withdrawn)
+        );
+        // By the time the late caller's own `begin_revoke` finally runs,
+        // the grant is already gone (the leader finished the transition
+        // while holding the lock the late caller was blocked on) — honestly
+        // refused, never a second, independent marker wait for an
+        // already-settled revoke.
+        assert!(
+            matches!(&late_outcome, Response::Error(e) if e.contains("not found")),
+            "{late_outcome:?}"
+        );
+
+        assert!(matches!(
+            lock(&served).handle(Request::Grants).0,
+            Response::Grants(g) if g.is_empty()
+        ));
+        let replay = lock(&served).subscribe(0).unwrap().replay;
+        let revoked_events = replay
+            .iter()
+            .filter(|r| matches!(r.event, WardEvent::CredentialRevoked { .. }))
+            .count();
+        assert_eq!(
+            revoked_events, 1,
+            "one logical revoke must record exactly one audit event: {replay:?}"
+        );
     }
 
     #[test]
@@ -2531,7 +3052,7 @@ mod tests {
             };
             assert!(matches!(
                 served.handle_conn(conn, request).0,
-                Response::Record(_)
+                Response::Record(_) | Response::Granted { .. }
             ));
         };
 
@@ -3014,7 +3535,7 @@ mod tests {
                     at_unix_ms: control::unix_ms(SystemTime::now()),
                 })
                 .unwrap(),
-                Response::Record(_)
+                Response::Record(_) | Response::Granted { .. }
             ));
         };
 

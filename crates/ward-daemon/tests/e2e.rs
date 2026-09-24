@@ -410,6 +410,159 @@ print(s.recv(200).split(b'\\r\\n')[0].decode()); print('key='+key)";
     );
 }
 
+/// #245: `ward session revoke` on an *active* credential grant must actually
+/// stop the proxy from honoring new requests using it — not just remove it
+/// from the authority projection or leave an audit record. This drives the
+/// whole real stack: a live `wardd`, a real sandboxed launch whose gateway
+/// route is tagged with the daemon-minted grant id (`Response::Granted`,
+/// `GatewayRoute::revocable`), a real `Request::Revoke` over the same control
+/// socket `ward session revoke` uses, and a second real request against the
+/// still-running proxy socket — the thing an event-log assertion alone could
+/// never prove.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn revoking_an_active_credential_grant_stops_the_proxy_from_honoring_it() {
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap")
+        || !ward_sandbox::ci::isolation_ready(
+            std::path::Path::new("/usr/bin/python3").exists(),
+            "python3",
+        )
+    {
+        return;
+    }
+    let (port, seen) = spawn_upstream();
+    let spec = ward_daemon::agents::profile("claude")
+        .and_then(|p| p.gateway)
+        .unwrap();
+    let route = ward_proxy::GatewayRoute::new(
+        spec.prefix,
+        "127.0.0.1",
+        port,
+        spec.header,
+        ward_proxy::Secret::from("sk-ant-real"),
+    )
+    .unwrap()
+    .strip_headers(spec.strip)
+    .plain_upstream(true);
+    let gateway = ward_daemon::gateway::Gateway::new(&spec, route);
+
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+
+    // `ward up`, then a real daemon: `ward session revoke` (and this test)
+    // reaches the grant over the control socket, exactly as the CLI does.
+    let up = Session::start_in(project.path(), state.path()).expect("up");
+    let session_id = up.id().to_owned();
+    up.persist_current().expect("persist");
+    drop(up);
+    let (state_path, id_for_serve) = (state.path().to_path_buf(), session_id.clone());
+    let served = std::thread::spawn(move || daemon::serve(&state_path, &id_for_serve));
+    assert!(
+        daemon::wait_until(daemon::STARTUP_TIMEOUT, || daemon::serving(
+            state.path(),
+            &session_id
+        )),
+        "the daemon answers a Ping"
+    );
+    let socket = daemon::socket_path(state.path(), &session_id);
+
+    // The sandboxed process makes one request, waits for the host to revoke
+    // (a `go` file it polls for — the sandbox has no other way to learn the
+    // host has acted), then makes a second one: the two outcomes on either
+    // side of the same still-running proxy socket are what this test compares.
+    let script = r"
+import os, socket, time
+base = os.environ['ANTHROPIC_BASE_URL']
+key = os.environ['ANTHROPIC_API_KEY']
+
+def req():
+    s = socket.socket(socket.AF_UNIX)
+    s.connect('/run/ward/proxy.sock')
+    path = base.split('3128', 1)[1] + '/v1/messages'
+    head = ('POST ' + path + ' HTTP/1.1\r\nHost: 127.0.0.1:3128\r\n'
+            'x-api-key: ' + key + '\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+    s.sendall(head.encode())
+    return s.recv(200).split(b'\r\n')[0].decode()
+
+open('first.txt', 'w').write(req())
+deadline = time.time() + 10
+while not os.path.exists('go.txt') and time.time() < deadline:
+    time.sleep(0.05)
+open('second.txt', 'w').write(req())
+";
+    let opts = LaunchOpts {
+        env: gateway.env.clone(),
+        gateways: vec![gateway],
+        ..LaunchOpts::default()
+    };
+    let argv: Vec<String> = ["python3", "-c", script]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut run = Session::open_current(project.path(), state.path())
+        .expect("open current")
+        .expect("a current session exists");
+    let launch = std::thread::spawn(move || run.launch(&argv, &opts));
+
+    let first = project.path().join("first.txt");
+    assert!(
+        daemon::wait_until(std::time::Duration::from_secs(10), || first.exists()),
+        "the first request must complete before the host can revoke anything"
+    );
+    assert!(
+        fs::read_to_string(&first)
+            .unwrap()
+            .starts_with("HTTP/1.1 200"),
+        "the credential is still honored before any revoke"
+    );
+
+    // The daemon's own side of `ward session revoke <id>`, over a second,
+    // independent connection — exactly what the CLI opens.
+    let mut sink = RemoteSink::connect(&socket).expect("revoke connection");
+    let id = match sink.call(&Request::Grants).expect("grants") {
+        Response::Grants(g) if g.len() == 1 => g[0].id,
+        other => panic!("{other:?}"),
+    };
+    let outcome = match sink.call(&Request::Revoke { id }).expect("revoke") {
+        Response::Revoked(outcome) => outcome,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        matches!(
+            outcome,
+            ward_daemon::approvals::RevokeOutcome::Withdrawn
+                | ward_daemon::approvals::RevokeOutcome::WithdrawnInFlight(_)
+        ),
+        "the owning proxy — this same launch's egress — must confirm: {outcome:?}"
+    );
+    assert!(
+        matches!(sink.call(&Request::Grants).expect("grants"), Response::Grants(g) if g.is_empty()),
+        "a confirmed revoke removes the grant from what `ward session grants` lists"
+    );
+
+    fs::write(project.path().join("go.txt"), "").expect("let the sandbox proceed");
+    // The script's own exit code is uninteresting here; `first.txt` and
+    // `second.txt` (read below) carry the two outcomes this test compares.
+    let _report = launch.join().unwrap().expect("launch");
+
+    let second = fs::read_to_string(project.path().join("second.txt")).unwrap();
+    assert!(
+        second.starts_with("HTTP/1.1 403"),
+        "the revoked credential must be refused for a new request: {second}"
+    );
+
+    drop(seen); // the upstream is never contacted a second time; nothing more to assert on it.
+    Session::open_current(project.path(), state.path())
+        .expect("open current")
+        .expect("still active")
+        .stop(EndReason::UserStop)
+        .expect("stop");
+    served
+        .join()
+        .unwrap()
+        .expect("serve returns Ok once the log is sealed");
+}
+
 #[test]
 fn hooks_answer_ask_under_step_through_and_are_logged_as_claims() {
     if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap")

@@ -36,7 +36,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::str::FromStr;
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,7 @@ impl Approval {
             scope: self.authority.scope(),
             lifetime: Lifetime::Session,
             granted_at_unix_ms,
+            revoke_state: RevokeState::Active,
         }
     }
 }
@@ -257,13 +258,39 @@ impl Authority {
     }
 }
 
+/// Where a credential grant stands with respect to a host-confirmed revoke
+/// (#245, closing the gap #243 left open in #140 items 4-5): `Active` until
+/// someone asks; `Revoking` from the moment `ward session revoke` marks it
+/// until the owning proxy acknowledges withdrawal or the wait
+/// (`crate::revoke::ACK_TIMEOUT`) runs out; `Unconfirmed` is the terminal
+/// answer for that timeout — the grant is *not* removed (a confirmed
+/// withdrawal is; see [`Approvals::finish_revoke`]), because the daemon
+/// cannot honestly say whether the credential is still being honored. This
+/// is the same discipline [`Lifetime::LaunchUnknown`] already applies to a
+/// severed connection: neither of the two false claims (still safely active,
+/// or confirmed gone) is supportable, so neither is made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RevokeState {
+    /// Nothing has asked to revoke this grant.
+    #[default]
+    Active,
+    /// Waiting for the owning proxy to acknowledge withdrawal.
+    Revoking,
+    /// The wait ran out with no acknowledgement.
+    Unconfirmed,
+}
+
 /// A credential the launch granted: the proxy injects it for `hosts`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credential {
     /// The daemon-minted id this credential's [`Grant`] carries (#140):
     /// stable for the life of the grant, unique within the session, never
     /// reused. `ward session revoke <id>` addresses a grant by this value
-    /// alone — never by label, which two simultaneous grants can share.
+    /// alone — never by label, which two simultaneous grants can share. The
+    /// same value tags the `GatewayRoute` the proxy holds for it
+    /// (`GatewayRoute::revocable`, #245), so a revoke instruction keyed by
+    /// this id reaches exactly the one route it was minted for.
     pub id: u64,
     /// The service (`github`).
     pub service: String,
@@ -291,6 +318,10 @@ pub struct Credential {
     /// called on the key instead: the credential stays, but reports as
     /// [`Lifetime::LaunchUnknown`] rather than [`Lifetime::Launch`].
     pub launch_key: Option<u64>,
+    /// Where this grant stands with respect to a host-confirmed revoke
+    /// (#245). `Active` until [`Approvals::begin_revoke`] marks it.
+    #[serde(default)]
+    pub revoke_state: RevokeState,
 }
 
 impl Credential {
@@ -342,35 +373,104 @@ pub struct Grant {
     pub lifetime: Lifetime,
     /// When, milliseconds since the Unix epoch.
     pub granted_at_unix_ms: u64,
+    /// Where this grant stands with respect to a host-confirmed revoke
+    /// (#245): always [`RevokeState::Active`] for a [`GrantKind::Approval`],
+    /// which has no proxy route to wait on.
+    #[serde(default)]
+    pub revoke_state: RevokeState,
 }
 
 impl Grant {
-    /// The grant as one line: id, label, scope, lifetime.
+    /// The grant as one line: id, label, scope, lifetime, and — while it is
+    /// anything other than [`RevokeState::Active`] — that state too, so a
+    /// pending or unconfirmed revoke is visible wherever a plain-text list of
+    /// grants is (#245's "no UI-only revoke is reported as enforced" bar
+    /// extends to "no revoke in progress is reported as though nothing were
+    /// happening" too).
     #[must_use]
     pub fn line(&self) -> String {
-        format!(
+        let mut line = format!(
             "{}   {}   {}   {}",
             self.id,
             self.label,
             self.scope,
             self.lifetime.as_str()
-        )
+        );
+        match self.revoke_state {
+            RevokeState::Active => {}
+            RevokeState::Revoking => line.push_str("   revoking"),
+            RevokeState::Unconfirmed => line.push_str("   revoke unconfirmed"),
+        }
+        line
     }
 }
 
-/// What [`Approvals::revoke`] removed (#140).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RevokedGrant {
-    /// A credential the proxy had injected, by its raw service id (`github`
-    /// — not [`service_name`]'s display form, which [`Approvals::grants`]
-    /// shows instead): the caller records `CredentialRevoked` for it.
+/// What [`Approvals::begin_revoke_wait`] found and decided for the grant it
+/// was asked to revoke (#245), and what the caller (`daemon::revoke`) must
+/// still do about it.
+#[derive(Debug)]
+pub enum RevokeStart {
+    /// A credential the proxy had injected, now marked
+    /// [`RevokeState::Revoking`]. `leader` tells the caller whether it must
+    /// itself write the proxy-facing marker (`crate::revoke::request`),
+    /// wait for its acknowledgement, and publish the result to `slot`
+    /// (`true`), or whether another connection is already doing exactly
+    /// that for this same id and this caller should instead only wait on
+    /// `slot` for that connection's result (`false`) — see
+    /// [`Approvals::publish_revoke_wait`] and
+    /// [`Approvals::join_revoke_wait`]. Either way the caller concludes with
+    /// [`Approvals::finish_revoke`].
     Credential {
-        /// The service id.
+        /// The service id, for the `CredentialRevoked` record a confirmed
+        /// outcome still owes.
         service: String,
+        /// This id's shared revoke-wait slot — see [`State::revoke_wait`].
+        slot: RevokeSlot,
+        /// Whether this caller leads the wait (`true`) or joins one already
+        /// in progress (`false`).
+        leader: bool,
     },
-    /// An `allow-session` answer, already removed from `remembered`; nothing
-    /// further for the caller to do.
+    /// An `allow-session` answer, already removed from `remembered`: no
+    /// proxy route exists for one, so there is nothing to wait on — the
+    /// caller reports [`RevokeOutcome::Withdrawn`] straight away.
     Approval,
+}
+
+/// The result of `ward session revoke` reaching (or failing to reach) the
+/// proxy that would have to withdraw an active credential route (#245): the
+/// host-confirmed half #140 item 4 asked for and #243 left for this issue to
+/// close. An `allow-session` answer has no proxy route at all, so revoking
+/// one is always [`Self::Withdrawn`] — nothing to wait on, nothing that can
+/// fail to confirm.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RevokeOutcome {
+    /// The owning proxy confirmed the credential no longer arms any route:
+    /// every new request using it from now on is refused. The grant is
+    /// removed from [`Approvals::grants`] from this call on, exactly as a
+    /// plain, unconfirmed removal always was.
+    Withdrawn,
+    /// The owning proxy confirmed and stopped honoring the credential for
+    /// new requests, but this many connection(s) that had already passed
+    /// that check when the marker landed are still relaying with it
+    /// injected — bytes already handed to a socket are not recalled
+    /// (`docs/security-model.md`). Not a failure: the authority itself is
+    /// withdrawn, exactly as [`Self::Withdrawn`] is, and the grant is
+    /// removed the same way; only its already-open use outlives that by
+    /// however long it takes to finish on its own.
+    WithdrawnInFlight(u32),
+    /// Nothing acknowledged the withdrawal within the wait
+    /// (`crate::revoke::ACK_TIMEOUT`): the owning proxy may be unreachable
+    /// (its launch crashed, or its connection to `wardd` died without ever
+    /// producing a terminal record — see [`Lifetime::LaunchUnknown`]), or it
+    /// simply has not polled the marker yet. The grant is *not* removed —
+    /// reporting it gone here would be exactly the "UI-only revoke...
+    /// reported as enforced" #140's acceptance criteria forbids — it is
+    /// instead marked [`RevokeState::Unconfirmed`] and keeps showing in
+    /// [`Approvals::grants`] until its launch's own terminal record retires
+    /// it, since nothing here can say whether the credential is still being
+    /// honored.
+    Unconfirmed,
 }
 
 /// Derives an [`Authority`] for a question: the session's manifest, the
@@ -1003,7 +1103,28 @@ struct State {
     /// the other finds its entry already gone (or a tombstone already in
     /// `handoff`) and does nothing further.
     unclaimed: BTreeMap<u64, (Approval, Outcome)>,
+    /// One shared slot per credential id with a proxy-facing revoke wait
+    /// currently in progress (#248 review): the first `daemon::revoke_bounded`
+    /// call for an id creates the slot and becomes its leader, the only
+    /// caller that ever touches `crate::revoke`'s marker file for that
+    /// attempt; any other connection racing a revoke of the same id finds
+    /// the slot already present and joins it instead, waiting on the shared
+    /// `Condvar` for the leader's published outcome rather than
+    /// independently polling and clearing the same marker file — the two
+    /// racers doing that themselves is what let the first to observe
+    /// `CONFIRMED` delete the marker out from under the second, which then
+    /// timed out and reported `Unconfirmed` for an operation that had
+    /// already succeeded. Removed by the leader once published: a joiner
+    /// that already cloned the `Arc` keeps working from its own reference,
+    /// unaffected, while a *later*, distinct revoke attempt for the same id
+    /// (a legitimate retry after an honest `Unconfirmed`) finds no slot and
+    /// correctly leads its own fresh wait rather than joining a stale one.
+    revoke_wait: BTreeMap<u64, RevokeSlot>,
 }
+
+/// A revoke wait's shared outcome: `None` while the leader's wait is still
+/// in progress, `Some` once published. See [`State::revoke_wait`].
+pub type RevokeSlot = Arc<(Mutex<Option<RevokeOutcome>>, Condvar)>;
 
 impl State {
     /// Mint the next grant id (#140): starts at 1, strictly increasing, never
@@ -1054,7 +1175,12 @@ impl Approvals {
     /// attributed to `launch_key` (the daemon's own opaque id for the launch
     /// this grant fell under, when it could tell one); a second route of the
     /// same service, permissions and launch adds its host rather than making
-    /// a second grant.
+    /// a second grant. Returns the id the grant is (or already was) known
+    /// by: the caller (`daemon::Served::handle_appendable`) hands this back
+    /// to the client over the wire (`Response::Granted`, #245) so the
+    /// `GatewayRoute` it built for this exact grant can be tagged with the
+    /// same id (`GatewayRoute::revocable`) — the one thing that lets a later
+    /// `ward session revoke` reach the right route in a different process.
     pub fn record_credential(
         &self,
         service: &str,
@@ -1062,7 +1188,7 @@ impl Approvals {
         permissions: Vec<String>,
         launch_key: Option<u64>,
         granted_at_unix_ms: u64,
-    ) {
+    ) -> u64 {
         let mut state = self.lock();
         if let Some(c) = state.credentials.iter_mut().find(|c| {
             c.service == service && c.permissions == permissions && c.launch_key == launch_key
@@ -1070,7 +1196,7 @@ impl Approvals {
             if !c.hosts.iter().any(|h| h == host) {
                 c.hosts.push(host.to_owned());
             }
-            return;
+            return c.id;
         }
         let id = state.next_grant_id();
         state.credentials.push(Credential {
@@ -1080,7 +1206,9 @@ impl Approvals {
             permissions,
             granted_at_unix_ms,
             launch_key,
+            revoke_state: RevokeState::Active,
         });
+        id
     }
 
     /// Retire every credential granted for launch `key` (the same opaque id
@@ -1142,6 +1270,7 @@ impl Approvals {
                     _ => Lifetime::Launch,
                 },
                 granted_at_unix_ms: c.granted_at_unix_ms,
+                revoke_state: c.revoke_state,
             })
             .chain(state.remembered.values().cloned())
             .collect();
@@ -1158,35 +1287,48 @@ impl Approvals {
         grants
     }
 
-    /// Revoke the grant `id` names (`ward session revoke <id>`, #140 items
-    /// 4-6): removes it from what [`grants`](Self::grants) reports from this
-    /// call on. `None` when no live grant has this id — already revoked,
-    /// retired by its launch ending, or never minted.
+    /// Begin revoking the grant `id` names (`ward session revoke <id>`,
+    /// #245, closing the gap #243 left open in #140 items 4-5), and decide
+    /// in the same step whether this caller leads or joins that id's
+    /// proxy-facing wait. An `allow-session` answer is removed from
+    /// `remembered` immediately — there is no proxy route for one to wait
+    /// on. A credential grant is instead marked [`RevokeState::Revoking`]
+    /// and *kept*: the caller (`daemon::revoke`) still has to reach the
+    /// outcome (leading a fresh marker wait, or joining one already running
+    /// for this id) and call [`finish_revoke`](Self::finish_revoke) with
+    /// what it learned before the grant either disappears (confirmed) or is
+    /// flagged [`RevokeState::Unconfirmed`] (it was not). `None` when no
+    /// live grant has this id — already gone, retired by its launch ending,
+    /// or never minted.
     ///
-    /// This is authority-projection-only, not host-confirmed enforcement:
-    /// item 4's full ask is "instruct the owning proxy to withdraw the route,
-    /// then await acknowledgement", with an intermediate "revoking" state
-    /// (item 5) until that acknowledgement arrives. Nothing here reaches the
-    /// proxy or the credential-injection boundary — removing a credential
-    /// grant here stops it from being *listed*, but an already-established
-    /// route using it can keep working until its own lifecycle ends (the
-    /// launch finishes, the session ends). Closing that gap is tracked
-    /// separately; this method, and the CLI/panel surface built on it, must
-    /// never be presented as if it already closes it (the acceptance
-    /// criterion "no UI-only revoke is reported as enforced").
-    ///
-    /// For a credential the proxy injected, the caller (`Served::revoke` in
-    /// `daemon.rs`) still has to record `CredentialRevoked` itself: this
-    /// method only owns the in-memory authority view, not the event log, the
-    /// same split `retire_launch` and `mark_launch_unknown` already draw. An
-    /// `allow-session` answer has no audit event of its own yet — removing it
-    /// from `remembered` is the whole of what revoking it does today.
-    pub fn revoke(&self, id: u64) -> Option<RevokedGrant> {
+    /// The credential lookup and the leader/joiner decision happen under
+    /// one lock acquisition, deliberately (#248 review): a caller whose
+    /// credential check and wait-slot claim were two separate steps could,
+    /// between them, have another connection finish revoking this exact
+    /// credential — at which point the credential is gone and so is its
+    /// slot, but a caller that never re-checked either would still create a
+    /// fresh slot and lead a second, independent wait for an id whose
+    /// revoke had already concluded. Calling this again on a credential
+    /// already `Revoking` is a harmless join, never a second, independent
+    /// wait: two racing `ward session revoke` calls for the same id always
+    /// end up waiting on the one shared slot, whichever of them ends up
+    /// leading it.
+    pub fn begin_revoke_wait(&self, id: u64) -> Option<RevokeStart> {
         let mut state = self.lock();
-        if let Some(pos) = state.credentials.iter().position(|c| c.id == id) {
-            let removed = state.credentials.remove(pos);
-            return Some(RevokedGrant::Credential {
-                service: removed.service,
+        if let Some(c) = state.credentials.iter_mut().find(|c| c.id == id) {
+            c.revoke_state = RevokeState::Revoking;
+            let service = c.service.clone();
+            let (slot, leader) = if let Some(slot) = state.revoke_wait.get(&id) {
+                (Arc::clone(slot), false)
+            } else {
+                let slot: RevokeSlot = Arc::new((Mutex::new(None), Condvar::new()));
+                state.revoke_wait.insert(id, Arc::clone(&slot));
+                (slot, true)
+            };
+            return Some(RevokeStart::Credential {
+                service,
+                slot,
+                leader,
             });
         }
         if let Some(key) = state
@@ -1196,9 +1338,90 @@ impl Approvals {
             .map(|(key, _)| key.clone())
         {
             state.remembered.remove(&key);
-            return Some(RevokedGrant::Approval);
+            return Some(RevokeStart::Approval);
         }
         None
+    }
+
+    /// Conclude a credential revoke [`begin_revoke_wait`](Self::begin_revoke_wait)
+    /// started (#245): a confirmed withdrawal — in or out of flight —
+    /// removes the grant from what [`grants`](Self::grants) reports, exactly
+    /// as the old, authority-projection-only revoke always did; an
+    /// unconfirmed wait instead leaves it, flagged
+    /// [`RevokeState::Unconfirmed`], so a client asking is never told a
+    /// revoke succeeded before the proxy actually said so. A no-op when `id`
+    /// is no longer a live credential at all (its launch ended and retired
+    /// it while the wait was still running) — there is nothing left to
+    /// conclude.
+    ///
+    /// For a confirmed outcome, the caller (`daemon::revoke`) still has to
+    /// record `CredentialRevoked` itself: this method only owns the
+    /// in-memory authority view, not the event log, the same split
+    /// `retire_launch` and `mark_launch_unknown` already draw.
+    ///
+    /// Returns whether *this* call performed the transition (found the
+    /// credential still present and acted on it), as opposed to a racing
+    /// call for the same `id` already having done so. Two connections
+    /// racing `ward session revoke` on the same id both reach this method
+    /// with the same confirmed outcome (`begin_revoke_wait` is a harmless
+    /// join on a credential already `Revoking`, so neither is refused earlier);
+    /// without this signal, both would think they were the one that closed
+    /// it out and both would append a `CredentialRevoked` audit event for
+    /// one logical revoke. The caller should only record the audit event
+    /// when this returns `true`.
+    pub fn finish_revoke(&self, id: u64, outcome: &RevokeOutcome) -> bool {
+        let mut state = self.lock();
+        match outcome {
+            RevokeOutcome::Withdrawn | RevokeOutcome::WithdrawnInFlight(_) => {
+                let before = state.credentials.len();
+                state.credentials.retain(|c| c.id != id);
+                state.credentials.len() != before
+            }
+            RevokeOutcome::Unconfirmed => {
+                if let Some(c) = state.credentials.iter_mut().find(|c| c.id == id) {
+                    let acted = c.revoke_state != RevokeState::Unconfirmed;
+                    c.revoke_state = RevokeState::Unconfirmed;
+                    acted
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// The leader's terminal result for `id`'s revoke wait, for every
+    /// connection that joined it to read. Removes `id` from `revoke_wait` so
+    /// a later, distinct revoke attempt (a legitimate retry) leads its own
+    /// fresh wait rather than joining this now-finished one — a joiner that
+    /// already cloned the slot's `Arc` before this call keeps working from
+    /// its own reference regardless.
+    pub fn publish_revoke_wait(&self, id: u64, slot: &RevokeSlot, outcome: RevokeOutcome) {
+        let (result, changed) = &**slot;
+        *result.lock().unwrap_or_else(PoisonError::into_inner) = Some(outcome);
+        changed.notify_all();
+        self.lock().revoke_wait.remove(&id);
+    }
+
+    /// A joiner's wait for the leader's published outcome, bounded by
+    /// `timeout` from this call (independent of how long the leader has
+    /// already been waiting — see [`begin_revoke_wait`](Self::begin_revoke_wait)).
+    /// `Unconfirmed` if the leader never publishes within that bound — the
+    /// same fail-safe direction an unparseable or missing marker ack already
+    /// takes, never a fabricated `Withdrawn`.
+    pub fn join_revoke_wait(slot: &RevokeSlot, timeout: Duration) -> RevokeOutcome {
+        let (result, changed) = &**slot;
+        let mut guard = result.lock().unwrap_or_else(PoisonError::into_inner);
+        let deadline = Instant::now() + timeout;
+        while guard.is_none() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (g, _timed_out) = changed
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(PoisonError::into_inner);
+            guard = g;
+        }
+        guard.clone().unwrap_or(RevokeOutcome::Unconfirmed)
     }
 
     /// Register a question. Refused once the session has ended. Its decision
@@ -1718,6 +1941,7 @@ mod tests {
             permissions: vec!["contents:read".into(), "issues:read".into()],
             granted_at_unix_ms: 1,
             launch_key: None,
+            revoke_state: RevokeState::Active,
         }
     }
 
@@ -1869,6 +2093,7 @@ mod tests {
                 permissions: perms(),
                 granted_at_unix_ms: 1,
                 launch_key: None,
+                revoke_state: RevokeState::Active,
             }],
             "one credential per service and scope, its hosts merged"
         );
@@ -1954,18 +2179,20 @@ mod tests {
                 permissions: perms(),
                 granted_at_unix_ms: 3,
                 launch_key: None,
+                revoke_state: RevokeState::Active,
             }]
         );
     }
 
     #[test]
-    fn revoke_removes_a_credential_by_id_and_records_nothing_else() {
+    fn begin_revoke_marks_a_credential_revoking_without_removing_it_yet() {
+        // #245: the intermediate state must be visible from the moment a
+        // revoke starts, before any proxy has had a chance to acknowledge it.
         let approvals = Approvals::new();
         let perms = || vec!["contents:read".to_owned()];
         approvals.record_credential("github", "github.com", perms(), None, 1);
         approvals.record_credential("npm", "registry.npmjs.org", perms(), None, 2);
         let grants = approvals.grants();
-        assert_eq!(grants.len(), 2);
         let github_id = grants
             .iter()
             .find(|g| g.label == "GitHub")
@@ -1978,24 +2205,193 @@ mod tests {
             .id;
         assert_ne!(github_id, npm_id);
 
-        assert_eq!(
-            approvals.revoke(github_id),
-            Some(RevokedGrant::Credential {
-                service: "github".into()
-            })
-        );
+        assert!(matches!(
+            approvals.begin_revoke_wait(github_id),
+            Some(RevokeStart::Credential { service, leader: true, .. }) if service == "github"
+        ));
+        // Still listed — never silently dropped before anything confirmed —
+        // but flagged, and the untouched grant is unaffected.
+        let grants = approvals.grants();
+        assert_eq!(grants.len(), 2, "{grants:?}");
+        let github = grants.iter().find(|g| g.id == github_id).unwrap();
+        assert_eq!(github.revoke_state, RevokeState::Revoking);
+        assert!(github.line().ends_with("   revoking"), "{}", github.line());
+        let npm = grants.iter().find(|g| g.id == npm_id).unwrap();
+        assert_eq!(npm.revoke_state, RevokeState::Active);
+        assert!(!npm.line().contains("revoking"), "{}", npm.line());
+
+        // Calling it again on the same, already-revoking id is a harmless
+        // join, not an error — this second caller is no longer the leader,
+        // since the first call already claimed that id's wait slot.
+        assert!(matches!(
+            approvals.begin_revoke_wait(github_id),
+            Some(RevokeStart::Credential { service, leader: false, .. }) if service == "github"
+        ));
+
+        // Unknown or already-gone ids find nothing to begin.
+        assert!(approvals.begin_revoke_wait(999).is_none());
+    }
+
+    #[test]
+    fn finish_revoke_withdrawn_and_in_flight_both_remove_the_grant() {
+        let approvals = Approvals::new();
+        let perms = || vec!["contents:read".to_owned()];
+        approvals.record_credential("github", "github.com", perms(), None, 1);
+        approvals.record_credential("npm", "registry.npmjs.org", perms(), None, 2);
+        let github_id = approvals
+            .grants()
+            .iter()
+            .find(|g| g.label == "GitHub")
+            .unwrap()
+            .id;
+        let npm_id = approvals
+            .grants()
+            .iter()
+            .find(|g| g.label == "npm")
+            .unwrap()
+            .id;
+
+        approvals.begin_revoke_wait(github_id);
+        approvals.finish_revoke(github_id, &RevokeOutcome::Withdrawn);
         let remaining = approvals.grants();
         assert_eq!(remaining.len(), 1, "{remaining:?}");
         assert_eq!(remaining[0].id, npm_id);
 
-        // Already gone: revoking it again finds nothing.
-        assert_eq!(approvals.revoke(github_id), None);
-        // Never minted: same answer.
-        assert_eq!(approvals.revoke(999), None);
+        approvals.begin_revoke_wait(npm_id);
+        // Confirmed, but with one connection still relaying: gone from the
+        // list exactly the same as a clean `Withdrawn` — the authority
+        // itself is withdrawn either way (#245).
+        approvals.finish_revoke(npm_id, &RevokeOutcome::WithdrawnInFlight(1));
+        assert!(approvals.grants().is_empty(), "{:?}", approvals.grants());
     }
 
     #[test]
-    fn revoke_removes_a_remembered_allow_session_grant_by_id() {
+    fn finish_revoke_unconfirmed_keeps_the_grant_but_flags_it() {
+        // #245's acceptance criterion in the other direction: a revoke that
+        // could not be confirmed must never be silently treated as either
+        // still-safely-active or gone.
+        let approvals = Approvals::new();
+        let perms = || vec!["contents:read".to_owned()];
+        approvals.record_credential("github", "github.com", perms(), None, 1);
+        let id = approvals.grants()[0].id;
+
+        approvals.begin_revoke_wait(id);
+        approvals.finish_revoke(id, &RevokeOutcome::Unconfirmed);
+
+        let grants = approvals.grants();
+        assert_eq!(grants.len(), 1, "never silently dropped: {grants:?}");
+        assert_eq!(grants[0].revoke_state, RevokeState::Unconfirmed);
+        assert!(
+            grants[0].line().ends_with("   revoke unconfirmed"),
+            "{}",
+            grants[0].line()
+        );
+
+        // The launch ending still retires it in the ordinary way, whatever
+        // its revoke state: an unconfirmed revoke is not a second lifecycle.
+        approvals.retire_launch(0);
+        assert_eq!(approvals.grants().len(), 1, "launch_key was None here");
+    }
+
+    #[test]
+    fn finish_revoke_reports_whether_it_performed_the_transition() {
+        // Two connections racing `ward session revoke` for the same id both
+        // reach `finish_revoke` with the same confirmed outcome (#248's
+        // review found this: `begin_revoke` is a harmless no-op on a
+        // credential already `Revoking`, so neither caller is refused
+        // earlier). Only one of them actually removes the grant; the caller
+        // uses this return value to decide which one records the audit
+        // event, so it must be true exactly once per logical revoke.
+        let approvals = Approvals::new();
+        let perms = || vec!["contents:read".to_owned()];
+        approvals.record_credential("github", "github.com", perms(), None, 1);
+        let id = approvals.grants()[0].id;
+
+        approvals.begin_revoke_wait(id);
+        approvals.begin_revoke_wait(id); // the racing second connection
+
+        assert!(approvals.finish_revoke(id, &RevokeOutcome::Withdrawn));
+        assert!(
+            !approvals.finish_revoke(id, &RevokeOutcome::Withdrawn),
+            "the grant is already gone: a second call must not report \
+             performing the transition again"
+        );
+        assert!(approvals.grants().is_empty());
+
+        // Same story for the `Unconfirmed` outcome: the first call flags
+        // it, the second finds it already flagged.
+        approvals.record_credential("npm", "registry.npmjs.org", perms(), None, 2);
+        let npm_id = approvals.grants()[0].id;
+        approvals.begin_revoke_wait(npm_id);
+        approvals.begin_revoke_wait(npm_id);
+        assert!(approvals.finish_revoke(npm_id, &RevokeOutcome::Unconfirmed));
+        assert!(!approvals.finish_revoke(npm_id, &RevokeOutcome::Unconfirmed));
+
+        // An id with no live grant at all (already retired) never reports
+        // having performed anything.
+        assert!(!approvals.finish_revoke(999, &RevokeOutcome::Withdrawn));
+    }
+
+    #[test]
+    fn concurrent_revoke_waits_for_the_same_id_share_one_leader_and_agree_on_the_outcome() {
+        // #248's review: before this leader/joiner coordination existed,
+        // two connections racing `daemon::revoke_bounded` for the same id
+        // each independently waited on and cleared `crate::revoke`'s marker
+        // file — whichever observed the confirmed ack first deleted the
+        // marker before the other could read it, so the loser timed out and
+        // reported `Unconfirmed` for an operation that had already
+        // succeeded. Only the leader here ever touches a marker file (none
+        // exists in this unit test at all); the joiner learns the outcome
+        // purely from the shared slot.
+        let approvals = Approvals::new();
+        let perms = || vec!["contents:read".to_owned()];
+        approvals.record_credential("github", "github.com", perms(), None, 1);
+        let id = approvals.grants()[0].id;
+
+        let (slot_a, leader_a) = match approvals.begin_revoke_wait(id) {
+            Some(RevokeStart::Credential { slot, leader, .. }) => (slot, leader),
+            other => panic!("{other:?}"),
+        };
+        assert!(leader_a, "the first caller for an id leads its wait");
+        let (slot_b, leader_b) = match approvals.begin_revoke_wait(id) {
+            Some(RevokeStart::Credential { slot, leader, .. }) => (slot, leader),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            !leader_b,
+            "a racing caller for the same id joins instead of leading its own"
+        );
+
+        // The joiner, on another thread, blocks on the shared slot exactly
+        // as `daemon::revoke_bounded` does, until the leader publishes —
+        // whether that happens before or after this thread reaches its
+        // wait: `join_revoke_wait` checks the current value before ever
+        // blocking on the `Condvar`.
+        let joined = std::thread::spawn(move || {
+            Approvals::join_revoke_wait(&slot_b, Duration::from_secs(2))
+        });
+        approvals.publish_revoke_wait(id, &slot_a, RevokeOutcome::Withdrawn);
+        assert_eq!(joined.join().unwrap(), RevokeOutcome::Withdrawn);
+
+        // A later, distinct claim for the same id — after the leader
+        // published and the slot was removed, but before `finish_revoke`
+        // ever ran (this test drives the slot mechanism directly, without
+        // the daemon-level caller that would conclude it) — leads a fresh
+        // wait rather than joining the one that already finished.
+        assert!(
+            matches!(
+                approvals.begin_revoke_wait(id),
+                Some(RevokeStart::Credential { leader: true, .. })
+            ),
+            "a later attempt gets its own fresh wait"
+        );
+    }
+
+    #[test]
+    fn begin_revoke_removes_a_remembered_allow_session_grant_immediately() {
+        // An `allow-session` answer has no proxy route to wait on, so it is
+        // gone the instant `begin_revoke_wait` runs — never an intermediate
+        // `revoking` state for a kind of grant that has nothing to confirm.
         let approvals = Approvals::new();
         approvals.register(approval(1)).unwrap();
         approvals.answer(1, ApprovalDecision::AllowSession).unwrap();
@@ -2003,12 +2399,20 @@ mod tests {
         assert!(approvals.remembered("Write", "/work/src/lib.rs"));
         let id = approvals.grants()[0].id;
 
-        assert_eq!(approvals.revoke(id), Some(RevokedGrant::Approval));
+        assert!(matches!(
+            approvals.begin_revoke_wait(id),
+            Some(RevokeStart::Approval)
+        ));
         assert!(approvals.grants().is_empty());
         assert!(
             !approvals.remembered("Write", "/work/src/lib.rs"),
             "revoking the remembered answer stops it from auto-approving again"
         );
+
+        // Already gone: beginning it again finds nothing.
+        assert!(approvals.begin_revoke_wait(id).is_none());
+        // Never minted: same answer.
+        assert!(approvals.begin_revoke_wait(999).is_none());
     }
 
     #[test]
