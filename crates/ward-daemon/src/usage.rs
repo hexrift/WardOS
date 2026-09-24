@@ -209,31 +209,43 @@ pub fn scan_scratch(state: &Path) -> Result<Vec<ScratchEntry>> {
         if !file_type.is_dir() {
             continue;
         }
-        let path = entry.path();
-        match open_dir_no_symlink(&path) {
-            Ok(dir) => {
-                let owner = read_owner_marker(&dir);
-                out.push(scan_one_entry(state, path, owner, dir, sum_dir_bytes));
-            }
-            Err(_) => {
-                // Vanished, permission-denied, or — the race this guards
-                // against — replaced with a symlink or a non-directory in the
-                // window between the `file_type()` lstat above and this open:
-                // `O_NOFOLLOW | O_DIRECTORY` refuses exactly that atomically,
-                // rather than silently traversing into whatever now sits at
-                // this name. Reported the same way any other uninspectable
-                // entry is: no owner read, no bytes summed, `Unknown`.
-                out.push(ScratchEntry {
-                    path,
-                    owner: None,
-                    bytes: None,
-                    status: ScratchStatus::Unknown,
-                });
-            }
-        }
+        out.push(rescan_entry(state, entry.path()));
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// Classify the single scratch directory at `path` exactly as [`scan_scratch`]
+/// would if it encountered this same path during a fresh listing of the OS
+/// temp dir right now. Factored out of [`scan_scratch`]'s own loop so
+/// [`crate::reclaim::reclaim_orphaned_scratch`] can re-verify one entry
+/// immediately before removing it, rather than trusting a possibly-stale
+/// classification from an earlier full scan — see that module's own doc
+/// comment for why the earlier scan's answer is never enough on its own for
+/// a destructive operation.
+pub(crate) fn rescan_entry(state: &Path, path: PathBuf) -> ScratchEntry {
+    match open_dir_no_symlink(&path) {
+        Ok(dir) => {
+            let owner = read_owner_marker(&dir);
+            scan_one_entry(state, path, owner, dir, sum_dir_bytes)
+        }
+        Err(_) => {
+            // Vanished, permission-denied, or — the race this guards
+            // against — replaced with a symlink or a non-directory in the
+            // window between the caller's own directory-type check and this
+            // open: `O_NOFOLLOW | O_DIRECTORY` refuses exactly that
+            // atomically, rather than silently traversing into whatever now
+            // sits at this name. Reported the same way any other
+            // uninspectable entry is: no owner read, no bytes summed,
+            // `Unknown`.
+            ScratchEntry {
+                path,
+                owner: None,
+                bytes: None,
+                status: ScratchStatus::Unknown,
+            }
+        }
+    }
 }
 
 /// Open `dir` for reading, refusing atomically — no separate check-then-open
