@@ -211,13 +211,8 @@ pub fn stabilize(session: &str, frozen: Frozen) -> (Frozen, bool) {
         &mut pids,
         FREEZE_SETTLE,
         || sandbox_pids(proc, session),
-        |fresh| match &cgroup {
-            // A process moved into a frozen cgroup is frozen by the kernel.
-            // Every migration must succeed before the freezer can be treated as
-            // a barrier for that pid. If one cannot be moved, SIGSTOP it as the
-            // safest fallback and report the barrier unconfirmed so callers
-            // cannot seal or restore on the cgroup's unrelated `frozen 1`.
-            Some(dir) => {
+        |fresh| {
+            if let Some(dir) = &cgroup {
                 let mut migrated = true;
                 for pid in fresh {
                     if fs::write(dir.join("cgroup.procs"), pid.to_string()).is_err() {
@@ -226,8 +221,7 @@ pub fn stabilize(session: &str, frozen: Frozen) -> (Frozen, bool) {
                     }
                 }
                 migrated
-            }
-            None => {
+            } else {
                 freeze_signals(fresh);
                 true
             }
