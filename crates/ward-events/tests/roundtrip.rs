@@ -783,6 +783,7 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             WardEvent::WorkloadsTerminated {
                 ended: 4,
                 pending: 0,
+                barrier_confirmed: true,
             },
         ),
         (
@@ -969,4 +970,32 @@ fn workloads_terminated_is_quiet_visible_and_critical() {
         EventKind::WorkloadsTerminated.name(),
         "workloads_terminated"
     );
+}
+
+#[test]
+fn workloads_terminated_round_trips_barrier_uncertainty() {
+    let session = SessionId::from_u128(0x5e56);
+    let mut chain = Chain::genesis(session, Blake3Hash::hash(b"manifest"));
+    let record = chain
+        .append(
+            Origin::Wardd,
+            WardEvent::WorkloadsTerminated {
+                ended: 2,
+                pending: 0,
+                barrier_confirmed: false,
+            },
+            Timestamp::mono(Duration::from_secs(1)),
+        )
+        .unwrap();
+    let frame = encode_record(&record).unwrap();
+    let (decoded, _) = decode_record(&frame).unwrap();
+    assert_eq!(decoded, record);
+    assert!(matches!(
+        decoded.event,
+        WardEvent::WorkloadsTerminated {
+            ended: 2,
+            pending: 0,
+            barrier_confirmed: false
+        }
+    ));
 }
