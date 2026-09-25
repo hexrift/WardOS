@@ -1294,6 +1294,7 @@ impl Served {
         })?;
         let held = self.paused.take();
         let since = held.as_ref().map(|p| p.since);
+        let retrying_incomplete_stop = held.as_ref().is_some_and(|p| p.hold == Hold::Stop);
         let outcome = terminate(&self.session, held.map(|p| p.frozen));
         let ended = outcome.ended;
         let pending = outcome.pending();
@@ -1302,7 +1303,7 @@ impl Served {
             // Everything the stop found is gone: nothing is left for the marker
             // to hold back. (Idempotent when there never was a marker.)
             let _ = pause::clear_marker(&self.state, &self.session);
-            if ended > 0 {
+            if ended > 0 || retrying_incomplete_stop {
                 self.append(WardEvent::WorkloadsTerminated {
                     ended,
                     pending: 0,
