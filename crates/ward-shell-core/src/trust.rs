@@ -1269,16 +1269,31 @@ mod tests {
             wardd(&[WardEvent::WorkloadsTerminated {
                 ended: 2,
                 pending: 1,
+                barrier_confirmed: true,
             }])
             .remove(0),
         );
         let segment = TrustBar::new(&h, &model).agent.unwrap();
         assert_eq!(segment.text, "CLAUDE ‖? STOP?");
         assert_eq!(segment.tone, Tone::Warn);
+
         model.apply(
             wardd(&[WardEvent::WorkloadsTerminated {
                 ended: 1,
                 pending: 0,
+                barrier_confirmed: false,
+            }])
+            .remove(0),
+        );
+        let segment = TrustBar::new(&h, &model).agent.unwrap();
+        assert_eq!(segment.text, "CLAUDE ‖? STOP?");
+        assert_eq!(segment.tone, Tone::Warn);
+
+        model.apply(
+            wardd(&[WardEvent::WorkloadsTerminated {
+                ended: 1,
+                pending: 0,
+                barrier_confirmed: true,
             }])
             .remove(0),
         );
