@@ -42,7 +42,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ward_events::{EventRecord, LogReader, Origin, Pid, RevokeReason, ServiceId, ShortText, WardEvent};
+use ward_events::{
+    EventRecord, LogReader, Origin, Pid, RevokeReason, ServiceId, ShortText, WardEvent,
+};
 
 use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
@@ -1309,14 +1311,14 @@ impl Served {
                     pending: 0,
                     barrier_confirmed: true,
                 })
-                    .map_err(|e| {
-                        Error::Daemon(format!(
-                            "stop ended {ended} sandboxed process(es) of session {}, but \
-                             the record of that could not be written ({e}); the log is not \
-                             sealed",
-                            self.session
-                        ))
-                    })?;
+                .map_err(|e| {
+                    Error::Daemon(format!(
+                        "stop ended {ended} sandboxed process(es) of session {}, but \
+                         the record of that could not be written ({e}); the log is not \
+                         sealed",
+                        self.session
+                    ))
+                })?;
             }
             return Ok(ended);
         };
@@ -2061,23 +2063,23 @@ mod tests {
             pids: Vec::new(),
             cgroup: None,
         };
-        let (response, done) = served.stop(
-            Served::INTERNAL_CONN,
-            EndReason::UserStop,
-            |_, held| {
+        let (response, done) =
+            served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
                 assert!(held.is_none());
                 pause::Termination {
                     ended: 2,
                     remaining: Some(empty_hold.clone()),
                     barrier_confirmed: false,
                 }
-            },
-        );
+            });
         let Response::Error(message) = response else {
             panic!("{response:?}");
         };
         assert!(!done);
-        assert!(message.contains("fork barrier was not confirmed"), "{message}");
+        assert!(
+            message.contains("fork barrier was not confirmed"),
+            "{message}"
+        );
         assert!(served.log.is_some());
         assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
         assert!(pause::marker_path(dir.path(), "sess_9").exists());
@@ -2093,14 +2095,11 @@ mod tests {
             }
         ));
 
-        let (response, done) = served.stop(
-            Served::INTERNAL_CONN,
-            EndReason::UserStop,
-            |_, held| {
+        let (response, done) =
+            served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
                 assert_eq!(held, Some(empty_hold));
                 pause::Termination::confirmed(0)
-            },
-        );
+            });
         assert!(matches!(response, Response::Sealed { ended: Some(0), .. }));
         assert!(done);
         let records: Vec<_> = LogReader::open(&served.log_path)
@@ -2252,11 +2251,9 @@ mod tests {
         let lock_path = session_dir(dir.path(), "sess_9").join(".pause-freeze.lock");
         std::fs::create_dir(&lock_path).unwrap();
 
-        let (response, done) = served.stop(
-            Served::INTERNAL_CONN,
-            EndReason::UserStop,
-            |_, _| panic!("termination must not run without the lifecycle lock"),
-        );
+        let (response, done) = served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+            panic!("termination must not run without the lifecycle lock")
+        });
         let Response::Error(message) = response else {
             panic!("{response:?}");
         };
@@ -2547,10 +2544,7 @@ mod tests {
         let replay = served.subscribe(0).unwrap().replay;
         assert!(matches!(
             replay.last().map(|r| &r.event),
-            Some(WardEvent::SessionPauseUnsettled {
-                pending: 0,
-                ..
-            })
+            Some(WardEvent::SessionPauseUnsettled { pending: 0, .. })
         ));
         // The injected empty freeze is safe to forget; the stop marker/record
         // are what this test is proving.
