@@ -1330,6 +1330,8 @@ mod tests {
             expected_subject,
             "still the same row, now at its shifted index"
         );
+    }
+
     /// #145 item 5: a refused stop (`WorkloadsTerminated { pending > 0 }`)
     /// leaves the session held paused and unconfirmed — the bar must say so,
     /// whether the session was running or already paused, and resume must
