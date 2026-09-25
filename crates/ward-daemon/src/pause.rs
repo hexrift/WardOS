@@ -1599,8 +1599,15 @@ mod tests {
             },
             |_| true,
         );
-        assert!(!stable, "failed cgroup membership must never be a confirmed barrier");
-        assert_eq!(pids, [12, 11], "the failed-to-migrate pid must still be retained for kill");
+        assert!(
+            !stable,
+            "failed cgroup membership must never be a confirmed barrier"
+        );
+        assert_eq!(
+            pids,
+            [12, 11],
+            "the failed-to-migrate pid must still be retained for kill"
+        );
         assert_eq!(rescans, 1);
     }
 
