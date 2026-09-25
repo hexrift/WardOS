@@ -213,12 +213,24 @@ pub fn stabilize(session: &str, frozen: Frozen) -> (Frozen, bool) {
         || sandbox_pids(proc, session),
         |fresh| match &cgroup {
             // A process moved into a frozen cgroup is frozen by the kernel.
+            // Every migration must succeed before the freezer can be treated as
+            // a barrier for that pid. If one cannot be moved, SIGSTOP it as the
+            // safest fallback and report the barrier unconfirmed so callers
+            // cannot seal or restore on the cgroup's unrelated `frozen 1`.
             Some(dir) => {
+                let mut migrated = true;
                 for pid in fresh {
-                    let _ = fs::write(dir.join("cgroup.procs"), pid.to_string());
+                    if fs::write(dir.join("cgroup.procs"), pid.to_string()).is_err() {
+                        migrated = false;
+                        let _ = kill(Pid::from_raw(as_pid(*pid)), Signal::SIGSTOP);
+                    }
                 }
+                migrated
             }
-            None => freeze_signals(fresh),
+            None => {
+                freeze_signals(fresh);
+                true
+            }
         },
         |pid| match &cgroup {
             // The freezer is synchronous per `cgroup.events`: a member is
@@ -253,7 +265,7 @@ fn stabilize_with(
     pids: &mut Vec<u32>,
     bound: Duration,
     mut rescan: impl FnMut() -> Vec<u32>,
-    mut freeze_more: impl FnMut(&[u32]),
+    mut freeze_more: impl FnMut(&[u32]) -> bool,
     settled: impl Fn(u32) -> bool,
 ) -> bool {
     let deadline = Instant::now() + bound;
@@ -266,13 +278,15 @@ fn stabilize_with(
             if fresh.is_empty() {
                 return true;
             }
-            freeze_more(&fresh);
+            let froze_more = freeze_more(&fresh);
             // Newest first: whatever was found late is a child (or an orphan)
             // of something already held, so it still comes before its parent.
+            // Merge even on a failed cgroup migration: terminate() must still
+            // know about and kill every process the rescan discovered.
             let mut merged = fresh;
             merged.extend(pids.iter().copied());
             *pids = merged;
-            if Instant::now() >= deadline {
+            if !froze_more || Instant::now() >= deadline {
                 return false;
             }
             continue;
@@ -529,7 +543,11 @@ pub fn terminate(session: &str, held: Option<Frozen>) -> Termination {
     });
     Termination {
         ended,
-        remaining: (!pending.is_empty()).then_some(Frozen {
+        // An unconfirmed barrier is itself an incomplete stop even when every
+        // currently known pid subsequently died. Preserve an empty hold in that
+        // case so the daemon refuses to seal and a retry must re-scan/stabilize
+        // before it can claim completion.
+        remaining: (!pending.is_empty() || !stable).then_some(Frozen {
             method: frozen.method,
             pids: pending,
             cgroup,
@@ -1522,7 +1540,10 @@ mod tests {
                 events.borrow_mut().push("rescan");
                 vec![14, 13, 11]
             },
-            |_| events.borrow_mut().push("stop-late"),
+            |_| {
+                events.borrow_mut().push("stop-late");
+                true
+            },
             |pid| stopped.borrow().contains(&pid),
         );
         // 13 never stopped within this bound: the freeze cannot be stable,
@@ -1544,6 +1565,7 @@ mod tests {
                 assert_eq!(fresh, [14]);
                 events.borrow_mut().push("stop-late");
                 stopped.borrow_mut().push(14);
+                true
             },
             |pid| stopped.borrow().contains(&pid),
         );
@@ -1560,6 +1582,28 @@ mod tests {
     /// been reparented away from the `bwrap` tree (its parent exited) is still
     /// the session's while it lives in the sandbox's pid namespace, and a
     /// process in the scanner's own namespace never is.
+    #[test]
+    fn a_failed_late_freeze_invalidates_the_barrier_even_when_the_pid_looks_settled() {
+        let mut pids = vec![11];
+        let mut rescans = 0;
+        let stable = stabilize_with(
+            &mut pids,
+            Duration::from_secs(1),
+            || {
+                rescans += 1;
+                vec![12, 11]
+            },
+            |fresh| {
+                assert_eq!(fresh, [12]);
+                false
+            },
+            |_| true,
+        );
+        assert!(!stable, "failed cgroup membership must never be a confirmed barrier");
+        assert_eq!(pids, [12, 11], "the failed-to-migrate pid must still be retained for kill");
+        assert_eq!(rescans, 1);
+    }
+
     #[test]
     fn an_orphan_in_the_sandboxs_pid_namespace_is_still_found() {
         let proc = tempfile::tempdir().unwrap();
