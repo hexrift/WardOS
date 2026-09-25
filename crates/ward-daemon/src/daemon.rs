@@ -1234,7 +1234,7 @@ impl Served {
         if let Err(e) = self.abort_open_launches_for_stop() {
             return (
                 Response::Error(format!(
-                    "stop ended every sandboxed process of session {} ({ended}), but an open                      launch could not be terminalized ({e}); the log is not sealed. Run `ward stop` again",
+                    "stop ended every sandboxed process of session {} ({ended}), but an open launch could not be terminalized ({e}); the log is not sealed. Run `ward stop` again",
                     self.session
                 )),
                 false,
