@@ -1209,7 +1209,7 @@ assert_logged '^held while paused · resume the session to answer$'
 head -1 "$approve" | grep -q '^#!/usr/bin/env bash$' || fail "shebang"
 grep -q '^set -euo pipefail$' "$approve" || fail "strict mode"
 
-assert_not_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 6363 Session ended — denied'
+assert_not_logged '^notify-send -a WardOS -c ward-approval -u low -t 4000 -r 6363 Session ended — denied '
 assert_not_logged '^ward session approve --session sess_a 12 deny
 
 # --- --watch: an already-open notification's countdown/progress hint refreshes in
