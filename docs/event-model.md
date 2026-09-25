@@ -120,13 +120,16 @@ pub enum WardEvent {
 
     // Appended at the end of the catalogue (#145 item 5): `ward stop` terminated the
     // session's sandboxed workloads before sealing — `ended` confirmed gone, `pending`
-    // killed but not confirmed gone within `pause::STOP_SETTLE`. Written only when
-    // there was anything to end. `pending == 0` is followed by the daemon's
-    // AgentStateChanged { Finished } and SessionEnded; `pending > 0` means the stop was
-    // refused: the log is not sealed, no Finished is recorded, and the session is held
-    // for the stop (not paused: `ward resume` refuses it) over what is left, until a
-    // later `ward stop` confirms it.
-    WorkloadsTerminated { ended: u32, pending: u32 },
+    // killed but not confirmed gone within `pause::STOP_SETTLE`, and
+    // `barrier_confirmed` records whether the pre-kill membership/fork barrier was
+    // proved stable. A completed stop requires `pending == 0 && barrier_confirmed`;
+    // then AgentStateChanged { Finished } and SessionEnded follow. Either `pending > 0`
+    // or `barrier_confirmed == false` means the stop was refused: the log is not
+    // sealed, no Finished is recorded, and the session is held for the stop (not paused:
+    // `ward resume` refuses it) until a later `ward stop` re-scans and confirms it.
+    // The barrier-false/pending-zero shape is intentionally durable: replay after a
+    // daemon restart must still show STOP? rather than losing the reason the stop is held.
+    WorkloadsTerminated { ended: u32, pending: u32, barrier_confirmed: bool },
 }
 ```
 
