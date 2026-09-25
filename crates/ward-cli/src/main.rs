@@ -2294,6 +2294,11 @@ mod tests {
             cli.command,
             Command::Snapshot(SnapshotCmd::Kept { json: true })
         ));
+    }
+
+    /// #145 item 5: the stop line says how many sandboxed processes the stop
+    /// ended, and says nothing extra when nothing was running.
+    #[test]
     fn stopped_line_counts_the_processes_the_stop_ended() {
         assert_eq!(stopped_line("sess_a", 0), "  session sess_a stopped");
         assert_eq!(
