@@ -1550,9 +1550,14 @@ impl Session {
         }
         if pending == 0 {
             // Nothing is left for a marker to hold back — including one an
-            // earlier refused stop of this session left behind.
+            // earlier refused stop of this session left behind. If such an
+            // incomplete-stop marker existed, emit a confirmed zero-pending
+            // record even when this retry found no process: replay must see the
+            // durable STOP? state clear before SessionEnded.
+            let retrying_incomplete_stop =
+                pause::marker_path(&self.state, &self.session_str).exists();
             let _ = pause::clear_marker(&self.state, &self.session_str);
-            if !outcome.touched_anything() {
+            if !outcome.touched_anything() && !retrying_incomplete_stop {
                 return Ok(0);
             }
             self.emit(
