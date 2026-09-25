@@ -11,8 +11,9 @@ cd "$(dirname "$0")/../.."
 
 raw="${1:?usage: scripts/release/prepare-version.sh <version>}"
 version="${raw#v}"
+semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
 
-if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+if [[ ! "$version" =~ $semver_re ]]; then
   echo "prepare-version: not a valid SemVer version: '$raw'" >&2
   exit 1
 fi
