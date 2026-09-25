@@ -2047,6 +2047,84 @@ mod tests {
         );
     }
 
+    /// A failed membership/fork barrier is an incomplete stop even when every
+    /// currently-known PID is already gone. The uncertainty itself is durable:
+    /// replay sees `barrier_confirmed: false`, the session stays held and
+    /// unsealed, and a later confirmed retry writes the clearing
+    /// `WorkloadsTerminated` record before sealing.
+    #[test]
+    fn an_unconfirmed_stop_barrier_with_zero_known_pids_is_durable_until_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let empty_hold = Frozen {
+            method: ward_events::PauseMethod::Sigstop,
+            pids: Vec::new(),
+            cgroup: None,
+        };
+        let (response, done) = served.stop(
+            Served::INTERNAL_CONN,
+            EndReason::UserStop,
+            |_, held| {
+                assert!(held.is_none());
+                pause::Termination {
+                    ended: 2,
+                    remaining: Some(empty_hold.clone()),
+                    barrier_confirmed: false,
+                }
+            },
+        );
+        let Response::Error(message) = response else {
+            panic!("{response:?}");
+        };
+        assert!(!done);
+        assert!(message.contains("fork barrier was not confirmed"), "{message}");
+        assert!(served.log.is_some());
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert!(pause::marker_path(dir.path(), "sess_9").exists());
+
+        let replay = served.subscribe(0).unwrap().replay;
+        let incomplete = replay.last().expect("incomplete stop record");
+        assert!(matches!(
+            incomplete.event,
+            WardEvent::WorkloadsTerminated {
+                ended: 2,
+                pending: 0,
+                barrier_confirmed: false
+            }
+        ));
+
+        let (response, done) = served.stop(
+            Served::INTERNAL_CONN,
+            EndReason::UserStop,
+            |_, held| {
+                assert_eq!(held, Some(empty_hold));
+                pause::Termination::confirmed(0)
+            },
+        );
+        assert!(matches!(response, Response::Sealed { ended: Some(0), .. }));
+        assert!(done);
+        let records: Vec<_> = LogReader::open(&served.log_path)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .collect();
+        let terminated: Vec<_> = records
+            .iter()
+            .filter_map(|r| match r.event {
+                WardEvent::WorkloadsTerminated {
+                    ended,
+                    pending,
+                    barrier_confirmed,
+                } => Some((ended, pending, barrier_confirmed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminated, [(2, 0, false), (0, 0, true)]);
+        assert!(matches!(
+            records.last().map(|r| &r.event),
+            Some(WardEvent::SessionEnded { .. })
+        ));
+    }
+
     /// The agent states the log recorded, in order.
     fn agent_states(served: &mut Served) -> Vec<AgentState> {
         served
