@@ -1303,7 +1303,11 @@ impl Served {
             // to hold back. (Idempotent when there never was a marker.)
             let _ = pause::clear_marker(&self.state, &self.session);
             if ended > 0 {
-                self.append(WardEvent::WorkloadsTerminated { ended, pending: 0 })
+                self.append(WardEvent::WorkloadsTerminated {
+                    ended,
+                    pending: 0,
+                    barrier_confirmed: true,
+                })
                     .map_err(|e| {
                         Error::Daemon(format!(
                             "stop ended {ended} sandboxed process(es) of session {}, but \
@@ -1329,14 +1333,17 @@ impl Served {
             since: since.unwrap_or_else(Instant::now),
             hold: Hold::Stop,
         });
-        // A zero-pending result with an unconfirmed membership barrier is not a
-        // confirmed STOP. Keep the log unsealed and avoid emitting the event
-        // whose pending=0 rendering would claim otherwise.
-        let logged = if barrier_confirmed {
-            self.append(WardEvent::WorkloadsTerminated { ended, pending }).err()
-        } else {
-            None
-        };
+        // Persist the incomplete result even when no currently-known PID remains:
+        // barrier uncertainty is itself evidence. Replay/restart must still know
+        // this stop was refused and keep showing STOP?, not fall back to the
+        // pre-stop agent state simply because `pending == 0`.
+        let logged = self
+            .append(WardEvent::WorkloadsTerminated {
+                ended,
+                pending,
+                barrier_confirmed,
+            })
+            .err();
         let detail = if barrier_confirmed {
             "the stop is incomplete and the session is held for it (proxy closed, \
              approvals held, no new launch admitted; `ward resume` cannot release it). \
@@ -1839,7 +1846,11 @@ mod tests {
         );
         assert!(matches!(
             replay[0].event,
-            WardEvent::WorkloadsTerminated { ended: e, pending: 0 } if e == ended
+            WardEvent::WorkloadsTerminated {
+                ended: e,
+                pending: 0,
+                barrier_confirmed: true
+            } if e == ended
         ));
         assert_eq!(replay[0].origin, Origin::Wardd);
         assert!(!pause::marker_path(dir.path(), &sandbox.session).exists());
@@ -1983,7 +1994,8 @@ mod tests {
                 last.event,
                 WardEvent::WorkloadsTerminated {
                     ended: 3,
-                    pending: 1
+                    pending: 1,
+                    barrier_confirmed: true
                 }
             ));
         }
