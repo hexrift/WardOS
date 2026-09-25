@@ -3201,6 +3201,151 @@ mod tests {
     /// #145 item 5 without a daemon: `Session::stop` itself ends the session's
     /// running sandbox and confirms it gone before sealing, and says how many
     /// processes it ended.
+    /// Full `Session::launch` regression for the logged-launch race from the
+    /// #253 review: hold the client immediately after its real CommandStarted
+    /// append has reached wardd, stop the session from a second connection while
+    /// no sandbox has spawned yet, then release the client. wardd must
+    /// terminalize that tracked launch with LaunchAborted before SessionEnded;
+    /// the resumed client is refused at spawn admission and cannot leave an
+    /// unmatched CommandStarted or a live launch-scoped grant behind.
+    #[test]
+    fn stop_terminalizes_a_full_session_launch_stalled_after_command_started() {
+        use crate::control::{Request, Response};
+
+        struct BlockAfterStarted {
+            inner: Box<dyn Sink>,
+            reached: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl Sink for BlockAfterStarted {
+            fn append(
+                &mut self,
+                origin: Origin,
+                event: WardEvent,
+                at: SystemTime,
+            ) -> Result<ward_events::EventRecord> {
+                let block = matches!(event, WardEvent::CommandStarted { .. });
+                let record = self.inner.append(origin, event, at)?;
+                if block {
+                    self.reached.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(record)
+            }
+
+            fn append_credential(
+                &mut self,
+                origin: Origin,
+                event: WardEvent,
+                at: SystemTime,
+            ) -> Result<(ward_events::EventRecord, Option<u64>)> {
+                self.inner.append_credential(origin, event, at)
+            }
+
+            fn sync(&mut self) -> Result<()> {
+                self.inner.sync()
+            }
+
+            fn seal(self: Box<Self>) -> Result<()> {
+                let Self { inner, .. } = *self;
+                inner.seal()
+            }
+
+            fn stop(self: Box<Self>, reason: EndReason) -> Result<u32> {
+                let Self { inner, .. } = *self;
+                inner.stop(reason)
+            }
+
+            fn ends_workloads(&self) -> bool {
+                self.inner.ends_workloads()
+            }
+
+            fn resync(&mut self) -> Result<()> {
+                self.inner.resync()
+            }
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut initial = Session::start_in(project.path(), state.path()).unwrap();
+        initial.persist_current().unwrap();
+        initial.sync().unwrap();
+        let session_id = initial.id().to_owned();
+        let log = initial.log_path();
+        drop(initial);
+
+        let daemon_state = state.path().to_path_buf();
+        let daemon_session = session_id.clone();
+        let daemon = std::thread::spawn(move || crate::daemon::serve(&daemon_state, &daemon_session));
+        assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
+            crate::daemon::serving(state.path(), &session_id)
+        }));
+
+        let mut client = Session::open_current(project.path(), state.path())
+            .unwrap()
+            .expect("current session");
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        client.sink = Box::new(BlockAfterStarted {
+            inner: std::mem::replace(&mut client.sink, Box::new(NullSink)),
+            reached: reached_tx,
+            release: release_rx,
+        });
+
+        let socket = session_dir(state.path(), &session_id).join(SOCKET_NAME);
+        let stopping = std::thread::spawn(move || {
+            reached_rx.recv().unwrap();
+            let mut control = RemoteSink::connect(&socket).expect("daemon connection");
+            let response = control.call(&Request::Stop {
+                reason: EndReason::UserStop,
+            });
+            release_tx.send(()).unwrap();
+            response
+        });
+
+        let err = client
+            .launch(&["true".to_owned()], &LaunchOpts::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(pause::STOPPED_REFUSAL) || err.contains("terminal record"),
+            "{err}"
+        );
+        let response = stopping.join().unwrap().unwrap();
+        assert!(
+            matches!(response, Response::Sealed { ended: Some(0), .. }),
+            "{response:?}"
+        );
+        daemon.join().unwrap().unwrap();
+
+        let records: Vec<_> = ward_events::LogReader::open(&log)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .collect();
+        let started = records
+            .iter()
+            .position(|r| matches!(r.event, WardEvent::CommandStarted { .. }))
+            .expect("CommandStarted");
+        let aborted = records
+            .iter()
+            .position(|r| matches!(r.event, WardEvent::LaunchAborted { .. }))
+            .expect("LaunchAborted");
+        let ended = records
+            .iter()
+            .position(|r| matches!(r.event, WardEvent::SessionEnded { .. }))
+            .expect("SessionEnded");
+        assert!(started < aborted && aborted < ended, "{records:?}");
+        let pid = match records[started].event {
+            WardEvent::CommandStarted { pid, .. } => pid,
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            records[aborted].event,
+            WardEvent::LaunchAborted { pid: p, .. } if p == pid
+        ));
+    }
+
     #[test]
     fn a_daemonless_stop_ends_a_running_sandbox_before_sealing() {
         let state = tempfile::tempdir().unwrap();
