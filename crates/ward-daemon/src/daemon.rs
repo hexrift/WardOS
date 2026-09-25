@@ -2518,6 +2518,45 @@ mod tests {
         served.paused = None;
     }
 
+    /// Barrier uncertainty is not normalized away merely because the immediate
+    /// recount has zero known PIDs. HoldForStop must report `Some(0)`, record an
+    /// unsettled hold, and therefore make the restore client refuse to write the
+    /// worktree until a later retry confirms the barrier.
+    #[test]
+    fn an_unconfirmed_stop_hold_with_zero_known_pids_is_still_unsettled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let unsettled = served
+            .hold_for_stop_with(
+                "ward stop --restore-entry",
+                |_| {
+                    (
+                        Frozen {
+                            method: ward_events::PauseMethod::Sigstop,
+                            pids: Vec::new(),
+                            cgroup: None,
+                        },
+                        false,
+                    )
+                },
+                |_, f| (f, true),
+            )
+            .unwrap();
+        assert_eq!(unsettled, Some(0));
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        let replay = served.subscribe(0).unwrap().replay;
+        assert!(matches!(
+            replay.last().map(|r| &r.event),
+            Some(WardEvent::SessionPauseUnsettled {
+                pending: 0,
+                ..
+            })
+        ));
+        // The injected empty freeze is safe to forget; the stop marker/record
+        // are what this test is proving.
+        served.paused = None;
+    }
+
     /// ADR-0019 §3 in the daemon: a pause writes the marker, holds the
     /// approvals and records itself; a second pause is refused; resume undoes
     /// it and records; a stop from paused seals with the marker gone.
