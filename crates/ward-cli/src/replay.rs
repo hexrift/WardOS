@@ -489,7 +489,7 @@ fn summary(event: &WardEvent) -> String {
             barrier_confirmed: false,
         } => format!(
             "{ended} ended · {pending} still known · membership barrier not confirmed · stop refused"
-        )
+        ),
         WardEvent::SessionResumed { paused_for } => format!("paused {}s", paused_for.as_secs()),
         WardEvent::EntryRestored {
             snapshot,
