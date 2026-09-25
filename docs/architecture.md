@@ -26,13 +26,64 @@ The product is the *combination*, not any one component:
 | TamperWard control plane | Semantic policy, protected invariants, agent-action decisions, evidence | TamperWard |
 | Trusted verifier | Independent execution of tests/checks against pristine + candidate state | Separate trust domain, spawned by `wardd` on TamperWard's request |
 
+### 1.1 Product split and fleet target (ADR-0029)
+
+The table above describes the **current local implementation**. The target architecture
+does not turn `wardd` into a remote monolith. ADR-0029 splits delivery and ownership
+into four explicit layers while preserving the runtime primitives already implemented:
+
+| Layer | Role | Required for local mode? |
+| --- | --- | --- |
+| WardOS distribution | Fedora bootc desktop/reference host that packages the runtime and node | No — it is the reference environment |
+| Portable Ward runtime | Capability, snapshot, evidence, sandbox, egress, credential, intervention and verifier primitives | Yes |
+| `ward-node` | Long-lived host worker; owns task lifecycle and local enforcement for one or many tasks | Yes |
+| Ward control plane | Optional remote identity/delegation, desired policy, placement, approvals, registry and audit index | No |
+
+```text
+Developer / CI / API / Web
+          |
+          v
+   Ward control plane
+   identity · policy · scheduling · approvals · audit index
+          |
+          | bounded, expiring task authority + lifecycle
+          | events/evidence + health/capacity
+          v
+       ward-node
+   admission · lifecycle · local enforcement · evidence
+      /                         \
+     v                           v
+task capsule                 trusted verifier /
+(untrusted)                  TamperWard path
+```
+
+Local mode is a single-node deployment: the CLI and desktop talk to a local
+`ward-node`; no remote service is needed. The control plane distributes bounded
+authority but is never consulted for every filesystem/process/network action. During a
+partition the node may continue only inside authority it can validate locally; expiry,
+revocation already received, hard policy and resource limits continue to apply. Loss of
+the control plane never widens authority.
+
+The stable cross-layer contracts are the task/delegation lease, capability manifest,
+node capability/capacity report, lifecycle/intervention API, and event/evidence stream.
+Their ownership, failure semantics, migration from current modules and compatibility
+rules are normative in
+[ADR-0029](decisions/ADR-0029-product-split-fleet-trust-boundaries.md).
+
 ---
 
 ## 2. Trust boundaries
 
-WardOS defines five trust zones. Every data flow in the system crosses zero or one
-boundary, and every boundary crossing is mediated by a narrow, typed interface owned by
-`wardd`.
+The five zones below describe the current local runtime. Under ADR-0029, the future
+control plane is a separate trusted coordination zone and `ward-node` becomes the
+node-local owner of the host-side interfaces currently attributed to `wardd`. Agent
+capsules remain untrusted and the verifier/TamperWard path remains outside agent
+authority. The control plane does not become the per-action enforcement point.
+
+WardOS defines five trust zones for the current local implementation. Every data flow in
+the system crosses zero or one boundary, and every boundary crossing is mediated by a
+narrow, typed host-side interface owned today by `wardd` and, after #258, by
+`ward-node`.
 
 ```text
  ┌──────────────────────────────────────────────────────────────────────────┐
