@@ -3202,36 +3202,31 @@ mod tests {
     /// running sandbox and confirms it gone before sealing, and says how many
     /// processes it ended.
     /// Full `Session::launch` regression for the logged-launch race from the
-    /// #253 review: hold the client immediately after its real CommandStarted
-    /// append has reached wardd, stop the session from a second connection while
-    /// no sandbox has spawned yet, then release the client. wardd must
-    /// terminalize that tracked launch with LaunchAborted before SessionEnded;
-    /// the resumed client is refused at spawn admission and cannot leave an
-    /// unmatched CommandStarted or a live launch-scoped grant behind.
+    /// #253 review: hold the client only after both its real `CommandStarted`
+    /// and a launch-scoped `CredentialGranted` have reached wardd, then stop
+    /// from a second connection while no sandbox has spawned. Stop must
+    /// terminalize the tracked launch with exactly one `LaunchAborted` before
+    /// `SessionEnded`; that terminal record retires the launch-scoped grant.
+    /// Releasing the client afterward reaches the stop marker at spawn admission
+    /// and cannot append a duplicate terminal record.
     #[test]
-    fn stop_terminalizes_a_full_session_launch_stalled_after_command_started() {
+    fn stop_terminalizes_a_full_session_launch_stalled_after_its_grant() {
         use crate::control::{Request, Response};
 
-        struct BlockAfterStarted {
+        struct BlockAfterGrant {
             inner: Box<dyn Sink>,
             reached: std::sync::mpsc::Sender<()>,
             release: std::sync::mpsc::Receiver<()>,
         }
 
-        impl Sink for BlockAfterStarted {
+        impl Sink for BlockAfterGrant {
             fn append(
                 &mut self,
                 origin: Origin,
                 event: WardEvent,
                 at: SystemTime,
             ) -> Result<ward_events::EventRecord> {
-                let block = matches!(event, WardEvent::CommandStarted { .. });
-                let record = self.inner.append(origin, event, at)?;
-                if block {
-                    self.reached.send(()).unwrap();
-                    self.release.recv().unwrap();
-                }
-                Ok(record)
+                self.inner.append(origin, event, at)
             }
 
             fn append_credential(
@@ -3240,7 +3235,10 @@ mod tests {
                 event: WardEvent,
                 at: SystemTime,
             ) -> Result<(ward_events::EventRecord, Option<u64>)> {
-                self.inner.append_credential(origin, event, at)
+                let result = self.inner.append_credential(origin, event, at)?;
+                self.reached.send(()).unwrap();
+                self.release.recv().unwrap();
+                Ok(result)
             }
 
             fn sync(&mut self) -> Result<()> {
@@ -3288,16 +3286,29 @@ mod tests {
             .expect("current session");
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        client.sink = Box::new(BlockAfterStarted {
+        client.sink = Box::new(BlockAfterGrant {
             inner: std::mem::replace(&mut client.sink, Box::new(NullSink)),
             reached: reached_tx,
             release: release_rx,
         });
 
+        let spec = crate::agents::profile("claude")
+            .and_then(|profile| profile.gateway)
+            .expect("claude gateway");
+        let gateway = Gateway::from_key(&spec, "test-stop-key").unwrap();
+        let opts = LaunchOpts {
+            gateways: vec![gateway],
+            ..LaunchOpts::default()
+        };
+
         let socket = session_dir(state.path(), &session_id).join(SOCKET_NAME);
         let stopping = std::thread::spawn(move || {
             reached_rx.recv().unwrap();
             let mut control = RemoteSink::connect(&socket).expect("daemon connection");
+            assert!(
+                matches!(control.call(&Request::Grants), Ok(Response::Grants(ref grants)) if grants.len() == 1),
+                "the launch-scoped grant must be live before Stop"
+            );
             let response = control.call(&Request::Stop {
                 reason: EndReason::UserStop,
             });
@@ -3306,7 +3317,7 @@ mod tests {
         });
 
         let err = client
-            .launch(&["true".to_owned()], &LaunchOpts::default())
+            .launch(&["true".to_owned()], &opts)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3324,25 +3335,44 @@ mod tests {
             .unwrap()
             .map_while(std::result::Result::ok)
             .collect();
-        let started = records
+        let started: Vec<_> = records
             .iter()
-            .position(|r| matches!(r.event, WardEvent::CommandStarted { .. }))
-            .expect("CommandStarted");
-        let aborted = records
+            .enumerate()
+            .filter(|(_, r)| matches!(r.event, WardEvent::CommandStarted { .. }))
+            .collect();
+        let grants: Vec<_> = records
             .iter()
-            .position(|r| matches!(r.event, WardEvent::LaunchAborted { .. }))
-            .expect("LaunchAborted");
+            .enumerate()
+            .filter(|(_, r)| matches!(r.event, WardEvent::CredentialGranted { .. }))
+            .collect();
+        let aborted: Vec<_> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r.event, WardEvent::LaunchAborted { .. }))
+            .collect();
+        let finished: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r.event, WardEvent::CommandFinished { .. }))
+            .collect();
         let ended = records
             .iter()
             .position(|r| matches!(r.event, WardEvent::SessionEnded { .. }))
             .expect("SessionEnded");
-        assert!(started < aborted && aborted < ended, "{records:?}");
-        let pid = match records[started].event {
+
+        assert_eq!(started.len(), 1, "{records:?}");
+        assert_eq!(grants.len(), 1, "{records:?}");
+        assert_eq!(aborted.len(), 1, "Stop owns the only terminal launch record: {records:?}");
+        assert!(finished.is_empty(), "the client cannot append a duplicate finish: {records:?}");
+        assert!(
+            started[0].0 < grants[0].0 && grants[0].0 < aborted[0].0 && aborted[0].0 < ended,
+            "{records:?}"
+        );
+        let pid = match started[0].1.event {
             WardEvent::CommandStarted { pid, .. } => pid,
             _ => unreachable!(),
         };
         assert!(matches!(
-            records[aborted].event,
+            aborted[0].1.event,
             WardEvent::LaunchAborted { pid: p, .. } if p == pid
         ));
     }
