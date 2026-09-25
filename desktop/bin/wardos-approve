@@ -886,7 +886,10 @@ finish_notification_locked() {
     notify-send -a WardOS -c ward-approval -u low -t 4000 -r "$notif_id" \
       "$(resolved_title "$state")" "<tt>$(esc "$destination")</tt>" 2>/dev/null || true
   fi
-  rm -f "$pid_file"
+  # A resolver records its daemon-confirmed terminal outcome before retiring the
+  # final group member. Once the notification itself has been replaced, that
+  # handoff is complete and no later sweep needs to recover it.
+  rm -f "${pid_file%.pid}.resolved" "$pid_file"
   kill "$pid" 2>/dev/null || true
 }
 
@@ -964,13 +967,17 @@ finish_notification_self_decided_locked() {
 # itself killed before printing): the caller then simply never refreshes, the
 # same no-live-refresh fallback as notify-send being entirely absent.
 wait_for_notif_id() {
-  local out_file=$1 id i
+  local out_file=$1 out_var=$2 id="" i
   for ((i = 0; i < 100; i++)); do
     id=$(head -n1 "$out_file" 2>/dev/null || true)
     [[ -n $id ]] && break
     sleep 0.02
   done
-  printf '%s\n' "${id:-}"
+  # Return through the caller's variable rather than stdout. refresh_loop is
+  # intentionally killable during teardown; the old command-substitution form
+  # could leave this helper writing into a pipe whose reader had just died,
+  # producing the repeated "Broken pipe" noise seen in CI.
+  printf -v "$out_var" '%s' "$id"
 }
 
 # One id currently gathered under gkey, read without disturbing the group — the
@@ -1068,8 +1075,8 @@ refresh_loop() {
   # same race #226 found in .worker (see the run_dir comment above notify_one).
   trap 'rm -f "$refresh_file"' RETURN
   printf '%s\n' "$BASHPID" >"$refresh_file"
-  local notif_id
-  notif_id=$(wait_for_notif_id "$out_file")
+  local notif_id=""
+  wait_for_notif_id "$out_file" notif_id
   [[ -n $notif_id ]] || return 0
   while :; do
     sleep "$refresh_interval"
@@ -1142,6 +1149,14 @@ resolve_notification() {
     flock -x "$lk"
     remaining=$(grep -vFx "$id" "$ids_file" 2>/dev/null || true)
     if [[ -z $remaining ]]; then
+      # Persist the daemon-confirmed outcome before publishing "no members left".
+      # follow_once is allowed to stop a per-session resolver once the pending
+      # stream has ended; without this handoff, a resolver descheduled in the
+      # tiny post-removal/pre-notification window could be killed and the generic
+      # sweep would incorrectly replace the known outcome with "Session ended".
+      # The sweep consumes this file if the resolver itself does not get to the
+      # terminal replace first.
+      printf '%s\n%s\n' "$state" "$destination" >"$run_dir/$gkey.resolved"
       rm -f "$ids_file"
       cur=$(cat "$run_dir/$key.current" 2>/dev/null || true)
       [[ $cur == "$gen" ]] && rm -f "$run_dir/$key.current"
@@ -1441,9 +1456,21 @@ stop_refreshes() {
 # into a resolve within the same window). Clear it anyway so nothing lingers into
 # the next round.
 sweep_run_dir() {
-  local pid_file
+  local pid_file resolved_file state destination
   for pid_file in "$run_dir"/*.pid; do
     [[ -f $pid_file ]] || continue
+    resolved_file=${pid_file%.pid}.resolved
+    if [[ -f $resolved_file ]]; then
+      state="" destination=""
+      {
+        IFS= read -r state || true
+        IFS= read -r destination || true
+      } <"$resolved_file"
+      if [[ -n $state ]]; then
+        finish_notification "$pid_file" "${pid_file%.pid}.out" "$state" "$destination"
+        continue
+      fi
+    fi
     finish_notification "$pid_file" "${pid_file%.pid}.out" "session-ended" ""
   done
   # wait_for_notifiers' own grace period is a bound on how long it waits, not a
