@@ -3361,8 +3361,15 @@ mod tests {
 
         assert_eq!(started.len(), 1, "{records:?}");
         assert_eq!(grants.len(), 1, "{records:?}");
-        assert_eq!(aborted.len(), 1, "Stop owns the only terminal launch record: {records:?}");
-        assert!(finished.is_empty(), "the client cannot append a duplicate finish: {records:?}");
+        assert_eq!(
+            aborted.len(),
+            1,
+            "Stop owns the only terminal launch record: {records:?}"
+        );
+        assert!(
+            finished.is_empty(),
+            "the client cannot append a duplicate finish: {records:?}"
+        );
         assert!(
             started[0].0 < grants[0].0 && grants[0].0 < aborted[0].0 && aborted[0].0 < ended,
             "{records:?}"
