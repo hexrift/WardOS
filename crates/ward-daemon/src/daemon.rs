@@ -2241,6 +2241,32 @@ mod tests {
         assert_eq!(agent_states(&mut served), [AgentState::Finished]);
     }
 
+    /// Stop fails closed before changing state when the lifecycle/admission
+    /// lock itself cannot be acquired. A directory at the lock-file path makes
+    /// `OpenOptions::open` fail deterministically; the injected terminator must
+    /// never run and no stop marker may be published.
+    #[test]
+    fn stop_refuses_before_termination_when_the_lifecycle_lock_cannot_be_acquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let lock_path = session_dir(dir.path(), "sess_9").join(".pause-freeze.lock");
+        std::fs::create_dir(&lock_path).unwrap();
+
+        let (response, done) = served.stop(
+            Served::INTERNAL_CONN,
+            EndReason::UserStop,
+            |_, _| panic!("termination must not run without the lifecycle lock"),
+        );
+        let Response::Error(message) = response else {
+            panic!("{response:?}");
+        };
+        assert!(!done);
+        assert!(message.contains("lifecycle lock"), "{message}");
+        assert!(served.log.is_some(), "the log remains open");
+        assert!(!pause::stop_marker_path(dir.path(), "sess_9").exists());
+        assert!(kinds_of(&mut served).is_empty(), "nothing was recorded");
+    }
+
     /// PR #253 review finding 2, deterministic barrier: a launch that has been
     /// admitted (`pause::admit_launch` holds the session lock across its
     /// `bwrap` spawn) and a stop that arrives meanwhile are serialized — the
