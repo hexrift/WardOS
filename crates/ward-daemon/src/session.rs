@@ -1472,7 +1472,15 @@ impl Session {
     /// records `WorkloadsTerminated { pending }`, then refuses the stop.
     fn end_workloads_here(&mut self) -> Result<u32> {
         let outcome = {
-            let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session_str)).ok();
+            let _lock =
+                pause::lock_pause_freeze(&session_dir(&self.state, &self.session_str)).map_err(
+                    |e| {
+                        Error::Daemon(format!(
+                            "stop could not take the lifecycle lock for session {} ({e}); nothing                              was terminated and the log is not sealed",
+                            self.session_str
+                        ))
+                    },
+                )?;
             pause::write_stop_marker(&self.state, &self.session_str).map_err(|e| {
                 Error::Daemon(format!(
                     "stop could not record that session {} is stopping ({e}), so it could \
@@ -1491,6 +1499,22 @@ impl Session {
     /// the refused path is testable without a process that survives `SIGKILL`.
     fn record_termination(&mut self, outcome: &pause::Termination) -> Result<u32> {
         let (ended, pending) = (outcome.ended, outcome.pending());
+        if !outcome.barrier_confirmed {
+            let marker = pause::write_marker(
+                &self.state,
+                &self.session_str,
+                "ward stop: pre-termination fork barrier not confirmed",
+            )
+            .err();
+            return Err(Error::Daemon(pause::stop_refusal(
+                &self.session_str,
+                ended,
+                pending,
+                "the pre-termination fork barrier was not confirmed, so Ward cannot prove the                  session is quiescent even though no known pid remains. The stop marker remains                  in force; run `ward stop` again to re-scan and retry",
+                marker.as_ref(),
+                None,
+            )));
+        }
         if pending == 0 {
             // Nothing is left for a marker to hold back — including one an
             // earlier refused stop of this session left behind.
