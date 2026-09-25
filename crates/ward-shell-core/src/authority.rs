@@ -110,6 +110,13 @@ impl Authority {
                     });
                 }
             }
+            WardEvent::CredentialRevoked { service, .. } => {
+                // #140: a `ward session revoke` on a credential grant records
+                // this once the daemon confirms it — drop it from the panel
+                // the same moment `ward session grants` stops listing it.
+                let label = service_name(service.as_str());
+                self.grants.retain(|g| g.label != label);
+            }
             _ => {}
         }
     }
@@ -360,6 +367,13 @@ mod tests {
         }
     }
 
+    fn revoked(service: &str) -> WardEvent {
+        WardEvent::CredentialRevoked {
+            service: ward_events::ServiceId::new(service).unwrap(),
+            reason: ward_events::RevokeReason::UserRevoked,
+        }
+    }
+
     #[test]
     fn grants_come_from_session_answers_and_injected_credentials_and_nothing_else() {
         let mut events = sequence();
@@ -425,6 +439,35 @@ mod tests {
         );
         assert_eq!(authority.network_tags(), ["github", "example.org"]);
         assert!(Authority::from_records(&wardd(&sequence())).is_empty());
+    }
+
+    #[test]
+    fn a_credential_revoked_record_drops_the_matching_grant() {
+        // #140: `ward session revoke` on a credential grant must disappear
+        // from the panel and the trust bar's `GRANTS n`, not just from
+        // `ward session grants` — this is what makes it so.
+        let mut events = sequence();
+        events.extend([
+            credential("github.com"),
+            decided(
+                CapabilityKind::FileWrite,
+                "Write /work/src/lib.rs",
+                Some(GrantScope::Session),
+            ),
+        ]);
+        let authority = Authority::from_records(&wardd(&events));
+        assert_eq!(authority.len(), 2);
+
+        let mut revoked_events = events.clone();
+        revoked_events.push(revoked("github"));
+        let authority = Authority::from_records(&wardd(&revoked_events));
+        assert_eq!(authority.len(), 1, "{authority:?}");
+        assert_eq!(authority.grants[0].label, "Write /work/src/lib.rs");
+
+        // Revoking a service with no matching grant is a no-op.
+        let mut unrelated_events = events.clone();
+        unrelated_events.push(revoked("npm"));
+        assert_eq!(Authority::from_records(&wardd(&unrelated_events)).len(), 2);
     }
 
     #[test]

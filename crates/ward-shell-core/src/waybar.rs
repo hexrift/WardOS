@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use ward_daemon::describe::SessionDescription;
 
-use crate::authority::{Authority, authority_panel};
+use crate::authority::authority_panel;
 use crate::feed::Model;
 use crate::panel::{Group, panel_text, session_panel, verify_panel};
 use crate::settings::{Row, rows_text};
@@ -139,18 +139,18 @@ fn explanation(
         }
         // The network and grants modules explain themselves with the
         // authority panel (ADR-0019), which their click opens in full.
+        // `model.authority` is kept incrementally rather than rescanned from
+        // `model.records` here (#138 item 4), so a session-scoped grant stays
+        // visible even once the record that created it has aged out of
+        // `model.records`.
         SegmentName::Network => {
-            let authority = authority_panel(d, &Authority::from_records(&model.records));
+            let authority = authority_panel(d, &model.authority);
             vec![
                 panel_row(&authority, "Network"),
                 panel_row(&authority, "Temporary grants"),
             ]
         }
-        SegmentName::Grants => {
-            authority_panel(d, &Authority::from_records(&model.records))
-                .swap_remove(1)
-                .rows
-        }
+        SegmentName::Grants => authority_panel(d, &model.authority).swap_remove(1).rows,
         SegmentName::Credentials => vec![row("Secrets")],
         SegmentName::Observer => vec![row("Observer")],
         SegmentName::Tamperward => vec![row("Policy"), row("Evidence")],

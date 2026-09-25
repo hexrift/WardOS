@@ -7,6 +7,11 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 if [[ -f Cargo.toml ]]; then
+  # A clean checkout must be buildable with --locked. Ordinary cargo fmt/clippy/test
+  # may update a stale lockfile in the writable CI checkout and hide a workspace
+  # version mismatch (issue #281), so make lock consistency an explicit merge gate.
+  cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
   cargo fmt --all -- --check
 
   cargo clippy \

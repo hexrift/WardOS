@@ -31,6 +31,7 @@
 use std::path::Path;
 
 use ward_events::{LogReader, WardEvent};
+use ward_snapshot::SnapshotId;
 use ward_snapshot::gc::{GcOptions, RootSet, SweepPlan, SweepReport};
 
 use crate::attempt::candidate_snapshot_ids;
@@ -207,6 +208,42 @@ pub fn plan(state: &Path, now: std::time::SystemTime, options: &GcOptions) -> Re
 pub fn apply(state: &Path, plan: &SweepPlan, now: std::time::SystemTime) -> Result<SweepReport> {
     ward_snapshot::gc::apply(&cas_root(state), plan, now)
         .map_err(|e| Error::Snapshot(e.to_string()))
+}
+
+/// Mark `id` as explicitly kept (#151 item 4 — "explicit user-selected retention
+/// policy"): a user-kept restore backup, exempt from a `ward snapshot gc` sweep
+/// regardless of whether any other root in [`roots`] still points at it.
+/// Idempotent. `ward snapshot keep <id>`.
+///
+/// Refused when `id` names no manifest actually stored in this CAS.
+/// `ward_snapshot::gc::plan` resolves every root by reading its manifest and
+/// aborts the *whole* sweep the instant any root fails to resolve (its own doc
+/// comment: "a failure resolving any root aborts the whole plan"). A kept
+/// marker for an id that was never captured — a typo, a truncated hash pasted
+/// from somewhere else — would satisfy [`ward_snapshot::gc::mark_kept`] just
+/// fine on its own (it never touches the manifest store), then poison every
+/// later `roots()`/`plan()` call (dry-run included) with an unresolvable root,
+/// until the same bogus marker is tracked down and removed by hand. Checking
+/// here, before the marker is written, is one read against a fixed set of
+/// existing manifests; the alternative is diagnosing why every `ward snapshot
+/// gc` on this machine started failing, from a bare id string in a marker
+/// file no error message points at.
+pub fn mark_kept(state: &Path, id: SnapshotId) -> Result<()> {
+    ward_snapshot::SnapshotStore::open(cas_root(state))
+        .and_then(|store| store.manifest(id))
+        .map_err(|_| Error::Snapshot(format!("no such snapshot: {id}")))?;
+    ward_snapshot::gc::mark_kept(&cas_root(state), id).map_err(|e| Error::Snapshot(e.to_string()))
+}
+
+/// Undo [`mark_kept`]. Removing a marker that was never set is not an error.
+/// `ward snapshot unkeep <id>`.
+pub fn unmark_kept(state: &Path, id: SnapshotId) -> Result<()> {
+    ward_snapshot::gc::unmark_kept(&cas_root(state), id).map_err(|e| Error::Snapshot(e.to_string()))
+}
+
+/// Every id [`mark_kept`] currently marks. `ward snapshot kept`.
+pub fn kept_ids(state: &Path) -> Result<RootSet> {
+    ward_snapshot::gc::kept_ids(&cas_root(state)).map_err(|e| Error::Snapshot(e.to_string()))
 }
 
 #[cfg(test)]
@@ -466,6 +503,59 @@ mod tests {
 
         let roots = roots(state.path()).unwrap();
         assert!(roots.contains(&id));
+    }
+
+    #[test]
+    fn mark_kept_unmark_kept_and_kept_ids_round_trip_through_the_daemon_wrapper() {
+        // #151 item 4: `ward snapshot keep`/`unkeep`/`kept`'s own daemon-side
+        // wrappers, not the `ward_snapshot::gc` functions they forward to.
+        let state = tempfile::tempdir().unwrap();
+        let id = store_snapshot(state.path());
+        assert!(kept_ids(state.path()).unwrap().is_empty());
+
+        mark_kept(state.path(), id).unwrap();
+        assert!(kept_ids(state.path()).unwrap().contains(&id));
+        assert!(
+            roots(state.path()).unwrap().contains(&id),
+            "a kept id is a root"
+        );
+
+        // Idempotent: marking an already-kept id again is not an error.
+        mark_kept(state.path(), id).unwrap();
+        assert_eq!(kept_ids(state.path()).unwrap().len(), 1);
+
+        unmark_kept(state.path(), id).unwrap();
+        assert!(kept_ids(state.path()).unwrap().is_empty());
+        assert!(!roots(state.path()).unwrap().contains(&id));
+
+        // Undoing a marker that was never set is not an error either.
+        unmark_kept(state.path(), id).unwrap();
+    }
+
+    #[test]
+    fn mark_kept_refuses_an_id_that_names_no_stored_snapshot() {
+        // A bogus id (well-formed hash, never actually captured) must be refused
+        // up front, never merged into `roots()` — see `mark_kept`'s own doc
+        // comment for why: once in, it would abort every future `plan()` call,
+        // not just fail to protect anything.
+        let state = tempfile::tempdir().unwrap();
+        let bogus = crate::snapshot::parse_id(&format!("blake3:{}", "ab".repeat(32))).unwrap();
+
+        let err = mark_kept(state.path(), bogus).unwrap_err();
+        assert!(err.to_string().contains("no such snapshot"), "{err}");
+        assert!(
+            kept_ids(state.path()).unwrap().is_empty(),
+            "a refused mark_kept must not write a marker"
+        );
+
+        // `roots()`/`plan()` still work normally afterward.
+        assert!(!roots(state.path()).unwrap().contains(&bogus));
+        plan(
+            state.path(),
+            std::time::SystemTime::now(),
+            &GcOptions::default(),
+        )
+        .unwrap();
     }
 
     #[test]

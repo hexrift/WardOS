@@ -107,6 +107,22 @@ pub enum Request {
     /// The temporary authority the session holds (ADR-0019): every
     /// `allow-session` answer and every credential the proxy injects.
     Grants,
+    /// Remove one grant from live authority, by the id [`Response::Grants`]
+    /// listed it under (#140 items 4-6, #245: host-confirmed for a
+    /// credential). An `allow-session` answer is forgotten immediately, so
+    /// the same tool on the same target asks again — it has no proxy route
+    /// to wait on. A credential grant is instead marked `revoking`
+    /// (surfaced in `Response::Grants` while this is in flight) while the
+    /// daemon instructs the owning proxy to withdraw the route and waits for
+    /// its acknowledgement (`crate::revoke`), bounded by
+    /// `crate::revoke::ACK_TIMEOUT`; see [`Response::Revoked`] for the
+    /// possible outcomes. Refused when `id` names no live grant. Served on
+    /// its own connection (like [`Request::Hold`]), since the wait can take
+    /// up to that bound.
+    Revoke {
+        /// The grant's id, as `ward session grants` lists it.
+        id: u64,
+    },
     /// Pause the session as one operation (ADR-0019 §3): freeze its sandbox
     /// processes, close the proxy to new traffic, suspend credential
     /// injection, hold the approvals, and record `SessionPaused`.
@@ -226,6 +242,21 @@ pub enum Response {
     Approvals(Vec<ApprovalRecord>),
     /// The session's temporary grants, oldest first.
     Grants(Vec<Grant>),
+    /// A `CredentialGranted` append answered (#245): the record, and the
+    /// grant id `crate::approvals::Approvals::record_credential` minted (or
+    /// already had) for it. The one client that appended it uses this id to
+    /// tag its own `GatewayRoute` (`GatewayRoute::revocable`) so a later
+    /// `ward session revoke` can reach that exact route. Every other append
+    /// still answers with a plain [`Response::Record`].
+    Granted {
+        /// The `CredentialGranted` record.
+        record: Box<EventRecord>,
+        /// The grant id.
+        grant_id: u64,
+    },
+    /// `Request::Revoke` answered (#245): what actually happened to the
+    /// grant, not merely that the authority projection changed.
+    Revoked(crate::approvals::RevokeOutcome),
 }
 
 /// Where a session's events go.
@@ -250,6 +281,28 @@ pub trait Sink: Send {
     fn ends_workloads(&self) -> bool {
         false
     }
+    /// [`append`](Self::append) a `CredentialGranted` event, also returning
+    /// the grant id the daemon recorded it under, when there is a daemon to
+    /// mint one (#245): the caller (`Session::launch`) tags the
+    /// `GatewayRoute` it built for this exact grant with that id
+    /// (`GatewayRoute::revocable`), the one thing that lets a later `ward
+    /// session revoke <id>` reach this route in what is, from the daemon's
+    /// point of view, a different process entirely.
+    ///
+    /// The default falls back to plain [`append`](Self::append) and answers
+    /// `None`: [`LocalLog`] has no `Approvals` to mint an id from at all (no
+    /// daemon is running, so `ward session revoke` could never reach this
+    /// process either), and every other event this trait ever appends has no
+    /// grant id to report, so only [`RemoteSink`] needs to override this.
+    fn append_credential(
+        &mut self,
+        origin: Origin,
+        event: WardEvent,
+        at: SystemTime,
+    ) -> Result<(EventRecord, Option<u64>)> {
+        self.append(origin, event, at).map(|record| (record, None))
+    }
+
     /// Re-read this sink's view of the chain from durable storage, discarding any
     /// cached head that may now be behind what is actually on disk (review 5283028228
     /// of #208, finding 4, `crate::attempt::reconcile_dangling_attempts`): a
@@ -505,6 +558,28 @@ impl Sink for RemoteSink {
         }
     }
 
+    fn append_credential(
+        &mut self,
+        origin: Origin,
+        event: WardEvent,
+        at: SystemTime,
+    ) -> Result<(EventRecord, Option<u64>)> {
+        match self.call(&Request::Append {
+            origin,
+            event,
+            at_unix_ms: unix_ms(at),
+        })? {
+            Response::Granted { record, grant_id } => Ok((*record, Some(grant_id))),
+            // A daemon that never learned about this credential grant (an
+            // older `wardd`, or an event `handle_appendable` did not
+            // recognise as a `CredentialGranted`) still appended it: no id
+            // to tag the route with, but the record itself is real.
+            Response::Record(record) => Ok((*record, None)),
+            Response::Error(e) => Err(Error::Events(format!("daemon refused append: {e}"))),
+            other => Err(Error::Events(format!("unexpected response {other:?}"))),
+        }
+    }
+
     fn sync(&mut self) -> Result<()> {
         expect_ok(self.call(&Request::Sync)?)
     }
@@ -667,6 +742,7 @@ pub fn handle_with(
         | Request::Pending
         | Request::Approvals
         | Request::Grants
+        | Request::Revoke { .. }
         | Request::Pause { .. }
         | Request::Resume
         // A plain log connection neither terminates workloads on `Stop` nor
@@ -898,19 +974,91 @@ mod tests {
             serde_json::to_string(&Request::Grants).unwrap(),
             r#"{"req":"grants"}"#
         );
-        let grants = Response::Grants(vec![Grant {
+        let base_grant = Grant {
+            id: 3,
             kind: crate::approvals::GrantKind::Credential,
             label: "GitHub".into(),
             scope: "contents:read · github.com".into(),
             lifetime: crate::approvals::Lifetime::Launch,
             granted_at_unix_ms: 9,
-        }]);
+            revoke_state: crate::approvals::RevokeState::Active,
+        };
+        let grants = Response::Grants(vec![base_grant.clone()]);
         let json = serde_json::to_string(&grants).unwrap();
         assert_eq!(
             json,
-            r#"{"resp":"grants","body":[{"kind":"credential","label":"GitHub","scope":"contents:read · github.com","lifetime":"launch","granted_at_unix_ms":9}]}"#
+            r#"{"resp":"grants","body":[{"id":3,"kind":"credential","label":"GitHub","scope":"contents:read · github.com","lifetime":"launch","granted_at_unix_ms":9,"revoke_state":"active"}]}"#
         );
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), grants);
+        // A grant listed while its revoke is still pending, or came back
+        // unconfirmed (#245): both round-trip, and `Grant::line` names the
+        // state so a plain-text list shows it too.
+        let revoking = Grant {
+            revoke_state: crate::approvals::RevokeState::Revoking,
+            ..base_grant.clone()
+        };
+        assert!(
+            revoking.line().ends_with("   revoking"),
+            "{}",
+            revoking.line()
+        );
+        let unconfirmed = Grant {
+            revoke_state: crate::approvals::RevokeState::Unconfirmed,
+            ..base_grant
+        };
+        assert!(
+            unconfirmed.line().ends_with("   revoke unconfirmed"),
+            "{}",
+            unconfirmed.line()
+        );
+        let json = serde_json::to_string(&Response::Grants(vec![revoking.clone()])).unwrap();
+        assert!(json.contains(r#""revoke_state":"revoking""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<Response>(&json).unwrap(),
+            Response::Grants(vec![revoking])
+        );
+
+        let revoke = Request::Revoke { id: 3 };
+        assert_eq!(
+            serde_json::to_string(&revoke).unwrap(),
+            r#"{"req":"revoke","id":3}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"req":"revoke","id":3}"#).unwrap(),
+            revoke
+        );
+        // `Request::Revoke`'s answer names what actually happened (#245), not
+        // merely that the authority projection changed; all three outcomes
+        // round-trip.
+        for outcome in [
+            crate::approvals::RevokeOutcome::Withdrawn,
+            crate::approvals::RevokeOutcome::WithdrawnInFlight(2),
+            crate::approvals::RevokeOutcome::Unconfirmed,
+        ] {
+            let revoked = Response::Revoked(outcome);
+            let json = serde_json::to_string(&revoked).unwrap();
+            assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), revoked);
+        }
+        assert_eq!(
+            serde_json::to_string(&Response::Revoked(
+                crate::approvals::RevokeOutcome::WithdrawnInFlight(2)
+            ))
+            .unwrap(),
+            r#"{"resp":"revoked","body":{"withdrawn-in-flight":2}}"#
+        );
+        // A `CredentialGranted` append answers with the grant id it minted
+        // (#245), distinct from every other append's plain `Response::Record`.
+        let record_dir = tempfile::tempdir().unwrap();
+        let record = fresh(record_dir.path())
+            .append(Origin::Wardd, working(), SystemTime::now())
+            .unwrap();
+        let granted = Response::Granted {
+            record: Box::new(record),
+            grant_id: 42,
+        };
+        let json = serde_json::to_string(&granted).unwrap();
+        assert!(json.contains(r#""grant_id":42"#), "{json}");
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), granted);
         // Pause and resume are the daemon's; they round-trip as their words.
         let pause = Request::Pause {
             reason: "looks wrong".into(),
@@ -923,7 +1071,7 @@ mod tests {
             serde_json::to_string(&Request::Resume).unwrap(),
             r#"{"req":"resume"}"#
         );
-        // A plain log connection does not hold or answer approvals, list grants, or pause.
+        // A plain log connection does not hold or answer approvals, list or revoke grants, or pause.
         let dir = tempfile::tempdir().unwrap();
         let mut log = Some(fresh(dir.path()));
         for request in [
@@ -932,6 +1080,7 @@ mod tests {
             Request::Pending,
             Request::Approvals,
             Request::Grants,
+            revoke,
             pause,
             Request::Resume,
         ] {

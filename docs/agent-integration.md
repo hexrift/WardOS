@@ -219,9 +219,55 @@ Temporary authority stays visible while it exists (decision 4): `Request::Grants
 `ward session grants [--json]` lists every `allow-session` answer (`kind: approval`,
 `label: "WebFetch api.github.com"`, `scope`, `lifetime: session`) and every credential
 the proxy injects (`kind: credential`, `label: "GitHub"`, `scope: "contents:read,
-issues:read · github.com, api.github.com"`, `lifetime: launch`), oldest first; the
-shell derives the same list from the stream (`ward-shell-core` `authority.rs`) for
-the bar's `NET restricted · github+` and `GRANTS n` and the authority panel.
+issues:read · github.com, api.github.com"`, `lifetime: launch`), oldest first, each
+with the daemon-minted `id` it was listed under and a `revoke_state` of `active`,
+`revoking` or `unconfirmed` (#245 — see below); the shell derives the same list from
+the stream (`ward-shell-core` `authority.rs`) for the bar's `NET restricted · github+`
+and `GRANTS n` and the authority panel.
+
+`Request::Revoke` / `ward session revoke <id>` (#140 items 4-6, #245) withdraws one
+grant by that id, host-confirmed. An `allow-session` answer is forgotten from
+`remembered` at once, so the same tool on the same target asks again — it has no proxy
+route to wait on. A credential grant instead instructs the owning proxy to stop
+honoring it (the same `GatewayRoute` the credential was injected through, tagged with
+this grant's id when it was granted — `Response::Granted`, `GatewayRoute::revocable`)
+and waits for that proxy's acknowledgement, up to `crate::revoke::ACK_TIMEOUT` (a
+couple of seconds); while it waits, the grant shows `revoke_state: revoking` in
+`Request::Grants`, never silently as still-plain-`active` or already gone. Refused
+when `id` names no live grant — already revoked, retired when its launch ended, or
+never minted. No panel action calls this yet (the layer-shell toolkit blocker #243 and
+#210 already noted); it is CLI-only.
+
+The daemon reaches the proxy the same way `ward pause` does (`pause.rs`'s own doc
+comment): a file under `sessions/<id>/revoke/`, since `wardd` has no direct handle onto
+a proxy that runs inside the client's own `Session::run_launch`, not the daemon. The
+answer, `Response::Revoked`, is one of three honest outcomes, never collapsed into a
+bare success or a bare error:
+
+- **`Withdrawn`** — the proxy confirmed; no new request may use the credential from now
+  on. The grant is removed from `Request::Grants` and `CredentialRevoked` is recorded
+  (the shell drops the matching panel row the same moment).
+- **`WithdrawnInFlight(n)`** — the proxy confirmed and stopped honoring the credential
+  for new requests, but `n` connection(s) that had already passed that check when the
+  marker landed are still relaying with it injected; bytes already handed to a socket
+  are not recalled (`docs/security-model.md`). Not a failure — the authority itself is
+  withdrawn exactly as `Withdrawn` is, the grant is removed the same way, and
+  `CredentialRevoked` is recorded — only its already-open use outlives the revoke by
+  however long it takes to finish on its own.
+- **`Unconfirmed`** — nothing acknowledged within the wait: the owning proxy's launch
+  may have crashed, its connection to `wardd` may have died without a terminal record
+  (`Lifetime::LaunchUnknown` is the same honest middle ground), or it simply has not
+  polled the marker yet. The grant is **not** removed — reporting it gone here would be
+  exactly the "UI-only revoke... reported as enforced" #140's acceptance criteria
+  forbid — it is instead marked `revoke_state: unconfirmed` and keeps being listed
+  until its launch's own terminal record retires it. No `CredentialRevoked` is recorded
+  for an outcome nothing confirmed. `ward session revoke`'s own exit code is non-zero
+  for this outcome, so a script checking it learns the credential may still be in
+  effect.
+
+This closes the gap #243 (which implemented #140 items 4-6's authority-projection half
+only) opened issue #245 to track: revoking an *active* credential grant now actually
+stops the proxy from honoring new requests using it, not merely the listing.
 
 The desktop side is `wardos-approve` (`desktop.md` §Commands): `--watch` follows
 `ward session pending --json --follow` (one JSON object per line: the record above

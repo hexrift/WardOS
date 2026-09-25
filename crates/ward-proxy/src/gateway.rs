@@ -47,6 +47,11 @@ pub struct GatewayRoute {
     paths: Vec<String>,
     /// Whether requests that are not read-only are permitted.
     write: bool,
+    /// The daemon-minted grant id this route's credential was recorded under
+    /// (#245), when the caller has one to give — a selftest or a gateway with
+    /// nothing to revoke leaves this `None`. [`Handle::revoke_credential`]
+    /// (`crate::proxy`) only ever matches a route that carries one.
+    credential_id: Option<u64>,
     #[cfg(feature = "test-loopback")]
     plain_upstream: bool,
 }
@@ -123,9 +128,26 @@ impl GatewayRoute {
             strip: Vec::new(),
             paths: Vec::new(),
             write: true,
+            credential_id: None,
             #[cfg(feature = "test-loopback")]
             plain_upstream: false,
         })
+    }
+
+    /// Tag this route with the grant id its credential was recorded under
+    /// (#245): the daemon later reaches a running proxy through this id
+    /// alone (`Handle::revoke_credential`), never by service name or host,
+    /// since either can be shared by more than one grant. Calling this again
+    /// replaces the previous id.
+    #[must_use]
+    pub fn revocable(mut self, id: u64) -> Self {
+        self.credential_id = Some(id);
+        self
+    }
+
+    /// The grant id [`Self::revocable`] tagged this route with, if any.
+    pub(crate) fn credential_id(&self) -> Option<u64> {
+        self.credential_id
     }
 
     /// Restrict what the injected credential may be used for.
@@ -366,6 +388,7 @@ impl fmt::Debug for GatewayRoute {
             .field("strip", &self.strip)
             .field("paths", &self.paths)
             .field("write", &self.write)
+            .field("credential_id", &self.credential_id)
             .finish_non_exhaustive()
     }
 }
@@ -463,6 +486,16 @@ mod tests {
 
     fn parsed(head: &str) -> Parsed {
         http::parse(head.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn a_route_carries_no_credential_id_until_revocable_tags_one() {
+        let r = route();
+        assert_eq!(r.credential_id(), None);
+        let tagged = r.revocable(42);
+        assert_eq!(tagged.credential_id(), Some(42));
+        // Calling it again replaces the previous id rather than stacking one.
+        assert_eq!(tagged.revocable(7).credential_id(), Some(7));
     }
 
     #[test]

@@ -4,11 +4,18 @@
 //! [`Model`] holds the records, the status-line counters
 //! (`docs/event-model.md` §8), the follow/scroll state and the seal transition;
 //! [`SessionState`] is the part of it the trust bar reads (agent state,
-//! verification verdict, TamperWard's presence). Both are derived from records as
-//! they arrive, never from rendered rows. The one input that is not a record is
-//! the worktree's digest ([`Model::observe_worktree`]), supplied by a viewer
-//! that can read the worktree so a verdict is shown only while it still
-//! describes the tree (ADR-0019).
+//! verification verdict, TamperWard's presence); [`Authority`] is the temporary
+//! grants the session holds (ADR-0019). All three are derived from records as
+//! they arrive, never from rendered rows, and never by rescanning
+//! [`Model::records`] — which is itself bounded to the most recent
+//! [`RECENT_CAPACITY`] records rather than retained for the process's lifetime
+//! (#138 item 4), so an aggregate that mattered for the whole session (a
+//! session-scoped grant, the verification verdict) would silently go stale
+//! once its record aged out if it were recomputed from `records` instead of
+//! kept incrementally. The one input that is not a record is the worktree's
+//! digest ([`Model::observe_worktree`]), supplied by a viewer that can read
+//! the worktree so a verdict is shown only while it still describes the tree
+//! (ADR-0019).
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -18,7 +25,47 @@ use ward_events::{
     AgentState, Decision, EventRecord, Origin, SnapshotId, VerifySummary, WardEvent,
 };
 
+use crate::authority::Authority;
 use crate::trust::VerifyState;
+
+/// How many of the most recent records (and their rendered rows)
+/// [`Model::records`] and [`Model::rows`] keep once a session has been
+/// running a while (#138 item 4).
+///
+/// The durable evidence log the daemon writes (`ward_events::log`) is the
+/// session's history authority: `ward replay` reads it directly and is
+/// unaffected by this bound. `Model` is the *live* view — the trust bar, the
+/// bar/panel segments, `ward watch`'s scrollback — and used to keep every
+/// record and every rendered row for the lifetime of the process, exactly
+/// the unbounded retention the issue's evidence points at.
+///
+/// Sized like `ward_daemon::observe::DEFAULT_CAPACITY` (4096), which the
+/// daemon's own ingestion queues use for the same reasoning: large enough
+/// that no realistic interactive session — a big `git checkout`, a busy
+/// verification run, an agent working for hours — notices the trim, while
+/// bounding memory for a session that runs indefinitely. At [`ObserverCells`]'
+/// handful of short `String`s per row, [`RECENT_CAPACITY`] rows is on the
+/// order of a few hundred KB: negligible against the < 700 MB idle-RAM
+/// budget in `docs/performance.md`.
+pub const RECENT_CAPACITY: usize = 4096;
+
+/// [`Model::records`]/[`Model::rows`] may grow up to this many entries past
+/// [`RECENT_CAPACITY`] before [`trim`] reclaims them back down to it, so a
+/// trim is a rare, amortised bulk drop rather than a shift paid on every
+/// record.
+const TRIM_AT: usize = RECENT_CAPACITY * 2;
+
+/// Drop `items`' oldest entries down to [`RECENT_CAPACITY`] once they exceed
+/// [`TRIM_AT`]. Returns how many were dropped, so a caller tracking an index
+/// into `items` (a scroll position) can shift it by the same amount.
+fn trim<T>(items: &mut Vec<T>) -> usize {
+    if items.len() <= TRIM_AT {
+        return 0;
+    }
+    let dropped = items.len() - RECENT_CAPACITY;
+    items.drain(..dropped);
+    dropped
+}
 
 /// The counters of the status line (`docs/event-model.md` §8), derived from
 /// records as they arrive, never from rendered rows.
@@ -294,12 +341,26 @@ impl SessionState {
 /// viewer is looking.
 #[derive(Clone, Debug)]
 pub struct Model {
-    /// Every record received, in sequence order.
+    /// The most recent records received, in sequence order, bounded to
+    /// [`RECENT_CAPACITY`] (#138 item 4). The durable evidence log is the
+    /// history authority; `ward replay` reads it directly and does not go
+    /// through this bound. Nothing here derives aggregate state by rescanning
+    /// this field — [`Model::counters`], [`Model::state`] and
+    /// [`Model::authority`] are all kept incrementally in [`Model::apply`],
+    /// so they stay correct for the whole session even once older records
+    /// have been trimmed out of this field.
     pub records: Vec<EventRecord>,
     /// The status-line counters.
     pub counters: Counters,
     /// The session state the trust bar shows.
     pub state: SessionState,
+    /// Every temporary grant the session holds (ADR-0019), applied per
+    /// record as it arrives in [`Model::apply`] rather than rescanned from
+    /// [`Model::records`] on every render — the repeated-derivation-from-
+    /// history the issue's evidence calls out — which also keeps a grant
+    /// visible for the life of the session even after the record that
+    /// created it has been trimmed from [`Model::records`].
+    pub authority: Authority,
     /// The worktree as last *successfully* digested, when the viewer can read it.
     /// A failed later read does not clear this history; [`Model::freshness`] says
     /// whether it still describes the tree.
@@ -318,7 +379,8 @@ pub struct Model {
     pub scroll: usize,
     /// Show the kinds the compact view hides, as a dim kind name (`--all`).
     all: bool,
-    /// The rendered rows, one per record that has one.
+    /// The rendered rows, one per record that has one, bounded to
+    /// [`RECENT_CAPACITY`] like [`Model::records`] (#138 item 4).
     rows: Vec<ObserverCells>,
     /// Paths already counted in `counters.files_changed`.
     paths: BTreeSet<String>,
@@ -332,6 +394,7 @@ impl Model {
             records: Vec::new(),
             counters: Counters::default(),
             state: SessionState::default(),
+            authority: Authority::default(),
             worktree: None,
             freshness: Freshness::NotObserving,
             obs_gen: 0,
@@ -344,7 +407,13 @@ impl Model {
         }
     }
 
-    /// Account for one record: its counters, its state, and its row if it has one.
+    /// Account for one record: its counters, its state, its authority, and its
+    /// row if it has one.
+    ///
+    /// [`Model::records`] and [`Model::rows`] are bounded to [`RECENT_CAPACITY`]
+    /// (#138 item 4): once trimmed, an active scroll position is shifted by
+    /// however many rows were dropped, so a paused view keeps showing the same
+    /// rows it was showing rather than silently jumping.
     pub fn apply(&mut self, rec: EventRecord) {
         match &rec.event {
             WardEvent::FileModified { path, .. } => {
@@ -363,12 +432,16 @@ impl Model {
             _ => {}
         }
         self.state.apply(&rec);
+        self.authority.apply(&rec);
         let cells =
             render::observer_cells(&rec).or_else(|| self.all.then(|| render::kind_cells(&rec)));
         if let Some(cells) = cells {
             self.rows.push(cells);
+            let dropped = trim(&mut self.rows);
+            self.scroll = self.scroll.saturating_sub(dropped);
         }
         self.records.push(rec);
+        trim(&mut self.records);
     }
 
     /// The daemon ended the stream: the log is sealed. The rows stay.
@@ -1094,6 +1167,169 @@ mod tests {
         );
     }
 
+    /// #138 item 4: `records`/`rows` used to grow for the lifetime of the
+    /// process; they are now bounded to `RECENT_CAPACITY`, trimmed back down
+    /// to it in one bulk drop once they exceed `TRIM_AT` rather than shifted
+    /// on every record.
+    #[test]
+    fn records_and_rows_are_bounded_and_trimmed_in_one_bulk_drop() {
+        let mut model = Model::new(false);
+        let total = TRIM_AT + 1;
+        for i in 0..total {
+            model.apply(wardd(&[edit(&format!("f{i}"))]).remove(0));
+        }
+        assert_eq!(
+            model.records.len(),
+            RECENT_CAPACITY,
+            "trimmed back down to the bound, not just capped below TRIM_AT"
+        );
+        assert_eq!(model.rows().len(), RECENT_CAPACITY);
+
+        // The oldest surviving entry is the first one the bulk trim did not
+        // drop; the newest is the very last one applied.
+        let dropped = total - RECENT_CAPACITY;
+        let WardEvent::FileModified {
+            path: first_path, ..
+        } = &model.records.first().unwrap().event
+        else {
+            panic!("expected FileModified");
+        };
+        assert_eq!(
+            first_path.to_string(),
+            path(&format!("f{dropped}")).to_string()
+        );
+        let WardEvent::FileModified {
+            path: last_path, ..
+        } = &model.records.last().unwrap().event
+        else {
+            panic!("expected FileModified");
+        };
+        assert_eq!(
+            last_path.to_string(),
+            path(&format!("f{}", total - 1)).to_string()
+        );
+        assert_eq!(
+            model.rows()[0].subject,
+            path(&format!("f{dropped}")).to_string()
+        );
+        assert_eq!(
+            model.rows()[RECENT_CAPACITY - 1].subject,
+            path(&format!("f{}", total - 1)).to_string()
+        );
+
+        // Counters, which are already kept incrementally rather than derived
+        // from `records`, are unaffected by the trim: every distinct path is
+        // still counted even though most of their records are gone.
+        assert_eq!(model.counters.files_changed, total as u64);
+
+        // Below TRIM_AT again, no further trim happens until it is reached once
+        // more: the bound does not become a per-record cost.
+        model.apply(wardd(&[edit("f-extra")]).remove(0));
+        assert_eq!(model.records.len(), RECENT_CAPACITY + 1);
+    }
+
+    /// #138 item 4, the correctness reason `Authority` is no longer derived by
+    /// rescanning `model.records` (which is now bounded): a session-scoped
+    /// grant has no revoke event and must stay visible for the whole session,
+    /// even long after the record that created it has aged out of the bounded
+    /// window. Recomputing it from `model.records` the way the trust bar and
+    /// the waybar/panel segments used to would silently drop it the moment its
+    /// record was trimmed.
+    #[test]
+    fn a_session_grant_stays_in_authority_after_its_record_is_trimmed_from_records() {
+        use ward_events::{
+            CapabilityKind, CapabilityRequest, DecisionSource, GrantScope, ShortText,
+        };
+
+        let grant = WardEvent::CapabilityDecided {
+            cap: CapabilityRequest {
+                kind: CapabilityKind::FileWrite,
+                target: ShortText::new("Write /work/src/lib.rs"),
+            },
+            decision: Decision::Allow,
+            by: DecisionSource::User,
+            grant: Some(GrantScope::Session),
+        };
+
+        let mut model = Model::new(false);
+        model.apply(wardd(&[grant]).remove(0));
+        assert_eq!(
+            model.authority.grants.len(),
+            1,
+            "granted as soon as it is decided"
+        );
+
+        // Flood the model with enough other records that the grant's own
+        // record — the very first one applied — is dropped by a bulk trim.
+        for i in 0..TRIM_AT {
+            model.apply(wardd(&[edit(&format!("f{i}"))]).remove(0));
+        }
+        assert_eq!(model.records.len(), RECENT_CAPACITY);
+        assert!(
+            !model
+                .records
+                .iter()
+                .any(|r| matches!(r.event, WardEvent::CapabilityDecided { .. })),
+            "the grant's own record has been trimmed out of `records`"
+        );
+
+        // The grant itself is still visible: it was applied to `authority`
+        // incrementally when it arrived, not recomputed from `records`.
+        assert_eq!(
+            model.authority.grants.len(),
+            1,
+            "a session grant must stay visible for the whole session, \
+             independent of whether its record is still in the bounded window"
+        );
+
+        // Rescanning the now-bounded `records` the old way would have lost it
+        // — the exact bug incremental `authority` avoids.
+        assert!(
+            Authority::from_records(&model.records).is_empty(),
+            "characterises the bug: recomputing from the trimmed window alone \
+             would show no grants at all"
+        );
+    }
+
+    /// #138 item 4: a paused (non-following) scroll position is shifted by
+    /// however many rows a bulk trim drops, so the view keeps showing the same
+    /// rows across the trim instead of silently jumping forward in content
+    /// (or, without the shift, only ever saved from an out-of-range index by
+    /// `top`'s clamp).
+    #[test]
+    fn a_paused_scroll_position_keeps_showing_the_same_row_across_a_bulk_trim() {
+        let mut model = Model::new(false);
+        for i in 0..(TRIM_AT - 5) {
+            model.apply(wardd(&[edit(&format!("f{i}"))]).remove(0));
+        }
+        model.scroll_up(0, 5);
+        assert!(!model.follow);
+        let scroll_before = model.scroll;
+        let expected_subject = path(&format!("f{scroll_before}")).to_string();
+        assert_eq!(
+            model.rows()[scroll_before].subject,
+            expected_subject,
+            "sanity: this is the row the paused view is showing"
+        );
+
+        // Push past TRIM_AT so the bulk trim fires while the view is paused.
+        for i in (TRIM_AT - 5)..=TRIM_AT {
+            model.apply(wardd(&[edit(&format!("f{i}"))]).remove(0));
+        }
+        assert_eq!(model.rows().len(), RECENT_CAPACITY);
+        assert!(!model.follow, "a trim never resumes following on its own");
+
+        let dropped = (TRIM_AT + 1) - RECENT_CAPACITY;
+        assert_eq!(
+            model.scroll,
+            scroll_before - dropped,
+            "shifted by exactly what the trim dropped"
+        );
+        assert_eq!(
+            model.rows()[model.scroll].subject,
+            expected_subject,
+            "still the same row, now at its shifted index"
+        );
     /// #145 item 5: a refused stop (`WorkloadsTerminated { pending > 0 }`)
     /// leaves the session held paused and unconfirmed — the bar must say so,
     /// whether the session was running or already paused, and resume must

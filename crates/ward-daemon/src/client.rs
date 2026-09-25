@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use ward_events::{EventKind, EventRecord, WardEvent};
 
-use crate::approvals::{Approval, ApprovalDecision, ApprovalRecord, Grant};
+use crate::approvals::{Approval, ApprovalDecision, ApprovalRecord, Grant, RevokeOutcome};
 use crate::control::{Next, RemoteSink, Request, Response, SOCKET_NAME, is_evidence};
 use crate::describe::SessionDescription;
 use crate::error::{Error, Result};
@@ -332,6 +332,20 @@ pub fn grants(sink: &mut RemoteSink) -> Result<Vec<Grant>> {
 pub fn approve(sink: &mut RemoteSink, id: u64, decision: ApprovalDecision) -> Result<()> {
     match sink.call(&Request::Approve { id, decision })? {
         Response::Ok => Ok(()),
+        Response::Error(e) => Err(Error::Daemon(e)),
+        other => Err(Error::Events(format!("unexpected response {other:?}"))),
+    }
+}
+
+/// Revoke a held grant by id, host-confirmed (`ward session revoke <id>`,
+/// #140, #245): blocks for up to `crate::revoke::ACK_TIMEOUT` while the
+/// daemon waits on the owning proxy, well inside this connection's own read
+/// timeout (`control::TIMEOUT`, 10 s). The returned [`RevokeOutcome`] is the
+/// daemon's own honest answer, not a bare success — the caller must not
+/// collapse it into one (#245's "no UI-only revoke is reported as enforced").
+pub fn revoke(sink: &mut RemoteSink, id: u64) -> Result<RevokeOutcome> {
+    match sink.call(&Request::Revoke { id })? {
+        Response::Revoked(outcome) => Ok(outcome),
         Response::Error(e) => Err(Error::Daemon(e)),
         other => Err(Error::Events(format!("unexpected response {other:?}"))),
     }
@@ -1252,6 +1266,7 @@ mod tests {
     /// [`fake_daemon`], but after streaming a subscription it keeps the
     /// connection open for `hold` (a live session with nothing new to say)
     /// before closing. `Describe` answers [`description`] as JSON.
+    #[allow(clippy::too_many_lines)]
     fn fake_daemon_holding(
         mut chain: Chain,
         log: Vec<EventRecord>,
@@ -1331,16 +1346,26 @@ mod tests {
                     Request::Grants => reply(
                         &mut writer,
                         &Response::Grants(vec![Grant {
+                            id: 1,
                             kind: crate::approvals::GrantKind::Approval,
                             label: "Write /work/a.rs".into(),
                             scope: "write".into(),
                             lifetime: crate::approvals::Lifetime::Session,
                             granted_at_unix_ms: 1,
+                            revoke_state: crate::approvals::RevokeState::Active,
                         }]),
                     ),
                     Request::Approve { id, .. } => reply(
                         &mut writer,
                         &Response::Error(format!("approval {id}: not pending")),
+                    ),
+                    Request::Revoke { id: 1 } => reply(
+                        &mut writer,
+                        &Response::Revoked(crate::approvals::RevokeOutcome::Withdrawn),
+                    ),
+                    Request::Revoke { id } => reply(
+                        &mut writer,
+                        &Response::Error(format!("revoke: grant {id} not found")),
                     ),
                     Request::Evidence { event } => {
                         let response = match refuse {
@@ -1629,6 +1654,12 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].approval.id, 4);
         assert_eq!(records[0].outcome, None);
+        assert_eq!(
+            revoke(&mut sink, held[0].id).unwrap(),
+            crate::approvals::RevokeOutcome::Withdrawn
+        );
+        let err = revoke(&mut sink, 42).unwrap_err();
+        assert_eq!(err.to_string(), "daemon: revoke: grant 42 not found");
         drop(sink);
         let seen = server.join().unwrap();
         assert_eq!(seen[1], Request::Pending);
@@ -1641,6 +1672,8 @@ mod tests {
         );
         assert_eq!(seen[4], Request::Grants);
         assert_eq!(seen[5], Request::Approvals);
+        assert_eq!(seen[6], Request::Revoke { id: 1 });
+        assert_eq!(seen[7], Request::Revoke { id: 42 });
     }
 
     #[test]

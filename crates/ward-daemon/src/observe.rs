@@ -61,7 +61,20 @@ use crate::watch::{Captured, WatchOutcome, Watcher};
 pub const DEFAULT_CAPACITY: usize = 4096;
 
 /// The longest an observation waits in a queue before the drain takes it.
-pub const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+///
+/// Tied to [`crate::sandbox::WAIT_POLL`] rather than a larger interval of its own:
+/// `session::launch`'s live drain only ever runs from the `on_tick` callback
+/// `Launch::run_observed` calls about once per `WAIT_POLL` while the command is
+/// still running (`crate::session`), so an interval longer than that tick cadence
+/// cannot amortise anything — it only adds pure waiting on top of it. A quiet
+/// single-file write measured through the real `Watcher` → drain path this way sits
+/// for roughly one tick, not the ~250 ms a fixed longer interval used to add on top
+/// of it: p99 dropped from ~260 ms to ~20 ms in that measurement (`docs/performance.md`
+/// §"Measured so far"), against the "Observer event propagation" budget of 25 ms
+/// p99 / 8 ms median (§2) that the earlier value made unreachable by construction,
+/// independent of how fast inotify or the queue itself is. [`DRAIN_BATCH`] still
+/// forces an earlier drain under real load; this only bounds the quiet case.
+pub const DRAIN_INTERVAL: Duration = crate::sandbox::WAIT_POLL;
 
 /// The drain also runs early once this many observations are queued, so a burst is
 /// ingested as a batch instead of waiting out [`DRAIN_INTERVAL`] and risking the
@@ -1012,6 +1025,74 @@ mod tests {
         // The second drain continues where the first stopped: no observation is
         // ever handed to the log out of the order its source offered it in.
         assert_eq!(q.drain().items, vec![3, 4, 5]);
+    }
+
+    /// #137/#150: a quiet single write must reach the drain in roughly one
+    /// [`crate::sandbox::WAIT_POLL`] tick, not the ~250 ms a longer fixed
+    /// [`DRAIN_INTERVAL`] used to add on top of it regardless of how fast `inotify`
+    /// or the queue itself were — the mismatch this measures is entirely the
+    /// interval's own wait, so this exercises the real `Watcher` → drain path rather
+    /// than `DrainClock` in isolation.
+    #[test]
+    fn a_quiet_write_is_drained_within_about_one_poll_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let Ok(watcher) = Watcher::start_bounded(dir.path(), false, DEFAULT_CAPACITY) else {
+            // No inotify on this host; nothing to measure.
+            return;
+        };
+        let samples: usize = 30;
+        let mut clock = DrainClock::new();
+        let mut deltas = Vec::with_capacity(samples);
+        for i in 0..samples {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), b"x").unwrap();
+            loop {
+                std::thread::sleep(crate::sandbox::WAIT_POLL);
+                if clock.due(watcher.queued()) {
+                    break;
+                }
+            }
+            let drained = watcher.drain();
+            let now = SystemTime::now();
+            for item in drained.items {
+                let at = match item {
+                    Captured::Modified { at, .. } | Captured::Read { at, .. } => at,
+                };
+                if let Ok(delta) = now.duration_since(at) {
+                    deltas.push(delta);
+                }
+            }
+        }
+        assert!(
+            deltas.len() >= samples,
+            "each of the {samples} writes must be observed at least once — inotify \
+             started but captured nothing, which would otherwise let this test pass \
+             vacuously on an empty sample set: got {} samples",
+            deltas.len()
+        );
+        deltas.sort();
+        let worst = deltas.iter().copied().max().unwrap_or(Duration::ZERO);
+        assert!(
+            worst < Duration::from_millis(150),
+            "a quiet write must not wait anywhere near the old 250ms fixed interval \
+             (budget is 25ms p99, docs/performance.md §2): worst observed {worst:?}"
+        );
+        // Nearest-rank percentile (integer-only, matching ward-bench's
+        // stats::percentile_ms): rank = ceil(pct * n / 100) - 1.
+        let percentile = |pct: usize| -> Duration {
+            if deltas.is_empty() {
+                return Duration::ZERO;
+            }
+            let rank = (pct * deltas.len()).div_ceil(100).saturating_sub(1);
+            deltas[rank.min(deltas.len() - 1)]
+        };
+        eprintln!(
+            "observer drain: p50={:?} p99={:?} worst={:?} ({} samples)",
+            percentile(50),
+            percentile(99),
+            worst,
+            deltas.len()
+        );
+        drop(watcher.finish());
     }
 
     #[test]

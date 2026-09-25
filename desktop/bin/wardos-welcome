@@ -164,6 +164,23 @@ step_project() {
   printf '%s\n' "$dir" >"$project_file"
 }
 
+# step_ready PROJECT AGENT: `ward ready` before starting an agent (#147 item 7 — the
+# preflight the issue asks onboarding to finish with). Checked silently first; a fully
+# ready project never opens a terminal, so the common case has no added friction. Only
+# when `ward ready` itself reports a blocking gap (`ExitCode::FAILURE` — setup required,
+# or readiness could not be established at all) does this show the same report in a
+# terminal and ask whether to start anyway or go fix it first; "Ready with limitations"
+# is `ward ready`'s own non-blocking verdict and is never surfaced here as if it were.
+# Returns failure only when the user chose not to start after seeing a blocking report.
+step_ready() {
+  local project=$1 agent=$2 choice
+  wardos_has ward || return 0
+  ward ready "$project" --agent "$agent" >/dev/null 2>&1 && return 0
+  in_terminal wardos-ready ward ready "$project" --agent "$agent" || true
+  choice=$(ask "$project is not ready yet" "Start anyway" "Fix it first")
+  [[ "$choice" == "Start anyway" ]]
+}
+
 step_agent() {
   local project="" choice
   [[ -f "$project_file" ]] && project=$(head -n1 "$project_file")
@@ -178,6 +195,7 @@ step_agent() {
     "Start Codex") choice=codex ;;
     *) return 0 ;;
   esac
+  step_ready "$project" "$choice" || return 0
   local bar="The trust bar, top of the screen: project, agent state, network, credentials, observer, TamperWard; green is verified, amber restricted, red denied."
   printf '%s\n' "$bar"
   wardos_notify "The trust bar" "$bar"

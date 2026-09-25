@@ -389,15 +389,21 @@ enum SessionCmd {
     },
     /// The temporary authority the session holds (ADR-0019): every
     /// `allow-session` answer and every credential the proxy injects, with its
-    /// scope and lifetime.
+    /// id, scope and lifetime. A credential mid-revoke shows `revoking` until
+    /// the owning proxy acknowledges withdrawal or `ward session revoke`'s
+    /// wait times out; one that timed out unconfirmed shows `revoke
+    /// unconfirmed` and keeps being listed — #245's acceptance bar is that no
+    /// revoke in progress, and no revoke that failed to confirm, is ever
+    /// shown as though it were either done or not happening at all.
     Grants {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
         /// The session id, instead of looking one up.
         #[arg(long)]
         session: Option<String>,
-        /// One JSON object per grant: `{kind, label, scope, lifetime,
-        /// granted_at_unix_ms}`.
+        /// One JSON object per grant: `{id, kind, label, scope, lifetime,
+        /// granted_at_unix_ms, revoke_state}`, `revoke_state` one of
+        /// `active`, `revoking` or `unconfirmed`.
         #[arg(long)]
         json: bool,
     },
@@ -412,6 +418,35 @@ enum SessionCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
         /// The session id, as `ward session pending` lists it.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Withdraw one grant, host-confirmed (#140 items 4-6, #245). An
+    /// `allow-session` answer is forgotten at once, so the same tool on the
+    /// same target asks again — it has no proxy route to wait on. A
+    /// credential grant instead instructs the proxy that injects it to stop
+    /// honoring it, and waits (a couple of seconds at most) for that proxy to
+    /// acknowledge before this command returns; `ward session grants` shows
+    /// it as `revoking` in the meantime. Refused when `id` names no live
+    /// grant.
+    ///
+    /// The proxy's acknowledgement is the honest, three-way answer this
+    /// prints: **revoked** (no new request may use the credential from now
+    /// on); **revoked — N connection(s) already using it are still open**
+    /// (the authority is withdrawn all the same; an already-open connection
+    /// simply cannot be recalled — bytes already sent are already sent); or
+    /// **could not be confirmed** (the proxy did not acknowledge in time —
+    /// its launch may have crashed, or it just has not answered yet — so the
+    /// grant is *not* removed and keeps showing as `revoke unconfirmed`
+    /// rather than being reported as either safely revoked or silently still
+    /// active).
+    Revoke {
+        /// The grant's id, as `ward session grants` lists it.
+        id: u64,
+        /// Project directory (default: current).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The session id, as `ward session grants` lists it.
         #[arg(long)]
         session: Option<String>,
     },
@@ -484,6 +519,24 @@ enum SnapshotCmd {
         #[arg(long)]
         apply: bool,
         /// Emit the plan or report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark a snapshot as explicitly kept (#151 item 4): a user-kept restore
+    /// backup, exempt from `ward snapshot gc` regardless of whether any other
+    /// retention root still points at it. Idempotent.
+    Keep {
+        /// The snapshot.
+        id: String,
+    },
+    /// Undo `keep`. Removing a marker that was never set is not an error.
+    Unkeep {
+        /// The snapshot.
+        id: String,
+    },
+    /// Every snapshot `keep` currently marks (#151 item 4).
+    Kept {
+        /// Emit a JSON array of ids instead of one per line.
         #[arg(long)]
         json: bool,
     },
@@ -584,6 +637,9 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Snapshot(SnapshotCmd::Cat { id, path }) => cmd_snapshot_cat(&id, &path),
         Command::Snapshot(SnapshotCmd::Usage { json }) => cmd_snapshot_usage(json),
         Command::Snapshot(SnapshotCmd::Gc { apply, json }) => cmd_snapshot_gc(apply, json),
+        Command::Snapshot(SnapshotCmd::Keep { id }) => cmd_snapshot_keep(&id),
+        Command::Snapshot(SnapshotCmd::Unkeep { id }) => cmd_snapshot_unkeep(&id),
+        Command::Snapshot(SnapshotCmd::Kept { json }) => cmd_snapshot_kept(json),
         Command::Evidence(EvidenceCmd::Append { dir, json }) => {
             cmd_evidence_append(&dir.unwrap_or_else(cwd), &json)
         }
@@ -646,6 +702,9 @@ fn cmd_session(cmd: SessionCmd) -> ward_daemon::Result<ExitCode> {
             dir,
             session,
         } => cmd_approve(&dir.unwrap_or_else(cwd), session.as_deref(), id, decision),
+        SessionCmd::Revoke { id, dir, session } => {
+            cmd_revoke(&dir.unwrap_or_else(cwd), session.as_deref(), id)
+        }
     }
 }
 
@@ -1260,6 +1319,39 @@ fn cmd_approve(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `ward session revoke <id>` (#140 items 4-6, #245): host-confirmed. The printed result
+/// is exactly the daemon's own three-way answer (see [`SessionCmd::Revoke`]'s doc comment)
+/// and never claims more than that confirms — the acceptance criterion "no UI-only revoke
+/// is reported as enforced" extends to this command's own exit code: `Unconfirmed` fails it,
+/// so a script checking the result learns the credential may still be in effect.
+fn cmd_revoke(dir: &Path, session: Option<&str>, id: u64) -> ward_daemon::Result<ExitCode> {
+    use ward_daemon::approvals::RevokeOutcome;
+    let state = ward_daemon::session::state_root();
+    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
+    let outcome = client::revoke(&mut sink, id)?;
+    match outcome {
+        RevokeOutcome::Withdrawn => {
+            println!("  grant {id} revoked");
+            Ok(ExitCode::SUCCESS)
+        }
+        RevokeOutcome::WithdrawnInFlight(n) => {
+            println!(
+                "  grant {id} revoked — {n} connection{} already using it \
+                 will finish on their own",
+                if n == 1 { "" } else { "s" }
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        RevokeOutcome::Unconfirmed => {
+            println!(
+                "  grant {id} could not be confirmed revoked; it may still be \
+                 in effect — see `ward session grants`"
+            );
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
 fn cmd_describe(dir: &Path, json: bool) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     let session = Session::open_current(dir, &state)?.ok_or_else(|| {
@@ -1369,6 +1461,44 @@ fn cmd_snapshot_gc(apply: bool, json: bool) -> ward_daemon::Result<ExitCode> {
         println!("{}", to_json(&plan)?);
     } else {
         print!("{}", render::gc_plan_panel(&state, &plan));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward snapshot keep <id>` (#151 item 4).
+fn cmd_snapshot_keep(id: &str) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let id = snapshot::parse_id(id)?;
+    retention::mark_kept(&state, id)?;
+    println!("  kept {id}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward snapshot unkeep <id>` (#151 item 4).
+fn cmd_snapshot_unkeep(id: &str) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let id = snapshot::parse_id(id)?;
+    retention::unmark_kept(&state, id)?;
+    println!("  unkept {id}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward snapshot kept [--json]` (#151 item 4).
+fn cmd_snapshot_kept(json: bool) -> ward_daemon::Result<ExitCode> {
+    let state = ward_daemon::session::state_root();
+    let mut ids: Vec<String> = retention::kept_ids(&state)?
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    ids.sort();
+    if json {
+        println!("{}", to_json(&ids)?);
+    } else if ids.is_empty() {
+        println!("  no kept snapshots");
+    } else {
+        for id in &ids {
+            println!("  {id}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -2139,6 +2269,31 @@ mod tests {
     /// #145 item 5: the stop line says how many sandboxed processes the stop
     /// ended, and says nothing extra when nothing was running.
     #[test]
+    fn snapshot_keep_unkeep_and_kept_parse() {
+        // #151 item 4: the explicit user-selected retention policy `gc`'s own
+        // retention roots already read back from (`ward_snapshot::gc::kept_ids`),
+        // but had no command that could ever set.
+        let id = "blake3:".to_owned() + &"ab".repeat(32);
+        let cli = Cli::try_parse_from(["ward", "snapshot", "keep", &id]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Keep { id: got }) if got == id
+        ));
+        let cli = Cli::try_parse_from(["ward", "snapshot", "unkeep", &id]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Unkeep { id: got }) if got == id
+        ));
+        let cli = Cli::try_parse_from(["ward", "snapshot", "kept"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Kept { json: false })
+        ));
+        let cli = Cli::try_parse_from(["ward", "snapshot", "kept", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot(SnapshotCmd::Kept { json: true })
+        ));
     fn stopped_line_counts_the_processes_the_stop_ended() {
         assert_eq!(stopped_line("sess_a", 0), "  session sess_a stopped");
         assert_eq!(

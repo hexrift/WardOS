@@ -72,6 +72,20 @@ outside the GitHub release UI or API.
    transparency evidence are preferred; emergency recovery and policy rotation
    must be documented before they are automated.
 
+**Implementation note (§2, §5):** the pinned identity-policy matching described in
+point 2 above, and the anti-rollback floor described in point 5 and in the
+verification contract's step 5 below, are implemented as pure, offline,
+unit-tested decision logic in [`crates/ward-release-verify`](../../crates/ward-release-verify)
+(issue #148). That crate decides whether already-extracted, already-cryptographically-verified
+claims satisfy this policy, and separately whether a candidate version must be
+refused as a downgrade; it does not retrieve or cryptographically verify a real
+attestation, call Sigstore/cosign/Fulcio/Rekor, make any network/OIDC call, or wire
+either decision into `.github/workflows/release.yml`, `install.sh`, or
+`desktop/bin/wardos-update`. Point 4's manifest format is implemented separately by
+`scripts/release/generate-manifest.sh`. This ADR's own status stays Proposed until
+enough of the verification contract below is real, wired together, and tested
+end-to-end.
+
 ## Verification contract
 
 The verifier must check, in order:

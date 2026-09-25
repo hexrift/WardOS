@@ -23,6 +23,7 @@
 //! bytes until the proxy is resumed. Bytes already handed to a socket are not
 //! recalled; that is the boundary the security model states.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
@@ -205,6 +206,20 @@ struct Shared {
     /// [`Shared::announce`].
     announcing: Mutex<()>,
     paused: AtomicBool,
+    /// Credential ids this proxy has been told to stop honoring (#245), and
+    /// how many connections were already relaying with each at the moment it
+    /// was revoked — decremented as they finish, never recalled (bytes
+    /// already handed to a socket are not, per `docs/security-model.md`).
+    /// One lock over both so a revoke and an in-flight count change can
+    /// never interleave torn.
+    revoked: Mutex<Revocation>,
+}
+
+/// See [`Shared::revoked`].
+#[derive(Default)]
+struct Revocation {
+    ids: HashSet<u64>,
+    in_flight: HashMap<u64, usize>,
 }
 
 impl Shared {
@@ -214,6 +229,39 @@ impl Shared {
 
     fn paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
+    }
+
+    /// Has credential `id` been revoked (#245)? Checked before a gateway
+    /// request's scope, so a revoked credential is refused for the same
+    /// reason it has no scope left at all: there is no authority to check.
+    fn credential_revoked(&self, id: u64) -> bool {
+        self.revoked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ids
+            .contains(&id)
+    }
+
+    /// One more connection is now relaying with credential `id` injected.
+    fn enter_credential(&self, id: u64) {
+        *self
+            .revoked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .in_flight
+            .entry(id)
+            .or_insert(0) += 1;
+    }
+
+    /// That connection's relay ended.
+    fn leave_credential(&self, id: u64) {
+        let mut rev = self.revoked.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(n) = rev.in_flight.get_mut(&id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                rev.in_flight.remove(&id);
+            }
+        }
     }
 
     /// Stop accepting — atomically with respect to announcing a connection.
@@ -292,6 +340,7 @@ impl Proxy {
             shutdown: AtomicBool::new(false),
             announcing: Mutex::new(()),
             paused: AtomicBool::new(false),
+            revoked: Mutex::new(Revocation::default()),
         });
         let (bound, acceptor) = match config.listen {
             Listen::Tcp(addr) => {
@@ -394,6 +443,42 @@ impl Handle {
         self.shared.paused()
     }
 
+    /// Does this proxy hold a gateway route carrying grant `id` (#245)? The
+    /// seam a caller applying a revoke instruction uses to tell whether
+    /// *this* launch's proxy is the one that must act on it — a session's
+    /// other, concurrent launches may hold routes of their own, tagged with
+    /// different ids, and must not be disturbed by this one's revoke.
+    pub fn has_credential_route(&self, id: u64) -> bool {
+        self.shared
+            .gateways
+            .iter()
+            .any(|g| g.credential_id() == Some(id))
+    }
+
+    /// Stop honoring credential `id` for any request not already relaying
+    /// (#245): from this call on, a route carrying it answers `403` instead
+    /// of injecting it. Returns how many connections were already relaying
+    /// with it injected at the instant of revocation — the module doc's
+    /// stated boundary is that bytes already handed to a socket are not
+    /// recalled, so those connections are not stopped, only ever reported
+    /// honestly instead of the revoke being silently treated as though
+    /// nothing was still using the credential. `None` when this proxy holds
+    /// no route for `id` at all, which the caller must not read as "nothing
+    /// to withdraw" for the grant as a whole — only the daemon, which knows
+    /// every launch of the session, can say that.
+    pub fn revoke_credential(&self, id: u64) -> Option<usize> {
+        if !self.has_credential_route(id) {
+            return None;
+        }
+        let mut rev = self
+            .shared
+            .revoked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        rev.ids.insert(id);
+        Some(rev.in_flight.get(&id).copied().unwrap_or(0))
+    }
+
     /// Stop accepting, ask every relay to wind down, join the acceptor when it can
     /// be woken, and (for a Unix listener) unlink the socket file. Idempotent.
     ///
@@ -478,6 +563,26 @@ impl Slot {
 impl Drop for Slot {
     fn drop(&mut self) {
         self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Leaves a gateway route's in-flight count decremented when dropped (#245):
+/// the same shape as [`Slot`], but keyed by credential id rather than by
+/// connection, and held only across a gateway exchange whose route carries
+/// one. What [`Shared::credential_revoked`] and [`Handle::revoke_credential`]
+/// account against.
+struct CredentialSlot(Arc<Shared>, u64);
+
+impl CredentialSlot {
+    fn acquire(shared: &Arc<Shared>, id: u64) -> Self {
+        shared.enter_credential(id);
+        Self(Arc::clone(shared), id)
+    }
+}
+
+impl Drop for CredentialSlot {
+    fn drop(&mut self) {
+        self.0.leave_credential(self.1);
     }
 }
 
@@ -639,6 +744,36 @@ fn accept_loop<L: Acceptor>(listener: &L, shared: &Arc<Shared>) {
     }
 }
 
+/// Why a gateway request must be refused before it is resolved, connected to
+/// or has its credential read — the observer's reason, and the body text —
+/// or `None` when it may proceed: a revoked credential (#245) is checked
+/// first, since there is no authority left for anything to be in or out of
+/// scope of; a request outside the route's scope is checked next, exactly as
+/// it always was.
+fn gateway_refusal(
+    route: &GatewayRoute,
+    req: &Request,
+    shared: &Shared,
+) -> Option<(String, &'static str)> {
+    if let Some(id) = route.credential_id()
+        && shared.credential_revoked(id)
+    {
+        return Some((
+            format!("gateway {}: credential revoked", route.prefix()),
+            "credential revoked",
+        ));
+    }
+    if let Method::Forward { verb, path } = &req.method
+        && let Err(denial) = route.permits(verb, path)
+    {
+        return Some((
+            format!("gateway {}: {denial}", route.prefix()),
+            "request outside credential scope",
+        ));
+    }
+    None
+}
+
 /// Serve exactly one request on `client`.
 ///
 /// `pending` is this connection's outstanding verdict: every return below either
@@ -676,20 +811,14 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>, mut pending: Pending) {
         None => Framing::None,
     };
     let req = &gateway.map_or_else(|| parsed.request.clone(), |g| g.request(&parsed));
-    // The route's credential scope is checked before anything is resolved or
-    // connected: a refused request never reaches the upstream and the secret
-    // is never read for it.
-    if let (Some(route), Method::Forward { verb, path }) = (gateway, &req.method)
-        && let Err(denial) = route.permits(verb, path)
+    // A revoked credential (#245) or one outside its route's scope: neither
+    // is resolved, connected to or ever gets its secret read. Checked before
+    // anything else so a refused request never reaches the upstream.
+    if let Some(route) = gateway
+        && let Some((reason, body)) = gateway_refusal(route, req, shared)
     {
-        let reason = format!("gateway {}: {denial}", route.prefix());
         pending.report(req, Decision::Deny, &reason);
-        return respond(
-            &mut client,
-            403,
-            "Forbidden",
-            "request outside credential scope",
-        );
+        return respond(&mut client, 403, "Forbidden", body);
     }
     let resolver = shared.resolver.as_ref();
     let pinned = match gateway.map_or_else(
@@ -726,7 +855,15 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>, mut pending: Pending) {
     };
     let _ = upstream.set_nodelay(true);
     if let Some(route) = gateway {
-        return serve_gateway(
+        // Held across the whole exchange, however long it relays for (an SSE
+        // stream can run for minutes): what a revoke landing mid-exchange
+        // reports as still in flight (#245) is this, not `active_connections`,
+        // which tracks a connection regardless of whether it ever carried a
+        // credential at all.
+        let _credential = route
+            .credential_id()
+            .map(|id| CredentialSlot::acquire(shared, id));
+        serve_gateway(
             client,
             upstream,
             route,
@@ -735,6 +872,7 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>, mut pending: Pending) {
             &head.remainder,
             shared,
         );
+        return;
     }
     let prelude = match &req.method {
         Method::Connect => {
@@ -779,9 +917,19 @@ fn serve_gateway<C: Conn>(
             "upstream TLS handshake failed",
         );
     };
-    // The last check before the credential leaves the host.
+    // The last check before the credential leaves the host. A revoke that
+    // landed while DNS resolution/TCP connect/TLS handshake were still in
+    // flight — a window `CredentialSlot::acquire` (taken only after the TCP
+    // connect succeeds, in `serve`) does not yet cover — must still stop the
+    // credential from being injected, exactly as `gateway_refusal`'s earlier
+    // check does for a revoke that lands before any of that starts.
     if shared.paused() {
         return refuse_paused(&mut client);
+    }
+    if let Some(id) = route.credential_id()
+        && shared.credential_revoked(id)
+    {
+        return respond(&mut client, 403, "Forbidden", "credential revoked");
     }
     let head = match route.rewrite_head(parsed, framing) {
         Ok(head) => head,
