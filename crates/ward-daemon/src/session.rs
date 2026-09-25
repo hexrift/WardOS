@@ -3318,7 +3318,8 @@ mod tests {
 
         let err = client
             .launch(&["true".to_owned()], &opts)
-            .unwrap_err()
+            .err()
+            .expect("launch must be refused after stop")
             .to_string();
         assert!(
             err.contains(pause::STOPPED_REFUSAL) || err.contains("terminal record"),
