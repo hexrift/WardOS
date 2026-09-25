@@ -1529,13 +1529,23 @@ impl Session {
                 "ward stop: pre-termination fork barrier not confirmed",
             )
             .err();
+            let logged = self
+                .emit(
+                    Origin::Wardd,
+                    WardEvent::WorkloadsTerminated {
+                        ended,
+                        pending,
+                        barrier_confirmed: false,
+                    },
+                )
+                .err();
             return Err(Error::Daemon(pause::stop_refusal(
                 &self.session_str,
                 ended,
                 pending,
                 "the pre-termination fork barrier was not confirmed, so Ward cannot prove the                  session is quiescent even though no known pid remains. The stop marker remains                  in force; run `ward stop` again to re-scan and retry",
                 marker.as_ref(),
-                None,
+                logged.as_ref(),
             )));
         }
         if pending == 0 {
@@ -1547,7 +1557,11 @@ impl Session {
             }
             self.emit(
                 Origin::Wardd,
-                WardEvent::WorkloadsTerminated { ended, pending },
+                WardEvent::WorkloadsTerminated {
+                    ended,
+                    pending,
+                    barrier_confirmed: true,
+                },
             )?;
             return Ok(ended);
         }
@@ -1560,7 +1574,11 @@ impl Session {
         let logged = self
             .emit(
                 Origin::Wardd,
-                WardEvent::WorkloadsTerminated { ended, pending },
+                WardEvent::WorkloadsTerminated {
+                    ended,
+                    pending,
+                    barrier_confirmed: true,
+                },
             )
             .err();
         Err(Error::Daemon(pause::stop_refusal(
