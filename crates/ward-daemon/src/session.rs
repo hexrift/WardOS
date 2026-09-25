@@ -3256,6 +3256,91 @@ mod tests {
         );
     }
 
+    /// Daemonless replay keeps the same durable incomplete-stop evidence as
+    /// the daemon path: a failed membership barrier with zero known pending PIDs
+    /// is still STOP?, and a confirmed zero-process retry explicitly clears it.
+    #[test]
+    fn a_daemonless_barrier_only_incomplete_stop_is_recorded_until_retry() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        let log = session.log_path();
+
+        let err = session
+            .record_termination(&pause::Termination {
+                ended: 2,
+                remaining: Some(pause::Frozen {
+                    method: ward_events::PauseMethod::Sigstop,
+                    pids: Vec::new(),
+                    cgroup: None,
+                }),
+                barrier_confirmed: false,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fork barrier was not confirmed"), "{err}");
+        assert!(session.paused());
+
+        let records: Vec<_> = ward_events::LogReader::open(&log)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .collect();
+        assert!(matches!(
+            records.last().map(|r| &r.event),
+            Some(WardEvent::WorkloadsTerminated {
+                ended: 2,
+                pending: 0,
+                barrier_confirmed: false
+            })
+        ));
+
+        assert_eq!(session.stop(EndReason::UserStop).unwrap(), 0);
+        let records: Vec<_> = ward_events::LogReader::open(&log)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .collect();
+        let terminated: Vec<_> = records
+            .iter()
+            .filter_map(|r| match r.event {
+                WardEvent::WorkloadsTerminated {
+                    ended,
+                    pending,
+                    barrier_confirmed,
+                } => Some((ended, pending, barrier_confirmed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminated, [(2, 0, false), (0, 0, true)]);
+        assert!(matches!(
+            records.last().map(|r| &r.event),
+            Some(WardEvent::SessionEnded { .. })
+        ));
+    }
+
+    /// The daemonless stop path uses the same fail-closed lifecycle lock as
+    /// the daemon. Making the lock path a directory forces acquisition to fail;
+    /// the live sandbox must remain untouched and nothing may be sealed.
+    #[test]
+    fn a_daemonless_stop_does_nothing_when_the_lifecycle_lock_cannot_be_acquired() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        let log = session.log_path();
+        let session_id = session.id().to_owned();
+        let lock_path = session_dir(state.path(), &session_id).join(".pause-freeze.lock");
+        std::fs::create_dir(&lock_path).unwrap();
+        let mut sandbox = pause::FakeSandbox::spawn_for(&session_id);
+
+        let err = session.stop(EndReason::UserStop).unwrap_err().to_string();
+        assert!(err.contains("lifecycle lock"), "{err}");
+        assert!(!sandbox.was_killed(), "termination must not run unlocked");
+        assert!(!pause::stop_marker_path(state.path(), &session_id).exists());
+        assert!(
+            !kinds_in(&log).iter().any(|k| k == "SessionEnded"),
+            "the log must remain unsealed"
+        );
+    }
+
     /// `ward stop --restore-entry` without a daemon: the workloads are ended
     /// *before* the restore (so nothing can write over the restored worktree
     /// afterwards), then the stop seals.
