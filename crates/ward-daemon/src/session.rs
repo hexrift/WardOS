@@ -3277,7 +3277,8 @@ mod tests {
 
         let daemon_state = state.path().to_path_buf();
         let daemon_session = session_id.clone();
-        let daemon = std::thread::spawn(move || crate::daemon::serve(&daemon_state, &daemon_session));
+        let daemon =
+            std::thread::spawn(move || crate::daemon::serve(&daemon_state, &daemon_session));
         assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
             crate::daemon::serving(state.path(), &session_id)
         }));
