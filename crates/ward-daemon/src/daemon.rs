@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ward_events::{EventRecord, LogReader, Origin, ShortText, WardEvent};
+use ward_events::{EventRecord, LogReader, Origin, Pid, ShortText, WardEvent};
 
 use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
@@ -485,7 +485,7 @@ struct Served {
     /// neither confirmed running nor confirmed safe (#140, PR #197 review
     /// round 3). #140 stays open for a host-owned teardown capability that
     /// could make EOF trustworthy enough to retire the grant outright.
-    open_launches: Vec<(u64, u64)>,
+    open_launches: Vec<(u64, u64, Pid)>,
     /// The agent state the log last recorded (`AgentStateChanged`), so a stop
     /// records `Finished` itself — once, and only after termination is
     /// confirmed (PR #253 review finding 5) — unless a client that predates
@@ -642,25 +642,25 @@ impl Served {
                 self.open_launches
                     .iter()
                     .rev()
-                    .find(|(c, _)| *c == conn)
-                    .map(|(_, key)| *key),
+                    .find(|(c, _, _)| *c == conn)
+                    .map(|(_, key, _)| *key),
             )),
             _ => None,
         };
-        let launch_started = matches!(
-            &other,
+        let launch_started = match &other {
             Request::Append {
-                event: WardEvent::CommandStarted { .. },
+                event: WardEvent::CommandStarted { pid, .. },
                 ..
-            }
-        );
-        let launch_finished = matches!(
-            &other,
+            } => Some(*pid),
+            _ => None,
+        };
+        let launch_finished = match &other {
             Request::Append {
-                event: WardEvent::CommandFinished { .. } | WardEvent::LaunchAborted { .. },
+                event: WardEvent::CommandFinished { pid, .. } | WardEvent::LaunchAborted { pid, .. },
                 ..
-            }
-        );
+            } => Some(*pid),
+            _ => None,
+        };
         let agent_state = match &other {
             Request::Append {
                 event: WardEvent::AgentStateChanged { state },
@@ -689,18 +689,18 @@ impl Served {
                     control::unix_ms(SystemTime::now()),
                 );
             }
-            if launch_started {
-                // The record's own sequence number is unique and monotonic by
-                // construction (the log assigns it), unlike the client-chosen
-                // `Pid` inside the event: pairing it with `conn` is what makes
-                // this launch's key collision-free even when two connections
-                // pick the same `Pid` (PR #197 review, finding 2).
-                self.open_launches.push((conn, record.seq));
+            if let Some(pid) = launch_started {
+                // Keep the logical pid so a confirmed stop can terminalize any
+                // still-open launch before sealing the log.
+                self.open_launches.push((conn, record.seq, pid));
             }
-            if launch_finished
-                && let Some(pos) = self.open_launches.iter().rposition(|(c, _)| *c == conn)
+            if let Some(pid) = launch_finished
+                && let Some(pos) = self
+                    .open_launches
+                    .iter()
+                    .rposition(|(c, _, p)| *c == conn && *p == pid)
             {
-                let (_, key) = self.open_launches.remove(pos);
+                let (_, key, _) = self.open_launches.remove(pos);
                 // The route this launch's credentials were scoped to is torn
                 // down with it: they are no longer active authority, whether
                 // the launch ran to completion, failed, was killed over
@@ -745,9 +745,38 @@ impl Served {
     /// closing). Closes out every one of `conn`'s open launches, not just
     /// one, since nothing about the protocol forbids a connection starting
     /// more than one launch before closing.
+    /// Terminalize every launch still open when Stop has confirmed that the
+    /// session's workloads are gone. This runs before SessionEnded/seal, so the
+    /// log never closes with an unmatched CommandStarted and launch-scoped
+    /// credentials retire through the same per-connection path as a client
+    /// supplied terminal record.
+    fn abort_open_launches_for_stop(&mut self) -> Result<()> {
+        let launches = self.open_launches.clone();
+        for (conn, _, pid) in launches {
+            let request = Request::Append {
+                origin: Origin::Wardd,
+                event: WardEvent::LaunchAborted {
+                    pid,
+                    reason: ShortText::new("terminated by ward stop"),
+                },
+                at_unix_ms: control::unix_ms(SystemTime::now()),
+            };
+            match self.handle_conn(conn, request).0 {
+                Response::Record(_) => {}
+                Response::Error(e) => return Err(Error::Daemon(e)),
+                other => {
+                    return Err(Error::Daemon(format!(
+                        "unexpected response while terminalizing launch {pid}: {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn disconnect_open_launches(&mut self, conn: u64) {
         let mut keys = Vec::new();
-        self.open_launches.retain(|&(c, key)| {
+        self.open_launches.retain(|&(c, key, _)| {
             if c == conn {
                 keys.push(key);
                 false
@@ -1072,7 +1101,11 @@ impl Served {
         pause::write_stop_marker(&self.state, &self.session)?;
         if let Some(paused) = self.paused.take() {
             let (frozen, stable) = restabilize(&self.session, paused.frozen);
-            let unsettled = pause::unsettled_count(&frozen, stable);
+            let unsettled = if stable {
+                None
+            } else {
+                Some(pause::unsettled_count(&frozen, false).unwrap_or(0))
+            };
             // The pause's marker normally stands already; a hold must not
             // depend on that.
             let marker = if pause::marker_path(&self.state, &self.session).exists() {
@@ -1099,7 +1132,11 @@ impl Served {
             return Err(e);
         }
         self.approvals.set_paused(true);
-        let unsettled = pause::unsettled_count(&frozen, stable);
+        let unsettled = if stable {
+            None
+        } else {
+            Some(pause::unsettled_count(&frozen, false).unwrap_or(0))
+        };
         let method = frozen.method;
         self.paused = Some(Paused {
             frozen,
@@ -1170,6 +1207,15 @@ impl Served {
             Ok(n) => n,
             Err(e) => return (Response::Error(refusal(e)), false),
         };
+        if let Err(e) = self.abort_open_launches_for_stop() {
+            return (
+                Response::Error(format!(
+                    "stop ended every sandboxed process of session {} ({ended}), but an open                      launch could not be terminalized ({e}); the log is not sealed. Run `ward stop` again",
+                    self.session
+                )),
+                false,
+            );
+        }
         if self.last_agent_state != Some(ward_events::AgentState::Finished)
             && let Err(e) = self.append(WardEvent::AgentStateChanged {
                 state: ward_events::AgentState::Finished,
@@ -1207,9 +1253,16 @@ impl Served {
         // #234: the lock `pause`/`resume`/`CaptureFreeze` take, and — PR #253
         // review finding 2 — the one `pause::admit_launch` takes around every
         // sandbox spawn, held from the stop marker through the scan, the kill
-        // and the confirmation. Best effort: a lock that cannot be taken is one
-        // no launch can take either, so none can be admitted meanwhile.
-        let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session)).ok();
+        // and the confirmation. Failure is fail-closed: without this lock Ward
+        // cannot prove another already-admitted launch will not spawn after the scan.
+        let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session)).map_err(
+            |e| {
+                Error::Daemon(format!(
+                    "stop could not take the lifecycle lock for session {} ({e}); nothing was                      terminated and the log is not sealed",
+                    self.session
+                ))
+            },
+        )?;
         pause::write_stop_marker(&self.state, &self.session).map_err(|e| {
             Error::Daemon(format!(
                 "stop could not record that session {} is stopping ({e}), so it could not \
@@ -1222,6 +1275,7 @@ impl Served {
         let outcome = terminate(&self.session, held.map(|p| p.frozen));
         let ended = outcome.ended;
         let pending = outcome.pending();
+        let barrier_confirmed = outcome.barrier_confirmed;
         let Some(remaining) = outcome.remaining else {
             // Everything the stop found is gone: nothing is left for the marker
             // to hold back. (Idempotent when there never was a marker.)
@@ -1253,16 +1307,28 @@ impl Served {
             since: since.unwrap_or_else(Instant::now),
             hold: Hold::Stop,
         });
-        let logged = self
-            .append(WardEvent::WorkloadsTerminated { ended, pending })
-            .err();
+        // A zero-pending result with an unconfirmed membership barrier is not a
+        // confirmed STOP. Keep the log unsealed and avoid emitting the event
+        // whose pending=0 rendering would claim otherwise.
+        let logged = if barrier_confirmed {
+            self.append(WardEvent::WorkloadsTerminated { ended, pending }).err()
+        } else {
+            None
+        };
+        let detail = if barrier_confirmed {
+            "the stop is incomplete and the session is held for it (proxy closed, \
+             approvals held, no new launch admitted; `ward resume` cannot release it). \
+             Run `ward stop` again to retry"
+        } else {
+            "the pre-termination fork barrier was not confirmed, so Ward cannot prove the \
+             session is quiescent even though no known pid remains. The session is held \
+             for the stop; `ward resume` cannot release it. Run `ward stop` again to retry"
+        };
         Err(Error::Daemon(pause::stop_refusal(
             &self.session,
             ended,
             pending,
-            "the stop is incomplete and the session is held for it (proxy closed, \
-             approvals held, no new launch admitted; `ward resume` cannot release it). \
-             Run `ward stop` again to retry",
+            detail,
             marker.as_ref(),
             logged.as_ref(),
         )))
