@@ -190,13 +190,17 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > the pause's freeze), confirms the freeze stable before anything is killed (the fork
 > barrier: every held process stopped and a rescan — by `bwrap` tree and by the
 > sandbox's pid namespace — finding nothing new), kills every process, watches until
-> each is confirmed gone (bounded by `pause::STOP_SETTLE`), appends `WorkloadsTerminated
-> { ended, pending: 0 }` when there was anything to end, and only then records the agent
-> `Finished`, closes the approvals, appends `SessionEnded` and seals; the worktree is
-> kept. When termination cannot be confirmed, the stop is refused rather than reported
-> done: the log is not sealed, no `Finished` is recorded, the session is held for the
-> stop over what is left (marker, held approvals), `WorkloadsTerminated { pending > 0 }`
-> records it, and `ward stop` retries; `ward resume` refuses an incomplete stop. `seal`
+> each is confirmed gone (bounded by `pause::STOP_SETTLE`), appends
+> `WorkloadsTerminated { ended, pending: 0, barrier_confirmed: true }` (including a
+> zero-ended retry that closes a previously incomplete stop), and only then records the
+> agent `Finished`, closes the approvals, appends `SessionEnded` and seals; the
+> worktree is kept. When termination cannot be confirmed, the stop is refused rather
+> than reported done: the log is not sealed, no `Finished` is recorded, the session is
+> held for the stop (marker, held approvals), and `WorkloadsTerminated` durably records
+> either known survivors (`pending > 0`) or an unconfirmed pre-kill membership barrier
+> (`barrier_confirmed: false`, even with `pending: 0`). Replay and the desktop therefore
+> keep showing `STOP?` across a daemon restart until a later `ward stop` records a
+> confirmed retry; `ward resume` refuses an incomplete stop. `seal`
 > stays the separate, log-only closure: it never touches a running sandbox. A client
 > sends `Stop` only to a daemon whose `Request::Capabilities` names confirmed stop, and
 > requires the answer to acknowledge it; an older daemon is refused with nothing sent.
