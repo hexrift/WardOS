@@ -1063,15 +1063,16 @@ pub enum WardEvent {
     /// was something to terminate — a stop with no sandbox running writes only the
     /// usual `SessionEnded`, as before.
     ///
-    /// `pending == 0` is the confirmed outcome: every process the stop found is
-    /// gone, and `SessionEnded` follows immediately. `pending > 0` means the daemon
-    /// could not confirm that many processes ended within the bound (a process
-    /// stuck in uninterruptible sleep, typically). The stop is then *refused*
-    /// rather than reported as done: the log is **not** sealed, the session is held
-    /// paused (marker written, so the proxy refuses; approvals held) as the safest
-    /// state it can preserve, and a later `ward stop` retries. A reader must never
-    /// treat a `pending > 0` record as a completed stop (#145 item 4, "do not
-    /// report a full success after a partial operation").
+    /// A stop is confirmed only when `pending == 0 && barrier_confirmed`: every
+    /// process the stop found is gone *and* Ward proved the membership/fork barrier
+    /// stable before killing. `pending > 0` means the daemon could not confirm
+    /// that many processes ended within the bound (a process stuck in uninterruptible
+    /// sleep, typically). `barrier_confirmed == false` means the known PIDs may all
+    /// be gone but Ward could not prove that no process escaped the pre-kill set.
+    /// Either case is an incomplete stop: the log is **not** sealed, the session is
+    /// held for the stop as the safest state it can preserve, and a later `ward stop`
+    /// retries. A reader must never treat either incomplete shape as a completed stop
+    /// (#145 item 4, "do not report a full success after a partial operation").
     ///
     /// This is the explicit difference between stopping and log-only closure
     /// (#145 item 5): `Request::Seal` still seals without touching a running
@@ -1086,6 +1087,12 @@ pub enum WardEvent {
         /// the pid list itself, for the same reason `SessionPauseUnsettled` keeps
         /// only a count.
         pending: u32,
+        /// Whether the pre-termination membership/fork barrier was confirmed
+        /// stable before any process was killed. A false value is an incomplete
+        /// stop even when `pending == 0`: Ward cannot prove that the known PID
+        /// set was closed, so the log must remain unsealed and the session stays
+        /// held for a retry.
+        barrier_confirmed: bool,
     },
 }
 
