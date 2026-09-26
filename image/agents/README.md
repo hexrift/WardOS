@@ -40,8 +40,12 @@ git add image/agents && git commit                    # both files, one commit
 ```
 
 Open the pull request; the image build (`image.yml`, "What the image holds") is the
-proof: it installs from the new lockfile and runs `claude --version`, `codex --version`
-and `tamperward --help` from `/usr/bin`. `npm view <pkg> engines` says which Node the
+proof: it installs from the new lockfile, runs `claude --version`, `codex --version`
+and `tamperward --help` from `/usr/bin`, then executes `smoke-tamperward.sh` against
+the installed package. The smoke creates a throwaway Git repository, exercises the exact
+`tamperward init --cwd` contract used by WardOS, proves a clean worktree check, and
+requires the documented `run` envelope to remain present. `npm view <pkg> engines`
+says which Node the
 package needs; the build fails when the image's Node is older than 22, the current
 floor (Claude Code's), and `ward doctor`'s `node` row checks the same floor on a host.
 Never `npm update` here (it would loosen nothing, but it re-resolves everything), and
