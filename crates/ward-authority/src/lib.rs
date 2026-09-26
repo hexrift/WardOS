@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod revocation;
+
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroU64;
 
