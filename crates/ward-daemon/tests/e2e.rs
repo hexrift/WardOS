@@ -484,7 +484,10 @@ def req():
     s.sendall(head.encode())
     return s.recv(200).split(b'\r\n')[0].decode()
 
-open('first.txt', 'w').write(req())
+first_status = req()
+with open('first.tmp', 'w') as first_file:
+    first_file.write(first_status)
+os.replace('first.tmp', 'first.txt')
 deadline = time.time() + 10
 while not os.path.exists('go.txt') and time.time() < deadline:
     time.sleep(0.05)
@@ -509,11 +512,10 @@ open('second.txt', 'w').write(req())
         daemon::wait_until(std::time::Duration::from_secs(10), || first.exists()),
         "the first request must complete before the host can revoke anything"
     );
+    let first_status = fs::read_to_string(&first).unwrap();
     assert!(
-        fs::read_to_string(&first)
-            .unwrap()
-            .starts_with("HTTP/1.1 200"),
-        "the credential is still honored before any revoke"
+        first_status.starts_with("HTTP/1.1 200"),
+        "the credential is still honored before any revoke: {first_status:?}"
     );
 
     // The daemon's own side of `ward session revoke <id>`, over a second,
