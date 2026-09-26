@@ -22,6 +22,7 @@ pub const WARD_NODE_PROTOCOL: SupportedProtocolRange = SupportedProtocolRange::v
 
 /// One negotiated node protocol version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProtocolVersion {
     major: u16,
     minor: u16,
@@ -121,6 +122,7 @@ impl Display for SupportedProtocolRangeError {
 impl std::error::Error for SupportedProtocolRangeError {}
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SupportedProtocolRangeWire {
     major: u16,
     min_minor: u16,
@@ -139,7 +141,7 @@ impl<'de> Deserialize<'de> for SupportedProtocolRange {
 
 /// The first message a node protocol client sends on a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "request", rename_all = "snake_case")]
+#[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HandshakeRequest {
     /// Advertise the protocol range the client can speak.
     Hello {
@@ -160,7 +162,7 @@ pub enum ProtocolRejectionReason {
 
 /// The node's response to a protocol handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "response", rename_all = "snake_case")]
+#[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HandshakeResponse {
     /// Both peers support the selected protocol version.
     Accepted {
@@ -334,6 +336,30 @@ mod tests {
             serde_json::to_string(&rejected).unwrap(),
             r#"{"response":"rejected","reason":"major_version_mismatch","supported":{"major":1,"min_minor":0,"max_minor":1}}"#
         );
+    }
+
+    #[test]
+    fn handshake_wire_rejects_unknown_fields() {
+        for raw in [
+            r#"{"request":"hello","protocol":{"major":1,"min_minor":0,"max_minor":1},"extra":true}"#,
+            r#"{"request":"hello","protocol":{"major":1,"min_minor":0,"max_minor":1,"extra":true}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<HandshakeRequest>(raw).is_err(),
+                "{raw} must fail closed"
+            );
+        }
+
+        for raw in [
+            r#"{"response":"accepted","protocol":{"major":1,"minor":0},"extra":true}"#,
+            r#"{"response":"accepted","protocol":{"major":1,"minor":0,"extra":true}}"#,
+            r#"{"response":"rejected","reason":"major_version_mismatch","supported":{"major":1,"min_minor":0,"max_minor":0},"extra":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<HandshakeResponse>(raw).is_err(),
+                "{raw} must fail closed"
+            );
+        }
     }
 
     #[test]
