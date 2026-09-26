@@ -21,13 +21,8 @@ fn ticks_to_duration(ticks: u64, ticks_per_second: u64) -> Option<Duration> {
 
     let whole_seconds = ticks / ticks_per_second;
     let remainder = ticks % ticks_per_second;
-    let nanos = u128::from(remainder)
-        .saturating_mul(1_000_000_000)
-        / u128::from(ticks_per_second);
-    Some(
-        Duration::from_secs(whole_seconds)
-            + Duration::from_nanos(u64::try_from(nanos).ok()?),
-    )
+    let nanos = u128::from(remainder).saturating_mul(1_000_000_000) / u128::from(ticks_per_second);
+    Some(Duration::from_secs(whole_seconds) + Duration::from_nanos(u64::try_from(nanos).ok()?))
 }
 
 #[cfg(target_os = "linux")]
@@ -194,10 +189,7 @@ mod tests {
 
     #[test]
     fn tick_conversion_uses_the_reported_runtime_rate() {
-        assert_eq!(
-            ticks_to_duration(250, 250),
-            Some(Duration::from_secs(1))
-        );
+        assert_eq!(ticks_to_duration(250, 250), Some(Duration::from_secs(1)));
         assert_eq!(
             ticks_to_duration(125, 250),
             Some(Duration::from_millis(500))
