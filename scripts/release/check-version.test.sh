@@ -38,6 +38,14 @@ ct_rc="$(cargo_toml 1.2.3-rc.1)"
 expect_status 0 "prerelease tag accepted" bash "$sut" v1.2.3-rc.1 "$ct_rc"
 ct_meta="$(cargo_toml 1.2.3+meta)"
 expect_status 0 "build-metadata tag accepted" bash "$sut" v1.2.3+meta "$ct_meta"
+ct_numeric_meta="$(cargo_toml 1.2.3+001)"
+expect_status 0 "numeric build metadata accepted" bash "$sut" v1.2.3+001 "$ct_numeric_meta"
+
+for invalid_version in   01.2.3   1.02.3   1.2.03   1.2.3-01   1.2.3-alpha..1   1.2.3+meta..build
+do
+  invalid_ct="$(cargo_toml "$invalid_version")"
+  expect_status 1 "invalid SemVer rejected: $invalid_version"     bash "$sut" "v$invalid_version" "$invalid_ct"
+done
 
 # Grammar gate: shell-metacharacter-bearing dispatch values never execute and
 # are rejected before the version comparison. The canary file must not appear.
