@@ -2372,6 +2372,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ward-authority"
+version = "0.18.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "ward-events",
+]
+
+[[package]]
 name = "ward-bench"
 version = "0.18.1"
 dependencies = [
