@@ -464,6 +464,42 @@ ulid_id!(
     "proj_"
 );
 
+ulid_id!(
+    /// Human or service principal identifier.
+    PrincipalId,
+    "prn_"
+);
+
+ulid_id!(
+    /// Agent principal identifier, separate from model/provider metadata.
+    AgentId,
+    "agent_"
+);
+
+ulid_id!(
+    /// Fleet task identifier.
+    TaskId,
+    "task_"
+);
+
+ulid_id!(
+    /// Delegation edge identifier.
+    DelegationId,
+    "deleg_"
+);
+
+ulid_id!(
+    /// Expiring authority lease identifier.
+    LeaseId,
+    "lease_"
+);
+
+ulid_id!(
+    /// One execution attempt of a task.
+    ExecutionAttemptId,
+    "exec_"
+);
+
 // ---------------------------------------------------------------------------------------
 // Pid
 // ---------------------------------------------------------------------------------------
