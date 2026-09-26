@@ -2439,6 +2439,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ward-node"
+version = "0.18.1"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "ward-node-protocol",
+]
+
+[[package]]
 name = "ward-node-protocol"
 version = "0.18.1"
 dependencies = [
