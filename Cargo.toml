@@ -9,6 +9,7 @@ members = [
     "crates/ward-agent",
     "crates/ward-daemon",
     "crates/ward-release-verify",
+    "crates/ward-bench",
     "crates/ward-cli",
     "crates/ward-shell-core",
     "desktop/shell",

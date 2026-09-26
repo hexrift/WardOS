@@ -1,0 +1,5 @@
+# WardOS capability policy for the ward-bench CI-subset fixture (#150).
+# Deliberately minimal and offline: the harness times sandbox start, `ward
+# status` and verifier spawn, not network/proxy setup.
+network: offline
+containers: none

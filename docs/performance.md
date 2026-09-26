@@ -70,34 +70,70 @@ runs: 20 (3 warm-up discarded)
 tool: ward-bench 0.1.0
 ```
 
-## 5. Tooling (planned, not yet implemented — #150)
+## 5. Tooling
 
-**Status: none of this exists in the workspace or CI today.** There is no `ward-bench`
-crate, no `benchmarks/` directory, no `ward benchmark` subcommand, and no CI job that
-measures or gates on any of the budgets in §2. `ward status` and the reproducibility
-record in §4 are real; a runnable, repeatable suite tying the two together is not.
+**Status, as of #150: the CI-measurable subset is real; the hardware/compositor subset
+is still planned.** `ward benchmark` (crate `ward-bench`, fixtures under `benchmarks/`)
+runs today, against pinned fixtures, and emits versioned JSON plus the human report
+below. It does **not** exist as a `ward-bench` binary of its own — it is a `ward-cli`
+subcommand backed by the `ward-bench` library crate, since that turned out to be the
+shape that needed no daemon and no second binary to install. What it measures, in
+process, with no daemon and no `ward` CLI subprocess in the timed path itself:
 
-The design intent, once built: `ward benchmark` (crate `ward-bench`, `benchmarks/`) would
-run the suite and emit JSON plus a human table shaped roughly like this illustrative
-mockup — **not measured output, not a shipped format**:
+* **`sandbox_start`** — `Session::run(["/bin/true"])`, the exact code path `ward run --
+  true` takes (bubblewrap spawn, proxy/hook sockets, the inotify watch), against the
+  budget "Agent sandbox warm start" (§2).
+* **`ward_status`** — `SessionMeta::current` plus `render::status_panel`, against
+  "`ward status`" (§2). No bubblewrap needed; always measurable.
+* **`verifier_spawn`** — `Session::verify()` with a no-op (`true`) verify command over a
+  tiny fixture: candidate capture, materialisation and sandbox spawn, without a real
+  build/test run. A proxy for "Verification startup" (§2), not an isolated PID1-exec
+  timestamp.
+* **`snapshot_digest_{cold,warm}`** and **`snapshot_capture_{cold,warm}`** —
+  `ward_snapshot::digest_worktree`/`SnapshotStore::capture` over a pinned ~220-file
+  fixture (`benchmarks/fixtures/snapshot-digest/`), cold (first run) and warm (median of
+  N after discarded warm-ups), mirroring the cold/warm split `docs/experiments.md`'s E-02
+  uses. Always measurable; no sandbox involved.
+
+`sandbox_start` and `verifier_spawn` need a working bubblewrap and user namespace; where
+that is unavailable (this repository's own nested dev sandbox, some hardened hosts) they
+report `status: "unsupported"` with a reason instead of failing the run or being
+silently dropped. Every `docs/performance.md` §2 budget this tool does not implement at
+all — everything needing Hyprland/Waybar (#84) or the reference rig (#99): launcher,
+workspace, terminal and bar latency, observer event propagation (producer-to-subscriber,
+not just row-rendering — deferred pending a cheap way to add a live subscriber),
+project warm resume, the Btrfs entry-snapshot stall, idle CPU/RAM, boot/login/resume and
+install — appears in the report as `status: "not_implemented"` with a reason, never
+omitted.
+
+Real sample output (`ward benchmark`, run from the repository root; numbers are from a
+4 vCPU CI-shaped VM, not the reference hardware in §4 — a CI run's own environment block
+in the JSON is the reproducibility record for these, not the yaml in §4):
 
 ```text
-Install                  31.8s
-Boot                      3.2s
-Desktop ready            430ms
-Launcher                  11ms
-Terminal                  34ms
-Agent warm start          91ms
-Observer latency           8ms
-Idle CPU                  0.4%
-Idle RAM                  690MB
+metric                         p50       p99       n    status notes
+sandbox_start              50.79ms   52.59ms      20  measured warm (budget 150 ms)
+ward_status                 0.02ms    0.03ms      20  measured warm (budget 10 ms)
+verifier_spawn             24.77ms   26.22ms      20  measured warm (budget 500 ms)
+snapshot_digest_cold        2.49ms    2.49ms       1  measured cold
+snapshot_digest_warm        1.77ms    1.94ms      20  measured warm
+snapshot_capture_cold     112.58ms  112.58ms       1  measured cold
+snapshot_capture_warm       3.33ms    3.80ms      20  measured warm
+launcher_visible                 —         —       —  not-impl needs a real Hyprland/Waybar compositor session; see #84
+…
 ```
 
-The plan is for CI to run the subset that is meaningful in a VM (sandbox start, snapshot,
-event latency, `ward status`, verifier spawn) on every PR and store results as artifacts,
-with the hardware subset run on the certification rig per release — none of that is wired
-up yet. Until `ward-bench` lands, §"Measured so far" below is the only source of real
-numbers, and each one carries its own reproducibility record rather than a suite run.
+CI (`.github/workflows/verify.yml`, `benchmark` job) runs this subset on every PR and
+push to `main` and retains the JSON as a build artifact (90 days) — no pass/fail
+regression gate yet: `docs/performance.md` §3's own noise-tolerance rule and #150's
+acceptance both say to introduce a gate only after variance is measured across enough
+real runs, not before. `--samples`/`--warm-up` default to §3's own 20/3; `--fixtures`
+points at a fixtures root other than `benchmarks/fixtures` (rarely needed).
+
+Not yet implemented, and deliberately out of this pass: opt-in replay statistics for
+E-13 (`docs/experiments.md`), the E-14 counterbalanced usability study, and any
+hardware/compositor measurement (reuse #84 for compositor evidence, #99 for reference
+hardware).
 
 ## 6. Installer performance plan (Phase 8, after correctness)
 
