@@ -18,8 +18,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// Minor versions are backwards-compatible within one major version. The initial
 /// implementation supports only 1.0; later compatible additions widen the supported
 /// minor range explicitly.
-pub const WARD_NODE_PROTOCOL: SupportedProtocolRange =
-    SupportedProtocolRange::valid(1, 0, 0);
+pub const WARD_NODE_PROTOCOL: SupportedProtocolRange = SupportedProtocolRange::valid(1, 0, 0);
 
 /// One negotiated node protocol version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
