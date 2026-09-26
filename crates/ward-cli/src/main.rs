@@ -221,6 +221,26 @@ enum Command {
         #[arg(long, conflicts_with = "tui")]
         plain: bool,
     },
+    /// Run the CI-measurable performance subset (docs/performance.md §5, #150):
+    /// sandbox start, `ward status`, verifier spawn and snapshot/digest work. Prints a
+    /// human report; `--json` also writes the versioned machine-readable one. Every
+    /// other budget in docs/performance.md §2 needs a real compositor or the
+    /// reference rig and is listed as unmeasured, not silently omitted.
+    Benchmark {
+        /// Root holding the pinned fixtures (default: `benchmarks/fixtures` under the
+        /// current directory — run from the repository root, or pass this explicitly).
+        #[arg(long)]
+        fixtures: Option<PathBuf>,
+        /// Also write the versioned JSON report here (e.g. for a CI artifact).
+        #[arg(long)]
+        json: Option<PathBuf>,
+        /// Timed samples per "warm" metric (docs/performance.md §3 default: 20).
+        #[arg(long, default_value_t = ward_bench::metrics::DEFAULT_SAMPLES)]
+        samples: usize,
+        /// Discarded warm-up runs before a "warm" metric's timed samples.
+        #[arg(long, default_value_t = ward_bench::metrics::DEFAULT_WARM_UP)]
+        warm_up: usize,
+    },
     /// Any other verb runs the matching WardOS desktop command: `ward <verb> …` runs
     /// `wardos-<verb> …` when that command is installed (docs/desktop.md §Commands). So
     /// `ward theme set ward-dark` is `wardos-theme set ward-dark`, `ward setup wifi` is
@@ -653,6 +673,12 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             },
             WatchMode::select(tui, plain, std::io::stdout().is_terminal()),
         ),
+        Command::Benchmark {
+            fixtures,
+            json,
+            samples,
+            warm_up,
+        } => cmd_benchmark(fixtures.as_deref(), json.as_deref(), samples, warm_up),
         Command::Desktop(argv) => cmd_desktop(&argv),
     }
 }
@@ -1812,6 +1838,40 @@ fn cmd_stop(dir: &Path, restore_entry: bool) -> ward_daemon::Result<ExitCode> {
         println!("  session {id} stopped");
     } else {
         println!("{}", render::session_status_line(None));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ward benchmark`: the CI-measurable subset of `docs/performance.md` §5 (#150).
+/// Always exits 0 on a successful run — this pass only measures and publishes; a
+/// pass/fail regression gate is explicitly deferred until variance is known.
+fn cmd_benchmark(
+    fixtures: Option<&Path>,
+    json: Option<&Path>,
+    samples: usize,
+    warm_up: usize,
+) -> ward_daemon::Result<ExitCode> {
+    let fixtures_root =
+        fixtures.map_or_else(|| PathBuf::from("benchmarks/fixtures"), Path::to_path_buf);
+    if !fixtures_root.join("ci-subset").is_dir() {
+        return Err(ward_daemon::Error::Project(format!(
+            "benchmark: no pinned fixture at {} — run from the repository root, or pass \
+             --fixtures <dir>",
+            fixtures_root.join("ci-subset").display()
+        )));
+    }
+    let options = ward_bench::Options { samples, warm_up };
+    let report = ward_bench::run_ci_subset(&fixtures_root, options)
+        .map_err(|e| ward_daemon::Error::Project(format!("benchmark: {e:#}")))?;
+    print!("{}", ward_bench::report::human_report(&report));
+    if let Some(path) = json {
+        let text = serde_json::to_string_pretty(&report)
+            .map_err(|e| ward_daemon::Error::Project(format!("benchmark: {e}")))?;
+        std::fs::write(path, text).map_err(|e| ward_daemon::Error::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        println!("\nwrote {}", path.display());
     }
     Ok(ExitCode::SUCCESS)
 }
