@@ -82,6 +82,6 @@ mod tests {
 
     #[test]
     fn meminfo_parser_source_reports_nonzero_host_memory() {
-        assert!(total_memory_bytes().expect("Linux MemTotal").is_positive());
+        assert!(total_memory_bytes().expect("Linux MemTotal") > 0);
     }
 }
