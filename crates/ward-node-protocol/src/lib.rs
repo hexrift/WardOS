@@ -546,13 +546,18 @@ impl NodeCapabilitiesWire {
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum CapabilityDiscoveryRequest {
     /// Request the node-owned capability document.
-    Capabilities,
+    Capabilities {
+        /// Exact protocol version selected by the handshake.
+        protocol: ProtocolVersion,
+    },
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
 enum CapabilityDiscoveryRequestWire {
-    Capabilities,
+    Capabilities {
+        protocol: ProtocolVersion,
+    },
 }
 
 /// Read-only node capability discovery response.
@@ -595,7 +600,6 @@ impl CapabilityDiscoveryContext {
     /// selected protocol predates capability discovery.
     pub const fn new(protocol: ProtocolVersion) -> Result<Self, CapabilityDiscoveryError> {
         if protocol.major != WARD_NODE_PROTOCOL.major
-            || protocol.minor < WARD_NODE_PROTOCOL.min_minor
             || protocol.minor > WARD_NODE_PROTOCOL.max_minor
         {
             return Err(CapabilityDiscoveryError::ProtocolOutsideSupportedRange);
@@ -617,7 +621,9 @@ impl CapabilityDiscoveryContext {
     /// Build the only read-only discovery request valid for this negotiated context.
     #[must_use]
     pub const fn request(self) -> CapabilityDiscoveryRequest {
-        CapabilityDiscoveryRequest::Capabilities
+        CapabilityDiscoveryRequest::Capabilities {
+            protocol: self.protocol,
+        }
     }
 
     /// Decode an inbound discovery request under the negotiated protocol.
@@ -634,8 +640,12 @@ impl CapabilityDiscoveryContext {
             .map_err(|_| CapabilityDiscoveryError::MalformedMessage)?;
 
         match wire {
-            CapabilityDiscoveryRequestWire::Capabilities => {
-                Ok(CapabilityDiscoveryRequest::Capabilities)
+            CapabilityDiscoveryRequestWire::Capabilities { protocol } => {
+                if protocol != self.protocol {
+                    return Err(CapabilityDiscoveryError::ProtocolMismatch);
+                }
+
+                Ok(CapabilityDiscoveryRequest::Capabilities { protocol })
             }
         }
     }
@@ -974,11 +984,11 @@ mod tests {
         let request = context.request();
         assert_eq!(
             serde_json::to_string(&request).unwrap(),
-            r#"{"request":"capabilities"}"#
+            r#"{"request":"capabilities","protocol":{"major":1,"minor":1}}"#
         );
         assert_eq!(
             context
-                .decode_request(r#"{"request":"capabilities"}"#)
+                .decode_request(r#"{"request":"capabilities","protocol":{"major":1,"minor":1}}"#)
                 .unwrap(),
             request
         );
@@ -1000,6 +1010,22 @@ mod tests {
             serde_json::to_string(&response).unwrap(),
             r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"aarch64","capacity":{"logical_cpus":64,"memory_bytes":137438953472},"isolation":{"namespaces":{"sandbox":true,"user_namespace":true},"backends":{"container":true,"microvm":true,"vm":true}},"network":{"offline":true,"proxy_allowlist":true},"credentials":{"proxy_injection":true,"scoped_http_gateway":true},"snapshots":{"content_addressed":true,"diff":true,"read":true},"verifier":{"isolated":true},"lifecycle":{"pause":true,"stop":true,"revoke":true}}}"#
         );
+    }
+
+    #[test]
+    fn capability_request_must_match_the_exact_negotiated_protocol() {
+        let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 1)).unwrap();
+
+        for claimed_minor in [0, 2] {
+            let raw = format!(
+                r#"{{"request":"capabilities","protocol":{{"major":1,"minor":{claimed_minor}}}}}"#
+            );
+            assert_eq!(
+                context.decode_request(&raw),
+                Err(CapabilityDiscoveryError::ProtocolMismatch),
+                "claimed protocol 1.{claimed_minor} must not be accepted for negotiated 1.1"
+            );
+        }
     }
 
     #[test]
@@ -1045,7 +1071,7 @@ mod tests {
 
         let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 1)).unwrap();
         for raw in [
-            r#"{"request":"capabilities","extra":true}"#,
+            r#"{"request":"capabilities","protocol":{"major":1,"minor":1},"extra":true}"#,
             r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"sparc","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#,
             r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":0,"memory_bytes":1024},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#,
             r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false},"extra":true}}"#,
