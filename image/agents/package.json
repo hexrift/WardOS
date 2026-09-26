@@ -7,6 +7,6 @@
   "dependencies": {
     "@anthropic-ai/claude-code": "2.1.263",
     "@openai/codex": "0.153.4",
-    "tamperward": "2.10.3"
+    "tamperward": "2.39.0"
   }
 }

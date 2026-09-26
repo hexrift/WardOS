@@ -7,7 +7,7 @@ runs and TamperWard, all from npm, at **exact** versions.
 | --- | --- | --- |
 | `@anthropic-ai/claude-code` | `claude` (`ward claude`) | `package.json` |
 | `@openai/codex` | `codex` (`ward codex`) | `package.json` |
-| `tamperward` | `tamperward` (`ward init` wires it; `tamperward run -- claude`) | `package.json` (2.10.3) |
+| `tamperward` | `tamperward` (`ward init` wires it; `tamperward run -- claude`) | `package.json` (2.39.0) |
 
 `package.json` names the three with exact versions (no `^`, no `~`), `private: true`
 so it is never published, and `package-lock.json` records every tarball the three

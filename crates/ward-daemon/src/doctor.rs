@@ -1040,13 +1040,13 @@ mod tests {
         let all = [
             ("claude", Some("2.1.263".to_owned())),
             ("codex", Some("0.153.4".to_owned())),
-            ("tamperward", Some("2.10.3".to_owned())),
+            ("tamperward", Some("2.39.0".to_owned())),
         ];
         let c = agents(&all);
         assert_eq!(c.status, Status::Ok);
         assert_eq!(
             c.detail,
-            "claude 2.1.263 · codex 0.153.4 · tamperward 2.10.3"
+            "claude 2.1.263 · codex 0.153.4 · tamperward 2.39.0"
         );
 
         let some = [
@@ -1197,7 +1197,7 @@ mod tests {
         std::fs::create_dir_all(pkg.join("dist/cli")).unwrap();
         std::fs::write(
             pkg.join("package.json"),
-            r#"{"name":"tamperward","version":"2.10.3"}"#,
+            r#"{"name":"tamperward","version":"2.39.0"}"#,
         )
         .unwrap();
         std::fs::write(pkg.join("dist/cli/index.js"), "").unwrap();
@@ -1208,7 +1208,7 @@ mod tests {
         std::os::unix::fs::symlink(pkg.join("dist/cli/index.js"), &link).unwrap();
         assert_eq!(
             package_version_at(&link, "tamperward").as_deref(),
-            Some("2.10.3")
+            Some("2.39.0")
         );
         assert_eq!(package_version_at(&link, "@openai/codex"), None);
         assert_eq!(
