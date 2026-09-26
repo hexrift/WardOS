@@ -9,8 +9,6 @@ description = "WardOS: versioned ward-node/control-plane protocol types"
 
 [dependencies]
 serde = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
 
 [lints]
