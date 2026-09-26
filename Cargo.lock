@@ -2372,6 +2372,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ward-bench"
+version = "0.18.1"
+dependencies = [
+ "anyhow",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ward-daemon",
+ "ward-snapshot",
+]
+
+[[package]]
 name = "ward-cli"
 version = "0.18.1"
 dependencies = [
@@ -2383,6 +2396,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "ward-bench",
  "ward-daemon",
  "ward-events",
  "ward-policy",
