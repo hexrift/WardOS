@@ -368,4 +368,154 @@ mod tests {
         assert_eq!(WARD_NODE_PROTOCOL.min_minor(), 0);
         assert_eq!(WARD_NODE_PROTOCOL.max_minor(), 0);
     }
+
+    fn minimal_capabilities() -> NodeCapabilities {
+        NodeCapabilities::new(
+            ProtocolVersion::new(1, 1),
+            NodeArchitecture::X86_64,
+            NodeCapacity::new(1, 1024).unwrap(),
+            IsolationCapabilities {
+                namespace_sandbox: false,
+                user_namespace: false,
+                container: false,
+                microvm: false,
+                vm: false,
+            },
+            NetworkCapabilities {
+                offline: false,
+                proxy_allowlist: false,
+            },
+            CredentialCapabilities {
+                proxy_injection: false,
+                scoped_http_gateway: false,
+            },
+            SnapshotCapabilities {
+                content_addressed: false,
+                diff: false,
+                read: false,
+            },
+            VerifierCapabilities { isolated: false },
+            LifecycleCapabilities {
+                pause: false,
+                stop: false,
+                revoke: false,
+            },
+        )
+        .unwrap()
+    }
+
+    fn full_capabilities() -> NodeCapabilities {
+        NodeCapabilities::new(
+            ProtocolVersion::new(1, 1),
+            NodeArchitecture::Aarch64,
+            NodeCapacity::new(64, 137_438_953_472).unwrap(),
+            IsolationCapabilities {
+                namespace_sandbox: true,
+                user_namespace: true,
+                container: true,
+                microvm: true,
+                vm: true,
+            },
+            NetworkCapabilities {
+                offline: true,
+                proxy_allowlist: true,
+            },
+            CredentialCapabilities {
+                proxy_injection: true,
+                scoped_http_gateway: true,
+            },
+            SnapshotCapabilities {
+                content_addressed: true,
+                diff: true,
+                read: true,
+            },
+            VerifierCapabilities { isolated: true },
+            LifecycleCapabilities {
+                pause: true,
+                stop: true,
+                revoke: true,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn capability_discovery_is_a_protocol_one_one_feature() {
+        assert!(!supports_capability_discovery(ProtocolVersion::new(1, 0)));
+        assert!(supports_capability_discovery(ProtocolVersion::new(1, 1)));
+        assert!(supports_capability_discovery(ProtocolVersion::new(1, 2)));
+        assert!(!supports_capability_discovery(ProtocolVersion::new(2, 0)));
+    }
+
+    #[test]
+    fn minimal_capability_discovery_wire_is_stable() {
+        let request = CapabilityDiscoveryRequest::Capabilities;
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"request":"capabilities"}"#
+        );
+
+        let response = CapabilityDiscoveryResponse::Capabilities {
+            capabilities: minimal_capabilities(),
+        };
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespace_sandbox":false,"user_namespace":false,"container":false,"microvm":false,"vm":false},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<CapabilityDiscoveryResponse>(
+                &serde_json::to_string(&response).unwrap()
+            )
+            .unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn fully_capable_node_wire_is_stable() {
+        let response = CapabilityDiscoveryResponse::Capabilities {
+            capabilities: full_capabilities(),
+        };
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"aarch64","capacity":{"logical_cpus":64,"memory_bytes":137438953472},"isolation":{"namespace_sandbox":true,"user_namespace":true,"container":true,"microvm":true,"vm":true},"network":{"offline":true,"proxy_allowlist":true},"credentials":{"proxy_injection":true,"scoped_http_gateway":true},"snapshots":{"content_addressed":true,"diff":true,"read":true},"verifier":{"isolated":true},"lifecycle":{"pause":true,"stop":true,"revoke":true}}}"#
+        );
+    }
+
+    #[test]
+    fn invalid_or_unknown_capability_facts_fail_closed() {
+        assert_eq!(
+            NodeCapacity::new(0, 1024),
+            Err(NodeCapacityError::ZeroLogicalCpus)
+        );
+        assert_eq!(
+            NodeCapacity::new(1, 0),
+            Err(NodeCapacityError::ZeroMemoryBytes)
+        );
+        assert_eq!(
+            NodeCapabilities::new(
+                ProtocolVersion::new(1, 0),
+                NodeArchitecture::X86_64,
+                NodeCapacity::new(1, 1024).unwrap(),
+                IsolationCapabilities::default(),
+                NetworkCapabilities::default(),
+                CredentialCapabilities::default(),
+                SnapshotCapabilities::default(),
+                VerifierCapabilities::default(),
+                LifecycleCapabilities::default(),
+            ),
+            Err(NodeCapabilitiesError::ProtocolDoesNotSupportDiscovery)
+        );
+
+        for raw in [
+            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"sparc","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespace_sandbox":false,"user_namespace":false,"container":false,"microvm":false,"vm":false},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#,
+            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":0,"memory_bytes":1024},"isolation":{"namespace_sandbox":false,"user_namespace":false,"container":false,"microvm":false,"vm":false},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#,
+            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespace_sandbox":false,"user_namespace":false,"container":false,"microvm":false,"vm":false},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false},"extra":true}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CapabilityDiscoveryResponse>(raw).is_err(),
+                "{raw} must fail closed"
+            );
+        }
+    }
 }
