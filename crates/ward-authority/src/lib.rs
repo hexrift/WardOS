@@ -125,11 +125,7 @@ pub struct CapabilityGrant {
 impl CapabilityGrant {
     /// Construct one exact grant.
     #[must_use]
-    pub const fn new(
-        capability: CapabilityName,
-        resource: ResourceRef,
-        delegable: bool,
-    ) -> Self {
+    pub const fn new(capability: CapabilityName, resource: ResourceRef, delegable: bool) -> Self {
         Self {
             capability,
             resource,
@@ -171,16 +167,11 @@ impl GrantSet {
     /// # Errors
     ///
     /// Rejects two entries for the same capability/resource scope.
-    pub fn new(
-        grants: impl IntoIterator<Item = CapabilityGrant>,
-    ) -> Result<Self, GrantSetError> {
+    pub fn new(grants: impl IntoIterator<Item = CapabilityGrant>) -> Result<Self, GrantSetError> {
         let mut values: Vec<_> = grants.into_iter().collect();
         values.sort_unstable();
 
-        if values
-            .windows(2)
-            .any(|pair| pair[0].same_scope(&pair[1]))
-        {
+        if values.windows(2).any(|pair| pair[0].same_scope(&pair[1])) {
             return Err(GrantSetError::DuplicateGrant);
         }
 
@@ -230,9 +221,7 @@ impl LeaseVersion {
     ///
     /// Returns an error for zero.
     pub fn new(value: u64) -> Result<Self, LeaseVersionError> {
-        NonZeroU64::new(value)
-            .map(Self)
-            .ok_or(LeaseVersionError)
+        NonZeroU64::new(value).map(Self).ok_or(LeaseVersionError)
     }
 
     /// Raw version.
@@ -477,9 +466,7 @@ impl AuthorityLease {
     /// # Errors
     ///
     /// Rejects delegated lineage on a root envelope and all ordinary root invariants.
-    pub fn validate_root(
-        wire: UntrustedAuthorityLease,
-    ) -> Result<Self, AuthorityLeaseError> {
+    pub fn validate_root(wire: UntrustedAuthorityLease) -> Result<Self, AuthorityLeaseError> {
         if wire.parent_lease_id.is_some() || wire.delegated_by.is_some() {
             return Err(AuthorityLeaseError::UnexpectedDelegatedLineage);
         }
