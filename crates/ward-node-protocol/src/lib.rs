@@ -555,9 +555,7 @@ pub enum CapabilityDiscoveryRequest {
 #[derive(Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
 enum CapabilityDiscoveryRequestWire {
-    Capabilities {
-        protocol: ProtocolVersion,
-    },
+    Capabilities { protocol: ProtocolVersion },
 }
 
 /// Read-only node capability discovery response.
