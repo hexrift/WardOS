@@ -418,7 +418,10 @@ mod tests {
 
     #[test]
     fn adapter_ids_are_provider_neutral_and_bounded() {
-        assert_eq!(AdapterId::new("claude-code").unwrap().as_str(), "claude-code");
+        assert_eq!(
+            AdapterId::new("claude-code").unwrap().as_str(),
+            "claude-code"
+        );
         assert_eq!(
             AdapterId::new("custom.acme-agent").unwrap().as_str(),
             "custom.acme-agent"
@@ -460,7 +463,9 @@ mod tests {
         );
         assert_eq!(
             AdapterFeatures::new([AdapterFeature::Launch, AdapterFeature::Launch]),
-            Err(AdapterFeaturesError::DuplicateFeature(AdapterFeature::Launch))
+            Err(AdapterFeaturesError::DuplicateFeature(
+                AdapterFeature::Launch
+            ))
         );
 
         assert!(
@@ -477,11 +482,19 @@ mod tests {
         let codex = codex_descriptor();
 
         assert_eq!(claude.visibility(), SemanticVisibility::AdapterClaims);
-        assert!(claude.features().contains(AdapterFeature::SemanticToolEvents));
+        assert!(
+            claude
+                .features()
+                .contains(AdapterFeature::SemanticToolEvents)
+        );
         assert!(claude.features().contains(AdapterFeature::ApprovalRequests));
 
         assert_eq!(codex.visibility(), SemanticVisibility::HostObservationsOnly);
-        assert!(!codex.features().contains(AdapterFeature::SemanticToolEvents));
+        assert!(
+            !codex
+                .features()
+                .contains(AdapterFeature::SemanticToolEvents)
+        );
         assert!(!codex.features().contains(AdapterFeature::ApprovalRequests));
         assert!(codex.features().contains(AdapterFeature::Launch));
     }
@@ -504,9 +517,17 @@ mod tests {
         )
         .unwrap();
 
-        assert!(descriptor.features().contains(AdapterFeature::CapabilityRequests));
+        assert!(
+            descriptor
+                .features()
+                .contains(AdapterFeature::CapabilityRequests)
+        );
         assert!(descriptor.features().contains(AdapterFeature::Cancellation));
-        assert!(descriptor.features().contains(AdapterFeature::StructuredTaskResult));
+        assert!(
+            descriptor
+                .features()
+                .contains(AdapterFeature::StructuredTaskResult)
+        );
     }
 
     #[test]
@@ -529,11 +550,8 @@ mod tests {
                 adapter,
                 runtime,
                 SemanticVisibility::HostObservationsOnly,
-                AdapterFeatures::new([
-                    AdapterFeature::Launch,
-                    AdapterFeature::SemanticToolEvents,
-                ])
-                .unwrap(),
+                AdapterFeatures::new([AdapterFeature::Launch, AdapterFeature::SemanticToolEvents,])
+                    .unwrap(),
             ),
             Err(AgentAdapterDescriptorError::SemanticVisibilityMismatch)
         );
