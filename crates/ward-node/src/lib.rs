@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 use ward_node_protocol::{
-    negotiate, CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse, NodeCapabilities,
-    SupportedProtocolRange,
+    CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse, NodeCapabilities,
+    SupportedProtocolRange, negotiate,
 };
 
 /// Maximum bytes in one node-protocol JSON request, excluding the terminating newline.
@@ -133,10 +133,7 @@ impl NodeService {
 ///
 /// Returns if the listener cannot be created/configured. Existing socket paths are never
 /// removed automatically.
-pub fn serve_local(
-    socket: &Path,
-    capabilities: NodeCapabilities,
-) -> Result<(), NodeServiceError> {
+pub fn serve_local(socket: &Path, capabilities: NodeCapabilities) -> Result<(), NodeServiceError> {
     let service = NodeService::new(capabilities)?;
     let listener = UnixListener::bind(socket)?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
@@ -339,8 +336,7 @@ mod tests {
             serde_json::to_string(&hello).unwrap()
         )
         .unwrap();
-        let _: HandshakeResponse =
-            serde_json::from_str(line(&mut rejected_client).trim()).unwrap();
+        let _: HandshakeResponse = serde_json::from_str(line(&mut rejected_client).trim()).unwrap();
         rejected.join().unwrap().unwrap();
 
         let (mut accepted_client, accepted_server) = UnixStream::pair().unwrap();
