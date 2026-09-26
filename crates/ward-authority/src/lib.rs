@@ -533,8 +533,8 @@ impl AuthorityLease {
 /// Untrusted serialized authority envelope.
 ///
 /// Deserializing this value grants nothing. A root envelope must pass
-/// AuthorityLease::validate_root; a delegated envelope must pass
-/// AuthorityLease::validate_delegated with its trusted parent.
+/// `AuthorityLease::validate_root`; a delegated envelope must pass
+/// `AuthorityLease::validate_delegated` with its trusted parent.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UntrustedAuthorityLease {
