@@ -2355,6 +2355,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ward-agent-adapter"
+version = "0.18.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ward-agent"
 version = "0.18.1"
 dependencies = [
