@@ -47,6 +47,9 @@ pub enum NodeServiceError {
     /// JSON response serialization failed.
     #[error("ward-node response serialization failed")]
     Serialization,
+    /// Administrative socket parent directory is accessible to another Unix identity.
+    #[error("ward-node socket parent directory must be private (mode 0700 or stricter)")]
+    InsecureSocketDirectory,
 }
 
 /// Read-only local node service for handshake and capability discovery.
@@ -135,8 +138,7 @@ impl NodeService {
 /// removed automatically.
 pub fn serve_local(socket: &Path, capabilities: NodeCapabilities) -> Result<(), NodeServiceError> {
     let service = NodeService::new(capabilities)?;
-    let listener = UnixListener::bind(socket)?;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    let listener = bind_local(socket)?;
 
     for connection in listener.incoming() {
         let stream = connection?;
@@ -147,6 +149,21 @@ pub fn serve_local(socket: &Path, capabilities: NodeCapabilities) -> Result<(), 
     }
 
     Ok(())
+}
+
+fn bind_local(socket: &Path) -> Result<UnixListener, NodeServiceError> {
+    let parent = socket
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let metadata = std::fs::metadata(parent)?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(NodeServiceError::InsecureSocketDirectory);
+    }
+
+    let listener = UnixListener::bind(socket)?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
 }
 
 fn read_request_line(reader: &mut BufReader<UnixStream>) -> Result<String, NodeServiceError> {
@@ -246,6 +263,26 @@ mod tests {
         let mut value = String::new();
         reader.read_line(&mut value).unwrap();
         value
+    }
+
+    #[test]
+    fn admin_socket_requires_private_parent_and_is_mode_six_hundred() {
+        let private = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = private.path().join("node.sock");
+        let listener = bind_local(&socket).unwrap();
+        assert_eq!(
+            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(listener);
+
+        let exposed = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(exposed.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            bind_local(&exposed.path().join("node.sock")),
+            Err(NodeServiceError::InsecureSocketDirectory)
+        ));
     }
 
     #[test]
