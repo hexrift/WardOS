@@ -4,6 +4,33 @@ Status: living document; the project's phase is in [`status.toml`](status.toml) 
 README's Status section, which this plan never restates. Phases are sequential in their *gates*; work inside a phase
 may overlap with experiments from the next.
 
+## Fleet evolution — ordered by trust dependency
+
+[ADR-0029](decisions/ADR-0029-product-split-fleet-trust-boundaries.md) defines the
+architecture used by the fleet/control-plane work in #256. This is an evolution of the
+existing runtime, not a replacement for local WardOS use.
+
+The implementation order is constrained by trust dependencies:
+
+1. **#257 boundary ADR** — distribution, portable runtime, `ward-node`, control plane,
+   partition semantics and migration rules.
+2. **#258 node extraction + #259 task/delegation identity** — move lifecycle behind a
+   long-lived local worker and make authority explicit, expiring and task-bound.
+3. **#260 single-node scheduling/admission** — prove 25+ concurrent task capsules,
+   resource accounting, backpressure and bounded verifier concurrency before any
+   distributed scheduler is trusted.
+4. **#261/#262 control-plane core and authenticated node enrolment**, followed by the P1
+   distributed policy/identity/credential/state/intervention/verification/observability
+   workstreams.
+5. **#274 fleet qualification** — security, chaos and load validation at 100+ concurrent
+   tasks before scale is treated as a delivered property.
+
+Local mode remains a single-node deployment throughout. Kubernetes is a supported
+deployment target later (#273), never a dependency for local execution. TamperWard
+verification remains independent and is extended across nodes in #270 rather than
+folded into scheduler/control-plane convenience paths.
+
+
 ## Phase 0 — Architecture (this repository, now)
 
 Deliverables (all in `docs/`): architecture, trust boundaries, threat model, security
