@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt::{Display, Formatter};
+use std::num::{NonZeroU16, NonZeroU64};
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -18,7 +19,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// Minor versions are backwards-compatible within one major version. The initial
 /// implementation supports only 1.0; later compatible additions widen the supported
 /// minor range explicitly.
-pub const WARD_NODE_PROTOCOL: SupportedProtocolRange = SupportedProtocolRange::valid(1, 0, 0);
+pub const WARD_NODE_PROTOCOL: SupportedProtocolRange = SupportedProtocolRange::valid(1, 0, 1);
+
+/// The first protocol version that supports node capability discovery.
+pub const CAPABILITY_DISCOVERY_PROTOCOL: ProtocolVersion = ProtocolVersion::new(1, 1);
 
 /// One negotiated node protocol version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -218,6 +222,329 @@ pub const fn negotiate(
     }
 }
 
+/// Whether a negotiated protocol version supports capability discovery.
+#[must_use]
+pub const fn supports_capability_discovery(protocol: ProtocolVersion) -> bool {
+    protocol.major == CAPABILITY_DISCOVERY_PROTOCOL.major
+        && protocol.minor >= CAPABILITY_DISCOVERY_PROTOCOL.minor
+}
+
+/// Architectures the current Ward node protocol can identify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeArchitecture {
+    /// 64-bit x86.
+    X86_64,
+    /// 64-bit ARM.
+    Aarch64,
+}
+
+/// Validated finite node capacity used for placement decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCapacity {
+    logical_cpus: NonZeroU16,
+    memory_bytes: NonZeroU64,
+}
+
+impl NodeCapacity {
+    /// Construct validated node capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either required capacity is zero.
+    pub const fn new(logical_cpus: u16, memory_bytes: u64) -> Result<Self, NodeCapacityError> {
+        let Some(logical_cpus) = NonZeroU16::new(logical_cpus) else {
+            return Err(NodeCapacityError::ZeroLogicalCpus);
+        };
+        let Some(memory_bytes) = NonZeroU64::new(memory_bytes) else {
+            return Err(NodeCapacityError::ZeroMemoryBytes);
+        };
+
+        Ok(Self {
+            logical_cpus,
+            memory_bytes,
+        })
+    }
+
+    /// Logical CPU capacity.
+    #[must_use]
+    pub const fn logical_cpus(self) -> u16 {
+        self.logical_cpus.get()
+    }
+
+    /// Memory capacity in bytes.
+    #[must_use]
+    pub const fn memory_bytes(self) -> u64 {
+        self.memory_bytes.get()
+    }
+}
+
+/// Invalid node capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeCapacityError {
+    /// A node cannot advertise zero logical CPUs.
+    ZeroLogicalCpus,
+    /// A node cannot advertise zero bytes of memory.
+    ZeroMemoryBytes,
+}
+
+impl Display for NodeCapacityError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroLogicalCpus => formatter.write_str("logical CPU capacity must be non-zero"),
+            Self::ZeroMemoryBytes => formatter.write_str("memory capacity must be non-zero"),
+        }
+    }
+}
+
+impl std::error::Error for NodeCapacityError {}
+
+/// Isolation mechanisms a node can enforce locally.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolationCapabilities {
+    /// Ward's Linux namespace sandbox backend.
+    pub namespace_sandbox: bool,
+    /// Unprivileged user namespaces are available where required.
+    pub user_namespace: bool,
+    /// Container-backed task isolation is available.
+    pub container: bool,
+    /// MicroVM-backed task isolation is available.
+    pub microvm: bool,
+    /// VM-backed task isolation is available.
+    pub vm: bool,
+}
+
+/// Network enforcement mechanisms a node can enforce locally.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkCapabilities {
+    /// The node can enforce an offline/no-egress task.
+    pub offline: bool,
+    /// The node can enforce proxy-mediated destination allowlists.
+    pub proxy_allowlist: bool,
+}
+
+/// Credential delivery mechanisms a node can enforce locally.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialCapabilities {
+    /// Credentials can be injected by a node-owned proxy without entering the sandbox.
+    pub proxy_injection: bool,
+    /// Scoped HTTP gateway routes can be granted to a task.
+    pub scoped_http_gateway: bool,
+}
+
+/// Snapshot and content-addressed storage mechanisms available on a node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotCapabilities {
+    /// Content-addressed immutable snapshots are available.
+    pub content_addressed: bool,
+    /// Snapshot manifests can be diffed.
+    pub diff: bool,
+    /// Immutable snapshot content can be read by trusted components.
+    pub read: bool,
+}
+
+/// Independent verifier capabilities available on a node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierCapabilities {
+    /// The node can run the trusted verifier outside task authority.
+    pub isolated: bool,
+}
+
+/// Host-confirmed lifecycle operations available on a node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleCapabilities {
+    /// Running work can be paused by the host boundary.
+    pub pause: bool,
+    /// Running work can be stopped by the host boundary.
+    pub stop: bool,
+    /// Temporary grants can be revoked by the host boundary.
+    pub revoke: bool,
+}
+
+/// Trusted, read-only node facts exposed after a compatible handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct NodeCapabilities {
+    protocol: ProtocolVersion,
+    architecture: NodeArchitecture,
+    capacity: NodeCapacity,
+    isolation: IsolationCapabilities,
+    network: NetworkCapabilities,
+    credentials: CredentialCapabilities,
+    snapshots: SnapshotCapabilities,
+    verifier: VerifierCapabilities,
+    lifecycle: LifecycleCapabilities,
+}
+
+impl NodeCapabilities {
+    /// Construct a capability document for a negotiated protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected protocol predates capability discovery.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        protocol: ProtocolVersion,
+        architecture: NodeArchitecture,
+        capacity: NodeCapacity,
+        isolation: IsolationCapabilities,
+        network: NetworkCapabilities,
+        credentials: CredentialCapabilities,
+        snapshots: SnapshotCapabilities,
+        verifier: VerifierCapabilities,
+        lifecycle: LifecycleCapabilities,
+    ) -> Result<Self, NodeCapabilitiesError> {
+        if !supports_capability_discovery(protocol) {
+            return Err(NodeCapabilitiesError::ProtocolDoesNotSupportDiscovery);
+        }
+
+        Ok(Self {
+            protocol,
+            architecture,
+            capacity,
+            isolation,
+            network,
+            credentials,
+            snapshots,
+            verifier,
+            lifecycle,
+        })
+    }
+
+    /// Negotiated protocol version this document belongs to.
+    #[must_use]
+    pub const fn protocol(self) -> ProtocolVersion {
+        self.protocol
+    }
+
+    /// Node architecture.
+    #[must_use]
+    pub const fn architecture(self) -> NodeArchitecture {
+        self.architecture
+    }
+
+    /// Node capacity.
+    #[must_use]
+    pub const fn capacity(self) -> NodeCapacity {
+        self.capacity
+    }
+
+    /// Isolation capabilities.
+    #[must_use]
+    pub const fn isolation(self) -> IsolationCapabilities {
+        self.isolation
+    }
+
+    /// Network capabilities.
+    #[must_use]
+    pub const fn network(self) -> NetworkCapabilities {
+        self.network
+    }
+
+    /// Credential capabilities.
+    #[must_use]
+    pub const fn credentials(self) -> CredentialCapabilities {
+        self.credentials
+    }
+
+    /// Snapshot capabilities.
+    #[must_use]
+    pub const fn snapshots(self) -> SnapshotCapabilities {
+        self.snapshots
+    }
+
+    /// Verifier capabilities.
+    #[must_use]
+    pub const fn verifier(self) -> VerifierCapabilities {
+        self.verifier
+    }
+
+    /// Lifecycle capabilities.
+    #[must_use]
+    pub const fn lifecycle(self) -> LifecycleCapabilities {
+        self.lifecycle
+    }
+}
+
+/// Invalid capability document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeCapabilitiesError {
+    /// Capability discovery was attempted under a protocol version that does not support it.
+    ProtocolDoesNotSupportDiscovery,
+}
+
+impl Display for NodeCapabilitiesError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProtocolDoesNotSupportDiscovery => {
+                formatter.write_str("protocol version does not support capability discovery")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NodeCapabilitiesError {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeCapabilitiesWire {
+    protocol: ProtocolVersion,
+    architecture: NodeArchitecture,
+    capacity: NodeCapacity,
+    isolation: IsolationCapabilities,
+    network: NetworkCapabilities,
+    credentials: CredentialCapabilities,
+    snapshots: SnapshotCapabilities,
+    verifier: VerifierCapabilities,
+    lifecycle: LifecycleCapabilities,
+}
+
+impl<'de> Deserialize<'de> for NodeCapabilities {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = NodeCapabilitiesWire::deserialize(deserializer)?;
+        Self::new(
+            wire.protocol,
+            wire.architecture,
+            wire.capacity,
+            wire.isolation,
+            wire.network,
+            wire.credentials,
+            wire.snapshots,
+            wire.verifier,
+            wire.lifecycle,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+/// Read-only node capability discovery request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CapabilityDiscoveryRequest {
+    /// Request the node-owned capability document.
+    Capabilities,
+}
+
+/// Read-only node capability discovery response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CapabilityDiscoveryResponse {
+    /// Trusted host facts for the negotiated protocol version.
+    Capabilities {
+        /// Node-owned capability document.
+        capabilities: NodeCapabilities,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -363,10 +690,10 @@ mod tests {
     }
 
     #[test]
-    fn initial_protocol_constant_is_version_one_zero_only() {
+    fn current_protocol_supports_one_zero_through_one_one() {
         assert_eq!(WARD_NODE_PROTOCOL.major(), 1);
         assert_eq!(WARD_NODE_PROTOCOL.min_minor(), 0);
-        assert_eq!(WARD_NODE_PROTOCOL.max_minor(), 0);
+        assert_eq!(WARD_NODE_PROTOCOL.max_minor(), 1);
     }
 
     fn minimal_capabilities() -> NodeCapabilities {
