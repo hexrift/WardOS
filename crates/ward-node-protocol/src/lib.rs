@@ -596,6 +596,13 @@ impl CapabilityDiscoveryContext {
     /// Returns [`CapabilityDiscoveryError::ProtocolDoesNotSupportDiscovery`] when the
     /// selected protocol predates capability discovery.
     pub const fn new(protocol: ProtocolVersion) -> Result<Self, CapabilityDiscoveryError> {
+        if protocol.major != WARD_NODE_PROTOCOL.major
+            || protocol.minor < WARD_NODE_PROTOCOL.min_minor
+            || protocol.minor > WARD_NODE_PROTOCOL.max_minor
+        {
+            return Err(CapabilityDiscoveryError::ProtocolOutsideSupportedRange);
+        }
+
         if !supports_capability_discovery(protocol) {
             return Err(CapabilityDiscoveryError::ProtocolDoesNotSupportDiscovery);
         }
@@ -679,6 +686,8 @@ impl CapabilityDiscoveryContext {
 /// Fail-closed capability-discovery protocol errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapabilityDiscoveryError {
+    /// The supplied protocol is outside the range implemented by this build.
+    ProtocolOutsideSupportedRange,
     /// The negotiated protocol predates capability discovery.
     ProtocolDoesNotSupportDiscovery,
     /// The capability document names a protocol other than the negotiated version.
@@ -690,6 +699,9 @@ pub enum CapabilityDiscoveryError {
 impl Display for CapabilityDiscoveryError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ProtocolOutsideSupportedRange => {
+                formatter.write_str("protocol version is outside this build's supported range")
+            }
             Self::ProtocolDoesNotSupportDiscovery => {
                 formatter.write_str("protocol version does not support capability discovery")
             }
@@ -942,6 +954,14 @@ mod tests {
         assert_eq!(
             CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 0)),
             Err(CapabilityDiscoveryError::ProtocolDoesNotSupportDiscovery)
+        );
+        assert_eq!(
+            CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 2)),
+            Err(CapabilityDiscoveryError::ProtocolOutsideSupportedRange)
+        );
+        assert_eq!(
+            CapabilityDiscoveryContext::new(ProtocolVersion::new(2, 0)),
+            Err(CapabilityDiscoveryError::ProtocolOutsideSupportedRange)
         );
     }
 
