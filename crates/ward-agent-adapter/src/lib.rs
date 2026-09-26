@@ -23,7 +23,7 @@ impl AdapterId {
     ///
     /// # Errors
     ///
-    /// Returns AdapterIdError when the identifier is empty, oversized, or contains
+    /// Returns `AdapterIdError` when the identifier is empty, oversized, or contains
     /// characters outside lowercase ASCII letters, digits, dot, underscore and hyphen.
     pub fn new(value: &str) -> Result<Self, AdapterIdError> {
         if value.is_empty()
@@ -175,7 +175,7 @@ impl<'de> Deserialize<'de> for RuntimeMetadata {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticVisibility {
-    /// Semantic intent is unavailable; WardOS relies on host observations.
+    /// Semantic intent is unavailable; `WardOS` relies on host observations.
     HostObservationsOnly,
     /// The adapter supplies untrusted semantic claims such as tool events.
     AdapterClaims,
@@ -185,11 +185,11 @@ pub enum SemanticVisibility {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterFeature {
-    /// WardOS can launch the runtime through this adapter.
+    /// `WardOS` can launch the runtime through this adapter.
     Launch,
     /// The adapter emits semantic tool-use events.
     SemanticToolEvents,
-    /// The adapter can surface approval requests to WardOS.
+    /// The adapter can surface approval requests to `WardOS`.
     ApprovalRequests,
     /// The adapter can request bounded capabilities.
     CapabilityRequests,
@@ -211,7 +211,7 @@ impl AdapterFeatures {
     ///
     /// # Errors
     ///
-    /// Returns DuplicateFeature when the same feature is supplied more than once.
+    /// Returns `DuplicateFeature` when the same feature is supplied more than once.
     pub fn new(
         features: impl IntoIterator<Item = AdapterFeature>,
     ) -> Result<Self, AdapterFeaturesError> {
@@ -291,7 +291,7 @@ impl AgentAdapterDescriptor {
     ///
     /// # Errors
     ///
-    /// Returns SemanticVisibilityMismatch when semantic feature claims contradict the
+    /// Returns `SemanticVisibilityMismatch` when semantic feature claims contradict the
     /// declared degraded/full semantic visibility.
     pub fn new(
         id: AdapterId,
