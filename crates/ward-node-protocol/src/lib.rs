@@ -69,8 +69,8 @@ impl SupportedProtocolRange {
     ///
     /// # Errors
     ///
-    /// Returns SupportedProtocolRangeError::InvertedMinorRange when
-    /// min_minor is greater than max_minor.
+    /// Returns `SupportedProtocolRangeError::InvertedMinorRange` when
+    /// `min_minor` is greater than `max_minor`.
     pub const fn new(
         major: u16,
         min_minor: u16,
