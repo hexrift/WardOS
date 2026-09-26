@@ -14,15 +14,27 @@
 
 use std::time::Duration;
 
-/// Linux's `USER_HZ` clock tick rate backing `/proc/[pid]/stat`'s `utime`/
-/// `stime`/`cutime`/`cstime` fields. Reading the real value needs
-/// `sysconf(_SC_CLK_TCK)`, a libc call this crate avoids (see the module
-/// doc comment); every mainstream Linux distribution — including every
-/// GitHub Actions runner image and every desktop/server distribution this
-/// project targets — fixes it at 100, so this is treated as a constant
-/// rather than plumbed through an unsafe FFI call for a value that has not
-/// changed in over two decades.
-const CLK_TCK: f64 = 100.0;
+fn ticks_to_duration(ticks: u64, ticks_per_second: u64) -> Option<Duration> {
+    if ticks_per_second == 0 {
+        return None;
+    }
+
+    let whole_seconds = ticks / ticks_per_second;
+    let remainder = ticks % ticks_per_second;
+    let nanos = u128::from(remainder)
+        .saturating_mul(1_000_000_000)
+        / u128::from(ticks_per_second);
+    Some(
+        Duration::from_secs(whole_seconds)
+            + Duration::from_nanos(u64::try_from(nanos).ok()?),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn clock_ticks_per_second() -> Option<u64> {
+    let ticks = rustix::param::clock_ticks_per_second();
+    (ticks > 0).then_some(ticks)
+}
 
 /// One usage reading: cumulative CPU time and a peak-RSS high-water mark.
 #[derive(Clone, Copy, Debug, Default)]
@@ -81,10 +93,7 @@ fn read_usage(who: Who) -> Option<Usage> {
     // utime(14)=fields[11], stime(15)=fields[12], cutime(16)=fields[13],
     // cstime(17)=fields[14].
     let ticks = |idx: usize| -> Option<u64> { fields.get(idx)?.parse().ok() };
-    // A tick count this process or its children have actually run for; even a decade of
-    // continuous CPU time at 100 Hz is far below f64's 52-bit mantissa limit.
-    #[allow(clippy::cast_precision_loss)]
-    let ticks_to_duration = |t: u64| Duration::from_secs_f64(t as f64 / CLK_TCK);
+    let ticks_per_second = clock_ticks_per_second()?;
     let (utime, stime) = match who {
         Who::SelfProcess => (ticks(11)?, ticks(12)?),
         Who::Children => (ticks(13)?, ticks(14)?),
@@ -94,8 +103,8 @@ fn read_usage(who: Who) -> Option<Usage> {
         Who::Children => None,
     };
     Some(Usage {
-        utime: ticks_to_duration(utime),
-        stime: ticks_to_duration(stime),
+        utime: ticks_to_duration(utime, ticks_per_second)?,
+        stime: ticks_to_duration(stime, ticks_per_second)?,
         max_rss_kb,
     })
 }
@@ -181,6 +190,19 @@ mod tests {
     fn self_usage_reads_something_on_linux() {
         let u = Usage::read(Who::SelfProcess).expect("/proc/self/stat should be readable in CI");
         assert!(u.max_rss_kb.unwrap_or(0) >= 0);
+    }
+
+    #[test]
+    fn tick_conversion_uses_the_reported_runtime_rate() {
+        assert_eq!(
+            ticks_to_duration(250, 250),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            ticks_to_duration(125, 250),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(ticks_to_duration(1, 0), None);
     }
 
     #[test]

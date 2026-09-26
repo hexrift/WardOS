@@ -2376,6 +2376,7 @@ name = "ward-bench"
 version = "0.18.1"
 dependencies = [
  "anyhow",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
