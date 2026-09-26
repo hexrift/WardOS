@@ -222,6 +222,13 @@ pub struct SessionState {
     restored: u32,
     /// What the agent said last before the host paused it, restored on resume.
     before_pause: Option<AgentState>,
+    /// A `ward stop` was refused (`WorkloadsTerminated` with `pending > 0`
+    /// or an unconfirmed membership barrier) and has not been completed since:
+    /// the session is held for that stop, not paused
+    /// (PR #253 review finding 5) — the daemon refuses `ward resume` for it, and
+    /// its held processes may already have taken `SIGKILL`. The bar reads
+    /// `STOP?`, never `PAUSED`/`PAUSED?`.
+    pub stop_incomplete: bool,
 }
 
 impl SessionState {
@@ -245,9 +252,34 @@ impl SessionState {
                 self.before_pause = self.agent;
                 self.agent = Some(AgentState::PauseUnsettled);
             }
+            // #145 item 5: a `ward stop` the daemon refused because it could not
+            // confirm every sandboxed process ended leaves the session held
+            // over what is still there — unconfirmed, and never a clean `Paused`
+            // or `Finished`. PR #253 review finding 5: that hold is an
+            // incomplete stop, not a pause (`stop_incomplete`, read as `STOP?`).
+            // A confirmed stop (`pending == 0`) ends the incomplete state; the
+            // daemon's `Finished` and `SessionEnded` follow it.
+            WardEvent::WorkloadsTerminated {
+                pending,
+                barrier_confirmed,
+                ..
+            } if *pending > 0 || !*barrier_confirmed => {
+                if !matches!(
+                    self.agent,
+                    Some(AgentState::Paused | AgentState::PauseUnsettled)
+                ) {
+                    self.before_pause = self.agent;
+                }
+                self.agent = Some(AgentState::PauseUnsettled);
+                self.stop_incomplete = true;
+            }
+            WardEvent::WorkloadsTerminated { .. } => self.stop_incomplete = false,
+            // Only a daemon that predates PR #253 lets a refused stop be
+            // resumed; read what it says.
             WardEvent::SessionResumed { .. } => {
                 self.agent = self.before_pause;
                 self.before_pause = None;
+                self.stop_incomplete = false;
             }
             WardEvent::VerificationAttemptStarted { .. } => {
                 self.verification = Verification::Preparing;
@@ -1303,5 +1335,95 @@ mod tests {
             expected_subject,
             "still the same row, now at its shifted index"
         );
+    }
+
+    /// #145 item 5: a refused stop (`WorkloadsTerminated { pending > 0 }`)
+    /// leaves the session held paused and unconfirmed — the bar must say so,
+    /// whether the session was running or already paused, and resume must
+    /// still restore what the agent said before either. A confirmed stop
+    /// changes nothing by itself: its `SessionEnded` follows.
+    #[test]
+    fn a_refused_stop_reads_as_an_unconfirmed_pause_and_a_confirmed_one_changes_nothing() {
+        let refused = || WardEvent::WorkloadsTerminated {
+            ended: 2,
+            pending: 1,
+            barrier_confirmed: true,
+        };
+        let mut model = Model::new(false);
+        for rec in wardd(&[agent(AgentState::Working)]) {
+            model.apply(rec);
+        }
+        model.apply(
+            wardd(&[WardEvent::WorkloadsTerminated {
+                ended: 3,
+                pending: 0,
+                barrier_confirmed: true,
+            }])
+            .remove(0),
+        );
+        assert_eq!(model.state.agent, Some(AgentState::Working));
+
+        model.apply(wardd(&[refused()]).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::PauseUnsettled));
+        model.apply(wardd(&[resumed()]).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::Working));
+
+        // From a confirmed pause: the refused stop downgrades it to unconfirmed,
+        // and a resume still restores the state from before the pause, not
+        // `Paused`.
+        model.apply(wardd(&[paused()]).remove(0));
+        model.apply(wardd(&[refused()]).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::PauseUnsettled));
+        model.apply(wardd(&[resumed()]).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::Working));
+    }
+
+    /// PR #253 review finding 5, what a 0.19 daemon actually records: `Working`
+    /// → a refused stop (an incomplete stop, not a pause) → the retry's
+    /// confirmed `WorkloadsTerminated` → the daemon's own `Finished`. The model
+    /// marks the stop incomplete until the confirmed termination, and never
+    /// derives `Finished` before the daemon records it.
+    #[test]
+    fn a_refused_stop_is_an_incomplete_stop_until_the_retry_confirms_it() {
+        let mut model = Model::new(false);
+        model.apply(wardd(&[agent(AgentState::Working)]).remove(0));
+        assert!(!model.state.stop_incomplete);
+        model.apply(
+            wardd(&[WardEvent::WorkloadsTerminated {
+                ended: 2,
+                pending: 1,
+                barrier_confirmed: true,
+            }])
+            .remove(0),
+        );
+        assert!(model.state.stop_incomplete);
+        assert_eq!(model.state.agent, Some(AgentState::PauseUnsettled));
+
+        // A zero-known-PID result is still incomplete when the pre-kill
+        // membership barrier was not confirmed. Replay after a restart must
+        // retain STOP? from this durable event rather than the stale agent state.
+        model.apply(
+            wardd(&[WardEvent::WorkloadsTerminated {
+                ended: 1,
+                pending: 0,
+                barrier_confirmed: false,
+            }])
+            .remove(0),
+        );
+        assert!(model.state.stop_incomplete);
+        assert_eq!(model.state.agent, Some(AgentState::PauseUnsettled));
+
+        model.apply(
+            wardd(&[WardEvent::WorkloadsTerminated {
+                ended: 1,
+                pending: 0,
+                barrier_confirmed: true,
+            }])
+            .remove(0),
+        );
+        assert!(!model.state.stop_incomplete, "the retry confirmed it");
+        assert_ne!(model.state.agent, Some(AgentState::Finished));
+        model.apply(wardd(&[agent(AgentState::Finished)]).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::Finished));
     }
 }

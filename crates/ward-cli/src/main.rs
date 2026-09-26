@@ -116,8 +116,12 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
-    /// End the current session and seal its log. A paused session's frozen
-    /// processes are ended; the workspace is kept as it is.
+    /// End the current session: every sandboxed process of it is ended and
+    /// confirmed gone, then its log is sealed (running or paused). Refused, with
+    /// the log left open and the session held for the stop (`ward resume`
+    /// cannot release it), when that cannot be confirmed; run it again to
+    /// retry. Refused up front by a session daemon too old to confirm it. The
+    /// workspace is kept as it is.
     Stop {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
@@ -1787,10 +1791,21 @@ fn cmd_resume(dir: &Path, session: Option<&str>) -> ward_daemon::Result<ExitCode
 
 fn cmd_stop(dir: &Path, restore_entry: bool) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
-    if let Some(mut session) = Session::open_current(dir, &state)? {
+    if let Some(session) = Session::open_current(dir, &state)? {
         let id = session.id().to_owned();
-        if restore_entry {
-            let report = session.restore_entry()?;
+        // With a daemon serving, `stop` is a `Request::Stop` — sent only once the
+        // daemon has confirmed it serves confirmed stop (PR #253 review finding
+        // 1): the daemon ends the session's sandboxed processes and confirms they
+        // are gone (#145 item 5), records `Finished` and `SessionEnded`, seals,
+        // and exits; otherwise this process does the same itself. A stop that
+        // cannot confirm the processes ended is refused with the daemon's own
+        // account of what is left, and the log stays open.
+        let served = daemon::serving(&state, &id);
+        let ended = if restore_entry {
+            // Held for the stop by the daemon first, then the restore, then the
+            // stop — one hold nothing else can release (see
+            // `Session::stop_restoring_entry`).
+            let (report, ended) = session.stop_restoring_entry(EndReason::UserStop)?;
             match &report.backup {
                 Some(backup) => println!(
                     "  entry {} restored · {} paths · what it replaced is in {backup}/",
@@ -1801,19 +1816,28 @@ fn cmd_stop(dir: &Path, restore_entry: bool) -> ward_daemon::Result<ExitCode> {
                     report.snapshot
                 ),
             }
-        }
-        // With a daemon serving, `stop` is a `Request::Stop`: the daemon writes
-        // `SessionEnded`, seals, and exits; otherwise this process seals the log.
-        let served = daemon::serving(&state, &id);
-        session.stop(EndReason::UserStop)?;
+            ended
+        } else {
+            session.stop(EndReason::UserStop)?
+        };
         if served && !daemon::wait_stopped(&state, &id, daemon::STARTUP_TIMEOUT) {
             eprintln!("ward: wardd has not released {}", control_name(&id));
         }
-        println!("  session {id} stopped");
+        println!("{}", stopped_line(&id, ended));
     } else {
         println!("{}", render::session_status_line(None));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `ward stop`'s result line: the session, and — when the stop found any — how
+/// many sandboxed processes it ended and confirmed gone before sealing.
+fn stopped_line(id: &str, ended: u32) -> String {
+    match ended {
+        0 => format!("  session {id} stopped"),
+        1 => format!("  session {id} stopped · 1 sandboxed process ended"),
+        n => format!("  session {id} stopped · {n} sandboxed processes ended"),
+    }
 }
 
 fn cmd_verify(dir: &Path) -> ward_daemon::Result<ExitCode> {
@@ -1929,7 +1953,7 @@ mod tests {
     use super::{
         Cli, Command, SessionCmd, SnapshotCmd, WatchMode, approvals_all_line, desktop_command,
         observer_degraded_warning, on_path_in, pause_status_word, pending_all_line, pending_text,
-        unreachable_line, verb_program,
+        stopped_line, unreachable_line, verb_program,
     };
     use clap::Parser as _;
     use std::time::Duration;
@@ -2242,6 +2266,8 @@ mod tests {
         ));
     }
 
+    /// #145 item 5: the stop line says how many sandboxed processes the stop
+    /// ended, and says nothing extra when nothing was running.
     #[test]
     fn snapshot_keep_unkeep_and_kept_parse() {
         // #151 item 4: the explicit user-selected retention policy `gc`'s own
@@ -2268,6 +2294,21 @@ mod tests {
             cli.command,
             Command::Snapshot(SnapshotCmd::Kept { json: true })
         ));
+    }
+
+    /// #145 item 5: the stop line says how many sandboxed processes the stop
+    /// ended, and says nothing extra when nothing was running.
+    #[test]
+    fn stopped_line_counts_the_processes_the_stop_ended() {
+        assert_eq!(stopped_line("sess_a", 0), "  session sess_a stopped");
+        assert_eq!(
+            stopped_line("sess_a", 1),
+            "  session sess_a stopped · 1 sandboxed process ended"
+        );
+        assert_eq!(
+            stopped_line("sess_a", 4),
+            "  session sess_a stopped · 4 sandboxed processes ended"
+        );
     }
 
     #[test]

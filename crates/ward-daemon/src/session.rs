@@ -840,7 +840,17 @@ impl Session {
         let run = match self.prepare(argv, opts, &run_dir, &observers) {
             Ok(launch) => {
                 let mut clock = DrainClock::new();
-                launch.run_observed(&mut || {
+                // Admission is re-decided under the session lock immediately
+                // before the spawn, and held across it (PR #253 review finding
+                // 2): the check at the top of `launch` alone left a window in
+                // which a pause or a stop could scan, find nothing, and seal
+                // before this sandbox existed.
+                let (state, session) = (self.state.clone(), self.session_str.clone());
+                let mut admit = || {
+                    pause::admit_launch(&state, &session)
+                        .map(|guard| Box::new(guard) as Box<dyn std::any::Any>)
+                };
+                launch.run_admitted(&mut admit, &mut || {
                     if live_error.is_some() || !clock.due(observers.queued()) {
                         return;
                     }
@@ -1276,11 +1286,17 @@ impl Session {
         })
     }
 
+    /// The early, unlocked admission check at the top of [`launch`](Self::launch):
+    /// refuses before anything is recorded when the session is paused or a stop
+    /// of it has begun. Not the guarantee — the authoritative check is
+    /// [`pause::admit_launch`], re-run under the session lock immediately before
+    /// the sandbox is spawned — only the cheap, early refusal.
     fn refuse_while_paused(&self) -> Result<()> {
+        if pause::stop_begun(&self.state, &self.session_str) {
+            return Err(Error::Sandbox(pause::STOPPED_REFUSAL.into()));
+        }
         if self.paused() {
-            return Err(Error::Sandbox(
-                "session is paused by ward; `ward resume` before running anything".into(),
-            ));
+            return Err(Error::Sandbox(pause::PAUSED_REFUSAL.into()));
         }
         Ok(())
     }
@@ -1366,10 +1382,31 @@ impl Session {
 
     /// End the session, seal the log, and clear the project's current pointer.
     ///
-    /// The `SessionEnded` record and the seal are one [`Sink::stop`]: a running
-    /// daemon (ADR-0015) writes them on a [`Request::Stop`](crate::control::Request::Stop)
-    /// and exits; without one this process seals the log itself.
-    pub fn stop(mut self, reason: EndReason) -> Result<()> {
+    /// Stop is termination of the session's workloads followed by evidence
+    /// sealing (#145 item 5): every sandboxed process of the session is ended and
+    /// confirmed gone ([`pause::terminate`]) before the log is sealed. A running
+    /// daemon (ADR-0015) does both on a
+    /// [`Request::Stop`](crate::control::Request::Stop) and exits; without one this
+    /// process terminates the workloads itself, then seals. Either way the call
+    /// fails — with the log left unsealed and the project's current pointer kept,
+    /// so `ward stop` can simply be run again — when termination could not be
+    /// confirmed. Returns how many sandboxed processes were ended.
+    ///
+    /// `AgentStateChanged { Finished }` is recorded only once termination is
+    /// confirmed (PR #253 review finding 5): by the daemon itself, between its
+    /// `WorkloadsTerminated` and `SessionEnded`, when one serves the session —
+    /// this client appends nothing before asking, so a refused stop leaves no
+    /// `Finished` behind — and here, after [`Self::end_workloads_here`]
+    /// succeeded, when none does. A daemon that cannot positively confirm it
+    /// terminates the workloads (an older one, finding 1) is refused before
+    /// anything is sent ([`RemoteSink::require`]).
+    pub fn stop(mut self, reason: EndReason) -> Result<u32> {
+        if self.sink.ends_workloads() {
+            let ended = self.sink.stop(reason)?;
+            clear_current(&self.state, &self.project_id, &self.session_str)?;
+            return Ok(ended);
+        }
+        let ended = self.end_workloads_here()?;
         self.emit(
             Origin::Wardd,
             WardEvent::AgentStateChanged {
@@ -1378,7 +1415,185 @@ impl Session {
         )?;
         self.sink.stop(reason)?;
         clear_current(&self.state, &self.project_id, &self.session_str)?;
-        Ok(())
+        Ok(ended)
+    }
+
+    /// `ward stop --restore-entry`: restore the entry snapshot over the worktree,
+    /// then [`stop`](Self::stop) — with the session's workloads already quiescent
+    /// before the restore begins, and still quiescent until they are terminated
+    /// (#145 acceptance: "stop/restoration must wait for quiescence"). A restore
+    /// holds its own capture freeze only for its own length, so without this a
+    /// still-running agent would resume in the gap between the restore and the
+    /// stop and could write over the restored worktree.
+    ///
+    /// With a daemon serving, the whole pause→restore→stop is one operation
+    /// the daemon owns (PR #253 review finding 3): `Request::HoldForStop` is
+    /// always sent — never skipped because a pause marker exists, which a
+    /// daemon restarted since it was written holds nothing for — and the
+    /// daemon freezes the sandboxes itself (or takes over its own pause),
+    /// records `SessionPaused` for a fresh hold, writes the stop marker so no
+    /// launch is admitted, and keeps that hold until the stop: `ward resume`
+    /// from another client cannot release it in between. The restore runs only
+    /// once the daemon confirms the freeze stable; otherwise nothing is
+    /// restored and the session stays held for its stop. A daemon that does
+    /// not serve the hold (an older one) is refused before anything is asked
+    /// of it. Without a daemon, the workloads are terminated first, in this
+    /// process. Returns the restore and how many sandboxed processes the stop
+    /// ended.
+    pub fn stop_restoring_entry(mut self, reason: EndReason) -> Result<(RestoreReport, u32)> {
+        let mut ended = 0;
+        if self.sink.ends_workloads() {
+            self.hold_for_stop("ward stop --restore-entry")?;
+        } else {
+            ended = self.end_workloads_here()?;
+        }
+        let report = self.restore_entry()?;
+        ended += self.stop(reason)?;
+        Ok((report, ended))
+    }
+
+    /// Ask the session's daemon for a [`Request::HoldForStop`](crate::control::Request::HoldForStop)
+    /// and require it confirmed stable: the precondition of a restore.
+    fn hold_for_stop(&self, reason: &str) -> Result<()> {
+        use crate::control::{FEATURE_STOP_HOLD, Request, Response};
+        let socket = session_dir(&self.state, &self.session_str).join(SOCKET_NAME);
+        let mut control = RemoteSink::connect(&socket).ok_or_else(|| {
+            Error::Daemon(format!(
+                "{}: the session daemon did not answer; nothing was restored",
+                socket.display()
+            ))
+        })?;
+        control.require(FEATURE_STOP_HOLD, "nothing was restored")?;
+        match control.call(&Request::HoldForStop {
+            reason: reason.into(),
+        })? {
+            Response::HeldForStop { unsettled: None } => Ok(()),
+            Response::HeldForStop {
+                unsettled: Some(pending),
+            } => Err(Error::Daemon(format!(
+                "session {} could not be confirmed quiescent before restoring: {pending} \
+                 process(es) not confirmed stopped within {}s. Nothing was restored; the \
+                 session is held for its stop. Run `ward stop --restore-entry` again, or \
+                 `ward stop`",
+                self.session_str,
+                pause::FREEZE_SETTLE.as_secs()
+            ))),
+            Response::Error(e) => Err(Error::Daemon(format!(
+                "could not hold the session for its stop before restoring: {e}; nothing \
+                 was restored"
+            ))),
+            other => Err(Error::Daemon(format!("unexpected response {other:?}"))),
+        }
+    }
+
+    /// The daemonless half of [`Self::stop`]: what `Served::stop` does for a
+    /// served session, in this process. The stop marker is written first, and
+    /// the termination runs, under the session lock every launch's admission
+    /// takes (PR #253 review finding 2), so no sandbox can be spawned past the
+    /// scan. With no daemon there is no pause state to hold, so an unconfirmed
+    /// termination writes the marker (every proxy of the session refuses) and
+    /// records `WorkloadsTerminated { pending }`, then refuses the stop.
+    fn end_workloads_here(&mut self) -> Result<u32> {
+        let outcome = {
+            let _lock =
+                pause::lock_pause_freeze(&session_dir(&self.state, &self.session_str)).map_err(
+                    |e| {
+                        Error::Daemon(format!(
+                            "stop could not take the lifecycle lock for session {} ({e}); nothing                              was terminated and the log is not sealed",
+                            self.session_str
+                        ))
+                    },
+                )?;
+            pause::write_stop_marker(&self.state, &self.session_str).map_err(|e| {
+                Error::Daemon(format!(
+                    "stop could not record that session {} is stopping ({e}), so it could \
+                     not keep new launches out; nothing was terminated and the log is not \
+                     sealed",
+                    self.session_str
+                ))
+            })?;
+            pause::terminate(&self.session_str, None)
+        };
+        self.record_termination(&outcome)
+    }
+
+    /// Record `outcome` and decide the stop: `Ok(ended)` once everything is
+    /// gone, the refusal otherwise. Split from [`Self::end_workloads_here`] so
+    /// the refused path is testable without a process that survives `SIGKILL`.
+    fn record_termination(&mut self, outcome: &pause::Termination) -> Result<u32> {
+        let (ended, pending) = (outcome.ended, outcome.pending());
+        if !outcome.barrier_confirmed {
+            let marker = pause::write_marker(
+                &self.state,
+                &self.session_str,
+                "ward stop: pre-termination fork barrier not confirmed",
+            )
+            .err();
+            let logged = self
+                .emit(
+                    Origin::Wardd,
+                    WardEvent::WorkloadsTerminated {
+                        ended,
+                        pending,
+                        barrier_confirmed: false,
+                    },
+                )
+                .err();
+            return Err(Error::Daemon(pause::stop_refusal(
+                &self.session_str,
+                ended,
+                pending,
+                "the pre-termination fork barrier was not confirmed, so Ward cannot prove the                  session is quiescent even though no known pid remains. The stop marker remains                  in force; run `ward stop` again to re-scan and retry",
+                marker.as_ref(),
+                logged.as_ref(),
+            )));
+        }
+        if pending == 0 {
+            // Nothing is left for a marker to hold back — including one an
+            // earlier refused stop of this session left behind. If such an
+            // incomplete-stop marker existed, emit a confirmed zero-pending
+            // record even when this retry found no process: replay must see the
+            // durable STOP? state clear before SessionEnded.
+            let retrying_incomplete_stop =
+                pause::marker_path(&self.state, &self.session_str).exists();
+            let _ = pause::clear_marker(&self.state, &self.session_str);
+            if !outcome.touched_anything() && !retrying_incomplete_stop {
+                return Ok(0);
+            }
+            self.emit(
+                Origin::Wardd,
+                WardEvent::WorkloadsTerminated {
+                    ended,
+                    pending,
+                    barrier_confirmed: true,
+                },
+            )?;
+            return Ok(ended);
+        }
+        let marker = pause::write_marker(
+            &self.state,
+            &self.session_str,
+            &pause::stop_hold_reason(pending),
+        )
+        .err();
+        let logged = self
+            .emit(
+                Origin::Wardd,
+                WardEvent::WorkloadsTerminated {
+                    ended,
+                    pending,
+                    barrier_confirmed: true,
+                },
+            )
+            .err();
+        Err(Error::Daemon(pause::stop_refusal(
+            &self.session_str,
+            ended,
+            pending,
+            "the proxy is closed. Run `ward stop` again to retry",
+            marker.as_ref(),
+            logged.as_ref(),
+        )))
     }
 
     /// Append one batch of drained observations, in the order the batch holds them,
@@ -2204,7 +2419,7 @@ mod tests {
             self.inner.seal()
         }
 
-        fn stop(self: Box<Self>, reason: EndReason) -> Result<()> {
+        fn stop(self: Box<Self>, reason: EndReason) -> Result<u32> {
             self.inner.stop(reason)
         }
     }
@@ -2285,7 +2500,7 @@ mod tests {
             unreachable!("NullSink is replaced before any use")
         }
 
-        fn stop(self: Box<Self>, _reason: EndReason) -> Result<()> {
+        fn stop(self: Box<Self>, _reason: EndReason) -> Result<u32> {
             unreachable!("NullSink is replaced before any use")
         }
     }
@@ -2973,5 +3188,356 @@ mod tests {
                 .expect("the lock is released once the holder's verify() call returns");
         drop(probe);
         assert_eq!(next_attempt_id(&dir.join("events.log")).get(), 2);
+    }
+
+    /// The kinds of every record in `log`, by name, in order.
+    fn kinds_in(log: &Path) -> Vec<String> {
+        ward_events::LogReader::open(log)
+            .unwrap()
+            .map(|r| format!("{:?}", r.unwrap().event.kind()))
+            .collect()
+    }
+
+    struct BlockAfterGrant {
+        inner: Box<dyn Sink>,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Sink for BlockAfterGrant {
+        fn append(
+            &mut self,
+            origin: Origin,
+            event: WardEvent,
+            at: SystemTime,
+        ) -> Result<ward_events::EventRecord> {
+            self.inner.append(origin, event, at)
+        }
+
+        fn append_credential(
+            &mut self,
+            origin: Origin,
+            event: WardEvent,
+            at: SystemTime,
+        ) -> Result<(ward_events::EventRecord, Option<u64>)> {
+            let result = self.inner.append_credential(origin, event, at)?;
+            self.reached.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(result)
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            self.inner.sync()
+        }
+
+        fn seal(self: Box<Self>) -> Result<()> {
+            let Self { inner, .. } = *self;
+            inner.seal()
+        }
+
+        fn stop(self: Box<Self>, reason: EndReason) -> Result<u32> {
+            let Self { inner, .. } = *self;
+            inner.stop(reason)
+        }
+
+        fn ends_workloads(&self) -> bool {
+            self.inner.ends_workloads()
+        }
+
+        fn resync(&mut self) -> Result<()> {
+            self.inner.resync()
+        }
+    }
+
+    fn assert_stopped_launch_log(log: &Path) {
+        let records: Vec<_> = ward_events::LogReader::open(log)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .collect();
+        let started: Vec<_> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r.event, WardEvent::CommandStarted { .. }))
+            .collect();
+        let grants: Vec<_> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r.event, WardEvent::CredentialGranted { .. }))
+            .collect();
+        let aborted: Vec<_> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r.event, WardEvent::LaunchAborted { .. }))
+            .collect();
+        let finished: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r.event, WardEvent::CommandFinished { .. }))
+            .collect();
+        let ended = records
+            .iter()
+            .position(|r| matches!(r.event, WardEvent::SessionEnded { .. }))
+            .expect("SessionEnded");
+
+        assert_eq!(started.len(), 1, "{records:?}");
+        assert_eq!(grants.len(), 1, "{records:?}");
+        assert_eq!(
+            aborted.len(),
+            1,
+            "Stop owns the only terminal launch record: {records:?}"
+        );
+        assert!(
+            finished.is_empty(),
+            "the client cannot append a duplicate finish: {records:?}"
+        );
+        assert!(
+            started[0].0 < grants[0].0 && grants[0].0 < aborted[0].0 && aborted[0].0 < ended,
+            "{records:?}"
+        );
+        let WardEvent::CommandStarted { pid, .. } = started[0].1.event else {
+            unreachable!()
+        };
+        assert!(matches!(
+            aborted[0].1.event,
+            WardEvent::LaunchAborted { pid: p, .. } if p == pid
+        ));
+    }
+
+    #[test]
+    fn stop_terminalizes_a_full_session_launch_stalled_after_its_grant() {
+        use crate::control::{Request, Response};
+
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut initial = Session::start_in(project.path(), state.path()).unwrap();
+        initial.persist_current().unwrap();
+        initial.sync().unwrap();
+        let session_id = initial.id().to_owned();
+        let log = initial.log_path();
+        drop(initial);
+
+        let daemon_state = state.path().to_path_buf();
+        let daemon_session = session_id.clone();
+        let daemon =
+            std::thread::spawn(move || crate::daemon::serve(&daemon_state, &daemon_session));
+        assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
+            crate::daemon::serving(state.path(), &session_id)
+        }));
+
+        let mut client = Session::open_current(project.path(), state.path())
+            .unwrap()
+            .expect("current session");
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        client.sink = Box::new(BlockAfterGrant {
+            inner: std::mem::replace(&mut client.sink, Box::new(NullSink)),
+            reached: reached_tx,
+            release: release_rx,
+        });
+
+        let spec = crate::agents::profile("claude")
+            .and_then(|profile| profile.gateway)
+            .expect("claude gateway");
+        let opts = LaunchOpts {
+            gateways: vec![Gateway::from_key(&spec, "test-stop-key").unwrap()],
+            ..LaunchOpts::default()
+        };
+
+        let socket = session_dir(state.path(), &session_id).join(SOCKET_NAME);
+        let stopping = std::thread::spawn(move || {
+            reached_rx.recv().unwrap();
+            let mut control = RemoteSink::connect(&socket).expect("daemon connection");
+            assert!(
+                matches!(control.call(&Request::Grants), Ok(Response::Grants(ref grants)) if grants.len() == 1),
+                "the launch-scoped grant must be live before Stop"
+            );
+            let response = control.call(&Request::Stop {
+                reason: EndReason::UserStop,
+            });
+            release_tx.send(()).unwrap();
+            response
+        });
+
+        let err = client
+            .launch(&["true".to_owned()], &opts)
+            .err()
+            .expect("launch must be refused after stop")
+            .to_string();
+        assert!(
+            err.contains(pause::STOPPED_REFUSAL) || err.contains("terminal record"),
+            "{err}"
+        );
+        let response = stopping.join().unwrap().unwrap();
+        assert!(
+            matches!(response, Response::Sealed { ended: Some(0), .. }),
+            "{response:?}"
+        );
+        daemon.join().unwrap().unwrap();
+        assert_stopped_launch_log(&log);
+    }
+
+    #[test]
+    fn a_daemonless_stop_ends_a_running_sandbox_before_sealing() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        let log = session.log_path();
+        let mut sandbox = pause::FakeSandbox::spawn_for(session.id());
+        let ended = session.stop(EndReason::UserStop).unwrap();
+        assert!(ended >= 2, "{ended}");
+        assert!(sandbox.was_killed());
+        let kinds = kinds_in(&log);
+        let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
+        assert!(at("WorkloadsTerminated") < at("SessionEnded"), "{kinds:?}");
+    }
+
+    /// Without a daemon, a stop that cannot confirm termination is refused the
+    /// same way: nothing sealed, the marker written so the proxy refuses, the
+    /// partial outcome recorded. The retry, once nothing is left, clears the
+    /// marker and seals.
+    #[test]
+    fn a_daemonless_stop_that_cannot_confirm_termination_is_refused_until_a_retry() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        let log = session.log_path();
+        let err = session
+            .record_termination(&pause::Termination {
+                ended: 1,
+                remaining: Some(pause::Frozen {
+                    method: ward_events::PauseMethod::Sigstop,
+                    pids: vec![999_999],
+                    cgroup: None,
+                }),
+                barrier_confirmed: true,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1 ended, 1 still present"), "{err}");
+        assert!(err.contains("not sealed"), "{err}");
+        assert!(session.paused(), "the marker holds the proxy closed");
+        let kinds = kinds_in(&log);
+        assert_eq!(
+            kinds.last().map(String::as_str),
+            Some("WorkloadsTerminated")
+        );
+        assert!(!kinds.iter().any(|k| k == "SessionEnded"));
+        let marker = pause::marker_path(state.path(), session.id());
+        assert_eq!(session.stop(EndReason::UserStop).unwrap(), 0);
+        assert!(!marker.exists(), "a confirmed stop clears the hold");
+        assert_eq!(
+            kinds_in(&log).last().map(String::as_str),
+            Some("SessionEnded")
+        );
+    }
+
+    /// Daemonless replay keeps the same durable incomplete-stop evidence as
+    /// the daemon path: a failed membership barrier with zero known pending PIDs
+    /// is still STOP?, and a confirmed zero-process retry explicitly clears it.
+    #[test]
+    fn a_daemonless_barrier_only_incomplete_stop_is_recorded_until_retry() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        let log = session.log_path();
+
+        let err = session
+            .record_termination(&pause::Termination {
+                ended: 2,
+                remaining: Some(pause::Frozen {
+                    method: ward_events::PauseMethod::Sigstop,
+                    pids: Vec::new(),
+                    cgroup: None,
+                }),
+                barrier_confirmed: false,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fork barrier was not confirmed"), "{err}");
+        assert!(session.paused());
+
+        let records: Vec<_> = ward_events::LogReader::open(&log)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .collect();
+        assert!(matches!(
+            records.last().map(|r| &r.event),
+            Some(WardEvent::WorkloadsTerminated {
+                ended: 2,
+                pending: 0,
+                barrier_confirmed: false
+            })
+        ));
+
+        assert_eq!(session.stop(EndReason::UserStop).unwrap(), 0);
+        let records: Vec<_> = ward_events::LogReader::open(&log)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .collect();
+        let terminated: Vec<_> = records
+            .iter()
+            .filter_map(|r| match r.event {
+                WardEvent::WorkloadsTerminated {
+                    ended,
+                    pending,
+                    barrier_confirmed,
+                } => Some((ended, pending, barrier_confirmed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminated, [(2, 0, false), (0, 0, true)]);
+        assert!(matches!(
+            records.last().map(|r| &r.event),
+            Some(WardEvent::SessionEnded { .. })
+        ));
+    }
+
+    /// The daemonless stop path uses the same fail-closed lifecycle lock as
+    /// the daemon. Making the lock path a directory forces acquisition to fail;
+    /// the live sandbox must remain untouched and nothing may be sealed.
+    #[test]
+    fn a_daemonless_stop_does_nothing_when_the_lifecycle_lock_cannot_be_acquired() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        let log = session.log_path();
+        let session_id = session.id().to_owned();
+        let lock_path = session_dir(state.path(), &session_id).join(".pause-freeze.lock");
+        std::fs::create_dir(&lock_path).unwrap();
+        let mut sandbox = pause::FakeSandbox::spawn_for(&session_id);
+
+        let err = session.stop(EndReason::UserStop).unwrap_err().to_string();
+        assert!(err.contains("lifecycle lock"), "{err}");
+        assert!(sandbox.running(), "termination must not run unlocked");
+        assert!(!pause::stop_marker_path(state.path(), &session_id).exists());
+        assert!(
+            !kinds_in(&log).iter().any(|k| k == "SessionEnded"),
+            "the log must remain unsealed"
+        );
+    }
+
+    /// `ward stop --restore-entry` without a daemon: the workloads are ended
+    /// *before* the restore (so nothing can write over the restored worktree
+    /// afterwards), then the stop seals.
+    #[test]
+    fn stop_restoring_entry_ends_the_workloads_before_restoring() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("a.txt"), "entry\n").unwrap();
+        let session = Session::start_in(project.path(), state.path()).unwrap();
+        let log = session.log_path();
+        std::fs::write(project.path().join("a.txt"), "agent\n").unwrap();
+        let mut sandbox = pause::FakeSandbox::spawn_for(session.id());
+        let (report, ended) = session.stop_restoring_entry(EndReason::UserStop).unwrap();
+        assert!(ended >= 2, "{ended}");
+        assert!(sandbox.was_killed());
+        assert_eq!(report.files, 1);
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("a.txt")).unwrap(),
+            "entry\n"
+        );
+        let kinds = kinds_in(&log);
+        let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
+        assert!(at("WorkloadsTerminated") < at("EntryRestored"), "{kinds:?}");
+        assert!(at("EntryRestored") < at("SessionEnded"), "{kinds:?}");
     }
 }

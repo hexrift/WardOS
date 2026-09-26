@@ -42,7 +42,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ward_events::{EventRecord, LogReader, Origin, RevokeReason, ServiceId, ShortText, WardEvent};
+use ward_events::{
+    EventRecord, LogReader, Origin, Pid, RevokeReason, ServiceId, ShortText, WardEvent,
+};
 
 use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
@@ -391,10 +393,24 @@ struct Subscription {
     live: Option<(Receiver<Delivery>, Sender<Delivery>)>,
 }
 
-/// A pause in force: what was frozen and since when.
+/// A pause in force: what was frozen, since when, and what holds it.
 struct Paused {
     frozen: Frozen,
     since: Instant,
+    hold: Hold,
+}
+
+/// What a [`Paused`] is holding the session for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hold {
+    /// `ward pause`: released by `ward resume`.
+    Pause,
+    /// A stop that has begun and not completed: a `HoldForStop` waiting for its
+    /// `Stop` (PR #253 review finding 3), or a `Stop` that was refused because
+    /// it could not confirm termination (finding 5) — whose held processes may
+    /// already have taken an irreversible `SIGKILL`. Never released by `ward
+    /// resume`; only a stop (or a log-only `Seal`) ends it.
+    Stop,
 }
 
 /// What [`Served::pause`] produced: the one terminal record the pause attempt
@@ -472,7 +488,12 @@ struct Served {
     /// neither confirmed running nor confirmed safe (#140, PR #197 review
     /// round 3). #140 stays open for a host-owned teardown capability that
     /// could make EOF trustworthy enough to retire the grant outright.
-    open_launches: Vec<(u64, u64)>,
+    open_launches: Vec<(u64, u64, Pid)>,
+    /// The agent state the log last recorded (`AgentStateChanged`), so a stop
+    /// records `Finished` itself — once, and only after termination is
+    /// confirmed (PR #253 review finding 5) — unless a client that predates
+    /// that (0.18, which appended `Finished` before asking to stop) already has.
+    last_agent_state: Option<ward_events::AgentState>,
 }
 
 impl Served {
@@ -496,6 +517,7 @@ impl Served {
             session,
             paused: None,
             open_launches: Vec::new(),
+            last_agent_state: None,
         }
     }
 
@@ -566,23 +588,38 @@ impl Served {
                     .map_or_else(|e| Response::Error(refusal(e)), Response::Record),
                 false,
             ),
-            // Ending from paused: the frozen tree is killed rather than left
-            // stopped for ever; the worktree is not touched.
-            request @ (Request::Stop { .. } | Request::Seal) if self.paused.is_some() => {
+            Request::Capabilities => (
+                Response::Capabilities {
+                    features: vec![
+                        control::FEATURE_STOP_TERMINATES.into(),
+                        control::FEATURE_STOP_HOLD.into(),
+                    ],
+                },
+                false,
+            ),
+            Request::HoldForStop { reason } => (
+                self.hold_for_stop(&reason).map_or_else(
+                    |e| Response::Error(refusal(e)),
+                    |unsettled| Response::HeldForStop { unsettled },
+                ),
+                false,
+            ),
+            // A stop ends the session's workloads before anything is sealed
+            // (#145 item 5), from running or from paused.
+            Request::Stop { reason } => self.stop(conn, reason, pause::terminate),
+            // Log-only closure from paused: the frozen tree is killed rather
+            // than left stopped for ever; the worktree is not touched.
+            Request::Seal if self.paused.is_some() => {
                 if let Some(paused) = self.paused.take() {
                     pause::kill_frozen(&paused.frozen);
                     let _ = pause::clear_marker(&self.state, &self.session);
                 }
-                self.handle_conn(conn, request)
+                self.handle_conn(conn, Request::Seal)
             }
             // Give every approval still open a terminal record before anything
             // that follows can seal the log (#146): once sealed, no record can
             // follow it, so this must happen first, not from inside
             // `handle_appendable`'s `done` handling below.
-            Request::Stop { reason } => {
-                self.close_pending_approvals();
-                self.handle_appendable(conn, Request::Stop { reason })
-            }
             Request::Seal => {
                 self.close_pending_approvals();
                 self.handle_appendable(conn, Request::Seal)
@@ -615,25 +652,32 @@ impl Served {
                 self.open_launches
                     .iter()
                     .rev()
-                    .find(|(c, _)| *c == conn)
-                    .map(|(_, key)| *key),
+                    .find(|(c, _, _)| *c == conn)
+                    .map(|(_, key, _)| *key),
             )),
             _ => None,
         };
-        let launch_started = matches!(
-            &other,
+        let launch_started = match &other {
             Request::Append {
-                event: WardEvent::CommandStarted { .. },
+                event: WardEvent::CommandStarted { pid, .. },
                 ..
-            }
-        );
-        let launch_finished = matches!(
-            &other,
+            } => Some(*pid),
+            _ => None,
+        };
+        let launch_finished = match &other {
             Request::Append {
-                event: WardEvent::CommandFinished { .. } | WardEvent::LaunchAborted { .. },
+                event: WardEvent::CommandFinished { pid, .. } | WardEvent::LaunchAborted { pid, .. },
                 ..
-            }
-        );
+            } => Some(*pid),
+            _ => None,
+        };
+        let agent_state = match &other {
+            Request::Append {
+                event: WardEvent::AgentStateChanged { state },
+                ..
+            } => Some(*state),
+            _ => None,
+        };
         let subscribers = &mut self.subscribers;
         let (response, done) = control::handle_with(&mut self.log, other, |record| {
             subscribers.retain(|s| s.send(Delivery::Record(Box::new(record.clone()))).is_ok());
@@ -646,6 +690,9 @@ impl Served {
         // process at all.
         let mut grant_id = None;
         if let Response::Record(record) = &response {
+            if agent_state.is_some() {
+                self.last_agent_state = agent_state;
+            }
             if let Some((service, subject, permissions, launch_key)) = credential {
                 // The subject is the route's upstream, `host:port`.
                 let host = subject
@@ -659,18 +706,18 @@ impl Served {
                     control::unix_ms(SystemTime::now()),
                 ));
             }
-            if launch_started {
-                // The record's own sequence number is unique and monotonic by
-                // construction (the log assigns it), unlike the client-chosen
-                // `Pid` inside the event: pairing it with `conn` is what makes
-                // this launch's key collision-free even when two connections
-                // pick the same `Pid` (PR #197 review, finding 2).
-                self.open_launches.push((conn, record.seq));
+            if let Some(pid) = launch_started {
+                // Keep the logical pid so a confirmed stop can terminalize any
+                // still-open launch before sealing the log.
+                self.open_launches.push((conn, record.seq, pid));
             }
-            if launch_finished
-                && let Some(pos) = self.open_launches.iter().rposition(|(c, _)| *c == conn)
+            if let Some(pid) = launch_finished
+                && let Some(pos) = self
+                    .open_launches
+                    .iter()
+                    .rposition(|(c, _, p)| *c == conn && *p == pid)
             {
-                let (_, key) = self.open_launches.remove(pos);
+                let (_, key, _) = self.open_launches.remove(pos);
                 // The route this launch's credentials were scoped to is torn
                 // down with it: they are no longer active authority, whether
                 // the launch ran to completion, failed, was killed over
@@ -719,9 +766,38 @@ impl Served {
     /// closing). Closes out every one of `conn`'s open launches, not just
     /// one, since nothing about the protocol forbids a connection starting
     /// more than one launch before closing.
+    /// Terminalize every launch still open when Stop has confirmed that the
+    /// session's workloads are gone. This runs before SessionEnded/seal, so the
+    /// log never closes with an unmatched CommandStarted and launch-scoped
+    /// credentials retire through the same per-connection path as a client
+    /// supplied terminal record.
+    fn abort_open_launches_for_stop(&mut self) -> Result<()> {
+        let launches = self.open_launches.clone();
+        for (conn, _, pid) in launches {
+            let request = Request::Append {
+                origin: Origin::Wardd,
+                event: WardEvent::LaunchAborted {
+                    pid,
+                    reason: ShortText::new("terminated by ward stop"),
+                },
+                at_unix_ms: control::unix_ms(SystemTime::now()),
+            };
+            match self.handle_conn(conn, request).0 {
+                Response::Record(_) => {}
+                Response::Error(e) => return Err(Error::Daemon(e)),
+                other => {
+                    return Err(Error::Daemon(format!(
+                        "unexpected response while terminalizing launch {pid}: {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn disconnect_open_launches(&mut self, conn: u64) {
         let mut keys = Vec::new();
-        self.open_launches.retain(|&(c, key)| {
+        self.open_launches.retain(|&(c, key, _)| {
             if c == conn {
                 keys.push(key);
                 false
@@ -946,6 +1022,7 @@ impl Served {
                     self.paused = Some(Paused {
                         frozen,
                         since: Instant::now(),
+                        hold: Hold::Pause,
                     });
                     return Err(Error::Daemon(format!(
                         "the freeze for session {} could not be confirmed settled \
@@ -961,6 +1038,7 @@ impl Served {
         self.paused = Some(Paused {
             frozen,
             since: Instant::now(),
+            hold: Hold::Pause,
         });
         Ok(PauseOutcome {
             record: Box::new(record),
@@ -970,10 +1048,26 @@ impl Served {
 
     /// Reverse [`Self::pause`]: release the approvals, open the proxy, thaw
     /// the processes, append `SessionResumed`.
+    ///
+    /// Refused while the session is held for a stop ([`Hold::Stop`]), and once
+    /// a stop of it has begun at all (the on-disk stop marker, which outlives
+    /// a daemon restart): a `HoldForStop` must stay in force until its stop
+    /// (PR #253 review finding 3), and a refused stop's remaining processes
+    /// have already been sent `SIGKILL` — releasing them as though they were an
+    /// ordinary pause would present a half-killed session as resumable
+    /// execution (finding 5). A stop is retried with `ward stop`.
     fn resume(&mut self) -> Result<Box<EventRecord>> {
         let Some(paused) = self.paused.as_ref() else {
             return Err(Error::Daemon("not paused".into()));
         };
+        if paused.hold == Hold::Stop || pause::stop_begun(&self.state, &self.session) {
+            return Err(Error::Daemon(format!(
+                "a stop of session {} has begun and not completed: its sandboxed processes \
+                 are held for that stop (some may already have been killed), so `ward \
+                 resume` cannot release them. Run `ward stop` to finish it",
+                self.session
+            )));
+        }
         // #234: the same lock `pause`/`CaptureFreeze` take, so a capture's own
         // marker check or thaw can never straddle this resume's marker clear and
         // thaw.
@@ -991,6 +1085,285 @@ impl Served {
         self.paused = None;
         let record = self.append(WardEvent::SessionResumed { paused_for })?;
         Ok(Box::new(record))
+    }
+
+    /// `Request::HoldForStop` (PR #253 review finding 3): make the session
+    /// quiescent for the stop that follows, as a daemon-owned hold nothing but
+    /// that stop (or a log-only `Seal`) can end. Always uses
+    /// [`pause::freeze_confirmed`] / [`pause::stabilize`]; see
+    /// [`Self::hold_for_stop_with`].
+    fn hold_for_stop(&mut self, reason: &str) -> Result<Option<u32>> {
+        self.hold_for_stop_with(reason, pause::freeze_confirmed, pause::stabilize)
+    }
+
+    /// [`Self::hold_for_stop`], with the freeze injectable (a test needs an
+    /// unsettled outcome no real process can produce on demand).
+    ///
+    /// Under [`pause::lock_pause_freeze`], in this order: the stop marker is
+    /// written, so no launch is admitted from here on
+    /// ([`pause::admit_launch`]); then the daemon's *own* view decides what is
+    /// frozen — never the pause marker on disk, which a daemon restarted since
+    /// it was written does not hold anything for. A pause already in force is
+    /// taken over (its freeze re-confirmed stable, since it may have been
+    /// unsettled) without a new record; otherwise the sandboxes are frozen now,
+    /// the marker is written, the approvals are held and `SessionPaused` (or
+    /// `SessionPauseUnsettled`) is appended, exactly as `ward pause` records
+    /// one. Either way the result is a [`Hold::Stop`], which `Resume` refuses.
+    /// Returns `Some(pending)` when the freeze could not be confirmed stable in
+    /// time — the hold still stands, and a caller that needs quiescence (a
+    /// restore) must not proceed on it.
+    fn hold_for_stop_with(
+        &mut self,
+        reason: &str,
+        freeze: impl FnOnce(&str) -> (Frozen, bool),
+        restabilize: impl FnOnce(&str, Frozen) -> (Frozen, bool),
+    ) -> Result<Option<u32>> {
+        if self.log.is_none() {
+            return Err(Error::Daemon("log is sealed".into()));
+        }
+        let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
+        pause::write_stop_marker(&self.state, &self.session)?;
+        if let Some(paused) = self.paused.take() {
+            let (frozen, stable) = restabilize(&self.session, paused.frozen);
+            let unsettled = if stable {
+                None
+            } else {
+                Some(pause::unsettled_count(&frozen, false).unwrap_or(0))
+            };
+            // The pause's marker normally stands already; a hold must not
+            // depend on that.
+            let marker = if pause::marker_path(&self.state, &self.session).exists() {
+                Ok(())
+            } else {
+                pause::write_marker(&self.state, &self.session, &pause::reason_text(reason))
+            };
+            self.approvals.set_paused(true);
+            self.paused = Some(Paused {
+                frozen,
+                since: paused.since,
+                hold: Hold::Stop,
+            });
+            marker?;
+            return Ok(unsettled);
+        }
+        let reason = pause::reason_text(reason);
+        let (frozen, stable) = freeze(&self.session);
+        if let Err(e) = pause::write_marker(&self.state, &self.session, &reason) {
+            // Nothing is held: let the tree run rather than leave it frozen
+            // with no marker saying so. The stop marker stays — the session
+            // is ending — so no launch is admitted either way.
+            pause::thaw(&frozen);
+            return Err(e);
+        }
+        self.approvals.set_paused(true);
+        let unsettled = if stable {
+            None
+        } else {
+            Some(pause::unsettled_count(&frozen, false).unwrap_or(0))
+        };
+        let method = frozen.method;
+        self.paused = Some(Paused {
+            frozen,
+            since: Instant::now(),
+            hold: Hold::Stop,
+        });
+        let event = match unsettled {
+            None => WardEvent::SessionPaused {
+                method,
+                reason: ShortText::new(&reason),
+            },
+            Some(pending) => WardEvent::SessionPauseUnsettled {
+                method,
+                reason: ShortText::new(&reason),
+                pending,
+            },
+        };
+        // The hold is never undone for a log-only failure: it is the safest
+        // state, and the stop that follows ends it.
+        self.append(event).map_err(|e| {
+            Error::Daemon(format!(
+                "session {} is held for its stop, but the record of that could not be \
+                 written ({e}); nothing was restored. Run `ward stop` to finish the stop",
+                self.session
+            ))
+        })?;
+        Ok(unsettled)
+    }
+
+    /// `Request::Stop` (#145 item 5): stop is termination of the session's
+    /// workloads followed by evidence sealing, not log-only closure (that is
+    /// `Request::Seal`). In order: the stop marker is written under the session
+    /// lock, so no launch is admitted from here on (PR #253 review finding 2);
+    /// every sandboxed process of the session is frozen (or already is, from a
+    /// pause or a stop hold), the freeze confirmed stable, killed and confirmed
+    /// gone (`terminate`, always [`pause::terminate`] outside tests); when
+    /// there was anything to end, `WorkloadsTerminated` records it; only then
+    /// is `AgentStateChanged { Finished }` appended (finding 5: never before
+    /// termination is confirmed), every approval still open gets its terminal
+    /// record (#146), and `SessionEnded` and the seal follow. The answer's
+    /// `ended` is `Some(n)`: the positive acknowledgement a client requires
+    /// (finding 1).
+    ///
+    /// When termination cannot be confirmed within [`pause::STOP_SETTLE`], the
+    /// stop is refused rather than reported as done (#145 item 4): the log is
+    /// not sealed, `Finished` is not recorded, and the session is held for the
+    /// stop ([`Hold::Stop`]) — the marker written so every proxy refuses, the
+    /// approvals held, the processes still present kept as the hold's freeze.
+    /// `WorkloadsTerminated { pending }` records the partial outcome. That is
+    /// an incomplete stop, not a pause: `ward resume` refuses it, and a later
+    /// `ward stop` retries from there.
+    ///
+    /// `terminate` is injectable for the same reason [`Self::pause_with`]'s
+    /// `settle` is: a real process that survives `SIGKILL` for the length of the
+    /// bound (uninterruptible sleep) cannot be produced on demand by a test.
+    fn stop(
+        &mut self,
+        conn: u64,
+        reason: ward_events::EndReason,
+        terminate: impl FnOnce(&str, Option<Frozen>) -> pause::Termination,
+    ) -> (Response, bool) {
+        // A log already sealed has nothing to stop; `handle_appendable` answers
+        // that exactly as it always has.
+        if self.log.is_none() {
+            return self.handle_appendable(conn, Request::Stop { reason });
+        }
+        let ended = match self.end_workloads(terminate) {
+            Ok(n) => n,
+            Err(e) => return (Response::Error(refusal(e)), false),
+        };
+        if let Err(e) = self.abort_open_launches_for_stop() {
+            return (
+                Response::Error(format!(
+                    "stop ended every sandboxed process of session {} ({ended}), but an open launch could not be terminalized ({e}); the log is not sealed. Run `ward stop` again",
+                    self.session
+                )),
+                false,
+            );
+        }
+        if self.last_agent_state != Some(ward_events::AgentState::Finished)
+            && let Err(e) = self.append(WardEvent::AgentStateChanged {
+                state: ward_events::AgentState::Finished,
+            })
+        {
+            return (
+                Response::Error(format!(
+                    "stop ended every sandboxed process of session {} ({ended}), but the \
+                     agent's finished state could not be recorded ({e}); the log is not \
+                     sealed. Run `ward stop` again",
+                    self.session
+                )),
+                false,
+            );
+        }
+        self.close_pending_approvals();
+        match self.handle_appendable(conn, Request::Stop { reason }) {
+            (Response::Sealed { head, .. }, done) => (
+                Response::Sealed {
+                    head,
+                    ended: Some(ended),
+                },
+                done,
+            ),
+            other => other,
+        }
+    }
+
+    /// The termination half of [`Self::stop`]: returns how many processes ended,
+    /// or the refusal once the session has been put in its held-for-stop state.
+    fn end_workloads(
+        &mut self,
+        terminate: impl FnOnce(&str, Option<Frozen>) -> pause::Termination,
+    ) -> Result<u32> {
+        // #234: the lock `pause`/`resume`/`CaptureFreeze` take, and — PR #253
+        // review finding 2 — the one `pause::admit_launch` takes around every
+        // sandbox spawn, held from the stop marker through the scan, the kill
+        // and the confirmation. Failure is fail-closed: without this lock Ward
+        // cannot prove another already-admitted launch will not spawn after the scan.
+        let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session)).map_err(
+            |e| {
+                Error::Daemon(format!(
+                    "stop could not take the lifecycle lock for session {} ({e}); nothing was                      terminated and the log is not sealed",
+                    self.session
+                ))
+            },
+        )?;
+        pause::write_stop_marker(&self.state, &self.session).map_err(|e| {
+            Error::Daemon(format!(
+                "stop could not record that session {} is stopping ({e}), so it could not \
+                 keep new launches out; nothing was terminated and the log is not sealed",
+                self.session
+            ))
+        })?;
+        let held = self.paused.take();
+        let since = held.as_ref().map(|p| p.since);
+        let retrying_incomplete_stop = held.as_ref().is_some_and(|p| p.hold == Hold::Stop);
+        let outcome = terminate(&self.session, held.map(|p| p.frozen));
+        let ended = outcome.ended;
+        let pending = outcome.pending();
+        let barrier_confirmed = outcome.barrier_confirmed;
+        let Some(remaining) = outcome.remaining else {
+            // Everything the stop found is gone: nothing is left for the marker
+            // to hold back. (Idempotent when there never was a marker.)
+            let _ = pause::clear_marker(&self.state, &self.session);
+            if ended > 0 || retrying_incomplete_stop {
+                self.append(WardEvent::WorkloadsTerminated {
+                    ended,
+                    pending: 0,
+                    barrier_confirmed: true,
+                })
+                .map_err(|e| {
+                    Error::Daemon(format!(
+                        "stop ended {ended} sandboxed process(es) of session {}, but \
+                         the record of that could not be written ({e}); the log is not \
+                         sealed",
+                        self.session
+                    ))
+                })?;
+            }
+            return Ok(ended);
+        };
+        // Not confirmed: hold the session for the stop over whatever is still
+        // there — an incomplete stop, not a pause.
+        let marker = pause::write_marker(
+            &self.state,
+            &self.session,
+            &pause::stop_hold_reason(pending),
+        )
+        .err();
+        self.approvals.set_paused(true);
+        self.paused = Some(Paused {
+            frozen: remaining,
+            since: since.unwrap_or_else(Instant::now),
+            hold: Hold::Stop,
+        });
+        // Persist the incomplete result even when no currently-known PID remains:
+        // barrier uncertainty is itself evidence. Replay/restart must still know
+        // this stop was refused and keep showing STOP?, not fall back to the
+        // pre-stop agent state simply because `pending == 0`.
+        let logged = self
+            .append(WardEvent::WorkloadsTerminated {
+                ended,
+                pending,
+                barrier_confirmed,
+            })
+            .err();
+        let detail = if barrier_confirmed {
+            "the stop is incomplete and the session is held for it (proxy closed, \
+             approvals held, no new launch admitted; `ward resume` cannot release it). \
+             Run `ward stop` again to retry"
+        } else {
+            "the pre-termination fork barrier was not confirmed, so Ward cannot prove the \
+             session is quiescent even though no known pid remains. The session is held \
+             for the stop; `ward resume` cannot release it. Run `ward stop` again to retry"
+        };
+        Err(Error::Daemon(pause::stop_refusal(
+            &self.session,
+            ended,
+            pending,
+            detail,
+            marker.as_ref(),
+            logged.as_ref(),
+        )))
     }
 
     /// Start a subscription from `from_seq`: everything in the log so far, and a
@@ -1396,6 +1769,12 @@ mod tests {
     }
 
     fn fresh_served(dir: &Path) -> Served {
+        fresh_served_as(dir, "sess_9")
+    }
+
+    /// [`fresh_served`] for a named session: tests that run real processes
+    /// under a session's run directory need an id no other test shares.
+    fn fresh_served_as(dir: &Path, session: &str) -> Served {
         let log_path = dir.join("events.log");
         let log = LocalLog::create(
             &log_path,
@@ -1409,15 +1788,767 @@ mod tests {
             Some("hexrift/WardOS".into()),
             vec!["tests/security_expiry.rs".into()],
         );
-        std::fs::create_dir_all(session_dir(dir, "sess_9")).unwrap();
+        std::fs::create_dir_all(session_dir(dir, session)).unwrap();
         Served::new(
             log,
             log_path,
-            serde_json::json!({"session": "sess_9"}),
+            serde_json::json!({ "session": session }),
             deriver,
             dir.to_path_buf(),
-            "sess_9".to_owned(),
+            session.to_owned(),
         )
+    }
+
+    /// The kinds of every record in `served`'s log, by name, in order.
+    fn kinds_of(served: &mut Served) -> Vec<String> {
+        served
+            .subscribe(0)
+            .unwrap()
+            .replay
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect()
+    }
+
+    /// #145 item 5, end to end in the daemon against real processes: `ward
+    /// stop` on a *running* session (never paused) ends every process of its
+    /// sandbox and confirms it gone before sealing, records how many, and
+    /// answers with the count. Before this, `Request::Stop` sealed the log and
+    /// left the agent running unobserved. `Finished` lands only after the
+    /// confirmed termination (PR #253 review finding 5).
+    #[test]
+    fn stop_ends_a_running_sandbox_before_sealing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sandbox = pause::FakeSandbox::spawn("sess_stoprun");
+        let mut served = fresh_served_as(dir.path(), &sandbox.session);
+        let (response, done) = served.handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        let Response::Sealed {
+            ended: Some(ended), ..
+        } = response
+        else {
+            panic!("{response:?}");
+        };
+        assert!(done, "the log is sealed");
+        assert!(ended >= 2, "the shell and its child: {ended}");
+        assert!(sandbox.was_killed(), "the sandbox root died of SIGKILL");
+        assert!(pause::sandbox_pids(Path::new("/proc"), &sandbox.session).is_empty());
+        let replay = LogReader::open(&served.log_path)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .collect::<Vec<_>>();
+        let kinds: Vec<_> = replay
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            ["WorkloadsTerminated", "AgentStateChanged", "SessionEnded"],
+            "{kinds:?}"
+        );
+        assert!(matches!(
+            replay[0].event,
+            WardEvent::WorkloadsTerminated {
+                ended: e,
+                pending: 0,
+                barrier_confirmed: true
+            } if e == ended
+        ));
+        assert_eq!(replay[0].origin, Origin::Wardd);
+        assert!(!pause::marker_path(dir.path(), &sandbox.session).exists());
+    }
+
+    /// The explicit other operation (#145 item 5): `Request::Seal` is log-only
+    /// closure and does not touch a running sandbox — and its answer carries no
+    /// termination acknowledgement (`ended: None`), so no client can mistake it
+    /// for a stop.
+    #[test]
+    fn seal_is_log_only_closure_and_leaves_a_running_sandbox_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sandbox = pause::FakeSandbox::spawn("sess_sealrun");
+        let mut served = fresh_served_as(dir.path(), &sandbox.session);
+        let (response, done) = served.handle(Request::Seal);
+        assert!(
+            matches!(response, Response::Sealed { ended: None, .. }),
+            "{response:?}"
+        );
+        assert!(done);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(sandbox.running(), "a seal does not end the workloads");
+    }
+
+    /// PR #253 review finding 1, daemon side: the daemon names the features a
+    /// 0.19 client checks for before it sends `Stop` or `HoldForStop`.
+    #[test]
+    fn capabilities_name_confirmed_stop_and_the_stop_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let (Response::Capabilities { features }, false) = served.handle(Request::Capabilities)
+        else {
+            panic!("capabilities");
+        };
+        assert!(
+            features
+                .iter()
+                .any(|f| f == control::FEATURE_STOP_TERMINATES)
+        );
+        assert!(features.iter().any(|f| f == control::FEATURE_STOP_HOLD));
+        assert!(kinds_of(&mut served).is_empty(), "nothing is recorded");
+    }
+
+    /// A pause's freeze is what a stop from paused terminates: the held
+    /// `Frozen` is handed to `terminate` (not re-frozen from scratch), and a
+    /// confirmed termination clears the marker and seals.
+    #[test]
+    fn stop_from_paused_terminates_the_pauses_own_freeze() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let held = Frozen {
+            method: ward_events::PauseMethod::Sigstop,
+            pids: vec![41, 42],
+            cgroup: None,
+        };
+        served.paused = Some(Paused {
+            frozen: held.clone(),
+            since: Instant::now(),
+            hold: Hold::Pause,
+        });
+        pause::write_marker(dir.path(), "sess_9", "looks wrong").unwrap();
+        let mut given = None;
+        let (response, done) = served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |s, f| {
+            assert_eq!(s, "sess_9");
+            given = f;
+            pause::Termination::confirmed(2)
+        });
+        assert_eq!(given, Some(held), "the pause's freeze, as held");
+        assert!(
+            matches!(response, Response::Sealed { ended: Some(2), .. }),
+            "{response:?}"
+        );
+        assert!(done);
+        assert!(served.paused.is_none());
+        assert!(!pause::marker_path(dir.path(), "sess_9").exists());
+    }
+
+    /// #145 items 4-5: a stop that cannot confirm every process ended is
+    /// refused, never reported as done — the log stays unsealed, the session is
+    /// held for the stop over exactly what is left (marker written, approvals
+    /// held), and `WorkloadsTerminated { pending }` records the partial outcome.
+    /// A retry hands the held remainder back to `terminate` and, once that is
+    /// confirmed, seals. Deterministic: `terminate` is injected.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_stop_that_cannot_confirm_termination_is_refused_and_held_paused_until_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let marker = pause::marker_path(dir.path(), "sess_9");
+        // A question is open when the stop is attempted.
+        let holding = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || hold(&served, "Write", "/work/a.rs", "r", 30))
+        };
+        assert!(wait_until(Duration::from_secs(2), || {
+            !lock(&served).approvals.pending().is_empty()
+        }));
+        let stuck = Frozen {
+            method: ward_events::PauseMethod::Sigstop,
+            pids: vec![77],
+            cgroup: None,
+        };
+        let (response, done) = {
+            let stuck = stuck.clone();
+            lock(&served).stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
+                assert_eq!(held, None, "nothing was paused");
+                pause::Termination {
+                    ended: 3,
+                    remaining: Some(stuck),
+                    barrier_confirmed: true,
+                }
+            })
+        };
+        let Response::Error(message) = response else {
+            panic!("{response:?}");
+        };
+        assert!(!done, "not sealed");
+        assert!(message.contains("3 ended, 1 still present"), "{message}");
+        assert!(message.contains("held for it"), "{message}");
+        assert!(message.contains("not sealed"), "{message}");
+        {
+            let mut served = lock(&served);
+            assert!(served.log.is_some(), "the log is still open");
+            let paused = served.paused.as_ref().unwrap();
+            assert_eq!(paused.frozen, stuck, "held over exactly what is left");
+            assert_eq!(paused.hold, Hold::Stop, "an incomplete stop, not a pause");
+            assert!(served.approvals.paused(), "approvals held");
+            assert_eq!(
+                served.approvals.pending().len(),
+                1,
+                "the open question is held, not closed out"
+            );
+            let kinds = kinds_of(&mut served);
+            assert_eq!(
+                kinds.last().map(String::as_str),
+                Some("WorkloadsTerminated")
+            );
+            assert!(!kinds.iter().any(|k| k == "SessionEnded"), "{kinds:?}");
+            let last = served.subscribe(0).unwrap().replay.pop().unwrap();
+            assert!(matches!(
+                last.event,
+                WardEvent::WorkloadsTerminated {
+                    ended: 3,
+                    pending: 1,
+                    barrier_confirmed: true
+                }
+            ));
+        }
+        assert!(
+            std::fs::read_to_string(&marker)
+                .unwrap()
+                .starts_with("ward stop: 1 process(es) not confirmed ended"),
+            "the proxy refuses while held"
+        );
+        // Still a session: a pause is refused as already in force (it is),
+        // and it is the retry that ends it.
+        assert!(matches!(
+            lock(&served).handle(Request::Pause { reason: String::new() }).0,
+            Response::Error(e) if e == "already paused"
+        ));
+
+        let (response, done) =
+            lock(&served).stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
+                assert_eq!(held, Some(stuck), "the retry gets the held remainder");
+                pause::Termination::confirmed(1)
+            });
+        assert!(
+            matches!(response, Response::Sealed { ended: Some(1), .. }),
+            "{response:?}"
+        );
+        assert!(done);
+        assert!(!marker.exists());
+        assert!(matches!(
+            holding.join().unwrap(),
+            Response::Decision { decision: crate::hooks::HookDecision::Deny, reason, .. }
+                if reason == "approval: session ended"
+        ));
+        let kinds: Vec<_> = LogReader::open(&lock(&served).log_path)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        let tail = &kinds[kinds.len() - 4..];
+        assert_eq!(
+            tail,
+            [
+                "WorkloadsTerminated",
+                "AgentStateChanged",
+                "CapabilityDecided",
+                "SessionEnded"
+            ],
+            "{kinds:?}"
+        );
+    }
+
+    /// A failed membership/fork barrier is an incomplete stop even when every
+    /// currently-known PID is already gone. The uncertainty itself is durable:
+    /// replay sees `barrier_confirmed: false`, the session stays held and
+    /// unsealed, and a later confirmed retry writes the clearing
+    /// `WorkloadsTerminated` record before sealing.
+    #[test]
+    fn an_unconfirmed_stop_barrier_with_zero_known_pids_is_durable_until_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let empty_hold = Frozen {
+            method: ward_events::PauseMethod::Sigstop,
+            pids: Vec::new(),
+            cgroup: None,
+        };
+        let (response, done) =
+            served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
+                assert!(held.is_none());
+                pause::Termination {
+                    ended: 2,
+                    remaining: Some(empty_hold.clone()),
+                    barrier_confirmed: false,
+                }
+            });
+        let Response::Error(message) = response else {
+            panic!("{response:?}");
+        };
+        assert!(!done);
+        assert!(
+            message.contains("fork barrier was not confirmed"),
+            "{message}"
+        );
+        assert!(served.log.is_some());
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert!(pause::marker_path(dir.path(), "sess_9").exists());
+
+        let replay = served.subscribe(0).unwrap().replay;
+        let incomplete = replay.last().expect("incomplete stop record");
+        assert!(matches!(
+            incomplete.event,
+            WardEvent::WorkloadsTerminated {
+                ended: 2,
+                pending: 0,
+                barrier_confirmed: false
+            }
+        ));
+
+        let (response, done) =
+            served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
+                assert_eq!(held, Some(empty_hold));
+                pause::Termination::confirmed(0)
+            });
+        assert!(matches!(response, Response::Sealed { ended: Some(0), .. }));
+        assert!(done);
+        let records: Vec<_> = LogReader::open(&served.log_path)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .collect();
+        let terminated: Vec<_> = records
+            .iter()
+            .filter_map(|r| match r.event {
+                WardEvent::WorkloadsTerminated {
+                    ended,
+                    pending,
+                    barrier_confirmed,
+                } => Some((ended, pending, barrier_confirmed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminated, [(2, 0, false), (0, 0, true)]);
+        assert!(matches!(
+            records.last().map(|r| &r.event),
+            Some(WardEvent::SessionEnded { .. })
+        ));
+    }
+
+    /// The agent states the log recorded, in order.
+    fn agent_states(served: &mut Served) -> Vec<AgentState> {
+        served
+            .subscribe(0)
+            .unwrap()
+            .replay
+            .iter()
+            .filter_map(|r| match r.event {
+                WardEvent::AgentStateChanged { state } => Some(state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// PR #253 review finding 5, the actual event sequence: `Working` → a
+    /// refused `Stop` → `Resume` → retry. The refused stop records no
+    /// `Finished` (nothing was confirmed); the `Resume` is refused — the held
+    /// process already took `SIGKILL`, so this is an incomplete stop, not a
+    /// resumable pause — and changes nothing; the retry, once confirmed,
+    /// records `Finished` exactly once, after the termination and before
+    /// `SessionEnded`.
+    #[test]
+    fn working_then_a_refused_stop_then_resume_is_refused_and_only_the_retry_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        assert!(matches!(served.handle(append(0)).0, Response::Record(_)));
+        let stuck = Frozen {
+            method: ward_events::PauseMethod::Sigstop,
+            pids: vec![999_999],
+            cgroup: None,
+        };
+        let (response, done) = {
+            let stuck = stuck.clone();
+            served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+                pause::Termination {
+                    ended: 2,
+                    remaining: Some(stuck),
+                    barrier_confirmed: true,
+                }
+            })
+        };
+        assert!(matches!(response, Response::Error(_)), "{response:?}");
+        assert!(!done);
+        assert_eq!(
+            agent_states(&mut served),
+            [AgentState::Working],
+            "no Finished yet"
+        );
+        let before = kinds_of(&mut served);
+        assert_eq!(before, ["AgentStateChanged", "WorkloadsTerminated"]);
+
+        let (response, _) = served.handle(Request::Resume);
+        let Response::Error(message) = response else {
+            panic!("{response:?}");
+        };
+        assert!(message.contains("cannot release"), "{message}");
+        assert_eq!(
+            kinds_of(&mut served),
+            before,
+            "the refused resume records nothing"
+        );
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert!(served.approvals.paused());
+        assert!(pause::marker_path(dir.path(), "sess_9").exists());
+
+        let (response, done) =
+            served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
+                assert_eq!(held, Some(stuck), "the retry gets the held remainder");
+                pause::Termination::confirmed(1)
+            });
+        assert!(
+            matches!(response, Response::Sealed { ended: Some(1), .. }),
+            "{response:?}"
+        );
+        assert!(done);
+        assert_eq!(
+            agent_states(&mut served),
+            [AgentState::Working, AgentState::Finished]
+        );
+        assert_eq!(
+            kinds_of(&mut served),
+            [
+                "AgentStateChanged",
+                "WorkloadsTerminated",
+                "WorkloadsTerminated",
+                "AgentStateChanged",
+                "SessionEnded"
+            ]
+        );
+    }
+
+    /// A 0.18 client appends `Finished` itself before it asks to stop; the
+    /// daemon must not record a second one.
+    #[test]
+    fn a_client_that_already_recorded_finished_gets_no_second_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let finished = Request::Append {
+            origin: Origin::Wardd,
+            event: WardEvent::AgentStateChanged {
+                state: AgentState::Finished,
+            },
+            at_unix_ms: 0,
+        };
+        assert!(matches!(served.handle(finished).0, Response::Record(_)));
+        let (response, done) = served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+            pause::Termination::nothing()
+        });
+        assert!(
+            matches!(response, Response::Sealed { ended: Some(0), .. }),
+            "{response:?}"
+        );
+        assert!(done);
+        assert_eq!(agent_states(&mut served), [AgentState::Finished]);
+    }
+
+    /// Stop fails closed before changing state when the lifecycle/admission
+    /// lock itself cannot be acquired. A directory at the lock-file path makes
+    /// `OpenOptions::open` fail deterministically; the injected terminator must
+    /// never run and no stop marker may be published.
+    #[test]
+    fn stop_refuses_before_termination_when_the_lifecycle_lock_cannot_be_acquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let lock_path = session_dir(dir.path(), "sess_9").join(".pause-freeze.lock");
+        std::fs::create_dir(&lock_path).unwrap();
+
+        let (response, done) = served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+            panic!("termination must not run without the lifecycle lock")
+        });
+        let Response::Error(message) = response else {
+            panic!("{response:?}");
+        };
+        assert!(!done);
+        assert!(message.contains("lifecycle lock"), "{message}");
+        assert!(served.log.is_some(), "the log remains open");
+        assert!(!pause::stop_marker_path(dir.path(), "sess_9").exists());
+        assert!(kinds_of(&mut served).is_empty(), "nothing was recorded");
+    }
+
+    /// PR #253 review finding 2, deterministic barrier: a launch that has been
+    /// admitted (`pause::admit_launch` holds the session lock across its
+    /// `bwrap` spawn) and a stop that arrives meanwhile are serialized — the
+    /// stop cannot scan until the spawn has returned, so what it scans includes
+    /// the new sandbox. The order is recorded by both sides; without the shared
+    /// lock the stop would scan first (the launch waits 150 ms before
+    /// "spawning").
+    #[test]
+    fn a_launch_admitted_before_a_stop_spawns_before_the_stops_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let admitted = pause::admit_launch(dir.path(), "sess_9").expect("admitted");
+        let stopping = {
+            let (served, order) = (Arc::clone(&served), Arc::clone(&order));
+            std::thread::spawn(move || {
+                lock(&served).stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+                    order.lock().unwrap().push("scanned");
+                    pause::Termination::confirmed(1)
+                })
+            })
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        order.lock().unwrap().push("spawned");
+        drop(admitted);
+        let (response, done) = stopping.join().unwrap();
+        assert!(
+            matches!(response, Response::Sealed { ended: Some(1), .. }),
+            "{response:?}"
+        );
+        assert!(done);
+        assert_eq!(*order.lock().unwrap(), ["spawned", "scanned"]);
+    }
+
+    /// PR #253 review finding 2, the reviewer's exact ordering: a launch passes
+    /// the early check, stalls, the stop runs (scans nothing, seals), and the
+    /// launch then reaches its spawn. The spawn's own admission — under the
+    /// session lock, after the stop marker — refuses it, so nothing is
+    /// spawned: the error is the admission refusal, never bubblewrap's own
+    /// (`bwrap` is not needed for this test to be meaningful). Deterministic:
+    /// the launch's admission is held on a channel until the stop has sealed.
+    #[test]
+    fn a_launch_that_stalls_past_a_stop_is_refused_before_it_spawns() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let (past_check, stalled) = std::sync::mpsc::channel::<()>();
+        let (stopped, release) = std::sync::mpsc::channel::<()>();
+        let state = dir.path().to_path_buf();
+        let launching = std::thread::spawn(move || {
+            let launch = crate::sandbox::Launch::new(worktree.path(), vec!["/bin/true".into()]);
+            let mut admit = || {
+                past_check.send(()).unwrap();
+                release.recv().unwrap();
+                pause::admit_launch(&state, "sess_9").map(|g| Box::new(g) as Box<dyn std::any::Any>)
+            };
+            launch.run_admitted(&mut admit, &mut || {}).map(|_| ())
+        });
+        stalled.recv().unwrap();
+        let (response, done) = served.handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        assert!(
+            matches!(response, Response::Sealed { ended: Some(0), .. }),
+            "{response:?}"
+        );
+        assert!(done);
+        stopped.send(()).unwrap();
+        let err = launching.join().unwrap().unwrap_err().to_string();
+        assert!(err.contains(pause::STOPPED_REFUSAL), "{err}");
+        assert!(!err.contains("bwrap"), "nothing was spawned: {err}");
+        assert!(pause::admit_launch(dir.path(), "sess_9").is_err());
+    }
+
+    /// Launch admission and pause share the lock too: a paused session admits
+    /// no spawn, and a resumed one does again.
+    #[test]
+    fn a_paused_session_admits_no_launch_until_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        assert!(matches!(
+            served
+                .handle(Request::Pause {
+                    reason: String::new()
+                })
+                .0,
+            Response::Paused { .. }
+        ));
+        let err = pause::admit_launch(dir.path(), "sess_9")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(pause::PAUSED_REFUSAL), "{err}");
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Record(_)
+        ));
+        drop(pause::admit_launch(dir.path(), "sess_9").expect("admitted again"));
+    }
+
+    /// PR #253 review finding 3, stale marker / restarted daemon: a pause
+    /// marker on disk that this daemon did not write (its predecessor died
+    /// while paused, or thawed without clearing it) holds nothing. A
+    /// `HoldForStop` must not trust it: it freezes the running sandbox itself,
+    /// records `SessionPaused`, and the stop then ends that tree.
+    #[test]
+    fn hold_for_stop_freezes_for_itself_even_with_a_stale_marker_from_before_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sandbox = pause::FakeSandbox::spawn("sess_stale");
+        let mut served = fresh_served_as(dir.path(), &sandbox.session);
+        pause::write_marker(dir.path(), &sandbox.session, "left by a dead wardd").unwrap();
+        assert!(served.paused.is_none(), "this daemon holds nothing");
+        assert!(!sandbox.stopped(), "the sandbox runs, marker or not");
+
+        let (response, _) = served.handle(Request::HoldForStop {
+            reason: "ward stop --restore-entry".into(),
+        });
+        assert!(
+            matches!(response, Response::HeldForStop { unsettled: None }),
+            "{response:?}"
+        );
+        let paused = served.paused.as_ref().unwrap();
+        assert!(
+            sandbox.frozen_by(&paused.frozen),
+            "frozen by the hold itself"
+        );
+        assert_eq!(paused.hold, Hold::Stop);
+        assert!(paused.frozen.pids.contains(&sandbox.root()));
+        assert!(pause::stop_begun(dir.path(), &sandbox.session));
+        assert_eq!(kinds_of(&mut served), ["SessionPaused"]);
+
+        let (response, done) = served.handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        assert!(done, "{response:?}");
+        assert!(sandbox.was_killed());
+    }
+
+    /// PR #253 review finding 3, concurrent Resume and launch: once held for a
+    /// stop, the session cannot be released by another client's `Resume`, no
+    /// launch is admitted, and a second `Pause` changes nothing — only the stop
+    /// ends the hold.
+    #[test]
+    fn a_stop_hold_cannot_be_released_by_resume_or_bypassed_by_a_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sandbox = pause::FakeSandbox::spawn("sess_hold");
+        let mut served = fresh_served_as(dir.path(), &sandbox.session);
+        assert!(matches!(
+            served
+                .handle(Request::HoldForStop {
+                    reason: String::new()
+                })
+                .0,
+            Response::HeldForStop { unsettled: None }
+        ));
+        let (response, _) = served.handle(Request::Resume);
+        assert!(
+            matches!(&response, Response::Error(e) if e.contains("cannot release")),
+            "{response:?}"
+        );
+        let frozen = served.paused.as_ref().unwrap().frozen.clone();
+        assert!(
+            sandbox.frozen_by(&frozen),
+            "still frozen after the refused resume"
+        );
+        assert!(served.approvals.paused());
+        let err = pause::admit_launch(dir.path(), &sandbox.session)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(pause::STOPPED_REFUSAL), "{err}");
+        assert!(matches!(
+            served.handle(Request::Pause { reason: String::new() }).0,
+            Response::Error(e) if e == "already paused"
+        ));
+        // A capture freeze (the restore's own) holds nothing and thaws nothing.
+        let capture = pause::CaptureFreeze::acquire(dir.path(), &sandbox.session);
+        assert_eq!(capture.method(), None);
+        drop(capture);
+        assert!(sandbox.frozen_by(&frozen), "the capture thawed nothing");
+
+        let (response, done) = served.handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        assert!(
+            matches!(response, Response::Sealed { ended: Some(n), .. } if n >= 2),
+            "{response:?}"
+        );
+        assert!(done);
+        assert!(sandbox.was_killed());
+    }
+
+    /// A `HoldForStop` on a session the user has already paused takes that
+    /// pause over (no second record) and makes it unreleasable.
+    #[test]
+    fn hold_for_stop_takes_over_a_pause_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        assert!(matches!(
+            served
+                .handle(Request::Pause {
+                    reason: "mine".into()
+                })
+                .0,
+            Response::Paused { .. }
+        ));
+        assert!(matches!(
+            served
+                .handle(Request::HoldForStop {
+                    reason: String::new()
+                })
+                .0,
+            Response::HeldForStop { unsettled: None }
+        ));
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert_eq!(kinds_of(&mut served), ["SessionPaused"]);
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Error(_)
+        ));
+    }
+
+    /// A hold whose freeze cannot be confirmed stable says so — the restore
+    /// that asked for it must not proceed — and still stands, recorded as
+    /// unsettled. Deterministic: the freeze is injected, holding a pid that is
+    /// really running (this test process) so the recount finds it pending.
+    #[test]
+    fn an_unconfirmed_stop_hold_is_reported_and_still_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let unsettled = served
+            .hold_for_stop_with(
+                "r",
+                |_| {
+                    (
+                        Frozen {
+                            method: ward_events::PauseMethod::Sigstop,
+                            pids: vec![std::process::id()],
+                            cgroup: None,
+                        },
+                        false,
+                    )
+                },
+                |_, f| (f, true),
+            )
+            .unwrap();
+        assert_eq!(unsettled, Some(1));
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert_eq!(kinds_of(&mut served), ["SessionPauseUnsettled"]);
+        // Never signal this test process: forget the injected freeze.
+        served.paused = None;
+    }
+
+    /// Barrier uncertainty is not normalized away merely because the immediate
+    /// recount has zero known PIDs. HoldForStop must report `Some(0)`, record an
+    /// unsettled hold, and therefore make the restore client refuse to write the
+    /// worktree until a later retry confirms the barrier.
+    #[test]
+    fn an_unconfirmed_stop_hold_with_zero_known_pids_is_still_unsettled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let unsettled = served
+            .hold_for_stop_with(
+                "ward stop --restore-entry",
+                |_| {
+                    (
+                        Frozen {
+                            method: ward_events::PauseMethod::Sigstop,
+                            pids: Vec::new(),
+                            cgroup: None,
+                        },
+                        false,
+                    )
+                },
+                |_, f| (f, true),
+            )
+            .unwrap();
+        assert_eq!(unsettled, Some(0));
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        let replay = served.subscribe(0).unwrap().replay;
+        assert!(matches!(
+            replay.last().map(|r| &r.event),
+            Some(WardEvent::SessionPauseUnsettled { pending: 0, .. })
+        ));
+        // The injected empty freeze is safe to forget; the stop marker/record
+        // are what this test is proving.
+        served.paused = None;
     }
 
     /// ADR-0019 §3 in the daemon: a pause writes the marker, holds the
@@ -1554,6 +2685,9 @@ mod tests {
                 "SessionResumed",
                 "CapabilityDecided",
                 "SessionPaused",
+                // The daemon's own `Finished`, once the stop's termination is
+                // confirmed (PR #253 review finding 5).
+                "AgentStateChanged",
                 "SessionEnded"
             ]
         );
@@ -1756,16 +2890,26 @@ mod tests {
             reason: EndReason::UserStop,
         });
         assert!(done);
-        assert!(matches!(response, Response::Sealed { head } if head.next_seq == 6));
+        // The daemon's own `Finished` (PR #253 review finding 5: recorded once
+        // termination is confirmed, not by the client beforehand), then the end.
+        assert!(
+            matches!(response, Response::Sealed { head, ended: Some(0) } if head.next_seq == 7)
+        );
         let (tail, ended) = drain(&rx);
-        assert_eq!(seqs(&tail), [5]);
-        assert!(matches!(tail[0].event, WardEvent::SessionEnded { .. }));
+        assert_eq!(seqs(&tail), [5, 6]);
+        assert!(matches!(
+            tail[0].event,
+            WardEvent::AgentStateChanged {
+                state: AgentState::Finished
+            }
+        ));
+        assert!(matches!(tail[1].event, WardEvent::SessionEnded { .. }));
         assert!(ended, "sealing ends every subscription");
         assert!(served.subscribers.is_empty());
 
         // After the seal a subscription is the replay alone.
         let after = served.subscribe(4).unwrap();
-        assert_eq!(seqs(&after.replay), [4, 5]);
+        assert_eq!(seqs(&after.replay), [4, 5, 6]);
         assert!(after.live.is_none());
         assert!(matches!(
             served.handle(Request::Ping),
@@ -1933,13 +3077,15 @@ mod tests {
             .iter()
             .map(|r| format!("{:?}", r.event.kind()))
             .collect();
+        // `AgentStateChanged` is the daemon's own `Finished`, recorded once the
+        // stop's termination is confirmed (PR #253 review finding 5).
         assert_eq!(
             kinds,
-            ["CapabilityDecided", "SessionEnded"],
+            ["AgentStateChanged", "CapabilityDecided", "SessionEnded"],
             "the still-open question's terminal record precedes the seal, not just the hook's own answer"
         );
         assert!(matches!(
-            &live[0].event,
+            &live[1].event,
             WardEvent::CapabilityDecided {
                 cap,
                 decision: Decision::Deny,
@@ -2059,9 +3205,14 @@ mod tests {
             .iter()
             .map(|r| format!("{:?}", r.event.kind()))
             .collect();
-        assert_eq!(kinds, ["CapabilityDecided", "SessionEnded"], "{live:?}");
+        // (`AgentStateChanged`: the daemon's `Finished`, PR #253 finding 5.)
+        assert_eq!(
+            kinds,
+            ["AgentStateChanged", "CapabilityDecided", "SessionEnded"],
+            "{live:?}"
+        );
         assert!(matches!(
-            &live[0].event,
+            &live[1].event,
             WardEvent::CapabilityDecided {
                 decision: Decision::Allow,
                 by: DecisionSource::User,
@@ -2204,9 +3355,14 @@ mod tests {
             .iter()
             .map(|r| format!("{:?}", r.event.kind()))
             .collect();
-        assert_eq!(kinds, ["CapabilityDecided", "SessionEnded"], "{live:?}");
+        // (`AgentStateChanged`: the daemon's `Finished`, PR #253 finding 5.)
+        assert_eq!(
+            kinds,
+            ["AgentStateChanged", "CapabilityDecided", "SessionEnded"],
+            "{live:?}"
+        );
         assert!(matches!(
-            &live[0].event,
+            &live[1].event,
             WardEvent::CapabilityDecided {
                 decision: Decision::Allow,
                 by: DecisionSource::User,
@@ -2290,9 +3446,14 @@ mod tests {
             .iter()
             .map(|r| format!("{:?}", r.event.kind()))
             .collect();
-        assert_eq!(kinds, ["CapabilityDecided", "SessionEnded"], "{live:?}");
+        // (`AgentStateChanged`: the daemon's `Finished`, PR #253 finding 5.)
+        assert_eq!(
+            kinds,
+            ["AgentStateChanged", "CapabilityDecided", "SessionEnded"],
+            "{live:?}"
+        );
         assert!(matches!(
-            &live[0].event,
+            &live[1].event,
             WardEvent::CapabilityDecided {
                 decision: Decision::Deny,
                 by: DecisionSource::Timeout,
@@ -3294,7 +4455,8 @@ mod tests {
                 reason: EndReason::UserStop
             })
             .unwrap(),
-            Response::Sealed { head } if head.next_seq == 4
+            // `Finished` (the daemon's, after termination) and `SessionEnded`.
+            Response::Sealed { head, ended: Some(0) } if head.next_seq == 5
         ));
         daemon
             .join()
@@ -3318,9 +4480,9 @@ mod tests {
                 _ => break,
             }
         }
-        assert_eq!(seen, [0, 1, 2, 3]);
+        assert_eq!(seen, [0, 1, 2, 3, 4]);
         let head = LogReader::open(&log_path).unwrap().verify_all().unwrap();
-        assert_eq!(head.next_seq, 4);
+        assert_eq!(head.next_seq, 5);
         assert!(
             RemoteSink::connect(&socket).is_none(),
             "nothing answers after exit"

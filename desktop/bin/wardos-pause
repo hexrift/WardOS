@@ -63,9 +63,20 @@ do_pause() {
   fi
 }
 
+# A resume the daemon refuses — a stop of the session has begun and not completed, so its
+# held processes (some possibly already killed) are not an ordinary pause to release (PR #253
+# review findings 3 and 5) — gets its own critical notification with ward's words, never
+# "Agents resumed", and the exit fails.
 do_resume() {
-  ward resume "${session_flag[@]}" "$project"
-  wardos_notify "Agents resumed" "" -t 2000
+  local out
+  if out=$(ward resume "${session_flag[@]}" "$project" 2>&1); then
+    [[ -n $out ]] && printf '%s\n' "$out"
+    wardos_notify "Agents resumed" "" -t 2000
+    return 0
+  fi
+  [[ -n $out ]] && printf '%s\n' "$out" >&2
+  wardos_notify "RESUME REFUSED" "$out" -u critical
+  return 1
 }
 
 # "Pause all sessions" (#141 item 5): every live session, not just this one, each its own
@@ -84,6 +95,23 @@ do_pause_all() {
   fi
 }
 
+# `ward stop [--restore-entry]`: ends every sandboxed process of the session and
+# confirms it gone before sealing (#145 item 5). A stop the daemon could not confirm is
+# refused — the log stays open and the session is held paused — so it gets its own
+# critical notification carrying ward's account of what is left, never "Session stopped".
+do_stop() {
+  local out
+  if out=$(ward stop "$@" "$project" 2>&1); then
+    [[ -n $out ]] && printf '%s
+' "$out"
+    return 0
+  fi
+  [[ -n $out ]] && printf '%s
+' "$out" >&2
+  wardos_notify "STOP NOT CONFIRMED" "$out" -u critical
+  return 1
+}
+
 # The exits of a pause. Cancelling is an answer too: everything stays held.
 menu() {
   local choice
@@ -92,12 +120,11 @@ menu() {
   case "$choice" in
     Resume) do_resume ;;
     "Stop & preserve workspace")
-      ward stop "$project"
-      wardos_notify "Session stopped" "workspace kept as it is" -t 3000
+      do_stop && wardos_notify "Session stopped" "workspace kept as it is" -t 3000
       ;;
     "Stop & restore entry state")
-      ward stop --restore-entry "$project"
-      wardos_notify "Session stopped" "entry state restored · what it replaced is in .ward/restore-*" -t 4000
+      do_stop --restore-entry &&
+        wardos_notify "Session stopped" "entry state restored · what it replaced is in .ward/restore-*" -t 4000
       ;;
     "Inspect activity") wardos_terminal_exec ward-observer ward watch "$project" ;;
   esac

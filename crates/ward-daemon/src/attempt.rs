@@ -1992,7 +1992,7 @@ mod tests {
             Box::new(self.inner).seal()
         }
 
-        fn stop(self: Box<Self>, reason: ward_events::EndReason) -> Result<()> {
+        fn stop(self: Box<Self>, reason: ward_events::EndReason) -> Result<u32> {
             Box::new(self.inner).stop(reason)
         }
     }
