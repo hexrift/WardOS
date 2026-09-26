@@ -65,7 +65,7 @@ impl NodeService {
     ///
     /// # Errors
     ///
-    /// Returns InvalidCapabilities if the capability document is not valid for
+    /// Returns `InvalidCapabilities` if the capability document is not valid for
     /// capability discovery in this build.
     pub fn new(capabilities: NodeCapabilities) -> Result<Self, NodeServiceError> {
         let protocol = capabilities.protocol();
