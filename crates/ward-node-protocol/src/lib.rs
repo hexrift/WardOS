@@ -300,20 +300,36 @@ impl Display for NodeCapacityError {
 
 impl std::error::Error for NodeCapacityError {}
 
-/// Isolation mechanisms a node can enforce locally.
+/// Namespace isolation mechanisms a node can enforce locally.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct IsolationCapabilities {
+pub struct NamespaceCapabilities {
     /// Ward's Linux namespace sandbox backend.
-    pub namespace_sandbox: bool,
+    pub sandbox: bool,
     /// Unprivileged user namespaces are available where required.
     pub user_namespace: bool,
+}
+
+/// Execution isolation backends available on a node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionBackendCapabilities {
     /// Container-backed task isolation is available.
     pub container: bool,
     /// MicroVM-backed task isolation is available.
     pub microvm: bool,
     /// VM-backed task isolation is available.
     pub vm: bool,
+}
+
+/// Isolation mechanisms a node can enforce locally.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IsolationCapabilities {
+    /// Namespace-related isolation support.
+    pub namespaces: NamespaceCapabilities,
+    /// Supported execution isolation backends.
+    pub backends: ExecutionBackendCapabilities,
 }
 
 /// Network enforcement mechanisms a node can enforce locally.
@@ -702,11 +718,15 @@ mod tests {
             NodeArchitecture::X86_64,
             NodeCapacity::new(1, 1024).unwrap(),
             IsolationCapabilities {
-                namespace_sandbox: false,
-                user_namespace: false,
-                container: false,
-                microvm: false,
-                vm: false,
+                namespaces: NamespaceCapabilities {
+                    sandbox: false,
+                    user_namespace: false,
+                },
+                backends: ExecutionBackendCapabilities {
+                    container: false,
+                    microvm: false,
+                    vm: false,
+                },
             },
             NetworkCapabilities {
                 offline: false,
@@ -737,11 +757,15 @@ mod tests {
             NodeArchitecture::Aarch64,
             NodeCapacity::new(64, 137_438_953_472).unwrap(),
             IsolationCapabilities {
-                namespace_sandbox: true,
-                user_namespace: true,
-                container: true,
-                microvm: true,
-                vm: true,
+                namespaces: NamespaceCapabilities {
+                    sandbox: true,
+                    user_namespace: true,
+                },
+                backends: ExecutionBackendCapabilities {
+                    container: true,
+                    microvm: true,
+                    vm: true,
+                },
             },
             NetworkCapabilities {
                 offline: true,
@@ -787,7 +811,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&response).unwrap(),
-            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespace_sandbox":false,"user_namespace":false,"container":false,"microvm":false,"vm":false},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#
+            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#
         );
         assert_eq!(
             serde_json::from_str::<CapabilityDiscoveryResponse>(
@@ -805,7 +829,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&response).unwrap(),
-            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"aarch64","capacity":{"logical_cpus":64,"memory_bytes":137438953472},"isolation":{"namespace_sandbox":true,"user_namespace":true,"container":true,"microvm":true,"vm":true},"network":{"offline":true,"proxy_allowlist":true},"credentials":{"proxy_injection":true,"scoped_http_gateway":true},"snapshots":{"content_addressed":true,"diff":true,"read":true},"verifier":{"isolated":true},"lifecycle":{"pause":true,"stop":true,"revoke":true}}}"#
+            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"aarch64","capacity":{"logical_cpus":64,"memory_bytes":137438953472},"isolation":{"namespaces":{"sandbox":true,"user_namespace":true},"backends":{"container":true,"microvm":true,"vm":true}},"network":{"offline":true,"proxy_allowlist":true},"credentials":{"proxy_injection":true,"scoped_http_gateway":true},"snapshots":{"content_addressed":true,"diff":true,"read":true},"verifier":{"isolated":true},"lifecycle":{"pause":true,"stop":true,"revoke":true}}}"#
         );
     }
 
@@ -835,9 +859,9 @@ mod tests {
         );
 
         for raw in [
-            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"sparc","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespace_sandbox":false,"user_namespace":false,"container":false,"microvm":false,"vm":false},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#,
-            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":0,"memory_bytes":1024},"isolation":{"namespace_sandbox":false,"user_namespace":false,"container":false,"microvm":false,"vm":false},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#,
-            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespace_sandbox":false,"user_namespace":false,"container":false,"microvm":false,"vm":false},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false},"extra":true}}"#,
+            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"sparc","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#,
+            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":0,"memory_bytes":1024},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#,
+            r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false},"extra":true}}"#,
         ] {
             assert!(
                 serde_json::from_str::<CapabilityDiscoveryResponse>(raw).is_err(),
