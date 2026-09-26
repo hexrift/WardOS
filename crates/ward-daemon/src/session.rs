@@ -3507,7 +3507,7 @@ mod tests {
 
         let err = session.stop(EndReason::UserStop).unwrap_err().to_string();
         assert!(err.contains("lifecycle lock"), "{err}");
-        assert!(!sandbox.was_killed(), "termination must not run unlocked");
+        assert!(sandbox.running(), "termination must not run unlocked");
         assert!(!pause::stop_marker_path(state.path(), &session_id).exists());
         assert!(
             !kinds_in(&log).iter().any(|k| k == "SessionEnded"),
