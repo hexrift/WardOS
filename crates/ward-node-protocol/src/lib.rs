@@ -521,38 +521,46 @@ struct NodeCapabilitiesWire {
     lifecycle: LifecycleCapabilities,
 }
 
-impl<'de> Deserialize<'de> for NodeCapabilities {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = NodeCapabilitiesWire::deserialize(deserializer)?;
-        Self::new(
-            wire.protocol,
-            wire.architecture,
-            wire.capacity,
-            wire.isolation,
-            wire.network,
-            wire.credentials,
-            wire.snapshots,
-            wire.verifier,
-            wire.lifecycle,
+impl NodeCapabilitiesWire {
+    fn into_capabilities(self) -> Result<NodeCapabilities, NodeCapabilitiesError> {
+        NodeCapabilities::new(
+            self.protocol,
+            self.architecture,
+            self.capacity,
+            self.isolation,
+            self.network,
+            self.credentials,
+            self.snapshots,
+            self.verifier,
+            self.lifecycle,
         )
-        .map_err(D::Error::custom)
     }
 }
 
 /// Read-only node capability discovery request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
+///
+/// This semantic type is serializable but intentionally not directly deserializable.
+/// Incoming wire data must be decoded through [`CapabilityDiscoveryContext`], which
+/// binds it to the protocol version selected by the handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "request", rename_all = "snake_case")]
 pub enum CapabilityDiscoveryRequest {
     /// Request the node-owned capability document.
     Capabilities,
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
+enum CapabilityDiscoveryRequestWire {
+    Capabilities,
+}
+
 /// Read-only node capability discovery response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
+///
+/// Incoming wire data is accepted only through [`CapabilityDiscoveryContext`] so the
+/// capability document must name the exact negotiated protocol version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "response", rename_all = "snake_case")]
 pub enum CapabilityDiscoveryResponse {
     /// Trusted host facts for the negotiated protocol version.
     Capabilities {
@@ -560,6 +568,140 @@ pub enum CapabilityDiscoveryResponse {
         capabilities: NodeCapabilities,
     },
 }
+
+#[derive(Deserialize)]
+#[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
+enum CapabilityDiscoveryResponseWire {
+    Capabilities {
+        capabilities: NodeCapabilitiesWire,
+    },
+}
+
+/// A negotiated capability-discovery protocol context.
+///
+/// Constructing this context proves that discovery is available for the selected
+/// handshake version. All inbound discovery messages are decoded through this value,
+/// preventing a transport from accepting capability wire data without checking the
+/// negotiated protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapabilityDiscoveryContext {
+    protocol: ProtocolVersion,
+}
+
+impl CapabilityDiscoveryContext {
+    /// Bind capability discovery to the exact protocol selected by the handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityDiscoveryError::ProtocolDoesNotSupportDiscovery`] when the
+    /// selected protocol predates capability discovery.
+    pub const fn new(protocol: ProtocolVersion) -> Result<Self, CapabilityDiscoveryError> {
+        if !supports_capability_discovery(protocol) {
+            return Err(CapabilityDiscoveryError::ProtocolDoesNotSupportDiscovery);
+        }
+
+        Ok(Self { protocol })
+    }
+
+    /// Exact protocol version selected by the handshake.
+    #[must_use]
+    pub const fn protocol(self) -> ProtocolVersion {
+        self.protocol
+    }
+
+    /// Build the only read-only discovery request valid for this negotiated context.
+    #[must_use]
+    pub const fn request(self) -> CapabilityDiscoveryRequest {
+        CapabilityDiscoveryRequest::Capabilities
+    }
+
+    /// Decode an inbound discovery request under the negotiated protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityDiscoveryError::MalformedMessage`] for any unknown,
+    /// malformed or unsupported wire value.
+    pub fn decode_request(
+        self,
+        json: &str,
+    ) -> Result<CapabilityDiscoveryRequest, CapabilityDiscoveryError> {
+        let wire = serde_json::from_str::<CapabilityDiscoveryRequestWire>(json)
+            .map_err(|_| CapabilityDiscoveryError::MalformedMessage)?;
+
+        match wire {
+            CapabilityDiscoveryRequestWire::Capabilities => {
+                Ok(CapabilityDiscoveryRequest::Capabilities)
+            }
+        }
+    }
+
+    /// Build a discovery response bound to the exact negotiated protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityDiscoveryError::ProtocolMismatch`] if the supplied
+    /// capability document names any other protocol version.
+    pub const fn response(
+        self,
+        capabilities: NodeCapabilities,
+    ) -> Result<CapabilityDiscoveryResponse, CapabilityDiscoveryError> {
+        if capabilities.protocol != self.protocol {
+            return Err(CapabilityDiscoveryError::ProtocolMismatch);
+        }
+
+        Ok(CapabilityDiscoveryResponse::Capabilities { capabilities })
+    }
+
+    /// Decode and validate an inbound discovery response.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed wire data, capability documents invalid for discovery, and any
+    /// document whose protocol does not exactly equal the handshake-selected version.
+    pub fn decode_response(
+        self,
+        json: &str,
+    ) -> Result<CapabilityDiscoveryResponse, CapabilityDiscoveryError> {
+        let wire = serde_json::from_str::<CapabilityDiscoveryResponseWire>(json)
+            .map_err(|_| CapabilityDiscoveryError::MalformedMessage)?;
+
+        match wire {
+            CapabilityDiscoveryResponseWire::Capabilities { capabilities } => {
+                let capabilities = capabilities
+                    .into_capabilities()
+                    .map_err(|_| CapabilityDiscoveryError::MalformedMessage)?;
+                self.response(capabilities)
+            }
+        }
+    }
+}
+
+/// Fail-closed capability-discovery protocol errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityDiscoveryError {
+    /// The negotiated protocol predates capability discovery.
+    ProtocolDoesNotSupportDiscovery,
+    /// The capability document names a protocol other than the negotiated version.
+    ProtocolMismatch,
+    /// The discovery message is malformed, unknown or contains invalid capability data.
+    MalformedMessage,
+}
+
+impl Display for CapabilityDiscoveryError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProtocolDoesNotSupportDiscovery => {
+                formatter.write_str("protocol version does not support capability discovery")
+            }
+            Self::ProtocolMismatch => {
+                formatter.write_str("capability document protocol does not match negotiated protocol")
+            }
+            Self::MalformedMessage => formatter.write_str("capability discovery message is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for CapabilityDiscoveryError {}
 
 #[cfg(test)]
 mod tests {
@@ -796,41 +938,61 @@ mod tests {
         assert!(supports_capability_discovery(ProtocolVersion::new(1, 1)));
         assert!(supports_capability_discovery(ProtocolVersion::new(1, 2)));
         assert!(!supports_capability_discovery(ProtocolVersion::new(2, 0)));
+
+        assert_eq!(
+            CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 0)),
+            Err(CapabilityDiscoveryError::ProtocolDoesNotSupportDiscovery)
+        );
     }
 
     #[test]
     fn minimal_capability_discovery_wire_is_stable() {
-        let request = CapabilityDiscoveryRequest::Capabilities;
+        let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 1)).unwrap();
+        let request = context.request();
         assert_eq!(
             serde_json::to_string(&request).unwrap(),
             r#"{"request":"capabilities"}"#
         );
-
-        let response = CapabilityDiscoveryResponse::Capabilities {
-            capabilities: minimal_capabilities(),
-        };
         assert_eq!(
-            serde_json::to_string(&response).unwrap(),
+            context
+                .decode_request(r#"{"request":"capabilities"}"#)
+                .unwrap(),
+            request
+        );
+
+        let response = context.response(minimal_capabilities()).unwrap();
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            json,
             r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#
         );
-        assert_eq!(
-            serde_json::from_str::<CapabilityDiscoveryResponse>(
-                &serde_json::to_string(&response).unwrap()
-            )
-            .unwrap(),
-            response
-        );
+        assert_eq!(context.decode_response(&json).unwrap(), response);
     }
 
     #[test]
     fn fully_capable_node_wire_is_stable() {
-        let response = CapabilityDiscoveryResponse::Capabilities {
-            capabilities: full_capabilities(),
-        };
+        let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 1)).unwrap();
+        let response = context.response(full_capabilities()).unwrap();
         assert_eq!(
             serde_json::to_string(&response).unwrap(),
             r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"aarch64","capacity":{"logical_cpus":64,"memory_bytes":137438953472},"isolation":{"namespaces":{"sandbox":true,"user_namespace":true},"backends":{"container":true,"microvm":true,"vm":true}},"network":{"offline":true,"proxy_allowlist":true},"credentials":{"proxy_injection":true,"scoped_http_gateway":true},"snapshots":{"content_addressed":true,"diff":true,"read":true},"verifier":{"isolated":true},"lifecycle":{"pause":true,"stop":true,"revoke":true}}}"#
         );
+    }
+
+    #[test]
+    fn capability_response_must_match_the_exact_negotiated_protocol() {
+        let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 1)).unwrap();
+
+        for claimed_minor in [0, 2] {
+            let raw = format!(
+                r#"{{"response":"capabilities","capabilities":{{"protocol":{{"major":1,"minor":{claimed_minor}}},"architecture":"x86_64","capacity":{{"logical_cpus":1,"memory_bytes":1024}},"isolation":{{"namespaces":{{"sandbox":false,"user_namespace":false}},"backends":{{"container":false,"microvm":false,"vm":false}}}},"network":{{"offline":false,"proxy_allowlist":false}},"credentials":{{"proxy_injection":false,"scoped_http_gateway":false}},"snapshots":{{"content_addressed":false,"diff":false,"read":false}},"verifier":{{"isolated":false}},"lifecycle":{{"pause":false,"stop":false,"revoke":false}}}}}}"#
+            );
+            assert_eq!(
+                context.decode_response(&raw),
+                Err(CapabilityDiscoveryError::ProtocolMismatch),
+                "claimed protocol 1.{claimed_minor} must not be accepted for negotiated 1.1"
+            );
+        }
     }
 
     #[test]
@@ -858,15 +1020,20 @@ mod tests {
             Err(NodeCapabilitiesError::ProtocolDoesNotSupportDiscovery)
         );
 
+        let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 1)).unwrap();
         for raw in [
+            r#"{"request":"capabilities","extra":true}"#,
             r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"sparc","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#,
             r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":0,"memory_bytes":1024},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#,
             r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"x86_64","capacity":{"logical_cpus":1,"memory_bytes":1024},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":false,"revoke":false},"extra":true}}"#,
         ] {
-            assert!(
-                serde_json::from_str::<CapabilityDiscoveryResponse>(raw).is_err(),
-                "{raw} must fail closed"
-            );
+            let failed = if raw.contains(r#""request":"#) {
+                context.decode_request(raw).is_err()
+            } else {
+                context.decode_response(raw).is_err()
+            };
+            assert!(failed, "{raw} must fail closed");
         }
     }
+
 }
