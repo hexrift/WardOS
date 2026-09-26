@@ -849,7 +849,10 @@ mod tests {
         assert!(lease.to_string().starts_with("lease_"));
         assert!(execution.to_string().starts_with("exec_"));
 
-        assert_eq!(principal.to_string().parse::<PrincipalId>().unwrap(), principal);
+        assert_eq!(
+            principal.to_string().parse::<PrincipalId>().unwrap(),
+            principal
+        );
         assert_eq!(agent.to_string().parse::<AgentId>().unwrap(), agent);
         assert_eq!(task.to_string().parse::<TaskId>().unwrap(), task);
         assert_eq!(
@@ -858,10 +861,7 @@ mod tests {
         );
         assert_eq!(lease.to_string().parse::<LeaseId>().unwrap(), lease);
         assert_eq!(
-            execution
-                .to_string()
-                .parse::<ExecutionAttemptId>()
-                .unwrap(),
+            execution.to_string().parse::<ExecutionAttemptId>().unwrap(),
             execution
         );
 
