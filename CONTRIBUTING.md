@@ -71,45 +71,44 @@ the same script runs in CI, so a green run locally is a green run there.
 
 WardOS follows [Semantic Versioning](https://semver.org): `MAJOR.MINOR.PATCH`. The
 single source of truth is `version` under `[workspace.package]` in the root
-[`Cargo.toml`](Cargo.toml); every crate and the image inherit it, and `git describe`
-against the release tag is what labels a built image.
+[`Cargo.toml`](Cargo.toml); every crate inherits it.
 
-**The rule — a pull request that changes shipped behaviour bumps the version in the
-same pull request.** `main` must never carry shippable changes ahead of its version.
+**Normal pull requests are version-neutral.** Feature, fix, refactor, test and
+documentation PRs do not bump the workspace version merely because they change
+shipped behaviour. `main` may therefore contain unreleased work after the last
+release; the exact development state is identified by its commit SHA (and image
+build metadata), not by inventing a new SemVer number for every merge.
 
-* **PATCH** (`0.3.0` → `0.3.1`) — bug fixes and other backwards-compatible fixes,
-  including desktop/image fixes that change what a booted machine does.
-* **MINOR** (`0.3.0` → `0.4.0`) — new, backwards-compatible features.
-* **MAJOR** (`0.3.0` → `1.0.0`) — incompatible changes. Pre-1.0, a breaking change is
-  a MINOR bump and is called out in the pull request.
+SemVer changes happen only in a **dedicated release PR**, immediately before a
+release is cut:
 
-Docs-only, test-only or refactor-only changes that alter no shipped behaviour do not
-bump the version. When in doubt, bump PATCH.
+1. Create a release branch from current `main` (for example
+   `release/v0.19.0`).
+2. Run `scripts/release/prepare-version.sh 0.19.0`. The helper updates the root
+   workspace version, all versioned internal path dependencies and `Cargo.lock`,
+   then verifies that Cargo metadata is locked and internally consistent.
+3. Open a PR whose only purpose is preparing that release, let the normal Verify,
+   TamperWard and image gates run on its exact head, and merge it.
+4. Dispatch [`.github/workflows/release.yml`](.github/workflows/release.yml) with
+   the matching `v0.19.0` tag. The release workflow independently refuses a tag
+   that does not exactly match the merged workspace version.
 
-Bumping means: edit the root `[workspace.package]` `version`, update the inter-crate
-`version = "…"` requirements across every workspace member to match, refresh
-`Cargo.lock` (`cargo update --workspace`), and confirm `cargo build --workspace`. After
-the pull request merges, the release is cut from the tag (`.github/workflows/release.yml`,
-dispatched with the `vX.Y.Z` version) and `image/Containerfile` is pinned to it.
+Choose the release number from the set of changes being released:
 
-**A version number is only checked against `main`, never against a sibling pull
-request.** Bump relative to `main`'s current version at the time you last rebased. When
-several pull requests are open at once, more than one may legitimately claim the same
-next number — that is expected, not a defect, and is **not a blocking review finding**:
-nothing enforces cross-PR uniqueness (`scripts/release/check-version.sh` only binds a
-release *tag* to the commit it is cut from), so it costs nothing while every claimant
-stays unmerged. Do not treat a still-open sibling PR's claimed version as a merge gate
-on this one, and do not rebase early just to dodge a collision that may not even exist
-by the time either PR actually merges.
+* **PATCH** (`0.18.1` → `0.18.2`) — backwards-compatible fixes.
+* **MINOR** (`0.18.1` → `0.19.0`) — new backwards-compatible features. Before
+  1.0, use MINOR for breaking changes and call them out in the release PR.
+* **MAJOR** (`1.4.2` → `2.0.0`) — incompatible changes after 1.0.
 
-This does **not** relax anything about the pull request that is *actually about to
-merge*. Immediately before merging, synchronize with current `main`, assign the
-immediate next valid version across every manifest and `Cargo.lock` (the same "Bumping
-means" steps above), and run every required check — Verify, TamperWard, and
-image/build where applicable — on that exact resulting head, same as any other push.
-If `main` moved since the branch's last rebase, its old bump target may already be
-taken; re-picking a free one and revalidating is a normal, expected part of merging,
-not a stale-head shortcut and not optional.
+Do not add a speculative version bump to an ordinary PR, do not rebase a feature
+branch merely to chase another PR's version number, and do not change
+`Cargo.lock` solely for a version bump outside the dedicated release PR. A normal
+PR may still change `Cargo.lock` when its dependency changes genuinely require
+that.
+
+This keeps semantic versions tied to actual release boundaries while preserving
+the existing release invariant: a published `vX.Y.Z` tag must exactly match the
+workspace version of the source commit from which its artifacts are built.
 
 ## Reporting a vulnerability
 
