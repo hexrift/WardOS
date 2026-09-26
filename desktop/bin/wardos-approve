@@ -26,10 +26,14 @@
 #                                   anything. Without --once the listener waits for the next
 #                                   round of live sessions when they all end (this is what
 #                                   wardos-approve.service runs). The decision time left is
-#                                   mako's thin progress line (§10: not a number), the
-#                                   daemon's own figure as the popup opens; a question whose
-#                                   session is paused says its clock is held instead. Two or
-#                                   more approvals that are exact duplicates — same session,
+#                                   mako's thin progress line (§10: not a number), refreshed
+#                                   in place (notify-send --replace-id) every few seconds for
+#                                   as long as the popup stays open (#146 item 4's live-refresh
+#                                   half) from the daemon's own current figure, not frozen at
+#                                   whatever it was when the popup opened; a question whose
+#                                   session is paused says its clock is held instead, and holds
+#                                   in place — visibly, not just silently stale — until resumed.
+#                                   Two or more approvals that are exact duplicates — same session,
 #                                   agent, project and authority (#146 item 7) — share one
 #                                   notification, titled with a count (×N); answering it
 #                                   answers every one of them and nothing broader.
@@ -73,6 +77,12 @@ max_notifiers=${WARDOS_APPROVE_MAX_NOTIFIERS:-10}
 # (seconds, fractional), not milliseconds, so tests can widen it past real
 # scheduling jitter without an extra fork to do the arithmetic.
 coalesce=${WARDOS_APPROVE_COALESCE_S:-0.05}
+# How often an already-open notification refreshes in place (#146 item 4's
+# live-refresh half, below: refresh_loop/refresh_apply): a `sleep` argument
+# (seconds, fractional), not milliseconds, so a test can shrink it well below any
+# real interaction time instead of racing real wall-clock cadence to see more
+# than one tick.
+refresh_interval=${WARDOS_APPROVE_REFRESH_S:-2}
 # WARDOS_SESSION pins the interactive path to one session (mirroring wardos-pause):
 # an immutable, explicitly given id — the persistent inbox's own way of opening a
 # pending approval belonging to a session other than $project's/the desktop's
@@ -352,14 +362,38 @@ interactive() {
 # (see notify_one), which is also the instant a same-key request that arrives after
 # must start a fresh generation of its own rather than being folded into one that
 # has already fixed its membership. Every read-and-maybe-mutate of key.current or a
-# generation's .ids file — here, in notify_one's close-out, and in
-# resolve_notification — holds key.lock for the whole operation, so an append
-# (this loop), a snapshot-and-clear (notify_one) and a remove (resolve_notification)
-# can never interleave and lose one another's write. Both key.current and key.lock
-# live for as long as run_dir does, same as everything else here.
+# generation's .ids file — here, in notify_one's close-out, in resolve_notification,
+# and in a refresh tick's own group_representative_id (#250 review, third round: an
+# unlocked read raced resolve_notification's own rewrite) — holds key.lock for the
+# whole operation, so an append (this loop), a snapshot-and-clear (notify_one), a
+# remove (resolve_notification) and a plain read (group_representative_id) can
+# never interleave and lose or tear one another's view of it. Both key.current and
+# key.lock live for as long as run_dir does, same as everything else here.
 #
 # It also holds one "session-<key>.resolver" marker per live session that has (or
 # had) an open notification, holding that session's own resolver's pid.
+#
+# Three more, per gkey, are #146 item 4's live-refresh half: a ".blockargs" file —
+# notifier_loop's own raw (pre-escape) block fields for this generation's request,
+# written once, alongside .pid/.worker, when the generation opens, so a refresh
+# tick can re-render the DECISION TIME block and progress hint from a *fresh*
+# countdown without notify_one's own signature having to carry those fields through
+# every one of its own callers, traps and tests just for this — a ".refresh" file,
+# reserved empty the same way and for the same reason .worker is (notify_one's own
+# comment on it), holding the refresh loop's own pid, filled in by that loop itself
+# as its first action so sweep_run_dir can find and stop it directly if notify_one
+# itself ever has to be force-killed past its own TERM trap's chance to do so — and
+# a ".notiflock" file, an empty file whose only job is the flock with_notiflock
+# takes on it: the single, dedicated critical section a refresh tick and
+# finish_notification's own terminal replace both run inside, so whichever of them
+# checks pid_file and acts on it *second* always sees the other's result. Never
+# key.lock for that: key.lock only ever guards *group membership* (ids/current),
+# shared across every generation of a key, and reusing it for a notification's own
+# content would give an unrelated generation's refresh tick contention with this
+# one, and complicate finish_notification's own already-carefully-ordered calls
+# into it, for no benefit — a refresh tick has no business touching membership at
+# all, only showing an accurate countdown for whichever ids are gathered under it
+# right now.
 run_dir=""
 
 # A short, fixed-shape, filesystem-safe stand-in for an opaque session id
@@ -511,11 +545,25 @@ notify_one() {
   local pid_file=$run_dir/$gkey.pid worker_file=$run_dir/$gkey.worker \
     answer_file=$run_dir/$gkey.answer ids_file=$run_dir/$gkey.ids hint=()
   local answer_pids=()
+  # This worker's own refresh_loop pid (#146 item 4's live-refresh half, below),
+  # empty until (and unless) one is actually started. Declared here, before either
+  # trap below, so both can safely test it even on a return path that fires before
+  # a refresh loop is ever started (notify-send missing, say).
+  local refresh_pid="" refresh_spawning=0
   # Remove both markers on every return path (notify-send missing, no action, an
   # unrecognised action, or a relayed answer) so wait_for_notifiers' wait, and
   # sweep_run_dir's own force-stop, never outlast this function actually finishing
-  # (#224, #226 review).
-  trap 'rm -f "$worker_file" "$answer_file"' RETURN
+  # (#224, #226 review). A refresh loop still running at that point is stopped
+  # here too, defence in depth alongside the explicit stop below (once notify-send
+  # itself is done) — every return path this function has must leave nothing of
+  # its own behind, not only the ordinary one.
+  trap '
+    rm -f "$worker_file" "$answer_file"
+    if [[ -n $refresh_pid ]]; then
+      kill "$refresh_pid" 2>/dev/null
+      wait "$refresh_pid" 2>/dev/null
+    fi
+  ' RETURN
   # sweep_run_dir may have to stop this worker directly, past its own grace
   # period — but only ever by signalling *this*, never an answer call directly:
   # this is every one of those calls' real parent, the only thing that can wait()
@@ -524,8 +572,22 @@ notify_one() {
   # was one process up — an already-killed answer call that nothing ever reaps
   # (#226 review). Bounded the same way sweep_run_dir's own escalation is; one id's
   # answer taking the grace window does not cost the others their own turn at it,
-  # since the signal to every one of them goes out first, in one pass.
+  # since the signal to every one of them goes out first, in one pass. The refresh
+  # loop, if one is running, is stopped first and separately — it answers nothing
+  # and has no grace window of its own to bound, so there is nothing to gain by
+  # folding it into the answer_pids loop below.
   trap '
+    if [[ -z $refresh_pid && $refresh_spawning -eq 1 ]]; then
+      refresh_pid=$!
+    fi
+    if [[ -n $refresh_pid ]]; then
+      kill "$refresh_pid" 2>/dev/null || true
+      wait_deadline "$refresh_pid" 1
+      if kill -0 "$refresh_pid" 2>/dev/null; then
+        kill -KILL "$refresh_pid" 2>/dev/null || true
+      fi
+      wait "$refresh_pid" 2>/dev/null || true
+    fi
     local p
     for p in "${answer_pids[@]:-}"; do
       [[ -n $p ]] && kill "$p" 2>/dev/null
@@ -592,10 +654,84 @@ notify_one() {
     "$title" "$body" >"$out" 2>/dev/null &
   ns_pid=$!
   printf '%s\n' "$ns_pid" >"$pid_file"
+  # #146 item 4's live-refresh half: notifier_loop wrote this generation's raw
+  # (pre-escape) block fields once, when it opened, precisely so this does not
+  # have to widen its own signature (and every caller's, trap's and test's
+  # understanding of it) just to carry them through to a loop that only exists to
+  # re-render the DECISION TIME block and hint from a fresh countdown later.
+  # Absent (an older run_dir layout, or the generation somehow never got one) or
+  # short a field is simply no live refresh for this popup — the same graceful
+  # fallback as notify-send itself being absent, never an error.
+  local blockargs_file=$run_dir/$gkey.blockargs
+  # Declared here, unconditionally, so it is always a defined (if empty) array
+  # under `set -u` — including on the no-live-refresh fallback below, and later
+  # when the self-decided/timed-out cleanup reads _blockargs[1] (destination) for
+  # its own terminal replacement (#250 review).
+  local -a _blockargs=()
+  if [[ -f $blockargs_file ]]; then
+    # A builtin `read` loop, not `mapfile`/`readarray`, matching this script's own
+    # established preference (see notify_one's own count, above) for one fewer
+    # thing to depend on being available.
+    local _blockarg
+    while IFS= read -r _blockarg; do _blockargs+=("$_blockarg"); done <"$blockargs_file"
+    if [[ ${#_blockargs[@]} -eq 7 ]]; then
+      # Reserved empty here, before backgrounding, the same way .worker/.pid
+      # already are — not left for the loop itself to create as its own first
+      # action (#250 review: the run_dir comment above already claims this
+      # ordering; the code did not actually do it, leaving a window between
+      # `&` and refresh_loop's own first write in which sweep_run_dir's
+      # "$run_dir"/*.refresh glob cannot find it at all, not even as an empty,
+      # not-yet-real marker the way stop_refresh already tolerates for every
+      # other case). refresh_loop still fills in its own real pid as its first
+      # action; stop_refresh's existing empty-pid handling covers the gap
+      # between the two.
+      : >"$run_dir/$gkey.refresh"
+      refresh_spawning=1
+      refresh_loop "$session" "$gkey" "$pid_file" "$out" "$title" "${_blockargs[@]}" &
+      refresh_pid=$!
+      refresh_spawning=0
+    fi
+  fi
   wait "$ns_pid" 2>/dev/null || true
-  rm -f "$pid_file"
+  # Stopped and reaped here, explicitly, not left to the RETURN/TERM traps
+  # alone. Killing/waiting $refresh_pid only reaches refresh_loop's own driver
+  # process, never a tick that has already entered with_notiflock and is
+  # synchronously running its own notify-send -r inside the lock (#250
+  # review): that tick is an orphan the driver's death cannot reach, free to
+  # land its now-stale redraw right after. The locked terminal step below,
+  # requested only once this has actually finished, does not reach into that
+  # already in-flight call either, but it does make every check-then-act
+  # against pid_file race-free from here on: whichever of this and a tick's
+  # own lock hold runs first, the other sees its result. At most the one tick
+  # already in-flight when notify-send returns can still land a single stale
+  # redraw; a later tick's own `[[ -f $pid_file ]]` check, now inside the same
+  # lock, finds it gone and refresh_loop stops itself before ever trying.
+  if [[ -n $refresh_pid ]]; then
+    kill "$refresh_pid" 2>/dev/null || true
+    wait "$refresh_pid" 2>/dev/null || true
+    refresh_pid=""
+  fi
   action=$(tail -n1 "$out" 2>/dev/null || true)
-  rm -f "$out"
+  # The state word this popup's own answer resolves to, if it resolves to one
+  # at all. Only decides *what to relay*, below — never, on its own, what the
+  # notification is finally replaced with (#250 review, third round: writing
+  # "Allowed"/"Denied" right here, before `ward session approve` has even been
+  # asked, let a paused/expired approval, an unreachable daemon, or a partial
+  # failure in a grouped notification leave the UI claiming a decision the
+  # daemon never actually recorded, with no tracked popup left for the
+  # resolver to ever correct). Empty for anything decision_of does not
+  # recognise (a timeout or a dismissed popup): nothing to relay, and
+  # notify-send itself already closed the notification in that case — but
+  # this popup can still have a redraw in flight, so it still gets its own
+  # locked terminal step below, never left to the resolver alone.
+  local state=""
+  if [[ -n $action ]]; then
+    case $(decision_of "$action" 2>/dev/null || true) in
+      allow) state=allowed ;;
+      allow-session) state=allowed-session ;;
+      deny) state=denied ;;
+    esac
+  fi
   # Whichever ids are still in the group now: one may have been answered from
   # another terminal, the inbox, or timed out while this was open (resolve_notification
   # removes it from ids_file as that happens) — never relayed to twice, and never to
@@ -605,8 +741,25 @@ notify_one() {
   # review), and it is the instant key becomes free to open a fresh generation of
   # its own — gkey's own files are never reused, only key's *next* gen may now start.
   ids=$(close_generation "$key" "$gkey")
-  [[ -n $action ]] || return 0
-  decision=$(decision_of "$action") || return 0
+  if [[ -n $state && -z $ids ]]; then
+    # Every member was already removed by the daemon-backed resolver. Zero relay
+    # attempts are not confirmation of this popup's locally clicked action.
+    # Leave pid_file/out_file intact so that resolver's authoritative terminal
+    # record owns the final replacement instead of publishing a guessed Allowed/
+    # Denied state here.
+    return 0
+  fi
+  if [[ -z $state ]]; then
+    # Nothing recognised to relay. pid_file is retired here, not left for the
+    # daemon's own eventual terminal record: a popup dismissed (or timed out)
+    # without the daemon itself ever hearing from this worker again can sit
+    # unresolved for a long time otherwise, stale content and all.
+    with_notiflock "$gkey" finish_notification_self_decided_locked \
+      "$pid_file" "$out" "closed" "${_blockargs[1]:-}"
+    rm -f "$out"
+    return 0
+  fi
+  decision=$(decision_of "$action")
   # Each backgrounded directly, the same reason and the same way as notify-send
   # above (a wrapper subshell's pid would not be the one actually still running if
   # the TERM trap above needs to stop it), rather than going through the shared
@@ -620,10 +773,32 @@ notify_one() {
     answer_pids+=("$!")
   done <<<"$ids"
   printf '%s\n' "${answer_pids[@]:-}" >"$answer_file"
-  local p
+  # pid_file is deliberately still here while these are outstanding: the
+  # notification stays showing (possibly stale-but-harmless pending content,
+  # or the one already-committed stale redraw from #250's earlier rounds)
+  # rather than being retired on an optimistic guess. A refresh tick already
+  # in flight when notify-send returned is still free to land its own redraw
+  # in this window — the with_notiflock ordering below still guarantees the
+  # locked terminal step, once it runs, is requested after any such tick, so
+  # it is always the one actually left on screen.
+  local p confirmed=1
   for p in "${answer_pids[@]:-}"; do
-    [[ -n $p ]] && wait "$p" 2>/dev/null
+    [[ -n $p ]] || continue
+    wait "$p" 2>/dev/null || confirmed=0
   done
+  # Only ever reported as the real decision once every relay for it actually
+  # succeeded; a partial or total failure — the daemon unreachable, the
+  # approval no longer answerable (paused, expired) — says so instead of
+  # claiming a decision that was never confirmed. finish_notification_self_
+  # decided_locked's own `[[ -f $pid_file ]]` guard already covers "resolved
+  # by some other actor in the meantime" (its terminal replace got there
+  # first, so there is nothing left here to overwrite): this call is a no-op
+  # in that case, not a second, conflicting terminal state.
+  local final_state=$state
+  [[ $confirmed -eq 1 ]] || final_state=unconfirmed
+  with_notiflock "$gkey" finish_notification_self_decided_locked \
+    "$pid_file" "$out" "$final_state" "${_blockargs[1]:-}"
+  rm -f "$out"
 }
 
 # The short, non-actionable title a resolved notification is replaced with.
@@ -638,6 +813,29 @@ resolved_title() {
   esac
 }
 
+# The single critical section a refresh tick (refresh_apply, below) and
+# finish_notification's own terminal replace both run inside, for gkey's own
+# notification (#146 item 4 review): whichever of them checks pid_file and acts
+# on it *second* always sees the other's result, so a refresh can never re-show
+# pending content over a notification already resolved elsewhere, and the
+# terminal replace can never be raced by a refresh update landing after it —
+# the same class of race #226 found one layer down, in a worker's own
+# bookkeeping, moved up here to the notification's own content. Deliberately its
+# own lock file, never key.lock (see the run_dir comment on .notiflock for why).
+# Runs "$@" in a subshell holding the lock, the same idiom key.lock's own users
+# (join_open_generation and friends) already rely on: the lock and its fd are
+# released the instant that subshell exits, with no matching unlock needed.
+# Exit status is whatever "$@" itself returned.
+with_notiflock() {
+  local gkey=$1
+  shift
+  (
+    exec {lk}>"$run_dir/$gkey.notiflock"
+    flock -x "$lk"
+    "$@"
+  )
+}
+
 # The shared tail of resolve_notification and sweep_run_dir: replace pid_file's
 # notification in place with the outcome (`notify-send -r`, the standard-library
 # `replaces_id`) so it stops offering an action nothing will honour any more, and
@@ -648,7 +846,7 @@ resolved_title() {
 # removes the pid file itself, so there is nothing here to race).
 finish_notification() {
   local pid_file=$1 out_file=$2 state=$3 destination=$4
-  local notif_id pid i
+  local pid i
   # notifier_loop reserves the pid file (empty, then the real pid once notify_one
   # has backgrounded notify-send) as soon as it sees the approval pending; deciding
   # it takes real time after that (a timeout, or a person acting), so in practice
@@ -665,13 +863,249 @@ finish_notification() {
     sleep 0.02
   done
   [[ -n ${pid:-} ]] || return 0
+  # gkey from pid_file's own name ("<gkey>.pid"), never reconstructed any other
+  # way, the same as every other file this function is handed.
+  local gkey; gkey=$(basename "$pid_file" .pid)
+  with_notiflock "$gkey" finish_notification_locked "$pid_file" "$out_file" "$state" "$destination" "$pid" || true
+}
+
+# Run under with_notiflock (see its own comment above): gkey's notification is
+# only ever changed here or by a refresh tick, and only one of them at a time
+# may act on it. The plain existence check finish_notification did before
+# taking the lock is only ever a defence against a not-yet-reserved pid_file
+# (the retry loop above); this re-check, under the very same lock a refresh
+# tick holds while it does its own, is what actually decides whether there is
+# still anything here to replace — a concurrent refresh tick landing in the gap
+# between that first check and this lock is exactly what the lock is for.
+finish_notification_locked() {
+  local pid_file=$1 out_file=$2 state=$3 destination=$4 pid=$5
+  [[ -f $pid_file ]] || return 0
+  local notif_id
   notif_id=$(head -n1 "$out_file" 2>/dev/null || true)
   if [[ -n $notif_id ]] && command -v notify-send >/dev/null 2>&1; then
     notify-send -a WardOS -c ward-approval -u low -t 4000 -r "$notif_id" \
       "$(resolved_title "$state")" "<tt>$(esc "$destination")</tt>" 2>/dev/null || true
   fi
-  rm -f "$pid_file"
+  # A resolver records its daemon-confirmed terminal outcome before retiring the
+  # final group member. Once the notification itself has been replaced, that
+  # handoff is complete and no later sweep needs to recover it.
+  rm -f "${pid_file%.pid}.resolved" "$pid_file"
   kill "$pid" 2>/dev/null || true
+}
+
+# The short, non-actionable title notify_one's own popup is replaced with once
+# it has answered its own question, right here — never resolved_title's
+# wording: every one of its cases says "elsewhere", which is only true for
+# finish_notification's callers (resolve_notification, sweep_run_dir), never
+# for this popup's own click.
+decided_title() {
+  case $1 in
+    allowed) echo "Allowed" ;;
+    allowed-session) echo "Allowed for the session" ;;
+    denied) echo "Denied" ;;
+    # Recognised locally, relayed, but not every relay for it actually
+    # confirmed (#250 review, third round) — never claim the decision itself,
+    # only that it could not be confirmed as fully applied.
+    unconfirmed) echo "Could not confirm — check ward session pending" ;;
+    # Nothing recognised to relay at all (dismissed, timed out, or an
+    # unrecognised action) — a plain, non-actionable close, never a decision.
+    closed) echo "Closed" ;;
+    *) echo "Decided" ;;
+  esac
+}
+
+# The self-decided counterpart of finish_notification_locked, run under the
+# same with_notiflock (#250 review, second and third rounds): unlike
+# finish_notification_locked, which only ever removes pid_file when it finds
+# nothing left to correctly replace, this always has real content to show —
+# but never a bare local guess about what was clicked (#250 review, third
+# round: notify_one only calls this once it knows what actually happened —
+# "closed" the instant there is nothing to relay, or "allowed"/"denied"/
+# "unconfirmed" only after every relay for the decision has actually been
+# waited on) — and does so in the same locked step that retires pid_file.
+# That is what closes the gap a plain `with_notiflock ... rm -f "$pid_file"`
+# leaves open: a tick already inside this same lock when this call queues
+# behind it can still land its own stale "still pending" redraw first, but
+# this always runs *after* it (with_notiflock is strictly FIFO across waiters
+# on one flock), so the real, confirmed, non-actionable outcome is always the
+# last thing written to the notification, never the tick's.
+finish_notification_self_decided_locked() {
+  local pid_file=$1 out_file=$2 state=$3 destination=$4
+  [[ -f $pid_file ]] || return 0
+  local notif_id
+  notif_id=$(head -n1 "$out_file" 2>/dev/null || true)
+  if [[ -n $notif_id ]] && command -v notify-send >/dev/null 2>&1; then
+    notify-send -a WardOS -c ward-approval -u low -t 4000 -r "$notif_id" \
+      "$(decided_title "$state")" "<tt>$(esc "$destination")</tt>" 2>/dev/null || true
+  fi
+  rm -f "$pid_file"
+}
+
+# --- refresh_loop: #146 item 4's live-refresh half -------------------------------
+#
+# An already-open notification is otherwise a snapshot from the instant it opened:
+# it never learns the daemon's countdown has moved on, or that the session it
+# belongs to was paused or resumed after it opened. Everything below keeps one
+# open popup's DECISION TIME block and progress hint current, in place
+# (notify-send -r, the standard `replaces_id`), for as long as it stays open, by
+# re-reading the exact same daemon-derived `fields`/`progress_value` machinery
+# notifier_loop and the interactive path already use — never a parallel clock or
+# pause notion of this script's own, and never anything finer-grained than the
+# daemon's own Countdown (remaining_ms/timeout_ms/held), the same one #225 made
+# authoritative. A held countdown's remaining_ms does not move while paused, so
+# ticking through the exact same query the daemon answers for the inbox already
+# holds this popup's own hint still, visibly, for exactly as long as the session
+# stays paused, and resumes counting the moment it does — no special-casing here
+# for pause/resume at all, only for showing whatever the daemon currently reports.
+
+# Poll out_file (bounded, mirroring finish_notification's own pid_file poll) for
+# notify-send's own --print-id line — the id a refresh tick needs to replace this
+# exact notification rather than opening a second one. Read early and separately
+# from notify_one's own later `tail -n1` (which waits for --wait to return): the
+# id itself is written well before that, as soon as the Notify() call succeeds.
+# Empty if it never appears (notify-send failed right after starting, or was
+# itself killed before printing): the caller then simply never refreshes, the
+# same no-live-refresh fallback as notify-send being entirely absent.
+wait_for_notif_id() {
+  local out_file=$1 out_var=$2 id="" i
+  for ((i = 0; i < 100; i++)); do
+    id=$(head -n1 "$out_file" 2>/dev/null || true)
+    [[ -n $id ]] && break
+    sleep 0.02
+  done
+  # Return through the caller's variable rather than stdout. refresh_loop is
+  # intentionally killable during teardown; the old command-substitution form
+  # could leave this helper writing into a pipe whose reader had just died,
+  # producing the repeated "Broken pipe" noise seen in CI.
+  printf -v "$out_var" '%s' "$id"
+}
+
+# One id currently gathered under gkey, read without disturbing the group — the
+# same .ids file notify_one's own close_generation reads-and-clears, here only
+# ever read. The first id in the file, deterministically: the same one whose
+# countdown the popup's own opening progress hint already came from (notifier_loop:
+# that hint is fixed from whichever line first opened this generation, never grown
+# by a later duplicate joining it), so a refresh tick never contradicts the figure
+# the popup opened with by tracking a different member's clock instead.
+#
+# Under key.lock, the same lock resolve_notification's own truncate-and-rewrite
+# of this exact file already holds for its whole read-modify-write (#250 review,
+# third round): an earlier, unlocked `head -n1` here could catch that rewrite
+# mid-flight — reading a transiently empty or partial file exactly as a member
+# is being removed — and either read a torn line or wrongly conclude the group
+# had emptied while a live sibling was still being written back. Cheap even
+# though it takes a lock every tick: an uncontended flock is a few syscalls,
+# far under the cost of the query current_countdown_for goes on to make.
+group_representative_id() {
+  local gkey=$1
+  local key=${gkey%.gen.*}
+  (
+    exec {lk}>"$run_dir/$key.lock"
+    flock -x "$lk"
+    head -n1 "$run_dir/$gkey.ids" 2>/dev/null || true
+  )
+}
+
+# The fresh countdown field (a `fields` column: "run:<remaining_ms>:<timeout_ms>",
+# "held:...", or "-") for id in session, from the daemon's own current pending
+# listing — a one-shot `ward session pending --json --all`, never --follow: this
+# is a poll, not a subscription, and reuses the very same `fields` jq notifier_loop
+# already builds every popup's opening figure from. Every command that can fail
+# (the daemon unreachable, jq erroring) is guarded so a transient failure skips
+# this tick rather than taking the refresh loop down under `set -e`/pipefail
+# (#225's exact class of bug, moved to this loop). Nothing, and a nonzero return,
+# when the daemon no longer reports id pending at all — read by the caller as
+# "already decided, elsewhere, this instant" and a cue to stop refreshing, exactly
+# as a terminal record from the resolver would be.
+current_countdown_for() {
+  local session=$1 id=$2 line
+  line=$(ward session pending --json --all 2>/dev/null | jq -r "$fields" 2>/dev/null \
+    | awk -F'\t' -v id="$id" -v session="$session" '$1 == id && $2 == session { print; exit }') || true
+  [[ -n $line ]] || return 1
+  printf '%s\n' "$line" | cut -f13
+}
+
+# Run under with_notiflock (see its own comment): gkey's notification is still
+# showing (pid_file present) — replace it in place with fresh content, the same
+# actions and hints notify_one opened it with, so refreshing never drops the
+# buttons that make it actionable. Exit status says whether it was still showing
+# (0) or had already gone (1, the caller's cue to stop refreshing) — never which,
+# if any, notify-send call itself succeeded, the same best-effort treatment of the
+# notification server every other call in this script already gives it.
+refresh_apply() {
+  local pid_file=$1 notif_id=$2 title=$3 body=$4 progress=$5
+  [[ -f $pid_file ]] || return 1
+  command -v notify-send >/dev/null 2>&1 || return 0
+  local hint=()
+  [[ -n $progress ]] && hint=(-h "int:value:$progress")
+  notify-send -a WardOS -c ward-approval -u critical -r "$notif_id" "${hint[@]}" \
+    -A allow="Allow once" -A session="Allow session" -A deny="Deny" \
+    "$title" "$body" >/dev/null 2>&1 || true
+  return 0
+}
+
+# The live-refresh loop for one open notification, backgrounded by notify_one
+# right after notify-send itself and always stopped from there too — explicitly,
+# before notify_one ever removes pid_file on its own self-decided/timed-out path,
+# and from its own TERM trap (sweep_run_dir's forced stop) — never left to notice
+# its own notification is gone only on its own timing: that would still eventually
+# self-terminate (the pid_file check below catches it within one more tick), but
+# would leave sweep_run_dir's own bounded teardown unable to actually bound this
+# the same way it bounds every other worker here (#226's exact class of bug,
+# moved to this loop). Past notify_one itself, sweep_run_dir also reaches this
+# loop directly if the worker had to be force-killed before its own TERM trap got
+# a chance to stop it (stop_refresh, mirroring stop_answer, below) — the `.refresh`
+# marker this writes as its own first action, mirroring `.worker`'s own reasoning,
+# is what lets it.
+#
+# `wait_for_notif_id` and the tick loop's own `sleep` are the only blocking calls:
+# neither depends on notify-send's own `--wait` (every refresh call is a separate,
+# short-lived invocation, never touching $out_file), and every command that can
+# fail is guarded (`|| true`/a bounded `[[ ]]` check) so a transient failure skips
+# a tick rather than taking the whole loop down under `set -e` (#225's exact class
+# of bug, moved to this loop).
+refresh_loop() {
+  local session=$1 gkey=$2 pid_file=$3 out_file=$4 title=$5
+  local claim=$6 destination=$7 network=$8 method=$9 credential=${10} repository=${11} lifetime=${12}
+  local refresh_file=$run_dir/$gkey.refresh
+  # Mirrors notify_one's own worker_file: reserved empty by notify_one before
+  # this is backgrounded, filled in here as this job's own very first action, so
+  # the write and this same job's later removal (RETURN, every return path) stay
+  # strictly ordered — never notify_one writing $! after backgrounding it, the
+  # same race #226 found in .worker (see the run_dir comment above notify_one).
+  trap 'rm -f "$refresh_file"' RETURN
+  printf '%s\n' "$BASHPID" >"$refresh_file"
+  local notif_id=""
+  wait_for_notif_id "$out_file" notif_id
+  [[ -n $notif_id ]] || return 0
+  while :; do
+    sleep "$refresh_interval"
+    [[ -f $pid_file ]] || return 0
+    local id
+    id=$(group_representative_id "$gkey")
+    [[ -n $id ]] || return 0
+    local countdown
+    # A failed query here is not on its own proof id is gone: it is the same
+    # "daemon briefly unreachable"/jq hiccup `current_countdown_for`'s own doc
+    # comment already promises is skipped, not fatal (#250 review, second
+    # round) — and it is also what a *representative* id resolving while
+    # another member of the same group is still pending looks like from here,
+    # since current_countdown_for only ever looks up this one id. `continue`,
+    # not `return 0`, for either: group_representative_id is re-read fresh
+    # every tick (the two lines above), so the next tick picks up a still-live
+    # group member on its own — a resolved representative with a live sibling
+    # switches to it without this loop ever having to notice which case it
+    # was — and the loop only actually stops once group_representative_id
+    # itself comes back empty, meaning nothing in the group is pending any
+    # more (the `[[ -n $id ]] || return 0` check above, unchanged).
+    countdown=$(current_countdown_for "$session" "$id") || continue
+    local held="" progress
+    [[ $countdown == held:* ]] && held="held while paused · resume the session to answer"
+    progress=$(progress_value "$countdown")
+    local body
+    body=$(blocks 1 "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime" "$held")
+    with_notiflock "$gkey" refresh_apply "$pid_file" "$notif_id" "$title" "$body" "$progress" || return 0
+  done
 }
 
 # id, *in session*, became terminal (state, one of ApprovalRecord::state_word's
@@ -715,6 +1149,14 @@ resolve_notification() {
     flock -x "$lk"
     remaining=$(grep -vFx "$id" "$ids_file" 2>/dev/null || true)
     if [[ -z $remaining ]]; then
+      # Persist the daemon-confirmed outcome before publishing "no members left".
+      # follow_once is allowed to stop a per-session resolver once the pending
+      # stream has ended; without this handoff, a resolver descheduled in the
+      # tiny post-removal/pre-notification window could be killed and the generic
+      # sweep would incorrectly replace the known outcome with "Session ended".
+      # The sweep consumes this file if the resolver itself does not get to the
+      # terminal replace first.
+      printf '%s\n%s\n' "$state" "$destination" >"$run_dir/$gkey.resolved"
       rm -f "$ids_file"
       cur=$(cat "$run_dir/$key.current" 2>/dev/null || true)
       [[ $cur == "$gen" ]] && rm -f "$run_dir/$key.current"
@@ -724,6 +1166,14 @@ resolve_notification() {
       printf '0\n'
     fi
   )
+  # Deterministic concurrency-test barrier: inert unless the test suite sets both
+  # WARDOS_TESTING=1 and a private barrier prefix. This lets the regression hold
+  # the resolver in the exact post-membership/pre-terminal window without changing
+  # production timing or using probabilistic sleeps.
+  if [[ $emptied == 1 && ${WARDOS_TESTING:-0} == 1 && -n ${WARDOS_TEST_RESOLVE_BARRIER:-} ]]; then
+    : >"${WARDOS_TEST_RESOLVE_BARRIER}.reached"
+    while [[ ! -f ${WARDOS_TEST_RESOLVE_BARRIER}.release ]]; do sleep 0.01; done
+  fi
   [[ $emptied == 1 ]] && finish_notification "$run_dir/$gkey.pid" "$run_dir/$gkey.out" "$state" "$destination"
 }
 
@@ -818,6 +1268,17 @@ notifier_loop() {
       # action, not this loop after backgrounding it (#226 review; see the run_dir
       # comment above notify_one for why the write has to happen there instead).
       : >"$run_dir/$gkey.worker"
+      # This generation's raw (pre-escape) block fields, written once, for a
+      # refresh tick to re-render the DECISION TIME block and hint from a fresh
+      # countdown later (#146 item 4's live-refresh half — see run_dir's own
+      # comment on .blockargs, and refresh_loop). One field per line, in the exact
+      # order blocks() itself takes them; safe as plain lines because every field
+      # here already went through jq's own @tsv encoding on its way from the
+      # daemon, which escapes an embedded tab or newline in the source value
+      # (never emits either raw) — the same property the tab-separated `read`
+      # above already relies on.
+      printf '%s\n' "$claim" "$destination" "$network" "$method" "$credential" "$repository" "$lifetime" \
+        >"$run_dir/$gkey.blockargs"
       # Here too, not as a `$(…)` argument of the backgrounded call below: bash
       # expands an asynchronous command's words in the forked child, so that would
       # put one more fork on notify_one's own timeline before its real pid reaches
@@ -924,6 +1385,70 @@ stop_answers() {
   done
 }
 
+# Mirrors stop_answer, for gkey's own refresh loop (#146 item 4's live-refresh
+# half): only the worker that backgrounded it (notify_one, .worker's own pid) is
+# refresh_loop's real parent and can wait() it — sweep_run_dir reaches it only by
+# asking the worker to reap it (kill -CONT, in case stopped, so its own TERM
+# trap's own cleanup, which already stops and waits its refresh_pid, gets a
+# chance to run first) or, past that chance, killing it directly and polling
+# `kill -0` until it is gone — the same way, and for the same reason, stop_answer
+# already does for a `ward session approve` call. A single pid, not a list (a
+# refresh loop is never shared the way a group's several `ward session approve`
+# calls are), but otherwise the exact same shape.
+stop_refresh() {
+  local refresh_file=$1 worker_file=${1%.refresh}.worker worker="" pid=""
+  [[ -f $worker_file ]] && worker=$(cat "$worker_file" 2>/dev/null || true)
+  pid=$(cat "$refresh_file" 2>/dev/null || true)
+
+  # An empty marker is the async-spawn handoff, not evidence that no refresh
+  # child exists. The worker is the owner of that handoff. Stop the owner and
+  # let its TERM trap reap whichever child it has already spawned; unlike the
+  # old bounded polling loop this remains correct even if the child is
+  # descheduled for arbitrarily long before publishing its own pid.
+  if [[ -z $pid ]]; then
+    if [[ -n $worker ]] && kill -0 "$worker" 2>/dev/null; then
+      kill -CONT "$worker" 2>/dev/null || true
+      kill "$worker" 2>/dev/null || true
+      wait_deadline "$worker" 1
+      if kill -0 "$worker" 2>/dev/null; then
+        kill -KILL "$worker" 2>/dev/null || true
+        wait_deadline "$worker" 2
+      fi
+    fi
+
+    # If the child managed to publish during that handoff, finish it directly
+    # as defence in depth. Otherwise the now-ownerless reservation is safe to
+    # remove: there is no live worker left that can spawn or publish into it.
+    pid=$(cat "$refresh_file" 2>/dev/null || true)
+    if [[ -z $pid ]]; then
+      rm -f "$refresh_file"
+      return 0
+    fi
+  fi
+
+  if [[ -n $worker ]]; then
+    kill -CONT "$worker" 2>/dev/null || true
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait_deadline "$pid" 1
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    if [[ -n $worker ]]; then
+      kill -CONT "$worker" 2>/dev/null || true
+    fi
+    wait_deadline "$pid" 2
+  fi
+  kill -0 "$pid" 2>/dev/null || rm -f "$refresh_file"
+}
+
+stop_refreshes() {
+  local refresh_file
+  for refresh_file in "$run_dir"/*.refresh; do
+    [[ -f $refresh_file ]] || continue
+    stop_refresh "$refresh_file"
+  done
+}
+
 # Whatever is still tracked once that grace window has passed did not get a
 # terminal record through the ordinary path (the daemon crashed or the connection
 # dropped mid-stream, not a clean seal — a clean seal gives every still-open
@@ -931,9 +1456,21 @@ stop_answers() {
 # into a resolve within the same window). Clear it anyway so nothing lingers into
 # the next round.
 sweep_run_dir() {
-  local pid_file
+  local pid_file resolved_file state destination
   for pid_file in "$run_dir"/*.pid; do
     [[ -f $pid_file ]] || continue
+    resolved_file=${pid_file%.pid}.resolved
+    if [[ -f $resolved_file ]]; then
+      state="" destination=""
+      {
+        IFS= read -r state || true
+        IFS= read -r destination || true
+      } <"$resolved_file"
+      if [[ -n $state ]]; then
+        finish_notification "$pid_file" "${pid_file%.pid}.out" "$state" "$destination"
+        continue
+      fi
+    fi
     finish_notification "$pid_file" "${pid_file%.pid}.out" "session-ended" ""
   done
   # wait_for_notifiers' own grace period is a bound on how long it waits, not a
@@ -951,9 +1488,14 @@ sweep_run_dir() {
   # Stopping a worker in that gap, or escalating it to KILL while its own TERM
   # trap (notify_one, above) is still reaping, orphans the answer alive past this
   # function's return (#226 review; reproduced by approve.test.sh with a worker
-  # held descheduled across the answer's escalation).
+  # held descheduled across the answer's escalation). A refresh loop, if any is
+  # still running, is stopped the same way and for the same reason (#146 item 4
+  # review) — it answers nothing, so ordering it before or after stop_answers
+  # makes no difference to that, but it must be fully stopped before its own
+  # worker is, exactly like an answer.
   stop_answers
-  local worker_file answer_file pid
+  stop_refreshes
+  local worker_file answer_file refresh_file pid
   for worker_file in "$run_dir"/*.worker; do
     [[ -f $worker_file ]] || continue
     pid=$(cat "$worker_file" 2>/dev/null || true)
@@ -963,11 +1505,18 @@ sweep_run_dir() {
     # Its answer, if stop_answers could not yet confirm it gone, is still listed:
     # only this worker can reap it, so keep the worker runnable and give it that
     # chance before stopping it — stopping the worker first would orphan the
-    # answer alive (#226 review, exact-head 07f9525).
+    # answer alive (#226 review, exact-head 07f9525). Its refresh loop, if
+    # stop_refreshes could not yet confirm it gone either, gets the exact same
+    # chance, for the exact same reason (#146 item 4 review).
     answer_file=${worker_file%.worker}.answer
+    refresh_file=${worker_file%.worker}.refresh
     if [[ -f $answer_file ]]; then
       kill -CONT "$pid" 2>/dev/null || true
       stop_answer "$answer_file"
+    fi
+    if [[ -f $refresh_file ]]; then
+      kill -CONT "$pid" 2>/dev/null || true
+      stop_refresh "$refresh_file"
     fi
     rm -f "$worker_file"
     kill "$pid" 2>/dev/null || true
@@ -984,11 +1533,13 @@ sweep_run_dir() {
     # for real rather than leaving a signalled-but-unreaped pid behind.
     wait "$pid" 2>/dev/null || true
   done
-  # Anything still listed now has no worker left to reap it — an answer recorded
-  # after the first pass by a worker stopped above, or one whose worker could not
-  # be made to reap in time: stop it and wait (bounded) for the system's reaper.
+  # Anything still listed now has no worker left to reap it — an answer (or a
+  # refresh loop) recorded after the first pass by a worker stopped above, or one
+  # whose worker could not be made to reap in time: stop it and wait (bounded)
+  # for the system's reaper.
   stop_answers
-  rm -f "$run_dir"/*.answer
+  stop_refreshes
+  rm -f "$run_dir"/*.answer "$run_dir"/*.refresh
 }
 
 follow_once() {
