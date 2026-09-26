@@ -461,29 +461,6 @@ impl AuthorityLease {
         self.version
     }
 
-    /// Validate an untrusted envelope as root authority.
-    ///
-    /// # Errors
-    ///
-    /// Rejects delegated lineage on a root envelope and all ordinary root invariants.
-    pub fn validate_root(wire: UntrustedAuthorityLease) -> Result<Self, AuthorityLeaseError> {
-        if wire.parent_lease_id.is_some() || wire.delegated_by.is_some() {
-            return Err(AuthorityLeaseError::UnexpectedDelegatedLineage);
-        }
-
-        Self::root(AuthorityLeaseInput {
-            id: wire.id,
-            delegation_id: wire.delegation_id,
-            issuer: wire.issuer,
-            subject: wire.subject,
-            task: wire.task,
-            grants: wire.grants,
-            issued_at_unix_ms: wire.issued_at_unix_ms,
-            expires_at_unix_ms: wire.expires_at_unix_ms,
-            version: wire.version,
-        })
-    }
-
     /// Validate an untrusted child envelope against this trusted parent lease.
     ///
     /// # Errors
@@ -532,9 +509,10 @@ impl AuthorityLease {
 
 /// Untrusted serialized authority envelope.
 ///
-/// Deserializing this value grants nothing. A root envelope must pass
-/// `AuthorityLease::validate_root`; a delegated envelope must pass
-/// `AuthorityLease::validate_delegated` with its trusted parent.
+/// Deserializing this value grants nothing. There is deliberately no promotion path
+/// from wire data to root authority in this slice. A delegated envelope must pass
+/// `AuthorityLease::validate_delegated` with its trusted parent. Root authority is
+/// constructed only from non-deserializable trusted `AuthorityLeaseInput`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UntrustedAuthorityLease {
@@ -579,9 +557,6 @@ pub enum AuthorityLeaseError {
     /// Parent grant exists but is not delegable.
     #[error("parent grant is not delegable")]
     GrantNotDelegable,
-    /// Root wire unexpectedly carried delegated lineage.
-    #[error("root authority envelope contains delegated lineage")]
-    UnexpectedDelegatedLineage,
     /// Child wire does not identify the supplied trusted parent/delegator/issuer.
     #[error("delegated authority lineage does not match the trusted parent")]
     LineageMismatch,
@@ -743,6 +718,20 @@ mod tests {
     }
 
     #[test]
+    fn root_shaped_wire_cannot_be_promoted_through_delegated_validation() {
+        let root = root();
+        let wire = serde_json::from_str::<UntrustedAuthorityLease>(
+            &serde_json::to_string(&root).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            root.validate_delegated(wire),
+            Err(AuthorityLeaseError::LineageMismatch)
+        );
+    }
+
+    #[test]
     fn grants_are_bounded_canonical_and_unambiguous() {
         assert!(CapabilityName::new("repo.read").is_ok());
         assert!(CapabilityName::new("Repo Read").is_err());
@@ -770,7 +759,8 @@ mod tests {
             r#"{"id":"lease_00000000000000000000000001","delegation_id":"deleg_00000000000000000000000001","issuer":"prn_00000000000000000000000001","subject":"agent_00000000000000000000000001","task":"task_00000000000000000000000001","parent_lease_id":null,"delegated_by":null,"grants":[{"capability":"network.fetch","resource":"host:api.github.com","delegable":false},{"capability":"repo.read","resource":"repo:hexrift/WardOS","delegable":true}],"issued_at_unix_ms":100,"expires_at_unix_ms":1000,"version":1}"#
         );
         let wire = serde_json::from_str::<UntrustedAuthorityLease>(&json).unwrap();
-        assert_eq!(AuthorityLease::validate_root(wire).unwrap(), lease);
+        assert_eq!(wire.parent_lease_id, None);
+        assert_eq!(wire.delegated_by, None);
 
         let mut value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
         value["provider"] = serde_json::Value::String("model".into());
