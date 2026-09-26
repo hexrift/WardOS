@@ -69,8 +69,10 @@ WORKDIR /src
 # The whole workspace, filtered by the repository's .containerignore (no target/, no .git).
 COPY . .
 # --locked refuses to touch Cargo.lock, so the image is built from exactly the dependency
-# set the repository reviewed. Five host binaries: the three of the secure-session
-# layer, the shell (desktop/shell) and the theme renderer (desktop/theme).
+# set the repository reviewed. Checkout builds carry six host binaries: the three of the
+# secure-session layer, ward-node, the shell (desktop/shell) and the theme renderer
+# (desktop/theme). The release stage above remains backwards-compatible with historical
+# release tarballs that predate ward-node.
 # Cache mounts (BuildKit and buildah alike): the cargo registry and the target
 # directory survive between builds, so a rebuild recompiles only what changed. Nothing
 # from a cache mount lands in the image; the binaries are copied out within the step.
@@ -80,11 +82,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
       --package ward-cli \
       --package ward-daemon \
       --package ward-agent \
+      --package ward-node \
       --package ward-shell \
       --package wardos-theme \
     && mkdir -p /out \
     && cp target/release/ward target/release/wardd target/release/ward-agent \
-          target/release/ward-shell target/release/wardos-theme-render /out/
+          target/release/ward-node target/release/ward-shell target/release/wardos-theme-render /out/
 
 # The chosen source, under one name for the host stage (a stage name, not an image;
 # hadolint cannot tell, hence the ignore).
