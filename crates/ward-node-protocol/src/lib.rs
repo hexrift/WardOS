@@ -646,7 +646,7 @@ impl CapabilityDiscoveryContext {
     ///
     /// Returns [`CapabilityDiscoveryError::ProtocolMismatch`] if the supplied
     /// capability document names any other protocol version.
-    pub const fn response(
+    pub fn response(
         self,
         capabilities: NodeCapabilities,
     ) -> Result<CapabilityDiscoveryResponse, CapabilityDiscoveryError> {
