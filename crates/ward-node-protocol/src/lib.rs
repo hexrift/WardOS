@@ -572,9 +572,7 @@ pub enum CapabilityDiscoveryResponse {
 #[derive(Deserialize)]
 #[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
 enum CapabilityDiscoveryResponseWire {
-    Capabilities {
-        capabilities: NodeCapabilitiesWire,
-    },
+    Capabilities { capabilities: NodeCapabilitiesWire },
 }
 
 /// A negotiated capability-discovery protocol context.
@@ -674,6 +672,10 @@ impl CapabilityDiscoveryContext {
 
         match wire {
             CapabilityDiscoveryResponseWire::Capabilities { capabilities } => {
+                if capabilities.protocol != self.protocol {
+                    return Err(CapabilityDiscoveryError::ProtocolMismatch);
+                }
+
                 let capabilities = capabilities
                     .into_capabilities()
                     .map_err(|_| CapabilityDiscoveryError::MalformedMessage)?;
@@ -705,10 +707,11 @@ impl Display for CapabilityDiscoveryError {
             Self::ProtocolDoesNotSupportDiscovery => {
                 formatter.write_str("protocol version does not support capability discovery")
             }
-            Self::ProtocolMismatch => {
-                formatter.write_str("capability document protocol does not match negotiated protocol")
+            Self::ProtocolMismatch => formatter
+                .write_str("capability document protocol does not match negotiated protocol"),
+            Self::MalformedMessage => {
+                formatter.write_str("capability discovery message is invalid")
             }
-            Self::MalformedMessage => formatter.write_str("capability discovery message is invalid"),
         }
     }
 }
@@ -1055,5 +1058,4 @@ mod tests {
             assert!(failed, "{raw} must fail closed");
         }
     }
-
 }
