@@ -200,6 +200,7 @@ RUN test -x /usr/bin/ward && test -x /usr/bin/wardd && test -x /usr/bin/ward-age
 # /tmp under a throwaway HOME, never under /root (which is /var on bootc), and are
 # removed in the same step. Node must satisfy every `engines` floor (Claude Code: 22).
 COPY image/agents/package.json image/agents/package-lock.json /usr/lib/wardos/agents/
+COPY image/agents/smoke-tamperward.sh /tmp/smoke-tamperward.sh
 RUN node --version && npm --version \
     && node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' \
     && export NODE_ENV=production HOME=/tmp/agents-home npm_config_cache=/tmp/npm-cache npm_config_update_notifier=false \
@@ -210,7 +211,8 @@ RUN node --version && npm --version \
          ln -s "/usr/lib/wardos/agents/node_modules/.bin/$cmd" "/usr/bin/$cmd"; \
        done \
     && /usr/bin/claude --version && /usr/bin/codex --version && /usr/bin/tamperward --help >/dev/null \
-    && rm -rf /tmp/agents-home /tmp/npm-cache \
+    && bash /tmp/smoke-tamperward.sh \
+    && rm -rf /tmp/smoke-tamperward.sh /tmp/agents-home /tmp/npm-cache \
     && du -sh /usr/lib/wardos/agents/node_modules
 
 # Host configuration, laid out under image/rootfs exactly as it lands in the image
