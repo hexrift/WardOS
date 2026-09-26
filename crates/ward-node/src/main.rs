@@ -1,3 +1,5 @@
+//! Local Ward node service executable.
+
 use std::io;
 use std::path::PathBuf;
 
@@ -78,6 +80,8 @@ fn total_memory_bytes() -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     #[test]
