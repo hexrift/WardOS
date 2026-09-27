@@ -2475,6 +2475,7 @@ version = "0.18.1"
 dependencies = [
  "serde",
  "serde_json",
+ "ward-events",
 ]
 
 [[package]]
