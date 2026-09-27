@@ -342,7 +342,11 @@ impl AuthorityLease {
         empty_policy: EmptyAuthorityPolicy,
     ) -> Result<Self, AuthorityLeaseError> {
         validate_lifetime(input.issued_at_unix_ms, input.expires_at_unix_ms)?;
-        validate_active_interval(input.issued_at_unix_ms, input.expires_at_unix_ms, now_unix_ms)?;
+        validate_active_interval(
+            input.issued_at_unix_ms,
+            input.expires_at_unix_ms,
+            now_unix_ms,
+        )?;
         validate_empty_policy(&input.grants, empty_policy)?;
 
         Ok(Self {
@@ -649,29 +653,33 @@ mod tests {
     use ward_events::{AgentId, DelegationId, LeaseId, PrincipalId, TaskId};
 
     fn root() -> AuthorityLease {
-        AuthorityLease::root(AuthorityLeaseInput {
-            id: LeaseId::from_u128(1),
-            delegation_id: DelegationId::from_u128(1),
-            issuer: PrincipalId::from_u128(1),
-            subject: AgentId::from_u128(1),
-            task: TaskId::from_u128(1),
-            grants: GrantSet::new([
-                CapabilityGrant::new(
-                    CapabilityName::new("repo.read").unwrap(),
-                    ResourceRef::new("repo:hexrift/WardOS").unwrap(),
-                    true,
-                ),
-                CapabilityGrant::new(
-                    CapabilityName::new("network.fetch").unwrap(),
-                    ResourceRef::new("host:api.github.com").unwrap(),
-                    false,
-                ),
-            ])
-            .unwrap(),
-            issued_at_unix_ms: 100,
-            expires_at_unix_ms: 1_000,
-            version: LeaseVersion::new(1).unwrap(),
-        }, 500, EmptyAuthorityPolicy::Reject)
+        AuthorityLease::root(
+            AuthorityLeaseInput {
+                id: LeaseId::from_u128(1),
+                delegation_id: DelegationId::from_u128(1),
+                issuer: PrincipalId::from_u128(1),
+                subject: AgentId::from_u128(1),
+                task: TaskId::from_u128(1),
+                grants: GrantSet::new([
+                    CapabilityGrant::new(
+                        CapabilityName::new("repo.read").unwrap(),
+                        ResourceRef::new("repo:hexrift/WardOS").unwrap(),
+                        true,
+                    ),
+                    CapabilityGrant::new(
+                        CapabilityName::new("network.fetch").unwrap(),
+                        ResourceRef::new("host:api.github.com").unwrap(),
+                        false,
+                    ),
+                ])
+                .unwrap(),
+                issued_at_unix_ms: 100,
+                expires_at_unix_ms: 1_000,
+                version: LeaseVersion::new(1).unwrap(),
+            },
+            500,
+            EmptyAuthorityPolicy::Reject,
+        )
         .unwrap()
     }
 
@@ -703,16 +711,20 @@ mod tests {
         .unwrap();
 
         let child = parent
-            .delegate(DelegationInput {
-                id: LeaseId::from_u128(2),
-                delegation_id: DelegationId::from_u128(2),
-                subject: AgentId::from_u128(2),
-                task: parent.task(),
-                grants: child_grants,
-                issued_at_unix_ms: 200,
-                expires_at_unix_ms: 900,
-                version: LeaseVersion::new(2).unwrap(),
-            }, 500, EmptyAuthorityPolicy::Reject)
+            .delegate(
+                DelegationInput {
+                    id: LeaseId::from_u128(2),
+                    delegation_id: DelegationId::from_u128(2),
+                    subject: AgentId::from_u128(2),
+                    task: parent.task(),
+                    grants: child_grants,
+                    issued_at_unix_ms: 200,
+                    expires_at_unix_ms: 900,
+                    version: LeaseVersion::new(2).unwrap(),
+                },
+                500,
+                EmptyAuthorityPolicy::Reject,
+            )
             .unwrap();
 
         assert_eq!(child.parent_lease_id(), Some(parent.id()));
@@ -755,16 +767,20 @@ mod tests {
 
         for (grants, task, expected) in cases {
             assert_eq!(
-                parent.delegate(DelegationInput {
-                    id: LeaseId::from_u128(2),
-                    delegation_id: DelegationId::from_u128(2),
-                    subject: AgentId::from_u128(2),
-                    task,
-                    grants,
-                    issued_at_unix_ms: 200,
-                    expires_at_unix_ms: 900,
-                    version: LeaseVersion::new(2).unwrap(),
-                }, 500, EmptyAuthorityPolicy::Reject),
+                parent.delegate(
+                    DelegationInput {
+                        id: LeaseId::from_u128(2),
+                        delegation_id: DelegationId::from_u128(2),
+                        subject: AgentId::from_u128(2),
+                        task,
+                        grants,
+                        issued_at_unix_ms: 200,
+                        expires_at_unix_ms: 900,
+                        version: LeaseVersion::new(2).unwrap(),
+                    },
+                    500,
+                    EmptyAuthorityPolicy::Reject
+                ),
                 Err(expected)
             );
         }
@@ -803,10 +819,9 @@ mod tests {
     #[test]
     fn root_shaped_wire_cannot_be_promoted_through_delegated_validation() {
         let root = root();
-        let wire = serde_json::from_str::<UntrustedAuthorityLease>(
-            &serde_json::to_string(&root).unwrap(),
-        )
-        .unwrap();
+        let wire =
+            serde_json::from_str::<UntrustedAuthorityLease>(&serde_json::to_string(&root).unwrap())
+                .unwrap();
 
         assert_eq!(
             root.validate_delegated(wire, 500, EmptyAuthorityPolicy::Reject),
