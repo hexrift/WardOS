@@ -2407,6 +2407,7 @@ dependencies = [
  "ward-bench",
  "ward-daemon",
  "ward-events",
+ "ward-node-protocol",
  "ward-policy",
  "ward-shell-core",
 ]
