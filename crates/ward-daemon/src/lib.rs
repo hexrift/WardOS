@@ -30,6 +30,7 @@ pub mod gateway;
 pub mod github;
 pub mod hooks;
 pub mod ids;
+pub mod node_readiness;
 pub mod observe;
 pub mod pause;
 pub mod readiness;

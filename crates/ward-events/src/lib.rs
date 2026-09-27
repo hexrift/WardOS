@@ -46,8 +46,8 @@ pub use event::{
     VerifySummary, WardEvent,
 };
 pub use ids::{
-    AttemptId, Blake3Hash, IdError, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId,
-    SnapshotId,
+    AgentId, AttemptId, Blake3Hash, DelegationId, ExecutionAttemptId, IdError, ImageDigest,
+    LeaseId, Pid, PrincipalId, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId, TaskId,
 };
 pub use log::{FsyncDecider, FsyncPolicy, LogError, LogReader, LogWriter};
 pub use origin::{Origin, OriginSet};
