@@ -2407,7 +2407,6 @@ dependencies = [
  "ward-bench",
  "ward-daemon",
  "ward-events",
- "ward-node-protocol",
  "ward-policy",
  "ward-shell-core",
 ]
@@ -2429,6 +2428,7 @@ dependencies = [
  "thiserror 2.0.20",
  "ward-agent",
  "ward-events",
+ "ward-node-protocol",
  "ward-policy",
  "ward-proxy",
  "ward-sandbox",
