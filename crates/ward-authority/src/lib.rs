@@ -1013,7 +1013,10 @@ mod tests {
         let original = serde_json::to_value(&child).unwrap();
 
         for (field, replacement) in [
-            ("id", serde_json::Value::String(LeaseId::from_u128(9).to_string())),
+            (
+                "id",
+                serde_json::Value::String(LeaseId::from_u128(9).to_string()),
+            ),
             (
                 "delegation_id",
                 serde_json::Value::String(DelegationId::from_u128(9).to_string()),
@@ -1031,12 +1034,7 @@ mod tests {
             tampered[field] = replacement;
             let wire = serde_json::from_value::<UntrustedAuthorityLease>(tampered).unwrap();
             assert_eq!(
-                parent.validate_delegated(
-                    wire,
-                    expected,
-                    500,
-                    EmptyAuthorityPolicy::Reject,
-                ),
+                parent.validate_delegated(wire, expected, 500, EmptyAuthorityPolicy::Reject,),
                 Err(AuthorityLeaseError::DelegationBindingMismatch)
             );
         }
