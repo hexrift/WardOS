@@ -458,8 +458,8 @@ mod tests {
 
     #[test]
     fn lineage_must_be_complete_and_contiguous_through_the_root() {
-        let root = root(1);
-        let parent = child(&root);
+        let root_lease = root(1);
+        let parent = child(&root_lease);
         let grandchild = delegated(&parent, 3, 300, 800, 3);
         let unrelated = root(99);
 
@@ -472,8 +472,8 @@ mod tests {
             Err(LeaseLineageError::NonContiguousAncestor)
         );
 
-        let lineage = LeaseLineage::for_lease(&grandchild, [&parent, &root]).unwrap();
-        assert_eq!(lineage.ancestors(), &[parent.id(), root.id()]);
+        let lineage = LeaseLineage::for_lease(&grandchild, [&parent, &root_lease]).unwrap();
+        assert_eq!(lineage.ancestors(), &[parent.id(), root_lease.id()]);
     }
 
     #[test]
