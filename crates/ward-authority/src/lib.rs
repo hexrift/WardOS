@@ -5,7 +5,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::fmt::{Display, Formatter};
 use std::num::NonZeroU64;
 
 use serde::de::Error as _;
