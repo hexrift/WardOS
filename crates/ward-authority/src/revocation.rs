@@ -39,11 +39,7 @@ pub struct AuthorityRevocation {
 impl AuthorityRevocation {
     /// Construct a trusted revocation fact.
     #[must_use]
-    pub const fn new(
-        lease_id: LeaseId,
-        revoked_at_unix_ms: u64,
-        reason: RevocationReason,
-    ) -> Self {
+    pub const fn new(lease_id: LeaseId, revoked_at_unix_ms: u64, reason: RevocationReason) -> Self {
         Self {
             lease_id,
             revoked_at_unix_ms,
@@ -242,9 +238,7 @@ impl AuthorityRevocations {
     fn id_is_unrevoked(&self, lease_id: LeaseId, now_unix_ms: u64) -> bool {
         match self.by_lease.get(&lease_id) {
             None => true,
-            Some(RevocationState::Known(revocation)) => {
-                now_unix_ms < revocation.revoked_at_unix_ms
-            }
+            Some(RevocationState::Known(revocation)) => now_unix_ms < revocation.revoked_at_unix_ms,
             Some(RevocationState::Conflict) => false,
         }
     }
@@ -336,8 +330,7 @@ mod tests {
     #[test]
     fn exact_duplicate_is_idempotent_and_there_is_no_unrevoke_path() {
         let lease = root(7);
-        let revocation =
-            AuthorityRevocation::new(lease.id(), 500, RevocationReason::Operator);
+        let revocation = AuthorityRevocation::new(lease.id(), 500, RevocationReason::Operator);
         let mut revocations = AuthorityRevocations::new();
 
         assert_eq!(revocations.record(revocation), Ok(()));
