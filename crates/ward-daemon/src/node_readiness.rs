@@ -168,10 +168,10 @@ fn connect_with_deadline(socket: &Path, deadline: Instant) -> Result<UnixStream,
     let result = receiver
         .recv_timeout(remaining(deadline)?)
         .map_err(|_| ProbeError::Unhealthy)?;
-    result.map_err(classify_connect_error)
+    result.map_err(|error| classify_connect_error(&error))
 }
 
-fn classify_connect_error(error: std::io::Error) -> ProbeError {
+fn classify_connect_error(error: &std::io::Error) -> ProbeError {
     match error.kind() {
         std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
             ProbeError::NotRunning
