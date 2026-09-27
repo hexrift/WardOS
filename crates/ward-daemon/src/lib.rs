@@ -31,6 +31,7 @@ pub mod github;
 pub mod hooks;
 pub mod ids;
 pub mod observe;
+pub mod node_readiness;
 pub mod pause;
 pub mod readiness;
 pub mod reclaim;
