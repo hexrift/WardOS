@@ -188,7 +188,7 @@ impl AuthorityRevocations {
                 Ok(())
             }
             Some(RevocationState::Known(existing)) if existing == revocation => Ok(()),
-            Some(RevocationState::Known(_)) | Some(RevocationState::Conflict) => {
+            Some(RevocationState::Known(_) | RevocationState::Conflict) => {
                 self.by_lease
                     .insert(revocation.lease_id, RevocationState::Conflict);
                 Err(AuthorityRevocationError::RevocationConflict)
