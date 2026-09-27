@@ -492,6 +492,51 @@ mod tests {
     }
 
     #[test]
+    fn malformed_capability_request_fails_closed_after_valid_handshake() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || service.serve_connection(server));
+
+        let hello = HandshakeRequest::Hello {
+            protocol: SupportedProtocolRange::new(1, 1, 1).unwrap(),
+        };
+        writeln!(client, "{}", serde_json::to_string(&hello).unwrap()).unwrap();
+        let _: HandshakeResponse = serde_json::from_str(line(&mut client).trim()).unwrap();
+
+        writeln!(client, "{{not-json").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(NodeServiceError::MalformedCapabilityRequest)
+        ));
+        assert_eq!(line(&mut client), "");
+    }
+
+    #[test]
+    fn oversized_capability_request_fails_closed_after_valid_handshake() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || service.serve_connection(server));
+
+        let hello = HandshakeRequest::Hello {
+            protocol: SupportedProtocolRange::new(1, 1, 1).unwrap(),
+        };
+        writeln!(client, "{}", serde_json::to_string(&hello).unwrap()).unwrap();
+        let _: HandshakeResponse = serde_json::from_str(line(&mut client).trim()).unwrap();
+
+        let payload = format!("{}\n", "x".repeat(MAX_REQUEST_LINE_BYTES + 1));
+        let _ = client.write_all(payload.as_bytes());
+        let _ = client.shutdown(std::net::Shutdown::Write);
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(NodeServiceError::RequestTooLarge)
+        ));
+        assert_eq!(line(&mut client), "");
+    }
+
+    #[test]
     fn protocol_state_is_connection_local() {
         let service = NodeService::new(capabilities()).unwrap();
 
