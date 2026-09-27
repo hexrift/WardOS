@@ -729,6 +729,11 @@ mod tests {
         }
     }
 
+    fn decode_wire(value: &serde_json::Value) -> UntrustedAuthorityLease {
+        let encoded = serde_json::to_string(value).unwrap();
+        serde_json::from_str(&encoded).unwrap()
+    }
+
     #[test]
     fn lease_lifetime_is_bounded_and_active_only_inside_interval() {
         let lease = root();
@@ -1016,7 +1021,7 @@ mod tests {
         let expected = binding_for(&child_v3);
         let json = serde_json::to_value(&child_v3).unwrap();
 
-        let current = serde_json::from_value::<UntrustedAuthorityLease>(json.clone()).unwrap();
+        let current = decode_wire(&json);
         assert_eq!(
             parent
                 .validate_delegated(current, expected, 500, EmptyAuthorityPolicy::Reject)
@@ -1027,7 +1032,7 @@ mod tests {
 
         let mut stale = json;
         stale["version"] = serde_json::Value::from(2_u64);
-        let stale = serde_json::from_value::<UntrustedAuthorityLease>(stale).unwrap();
+        let stale = decode_wire(&stale);
         assert_eq!(
             parent.validate_delegated(stale, expected, 500, EmptyAuthorityPolicy::Reject),
             Err(AuthorityLeaseError::DelegationBindingMismatch)
@@ -1081,7 +1086,7 @@ mod tests {
         ] {
             let mut tampered = original.clone();
             tampered[field] = replacement;
-            let wire = serde_json::from_value::<UntrustedAuthorityLease>(tampered).unwrap();
+            let wire = decode_wire(&tampered);
             assert_eq!(
                 parent.validate_delegated(wire, expected, 500, EmptyAuthorityPolicy::Reject,),
                 Err(AuthorityLeaseError::DelegationBindingMismatch)
