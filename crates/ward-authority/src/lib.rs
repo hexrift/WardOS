@@ -528,6 +528,7 @@ impl AuthorityLease {
             || wire.delegation_id != expected.delegation_id
             || wire.subject != expected.subject
             || wire.task != expected.task
+            || wire.version != expected.version
         {
             return Err(AuthorityLeaseError::DelegationBindingMismatch);
         }
@@ -580,6 +581,8 @@ pub struct DelegationBinding {
     pub subject: AgentId,
     /// Expected task identity.
     pub task: TaskId,
+    /// Expected monotonic lease version.
+    pub version: LeaseVersion,
 }
 
 /// Untrusted serialized authority envelope.
@@ -723,6 +726,7 @@ mod tests {
             delegation_id: lease.delegation_id(),
             subject: lease.subject(),
             task: lease.task(),
+            version: lease.version(),
         }
     }
 
@@ -874,6 +878,7 @@ mod tests {
                     delegation_id: DelegationId::from_u128(2),
                     subject: AgentId::from_u128(2),
                     task: root.task(),
+                    version: LeaseVersion::new(2).unwrap(),
                 },
                 500,
                 EmptyAuthorityPolicy::Reject,
@@ -982,6 +987,52 @@ mod tests {
                 EmptyAuthorityPolicy::Reject,
             ),
             Err(AuthorityLeaseError::DelegationIdReuse)
+        );
+    }
+
+    #[test]
+    fn delegated_wire_rejects_stale_version_replay() {
+        let parent = root();
+        let child_v3 = parent
+            .delegate(
+                DelegationInput {
+                    id: LeaseId::from_u128(3),
+                    delegation_id: DelegationId::from_u128(3),
+                    subject: AgentId::from_u128(3),
+                    task: parent.task(),
+                    grants: GrantSet::new([CapabilityGrant::new(
+                        CapabilityName::new("repo.read").unwrap(),
+                        ResourceRef::new("repo:hexrift/WardOS").unwrap(),
+                        false,
+                    )])
+                    .unwrap(),
+                    issued_at_unix_ms: 200,
+                    expires_at_unix_ms: 900,
+                    version: LeaseVersion::new(3).unwrap(),
+                },
+                500,
+                EmptyAuthorityPolicy::Reject,
+            )
+            .unwrap();
+        let expected = binding_for(&child_v3);
+        let json = serde_json::to_value(&child_v3).unwrap();
+
+        let current =
+            serde_json::from_value::<UntrustedAuthorityLease>(json.clone()).unwrap();
+        assert_eq!(
+            parent
+                .validate_delegated(current, expected, 500, EmptyAuthorityPolicy::Reject)
+                .unwrap()
+                .version(),
+            LeaseVersion::new(3).unwrap()
+        );
+
+        let mut stale = json;
+        stale["version"] = serde_json::Value::from(2_u64);
+        let stale = serde_json::from_value::<UntrustedAuthorityLease>(stale).unwrap();
+        assert_eq!(
+            parent.validate_delegated(stale, expected, 500, EmptyAuthorityPolicy::Reject),
+            Err(AuthorityLeaseError::DelegationBindingMismatch)
         );
     }
 
