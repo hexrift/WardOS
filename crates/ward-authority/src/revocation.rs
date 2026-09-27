@@ -83,41 +83,67 @@ pub struct LeaseLineage {
 }
 
 impl LeaseLineage {
-    /// Construct lineage for one trusted lease.
+    /// Construct a complete lineage for one trusted lease.
+    ///
+    /// Ancestors must be supplied as trusted leases, nearest parent first, through the
+    /// root. Every adjacent parent link is validated before the lineage can be used for
+    /// revocation evaluation.
     ///
     /// # Errors
     ///
-    /// Rejects a missing/wrong direct parent, ancestors on a root lease, the current lease
-    /// appearing among its own ancestors, or duplicate ancestor IDs.
-    pub fn for_lease(
+    /// Rejects ancestors on a root lease, a missing/wrong direct parent, an omitted
+    /// ancestor, a non-contiguous chain, the current lease appearing as its own ancestor,
+    /// duplicate ancestors, or entries beyond the root.
+    pub fn for_lease<'a>(
         lease: &AuthorityLease,
-        ancestors: impl IntoIterator<Item = LeaseId>,
+        ancestors: impl IntoIterator<Item = &'a AuthorityLease>,
     ) -> Result<Self, LeaseLineageError> {
         let ancestors: Vec<_> = ancestors.into_iter().collect();
 
-        match lease.parent_lease_id() {
-            None if !ancestors.is_empty() => {
-                return Err(LeaseLineageError::UnexpectedAncestorsForRoot);
+        if lease.parent_lease_id().is_none() {
+            if ancestors.is_empty() {
+                return Ok(Self {
+                    lease_id: lease.id(),
+                    ancestors: Vec::new(),
+                });
             }
-            Some(parent) if ancestors.first().copied() != Some(parent) => {
-                return Err(LeaseLineageError::DirectParentMismatch);
-            }
-            None | Some(_) => {}
+            return Err(LeaseLineageError::UnexpectedAncestorsForRoot);
         }
 
+        let mut expected_parent = lease.parent_lease_id();
         let mut seen = BTreeSet::new();
-        for ancestor in &ancestors {
-            if *ancestor == lease.id() {
+        let mut ancestor_ids = Vec::with_capacity(ancestors.len());
+
+        for (index, ancestor) in ancestors.into_iter().enumerate() {
+            if ancestor.id() == lease.id() {
                 return Err(LeaseLineageError::CurrentLeaseInAncestors);
             }
-            if !seen.insert(*ancestor) {
+            if !seen.insert(ancestor.id()) {
                 return Err(LeaseLineageError::DuplicateAncestor);
             }
+
+            let Some(expected_id) = expected_parent else {
+                return Err(LeaseLineageError::AncestorBeyondRoot);
+            };
+            if ancestor.id() != expected_id {
+                return Err(if index == 0 {
+                    LeaseLineageError::DirectParentMismatch
+                } else {
+                    LeaseLineageError::NonContiguousAncestor
+                });
+            }
+
+            ancestor_ids.push(ancestor.id());
+            expected_parent = ancestor.parent_lease_id();
+        }
+
+        if expected_parent.is_some() {
+            return Err(LeaseLineageError::IncompleteAncestors);
         }
 
         Ok(Self {
             lease_id: lease.id(),
-            ancestors,
+            ancestors: ancestor_ids,
         })
     }
 
@@ -143,6 +169,15 @@ pub enum LeaseLineageError {
     /// The first ancestor must be the lease's recorded parent.
     #[error("authority lineage direct parent does not match lease")]
     DirectParentMismatch,
+    /// Every ancestor must name the next supplied ancestor as its recorded parent.
+    #[error("authority lineage contains a non-contiguous ancestor")]
+    NonContiguousAncestor,
+    /// The supplied lineage stopped before reaching a root lease.
+    #[error("authority lineage omits one or more ancestors")]
+    IncompleteAncestors,
+    /// Entries were supplied after the lineage already reached its root.
+    #[error("authority lineage continues beyond the root")]
+    AncestorBeyondRoot,
     /// A lease cannot appear in its own ancestor set.
     #[error("authority lineage contains the current lease")]
     CurrentLeaseInAncestors,
@@ -281,23 +316,33 @@ mod tests {
         .unwrap()
     }
 
-    fn child(parent: &AuthorityLease) -> AuthorityLease {
+    fn delegated(
+        parent: &AuthorityLease,
+        id: u128,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        version: u64,
+    ) -> AuthorityLease {
         parent
             .delegate(
                 DelegationInput {
-                    id: LeaseId::from_u128(2),
-                    delegation_id: DelegationId::from_u128(102),
-                    subject: AgentId::from_u128(202),
+                    id: LeaseId::from_u128(id),
+                    delegation_id: DelegationId::from_u128(id + 100),
+                    subject: AgentId::from_u128(id + 200),
                     task: parent.task(),
                     grants: GrantSet::new([]).unwrap(),
-                    issued_at_unix_ms: 200,
-                    expires_at_unix_ms: 900,
-                    version: LeaseVersion::new(2).unwrap(),
+                    issued_at_unix_ms,
+                    expires_at_unix_ms,
+                    version: LeaseVersion::new(version).unwrap(),
                 },
                 500,
                 EmptyAuthorityPolicy::Allow,
             )
             .unwrap()
+    }
+
+    fn child(parent: &AuthorityLease) -> AuthorityLease {
+        delegated(parent, 2, 200, 900, 2)
     }
 
     #[test]
@@ -366,7 +411,7 @@ mod tests {
     fn ancestor_revocation_denies_an_otherwise_active_child() {
         let parent = root(1);
         let child = child(&parent);
-        let lineage = LeaseLineage::for_lease(&child, [parent.id()]).unwrap();
+        let lineage = LeaseLineage::for_lease(&child, [&parent]).unwrap();
         let mut revocations = AuthorityRevocations::new();
 
         revocations
@@ -387,26 +432,71 @@ mod tests {
     fn lineage_rejects_missing_wrong_duplicate_or_self_ancestors() {
         let parent = root(1);
         let child = child(&parent);
+        let wrong_parent = root(99);
 
         assert_eq!(
             LeaseLineage::for_lease(&child, []),
+            Err(LeaseLineageError::IncompleteAncestors)
+        );
+        assert_eq!(
+            LeaseLineage::for_lease(&child, [&wrong_parent]),
             Err(LeaseLineageError::DirectParentMismatch)
         );
         assert_eq!(
-            LeaseLineage::for_lease(&child, [LeaseId::from_u128(99)]),
-            Err(LeaseLineageError::DirectParentMismatch)
-        );
-        assert_eq!(
-            LeaseLineage::for_lease(&child, [parent.id(), parent.id()]),
+            LeaseLineage::for_lease(&child, [&parent, &parent]),
             Err(LeaseLineageError::DuplicateAncestor)
         );
         assert_eq!(
-            LeaseLineage::for_lease(&child, [parent.id(), child.id()]),
+            LeaseLineage::for_lease(&child, [&parent, &child]),
             Err(LeaseLineageError::CurrentLeaseInAncestors)
         );
         assert_eq!(
-            LeaseLineage::for_lease(&parent, [child.id()]),
+            LeaseLineage::for_lease(&parent, [&child]),
             Err(LeaseLineageError::UnexpectedAncestorsForRoot)
+        );
+    }
+
+    #[test]
+    fn lineage_must_be_complete_and_contiguous_through_the_root() {
+        let root = root(1);
+        let parent = child(&root);
+        let grandchild = delegated(&parent, 3, 300, 800, 3);
+        let unrelated = root(99);
+
+        assert_eq!(
+            LeaseLineage::for_lease(&grandchild, [&parent]),
+            Err(LeaseLineageError::IncompleteAncestors)
+        );
+        assert_eq!(
+            LeaseLineage::for_lease(&grandchild, [&parent, &unrelated]),
+            Err(LeaseLineageError::NonContiguousAncestor)
+        );
+
+        let lineage = LeaseLineage::for_lease(&grandchild, [&parent, &root]).unwrap();
+        assert_eq!(lineage.ancestors(), &[parent.id(), root.id()]);
+    }
+
+    #[test]
+    fn revoked_grandparent_cannot_be_omitted_from_child_evaluation() {
+        let root = root(1);
+        let parent = child(&root);
+        let grandchild = delegated(&parent, 3, 300, 800, 3);
+        let lineage = LeaseLineage::for_lease(&grandchild, [&parent, &root]).unwrap();
+        let mut revocations = AuthorityRevocations::new();
+
+        revocations
+            .record(AuthorityRevocation::new(
+                root.id(),
+                600,
+                RevocationReason::DelegationRevoked,
+            ))
+            .unwrap();
+
+        assert!(revocations.is_usable_with_lineage(&grandchild, &lineage, 599));
+        assert!(!revocations.is_usable_with_lineage(&grandchild, &lineage, 600));
+        assert_eq!(
+            LeaseLineage::for_lease(&grandchild, [&parent]),
+            Err(LeaseLineageError::IncompleteAncestors)
         );
     }
 
@@ -415,7 +505,7 @@ mod tests {
         let parent = root(1);
         let child = child(&parent);
         let other = root(20);
-        let lineage = LeaseLineage::for_lease(&child, [parent.id()]).unwrap();
+        let lineage = LeaseLineage::for_lease(&child, [&parent]).unwrap();
         let revocations = AuthorityRevocations::new();
 
         assert!(!revocations.is_usable_with_lineage(&other, &lineage, 500));
