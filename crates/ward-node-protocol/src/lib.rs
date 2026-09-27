@@ -1961,25 +1961,83 @@ mod tests {
         let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
         let binding = lifecycle_binding();
         let operation = OperationId::new(11).unwrap();
+        let bound_binding = r#""task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009""#;
 
-        let accepted = context.accepted(operation, binding, TaskLifecycleState::Running);
-        let inspected = context.inspected(binding, TaskLifecycleState::Paused);
-        let stream = context.stream_ready(binding, 42);
-        let rejected = context.rejected(
-            Some(operation),
-            binding,
-            TaskLifecycleRejectionReason::LeaseRevoked,
-        );
+        let cases = [
+            (
+                context.accepted(operation, binding, TaskLifecycleState::Running),
+                format!(
+                    r#"{{"response":"accepted","protocol":{{"major":1,"minor":2}},"operation_id":11,"binding":{{{bound_binding}}},"state":"running"}}"#
+                ),
+            ),
+            (
+                context.inspected(binding, TaskLifecycleState::Paused),
+                format!(
+                    r#"{{"response":"inspected","protocol":{{"major":1,"minor":2}},"binding":{{{bound_binding}}},"state":"paused"}}"#
+                ),
+            ),
+            (
+                context.stream_ready(binding, 42),
+                format!(
+                    r#"{{"response":"stream_ready","protocol":{{"major":1,"minor":2}},"binding":{{{bound_binding}}},"from_seq":42}}"#
+                ),
+            ),
+            (
+                context.rejected(
+                    Some(operation),
+                    binding,
+                    TaskLifecycleRejectionReason::LeaseRevoked,
+                ),
+                format!(
+                    r#"{{"response":"rejected","protocol":{{"major":1,"minor":2}},"operation_id":11,"binding":{{{bound_binding}}},"reason":"lease_revoked"}}"#
+                ),
+            ),
+        ];
 
-        for response in [accepted, inspected, stream, rejected] {
-            let json = serde_json::to_string(&response).unwrap();
-            assert_eq!(context.decode_response(&json).unwrap(), response);
+        for (response, expected) in cases {
+            assert_eq!(serde_json::to_string(&response).unwrap(), expected);
+            assert_eq!(context.decode_response(&expected).unwrap(), response);
         }
 
-        assert_eq!(
-            serde_json::to_string(&rejected).unwrap(),
-            r#"{"response":"rejected","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"reason":"lease_revoked"}"#
-        );
+        let reasons = [
+            (TaskLifecycleRejectionReason::TaskNotFound, "task_not_found"),
+            (
+                TaskLifecycleRejectionReason::AttemptMismatch,
+                "attempt_mismatch",
+            ),
+            (
+                TaskLifecycleRejectionReason::LeaseMismatch,
+                "lease_mismatch",
+            ),
+            (TaskLifecycleRejectionReason::LeaseExpired, "lease_expired"),
+            (TaskLifecycleRejectionReason::LeaseRevoked, "lease_revoked"),
+            (
+                TaskLifecycleRejectionReason::StaleOperation,
+                "stale_operation",
+            ),
+            (TaskLifecycleRejectionReason::InvalidState, "invalid_state"),
+            (
+                TaskLifecycleRejectionReason::AuthorityDenied,
+                "authority_denied",
+            ),
+            (
+                TaskLifecycleRejectionReason::ResourceUnavailable,
+                "resource_unavailable",
+            ),
+            (
+                TaskLifecycleRejectionReason::UnsupportedOperation,
+                "unsupported_operation",
+            ),
+        ];
+
+        for (reason, wire_name) in reasons {
+            let rejected = context.rejected(None, binding, reason);
+            let expected = format!(
+                r#"{{"response":"rejected","protocol":{{"major":1,"minor":2}},"operation_id":null,"binding":{{{bound_binding}}},"reason":"{wire_name}"}}"#
+            );
+            assert_eq!(serde_json::to_string(&rejected).unwrap(), expected);
+            assert_eq!(context.decode_response(&expected).unwrap(), rejected);
+        }
     }
 
     #[test]
@@ -1994,6 +2052,22 @@ mod tests {
         ] {
             assert!(
                 context.decode_request(raw).is_err(),
+                "{raw} must fail closed"
+            );
+        }
+
+        for raw in [
+            // Wrong protocol version.
+            r#"{"response":"inspected","protocol":{"major":1,"minor":1},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"state":"paused"}"#,
+            // Unknown field.
+            r#"{"response":"inspected","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"state":"paused","extra":true}"#,
+            // Unknown response variant.
+            r#"{"response":"unknown","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"state":"paused"}"#,
+            // Malformed typed id.
+            r#"{"response":"inspected","protocol":{"major":1,"minor":2},"binding":{"task":"not-a-task","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"state":"paused"}"#,
+        ] {
+            assert!(
+                context.decode_response(raw).is_err(),
                 "{raw} must fail closed"
             );
         }
