@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -450,19 +450,23 @@ mod tests {
     fn slow_drip_cannot_extend_the_absolute_connection_deadline() {
         let service = NodeService::new(capabilities()).unwrap();
         let (mut client, server) = UnixStream::pair().unwrap();
+        let started = Instant::now();
         let worker = std::thread::spawn(move || {
-            service.serve_connection_with_lifetime(server, Duration::from_millis(80))
+            service.serve_connection_with_lifetime(server, Duration::from_millis(120))
         });
 
-        for _ in 0..4 {
-            client.write_all(b"{").unwrap();
-            std::thread::sleep(Duration::from_millis(30));
-        }
+        client.write_all(b"{").unwrap();
+        std::thread::sleep(Duration::from_millis(70));
+        client.write_all(b"{").unwrap();
 
         assert!(matches!(
             worker.join().unwrap(),
             Err(NodeServiceError::ConnectionDeadlineExceeded)
         ));
+        assert!(
+            started.elapsed() < Duration::from_millis(190),
+            "partial progress must not reset the 120 ms absolute deadline"
+        );
     }
 
     #[test]
