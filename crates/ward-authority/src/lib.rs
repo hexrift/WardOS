@@ -383,6 +383,9 @@ impl AuthorityLease {
         if input.id == self.id {
             return Err(AuthorityLeaseError::LeaseIdReuse);
         }
+        if input.delegation_id == self.delegation_id {
+            return Err(AuthorityLeaseError::DelegationIdReuse);
+        }
         if input.task != self.task {
             return Err(AuthorityLeaseError::TaskMismatch);
         }
@@ -511,6 +514,7 @@ impl AuthorityLease {
     pub fn validate_delegated(
         &self,
         wire: UntrustedAuthorityLease,
+        expected: DelegationBinding,
         now_unix_ms: u64,
         empty_policy: EmptyAuthorityPolicy,
     ) -> Result<Self, AuthorityLeaseError> {
@@ -519,6 +523,13 @@ impl AuthorityLease {
             || wire.issuer != self.issuer
         {
             return Err(AuthorityLeaseError::LineageMismatch);
+        }
+        if wire.id != expected.lease_id
+            || wire.delegation_id != expected.delegation_id
+            || wire.subject != expected.subject
+            || wire.task != expected.task
+        {
+            return Err(AuthorityLeaseError::DelegationBindingMismatch);
         }
 
         self.delegate(
@@ -552,6 +563,23 @@ impl AuthorityLease {
             version: self.version,
         }
     }
+}
+
+/// Trusted child identity binding supplied by the application/control plane.
+///
+/// This value is deliberately not deserializable from the authority envelope itself.
+/// It gives delegated-wire validation an independent expected lease, delegation,
+/// subject and task identity so untrusted bytes cannot substitute those identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DelegationBinding {
+    /// Expected child lease identity.
+    pub lease_id: LeaseId,
+    /// Expected delegation identity.
+    pub delegation_id: DelegationId,
+    /// Expected child agent identity.
+    pub subject: AgentId,
+    /// Expected task identity.
+    pub task: TaskId,
 }
 
 /// Untrusted serialized authority envelope.
@@ -622,6 +650,9 @@ pub enum AuthorityLeaseError {
     /// Child attempted to reuse its parent's lease identity.
     #[error("child authority lease id must differ from parent lease id")]
     LeaseIdReuse,
+    /// Child attempted to reuse its parent's delegation identity.
+    #[error("child delegation id must differ from parent delegation id")]
+    DelegationIdReuse,
     /// Empty authority was not explicitly allowed by the caller.
     #[error("empty authority requires explicit caller opt-in")]
     EmptyAuthorityNotAllowed,
@@ -643,6 +674,9 @@ pub enum AuthorityLeaseError {
     /// Child wire does not identify the supplied trusted parent/delegator/issuer.
     #[error("delegated authority lineage does not match the trusted parent")]
     LineageMismatch,
+    /// Child wire does not match the independently trusted child identity binding.
+    #[error("delegated authority identity does not match the expected child binding")]
+    DelegationBindingMismatch,
 }
 
 #[cfg(test)]
@@ -681,6 +715,15 @@ mod tests {
             EmptyAuthorityPolicy::Reject,
         )
         .unwrap()
+    }
+
+    fn binding_for(lease: &AuthorityLease) -> DelegationBinding {
+        DelegationBinding {
+            lease_id: lease.id(),
+            delegation_id: lease.delegation_id(),
+            subject: lease.subject(),
+            task: lease.task(),
+        }
     }
 
     #[test]
@@ -824,7 +867,17 @@ mod tests {
                 .unwrap();
 
         assert_eq!(
-            root.validate_delegated(wire, 500, EmptyAuthorityPolicy::Reject),
+            root.validate_delegated(
+                wire,
+                DelegationBinding {
+                    lease_id: LeaseId::from_u128(2),
+                    delegation_id: DelegationId::from_u128(2),
+                    subject: AgentId::from_u128(2),
+                    task: root.task(),
+                },
+                500,
+                EmptyAuthorityPolicy::Reject,
+            ),
             Err(AuthorityLeaseError::LineageMismatch)
         );
     }
@@ -904,6 +957,92 @@ mod tests {
     }
 
     #[test]
+    fn child_cannot_reuse_parent_delegation_id() {
+        let parent = root();
+        let grants = GrantSet::new([CapabilityGrant::new(
+            CapabilityName::new("repo.read").unwrap(),
+            ResourceRef::new("repo:hexrift/WardOS").unwrap(),
+            false,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            parent.delegate(
+                DelegationInput {
+                    id: LeaseId::from_u128(2),
+                    delegation_id: parent.delegation_id(),
+                    subject: AgentId::from_u128(2),
+                    task: parent.task(),
+                    grants,
+                    issued_at_unix_ms: 200,
+                    expires_at_unix_ms: 900,
+                    version: LeaseVersion::new(2).unwrap(),
+                },
+                500,
+                EmptyAuthorityPolicy::Reject,
+            ),
+            Err(AuthorityLeaseError::DelegationIdReuse)
+        );
+    }
+
+    #[test]
+    fn delegated_wire_cannot_substitute_child_identity() {
+        let parent = root();
+        let child = parent
+            .delegate(
+                DelegationInput {
+                    id: LeaseId::from_u128(2),
+                    delegation_id: DelegationId::from_u128(2),
+                    subject: AgentId::from_u128(2),
+                    task: parent.task(),
+                    grants: GrantSet::new([CapabilityGrant::new(
+                        CapabilityName::new("repo.read").unwrap(),
+                        ResourceRef::new("repo:hexrift/WardOS").unwrap(),
+                        false,
+                    )])
+                    .unwrap(),
+                    issued_at_unix_ms: 200,
+                    expires_at_unix_ms: 900,
+                    version: LeaseVersion::new(2).unwrap(),
+                },
+                500,
+                EmptyAuthorityPolicy::Reject,
+            )
+            .unwrap();
+        let expected = binding_for(&child);
+        let original = serde_json::to_value(&child).unwrap();
+
+        for (field, replacement) in [
+            ("id", serde_json::Value::String(LeaseId::from_u128(9).to_string())),
+            (
+                "delegation_id",
+                serde_json::Value::String(DelegationId::from_u128(9).to_string()),
+            ),
+            (
+                "subject",
+                serde_json::Value::String(AgentId::from_u128(9).to_string()),
+            ),
+            (
+                "task",
+                serde_json::Value::String(TaskId::from_u128(9).to_string()),
+            ),
+        ] {
+            let mut tampered = original.clone();
+            tampered[field] = replacement;
+            let wire = serde_json::from_value::<UntrustedAuthorityLease>(tampered).unwrap();
+            assert_eq!(
+                parent.validate_delegated(
+                    wire,
+                    expected,
+                    500,
+                    EmptyAuthorityPolicy::Reject,
+                ),
+                Err(AuthorityLeaseError::DelegationBindingMismatch)
+            );
+        }
+    }
+
+    #[test]
     fn empty_authority_requires_explicit_opt_in() {
         let parent = root();
         let input = DelegationInput {
@@ -963,7 +1102,12 @@ mod tests {
         ] {
             let wire = serde_json::from_str::<UntrustedAuthorityLease>(&json).unwrap();
             assert_eq!(
-                parent.validate_delegated(wire, now, EmptyAuthorityPolicy::Reject),
+                parent.validate_delegated(
+                    wire,
+                    binding_for(&child),
+                    now,
+                    EmptyAuthorityPolicy::Reject,
+                ),
                 Err(expected)
             );
         }
