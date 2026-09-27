@@ -405,10 +405,7 @@ fn ward_node() -> Check {
     ward_node_check(&readiness, socket.as_deref())
 }
 
-fn ward_node_check(
-    readiness: &node_readiness::WardNodeReadiness,
-    socket: Option<&Path>,
-) -> Check {
+fn ward_node_check(readiness: &node_readiness::WardNodeReadiness, socket: Option<&Path>) -> Check {
     use node_readiness::WardNodeReadinessState as State;
 
     let state = readiness.state.as_str();
