@@ -1017,8 +1017,7 @@ mod tests {
         let expected = binding_for(&child_v3);
         let json = serde_json::to_value(&child_v3).unwrap();
 
-        let current =
-            serde_json::from_value::<UntrustedAuthorityLease>(json.clone()).unwrap();
+        let current = serde_json::from_value::<UntrustedAuthorityLease>(json.clone()).unwrap();
         assert_eq!(
             parent
                 .validate_delegated(current, expected, 500, EmptyAuthorityPolicy::Reject)
