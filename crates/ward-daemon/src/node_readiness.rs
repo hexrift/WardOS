@@ -169,7 +169,7 @@ fn probe(socket: &Path, timeout: Duration) -> Result<HandshakeResponse, ProbeErr
 fn connect_with_deadline(socket: &Path, deadline: Instant) -> Result<UnixStream, ProbeError> {
     let path = PathBuf::from(socket);
     let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
+    let _connector = std::thread::spawn(move || {
         let _ = sender.send(UnixStream::connect(path));
     });
 
@@ -260,10 +260,10 @@ mod tests {
             }
             match response {
                 FixtureResponse::Handshake(response) => {
-                    writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+                    let _ = writeln!(stream, "{}", serde_json::to_string(&response).unwrap());
                 }
                 FixtureResponse::Malformed => {
-                    writeln!(stream, "{{not-json").unwrap();
+                    let _ = writeln!(stream, "{{not-json");
                 }
             }
         });
