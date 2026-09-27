@@ -13,16 +13,20 @@ use std::num::{NonZeroU16, NonZeroU64};
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
+use ward_events::{ExecutionAttemptId, LeaseId, TaskId};
 
 /// The node protocol version currently implemented by this revision.
 ///
 /// Minor versions are backwards-compatible within one major version. The initial
 /// implementation supports only 1.0; later compatible additions widen the supported
 /// minor range explicitly.
-pub const WARD_NODE_PROTOCOL: SupportedProtocolRange = SupportedProtocolRange::valid(1, 0, 1);
+pub const WARD_NODE_PROTOCOL: SupportedProtocolRange = SupportedProtocolRange::valid(1, 0, 2);
 
 /// The first protocol version that supports node capability discovery.
 pub const CAPABILITY_DISCOVERY_PROTOCOL: ProtocolVersion = ProtocolVersion::new(1, 1);
+
+/// The first protocol version that supports task lifecycle messages.
+pub const TASK_LIFECYCLE_PROTOCOL: ProtocolVersion = ProtocolVersion::new(1, 2);
 
 /// One negotiated node protocol version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -725,6 +729,509 @@ impl Display for CapabilityDiscoveryError {
 }
 
 impl std::error::Error for CapabilityDiscoveryError {}
+
+
+/// Whether a negotiated protocol version supports task lifecycle messages.
+#[must_use]
+pub const fn supports_task_lifecycle(protocol: ProtocolVersion) -> bool {
+    protocol.major == TASK_LIFECYCLE_PROTOCOL.major
+        && protocol.minor >= TASK_LIFECYCLE_PROTOCOL.minor
+}
+
+/// Stable idempotency identity for one mutating lifecycle command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OperationId(NonZeroU64);
+
+impl OperationId {
+    /// Construct a non-zero operation identity.
+    pub const fn new(value: u64) -> Result<Self, OperationIdError> {
+        match NonZeroU64::new(value) {
+            Some(value) => Ok(Self(value)),
+            None => Err(OperationIdError::Zero),
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationIdError {
+    Zero,
+}
+
+impl Display for OperationIdError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("lifecycle operation id must be non-zero")
+    }
+}
+
+impl std::error::Error for OperationIdError {}
+
+/// Immutable task, execution-attempt and authority-lease identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskBinding {
+    task: TaskId,
+    attempt: ExecutionAttemptId,
+    lease: LeaseId,
+}
+
+impl TaskBinding {
+    #[must_use]
+    pub const fn new(task: TaskId, attempt: ExecutionAttemptId, lease: LeaseId) -> Self {
+        Self { task, attempt, lease }
+    }
+
+    #[must_use]
+    pub const fn task(self) -> TaskId {
+        self.task
+    }
+
+    #[must_use]
+    pub const fn attempt(self) -> ExecutionAttemptId {
+        self.attempt
+    }
+
+    #[must_use]
+    pub const fn lease(self) -> LeaseId {
+        self.lease
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLifecycleState {
+    Created,
+    Ready,
+    Running,
+    Paused,
+    Stopped,
+    Revoked,
+    Sealed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLifecycleRejectionReason {
+    TaskNotFound,
+    AttemptMismatch,
+    LeaseMismatch,
+    LeaseExpired,
+    LeaseRevoked,
+    StaleOperation,
+    InvalidState,
+    AuthorityDenied,
+    ResourceUnavailable,
+    UnsupportedOperation,
+}
+
+/// Version-bound task lifecycle request. Inbound data is decoded through TaskLifecycleContext.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "request", rename_all = "snake_case")]
+pub enum TaskLifecycleRequest {
+    Create {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Start {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Pause {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Resume {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Stop {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Revoke {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Inspect {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+    },
+    Stream {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+        from_seq: u64,
+    },
+    Seal {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+}
+
+impl TaskLifecycleRequest {
+    const fn protocol(self) -> ProtocolVersion {
+        match self {
+            Self::Create { protocol, .. }
+            | Self::Start { protocol, .. }
+            | Self::Pause { protocol, .. }
+            | Self::Resume { protocol, .. }
+            | Self::Stop { protocol, .. }
+            | Self::Revoke { protocol, .. }
+            | Self::Inspect { protocol, .. }
+            | Self::Stream { protocol, .. }
+            | Self::Seal { protocol, .. } => protocol,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
+enum TaskLifecycleRequestWire {
+    Create {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Start {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Pause {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Resume {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Stop {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Revoke {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Inspect {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+    },
+    Stream {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+        from_seq: u64,
+    },
+    Seal {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+}
+
+impl From<TaskLifecycleRequestWire> for TaskLifecycleRequest {
+    fn from(wire: TaskLifecycleRequestWire) -> Self {
+        match wire {
+            TaskLifecycleRequestWire::Create { protocol, operation_id, binding } => {
+                Self::Create { protocol, operation_id, binding }
+            }
+            TaskLifecycleRequestWire::Start { protocol, operation_id, binding } => {
+                Self::Start { protocol, operation_id, binding }
+            }
+            TaskLifecycleRequestWire::Pause { protocol, operation_id, binding } => {
+                Self::Pause { protocol, operation_id, binding }
+            }
+            TaskLifecycleRequestWire::Resume { protocol, operation_id, binding } => {
+                Self::Resume { protocol, operation_id, binding }
+            }
+            TaskLifecycleRequestWire::Stop { protocol, operation_id, binding } => {
+                Self::Stop { protocol, operation_id, binding }
+            }
+            TaskLifecycleRequestWire::Revoke { protocol, operation_id, binding } => {
+                Self::Revoke { protocol, operation_id, binding }
+            }
+            TaskLifecycleRequestWire::Inspect { protocol, binding } => {
+                Self::Inspect { protocol, binding }
+            }
+            TaskLifecycleRequestWire::Stream { protocol, binding, from_seq } => {
+                Self::Stream { protocol, binding, from_seq }
+            }
+            TaskLifecycleRequestWire::Seal { protocol, operation_id, binding } => {
+                Self::Seal { protocol, operation_id, binding }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "response", rename_all = "snake_case")]
+pub enum TaskLifecycleResponse {
+    Accepted {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+        state: TaskLifecycleState,
+    },
+    Inspected {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+        state: TaskLifecycleState,
+    },
+    StreamReady {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+        from_seq: u64,
+    },
+    Rejected {
+        protocol: ProtocolVersion,
+        operation_id: Option<OperationId>,
+        binding: TaskBinding,
+        reason: TaskLifecycleRejectionReason,
+    },
+}
+
+impl TaskLifecycleResponse {
+    const fn protocol(self) -> ProtocolVersion {
+        match self {
+            Self::Accepted { protocol, .. }
+            | Self::Inspected { protocol, .. }
+            | Self::StreamReady { protocol, .. }
+            | Self::Rejected { protocol, .. } => protocol,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
+enum TaskLifecycleResponseWire {
+    Accepted {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+        state: TaskLifecycleState,
+    },
+    Inspected {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+        state: TaskLifecycleState,
+    },
+    StreamReady {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+        from_seq: u64,
+    },
+    Rejected {
+        protocol: ProtocolVersion,
+        operation_id: Option<OperationId>,
+        binding: TaskBinding,
+        reason: TaskLifecycleRejectionReason,
+    },
+}
+
+impl From<TaskLifecycleResponseWire> for TaskLifecycleResponse {
+    fn from(wire: TaskLifecycleResponseWire) -> Self {
+        match wire {
+            TaskLifecycleResponseWire::Accepted { protocol, operation_id, binding, state } => {
+                Self::Accepted { protocol, operation_id, binding, state }
+            }
+            TaskLifecycleResponseWire::Inspected { protocol, binding, state } => {
+                Self::Inspected { protocol, binding, state }
+            }
+            TaskLifecycleResponseWire::StreamReady { protocol, binding, from_seq } => {
+                Self::StreamReady { protocol, binding, from_seq }
+            }
+            TaskLifecycleResponseWire::Rejected {
+                protocol,
+                operation_id,
+                binding,
+                reason,
+            } => Self::Rejected {
+                protocol,
+                operation_id,
+                binding,
+                reason,
+            },
+        }
+    }
+}
+
+/// Negotiated context for lifecycle messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskLifecycleContext {
+    protocol: ProtocolVersion,
+}
+
+impl TaskLifecycleContext {
+    pub const fn new(protocol: ProtocolVersion) -> Result<Self, TaskLifecycleError> {
+        if protocol.major != WARD_NODE_PROTOCOL.major
+            || protocol.minor > WARD_NODE_PROTOCOL.max_minor
+        {
+            return Err(TaskLifecycleError::ProtocolOutsideSupportedRange);
+        }
+        if !supports_task_lifecycle(protocol) {
+            return Err(TaskLifecycleError::ProtocolDoesNotSupportLifecycle);
+        }
+        Ok(Self { protocol })
+    }
+
+    #[must_use]
+    pub const fn protocol(self) -> ProtocolVersion {
+        self.protocol
+    }
+
+    #[must_use]
+    pub const fn create(self, operation_id: OperationId, binding: TaskBinding) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Create { protocol: self.protocol, operation_id, binding }
+    }
+
+    #[must_use]
+    pub const fn start(self, operation_id: OperationId, binding: TaskBinding) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Start { protocol: self.protocol, operation_id, binding }
+    }
+
+    #[must_use]
+    pub const fn pause(self, operation_id: OperationId, binding: TaskBinding) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Pause { protocol: self.protocol, operation_id, binding }
+    }
+
+    #[must_use]
+    pub const fn resume(self, operation_id: OperationId, binding: TaskBinding) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Resume { protocol: self.protocol, operation_id, binding }
+    }
+
+    #[must_use]
+    pub const fn stop(self, operation_id: OperationId, binding: TaskBinding) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Stop { protocol: self.protocol, operation_id, binding }
+    }
+
+    #[must_use]
+    pub const fn revoke(self, operation_id: OperationId, binding: TaskBinding) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Revoke { protocol: self.protocol, operation_id, binding }
+    }
+
+    #[must_use]
+    pub const fn inspect(self, binding: TaskBinding) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Inspect { protocol: self.protocol, binding }
+    }
+
+    #[must_use]
+    pub const fn stream(self, binding: TaskBinding, from_seq: u64) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Stream { protocol: self.protocol, binding, from_seq }
+    }
+
+    #[must_use]
+    pub const fn seal(self, operation_id: OperationId, binding: TaskBinding) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Seal { protocol: self.protocol, operation_id, binding }
+    }
+
+    pub fn decode_request(self, json: &str) -> Result<TaskLifecycleRequest, TaskLifecycleError> {
+        let request: TaskLifecycleRequest =
+            serde_json::from_str::<TaskLifecycleRequestWire>(json)
+                .map(Into::into)
+                .map_err(|_| TaskLifecycleError::MalformedMessage)?;
+        if request.protocol() != self.protocol {
+            return Err(TaskLifecycleError::ProtocolMismatch);
+        }
+        Ok(request)
+    }
+
+    #[must_use]
+    pub const fn accepted(
+        self,
+        operation_id: OperationId,
+        binding: TaskBinding,
+        state: TaskLifecycleState,
+    ) -> TaskLifecycleResponse {
+        TaskLifecycleResponse::Accepted {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+            state,
+        }
+    }
+
+    #[must_use]
+    pub const fn inspected(
+        self,
+        binding: TaskBinding,
+        state: TaskLifecycleState,
+    ) -> TaskLifecycleResponse {
+        TaskLifecycleResponse::Inspected { protocol: self.protocol, binding, state }
+    }
+
+    #[must_use]
+    pub const fn stream_ready(self, binding: TaskBinding, from_seq: u64) -> TaskLifecycleResponse {
+        TaskLifecycleResponse::StreamReady { protocol: self.protocol, binding, from_seq }
+    }
+
+    #[must_use]
+    pub const fn rejected(
+        self,
+        operation_id: Option<OperationId>,
+        binding: TaskBinding,
+        reason: TaskLifecycleRejectionReason,
+    ) -> TaskLifecycleResponse {
+        TaskLifecycleResponse::Rejected {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+            reason,
+        }
+    }
+
+    pub fn decode_response(self, json: &str) -> Result<TaskLifecycleResponse, TaskLifecycleError> {
+        let response: TaskLifecycleResponse =
+            serde_json::from_str::<TaskLifecycleResponseWire>(json)
+                .map(Into::into)
+                .map_err(|_| TaskLifecycleError::MalformedMessage)?;
+        if response.protocol() != self.protocol {
+            return Err(TaskLifecycleError::ProtocolMismatch);
+        }
+        Ok(response)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskLifecycleError {
+    ProtocolOutsideSupportedRange,
+    ProtocolDoesNotSupportLifecycle,
+    ProtocolMismatch,
+    MalformedMessage,
+}
+
+impl Display for TaskLifecycleError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProtocolOutsideSupportedRange => {
+                formatter.write_str("protocol version is outside this build's supported range")
+            }
+            Self::ProtocolDoesNotSupportLifecycle => {
+                formatter.write_str("protocol version does not support task lifecycle")
+            }
+            Self::ProtocolMismatch => {
+                formatter.write_str("task lifecycle message protocol does not match negotiated protocol")
+            }
+            Self::MalformedMessage => formatter.write_str("task lifecycle message is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for TaskLifecycleError {}
 
 #[cfg(test)]
 mod tests {
