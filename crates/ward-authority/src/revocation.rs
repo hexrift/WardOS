@@ -179,8 +179,8 @@ impl AuthorityRevocations {
     ///
     /// # Errors
     ///
-    /// Returns AuthorityRevocationError::RevocationConflict when the same lease already
-    /// has a different fact or has previously entered the conflicted state.
+    /// Returns a conflict error when the same lease already has a different fact or
+    /// has previously entered the conflicted state.
     pub fn record(
         &mut self,
         revocation: AuthorityRevocation,
