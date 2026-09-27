@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ward_snapshot::gc::GcOptions;
 
-use crate::{daemon, render, retention, sandbox, session, usage, verify};
+use crate::{daemon, node_readiness, render, retention, sandbox, session, usage, verify};
 
 /// Outcome of one check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +88,7 @@ pub fn run() -> Vec<Check> {
         cgroup_v2(Path::new("/sys/fs/cgroup/cgroup.controllers").exists()),
         inotify(read("/proc/sys/fs/inotify/max_user_watches").as_deref()),
         companions(),
+        ward_node(),
         toolchain(),
         tool("git", true),
         tool("curl", false),
@@ -390,6 +391,75 @@ fn companions() -> Check {
             "wardd not found beside ward or on PATH; sessions cannot have a daemon",
         ),
     }
+}
+
+fn ward_node() -> Check {
+    let socket = std::env::var_os(node_readiness::WARD_NODE_SOCKET_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let readiness = node_readiness::assess(
+        which("ward-node").is_some(),
+        socket.as_deref(),
+        node_readiness::PROBE_TIMEOUT,
+    );
+    ward_node_check(&readiness, socket.as_deref())
+}
+
+fn ward_node_check(readiness: &node_readiness::WardNodeReadiness, socket: Option<&Path>) -> Check {
+    use node_readiness::WardNodeReadinessState as State;
+
+    let state = readiness.state.as_str();
+    let (status, detail) = match readiness.state {
+        State::BinaryAbsent => (
+            Status::Warn,
+            format!("{state} · ward-node not found on PATH"),
+        ),
+        State::NotConfigured => (
+            Status::Warn,
+            format!(
+                "{state} · set {} to the local ward-node administrative socket",
+                node_readiness::WARD_NODE_SOCKET_ENV
+            ),
+        ),
+        State::NotRunning => (
+            Status::Warn,
+            format!(
+                "{state} · {} is not accepting local node connections",
+                socket.map_or_else(
+                    || "configured socket".to_owned(),
+                    |path| path.display().to_string(),
+                )
+            ),
+        ),
+        State::ProtocolCompatible => {
+            let protocol = readiness.protocol.map_or_else(
+                || "unknown".to_owned(),
+                |version| format!("{}.{}", version.major(), version.minor()),
+            );
+            (
+                Status::Ok,
+                format!(
+                    "{state} · protocol {protocol} · {}",
+                    socket.map_or_else(
+                        || "configured socket".to_owned(),
+                        |path| path.display().to_string(),
+                    )
+                ),
+            )
+        }
+        State::ProtocolIncompatible => (
+            Status::Warn,
+            format!(
+                "{state} · configured ward-node has no supported protocol overlap; no wardd fallback"
+            ),
+        ),
+        State::Unhealthy => (
+            Status::Warn,
+            format!("{state} · configured ward-node handshake failed or timed out"),
+        ),
+    };
+
+    Check::new("ward-node", status, detail)
 }
 
 fn toolchain() -> Check {
@@ -1011,6 +1081,40 @@ mod tests {
     }
 
     #[test]
+    fn ward_node_readiness_is_informational_and_names_stable_states() {
+        use node_readiness::{WardNodeReadiness, WardNodeReadinessState as State};
+
+        for state in [
+            State::BinaryAbsent,
+            State::NotConfigured,
+            State::NotRunning,
+            State::ProtocolIncompatible,
+            State::Unhealthy,
+        ] {
+            let check = ward_node_check(
+                &WardNodeReadiness {
+                    state,
+                    protocol: None,
+                },
+                Some(Path::new("/run/user/1000/wardos/node.sock")),
+            );
+            assert_eq!(check.status, Status::Warn);
+            assert!(check.detail.starts_with(state.as_str()));
+        }
+
+        let compatible = ward_node_check(
+            &WardNodeReadiness {
+                state: State::ProtocolCompatible,
+                protocol: Some(ward_node_protocol::ProtocolVersion::new(1, 1)),
+            },
+            Some(Path::new("/run/user/1000/wardos/node.sock")),
+        );
+        assert_eq!(compatible.status, Status::Ok);
+        assert!(compatible.detail.starts_with("protocol_compatible"));
+        assert!(compatible.detail.contains("protocol 1.1"));
+    }
+
+    #[test]
     fn version_is_the_first_dotted_number_in_the_output() {
         assert_eq!(version_in("2.1.263 (Claude Code)\n"), Some("2.1.263"));
         assert_eq!(version_in("codex-cli 0.153.4"), Some("0.153.4"));
@@ -1230,6 +1334,7 @@ mod tests {
             "cgroup v2",
             "inotify",
             "companion binaries",
+            "ward-node",
             "verifier toolchain",
             "git",
             "state dir",
