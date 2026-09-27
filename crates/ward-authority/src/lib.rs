@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod revocation;
+
 use std::num::NonZeroU64;
 
 use serde::de::Error as _;
