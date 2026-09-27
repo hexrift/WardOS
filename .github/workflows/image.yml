@@ -65,6 +65,8 @@ jobs:
           docker run --rm wardos:ci bash -c '
             uname -m
             ls -l /usr/bin/ward*
+            test -x /usr/bin/ward-node
+            ward-node --help >/dev/null
             ls /usr/share/wardos
             cat /usr/lib/systemd/user-preset/90-wardos.preset
             readlink /etc/xdg/hypr
@@ -126,6 +128,8 @@ jobs:
           docker run --rm wardos:ci bash -c '
             uname -m
             ls -l /usr/bin/ward*
+            test -x /usr/bin/ward-node
+            ward-node --help >/dev/null
             ls /usr/share/wardos
             cat /usr/lib/systemd/user-preset/90-wardos.preset
             readlink /etc/xdg/hypr
