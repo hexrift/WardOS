@@ -13,16 +13,20 @@ use std::num::{NonZeroU16, NonZeroU64};
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
+use ward_events::{ExecutionAttemptId, LeaseId, TaskId};
 
 /// The node protocol version currently implemented by this revision.
 ///
 /// Minor versions are backwards-compatible within one major version. The initial
 /// implementation supports only 1.0; later compatible additions widen the supported
 /// minor range explicitly.
-pub const WARD_NODE_PROTOCOL: SupportedProtocolRange = SupportedProtocolRange::valid(1, 0, 1);
+pub const WARD_NODE_PROTOCOL: SupportedProtocolRange = SupportedProtocolRange::valid(1, 0, 2);
 
 /// The first protocol version that supports node capability discovery.
 pub const CAPABILITY_DISCOVERY_PROTOCOL: ProtocolVersion = ProtocolVersion::new(1, 1);
+
+/// The first protocol version that supports task lifecycle messages.
+pub const TASK_LIFECYCLE_PROTOCOL: ProtocolVersion = ProtocolVersion::new(1, 2);
 
 /// One negotiated node protocol version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -726,6 +730,775 @@ impl Display for CapabilityDiscoveryError {
 
 impl std::error::Error for CapabilityDiscoveryError {}
 
+/// Whether a negotiated protocol version supports task lifecycle messages.
+#[must_use]
+pub const fn supports_task_lifecycle(protocol: ProtocolVersion) -> bool {
+    protocol.major == TASK_LIFECYCLE_PROTOCOL.major
+        && protocol.minor >= TASK_LIFECYCLE_PROTOCOL.minor
+}
+
+/// Stable idempotency identity for one mutating lifecycle command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OperationId(NonZeroU64);
+
+impl OperationId {
+    /// Construct a non-zero operation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationIdError::Zero`] if `value` is zero.
+    pub const fn new(value: u64) -> Result<Self, OperationIdError> {
+        match NonZeroU64::new(value) {
+            Some(value) => Ok(Self(value)),
+            None => Err(OperationIdError::Zero),
+        }
+    }
+
+    /// The wrapped non-zero value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Reasons [`OperationId::new`] can be refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationIdError {
+    /// The supplied value was zero, which is not a valid operation id.
+    Zero,
+}
+
+impl Display for OperationIdError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("lifecycle operation id must be non-zero")
+    }
+}
+
+impl std::error::Error for OperationIdError {}
+
+/// Immutable task, execution-attempt and authority-lease identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskBinding {
+    task: TaskId,
+    attempt: ExecutionAttemptId,
+    lease: LeaseId,
+}
+
+impl TaskBinding {
+    /// Bind a task, its execution attempt and the authority lease covering it.
+    #[must_use]
+    pub const fn new(task: TaskId, attempt: ExecutionAttemptId, lease: LeaseId) -> Self {
+        Self {
+            task,
+            attempt,
+            lease,
+        }
+    }
+
+    /// The bound task's identity.
+    #[must_use]
+    pub const fn task(self) -> TaskId {
+        self.task
+    }
+
+    /// The bound execution attempt's identity.
+    #[must_use]
+    pub const fn attempt(self) -> ExecutionAttemptId {
+        self.attempt
+    }
+
+    /// The authority lease this binding was authorized under.
+    #[must_use]
+    pub const fn lease(self) -> LeaseId {
+        self.lease
+    }
+}
+
+/// The lifecycle state of a task as reported by a lifecycle response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLifecycleState {
+    /// The task has been created but has not yet started running.
+    Created,
+    /// The task is admitted and ready to start.
+    Ready,
+    /// The task is actively running.
+    Running,
+    /// The task's execution is paused.
+    Paused,
+    /// The task's workloads have been terminated.
+    Stopped,
+    /// The task's authority lease has been revoked.
+    Revoked,
+    /// The task's evidence has been sealed; the task is terminal.
+    Sealed,
+}
+
+/// Why a lifecycle request was rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLifecycleRejectionReason {
+    /// The referenced task is not known to the node.
+    TaskNotFound,
+    /// The request's execution attempt does not match the task's current attempt.
+    AttemptMismatch,
+    /// The request's lease does not match the task's current lease.
+    LeaseMismatch,
+    /// The request's lease has expired.
+    LeaseExpired,
+    /// The request's lease has been revoked.
+    LeaseRevoked,
+    /// The request's idempotency id has already been superseded by a later operation.
+    StaleOperation,
+    /// The task is not in a state that allows this operation.
+    InvalidState,
+    /// The bound authority lease does not grant this operation.
+    AuthorityDenied,
+    /// A resource required to service the request is unavailable.
+    ResourceUnavailable,
+    /// The negotiated protocol version does not support this operation.
+    UnsupportedOperation,
+}
+
+/// Version-bound task lifecycle request. Inbound data is decoded through `TaskLifecycleContext`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "request", rename_all = "snake_case")]
+pub enum TaskLifecycleRequest {
+    /// Create the task's execution attempt.
+    Create {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
+        operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
+        binding: TaskBinding,
+    },
+    /// Start the task's admitted execution attempt.
+    Start {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
+        operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
+        binding: TaskBinding,
+    },
+    /// Pause the task's running execution.
+    Pause {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
+        operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
+        binding: TaskBinding,
+    },
+    /// Resume a previously paused execution.
+    Resume {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
+        operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
+        binding: TaskBinding,
+    },
+    /// Terminate the task's workloads.
+    Stop {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
+        operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
+        binding: TaskBinding,
+    },
+    /// Revoke the task's authority lease.
+    Revoke {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
+        operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
+        binding: TaskBinding,
+    },
+    /// Query the task's current lifecycle state.
+    Inspect {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// The task/attempt/lease this command applies to.
+        binding: TaskBinding,
+    },
+    /// Subscribe to the task's event stream from a given sequence number.
+    Stream {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// The task/attempt/lease this command applies to.
+        binding: TaskBinding,
+        /// The first sequence number the caller has not yet observed.
+        from_seq: u64,
+    },
+    /// Seal the task's evidence, making it terminal.
+    Seal {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
+        operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
+        binding: TaskBinding,
+    },
+}
+
+impl TaskLifecycleRequest {
+    const fn protocol(self) -> ProtocolVersion {
+        match self {
+            Self::Create { protocol, .. }
+            | Self::Start { protocol, .. }
+            | Self::Pause { protocol, .. }
+            | Self::Resume { protocol, .. }
+            | Self::Stop { protocol, .. }
+            | Self::Revoke { protocol, .. }
+            | Self::Inspect { protocol, .. }
+            | Self::Stream { protocol, .. }
+            | Self::Seal { protocol, .. } => protocol,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
+enum TaskLifecycleRequestWire {
+    Create {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Start {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Pause {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Resume {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Stop {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Revoke {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+    Inspect {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+    },
+    Stream {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+        from_seq: u64,
+    },
+    Seal {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    },
+}
+
+impl From<TaskLifecycleRequestWire> for TaskLifecycleRequest {
+    fn from(wire: TaskLifecycleRequestWire) -> Self {
+        match wire {
+            TaskLifecycleRequestWire::Create {
+                protocol,
+                operation_id,
+                binding,
+            } => Self::Create {
+                protocol,
+                operation_id,
+                binding,
+            },
+            TaskLifecycleRequestWire::Start {
+                protocol,
+                operation_id,
+                binding,
+            } => Self::Start {
+                protocol,
+                operation_id,
+                binding,
+            },
+            TaskLifecycleRequestWire::Pause {
+                protocol,
+                operation_id,
+                binding,
+            } => Self::Pause {
+                protocol,
+                operation_id,
+                binding,
+            },
+            TaskLifecycleRequestWire::Resume {
+                protocol,
+                operation_id,
+                binding,
+            } => Self::Resume {
+                protocol,
+                operation_id,
+                binding,
+            },
+            TaskLifecycleRequestWire::Stop {
+                protocol,
+                operation_id,
+                binding,
+            } => Self::Stop {
+                protocol,
+                operation_id,
+                binding,
+            },
+            TaskLifecycleRequestWire::Revoke {
+                protocol,
+                operation_id,
+                binding,
+            } => Self::Revoke {
+                protocol,
+                operation_id,
+                binding,
+            },
+            TaskLifecycleRequestWire::Inspect { protocol, binding } => {
+                Self::Inspect { protocol, binding }
+            }
+            TaskLifecycleRequestWire::Stream {
+                protocol,
+                binding,
+                from_seq,
+            } => Self::Stream {
+                protocol,
+                binding,
+                from_seq,
+            },
+            TaskLifecycleRequestWire::Seal {
+                protocol,
+                operation_id,
+                binding,
+            } => Self::Seal {
+                protocol,
+                operation_id,
+                binding,
+            },
+        }
+    }
+}
+
+/// Version-bound task lifecycle response. Inbound data is decoded through `TaskLifecycleContext`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "response", rename_all = "snake_case")]
+pub enum TaskLifecycleResponse {
+    /// The mutating command was accepted and applied.
+    Accepted {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// The idempotency identity of the command this responds to.
+        operation_id: OperationId,
+        /// The task/attempt/lease this response applies to.
+        binding: TaskBinding,
+        /// The task's lifecycle state after applying the command.
+        state: TaskLifecycleState,
+    },
+    /// The task's current lifecycle state, in response to an inspect request.
+    Inspected {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// The task/attempt/lease this response applies to.
+        binding: TaskBinding,
+        /// The task's current lifecycle state.
+        state: TaskLifecycleState,
+    },
+    /// The task's event stream is ready starting from a given sequence number.
+    StreamReady {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// The task/attempt/lease this response applies to.
+        binding: TaskBinding,
+        /// The sequence number the stream will resume from.
+        from_seq: u64,
+    },
+    /// The request was rejected.
+    Rejected {
+        /// The negotiated protocol version this message is bound to.
+        protocol: ProtocolVersion,
+        /// The idempotency identity of the rejected command, if it carried one.
+        operation_id: Option<OperationId>,
+        /// The task/attempt/lease this response applies to.
+        binding: TaskBinding,
+        /// Why the request was rejected.
+        reason: TaskLifecycleRejectionReason,
+    },
+}
+
+impl TaskLifecycleResponse {
+    const fn protocol(self) -> ProtocolVersion {
+        match self {
+            Self::Accepted { protocol, .. }
+            | Self::Inspected { protocol, .. }
+            | Self::StreamReady { protocol, .. }
+            | Self::Rejected { protocol, .. } => protocol,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
+enum TaskLifecycleResponseWire {
+    Accepted {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+        state: TaskLifecycleState,
+    },
+    Inspected {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+        state: TaskLifecycleState,
+    },
+    StreamReady {
+        protocol: ProtocolVersion,
+        binding: TaskBinding,
+        from_seq: u64,
+    },
+    Rejected {
+        protocol: ProtocolVersion,
+        operation_id: Option<OperationId>,
+        binding: TaskBinding,
+        reason: TaskLifecycleRejectionReason,
+    },
+}
+
+impl From<TaskLifecycleResponseWire> for TaskLifecycleResponse {
+    fn from(wire: TaskLifecycleResponseWire) -> Self {
+        match wire {
+            TaskLifecycleResponseWire::Accepted {
+                protocol,
+                operation_id,
+                binding,
+                state,
+            } => Self::Accepted {
+                protocol,
+                operation_id,
+                binding,
+                state,
+            },
+            TaskLifecycleResponseWire::Inspected {
+                protocol,
+                binding,
+                state,
+            } => Self::Inspected {
+                protocol,
+                binding,
+                state,
+            },
+            TaskLifecycleResponseWire::StreamReady {
+                protocol,
+                binding,
+                from_seq,
+            } => Self::StreamReady {
+                protocol,
+                binding,
+                from_seq,
+            },
+            TaskLifecycleResponseWire::Rejected {
+                protocol,
+                operation_id,
+                binding,
+                reason,
+            } => Self::Rejected {
+                protocol,
+                operation_id,
+                binding,
+                reason,
+            },
+        }
+    }
+}
+
+/// Negotiated context for lifecycle messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskLifecycleContext {
+    protocol: ProtocolVersion,
+}
+
+impl TaskLifecycleContext {
+    /// Bind a lifecycle context to a negotiated protocol version.
+    ///
+    /// Fails closed if the version is outside the range this revision supports, or if it
+    /// predates task lifecycle support.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLifecycleError::ProtocolOutsideSupportedRange`] or
+    /// [`TaskLifecycleError::ProtocolDoesNotSupportLifecycle`] as appropriate.
+    pub const fn new(protocol: ProtocolVersion) -> Result<Self, TaskLifecycleError> {
+        if protocol.major != WARD_NODE_PROTOCOL.major
+            || protocol.minor > WARD_NODE_PROTOCOL.max_minor
+        {
+            return Err(TaskLifecycleError::ProtocolOutsideSupportedRange);
+        }
+        if !supports_task_lifecycle(protocol) {
+            return Err(TaskLifecycleError::ProtocolDoesNotSupportLifecycle);
+        }
+        Ok(Self { protocol })
+    }
+
+    /// The protocol version this context is bound to.
+    #[must_use]
+    pub const fn protocol(self) -> ProtocolVersion {
+        self.protocol
+    }
+
+    /// Build a [`TaskLifecycleRequest::Create`] bound to this context's protocol.
+    #[must_use]
+    pub const fn create(
+        self,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    ) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Create {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+        }
+    }
+
+    /// Build a [`TaskLifecycleRequest::Start`] bound to this context's protocol.
+    #[must_use]
+    pub const fn start(
+        self,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    ) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Start {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+        }
+    }
+
+    /// Build a [`TaskLifecycleRequest::Pause`] bound to this context's protocol.
+    #[must_use]
+    pub const fn pause(
+        self,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    ) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Pause {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+        }
+    }
+
+    /// Build a [`TaskLifecycleRequest::Resume`] bound to this context's protocol.
+    #[must_use]
+    pub const fn resume(
+        self,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    ) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Resume {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+        }
+    }
+
+    /// Build a [`TaskLifecycleRequest::Stop`] bound to this context's protocol.
+    #[must_use]
+    pub const fn stop(
+        self,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    ) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Stop {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+        }
+    }
+
+    /// Build a [`TaskLifecycleRequest::Revoke`] bound to this context's protocol.
+    #[must_use]
+    pub const fn revoke(
+        self,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    ) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Revoke {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+        }
+    }
+
+    /// Build a [`TaskLifecycleRequest::Inspect`] bound to this context's protocol.
+    #[must_use]
+    pub const fn inspect(self, binding: TaskBinding) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Inspect {
+            protocol: self.protocol,
+            binding,
+        }
+    }
+
+    /// Build a [`TaskLifecycleRequest::Stream`] bound to this context's protocol.
+    #[must_use]
+    pub const fn stream(self, binding: TaskBinding, from_seq: u64) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Stream {
+            protocol: self.protocol,
+            binding,
+            from_seq,
+        }
+    }
+
+    /// Build a [`TaskLifecycleRequest::Seal`] bound to this context's protocol.
+    #[must_use]
+    pub const fn seal(
+        self,
+        operation_id: OperationId,
+        binding: TaskBinding,
+    ) -> TaskLifecycleRequest {
+        TaskLifecycleRequest::Seal {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+        }
+    }
+
+    /// Decode a wire-format lifecycle request, rejecting anything not bound to this context's
+    /// exact protocol version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLifecycleError::MalformedMessage`] if `json` cannot be decoded, or
+    /// [`TaskLifecycleError::ProtocolMismatch`] if it is bound to a different protocol version.
+    pub fn decode_request(self, json: &str) -> Result<TaskLifecycleRequest, TaskLifecycleError> {
+        let request: TaskLifecycleRequest = serde_json::from_str::<TaskLifecycleRequestWire>(json)
+            .map(Into::into)
+            .map_err(|_| TaskLifecycleError::MalformedMessage)?;
+        if request.protocol() != self.protocol {
+            return Err(TaskLifecycleError::ProtocolMismatch);
+        }
+        Ok(request)
+    }
+
+    /// Build a [`TaskLifecycleResponse::Accepted`] bound to this context's protocol.
+    #[must_use]
+    pub const fn accepted(
+        self,
+        operation_id: OperationId,
+        binding: TaskBinding,
+        state: TaskLifecycleState,
+    ) -> TaskLifecycleResponse {
+        TaskLifecycleResponse::Accepted {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+            state,
+        }
+    }
+
+    /// Build a [`TaskLifecycleResponse::Inspected`] bound to this context's protocol.
+    #[must_use]
+    pub const fn inspected(
+        self,
+        binding: TaskBinding,
+        state: TaskLifecycleState,
+    ) -> TaskLifecycleResponse {
+        TaskLifecycleResponse::Inspected {
+            protocol: self.protocol,
+            binding,
+            state,
+        }
+    }
+
+    /// Build a [`TaskLifecycleResponse::StreamReady`] bound to this context's protocol.
+    #[must_use]
+    pub const fn stream_ready(self, binding: TaskBinding, from_seq: u64) -> TaskLifecycleResponse {
+        TaskLifecycleResponse::StreamReady {
+            protocol: self.protocol,
+            binding,
+            from_seq,
+        }
+    }
+
+    /// Build a [`TaskLifecycleResponse::Rejected`] bound to this context's protocol.
+    #[must_use]
+    pub const fn rejected(
+        self,
+        operation_id: Option<OperationId>,
+        binding: TaskBinding,
+        reason: TaskLifecycleRejectionReason,
+    ) -> TaskLifecycleResponse {
+        TaskLifecycleResponse::Rejected {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+            reason,
+        }
+    }
+
+    /// Decode a wire-format lifecycle response, rejecting anything not bound to this context's
+    /// exact protocol version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLifecycleError::MalformedMessage`] if `json` cannot be decoded, or
+    /// [`TaskLifecycleError::ProtocolMismatch`] if it is bound to a different protocol version.
+    pub fn decode_response(self, json: &str) -> Result<TaskLifecycleResponse, TaskLifecycleError> {
+        let response: TaskLifecycleResponse =
+            serde_json::from_str::<TaskLifecycleResponseWire>(json)
+                .map(Into::into)
+                .map_err(|_| TaskLifecycleError::MalformedMessage)?;
+        if response.protocol() != self.protocol {
+            return Err(TaskLifecycleError::ProtocolMismatch);
+        }
+        Ok(response)
+    }
+}
+
+/// Reasons a task lifecycle message can be refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskLifecycleError {
+    /// The protocol version is outside the range this revision supports.
+    ProtocolOutsideSupportedRange,
+    /// The protocol version predates task lifecycle support.
+    ProtocolDoesNotSupportLifecycle,
+    /// The message's protocol version does not match the context's negotiated version.
+    ProtocolMismatch,
+    /// The message could not be decoded from its wire format.
+    MalformedMessage,
+}
+
+impl Display for TaskLifecycleError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProtocolOutsideSupportedRange => {
+                formatter.write_str("protocol version is outside this build's supported range")
+            }
+            Self::ProtocolDoesNotSupportLifecycle => {
+                formatter.write_str("protocol version does not support task lifecycle")
+            }
+            Self::ProtocolMismatch => formatter
+                .write_str("task lifecycle message protocol does not match negotiated protocol"),
+            Self::MalformedMessage => formatter.write_str("task lifecycle message is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for TaskLifecycleError {}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -871,10 +1644,10 @@ mod tests {
     }
 
     #[test]
-    fn current_protocol_supports_one_zero_through_one_one() {
+    fn current_protocol_supports_one_zero_through_one_two() {
         assert_eq!(WARD_NODE_PROTOCOL.major(), 1);
         assert_eq!(WARD_NODE_PROTOCOL.min_minor(), 0);
-        assert_eq!(WARD_NODE_PROTOCOL.max_minor(), 1);
+        assert_eq!(WARD_NODE_PROTOCOL.max_minor(), 2);
     }
 
     fn minimal_capabilities() -> NodeCapabilities {
@@ -966,9 +1739,9 @@ mod tests {
             CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 0)),
             Err(CapabilityDiscoveryError::ProtocolDoesNotSupportDiscovery)
         );
-        assert_eq!(
-            CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 2)),
-            Err(CapabilityDiscoveryError::ProtocolOutsideSupportedRange)
+        assert!(
+            CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 2)).is_ok(),
+            "capability discovery remains available in later compatible minors"
         );
         assert_eq!(
             CapabilityDiscoveryContext::new(ProtocolVersion::new(2, 0)),
@@ -1081,5 +1854,234 @@ mod tests {
             };
             assert!(failed, "{raw} must fail closed");
         }
+    }
+
+    fn lifecycle_binding() -> TaskBinding {
+        TaskBinding::new(
+            ward_events::TaskId::from_u128(7),
+            ward_events::ExecutionAttemptId::from_u128(8),
+            ward_events::LeaseId::from_u128(9),
+        )
+    }
+
+    #[test]
+    fn task_lifecycle_is_a_protocol_one_two_feature() {
+        assert!(!supports_task_lifecycle(ProtocolVersion::new(1, 0)));
+        assert!(!supports_task_lifecycle(ProtocolVersion::new(1, 1)));
+        assert!(supports_task_lifecycle(ProtocolVersion::new(1, 2)));
+        assert!(!supports_task_lifecycle(ProtocolVersion::new(2, 0)));
+
+        assert_eq!(
+            TaskLifecycleContext::new(ProtocolVersion::new(1, 1)),
+            Err(TaskLifecycleError::ProtocolDoesNotSupportLifecycle)
+        );
+        assert_eq!(
+            TaskLifecycleContext::new(ProtocolVersion::new(1, 3)),
+            Err(TaskLifecycleError::ProtocolOutsideSupportedRange)
+        );
+    }
+
+    #[test]
+    fn task_binding_keeps_task_attempt_and_lease_together() {
+        let binding = lifecycle_binding();
+        assert_eq!(binding.task(), ward_events::TaskId::from_u128(7));
+        assert_eq!(
+            binding.attempt(),
+            ward_events::ExecutionAttemptId::from_u128(8)
+        );
+        assert_eq!(binding.lease(), ward_events::LeaseId::from_u128(9));
+
+        assert_eq!(
+            serde_json::to_string(&binding).unwrap(),
+            r#"{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}"#
+        );
+    }
+
+    #[test]
+    fn mutating_lifecycle_requests_have_stable_idempotency_and_binding_wire() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        let binding = lifecycle_binding();
+        let operation = OperationId::new(11).unwrap();
+
+        let cases = [
+            (
+                context.create(operation, binding),
+                r#"{"request":"create","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.start(operation, binding),
+                r#"{"request":"start","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.pause(operation, binding),
+                r#"{"request":"pause","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.resume(operation, binding),
+                r#"{"request":"resume","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.stop(operation, binding),
+                r#"{"request":"stop","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.revoke(operation, binding),
+                r#"{"request":"revoke","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.seal(operation, binding),
+                r#"{"request":"seal","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+        ];
+
+        for (request, expected) in cases {
+            assert_eq!(serde_json::to_string(&request).unwrap(), expected);
+            assert_eq!(context.decode_request(expected).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn read_only_lifecycle_requests_are_bound_and_bounded() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        let binding = lifecycle_binding();
+        let inspect = context.inspect(binding);
+        let stream = context.stream(binding, 42);
+
+        let inspect_json = r#"{"request":"inspect","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#;
+        let stream_json = r#"{"request":"stream","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"from_seq":42}"#;
+
+        assert_eq!(serde_json::to_string(&inspect).unwrap(), inspect_json);
+        assert_eq!(serde_json::to_string(&stream).unwrap(), stream_json);
+        assert_eq!(context.decode_request(inspect_json).unwrap(), inspect);
+        assert_eq!(context.decode_request(stream_json).unwrap(), stream);
+    }
+
+    #[test]
+    fn lifecycle_responses_and_rejection_reasons_have_stable_wire() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        let binding = lifecycle_binding();
+        let operation = OperationId::new(11).unwrap();
+        let bound_binding = r#""task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009""#;
+
+        let cases = [
+            (
+                context.accepted(operation, binding, TaskLifecycleState::Running),
+                format!(
+                    r#"{{"response":"accepted","protocol":{{"major":1,"minor":2}},"operation_id":11,"binding":{{{bound_binding}}},"state":"running"}}"#
+                ),
+            ),
+            (
+                context.inspected(binding, TaskLifecycleState::Paused),
+                format!(
+                    r#"{{"response":"inspected","protocol":{{"major":1,"minor":2}},"binding":{{{bound_binding}}},"state":"paused"}}"#
+                ),
+            ),
+            (
+                context.stream_ready(binding, 42),
+                format!(
+                    r#"{{"response":"stream_ready","protocol":{{"major":1,"minor":2}},"binding":{{{bound_binding}}},"from_seq":42}}"#
+                ),
+            ),
+            (
+                context.rejected(
+                    Some(operation),
+                    binding,
+                    TaskLifecycleRejectionReason::LeaseRevoked,
+                ),
+                format!(
+                    r#"{{"response":"rejected","protocol":{{"major":1,"minor":2}},"operation_id":11,"binding":{{{bound_binding}}},"reason":"lease_revoked"}}"#
+                ),
+            ),
+        ];
+
+        for (response, expected) in cases {
+            assert_eq!(serde_json::to_string(&response).unwrap(), expected);
+            assert_eq!(context.decode_response(&expected).unwrap(), response);
+        }
+
+        let reasons = [
+            (TaskLifecycleRejectionReason::TaskNotFound, "task_not_found"),
+            (
+                TaskLifecycleRejectionReason::AttemptMismatch,
+                "attempt_mismatch",
+            ),
+            (
+                TaskLifecycleRejectionReason::LeaseMismatch,
+                "lease_mismatch",
+            ),
+            (TaskLifecycleRejectionReason::LeaseExpired, "lease_expired"),
+            (TaskLifecycleRejectionReason::LeaseRevoked, "lease_revoked"),
+            (
+                TaskLifecycleRejectionReason::StaleOperation,
+                "stale_operation",
+            ),
+            (TaskLifecycleRejectionReason::InvalidState, "invalid_state"),
+            (
+                TaskLifecycleRejectionReason::AuthorityDenied,
+                "authority_denied",
+            ),
+            (
+                TaskLifecycleRejectionReason::ResourceUnavailable,
+                "resource_unavailable",
+            ),
+            (
+                TaskLifecycleRejectionReason::UnsupportedOperation,
+                "unsupported_operation",
+            ),
+        ];
+
+        for (reason, wire_name) in reasons {
+            let rejected = context.rejected(None, binding, reason);
+            let expected = format!(
+                r#"{{"response":"rejected","protocol":{{"major":1,"minor":2}},"operation_id":null,"binding":{{{bound_binding}}},"reason":"{wire_name}"}}"#
+            );
+            assert_eq!(serde_json::to_string(&rejected).unwrap(), expected);
+            assert_eq!(context.decode_response(&expected).unwrap(), rejected);
+        }
+    }
+
+    #[test]
+    fn lifecycle_wire_rejects_protocol_mismatch_unknown_fields_and_bad_ids() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+
+        for raw in [
+            r#"{"request":"inspect","protocol":{"major":1,"minor":1},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            r#"{"request":"inspect","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"extra":true}"#,
+            r#"{"request":"inspect","protocol":{"major":1,"minor":2},"binding":{"task":"not-a-task","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            r#"{"request":"unknown","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+        ] {
+            assert!(
+                context.decode_request(raw).is_err(),
+                "{raw} must fail closed"
+            );
+        }
+
+        for raw in [
+            // Wrong protocol version.
+            r#"{"response":"inspected","protocol":{"major":1,"minor":1},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"state":"paused"}"#,
+            // Unknown field.
+            r#"{"response":"inspected","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"state":"paused","extra":true}"#,
+            // Unknown response variant.
+            r#"{"response":"unknown","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"state":"paused"}"#,
+            // Malformed typed id.
+            r#"{"response":"inspected","protocol":{"major":1,"minor":2},"binding":{"task":"not-a-task","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"state":"paused"}"#,
+        ] {
+            assert!(
+                context.decode_response(raw).is_err(),
+                "{raw} must fail closed"
+            );
+        }
+
+        let wrong_protocol_response = r#"{"response":"inspected","protocol":{"major":1,"minor":1},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"state":"paused"}"#;
+        assert_eq!(
+            context.decode_response(wrong_protocol_response),
+            Err(TaskLifecycleError::ProtocolMismatch)
+        );
+    }
+
+    #[test]
+    fn lifecycle_operation_id_must_be_non_zero() {
+        assert_eq!(OperationId::new(0), Err(OperationIdError::Zero));
+        assert_eq!(OperationId::new(1).unwrap().get(), 1);
     }
 }
