@@ -425,16 +425,17 @@ fn ward_node_check(readiness: &node_readiness::WardNodeReadiness, socket: Option
             Status::Warn,
             format!(
                 "{state} · {} is not accepting local node connections",
-                socket
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "configured socket".to_owned())
+                socket.map_or_else(
+                    || "configured socket".to_owned(),
+                    |path| path.display().to_string(),
+                )
             ),
         ),
         State::ProtocolCompatible => {
-            let protocol = readiness
-                .protocol
-                .map(|version| format!("{}.{}", version.major(), version.minor()))
-                .unwrap_or_else(|| "unknown".to_owned());
+            let protocol = readiness.protocol.map_or_else(
+                || "unknown".to_owned(),
+                |version| format!("{}.{}", version.major(), version.minor()),
+            );
             (
                 Status::Ok,
                 format!(
