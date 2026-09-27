@@ -98,11 +98,7 @@ impl WardNodeReadiness {
 /// A stable readiness state. Operational failures are represented as states because
 /// ward-node remains informational during migration.
 #[must_use]
-pub fn assess(
-    binary_present: bool,
-    socket: Option<&Path>,
-    timeout: Duration,
-) -> WardNodeReadiness {
+pub fn assess(binary_present: bool, socket: Option<&Path>, timeout: Duration) -> WardNodeReadiness {
     if !binary_present {
         return WardNodeReadiness::state(WardNodeReadinessState::BinaryAbsent);
     }
@@ -117,12 +113,8 @@ pub fn assess(
         Ok(HandshakeResponse::Accepted { .. } | HandshakeResponse::Rejected { .. }) => {
             WardNodeReadiness::state(WardNodeReadinessState::ProtocolIncompatible)
         }
-        Err(ProbeError::NotRunning) => {
-            WardNodeReadiness::state(WardNodeReadinessState::NotRunning)
-        }
-        Err(ProbeError::Unhealthy) => {
-            WardNodeReadiness::state(WardNodeReadinessState::Unhealthy)
-        }
+        Err(ProbeError::NotRunning) => WardNodeReadiness::state(WardNodeReadinessState::NotRunning),
+        Err(ProbeError::Unhealthy) => WardNodeReadiness::state(WardNodeReadinessState::Unhealthy),
     }
 }
 
@@ -278,8 +270,14 @@ mod tests {
 
     #[test]
     fn state_values_are_stable() {
-        assert_eq!(WardNodeReadinessState::BinaryAbsent.as_str(), "binary_absent");
-        assert_eq!(WardNodeReadinessState::NotConfigured.as_str(), "not_configured");
+        assert_eq!(
+            WardNodeReadinessState::BinaryAbsent.as_str(),
+            "binary_absent"
+        );
+        assert_eq!(
+            WardNodeReadinessState::NotConfigured.as_str(),
+            "not_configured"
+        );
         assert_eq!(WardNodeReadinessState::NotRunning.as_str(), "not_running");
         assert_eq!(
             WardNodeReadinessState::ProtocolCompatible.as_str(),
@@ -357,8 +355,7 @@ mod tests {
 
     #[test]
     fn malformed_or_timed_out_node_is_unhealthy() {
-        let (malformed_dir, malformed_server) =
-            fixture(FixtureResponse::Malformed, Duration::ZERO);
+        let (malformed_dir, malformed_server) = fixture(FixtureResponse::Malformed, Duration::ZERO);
         assert_eq!(
             assess(
                 true,
@@ -373,8 +370,10 @@ mod tests {
         let response = HandshakeResponse::Accepted {
             protocol: ProtocolVersion::new(1, 1),
         };
-        let (slow_dir, slow_server) =
-            fixture(FixtureResponse::Handshake(response), Duration::from_millis(100));
+        let (slow_dir, slow_server) = fixture(
+            FixtureResponse::Handshake(response),
+            Duration::from_millis(100),
+        );
         assert_eq!(
             assess(
                 true,
