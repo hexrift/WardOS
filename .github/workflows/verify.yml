@@ -248,3 +248,35 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: ./image/check-hyprland.sh
+
+  # The CI-measurable subset of docs/performance.md §5 (#150): measures and publishes,
+  # never gates. No pass/fail threshold here — docs/performance.md §3 and #150 both say
+  # to introduce a regression gate only once variance across runs is known.
+  benchmark:
+    name: ward-bench (CI-measurable subset)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (2026-09-21)
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+      # Best-effort: the sandbox_start and verifier_spawn metrics need bubblewrap and a
+      # working user namespace. When either is unavailable ward-bench reports them
+      # `unsupported` with a reason instead of failing the job (see ward-bench's own
+      # tests) -- so this step's own failure is ignored rather than gating the job.
+      - name: Install bubblewrap (best-effort; see ward-bench's unsupported fallback)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+        continue-on-error: true
+      - run: cargo build --release -p ward-cli
+      - name: ward benchmark
+        run: ./target/release/ward benchmark --json ward-bench-report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ward-bench-report
+          path: ward-bench-report.json
+          retention-days: 90

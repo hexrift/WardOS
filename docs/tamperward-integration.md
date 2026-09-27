@@ -205,7 +205,7 @@ image (ADR-0004 addendum).
 
 ## 8. Shipped in the image (ADR-0017)
 
-The WardOS image installs the `tamperward` npm package (2.10.3, pinned in
+The WardOS image installs the `tamperward` npm package (2.39.0, pinned in
 [`image/agents/package.json`](../image/agents/package.json) with its lockfile, `npm ci`
 at build time, [`image/agents/README.md`](../image/agents/README.md)) and links the
 binary at `/usr/bin/tamperward` (→ `/usr/lib/wardos/agents/node_modules/.bin/tamperward`).

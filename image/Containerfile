@@ -69,8 +69,10 @@ WORKDIR /src
 # The whole workspace, filtered by the repository's .containerignore (no target/, no .git).
 COPY . .
 # --locked refuses to touch Cargo.lock, so the image is built from exactly the dependency
-# set the repository reviewed. Five host binaries: the three of the secure-session
-# layer, the shell (desktop/shell) and the theme renderer (desktop/theme).
+# set the repository reviewed. Checkout builds carry six host binaries: the three of the
+# secure-session layer, ward-node, the shell (desktop/shell) and the theme renderer
+# (desktop/theme). The release stage above remains backwards-compatible with historical
+# release tarballs that predate ward-node.
 # Cache mounts (BuildKit and buildah alike): the cargo registry and the target
 # directory survive between builds, so a rebuild recompiles only what changed. Nothing
 # from a cache mount lands in the image; the binaries are copied out within the step.
@@ -80,11 +82,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
       --package ward-cli \
       --package ward-daemon \
       --package ward-agent \
+      --package ward-node \
       --package ward-shell \
       --package wardos-theme \
     && mkdir -p /out \
     && cp target/release/ward target/release/wardd target/release/ward-agent \
-          target/release/ward-shell target/release/wardos-theme-render /out/
+          target/release/ward-node target/release/ward-shell target/release/wardos-theme-render /out/
 
 # The chosen source, under one name for the host stage (a stage name, not an image;
 # hadolint cannot tell, hence the ignore).
@@ -200,6 +203,7 @@ RUN test -x /usr/bin/ward && test -x /usr/bin/wardd && test -x /usr/bin/ward-age
 # /tmp under a throwaway HOME, never under /root (which is /var on bootc), and are
 # removed in the same step. Node must satisfy every `engines` floor (Claude Code: 22).
 COPY image/agents/package.json image/agents/package-lock.json /usr/lib/wardos/agents/
+COPY image/agents/smoke-tamperward.sh /tmp/smoke-tamperward.sh
 RUN node --version && npm --version \
     && node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' \
     && export NODE_ENV=production HOME=/tmp/agents-home npm_config_cache=/tmp/npm-cache npm_config_update_notifier=false \
@@ -210,7 +214,8 @@ RUN node --version && npm --version \
          ln -s "/usr/lib/wardos/agents/node_modules/.bin/$cmd" "/usr/bin/$cmd"; \
        done \
     && /usr/bin/claude --version && /usr/bin/codex --version && /usr/bin/tamperward --help >/dev/null \
-    && rm -rf /tmp/agents-home /tmp/npm-cache \
+    && bash /tmp/smoke-tamperward.sh \
+    && rm -rf /tmp/smoke-tamperward.sh /tmp/agents-home /tmp/npm-cache \
     && du -sh /usr/lib/wardos/agents/node_modules
 
 # Host configuration, laid out under image/rootfs exactly as it lands in the image

@@ -1,0 +1,20 @@
+[package]
+name = "ward-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WardOS: reproducible, CI-measurable performance harness (docs/performance.md, #150)"
+
+[dependencies]
+ward-daemon = { path = "../ward-daemon", version = "0.18.0" }
+ward-snapshot = { path = "../ward-snapshot", version = "0.18.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+rustix = { version = "1", features = ["param"] }
+
+[lints]
+workspace = true

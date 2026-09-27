@@ -1,0 +1,12 @@
+# TamperWard config for the ward-bench CI-subset fixture (#150).
+# The verify command is a no-op (`true`): this fixture measures verifier
+# *spawn* latency (sandbox start + candidate materialisation for a tiny
+# tree), not a real build/test run.
+version: 1
+protected:
+  tests: []
+rules:
+  test-skip: block
+verify:
+  command: "true"
+  budget_secs: 30
