@@ -235,7 +235,7 @@ agents `ward` exists to run and TamperWard, at pinned versions, installed at bui
 | --- | --- | --- | --- |
 | Claude Code | `@anthropic-ai/claude-code` | `/usr/bin/claude` | `/usr/lib/wardos/agents/node_modules/@anthropic-ai/claude-code/` (the native binary of the build's platform, placed by the package's postinstall) |
 | Codex | `@openai/codex` | `/usr/bin/codex` | `/usr/lib/wardos/agents/node_modules/@openai/codex/` (+ the platform package) |
-| TamperWard | `tamperward` 2.10.3 | `/usr/bin/tamperward` | `/usr/lib/wardos/agents/node_modules/tamperward/` |
+| TamperWard | `tamperward` 2.39.0 | `/usr/bin/tamperward` | `/usr/lib/wardos/agents/node_modules/tamperward/` |
 | Node.js | Fedora `nodejs24`, `nodejs24-npm` | `/usr/bin/node` | the distro runtime (Fedora ships versioned streams, no plain `nodejs`); the build fails when it is older than the `engines` floor (22) |
 
 [`agents/package.json`](agents/package.json) pins the three exactly and

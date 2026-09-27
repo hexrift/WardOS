@@ -2355,6 +2355,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ward-agent-adapter"
+version = "0.18.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ward-agent"
 version = "0.18.1"
 dependencies = [
@@ -2369,6 +2377,16 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "ward-sandbox",
+]
+
+[[package]]
+name = "ward-authority"
+version = "0.18.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "ward-events",
 ]
 
 [[package]]
@@ -2420,6 +2438,7 @@ dependencies = [
  "thiserror 2.0.20",
  "ward-agent",
  "ward-events",
+ "ward-node-protocol",
  "ward-policy",
  "ward-proxy",
  "ward-sandbox",
@@ -2436,6 +2455,26 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "ward-node"
+version = "0.18.1"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "ward-node-protocol",
+]
+
+[[package]]
+name = "ward-node-protocol"
+version = "0.18.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

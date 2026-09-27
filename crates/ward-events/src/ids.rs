@@ -464,6 +464,42 @@ ulid_id!(
     "proj_"
 );
 
+ulid_id!(
+    /// Human or service principal identifier.
+    PrincipalId,
+    "prn_"
+);
+
+ulid_id!(
+    /// Agent principal identifier, separate from model/provider metadata.
+    AgentId,
+    "agent_"
+);
+
+ulid_id!(
+    /// Fleet task identifier.
+    TaskId,
+    "task_"
+);
+
+ulid_id!(
+    /// Delegation edge identifier.
+    DelegationId,
+    "deleg_"
+);
+
+ulid_id!(
+    /// Expiring authority lease identifier.
+    LeaseId,
+    "lease_"
+);
+
+ulid_id!(
+    /// One execution attempt of a task.
+    ExecutionAttemptId,
+    "exec_"
+);
+
 // ---------------------------------------------------------------------------------------
 // Pid
 // ---------------------------------------------------------------------------------------
@@ -793,6 +829,52 @@ mod tests {
         assert_eq!(bytes.len(), 32);
         let back: Blake3Hash = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, h);
+    }
+
+    #[test]
+    fn fleet_identity_types_are_distinct_prefixed_ulids() {
+        let raw = 0x0192_8f6a_1234_5678_9abc_def0_1122_3344u128;
+
+        let principal = PrincipalId::from_u128(raw);
+        let agent = AgentId::from_u128(raw);
+        let task = TaskId::from_u128(raw);
+        let delegation = DelegationId::from_u128(raw);
+        let lease = LeaseId::from_u128(raw);
+        let execution = ExecutionAttemptId::from_u128(raw);
+
+        assert!(principal.to_string().starts_with("prn_"));
+        assert!(agent.to_string().starts_with("agent_"));
+        assert!(task.to_string().starts_with("task_"));
+        assert!(delegation.to_string().starts_with("deleg_"));
+        assert!(lease.to_string().starts_with("lease_"));
+        assert!(execution.to_string().starts_with("exec_"));
+
+        assert_eq!(
+            principal.to_string().parse::<PrincipalId>().unwrap(),
+            principal
+        );
+        assert_eq!(agent.to_string().parse::<AgentId>().unwrap(), agent);
+        assert_eq!(task.to_string().parse::<TaskId>().unwrap(), task);
+        assert_eq!(
+            delegation.to_string().parse::<DelegationId>().unwrap(),
+            delegation
+        );
+        assert_eq!(lease.to_string().parse::<LeaseId>().unwrap(), lease);
+        assert_eq!(
+            execution.to_string().parse::<ExecutionAttemptId>().unwrap(),
+            execution
+        );
+
+        assert!(principal.to_string().parse::<AgentId>().is_err());
+        assert!(agent.to_string().parse::<TaskId>().is_err());
+        assert!(task.to_string().parse::<LeaseId>().is_err());
+
+        let bytes = postcard::to_allocvec(&execution).unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(
+            postcard::from_bytes::<ExecutionAttemptId>(&bytes).unwrap(),
+            execution
+        );
     }
 
     #[test]

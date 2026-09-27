@@ -1,0 +1,15 @@
+[package]
+name = "ward-node-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WardOS: versioned ward-node/control-plane protocol types"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
