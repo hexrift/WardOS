@@ -966,9 +966,9 @@ mod tests {
             CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 0)),
             Err(CapabilityDiscoveryError::ProtocolDoesNotSupportDiscovery)
         );
-        assert_eq!(
-            CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 2)),
-            Err(CapabilityDiscoveryError::ProtocolOutsideSupportedRange)
+        assert!(
+            CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 2)).is_ok(),
+            "capability discovery remains available in later compatible minors"
         );
         assert_eq!(
             CapabilityDiscoveryContext::new(ProtocolVersion::new(2, 0)),
@@ -1082,4 +1082,157 @@ mod tests {
             assert!(failed, "{raw} must fail closed");
         }
     }
+
+    fn lifecycle_binding() -> TaskBinding {
+        TaskBinding::new(
+            ward_events::TaskId::from_u128(7),
+            ward_events::ExecutionAttemptId::from_u128(8),
+            ward_events::LeaseId::from_u128(9),
+        )
+    }
+
+    #[test]
+    fn task_lifecycle_is_a_protocol_one_two_feature() {
+        assert!(!supports_task_lifecycle(ProtocolVersion::new(1, 0)));
+        assert!(!supports_task_lifecycle(ProtocolVersion::new(1, 1)));
+        assert!(supports_task_lifecycle(ProtocolVersion::new(1, 2)));
+        assert!(!supports_task_lifecycle(ProtocolVersion::new(2, 0)));
+
+        assert_eq!(
+            TaskLifecycleContext::new(ProtocolVersion::new(1, 1)),
+            Err(TaskLifecycleError::ProtocolDoesNotSupportLifecycle)
+        );
+        assert_eq!(
+            TaskLifecycleContext::new(ProtocolVersion::new(1, 3)),
+            Err(TaskLifecycleError::ProtocolOutsideSupportedRange)
+        );
+    }
+
+    #[test]
+    fn task_binding_keeps_task_attempt_and_lease_together() {
+        let binding = lifecycle_binding();
+        assert_eq!(binding.task(), ward_events::TaskId::from_u128(7));
+        assert_eq!(
+            binding.attempt(),
+            ward_events::ExecutionAttemptId::from_u128(8)
+        );
+        assert_eq!(binding.lease(), ward_events::LeaseId::from_u128(9));
+
+        assert_eq!(
+            serde_json::to_string(&binding).unwrap(),
+            r#"{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}"#
+        );
+    }
+
+    #[test]
+    fn mutating_lifecycle_requests_have_stable_idempotency_and_binding_wire() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        let binding = lifecycle_binding();
+        let operation = OperationId::new(11).unwrap();
+
+        let cases = [
+            (
+                context.create(operation, binding),
+                r#"{"request":"create","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.start(operation, binding),
+                r#"{"request":"start","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.pause(operation, binding),
+                r#"{"request":"pause","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.resume(operation, binding),
+                r#"{"request":"resume","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.stop(operation, binding),
+                r#"{"request":"stop","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.revoke(operation, binding),
+                r#"{"request":"revoke","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+            (
+                context.seal(operation, binding),
+                r#"{"request":"seal","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            ),
+        ];
+
+        for (request, expected) in cases {
+            assert_eq!(serde_json::to_string(&request).unwrap(), expected);
+            assert_eq!(context.decode_request(expected).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn read_only_lifecycle_requests_are_bound_and_bounded() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        let binding = lifecycle_binding();
+        let inspect = context.inspect(binding);
+        let stream = context.stream(binding, 42);
+
+        let inspect_json = r#"{"request":"inspect","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#;
+        let stream_json = r#"{"request":"stream","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"from_seq":42}"#;
+
+        assert_eq!(serde_json::to_string(&inspect).unwrap(), inspect_json);
+        assert_eq!(serde_json::to_string(&stream).unwrap(), stream_json);
+        assert_eq!(context.decode_request(inspect_json).unwrap(), inspect);
+        assert_eq!(context.decode_request(stream_json).unwrap(), stream);
+    }
+
+    #[test]
+    fn lifecycle_responses_and_rejection_reasons_have_stable_wire() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        let binding = lifecycle_binding();
+        let operation = OperationId::new(11).unwrap();
+
+        let accepted = context.accepted(operation, binding, TaskLifecycleState::Running);
+        let inspected = context.inspected(binding, TaskLifecycleState::Paused);
+        let stream = context.stream_ready(binding, 42);
+        let rejected = context.rejected(
+            Some(operation),
+            binding,
+            TaskLifecycleRejectionReason::LeaseRevoked,
+        );
+
+        for response in [accepted, inspected, stream, rejected] {
+            let json = serde_json::to_string(&response).unwrap();
+            assert_eq!(context.decode_response(&json).unwrap(), response);
+        }
+
+        assert_eq!(
+            serde_json::to_string(&rejected).unwrap(),
+            r#"{"response":"rejected","protocol":{"major":1,"minor":2},"operation_id":11,"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"reason":"lease_revoked"}"#
+        );
+    }
+
+    #[test]
+    fn lifecycle_wire_rejects_protocol_mismatch_unknown_fields_and_bad_ids() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+
+        for raw in [
+            r#"{"request":"inspect","protocol":{"major":1,"minor":1},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            r#"{"request":"inspect","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"extra":true}"#,
+            r#"{"request":"inspect","protocol":{"major":1,"minor":2},"binding":{"task":"not-a-task","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+            r#"{"request":"unknown","protocol":{"major":1,"minor":2},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}}"#,
+        ] {
+            assert!(context.decode_request(raw).is_err(), "{raw} must fail closed");
+        }
+
+        let wrong_protocol_response = r#"{"response":"inspected","protocol":{"major":1,"minor":1},"binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"},"state":"paused"}"#;
+        assert_eq!(
+            context.decode_response(wrong_protocol_response),
+            Err(TaskLifecycleError::ProtocolMismatch)
+        );
+    }
+
+    #[test]
+    fn lifecycle_operation_id_must_be_non_zero() {
+        assert_eq!(OperationId::new(0), Err(OperationIdError::Zero));
+        assert_eq!(OperationId::new(1).unwrap().get(), 1);
+    }
+
 }
