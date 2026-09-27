@@ -405,7 +405,7 @@ mod tests {
                 ProtocolRejectionReason::MajorVersionMismatch,
             ),
             (
-                SupportedProtocolRange::new(1, 2, 3).unwrap(),
+                SupportedProtocolRange::new(1, 3, 4).unwrap(),
                 ProtocolRejectionReason::NoCommonMinor,
             ),
         ] {

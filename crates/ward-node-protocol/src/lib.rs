@@ -744,6 +744,10 @@ pub struct OperationId(NonZeroU64);
 
 impl OperationId {
     /// Construct a non-zero operation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OperationIdError::Zero`] if `value` is zero.
     pub const fn new(value: u64) -> Result<Self, OperationIdError> {
         match NonZeroU64::new(value) {
             Some(value) => Ok(Self(value)),
@@ -751,14 +755,17 @@ impl OperationId {
         }
     }
 
+    /// The wrapped non-zero value.
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0.get()
     }
 }
 
+/// Reasons [`OperationId::new`] can be refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationIdError {
+    /// The supplied value was zero, which is not a valid operation id.
     Zero,
 }
 
@@ -780,6 +787,7 @@ pub struct TaskBinding {
 }
 
 impl TaskBinding {
+    /// Bind a task, its execution attempt and the authority lease covering it.
     #[must_use]
     pub const fn new(task: TaskId, attempt: ExecutionAttemptId, lease: LeaseId) -> Self {
         Self {
@@ -789,95 +797,152 @@ impl TaskBinding {
         }
     }
 
+    /// The bound task's identity.
     #[must_use]
     pub const fn task(self) -> TaskId {
         self.task
     }
 
+    /// The bound execution attempt's identity.
     #[must_use]
     pub const fn attempt(self) -> ExecutionAttemptId {
         self.attempt
     }
 
+    /// The authority lease this binding was authorized under.
     #[must_use]
     pub const fn lease(self) -> LeaseId {
         self.lease
     }
 }
 
+/// The lifecycle state of a task as reported by a lifecycle response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskLifecycleState {
+    /// The task has been created but has not yet started running.
     Created,
+    /// The task is admitted and ready to start.
     Ready,
+    /// The task is actively running.
     Running,
+    /// The task's execution is paused.
     Paused,
+    /// The task's workloads have been terminated.
     Stopped,
+    /// The task's authority lease has been revoked.
     Revoked,
+    /// The task's evidence has been sealed; the task is terminal.
     Sealed,
 }
 
+/// Why a lifecycle request was rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskLifecycleRejectionReason {
+    /// The referenced task is not known to the node.
     TaskNotFound,
+    /// The request's execution attempt does not match the task's current attempt.
     AttemptMismatch,
+    /// The request's lease does not match the task's current lease.
     LeaseMismatch,
+    /// The request's lease has expired.
     LeaseExpired,
+    /// The request's lease has been revoked.
     LeaseRevoked,
+    /// The request's idempotency id has already been superseded by a later operation.
     StaleOperation,
+    /// The task is not in a state that allows this operation.
     InvalidState,
+    /// The bound authority lease does not grant this operation.
     AuthorityDenied,
+    /// A resource required to service the request is unavailable.
     ResourceUnavailable,
+    /// The negotiated protocol version does not support this operation.
     UnsupportedOperation,
 }
 
-/// Version-bound task lifecycle request. Inbound data is decoded through TaskLifecycleContext.
+/// Version-bound task lifecycle request. Inbound data is decoded through `TaskLifecycleContext`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum TaskLifecycleRequest {
+    /// Create the task's execution attempt.
     Create {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
         operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
         binding: TaskBinding,
     },
+    /// Start the task's admitted execution attempt.
     Start {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
         operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
         binding: TaskBinding,
     },
+    /// Pause the task's running execution.
     Pause {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
         operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
         binding: TaskBinding,
     },
+    /// Resume a previously paused execution.
     Resume {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
         operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
         binding: TaskBinding,
     },
+    /// Terminate the task's workloads.
     Stop {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
         operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
         binding: TaskBinding,
     },
+    /// Revoke the task's authority lease.
     Revoke {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
         operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
         binding: TaskBinding,
     },
+    /// Query the task's current lifecycle state.
     Inspect {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// The task/attempt/lease this command applies to.
         binding: TaskBinding,
     },
+    /// Subscribe to the task's event stream from a given sequence number.
     Stream {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// The task/attempt/lease this command applies to.
         binding: TaskBinding,
+        /// The first sequence number the caller has not yet observed.
         from_seq: u64,
     },
+    /// Seal the task's evidence, making it terminal.
     Seal {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
         operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
         binding: TaskBinding,
     },
 }
@@ -1029,29 +1094,48 @@ impl From<TaskLifecycleRequestWire> for TaskLifecycleRequest {
     }
 }
 
+/// Version-bound task lifecycle response. Inbound data is decoded through `TaskLifecycleContext`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "response", rename_all = "snake_case")]
 pub enum TaskLifecycleResponse {
+    /// The mutating command was accepted and applied.
     Accepted {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// The idempotency identity of the command this responds to.
         operation_id: OperationId,
+        /// The task/attempt/lease this response applies to.
         binding: TaskBinding,
+        /// The task's lifecycle state after applying the command.
         state: TaskLifecycleState,
     },
+    /// The task's current lifecycle state, in response to an inspect request.
     Inspected {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// The task/attempt/lease this response applies to.
         binding: TaskBinding,
+        /// The task's current lifecycle state.
         state: TaskLifecycleState,
     },
+    /// The task's event stream is ready starting from a given sequence number.
     StreamReady {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// The task/attempt/lease this response applies to.
         binding: TaskBinding,
+        /// The sequence number the stream will resume from.
         from_seq: u64,
     },
+    /// The request was rejected.
     Rejected {
+        /// The negotiated protocol version this message is bound to.
         protocol: ProtocolVersion,
+        /// The idempotency identity of the rejected command, if it carried one.
         operation_id: Option<OperationId>,
+        /// The task/attempt/lease this response applies to.
         binding: TaskBinding,
+        /// Why the request was rejected.
         reason: TaskLifecycleRejectionReason,
     },
 }
@@ -1148,6 +1232,15 @@ pub struct TaskLifecycleContext {
 }
 
 impl TaskLifecycleContext {
+    /// Bind a lifecycle context to a negotiated protocol version.
+    ///
+    /// Fails closed if the version is outside the range this revision supports, or if it
+    /// predates task lifecycle support.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLifecycleError::ProtocolOutsideSupportedRange`] or
+    /// [`TaskLifecycleError::ProtocolDoesNotSupportLifecycle`] as appropriate.
     pub const fn new(protocol: ProtocolVersion) -> Result<Self, TaskLifecycleError> {
         if protocol.major != WARD_NODE_PROTOCOL.major
             || protocol.minor > WARD_NODE_PROTOCOL.max_minor
@@ -1160,11 +1253,13 @@ impl TaskLifecycleContext {
         Ok(Self { protocol })
     }
 
+    /// The protocol version this context is bound to.
     #[must_use]
     pub const fn protocol(self) -> ProtocolVersion {
         self.protocol
     }
 
+    /// Build a [`TaskLifecycleRequest::Create`] bound to this context's protocol.
     #[must_use]
     pub const fn create(
         self,
@@ -1178,6 +1273,7 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Build a [`TaskLifecycleRequest::Start`] bound to this context's protocol.
     #[must_use]
     pub const fn start(
         self,
@@ -1191,6 +1287,7 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Build a [`TaskLifecycleRequest::Pause`] bound to this context's protocol.
     #[must_use]
     pub const fn pause(
         self,
@@ -1204,6 +1301,7 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Build a [`TaskLifecycleRequest::Resume`] bound to this context's protocol.
     #[must_use]
     pub const fn resume(
         self,
@@ -1217,6 +1315,7 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Build a [`TaskLifecycleRequest::Stop`] bound to this context's protocol.
     #[must_use]
     pub const fn stop(
         self,
@@ -1230,6 +1329,7 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Build a [`TaskLifecycleRequest::Revoke`] bound to this context's protocol.
     #[must_use]
     pub const fn revoke(
         self,
@@ -1243,6 +1343,7 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Build a [`TaskLifecycleRequest::Inspect`] bound to this context's protocol.
     #[must_use]
     pub const fn inspect(self, binding: TaskBinding) -> TaskLifecycleRequest {
         TaskLifecycleRequest::Inspect {
@@ -1251,6 +1352,7 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Build a [`TaskLifecycleRequest::Stream`] bound to this context's protocol.
     #[must_use]
     pub const fn stream(self, binding: TaskBinding, from_seq: u64) -> TaskLifecycleRequest {
         TaskLifecycleRequest::Stream {
@@ -1260,6 +1362,7 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Build a [`TaskLifecycleRequest::Seal`] bound to this context's protocol.
     #[must_use]
     pub const fn seal(
         self,
@@ -1273,6 +1376,13 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Decode a wire-format lifecycle request, rejecting anything not bound to this context's
+    /// exact protocol version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLifecycleError::MalformedMessage`] if `json` cannot be decoded, or
+    /// [`TaskLifecycleError::ProtocolMismatch`] if it is bound to a different protocol version.
     pub fn decode_request(self, json: &str) -> Result<TaskLifecycleRequest, TaskLifecycleError> {
         let request: TaskLifecycleRequest = serde_json::from_str::<TaskLifecycleRequestWire>(json)
             .map(Into::into)
@@ -1283,6 +1393,7 @@ impl TaskLifecycleContext {
         Ok(request)
     }
 
+    /// Build a [`TaskLifecycleResponse::Accepted`] bound to this context's protocol.
     #[must_use]
     pub const fn accepted(
         self,
@@ -1298,6 +1409,7 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Build a [`TaskLifecycleResponse::Inspected`] bound to this context's protocol.
     #[must_use]
     pub const fn inspected(
         self,
@@ -1311,6 +1423,7 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Build a [`TaskLifecycleResponse::StreamReady`] bound to this context's protocol.
     #[must_use]
     pub const fn stream_ready(self, binding: TaskBinding, from_seq: u64) -> TaskLifecycleResponse {
         TaskLifecycleResponse::StreamReady {
@@ -1320,6 +1433,7 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Build a [`TaskLifecycleResponse::Rejected`] bound to this context's protocol.
     #[must_use]
     pub const fn rejected(
         self,
@@ -1335,6 +1449,13 @@ impl TaskLifecycleContext {
         }
     }
 
+    /// Decode a wire-format lifecycle response, rejecting anything not bound to this context's
+    /// exact protocol version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLifecycleError::MalformedMessage`] if `json` cannot be decoded, or
+    /// [`TaskLifecycleError::ProtocolMismatch`] if it is bound to a different protocol version.
     pub fn decode_response(self, json: &str) -> Result<TaskLifecycleResponse, TaskLifecycleError> {
         let response: TaskLifecycleResponse =
             serde_json::from_str::<TaskLifecycleResponseWire>(json)
@@ -1347,11 +1468,16 @@ impl TaskLifecycleContext {
     }
 }
 
+/// Reasons a task lifecycle message can be refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskLifecycleError {
+    /// The protocol version is outside the range this revision supports.
     ProtocolOutsideSupportedRange,
+    /// The protocol version predates task lifecycle support.
     ProtocolDoesNotSupportLifecycle,
+    /// The message's protocol version does not match the context's negotiated version.
     ProtocolMismatch,
+    /// The message could not be decoded from its wire format.
     MalformedMessage,
 }
 
@@ -1518,10 +1644,10 @@ mod tests {
     }
 
     #[test]
-    fn current_protocol_supports_one_zero_through_one_one() {
+    fn current_protocol_supports_one_zero_through_one_two() {
         assert_eq!(WARD_NODE_PROTOCOL.major(), 1);
         assert_eq!(WARD_NODE_PROTOCOL.min_minor(), 0);
-        assert_eq!(WARD_NODE_PROTOCOL.max_minor(), 1);
+        assert_eq!(WARD_NODE_PROTOCOL.max_minor(), 2);
     }
 
     fn minimal_capabilities() -> NodeCapabilities {
