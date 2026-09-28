@@ -666,6 +666,7 @@ mod tests {
                 },
                 expires: Duration::from_secs(600),
                 delivery: CredentialDelivery::ProxyInjected,
+                launch_seq: None,
             },
             WardEvent::CommandFinished {
                 pid: Pid::new(7).unwrap(),

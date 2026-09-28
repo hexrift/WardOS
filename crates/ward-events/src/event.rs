@@ -713,6 +713,34 @@ pub enum WardEvent {
         expires: Duration,
         /// How the credential reaches the agent's traffic.
         delivery: CredentialDelivery,
+        /// The sequence number of this launch's own `CommandStarted` record
+        /// (`chain::EventRecord::seq`), when the daemon could attribute this
+        /// grant to a launch it is tracking (PR #318 review round 2, finding 2).
+        /// This is the same identity `ward-daemon::approvals::Credential::launch_key`
+        /// is keyed by — see that field's own doc comment for why the
+        /// client-supplied `Pid` on `CommandStarted`/`CommandFinished` is not
+        /// safe to correlate by (two independently opened `Session`s allocate
+        /// pids from the same small range and can collide, even within one
+        /// session's own event stream, across two genuinely concurrent
+        /// launches — `crates/ward-daemon/src/daemon.rs`'s
+        /// `concurrent_launches_on_different_connections_neither_share_nor_retire_each_others_grants`
+        /// exercises exactly that). Two routes of the same launch always share
+        /// this value; a second, independent launch granting the same service
+        /// and permissions again always gets a different one, however close
+        /// together in time the two launches land — the exact case a
+        /// tolerance/window on the recorded instant cannot handle, since
+        /// concurrent launches can interleave.
+        ///
+        /// Always stamped by the daemon itself
+        /// (`ward-daemon::daemon::Served::handle_appendable`) from its own
+        /// `open_launches`, from the moment this field existed onward — never
+        /// supplied by the client that requested the grant, the same way
+        /// `chain::EventRecord::ts_wall` is daemon-owned, not client-supplied.
+        /// `None` for a credential granted outside a tracked launch (a test, a
+        /// fixture, or a record from before this field existed): a reader with
+        /// only that to go on has no per-launch identity to compare and must
+        /// fall back to whatever it used before this field existed.
+        launch_seq: Option<u64>,
     },
     /// A credential request was refused.
     CredentialDenied {

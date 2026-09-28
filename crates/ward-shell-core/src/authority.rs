@@ -19,7 +19,14 @@
 //! already does, while dropping out of every *current*-authority surface —
 //! the grant count, the network tags/tone, and the `GRANTS n` segment (PR
 //! #318 review, finding 1) — the same way `ward session grants` itself has
-//! already stopped listing it.
+//! already stopped listing it. A second route of the same launch (two
+//! gateways one `Session::launch` call grants at once) merges into one
+//! [`Grant`] by its daemon-stamped `launch_seq` (PR #318 review round 2,
+//! finding 2) — the identity `ward-daemon::approvals::Credential::launch_key`
+//! already used, now reaching the wire — so two routes appended at genuinely
+//! distinct wall-clock instants still merge, while a later, independent
+//! launch granting the same service and permissions again always starts its
+//! own row, however close together in time the two launches land.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -60,15 +67,23 @@ pub struct Grant {
     /// The credential's raw permissions, joined (`contents:read,
     /// issues:read`) — `None` for a session-scope answer, which has no
     /// permissions concept and dedupes by label alone (PR #318 review,
-    /// finding 2). Used only to decide whether a later `CredentialGranted`
-    /// record folds into this row or starts a new one: the daemon's own
-    /// dedup key is `service + permissions + launch_key`
-    /// (`ward-daemon::approvals::Credential`), and `launch_key` never
-    /// reaches the wire (see `Credential::launch_key`'s own doc comment), so
-    /// this projection cannot match on it directly — matching on the
-    /// permissions actually granted, not just the display label, is as much
-    /// of that key as the wire carries.
+    /// finding 2). Used, together with [`Self::launch_seq`], to decide
+    /// whether a later `CredentialGranted` record folds into this row or
+    /// starts a new one: the daemon's own dedup key is
+    /// `service + permissions + launch_key`
+    /// (`ward-daemon::approvals::Credential`), and permissions is the part
+    /// of that key this projection always had directly on the wire.
     pub permissions: Option<String>,
+    /// [`WardEvent::CredentialGranted`]'s own `launch_seq` (PR #318 review
+    /// round 2, finding 2): the daemon-stamped identity of the launch this
+    /// grant's first route was recorded under, when it has one. This is now
+    /// the primary key a later route is matched against — the daemon's own
+    /// `launch_key` finally reaching the wire — with the record's own
+    /// computed expiry kept only as a fallback for a grant with no
+    /// `launch_seq` at all (a credential recorded outside a tracked launch, a
+    /// fixture, or a stream from before this field existed). `None` for a
+    /// session-scope answer, the same as [`Self::permissions`].
+    pub launch_seq: Option<u64>,
 }
 
 impl Grant {
@@ -152,6 +167,7 @@ impl Authority {
                         network_tag: tag,
                         expires_at_unix_ms: None,
                         permissions: None,
+                        launch_seq: None,
                     });
                 }
             }
@@ -159,6 +175,7 @@ impl Authority {
                 service,
                 scope,
                 expires,
+                launch_seq,
                 ..
             } => {
                 let label = service_name(service.as_str());
@@ -171,25 +188,33 @@ impl Authority {
                 // The subject is the route's upstream, `host:port`.
                 let subject = scope.subject.as_str();
                 let host = subject.rsplit_once(':').map_or(subject, |(h, _)| h);
-                // This record's own computed expiry (#316 review, finding
-                // 2): the identity the daemon's real dedup key uses
-                // (`service + permissions + launch_key`) has no `launch_key`
-                // on the wire to match against, so a second route is only
-                // folded into an existing grant when its label, permissions
-                // *and* own computed deadline all agree with that grant's —
-                // every real caller mints the same nominal lifetime for
-                // every route one launch grants at once, so routes of one
-                // launch land with the same absolute deadline, while a
-                // genuinely separate, later launch computes its own,
-                // different one even for an identical relative `Duration`.
-                // A mismatch on any of the three starts a new row instead of
-                // silently inheriting a deadline that was never this route's
-                // own.
                 let computed_expiry = expiry_unix_ms(rec.ts_wall, *expires);
+                // The daemon's own real dedup key is `service + permissions +
+                // launch_key` (`ward-daemon::approvals::Credential`), and
+                // `launch_key` now reaches the wire as `launch_seq` (PR #318
+                // review round 2, finding 2) — the daemon stamps it from its
+                // own `open_launches`, so it is stable across every route one
+                // real launch grants, whatever wall-clock instant each route's
+                // own append happened to land on, and different for any other
+                // launch, however close together in time the two land or
+                // however their connections interleave. Matching on it
+                // directly (when both sides have one) replaces the previous
+                // "same computed expiry" proxy that a `Session::launch`
+                // granting two gateways one after another could miss by a
+                // sub-millisecond timestamp difference, splitting one launch's
+                // routes into two rows instead of merging them. The computed
+                // expiry is kept only as a fallback for a grant recorded with
+                // no `launch_seq` at all (a fixture, a test, or a stream from
+                // before this field existed) — every real caller still mints
+                // the same nominal lifetime for every route one launch grants
+                // at once, so that proxy is still correct there.
                 if let Some(g) = self.grants.iter_mut().find(|g| {
                     g.label == label
                         && g.permissions.as_deref() == Some(permissions.as_str())
-                        && g.expires_at_unix_ms == computed_expiry
+                        && match (g.launch_seq, launch_seq) {
+                            (Some(a), Some(b)) => a == *b,
+                            _ => g.expires_at_unix_ms == computed_expiry,
+                        }
                 }) {
                     if !g.scope.contains(host) {
                         g.scope.push_str(", ");
@@ -203,6 +228,7 @@ impl Authority {
                         network_tag: Some(service.as_str().to_owned()),
                         expires_at_unix_ms: computed_expiry,
                         permissions: Some(permissions),
+                        launch_seq: *launch_seq,
                     });
                 }
             }
@@ -526,6 +552,31 @@ mod tests {
             },
             expires: Duration::from_secs(60),
             delivery: CredentialDelivery::ProxyInjected,
+            launch_seq: None,
+        }
+    }
+
+    /// [`credential`], but carrying a daemon-stamped `launch_seq` (PR #318
+    /// review round 2, finding 2) — the shape a real daemon append actually
+    /// produces once a `CommandStarted` is open, rather than the `None` every
+    /// other fixture here uses (a credential recorded outside a tracked
+    /// launch).
+    fn credential_in_launch(host: &str, launch_seq: u64) -> WardEvent {
+        match credential(host) {
+            WardEvent::CredentialGranted {
+                service,
+                scope,
+                expires,
+                delivery,
+                ..
+            } => WardEvent::CredentialGranted {
+                service,
+                scope,
+                expires,
+                delivery,
+                launch_seq: Some(launch_seq),
+            },
+            other => other,
         }
     }
 
@@ -593,6 +644,7 @@ mod tests {
                 network_tag: None,
                 expires_at_unix_ms: None,
                 permissions: None,
+                launch_seq: None,
             }
         );
         assert_eq!(
@@ -607,6 +659,10 @@ mod tests {
                 // never expires on its own — see `expiry_unix_ms`.
                 expires_at_unix_ms: None,
                 permissions: Some("contents:read, issues:read".into()),
+                // `credential(..)` (this fixture) carries no `launch_seq`
+                // either — the same "outside a tracked launch" shape as
+                // every other fixture that predates PR #318 review round 2.
+                launch_seq: None,
             }
         );
         assert_eq!(
@@ -618,6 +674,7 @@ mod tests {
                 network_tag: Some("example.org".into()),
                 expires_at_unix_ms: None,
                 permissions: None,
+                launch_seq: None,
             },
             "a network grant is listed by its host, never the whole URL"
         );
@@ -900,6 +957,7 @@ mod tests {
             },
             expires: Duration::from_secs(60),
             delivery: CredentialDelivery::ProxyInjected,
+            launch_seq: None,
         };
         let events = [credential("github.com"), different_scope];
         let authority = Authority::from_records(&wardd_at_walls(&events, &[GRANTED_AT_UNIX_MS; 2]));
@@ -1091,5 +1149,77 @@ mod tests {
         let groups = authority_panel(&d, &Authority::default(), 0);
         let cloud = &groups[2].rows[2];
         assert_eq!((cloud.value.as_str(), cloud.tone), ("denied", Tone::Ok));
+    }
+
+    /// PR #318 review round 2, finding 2: the exact production-style sequence
+    /// the review named. `CommandStarted`, then two separately appended
+    /// same-launch `CredentialGranted` records with genuinely distinct daemon
+    /// timestamps (`wardd_at_wall` gives every record its own, one second
+    /// apart — never the previous fix's artificial identical-instant
+    /// shortcut) must still merge into one grant row, because a real daemon
+    /// now stamps both routes with the same `launch_seq` regardless of when
+    /// each one's own append actually lands (`daemon::Served::handle_appendable`).
+    /// A later, independent launch — its own `CommandStarted`/…/`CommandFinished`
+    /// bracket — granting the same service and permissions again gets a
+    /// different `launch_seq` and so its own separate row, with its own
+    /// expiry, exactly as `ward session grants` already lists it. Before this
+    /// fix (matching on computed expiry alone), this exact sequence split the
+    /// first launch's two routes into two rows instead of merging them — the
+    /// opposite failure from the one finding 2's first fix targeted.
+    #[test]
+    fn same_launch_routes_merge_by_launch_seq_at_distinct_instants_and_a_later_launch_gets_its_own_row()
+     {
+        let pid = ward_events::Pid::new(2).unwrap();
+        let started = || WardEvent::CommandStarted {
+            pid,
+            parent: ward_events::Pid::new(1).unwrap(),
+            argv: ward_events::BoundedArgv::from_strs(&["true"]),
+            cwd: ward_events::SandboxPath::new(ward_events::SandboxRoot::Work, ".").unwrap(),
+            exe_digest: None,
+        };
+        let finished = || WardEvent::CommandFinished {
+            pid,
+            exit: ward_events::ExitStatus::Exited { code: 0 },
+            duration: Duration::from_secs(1),
+        };
+
+        let events = [
+            started(),
+            // Two routes of the first launch, sharing `launch_seq: Some(1)`
+            // (what a real daemon stamps for every route one `Session::launch`
+            // call grants) but recorded at genuinely distinct instants.
+            credential_in_launch("github.com", 1),
+            credential_in_launch("api.github.com", 1),
+            finished(),
+            // A second, independent launch, same service and permissions,
+            // its own `launch_seq`.
+            started(),
+            credential_in_launch("github.com", 2),
+            finished(),
+        ];
+        let authority = Authority::from_records(&wardd_at_wall(&events, GRANTED_AT_UNIX_MS));
+
+        assert_eq!(
+            authority.grants.len(),
+            2,
+            "one merged grant for the first launch's two routes, a second, \
+             separate grant for the later independent launch: {:?}",
+            authority.grants
+        );
+        assert_eq!(
+            authority.grants[0].scope, "contents:read, issues:read · github.com, api.github.com",
+            "both routes of the first launch merged despite distinct \
+             wall-clock instants: {:?}",
+            authority.grants[0]
+        );
+        assert_eq!(authority.grants[0].launch_seq, Some(1));
+        assert_eq!(authority.grants[1].launch_seq, Some(2));
+        assert_ne!(
+            authority.grants[0].expires_at_unix_ms, authority.grants[1].expires_at_unix_ms,
+            "the two launches were recorded at genuinely different instants, \
+             so they must not share a deadline either: {:?}",
+            authority.grants
+        );
+        assert_eq!(authority.len(0), 2);
     }
 }

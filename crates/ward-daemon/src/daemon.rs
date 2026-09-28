@@ -603,7 +603,7 @@ impl Served {
     /// launch's terminal record (`CommandFinished` or `LaunchAborted`) retires
     /// only that same connection's launch — never a launch on another
     /// connection, even one whose client-chosen `Pid` happens to collide.
-    fn handle_appendable(&mut self, conn: u64, other: Request) -> (Response, bool) {
+    fn handle_appendable(&mut self, conn: u64, mut other: Request) -> (Response, bool) {
         let credential = match &other {
             Request::Append {
                 event:
@@ -631,6 +631,29 @@ impl Served {
             )),
             _ => None,
         };
+        // Stamp the same `launch_seq` this append's own credential attribution
+        // just computed (above) into the event's own `launch_seq` field before
+        // it is ever persisted (PR #318 review round 2, finding 2): whatever
+        // the client sent here (always `None` -- see `GatewayRoute::granted`'s
+        // own doc comment) is overwritten, the same way `EventRecord::ts_wall`
+        // is daemon-owned rather than client-supplied. This makes the identity
+        // `open_launches` already uses to attribute a grant to the right
+        // launch wire-visible, so a single ordered replay of this session's
+        // own records -- the shell/desktop panel's `Authority` projection,
+        // which has no `conn` to key by -- can regroup a launch's routes into
+        // one grant without needing per-connection information the wire never
+        // carried before.
+        if let Some((_, _, _, launch_seq, _)) = credential
+            && let Request::Append {
+                event:
+                    WardEvent::CredentialGranted {
+                        launch_seq: field, ..
+                    },
+                ..
+            } = &mut other
+        {
+            *field = launch_seq;
+        }
         let launch_started = matches!(
             &other,
             Request::Append {
@@ -2475,6 +2498,7 @@ mod tests {
                 },
                 expires: Duration::from_secs(60),
                 delivery: CredentialDelivery::ProxyInjected,
+                launch_seq: None,
             };
             assert!(matches!(
                 lock(&served).append(granted),
@@ -2564,6 +2588,7 @@ mod tests {
             },
             expires: Duration::from_secs(60),
             delivery: CredentialDelivery::ProxyInjected,
+            launch_seq: None,
         };
         let before = control::unix_ms(SystemTime::now());
         // A capture time from decades before this append actually reaches
@@ -2620,6 +2645,7 @@ mod tests {
             },
             expires: Duration::from_secs(60),
             delivery: CredentialDelivery::ProxyInjected,
+            launch_seq: None,
         };
         assert!(lock(served).append(granted).is_ok());
         match lock(served).handle(Request::Grants).0 {
@@ -3080,6 +3106,7 @@ mod tests {
             },
             expires: Duration::from_secs(60),
             delivery: CredentialDelivery::ProxyInjected,
+            launch_seq: None,
         };
         assert!(lock(&served).append(granted).is_ok());
 
@@ -3143,6 +3170,7 @@ mod tests {
             },
             expires: Duration::from_secs(60),
             delivery: CredentialDelivery::ProxyInjected,
+            launch_seq: None,
         };
         let finished = || WardEvent::CommandFinished {
             pid: collided_pid,
@@ -3189,6 +3217,103 @@ mod tests {
             "A's own finish retires A's own credential: {:?}",
             served.approvals.grants()
         );
+    }
+
+    /// PR #318 review round 2, finding 2: `WardEvent::CredentialGranted`'s
+    /// own `launch_seq` field must carry the same identity `open_launches`
+    /// already uses to attribute a grant to the right launch (the
+    /// `CommandStarted` record's own `seq`) — persisted onto the record
+    /// itself, not just used internally — so a reader with no `conn` to key
+    /// by (the shell/desktop panel's `Authority` projection, replaying one
+    /// session's own ordered records) can still tell two routes of one launch
+    /// apart from a later, independent one. Two routes of the same launch
+    /// must share it even when their own appends land at genuinely distinct
+    /// wall-clock instants (a real `sleep` between them here, not the
+    /// artificial identical-instant shortcut the earlier fix's own test
+    /// used); a later, independent launch granting the same service and
+    /// permissions again must get a different one.
+    #[test]
+    fn credential_granted_records_carry_a_stable_launch_seq_across_routes_and_a_fresh_one_for_a_later_launch()
+     {
+        use ward_events::{
+            BoundedArgv, CredentialDelivery, ExitStatus, NameText, Pid, SandboxPath, SandboxRoot,
+            Scope, ServiceId,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+
+        let pid = Pid::new(2).unwrap();
+        let started = || WardEvent::CommandStarted {
+            pid,
+            parent: Pid::new(1).unwrap(),
+            argv: BoundedArgv::from_bytes([b"a".as_slice()]),
+            cwd: SandboxPath::new(SandboxRoot::Work, ".").unwrap(),
+            exe_digest: None,
+        };
+        let granted = |host: &str| WardEvent::CredentialGranted {
+            service: ServiceId::new("github").unwrap(),
+            scope: Scope {
+                subject: ShortText::new(&format!("{host}:443")),
+                permissions: vec![NameText::new("contents:read")],
+            },
+            expires: Duration::from_secs(60),
+            delivery: CredentialDelivery::ProxyInjected,
+            // Whatever the client sends here is always overwritten by the
+            // daemon (`GatewayRoute::granted`'s own doc comment) -- `Some`
+            // here on purpose, to prove that overwrite actually happens
+            // rather than merely leaving an already-absent field absent.
+            launch_seq: Some(999),
+        };
+        let finished = || WardEvent::CommandFinished {
+            pid,
+            exit: ExitStatus::Exited { code: 0 },
+            duration: Duration::from_secs(1),
+        };
+        let launch_seq_of = |record: &EventRecord| match record.event {
+            WardEvent::CredentialGranted { launch_seq, .. } => launch_seq,
+            ref other => panic!("expected CredentialGranted, got {other:?}"),
+        };
+
+        let started_record = served.append(started()).unwrap();
+
+        // Two routes of the *same* launch, appended with a real, deliberate
+        // delay between them -- genuinely distinct wall-clock instants, not
+        // an identical one.
+        let route_a = served.append(granted("github.com")).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let route_b = served.append(granted("api.github.com")).unwrap();
+
+        assert_ne!(
+            route_a.ts_wall, route_b.ts_wall,
+            "the two routes really were appended at different instants"
+        );
+        assert_eq!(
+            launch_seq_of(&route_a),
+            Some(started_record.seq),
+            "stamped from this launch's own CommandStarted record"
+        );
+        assert_eq!(
+            launch_seq_of(&route_a),
+            launch_seq_of(&route_b),
+            "two routes of one launch share one launch_seq even at genuinely \
+             distinct wall-clock instants"
+        );
+
+        served.append(finished()).unwrap();
+
+        // A later, independent launch granting the same service and
+        // permissions again must get a different launch_seq.
+        let started_again = served.append(started()).unwrap();
+        let route_c = served.append(granted("github.com")).unwrap();
+        assert_eq!(launch_seq_of(&route_c), Some(started_again.seq));
+        assert_ne!(
+            launch_seq_of(&route_c),
+            launch_seq_of(&route_a),
+            "a later independent launch does not inherit the first launch's \
+             own launch_seq"
+        );
+        served.append(finished()).unwrap();
     }
 
     #[test]
@@ -3631,6 +3756,7 @@ mod tests {
             },
             expires: Duration::from_secs(60),
             delivery: CredentialDelivery::ProxyInjected,
+            launch_seq: None,
         };
         let append = |sink: &mut RemoteSink, event: WardEvent| {
             assert!(matches!(

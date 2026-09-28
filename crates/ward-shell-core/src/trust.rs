@@ -849,6 +849,7 @@ mod tests {
             },
             expires: std::time::Duration::from_secs(60),
             delivery: CredentialDelivery::ProxyInjected,
+            launch_seq: None,
         }
     }
 
