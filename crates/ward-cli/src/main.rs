@@ -408,18 +408,29 @@ enum SessionCmd {
     /// id, scope and lifetime. A credential mid-revoke shows `revoking` until
     /// the owning proxy acknowledges withdrawal or `ward session revoke`'s
     /// wait times out; one that timed out unconfirmed shows `revoke
-    /// unconfirmed` and keeps being listed — #245's acceptance bar is that no
-    /// revoke in progress, and no revoke that failed to confirm, is ever
-    /// shown as though it were either done or not happening at all.
+    /// unconfirmed` and keeps being listed; one suspended while the session
+    /// is paused shows `suspended`, and returns to plain (`active`) on resume
+    /// — #245's acceptance bar is that no revoke in progress, and no other
+    /// non-active state, is ever shown as though it were either done or not
+    /// happening at all (#140).
     Grants {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
         /// The session id, instead of looking one up.
         #[arg(long)]
         session: Option<String>,
+        /// List the bounded history of retired grants instead (#140): every
+        /// grant a confirmed `ward session revoke` withdrew, or whose own
+        /// recorded lifetime ran out, oldest first — `revoked` or `expired`
+        /// respectively. Kept separate from the live list above, never
+        /// deleted outright, so what happened to authority that no longer
+        /// shows as active stays inspectable.
+        #[arg(long)]
+        history: bool,
         /// One JSON object per grant: `{id, kind, label, scope, lifetime,
         /// granted_at_unix_ms, revoke_state}`, `revoke_state` one of
-        /// `active`, `revoking` or `unconfirmed`.
+        /// `active`, `suspended`, `revoking`, `revoked`, `unconfirmed` or
+        /// `expired`.
         #[arg(long)]
         json: bool,
     },
@@ -715,9 +726,12 @@ fn cmd_session(cmd: SessionCmd) -> ward_daemon::Result<ExitCode> {
             }
         }
         SessionCmd::Select { id, show, clear } => cmd_session_select(id.as_deref(), show, clear),
-        SessionCmd::Grants { dir, session, json } => {
-            cmd_grants(&dir.unwrap_or_else(cwd), session.as_deref(), json)
-        }
+        SessionCmd::Grants {
+            dir,
+            session,
+            history,
+            json,
+        } => cmd_grants(&dir.unwrap_or_else(cwd), session.as_deref(), history, json),
         SessionCmd::Approve {
             id,
             decision,
@@ -1302,14 +1316,31 @@ fn cmd_approvals_all(json: bool) -> ward_daemon::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `ward session grants [--json]`: the temporary authority the session holds.
-fn cmd_grants(dir: &Path, session: Option<&str>, json: bool) -> ward_daemon::Result<ExitCode> {
+/// `ward session grants [--history] [--json]`: the temporary authority the
+/// session holds, or (`--history`) its bounded retired-grant history (#140).
+fn cmd_grants(
+    dir: &Path,
+    session: Option<&str>,
+    history: bool,
+    json: bool,
+) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
-    let grants = client::grants(&mut sink)?;
+    let grants = if history {
+        client::grant_history(&mut sink)?
+    } else {
+        client::grants(&mut sink)?
+    };
     let mut out = std::io::stdout();
     if grants.is_empty() && !json {
-        println!("  no temporary grants");
+        println!(
+            "  {}",
+            if history {
+                "no retired grants"
+            } else {
+                "no temporary grants"
+            }
+        );
     }
     for grant in &grants {
         let line = if json {
@@ -2116,7 +2147,11 @@ mod tests {
         let cli = Cli::parse_from(["ward", "session", "grants", "--json"]);
         assert!(matches!(
             cli.command,
-            Command::Session(SessionCmd::Grants { json: true, .. })
+            Command::Session(SessionCmd::Grants {
+                json: true,
+                history: false,
+                ..
+            })
         ));
         let approval = ward_daemon::approvals::Approval::new(
             12,
@@ -2155,6 +2190,30 @@ mod tests {
         };
         assert_eq!(decided.state_word(), "timed-out");
         assert!(decided.line().contains("timed-out"), "{}", decided.line());
+    }
+
+    #[test]
+    fn session_grants_history_parses_separately_from_json() {
+        // #140: `--history` lists the bounded retired-grant history instead
+        // of the live list, and is independent of `--json`.
+        let cli = Cli::parse_from(["ward", "session", "grants", "--history"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCmd::Grants {
+                history: true,
+                json: false,
+                ..
+            })
+        ));
+        let cli = Cli::parse_from(["ward", "session", "grants", "--history", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Command::Session(SessionCmd::Grants {
+                history: true,
+                json: true,
+                ..
+            })
+        ));
     }
 
     /// `ward session pending`'s text gives the daemon's decision time (#146

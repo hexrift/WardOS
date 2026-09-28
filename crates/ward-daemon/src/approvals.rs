@@ -258,27 +258,54 @@ impl Authority {
     }
 }
 
-/// Where a credential grant stands with respect to a host-confirmed revoke
-/// (#245, closing the gap #243 left open in #140 items 4-5): `Active` until
-/// someone asks; `Revoking` from the moment `ward session revoke` marks it
+/// Where a grant stands in its lifecycle (#140: active/suspended/revoking/
+/// revoked/expired), with the host-confirmed revoke refinement #245 already
+/// added: `Active` until something changes that; `Suspended` while the
+/// owning session is paused ([`Approvals::set_paused`]) — every grant that
+/// was `Active` the instant the pause landed, and only those, moves here,
+/// and moves back to `Active` the instant it is resumed, so the daemon never
+/// shows temporary authority as exercisable while nothing can actually use it
+/// (ADR-0019 §3); `Revoking` from the moment `ward session revoke` marks it
 /// until the owning proxy acknowledges withdrawal or the wait
-/// (`crate::revoke::ACK_TIMEOUT`) runs out; `Unconfirmed` is the terminal
-/// answer for that timeout — the grant is *not* removed (a confirmed
-/// withdrawal is; see [`Approvals::finish_revoke`]), because the daemon
-/// cannot honestly say whether the credential is still being honored. This
-/// is the same discipline [`Lifetime::LaunchUnknown`] already applies to a
-/// severed connection: neither of the two false claims (still safely active,
-/// or confirmed gone) is supportable, so neither is made.
+/// (`crate::revoke::ACK_TIMEOUT`) runs out; `Revoked` once that withdrawal is
+/// confirmed — the grant leaves [`Approvals::grants`] the same moment it
+/// enters this state, but is kept, not deleted, in
+/// [`Approvals::grant_history`] (#140's "history remains inspectable");
+/// `Unconfirmed` is the terminal answer for a wait that ran out with no
+/// acknowledgement — the grant is *not* removed and does *not* move to
+/// history (see [`Approvals::finish_revoke`]), because the daemon cannot
+/// honestly say whether the credential is still being honored, the same
+/// discipline [`Lifetime::LaunchUnknown`] already applies to a severed
+/// connection: neither of the two false claims (still safely active, or
+/// confirmed gone) is supportable, so neither is made; `Expired` once a
+/// credential's own recorded lifetime
+/// (`WardEvent::CredentialGranted`'s `expires`, threaded through
+/// [`Credential::expires_at_unix_ms`]) runs out on its own, with no revoke
+/// ever asked for — moved to history the same way a confirmed revoke is. An
+/// `allow-session` answer (a [`GrantKind::Approval`], with no proxy route to
+/// wait on and no recorded expiry of its own) is never `Revoking`,
+/// `Unconfirmed` or `Expired` — only ever `Active`, `Suspended` while the
+/// session is paused, or `Revoked` once `ward session revoke` removes it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RevokeState {
-    /// Nothing has asked to revoke this grant.
+    /// Nothing has asked to revoke this grant, and it has not expired.
     #[default]
     Active,
+    /// The owning session is paused (ADR-0019 §3): held, like the rest of
+    /// the hold, until it is resumed.
+    Suspended,
     /// Waiting for the owning proxy to acknowledge withdrawal.
     Revoking,
+    /// A host-confirmed withdrawal: retained in
+    /// [`Approvals::grant_history`], no longer in [`Approvals::grants`].
+    Revoked,
     /// The wait ran out with no acknowledgement.
     Unconfirmed,
+    /// The credential's own recorded lifetime ran out with no revoke ever
+    /// asked for: retained in [`Approvals::grant_history`], no longer in
+    /// [`Approvals::grants`].
+    Expired,
 }
 
 /// A credential the launch granted: the proxy injects it for `hosts`.
@@ -322,6 +349,19 @@ pub struct Credential {
     /// (#245). `Active` until [`Approvals::begin_revoke`] marks it.
     #[serde(default)]
     pub revoke_state: RevokeState,
+    /// When this credential's own recorded lifetime runs out, milliseconds
+    /// since the Unix epoch (#140) — the instant `granted_at_unix_ms` plus
+    /// `WardEvent::CredentialGranted`'s `expires` names, when the caller
+    /// recorded one ([`Approvals::record_credential_with_expiry`]); `None`
+    /// for a credential recorded through the plain
+    /// [`Approvals::record_credential`] (every existing caller and fixture
+    /// that predates #140, and any credential the daemon could not attribute
+    /// a lifetime to). A credential with `None` here never expires on its
+    /// own — it is retired only when its launch ends
+    /// ([`Approvals::retire_launch`]) or it is revoked
+    /// ([`Approvals::begin_revoke_wait`]/[`Approvals::finish_revoke`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<u64>,
 }
 
 impl Credential {
@@ -342,6 +382,25 @@ pub fn service_name(service: &str) -> String {
     match service {
         "github" => "GitHub".to_owned(),
         other => other.to_owned(),
+    }
+}
+
+/// The [`Grant`] projection of one credential (#140): shared by
+/// [`Approvals::grants`] (for a still-live credential) and its expiry sweep
+/// (for one just retired into [`Approvals::grant_history`]), so the two never
+/// disagree about what a credential's grant looks like.
+fn credential_grant(c: &Credential, unknown_launches: &BTreeSet<u64>) -> Grant {
+    Grant {
+        id: c.id,
+        kind: GrantKind::Credential,
+        label: service_name(&c.service),
+        scope: format!("{} · {}", c.permissions.join(", "), c.hosts.join(", ")),
+        lifetime: match c.launch_key {
+            Some(key) if unknown_launches.contains(&key) => Lifetime::LaunchUnknown,
+            _ => Lifetime::Launch,
+        },
+        granted_at_unix_ms: c.granted_at_unix_ms,
+        revoke_state: c.revoke_state,
     }
 }
 
@@ -373,9 +432,11 @@ pub struct Grant {
     pub lifetime: Lifetime,
     /// When, milliseconds since the Unix epoch.
     pub granted_at_unix_ms: u64,
-    /// Where this grant stands with respect to a host-confirmed revoke
-    /// (#245): always [`RevokeState::Active`] for a [`GrantKind::Approval`],
-    /// which has no proxy route to wait on.
+    /// Where this grant stands in its lifecycle (#140): never `Revoking`,
+    /// `Unconfirmed` or `Expired` for a [`GrantKind::Approval`], which has no
+    /// proxy route to wait on and no recorded expiry of its own — only
+    /// `Active`, `Suspended` while the session is paused, or `Revoked` once
+    /// `ward session revoke` removes it.
     #[serde(default)]
     pub revoke_state: RevokeState,
 }
@@ -383,10 +444,11 @@ pub struct Grant {
 impl Grant {
     /// The grant as one line: id, label, scope, lifetime, and — while it is
     /// anything other than [`RevokeState::Active`] — that state too, so a
-    /// pending or unconfirmed revoke is visible wherever a plain-text list of
-    /// grants is (#245's "no UI-only revoke is reported as enforced" bar
-    /// extends to "no revoke in progress is reported as though nothing were
-    /// happening" too).
+    /// suspended grant, a pending or unconfirmed revoke, or an expired or
+    /// revoked entry in [`Approvals::grant_history`] is visible wherever a
+    /// plain-text list of grants is (#245's "no UI-only revoke is reported as
+    /// enforced" bar extends to "no revoke in progress, and no other
+    /// non-active state, is reported as though nothing were happening" too).
     #[must_use]
     pub fn line(&self) -> String {
         let mut line = format!(
@@ -398,8 +460,11 @@ impl Grant {
         );
         match self.revoke_state {
             RevokeState::Active => {}
+            RevokeState::Suspended => line.push_str("   suspended"),
             RevokeState::Revoking => line.push_str("   revoking"),
+            RevokeState::Revoked => line.push_str("   revoked"),
             RevokeState::Unconfirmed => line.push_str("   revoke unconfirmed"),
+            RevokeState::Expired => line.push_str("   expired"),
         }
         line
     }
@@ -1034,6 +1099,14 @@ impl ApprovalRecord {
 /// dismissed a notification and asks later, while the session is still up.
 pub const HISTORY_CAP: usize = 200;
 
+/// How many retired grants [`Approvals::grant_history`] keeps, oldest
+/// dropped first (#140: "history remains inspectable" for a confirmed
+/// revoke or an expiry, never an unbounded — or absent — record of either).
+/// Mirrors [`HISTORY_CAP`]'s bound on the approvals history for the same
+/// reason: this is the daemon's own live view for a client asking after the
+/// fact, not the durable record (`ward replay` reads the event log itself).
+pub const GRANT_HISTORY_CAP: usize = 200;
+
 #[derive(Debug, Default)]
 struct State {
     held: Vec<Held>,
@@ -1120,6 +1193,13 @@ struct State {
     /// (a legitimate retry after an honest `Unconfirmed`) finds no slot and
     /// correctly leads its own fresh wait rather than joining a stale one.
     revoke_wait: BTreeMap<u64, RevokeSlot>,
+    /// Grants retired by a confirmed revoke ([`Approvals::finish_revoke`],
+    /// [`Approvals::begin_revoke_wait`]'s `Approval` arm) or by their own
+    /// expiry ([`Approvals::grants`]'s lazy sweep), oldest first, capped at
+    /// [`GRANT_HISTORY_CAP`] (#140: "history remains inspectable"). A grant
+    /// marked [`RevokeState::Unconfirmed`] does *not* enter here — it is not
+    /// retired at all, and keeps showing in [`Approvals::grants`] instead.
+    grant_history: VecDeque<Grant>,
 }
 
 /// A revoke wait's shared outcome: `None` while the leader's wait is still
@@ -1145,6 +1225,56 @@ impl State {
             outcome: Some(outcome),
             decided_at_unix_ms: Some(at_unix_ms),
         });
+    }
+
+    /// Retire `grant` into the bounded grant history (#140), evicting the
+    /// oldest entry first when full. `grant.revoke_state` must already be
+    /// [`RevokeState::Revoked`] or [`RevokeState::Expired`] — the terminal
+    /// states this history exists for.
+    fn record_grant_history(&mut self, grant: Grant) {
+        debug_assert!(matches!(
+            grant.revoke_state,
+            RevokeState::Revoked | RevokeState::Expired
+        ));
+        if self.grant_history.len() >= GRANT_HISTORY_CAP {
+            self.grant_history.pop_front();
+        }
+        self.grant_history.push_back(grant);
+    }
+
+    /// Retire every credential whose own recorded lifetime has run out into
+    /// [`State::grant_history`] as [`RevokeState::Expired`] (#140), leaving
+    /// only a revoke already in flight (`Revoking`/`Unconfirmed`) exempt —
+    /// `Active` and `Suspended` are otherwise-live states and are equally
+    /// subject to the credential's own clock. This is the single expiry
+    /// transition every credential-reading path shares: [`grants_at`] (and so
+    /// `grants`/`grant_history`) and [`Approvals::credentials_at`] (and so
+    /// `Approvals::credentials`, which `Served::hold`'s authority derivation
+    /// reads directly) both call this before reading `self.credentials`, so
+    /// none of them can observe an expired credential the others have
+    /// already swept, or fail to notice one none of them has queried yet
+    /// (review on #315 7fa987b: expiry must not depend on which accessor
+    /// happens to be called first).
+    ///
+    /// [`grants_at`]: Approvals::grants_at
+    fn sweep_expired_credentials(&mut self, now_unix_ms: u64) {
+        let expired: Vec<Credential> = {
+            let (still_live, expired) = std::mem::take(&mut self.credentials)
+                .into_iter()
+                .partition(|c| {
+                    matches!(
+                        c.revoke_state,
+                        RevokeState::Revoking | RevokeState::Unconfirmed
+                    ) || c.expires_at_unix_ms.is_none_or(|e| now_unix_ms < e)
+                });
+            self.credentials = still_live;
+            expired
+        };
+        for mut c in expired {
+            c.revoke_state = RevokeState::Expired;
+            let grant = credential_grant(&c, &self.unknown_launches);
+            self.record_grant_history(grant);
+        }
     }
 }
 
@@ -1189,6 +1319,35 @@ impl Approvals {
         launch_key: Option<u64>,
         granted_at_unix_ms: u64,
     ) -> u64 {
+        self.record_credential_with_expiry(
+            service,
+            host,
+            permissions,
+            launch_key,
+            granted_at_unix_ms,
+            None,
+        )
+    }
+
+    /// [`record_credential`](Self::record_credential), also recording when
+    /// this credential's own lifetime runs out (#140): `expires_at_unix_ms`
+    /// is `granted_at_unix_ms` plus `WardEvent::CredentialGranted`'s
+    /// `expires`, when the caller (`daemon::Served::handle_appendable`) could
+    /// compute one; `None` has the same never-expires-on-its-own meaning
+    /// [`Credential::expires_at_unix_ms`] documents. Ignored when merging
+    /// into an existing credential (a second route of the same service,
+    /// permissions and launch): every real caller mints the same nominal
+    /// lifetime for every route one launch grants at once, so the first
+    /// value recorded already matches.
+    pub fn record_credential_with_expiry(
+        &self,
+        service: &str,
+        host: &str,
+        permissions: Vec<String>,
+        launch_key: Option<u64>,
+        granted_at_unix_ms: u64,
+        expires_at_unix_ms: Option<u64>,
+    ) -> u64 {
         let mut state = self.lock();
         if let Some(c) = state.credentials.iter_mut().find(|c| {
             c.service == service && c.permissions == permissions && c.launch_key == launch_key
@@ -1199,6 +1358,15 @@ impl Approvals {
             return c.id;
         }
         let id = state.next_grant_id();
+        // Ordinarily unreachable (a launch is refused while the session is
+        // paused — `Session::refuse_while_paused`), but a credential recorded
+        // anyway while paused starts `Suspended`, not `Active`, so this can
+        // never show exercisable authority the session cannot currently use.
+        let revoke_state = if state.paused {
+            RevokeState::Suspended
+        } else {
+            RevokeState::Active
+        };
         state.credentials.push(Credential {
             id,
             service: service.to_owned(),
@@ -1206,7 +1374,8 @@ impl Approvals {
             permissions,
             granted_at_unix_ms,
             launch_key,
-            revoke_state: RevokeState::Active,
+            revoke_state,
+            expires_at_unix_ms,
         });
         id
     }
@@ -1246,32 +1415,49 @@ impl Approvals {
         self.lock().unknown_launches.insert(key);
     }
 
-    /// The credentials granted so far, in grant order.
+    /// The credentials granted so far, in grant order. Sweeps any credential
+    /// whose own recorded lifetime has already run out into
+    /// [`Approvals::grant_history`] as [`RevokeState::Expired`] first (#140):
+    /// `Served::hold` reads this directly to build the authority
+    /// [`Deriver::derive`] answers a hook question with, so it must never
+    /// report an expired credential as present just because nothing else
+    /// happened to call [`Approvals::grants`] first (review on #315
+    /// 7fa987b).
     #[must_use]
     pub fn credentials(&self) -> Vec<Credential> {
-        self.lock().credentials.clone()
+        self.credentials_at(now_unix_ms())
+    }
+
+    /// [`credentials`](Self::credentials) judged at a fixed `now_unix_ms`:
+    /// the deterministic seam the expiry tests drive, mirroring
+    /// [`grants_at`](Self::grants_at).
+    fn credentials_at(&self, now_unix_ms: u64) -> Vec<Credential> {
+        let mut state = self.lock();
+        state.sweep_expired_credentials(now_unix_ms);
+        state.credentials.clone()
     }
 
     /// Every temporary grant the session holds, oldest first: the credentials
     /// the proxy injects and the `allow-session` answers.
     #[must_use]
     pub fn grants(&self) -> Vec<Grant> {
-        let state = self.lock();
+        self.grants_at(now_unix_ms())
+    }
+
+    /// [`grants`](Self::grants) judged at a fixed `now_unix_ms`: the
+    /// deterministic seam the expiry tests drive. Sweeps every credential
+    /// whose own recorded lifetime has run out into
+    /// [`Approvals::grant_history`] as [`RevokeState::Expired`] first (#140),
+    /// so the projection this returns and the history a concurrent
+    /// [`Approvals::grant_history`] call reads are never out of step with
+    /// each other.
+    fn grants_at(&self, now_unix_ms: u64) -> Vec<Grant> {
+        let mut state = self.lock();
+        state.sweep_expired_credentials(now_unix_ms);
         let mut grants: Vec<Grant> = state
             .credentials
             .iter()
-            .map(|c| Grant {
-                id: c.id,
-                kind: GrantKind::Credential,
-                label: service_name(&c.service),
-                scope: format!("{} · {}", c.permissions.join(", "), c.hosts.join(", ")),
-                lifetime: match c.launch_key {
-                    Some(key) if state.unknown_launches.contains(&key) => Lifetime::LaunchUnknown,
-                    _ => Lifetime::Launch,
-                },
-                granted_at_unix_ms: c.granted_at_unix_ms,
-                revoke_state: c.revoke_state,
-            })
+            .map(|c| credential_grant(c, &state.unknown_launches))
             .chain(state.remembered.values().cloned())
             .collect();
         // Order by when the grant was made; on a tie (the same millisecond, common
@@ -1285,6 +1471,29 @@ impl Approvals {
             (g.granted_at_unix_ms, kind_rank)
         });
         grants
+    }
+
+    /// Every grant retired into the bounded history (#140): a confirmed
+    /// revoke, or an expiry, oldest first. `ward session grants --history`
+    /// reads this instead of [`grants`](Self::grants) so a caller can still
+    /// see what happened to authority that no longer shows as live —
+    /// #140's "history remains inspectable" bar. Sweeps expired credentials
+    /// into the history first, the same as [`grants`](Self::grants), so a
+    /// credential whose lifetime ran out shows up here even if nothing ever
+    /// called [`grants`](Self::grants) to notice.
+    #[must_use]
+    pub fn grant_history(&self) -> Vec<Grant> {
+        self.grant_history_at(now_unix_ms())
+    }
+
+    /// [`grant_history`](Self::grant_history) judged at a fixed
+    /// `now_unix_ms`: the deterministic seam the expiry tests drive, mirroring
+    /// [`grants_at`](Self::grants_at).
+    fn grant_history_at(&self, now_unix_ms: u64) -> Vec<Grant> {
+        // Discarded: only the sweep side effect (moving anything newly
+        // expired into `grant_history`) is wanted here.
+        let _ = self.grants_at(now_unix_ms);
+        self.lock().grant_history.iter().cloned().collect()
     }
 
     /// Begin revoking the grant `id` names (`ward session revoke <id>`,
@@ -1337,7 +1546,14 @@ impl Approvals {
             .find(|(_, g)| g.id == id)
             .map(|(key, _)| key.clone())
         {
-            state.remembered.remove(&key);
+            if let Some(mut grant) = state.remembered.remove(&key) {
+                // No proxy route to wait on, so this is already the terminal
+                // transition (#140): retained in `grant_history`, the same as
+                // a credential's confirmed withdrawal, rather than dropped
+                // with no trace.
+                grant.revoke_state = RevokeState::Revoked;
+                state.record_grant_history(grant);
+            }
             return Some(RevokeStart::Approval);
         }
         None
@@ -1373,9 +1589,17 @@ impl Approvals {
         let mut state = self.lock();
         match outcome {
             RevokeOutcome::Withdrawn | RevokeOutcome::WithdrawnInFlight(_) => {
-                let before = state.credentials.len();
-                state.credentials.retain(|c| c.id != id);
-                state.credentials.len() != before
+                let Some(pos) = state.credentials.iter().position(|c| c.id == id) else {
+                    return false;
+                };
+                let mut c = state.credentials.remove(pos);
+                c.revoke_state = RevokeState::Revoked;
+                // Retained, not dropped (#140: "history remains inspectable"):
+                // the same terminal treatment `begin_revoke_wait` already gives
+                // an `allow-session` answer, which has no wait to conclude here.
+                let grant = credential_grant(&c, &state.unknown_launches);
+                state.record_grant_history(grant);
+                true
             }
             RevokeOutcome::Unconfirmed => {
                 if let Some(c) = state.credentials.iter_mut().find(|c| c.id == id) {
@@ -1805,6 +2029,17 @@ impl Approvals {
     }
 
     fn set_paused_at(&self, paused: bool, now: Instant) {
+        self.set_paused_at_wall(paused, now, now_unix_ms());
+    }
+
+    /// [`set_paused_at`](Self::set_paused_at), also given the wall-clock
+    /// instant a resumed credential's own expiry is judged against: the
+    /// deterministic seam the expiry-during-pause tests drive, mirroring
+    /// [`grants_at`](Self::grants_at). Existing pause/countdown tests keep
+    /// calling [`set_paused_at`](Self::set_paused_at) unchanged — they carry
+    /// no credential with a recorded expiry, so the real wall clock it
+    /// supplies never matters to them.
+    fn set_paused_at_wall(&self, paused: bool, now: Instant, now_unix_ms: u64) {
         let mut state = self.lock();
         state.paused = paused;
         for clock in state.held.iter_mut().filter_map(|h| h.clock.as_mut()) {
@@ -1812,6 +2047,50 @@ impl Approvals {
                 clock.hold(now);
             } else {
                 clock.run(now);
+            }
+        }
+        // Every grant that is exercisable moves with the session it belongs
+        // to (#140): `Active` <-> `Suspended` in lockstep with the pause
+        // itself, in this same lock hold, so a client can never observe the
+        // marker flipped without the grants agreeing, or vice versa. A grant
+        // already `Revoking`, `Unconfirmed`, `Revoked` or `Expired` is left
+        // alone — pausing or resuming the session changes nothing about a
+        // revoke already in flight or already concluded, or about a
+        // credential whose own lifetime already ran out. Resuming a
+        // `Suspended` credential whose own recorded lifetime has already run
+        // out must not reactivate it as `Active` — it is retired into
+        // history as `Expired` instead, exactly as an ordinary
+        // `grants`/`grant_history` sweep would have done (review on #315
+        // bb51419: a resume is not a loophole around a credential's own
+        // clock).
+        let (from, to) = if paused {
+            (RevokeState::Active, RevokeState::Suspended)
+        } else {
+            (RevokeState::Suspended, RevokeState::Active)
+        };
+        let mut newly_expired = Vec::new();
+        state.credentials.retain_mut(|c| {
+            if c.revoke_state != from {
+                return true;
+            }
+            if !paused
+                && let Some(expires) = c.expires_at_unix_ms
+                && now_unix_ms >= expires
+            {
+                newly_expired.push(c.clone());
+                return false;
+            }
+            c.revoke_state = to;
+            true
+        });
+        for mut c in newly_expired {
+            c.revoke_state = RevokeState::Expired;
+            let grant = credential_grant(&c, &state.unknown_launches);
+            state.record_grant_history(grant);
+        }
+        for g in state.remembered.values_mut() {
+            if g.revoke_state == from {
+                g.revoke_state = to;
             }
         }
         drop(state);
@@ -1942,6 +2221,7 @@ mod tests {
             granted_at_unix_ms: 1,
             launch_key: None,
             revoke_state: RevokeState::Active,
+            expires_at_unix_ms: None,
         }
     }
 
@@ -2094,6 +2374,7 @@ mod tests {
                 granted_at_unix_ms: 1,
                 launch_key: None,
                 revoke_state: RevokeState::Active,
+                expires_at_unix_ms: None,
             }],
             "one credential per service and scope, its hosts merged"
         );
@@ -2180,6 +2461,7 @@ mod tests {
                 granted_at_unix_ms: 3,
                 launch_key: None,
                 revoke_state: RevokeState::Active,
+                expires_at_unix_ms: None,
             }]
         );
     }
@@ -3158,5 +3440,331 @@ mod tests {
         assert_eq!(capability_kind("Bash"), CapabilityKind::Exec);
         assert_eq!(capability_kind("Read"), CapabilityKind::FileRead);
         assert_eq!(capability_kind("Task"), CapabilityKind::Other);
+    }
+
+    // -- #140: suspend/resume, expiry and the retained grant history --------
+
+    #[test]
+    fn pausing_suspends_every_active_grant_and_resuming_reactivates_only_those() {
+        // #140: a grant is never shown as exercisable authority for longer
+        // than the session it belongs to can actually use it.
+        let approvals = Approvals::new();
+        let perms = || vec!["contents:read".to_owned()];
+        approvals.record_credential("github", "github.com", perms(), None, 1);
+        approvals.record_credential("npm", "registry.npmjs.org", perms(), None, 2);
+        approvals.register(approval(1)).unwrap();
+        approvals.answer(1, ApprovalDecision::AllowSession).unwrap();
+        approvals.wait(1, Duration::ZERO);
+        assert_eq!(approvals.grants().len(), 3);
+
+        // One credential is already mid-revoke: pausing must not disturb it.
+        let npm_id = approvals
+            .grants()
+            .iter()
+            .find(|g| g.label == "npm")
+            .unwrap()
+            .id;
+        approvals.begin_revoke_wait(npm_id);
+
+        approvals.set_paused(true);
+        let grants = approvals.grants();
+        assert_eq!(grants.len(), 3, "{grants:?}");
+        for g in &grants {
+            if g.id == npm_id {
+                assert_eq!(g.revoke_state, RevokeState::Revoking, "{g:?}");
+            } else {
+                assert_eq!(g.revoke_state, RevokeState::Suspended, "{g:?}");
+                assert!(g.line().ends_with("   suspended"), "{}", g.line());
+            }
+        }
+
+        approvals.set_paused(false);
+        let grants = approvals.grants();
+        for g in &grants {
+            if g.id == npm_id {
+                assert_eq!(g.revoke_state, RevokeState::Revoking, "{g:?}");
+            } else {
+                assert_eq!(g.revoke_state, RevokeState::Active, "{g:?}");
+                assert!(!g.line().contains("suspended"), "{}", g.line());
+            }
+        }
+
+        // Pausing again with nothing left `Active` (everything `Revoking`
+        // still, once one grant is) never panics and touches nothing it
+        // should not.
+        approvals.set_paused(true);
+        approvals.set_paused(false);
+    }
+
+    #[test]
+    fn a_credential_recorded_while_already_paused_starts_suspended() {
+        // Ordinarily unreachable (a launch is refused while paused), but
+        // never shown as exercisable authority regardless (#140).
+        let approvals = Approvals::new();
+        approvals.set_paused(true);
+        approvals.record_credential(
+            "github",
+            "github.com",
+            vec!["contents:read".into()],
+            None,
+            1,
+        );
+        let grants = approvals.grants();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].revoke_state, RevokeState::Suspended);
+    }
+
+    #[test]
+    fn a_credentials_own_lifetime_running_out_expires_it_into_history() {
+        // #140: real time-based expiry, independent of any revoke ever
+        // being asked for.
+        let approvals = Approvals::new();
+        approvals.record_credential_with_expiry(
+            "github",
+            "github.com",
+            vec!["contents:read".into()],
+            None,
+            1_000,
+            Some(2_000),
+        );
+        // A second credential with no recorded expiry at all: never swept,
+        // however far `now` moves.
+        approvals.record_credential(
+            "npm",
+            "registry.npmjs.org",
+            vec!["contents:read".into()],
+            None,
+            1_000,
+        );
+
+        // Not yet expired at exactly its own expiry instant minus one: still
+        // listed, unchanged.
+        let grants = approvals.grants_at(1_999);
+        assert_eq!(grants.len(), 2, "{grants:?}");
+        assert!(approvals.grant_history_at(1_999).is_empty());
+
+        // At its recorded instant, swept out of the live list and into the
+        // bounded history, without ever being asked to revoke.
+        let grants = approvals.grants_at(2_000);
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].label, "npm");
+        let history = approvals.grant_history_at(2_000);
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0].label, "GitHub");
+        assert_eq!(history[0].revoke_state, RevokeState::Expired);
+        assert!(
+            history[0].line().ends_with("   expired"),
+            "{}",
+            history[0].line()
+        );
+
+        // Idempotent: asking again after it already expired changes nothing
+        // further (it is not still in `credentials` to sweep a second time).
+        assert_eq!(approvals.grants_at(3_000).len(), 1);
+        assert_eq!(approvals.grant_history_at(3_000).len(), 1);
+    }
+
+    #[test]
+    fn credentials_used_by_authority_derivation_sweeps_expiry_without_any_prior_grants_query() {
+        // Review finding on #315 7fa987b: `credentials()` — what
+        // `Served::hold` passes straight to `Deriver::derive` to build the
+        // authority a hook question is answered against — cloned
+        // `state.credentials` with no expiry sweep of its own. An expired
+        // credential therefore kept reporting as present to ordinary
+        // authority derivation indefinitely, unless something else happened
+        // to call `grants`/`grant_history`/a pause/a resume first. Checked
+        // here with *no* such call in between recording the credential and
+        // reading `credentials()`.
+        let approvals = Approvals::new();
+        approvals.record_credential_with_expiry(
+            "github",
+            "github.com",
+            vec!["contents:read".into()],
+            None,
+            1_000,
+            Some(2_000),
+        );
+        assert_eq!(approvals.credentials_at(1_999).len(), 1, "not yet expired");
+
+        assert!(
+            approvals.credentials_at(2_000).is_empty(),
+            "an expired credential must not still be reported to authority derivation"
+        );
+        let history = approvals.grant_history_at(2_000);
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0].revoke_state, RevokeState::Expired);
+    }
+
+    #[test]
+    fn a_suspended_credential_still_expires_on_schedule() {
+        // Review finding on #315 bb51419: the expiry sweep in `grants_at`
+        // kept every non-`Active` credential alive regardless of its own
+        // recorded lifetime, so pausing a session sheltered its credentials
+        // from an expiry that would otherwise have applied. `Suspended` must
+        // be swept exactly like `Active` — only a revoke already in flight
+        // (`Revoking`/`Unconfirmed`) is left alone by the clock.
+        let approvals = Approvals::new();
+        approvals.record_credential_with_expiry(
+            "github",
+            "github.com",
+            vec!["contents:read".into()],
+            None,
+            1_000,
+            Some(2_000),
+        );
+        approvals.set_paused_at_wall(true, Instant::now(), 1_500);
+        assert_eq!(
+            approvals.grants_at(1_999)[0].revoke_state,
+            RevokeState::Suspended,
+            "not yet expired: still suspended, not swept"
+        );
+        assert!(approvals.grant_history_at(1_999).is_empty());
+
+        // Queried again, still paused, exactly at its own recorded expiry
+        // instant: swept into history as `Expired`, not left `Suspended`
+        // forever just because the session never resumed.
+        assert!(
+            approvals.grants_at(2_000).is_empty(),
+            "an expired credential must not still read as a live, suspended grant"
+        );
+        let history = approvals.grant_history_at(2_000);
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0].revoke_state, RevokeState::Expired);
+    }
+
+    #[test]
+    fn resume_does_not_reactivate_a_credential_that_expired_while_suspended() {
+        // Review finding on #315 bb51419: resume flipped every `Suspended`
+        // credential straight back to `Active` with no regard for its own
+        // recorded expiry, so a credential that ran out while the session
+        // was paused could be reported live again, if only briefly, purely
+        // because the session resumed.
+        let approvals = Approvals::new();
+        approvals.record_credential_with_expiry(
+            "github",
+            "github.com",
+            vec!["contents:read".into()],
+            None,
+            1_000,
+            Some(2_000),
+        );
+        approvals.set_paused_at_wall(true, Instant::now(), 1_500);
+        assert_eq!(
+            approvals.grants_at(1_500)[0].revoke_state,
+            RevokeState::Suspended
+        );
+
+        // Resumed only after the credential's own lifetime already ran out
+        // while it was suspended: the resume transition itself must retire
+        // it as `Expired`, never hand it back as a reactivated `Active`
+        // grant even for the instant before the next `grants`/`grant_history`
+        // sweep would have caught it. Checked via the raw, non-sweeping
+        // `credentials()` accessor (also read directly by, e.g., the
+        // command-display path) so a resume that skipped its own expiry
+        // check — leaving the credential briefly `Active` in `state.credentials`
+        // until some other call happened to sweep it — cannot hide behind a
+        // `grants()` call that would immediately re-sweep it anyway.
+        approvals.set_paused_at_wall(false, Instant::now(), 2_500);
+        assert!(
+            approvals.credentials().is_empty(),
+            "resume must not reactivate an already-expired credential, even transiently"
+        );
+        assert!(approvals.grants().is_empty());
+        let history = approvals.grant_history();
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0].revoke_state, RevokeState::Expired);
+    }
+
+    #[test]
+    fn a_confirmed_revoke_retains_the_grant_in_history_instead_of_deleting_it() {
+        // #140's acceptance criterion: history remains inspectable.
+        let approvals = Approvals::new();
+        approvals.record_credential(
+            "github",
+            "github.com",
+            vec!["contents:read".into()],
+            None,
+            1,
+        );
+        let id = approvals.grants()[0].id;
+
+        approvals.begin_revoke_wait(id);
+        approvals.finish_revoke(id, &RevokeOutcome::Withdrawn);
+
+        assert!(approvals.grants().is_empty());
+        let history = approvals.grant_history();
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0].id, id);
+        assert_eq!(history[0].revoke_state, RevokeState::Revoked);
+        assert!(
+            history[0].line().ends_with("   revoked"),
+            "{}",
+            history[0].line()
+        );
+
+        // An unconfirmed revoke, by contrast, never enters the history: the
+        // grant is not retired at all (#245).
+        approvals.record_credential(
+            "npm",
+            "registry.npmjs.org",
+            vec!["contents:read".into()],
+            None,
+            2,
+        );
+        let npm_id = approvals.grants()[0].id;
+        approvals.begin_revoke_wait(npm_id);
+        approvals.finish_revoke(npm_id, &RevokeOutcome::Unconfirmed);
+        assert_eq!(
+            approvals.grant_history().len(),
+            1,
+            "unconfirmed must not enter history"
+        );
+    }
+
+    #[test]
+    fn revoking_an_allow_session_answer_retains_it_in_history_too() {
+        // #140: an `allow-session` grant has no proxy route to wait on, so
+        // its revoke is immediate — but it must not vanish with no trace any
+        // more than a credential's does.
+        let approvals = Approvals::new();
+        approvals.register(approval(1)).unwrap();
+        approvals.answer(1, ApprovalDecision::AllowSession).unwrap();
+        approvals.wait(1, Duration::ZERO);
+        let id = approvals.grants()[0].id;
+
+        assert!(matches!(
+            approvals.begin_revoke_wait(id),
+            Some(RevokeStart::Approval)
+        ));
+        assert!(approvals.grants().is_empty());
+        let history = approvals.grant_history();
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0].id, id);
+        assert_eq!(history[0].revoke_state, RevokeState::Revoked);
+    }
+
+    #[test]
+    fn grant_history_is_bounded_oldest_dropped_first() {
+        let approvals = Approvals::new();
+        for i in 0..(GRANT_HISTORY_CAP as u64 + 3) {
+            approvals.record_credential(
+                "github",
+                "github.com",
+                vec!["contents:read".into()],
+                None,
+                i,
+            );
+            let id = approvals.grants()[0].id;
+            approvals.begin_revoke_wait(id);
+            approvals.finish_revoke(id, &RevokeOutcome::Withdrawn);
+        }
+        let history = approvals.grant_history();
+        assert_eq!(history.len(), GRANT_HISTORY_CAP);
+        // The oldest three were evicted; the earliest remaining is #3.
+        assert_eq!(history.first().unwrap().granted_at_unix_ms, 3);
+        assert_eq!(
+            history.last().unwrap().granted_at_unix_ms,
+            GRANT_HISTORY_CAP as u64 + 2
+        );
     }
 }
