@@ -99,7 +99,60 @@ mock wardos-menu-select 'if [[ $2 == Grants ]]; then
 else
   printf "%s\n" Revoke
 fi'
-for bad in 999 "not a listed grant"; do
+for bad in 999 "not a listed grant" 
+  : >"$MOCK_LOG"
+  export WARDOS_MENU_OUTPUT=$bad
+  set +e
+  "$grants"
+  status=$?
+  set -e
+  [[ $status -ne 0 ]] || fail "unlisted menu output must fail closed"
+  assert_not_logged '^ward session revoke '
+done
+
+# --- unconfirmed is visibly failure, with the CLI's exact warning preserved ----
+: >"$MOCK_LOG"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session select --show") echo "sess_a" ;;
+  "session grants --session sess_a --json") printf "%s\n" "$CREDENTIAL" ;;
+  "session revoke 7 --session sess_a")
+    echo "  grant 7 could not be confirmed revoked; it may still be in effect - see \`ward session grants\`"
+    exit 1
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# shellcheck disable=SC2016
+mock wardos-menu-select 'case "$2" in
+  Grants) grep -m1 "^7$(printf "\t")" ;;
+  "Revoke grant 7?") printf "%s\n" Revoke ;;
+  *) exit 1 ;;
+esac'
+set +e
+"$grants"
+status=$?
+set -e
+[[ $status -ne 0 ]] || fail "an unconfirmed revoke must fail"
+assert_logged '^ward session revoke 7 --session sess_a$'
+assert_logged 'notify-send -a WardOS -u critical -t 8000 Grant revoke result .*could not be confirmed revoked; it may still be in effect'
+
+# --- an in-flight success remains a success and keeps the warning ----------------
+: >"$MOCK_LOG"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session select --show") echo "sess_a" ;;
+  "session grants --session sess_a --json") printf "%s\n" "$CREDENTIAL" ;;
+  "session revoke 7 --session sess_a")
+    echo "  grant 7 revoked - 2 connections already using it will finish on their own"
+    ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+"$grants"
+assert_logged 'notify-send -a WardOS -t 6000 Grant revoke result .*2 connections already using it will finish on their own$'
+
+head -1 "$grants" | grep -q '^#!/usr/bin/env bash$' || fail "shebang"
+grep -q '^set -euo pipefail$' "$grants" || fail "strict mode"
+two lines\nfrom the menu'; do
   : >"$MOCK_LOG"
   export WARDOS_MENU_OUTPUT=$bad
   set +e
