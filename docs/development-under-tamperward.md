@@ -204,6 +204,20 @@ can never grant itself the sign-off it needs. Concretely:
   skip, guard removal, or assertion weakening in the protected diff as a hold: those need
   the same scrutiny as a suppression, and are grounds to withhold sign-off even if the
   visible suite and the stated intent look reasonable.
+
+The two bullets below, between the `reviewed-block` markers, are the only place
+in this document allowed to describe whether a legacy label's abbreviated SHA
+`prefix` is accepted.
+[`tamperward-signoff-doc.py`](../scripts/security-check/tamperward-signoff-doc.py)
+fails the build if that word appears in this document's prose outside this
+block, and separately pins this block's exact content by a stored hash:
+editing it requires updating that hash in the same pull request, which is
+itself a `scripts/security-check/**`-protected, reviewed path. (Issue #320's
+review found three rounds of a regex heuristic for "is this claim negated"
+each defeated by a new paraphrase; this location constraint plus content pin
+replaces that heuristic rather than extending it further.)
+
+<!-- tamperward-prefix-guidance:reviewed-block:start -->
 * **How, today — the compact head-bound token (canonical).** Generate one with:
 
   ```
@@ -250,6 +264,7 @@ can never grant itself the sign-off it needs. Concretely:
   be the literal, complete 40-character head object id to have a chance of matching,
   which cannot fit the label cap — so treat any legacy label seen on a PR here as
   inert, not as a granted sign-off, and reissue a `tw1:` token instead.
+<!-- tamperward-prefix-guidance:reviewed-block:end -->
 * **What it does not clear** — a red *visible* suite, a run that could not execute, or any
   other failing rule. A `tw1:` sign-off clears only a masked failure on the rule (and file,
   where scoped) it was generated for, on that one head SHA; nothing else.
