@@ -430,7 +430,6 @@ mod tests {
                 },
                 expires: Duration::from_secs(60),
                 delivery: CredentialDelivery::ProxyInjected,
-                launch_seq: None,
             }])
             .remove(0),
         );

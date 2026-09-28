@@ -504,6 +504,9 @@ fn summary(event: &WardEvent) -> String {
             },
             if *degraded { " · degraded" } else { "" }
         ),
+        WardEvent::CredentialGrantedLaunch { launch_seq } => {
+            format!("launch_seq {launch_seq}")
+        }
         WardEvent::NetworkRequested { .. }
         | WardEvent::NetworkDenied { .. }
         | WardEvent::CapabilityRequested { .. }
@@ -666,7 +669,6 @@ mod tests {
                 },
                 expires: Duration::from_secs(600),
                 delivery: CredentialDelivery::ProxyInjected,
-                launch_seq: None,
             },
             WardEvent::CommandFinished {
                 pid: Pid::new(7).unwrap(),

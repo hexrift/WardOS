@@ -154,11 +154,11 @@ impl Gateway {
     /// The grant as recorded in the log. Its validity is the launch: the route is
     /// torn down with the session proxy when the command exits.
     ///
-    /// `launch_seq` is always `None` here: the client building this event has no
-    /// way to know which launch the daemon will attribute it to (PR #318 review
-    /// round 2, finding 2) -- `ward-daemon::daemon::Served::handle_appendable`
-    /// stamps the real value in from its own `open_launches` before the record is
-    /// ever persisted, the same way it owns `EventRecord::ts_wall`.
+    /// Carries no launch identity of its own: `ward-daemon::daemon::Served::handle_appendable`
+    /// appends a second `WardEvent::CredentialGrantedLaunch` record right after this one,
+    /// stamped from its own `open_launches`, when it can attribute this grant to a launch
+    /// it is tracking (PR #318 review round 3) -- this client has no way to know that
+    /// value in advance, the same way it does not own `EventRecord::ts_wall`.
     pub fn granted(&self, expires: core::time::Duration) -> Result<WardEvent> {
         Ok(WardEvent::CredentialGranted {
             service: ServiceId::new(&self.service).map_err(|e| Error::Events(e.to_string()))?,
@@ -168,7 +168,6 @@ impl Gateway {
             },
             expires,
             delivery: CredentialDelivery::ProxyInjected,
-            launch_seq: None,
         })
     }
 }
