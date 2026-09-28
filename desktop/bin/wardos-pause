@@ -39,6 +39,26 @@ session_flag=()
 # must never inspect a different one just because they disagree).
 status() { ward pause --status "${session_flag[@]}" "$project" 2>/dev/null || echo none; }
 
+# `ward pause`/`ward resume` print a leading "resolved-session: <id> <project>"
+# line naming the session they actually acted on — which, with no WARDOS_SESSION
+# pinned, can be the desktop's shared selection or the newest live session rather
+# than $project itself (#141 finding 3: a no-argument toggle must never let its
+# confirmation imply it acted on the directory the caller happened to be in when
+# it acted on a different live session's fallback pick instead). Extracted here
+# so the one notification a keybind press actually shows says which project was
+# paused/resumed, not just that some session was.
+resolved_project() {
+  local line rest
+  while IFS= read -r line; do
+    if [[ $line == *"resolved-session: "* ]]; then
+      rest=${line#*resolved-session: }
+      printf '%s\n' "${rest#* }"
+      return 0
+    fi
+  done <<<"$1"
+  return 0 # no such line (unexpected older `ward`): never abort the caller under -e
+}
+
 # The one notification of a pause (ADR-0019 §3), critical so it stays until read.
 # `ward pause` can legitimately end in an *unsettled* freeze (the marker is held and
 # approvals stay suspended, but not every sandboxed process is confirmed stopped yet —
@@ -46,26 +66,31 @@ status() { ward pause --status "${session_flag[@]}" "$project" 2>/dev/null || ec
 # the same "processes frozen" text either way, since this is the one notification most
 # users actually see for a keybind-triggered pause with no terminal visible.
 do_pause() {
-  local out
+  local out resolved
   out=$(ward pause "${session_flag[@]}" "$project")
   # Captured to read the outcome below; still shown to a terminal user as before.
   [[ -n $out ]] && printf '%s\n' "$out"
+  resolved=$(resolved_project "$out")
+  [[ -n $resolved ]] && resolved="$resolved · "
   if [[ $out =~ ([0-9]+)\ process(es)?\ had\ not\ confirmed\ stopped ]]; then
     local pending=${BASH_REMATCH[1]} plural=""
     [[ $pending != 1 ]] && plural="es"
     wardos_notify "AGENTS PAUSING" \
-      "network closed · credential grants suspended · $pending process$plural not yet confirmed stopped · workspace retained" \
+      "${resolved}network closed · credential grants suspended · $pending process$plural not yet confirmed stopped · workspace retained" \
       -u critical
   else
     wardos_notify "AGENTS PAUSED" \
-      "network closed · credential grants suspended · processes frozen · workspace retained" \
+      "${resolved}network closed · credential grants suspended · processes frozen · workspace retained" \
       -u critical
   fi
 }
 
 do_resume() {
-  ward resume "${session_flag[@]}" "$project"
-  wardos_notify "Agents resumed" "" -t 2000
+  local out resolved
+  out=$(ward resume "${session_flag[@]}" "$project")
+  [[ -n $out ]] && printf '%s\n' "$out"
+  resolved=$(resolved_project "$out")
+  wardos_notify "Agents resumed" "$resolved" -t 2000
 }
 
 # "Pause all sessions" (#141 item 5): every live session, not just this one, each its own

@@ -32,18 +32,34 @@ mock ward 'case "$*" in
     ;;
   "pause --session "*)
     echo paused >"$WARD_STATE_FILE"
+    if [[ -f "$TMP/pause-resolved" ]]; then
+      printf "  resolved-session: sess_fallback /home/dev/other-project\n"
+    fi
     if [[ -f "$TMP/pause-unsettled" ]]; then
       printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
     fi
     ;;
   "pause "*)
     echo paused >"$WARD_STATE_FILE"
+    if [[ -f "$TMP/pause-resolved" ]]; then
+      printf "  resolved-session: sess_fallback /home/dev/other-project\n"
+    fi
     if [[ -f "$TMP/pause-unsettled" ]]; then
       printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
     fi
     ;;
-  "resume --session "*) echo running >"$WARD_STATE_FILE" ;;
-  "resume "*) echo running >"$WARD_STATE_FILE" ;;
+  "resume --session "*)
+    echo running >"$WARD_STATE_FILE"
+    if [[ -f "$TMP/pause-resolved" ]]; then
+      printf "  resolved-session: sess_fallback /home/dev/other-project\n"
+    fi
+    ;;
+  "resume "*)
+    echo running >"$WARD_STATE_FILE"
+    if [[ -f "$TMP/pause-resolved" ]]; then
+      printf "  resolved-session: sess_fallback /home/dev/other-project\n"
+    fi
+    ;;
   "stop "*) echo none >"$WARD_STATE_FILE" ;;
   "watch "*) : ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -72,6 +88,20 @@ assert_logged '^ward pause /home/dev/payments-api$'
 assert_logged '^notify-send -a WardOS -u critical AGENTS PAUSING network closed · credential grants suspended · 2 processes not yet confirmed stopped · workspace retained$'
 assert_not_logged 'AGENTS PAUSED network closed'
 rm -f "$TMP/pause-unsettled"
+assert_eq "$(cat "$WARD_STATE_FILE")" running
+
+# --- an unpinned pause/resume that resolves to a different live session than
+# $WARDOS_PROJECT (the desktop's shared selection or newest-live fallback, #141
+# finding 3) must say so in the one notification a keybind press shows — never
+# let the acknowledgement imply it acted on $WARDOS_PROJECT when `ward` itself
+# named a different resolved project ---
+: >"$MOCK_LOG"
+echo running >"$WARD_STATE_FILE"
+touch "$TMP/pause-resolved"
+WARDOS_MENU_CHOICE=Resume "$pause"
+assert_logged '^notify-send -a WardOS -u critical AGENTS PAUSED /home/dev/other-project · network closed · credential grants suspended · processes frozen · workspace retained$'
+assert_logged '^notify-send -a WardOS -t 2000 Agents resumed /home/dev/other-project$'
+rm -f "$TMP/pause-resolved"
 assert_eq "$(cat "$WARD_STATE_FILE")" running
 
 # --- already paused: the menu alone; Stop & preserve keeps the workspace -------

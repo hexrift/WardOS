@@ -1756,6 +1756,19 @@ fn pause_status_word(
 /// session named" means, instead of independently falling back to its own
 /// notion of the current one (#141's evidence against the old
 /// `client::socket_path`-only resolution here).
+/// Which session `desktop_socket` actually resolved to. A caller that pins no
+/// session (`wardos-pause` with no `WARDOS_SESSION`, run from a directory with
+/// no session of its own) can be handed back the desktop's shared selection or
+/// the newest live session instead — silently a different project than the one
+/// named on the command line (#141 finding 3). Printing this makes the
+/// resolved project explicit in the confirmation instead of letting it read as
+/// confirmation of whatever directory the caller asked about.
+fn resolved_session_line(state: &Path, socket: &Path) -> Option<String> {
+    let id = socket.parent()?.file_name()?.to_str()?;
+    let meta = SessionMeta::load(state, id).ok()?;
+    Some(format!("resolved-session: {id} {}", meta.project.display()))
+}
+
 fn cmd_pause(
     dir: &Path,
     session: Option<&str>,
@@ -1808,7 +1821,11 @@ fn cmd_pause(
             ExitCode::SUCCESS
         });
     }
-    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
+    let socket = client::desktop_socket(dir, &state, session)?;
+    if let Some(line) = resolved_session_line(&state, &socket) {
+        println!("  {line}");
+    }
+    let mut sink = client::connect(&socket)?;
     let outcome = client::pause(&mut sink, reason.unwrap_or_default())?;
     if let Some(row) = render::observer_row(&outcome.record) {
         println!("{row}");
@@ -1834,7 +1851,11 @@ fn cmd_pause(
 /// `ward resume`: the daemon reverses the pause and answers with its record.
 fn cmd_resume(dir: &Path, session: Option<&str>) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
-    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
+    let socket = client::desktop_socket(dir, &state, session)?;
+    if let Some(line) = resolved_session_line(&state, &socket) {
+        println!("  {line}");
+    }
+    let mut sink = client::connect(&socket)?;
     let record = client::resume(&mut sink)?;
     if let Some(row) = render::observer_row(&record) {
         println!("{row}");
@@ -2020,7 +2041,7 @@ mod tests {
     use super::{
         Cli, Command, SessionCmd, SnapshotCmd, WatchMode, approvals_all_line, desktop_command,
         observer_degraded_warning, on_path_in, pause_status_word, pending_all_line, pending_text,
-        unreachable_line, verb_program,
+        resolved_session_line, unreachable_line, verb_program,
     };
     use clap::Parser as _;
     use std::time::Duration;
@@ -2068,6 +2089,34 @@ mod tests {
         assert_eq!(verb_program("../etc/passwd"), None);
         assert_eq!(verb_program("a/b"), None);
         assert_eq!(verb_program("-rf"), None);
+    }
+
+    #[test]
+    fn resolved_session_line_names_the_session_actually_behind_the_socket() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = ward_daemon::Session::start_in(project.path(), state.path()).unwrap();
+        session.persist_current().unwrap();
+        let id = session.id().to_owned();
+        drop(session);
+
+        let socket = ward_daemon::session::session_dir(state.path(), &id).join("control.sock");
+        let line = resolved_session_line(state.path(), &socket).unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "resolved-session: {id} {}",
+                project.path().canonicalize().unwrap().display()
+            )
+        );
+    }
+
+    #[test]
+    fn resolved_session_line_is_none_for_an_unknown_session() {
+        let state = tempfile::tempdir().unwrap();
+        let socket =
+            ward_daemon::session::session_dir(state.path(), "sess_missing").join("control.sock");
+        assert!(resolved_session_line(state.path(), &socket).is_none());
     }
 
     #[test]
