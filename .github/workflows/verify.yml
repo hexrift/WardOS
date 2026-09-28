@@ -100,6 +100,7 @@ jobs:
       # The TamperWard sign-off guidance (docs/development-under-tamperward.md §4.4)
       # names the pinned CLI version and its actual out-of-band sign-off mechanics
       # (tamperward.yml); keep the two from drifting apart again (issue #320).
+      - run: bash scripts/security-check/tamperward-signoff-doc.test.sh
       - run: python3 scripts/security-check/tamperward-signoff-doc.py
 
   # The host image (image/) cannot be built or booted here; keep it lintable instead.
