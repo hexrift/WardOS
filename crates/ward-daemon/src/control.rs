@@ -306,9 +306,26 @@ impl LocalLog {
 
 impl Sink for LocalLog {
     fn append(&mut self, origin: Origin, event: WardEvent, at: SystemTime) -> Result<EventRecord> {
+        // `ts_mono` still comes from `at` (the capture time `Session::launch`
+        // etc. supplied, possibly over the wire as `Request::Append`'s
+        // `at_unix_ms`) via `ts_at`, unchanged. `ts_wall` is instead read
+        // right here, at the moment this daemon actually commits the record
+        // — never from `at` (PR #318 review, finding 3): a client-supplied
+        // capture time can lag behind when the daemon actually appends (a
+        // slow send, a busy socket), and `Served::handle_appendable` used to
+        // read a *second*, independent `SystemTime::now()` after append for
+        // `Credential::granted_at_unix_ms` — two different clock reads for
+        // what is supposed to be the one instant a credential was granted.
+        // Populating `ts_wall` here and having `handle_appendable` read it
+        // back from the record it just got makes them the same read.
+        // `chain.rs`'s own module doc already excludes `ts_wall` from the
+        // hash (`session, ts_mono and ts_wall are *not* part of the hash`),
+        // so this touches nothing TamperWard-protected.
+        let mut ts = ts_at(self.started, at);
+        ts.wall = Some(SystemTime::now());
         let record = self
             .chain
-            .append(origin, event, ts_at(self.started, at))
+            .append(origin, event, ts)
             .map_err(|e| Error::Events(e.to_string()))?;
         self.log
             .append(&record)
@@ -741,6 +758,34 @@ mod tests {
         assert_eq!(
             ts_at(started, started - Duration::from_secs(1)).mono,
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn local_log_append_stamps_ts_wall_from_its_own_clock_not_the_capture_time() {
+        // PR #318 review, finding 3: a record's `ts_wall` used to stay `None`
+        // forever on every real append (`ts_at` only ever sets `mono`) —
+        // this projection's whole expiry feature was inert in production as
+        // a result. `LocalLog::append` must now populate it from the
+        // daemon's own `SystemTime::now()` at the moment of append, and —
+        // the actual bug finding 3 describes — it must do so from *that*
+        // clock, never from the caller-supplied `at` (a stale capture time
+        // stands in here for a delayed append: a slow send, a busy socket).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = fresh(dir.path());
+        let stale_capture = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let before = SystemTime::now();
+        let record = Sink::append(&mut log, Origin::Wardd, working(), stale_capture).unwrap();
+        let after = SystemTime::now();
+        let ts_wall = record.ts_wall.expect("ts_wall is now always populated");
+        assert!(
+            ts_wall >= before && ts_wall <= after,
+            "ts_wall must be this append's own real-time instant, not the \
+             stale capture time {stale_capture:?}"
+        );
+        assert_ne!(
+            ts_wall, stale_capture,
+            "must not merely echo back the caller-supplied capture time"
         );
     }
 

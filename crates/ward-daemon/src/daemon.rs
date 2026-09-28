@@ -662,7 +662,23 @@ impl Served {
                 let host = subject
                     .rsplit_once(':')
                     .map_or(subject.as_str(), |(h, _)| h);
-                let granted_at_unix_ms = control::unix_ms(SystemTime::now());
+                // Read from the record this very append just committed
+                // rather than taking a second, independent `SystemTime::now()`
+                // (PR #318 review, finding 3): `LocalLog::append` (`control.rs`)
+                // now always stamps `ts_wall` with the daemon's own
+                // `SystemTime::now()` at the moment of append, so this and
+                // the persisted/replayed `EventRecord.ts_wall` the shell/
+                // desktop panel projection reads (`ward-shell-core::authority`)
+                // are the exact same instant, not two clock reads that a
+                // delayed append could pull apart. The fallback is defensive
+                // only — unreachable in practice post-fix, since every
+                // `Sink::append` path now populates `ts_wall` — so a `None`
+                // here (an older log format, or `Sink` implementation this
+                // daemon does not control) still produces a sane bound
+                // instead of panicking or nonsense-dating the grant.
+                let granted_at_unix_ms = record
+                    .ts_wall
+                    .map_or_else(|| control::unix_ms(SystemTime::now()), control::unix_ms);
                 // The instant this credential's own recorded lifetime runs out
                 // (#140): `granted_at_unix_ms` plus the event's own `expires`,
                 // saturating rather than overflowing on a pathological huge
@@ -2522,6 +2538,73 @@ mod tests {
             2,
             "a denial grants nothing"
         );
+    }
+
+    /// PR #318 review, finding 3: `Credential::granted_at_unix_ms` (and so
+    /// its `expires_at_unix_ms`) must come from the same instant this
+    /// append's own `EventRecord.ts_wall` is persisted with — the exact
+    /// value `ward-shell-core::authority`'s panel projection reads back —
+    /// not from a second, independent `SystemTime::now()` read in
+    /// `Served::handle_appendable`. A delayed append (a client-supplied
+    /// `at_unix_ms` far in the past — a slow send, a busy socket) must not
+    /// be able to pull those two apart: both must still land at the
+    /// daemon's own real append-time clock, not the stale client capture
+    /// time.
+    #[test]
+    fn a_delayed_appends_stale_capture_time_does_not_skew_the_grants_own_deadline() {
+        use ward_events::{CredentialDelivery, NameText, Scope, ServiceId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let granted = WardEvent::CredentialGranted {
+            service: ServiceId::new("github").unwrap(),
+            scope: Scope {
+                subject: ShortText::new("github.com:443"),
+                permissions: vec![NameText::new("contents:read")],
+            },
+            expires: Duration::from_secs(60),
+            delivery: CredentialDelivery::ProxyInjected,
+        };
+        let before = control::unix_ms(SystemTime::now());
+        // A capture time from decades before this append actually reaches
+        // the daemon: exactly the "delayed append" the review's finding 3
+        // describes, deliberately exaggerated so a bug that leaks this
+        // stale value into either clock read is unmistakable.
+        let (response, _) = lock(&served).handle(Request::Append {
+            origin: Origin::Wardd,
+            event: granted,
+            at_unix_ms: 0,
+        });
+        let after = control::unix_ms(SystemTime::now());
+        let record = match response {
+            Response::Granted { record, .. } => record,
+            other => panic!("{other:?}"),
+        };
+
+        // The persisted record's own wall clock is the daemon's real
+        // append-time instant, not the stale client-supplied capture time.
+        let ts_wall_ms = record
+            .ts_wall
+            .map(control::unix_ms)
+            .expect("ts_wall is now always populated on append");
+        assert!(
+            (before..=after).contains(&ts_wall_ms),
+            "ts_wall {ts_wall_ms} must fall within [{before}, {after}], not near 0"
+        );
+
+        // The daemon's own in-memory grant shares that exact same instant —
+        // read back from the record, not a second independent clock call.
+        let grants = match lock(&served).handle(Request::Grants).0 {
+            Response::Grants(g) => g,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(
+            grants[0].granted_at_unix_ms, ts_wall_ms,
+            "the daemon's own Credential and the persisted record must agree \
+             on the exact instant the credential was granted"
+        );
+        assert!((before..=after).contains(&grants[0].granted_at_unix_ms));
     }
 
     /// A credential's grant id in a fresh `Served`, with a `CredentialGranted`
