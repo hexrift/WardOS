@@ -204,75 +204,54 @@ can never grant itself the sign-off it needs. Concretely:
   skip, guard removal, or assertion weakening in the protected diff as a hold: those need
   the same scrutiny as a suppression, and are grounds to withhold sign-off even if the
   visible suite and the stated intent look reasonable.
-* **How, today — a non-authoritative fallback, not a closed control.** Until the mechanism
-  in the next paragraph is adopted, apply the label `tamperward:allow:verify@<sha-prefix>`
-  to the pull request. **GitHub label names are capped at 50 characters**;
-  `tamperward:allow:verify@` alone is 24, leaving 26 for the SHA, so a full 40-character SHA
-  (64 characters total) is rejected by GitHub outright — this was hit and confirmed in
-  practice against this repository (see #203) before this note was added. `tamperward`'s own
-  OOB-signoff matcher (`oobToken` in the CLI) accepts any *prefix* of the head SHA that is at
-  least 7 hex characters (`sha.length >= 7 && head.startsWith(sha)`) — it is a prefix match,
-  not an equality check against the full object id, so treat the label as authorizing "a
-  commit whose id starts with this prefix," not "this exact commit and no other." Use the
-  longest prefix the cap allows — `tamperward:allow:verify@` + a 26-character abbreviation
-  (`git rev-parse --short=26 <head-sha>`, exactly 50 characters) — rather than a shorter one;
-  there is no reason to spend less of the budget than the cap allows. But do not read a
-  longer prefix as closing the risk: a naive preimage-search framing (fix the approved head,
-  brute-force a colliding successor) would put a 104-bit prefix out of reach, but that is the
-  wrong model here. The party this label is meant to constrain can typically influence *both*
-  sides of the match — the head that gets reviewed and labeled, and the successor pushed
-  afterward — which makes this a **chosen-prefix / birthday-style search**, not a plain
-  preimage search: with freedom to vary superficial bits of a candidate on both ends (commit
-  timestamps, trailing whitespace, blank lines, other content a reviewer would not weigh),
-  the generic cost of finding *some* pair that shares a target prefix scales with the square
-  root of the prefix's bit length, roughly 2^52 work for this 104-bit prefix rather than
-  2^104. The right citation for this being a real, demonstrated attack *class* against SHA-1
-  — not merely a textbook one — is "SHA-1 is a Shambles" (Leurent & Peyrin, USENIX Security
-  2020), which produced two inputs with attacker-chosen, independent prefixes colliding after
-  appended near-collision blocks, at a reported cost of about 2^63.4 SHA-1 evaluations. (The
-  earlier 2017 SHAttered result was an identical-prefix collision — the same shared prefix on
-  both sides — a materially easier, different attack; not the right citation for a
-  chosen-prefix claim.) **2^63.4 and 2^52 are not the same order of magnitude — about 2^11.4,
-  roughly 2,700×, apart** — because they answer different questions: the paper's figure is
-  the engineered cost of a *full* 160-bit chosen-prefix collision against unmodified SHA-1,
-  using structure specific to the hash function that beats the generic square-root bound for
-  a full-length target; the 2^52 figure here is the *generic*, structure-agnostic bound for
-  matching only a 104-bit *truncated* prefix of a commit id, a smaller and easier target by
-  construction. The paper is cited only to establish that chosen-prefix attacks against SHA-1
-  are a real, practically-demonstrated capability, not a hypothetical one — not as a
-  measurement of this specific 104-bit target's cost, which has no known engineered attack
-  faster than the generic 2^52 estimate. That estimate alone is what should be weighed: a
-  real, if expensive, budget for a well-resourced adversary, not a theoretical one — so the
-  26-character prefix is a meaningfully stronger fallback than the
-  12-character guidance it replaces, but it is a **temporary, non-authoritative compatibility
-  fallback**, not a resolution of the underlying gap: it does not by itself close #203, and
-  should not be cited as though it does. The gate reads labels from the triggering event
-  (`labeled`/`unlabeled` are both in the workflow's `on.pull_request.types`), so applying it
-  re-runs the check rather than requiring a new push. An *ordinary* later push — one nobody
-  deliberately ground to match — normally stops matching the label's prefix and needs a fresh
-  one bound to the new head, which is what makes a routine rebase behave as intended
-  (§ci-tampering's whole point is that a sign-off can't quietly outlive the diff it was read
-  against). **That is not a security guarantee against the attack this section just
-  described**: a successor deliberately prepared to share the labeled prefix remains
-  authorized by a label nobody removed. Do not rely on a later push to invalidate a stale
-  label — remove the label itself (or downgrade to the strongest available mechanism at that
-  point) as soon as the PR it was granted on merges, closes, or gets a head that no longer
-  needs it; the removal is the control, not the push.
-* **How, once available — the actual resolution.** A full-object-id sign-off mechanism that
-  fits GitHub's label-length cap without relying on a display-SHA prefix at all (e.g. a
-  versioned, hashed token binding the rule, optional file, and the complete head object id)
-  closes the gap the paragraph above only narrows. Adopting one is *not* something this
-  documentation PR can do from inside this repository: it depends on that mechanism actually
-  being released by the `tamperward` project this repo consumes from the npm registry (see
-  `.github/workflows/tamperward.yml`'s pinned `tamperward@2.10.3`), which is out of this
-  repository's control and outside what this session can independently verify. Once a
-  release is confirmed to exist and to do what it claims, adopting it is: bump the pinned
-  version in `tamperward.yml`, update this section with its actual label/token format and
-  CLI invocation, and replace the fallback above rather than keep it as a second path. Track
-  that adoption as its own follow-up rather than assuming it here.
+* **How, today — the compact head-bound token (canonical).** Generate one with:
+
+  ```
+  npx --yes tamperward@2.33.0 signoff-label --rule verify --head <full-head-sha>
+  ```
+
+  (or `--rule check` for a diff-time-gate sign-off, and `--file <path>` when the rule
+  is file-scoped), and apply the resulting `tw1:<digest>` label to the pull request.
+  This is the mechanism `.github/workflows/tamperward.yml`'s pinned `tamperward@2.33.0`
+  actually verifies against: a short, opaque, versioned token that hashes the rule, the
+  optional file, and the **complete** head object id — never a truncated display SHA —
+  so it fits GitHub's 50-character label-name cap without relying on a prefix at all. It
+  is bound to one exact head: an *ordinary* later push (one nobody deliberately crafted)
+  no longer matches, and needs a fresh token for the new head, which is what makes a
+  routine rebase or merge-from-main behave as intended (§ci-tampering's whole point is
+  that a sign-off can't quietly outlive the diff it was read against — see #318's own
+  PR thread for a worked example of a sign-off going stale across three separate
+  `main`-syncs). Still remove the label itself as soon as the PR it was granted on
+  merges, closes, or gets a head that no longer needs it — a label a maintainer forgot
+  to remove is a standing authorization, and the removal is the control, not the next
+  push.
+* **The legacy `tamperward:allow:<rule>@<sha>` label is accepted by the workflow's label
+  resolver but does not work against this pin — do not use it.** Earlier guidance here
+  described applying `tamperward:allow:verify@<sha-prefix>` (a 26-character abbreviation,
+  the longest that fits alongside the `tamperward:allow:verify@` prefix under GitHub's
+  50-character label cap) as a fallback, reasoning that `tamperward`'s `oobToken` matcher
+  accepted any prefix of the head SHA that was at least 7 hex characters. That is no
+  longer how the pinned CLI behaves: under `tamperward@2.33.0`, once a full head SHA is
+  supplied — which this repository's workflow always does, via `TAMPERWARD_OOB_HEAD`
+  — `oobToken` requires a legacy label's SHA to equal that **full** 40-character object
+  id; a prefix is rejected outright, not treated as a weaker-but-valid match. Since a
+  legacy label's SHA portion is capped at 26 characters by the label-name limit, it can
+  *never* equal a full 40-character SHA against this workflow's configuration, so this
+  path cannot clear a check here at all, however it is applied. This was hit and
+  confirmed in practice on PR #318 — a correctly-formed 26-character legacy label was
+  applied, `tamperward-verify` still failed the same way, and only re-applying the
+  sign-off as a `tw1:` compact token cleared it (see #320 for the full incident). The
+  resolver step in `tamperward.yml` still recognizes a `tamperward:allow:` label
+  (alongside `tw1:` ones) and passes it through to `TAMPERWARD_OOB_SIGNOFF` — that is
+  compatibility for *other* deployments of `tamperward` that may not require a full head
+  match, not evidence that the legacy path works here. Prefer the `tw1:` token above in
+  every case; if a legacy label is ever proposed as the sign-off, its SHA would need to
+  be the literal, complete 40-character head object id to have a chance of matching,
+  which cannot fit the label cap — so treat any legacy label seen on a PR here as
+  inert, not as a granted sign-off, and reissue a `tw1:` token instead.
 * **What it does not clear** — a red *visible* suite, a run that could not execute, or any
-  other failing rule. `tamperward:allow:verify@<sha>` clears only a masked failure on the
-  `verify` rule for that one SHA; nothing else.
+  other failing rule. A `tw1:` sign-off clears only a masked failure on the rule (and file,
+  where scoped) it was generated for, on that one head SHA; nothing else.
 * **Current limits on this being an authoritative control** — branch protection on `main`
   does not yet require the `tamperward`/`tamperward-verify` checks or Code Owner review, and
   CODEOWNERS does not yet cover `.github/workflows/**`. Until both are true, a pull request

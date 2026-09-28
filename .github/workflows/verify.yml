@@ -97,6 +97,10 @@ jobs:
       # One status source (ADR-0019): docs/status.toml and the README agree, and no other
       # document states a phase of its own.
       - run: python3 scripts/security-check/doc-status.py
+      # The TamperWard sign-off guidance (docs/development-under-tamperward.md §4.4)
+      # names the pinned CLI version and its actual out-of-band sign-off mechanics
+      # (tamperward.yml); keep the two from drifting apart again (issue #320).
+      - run: python3 scripts/security-check/tamperward-signoff-doc.py
 
   # The host image (image/) cannot be built or booted here; keep it lintable instead.
   image-lint:
