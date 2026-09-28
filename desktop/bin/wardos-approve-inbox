@@ -26,7 +26,10 @@
 # request: this is the same daemon-held, multiplexed list either way, reachable from
 # the command centre (SECURITY ▸ Approval inbox) and the keyboard (Super + Alt + A), not
 # only from whatever popup first announced a request. A listing that fails outright
-# says so in a notification rather than exiting where no one sees it. Needs jq.
+# says so through a read-only menu screen, not only a notification: wardos_notify is
+# best-effort and stays silent when notify-send is missing or cannot reach a running
+# notification service, which would otherwise make this exact failure invisible again
+# from the keybinding/command-centre path that has no stderr either. Needs jq.
 set -euo pipefail
 # shellcheck source=desktop/lib/wardos.sh disable=SC1091
 source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
@@ -74,12 +77,17 @@ fields='
     ["-", "unreachable", .session, "-", "-", "-", "-", "-", .error];
   if has("error") then unreachable else row end | @tsv'
 
-# unavailable MESSAGE: the listing itself failed. Said in a notification — this is
-# started from a keybinding or the command centre, where stderr reaches no one — and
-# a failure, never an empty inbox.
+# unavailable MESSAGE: the listing itself failed. Said on stderr, in a notification
+# when one can be shown, and — since wardos_notify sends nothing when notify-send is
+# missing or cannot reach a running notification service, and this is started from a
+# keybinding or the command centre, where stderr reaches no one either — in a
+# read-only menu screen too, the one surface this script's own menu action already
+# depends on. A failure, never an empty inbox.
 unavailable() {
   echo "wardos-approve-inbox: $1" >&2
   wardos_notify "Approval inbox unavailable" "$1" -u critical -t 8000
+  printf 'State        unavailable\nError        %s' "$1" \
+    | wardos_menu "Approval inbox unavailable" >/dev/null || true
   exit 1
 }
 errors=$(mktemp)

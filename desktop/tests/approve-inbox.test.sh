@@ -165,17 +165,45 @@ grep -q '^Error        io: connection refused$' "$TMP/info.txt" || fail "the sum
 
 # --- the listing itself failing is visible, not a silent exit ----------------------
 # The inbox is started from a keybinding or the command centre, where stderr goes
-# nowhere a person looks: a failed `ward session approvals` must say so.
+# nowhere a person looks: a failed `ward session approvals` must say so — and must
+# still say so when no notification can be shown at all, since wardos_notify is
+# best-effort and silently sends nothing in that case (review finding on #327).
 : >"$MOCK_LOG"
+: >"$TMP/info.txt"
 # shellcheck disable=SC2016
 mock ward 'case "$*" in
   "session approvals --json --all") echo "ward: state root unreadable" >&2; exit 1 ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
-mock wardos-menu-select 'echo "wardos-menu-select must not run here" >&2; exit 1'
+mock notify-send
+# shellcheck disable=SC2016
+mock wardos-menu-select 'cat >"$TMP/info.txt"'
 "$inbox" 2>/dev/null && fail "a failed listing is not success"
 assert_logged '^notify-send -a WardOS -u critical -t 8000 Approval inbox unavailable ward: state root unreadable$'
-assert_not_logged '^wardos-menu-select'
+grep -q '^State        unavailable$' "$TMP/info.txt" || fail "the fallback screen names the state: $(cat "$TMP/info.txt")"
+grep -q '^Error        ward: state root unreadable$' "$TMP/info.txt" || fail "the fallback screen names the error: $(cat "$TMP/info.txt")"
+
+# No notify-send on PATH at all (a plain terminal session, or one with no notification
+# binary installed): wardos_notify sends nothing and returns success, so the read-only
+# menu screen is the only surface left — it must still show the failure.
+: >"$MOCK_LOG"
+: >"$TMP/info.txt"
+rm -f "$MOCK_DIR/notify-send"
+"$inbox" 2>/dev/null && fail "a failed listing is not success"
+assert_not_logged '^notify-send'
+grep -q '^Error        ward: state root unreadable$' "$TMP/info.txt" ||
+  fail "still visible with no notify-send on PATH: $(cat "$TMP/info.txt")"
+
+# notify-send is installed but cannot reach a running notification service (no
+# org.freedesktop.Notifications owner — the pre-login/bootstrap case wardos_notify's
+# own comment describes): it exits non-zero, wardos_notify swallows that too, and the
+# menu screen must still carry the failure.
+: >"$MOCK_LOG"
+: >"$TMP/info.txt"
+mock notify-send 'exit 1'
+"$inbox" 2>/dev/null && fail "a failed listing is not success"
+grep -q '^Error        ward: state root unreadable$' "$TMP/info.txt" ||
+  fail "still visible when notify-send cannot reach a service: $(cat "$TMP/info.txt")"
 
 # --- a pending choice's terminal stays open on the daemon's own answer (#146 item 5).
 # The window used to close the moment wardos-approve exited, taking with it whether the
