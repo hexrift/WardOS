@@ -39,29 +39,43 @@ session_flag=()
 # must never inspect a different one just because they disagree).
 status() { ward pause --status "${session_flag[@]}" "$project" 2>/dev/null || echo none; }
 
-# `ward pause`/`ward resume` print a leading `resolved-session: {"id":...,
-# "project":...}` line naming the session they actually acted on — which, with
-# no WARDOS_SESSION pinned, can be the desktop's shared selection or the
+# `ward pause`/`ward resume` print exactly one leading `  resolved-session:
+# {"id":...,"project":...}` line (the daemon-CLI's own two-space indent, from
+# `println!("  {line}")`) naming the session they actually acted on — which,
+# with no WARDOS_SESSION pinned, can be the desktop's shared selection or the
 # newest live session rather than $project itself (#141 finding 3: a
 # no-argument toggle must never let its confirmation imply it acted on the
 # directory the caller happened to be in when it acted on a different live
 # session's fallback pick instead). JSON-encoded (review on #330), not plain
 # text: a project path is an arbitrary Unix path and may itself contain a
 # newline, which a line-oriented record can't carry without truncating the
-# path or splitting the record across two physical lines — `jq` decodes the
-# escaped value exactly, whatever it holds. Extracted here so the one
-# notification a keybind press actually shows says which project was
-# paused/resumed, not just that some session was.
+# path or splitting the record across two physical lines.
+#
+# Matches the exact producer prefix (never an arbitrary substring some other
+# line of `ward`'s own output could happen to contain) and validates both
+# fields are actually strings before trusting either — a malformed or
+# unrecognized record is treated the same as no record at all, not partially
+# trusted. Emits the decoded value followed by an ASCII RS (0x1E) byte that
+# is never itself a newline, so a project path that legitimately ends in a
+# newline survives the caller's own `resolved=$(resolved_project ...)`
+# command substitution, which would otherwise silently strip a real trailing
+# newline the same way it strips this function's own terminator — the
+# caller strips the trailing RS back off once capture is done (review on
+# #330: command substitution trims *all* trailing newlines, not just its
+# own).
 resolved_project() {
-  local line json
+  local line json value
   while IFS= read -r line; do
-    if [[ $line == *"resolved-session: "* ]]; then
-      json=${line#*resolved-session: }
-      jq -r '.project' <<<"$json" 2>/dev/null || true
+    if [[ $line == "  resolved-session: "* ]]; then
+      json=${line#  resolved-session: }
+      value=$(jq -r 'if (.id | type) == "string" and (.project | type) == "string"
+                     then .project + "\u001e" else "\u001e" end' <<<"$json" 2>/dev/null) ||
+        value=$'\x1e'
+      printf '%s' "$value"
       return 0
     fi
   done <<<"$1"
-  return 0 # no such line (unexpected older `ward`): never abort the caller under -e
+  printf '\x1e' # no such line (unexpected older `ward`, or no match): empty, marker only
 }
 
 # The one notification of a pause (ADR-0019 §3), critical so it stays until read.
@@ -76,6 +90,7 @@ do_pause() {
   # Captured to read the outcome below; still shown to a terminal user as before.
   [[ -n $out ]] && printf '%s\n' "$out"
   resolved=$(resolved_project "$out")
+  resolved=${resolved%$'\x1e'}
   [[ -n $resolved ]] && resolved="$resolved · "
   if [[ $out =~ ([0-9]+)\ process(es)?\ had\ not\ confirmed\ stopped ]]; then
     local pending=${BASH_REMATCH[1]} plural=""
@@ -95,6 +110,7 @@ do_resume() {
   out=$(ward resume "${session_flag[@]}" "$project")
   [[ -n $out ]] && printf '%s\n' "$out"
   resolved=$(resolved_project "$out")
+  resolved=${resolved%$'\x1e'}
   wardos_notify "Agents resumed" "$resolved" -t 2000
 }
 

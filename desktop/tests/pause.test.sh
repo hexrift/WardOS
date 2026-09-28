@@ -38,6 +38,12 @@ mock ward 'case "$*" in
     if [[ -f "$TMP/pause-newline" ]]; then
       printf "%s\n" "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/oth\ner-project\"}"
     fi
+    if [[ -f "$TMP/pause-trailing-newline" ]]; then
+      printf "%s\n" "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\n\"}"
+    fi
+    if [[ -f "$TMP/pause-decoy" ]]; then
+      printf "  note: see resolved-session: {\"id\":\"x\",\"project\":\"/should/not/be/used\"} for details\n"
+    fi
     if [[ -f "$TMP/pause-unsettled" ]]; then
       printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
     fi
@@ -49,6 +55,12 @@ mock ward 'case "$*" in
     fi
     if [[ -f "$TMP/pause-newline" ]]; then
       printf "%s\n" "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/oth\ner-project\"}"
+    fi
+    if [[ -f "$TMP/pause-trailing-newline" ]]; then
+      printf "%s\n" "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\n\"}"
+    fi
+    if [[ -f "$TMP/pause-decoy" ]]; then
+      printf "  note: see resolved-session: {\"id\":\"x\",\"project\":\"/should/not/be/used\"} for details\n"
     fi
     if [[ -f "$TMP/pause-unsettled" ]]; then
       printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
@@ -126,6 +138,36 @@ expected=$'AGENTS PAUSED /home/dev/oth\ner-project \xc2\xb7 network closed'
   fail "a newline in the resolved project must survive into the notification unchanged; log:
 $log"
 rm -f "$TMP/pause-newline"
+assert_eq "$(cat "$WARD_STATE_FILE")" running
+
+# --- a resolved project path whose *last byte* is a newline survives the
+# caller's own command substitution (review on #330): `resolved=$(resolved_project
+# ...)` would otherwise silently strip a real trailing newline exactly the way it
+# strips resolved_project's own terminator, indistinguishably from a path with no
+# trailing newline at all ---
+: >"$MOCK_LOG"
+echo running >"$WARD_STATE_FILE"
+touch "$TMP/pause-trailing-newline"
+WARDOS_MENU_CHOICE=Resume "$pause"
+log=$(cat "$MOCK_LOG")
+expected=$'AGENTS PAUSED /home/dev/other-project\n \xc2\xb7 network closed'
+[[ $log == *"$expected"* ]] ||
+  fail "a trailing newline in the resolved project must survive into the notification unchanged; log:
+$log"
+rm -f "$TMP/pause-trailing-newline"
+assert_eq "$(cat "$WARD_STATE_FILE")" running
+
+# --- a line that merely contains "resolved-session: " as a substring, without the
+# producer's own exact two-space-indented prefix, is never mistaken for the record
+# (review on #330) — the notification must fall back to naming no project at all
+# rather than trusting an arbitrary line of `ward`'s own output ---
+: >"$MOCK_LOG"
+echo running >"$WARD_STATE_FILE"
+touch "$TMP/pause-decoy"
+WARDOS_MENU_CHOICE=Resume "$pause"
+assert_logged '^notify-send -a WardOS -u critical AGENTS PAUSED network closed · credential grants suspended · processes frozen · workspace retained$'
+assert_not_logged 'should/not/be/used'
+rm -f "$TMP/pause-decoy"
 assert_eq "$(cat "$WARD_STATE_FILE")" running
 
 # --- already paused: the menu alone; Stop & preserve keeps the workspace -------
