@@ -1401,19 +1401,30 @@ stop_refresh() {
   pid=$(cat "$refresh_file" 2>/dev/null || true)
 
   # An empty marker is the async-spawn handoff, not evidence that no refresh
-  # child exists. The worker is the owner of that handoff. Stop the owner and
-  # let its TERM trap reap whichever child it has already spawned; unlike the
-  # old bounded polling loop this remains correct even if the child is
-  # descheduled for arbitrarily long before publishing its own pid.
+  # child exists. The worker is the owner of that handoff, and — unlike the
+  # refresh child itself, which is only ever the worker's own descendant, never
+  # this shell's — the worker is this shell's *direct* child (notifier_loop
+  # backgrounds it in this same process), so it can, and must, actually be
+  # joined here, not raced against a bounded poll of our own guessing how long
+  # its own cleanup takes. Its TERM trap runs its own bounded kill-then-reap of
+  # whichever child it has already spawned, mirroring this function's own
+  # escalation one process up; blocking on `wait` is therefore bounded by that
+  # trap's own arithmetic, not open-ended. A previous version raced that trap
+  # with an outer `wait_deadline "$worker" 1` of the exact same width as the
+  # trap's own `wait_deadline "$refresh_pid" 1`: whichever finished a hair
+  # first decided the outcome, so ordinary scheduling jitter could make this
+  # function's own 1-second deadline lapse before the trap ever got to its own
+  # escalation, SIGKILLing the worker mid-trap and abandoning the refresh child
+  # with nothing left able to reap it (reproduced locally at roughly 1 run in
+  # 3; desktop/tests/approve.test.sh's "delayed refresh child survived the
+  # empty-marker handoff sweep" case). A real `wait` has no such race: it
+  # returns only once the worker's own bounded cleanup has actually finished,
+  # however long that took.
   if [[ -z $pid ]]; then
     if [[ -n $worker ]] && kill -0 "$worker" 2>/dev/null; then
       kill -CONT "$worker" 2>/dev/null || true
       kill "$worker" 2>/dev/null || true
-      wait_deadline "$worker" 1
-      if kill -0 "$worker" 2>/dev/null; then
-        kill -KILL "$worker" 2>/dev/null || true
-        wait_deadline "$worker" 2
-      fi
+      wait "$worker" 2>/dev/null || true
     fi
 
     # If the child managed to publish during that handoff, finish it directly
