@@ -36,7 +36,7 @@ mock ward 'case "$*" in
       printf "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\"}\n"
     fi
     if [[ -f "$TMP/pause-newline" ]]; then
-      printf '%s\n' "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/oth\ner-project\"}"
+      printf "%s\n" "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/oth\ner-project\"}"
     fi
     if [[ -f "$TMP/pause-unsettled" ]]; then
       printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
@@ -48,7 +48,7 @@ mock ward 'case "$*" in
       printf "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\"}\n"
     fi
     if [[ -f "$TMP/pause-newline" ]]; then
-      printf '%s\n' "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/oth\ner-project\"}"
+      printf "%s\n" "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/oth\ner-project\"}"
     fi
     if [[ -f "$TMP/pause-unsettled" ]]; then
       printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
