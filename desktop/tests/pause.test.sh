@@ -32,18 +32,52 @@ mock ward 'case "$*" in
     ;;
   "pause --session "*)
     echo paused >"$WARD_STATE_FILE"
+    if [[ -f "$TMP/pause-resolved" ]]; then
+      printf "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\"}\n"
+    fi
+    if [[ -f "$TMP/pause-newline" ]]; then
+      printf "%s\n" "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/oth\ner-project\"}"
+    fi
+    if [[ -f "$TMP/pause-trailing-newline" ]]; then
+      printf "%s\n" "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\n\"}"
+    fi
+    if [[ -f "$TMP/pause-decoy" ]]; then
+      printf "  note: see resolved-session: {\"id\":\"x\",\"project\":\"/should/not/be/used\"} for details\n"
+    fi
     if [[ -f "$TMP/pause-unsettled" ]]; then
       printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
     fi
     ;;
   "pause "*)
     echo paused >"$WARD_STATE_FILE"
+    if [[ -f "$TMP/pause-resolved" ]]; then
+      printf "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\"}\n"
+    fi
+    if [[ -f "$TMP/pause-newline" ]]; then
+      printf "%s\n" "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/oth\ner-project\"}"
+    fi
+    if [[ -f "$TMP/pause-trailing-newline" ]]; then
+      printf "%s\n" "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\n\"}"
+    fi
+    if [[ -f "$TMP/pause-decoy" ]]; then
+      printf "  note: see resolved-session: {\"id\":\"x\",\"project\":\"/should/not/be/used\"} for details\n"
+    fi
     if [[ -f "$TMP/pause-unsettled" ]]; then
       printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
     fi
     ;;
-  "resume --session "*) echo running >"$WARD_STATE_FILE" ;;
-  "resume "*) echo running >"$WARD_STATE_FILE" ;;
+  "resume --session "*)
+    echo running >"$WARD_STATE_FILE"
+    if [[ -f "$TMP/pause-resolved" ]]; then
+      printf "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\"}\n"
+    fi
+    ;;
+  "resume "*)
+    echo running >"$WARD_STATE_FILE"
+    if [[ -f "$TMP/pause-resolved" ]]; then
+      printf "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\"}\n"
+    fi
+    ;;
   "stop "*) echo none >"$WARD_STATE_FILE" ;;
   "watch "*) : ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
@@ -72,6 +106,68 @@ assert_logged '^ward pause /home/dev/payments-api$'
 assert_logged '^notify-send -a WardOS -u critical AGENTS PAUSING network closed · credential grants suspended · 2 processes not yet confirmed stopped · workspace retained$'
 assert_not_logged 'AGENTS PAUSED network closed'
 rm -f "$TMP/pause-unsettled"
+assert_eq "$(cat "$WARD_STATE_FILE")" running
+
+# --- an unpinned pause/resume that resolves to a different live session than
+# $WARDOS_PROJECT (the desktop's shared selection or newest-live fallback, #141
+# finding 3) must say so in the one notification a keybind press shows — never
+# let the acknowledgement imply it acted on $WARDOS_PROJECT when `ward` itself
+# named a different resolved project ---
+: >"$MOCK_LOG"
+echo running >"$WARD_STATE_FILE"
+touch "$TMP/pause-resolved"
+WARDOS_MENU_CHOICE=Resume "$pause"
+assert_logged '^notify-send -a WardOS -u critical AGENTS PAUSED /home/dev/other-project · network closed · credential grants suspended · processes frozen · workspace retained$'
+assert_logged '^notify-send -a WardOS -t 2000 Agents resumed /home/dev/other-project$'
+rm -f "$TMP/pause-resolved"
+assert_eq "$(cat "$WARD_STATE_FILE")" running
+
+# --- a resolved project path containing a newline reaches the notification intact
+# (review on #330): a plain-text line-oriented record between `ward` and
+# `wardos-pause` can't carry a path with an embedded newline without truncating it
+# or splitting the record across two physical lines. `ward` JSON-encodes the
+# record, so `resolved_project`'s `jq` decode must recover the exact path, newline
+# included, not a prefix cut off at the first line break ---
+: >"$MOCK_LOG"
+echo running >"$WARD_STATE_FILE"
+touch "$TMP/pause-newline"
+WARDOS_MENU_CHOICE=Resume "$pause"
+log=$(cat "$MOCK_LOG")
+expected=$'AGENTS PAUSED /home/dev/oth\ner-project \xc2\xb7 network closed'
+[[ $log == *"$expected"* ]] ||
+  fail "a newline in the resolved project must survive into the notification unchanged; log:
+$log"
+rm -f "$TMP/pause-newline"
+assert_eq "$(cat "$WARD_STATE_FILE")" running
+
+# --- a resolved project path whose *last byte* is a newline survives the
+# caller's own command substitution (review on #330): `resolved=$(resolved_project
+# ...)` would otherwise silently strip a real trailing newline exactly the way it
+# strips resolved_project's own terminator, indistinguishably from a path with no
+# trailing newline at all ---
+: >"$MOCK_LOG"
+echo running >"$WARD_STATE_FILE"
+touch "$TMP/pause-trailing-newline"
+WARDOS_MENU_CHOICE=Resume "$pause"
+log=$(cat "$MOCK_LOG")
+expected=$'AGENTS PAUSED /home/dev/other-project\n \xc2\xb7 network closed'
+[[ $log == *"$expected"* ]] ||
+  fail "a trailing newline in the resolved project must survive into the notification unchanged; log:
+$log"
+rm -f "$TMP/pause-trailing-newline"
+assert_eq "$(cat "$WARD_STATE_FILE")" running
+
+# --- a line that merely contains "resolved-session: " as a substring, without the
+# producer's own exact two-space-indented prefix, is never mistaken for the record
+# (review on #330) — the notification must fall back to naming no project at all
+# rather than trusting an arbitrary line of `ward`'s own output ---
+: >"$MOCK_LOG"
+echo running >"$WARD_STATE_FILE"
+touch "$TMP/pause-decoy"
+WARDOS_MENU_CHOICE=Resume "$pause"
+assert_logged '^notify-send -a WardOS -u critical AGENTS PAUSED network closed · credential grants suspended · processes frozen · workspace retained$'
+assert_not_logged 'should/not/be/used'
+rm -f "$TMP/pause-decoy"
 assert_eq "$(cat "$WARD_STATE_FILE")" running
 
 # --- already paused: the menu alone; Stop & preserve keeps the workspace -------
