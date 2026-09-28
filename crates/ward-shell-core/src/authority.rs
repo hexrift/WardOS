@@ -9,7 +9,14 @@
 //! segment appears — and the panel behind them ([`authority_panel`]) lists
 //! the filesystem, the network, every grant with its scope and lifetime, and
 //! the standing denials. Nothing here is enforcement: the daemon's
-//! `ward session grants` is the same list from the hold itself.
+//! `ward session grants` is the same list from the hold itself. `Authority`
+//! itself keeps no clock: `now` enters only at [`authority_panel`], the one
+//! place a grant's own recorded lifetime (a credential's `expires`, carried
+//! since #315) is judged against it, so a grant past its lifetime reads
+//! `· expired` there (#316) the same way the daemon's own `ward session
+//! grants` already does.
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ward_daemon::approvals::{host_of, service_name};
 use ward_daemon::describe::SessionDescription;
@@ -33,6 +40,18 @@ pub struct Grant {
     /// The tag the network segment shows for it (`github`, a host) when the
     /// grant widens what the network reaches.
     pub network_tag: Option<String>,
+    /// When this grant's own recorded lifetime runs out, milliseconds since
+    /// the Unix epoch (#316): the record's own `ts_wall` plus
+    /// `WardEvent::CredentialGranted`'s `expires`, the same two materials
+    /// `ward-daemon::approvals::Credential::expires_at_unix_ms` derives from
+    /// (#140/#315) — no new event kind, just this projection finally reusing
+    /// them too. `None` for an `allow-session` answer (a
+    /// [`GrantScope::Session`] grant has no recorded expiry of its own, only
+    /// ever plain or session-suspended) and for a credential grant whose
+    /// record carries no wall clock at all (a mono-only fixture, or a stream
+    /// that never got one) — never expires on its own, the same meaning
+    /// `Credential::expires_at_unix_ms`'s own `None` carries.
+    pub expires_at_unix_ms: Option<u64>,
 }
 
 impl Grant {
@@ -45,6 +64,30 @@ impl Grant {
             Tone::Warn,
         )
     }
+
+    /// Whether this grant's own recorded lifetime has run out by `now_unix_ms`
+    /// (#316) — mirrors `ward-daemon::approvals`'s own expiry sweep
+    /// (`now_unix_ms >= expires_at_unix_ms`), `false` for a grant that never
+    /// expires on its own ([`Self::expires_at_unix_ms`] is `None`).
+    #[must_use]
+    pub fn is_expired(&self, now_unix_ms: u64) -> bool {
+        self.expires_at_unix_ms
+            .is_some_and(|expires| now_unix_ms >= expires)
+    }
+}
+
+/// `granted`'s recorded lifetime running out (#316): `ts_wall` (when the
+/// record has one) plus `expires`, saturating rather than overflowing on a
+/// pathological huge duration — the same "never expires on its own" meaning
+/// as being unable to compute a bound at all. Mirrors
+/// `daemon.rs`'s own `granted_at_unix_ms.saturating_add(expires_ms)`, with
+/// the record's own `ts_wall` standing in for the daemon's `SystemTime::now()`
+/// at grant time, since this projection has no clock of its own to call.
+fn expiry_unix_ms(ts_wall: Option<SystemTime>, expires: Duration) -> Option<u64> {
+    let granted_at_unix_ms = ts_wall?.duration_since(UNIX_EPOCH).ok()?;
+    let granted_at_unix_ms = u64::try_from(granted_at_unix_ms.as_millis()).ok()?;
+    let expires_ms = u64::try_from(expires.as_millis()).ok()?;
+    Some(granted_at_unix_ms.saturating_add(expires_ms))
 }
 
 /// Every temporary grant the session holds, in the order the stream granted
@@ -90,10 +133,16 @@ impl Authority {
                         scope: kind_word(cap.kind).to_owned(),
                         lifetime: "session",
                         network_tag: tag,
+                        expires_at_unix_ms: None,
                     });
                 }
             }
-            WardEvent::CredentialGranted { service, scope, .. } => {
+            WardEvent::CredentialGranted {
+                service,
+                scope,
+                expires,
+                ..
+            } => {
                 let label = service_name(service.as_str());
                 let permissions = scope
                     .permissions
@@ -109,12 +158,18 @@ impl Authority {
                         g.scope.push_str(", ");
                         g.scope.push_str(host);
                     }
+                    // The first route's expiry stands (#316): every real
+                    // caller mints the same nominal lifetime for every route
+                    // one launch grants at once, mirroring
+                    // `Approvals::record_credential_with_expiry`'s own
+                    // "ignored when merging" rule.
                 } else {
                     self.grants.push(Grant {
                         label,
                         scope: format!("{permissions} · {host}"),
                         lifetime: "launch",
                         network_tag: Some(service.as_str().to_owned()),
+                        expires_at_unix_ms: expiry_unix_ms(rec.ts_wall, *expires),
                     });
                 }
             }
@@ -296,9 +351,18 @@ fn worst_credential_decision(m: &CapabilityManifest, service: &str) -> ward_poli
 }
 
 /// The "Current agent authority" panel (ADR-0019): filesystem, network,
-/// every temporary grant with its scope and lifetime, the standing denials.
+/// every temporary grant with its scope and lifetime, the standing denials,
+/// judged at `now_unix_ms` (#316) — the same deterministic seam
+/// `session_panel`/`verify_panel` already take a `now_unix_ms` through, so a
+/// credential grant whose own recorded lifetime has run out by then reads
+/// `· expired`, mirroring `ward session grants`'s own display convention
+/// (`Grant::line()` in `ward-daemon::approvals`) with no daemon round-trip.
 #[must_use]
-pub fn authority_panel(d: &SessionDescription, authority: &Authority) -> Vec<Group> {
+pub fn authority_panel(
+    d: &SessionDescription,
+    authority: &Authority,
+    now_unix_ms: u64,
+) -> Vec<Group> {
     let m = &d.manifest;
     let tone = if authority.network_tags().is_empty() {
         network_tone(&m.network)
@@ -326,9 +390,18 @@ pub fn authority_panel(d: &SessionDescription, authority: &Authority) -> Vec<Gro
             .iter()
             .map(|g| {
                 let mut row = g.row();
-                // #140: a grant is never shown as exercisable authority for
-                // longer than the session it belongs to can actually use it.
-                if authority.suspended {
+                // #316: a credential whose own recorded lifetime has run out
+                // reads `expired` even while the session is paused — the
+                // same precedence `ward-daemon::approvals`'s own sweep gives
+                // expiry over `Suspended` (`sweep_expired_credentials`'s doc
+                // comment: "Active and Suspended are otherwise-live states
+                // and are equally subject to the credential's own clock").
+                // #140: short of that, a grant is never shown as exercisable
+                // authority for longer than the session it belongs to can
+                // actually use it.
+                if g.is_expired(now_unix_ms) {
+                    row.value.push_str(" · expired");
+                } else if authority.suspended {
                     row.value.push_str(" · suspended");
                 }
                 row
@@ -355,7 +428,7 @@ pub fn authority_panel(d: &SessionDescription, authority: &Authority) -> Vec<Gro
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::feed::fixtures::{records, sequence, wardd};
+    use crate::feed::fixtures::{records, sequence, wardd, wardd_at_wall};
     use crate::panel::panel_text;
     use crate::trust::fixtures::description;
     use std::time::Duration;
@@ -454,6 +527,7 @@ mod tests {
                 scope: "write".into(),
                 lifetime: "session",
                 network_tag: None,
+                expires_at_unix_ms: None,
             }
         );
         assert_eq!(
@@ -463,6 +537,10 @@ mod tests {
                 scope: "contents:read, issues:read · github.com, api.github.com".into(),
                 lifetime: "launch",
                 network_tag: Some("github".into()),
+                // `wardd`'s records carry no wall clock (#316): a credential
+                // grant this projection cannot judge against `now` at all
+                // never expires on its own — see `expiry_unix_ms`.
+                expires_at_unix_ms: None,
             }
         );
         assert_eq!(
@@ -472,6 +550,7 @@ mod tests {
                 scope: "network".into(),
                 lifetime: "session",
                 network_tag: Some("example.org".into()),
+                expires_at_unix_ms: None,
             },
             "a network grant is listed by its host, never the whole URL"
         );
@@ -525,7 +604,7 @@ mod tests {
         let live = Authority::from_records(&wardd(&events));
         assert!(!live.suspended);
         let d = description(NetworkCapability::Development);
-        let groups = authority_panel(&d, &live);
+        let groups = authority_panel(&d, &live, 0);
         assert!(
             groups[1]
                 .rows
@@ -538,7 +617,7 @@ mod tests {
         let paused_authority = Authority::from_records(&wardd(&paused_events));
         assert!(paused_authority.suspended);
         assert_eq!(paused_authority.len(), 2, "pausing drops nothing");
-        let groups = authority_panel(&d, &paused_authority);
+        let groups = authority_panel(&d, &paused_authority, 0);
         assert!(
             groups[1]
                 .rows
@@ -552,7 +631,7 @@ mod tests {
         resumed_events.push(resumed());
         let resumed_authority = Authority::from_records(&wardd(&resumed_events));
         assert!(!resumed_authority.suspended);
-        let groups = authority_panel(&d, &resumed_authority);
+        let groups = authority_panel(&d, &resumed_authority, 0);
         assert!(
             groups[1]
                 .rows
@@ -561,6 +640,111 @@ mod tests {
             "{:?}",
             groups[1].rows
         );
+    }
+
+    /// `credential("github.com")`'s own `expires: Duration::from_secs(60)`,
+    /// recorded at wall clock `start_unix_ms`.
+    const GRANTED_AT_UNIX_MS: u64 = 1_000_000_000_000;
+    const EXPIRES_AT_UNIX_MS: u64 = GRANTED_AT_UNIX_MS + 60_000;
+
+    #[test]
+    fn a_credential_grant_reads_expired_once_its_own_recorded_lifetime_runs_out() {
+        // #316: the daemon side (#140/#315) already gives a credential's
+        // `expires` real meaning (`Approvals::sweep_expired_credentials`);
+        // this projection reuses the exact same materials — the record's own
+        // `ts_wall` plus `CredentialGranted`'s `expires` — with no new event.
+        let events = [credential("github.com")];
+        let records = wardd_at_wall(&events, GRANTED_AT_UNIX_MS);
+        let authority = Authority::from_records(&records);
+        assert_eq!(
+            authority.grants[0].expires_at_unix_ms,
+            Some(EXPIRES_AT_UNIX_MS)
+        );
+        let d = description(NetworkCapability::Development);
+
+        let before = authority_panel(&d, &authority, EXPIRES_AT_UNIX_MS - 1);
+        assert_eq!(
+            before[1].rows[0].value, "contents:read, issues:read · github.com · launch",
+            "not yet expired, no suffix"
+        );
+
+        let at = authority_panel(&d, &authority, EXPIRES_AT_UNIX_MS);
+        assert_eq!(
+            at[1].rows[0].value, "contents:read, issues:read · github.com · launch · expired",
+            "the instant its own recorded lifetime runs out, ward session \
+             grants and this panel must not disagree"
+        );
+
+        let after = authority_panel(&d, &authority, EXPIRES_AT_UNIX_MS + 60_000);
+        assert!(after[1].rows[0].value.ends_with("· expired"));
+    }
+
+    #[test]
+    fn a_session_answer_never_reads_expired_no_matter_how_far_now_runs() {
+        // #316: an `allow-session` answer has no recorded expiry of its own
+        // (`ward-daemon::approvals`'s own `RevokeState::Expired` is likewise
+        // never reached for a `GrantKind::Approval`) — only ever plain or
+        // session-suspended.
+        let events = [decided(
+            CapabilityKind::FileWrite,
+            "Write /work/src/lib.rs",
+            Some(GrantScope::Session),
+        )];
+        let authority = Authority::from_records(&wardd_at_wall(&events, GRANTED_AT_UNIX_MS));
+        assert_eq!(authority.grants[0].expires_at_unix_ms, None);
+        let d = description(NetworkCapability::Development);
+        let groups = authority_panel(&d, &authority, u64::MAX);
+        assert_eq!(groups[1].rows[0].value, "write · session");
+    }
+
+    #[test]
+    fn expiry_takes_precedence_over_suspended_the_same_way_the_daemons_sweep_does() {
+        // #316: `ward-daemon::approvals::sweep_expired_credentials` sweeps a
+        // `Suspended` credential into `Expired` exactly like an `Active` one
+        // — "equally subject to the credential's own clock" — so a paused
+        // session must never mask an already-expired grant behind
+        // `· suspended` here either.
+        let events = [credential("github.com"), paused()];
+        let authority = Authority::from_records(&wardd_at_wall(&events, GRANTED_AT_UNIX_MS));
+        assert!(authority.suspended);
+        let d = description(NetworkCapability::Development);
+        let groups = authority_panel(&d, &authority, EXPIRES_AT_UNIX_MS);
+        assert!(
+            groups[1].rows[0].value.ends_with("· expired"),
+            "{:?}",
+            groups[1].rows
+        );
+        assert!(!groups[1].rows[0].value.contains("suspended"));
+    }
+
+    #[test]
+    fn a_second_route_of_the_same_credential_keeps_the_first_routes_expiry() {
+        // #316, mirroring `Approvals::record_credential_with_expiry`'s own
+        // "ignored when merging" rule: every real caller mints the same
+        // nominal lifetime for every route one launch grants at once, so a
+        // second host folded into an existing grant must not push its
+        // expiry out to the second record's own (later) timestamp.
+        let events = [credential("github.com"), credential("api.github.com")];
+        let authority = Authority::from_records(&wardd_at_wall(&events, GRANTED_AT_UNIX_MS));
+        assert_eq!(authority.len(), 1);
+        assert_eq!(
+            authority.grants[0].expires_at_unix_ms,
+            Some(EXPIRES_AT_UNIX_MS),
+            "the second route's record is a second later, but the grant's \
+             expiry must still be the first route's"
+        );
+    }
+
+    #[test]
+    fn a_credential_grant_with_no_wall_clock_never_expires_on_its_own() {
+        // #316: `wardd`/`records` (every fixture that predates this) carries
+        // no wall clock at all — the same "cannot compute a bound" case
+        // `Credential::expires_at_unix_ms` documents for the daemon side.
+        let authority = Authority::from_records(&wardd(&[credential("github.com")]));
+        assert_eq!(authority.grants[0].expires_at_unix_ms, None);
+        let d = description(NetworkCapability::Development);
+        let groups = authority_panel(&d, &authority, u64::MAX);
+        assert!(!groups[1].rows[0].value.contains("expired"));
     }
 
     #[test]
@@ -616,7 +800,7 @@ mod tests {
     #[test]
     fn the_panel_lists_filesystem_network_every_grant_and_the_standing_denials() {
         let d = description(NetworkCapability::Development);
-        let empty = authority_panel(&d, &Authority::default());
+        let empty = authority_panel(&d, &Authority::default(), 0);
         let text = panel_text(&empty);
         assert!(
             text.starts_with(
@@ -652,7 +836,7 @@ mod tests {
                 .map(|e| (Origin::Wardd, e.clone()))
                 .collect::<Vec<_>>(),
         ));
-        let groups = authority_panel(&d, &authority);
+        let groups = authority_panel(&d, &authority, 0);
         let network = &groups[0].rows[1];
         assert_eq!(
             (network.value.as_str(), network.tone),
@@ -678,7 +862,7 @@ mod tests {
             ServiceId("cloud-*".into()),
             CredentialRule::Ask(ward_policy::CredentialScope::default()),
         );
-        let groups = authority_panel(&d, &Authority::default());
+        let groups = authority_panel(&d, &Authority::default(), 0);
         assert!(groups[0].rows[0].value.starts_with("/work read-only"));
         let cloud = &groups[2].rows[2];
         assert_eq!((cloud.value.as_str(), cloud.tone), ("ask", Tone::Warn));
@@ -710,7 +894,7 @@ mod tests {
             ward_policy::Decision::Ask
         );
 
-        let groups = authority_panel(&d, &Authority::default());
+        let groups = authority_panel(&d, &Authority::default(), 0);
         let cloud = &groups[2].rows[2];
         assert_eq!((cloud.value.as_str(), cloud.tone), ("denied", Tone::Ok));
     }

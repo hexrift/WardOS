@@ -144,13 +144,17 @@ fn explanation(
         // visible even once the record that created it has aged out of
         // `model.records`.
         SegmentName::Network => {
-            let authority = authority_panel(d, &model.authority);
+            let authority = authority_panel(d, &model.authority, now_unix_ms);
             vec![
                 panel_row(&authority, "Network"),
                 panel_row(&authority, "Temporary grants"),
             ]
         }
-        SegmentName::Grants => authority_panel(d, &model.authority).swap_remove(1).rows,
+        SegmentName::Grants => {
+            authority_panel(d, &model.authority, now_unix_ms)
+                .swap_remove(1)
+                .rows
+        }
         SegmentName::Credentials => vec![row("Secrets")],
         SegmentName::Observer => vec![row("Observer")],
         SegmentName::Tamperward => vec![row("Policy"), row("Evidence")],

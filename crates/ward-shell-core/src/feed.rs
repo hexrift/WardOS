@@ -790,6 +790,35 @@ pub(crate) mod fixtures {
         records(&events)
     }
 
+    /// [`wardd`], but every record also carries a wall clock: `start_unix_ms`
+    /// for the first record, one second later for each after it — the seam
+    /// the panel-expiry tests (#316) drive, since `records`/`wardd` leave
+    /// `ts_wall` unset (mono-only) and a [`WardEvent::CredentialGranted`]'s
+    /// expiry cannot be judged against a record with no wall clock at all.
+    pub fn wardd_at_wall(events: &[WardEvent], start_unix_ms: u64) -> Vec<EventRecord> {
+        let mut chain = Chain::genesis(SessionId::from_u128(7), Blake3Hash::from_bytes([1; 32]));
+        events
+            .iter()
+            .enumerate()
+            .map(|(i, event)| {
+                let i = i as u64;
+                chain
+                    .append(
+                        Origin::Wardd,
+                        event.clone(),
+                        Timestamp {
+                            mono: Duration::from_secs(i),
+                            wall: Some(
+                                std::time::UNIX_EPOCH
+                                    + Duration::from_millis(start_unix_ms + i * 1000),
+                            ),
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect()
+    }
+
     /// The §8 sequence the TUI tests use: two files, two commands, three
     /// network outcomes, one claim, one hidden kind.
     pub fn sequence() -> Vec<WardEvent> {

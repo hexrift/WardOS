@@ -580,7 +580,11 @@ fn render(s: &Snapshot, surface: Surface) -> String {
         // `model.records`.
         Surface::AuthorityPanel => format!(
             "{bar}\n\n{}",
-            panel_text(&authority_panel(&s.description, &s.model.authority))
+            panel_text(&authority_panel(
+                &s.description,
+                &s.model.authority,
+                now_unix_ms()
+            ))
         ),
         Surface::Launcher { query, .. } => {
             let card = SessionCard::new(&s.description, &s.model);
