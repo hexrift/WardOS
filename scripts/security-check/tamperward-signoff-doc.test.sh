@@ -123,6 +123,17 @@ expect_fail "paraphrased claim using 'permit' instead of 'accept'" \
 expect_fail "claim true in its own clause despite a later, unrelated negation" \
   "$tmp/trailing_negation.md" "claiming a legacy label's SHA prefix is"
 
+# --- Case (b''''): a causal clause ("because ... do not fit") puts an -------
+# --- unrelated negation after the claim, same failure mode as (b'''), just ---
+# --- via a causal conjunction instead of a comma ------------------------------
+{
+  good_doc "$tmp/causal_negation.md"
+  echo "" >>"$tmp/causal_negation.md"
+  echo "Legacy labels accept abbreviated head prefixes because full SHAs do not fit." >>"$tmp/causal_negation.md"
+}
+expect_fail "claim true in its own causal clause despite a later negation" \
+  "$tmp/causal_negation.md" "claiming a legacy label's SHA prefix is"
+
 # --- Case: a literal label name in backticks is code, not an English claim ---
 # --- (guards the CODE_SPAN_RE stripping: "allow" inside `tamperward:allow:...` -
 # --- must not itself read as the acceptance verb "allow") --------------------
@@ -154,4 +165,4 @@ if [[ $fails -gt 0 ]]; then
   echo "tamperward-signoff-doc.test.sh: $fails case(s) failed" >&2
   exit 1
 fi
-echo "tamperward-signoff-doc.test.sh: PASS (9/9 cases)"
+echo "tamperward-signoff-doc.test.sh: PASS (10/10 cases)"

@@ -33,18 +33,32 @@ PIN_RE = re.compile(r"tamperward@([0-9]+\.[0-9]+\.[0-9]+)")
 
 # A "prefix" clause is one that could be read as guidance, not just a
 # glossary mention of the word. It's suspect if it pairs "prefix" with a
-# word implying the prefix is accepted/effective, and isn't itself the
-# clause explaining that prefixes are rejected/inert (issue #320, and the
-# paraphrases PR #323's review supplied: "legacy labels accept abbreviated
-# head prefixes", "... permit ...", and "... accept ..., not full SHAs").
+# word implying the prefix is accepted/effective, and isn't itself framed
+# as false (issue #320, and the paraphrases PR #323's review supplied:
+# "... permit ...", "... accept ..., not full SHAs", and "... accept ...
+# because full SHAs do not fit").
 #
-# Checked per CLAUSE, not per sentence: a sentence-wide check let a negation
-# anywhere in the sentence suppress a positive claim in an unrelated clause
-# ("Legacy labels accept abbreviated head prefixes, not full SHAs." has
-# "not", but it negates "full SHAs", not "accept" - the first clause alone
-# is still the false claim). Splitting on clause boundaries (, ; — and
-# coordinating/subordinating conjunctions) keeps the negation checked
-# against the same clause that carries the positive claim.
+# Two different kinds of "this claim is false" marker are handled
+# differently, because they scope differently in English:
+#
+# - FRAMING_RE (mistaken/wrong/false/rejected/...) is a clause-wide
+#   qualifier - "on the mistaken premise that X accepts Y" reads as false
+#   regardless of where in the clause "mistaken" sits relative to "accepts".
+#   Checked anywhere in the clause.
+# - Grammatical negation (not/never/cannot/doesn't/no longer) attaches to
+#   whatever verb it's adjacent to, not to the clause as a whole - "accepts
+#   abbreviated prefixes, not full SHAs" and "accepts abbreviated prefixes
+#   because full SHAs do not fit" both have a "not" in the clause/sentence,
+#   but neither negates "accepts": one negates "full SHAs", the other
+#   negates "fit". A clause-wide (or sentence-wide) search for these treats
+#   any "not" as covering the whole clause and was wrong twice over during
+#   review. Checked only in the few words immediately before the positive
+#   verb match it would need to negate.
+#
+# Clause boundaries themselves (, ; — and coordinating/subordinating
+# conjunctions, causal ones included) still matter for FRAMING_RE and for
+# keeping PREFIX_WORD_RE's match paired with the right verb, so sentences
+# are still split into clauses first.
 #
 # Inline/fenced code spans are stripped before any of this runs. This
 # document necessarily contains the literal label name
@@ -57,7 +71,8 @@ PIN_RE = re.compile(r"tamperward@([0-9]+\.[0-9]+\.[0-9]+)")
 CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n{2,}")
 CLAUSE_SPLIT_RE = re.compile(
-    r",|;|—|\b(?:but|however|though|although|while|except|whereas|yet)\b",
+    r",|;|—|\b(?:but|however|though|although|while|except|whereas|yet|"
+    r"because|since|given that|so that|insofar as)\b",
     re.IGNORECASE,
 )
 PREFIX_WORD_RE = re.compile(r"\bprefix(es)?\b", re.IGNORECASE)
@@ -67,15 +82,23 @@ POSITIVE_RE = re.compile(
     r"enable(s|d|ing)?|grant(s|ed|ing)?|authorize(s|d)?|valid|sufficient|enough)\b",
     re.IGNORECASE,
 )
-# A claim in the same clause as one of these reads as flagged-as-false by
-# the document itself (a negation, or the claim explicitly marked as an
-# earlier mistake), not as live guidance.
-NEGATIVE_RE = re.compile(
-    r"\b(reject(s|ed|ing)?|not|never|cannot|can't|doesn't|does not|no longer|"
-    r"inert|false|stale|incompatible|used to|earlier guidance|previously|"
-    r"outdated|wrong|nor|mistaken(ly)?|mistake|incorrect(ly)?|erroneous(ly)?)\b",
+# Clause-wide framing: the claim is presented as false wherever this sits
+# in the clause, so no positional check is needed.
+FRAMING_RE = re.compile(
+    r"\b(reject(s|ed|ing)?|inert|false|stale|incompatible|used to|"
+    r"earlier guidance|previously|outdated|wrong|nor|mistaken(ly)?|mistake|"
+    r"incorrect(ly)?|erroneous(ly)?)\b",
     re.IGNORECASE,
 )
+# Grammatical negation: only counts against a specific positive-verb match
+# when it sits in the few words immediately before that match (see above).
+VERB_NEGATOR_RE = re.compile(
+    r"\b(not|never|cannot|can't|doesn't|does not|no longer)\b", re.IGNORECASE
+)
+# How far back (characters) to look for a verb negator before a positive
+# match - wide enough for "does not currently/still/ever accept", narrow
+# enough to stay within the same claim rather than an earlier one.
+NEGATOR_LOOKBACK = 40
 
 
 def read(path):
@@ -88,18 +111,21 @@ def pinned_versions(text):
 
 
 def suspect_prefix_sentences(doc):
-    """Clauses pairing 'prefix' with acceptance language and no negation."""
+    """Clauses pairing 'prefix' with an unnegated acceptance claim."""
     prose = CODE_SPAN_RE.sub(" ", doc)
     found = []
     for sentence in SENTENCE_SPLIT_RE.split(prose):
         for clause in CLAUSE_SPLIT_RE.split(sentence):
             if not PREFIX_WORD_RE.search(clause):
                 continue
-            if not POSITIVE_RE.search(clause):
+            if FRAMING_RE.search(clause):
                 continue
-            if NEGATIVE_RE.search(clause):
-                continue
-            found.append(clause.strip().replace("\n", " ")[:160])
+            for m in POSITIVE_RE.finditer(clause):
+                lookback = clause[max(0, m.start() - NEGATOR_LOOKBACK) : m.start()]
+                if VERB_NEGATOR_RE.search(lookback):
+                    continue
+                found.append(clause.strip().replace("\n", " ")[:160])
+                break
     return found
 
 
