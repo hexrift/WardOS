@@ -12,7 +12,8 @@
     "custom/ward-network",
     "custom/ward-grants",
     "custom/ward-tamperward",
-    "custom/ward-verify"
+    "custom/ward-verify",
+    "custom/ward-daemon"
   ],
   "modules-center": ["hyprland/workspaces"],
   "modules-right": [
@@ -72,6 +73,13 @@
     "restart-interval": 5,
     "format": "{}",
     "on-click": "foot --app-id ward-session -e sh -c 'ward-shell verify-panel; read -r _'"
+  },
+  "custom/ward-daemon": {
+    "exec": "ward-shell bar --waybar --segment daemon --follow",
+    "return-type": "json",
+    "restart-interval": 5,
+    "format": "{}",
+    "on-click": "foot --app-id ward-session -e sh -c 'ward-shell session; read -r _'"
   },
 
   "hyprland/workspaces": {

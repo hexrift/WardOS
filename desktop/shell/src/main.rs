@@ -27,7 +27,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use ward_daemon::client::{self, WatchEnd};
+use ward_daemon::client::{self, WatchEnd, WatchUpdate};
 use ward_daemon::ids::{ev_snapshot, snap_snapshot};
 use ward_daemon::session::state_root;
 use ward_daemon::verify::candidate_options;
@@ -348,13 +348,34 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(100);
 /// the log sealed (`WatchEnd::Closed`) is not the log ending — #138 item 5's
 /// distinction from a genuine `WatchEnd::Sealed` — so this reconnects from
 /// the last confirmed sequence instead of returning, marking the model
-/// disconnected ([`Model::mark_disconnected`]) the moment the drop is
-/// noticed so the very next emitted module already reads the bar's
-/// `unknown` state, and clearing it ([`Model::mark_connected`]) the moment a
-/// new connection lands. Returns the final snapshot once the log is
-/// genuinely sealed, or once [`RECONNECT_ATTEMPTS`] reconnect attempts have
-/// all failed in a row (Waybar's `restart-interval` is the fallback then).
-#[allow(clippy::too_many_arguments)]
+/// disconnected ([`Model::mark_disconnected`]) the moment a connect fails, a
+/// drop is noticed, or a fresh connection is opened but not yet caught up, so
+/// the very next emitted module already reads the bar's `unknown` state.
+///
+/// Review 5337489166 of #329, finding 2: the model is cleared back to
+/// connected ([`Model::mark_connected`]) only once the daemon's own
+/// replay-complete boundary confirms this subscription's backlog is fully
+/// applied ([`client::watch_records_ticking`]'s [`WatchUpdate::CaughtUp`],
+/// driven by `Response::CaughtUp`), or once a confirmed seal arrives first — never
+/// merely because `client::connect` (which only completes `Ping`) succeeded.
+/// `Subscribe` has not even been sent at that point, so the projection is
+/// still whatever it was before the drop; showing it as live then would be
+/// exactly the stale-shown-as-current bug ADR-0019's fail-closed rule exists
+/// to prevent. The same review's finding 3: [`RECONNECT_ATTEMPTS`] bounds
+/// only a *consecutive* run of failures — `attempts` resets to zero at that
+/// same catch-up boundary, a confirmed live handover, not on every bare
+/// `connect()` — so a long-lived bar that keeps recovering from isolated,
+/// separated daemon restarts never exhausts its budget just because time has
+/// passed; and a transport failure anywhere in the Ping→Subscribe race or the
+/// subsequent read (e.g. a daemon that answers `Ping` and then closes before
+/// `Subscribe`) is folded into this same disconnected/retry path rather than
+/// aborting the loop outright via a bare `?` while the last emitted module
+/// still reads live.
+///
+/// Returns the final snapshot once the log is genuinely sealed, or once
+/// [`RECONNECT_ATTEMPTS`] consecutive reconnect attempts have all failed in a
+/// row (Waybar's `restart-interval` is the fallback then).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn follow_loop(
     socket: &Path,
     mut snapshot: Snapshot,
@@ -387,19 +408,42 @@ fn follow_loop(
                 continue;
             }
         };
-        // Attached (again, if this follows a drop): render it at once rather
-        // than waiting for the next record or tick.
-        snapshot.model.mark_connected();
-        let now = module(&snapshot, segment);
-        if now != last {
-            emit(&now)?;
-            last = now;
-        }
+        // `connect` only completed `Ping`: `Subscribe` has not been sent yet
+        // and this subscription's backlog has not reached the daemon's own
+        // `CaughtUp` boundary, so the model stays in its disconnected/unknown
+        // state (a no-op if a prior failure already set it) until that
+        // boundary — or a confirmed seal — says otherwise (finding 2). No
+        // emit here: the render already reads `unknown` from whichever branch
+        // got the loop here, and the common, no-real-drop path below reaches
+        // `on_caught_up` before anything is ever shown.
+        snapshot.model.mark_disconnected();
         let mut failed = None;
-        let end = client::watch_records_ticking(subscriber, next_seq, poll_tick, |rec| {
-            if let Some(r) = &rec {
-                next_seq = r.seq + 1;
-            }
+        let result = client::watch_records_ticking(subscriber, next_seq, poll_tick, |watched| {
+            let rec = match watched {
+                WatchUpdate::Record(rec) => {
+                    next_seq = rec.seq + 1;
+                    Some(*rec)
+                }
+                WatchUpdate::Tick => None,
+                WatchUpdate::CaughtUp => {
+                    // The daemon's own confirmation that this subscription's
+                    // backlog is fully applied: only now is the projection
+                    // current, so only now does the bar leave `unknown` and
+                    // the consecutive-failure streak reset (finding 3) — a
+                    // confirmed live handover, not merely a successful
+                    // `connect()`.
+                    attempts = 0;
+                    snapshot.model.mark_connected();
+                    let now = module(&snapshot, segment);
+                    if now != last {
+                        if let Err(e) = emit(&now) {
+                            failed = Some(e);
+                        }
+                        last = now;
+                    }
+                    return;
+                }
+            };
             let at = Instant::now();
             let force = rec.is_none() && at.duration_since(last_force) >= tick;
             let scanned = observe_event(
@@ -421,15 +465,45 @@ fn follow_loop(
                 }
                 last = now;
             }
-        })?;
+        });
+        let end = match result {
+            Ok(end) => end,
+            Err(e) => {
+                // A transport failure anywhere between `Ping` and `Subscribe`
+                // or in the subscription's own read path (finding 3): folded
+                // into the same disconnected/retry path a clean `Closed` end
+                // takes, rather than aborting the whole loop here via a bare
+                // `?` while the last emitted module still reads live/unknown
+                // from before this attempt. An `emit` failure from inside the
+                // closures above is the caller's own I/O (e.g. a broken
+                // stdout pipe) and takes priority: that one is never retried.
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+                snapshot.model.mark_disconnected();
+                let now = module(&snapshot, segment);
+                if now != last {
+                    emit(&now)?;
+                    last = now;
+                }
+                if attempts >= RECONNECT_ATTEMPTS {
+                    return Err(e);
+                }
+                attempts += 1;
+                std::thread::sleep(RECONNECT_DELAY);
+                continue;
+            }
+        };
         if let Some(e) = failed {
             return Err(e);
         }
         // `watch_records_ticking` only ever ends on `Closed` or `Sealed`
-        // (its own loop swallows the replay-complete `CaughtUp` marker), but
-        // `CaughtUp` is matched here too rather than assumed unreachable —
-        // fail closed on the connection state even if that ever changes,
-        // instead of risking a panic in an unattended background process.
+        // (its replay-complete `CaughtUp` marker is now surfaced live, as
+        // `WatchUpdate::CaughtUp` in the closure above, rather than only at
+        // the end of the stream), but `WatchEnd::CaughtUp` is matched here
+        // too rather than assumed unreachable — fail closed on the
+        // connection state even if that ever changes, instead of risking a
+        // panic in an unattended background process.
         match end {
             WatchEnd::Sealed { .. } => {
                 snapshot.model.seal();
@@ -1663,6 +1737,471 @@ mod tests {
                 .any(|m| m.class.first().map(String::as_str) == Some("unknown")),
             "the never-connected state must render as unknown, not stay silent: {emitted:?}"
         );
+    }
+
+    /// Like [`fake_reconnect_daemon`], but the *last* connection also proves
+    /// the #138 item 5 catch-up boundary (review 5337489166 of #329, finding
+    /// 2): after replaying its own backlog it pauses for real wall-clock
+    /// time (`hold`) — a daemon slow to drain a backlog, or simply time
+    /// passing — before sending the daemon's own explicit `Response::CaughtUp`
+    /// and then `Response::Sealed`. Every earlier connection behaves exactly
+    /// as [`fake_reconnect_daemon`]'s: one record, then drop without
+    /// confirming anything (a crash mid-stream).
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn fake_catchup_pause_daemon(
+        log: Vec<ward_events::EventRecord>,
+        connections: usize,
+        hold: Duration,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::thread::JoinHandle<Vec<u64>>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use ward_daemon::control::{Request, Response, SOCKET_NAME};
+        use ward_events::{Blake3Hash, Chain, SessionId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let head = Chain::genesis(SessionId::from_u128(23), Blake3Hash::from_bytes([7; 32])).head();
+        let handle = std::thread::spawn(move || {
+            let mut seen_from_seq = Vec::new();
+            for i in 0..connections {
+                let (stream, _) = listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                let reply = |writer: &mut UnixStream, r: &Response| {
+                    let mut b = serde_json::to_vec(r).unwrap();
+                    b.push(b'\n');
+                    writer.write_all(&b).unwrap();
+                };
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    let request: Request = serde_json::from_str(&line).unwrap();
+                    match request {
+                        Request::Ping => reply(&mut writer, &Response::Ok),
+                        Request::Subscribe { from_seq } => {
+                            seen_from_seq.push(from_seq);
+                            let matching: Vec<_> =
+                                log.iter().filter(|r| r.seq >= from_seq).collect();
+                            let last_connection = i + 1 == connections;
+                            if last_connection {
+                                // The backlog in two halves with a real pause
+                                // between them — mid-backlog, not just
+                                // mid-connect — so a test reading the emitted
+                                // classes through that pause can prove the
+                                // model never renders live while it waits.
+                                let mid = matching.len() / 2;
+                                for rec in &matching[..mid] {
+                                    reply(&mut writer, &Response::Record(Box::new((*rec).clone())));
+                                }
+                                std::thread::sleep(hold);
+                                for rec in &matching[mid..] {
+                                    reply(&mut writer, &Response::Record(Box::new((*rec).clone())));
+                                }
+                                let next_seq = matching.last().map_or(from_seq, |r| r.seq + 1);
+                                reply(&mut writer, &Response::CaughtUp { next_seq });
+                                reply(&mut writer, &Response::Sealed { head });
+                            } else {
+                                // Every connection but the last replays only
+                                // the next one record before dropping, the
+                                // same crash-mid-stream shape as
+                                // `fake_reconnect_daemon`.
+                                for rec in &matching[..matching.len().min(1)] {
+                                    reply(&mut writer, &Response::Record(Box::new((*rec).clone())));
+                                }
+                            }
+                            break;
+                        }
+                        other => panic!("unexpected request in a catch-up pause test: {other:?}"),
+                    }
+                }
+            }
+            seen_from_seq
+        });
+        (dir, socket, handle)
+    }
+
+    /// Review 5337489166 of #329, finding 2: a connection lost mid-`--follow`
+    /// and then reconnected must not render `live` again until the daemon's
+    /// own `CaughtUp` boundary confirms the backlog this reconnect asked for
+    /// is fully applied — never merely because `client::connect` (which only
+    /// completes `Ping`) succeeded. The reconnect here pauses for real
+    /// wall-clock time mid-backlog before that boundary arrives, so a
+    /// premature `live` would be directly observable if `follow_loop` ever
+    /// cleared `unknown` too early.
+    #[test]
+    fn follow_loop_never_renders_live_before_the_reconnect_reaches_caught_up() {
+        #![allow(clippy::unwrap_used)]
+        use ward_events::{Blake3Hash, Chain, SessionId};
+
+        let work = tempfile::tempdir().unwrap();
+        let mut s = snapshot_on(work.path(), &[]);
+        let mut chain = Chain::genesis(SessionId::from_u128(29), Blake3Hash::from_bytes([11; 32]));
+        let records = vec![
+            note(&mut chain, 0),
+            note(&mut chain, 1),
+            note(&mut chain, 2),
+            note(&mut chain, 3),
+        ];
+        s.model.apply(records[0].clone());
+        let last = module(&s, None);
+        assert_eq!(
+            last.class.first().map(String::as_str),
+            Some("live"),
+            "sanity: the run starts live, before any drop"
+        );
+
+        let (_dir, socket, server) =
+            fake_catchup_pause_daemon(records, 2, Duration::from_millis(200));
+
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&emitted);
+        let result = follow_loop(
+            &socket,
+            s,
+            None,
+            None,
+            DigestGate::new(),
+            Duration::from_millis(20),
+            Duration::from_secs(3600),
+            last,
+            move |m: &Module| {
+                recorded.lock().unwrap().push(m.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let seen_from_seq = server.join().unwrap();
+        assert_eq!(
+            seen_from_seq,
+            vec![1, 2],
+            "the reconnect must resume from the last confirmed sequence"
+        );
+        assert!(result.model.sealed, "the last connection confirmed a seal");
+        // Every record was applied exactly once: none skipped by the
+        // reconnect's resume point, none replayed twice by it either.
+        assert_eq!(result.model.counters.claims, 4);
+
+        let emitted = emitted.lock().unwrap();
+        let classes: Vec<&str> = emitted
+            .iter()
+            .map(|m| m.class.first().map_or("", String::as_str))
+            .collect();
+        let mut deduped = classes.clone();
+        deduped.dedup();
+        assert_eq!(
+            deduped,
+            vec!["unknown", "live", "sealed"],
+            "must read unknown for the whole reconnect-and-replay, live only once caught \
+             up, and never a live frame in between: {classes:?}"
+        );
+    }
+
+    /// A fake daemon serving `cycles` connections, each a *successful*
+    /// reconnect (review 5337489166 of #329, finding 3): every connection
+    /// answers `Ping`, then `Subscribe` with nothing new (a quiet,
+    /// already-caught-up session) followed by the daemon's own
+    /// `Response::CaughtUp`, then drops without a seal — the same shape a
+    /// daemon restart between otherwise healthy periods leaves, repeated more
+    /// times than [`RECONNECT_ATTEMPTS`] bounds a single *consecutive* run of
+    /// failures. The last connection also sends `Response::Sealed` so the
+    /// test ends deterministically.
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn fake_many_successful_reconnects_daemon(
+        cycles: usize,
+    ) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<usize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use ward_daemon::control::{Request, Response, SOCKET_NAME};
+        use ward_events::{Blake3Hash, Chain, SessionId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let head =
+            Chain::genesis(SessionId::from_u128(31), Blake3Hash::from_bytes([13; 32])).head();
+        let handle = std::thread::spawn(move || {
+            let mut seen = 0usize;
+            for i in 0..cycles {
+                let (stream, _) = listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                let reply = |writer: &mut UnixStream, r: &Response| {
+                    let mut b = serde_json::to_vec(r).unwrap();
+                    b.push(b'\n');
+                    writer.write_all(&b).unwrap();
+                };
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    let request: Request = serde_json::from_str(&line).unwrap();
+                    match request {
+                        Request::Ping => reply(&mut writer, &Response::Ok),
+                        Request::Subscribe { from_seq } => {
+                            seen += 1;
+                            reply(&mut writer, &Response::CaughtUp { next_seq: from_seq });
+                            if i + 1 == cycles {
+                                reply(&mut writer, &Response::Sealed { head });
+                            }
+                            break;
+                        }
+                        other => panic!("unexpected request: {other:?}"),
+                    }
+                }
+            }
+            seen
+        });
+        (dir, socket, handle)
+    }
+
+    /// Review 5337489166 of #329, finding 3: the reconnect budget bounds a
+    /// *consecutive* run of failures, not the whole process's lifetime — a
+    /// confirmed catch-up resets it. More separated, individually-successful
+    /// reconnects than [`RECONNECT_ATTEMPTS`] must not exhaust it; a bar that
+    /// keeps recovering from isolated daemon restarts must not give up on the
+    /// next one just because time (and other, unrelated restarts) has
+    /// passed.
+    #[test]
+    fn follow_loop_survives_more_successful_reconnects_than_the_retry_budget() {
+        #![allow(clippy::unwrap_used, clippy::panic)]
+        let work = tempfile::tempdir().unwrap();
+        let s = snapshot_on(work.path(), &[]);
+        let last = module(&s, None);
+
+        let cycles = usize::try_from(RECONNECT_ATTEMPTS).unwrap() + 3;
+        let (_dir, socket, server) = fake_many_successful_reconnects_daemon(cycles);
+
+        let result = follow_loop(
+            &socket,
+            s,
+            None,
+            None,
+            DigestGate::new(),
+            Duration::from_millis(5),
+            Duration::from_secs(3600),
+            last,
+            |_m: &Module| Ok(()),
+        );
+
+        let seen = server.join().unwrap();
+        assert_eq!(
+            seen, cycles,
+            "every one of the separated reconnects must be tried, not just the first \
+             {RECONNECT_ATTEMPTS}"
+        );
+        let result = result
+            .unwrap_or_else(|e| panic!("must not give up on isolated, successful reconnects: {e}"));
+        assert!(result.model.sealed, "the last connection confirmed a seal");
+    }
+
+    /// A fake daemon serving `count` connections that each answer `Ping` and
+    /// then close before ever seeing `Subscribe` — the shape review
+    /// 5337489166 of #329, finding 3 calls out explicitly: a daemon gone in
+    /// the narrow window between completing `Ping` (which `client::connect`
+    /// blocks on) and the subscription actually reaching it.
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn fake_close_before_subscribe_daemon(
+        count: usize,
+    ) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<usize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use ward_daemon::control::{Request, Response, SOCKET_NAME};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut served = 0usize;
+            for _ in 0..count {
+                let (stream, _) = listener.accept().unwrap();
+                served += 1;
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let request: Request = serde_json::from_str(&line).unwrap();
+                assert!(
+                    matches!(request, Request::Ping),
+                    "expected Ping first, got {request:?}"
+                );
+                let mut b = serde_json::to_vec(&Response::Ok).unwrap();
+                b.push(b'\n');
+                writer.write_all(&b).unwrap();
+                // `reader`/`writer` are dropped here, closing the connection
+                // before `Subscribe` is ever read or answered.
+            }
+            served
+        });
+        (dir, socket, handle)
+    }
+
+    /// Review 5337489166 of #329, finding 3: a daemon that answers `Ping`
+    /// and then closes before `Subscribe`, repeated consecutively, must still
+    /// be bounded by [`RECONNECT_ATTEMPTS`] — the same "fail closed, not
+    /// hang" contract [`follow_loop_gives_up_after_bounded_reconnect_attempts_when_nothing_answers`]
+    /// proves for a connect that never even completes `Ping`, but exercised
+    /// through the read/subscribe path instead so a transport failure there
+    /// cannot quietly bypass the bound via a bare `?`.
+    #[test]
+    fn follow_loop_gives_up_after_bounded_consecutive_failures_even_when_ping_answers() {
+        #![allow(clippy::unwrap_used, clippy::panic)]
+        let work = tempfile::tempdir().unwrap();
+        let s = snapshot_on(work.path(), &[]);
+        let last = module(&s, None);
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&emitted);
+
+        // Exactly enough connections to answer every attempt `follow_loop`
+        // will make (the first, plus `RECONNECT_ATTEMPTS` retries) and not
+        // one more: if it ever tried an extra connection, `accept()` would
+        // have nothing left to answer it, the same "must fail closed, not
+        // hang" shape the unreachable-socket test above proves.
+        let count = usize::try_from(RECONNECT_ATTEMPTS).unwrap() + 1;
+        let (_dir, socket, server) = fake_close_before_subscribe_daemon(count);
+
+        let started = Instant::now();
+        let result = follow_loop(
+            &socket,
+            s,
+            None,
+            None,
+            DigestGate::new(),
+            Duration::from_millis(20),
+            Duration::from_secs(3600),
+            last,
+            move |m: &Module| {
+                recorded.lock().unwrap().push(m.clone());
+                Ok(())
+            },
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            result.is_err(),
+            "a daemon that never once answers Subscribe must eventually be given up on"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "bounded backoff must fail closed quickly, not hang: {elapsed:?}"
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            count,
+            "every bounded attempt must actually be tried — not fewer (giving up too \
+             early) and not more (the budget not actually bounded)"
+        );
+        let emitted = emitted.lock().unwrap();
+        assert!(
+            emitted
+                .iter()
+                .any(|m| m.class.first().map(String::as_str) == Some("unknown")),
+            "must render unknown along the way, not stay silent: {emitted:?}"
+        );
+    }
+
+    /// [`fake_close_before_subscribe_daemon`], but after `bad_connections`
+    /// such connections a final, good one actually answers `Subscribe`:
+    /// replays `log`, then `Response::CaughtUp`, then `Response::Sealed`.
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn fake_close_before_subscribe_then_recover_daemon(
+        log: Vec<ward_events::EventRecord>,
+        bad_connections: usize,
+    ) -> (tempfile::TempDir, PathBuf) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use ward_daemon::control::{Request, Response, SOCKET_NAME};
+        use ward_events::{Blake3Hash, Chain, SessionId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let head =
+            Chain::genesis(SessionId::from_u128(37), Blake3Hash::from_bytes([17; 32])).head();
+        std::thread::spawn(move || {
+            for _ in 0..bad_connections {
+                let (stream, _) = listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let request: Request = serde_json::from_str(&line).unwrap();
+                assert!(matches!(request, Request::Ping));
+                let mut b = serde_json::to_vec(&Response::Ok).unwrap();
+                b.push(b'\n');
+                writer.write_all(&b).unwrap();
+                // Dropped here, without ever reading `Subscribe`.
+            }
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let reply = |writer: &mut UnixStream, r: &Response| {
+                let mut b = serde_json::to_vec(r).unwrap();
+                b.push(b'\n');
+                writer.write_all(&b).unwrap();
+            };
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                let request: Request = serde_json::from_str(&line).unwrap();
+                match request {
+                    Request::Ping => reply(&mut writer, &Response::Ok),
+                    Request::Subscribe { from_seq } => {
+                        let mut next_seq = from_seq;
+                        for rec in log.iter().filter(|r| r.seq >= from_seq) {
+                            next_seq = rec.seq + 1;
+                            reply(&mut writer, &Response::Record(Box::new(rec.clone())));
+                        }
+                        reply(&mut writer, &Response::CaughtUp { next_seq });
+                        reply(&mut writer, &Response::Sealed { head });
+                        break;
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            }
+        });
+        (dir, socket)
+    }
+
+    /// Review 5337489166 of #329, finding 3: a daemon closing between `Ping`
+    /// and `Subscribe` must be folded into the ordinary disconnect/retry
+    /// path, not abort `follow_loop` outright — it recovers on the next
+    /// connection exactly as a real daemon coming back up would.
+    #[test]
+    fn follow_loop_recovers_after_the_daemon_closes_between_ping_and_subscribe() {
+        #![allow(clippy::unwrap_used, clippy::panic)]
+        use ward_events::{Blake3Hash, Chain, SessionId};
+
+        let work = tempfile::tempdir().unwrap();
+        let mut s = snapshot_on(work.path(), &[]);
+        let mut chain = Chain::genesis(SessionId::from_u128(41), Blake3Hash::from_bytes([19; 32]));
+        let records = vec![note(&mut chain, 0), note(&mut chain, 1)];
+        s.model.apply(records[0].clone());
+        let last = module(&s, None);
+
+        let (_dir, socket) = fake_close_before_subscribe_then_recover_daemon(records, 2);
+
+        let result = follow_loop(
+            &socket,
+            s,
+            None,
+            None,
+            DigestGate::new(),
+            Duration::from_millis(20),
+            Duration::from_secs(3600),
+            last,
+            |_m: &Module| Ok(()),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "a daemon that recovers after closing before Subscribe must not abort \
+                 the loop outright: {e}"
+            )
+        });
+
+        assert!(
+            result.model.sealed,
+            "the recovered connection confirmed a seal"
+        );
+        assert_eq!(result.model.counters.claims, 2);
     }
 
     #[test]

@@ -36,6 +36,7 @@ window#waybar {
 #custom-ward-network,
 #custom-ward-tamperward,
 #custom-ward-verify,
+#custom-ward-daemon,
 #custom-ward-update,
 #pulseaudio,
 #network,
@@ -60,8 +61,12 @@ window#waybar {
 #custom-ward-agent,
 #custom-ward-network,
 #custom-ward-tamperward,
-#custom-ward-verify {
+#custom-ward-verify,
+#custom-ward-daemon {
   color: @text;
+}
+#custom-ward-daemon {
+  font-weight: 600;
 }
 /* State colour on the segment's text (the shell puts it on the glyph), never a fill. */
 .working   { color: @accent; }
@@ -76,6 +81,25 @@ window#waybar {
 .idle,
 .sealed,
 .none { color: @text_muted; }
+/* A daemon connection lost without a confirmed seal (#138 item 5): its own
+ * state, never a colour a segment could just as well carry for an unrelated
+ * reason (in particular `.dim`/`.restricted`, which `sealed`/a plain warn
+ * tone already use) — a 2 px dashed marker under the cell, the same
+ * under-cell-marker convention `#battery.warning`/`#battery.critical` use,
+ * on every segment module this class reaches (`waybar.rs`'s `Module::segment`),
+ * not only the whole-bar module. Paired with each module's own id, like the
+ * battery markers, so it wins over the plain transparent border every cell
+ * above starts from (an id selector otherwise outranks a bare class one). */
+#custom-ward-mark.unknown,
+#custom-ward-project.unknown,
+#custom-ward-agent.unknown,
+#custom-ward-network.unknown,
+#custom-ward-grants.unknown,
+#custom-ward-tamperward.unknown,
+#custom-ward-verify.unknown,
+#custom-ward-daemon.unknown {
+  border-bottom: 2px dashed @restricted;
+}
 
 /* --- Workspaces (centre): the names, the active one marked ---------------------- */
 #workspaces button {
