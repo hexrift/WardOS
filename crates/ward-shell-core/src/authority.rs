@@ -35,7 +35,15 @@
 //! an upgraded `wardd` could no longer verify its own session's own earlier
 //! log) — see [`Authority::apply`] and [`Authority::attribute_launch`] for how
 //! this projection consumes that second record without ever needing the
-//! daemon's own per-connection bookkeeping.
+//! daemon's own per-connection bookkeeping. [`Authority::apply`]'s own
+//! provisional label+permissions+computed-expiry match (the best available
+//! identity before a grant's own attribution record arrives) only ever lands
+//! on a row that is itself still unattributed (PR #318 review round 4):
+//! `expiry_unix_ms` truncates to milliseconds, so two independent launches
+//! granting the same service, permissions, TTL and route within the same
+//! millisecond is a realistic collision, and a row already attributed to one
+//! launch must never provisionally absorb another launch's grant and then
+//! have its own identity overwritten by that launch's own attribution record.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -239,6 +247,27 @@ impl Authority {
                     g.label == label
                         && g.permissions.as_deref() == Some(permissions.as_str())
                         && g.expires_at_unix_ms == computed_expiry
+                        // PR #318 review round 4: a row already attributed to
+                        // a launch (`launch_seq: Some(_)`) is never a valid
+                        // provisional home for a *different* record, no
+                        // matter how well label/permissions/computed-expiry
+                        // line up — `expiry_unix_ms` truncates to
+                        // milliseconds, so two independent launches granting
+                        // the same service/permissions/TTL/route within one
+                        // millisecond is a realistic collision, not a
+                        // contrived one, and merging into an attributed row
+                        // here would let the next, unrelated
+                        // `CredentialGrantedLaunch` overwrite that row's real
+                        // identity in `Self::attribute_launch`. A new route
+                        // with no attribution of its own yet may only join
+                        // another row that is likewise still unattributed;
+                        // it starts as its own provisional row otherwise, and
+                        // its own immediately-following attribution record
+                        // either claims that row or, if it turns out to
+                        // belong to an already-attributed earlier row after
+                        // all, merges into that one there instead (see
+                        // `Self::attribute_launch`).
+                        && g.launch_seq.is_none()
                 }) {
                     if !self.grants[pos].scope.contains(host) {
                         self.grants[pos].scope.push_str(", ");
@@ -305,7 +334,16 @@ impl Authority {
             .iter()
             .position(|g| g.launch_seq == Some(launch_seq))
         else {
-            if let Some(g) = self.grants.get_mut(idx) {
+            // PR #318 review round 4: never clobber a conflicting, already-
+            // attributed launch identity. `idx` is only ever unattributed
+            // here in practice — `Self::apply`'s own merge-target rule now
+            // refuses to land a new record on an already-attributed row — but
+            // refusing the overwrite outright, rather than relying solely on
+            // that invariant holding elsewhere, means this method can never
+            // itself be the one that loses a row's real identity.
+            if let Some(g) = self.grants.get_mut(idx)
+                && g.launch_seq.is_none()
+            {
                 g.launch_seq = Some(launch_seq);
             }
             return;
@@ -1303,6 +1341,80 @@ mod tests {
             authority.grants
         );
         assert_eq!(authority.len(0), 2);
+    }
+
+    /// PR #318 review round 4: `expiry_unix_ms` truncates to milliseconds, so
+    /// two independent launches granting the same service, permissions, TTL
+    /// and route within the same millisecond is a realistic outcome, not a
+    /// contrived one — and used to be merged into one row before the second
+    /// launch's own `CredentialGrantedLaunch` arrived, which then overwrote
+    /// the first launch's `launch_seq` outright: [`Authority::apply`]'s
+    /// provisional merge matched the target by label + permissions +
+    /// computed expiry alone, with no regard for whether that row was
+    /// already attributed to a different launch, and
+    /// [`Authority::attribute_launch`] then had nothing telling it the row
+    /// it was about to stamp already belonged to someone else.
+    #[test]
+    fn two_independent_launches_sharing_a_millisecond_project_as_two_grants_with_their_own_launch_seq()
+     {
+        let pid = ward_events::Pid::new(2).unwrap();
+        let started = || WardEvent::CommandStarted {
+            pid,
+            parent: ward_events::Pid::new(1).unwrap(),
+            argv: ward_events::BoundedArgv::from_strs(&["true"]),
+            cwd: ward_events::SandboxPath::new(ward_events::SandboxRoot::Work, ".").unwrap(),
+            exe_digest: None,
+        };
+        let finished = || WardEvent::CommandFinished {
+            pid,
+            exit: ward_events::ExitStatus::Exited { code: 0 },
+            duration: Duration::from_secs(1),
+        };
+
+        let mut events = vec![started()];
+        // First launch, one route, its own attribution.
+        events.extend(credential_in_launch("github.com", 1));
+        events.push(finished());
+        // A second, wholly independent launch, granting the very same
+        // service, permissions and route again, its own different
+        // `launch_seq`.
+        events.push(started());
+        events.extend(credential_in_launch("github.com", 2));
+        events.push(finished());
+
+        // Every record shares the exact same wall-clock millisecond — the
+        // realistic same-millisecond collision the review names (two
+        // launches landing within a millisecond of each other), not the
+        // artificial identical-instant shortcut the same-launch tests apply
+        // only to routes that really do belong to one launch.
+        let walls = vec![GRANTED_AT_UNIX_MS; events.len()];
+        let authority = Authority::from_records(&wardd_at_walls(&events, &walls));
+
+        assert_eq!(
+            authority.grants.len(),
+            2,
+            "two independent launches must project as two rows, even though \
+             their computed deadlines collide to the millisecond: {:?}",
+            authority.grants
+        );
+        assert_eq!(
+            authority.grants[0].launch_seq,
+            Some(1),
+            "the first launch's own identity must survive: {:?}",
+            authority.grants
+        );
+        assert_eq!(
+            authority.grants[1].launch_seq,
+            Some(2),
+            "the second launch's own identity must land on its own row: {:?}",
+            authority.grants
+        );
+        assert_eq!(
+            authority.grants[0].expires_at_unix_ms, authority.grants[1].expires_at_unix_ms,
+            "same wall clock and same TTL: the computed deadlines really do \
+             collide, which is exactly what makes this reproduction real"
+        );
+        assert_eq!(authority.len(0), 2, "both are still live authority");
     }
 
     /// PR #318 review round 3, requirement 3: a `CredentialGranted` record
