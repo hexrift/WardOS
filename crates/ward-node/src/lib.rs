@@ -1,21 +1,34 @@
 //! Local ward-node service.
 //!
-//! The first service slice exposes only protocol negotiation and read-only node capability
-//! discovery. Task lifecycle and remote transport are deliberately absent.
+//! The service negotiates the node protocol, then serves exactly one request per
+//! connection:
+//!
+//! * at protocol 1.1, read-only node capability discovery;
+//! * at protocol 1.2, one task lifecycle request against the node-owned
+//!   [`task::TaskRegistry`]. Only `create` and `inspect` are implemented; every other
+//!   verb is refused explicitly (see [`task`]).
+//!
+//! No task is executed yet, and remote transport is deliberately absent.
 
 #![forbid(unsafe_code)]
+
+pub mod task;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use ward_node_protocol::{
     CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse, NodeCapabilities,
-    SupportedProtocolRange, WARD_NODE_PROTOCOL, negotiate,
+    SupportedProtocolRange, TaskLifecycleContext, WARD_NODE_PROTOCOL, negotiate,
+    supports_task_lifecycle,
 };
+
+use crate::task::TaskRegistry;
 
 /// Maximum bytes in one node-protocol JSON request, excluding the terminating newline.
 pub const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024;
@@ -56,14 +69,21 @@ pub enum NodeServiceError {
     /// The absolute connection lifetime expired.
     #[error("ward-node connection exceeded its lifetime")]
     ConnectionDeadlineExceeded,
+    /// The node task registry lock was poisoned by an earlier panic.
+    #[error("ward-node task registry is unavailable")]
+    TaskRegistryUnavailable,
 }
 
-/// Read-only local node service for handshake and capability discovery.
+/// Local node service for handshake, capability discovery and the task registry.
+///
+/// Clones share one task registry, so a task created on one connection is visible to
+/// every later connection served by any clone.
 #[derive(Clone)]
 pub struct NodeService {
     capabilities: NodeCapabilities,
     context: CapabilityDiscoveryContext,
     supported: SupportedProtocolRange,
+    tasks: Arc<Mutex<TaskRegistry>>,
 }
 
 impl NodeService {
@@ -81,14 +101,21 @@ impl NodeService {
             capabilities,
             context,
             supported: WARD_NODE_PROTOCOL,
+            tasks: Arc::new(Mutex::new(TaskRegistry::default())),
         })
     }
 
     /// Serve exactly one local protocol connection.
     ///
     /// The first request must be a handshake. Rejected handshakes receive a bounded
-    /// machine-readable response and close. Accepted connections may issue one read-only
-    /// capability-discovery request before closing.
+    /// machine-readable response and close. A connection accepted at the capability
+    /// document's protocol (1.1) may issue one read-only capability-discovery request; a
+    /// connection accepted at a task-lifecycle protocol (1.2) may issue one lifecycle
+    /// request. Either way the connection then closes.
+    ///
+    /// A lifecycle request is applied to the registry before its response is written, so
+    /// a `create` whose client disconnects before reading the response still took effect;
+    /// the client recovers by replaying the same operation id or by inspecting.
     ///
     /// # Errors
     ///
@@ -122,6 +149,9 @@ impl NodeService {
         };
 
         if protocol != self.context.protocol() {
+            if supports_task_lifecycle(protocol) {
+                return self.serve_lifecycle(&mut stream, &mut reader, protocol, deadline);
+            }
             return Ok(());
         }
 
@@ -134,6 +164,27 @@ impl NodeService {
             .response(self.capabilities)
             .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         write_json_line(&mut stream, &response, deadline)
+    }
+
+    fn serve_lifecycle(
+        &self,
+        stream: &mut UnixStream,
+        reader: &mut BufReader<UnixStream>,
+        protocol: ward_node_protocol::ProtocolVersion,
+        deadline: Instant,
+    ) -> Result<(), NodeServiceError> {
+        let context = TaskLifecycleContext::new(protocol)
+            .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
+        let request_line = read_request_line(reader, deadline)?;
+        let request = context
+            .decode_request(&request_line)
+            .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
+        let response = self
+            .tasks
+            .lock()
+            .map_err(|_| NodeServiceError::TaskRegistryUnavailable)?
+            .handle(context, request);
+        write_json_line(stream, &response, deadline)
     }
 }
 
@@ -273,6 +324,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
+    use ward_events::{ExecutionAttemptId, LeaseId, TaskId};
     use ward_node_protocol::{
         CapabilityDiscoveryContext, CredentialCapabilities, ExecutionBackendCapabilities,
         HandshakeRequest, HandshakeResponse, IsolationCapabilities, LifecycleCapabilities,
@@ -280,7 +332,6 @@ mod tests {
         NodeCapacity, ProtocolRejectionReason, ProtocolVersion, SnapshotCapabilities,
         SupportedProtocolRange, VerifierCapabilities, WARD_NODE_PROTOCOL,
     };
-    use ward_events::{ExecutionAttemptId, LeaseId, TaskId};
     use ward_node_protocol::{
         OperationId, TaskBinding, TaskLifecycleContext, TaskLifecycleRejectionReason,
         TaskLifecycleRequest, TaskLifecycleResponse, TaskLifecycleState,
