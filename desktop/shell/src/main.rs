@@ -461,9 +461,25 @@ fn launcher_lines(dir: &Path, settle: Duration, query: &str) -> ward_daemon::Res
 /// that line's own session id (`ward session select <id>`, quoted), so
 /// choosing one always selects the session you read, never whichever session
 /// happens to be selected — or newest, or gone — by the time you press enter.
+///
+/// The shared selection and each line's pending-approval count both come
+/// from one [`ward_daemon::registry::snapshot`] call (#141 item 2) instead
+/// of this function's former separate `selection::current` read and a
+/// second per-session `Pending` request on top of `load_from`'s own
+/// connection. The session *list* itself still comes from
+/// [`ward_daemon::daemon::live_sessions`], deliberately not from
+/// `registry.entries`: the registry drops a session whose own, separate
+/// probe connection hit a disconnect (registry.rs's module doc, "a session
+/// whose daemon does not answer... is simply left out"), and a keyboard
+/// switcher listing "every live session" should not flicker a session out
+/// of the list over a transient hiccup on a connection this function does
+/// not otherwise need — `load_from`'s own connection right below is what
+/// decides whether a line is shown, exactly as before. A live session with
+/// no matching registry entry (the same kind of gap) reads as `0` pending,
+/// the same fallback `.map_or(0, ...)` gave its old direct `Pending` call.
 fn switcher(settle: Duration, lines: bool) -> ward_daemon::Result<()> {
     let state = state_root();
-    let selected = ward_daemon::selection::current(&state).session;
+    let registry = ward_daemon::registry::snapshot(&state, settle);
     let live = ward_daemon::daemon::live_sessions(&state)?;
     if live.is_empty() {
         if !lines {
@@ -471,6 +487,7 @@ fn switcher(settle: Duration, lines: bool) -> ward_daemon::Result<()> {
         }
         return Ok(());
     }
+    let selected = registry.selection.session.as_deref();
     let mut digester = Digester::new();
     for meta in &live {
         let socket = ward_daemon::session::session_dir(&state, &meta.id)
@@ -479,10 +496,12 @@ fn switcher(settle: Duration, lines: bool) -> ward_daemon::Result<()> {
             continue;
         };
         digester.observe(&mut snapshot);
-        let pending = client::connect(&socket)
-            .and_then(|mut sink| client::pending(&mut sink))
-            .map_or(0, |p| p.len());
-        let is_selected = selected.as_deref() == Some(meta.id.as_str());
+        let pending = registry
+            .entries
+            .iter()
+            .find(|e| e.session == meta.id)
+            .map_or(0, |e| e.pending_approvals);
+        let is_selected = selected == Some(meta.id.as_str());
         let label = switcher_label(&snapshot, pending, is_selected);
         if lines {
             println!("SESSIONS\t{label}\tward session select {}", quote(&meta.id));
