@@ -544,6 +544,10 @@ impl Served {
             Request::Pending => (Response::Pending(self.approvals.pending()), false),
             Request::Approvals => (Response::Approvals(self.approvals.approvals()), false),
             Request::Grants => (Response::Grants(self.approvals.grants()), false),
+            Request::GrantHistory => (
+                Response::GrantHistory(self.approvals.grant_history()),
+                false,
+            ),
             // Can block on the owning proxy's acknowledgement (#245): served
             // on its own connection, exactly like `Hold`, so this never holds
             // the whole daemon's lock across that wait.
@@ -602,7 +606,13 @@ impl Served {
     fn handle_appendable(&mut self, conn: u64, other: Request) -> (Response, bool) {
         let credential = match &other {
             Request::Append {
-                event: WardEvent::CredentialGranted { service, scope, .. },
+                event:
+                    WardEvent::CredentialGranted {
+                        service,
+                        scope,
+                        expires,
+                        ..
+                    },
                 ..
             } => Some((
                 service.as_str().to_owned(),
@@ -617,6 +627,7 @@ impl Served {
                     .rev()
                     .find(|(c, _)| *c == conn)
                     .map(|(_, key)| *key),
+                *expires,
             )),
             _ => None,
         };
@@ -646,17 +657,28 @@ impl Served {
         // process at all.
         let mut grant_id = None;
         if let Response::Record(record) = &response {
-            if let Some((service, subject, permissions, launch_key)) = credential {
+            if let Some((service, subject, permissions, launch_key, expires)) = credential {
                 // The subject is the route's upstream, `host:port`.
                 let host = subject
                     .rsplit_once(':')
                     .map_or(subject.as_str(), |(h, _)| h);
-                grant_id = Some(self.approvals.record_credential(
+                let granted_at_unix_ms = control::unix_ms(SystemTime::now());
+                // The instant this credential's own recorded lifetime runs out
+                // (#140): `granted_at_unix_ms` plus the event's own `expires`,
+                // saturating rather than overflowing on a pathological huge
+                // duration — a credential that could never expire on its own
+                // maths is exactly the same as one this cannot compute a
+                // bound for at all.
+                let expires_at_unix_ms = u64::try_from(expires.as_millis())
+                    .ok()
+                    .map(|ms| granted_at_unix_ms.saturating_add(ms));
+                grant_id = Some(self.approvals.record_credential_with_expiry(
                     &service,
                     host,
                     permissions,
                     launch_key,
-                    control::unix_ms(SystemTime::now()),
+                    granted_at_unix_ms,
+                    expires_at_unix_ms,
                 ));
             }
             if launch_started {
