@@ -80,8 +80,35 @@ assert_not_logged '^ward session revoke 8 '
 
 # --- cancellation never mutates authority --------------------------------------
 : >"$MOCK_LOG"
-WARDOS_MENU_CHOICE=7 WARDOS_CONFIRM=Cancel "$grants"
+# shellcheck disable=SC2016
+mock wardos-menu-select 'if [[ $2 == Grants ]]; then
+  grep -m1 "^7$(printf "\t")"
+else
+  printf "%s\n" Cancel
+fi'
+WARDOS_MENU_CHOICE=7 "$grants"
 assert_not_logged '^ward session revoke '
+
+# --- free-form menu output is never treated as a destructive selection ----------
+# The stdin backend intentionally allows arbitrary text, and fuzzel is a free-form
+# dmenu. Neither an unlisted numeric id nor malformed text may reach revoke.
+# shellcheck disable=SC2016
+mock wardos-menu-select 'if [[ $2 == Grants ]]; then
+  cat >/dev/null
+  printf "%s\n" "$WARDOS_MENU_OUTPUT"
+else
+  printf "%s\n" Revoke
+fi'
+for bad in 999 "not a listed grant"; do
+  : >"$MOCK_LOG"
+  export WARDOS_MENU_OUTPUT=$bad
+  set +e
+  "$grants"
+  status=$?
+  set -e
+  [[ $status -ne 0 ]] || fail "unlisted menu output must fail closed"
+  assert_not_logged '^ward session revoke '
+done
 
 # --- unconfirmed is visibly failure, with the CLI's exact warning preserved ----
 : >"$MOCK_LOG"
