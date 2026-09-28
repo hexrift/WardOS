@@ -105,9 +105,14 @@ enum Surface {
         #[arg(long, requires = "waybar")]
         follow: bool,
         /// Milliseconds between re-reads of the worktree while following and
-        /// the stream is quiet.
-        #[arg(long, requires = "follow", default_value_t = TICK_MS)]
-        tick_ms: u64,
+        /// the stream is quiet (default: `TICK_MS`, 2000). The shared worker
+        /// (#138 item 2) always runs on that default cadence — it cannot
+        /// honour a caller-chosen one, since it serves every connected
+        /// segment at once — so naming this explicitly bypasses the worker
+        /// and subscribes directly, the one way to actually get a different
+        /// tick; leaving it unset is what lets `--follow` use the worker.
+        #[arg(long, requires = "follow")]
+        tick_ms: Option<u64>,
     },
     /// The trust bar and the session panel behind its agent segment.
     Session,
@@ -235,15 +240,15 @@ fn main() -> ExitCode {
     // case the worker relay path is for. An explicit `--dir` names a
     // specific project's session, which the desktop-wide worker does not
     // parameterise by, so a caller that passed one keeps subscribing for
-    // itself (`use_worker` below), exactly as before this change.
-    let use_worker = cli.dir.is_none();
+    // itself ([`may_use_worker`] below), exactly as before this change.
+    let dir_given = cli.dir.is_some();
     let dir = cli.dir.unwrap_or_else(|| PathBuf::from("."));
     let settle = Duration::from_millis(cli.settle_ms);
     let surface = cli.surface.unwrap_or(Surface::Bar {
         waybar: false,
         segment: None,
         follow: false,
-        tick_ms: TICK_MS,
+        tick_ms: None,
     });
     let result = match surface {
         Surface::Bar {
@@ -256,8 +261,8 @@ fn main() -> ExitCode {
             settle,
             segment,
             follow,
-            Duration::from_millis(tick_ms),
-            use_worker,
+            Duration::from_millis(tick_ms.unwrap_or(TICK_MS)),
+            may_use_worker(dir_given, tick_ms),
         ),
         Surface::Launcher { query, lines: true } => launcher_lines(&dir, settle, &query),
         Surface::Switcher { lines } => switcher(settle, lines),
@@ -298,6 +303,23 @@ fn surface_text(snapshot: Option<&Snapshot>, surface: Surface) -> String {
     }
 }
 
+/// Whether `bar --waybar --follow` may ask the shared worker (#138 item 2)
+/// instead of subscribing for itself. Two things rule it out, each because
+/// the worker cannot honour what the caller asked for: an explicit `--dir`
+/// names a specific project's session, which the desktop-wide worker does
+/// not parameterise by (it always follows [`locate`]'s own default, "."); an
+/// explicit `--tick-ms` asks for a worktree re-read cadence, but the worker
+/// runs one cadence ([`TICK_MS`]) for every segment it serves at once and
+/// cannot honour a caller-chosen one. Silently relaying the worker's fixed
+/// cadence instead of the requested one would make `--tick-ms` — a
+/// documented, tested CLI option — a silent no-op once a worker happens to
+/// be running (review finding 2 on #331); bypassing the worker in that case
+/// keeps `--tick-ms` working exactly as it always has, through the
+/// unconditional direct-subscription path below.
+fn may_use_worker(dir_given: bool, tick_ms: Option<u64>) -> bool {
+    !dir_given && tick_ms.is_none()
+}
+
 /// `bar --waybar`: the module's JSON, once or on every change. Only a segment
 /// whose text or tone depends on freshness ([`SegmentName::needs_freshness`]:
 /// the whole bar, since it carries the verify segment, or `--segment verify`
@@ -317,24 +339,25 @@ fn surface_text(snapshot: Option<&Snapshot>, surface: Surface) -> String {
 /// polled at least as often as that interval so the deadline itself gets a
 /// digest without needing another record.
 ///
-/// With `--follow` and `use_worker`, this first tries
+/// With `--follow` and `may_worker` ([`may_use_worker`]), this first tries
 /// [`worker::relay_from_worker`] (#138 item 2): the shared worker, when one
 /// answers, already keeps the one cache and the one subscription this
 /// function's own logic below would otherwise duplicate per segment, so a
 /// live worker means this process never opens its own connection to the
 /// daemon or digests the worktree itself at all — it just copies the
 /// worker's lines to stdout. Everything below only ever runs when there is no
-/// worker to ask (not installed, mid-restart, or a caller that passed
-/// `--dir`), which is also exactly what always ran before this change.
+/// worker to ask (not installed, mid-restart, an explicit `--dir`, or an
+/// explicit `--tick-ms`), which is also exactly what always ran before this
+/// change.
 fn waybar(
     dir: &Path,
     settle: Duration,
     segment: Option<SegmentName>,
     follow: bool,
     tick: Duration,
-    use_worker: bool,
+    may_worker: bool,
 ) -> ward_daemon::Result<()> {
-    if follow && use_worker && worker::relay_from_worker(&state_root(), segment)? {
+    if follow && may_worker && worker::relay_from_worker(&state_root(), segment)? {
         return Ok(());
     }
     let Some(socket) = locate(dir)? else {
@@ -758,7 +781,7 @@ mod tests {
                 waybar: true,
                 segment: Some(SegmentName::Agent),
                 follow: true,
-                tick_ms: TICK_MS,
+                tick_ms: None,
             })
         ));
         assert!(Cli::try_parse_from(["ward-shell", "bar", "--segment", "agent"]).is_err());
@@ -773,7 +796,10 @@ mod tests {
         ]);
         assert!(matches!(
             cli.surface,
-            Some(Surface::Bar { tick_ms: 500, .. })
+            Some(Surface::Bar {
+                tick_ms: Some(500),
+                ..
+            })
         ));
         assert!(
             Cli::try_parse_from(["ward-shell", "bar", "--waybar", "--tick-ms", "500"]).is_err(),
@@ -788,6 +814,42 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("unknown segment `clock`"), "{err}");
+    }
+
+    /// Review finding 2 on #331: a live shared worker runs one fixed cadence
+    /// ([`TICK_MS`]) for every segment it serves, so it must never be asked
+    /// on behalf of a caller who named a different one explicitly — that
+    /// would silently turn a documented, tested `--tick-ms` into a no-op the
+    /// moment a worker happens to be running. `waybar`'s own dispatch is
+    /// `follow && may_worker && worker::relay_from_worker(..)`: a boolean
+    /// short-circuit, so whether the worker is ever asked at all reduces
+    /// entirely to this function's result — proving it here, without a
+    /// socket, is a complete proof for every caller of `waybar`, the same
+    /// reasoning `observe_event`'s own doc comment gives for being factored
+    /// out ("testable without a socket"). [`worker::tests`] separately
+    /// proves `relay_from_worker` correctly relays a real listening worker's
+    /// lines once it *is* asked, so together these cover both halves of the
+    /// behaviour: the decision, and what the decision gates.
+    #[test]
+    fn the_worker_is_asked_only_with_no_explicit_dir_and_no_explicit_tick() {
+        assert!(
+            may_use_worker(false, None),
+            "the common case: no --dir, no --tick-ms"
+        );
+        assert!(
+            !may_use_worker(true, None),
+            "an explicit --dir names a session the desktop-wide worker doesn't serve"
+        );
+        assert!(
+            !may_use_worker(false, Some(TICK_MS)),
+            "even a --tick-ms equal to the worker's own default must still bypass it: \
+             the caller asked for a specific cadence explicitly, not 'whatever the default is'"
+        );
+        assert!(
+            !may_use_worker(false, Some(500)),
+            "a --tick-ms the worker cannot honour must bypass it"
+        );
+        assert!(!may_use_worker(true, Some(500)), "both reasons at once");
     }
 
     #[test]
@@ -805,7 +867,7 @@ mod tests {
                 waybar: false,
                 segment: None,
                 follow: false,
-                tick_ms: TICK_MS,
+                tick_ms: None,
             },
             Surface::Session,
             Surface::VerifyPanel,

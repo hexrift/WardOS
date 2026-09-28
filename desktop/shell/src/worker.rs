@@ -7,14 +7,17 @@
 //! each subscribing and digesting independently.
 //!
 //! `ward-shell worker` (`desktop/systemd/user/wardos-shell-worker.service`,
-//! bound to the graphical session the same way `wardos-approve.service` is)
+//! bound to the graphical session the same way `wardos-approve.service` is,
+//! and started before `waybar` execs — `desktop/hyprland/autostart.conf`)
 //! runs [`run`]. `bar --waybar --follow` calls [`relay_from_worker`] first
 //! and only falls back to subscribing itself (`main.rs`'s own `waybar`,
-//! unchanged) when nothing answers there — a machine without the unit
-//! installed, or the gap between the worker exiting and systemd restarting
-//! it, still draws a correct bar, just paying each segment's own
-//! subscription (and, for the verify segment, digest) cost, exactly as
-//! before this change.
+//! unchanged) when nothing answers there even after
+//! [`connect_with_retries`]'s bounded retries — a machine without the unit
+//! installed, the gap between the worker exiting and systemd restarting it,
+//! or an explicit `--dir`/`--tick-ms` the desktop-wide worker cannot serve
+//! ([`crate::may_use_worker`]) — still draws a correct bar, just paying each
+//! segment's own subscription (and, for the verify segment, digest) cost,
+//! exactly as before this change.
 //!
 //! # Protocol
 //! One request line: a segment name ([`SegmentName::as_str`]) or `bar` for
@@ -28,16 +31,21 @@
 //! source tree, not a stable interface anything else speaks.
 //!
 //! # Failure
-//! A wedged worker (accepting connections but never answering) is bounded by
-//! [`relay_from_worker`]'s own handshake timeout, not by anything the worker
-//! does — the worker side deliberately stays as simple as a bind, an accept
-//! loop and one session loop, with no timeout or health-check logic of its
-//! own to get wrong. If the worker process dies outright, systemd's
-//! `Restart=on-failure` starts a new one and every client currently relaying
-//! sees its connection close, which (via [`relay_from_worker`] returning
-//! `Ok(true)`, the same as a closed session) makes that segment's process
-//! exit 0 for Waybar's `restart-interval` to relaunch — again, unchanged
-//! from what a segment losing its own daemon connection already did.
+//! A worker that has not bound its socket *yet* (the cold-start race:
+//! `autostart.conf` starts the unit before `waybar`, but a `systemctl start`
+//! that has returned only means the process was forked, not that it has
+//! reached `bind_socket`) is bridged by [`connect_with_retries`]'s bounded
+//! retry, not by anything the worker does. A wedged worker (accepting
+//! connections but never answering) is bounded by [`relay_from_worker`]'s
+//! own handshake timeout, likewise not by the worker side, which
+//! deliberately stays as simple as a bind, an accept loop and one session
+//! loop, with no timeout or health-check logic of its own to get wrong. If
+//! the worker process dies outright, systemd's `Restart=on-failure` starts a
+//! new one and every client currently relaying sees its connection close,
+//! which (via [`relay_from_worker`] returning `Ok(true)`, the same as a
+//! closed session) makes that segment's process exit 0 for Waybar's
+//! `restart-interval` to relaunch — again, unchanged from what a segment
+//! losing its own daemon connection already did.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -75,9 +83,52 @@ const NO_SESSION_POLL: Duration = Duration::from_secs(5);
 /// not a module frozen until someone notices.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// How many times [`relay_from_worker`] retries connecting to an absent or
+/// refused worker socket, and how long it waits between tries, before
+/// falling back to a direct subscription (review finding 1 on #331): a
+/// cold-start race where a Waybar segment's `--follow` process execs and
+/// asks before `wardos-shell-worker.service`'s own `bind_socket` call has
+/// run — `autostart.conf` starts that unit before `waybar`, but a
+/// `systemctl --user start` that has returned only means the unit's process
+/// was forked, not that it has bound its socket yet, so the race is still
+/// possible without this. Without a retry, the very first ask of that
+/// process's whole lifetime would lose the race, `relay_from_worker` would
+/// answer `Ok(false)` exactly once, and — because a `--follow` process picks
+/// this once at the top of `waybar()` and then runs its (also long-lived)
+/// direct subscription for the rest of that process's life — that one
+/// segment would keep subscribing and digesting for itself until Waybar's
+/// own `restart-interval` eventually respawns it, silently defeating this
+/// item's whole point for however long that takes. Five tries, 20ms apart:
+/// generous next to how fast a freshly-started worker actually binds (one
+/// `bind(2)` and a `chmod`, no I/O on that path), small enough that a
+/// genuinely absent worker (no unit installed, or still mid-restart past
+/// this budget) adds well under 100ms before falling back — imperceptible
+/// next to Waybar's own 5s `restart-interval`.
+const CONNECT_RETRIES: u32 = 5;
+
+/// The interval between [`CONNECT_RETRIES`] connect attempts.
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
 /// The worker's socket path under `state`.
 fn socket_path(state: &Path) -> PathBuf {
     state.join(SOCKET_NAME)
+}
+
+/// [`UnixStream::connect`] with [`CONNECT_RETRIES`] bounded retries
+/// ([`CONNECT_RETRY_INTERVAL`] apart) before giving up — the cold-start-race
+/// mitigation [`CONNECT_RETRIES`]'s own doc comment explains. `None` only
+/// after every attempt has failed.
+fn connect_with_retries(path: &Path) -> Option<UnixStream> {
+    for attempt in 0..CONNECT_RETRIES {
+        match UnixStream::connect(path) {
+            Ok(stream) => return Some(stream),
+            Err(_) if attempt + 1 < CONNECT_RETRIES => {
+                std::thread::sleep(CONNECT_RETRY_INTERVAL);
+            }
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -90,17 +141,19 @@ fn socket_path(state: &Path) -> PathBuf {
 /// `Ok(true)`: the worker answered and this function ran the relay to
 /// completion — the caller (`main.rs`'s `waybar`) is done, exactly as if it
 /// had subscribed and printed the lines itself. `Ok(false)`: there is no
-/// worker to ask (nothing is listening, or it did not answer within
-/// [`HANDSHAKE_TIMEOUT`]), so the caller falls back to its own subscription.
-/// `Err`: a real I/O failure *after* the worker had already committed to
-/// answering (its first line arrived), mirroring how the direct path
-/// propagates a failure from mid-subscription rather than silently
-/// swallowing it.
+/// worker to ask — nothing answered a connect within
+/// [`connect_with_retries`]'s bounded retries (covers the cold-start race:
+/// not installed, or not bound yet), or it accepted but did not answer
+/// within [`HANDSHAKE_TIMEOUT`] (wedged) — so the caller falls back to its
+/// own subscription. `Err`: a real I/O failure *after* the worker had
+/// already committed to answering (its first line arrived), mirroring how
+/// the direct path propagates a failure from mid-subscription rather than
+/// silently swallowing it.
 pub(crate) fn relay_from_worker(
     state: &Path,
     segment: Option<SegmentName>,
 ) -> ward_daemon::Result<bool> {
-    let Ok(stream) = UnixStream::connect(socket_path(state)) else {
+    let Some(stream) = connect_with_retries(&socket_path(state)) else {
         return Ok(false);
     };
     let request = segment.map_or_else(|| "bar".to_owned(), |s| s.to_string());
@@ -493,7 +546,7 @@ fn write_module(stream: &mut UnixStream, module: &Module) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use std::thread::JoinHandle;
     use ward_shell_core::{Header, Model, SessionDescription};
@@ -658,8 +711,70 @@ mod tests {
     #[test]
     fn relay_falls_back_when_nothing_is_listening() {
         let dir = tempfile::tempdir().unwrap();
+        // Retried CONNECT_RETRIES times (review finding 1 on #331) before
+        // giving up — still fast (well under a second) and still `Ok(false)`,
+        // not an error, when truly nothing is ever going to answer.
         let ok = relay_from_worker(dir.path(), Some(SegmentName::Agent)).unwrap();
         assert!(!ok, "no socket at all must fall back, not error");
+    }
+
+    /// Review finding 1 on #331: several Waybar segment processes can ask
+    /// before `wardos-shell-worker.service` has bound its socket at all
+    /// (nothing merely wedged — genuinely not listening yet), the exact
+    /// cold-start race `autostart.conf` starting the unit before `waybar`
+    /// only narrows, never closes on its own. Every one of them must still
+    /// converge on the worker once it *does* bind, within
+    /// `connect_with_retries`'s bounded retry budget — not fall back to a
+    /// direct subscription permanently for that process's whole lifetime,
+    /// which is what a single, un-retried connect attempt would do.
+    #[test]
+    fn a_cold_start_race_still_converges_every_relay_client_onto_the_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let path = socket_path(dir.path());
+
+        // Three segment processes ask while nothing is listening at all —
+        // not started via `fake_daemon_once`/`bind_socket`, deliberately: at
+        // this instant the worker has not even called `UnixListener::bind`
+        // yet, the actual race this test is about.
+        let segments = [
+            SegmentName::Agent,
+            SegmentName::Verify,
+            SegmentName::Project,
+        ];
+        let clients: Vec<JoinHandle<ward_daemon::Result<bool>>> = segments
+            .iter()
+            .map(|&segment| {
+                let dir_path = dir_path.clone();
+                std::thread::spawn(move || relay_from_worker(&dir_path, Some(segment)))
+            })
+            .collect();
+
+        // Bind partway through the retry budget (CONNECT_RETRIES *
+        // CONNECT_RETRY_INTERVAL = 100ms): late enough that a single,
+        // un-retried connect from each thread above would already have
+        // failed almost every time, comfortably inside the retry window a
+        // real worker's near-instant startup easily beats in practice.
+        std::thread::sleep(CONNECT_RETRY_INTERVAL * 2);
+        let listener = UnixListener::bind(&path).unwrap();
+        let shared = Shared::new();
+        {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || accept_loop(&listener, &shared));
+        }
+        // No session is ever started: each client's request is answered
+        // `Module::none` and closed at once (`Shared::register` on
+        // `State::NoSession`), which is still `relay_from_worker` reaching
+        // and being answered by the worker — `Ok(true)` — the only thing
+        // this test asserts. What the worker answers with is covered by the
+        // multiplexing tests above; this one is only about whether the
+        // connection is reached at all under a cold start.
+        for (client, segment) in clients.into_iter().zip(segments) {
+            assert!(
+                client.join().unwrap().unwrap(),
+                "{segment}: must converge onto the worker, not fall back permanently"
+            );
+        }
     }
 
     /// An end-to-end pass: a real worker thread (bind, accept, one fake
@@ -689,10 +804,11 @@ mod tests {
         let verify_client =
             std::thread::spawn(move || read_n_lines(&dir_path, Some(SegmentName::Verify), 1));
 
-        // Give both clients time to register before publishing, so the
-        // change below is guaranteed to be seen as a change, not folded into
-        // either one's first frame.
-        std::thread::sleep(Duration::from_millis(50));
+        // Wait for both clients to actually register (review finding 4 on
+        // #331: not a fixed sleep) before publishing, so the change below is
+        // guaranteed to be seen as a change, not folded into either one's
+        // first frame.
+        wait_for_subscribers(&shared, 2);
         shared.publish(BTreeMap::from([
             (Some(SegmentName::Agent), bar("agent v2")),
             (Some(SegmentName::Verify), bar("verify v1")), // unchanged
@@ -705,12 +821,21 @@ mod tests {
         assert_eq!(verify_lines, vec![bar("verify v1")]);
     }
 
+    /// How long a test helper's blocking read or registration wait is given
+    /// before it panics instead of hanging (review finding 4 on #331): a
+    /// genuine regression must fail the suite loudly within one bounded
+    /// wait, never stall it — generous next to how fast these in-process,
+    /// no-I/O operations actually complete, small next to a CI timeout.
+    const TEST_BOUND: Duration = Duration::from_secs(5);
+
     /// Connect to the worker at `dir`, ask for `segment`, and collect the
     /// first `n` [`Module`] lines it sends (test helper, not
     /// [`relay_from_worker`]: that one relays to stdout, this one collects
-    /// for assertion).
+    /// for assertion). Bounded by [`TEST_BOUND`]: a line that never arrives
+    /// is a test failure (a clear panic), not a hung test binary.
     fn read_n_lines(dir: &Path, segment: Option<SegmentName>, n: usize) -> Vec<Module> {
         let stream = UnixStream::connect(socket_path(dir)).unwrap();
+        stream.set_read_timeout(Some(TEST_BOUND)).unwrap();
         let mut writer = stream.try_clone().unwrap();
         let request = segment.map_or_else(|| "bar".to_owned(), |s| s.to_string());
         writeln!(writer, "{request}").unwrap();
@@ -718,10 +843,44 @@ mod tests {
         (0..n)
             .map(|_| {
                 let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
+                reader
+                    .read_line(&mut line)
+                    .expect("a Module line within TEST_BOUND, not a hang");
                 serde_json::from_str(&line).unwrap()
             })
             .collect()
+    }
+
+    /// Block until `shared` has exactly `n` registered subscribers, or panic
+    /// after [`TEST_BOUND`] (review finding 4 on #331): the deterministic
+    /// replacement for a fixed sleep before publishing a change a test
+    /// expects every subscriber to see. A fixed sleep only assumes the
+    /// scheduler runs the spawned client threads far enough to register
+    /// within that window — not guaranteed, and wrong on a slow or
+    /// contended runner: a client that registers *after* the publish would
+    /// see the published value as its own first frame instead of a second,
+    /// distinct line, and then block forever in [`read_n_lines`] waiting for
+    /// a change that will never come, hanging the whole suite rather than
+    /// failing the one test. Polling `shared`'s own subscriber count instead
+    /// waits for the actual condition the test depends on, however long the
+    /// scheduler takes, and still fails loudly (not silently) if it never
+    /// arrives.
+    fn wait_for_subscribers(shared: &Shared, n: usize) {
+        let deadline = Instant::now() + TEST_BOUND;
+        loop {
+            let count = match &*shared.lock() {
+                State::Serving { subscribers, .. } => subscribers.len(),
+                State::NoSession => 0,
+            };
+            if count >= n {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {TEST_BOUND:?} waiting for {n} subscribers to register (got {count})"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// A minimal fake `wardd`: answers exactly the three connections
