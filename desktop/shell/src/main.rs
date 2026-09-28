@@ -508,12 +508,13 @@ fn switcher(settle: Duration, lines: bool) -> ward_daemon::Result<()> {
 /// One live session's pending-approval count and whether it is the
 /// desktop's current selection, joined from `registry` by session id (#141
 /// item 2, review 5336575691 finding 1) — never by position: `live_sessions`
-/// and `registry.entries` are two separate listings (`live_sessions`, then
-/// `registry::snapshot`'s own fresh scan a moment later) that are not
-/// guaranteed to agree on order, or even on membership, so a positional
-/// pairing could silently attach one session's count or selection mark to
-/// another. `0`/`false` for a session `registry.entries` has no matching
-/// entry for — the same gap [`switcher`]'s doc comment already accepts.
+/// and `registry.entries` are two separate listings (`registry::snapshot`'s
+/// own fresh scan, then [`switcher`]'s own separate `live_sessions` call a
+/// moment later) that are not guaranteed to agree on order, or even on
+/// membership, so a positional pairing could silently attach one session's
+/// count or selection mark to another. `0`/`false` for a session
+/// `registry.entries` has no matching entry for — the same gap
+/// [`switcher`]'s doc comment already accepts.
 fn switcher_binding(registry: &ward_daemon::registry::Registry, session: &str) -> (usize, bool) {
     let pending = registry
         .entries
