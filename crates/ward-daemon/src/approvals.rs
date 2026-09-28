@@ -1406,8 +1406,17 @@ impl Approvals {
             let (still_live, expired) = std::mem::take(&mut state.credentials)
                 .into_iter()
                 .partition(|c| {
-                    c.revoke_state != RevokeState::Active
-                        || c.expires_at_unix_ms.is_none_or(|e| now_unix_ms < e)
+                    // A revoke already in flight (or unconfirmed) is left
+                    // alone by the expiry sweep — that outcome is decided by
+                    // `finish_revoke`, not by the clock. `Active` and
+                    // `Suspended` are both otherwise-live states and are
+                    // equally subject to the credential's own recorded
+                    // lifetime: pausing must never shelter an expiry that
+                    // would have applied anyway (review on #315 bb51419).
+                    matches!(
+                        c.revoke_state,
+                        RevokeState::Revoking | RevokeState::Unconfirmed
+                    ) || c.expires_at_unix_ms.is_none_or(|e| now_unix_ms < e)
                 });
             state.credentials = still_live;
             expired
@@ -1992,6 +2001,17 @@ impl Approvals {
     }
 
     fn set_paused_at(&self, paused: bool, now: Instant) {
+        self.set_paused_at_wall(paused, now, now_unix_ms());
+    }
+
+    /// [`set_paused_at`](Self::set_paused_at), also given the wall-clock
+    /// instant a resumed credential's own expiry is judged against: the
+    /// deterministic seam the expiry-during-pause tests drive, mirroring
+    /// [`grants_at`](Self::grants_at). Existing pause/countdown tests keep
+    /// calling [`set_paused_at`](Self::set_paused_at) unchanged — they carry
+    /// no credential with a recorded expiry, so the real wall clock it
+    /// supplies never matters to them.
+    fn set_paused_at_wall(&self, paused: bool, now: Instant, now_unix_ms: u64) {
         let mut state = self.lock();
         state.paused = paused;
         for clock in state.held.iter_mut().filter_map(|h| h.clock.as_mut()) {
@@ -2008,16 +2028,37 @@ impl Approvals {
         // already `Revoking`, `Unconfirmed`, `Revoked` or `Expired` is left
         // alone — pausing or resuming the session changes nothing about a
         // revoke already in flight or already concluded, or about a
-        // credential whose own lifetime already ran out.
+        // credential whose own lifetime already ran out. Resuming a
+        // `Suspended` credential whose own recorded lifetime has already run
+        // out must not reactivate it as `Active` — it is retired into
+        // history as `Expired` instead, exactly as an ordinary
+        // `grants`/`grant_history` sweep would have done (review on #315
+        // bb51419: a resume is not a loophole around a credential's own
+        // clock).
         let (from, to) = if paused {
             (RevokeState::Active, RevokeState::Suspended)
         } else {
             (RevokeState::Suspended, RevokeState::Active)
         };
-        for c in &mut state.credentials {
-            if c.revoke_state == from {
-                c.revoke_state = to;
+        let mut newly_expired = Vec::new();
+        state.credentials.retain_mut(|c| {
+            if c.revoke_state != from {
+                return true;
             }
+            if !paused
+                && let Some(expires) = c.expires_at_unix_ms
+                && now_unix_ms >= expires
+            {
+                newly_expired.push(c.clone());
+                return false;
+            }
+            c.revoke_state = to;
+            true
+        });
+        for mut c in newly_expired {
+            c.revoke_state = RevokeState::Expired;
+            let grant = credential_grant(&c, &state.unknown_launches);
+            state.record_grant_history(grant);
         }
         for g in state.remembered.values_mut() {
             if g.revoke_state == from {
@@ -3493,6 +3534,86 @@ mod tests {
         // further (it is not still in `credentials` to sweep a second time).
         assert_eq!(approvals.grants_at(3_000).len(), 1);
         assert_eq!(approvals.grant_history_at(3_000).len(), 1);
+    }
+
+    #[test]
+    fn a_suspended_credential_still_expires_on_schedule() {
+        // Review finding on #315 bb51419: the expiry sweep in `grants_at`
+        // kept every non-`Active` credential alive regardless of its own
+        // recorded lifetime, so pausing a session sheltered its credentials
+        // from an expiry that would otherwise have applied. `Suspended` must
+        // be swept exactly like `Active` — only a revoke already in flight
+        // (`Revoking`/`Unconfirmed`) is left alone by the clock.
+        let approvals = Approvals::new();
+        approvals.record_credential_with_expiry(
+            "github",
+            "github.com",
+            vec!["contents:read".into()],
+            None,
+            1_000,
+            Some(2_000),
+        );
+        approvals.set_paused_at_wall(true, Instant::now(), 1_500);
+        assert_eq!(
+            approvals.grants_at(1_999)[0].revoke_state,
+            RevokeState::Suspended,
+            "not yet expired: still suspended, not swept"
+        );
+        assert!(approvals.grant_history_at(1_999).is_empty());
+
+        // Queried again, still paused, exactly at its own recorded expiry
+        // instant: swept into history as `Expired`, not left `Suspended`
+        // forever just because the session never resumed.
+        assert!(
+            approvals.grants_at(2_000).is_empty(),
+            "an expired credential must not still read as a live, suspended grant"
+        );
+        let history = approvals.grant_history_at(2_000);
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0].revoke_state, RevokeState::Expired);
+    }
+
+    #[test]
+    fn resume_does_not_reactivate_a_credential_that_expired_while_suspended() {
+        // Review finding on #315 bb51419: resume flipped every `Suspended`
+        // credential straight back to `Active` with no regard for its own
+        // recorded expiry, so a credential that ran out while the session
+        // was paused could be reported live again, if only briefly, purely
+        // because the session resumed.
+        let approvals = Approvals::new();
+        approvals.record_credential_with_expiry(
+            "github",
+            "github.com",
+            vec!["contents:read".into()],
+            None,
+            1_000,
+            Some(2_000),
+        );
+        approvals.set_paused_at_wall(true, Instant::now(), 1_500);
+        assert_eq!(
+            approvals.grants_at(1_500)[0].revoke_state,
+            RevokeState::Suspended
+        );
+
+        // Resumed only after the credential's own lifetime already ran out
+        // while it was suspended: the resume transition itself must retire
+        // it as `Expired`, never hand it back as a reactivated `Active`
+        // grant even for the instant before the next `grants`/`grant_history`
+        // sweep would have caught it. Checked via the raw, non-sweeping
+        // `credentials()` accessor (also read directly by, e.g., the
+        // command-display path) so a resume that skipped its own expiry
+        // check — leaving the credential briefly `Active` in `state.credentials`
+        // until some other call happened to sweep it — cannot hide behind a
+        // `grants()` call that would immediately re-sweep it anyway.
+        approvals.set_paused_at_wall(false, Instant::now(), 2_500);
+        assert!(
+            approvals.credentials().is_empty(),
+            "resume must not reactivate an already-expired credential, even transiently"
+        );
+        assert!(approvals.grants().is_empty());
+        let history = approvals.grant_history();
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0].revoke_state, RevokeState::Expired);
     }
 
     #[test]
