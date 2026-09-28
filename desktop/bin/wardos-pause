@@ -39,20 +39,25 @@ session_flag=()
 # must never inspect a different one just because they disagree).
 status() { ward pause --status "${session_flag[@]}" "$project" 2>/dev/null || echo none; }
 
-# `ward pause`/`ward resume` print a leading "resolved-session: <id> <project>"
-# line naming the session they actually acted on — which, with no WARDOS_SESSION
-# pinned, can be the desktop's shared selection or the newest live session rather
-# than $project itself (#141 finding 3: a no-argument toggle must never let its
-# confirmation imply it acted on the directory the caller happened to be in when
-# it acted on a different live session's fallback pick instead). Extracted here
-# so the one notification a keybind press actually shows says which project was
+# `ward pause`/`ward resume` print a leading `resolved-session: {"id":...,
+# "project":...}` line naming the session they actually acted on — which, with
+# no WARDOS_SESSION pinned, can be the desktop's shared selection or the
+# newest live session rather than $project itself (#141 finding 3: a
+# no-argument toggle must never let its confirmation imply it acted on the
+# directory the caller happened to be in when it acted on a different live
+# session's fallback pick instead). JSON-encoded (review on #330), not plain
+# text: a project path is an arbitrary Unix path and may itself contain a
+# newline, which a line-oriented record can't carry without truncating the
+# path or splitting the record across two physical lines — `jq` decodes the
+# escaped value exactly, whatever it holds. Extracted here so the one
+# notification a keybind press actually shows says which project was
 # paused/resumed, not just that some session was.
 resolved_project() {
-  local line rest
+  local line json
   while IFS= read -r line; do
     if [[ $line == *"resolved-session: "* ]]; then
-      rest=${line#*resolved-session: }
-      printf '%s\n' "${rest#* }"
+      json=${line#*resolved-session: }
+      jq -r '.project' <<<"$json" 2>/dev/null || true
       return 0
     fi
   done <<<"$1"

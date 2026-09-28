@@ -33,7 +33,10 @@ mock ward 'case "$*" in
   "pause --session "*)
     echo paused >"$WARD_STATE_FILE"
     if [[ -f "$TMP/pause-resolved" ]]; then
-      printf "  resolved-session: sess_fallback /home/dev/other-project\n"
+      printf "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\"}\n"
+    fi
+    if [[ -f "$TMP/pause-newline" ]]; then
+      printf '%s\n' "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/oth\ner-project\"}"
     fi
     if [[ -f "$TMP/pause-unsettled" ]]; then
       printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
@@ -42,7 +45,10 @@ mock ward 'case "$*" in
   "pause "*)
     echo paused >"$WARD_STATE_FILE"
     if [[ -f "$TMP/pause-resolved" ]]; then
-      printf "  resolved-session: sess_fallback /home/dev/other-project\n"
+      printf "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\"}\n"
+    fi
+    if [[ -f "$TMP/pause-newline" ]]; then
+      printf '%s\n' "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/oth\ner-project\"}"
     fi
     if [[ -f "$TMP/pause-unsettled" ]]; then
       printf "  paused, but 2 processes had not confirmed stopped within 1s — the marker is held and approvals stay frozen regardless\n"
@@ -51,13 +57,13 @@ mock ward 'case "$*" in
   "resume --session "*)
     echo running >"$WARD_STATE_FILE"
     if [[ -f "$TMP/pause-resolved" ]]; then
-      printf "  resolved-session: sess_fallback /home/dev/other-project\n"
+      printf "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\"}\n"
     fi
     ;;
   "resume "*)
     echo running >"$WARD_STATE_FILE"
     if [[ -f "$TMP/pause-resolved" ]]; then
-      printf "  resolved-session: sess_fallback /home/dev/other-project\n"
+      printf "  resolved-session: {\"id\":\"sess_fallback\",\"project\":\"/home/dev/other-project\"}\n"
     fi
     ;;
   "stop "*) echo none >"$WARD_STATE_FILE" ;;
@@ -102,6 +108,24 @@ WARDOS_MENU_CHOICE=Resume "$pause"
 assert_logged '^notify-send -a WardOS -u critical AGENTS PAUSED /home/dev/other-project · network closed · credential grants suspended · processes frozen · workspace retained$'
 assert_logged '^notify-send -a WardOS -t 2000 Agents resumed /home/dev/other-project$'
 rm -f "$TMP/pause-resolved"
+assert_eq "$(cat "$WARD_STATE_FILE")" running
+
+# --- a resolved project path containing a newline reaches the notification intact
+# (review on #330): a plain-text line-oriented record between `ward` and
+# `wardos-pause` can't carry a path with an embedded newline without truncating it
+# or splitting the record across two physical lines. `ward` JSON-encodes the
+# record, so `resolved_project`'s `jq` decode must recover the exact path, newline
+# included, not a prefix cut off at the first line break ---
+: >"$MOCK_LOG"
+echo running >"$WARD_STATE_FILE"
+touch "$TMP/pause-newline"
+WARDOS_MENU_CHOICE=Resume "$pause"
+log=$(cat "$MOCK_LOG")
+expected=$'AGENTS PAUSED /home/dev/oth\ner-project \xc2\xb7 network closed'
+[[ $log == *"$expected"* ]] ||
+  fail "a newline in the resolved project must survive into the notification unchanged; log:
+$log"
+rm -f "$TMP/pause-newline"
 assert_eq "$(cat "$WARD_STATE_FILE")" running
 
 # --- already paused: the menu alone; Stop & preserve keeps the workspace -------

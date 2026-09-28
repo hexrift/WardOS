@@ -1763,10 +1763,18 @@ fn pause_status_word(
 /// named on the command line (#141 finding 3). Printing this makes the
 /// resolved project explicit in the confirmation instead of letting it read as
 /// confirmation of whatever directory the caller asked about.
+///
+/// JSON-encoded rather than plain text: a project path is an arbitrary Unix
+/// path and may itself contain a newline, which a line-oriented record can't
+/// carry without either truncating it or splitting the record across two
+/// physical lines (review on #330). `serde_json` escapes any such byte as
+/// `\n` inside the string, so the record — read by `wardos-pause` with `jq`
+/// — always stays on the one line it was printed on, whatever the path holds.
 fn resolved_session_line(state: &Path, socket: &Path) -> Option<String> {
     let id = socket.parent()?.file_name()?.to_str()?;
     let meta = SessionMeta::load(state, id).ok()?;
-    Some(format!("resolved-session: {id} {}", meta.project.display()))
+    let payload = serde_json::json!({ "id": id, "project": meta.project.display().to_string() });
+    Some(format!("resolved-session: {payload}"))
 }
 
 fn cmd_pause(
@@ -2102,12 +2110,13 @@ mod tests {
 
         let socket = ward_daemon::session::session_dir(state.path(), &id).join("control.sock");
         let line = resolved_session_line(state.path(), &socket).unwrap();
+        let prefix = "resolved-session: ";
+        assert!(line.starts_with(prefix), "{line}");
+        let value: serde_json::Value = serde_json::from_str(&line[prefix.len()..]).unwrap();
+        assert_eq!(value["id"], id);
         assert_eq!(
-            line,
-            format!(
-                "resolved-session: {id} {}",
-                project.path().canonicalize().unwrap().display()
-            )
+            value["project"],
+            project.path().canonicalize().unwrap().display().to_string()
         );
     }
 
@@ -2117,6 +2126,37 @@ mod tests {
         let socket =
             ward_daemon::session::session_dir(state.path(), "sess_missing").join("control.sock");
         assert!(resolved_session_line(state.path(), &socket).is_none());
+    }
+
+    /// A project path is an arbitrary Unix path and may itself contain a
+    /// newline. Review on #330: a plain-text line-oriented record can't carry
+    /// that without truncating the path or splitting the record across two
+    /// physical lines, silently naming the wrong (or a partial) project in
+    /// the pause/resume acknowledgement. JSON-encoding it must keep the
+    /// record on the one line it was printed on and preserve the path byte
+    /// for byte.
+    #[test]
+    fn resolved_session_line_carries_a_newline_in_the_project_path_intact() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("weird\nproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let session = ward_daemon::Session::start_in(&project_dir, state.path()).unwrap();
+        session.persist_current().unwrap();
+        let id = session.id().to_owned();
+        let canonical = project_dir.canonicalize().unwrap();
+        drop(session);
+
+        let socket = ward_daemon::session::session_dir(state.path(), &id).join("control.sock");
+        let line = resolved_session_line(state.path(), &socket).unwrap();
+        let prefix = "resolved-session: ";
+        let json_part = &line[prefix.len()..];
+        assert!(
+            !json_part.contains('\n'),
+            "the record must stay on one physical line: {line:?}"
+        );
+        let value: serde_json::Value = serde_json::from_str(json_part).unwrap();
+        assert_eq!(value["project"], canonical.display().to_string());
     }
 
     #[test]
