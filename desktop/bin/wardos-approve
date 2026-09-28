@@ -235,7 +235,10 @@ ask_decision() {
 interactive() {
   local id=${1:-} given=${2:-} pending chosen session decision
   pending=$(ward session pending --json "${session_flag[@]}" "$project" | jq -r "$fields")
-  if [[ -z $pending ]]; then
+  # Nothing pending is "nothing to do" only when no particular approval was asked
+  # for: an explicit <id> (how the inbox opens one) that has since been answered
+  # elsewhere or timed out is not pending, the same error as below (#146).
+  if [[ -z $pending && -z $id ]]; then
     echo "  no pending approvals"
     return 0
   fi

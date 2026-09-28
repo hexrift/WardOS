@@ -50,13 +50,13 @@ assert_logged '^ward session approvals --json --all$'
 assert_logged '^wardos-menu-select --prompt Approvals$'
 # Choosing a pending one (12) opens a terminal running wardos-approve 12 pinned to
 # its own session, WARDOS_SESSION=sess_a — never $project's/the desktop's selection.
-assert_logged '^foot --app-id ward-approval -e wardos-approve 12$'
+assert_logged '^foot --app-id ward-approval -e sh -c .* sh wardos-approve 12$'
 
 # The other live session's pending approval (20, sess_b) is reachable too, pinned to
 # its own session.
 : >"$MOCK_LOG"
 WARDOS_MENU_CHOICE=20 "$inbox"
-assert_logged '^foot --app-id ward-approval -e wardos-approve 20$'
+assert_logged '^foot --app-id ward-approval -e sh -c .* sh wardos-approve 20$'
 
 # --- a pending row ends with the daemon's decision time (#146 item 4) -------------
 # 12 running with 41.001 s left, 20 held because its session is paused; the decided
@@ -78,7 +78,7 @@ assert_logged 'pending         sess_a · payments-api · claude · Write · /wor
 assert_logged 'pending         sess_b · other-service · codex · Write · /work/other/db.rs · held while paused · 45 s left once resumed$'
 assert_logged 'timed-out       sess_a · payments-api · claude · WebFetch · api.github.com$'
 # The countdown is display only: the chosen row still parses to its own session.
-assert_logged '^foot --app-id ward-approval -e wardos-approve 12$'
+assert_logged '^foot --app-id ward-approval -e sh -c .* sh wardos-approve 12$'
 
 # --- a decided choice shows a read-only summary, no terminal ----------------------
 : >"$MOCK_LOG"
@@ -120,14 +120,156 @@ mock foot 'printf "%s\n" "${WARDOS_SESSION:-}" >>"$TMP/opened_sessions"'
 # shellcheck disable=SC2016
 mock wardos-menu-select 'grep -m1 -F -- "$WARDOS_MENU_CHOICE"'
 WARDOS_MENU_CHOICE=sess_a "$inbox"
-assert_logged '^foot --app-id ward-approval -e wardos-approve 12$'
+assert_logged '^foot --app-id ward-approval -e sh -c .* sh wardos-approve 12$'
 assert_eq "$(cat "$TMP/opened_sessions")" "sess_a"
 
 : >"$MOCK_LOG"
 : >"$TMP/opened_sessions"
 WARDOS_MENU_CHOICE=sess_c "$inbox"
-assert_logged '^foot --app-id ward-approval -e wardos-approve 12$'
+assert_logged '^foot --app-id ward-approval -e sh -c .* sh wardos-approve 12$'
 assert_eq "$(cat "$TMP/opened_sessions")" "sess_c"
+mock foot
+
+# --- an unreachable session is its own row, never a pending approval (#146 acceptance:
+# daemon disconnect). `ward session approvals --json --all` reports a live session it
+# could not ask as {"session", "error"} rather than dropping it (#141 finding 5); read as
+# an approval, that line has no outcome and so used to show as "pending" with empty
+# fields — an approval that does not exist — and choosing it opened a terminal for it --
+: >"$MOCK_LOG"
+: >"$TMP/info.txt"
+unreachable_x='{"session":"sess_x","error":"io: connection refused"}'
+export UNREACHABLE_X=$unreachable_x
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session approvals --json --all") printf "%s\n%s\n%s\n" "$DECIDED7" "$UNREACHABLE_X" "$PENDING12" ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+# shellcheck disable=SC2016
+mock wardos-menu-select 'if [[ $2 == Approvals ]]; then
+  tee -a "$MOCK_LOG" | grep -m1 -F -- "$WARDOS_MENU_CHOICE"
+else
+  cat >"$TMP/info.txt"
+fi'
+WARDOS_MENU_CHOICE=sess_x "$inbox"
+assert_logged 'unreachable     sess_x · approvals could not be listed: io: connection refused$'
+assert_not_logged 'pending +sess_x'
+# Pending first, then what could not be listed (it may be hiding pending ones), then
+# what was decided.
+order=$(grep -oE '^[^[:space:]]+	(pending|unreachable|timed-out)	' "$MOCK_LOG" | cut -f2 | tr '\n' ' ')
+assert_eq "$order" "pending unreachable timed-out "
+# Nothing to answer there: read-only, no terminal.
+assert_not_logged '^foot'
+grep -q '^State        unreachable$' "$TMP/info.txt" || fail "the summary says unreachable: $(cat "$TMP/info.txt")"
+grep -q '^Session      sess_x$' "$TMP/info.txt" || fail "the summary names the session: $(cat "$TMP/info.txt")"
+grep -q '^Error        io: connection refused$' "$TMP/info.txt" || fail "the summary gives the error: $(cat "$TMP/info.txt")"
+
+# --- the listing itself failing is visible, not a silent exit ----------------------
+# The inbox is started from a keybinding or the command centre, where stderr goes
+# nowhere a person looks: a failed `ward session approvals` must say so — and must
+# still say so when no notification can be shown at all, since wardos_notify is
+# best-effort and silently sends nothing in that case (review finding on #327).
+: >"$MOCK_LOG"
+: >"$TMP/info.txt"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session approvals --json --all") echo "ward: state root unreadable" >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+mock notify-send
+# shellcheck disable=SC2016
+mock wardos-menu-select 'cat >"$TMP/info.txt"'
+"$inbox" 2>/dev/null && fail "a failed listing is not success"
+assert_logged '^notify-send -a WardOS -u critical -t 8000 Approval inbox unavailable ward: state root unreadable$'
+grep -q '^State        unavailable$' "$TMP/info.txt" || fail "the fallback screen names the state: $(cat "$TMP/info.txt")"
+grep -q '^Error        ward: state root unreadable$' "$TMP/info.txt" || fail "the fallback screen names the error: $(cat "$TMP/info.txt")"
+
+# No notify-send on PATH at all (a plain terminal session, or one with no notification
+# binary installed): wardos_notify sends nothing and returns success, so the read-only
+# menu screen is the only surface left — it must still show the failure.
+: >"$MOCK_LOG"
+: >"$TMP/info.txt"
+rm -f "$MOCK_DIR/notify-send"
+"$inbox" 2>/dev/null && fail "a failed listing is not success"
+assert_not_logged '^notify-send'
+grep -q '^Error        ward: state root unreadable$' "$TMP/info.txt" ||
+  fail "still visible with no notify-send on PATH: $(cat "$TMP/info.txt")"
+
+# notify-send is installed but cannot reach a running notification service (no
+# org.freedesktop.Notifications owner — the pre-login/bootstrap case wardos_notify's
+# own comment describes): it exits non-zero, wardos_notify swallows that too, and the
+# menu screen must still carry the failure.
+: >"$MOCK_LOG"
+: >"$TMP/info.txt"
+mock notify-send 'exit 1'
+"$inbox" 2>/dev/null && fail "a failed listing is not success"
+grep -q '^Error        ward: state root unreadable$' "$TMP/info.txt" ||
+  fail "still visible when notify-send cannot reach a service: $(cat "$TMP/info.txt")"
+
+# --- a pending choice's terminal stays open on the daemon's own answer (#146 item 5).
+# The window used to close the moment wardos-approve exited, taking with it whether the
+# daemon accepted the answer, refused it (answered elsewhere, timed out) or could not be
+# reached. A shim terminal actually runs the -e command here (as launch-run-exit.test.sh
+# does), so the real wardos-launch run wrapper and the real wardos-approve both run ------
+# shellcheck disable=SC2016
+mock foot '
+while [[ $# -gt 0 && "$1" != "-e" ]]; do shift; done
+shift
+"$@" >>"$TMP/terminal.txt" 2>&1 </dev/null || true
+'
+# shellcheck disable=SC2016
+mock wardos-menu-select 'if [[ $2 == Approvals ]]; then
+  grep -m1 "^12$(printf "\t")"
+else
+  grep -m1 "^y$(printf "\t")"
+fi'
+line12='{"id":12,"tool":"Write","summary":"/work/src/lib.rs","claim":"Write /work/src/lib.rs","authority":{"rule":"r","destination":"/work/src/lib.rs","network":"none","method":"write","credential":"none","repository":null,"lifetime":null},"requested_at_unix_ms":1,"agent":"claude","session":"sess_a","project":"payments-api"}'
+export LINE12=$line12
+
+# Accepted: the daemon's own confirmation, then [done].
+: >"$MOCK_LOG"
+: >"$TMP/terminal.txt"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session approvals --json --all") printf "%s\n" "$PENDING12" ;;
+  "session pending --json --session sess_a "*) printf "%s\n" "$LINE12" ;;
+  "session approve --session sess_a 12 allow") echo "  approval 12 allow" ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+"$inbox"
+assert_logged '^ward session approve --session sess_a 12 allow$'
+grep -q '^  approval 12 allow$' "$TMP/terminal.txt" || fail "the daemon's confirmation stays visible: $(cat "$TMP/terminal.txt")"
+grep -q '\[done\]  press Enter to close' "$TMP/terminal.txt" || fail "the window holds on success: $(cat "$TMP/terminal.txt")"
+
+# Refused: the daemon's own reason, then [failed, …] — never a silent close.
+: >"$MOCK_LOG"
+: >"$TMP/terminal.txt"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session approvals --json --all") printf "%s\n" "$PENDING12" ;;
+  "session pending --json --session sess_a "*) printf "%s\n" "$LINE12" ;;
+  "session approve --session sess_a 12 allow") echo "ward: daemon: approval 12: timed out" >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+"$inbox"
+grep -q 'ward: daemon: approval 12: timed out' "$TMP/terminal.txt" || fail "the refusal stays visible: $(cat "$TMP/terminal.txt")"
+grep -q '\[failed, exit 1\]  press Enter to close' "$TMP/terminal.txt" || fail "a refusal is a failure: $(cat "$TMP/terminal.txt")"
+
+# Gone before the terminal asked (expiry before click, or answered from another
+# terminal): the chosen approval is not pending any more, and says so as a failure —
+# not "no pending approvals" and [done], as if there had been nothing to do.
+: >"$MOCK_LOG"
+: >"$TMP/terminal.txt"
+# shellcheck disable=SC2016
+mock ward 'case "$*" in
+  "session approvals --json --all") printf "%s\n" "$PENDING12" ;;
+  "session pending --json --session sess_a "*) : ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac'
+"$inbox"
+assert_not_logged '^ward session approve '
+grep -q 'wardos-approve: approval 12 is not pending' "$TMP/terminal.txt" || fail "a vanished approval is named: $(cat "$TMP/terminal.txt")"
+grep -q '\[failed, exit 1\]' "$TMP/terminal.txt" || fail "a vanished approval is a failure: $(cat "$TMP/terminal.txt")"
+grep -q '\[done\]' "$TMP/terminal.txt" && fail "a vanished approval is not done: $(cat "$TMP/terminal.txt")"
 mock foot
 
 # --- a cancelled listing does nothing, quietly ------------------------------------

@@ -858,7 +858,8 @@ pub enum TaskLifecycleRejectionReason {
     AuthorityDenied,
     /// A resource required to service the request is unavailable.
     ResourceUnavailable,
-    /// The negotiated protocol version does not support this operation.
+    /// The negotiated protocol version, or the node implementation serving it, does not
+    /// support this operation. The request was not applied.
     UnsupportedOperation,
 }
 
