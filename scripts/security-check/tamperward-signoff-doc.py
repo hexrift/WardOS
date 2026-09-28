@@ -31,23 +31,49 @@ DEFAULT_DOC = "docs/development-under-tamperward.md"
 
 PIN_RE = re.compile(r"tamperward@([0-9]+\.[0-9]+\.[0-9]+)")
 
-# A "prefix" sentence is one that could be read as guidance, not just a
+# A "prefix" clause is one that could be read as guidance, not just a
 # glossary mention of the word. It's suspect if it pairs "prefix" with a
 # word implying the prefix is accepted/effective, and isn't itself the
-# sentence explaining that prefixes are rejected/inert (issue #320, and the
-# semantically-identical paraphrase PR #323's review called out: "legacy
-# labels accept abbreviated head prefixes").
+# clause explaining that prefixes are rejected/inert (issue #320, and the
+# paraphrases PR #323's review supplied: "legacy labels accept abbreviated
+# head prefixes", "... permit ...", and "... accept ..., not full SHAs").
+#
+# Checked per CLAUSE, not per sentence: a sentence-wide check let a negation
+# anywhere in the sentence suppress a positive claim in an unrelated clause
+# ("Legacy labels accept abbreviated head prefixes, not full SHAs." has
+# "not", but it negates "full SHAs", not "accept" - the first clause alone
+# is still the false claim). Splitting on clause boundaries (, ; — and
+# coordinating/subordinating conjunctions) keeps the negation checked
+# against the same clause that carries the positive claim.
+#
+# Inline/fenced code spans are stripped before any of this runs. This
+# document necessarily contains the literal label name
+# `tamperward:allow:<rule>@<sha-prefix>` and similar identifiers verbatim,
+# in backticks, while explaining why they don't work - "allow" and "prefix"
+# inside a code-formatted identifier are not an English claim about what's
+# accepted, and must not be read as one (that false match is exactly what
+# adding "allow" to POSITIVE_RE below produced against this doc's own
+# `tamperward:allow:verify@...` label name before this stripping existed).
+CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n{2,}")
+CLAUSE_SPLIT_RE = re.compile(
+    r",|;|—|\b(?:but|however|though|although|while|except|whereas|yet)\b",
+    re.IGNORECASE,
+)
 PREFIX_WORD_RE = re.compile(r"\bprefix(es)?\b", re.IGNORECASE)
 POSITIVE_RE = re.compile(
     r"\b(accept(s|ed|ing)?|honor(s|ed)?|match(es|ed|ing)?|work(s|ed|ing)?|"
-    r"clear(s|ed|ing)?|support(s|ed|ing)?|valid|sufficient|enough)\b",
+    r"clear(s|ed|ing)?|support(s|ed|ing)?|allow(s|ed|ing)?|permit(s|ted|ting)?|"
+    r"enable(s|d|ing)?|grant(s|ed|ing)?|authorize(s|d)?|valid|sufficient|enough)\b",
     re.IGNORECASE,
 )
+# A claim in the same clause as one of these reads as flagged-as-false by
+# the document itself (a negation, or the claim explicitly marked as an
+# earlier mistake), not as live guidance.
 NEGATIVE_RE = re.compile(
     r"\b(reject(s|ed|ing)?|not|never|cannot|can't|doesn't|does not|no longer|"
     r"inert|false|stale|incompatible|used to|earlier guidance|previously|"
-    r"outdated|wrong|nor)\b",
+    r"outdated|wrong|nor|mistaken(ly)?|mistake|incorrect(ly)?|erroneous(ly)?)\b",
     re.IGNORECASE,
 )
 
@@ -62,16 +88,18 @@ def pinned_versions(text):
 
 
 def suspect_prefix_sentences(doc):
-    """Sentences pairing 'prefix' with acceptance language and no negation."""
+    """Clauses pairing 'prefix' with acceptance language and no negation."""
+    prose = CODE_SPAN_RE.sub(" ", doc)
     found = []
-    for sentence in SENTENCE_SPLIT_RE.split(doc):
-        if not PREFIX_WORD_RE.search(sentence):
-            continue
-        if not POSITIVE_RE.search(sentence):
-            continue
-        if NEGATIVE_RE.search(sentence):
-            continue
-        found.append(sentence.strip().replace("\n", " ")[:160])
+    for sentence in SENTENCE_SPLIT_RE.split(prose):
+        for clause in CLAUSE_SPLIT_RE.split(sentence):
+            if not PREFIX_WORD_RE.search(clause):
+                continue
+            if not POSITIVE_RE.search(clause):
+                continue
+            if NEGATIVE_RE.search(clause):
+                continue
+            found.append(clause.strip().replace("\n", " ")[:160])
     return found
 
 

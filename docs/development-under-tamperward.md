@@ -229,14 +229,15 @@ can never grant itself the sign-off it needs. Concretely:
   resolver but does not work against this pin — do not use it.** Earlier guidance here
   described applying `tamperward:allow:verify@<sha-prefix>` (a 26-character abbreviation,
   the longest that fits alongside the `tamperward:allow:verify@` prefix under GitHub's
-  50-character label cap) as a fallback, reasoning that `tamperward`'s `oobToken` matcher
-  accepted any prefix of the head SHA that was at least 7 hex characters. That is no
-  longer how the pinned CLI behaves: under `tamperward@2.33.0`, once a full head SHA is
-  supplied — which this repository's workflow always does, via `TAMPERWARD_OOB_HEAD`
-  — `oobToken` requires a legacy label's SHA to equal that **full** 40-character object
-  id; a prefix is rejected outright, not treated as a weaker-but-valid match. Since a
-  legacy label's SHA portion is capped at 26 characters by the label-name limit, it can
-  *never* equal a full 40-character SHA against this workflow's configuration, so this
+  50-character label cap) as a fallback, on the mistaken premise that `tamperward`'s
+  `oobToken` matcher accepted any prefix of the head SHA that was at least 7 hex
+  characters. That premise is wrong for the pinned CLI: under `tamperward@2.33.0`,
+  once a full head SHA is supplied — which this repository's workflow always does,
+  via `TAMPERWARD_OOB_HEAD` — `oobToken` requires a legacy label's SHA to equal
+  that **full** 40-character object id; a prefix is rejected outright, not treated
+  as a weaker-but-valid match. Since a legacy label's SHA portion is capped at 26
+  characters by the label-name limit, it can *never* equal a full 40-character
+  SHA against this workflow's configuration, so this
   path cannot clear a check here at all, however it is applied. This was hit and
   confirmed in practice on PR #318 — a correctly-formed 26-character legacy label was
   applied, `tamperward-verify` still failed the same way, and only re-applying the

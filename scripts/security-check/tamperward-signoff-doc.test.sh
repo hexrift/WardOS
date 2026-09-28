@@ -104,6 +104,44 @@ expect_fail "exact original claim (accepts any *prefix* of the head SHA)" "$tmp/
 expect_fail "paraphrased claim (legacy labels accept abbreviated head prefixes)" \
   "$tmp/paraphrase.md" "claiming a legacy label's SHA prefix is"
 
+# --- Case (b''): "permit" is an acceptance verb too, not just "accept" --------
+{
+  good_doc "$tmp/permit.md"
+  echo "" >>"$tmp/permit.md"
+  echo "Legacy labels permit abbreviated head prefixes." >>"$tmp/permit.md"
+}
+expect_fail "paraphrased claim using 'permit' instead of 'accept'" \
+  "$tmp/permit.md" "claiming a legacy label's SHA prefix is"
+
+# --- Case (b'''): a negation elsewhere in the sentence must not suppress the --
+# --- positive claim in its own clause (the bug the clause split exists for) --
+{
+  good_doc "$tmp/trailing_negation.md"
+  echo "" >>"$tmp/trailing_negation.md"
+  echo "Legacy labels accept abbreviated head prefixes, not full SHAs." >>"$tmp/trailing_negation.md"
+}
+expect_fail "claim true in its own clause despite a later, unrelated negation" \
+  "$tmp/trailing_negation.md" "claiming a legacy label's SHA prefix is"
+
+# --- Case: a literal label name in backticks is code, not an English claim ---
+# --- (guards the CODE_SPAN_RE stripping: "allow" inside `tamperward:allow:...` -
+# --- must not itself read as the acceptance verb "allow") --------------------
+{
+  good_doc "$tmp/code_span.md"
+  echo "" >>"$tmp/code_span.md"
+  echo 'See `tamperward:allow:verify@<sha-prefix>` for the retired label shape.' >>"$tmp/code_span.md"
+}
+expect_pass "a literal label name in backticks is not an English 'allow' claim" "$tmp/code_span.md"
+
+# --- Case: a claim explicitly marked mistaken in its own clause still passes -
+# --- (the same pattern the real doc uses for its own historical quote) -------
+{
+  good_doc "$tmp/mistaken_premise.md"
+  echo "" >>"$tmp/mistaken_premise.md"
+  echo "Earlier guidance rested on the mistaken premise that oobToken accepted a prefix of the head SHA." >>"$tmp/mistaken_premise.md"
+}
+expect_pass "a claim marked mistaken in the same clause is not live guidance" "$tmp/mistaken_premise.md"
+
 # --- Case: missing the canonical tw1:/signoff-label guidance entirely ---------
 cat >"$tmp/missing.md" <<'EOF'
 ### 4.4 Out-of-band sign-off mechanics
@@ -116,4 +154,4 @@ if [[ $fails -gt 0 ]]; then
   echo "tamperward-signoff-doc.test.sh: $fails case(s) failed" >&2
   exit 1
 fi
-echo "tamperward-signoff-doc.test.sh: PASS (5/5 cases)"
+echo "tamperward-signoff-doc.test.sh: PASS (9/9 cases)"
