@@ -60,7 +60,16 @@ impl Module {
     #[must_use]
     pub fn bar(d: &SessionDescription, header: &Header, model: &Model, now_unix_ms: u64) -> Self {
         let bar = TrustBar::new(header, model);
-        let state = if bar.sealed { "sealed" } else { "live" };
+        // #138 item 5: a connection lost without a confirmed seal is its own
+        // `unknown` class, never folded into `sealed` (a claim the daemon
+        // never made) or left as `live` (stale state shown as current).
+        let state = if bar.sealed {
+            "sealed"
+        } else if bar.unknown {
+            "unknown"
+        } else {
+            "live"
+        };
         Self {
             text: bar.text(),
             tooltip: panel_text(&session_panel(d, model, now_unix_ms))
@@ -118,7 +127,13 @@ fn explanation(
 ) -> String {
     let panel = session_panel(d, model, now_unix_ms);
     let row = |label: &str| panel_row(&panel, label);
-    let state = if bar.sealed { "sealed" } else { "live" };
+    let state = if bar.sealed {
+        "sealed"
+    } else if bar.unknown {
+        "unknown"
+    } else {
+        "live"
+    };
     let rows = match name {
         SegmentName::Mark => vec![
             Row::new("Session", d.session.clone(), Tone::Ink),
@@ -195,6 +210,14 @@ mod tests {
         let (d, header, mut model) = live();
         model.apply(wardd(&[ended()]).remove(0));
         model.seal();
+        (d, header, model)
+    }
+
+    /// #138 item 5: the connection was lost, and the daemon never confirmed
+    /// the log sealed — distinct from [`sealed`], which is a confirmed fact.
+    fn unknown() -> (SessionDescription, Header, Model) {
+        let (d, header, mut model) = live();
+        model.mark_disconnected();
         (d, header, model)
     }
 
@@ -385,6 +408,51 @@ mod tests {
             module(SegmentName::Daemon)
                 .tooltip
                 .starts_with("Log        sealed\n")
+        );
+    }
+
+    #[test]
+    fn the_whole_bar_module_reads_unknown_when_disconnected_without_a_seal() {
+        let (d, header, model) = unknown();
+        let module = Module::bar(&d, &header, &model, now(&d));
+        assert!(module.text.starts_with("? WARD"), "{}", module.text);
+        assert!(module.text.ends_with("│ UNKNOWN"), "{}", module.text);
+        assert_eq!(module.class, ["unknown", "restricted"]);
+    }
+
+    #[test]
+    fn every_segment_is_a_module_in_the_unknown_state() {
+        let (d, header, model) = unknown();
+        let module = |name| Module::segment(&d, &header, &model, name, now(&d));
+        let cases = [
+            (SegmentName::Mark, "WARD", vec!["restricted"]),
+            (SegmentName::Session, "sess_01J8ZK3…", vec!["dim"]),
+            (SegmentName::Project, "payments-api", vec!["ink"]),
+            (
+                SegmentName::Agent,
+                "CLAUDE ● working",
+                vec!["dim", "working"],
+            ),
+            (SegmentName::Network, "NET restricted (dev)", vec!["dim"]),
+            (SegmentName::Credentials, "CRED 0 granted", vec!["ink"]),
+            (SegmentName::Observer, "OBS live", vec!["ink"]),
+            (SegmentName::Tamperward, "TW ✓", vec!["verified"]),
+            (SegmentName::Verify, "VERIFY ✓ abababab", vec!["verified"]),
+            (SegmentName::Daemon, "UNKNOWN", vec!["restricted"]),
+        ];
+        for (name, text, class) in cases {
+            let m = module(name);
+            assert_eq!(m.text, text, "{name}");
+            assert_eq!(m.class, class, "{name}");
+        }
+        assert_eq!(
+            module(SegmentName::Mark).tooltip,
+            "Session   sess_01J8ZK3Q9X7VY2\nLog       unknown"
+        );
+        assert!(
+            module(SegmentName::Daemon)
+                .tooltip
+                .starts_with("Log        unknown\n")
         );
     }
 

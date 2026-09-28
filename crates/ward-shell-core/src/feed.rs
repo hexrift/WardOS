@@ -312,6 +312,15 @@ impl SessionState {
 
 /// The observer's state: what has arrived, what it adds up to, and where the
 /// viewer is looking.
+///
+/// `sealed`, `connected`, `follow` and `all` are four independent facts, not
+/// a combined state to fold into one flag or a state machine: `follow`/`all`
+/// are fixed viewer preferences set once at construction, and `sealed`/
+/// `connected` are two deliberately separate bits (#138 item 5) — a
+/// daemon-*confirmed* fact and this viewer's own *unconfirmed* connection
+/// state — exactly because conflating them into a single "is this session
+/// over" bit is the bug being fixed.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug)]
 pub struct Model {
     /// The most recent records received, in sequence order, bounded to
@@ -346,6 +355,20 @@ pub struct Model {
     obs_gen: u64,
     /// The daemon closed the stream: the log is sealed.
     pub sealed: bool,
+    /// This viewer's subscription is attached to the daemon right now (#138
+    /// item 5). Distinct from [`Model::sealed`]: `sealed` is a *confirmed*
+    /// fact the daemon reported (`Response::Sealed`) that the log has ended
+    /// and will never grow again; `connected = false` is the opposite kind
+    /// of information — an *unconfirmed* connection loss (a daemon restart,
+    /// a socket hiccup) that says nothing about whether the session is
+    /// actually done. `true` until a caller reports otherwise
+    /// ([`Model::mark_disconnected`]); a follower that reconnects reports
+    /// [`Model::mark_connected`] once it is attached again. [`crate::trust`]
+    /// renders `!sealed && !connected` as its own explicit `unknown` state —
+    /// never as `sealed` (a lie about the session having ended) and never by
+    /// silently keeping the last state shown as if it were still live
+    /// (ADR-0019 fail-closed).
+    pub connected: bool,
     /// The view tracks the newest row.
     pub follow: bool,
     /// Index of the first visible row while not following.
@@ -372,6 +395,7 @@ impl Model {
             freshness: Freshness::NotObserving,
             obs_gen: 0,
             sealed: false,
+            connected: true,
             follow: true,
             scroll: 0,
             all,
@@ -420,6 +444,21 @@ impl Model {
     /// The daemon ended the stream: the log is sealed. The rows stay.
     pub const fn seal(&mut self) {
         self.sealed = true;
+    }
+
+    /// The connection to the daemon was lost without the daemon confirming
+    /// the log sealed (#138 item 5): a follower is about to attempt a
+    /// reconnect, or has given up. Idempotent, and never overrides
+    /// [`Model::sealed`] once that has been confirmed — a caller that keeps
+    /// polling a sealed session has nothing left to reconnect to.
+    pub const fn mark_disconnected(&mut self) {
+        self.connected = false;
+    }
+
+    /// A reconnect landed: this viewer is attached to the daemon's stream
+    /// again. Idempotent.
+    pub const fn mark_connected(&mut self) {
+        self.connected = true;
     }
 
     /// The worktree digests to `digest` now, with `changes` manifest entries
@@ -968,6 +1007,32 @@ mod tests {
         assert!(!model.sealed);
         model.seal();
         assert!(model.sealed);
+    }
+
+    /// #138 item 5: `connected` is `true` until a follower reports
+    /// otherwise, toggles independently of `sealed`, and a reconnect clears
+    /// it again — the two never conflated into one bit.
+    #[test]
+    fn connected_starts_true_and_toggles_independently_of_sealed() {
+        let mut model = Model::new(false);
+        assert!(model.connected);
+        assert!(!model.sealed);
+
+        model.mark_disconnected();
+        assert!(!model.connected);
+        assert!(!model.sealed, "a lost connection is not a confirmed seal");
+
+        model.mark_connected();
+        assert!(model.connected);
+        assert!(!model.sealed);
+
+        // A confirmed seal does not by itself imply the last-known
+        // connection state changes; the two are tracked separately, and
+        // `trust::TrustBar` is what decides `sealed` wins the render.
+        model.mark_disconnected();
+        model.seal();
+        assert!(model.sealed);
+        assert!(!model.connected);
     }
 
     /// #139: a verification attempt that could not run to a pass/fail result (an
