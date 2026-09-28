@@ -54,22 +54,7 @@ if [[ $matched -ne 1 ]]; then
   exit 1
 fi
 
-id=${chosen%%
-[[ $confirm == Revoke ]] || exit 0
-
-set +e
-output=$(ward session revoke "$id" --session "$session" 2>&1)
-status=$?
-set -e
-printf '%s\n' "$output"
-message=$(printf '%s' "$output" | tr '\n' ' ')
-if [[ $status -eq 0 ]]; then
-  wardos_notify "Grant revoke result" "$message" -t 6000
-else
-  wardos_notify "Grant revoke result" "$message" -u critical -t 8000
-fi
-exit "$status"
-\t'*}
+id=${chosen%%$'\t'*}
 if [[ ! $id =~ ^[0-9]+$ ]]; then
   wardos_notify "Grant unchanged" "selected grant id was malformed" -u critical -t 5000
   exit 1
