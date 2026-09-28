@@ -6,14 +6,18 @@
 # heuristic. Three review rounds each supplied a paraphrase that defeated
 # the current heuristic (a trailing "not full SHAs", a causal "because ...
 # do not fit", and a fourth negating an unrelated earlier verb within
-# lookback range) - proof the approach doesn't converge, not just three
-# bugs to patch. The checker now enforces structure instead: the word
-# "prefix" may only appear, in prose, inside one reviewed block in section
-# 4.4, and that block's exact content is pinned by a SHA-256 hash. Any
-# prefix-related claim anywhere else fails outright, regardless of
-# wording; any edit inside the reviewed block - true or false - fails
-# until a human updates the pinned hash. This suite exercises both halves
-# of that mechanism, plus the version-pin guard from the same checker.
+# lookback range). A fourth round then showed that scoping the *location*
+# of reviewed content by the single word "prefix" has the same problem one
+# level up: "legacy labels accept abbreviated head SHAs" carries the same
+# meaning without that word, so it could be added right next to the
+# reviewed bullets and never be flagged.
+#
+# The checker now pins section 4.4 in its entirety by content hash, rather
+# than naming every word that could carry the meaning it's trying to
+# contain. This suite exercises: the whole-section pin (an edit anywhere in
+# the section, whatever it's worded as, fails until the hash is updated);
+# the secondary word-based signal for content entirely outside the section;
+# and the unrelated version-pin guard from the same checker.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,23 +43,25 @@ jobs:
 EOF
 }
 
-# A minimal doc with a correctly-marked reviewed block. $1 = output path,
-# $2 = the block's inner content (defaults to a real, correct paragraph).
-doc_with_block() {
-  local out=$1 block_content=${2:-$'\n* Legacy labels: a SHA `prefix` is rejected outright by this pinned CLI.\nSee `tamperward signoff-label` for the `tw1:` token that actually works.\n'}
+# A minimal doc shaped like the real section: a heading, then the whole
+# reviewed block (everything up to :end), then the next section's heading.
+# $1 = output path, $2 = the block's inner content (a real, correct
+# paragraph by default).
+doc_with_section() {
+  local out=$1
+  local block_content=${2:-$'\nGenerate a sign-off with `tamperward signoff-label --rule verify --head <sha>`\n(tamperward@2.33.0) and apply the resulting `tw1:<digest>` label.\n\n* Legacy labels: a SHA `prefix` is rejected outright by this pinned CLI.\n'}
   {
     echo "### 4.4 Out-of-band sign-off mechanics"
-    echo
-    echo "Generate a sign-off with \`tamperward signoff-label --rule verify --head <sha>\`"
-    echo "(tamperward@2.33.0) and apply the resulting \`tw1:<digest>\` label."
     echo
     echo "$BLOCK_START"
     printf '%s' "$block_content"
     echo "$BLOCK_END"
+    echo
+    echo "## 5. What the dogfooding loop is expected to surface"
   } >"$out"
 }
 
-block_sha256() {
+section_sha256() {
   python3 -c '
 import hashlib, sys
 doc = open(sys.argv[1], encoding="utf-8").read()
@@ -69,7 +75,7 @@ run_checker() {
   # $1 = doc path, $2 = pinned sha256 (optional, defaults to the doc's own)
   local doc=$1 pin=${2:-}
   if [[ -z "$pin" ]]; then
-    pin=$(block_sha256 "$doc")
+    pin=$(section_sha256 "$doc")
   fi
   python3 "$checker" --workflow "$tmp/workflow.yml" --doc "$doc" --pinned-sha256 "$pin"
 }
@@ -103,8 +109,8 @@ expect_fail() {
 workflow_pinned_2_33_0 "$tmp/workflow.yml"
 
 # --- Baseline: a correctly-marked, correctly-pinned doc passes ----------------
-doc_with_block "$tmp/good.md"
-expect_pass "clean doc: reviewed block present and hash matches" "$tmp/good.md"
+doc_with_section "$tmp/good.md"
+expect_pass "clean doc: reviewed section present and hash matches" "$tmp/good.md"
 
 # --- Missing markers entirely fails --------------------------------------------
 cat >"$tmp/no_markers.md" <<'EOF'
@@ -115,8 +121,19 @@ EOF
 expect_fail "doc has no reviewed-block markers at all" "$tmp/no_markers.md" \
   "missing the \`$BLOCK_START\`"
 
-# --- Any of the three review-round counterexamples, placed OUTSIDE the block, -
-# --- fail on the location constraint - wording no longer matters --------------
+# --- The exact review-round counterexample, appended INSIDE section 4.4 ------
+# --- (right after the existing bullets, before :end) - this is the literal --
+# --- reproduction from the review: a paraphrase with no word this checker ---
+# --- could have listed, placed right next to already-reviewed guidance ------
+{
+  doc_with_section "$tmp/inside_wordless.md" \
+    $'\n* Legacy labels: a SHA `prefix` is rejected outright by this pinned CLI.\nLegacy labels accept abbreviated head SHAs.\n'
+}
+expect_fail "wordless-of-prefix false claim inside the section fails on the pin" \
+  "$tmp/inside_wordless.md" "content changed" "$(section_sha256 "$tmp/good.md")"
+
+# --- Every prior counterexample, appended INSIDE the section, is caught the --
+# --- same way - the whole-section pin doesn't care what changed or how ------
 n=0
 for phrasing in \
   "Legacy labels permit abbreviated head prefixes." \
@@ -124,65 +141,65 @@ for phrasing in \
   "Legacy labels accept abbreviated head prefixes because full SHAs do not fit." \
   "Legacy labels do not require full SHAs and accept abbreviated head prefixes."
 do
-  doc="$tmp/outside_$((++n)).md"
-  {
-    doc_with_block "$doc"
-    echo "" >>"$doc"
-    echo "$phrasing" >>"$doc"
-  }
-  expect_fail "outside-block claim rejected regardless of phrasing: $phrasing" \
-    "$doc" "outside the reviewed"
+  doc="$tmp/inside_$((++n)).md"
+  doc_with_section "$doc" \
+    "$(printf '\n* Legacy labels: a SHA `prefix` is rejected outright by this pinned CLI.\n%s\n' "$phrasing")"
+  expect_fail "prior counterexample inside the section still fails on the pin: $phrasing" \
+    "$doc" "content changed" "$(section_sha256 "$tmp/good.md")"
 done
 
-# --- The same false claim placed INSIDE the block fails on the content pin, --
-# --- not on prose analysis - this is the case that defeated three rounds of --
-# --- the old heuristic, and the new mechanism doesn't try to parse it at all -
+# --- ANY edit inside the section fails until the hash is updated - even a ----
+# --- true correction, proving this is a change-detector, not a truth-detector
 {
-  doc_with_block "$tmp/bad_inside.md" \
-    $'\nLegacy labels do not require full SHAs and accept abbreviated head prefixes.\n'
+  doc_with_section "$tmp/edited_inside.md" \
+    $'\nGenerate a sign-off with `tamperward signoff-label --rule verify --head <sha>`\n(tamperward@2.33.0) and apply the resulting `tw1:<digest>` label.\n\n* Legacy labels: a SHA `prefix` is rejected outright, even more clearly worded now.\n'
 }
-expect_fail "false claim inside the block fails on the stale content pin" \
-  "$tmp/bad_inside.md" "content changed" "$(block_sha256 "$tmp/good.md")"
-
-# --- ANY edit inside the block fails until the hash is updated - even a true -
-# --- correction, proving this isn't a truth-detector, just a change-detector -
-{
-  doc_with_block "$tmp/edited_inside.md" \
-    $'\n* Legacy labels: a SHA `prefix` is rejected outright, even more clearly worded now.\n'
-}
-expect_fail "even a strictly-better rewording inside the block needs its pin bumped" \
-  "$tmp/edited_inside.md" "content changed" "$(block_sha256 "$tmp/good.md")"
+expect_fail "even a strictly-better rewording inside the section needs its pin bumped" \
+  "$tmp/edited_inside.md" "content changed" "$(section_sha256 "$tmp/good.md")"
 
 # --- Updating the pin alongside a content edit passes - the mechanism's job is
 # --- "this was a reviewed, deliberate change", not "this text is true" -------
-expect_pass "an edited block passes once its own new hash is supplied" \
+expect_pass "an edited section passes once its own new hash is supplied" \
   "$tmp/edited_inside.md"
 
-# --- A prefix mention outside the block still fails even when the block's own
-# --- pin is otherwise fine - the two checks are independent ------------------
+# --- Secondary signal: "prefix" appearing truly outside section 4.4 (after ---
+# --- its :end marker) is still flagged, independent of the section's own ----
+# --- pin - documented as best-effort, not the load-bearing guarantee --------
 {
-  doc_with_block "$tmp/both.md"
-  echo "" >>"$tmp/both.md"
-  echo "A stray prefix mention here should still be caught." >>"$tmp/both.md"
+  doc_with_section "$tmp/outside.md"
+  echo "" >>"$tmp/outside.md"
+  echo "A stray prefix mention out here should still be caught." >>"$tmp/outside.md"
 }
-expect_fail "outside-block mention still caught even with a matching pin" \
-  "$tmp/both.md" "outside the reviewed"
+expect_fail "a 'prefix' mention truly outside the section is still caught" \
+  "$tmp/outside.md" "outside section 4.4"
+
+# --- ...but that secondary signal is only a best-effort word match, not a ----
+# --- guarantee: the same wordless-of-"prefix" claim, placed truly outside the
+# --- section instead of right next to it, passes silently - the documented, --
+# --- accepted residual scope boundary (see the module docstring) -------------
+{
+  doc_with_section "$tmp/outside_wordless.md"
+  echo "" >>"$tmp/outside_wordless.md"
+  echo "Legacy labels accept abbreviated head SHAs." >>"$tmp/outside_wordless.md"
+}
+expect_pass "documented residual gap: a wordless-of-prefix claim truly outside the section is not caught" \
+  "$tmp/outside_wordless.md"
 
 # --- Version-pin guard (unchanged mechanism, still covered here) -------------
 {
-  doc_with_block "$tmp/stale.md"
+  doc_with_section "$tmp/stale.md"
   echo "" >>"$tmp/stale.md"
   echo "Historically this repository pinned tamperward@2.10.3." >>"$tmp/stale.md"
 }
 expect_fail "stale version alongside the current pin" "$tmp/stale.md" "stale tamperward version"
 
 # --- Missing the canonical tw1:/signoff-label guidance entirely --------------
-cat >"$tmp/missing_tw1.md" <<'EOF'
+cat >"$tmp/missing_tw1.md" <<EOF
 ### 4.4 Out-of-band sign-off mechanics
 
-<!-- tamperward-prefix-guidance:reviewed-block:start -->
+$BLOCK_START
 * Ask a maintainer to sort it out somehow.
-<!-- tamperward-prefix-guidance:reviewed-block:end -->
+$BLOCK_END
 EOF
 expect_fail "doc omits tw1:/signoff-label guidance entirely" "$tmp/missing_tw1.md" "missing 'tw1:'"
 

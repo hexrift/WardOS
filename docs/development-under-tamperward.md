@@ -172,6 +172,7 @@ itself, with TamperWard in the loop as described in
 
 ### 4.4 Out-of-band sign-off mechanics
 
+<!-- tamperward-prefix-guidance:reviewed-block:start -->
 `tamperward-verify` (§2, the pristine re-execution job in
 [`.github/workflows/tamperward.yml`](../.github/workflows/tamperward.yml)) will fail
 whenever a pull request legitimately grows a protected fixture — most commonly
@@ -205,19 +206,23 @@ can never grant itself the sign-off it needs. Concretely:
   the same scrutiny as a suppression, and are grounds to withhold sign-off even if the
   visible suite and the stated intent look reasonable.
 
-The two bullets below, between the `reviewed-block` markers, are the only place
-in this document allowed to describe whether a legacy label's abbreviated SHA
-`prefix` is accepted.
-[`tamperward-signoff-doc.py`](../scripts/security-check/tamperward-signoff-doc.py)
-fails the build if that word appears in this document's prose outside this
-block, and separately pins this block's exact content by a stored hash:
-editing it requires updating that hash in the same pull request, which is
-itself a `scripts/security-check/**`-protected, reviewed path. (Issue #320's
-review found three rounds of a regex heuristic for "is this claim negated"
-each defeated by a new paraphrase; this location constraint plus content pin
-replaces that heuristic rather than extending it further.)
+This whole section, from its heading above to the matching
+`reviewed-block:end` marker before §5, is pinned by a stored SHA-256 hash in
+[`tamperward-signoff-doc.py`](../scripts/security-check/tamperward-signoff-doc.py):
+editing anything in it — a word, a sentence, a whole bullet, anywhere in §4.4,
+not just the two bullets that discuss the legacy label's abbreviated SHA
+`prefix` directly — changes the hash and fails the build until a human
+re-reads the new wording and updates the pin in the same pull request, which
+is itself a `scripts/security-check/**`-protected, reviewed path. (Issue
+#320's review spent three rounds on a regex heuristic for "is this claim
+negated", each defeated by a new paraphrase, then found that scoping the
+*location* of reviewed content to two bullets by the literal word `prefix`
+was itself gameable by a paraphrase that dropped the word — "legacy labels
+accept abbreviated head SHAs" has the same meaning without it. Pinning the
+whole section this word could have been added to anywhere in, rather than
+trying to name every word that could carry that meaning, is what actually
+closes it.)
 
-<!-- tamperward-prefix-guidance:reviewed-block:start -->
 * **How, today — the compact head-bound token (canonical).** Generate one with:
 
   ```
@@ -264,7 +269,6 @@ replaces that heuristic rather than extending it further.)
   be the literal, complete 40-character head object id to have a chance of matching,
   which cannot fit the label cap — so treat any legacy label seen on a PR here as
   inert, not as a granted sign-off, and reissue a `tw1:` token instead.
-<!-- tamperward-prefix-guidance:reviewed-block:end -->
 * **What it does not clear** — a red *visible* suite, a run that could not execute, or any
   other failing rule. A `tw1:` sign-off clears only a masked failure on the rule (and file,
   where scoped) it was generated for, on that one head SHA; nothing else.
@@ -275,6 +279,7 @@ replaces that heuristic rather than extending it further.)
   list) without a human in the loop; treat the mechanics above as the intended design, not
   yet as a fully closed loop, and tighten the ruleset/CODEOWNERS as a repository-settings
   follow-up.
+<!-- tamperward-prefix-guidance:reviewed-block:end -->
 
 ## 5. What the dogfooding loop is expected to surface
 
