@@ -1241,6 +1241,41 @@ impl State {
         }
         self.grant_history.push_back(grant);
     }
+
+    /// Retire every credential whose own recorded lifetime has run out into
+    /// [`State::grant_history`] as [`RevokeState::Expired`] (#140), leaving
+    /// only a revoke already in flight (`Revoking`/`Unconfirmed`) exempt —
+    /// `Active` and `Suspended` are otherwise-live states and are equally
+    /// subject to the credential's own clock. This is the single expiry
+    /// transition every credential-reading path shares: [`grants_at`] (and so
+    /// `grants`/`grant_history`) and [`Approvals::credentials_at`] (and so
+    /// `Approvals::credentials`, which `Served::hold`'s authority derivation
+    /// reads directly) both call this before reading `self.credentials`, so
+    /// none of them can observe an expired credential the others have
+    /// already swept, or fail to notice one none of them has queried yet
+    /// (review on #315 7fa987b: expiry must not depend on which accessor
+    /// happens to be called first).
+    ///
+    /// [`grants_at`]: Approvals::grants_at
+    fn sweep_expired_credentials(&mut self, now_unix_ms: u64) {
+        let expired: Vec<Credential> = {
+            let (still_live, expired) = std::mem::take(&mut self.credentials)
+                .into_iter()
+                .partition(|c| {
+                    matches!(
+                        c.revoke_state,
+                        RevokeState::Revoking | RevokeState::Unconfirmed
+                    ) || c.expires_at_unix_ms.is_none_or(|e| now_unix_ms < e)
+                });
+            self.credentials = still_live;
+            expired
+        };
+        for mut c in expired {
+            c.revoke_state = RevokeState::Expired;
+            let grant = credential_grant(&c, &self.unknown_launches);
+            self.record_grant_history(grant);
+        }
+    }
 }
 
 /// The daemon's hold: what is pending, what was answered, what is remembered,
@@ -1380,10 +1415,26 @@ impl Approvals {
         self.lock().unknown_launches.insert(key);
     }
 
-    /// The credentials granted so far, in grant order.
+    /// The credentials granted so far, in grant order. Sweeps any credential
+    /// whose own recorded lifetime has already run out into
+    /// [`Approvals::grant_history`] as [`RevokeState::Expired`] first (#140):
+    /// `Served::hold` reads this directly to build the authority
+    /// [`Deriver::derive`] answers a hook question with, so it must never
+    /// report an expired credential as present just because nothing else
+    /// happened to call [`Approvals::grants`] first (review on #315
+    /// 7fa987b).
     #[must_use]
     pub fn credentials(&self) -> Vec<Credential> {
-        self.lock().credentials.clone()
+        self.credentials_at(now_unix_ms())
+    }
+
+    /// [`credentials`](Self::credentials) judged at a fixed `now_unix_ms`:
+    /// the deterministic seam the expiry tests drive, mirroring
+    /// [`grants_at`](Self::grants_at).
+    fn credentials_at(&self, now_unix_ms: u64) -> Vec<Credential> {
+        let mut state = self.lock();
+        state.sweep_expired_credentials(now_unix_ms);
+        state.credentials.clone()
     }
 
     /// Every temporary grant the session holds, oldest first: the credentials
@@ -1402,30 +1453,7 @@ impl Approvals {
     /// each other.
     fn grants_at(&self, now_unix_ms: u64) -> Vec<Grant> {
         let mut state = self.lock();
-        let expired: Vec<Credential> = {
-            let (still_live, expired) = std::mem::take(&mut state.credentials)
-                .into_iter()
-                .partition(|c| {
-                    // A revoke already in flight (or unconfirmed) is left
-                    // alone by the expiry sweep — that outcome is decided by
-                    // `finish_revoke`, not by the clock. `Active` and
-                    // `Suspended` are both otherwise-live states and are
-                    // equally subject to the credential's own recorded
-                    // lifetime: pausing must never shelter an expiry that
-                    // would have applied anyway (review on #315 bb51419).
-                    matches!(
-                        c.revoke_state,
-                        RevokeState::Revoking | RevokeState::Unconfirmed
-                    ) || c.expires_at_unix_ms.is_none_or(|e| now_unix_ms < e)
-                });
-            state.credentials = still_live;
-            expired
-        };
-        for mut c in expired {
-            c.revoke_state = RevokeState::Expired;
-            let grant = credential_grant(&c, &state.unknown_launches);
-            state.record_grant_history(grant);
-        }
+        state.sweep_expired_credentials(now_unix_ms);
         let mut grants: Vec<Grant> = state
             .credentials
             .iter()
@@ -3534,6 +3562,37 @@ mod tests {
         // further (it is not still in `credentials` to sweep a second time).
         assert_eq!(approvals.grants_at(3_000).len(), 1);
         assert_eq!(approvals.grant_history_at(3_000).len(), 1);
+    }
+
+    #[test]
+    fn credentials_used_by_authority_derivation_sweeps_expiry_without_any_prior_grants_query() {
+        // Review finding on #315 7fa987b: `credentials()` — what
+        // `Served::hold` passes straight to `Deriver::derive` to build the
+        // authority a hook question is answered against — cloned
+        // `state.credentials` with no expiry sweep of its own. An expired
+        // credential therefore kept reporting as present to ordinary
+        // authority derivation indefinitely, unless something else happened
+        // to call `grants`/`grant_history`/a pause/a resume first. Checked
+        // here with *no* such call in between recording the credential and
+        // reading `credentials()`.
+        let approvals = Approvals::new();
+        approvals.record_credential_with_expiry(
+            "github",
+            "github.com",
+            vec!["contents:read".into()],
+            None,
+            1_000,
+            Some(2_000),
+        );
+        assert_eq!(approvals.credentials_at(1_999).len(), 1, "not yet expired");
+
+        assert!(
+            approvals.credentials_at(2_000).is_empty(),
+            "an expired credential must not still be reported to authority derivation"
+        );
+        let history = approvals.grant_history_at(2_000);
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0].revoke_state, RevokeState::Expired);
     }
 
     #[test]
