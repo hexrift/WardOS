@@ -10,11 +10,16 @@
 //! the filesystem, the network, every grant with its scope and lifetime, and
 //! the standing denials. Nothing here is enforcement: the daemon's
 //! `ward session grants` is the same list from the hold itself. `Authority`
-//! itself keeps no clock: `now` enters only at [`authority_panel`], the one
-//! place a grant's own recorded lifetime (a credential's `expires`, carried
-//! since #315) is judged against it, so a grant past its lifetime reads
-//! `· expired` there (#316) the same way the daemon's own `ward session
-//! grants` already does.
+//! itself keeps no clock: `now_unix_ms` is always passed in explicitly, at
+//! [`authority_panel`] and at [`Authority::len`]/[`Authority::network_tags`]
+//! (and so [`grants_segment`]/[`network_segment_text`]/`crate::trust::TrustBar::new`)
+//! alike, so a grant past its own recorded lifetime (a
+//! credential's `expires`, carried since #315) reads `· expired` in the
+//! per-grant list (#316) the same way the daemon's own `ward session grants`
+//! already does, while dropping out of every *current*-authority surface —
+//! the grant count, the network tags/tone, and the `GRANTS n` segment (PR
+//! #318 review, finding 1) — the same way `ward session grants` itself has
+//! already stopped listing it.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +57,18 @@ pub struct Grant {
     /// that never got one) — never expires on its own, the same meaning
     /// `Credential::expires_at_unix_ms`'s own `None` carries.
     pub expires_at_unix_ms: Option<u64>,
+    /// The credential's raw permissions, joined (`contents:read,
+    /// issues:read`) — `None` for a session-scope answer, which has no
+    /// permissions concept and dedupes by label alone (PR #318 review,
+    /// finding 2). Used only to decide whether a later `CredentialGranted`
+    /// record folds into this row or starts a new one: the daemon's own
+    /// dedup key is `service + permissions + launch_key`
+    /// (`ward-daemon::approvals::Credential`), and `launch_key` never
+    /// reaches the wire (see `Credential::launch_key`'s own doc comment), so
+    /// this projection cannot match on it directly — matching on the
+    /// permissions actually granted, not just the display label, is as much
+    /// of that key as the wire carries.
+    pub permissions: Option<String>,
 }
 
 impl Grant {
@@ -134,6 +151,7 @@ impl Authority {
                         lifetime: "session",
                         network_tag: tag,
                         expires_at_unix_ms: None,
+                        permissions: None,
                     });
                 }
             }
@@ -153,23 +171,38 @@ impl Authority {
                 // The subject is the route's upstream, `host:port`.
                 let subject = scope.subject.as_str();
                 let host = subject.rsplit_once(':').map_or(subject, |(h, _)| h);
-                if let Some(g) = self.grants.iter_mut().find(|g| g.label == label) {
+                // This record's own computed expiry (#316 review, finding
+                // 2): the identity the daemon's real dedup key uses
+                // (`service + permissions + launch_key`) has no `launch_key`
+                // on the wire to match against, so a second route is only
+                // folded into an existing grant when its label, permissions
+                // *and* own computed deadline all agree with that grant's —
+                // every real caller mints the same nominal lifetime for
+                // every route one launch grants at once, so routes of one
+                // launch land with the same absolute deadline, while a
+                // genuinely separate, later launch computes its own,
+                // different one even for an identical relative `Duration`.
+                // A mismatch on any of the three starts a new row instead of
+                // silently inheriting a deadline that was never this route's
+                // own.
+                let computed_expiry = expiry_unix_ms(rec.ts_wall, *expires);
+                if let Some(g) = self.grants.iter_mut().find(|g| {
+                    g.label == label
+                        && g.permissions.as_deref() == Some(permissions.as_str())
+                        && g.expires_at_unix_ms == computed_expiry
+                }) {
                     if !g.scope.contains(host) {
                         g.scope.push_str(", ");
                         g.scope.push_str(host);
                     }
-                    // The first route's expiry stands (#316): every real
-                    // caller mints the same nominal lifetime for every route
-                    // one launch grants at once, mirroring
-                    // `Approvals::record_credential_with_expiry`'s own
-                    // "ignored when merging" rule.
                 } else {
                     self.grants.push(Grant {
                         label,
                         scope: format!("{permissions} · {host}"),
                         lifetime: "launch",
                         network_tag: Some(service.as_str().to_owned()),
-                        expires_at_unix_ms: expiry_unix_ms(rec.ts_wall, *expires),
+                        expires_at_unix_ms: computed_expiry,
+                        permissions: Some(permissions),
                     });
                 }
             }
@@ -189,23 +222,44 @@ impl Authority {
         }
     }
 
-    /// Whether nothing is granted.
+    /// Whether nothing is recorded at all — including a grant whose own
+    /// recorded lifetime has already run out (PR #318 review, finding 1): an
+    /// expired grant still belongs in the per-grant list, marked `·
+    /// expired`, so this is never the right check for whether anything is
+    /// *currently* granted. [`Self::len`] is.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.grants.is_empty()
     }
 
-    /// How many grants are live.
+    /// How many grants are current authority at `now_unix_ms` (#316,
+    /// PR #318 review finding 1): a grant whose own recorded lifetime has
+    /// run out by then does not count, the same as
+    /// `ward-daemon::approvals::Approvals::grants` no longer listing it —
+    /// only [`Grant::row`]'s own per-grant `· expired` marker still shows it
+    /// at all.
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.grants.len()
+    pub fn len(&self, now_unix_ms: u64) -> usize {
+        self.grants
+            .iter()
+            .filter(|g| !g.is_expired(now_unix_ms))
+            .count()
     }
 
-    /// The tags of the grants that widen the network, each once, in order.
+    /// The tags of the grants that widen the network and are still current
+    /// authority at `now_unix_ms` (#316, PR #318 review finding 1), each
+    /// once, in order: an expired grant no longer widens anything, so its
+    /// tag must not keep the network segment or its tone reading as if it
+    /// still did.
     #[must_use]
-    pub fn network_tags(&self) -> Vec<String> {
+    pub fn network_tags(&self, now_unix_ms: u64) -> Vec<String> {
         let mut tags: Vec<String> = Vec::new();
-        for tag in self.grants.iter().filter_map(|g| g.network_tag.clone()) {
+        for tag in self
+            .grants
+            .iter()
+            .filter(|g| !g.is_expired(now_unix_ms))
+            .filter_map(|g| g.network_tag.clone())
+        {
             if !tags.contains(&tag) {
                 tags.push(tag);
             }
@@ -254,10 +308,16 @@ pub const fn network_word(network: &NetworkCapability) -> &'static str {
 }
 
 /// The network segment's text: the mode as the panels name it, or `restricted
-/// · github+` while a grant widens what the network reaches.
+/// · github+` while a grant still currently widens what the network reaches
+/// at `now_unix_ms` — an expired grant's tag drops out (#316, PR #318 review
+/// finding 1), the same as [`Authority::network_tags`].
 #[must_use]
-pub fn network_segment_text(network: &NetworkCapability, authority: &Authority) -> String {
-    let tags = authority.network_tags();
+pub fn network_segment_text(
+    network: &NetworkCapability,
+    authority: &Authority,
+    now_unix_ms: u64,
+) -> String {
+    let tags = authority.network_tags(now_unix_ms);
     if tags.is_empty() {
         network_text(network)
     } else {
@@ -265,16 +325,19 @@ pub fn network_segment_text(network: &NetworkCapability, authority: &Authority) 
     }
 }
 
-/// `GRANTS n`, amber while the session is live and something is granted; dim
-/// once the log is sealed; `None` with nothing granted, so the bar shows no
-/// segment.
+/// `GRANTS n`, amber while the session is live and something is currently
+/// granted at `now_unix_ms`; dim once the log is sealed; `None` once nothing
+/// is (#316, PR #318 review finding 1): a grant whose own recorded lifetime
+/// has run out does not hold this segment up, the same as
+/// [`Authority::len`].
 #[must_use]
-pub fn grants_segment(authority: &Authority, sealed: bool) -> Option<Segment> {
-    if authority.is_empty() {
+pub fn grants_segment(authority: &Authority, sealed: bool, now_unix_ms: u64) -> Option<Segment> {
+    let current = authority.len(now_unix_ms);
+    if current == 0 {
         return None;
     }
     let tone = if sealed { Tone::Dim } else { Tone::Warn };
-    Some(Segment::new(format!("GRANTS {}", authority.len()), tone))
+    Some(Segment::new(format!("GRANTS {current}"), tone))
 }
 
 /// `/work read-write · /env read-write · home and /tmp private`, plus any
@@ -364,22 +427,23 @@ pub fn authority_panel(
     now_unix_ms: u64,
 ) -> Vec<Group> {
     let m = &d.manifest;
-    let tone = if authority.network_tags().is_empty() {
+    let live = authority.len(now_unix_ms);
+    let tone = if authority.network_tags(now_unix_ms).is_empty() {
         network_tone(&m.network)
     } else {
         Tone::Warn
     };
     let current = vec![
         Row::new("Filesystem", filesystem_text(m), Tone::Ink),
-        Row::new("Network", network_segment_text(&m.network, authority), tone),
+        Row::new(
+            "Network",
+            network_segment_text(&m.network, authority, now_unix_ms),
+            tone,
+        ),
         Row::new(
             "Temporary grants",
-            authority.len().to_string(),
-            if authority.is_empty() {
-                Tone::Ink
-            } else {
-                Tone::Warn
-            },
+            live.to_string(),
+            if live == 0 { Tone::Ink } else { Tone::Warn },
         ),
     ];
     let grants = if authority.is_empty() {
@@ -428,7 +492,7 @@ pub fn authority_panel(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::feed::fixtures::{records, sequence, wardd, wardd_at_wall};
+    use crate::feed::fixtures::{records, sequence, wardd, wardd_at_wall, wardd_at_walls};
     use crate::panel::panel_text;
     use crate::trust::fixtures::description;
     use std::time::Duration;
@@ -519,7 +583,7 @@ mod tests {
             ),
         ]);
         let authority = Authority::from_records(&wardd(&events));
-        assert_eq!(authority.len(), 3);
+        assert_eq!(authority.len(0), 3);
         assert_eq!(
             authority.grants[0],
             Grant {
@@ -528,6 +592,7 @@ mod tests {
                 lifetime: "session",
                 network_tag: None,
                 expires_at_unix_ms: None,
+                permissions: None,
             }
         );
         assert_eq!(
@@ -541,6 +606,7 @@ mod tests {
                 // grant this projection cannot judge against `now` at all
                 // never expires on its own — see `expiry_unix_ms`.
                 expires_at_unix_ms: None,
+                permissions: Some("contents:read, issues:read".into()),
             }
         );
         assert_eq!(
@@ -551,10 +617,11 @@ mod tests {
                 lifetime: "session",
                 network_tag: Some("example.org".into()),
                 expires_at_unix_ms: None,
+                permissions: None,
             },
             "a network grant is listed by its host, never the whole URL"
         );
-        assert_eq!(authority.network_tags(), ["github", "example.org"]);
+        assert_eq!(authority.network_tags(0), ["github", "example.org"]);
         assert!(Authority::from_records(&wardd(&sequence())).is_empty());
     }
 
@@ -573,18 +640,18 @@ mod tests {
             ),
         ]);
         let authority = Authority::from_records(&wardd(&events));
-        assert_eq!(authority.len(), 2);
+        assert_eq!(authority.len(0), 2);
 
         let mut revoked_events = events.clone();
         revoked_events.push(revoked("github"));
         let authority = Authority::from_records(&wardd(&revoked_events));
-        assert_eq!(authority.len(), 1, "{authority:?}");
+        assert_eq!(authority.len(0), 1, "{authority:?}");
         assert_eq!(authority.grants[0].label, "Write /work/src/lib.rs");
 
         // Revoking a service with no matching grant is a no-op.
         let mut unrelated_events = events.clone();
         unrelated_events.push(revoked("npm"));
-        assert_eq!(Authority::from_records(&wardd(&unrelated_events)).len(), 2);
+        assert_eq!(Authority::from_records(&wardd(&unrelated_events)).len(0), 2);
     }
 
     #[test]
@@ -616,7 +683,7 @@ mod tests {
         paused_events.push(paused());
         let paused_authority = Authority::from_records(&wardd(&paused_events));
         assert!(paused_authority.suspended);
-        assert_eq!(paused_authority.len(), 2, "pausing drops nothing");
+        assert_eq!(paused_authority.len(0), 2, "pausing drops nothing");
         let groups = authority_panel(&d, &paused_authority, 0);
         assert!(
             groups[1]
@@ -667,6 +734,12 @@ mod tests {
             before[1].rows[0].value, "contents:read, issues:read · github.com · launch",
             "not yet expired, no suffix"
         );
+        assert_eq!(
+            before[0].rows[2].value, "1",
+            "still current authority just before its own deadline"
+        );
+        assert_eq!(before[0].rows[2].tone, Tone::Warn);
+        assert_eq!(before[0].rows[1].value, "restricted · github+");
 
         let at = authority_panel(&d, &authority, EXPIRES_AT_UNIX_MS);
         assert_eq!(
@@ -674,9 +747,28 @@ mod tests {
             "the instant its own recorded lifetime runs out, ward session \
              grants and this panel must not disagree"
         );
+        // PR #318 review, finding 1: an expired grant reads `expired` in its
+        // own row, but must not go on counting as current, exercisable
+        // authority anywhere else — the "Temporary grants" count, the
+        // network segment's tone and tags, and the trust bar's `GRANTS n`
+        // segment must all agree with `ward session grants` having already
+        // dropped it.
+        assert_eq!(
+            at[0].rows[2].value, "0",
+            "an expired grant is no longer current authority"
+        );
+        assert_eq!(at[0].rows[2].tone, Tone::Ink);
+        assert_eq!(
+            at[0].rows[1].value, "restricted (dev)",
+            "an expired grant no longer widens the network"
+        );
+        assert_eq!(authority.len(EXPIRES_AT_UNIX_MS), 0);
+        assert!(authority.network_tags(EXPIRES_AT_UNIX_MS).is_empty());
+        assert_eq!(grants_segment(&authority, false, EXPIRES_AT_UNIX_MS), None);
 
         let after = authority_panel(&d, &authority, EXPIRES_AT_UNIX_MS + 60_000);
         assert!(after[1].rows[0].value.ends_with("· expired"));
+        assert_eq!(after[0].rows[2].value, "0");
     }
 
     #[test]
@@ -718,20 +810,105 @@ mod tests {
     }
 
     #[test]
-    fn a_second_route_of_the_same_credential_keeps_the_first_routes_expiry() {
+    fn a_second_route_of_the_same_launch_merges_into_one_grant() {
         // #316, mirroring `Approvals::record_credential_with_expiry`'s own
         // "ignored when merging" rule: every real caller mints the same
-        // nominal lifetime for every route one launch grants at once, so a
-        // second host folded into an existing grant must not push its
-        // expiry out to the second record's own (later) timestamp.
+        // nominal lifetime for every route one launch grants at once, so
+        // two routes recorded at the same instant (the same launch minting
+        // both at once) fold into one grant, keeping that one shared
+        // expiry.
         let events = [credential("github.com"), credential("api.github.com")];
-        let authority = Authority::from_records(&wardd_at_wall(&events, GRANTED_AT_UNIX_MS));
-        assert_eq!(authority.len(), 1);
+        let authority = Authority::from_records(&wardd_at_walls(&events, &[GRANTED_AT_UNIX_MS; 2]));
+        assert_eq!(authority.len(0), 1);
         assert_eq!(
             authority.grants[0].expires_at_unix_ms,
-            Some(EXPIRES_AT_UNIX_MS),
-            "the second route's record is a second later, but the grant's \
-             expiry must still be the first route's"
+            Some(EXPIRES_AT_UNIX_MS)
+        );
+        assert_eq!(
+            authority.grants[0].scope,
+            "contents:read, issues:read · github.com, api.github.com"
+        );
+    }
+
+    #[test]
+    fn a_later_independent_grant_for_the_same_service_gets_its_own_row_and_expiry() {
+        // PR #318 review, finding 2: `Authority::apply` used to merge every
+        // `CredentialGranted` by the display label alone and always kept the
+        // *first* grant's expiry — so a second, wholly independent launch
+        // granting the same service again (its own later, different
+        // deadline) got silently folded into the first grant and inherited
+        // an expiry that was never its own. The daemon's real identity is
+        // `service + permissions + launch_key`; with no `launch_key` on the
+        // wire, this projection's best-available proxy is: same label, same
+        // permissions, *and* the same already-computed deadline (what every
+        // route of one real launch actually shares). A second grant whose
+        // own computed deadline differs is a different launch and must get
+        // its own row with its own expiry, exactly as `ward session grants`
+        // already lists it.
+        let events = [credential("github.com"), credential("github.com")];
+        // One second apart (`wardd_at_wall`): two records that are not the
+        // same instant, so — even though the label, host and permissions
+        // are identical — their own computed deadlines differ by 1 second.
+        let authority = Authority::from_records(&wardd_at_wall(&events, GRANTED_AT_UNIX_MS));
+        assert_eq!(
+            authority.grants.len(),
+            2,
+            "two independent grants, not one merged row: {:?}",
+            authority.grants
+        );
+        assert_eq!(authority.grants[0].label, "GitHub");
+        assert_eq!(authority.grants[1].label, "GitHub");
+        assert_eq!(
+            authority.grants[0].expires_at_unix_ms,
+            Some(EXPIRES_AT_UNIX_MS)
+        );
+        assert_eq!(
+            authority.grants[1].expires_at_unix_ms,
+            Some(EXPIRES_AT_UNIX_MS + 1000),
+            "the second grant's own later record computes its own, later deadline"
+        );
+
+        let d = description(NetworkCapability::Development);
+        // At the first grant's deadline, it alone has expired; the second,
+        // genuinely later grant is still live — the exact disagreement the
+        // review's reproduction describes (T0+60 must not expire a grant
+        // that is only really due at T0+90).
+        let groups = authority_panel(&d, &authority, EXPIRES_AT_UNIX_MS);
+        assert!(
+            groups[1].rows[0].value.ends_with("· expired"),
+            "{:?}",
+            groups[1].rows
+        );
+        assert!(
+            !groups[1].rows[1].value.contains("expired"),
+            "the second, independently-timed grant is not due yet: {:?}",
+            groups[1].rows
+        );
+        assert_eq!(
+            authority.len(EXPIRES_AT_UNIX_MS),
+            1,
+            "one of the two is still current authority"
+        );
+
+        // Different permissions for the same service must not merge either,
+        // even recorded at the very same instant.
+        let different_scope = WardEvent::CredentialGranted {
+            service: ward_events::ServiceId::new("github").unwrap(),
+            scope: Scope {
+                subject: ShortText::new("github.com:443"),
+                permissions: vec![NameText::new("contents:write")],
+            },
+            expires: Duration::from_secs(60),
+            delivery: CredentialDelivery::ProxyInjected,
+        };
+        let events = [credential("github.com"), different_scope];
+        let authority = Authority::from_records(&wardd_at_walls(&events, &[GRANTED_AT_UNIX_MS; 2]));
+        assert_eq!(
+            authority.grants.len(),
+            2,
+            "same instant and same label, but different permissions: still \
+             two rows: {:?}",
+            authority.grants
         );
     }
 
@@ -751,28 +928,45 @@ mod tests {
     fn the_network_segment_carries_the_grant_tags_and_the_grants_segment_counts() {
         let none = Authority::default();
         assert_eq!(
-            network_segment_text(&NetworkCapability::Development, &none),
+            network_segment_text(&NetworkCapability::Development, &none, 0),
             "restricted (dev)",
             "unchanged without a grant"
         );
-        assert_eq!(grants_segment(&none, false), None);
+        assert_eq!(grants_segment(&none, false, 0), None);
         let github = Authority::from_records(&wardd(&[credential("github.com")]));
         assert_eq!(
-            network_segment_text(&NetworkCapability::Development, &github),
+            network_segment_text(&NetworkCapability::Development, &github, 0),
             "restricted · github+"
         );
         assert_eq!(
-            network_segment_text(&NetworkCapability::Offline, &github),
+            network_segment_text(&NetworkCapability::Offline, &github, 0),
             "offline · github+"
         );
         assert_eq!(
-            grants_segment(&github, false),
+            grants_segment(&github, false, 0),
             Some(Segment::new("GRANTS 1", Tone::Warn))
         );
         assert_eq!(
-            grants_segment(&github, true),
+            grants_segment(&github, true, 0),
             Some(Segment::new("GRANTS 1", Tone::Dim))
         );
+        // PR #318 review, finding 1: once its own recorded lifetime has run
+        // out, a grant holds up neither the network segment's tag nor the
+        // trust bar's `GRANTS n` segment any longer.
+        let expiring = Authority::from_records(&wardd_at_wall(
+            &[credential("github.com")],
+            GRANTED_AT_UNIX_MS,
+        ));
+        assert_eq!(
+            network_segment_text(
+                &NetworkCapability::Development,
+                &expiring,
+                EXPIRES_AT_UNIX_MS
+            ),
+            "restricted (dev)",
+            "expired, so the tag drops out"
+        );
+        assert_eq!(grants_segment(&expiring, false, EXPIRES_AT_UNIX_MS), None);
         // A file grant is a grant, but widens no network.
         let write = Authority::from_records(&wardd(&[decided(
             CapabilityKind::FileWrite,
@@ -780,10 +974,10 @@ mod tests {
             Some(GrantScope::Session),
         )]));
         assert_eq!(
-            network_segment_text(&NetworkCapability::Development, &write),
+            network_segment_text(&NetworkCapability::Development, &write, 0),
             "restricted (dev)"
         );
-        assert_eq!(grants_segment(&write, false).unwrap().text, "GRANTS 1");
+        assert_eq!(grants_segment(&write, false, 0).unwrap().text, "GRANTS 1");
         for (network, word) in [
             (NetworkCapability::LocalhostOnly, "localhost"),
             (NetworkCapability::Registries, "registries"),

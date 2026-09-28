@@ -59,7 +59,7 @@ impl Module {
     /// tooltip, `live`/`sealed` and the bar's state tone as classes.
     #[must_use]
     pub fn bar(d: &SessionDescription, header: &Header, model: &Model, now_unix_ms: u64) -> Self {
-        let bar = TrustBar::new(header, model);
+        let bar = TrustBar::new(header, model, now_unix_ms);
         let state = if bar.sealed { "sealed" } else { "live" };
         Self {
             text: bar.text(),
@@ -80,7 +80,7 @@ impl Module {
         name: SegmentName,
         now_unix_ms: u64,
     ) -> Self {
-        let bar = TrustBar::new(header, model);
+        let bar = TrustBar::new(header, model, now_unix_ms);
         let Some(segment) = bar.segment(name) else {
             return Self::none(Some(name));
         };
