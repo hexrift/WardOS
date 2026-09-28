@@ -559,6 +559,7 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
                 scope: scope.clone(),
                 expires: Duration::from_secs(600),
                 delivery: CredentialDelivery::ProxyInjected,
+                launch_seq: Some(3),
             },
         ),
         (
@@ -889,6 +890,7 @@ fn credential_granted_has_no_secret_bearing_field() {
         scope: Scope::default(),
         expires: Duration::from_secs(1),
         delivery: CredentialDelivery::MintedToken,
+        launch_seq: None,
     };
     let rendered = format!("{ev:?}");
     for word in ["token", "secret", "password", "key"] {
@@ -941,4 +943,62 @@ fn session_pause_unsettled_is_quiet_visible() {
             .contains(EventKind::SessionPauseUnsettled)
     );
     assert!(Filter::quiet().kinds.contains(EventKind::SessionPaused));
+}
+
+/// PR #318 review round 2, finding 2: `CredentialGranted::launch_seq` must
+/// survive chain append, wire encode/decode and the log unchanged, in both
+/// its `Some` (a grant the daemon attributed to a tracked launch) and `None`
+/// (a grant recorded outside one) shapes -- a reader downstream of any of
+/// those three steps (the shell/desktop panel projection included) must see
+/// exactly the value the daemon stamped, not a default or a dropped field.
+#[test]
+fn credential_granted_round_trips_its_launch_seq() {
+    let session = SessionId::from_u128(0x5e56);
+    let mut chain = Chain::genesis(session, Blake3Hash::hash(b"manifest"));
+    let granted = |launch_seq: Option<u64>| WardEvent::CredentialGranted {
+        service: ServiceId::new("github").unwrap(),
+        scope: Scope {
+            subject: text("github.com:443"),
+            permissions: vec![text("contents:read")],
+        },
+        expires: Duration::from_secs(60),
+        delivery: CredentialDelivery::ProxyInjected,
+        launch_seq,
+    };
+
+    let with_launch = chain
+        .append(
+            Origin::Wardd,
+            granted(Some(1)),
+            Timestamp::mono(Duration::from_secs(1)),
+        )
+        .unwrap();
+    let frame = encode_record(&with_launch).unwrap();
+    let (decoded, _) = decode_record(&frame).unwrap();
+    assert_eq!(decoded, with_launch);
+    assert!(matches!(
+        decoded.event,
+        WardEvent::CredentialGranted {
+            launch_seq: Some(1),
+            ..
+        }
+    ));
+
+    let without_launch = chain
+        .append(
+            Origin::Wardd,
+            granted(None),
+            Timestamp::mono(Duration::from_secs(2)),
+        )
+        .unwrap();
+    let frame = encode_record(&without_launch).unwrap();
+    let (decoded, _) = decode_record(&frame).unwrap();
+    assert_eq!(decoded, without_launch);
+    assert!(matches!(
+        decoded.event,
+        WardEvent::CredentialGranted {
+            launch_seq: None,
+            ..
+        }
+    ));
 }
