@@ -107,6 +107,14 @@ pub enum Request {
     /// The temporary authority the session holds (ADR-0019): every
     /// `allow-session` answer and every credential the proxy injects.
     Grants,
+    /// Every grant retired into the bounded history (#140): a confirmed
+    /// revoke, or a credential whose own recorded lifetime ran out, oldest
+    /// first — `ward session grants --history`. Kept separate from
+    /// [`Request::Grants`] rather than folded into it (a flag on the same
+    /// variant would change its wire shape for every existing client) so an
+    /// older `ward` binary talking to a newer daemon, or the reverse, never
+    /// has to parse a field it does not expect.
+    GrantHistory,
     /// Remove one grant from live authority, by the id [`Response::Grants`]
     /// listed it under (#140 items 4-6, #245: host-confirmed for a
     /// credential). An `allow-session` answer is forgotten immediately, so
@@ -242,6 +250,9 @@ pub enum Response {
     Approvals(Vec<ApprovalRecord>),
     /// The session's temporary grants, oldest first.
     Grants(Vec<Grant>),
+    /// `Request::GrantHistory` answered (#140): every retired grant, oldest
+    /// first.
+    GrantHistory(Vec<Grant>),
     /// A `CredentialGranted` append answered (#245): the record, and the
     /// grant id `crate::approvals::Approvals::record_credential` minted (or
     /// already had) for it. The one client that appended it uses this id to
@@ -742,6 +753,7 @@ pub fn handle_with(
         | Request::Pending
         | Request::Approvals
         | Request::Grants
+        | Request::GrantHistory
         | Request::Revoke { .. }
         | Request::Pause { .. }
         | Request::Resume

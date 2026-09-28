@@ -328,6 +328,17 @@ pub fn grants(sink: &mut RemoteSink) -> Result<Vec<Grant>> {
     }
 }
 
+/// Every grant retired into the bounded history (#140), oldest first: a
+/// confirmed revoke, or a credential whose own recorded lifetime ran out
+/// (`ward session grants --history`).
+pub fn grant_history(sink: &mut RemoteSink) -> Result<Vec<Grant>> {
+    match sink.call(&Request::GrantHistory)? {
+        Response::GrantHistory(grants) => Ok(grants),
+        Response::Error(e) => Err(Error::Daemon(format!("daemon refused grant history: {e}"))),
+        other => Err(Error::Events(format!("unexpected response {other:?}"))),
+    }
+}
+
 /// Answer a held approval (`ward session approve <id> <decision>`).
 pub fn approve(sink: &mut RemoteSink, id: u64, decision: ApprovalDecision) -> Result<()> {
     match sink.call(&Request::Approve { id, decision })? {

@@ -53,6 +53,14 @@ impl Grant {
 pub struct Authority {
     /// The grants.
     pub grants: Vec<Grant>,
+    /// The session is currently paused (ADR-0019 §3, #140): every grant
+    /// shows suspended in [`authority_panel`] while this is true, and plain
+    /// again from the moment `SessionResumed` lands — the same single source
+    /// of truth (`WardEvent::SessionPaused`/`SessionResumed`) the daemon's
+    /// own `Approvals::set_paused` reacts to, never a second, parallel notion
+    /// of "paused" derived here. Session-wide, not per-grant: pausing
+    /// suspends every grant at once, exactly as `wardd` does.
+    pub suspended: bool,
 }
 
 impl Authority {
@@ -117,6 +125,11 @@ impl Authority {
                 let label = service_name(service.as_str());
                 self.grants.retain(|g| g.label != label);
             }
+            // #140: the same pause the daemon suspends every grant for
+            // (`Approvals::set_paused`) — reusing that single source of
+            // truth here, not a second one.
+            WardEvent::SessionPaused { .. } => self.suspended = true,
+            WardEvent::SessionResumed { .. } => self.suspended = false,
             _ => {}
         }
     }
@@ -308,7 +321,19 @@ pub fn authority_panel(d: &SessionDescription, authority: &Authority) -> Vec<Gro
     let grants = if authority.is_empty() {
         vec![Row::new("none", "", Tone::Dim)]
     } else {
-        authority.grants.iter().map(Grant::row).collect()
+        authority
+            .grants
+            .iter()
+            .map(|g| {
+                let mut row = g.row();
+                // #140: a grant is never shown as exercisable authority for
+                // longer than the session it belongs to can actually use it.
+                if authority.suspended {
+                    row.value.push_str(" · suspended");
+                }
+                row
+            })
+            .collect()
     };
     vec![
         Group {
@@ -371,6 +396,19 @@ mod tests {
         WardEvent::CredentialRevoked {
             service: ward_events::ServiceId::new(service).unwrap(),
             reason: ward_events::RevokeReason::UserRevoked,
+        }
+    }
+
+    fn paused() -> WardEvent {
+        WardEvent::SessionPaused {
+            method: ward_events::PauseMethod::CgroupFreezer,
+            reason: ShortText::new(""),
+        }
+    }
+
+    fn resumed() -> WardEvent {
+        WardEvent::SessionResumed {
+            paused_for: Duration::from_secs(1),
         }
     }
 
@@ -468,6 +506,61 @@ mod tests {
         let mut unrelated_events = events.clone();
         unrelated_events.push(revoked("npm"));
         assert_eq!(Authority::from_records(&wardd(&unrelated_events)).len(), 2);
+    }
+
+    #[test]
+    fn pausing_suspends_every_grant_in_the_panel_and_resuming_reactivates_them() {
+        // #140: the shell/desktop panel projection reuses the daemon's own
+        // single source of truth for "is this session paused"
+        // (`SessionPaused`/`SessionResumed`), not a second, parallel notion.
+        let mut events = sequence();
+        events.extend([
+            credential("github.com"),
+            decided(
+                CapabilityKind::FileWrite,
+                "Write /work/src/lib.rs",
+                Some(GrantScope::Session),
+            ),
+        ]);
+        let live = Authority::from_records(&wardd(&events));
+        assert!(!live.suspended);
+        let d = description(NetworkCapability::Development);
+        let groups = authority_panel(&d, &live);
+        assert!(
+            groups[1]
+                .rows
+                .iter()
+                .all(|r| !r.value.contains("suspended"))
+        );
+
+        let mut paused_events = events.clone();
+        paused_events.push(paused());
+        let paused_authority = Authority::from_records(&wardd(&paused_events));
+        assert!(paused_authority.suspended);
+        assert_eq!(paused_authority.len(), 2, "pausing drops nothing");
+        let groups = authority_panel(&d, &paused_authority);
+        assert!(
+            groups[1]
+                .rows
+                .iter()
+                .all(|r| r.value.ends_with("· suspended")),
+            "{:?}",
+            groups[1].rows
+        );
+
+        let mut resumed_events = paused_events;
+        resumed_events.push(resumed());
+        let resumed_authority = Authority::from_records(&wardd(&resumed_events));
+        assert!(!resumed_authority.suspended);
+        let groups = authority_panel(&d, &resumed_authority);
+        assert!(
+            groups[1]
+                .rows
+                .iter()
+                .all(|r| !r.value.contains("suspended")),
+            "{:?}",
+            groups[1].rows
+        );
     }
 
     #[test]
