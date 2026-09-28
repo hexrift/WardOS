@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# wardos-grants — list a session's temporary grants and revoke one, on demand
+# (#317, docs/desktop.md §Commands).
+#
+# Usage:
+#   wardos-grants   list this session's temporary grants (`ward session grants`),
+#                   fuzzel-dmenu style: id, label, scope, lifetime, and — while
+#                   it is anything other than plain and active — its own state
+#                   too (`suspended`, `revoking`, `revoke unconfirmed`), the
+#                   same wording `Grant::line()` gives a plain-text listing
+#                   (#140, #245); choosing one asks to confirm, then runs
+#                   `ward session revoke <id>` (host-confirmed: it waits for
+#                   the owning proxy to acknowledge withdrawal) and relays its
+#                   result verbatim — the daemon's own three-way, honest
+#                   answer, never reworded or collapsed to a plain "done":
+#                     grant <id> revoked
+#                     grant <id> revoked — N connection(s) already using it
+#                       will finish on their own
+#                     grant <id> could not be confirmed revoked; it may still
+#                       be in effect — see `ward session grants`
+#                   the last one (and any other failure) is shown at critical
+#                   urgency, since it is exactly the case that must never be
+#                   glanced past as a success
+#   wardos-grants --help
+#
+# "This session" is WARDOS_SESSION's when set (an immutable, explicitly pinned
+# id), else WARDOS_PROJECT's (default: the current directory) — the same
+# single-session model wardos-pause already uses, and the one waybar's grants
+# module and `ward-shell authority-panel` both already point at.
+#
+# A grant is not a pending question with one answer window the way an approval
+# is (wardos-approve): it already exists, indefinitely, until revoked,
+# suspended or expired, and there is nothing to notify about the moment one is
+# created. This is deliberately a "list + act" surface, on demand, not a
+# proactive notifier: no per-key/per-generation membership tracking, no
+# notifier pool, none of wardos-approve's ~1000 lines of race-proofing around a
+# popup's lifecycle — one dmenu, one confirm, one revoke call, done. Needs jq.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+project=${WARDOS_PROJECT:-$PWD}
+session_flag=()
+[[ -n ${WARDOS_SESSION:-} ]] && session_flag=(--session "$WARDOS_SESSION")
+
+rows=$(ward session grants --json "${session_flag[@]}" "$project" \
+  | jq -r '[.id, .label, .scope, .lifetime, .revoke_state] | @tsv') ||
+  wardos_die "no agent session for $project (ward up)"
+if [[ -z $rows ]]; then
+  wardos_notify "No temporary grants" "nothing to revoke in this session" -t 2500
+  exit 0
+fi
+
+# Every menu line carries its own row's id and label ahead of the
+# human-readable text (mirroring wardos-approve-inbox): parsing the exact line
+# chosen, rather than re-deriving it from a bare id, means a row picked here is
+# always the one shown, even if the list changed underneath between listing
+# and choosing. The display column mirrors Grant::line() exactly: id, label,
+# scope, lifetime, then the grant's own state only while it is not plain
+# "active" (#140, #245's "no non-active state is shown as though nothing were
+# happening").
+menu_lines=$(printf '%s\n' "$rows" | awk -F'\t' '{
+  display = sprintf("%4s  %-28s %s · %s", $1, $2, $3, $4)
+  if ($5 != "active") display = display " · " $5
+  printf "%s\t%s\t%s\n", $1, $2, display
+}')
+chosen=$(printf '%s\n' "$menu_lines" | wardos_menu "Temporary grants") || exit 0
+id=$(printf '%s\n' "$chosen" | cut -f1)
+label=$(printf '%s\n' "$chosen" | cut -f2)
+
+# Revoking is destructive (a forgotten `allow-session` answer asks again; a
+# forgotten credential is never re-offered on its own): one confirmation,
+# cancellable, before anything happens — cancelling changes nothing, exactly
+# like wardos-pause's menu.
+confirm=$(wardos_menu "Revoke $label?" "Revoke" "Cancel") || exit 0
+[[ $confirm == Revoke ]] || exit 0
+
+# `ward session revoke` prints exactly one line, the daemon's own honest
+# three-way answer, and its exit code already carries the same honesty
+# (0 for `revoked`/`revoked — N in flight`, 1 for `could not be confirmed`
+# and for a hard refusal such as an id that is no longer live) — relayed
+# verbatim, never reworded, so this script cannot itself introduce a claim
+# the daemon did not make.
+status=0
+message=$(ward session revoke "$id" "$project" "${session_flag[@]}" 2>&1) || status=$?
+message=${message#  }
+if [[ $status -ne 0 ]]; then
+  wardos_notify "Revoke failed" "$message" -u critical
+  exit "$status"
+elif [[ $message == *" connection"* ]]; then
+  # `revoked — N connection(s) already using it will finish on their own`:
+  # the authority is withdrawn, but critical urgency all the same, since this
+  # is exactly the qualified case that must not be glanced past as a clean
+  # `revoked`.
+  wardos_notify "Grant revoked — still in flight" "$message" -u critical
+else
+  wardos_notify "Grant revoked" "$message" -t 3000
+fi

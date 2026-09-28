@@ -29,7 +29,14 @@ What changes is what a human can *read* from the desktop at a glance, in this or
 4. **Temporary authority stays visible while it exists.** A session-scoped grant
    changes the bar (`NET restricted · github+`, `GRANTS 1`) until the session ends;
    clicking it lists the current authority: filesystem, network, every temporary grant
-   with its scope and lifetime, and the standing denials.
+   with its scope and lifetime, and the standing denials. A listed grant can be
+   withdrawn, host-confirmed (#140, #245): `ward session revoke <id>` waits for the
+   owning proxy to acknowledge before answering `revoked`, `revoked — N in flight`,
+   or `could not be confirmed` — never a plain success, and an unconfirmed revoke
+   leaves the grant exactly where it was rather than being reported as either safely
+   gone or silently still active. `wardos-grants` offers the same action from the
+   desktop layer on demand (#317), from the bar's `grants` module, without the
+   proactive-notifier machinery an approval's one-shot answer window needs.
 5. **Approval load is a security metric.** E-13 measures approvals per agent-hour,
    approve and deny rates, decision time, allow-once followed by the same request,
    allow-session rate, requests contained by the sandbox, requests caused by missing

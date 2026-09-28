@@ -57,7 +57,8 @@
     "return-type": "json",
     "restart-interval": 5,
     "format": "{}",
-    "on-click": "foot --app-id ward-authority -e sh -c 'ward-shell authority-panel; read -r _'"
+    "on-click": "foot --app-id ward-grants -e wardos-grants",
+    "on-click-right": "foot --app-id ward-authority -e sh -c 'ward-shell authority-panel; read -r _'"
   },
   "custom/ward-tamperward": {
     "exec": "ward-shell bar --waybar --segment tamperward --follow",
