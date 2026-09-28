@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# wardos-grants - inspect and revoke the selected session's temporary grants (#317).
+#
+# Usage:
+#   wardos-grants          list the desktop-selected session's live grants, choose one,
+#                          confirm, and call the existing host-confirmed
+#                          `ward session revoke <id> --session <session>` path
+#   wardos-grants --help
+#
+# The session is resolved once, before listing, then pinned explicitly for both the
+# list and revoke calls. A desktop selection change while the menu is open therefore
+# cannot retarget the action. The daemon/CLI remains authoritative for the outcome:
+# its exact `revoked`, `revoked - N connections...`, or `could not be confirmed`
+# result is printed and shown; a non-zero result stays non-zero.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+[[ $# -eq 0 ]] || wardos_die "unexpected argument: $1"
+
+session=$(ward session select --show)
+if [[ -z $session || $session == "(none)" ]]; then
+  wardos_notify "No active session" "select or start a Ward session first" -t 2500
+  exit 0
+fi
+
+rows=$(ward session grants --session "$session" --json)
+if [[ -z $rows ]]; then
+  wardos_notify "No temporary grants" "$session holds no temporary authority" -t 2500
+  exit 0
+fi
+
+# Keep the daemon-minted id and lifecycle state in the chosen row. The id is only
+# meaningful inside this pinned session, which is why the session never gets
+# re-resolved after the menu opens.
+fields='[.id, .kind, .label, .scope, .lifetime, .revoke_state] | @tsv'
+parsed=$(printf '%s\n' "$rows" | jq -r "$fields")
+menu_lines=$(printf '%s\n' "$parsed" | awk -F'\t' '{
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t#%-5s %-10s %s | %s | %s | %s\n", \
+    $1, $2, $3, $4, $5, $6, $1, $2, $3, $4, $5, $6
+}')
+chosen=$(printf '%s\n' "$menu_lines" | wardos_menu "Grants") || exit 0
+id=$(printf '%s\n' "$chosen" | cut -f1)
+
+confirm=$(wardos_menu "Revoke grant $id?" "Revoke" "Cancel") || exit 0
+[[ $confirm == Revoke ]] || exit 0
+
+set +e
+output=$(ward session revoke "$id" --session "$session" 2>&1)
+status=$?
+set -e
+printf '%s\n' "$output"
+message=$(printf '%s' "$output" | tr '\n' ' ')
+if [[ $status -eq 0 ]]; then
+  wardos_notify "Grant revoke result" "$message" -t 6000
+else
+  wardos_notify "Grant revoke result" "$message" -u critical -t 8000
+fi
+exit "$status"
