@@ -461,9 +461,24 @@ fn launcher_lines(dir: &Path, settle: Duration, query: &str) -> ward_daemon::Res
 /// that line's own session id (`ward session select <id>`, quoted), so
 /// choosing one always selects the session you read, never whichever session
 /// happens to be selected — or newest, or gone — by the time you press enter.
+///
+/// The shared selection and each line's pending-approval count both come
+/// from one [`ward_daemon::registry::snapshot`] call (#141 item 2) instead
+/// of this function's former separate `selection::current` read and a
+/// second per-session `Pending` request on top of `load_from`'s own
+/// connection; [`switcher_binding`] does the actual join, by session id.
+/// The session *list* itself still comes from
+/// [`ward_daemon::daemon::live_sessions`], deliberately not from
+/// `registry.entries`: the registry drops a session whose own, separate
+/// probe connection hit a disconnect (registry.rs's module doc, "a session
+/// whose daemon does not answer... is simply left out"), and a keyboard
+/// switcher listing "every live session" should not flicker a session out
+/// of the list over a transient hiccup on a connection this function does
+/// not otherwise need — `load_from`'s own connection right below is what
+/// decides whether a line is shown, exactly as before.
 fn switcher(settle: Duration, lines: bool) -> ward_daemon::Result<()> {
     let state = state_root();
-    let selected = ward_daemon::selection::current(&state).session;
+    let registry = ward_daemon::registry::snapshot(&state, settle);
     let live = ward_daemon::daemon::live_sessions(&state)?;
     if live.is_empty() {
         if !lines {
@@ -479,10 +494,7 @@ fn switcher(settle: Duration, lines: bool) -> ward_daemon::Result<()> {
             continue;
         };
         digester.observe(&mut snapshot);
-        let pending = client::connect(&socket)
-            .and_then(|mut sink| client::pending(&mut sink))
-            .map_or(0, |p| p.len());
-        let is_selected = selected.as_deref() == Some(meta.id.as_str());
+        let (pending, is_selected) = switcher_binding(&registry, &meta.id);
         let label = switcher_label(&snapshot, pending, is_selected);
         if lines {
             println!("SESSIONS\t{label}\tward session select {}", quote(&meta.id));
@@ -491,6 +503,26 @@ fn switcher(settle: Duration, lines: bool) -> ward_daemon::Result<()> {
         }
     }
     Ok(())
+}
+
+/// One live session's pending-approval count and whether it is the
+/// desktop's current selection, joined from `registry` by session id (#141
+/// item 2, review 5336575691 finding 1) — never by position: `live_sessions`
+/// and `registry.entries` are two separate listings (`registry::snapshot`'s
+/// own fresh scan, then [`switcher`]'s own separate `live_sessions` call a
+/// moment later) that are not guaranteed to agree on order, or even on
+/// membership, so a positional pairing could silently attach one session's
+/// count or selection mark to another. `0`/`false` for a session
+/// `registry.entries` has no matching entry for — the same gap
+/// [`switcher`]'s doc comment already accepts.
+fn switcher_binding(registry: &ward_daemon::registry::Registry, session: &str) -> (usize, bool) {
+    let pending = registry
+        .entries
+        .iter()
+        .find(|e| e.session == session)
+        .map_or(0, |e| e.pending_approvals);
+    let is_selected = registry.selection.session.as_deref() == Some(session);
+    (pending, is_selected)
 }
 
 /// One switcher line: the project, the agent segment's text (which already
@@ -741,6 +773,48 @@ mod tests {
 
         let many = switcher_label(&s, 3, false);
         assert!(many.contains("3 approvals pending"), "{many}");
+    }
+
+    /// Review 5336575691 of #328, finding 1: `switcher_binding` joins
+    /// `live_sessions` to `registry.entries`/`registry.selection` by session
+    /// id, not by position — `registry.entries` here is deliberately in the
+    /// opposite order a caller iterating `live_sessions` would encounter
+    /// these two ids, so a positional pairing (rather than a real lookup)
+    /// would attach `sess_a`'s count to `sess_b` and mark the wrong row
+    /// selected.
+    #[test]
+    fn switcher_binding_joins_by_session_id_not_position() {
+        use ward_daemon::registry::{Registry, RegistryEntry, VerificationState};
+        use ward_daemon::selection::Selection;
+
+        fn entry(session: &str, pending: usize) -> RegistryEntry {
+            RegistryEntry {
+                session: session.to_owned(),
+                project: PathBuf::from("/tmp/proj"),
+                agent: None,
+                agent_state: None,
+                pending_approvals: pending,
+                verification: VerificationState::NeverRun,
+            }
+        }
+
+        let registry = Registry {
+            // Reverse of the order a `live_sessions` scan would give
+            // `switcher`: `sess_b` first, `sess_a` second.
+            entries: vec![entry("sess_b", 5), entry("sess_a", 1)],
+            selection: Selection {
+                session: Some("sess_a".to_owned()),
+                generation: 1,
+            },
+        };
+
+        assert_eq!(switcher_binding(&registry, "sess_a"), (1, true));
+        assert_eq!(switcher_binding(&registry, "sess_b"), (5, false));
+        // A live session the registry has no entry for at all (its own
+        // separate probe connection hit a disconnect): the documented `0`/
+        // not-selected fallback, not an error and not another session's
+        // values.
+        assert_eq!(switcher_binding(&registry, "sess_c"), (0, false));
     }
 
     /// A described session on a worktree, with its stream so far.
