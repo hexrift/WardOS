@@ -41,7 +41,39 @@ menu_lines=$(printf '%s\n' "$parsed" | awk -F'\t' '{
     $1, $2, $3, $4, $5, $6, $1, $2, $3, $4, $5, $6
 }')
 chosen=$(printf '%s\n' "$menu_lines" | wardos_menu "Grants") || exit 0
-id=$(printf '%s\n' "$chosen" | cut -f1)
+
+matched=0
+while IFS= read -r row; do
+  if [[ $chosen == "$row" ]]; then
+    matched=1
+    break
+  fi
+done <<<"$menu_lines"
+if [[ $matched -ne 1 ]]; then
+  wardos_notify "Grant unchanged" "selection did not match the displayed grant list" -u critical -t 5000
+  exit 1
+fi
+
+id=${chosen%%
+[[ $confirm == Revoke ]] || exit 0
+
+set +e
+output=$(ward session revoke "$id" --session "$session" 2>&1)
+status=$?
+set -e
+printf '%s\n' "$output"
+message=$(printf '%s' "$output" | tr '\n' ' ')
+if [[ $status -eq 0 ]]; then
+  wardos_notify "Grant revoke result" "$message" -t 6000
+else
+  wardos_notify "Grant revoke result" "$message" -u critical -t 8000
+fi
+exit "$status"
+\t'*}
+if [[ ! $id =~ ^[0-9]+$ ]]; then
+  wardos_notify "Grant unchanged" "selected grant id was malformed" -u critical -t 5000
+  exit 1
+fi
 
 confirm=$(wardos_menu "Revoke grant $id?" "Revoke" "Cancel") || exit 0
 [[ $confirm == Revoke ]] || exit 0
