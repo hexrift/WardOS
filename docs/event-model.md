@@ -117,6 +117,19 @@ pub enum WardEvent {
     // prior SessionPaused record to make sense of it), plus how many processes were
     // still not confirmed stopped when the daemon's settle bound expired.
     SessionPauseUnsettled { method: CgroupFreezer | Sigstop, reason: BoundedText, pending: u32 },
+
+    // Appended at the end of the catalogue (#145 item 5): `ward stop` terminated the
+    // session's sandboxed workloads before sealing — `ended` confirmed gone, `pending`
+    // killed but not confirmed gone within `pause::STOP_SETTLE`, and
+    // `barrier_confirmed` records whether the pre-kill membership/fork barrier was
+    // proved stable. A completed stop requires `pending == 0 && barrier_confirmed`;
+    // then AgentStateChanged { Finished } and SessionEnded follow. Either `pending > 0`
+    // or `barrier_confirmed == false` means the stop was refused: the log is not
+    // sealed, no Finished is recorded, and the session is held for the stop (not paused:
+    // `ward resume` refuses it) until a later `ward stop` re-scans and confirms it.
+    // The barrier-false/pending-zero shape is intentionally durable: replay after a
+    // daemon restart must still show STOP? rather than losing the reason the stop is held.
+    WorkloadsTerminated { ended: u32, pending: u32, barrier_confirmed: bool },
 }
 ```
 
@@ -167,7 +180,7 @@ source of truth, not the socket. Latency budget from kernel event to subscriber 
 
 | Mode | Shows | Blocks? |
 | --- | --- | --- |
-| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed,Errored,Cancelled,Interrupted}`, the host's interventions (`SessionPaused`, `SessionPauseUnsettled`, `SessionResumed`, `EntryRestored`), `ObservationsDropped`, `SessionEnded` | Only on `Ask` |
+| Quiet | `AgentStateChanged`, `PolicyDenied`, `Capability*` needing approval, `Verification{Passed,Failed,Errored,Cancelled,Interrupted}`, the host's interventions (`SessionPaused`, `SessionPauseUnsettled`, `WorkloadsTerminated`, `SessionResumed`, `EntryRestored`), `ObservationsDropped`, `SessionEnded` | Only on `Ask` |
 | Live | Everything except `AgentClaim{Note}` | Only on `Ask` |
 | Step-through | Everything; additionally the manifest's `step_policy` marks actions (`FileModified` under given globs, `CommandStarted` matching patterns, any `NetworkRequested`) as `Ask` | Yes, on configured actions |
 

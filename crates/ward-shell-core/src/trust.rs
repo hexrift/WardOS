@@ -537,7 +537,9 @@ impl TrustBar {
     pub fn new(header: &Header, model: &Model) -> Self {
         let state = &model.state;
         let mut bar = Self::from_header(header, model.sealed);
-        bar.agent = state.agent.map(|s| agent_segment(header, s, model.sealed));
+        bar.agent = state
+            .agent
+            .map(|s| agent_segment(header, s, model.sealed, state.stop_incomplete));
         // Temporary authority shows while it exists (ADR-0019): on the network
         // segment's text and as a segment of its own. Kept incrementally on the
         // model rather than rescanned here (#138 item 4), so a session-scoped
@@ -645,14 +647,22 @@ impl TrustBar {
 /// bar's other host-owned states, in the denied tone; a pause the host could not
 /// confirm settled (PR #207 review finding 1) reads `PAUSED?` instead — never the
 /// same word as a confirmed pause — in the warn tone [`agent_tone`] already gives
-/// [`AgentState::PauseUnsettled`].
-fn agent_segment(header: &Header, state: AgentState, sealed: bool) -> Segment {
+/// [`AgentState::PauseUnsettled`]. A stop the host refused and that has not been
+/// completed since (`stop_incomplete`, PR #253 review finding 5) reads `STOP?`:
+/// the session is held for that stop, which `ward resume` cannot release.
+fn agent_segment(
+    header: &Header,
+    state: AgentState,
+    sealed: bool,
+    stop_incomplete: bool,
+) -> Segment {
     let name = header
         .agent
         .as_deref()
         .map_or_else(|| "AGENT".to_owned(), str::to_uppercase);
     let tone = if sealed { Tone::Dim } else { agent_tone(state) };
     let word = match state {
+        AgentState::PauseUnsettled if stop_incomplete => "STOP?",
         AgentState::Paused => "PAUSED",
         AgentState::PauseUnsettled => "PAUSED?",
         other => agent_word(other),
@@ -1249,6 +1259,48 @@ mod tests {
         assert_eq!(
             TrustBar::new(&h, &model).agent.unwrap().text,
             "CLAUDE ● working"
+        );
+        // PR #253 review finding 5: a refused stop is an incomplete stop, not a
+        // pause — `STOP?`, never `PAUSED`/`PAUSED?` — until the retry's confirmed
+        // termination; then the daemon's `Finished`.
+        let mut model = Model::new(false);
+        model.apply(wardd(&[agent(S::Working)]).remove(0));
+        model.apply(
+            wardd(&[WardEvent::WorkloadsTerminated {
+                ended: 2,
+                pending: 1,
+                barrier_confirmed: true,
+            }])
+            .remove(0),
+        );
+        let segment = TrustBar::new(&h, &model).agent.unwrap();
+        assert_eq!(segment.text, "CLAUDE ‖? STOP?");
+        assert_eq!(segment.tone, Tone::Warn);
+
+        model.apply(
+            wardd(&[WardEvent::WorkloadsTerminated {
+                ended: 1,
+                pending: 0,
+                barrier_confirmed: false,
+            }])
+            .remove(0),
+        );
+        let segment = TrustBar::new(&h, &model).agent.unwrap();
+        assert_eq!(segment.text, "CLAUDE ‖? STOP?");
+        assert_eq!(segment.tone, Tone::Warn);
+
+        model.apply(
+            wardd(&[WardEvent::WorkloadsTerminated {
+                ended: 1,
+                pending: 0,
+                barrier_confirmed: true,
+            }])
+            .remove(0),
+        );
+        model.apply(wardd(&[agent(S::Finished)]).remove(0));
+        assert_eq!(
+            TrustBar::new(&h, &model).agent.unwrap().text,
+            "CLAUDE ✓ finished"
         );
         // No recorded agent: a neutral name, never an invented one.
         let mut anon = h.clone();

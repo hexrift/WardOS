@@ -779,6 +779,14 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Wardd,
+            WardEvent::WorkloadsTerminated {
+                ended: 4,
+                pending: 0,
+                barrier_confirmed: true,
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -878,7 +886,9 @@ fn every_catalogue_variant_survives_chain_wire_and_log() {
     // marker, not a terminal outcome, and is deliberately not in Quiet mode (like
     // `VerificationRequested`/`VerificationStarted` before it) -- neither is
     // `LaunchAborted`, matching its siblings `CommandStarted`/`CommandFinished`.
-    assert_eq!(quiet, 19);
+    // Plus `WorkloadsTerminated` (#145 item 5): `ward stop` ending the session's
+    // sandboxed processes is a host intervention like pause, and is Quiet-visible.
+    assert_eq!(quiet, 20);
 }
 
 #[test]
@@ -941,4 +951,51 @@ fn session_pause_unsettled_is_quiet_visible() {
             .contains(EventKind::SessionPauseUnsettled)
     );
     assert!(Filter::quiet().kinds.contains(EventKind::SessionPaused));
+}
+
+/// #145 item 5: `ward stop` terminating the session's workloads is a host
+/// intervention, as visible in the Quiet observer mode as a pause is — a
+/// refused stop (`pending > 0`) in particular must never be hidden from a
+/// reader that only sees Quiet.
+#[test]
+fn workloads_terminated_is_quiet_visible_and_critical() {
+    assert!(
+        Filter::quiet()
+            .kinds
+            .contains(EventKind::WorkloadsTerminated)
+    );
+    assert!(EventKind::WorkloadsTerminated.is_critical());
+    assert_eq!(EventKind::WorkloadsTerminated.bit(), 1u64 << 38);
+    assert_eq!(
+        EventKind::WorkloadsTerminated.name(),
+        "workloads_terminated"
+    );
+}
+
+#[test]
+fn workloads_terminated_round_trips_barrier_uncertainty() {
+    let session = SessionId::from_u128(0x5e56);
+    let mut chain = Chain::genesis(session, Blake3Hash::hash(b"manifest"));
+    let record = chain
+        .append(
+            Origin::Wardd,
+            WardEvent::WorkloadsTerminated {
+                ended: 2,
+                pending: 0,
+                barrier_confirmed: false,
+            },
+            Timestamp::mono(Duration::from_secs(1)),
+        )
+        .unwrap();
+    let frame = encode_record(&record).unwrap();
+    let (decoded, _) = decode_record(&frame).unwrap();
+    assert_eq!(decoded, record);
+    assert!(matches!(
+        decoded.event,
+        WardEvent::WorkloadsTerminated {
+            ended: 2,
+            pending: 0,
+            barrier_confirmed: false
+        }
+    ));
 }

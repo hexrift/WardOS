@@ -1460,3 +1460,296 @@ fn restore_entry_materialises_the_snapshot_and_keeps_what_it_replaced() {
     assert!(restored[0].0 >= 3 && restored[0].1.starts_with(".ward/restore-"));
     assert_eq!(restored[1], (0, String::new()));
 }
+
+/// The kinds of every record in `log`, by name, in order.
+fn kinds_in(log: &std::path::Path) -> Vec<String> {
+    LogReader::open(log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|r| format!("{:?}", r.event.kind()))
+        .collect()
+}
+
+/// Every pid whose command line mentions `marker`.
+fn pids_tagged(marker: &str) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for entry in fs::read_dir("/proc").unwrap().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        if String::from_utf8_lossy(&cmdline).contains(marker) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Start `wardd serve` for a fresh, persisted session of `project` on a thread,
+/// and wait until it answers.
+fn serve_new_session(
+    project: &std::path::Path,
+    state: &std::path::Path,
+) -> (
+    String,
+    std::path::PathBuf,
+    std::thread::JoinHandle<ward_daemon::Result<()>>,
+) {
+    let up = Session::start_in(project, state).expect("up");
+    let session_id = up.id().to_owned();
+    let log = up.log_path();
+    up.persist_current().expect("persist");
+    drop(up);
+    let (state_path, id) = (state.to_path_buf(), session_id.clone());
+    let served = std::thread::spawn(move || daemon::serve(&state_path, &id));
+    assert!(daemon::wait_until(daemon::STARTUP_TIMEOUT, || {
+        daemon::serving(state, &session_id)
+    }));
+    (session_id, log, served)
+}
+
+/// #145 item 5 end to end on a real sandbox: `ward stop` on a session whose
+/// command is still running (never paused) ends every process of the sandbox
+/// before the daemon seals the log — where it used to seal and leave the agent
+/// running unobserved. The log records the termination between the command's
+/// start and the session's end.
+#[test]
+fn stop_ends_a_running_sandbox_before_the_log_is_sealed() {
+    if !ward_sandbox::ci::isolation_ready(sandbox::available(), "bubblewrap") {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let (_, log, served) = serve_new_session(project.path(), state.path());
+
+    let marker = format!("ward-stop-e2e-{}", std::process::id());
+    let script = format!("i=0; while [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done # {marker}");
+    let runner = {
+        let (p, s) = (project.path().to_path_buf(), state.path().to_path_buf());
+        std::thread::spawn(move || {
+            let mut run = Session::open_current(&p, &s).unwrap().unwrap();
+            // The launch's own end cannot be recorded once the log is sealed:
+            // whatever `run` answers, it must return rather than hang.
+            let _ = run.run(&["/bin/sh".into(), "-c".into(), script]);
+        })
+    };
+    assert!(
+        daemon::wait_until(std::time::Duration::from_secs(5), || pids_tagged(&marker)
+            .len()
+            >= 2),
+        "the command runs inside the sandbox"
+    );
+
+    let stop = Session::open_current(project.path(), state.path())
+        .unwrap()
+        .unwrap();
+    let ended = stop.stop(EndReason::UserStop).expect("stop");
+    assert!(ended >= 2, "bwrap and the shell at least: {ended}");
+    assert!(
+        pids_tagged(&marker).is_empty(),
+        "nothing of the sandbox survives a confirmed stop: {:?}",
+        pids_tagged(&marker)
+    );
+    runner.join().unwrap();
+    served.join().unwrap().expect("serve returns Ok");
+
+    let kinds = kinds_in(&log);
+    let at = |k: &str| {
+        kinds
+            .iter()
+            .position(|x| x == k)
+            .unwrap_or_else(|| panic!("{k} in {kinds:?}"))
+    };
+    assert!(
+        at("CommandStarted") < at("WorkloadsTerminated"),
+        "{kinds:?}"
+    );
+    assert!(at("WorkloadsTerminated") < at("SessionEnded"), "{kinds:?}");
+    assert_eq!(kinds.last().map(String::as_str), Some("SessionEnded"));
+}
+
+/// #145 item 5 with a real daemon on any host, bubblewrap or not: a process
+/// tree the daemon's scan recognises as the session's sandbox (a copy of `sh`
+/// named `bwrap`, bound to the session's run directory, as a real launch is) is
+/// ended by `ward stop --restore-entry` through the control socket. The order
+/// is the acceptance's: the session is made quiescent (paused) before the
+/// restore, the restore happens with nothing able to write over it, and only
+/// then are the workloads terminated and the log sealed.
+#[test]
+fn stop_restore_entry_through_the_daemon_pauses_restores_then_terminates() {
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let (session_id, log, served) = serve_new_session(project.path(), state.path());
+    fs::write(project.path().join("README.md"), "agent was here\n").unwrap();
+
+    let bin = tempfile::tempdir().unwrap();
+    let bwrap = bin.path().join("bwrap");
+    fs::copy("/bin/sh", &bwrap).unwrap();
+    let marker = format!("ward-stop-fake-{}", std::process::id());
+    let mut tree = std::process::Command::new(&bwrap)
+        .args(["-c", &format!("while :; do sleep 0.05; done # {marker}")])
+        .arg(ward_daemon::session::run_dir_path(&session_id).join("proxy.sock"))
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(daemon::wait_until(
+        std::time::Duration::from_secs(5),
+        || ward_daemon::pause::sandbox_pids(std::path::Path::new("/proc"), &session_id).len() >= 2
+    ));
+
+    let session = Session::open_current(project.path(), state.path())
+        .unwrap()
+        .unwrap();
+    let (report, ended) = session
+        .stop_restoring_entry(EndReason::UserStop)
+        .expect("stop --restore-entry");
+    assert!(ended >= 2, "the shell and its child: {ended}");
+    assert_eq!(report.files, 1, "{report:?}");
+    assert_eq!(
+        fs::read_to_string(project.path().join("README.md")).unwrap(),
+        "demo\n"
+    );
+    let status = tree.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(9),
+        "killed, not left frozen: {status:?}"
+    );
+    assert!(pids_tagged(&marker).is_empty());
+    served.join().unwrap().expect("serve returns Ok");
+    assert!(!ward_daemon::pause::marker_path(state.path(), &session_id).exists());
+
+    let kinds = kinds_in(&log);
+    let at = |k: &str| {
+        kinds
+            .iter()
+            .position(|x| x == k)
+            .unwrap_or_else(|| panic!("{k} in {kinds:?}"))
+    };
+    assert!(at("SessionPaused") < at("EntryRestored"), "{kinds:?}");
+    assert!(at("EntryRestored") < at("WorkloadsTerminated"), "{kinds:?}");
+    assert!(at("WorkloadsTerminated") < at("SessionEnded"), "{kinds:?}");
+}
+
+/// A process tree the daemon's scan recognises as `session_id`'s sandbox on
+/// any host (a copy of `sh` named `bwrap`, bound to the session's run
+/// directory), looping forever; its command line carries `marker`. The copy
+/// lives in `bin`, which must outlive the tree.
+fn fake_sandbox(bin: &std::path::Path, session_id: &str, marker: &str) -> std::process::Child {
+    let bwrap = bin.join("bwrap");
+    fs::copy("/bin/sh", &bwrap).unwrap();
+    let tree = std::process::Command::new(&bwrap)
+        .args(["-c", &format!("while :; do sleep 0.05; done # {marker}")])
+        .arg(ward_daemon::session::run_dir_path(session_id).join("proxy.sock"))
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(daemon::wait_until(
+        std::time::Duration::from_secs(5),
+        || ward_daemon::pause::sandbox_pids(std::path::Path::new("/proc"), session_id).len() >= 2
+    ));
+    tree
+}
+
+/// PR #253 review finding 5 through a real daemon: `Session::stop` appends
+/// nothing itself before asking; the daemon records `Finished` exactly once,
+/// after the confirmed `WorkloadsTerminated` and before `SessionEnded` — so a
+/// stop the daemon had refused could never have left a `Finished` behind.
+#[test]
+fn a_stop_through_the_daemon_records_finished_only_after_the_termination() {
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let (session_id, log, served) = serve_new_session(project.path(), state.path());
+    let bin = tempfile::tempdir().unwrap();
+    let marker = format!("ward-stop-finished-{}", std::process::id());
+    let mut tree = fake_sandbox(bin.path(), &session_id, &marker);
+
+    let session = Session::open_current(project.path(), state.path())
+        .unwrap()
+        .unwrap();
+    let ended = session.stop(EndReason::UserStop).expect("stop");
+    assert!(ended >= 2, "{ended}");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&tree.wait().unwrap()),
+        Some(9)
+    );
+    served.join().unwrap().expect("serve returns Ok");
+
+    let records: Vec<EventRecord> = LogReader::open(&log)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    let finished: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            matches!(
+                r.event,
+                WardEvent::AgentStateChanged {
+                    state: ward_events::AgentState::Finished
+                }
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let kinds: Vec<String> = records
+        .iter()
+        .map(|r| format!("{:?}", r.event.kind()))
+        .collect();
+    assert_eq!(finished.len(), 1, "exactly one Finished: {kinds:?}");
+    let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
+    assert!(at("WorkloadsTerminated") < finished[0], "{kinds:?}");
+    assert!(finished[0] < at("SessionEnded"), "{kinds:?}");
+    assert_eq!(records[finished[0]].origin, Origin::Wardd);
+}
+
+/// PR #253 review finding 3, stale marker: a pause marker left on disk by a
+/// daemon that has since gone (here: written by hand; this daemon never
+/// paused) must not make `ward stop --restore-entry` skip establishing
+/// quiescence. The daemon freezes the running tree itself for the hold —
+/// `SessionPaused` is recorded before `EntryRestored` — and the stop then
+/// ends it.
+#[test]
+fn stop_restore_entry_does_not_trust_a_stale_pause_marker() {
+    let state = tempfile::tempdir().unwrap();
+    let project = scratch_project();
+    let (session_id, log, served) = serve_new_session(project.path(), state.path());
+    fs::write(project.path().join("README.md"), "agent was here\n").unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let marker = format!("ward-stop-stale-{}", std::process::id());
+    let mut tree = fake_sandbox(bin.path(), &session_id, &marker);
+    ward_daemon::pause::write_marker(state.path(), &session_id, "left by a dead wardd").unwrap();
+
+    let session = Session::open_current(project.path(), state.path())
+        .unwrap()
+        .unwrap();
+    assert!(session.paused(), "the stale marker reads as paused");
+    let (report, ended) = session
+        .stop_restoring_entry(EndReason::UserStop)
+        .expect("stop --restore-entry");
+    assert!(ended >= 2, "{ended}");
+    assert_eq!(report.files, 1, "{report:?}");
+    assert_eq!(
+        fs::read_to_string(project.path().join("README.md")).unwrap(),
+        "demo\n"
+    );
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&tree.wait().unwrap()),
+        Some(9)
+    );
+    served.join().unwrap().expect("serve returns Ok");
+    let kinds = kinds_in(&log);
+    let at = |k: &str| {
+        kinds
+            .iter()
+            .position(|x| x == k)
+            .unwrap_or_else(|| panic!("{k} in {kinds:?}"))
+    };
+    assert!(at("SessionPaused") < at("EntryRestored"), "{kinds:?}");
+    assert!(at("EntryRestored") < at("WorkloadsTerminated"), "{kinds:?}");
+    assert!(at("WorkloadsTerminated") < at("SessionEnded"), "{kinds:?}");
+}
