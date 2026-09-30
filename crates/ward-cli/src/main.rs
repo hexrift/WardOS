@@ -1760,6 +1760,27 @@ fn pause_status_word(
 /// session named" means, instead of independently falling back to its own
 /// notion of the current one (#141's evidence against the old
 /// `client::socket_path`-only resolution here).
+/// Which session `desktop_socket` actually resolved to. A caller that pins no
+/// session (`wardos-pause` with no `WARDOS_SESSION`, run from a directory with
+/// no session of its own) can be handed back the desktop's shared selection or
+/// the newest live session instead — silently a different project than the one
+/// named on the command line (#141 finding 3). Printing this makes the
+/// resolved project explicit in the confirmation instead of letting it read as
+/// confirmation of whatever directory the caller asked about.
+///
+/// JSON-encoded rather than plain text: a project path is an arbitrary Unix
+/// path and may itself contain a newline, which a line-oriented record can't
+/// carry without either truncating it or splitting the record across two
+/// physical lines (review on #330). `serde_json` escapes any such byte as
+/// `\n` inside the string, so the record — read by `wardos-pause` with `jq`
+/// — always stays on the one line it was printed on, whatever the path holds.
+fn resolved_session_line(state: &Path, socket: &Path) -> Option<String> {
+    let id = socket.parent()?.file_name()?.to_str()?;
+    let meta = SessionMeta::load(state, id).ok()?;
+    let payload = serde_json::json!({ "id": id, "project": meta.project.display().to_string() });
+    Some(format!("resolved-session: {payload}"))
+}
+
 fn cmd_pause(
     dir: &Path,
     session: Option<&str>,
@@ -1812,7 +1833,11 @@ fn cmd_pause(
             ExitCode::SUCCESS
         });
     }
-    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
+    let socket = client::desktop_socket(dir, &state, session)?;
+    if let Some(line) = resolved_session_line(&state, &socket) {
+        println!("  {line}");
+    }
+    let mut sink = client::connect(&socket)?;
     let outcome = client::pause(&mut sink, reason.unwrap_or_default())?;
     if let Some(row) = render::observer_row(&outcome.record) {
         println!("{row}");
@@ -1838,7 +1863,11 @@ fn cmd_pause(
 /// `ward resume`: the daemon reverses the pause and answers with its record.
 fn cmd_resume(dir: &Path, session: Option<&str>) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
-    let mut sink = client::connect(&client::desktop_socket(dir, &state, session)?)?;
+    let socket = client::desktop_socket(dir, &state, session)?;
+    if let Some(line) = resolved_session_line(&state, &socket) {
+        println!("  {line}");
+    }
+    let mut sink = client::connect(&socket)?;
     let record = client::resume(&mut sink)?;
     if let Some(row) = render::observer_row(&record) {
         println!("{row}");
@@ -2044,7 +2073,7 @@ mod tests {
     use super::{
         Cli, Command, SessionCmd, SnapshotCmd, WatchMode, approvals_all_line, desktop_command,
         observer_degraded_warning, on_path_in, pause_status_word, pending_all_line, pending_text,
-        stopped_line, unreachable_line, verb_program,
+        resolved_session_line, stopped_line, unreachable_line, verb_program,
     };
     use clap::Parser as _;
     use std::time::Duration;
@@ -2092,6 +2121,66 @@ mod tests {
         assert_eq!(verb_program("../etc/passwd"), None);
         assert_eq!(verb_program("a/b"), None);
         assert_eq!(verb_program("-rf"), None);
+    }
+
+    #[test]
+    fn resolved_session_line_names_the_session_actually_behind_the_socket() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = ward_daemon::Session::start_in(project.path(), state.path()).unwrap();
+        session.persist_current().unwrap();
+        let id = session.id().to_owned();
+        drop(session);
+
+        let socket = ward_daemon::session::session_dir(state.path(), &id).join("control.sock");
+        let line = resolved_session_line(state.path(), &socket).unwrap();
+        let prefix = "resolved-session: ";
+        assert!(line.starts_with(prefix), "{line}");
+        let value: serde_json::Value = serde_json::from_str(&line[prefix.len()..]).unwrap();
+        assert_eq!(value["id"], id);
+        assert_eq!(
+            value["project"],
+            project.path().canonicalize().unwrap().display().to_string()
+        );
+    }
+
+    #[test]
+    fn resolved_session_line_is_none_for_an_unknown_session() {
+        let state = tempfile::tempdir().unwrap();
+        let socket =
+            ward_daemon::session::session_dir(state.path(), "sess_missing").join("control.sock");
+        assert!(resolved_session_line(state.path(), &socket).is_none());
+    }
+
+    /// A project path is an arbitrary Unix path and may itself contain a
+    /// newline. Review on #330: a plain-text line-oriented record can't carry
+    /// that without truncating the path or splitting the record across two
+    /// physical lines, silently naming the wrong (or a partial) project in
+    /// the pause/resume acknowledgement. JSON-encoding it must keep the
+    /// record on the one line it was printed on and preserve the path byte
+    /// for byte.
+    #[test]
+    fn resolved_session_line_carries_a_newline_in_the_project_path_intact() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("weird\nproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let session = ward_daemon::Session::start_in(&project_dir, state.path()).unwrap();
+        session.persist_current().unwrap();
+        let id = session.id().to_owned();
+        let canonical = project_dir.canonicalize().unwrap();
+        drop(session);
+
+        let socket = ward_daemon::session::session_dir(state.path(), &id).join("control.sock");
+        let line = resolved_session_line(state.path(), &socket).unwrap();
+        let prefix = "resolved-session: ";
+        let json_part = &line[prefix.len()..];
+        assert!(
+            !json_part.contains('\n'),
+            "the record must stay on one physical line: {line:?}"
+        );
+        let value: serde_json::Value = serde_json::from_str(json_part).unwrap();
+        assert_eq!(value["project"], canonical.display().to_string());
     }
 
     #[test]
