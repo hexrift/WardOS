@@ -530,7 +530,7 @@ fn switcher_binding(registry: &ward_daemon::registry::Registry, session: &str) -
 /// approvals are pending, and the verify segment's text — the same facts the
 /// bar shows for the selected session, just for every live one at once.
 fn switcher_label(snapshot: &Snapshot, pending: usize, selected: bool) -> String {
-    let bar = TrustBar::new(&snapshot.header, &snapshot.model);
+    let bar = TrustBar::new(&snapshot.header, &snapshot.model, now_unix_ms());
     let agent = bar
         .segment(SegmentName::Agent)
         .map_or_else(String::new, |s| s.text);
@@ -595,7 +595,7 @@ fn load_from(socket: &Path, settle: Duration) -> ward_daemon::Result<Option<Snap
 
 /// The text of one surface.
 fn render(s: &Snapshot, surface: Surface) -> String {
-    let bar = TrustBar::new(&s.header, &s.model).text();
+    let bar = TrustBar::new(&s.header, &s.model, now_unix_ms()).text();
     match surface {
         Surface::Bar { .. } => format!("{bar}\n"),
         Surface::Session => {
@@ -612,7 +612,11 @@ fn render(s: &Snapshot, surface: Surface) -> String {
         // `model.records`.
         Surface::AuthorityPanel => format!(
             "{bar}\n\n{}",
-            panel_text(&authority_panel(&s.description, &s.model.authority))
+            panel_text(&authority_panel(
+                &s.description,
+                &s.model.authority,
+                now_unix_ms()
+            ))
         ),
         Surface::Launcher { query, .. } => {
             let card = SessionCard::new(&s.description, &s.model);
@@ -900,7 +904,7 @@ mod tests {
         // Verified, and the tree is the candidate: green, and the panel says 0 changes.
         let mut s = snapshot_on(work.path(), &[passed(candidate)]);
         digester.observe(&mut s);
-        let bar = TrustBar::new(&s.header, &s.model);
+        let bar = TrustBar::new(&s.header, &s.model, now_unix_ms());
         let verify = bar.segment(SegmentName::Verify).unwrap();
         assert_eq!(
             verify.text,
@@ -915,7 +919,7 @@ mod tests {
         std::fs::write(work.path().join("lib.rs"), "fn f() { g() }\n").unwrap();
         std::fs::write(work.path().join("new.rs"), "").unwrap();
         digester.observe(&mut s);
-        let bar = TrustBar::new(&s.header, &s.model);
+        let bar = TrustBar::new(&s.header, &s.model, now_unix_ms());
         let verify = bar.segment(SegmentName::Verify).unwrap();
         assert_eq!(verify.text, "VERIFY ~ STALE");
         assert_eq!(verify.tone, ward_shell_core::Tone::Warn);
@@ -931,7 +935,7 @@ mod tests {
         std::fs::remove_file(work.path().join("new.rs")).unwrap();
         digester.observe(&mut s);
         assert!(
-            TrustBar::new(&s.header, &s.model)
+            TrustBar::new(&s.header, &s.model, now_unix_ms())
                 .segment(SegmentName::Verify)
                 .unwrap()
                 .text
@@ -1148,7 +1152,7 @@ mod tests {
             false,
         ));
         assert!(
-            TrustBar::new(&s.header, &s.model)
+            TrustBar::new(&s.header, &s.model, now_unix_ms())
                 .segment(SegmentName::Verify)
                 .unwrap()
                 .text
@@ -1176,7 +1180,7 @@ mod tests {
         // keep asserting a confirmed match with evidence the tree may have
         // changed, before that debounced digest ever runs.
         assert_ne!(
-            TrustBar::new(&s.header, &s.model)
+            TrustBar::new(&s.header, &s.model, now_unix_ms())
                 .segment(SegmentName::Verify)
                 .unwrap()
                 .tone,
@@ -1202,7 +1206,7 @@ mod tests {
             "the debounce deadline itself must be scanned, not only another record or a forced tick"
         );
         assert_eq!(
-            TrustBar::new(&s.header, &s.model)
+            TrustBar::new(&s.header, &s.model, now_unix_ms())
                 .segment(SegmentName::Verify)
                 .unwrap()
                 .text,

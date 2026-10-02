@@ -532,9 +532,13 @@ impl TrustBar {
     }
 
     /// The bar from the session facts and everything the stream has said: the
-    /// shell's bar.
+    /// shell's bar, judged at `now_unix_ms` (#316, PR #318 review finding 1)
+    /// — the same deterministic seam `authority_panel` already takes one
+    /// through, so a credential grant whose own recorded lifetime has run
+    /// out contributes to neither the network segment's tag/tone nor
+    /// `GRANTS n` here either.
     #[must_use]
-    pub fn new(header: &Header, model: &Model) -> Self {
+    pub fn new(header: &Header, model: &Model, now_unix_ms: u64) -> Self {
         let state = &model.state;
         let mut bar = Self::from_header(header, model.sealed);
         bar.agent = state.agent.map(|s| agent_segment(header, s, model.sealed));
@@ -544,8 +548,8 @@ impl TrustBar {
         // grant stays visible even once the record that created it has aged
         // out of `model.records`.
         let authority = &model.authority;
-        bar.network.text = network_segment_text(&header.network, authority);
-        bar.grants = grants_segment(authority, model.sealed);
+        bar.network.text = network_segment_text(&header.network, authority, now_unix_ms);
+        bar.grants = grants_segment(authority, model.sealed, now_unix_ms);
         bar.tamperward = match state.tamperward {
             TamperWard::Unknown => None,
             TamperWard::Clean => Some(Segment::new("TW ✓", Tone::Ok)),
@@ -718,9 +722,11 @@ mod tests {
         agent, denied, edited, ended, model_with, pause_unsettled, paused, records, resumed,
         sequence, snapshot, tamper, verify_attempt_started, verify_cancelled, verify_errored,
         verify_failed, verify_interrupted, verify_passed, verify_requested, verify_timed_out,
-        wardd,
+        wardd, wardd_at_wall,
     };
-    use ward_events::{Origin, WardEvent};
+    use ward_events::{
+        CredentialDelivery, NameText, Origin, Scope, ServiceId, ShortText, WardEvent,
+    };
     use ward_policy::merge;
 
     const VERIFY_NEVER: &str = "VERIFY —";
@@ -828,6 +834,51 @@ mod tests {
         assert_eq!(bar.credentials.text, "CRED 2 granted");
     }
 
+    /// `GRANTED_AT_UNIX_MS` and its 60-second-later deadline, matching
+    /// `authority.rs`'s own test constants: the credential granted below has
+    /// the same nominal lifetime.
+    const GRANTED_AT_UNIX_MS: u64 = 1_000_000_000_000;
+    const EXPIRES_AT_UNIX_MS: u64 = GRANTED_AT_UNIX_MS + 60_000;
+
+    fn github_credential() -> WardEvent {
+        WardEvent::CredentialGranted {
+            service: ServiceId::new("github").unwrap(),
+            scope: Scope {
+                subject: ShortText::new("github.com:443"),
+                permissions: vec![NameText::new("contents:read")],
+            },
+            expires: std::time::Duration::from_secs(60),
+            delivery: CredentialDelivery::ProxyInjected,
+        }
+    }
+
+    #[test]
+    fn an_expired_grant_drops_out_of_the_bars_network_and_grants_segments() {
+        // PR #318 review, finding 1: `TrustBar::new` must judge `model.authority`
+        // against the same `now_unix_ms` `authority_panel` already does, not
+        // keep showing an expired grant as if it still widened the network
+        // or still held the `GRANTS n` segment up.
+        let h = header(NetworkCapability::Development);
+        let mut model = Model::new(false);
+        for rec in wardd_at_wall(&[github_credential()], GRANTED_AT_UNIX_MS) {
+            model.apply(rec);
+        }
+
+        let live = TrustBar::new(&h, &model, EXPIRES_AT_UNIX_MS - 1);
+        assert_eq!(live.network.text, "restricted · github+");
+        assert_eq!(live.grants, Some(Segment::new("GRANTS 1", Tone::Warn)));
+
+        let expired = TrustBar::new(&h, &model, EXPIRES_AT_UNIX_MS);
+        assert_eq!(
+            expired.network.text, "restricted (dev)",
+            "the expired grant's tag no longer widens the network"
+        );
+        assert_eq!(
+            expired.grants, None,
+            "an expired grant no longer holds up GRANTS n"
+        );
+    }
+
     #[test]
     fn the_watch_bar_omits_what_the_stream_has_not_said() {
         let h = header(NetworkCapability::Development);
@@ -842,7 +893,7 @@ mod tests {
         assert!(bar.daemon.bold);
         // The shell's bar from an empty model adds one thing: the verify
         // segment in its never-verified state (ADR-0019), dim.
-        let shell = TrustBar::new(&h, &Model::new(false));
+        let shell = TrustBar::new(&h, &Model::new(false), 0);
         assert_eq!(shell.verified, Some(Segment::new(VERIFY_NEVER, Tone::Dim)));
         assert_eq!(
             TrustBar {
@@ -860,7 +911,7 @@ mod tests {
         let h = header(NetworkCapability::Development);
         let mut model = Model::new(false);
         let state = |m: &Model| m.verify_state();
-        let seg = |m: &Model| TrustBar::new(&h, m).verified.unwrap();
+        let seg = |m: &Model| TrustBar::new(&h, m, 0).verified.unwrap();
 
         // — : nothing verified, with or without a digest.
         assert_eq!(state(&model), V::Never);
@@ -1039,7 +1090,7 @@ mod tests {
                 candidate: snapshot()
             }
         );
-        let seg = TrustBar::new(&h, &model).verified.unwrap();
+        let seg = TrustBar::new(&h, &model, 0).verified.unwrap();
         assert_eq!(seg.tone, Tone::Warn);
         assert_eq!(seg.text, "VERIFY ? abababab");
 
@@ -1140,7 +1191,7 @@ mod tests {
     fn the_shell_bar_adds_agent_tamperward_and_verification_segments() {
         let h = header(NetworkCapability::Development);
         let mut model = model_with(&sequence(), false);
-        let bar = TrustBar::new(&h, &model);
+        let bar = TrustBar::new(&h, &model, 0);
         assert_eq!(
             bar.agent,
             Some(Segment::new("CLAUDE ● working", Tone::Accent))
@@ -1153,18 +1204,18 @@ mod tests {
         for rec in wardd(&[verify_requested()]) {
             model.apply(rec);
         }
-        let bar = TrustBar::new(&h, &model);
+        let bar = TrustBar::new(&h, &model, 0);
         assert_eq!(
             bar.verified,
             Some(Segment::new("VERIFY ◐ abababab", Tone::Accent))
         );
         model.apply(wardd(&[verify_failed()]).remove(0));
         assert_eq!(
-            TrustBar::new(&h, &model).verified,
+            TrustBar::new(&h, &model, 0).verified,
             Some(Segment::new("VERIFY ✗", Tone::Deny))
         );
         model.apply(wardd(&[verify_passed()]).remove(0));
-        let bar = TrustBar::new(&h, &model);
+        let bar = TrustBar::new(&h, &model, 0);
         assert_eq!(bar.verified, Some(Segment::new(VERIFY_OK, Tone::Ok)));
         assert_eq!(
             bar.tamperward, None,
@@ -1172,7 +1223,7 @@ mod tests {
         );
 
         model.apply(records(&[(Origin::TamperWard, denied())]).remove(0));
-        let bar = TrustBar::new(&h, &model);
+        let bar = TrustBar::new(&h, &model, 0);
         assert_eq!(bar.tamperward, Some(Segment::new("TW ✓", Tone::Ok)));
         assert!(
             bar.text()
@@ -1182,7 +1233,7 @@ mod tests {
         );
         model.apply(records(&[(Origin::TamperWard, tamper())]).remove(0));
         assert_eq!(
-            TrustBar::new(&h, &model).tamperward,
+            TrustBar::new(&h, &model, 0).tamperward,
             Some(Segment::new("TW ■", Tone::Deny))
         );
     }
@@ -1205,7 +1256,7 @@ mod tests {
             assert_eq!(agent_tone(state), tone);
             let mut model = Model::new(false);
             model.apply(wardd(&[agent(state)]).remove(0));
-            let segment = TrustBar::new(&h, &model).agent.unwrap();
+            let segment = TrustBar::new(&h, &model, 0).agent.unwrap();
             assert_eq!(segment.text, format!("CLAUDE {glyph} {word}"));
             assert_eq!(segment.tone, tone);
         }
@@ -1218,12 +1269,12 @@ mod tests {
         assert_eq!(agent_glyph(S::Paused), "‖");
         assert_eq!(agent_word(S::Paused), "paused");
         assert_eq!(agent_tone(S::Paused), Tone::Deny);
-        let segment = TrustBar::new(&h, &model).agent.unwrap();
+        let segment = TrustBar::new(&h, &model, 0).agent.unwrap();
         assert_eq!(segment.text, "CLAUDE ‖ PAUSED");
         assert_eq!(segment.tone, Tone::Deny);
         model.apply(wardd(&[resumed()]).remove(0));
         assert_eq!(
-            TrustBar::new(&h, &model).agent.unwrap().text,
+            TrustBar::new(&h, &model, 0).agent.unwrap().text,
             "CLAUDE ● working"
         );
 
@@ -1238,7 +1289,7 @@ mod tests {
         assert_eq!(agent_glyph(S::PauseUnsettled), "‖?");
         assert_eq!(agent_word(S::PauseUnsettled), "unsettled");
         assert_eq!(agent_tone(S::PauseUnsettled), Tone::Warn);
-        let segment = TrustBar::new(&h, &model).agent.unwrap();
+        let segment = TrustBar::new(&h, &model, 0).agent.unwrap();
         assert_eq!(segment.text, "CLAUDE ‖? PAUSED?");
         assert_eq!(segment.tone, Tone::Warn);
         assert_ne!(
@@ -1247,7 +1298,7 @@ mod tests {
         );
         model.apply(wardd(&[resumed()]).remove(0));
         assert_eq!(
-            TrustBar::new(&h, &model).agent.unwrap().text,
+            TrustBar::new(&h, &model, 0).agent.unwrap().text,
             "CLAUDE ● working"
         );
         // No recorded agent: a neutral name, never an invented one.
@@ -1256,7 +1307,7 @@ mod tests {
         let mut model = Model::new(false);
         model.apply(wardd(&[agent(S::Working)]).remove(0));
         assert_eq!(
-            TrustBar::new(&anon, &model).agent.unwrap().text,
+            TrustBar::new(&anon, &model, 0).agent.unwrap().text,
             "AGENT ● working"
         );
     }
@@ -1330,7 +1381,7 @@ mod tests {
         assert_eq!(watch.segment(SegmentName::Tamperward), None);
         assert_eq!(watch.segment(SegmentName::Verify), None, "ward watch's bar");
         assert_eq!(
-            TrustBar::new(&h, &Model::new(false)).segment(SegmentName::Verify),
+            TrustBar::new(&h, &Model::new(false), 0).segment(SegmentName::Verify),
             Some(Segment::new(VERIFY_NEVER, Tone::Dim)),
             "the shell's bar"
         );
@@ -1344,7 +1395,7 @@ mod tests {
             model.apply(rec);
         }
         model.apply(records(&[(Origin::TamperWard, denied())]).remove(0));
-        let live = TrustBar::new(&h, &model);
+        let live = TrustBar::new(&h, &model, 0);
         assert_eq!(
             live.segment(SegmentName::Agent),
             Some(Segment::new("CLAUDE ● working", Tone::Accent))
@@ -1373,7 +1424,7 @@ mod tests {
         }
 
         model.seal();
-        let sealed = TrustBar::new(&h, &model);
+        let sealed = TrustBar::new(&h, &model, 0);
         assert_eq!(
             sealed.segment(SegmentName::Mark),
             Some(Segment::bold("WARD", Tone::Dim))
@@ -1406,7 +1457,7 @@ mod tests {
         }
         model.apply(records(&[(Origin::TamperWard, denied())]).remove(0));
         model.seal();
-        let bar = TrustBar::new(&h, &model);
+        let bar = TrustBar::new(&h, &model, 0);
         assert!(bar.sealed);
         assert_eq!(bar.tone(), Tone::Dim);
         assert_eq!(bar.network.tone, Tone::Dim);
@@ -1428,7 +1479,7 @@ mod tests {
         // It does expire with the tree: a sealed log and a changed worktree
         // is a stale verdict, whatever the seal says.
         model.observe_worktree(edited(), Some(2));
-        let bar = TrustBar::new(&h, &model);
+        let bar = TrustBar::new(&h, &model, 0);
         assert_eq!(
             bar.verified,
             Some(Segment::new("VERIFY ~ STALE", Tone::Warn))
