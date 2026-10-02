@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admission;
 pub mod task;
 
 use std::io::{BufRead, BufReader, Write};

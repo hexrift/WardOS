@@ -259,6 +259,16 @@ This is a contract only. The current `ward-node` task registry still supports
 node implementation must bind admission, durable evidence, and recovery before a
 receipt can be treated as an authoritative execution result.
 
+### 3.9 Trusted task-authority check
+
+`ward-node` can compare an exact task binding and expected agent with an already
+trusted `AuthorityLease`, its validated lineage, and locally known monotonic
+revocations. Inactive, mismatched, or revoked authority fails closed. This is a
+pure prerequisite check, not a way to promote inbound lease bytes into trust:
+the node still does not accept a workload, admit execution, or run `start`.
+Execution-attempt identity remains bound by node-owned task state, not by the
+authority lease itself.
+
 ---
 
 ## 4. Session lifecycle
