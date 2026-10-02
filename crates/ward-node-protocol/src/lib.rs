@@ -8,6 +8,12 @@
 
 #![forbid(unsafe_code)]
 
+mod receipt;
+
+pub use receipt::{
+    TaskExecutionOutcome, TaskExecutionReceipt, TaskReceiptContext, TaskReceiptError,
+};
+
 use std::fmt::{Display, Formatter};
 use std::num::{NonZeroU16, NonZeroU64};
 
