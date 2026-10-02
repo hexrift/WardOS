@@ -483,6 +483,12 @@ ulid_id!(
 );
 
 ulid_id!(
+    /// Execution node identifier for task audience binding.
+    NodeId,
+    "node_"
+);
+
+ulid_id!(
     /// Delegation edge identifier.
     DelegationId,
     "deleg_"
