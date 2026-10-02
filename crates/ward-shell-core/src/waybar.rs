@@ -13,7 +13,7 @@
 //! is the empty module (`text: ""`, class `none`), which Waybar hides; the
 //! verify module is never empty with a session, since `VERIFY —` is a state.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use ward_daemon::describe::SessionDescription;
 
@@ -24,8 +24,12 @@ use crate::settings::{Row, rows_text};
 use crate::trust::{Header, SegmentName, TrustBar, agent_word, tone_name};
 use ward_daemon::render::Tone;
 
-/// One Waybar custom module's JSON (`return-type: json`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// One Waybar custom module's JSON (`return-type: json`). `Deserialize` is
+/// for the shared worker's own client relay (#138 item 2): a consumer that
+/// reads the worker's stream back as a typed value in a test, rather than
+/// forwarding its bytes verbatim the way `bar --waybar --follow`'s real
+/// relay path does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Module {
     /// The module's text; empty hides it.
     pub text: String,

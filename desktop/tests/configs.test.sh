@@ -325,6 +325,31 @@ unit_has "$root/systemd/user/wardos-approve.service" 'ExecStart=.*wardos-approve
 unit_has "$root/systemd/user/wardos-approve.service" 'WantedBy=graphical-session.target'
 unit_has "$root/systemd/user/swayosd.service" 'ExecStart=.*swayosd-server --style %h/.config/wardos/theme/current/swayosd.css'
 unit_has "$root/systemd/user/wardos-battery-monitor.timer" 'OnUnitActiveSec=2min'
+unit_has "$root/systemd/user/wardos-shell-worker.service" 'ExecStart=.*ward-shell worker'
+unit_has "$root/systemd/user/wardos-shell-worker.service" 'WantedBy=graphical-session.target'
+
+# --- autostart: the shared bar worker is actually started on the plain-Hyprland path ---
+# (review finding 1 on #331): the systemd preset (image/install-desktop.sh) only reaches
+# units under systemd --user's own graphical-session.target, i.e. the UWSM-driven path
+# (`uwsm start hyprland.desktop`); a plain `Hyprland` session has no target pulling
+# `[Install]`-enabled units in automatically, so every unit `waybar`/the bar depends on
+# that isn't itself exec-once'd is instead started explicitly by this one
+# `systemctl --user start` line, same as hyprpolkitagent/swayosd/wardos-approve/the
+# battery timer already are. wardos-shell-worker.service must be named there too, and
+# before the `exec-once = waybar` line, so a freshly-started session gives the worker as
+# much of a head start on binding its socket as this file can give it (`relay_from_worker`'s
+# own bounded connect-retry, `ward-shell` `worker::tests::a_cold_start_race_*`, is what
+# actually closes the remaining race once Waybar's six segment processes exec).
+autostart="$root/hyprland/autostart.conf"
+start_line=$(grep '^exec-once = systemctl --user start ' "$autostart") \
+  || fail "autostart.conf has no 'systemctl --user start' line"
+grep -qw 'wardos-shell-worker.service' <<<"$start_line" \
+  || fail "autostart.conf's systemctl start line does not start wardos-shell-worker.service: $start_line"
+start_line_no=$(grep -n '^exec-once = systemctl --user start ' "$autostart" | cut -d: -f1)
+waybar_line_no=$(grep -n '^exec-once = waybar$' "$autostart" | cut -d: -f1)
+[[ -n $waybar_line_no ]] || fail "autostart.conf has no 'exec-once = waybar' line"
+(( start_line_no < waybar_line_no )) \
+  || fail "autostart.conf must start wardos-shell-worker.service (and its siblings) before execing waybar"
 
 # --- flatpaks: one id per line with a purpose ---------------------------------
 grep -Ev '^#|^$' "$root/flatpaks.txt" | grep -Evq '^[a-z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_-]+)+ +# .+$' \
