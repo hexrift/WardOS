@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ward_policy::NetworkCapability;
@@ -176,6 +176,73 @@ pub struct Launch {
     budget: Option<Duration>,
     capture_bytes: Option<usize>,
     keep_prefix: Option<String>,
+}
+
+/// A spawned sandbox whose child is owned until it is waited or dropped.
+#[must_use = "wait for the sandbox outcome or drop the handle to terminate it"]
+pub struct RunningLaunch {
+    child: Child,
+    stdout: Option<std::thread::JoinHandle<StreamCapture>>,
+    stderr: Option<std::thread::JoinHandle<StreamCapture>>,
+    start: Instant,
+    budget: Option<Duration>,
+    reaped: bool,
+}
+
+impl RunningLaunch {
+    /// Host process id of the spawned bubblewrap child.
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Wait for the child and collect its bounded outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if waiting for the child fails.
+    pub fn wait(self) -> Result<Outcome> {
+        self.wait_observed(&mut || {})
+    }
+
+    /// Wait while calling `on_tick` between child status polls.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if waiting for the child fails.
+    pub fn wait_observed(mut self, on_tick: &mut dyn FnMut()) -> Result<Outcome> {
+        let (status, timed_out) = wait_within(&mut self.child, self.budget, on_tick)?;
+        self.reaped = true;
+        let collect = |handle: Option<std::thread::JoinHandle<StreamCapture>>| {
+            handle
+                .and_then(|handle| handle.join().ok())
+                .unwrap_or_default()
+        };
+        let out = collect(self.stdout.take());
+        let err = collect(self.stderr.take());
+        let mut kept_lines = out.kept_lines;
+        kept_lines.extend(err.kept_lines);
+        Ok(Outcome {
+            code: status.and_then(|status| status.code()),
+            stdout: out.text,
+            stderr: err.text,
+            stdout_bytes: out.total,
+            stderr_bytes: err.total,
+            truncated: out.truncated || err.truncated,
+            kept_lines,
+            duration: self.start.elapsed(),
+            timed_out,
+        })
+    }
+}
+
+impl Drop for RunningLaunch {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 impl Launch {
@@ -394,6 +461,15 @@ impl Launch {
     /// the child has been reaped, which leaves the final flush unambiguously the
     /// caller's to do exactly once.
     pub fn run_observed(&self, on_tick: &mut dyn FnMut()) -> Result<Outcome> {
+        self.spawn()?.wait_observed(on_tick)
+    }
+
+    /// Spawn the sandbox and return its owned, live child handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty command, invalid worktree, or failed spawn.
+    pub fn spawn(&self) -> Result<RunningLaunch> {
         if self.argv.is_empty() {
             return Err(Error::Sandbox("empty command".into()));
         }
@@ -419,24 +495,13 @@ impl Launch {
         let keep = self.keep_prefix.clone();
         let stdout = child.stdout.take().map(|r| drain(r, bound, keep.clone()));
         let stderr = child.stderr.take().map(|r| drain(r, bound, keep));
-        let (status, timed_out) = wait_within(&mut child, self.budget, on_tick)?;
-        let collect = |h: Option<std::thread::JoinHandle<StreamCapture>>| {
-            h.and_then(|h| h.join().ok()).unwrap_or_default()
-        };
-        let out = collect(stdout);
-        let err = collect(stderr);
-        let mut kept_lines = out.kept_lines;
-        kept_lines.extend(err.kept_lines);
-        Ok(Outcome {
-            code: status.and_then(|s| s.code()),
-            stdout: out.text,
-            stderr: err.text,
-            stdout_bytes: out.total,
-            stderr_bytes: err.total,
-            truncated: out.truncated || err.truncated,
-            kept_lines,
-            duration: start.elapsed(),
-            timed_out,
+        Ok(RunningLaunch {
+            child,
+            stdout,
+            stderr,
+            start,
+            budget: self.budget,
+            reaped: false,
         })
     }
 }
@@ -766,6 +831,39 @@ mod tests {
             .unwrap();
         assert!(!ok.timed_out);
         assert_eq!(ok.stdout.trim(), "fine");
+    }
+
+    #[test]
+    fn spawned_launch_exposes_host_child_and_preserves_observed_outcome() {
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        let running = Launch::new(
+            "/tmp",
+            vec!["sh".into(), "-c".into(), "sleep 0.1; echo ready".into()],
+        )
+        .spawn()
+        .unwrap();
+        assert!(running.id() > 0);
+        let mut ticks = 0;
+        let outcome = running.wait_observed(&mut || ticks += 1).unwrap();
+        assert!(ticks > 0);
+        assert_eq!(outcome.code, Some(0));
+        assert_eq!(outcome.stdout.trim(), "ready");
+        assert!(!outcome.timed_out);
+    }
+
+    #[test]
+    fn dropping_an_unwaited_launch_terminates_and_reaps_it() {
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        let running = Launch::new("/tmp", vec!["sleep".into(), "5".into()])
+            .spawn()
+            .unwrap();
+        let pid = running.id();
+        drop(running);
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
     #[test]
