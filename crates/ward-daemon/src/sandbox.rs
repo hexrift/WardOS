@@ -834,6 +834,23 @@ mod tests {
     }
 
     #[test]
+    fn spawned_launch_budget_does_not_restart_when_wait_begins() {
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        let running = Launch::new("/tmp", vec!["sleep".into(), "5".into()])
+            .budget(Duration::from_millis(50))
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut ticks = 0;
+        let outcome = running.wait_observed(&mut || ticks += 1).unwrap();
+        assert!(outcome.timed_out);
+        assert_eq!(ticks, 0);
+    }
+
+    #[test]
     fn spawned_launch_exposes_host_child_and_preserves_observed_outcome() {
         if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
             return;
