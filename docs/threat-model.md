@@ -29,6 +29,10 @@ Under the repository's TamperWard/CODEOWNERS split
 | A12 | The project worktree itself | 3 | The thing the agent is *supposed* to change; integrity of the *accepted* result is A6+A8's job |
 | A13 | Control channels (`wardd` socket, TamperWard socket, proxy, event subscription) | 0 | Confused-deputy and injection surface |
 | A14 | Boot chain, disk encryption keys, TPM state | 0 | Physical/offline integrity |
+| A15 | Node task leases, delegation lineage, revocation state and node identity | node trust domain | Defines which remote work a node may execute and for how long |
+| A16 | Control-plane worker/task/policy state | control-plane trust domain | Coordinates desired authority and placement across workers |
+| A17 | Node-local durable event/evidence spool | node trust domain | Preserves audit continuity when the control plane is unavailable |
+| A18 | Other tasks' capsules, writable layers and task-scoped caches | untrusted task domains separated by node | Cross-task confidentiality/integrity on shared workers |
 
 ---
 
@@ -44,6 +48,8 @@ Under the repository's TamperWard/CODEOWNERS split
 | T6 | Network attacker | Controls Zone 4; can serve hostile responses to allowlisted hosts if TLS is defeated (it must not be) | Zone 4 |
 | T7 | Local unprivileged user account (multi-user host, rare) | Ordinary Unix user on the host | Zone 0 (unprivileged) |
 | T8 | Thief with powered-off device | Physical access, no running session | Offline |
+| T9 | Network peer impersonating a node or control plane | Can observe, replay, delay, reorder and inject network traffic; does not possess valid peer identity | node/control-plane transport |
+| T10 | Compromised task sharing a worker with other tasks | Same power as T1 inside its own capsule; attempts cross-task resource, cache, IPC and identity substitution | one untrusted task domain on a multi-task node |
 
 **Not modelled (explicitly out of scope for 0.1):** kernel exploitation from Zone 3 (we
 reduce attack surface but do not claim to stop a working kernel LPE), hostile firmware,
@@ -51,7 +57,10 @@ evil-maid attacks on a running/suspended machine, DMA attacks, speculative-execu
 channels, a compromised `wardd`/TamperWard/host root, a malicious *user*, supply-chain
 compromise of the WardOS image itself (mitigated by signing, not modelled as an attacker
 here), and denial of service by the agent against its own sandbox (bounded by cgroups, not
-prevented).
+prevented). A fully compromised fleet control plane or a root-compromised execution node
+is also outside the containment claim: ADR-0029 still requires nodes to validate bounded
+leases, expiry and hard local policy so remote compromise does not become ambient,
+unversioned authority.
 
 ---
 
@@ -69,6 +78,29 @@ WardOS assumes:
    Phase 7; before that, this assumption is unenforced and documented as such).
 6. Zone 3 is **fully compromised** at all times. Every design decision is checked against
    this.
+
+### 3.1 Fleet trust extension (ADR-0029)
+
+Fleet mode adds two trusted-but-distinct administrative domains without changing the
+agent assumption:
+
+- **Ward control plane:** trusted to authenticate principals and issue bounded desired
+  authority, but not placed on the synchronous enforcement path for each agent action.
+- **`ward-node`:** trusted to authenticate control-plane messages, validate task
+  authority, enforce it locally, own task lifecycle/resource isolation and preserve
+  evidence while disconnected.
+- **Task capsules:** remain fully untrusted. Two tasks on one node are mutually
+  untrusted and may not share writable trust, credentials, admin IPC or task identity.
+- **Verifier/TamperWard:** remain outside task authority. A task cannot manufacture a
+  verified result because the control plane or node is unavailable.
+- **External services and the node/control-plane network:** untrusted transport. Node
+  enrolment and the node protocol must authenticate both ends and reject stale/replayed
+  authority.
+
+A partition is an availability event, not an authority event. A node may continue
+already-admitted work only inside locally provable, unexpired authority. It cannot
+create a wider lease, renew an expired one, infer a revocation outcome, or silently drop
+evidence because the control plane is unreachable. See ADR-0029's failure-mode table.
 
 ---
 
@@ -92,6 +124,11 @@ Enumerated from the perspective of T1 (everything else is a subset).
 | S12 | Credentials delivered in-sandbox | Persist beyond session, exfiltrate, replay |
 | S13 | `.ward/` policy in repo | Attempt to grant itself capabilities |
 | S14 | Signals/ptrace/`/proc` | Attack sibling processes |
+| S15 | Node/control-plane protocol | Replay stale leases, impersonate peers, reorder lifecycle/revocation messages, flood control traffic |
+| S16 | Multi-task scheduler/admission | Starve other tasks, exhaust CPU/RAM/PIDs/disk, force verifier starvation, exploit accounting gaps |
+| S17 | Shared build/package caches | Poison mutable cache state so another task executes attacker-controlled bytes |
+| S18 | Node restart/recovery state | Race restart, resurrect expired authority, orphan enforcement or confuse execution-attempt identity |
+| S19 | Evidence/telemetry spool | Fill local storage, force silent drops, reorder remote ingestion or detach records from task/lease identity |
 
 ---
 
@@ -113,6 +150,10 @@ Enumerated from the perspective of T1 (everything else is a subset).
 | O12 | Resource abuse in Zone 3 does not take down Zone 0/1/2 | cgroup memory/pids/io limits; disk quota on project environment; snapshot size caps |
 | O13 | Data at rest is protected when the device is off | LUKS2 + TPM2-bound unlock with PCR policy + recovery key (Phase 7) |
 | O14 | A broken update never leaves the machine unbootable | bootc atomic deployments, automatic boot-counting rollback + `ward system rollback` (Phase 7) |
+| O15 | A node accepts remote work only with authenticated, task-bound, unexpired and non-replayed authority; loss of the control plane never widens it | node protocol authentication + lease/audience/version/expiry validation (#258/#259) |
+| O16 | One task cannot reuse another task's identity, credentials, writable cache trust or execution boundary | task identity/delegation binding + per-task isolation + scoped caches (#259/#260) |
+| O17 | CPU/RAM/PIDs/disk pressure from agent tasks cannot starve node enforcement or verifier capacity without visible admission/backpressure | cgroup/resource enforcement + scheduler reservations/admission (#260) |
+| O18 | Control-plane partitions or upload failures do not silently erase audit/evidence continuity | durable bounded node spool + explicit pressure/failure state (#268/#271) |
 
 ---
 

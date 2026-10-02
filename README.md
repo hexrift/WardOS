@@ -11,6 +11,16 @@ coding agents (Claude Code, Codex, Gemini CLI, Aider, and whatever comes next) e
 they need to work effectively, while keeping the host, policy, credentials, verifier, and
 trusted state **outside the agent's authority**.
 
+WardOS is also being evolved into a local + distributed execution platform without
+discarding that workstation/runtime path. The target split is **WardOS distribution +
+portable Ward runtime + `ward-node` + optional Ward control plane**
+([ADR-0029](docs/decisions/ADR-0029-product-split-fleet-trust-boundaries.md)). Local mode
+remains first-class and needs no remote service; fleet coordination distributes bounded,
+expiring authority while enforcement, resource limits, credential isolation and evidence
+remain node-local. The fleet pieces are tracked under
+[#256](https://github.com/hexrift/WardOS/issues/256) and are not claimed as delivered
+until their acceptance tests land.
+
 ![The WardOS desktop from boot to lock: the splash, autologin into Hyprland, the four steps of the first login (theme, a key kept on the host, a project, an agent), ward claude with the trust bar live, an approval answered from a notification, the command centre, a theme switch to Tokyo Night, the lock screen](assets/wardos-desktop.gif)
 
 <p align="center"><sub>Rendered from the shipped configs, theme tokens and real command output (<a href="assets/storyboard/">how</a>); a compositor capture is <a href="https://github.com/hexrift/WardOS/issues/84">#84</a>.</sub></p>
