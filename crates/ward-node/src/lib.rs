@@ -4,9 +4,9 @@
 //! connection:
 //!
 //! * at protocol 1.1, read-only node capability discovery;
-//! * at protocol 1.2, one task lifecycle request against the node-owned
-//!   [`task::TaskRegistry`]. Only `create` and `inspect` are implemented; every other
-//!   verb is refused explicitly (see [`task`]).
+//! * at protocol 1.2, read-only discovery or one task lifecycle request against
+//!   the node-owned [`task::TaskRegistry`]. Only `create` and `inspect` are
+//!   implemented; every other verb is refused explicitly (see [`task`]).
 //!
 //! No task is executed yet, and remote transport is deliberately absent.
 
@@ -82,7 +82,6 @@ pub enum NodeServiceError {
 #[derive(Clone)]
 pub struct NodeService {
     capabilities: NodeCapabilities,
-    context: CapabilityDiscoveryContext,
     supported: SupportedProtocolRange,
     tasks: Arc<Mutex<TaskRegistry>>,
 }
@@ -95,12 +94,10 @@ impl NodeService {
     /// Returns `InvalidCapabilities` if the capability document is not valid for
     /// capability discovery in this build.
     pub fn new(capabilities: NodeCapabilities) -> Result<Self, NodeServiceError> {
-        let protocol = capabilities.protocol();
-        let context = CapabilityDiscoveryContext::new(protocol)
+        CapabilityDiscoveryContext::new(capabilities.protocol())
             .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         Ok(Self {
             capabilities,
-            context,
             supported: WARD_NODE_PROTOCOL,
             tasks: Arc::new(Mutex::new(TaskRegistry::default())),
         })
@@ -110,9 +107,9 @@ impl NodeService {
     ///
     /// The first request must be a handshake. Rejected handshakes receive a bounded
     /// machine-readable response and close. A connection accepted at the capability
-    /// document's protocol (1.1) may issue one read-only capability-discovery request; a
-    /// connection accepted at a task-lifecycle protocol (1.2) may issue one lifecycle
-    /// request. Either way the connection then closes.
+    /// negotiated protocol may issue one read-only capability-discovery request; a
+    /// connection accepted at 1.2 may instead issue one lifecycle request. The
+    /// connection then closes.
     ///
     /// A lifecycle request is applied to the registry before its response is written, so
     /// a `create` whose client disconnects before reading the response still took effect;
@@ -149,36 +146,63 @@ impl NodeService {
             return Ok(());
         };
 
-        if protocol != self.context.protocol() {
-            if supports_task_lifecycle(protocol) {
-                return self.serve_lifecycle(&mut stream, &mut reader, protocol, deadline);
-            }
+        if !ward_node_protocol::supports_capability_discovery(protocol) {
             return Ok(());
         }
 
         let request_line = read_request_line(&mut reader, deadline)?;
-        self.context
-            .decode_request(&request_line)
+        if serde_json::from_str::<serde_json::Value>(&request_line)
+            .is_ok_and(|value| value["request"] == "capabilities")
+        {
+            return self.serve_capabilities(&mut stream, protocol, &request_line, deadline);
+        }
+        if supports_task_lifecycle(protocol) {
+            return self.serve_lifecycle(&mut stream, protocol, &request_line, deadline);
+        }
+        Err(NodeServiceError::MalformedCapabilityRequest)
+    }
+
+    fn serve_capabilities(
+        &self,
+        stream: &mut UnixStream,
+        protocol: ward_node_protocol::ProtocolVersion,
+        request_line: &str,
+        deadline: Instant,
+    ) -> Result<(), NodeServiceError> {
+        let context = CapabilityDiscoveryContext::new(protocol)
             .map_err(|_| NodeServiceError::MalformedCapabilityRequest)?;
-        let response = self
-            .context
-            .response(self.capabilities)
+        context
+            .decode_request(request_line)
+            .map_err(|_| NodeServiceError::MalformedCapabilityRequest)?;
+        let capabilities = NodeCapabilities::new(
+            protocol,
+            self.capabilities.architecture(),
+            self.capabilities.capacity(),
+            self.capabilities.isolation(),
+            self.capabilities.network(),
+            self.capabilities.credentials(),
+            self.capabilities.snapshots(),
+            self.capabilities.verifier(),
+            self.capabilities.lifecycle(),
+        )
+        .map_err(|_| NodeServiceError::InvalidCapabilities)?;
+        let response = context
+            .response(capabilities)
             .map_err(|_| NodeServiceError::InvalidCapabilities)?;
-        write_json_line(&mut stream, &response, deadline)
+        write_json_line(stream, &response, deadline)
     }
 
     fn serve_lifecycle(
         &self,
         stream: &mut UnixStream,
-        reader: &mut BufReader<UnixStream>,
         protocol: ward_node_protocol::ProtocolVersion,
+        request_line: &str,
         deadline: Instant,
     ) -> Result<(), NodeServiceError> {
         let context = TaskLifecycleContext::new(protocol)
             .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
-        let request_line = read_request_line(reader, deadline)?;
         let request = context
-            .decode_request(&request_line)
+            .decode_request(request_line)
             .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
         let response = self
             .tasks
@@ -564,7 +588,7 @@ mod tests {
         let _: HandshakeResponse = serde_json::from_str(line(&mut client).trim()).unwrap();
 
         writeln!(client, "{{not-json").unwrap();
-        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let _ = client.shutdown(std::net::Shutdown::Write);
 
         assert!(matches!(
             worker.join().unwrap(),
@@ -651,6 +675,11 @@ mod tests {
         assert_eq!(observed.protocol(), ProtocolVersion::new(1, 2));
         assert_eq!(observed.architecture(), service.capabilities.architecture());
         assert_eq!(observed.capacity(), service.capabilities.capacity());
+        assert_eq!(observed.isolation(), service.capabilities.isolation());
+        assert_eq!(observed.network(), service.capabilities.network());
+        assert_eq!(observed.credentials(), service.capabilities.credentials());
+        assert_eq!(observed.snapshots(), service.capabilities.snapshots());
+        assert_eq!(observed.verifier(), service.capabilities.verifier());
         assert_eq!(observed.lifecycle(), service.capabilities.lifecycle());
         worker.join().unwrap().unwrap();
         assert!(service.tasks.lock().unwrap().is_empty());

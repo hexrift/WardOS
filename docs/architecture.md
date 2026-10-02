@@ -269,6 +269,13 @@ the node still does not accept a workload, admit execution, or run `start`.
 Execution-attempt identity remains bound by node-owned task state, not by the
 authority lease itself.
 
+### 3.10 Node protocol discovery
+
+After negotiation, the local node serves one request per connection. Protocol
+1.1 supports read-only capability discovery; 1.2 supports discovery or a task
+lifecycle request. Capability responses retain the same node facts while naming
+the exact negotiated version. Protocol 1.0 has no discovery endpoint.
+
 ---
 
 ## 4. Session lifecycle
