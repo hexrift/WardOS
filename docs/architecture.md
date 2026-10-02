@@ -245,6 +245,20 @@ One append-only, hash-chained log per session, owned by `ward` uid, stored under
 `/var/lib/ward/sessions/<id>/events.log`. Live subscribers receive the same records over
 a Unix socket. Details in [`event-model.md`](event-model.md).
 
+### 3.8 Governed task receipt contract
+
+`ward-node-protocol` defines a bounded report for one task attempt. It uses the
+existing `TaskBinding` (task, execution attempt, authority lease), a WardOS
+session identity, and one outcome: `completed`, `failed`, or `unknown`. A receiver
+decodes the report against the expected binding and session; malformed data,
+unknown fields, and a mismatched identity are refused. The report contains no
+workload output or credential material.
+
+This is a contract only. The current `ward-node` task registry still supports
+`create` and `inspect`; it does not yet execute tasks or emit receipts. A future
+node implementation must bind admission, durable evidence, and recovery before a
+receipt can be treated as an authoritative execution result.
+
 ---
 
 ## 4. Session lifecycle
