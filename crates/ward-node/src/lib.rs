@@ -632,6 +632,50 @@ mod tests {
         (client, worker)
     }
 
+    #[test]
+    fn one_two_client_discovers_capabilities_without_registering_a_task() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let (mut client, worker) = lifecycle_connection(&service);
+        let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&context.request()).unwrap()
+        )
+        .unwrap();
+
+        let response = context.decode_response(line(&mut client).trim()).unwrap();
+        let ward_node_protocol::CapabilityDiscoveryResponse::Capabilities {
+            capabilities: observed,
+        } = response;
+        assert_eq!(observed.protocol(), ProtocolVersion::new(1, 2));
+        assert_eq!(observed.architecture(), service.capabilities.architecture());
+        assert_eq!(observed.capacity(), service.capabilities.capacity());
+        assert_eq!(observed.lifecycle(), service.capabilities.lifecycle());
+        worker.join().unwrap().unwrap();
+        assert!(service.tasks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_two_capability_request_with_one_one_version_fails_closed() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let (mut client, worker) = lifecycle_connection(&service);
+        let one_one = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 1)).unwrap();
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&one_one.request()).unwrap()
+        )
+        .unwrap();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(NodeServiceError::MalformedCapabilityRequest)
+        ));
+        assert_eq!(line(&mut client), "");
+        assert!(service.tasks.lock().unwrap().is_empty());
+    }
+
     /// One lifecycle request on its own 1.2 connection; returns the decoded response.
     fn lifecycle_round_trip(
         service: &NodeService,
