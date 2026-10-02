@@ -769,6 +769,39 @@ mod tests {
     }
 
     #[test]
+    fn spawned_launch_exposes_host_child_and_preserves_observed_outcome() {
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        let running = Launch::new(
+            "/tmp",
+            vec!["sh".into(), "-c".into(), "sleep 0.1; echo ready".into()],
+        )
+        .spawn()
+        .unwrap();
+        assert!(running.id() > 0);
+        let mut ticks = 0;
+        let outcome = running.wait_observed(&mut || ticks += 1).unwrap();
+        assert!(ticks > 0);
+        assert_eq!(outcome.code, Some(0));
+        assert_eq!(outcome.stdout.trim(), "ready");
+        assert!(!outcome.timed_out);
+    }
+
+    #[test]
+    fn dropping_an_unwaited_launch_terminates_and_reaps_it() {
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        let running = Launch::new("/tmp", vec!["sleep".into(), "5".into()])
+            .spawn()
+            .unwrap();
+        let pid = running.id();
+        drop(running);
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
     fn bounded_capture_drains_a_large_pipe_without_hanging() {
         if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
             return;
