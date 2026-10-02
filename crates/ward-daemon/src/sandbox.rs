@@ -185,7 +185,7 @@ pub struct RunningLaunch {
     stdout: Option<std::thread::JoinHandle<StreamCapture>>,
     stderr: Option<std::thread::JoinHandle<StreamCapture>>,
     start: Instant,
-    budget: Option<Duration>,
+    deadline: Option<Instant>,
     reaped: bool,
 }
 
@@ -211,7 +211,7 @@ impl RunningLaunch {
     ///
     /// Returns an error if waiting for the child fails.
     pub fn wait_observed(mut self, on_tick: &mut dyn FnMut()) -> Result<Outcome> {
-        let (status, timed_out) = wait_within(&mut self.child, self.budget, on_tick)?;
+        let (status, timed_out) = wait_within(&mut self.child, self.deadline, on_tick)?;
         self.reaped = true;
         let collect = |handle: Option<std::thread::JoinHandle<StreamCapture>>| {
             handle
@@ -465,6 +465,8 @@ impl Launch {
     }
 
     /// Spawn the sandbox and return its owned, live child handle.
+    /// The budget is measured from spawn; callers must wait promptly because no
+    /// background watchdog runs while the handle is held.
     ///
     /// # Errors
     ///
@@ -480,6 +482,14 @@ impl Launch {
         let mut cmd = Command::new("bwrap");
         cmd.args(self.args(&worktree));
         let start = Instant::now();
+        let deadline = self
+            .budget
+            .map(|budget| {
+                start
+                    .checked_add(budget)
+                    .ok_or_else(|| Error::Sandbox("sandbox budget is out of range".into()))
+            })
+            .transpose()?;
         let launch_err = |e: std::io::Error| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::Sandbox("bubblewrap (bwrap) is not installed".into())
@@ -500,7 +510,7 @@ impl Launch {
             stdout,
             stderr,
             start,
-            budget: self.budget,
+            deadline,
             reaped: false,
         })
     }
@@ -657,22 +667,21 @@ fn push_kept_line(line: &[u8], prefix: &str, out: &mut Vec<String>, kept_bytes: 
 /// offered to the caller at.
 pub const WAIT_POLL: Duration = Duration::from_millis(20);
 
-/// Wait for `child`, killing it once `budget` elapses, and call `on_tick` between
+/// Wait for `child`, killing it once `deadline` passes, and call `on_tick` between
 /// waits so the caller can make progress (draining observers, #137) while the child
 /// still runs. Returns the exit status (`None` when killed) and whether the budget
 /// was exceeded.
 ///
-/// The wait polls even with no budget, where it used to block in `wait(2)`: a
+/// The wait polls even with no deadline, where it used to block in `wait(2)`: a
 /// blocking wait cannot offer the caller a turn, and an interactive agent session
 /// is exactly the case where the whole run would otherwise pass with nothing on the
 /// log. `on_tick` never runs after the child has been reaped.
 fn wait_within(
     child: &mut std::process::Child,
-    budget: Option<Duration>,
+    deadline: Option<Instant>,
     on_tick: &mut dyn FnMut(),
 ) -> Result<(Option<std::process::ExitStatus>, bool)> {
     let wait_err = |e: std::io::Error| Error::Sandbox(format!("waiting for bwrap: {e}"));
-    let deadline = budget.map(|b| Instant::now() + b);
     loop {
         if let Some(status) = child.try_wait().map_err(wait_err)? {
             return Ok((Some(status), false));
