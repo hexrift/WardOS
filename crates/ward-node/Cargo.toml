@@ -21,6 +21,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 ward-events = { path = "../ward-events", version = "0.18.0" }
+ward-authority = { path = "../ward-authority", version = "0.18.0" }
 ward-node-protocol = { path = "../ward-node-protocol", version = "0.18.0" }
 
 [dev-dependencies]
