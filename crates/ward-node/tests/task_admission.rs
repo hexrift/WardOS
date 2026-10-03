@@ -64,8 +64,7 @@ fn admission_preserves_the_exact_execution_identity() {
     let binding = binding(1, 40, 2);
     let identity = identity(binding, 3);
 
-    let admission =
-        TrustedTaskAdmission::new(identity, lease, lineage, &revocations, 500).unwrap();
+    let admission = TrustedTaskAdmission::new(identity, lease, lineage, &revocations, 500).unwrap();
 
     assert_eq!(admission.identity(), identity);
     assert_eq!(identity.binding(), binding);
@@ -79,33 +78,15 @@ fn admission_reuses_the_existing_fail_closed_authority_predicate() {
     let revocations = AuthorityRevocations::new();
 
     for (binding, agent, expected) in [
-        (
-            binding(9, 40, 2),
-            3,
-            TaskAuthorityError::TaskMismatch,
-        ),
-        (
-            binding(1, 40, 9),
-            3,
-            TaskAuthorityError::LeaseMismatch,
-        ),
-        (
-            binding(1, 40, 2),
-            9,
-            TaskAuthorityError::AgentMismatch,
-        ),
+        (binding(9, 40, 2), 3, TaskAuthorityError::TaskMismatch),
+        (binding(1, 40, 9), 3, TaskAuthorityError::LeaseMismatch),
+        (binding(1, 40, 2), 9, TaskAuthorityError::AgentMismatch),
     ] {
         let lease = lease();
         let lineage = LeaseLineage::for_lease(&lease, []).unwrap();
 
         assert_eq!(
-            TrustedTaskAdmission::new(
-                identity(binding, agent),
-                lease,
-                lineage,
-                &revocations,
-                500,
-            ),
+            TrustedTaskAdmission::new(identity(binding, agent), lease, lineage, &revocations, 500,),
             Err(expected)
         );
     }
