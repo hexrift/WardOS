@@ -77,11 +77,11 @@ impl TaskAdmissionIdentity {
 /// Node-local admission whose already-trusted authority passed the current checks.
 ///
 /// This value is not an authenticated wire envelope and does not make authority
-/// permanently usable. Its constructor accepts only an [AuthorityLease] and
-/// [LeaseLineage] the caller has already established as trusted, binds them to one
-/// [TaskAdmissionIdentity], and checks current revocation/lifetime state.
+/// permanently usable. Its constructor accepts only an [`AuthorityLease`] and
+/// [`LeaseLineage`] the caller has already established as trusted, binds them to one
+/// [`TaskAdmissionIdentity`], and checks current revocation/lifetime state.
 ///
-/// A later execution boundary must call [Self::revalidate] immediately before using
+/// A later execution boundary must call [`Self::revalidate`] immediately before using
 /// the authority. That catches expiry or revocation that happened after this value was
 /// constructed. No lifecycle transition is implied by holding this value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,7 +96,7 @@ impl TrustedTaskAdmission {
     ///
     /// # Errors
     ///
-    /// Returns [TaskAuthorityError] when the lease does not match the task/agent or
+    /// Returns [`TaskAuthorityError`] when the lease does not match the task/agent or
     /// is not currently usable under its validated lineage and local revocation state.
     pub fn new(
         identity: TaskAdmissionIdentity,
@@ -134,7 +134,7 @@ impl TrustedTaskAdmission {
     ///
     /// # Errors
     ///
-    /// Returns [TaskAuthorityError] if retained authority is no longer usable.
+    /// Returns [`TaskAuthorityError`] if retained authority is no longer usable.
     pub fn revalidate(
         &self,
         revocations: &AuthorityRevocations,
