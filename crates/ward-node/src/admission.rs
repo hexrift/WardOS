@@ -1,9 +1,9 @@
-//! Trusted task-lease checks for a future node-owned admission path.
+//! Trusted task-lease checks and node-local admission identity.
 
 use thiserror::Error;
 use ward_authority::AuthorityLease;
 use ward_authority::revocation::{AuthorityRevocations, LeaseLineage};
-use ward_events::AgentId;
+use ward_events::{AgentId, NodeId, SessionId};
 use ward_node_protocol::TaskBinding;
 
 /// Why a trusted lease does not cover the requested task binding.
@@ -23,7 +23,113 @@ pub enum TaskAuthorityError {
     AuthorityUnavailable,
 }
 
+/// Node-local identity for a task whose already-trusted authority passed admission.
+///
+/// This value is not an authenticated wire envelope and does not make authority
+/// permanently usable. Its constructor accepts only an AuthorityLease and
+/// LeaseLineage the caller has already established as trusted, binds them to the
+/// exact execution attempt, agent, node and Ward session, and checks current
+/// revocation/lifetime state.
+///
+/// A later execution boundary must call Self::revalidate immediately before using
+/// the authority. That catches expiry or revocation that happened after this value was
+/// constructed. No lifecycle transition is implied by holding this value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedTaskAdmission {
+    binding: TaskBinding,
+    agent: AgentId,
+    node: NodeId,
+    session: SessionId,
+    lease: AuthorityLease,
+    lineage: LeaseLineage,
+}
+
+impl TrustedTaskAdmission {
+    /// Bind already-trusted authority to one exact node execution identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns TaskAuthorityError when the lease does not match the task/agent or
+    /// is not currently usable under its validated lineage and local revocation state.
+    pub fn new(
+        binding: TaskBinding,
+        agent: AgentId,
+        node: NodeId,
+        session: SessionId,
+        lease: AuthorityLease,
+        lineage: LeaseLineage,
+        revocations: &AuthorityRevocations,
+        now_unix_ms: u64,
+    ) -> Result<Self, TaskAuthorityError> {
+        validate_trusted_task_authority(
+            binding,
+            agent,
+            &lease,
+            &lineage,
+            revocations,
+            now_unix_ms,
+        )?;
+
+        Ok(Self {
+            binding,
+            agent,
+            node,
+            session,
+            lease,
+            lineage,
+        })
+    }
+
+    /// Exact task / execution-attempt / authority-lease binding.
+    #[must_use]
+    pub const fn binding(&self) -> TaskBinding {
+        self.binding
+    }
+
+    /// Agent whose trusted lease was admitted.
+    #[must_use]
+    pub const fn agent(&self) -> AgentId {
+        self.agent
+    }
+
+    /// Node audience this admission is local to.
+    #[must_use]
+    pub const fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// Ward session this admission is local to.
+    #[must_use]
+    pub const fn session(&self) -> SessionId {
+        self.session
+    }
+
+    /// Re-check the retained trusted authority against current time and revocations.
+    ///
+    /// A successful construction is deliberately not a permanent authorization:
+    /// callers must use this immediately before a later authority-exercising transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns TaskAuthorityError if retained authority is no longer usable.
+    pub fn revalidate(
+        &self,
+        revocations: &AuthorityRevocations,
+        now_unix_ms: u64,
+    ) -> Result<(), TaskAuthorityError> {
+        validate_trusted_task_authority(
+            self.binding,
+            self.agent,
+            &self.lease,
+            &self.lineage,
+            revocations,
+            now_unix_ms,
+        )
+    }
+}
+
 /// Check that trusted, currently usable authority covers a task and agent.
+///
 /// This does not authenticate lease delivery or admit execution. The node must
 /// bind the execution attempt separately; it is not part of an authority lease.
 ///
