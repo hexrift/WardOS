@@ -518,4 +518,33 @@ mod tests {
             assert!(m.unmeasured_reason.is_some());
         }
     }
+
+    #[test]
+    fn observer_event_propagation_uses_the_real_path_or_reports_unsupported() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let metric = observer_event_propagation(&fixtures_root(), state.path(), 1, 3);
+
+        assert!(matches!(
+            metric.status,
+            MetricStatus::Measured | MetricStatus::Unsupported
+        ));
+        match metric.status {
+            MetricStatus::Measured => {
+                let stats = metric.stats.expect("measured");
+                assert_eq!(stats.samples, 3);
+                assert!(stats.p50_ms >= 0.0);
+                assert!(stats.p99_ms >= stats.p50_ms);
+            }
+            MetricStatus::Unsupported => {
+                assert!(
+                    metric.unmeasured_reason.is_some(),
+                    "unsupported measurements must explain why"
+                );
+            }
+            MetricStatus::NotImplemented => {
+                panic!("observer propagation is implemented by this slice")
+            }
+        }
+    }
+
 }
