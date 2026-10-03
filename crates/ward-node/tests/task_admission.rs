@@ -12,7 +12,7 @@ use ward_authority::{
 use ward_events::{
     AgentId, DelegationId, ExecutionAttemptId, LeaseId, NodeId, PrincipalId, SessionId, TaskId,
 };
-use ward_node::admission::{TaskAuthorityError, TrustedTaskAdmission};
+use ward_node::admission::{TaskAdmissionIdentity, TaskAuthorityError, TrustedTaskAdmission};
 use ward_node_protocol::TaskBinding;
 
 fn lease() -> AuthorityLease {
@@ -47,32 +47,31 @@ fn binding(task: u128, attempt: u128, lease: u128) -> TaskBinding {
     )
 }
 
+fn identity(binding: TaskBinding, agent: u128) -> TaskAdmissionIdentity {
+    TaskAdmissionIdentity::new(
+        binding,
+        AgentId::from_u128(agent),
+        NodeId::from_u128(4),
+        SessionId::from_u128(5),
+    )
+}
+
 #[test]
 fn admission_preserves_the_exact_execution_identity() {
     let lease = lease();
     let lineage = LeaseLineage::for_lease(&lease, []).unwrap();
     let revocations = AuthorityRevocations::new();
     let binding = binding(1, 40, 2);
-    let agent = AgentId::from_u128(3);
-    let node = NodeId::from_u128(4);
-    let session = SessionId::from_u128(5);
+    let identity = identity(binding, 3);
 
-    let admission = TrustedTaskAdmission::new(
-        binding,
-        agent,
-        node,
-        session,
-        lease,
-        lineage,
-        &revocations,
-        500,
-    )
-    .unwrap();
+    let admission =
+        TrustedTaskAdmission::new(identity, lease, lineage, &revocations, 500).unwrap();
 
-    assert_eq!(admission.binding(), binding);
-    assert_eq!(admission.agent(), agent);
-    assert_eq!(admission.node(), node);
-    assert_eq!(admission.session(), session);
+    assert_eq!(admission.identity(), identity);
+    assert_eq!(identity.binding(), binding);
+    assert_eq!(identity.agent(), AgentId::from_u128(3));
+    assert_eq!(identity.node(), NodeId::from_u128(4));
+    assert_eq!(identity.session(), SessionId::from_u128(5));
 }
 
 #[test]
@@ -82,17 +81,17 @@ fn admission_reuses_the_existing_fail_closed_authority_predicate() {
     for (binding, agent, expected) in [
         (
             binding(9, 40, 2),
-            AgentId::from_u128(3),
+            3,
             TaskAuthorityError::TaskMismatch,
         ),
         (
             binding(1, 40, 9),
-            AgentId::from_u128(3),
+            3,
             TaskAuthorityError::LeaseMismatch,
         ),
         (
             binding(1, 40, 2),
-            AgentId::from_u128(9),
+            9,
             TaskAuthorityError::AgentMismatch,
         ),
     ] {
@@ -101,10 +100,7 @@ fn admission_reuses_the_existing_fail_closed_authority_predicate() {
 
         assert_eq!(
             TrustedTaskAdmission::new(
-                binding,
-                agent,
-                NodeId::from_u128(4),
-                SessionId::from_u128(5),
+                identity(binding, agent),
                 lease,
                 lineage,
                 &revocations,
@@ -122,10 +118,7 @@ fn admitted_authority_is_revalidated_for_expiry_and_later_revocation() {
     let mut revocations = AuthorityRevocations::new();
 
     let admission = TrustedTaskAdmission::new(
-        binding(1, 40, 2),
-        AgentId::from_u128(3),
-        NodeId::from_u128(4),
-        SessionId::from_u128(5),
+        identity(binding(1, 40, 2), 3),
         lease,
         lineage,
         &revocations,

@@ -23,23 +23,70 @@ pub enum TaskAuthorityError {
     AuthorityUnavailable,
 }
 
-/// Node-local identity for a task whose already-trusted authority passed admission.
-///
-/// This value is not an authenticated wire envelope and does not make authority
-/// permanently usable. Its constructor accepts only an AuthorityLease and
-/// LeaseLineage the caller has already established as trusted, binds them to the
-/// exact execution attempt, agent, node and Ward session, and checks current
-/// revocation/lifetime state.
-///
-/// A later execution boundary must call Self::revalidate immediately before using
-/// the authority. That catches expiry or revocation that happened after this value was
-/// constructed. No lifecycle transition is implied by holding this value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TrustedTaskAdmission {
+/// Immutable typed identity for one node-local task admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskAdmissionIdentity {
     binding: TaskBinding,
     agent: AgentId,
     node: NodeId,
     session: SessionId,
+}
+
+impl TaskAdmissionIdentity {
+    /// Bind one task attempt and lease to its agent, node audience and Ward session.
+    #[must_use]
+    pub const fn new(
+        binding: TaskBinding,
+        agent: AgentId,
+        node: NodeId,
+        session: SessionId,
+    ) -> Self {
+        Self {
+            binding,
+            agent,
+            node,
+            session,
+        }
+    }
+
+    /// Exact task / execution-attempt / authority-lease binding.
+    #[must_use]
+    pub const fn binding(self) -> TaskBinding {
+        self.binding
+    }
+
+    /// Agent whose authority applies to this admission.
+    #[must_use]
+    pub const fn agent(self) -> AgentId {
+        self.agent
+    }
+
+    /// Node audience this admission is local to.
+    #[must_use]
+    pub const fn node(self) -> NodeId {
+        self.node
+    }
+
+    /// Ward session this admission is local to.
+    #[must_use]
+    pub const fn session(self) -> SessionId {
+        self.session
+    }
+}
+
+/// Node-local admission whose already-trusted authority passed the current checks.
+///
+/// This value is not an authenticated wire envelope and does not make authority
+/// permanently usable. Its constructor accepts only an [AuthorityLease] and
+/// [LeaseLineage] the caller has already established as trusted, binds them to one
+/// [TaskAdmissionIdentity], and checks current revocation/lifetime state.
+///
+/// A later execution boundary must call [Self::revalidate] immediately before using
+/// the authority. That catches expiry or revocation that happened after this value was
+/// constructed. No lifecycle transition is implied by holding this value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedTaskAdmission {
+    identity: TaskAdmissionIdentity,
     lease: AuthorityLease,
     lineage: LeaseLineage,
 }
@@ -49,21 +96,18 @@ impl TrustedTaskAdmission {
     ///
     /// # Errors
     ///
-    /// Returns TaskAuthorityError when the lease does not match the task/agent or
+    /// Returns [TaskAuthorityError] when the lease does not match the task/agent or
     /// is not currently usable under its validated lineage and local revocation state.
     pub fn new(
-        binding: TaskBinding,
-        agent: AgentId,
-        node: NodeId,
-        session: SessionId,
+        identity: TaskAdmissionIdentity,
         lease: AuthorityLease,
         lineage: LeaseLineage,
         revocations: &AuthorityRevocations,
         now_unix_ms: u64,
     ) -> Result<Self, TaskAuthorityError> {
         validate_trusted_task_authority(
-            binding,
-            agent,
+            identity.binding,
+            identity.agent,
             &lease,
             &lineage,
             revocations,
@@ -71,37 +115,16 @@ impl TrustedTaskAdmission {
         )?;
 
         Ok(Self {
-            binding,
-            agent,
-            node,
-            session,
+            identity,
             lease,
             lineage,
         })
     }
 
-    /// Exact task / execution-attempt / authority-lease binding.
+    /// Exact typed execution identity bound by this admission.
     #[must_use]
-    pub const fn binding(&self) -> TaskBinding {
-        self.binding
-    }
-
-    /// Agent whose trusted lease was admitted.
-    #[must_use]
-    pub const fn agent(&self) -> AgentId {
-        self.agent
-    }
-
-    /// Node audience this admission is local to.
-    #[must_use]
-    pub const fn node(&self) -> NodeId {
-        self.node
-    }
-
-    /// Ward session this admission is local to.
-    #[must_use]
-    pub const fn session(&self) -> SessionId {
-        self.session
+    pub const fn identity(&self) -> TaskAdmissionIdentity {
+        self.identity
     }
 
     /// Re-check the retained trusted authority against current time and revocations.
@@ -111,15 +134,15 @@ impl TrustedTaskAdmission {
     ///
     /// # Errors
     ///
-    /// Returns TaskAuthorityError if retained authority is no longer usable.
+    /// Returns [TaskAuthorityError] if retained authority is no longer usable.
     pub fn revalidate(
         &self,
         revocations: &AuthorityRevocations,
         now_unix_ms: u64,
     ) -> Result<(), TaskAuthorityError> {
         validate_trusted_task_authority(
-            self.binding,
-            self.agent,
+            self.identity.binding,
+            self.identity.agent,
             &self.lease,
             &self.lineage,
             revocations,
