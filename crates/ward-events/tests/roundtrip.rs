@@ -563,6 +563,10 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
         ),
         (
             Origin::Wardd,
+            WardEvent::CredentialGrantedLaunch { launch_seq: 3 },
+        ),
+        (
+            Origin::Wardd,
             WardEvent::CredentialDenied {
                 service: service.clone(),
                 scope,
@@ -941,4 +945,165 @@ fn session_pause_unsettled_is_quiet_visible() {
             .contains(EventKind::SessionPauseUnsettled)
     );
     assert!(Filter::quiet().kinds.contains(EventKind::SessionPaused));
+}
+
+/// PR #318 review round 3: `WardEvent::CredentialGrantedLaunch` -- the
+/// trailing variant that carries a launch identity instead of a field on
+/// `CredentialGranted` itself -- must survive chain append, wire encode/decode
+/// and the log unchanged, exactly like any other event.
+#[test]
+fn credential_granted_launch_round_trips() {
+    let session = SessionId::from_u128(0x5e56);
+    let mut chain = Chain::genesis(session, Blake3Hash::hash(b"manifest"));
+    let granted = WardEvent::CredentialGranted {
+        service: ServiceId::new("github").unwrap(),
+        scope: Scope {
+            subject: text("github.com:443"),
+            permissions: vec![text("contents:read")],
+        },
+        expires: Duration::from_secs(60),
+        delivery: CredentialDelivery::ProxyInjected,
+    };
+    let grant_record = chain
+        .append(
+            Origin::Wardd,
+            granted,
+            Timestamp::mono(Duration::from_secs(1)),
+        )
+        .unwrap();
+    let attribution = chain
+        .append(
+            Origin::Wardd,
+            WardEvent::CredentialGrantedLaunch { launch_seq: 1 },
+            Timestamp::mono(Duration::from_secs(1)),
+        )
+        .unwrap();
+    assert_eq!(
+        attribution.prev, grant_record.hash,
+        "immediately follows it"
+    );
+
+    let frame = encode_record(&attribution).unwrap();
+    let (decoded, _) = decode_record(&frame).unwrap();
+    assert_eq!(decoded, attribution);
+    assert!(matches!(
+        decoded.event,
+        WardEvent::CredentialGrantedLaunch { launch_seq: 1 }
+    ));
+    assert!(decoded.is_enforcement_fact());
+}
+
+/// PR #318 review round 3: the whole point of reverting `launch_seq` off
+/// `CredentialGranted` itself (round 2's shape) is that this variant's own
+/// encoding must never again change once shipped -- a byte a session log
+/// persisted under any earlier build must still verify under this one,
+/// forever. This freezes the exact bytes `postcard` produced for a
+/// `CredentialGranted` event under the plain four-field shape (`service`,
+/// `scope`, `expires`, `delivery`) -- the shape this variant had before PR
+/// #318 and has again after round 3's revert -- as a fixed literal, not
+/// merely "whatever today's code happens to produce": a future change that
+/// added a field to this variant again would change what
+/// `postcard::to_allocvec` produces for it and fail the first assertion
+/// below immediately, long before it ever reached hash verification.
+///
+/// From that frozen body this test hand-builds a complete `EventRecord` the
+/// same way `chain.rs`'s own module doc describes the hash
+/// (`BLAKE3(prev || seq_le || origin_tag || postcard(event))`) -- not through
+/// `EventRecord::compute_hash`, which is the function under test -- and
+/// proves this head still: (1) verifies that record's stored hash unchanged,
+/// (2) verifies its chain linkage as a continuation of a known head, (3)
+/// decodes it over the wire, and (4) replays it back as the same plain
+/// four-field grant a reader before any of PR #318's changes would have
+/// seen. Exactly the reproduction PR #318 review round 3 asked for: a record
+/// "produced by the previous schema" that this head must not report as
+/// tampered.
+#[test]
+fn a_frozen_pre_318_credential_granted_record_still_verifies_its_hash_and_replays() {
+    let event = WardEvent::CredentialGranted {
+        service: ServiceId::new("github").unwrap(),
+        scope: Scope {
+            subject: text("repo:hexrift/wardos"),
+            permissions: vec![text("contents:read")],
+        },
+        expires: Duration::from_secs(600),
+        delivery: CredentialDelivery::ProxyInjected,
+    };
+    // Frozen: `postcard::to_allocvec(&event)` for the exact event above, under
+    // the plain four-field `CredentialGranted` shape.
+    let frozen_body: &[u8] = &[
+        12, 6, 103, 105, 116, 104, 117, 98, 19, 114, 101, 112, 111, 58, 104, 101, 120, 114, 105,
+        102, 116, 47, 119, 97, 114, 100, 111, 115, 0, 0, 1, 13, 99, 111, 110, 116, 101, 110, 116,
+        115, 58, 114, 101, 97, 100, 0, 0, 216, 4, 0, 0,
+    ];
+    assert_eq!(
+        postcard::to_allocvec(&event).unwrap(),
+        frozen_body,
+        "CredentialGranted's own encoding must never drift from its frozen \
+         pre-#318 bytes -- a future field added to this variant would change \
+         this and must be caught here, not downstream at hash verification"
+    );
+
+    let session = SessionId::from_u128(0x5e57);
+    let prev = Blake3Hash::hash(b"manifest");
+    let seq = 4u64;
+    let origin = Origin::Wardd;
+    // `prev || seq_le || origin_tag || postcard(event)` (`chain.rs`'s own
+    // module doc), built by hand from the frozen body above -- exactly as a
+    // pre-#318 `wardd` would have computed it when it first wrote this
+    // record, and exactly what `EventRecord::compute_hash` must still
+    // reproduce today.
+    let mut hashed = Vec::new();
+    hashed.extend_from_slice(prev.as_bytes());
+    hashed.extend_from_slice(&seq.to_le_bytes());
+    hashed.push(origin.tag());
+    hashed.extend_from_slice(frozen_body);
+    let hash = Blake3Hash::hash(&hashed);
+
+    let record = ward_events::chain::EventRecord {
+        session,
+        seq,
+        ts_mono: Duration::from_secs(4),
+        ts_wall: None,
+        origin,
+        prev,
+        event,
+        hash,
+    };
+
+    // (1) The record's own stored hash verifies, unchanged.
+    record.verify_hash().unwrap();
+
+    // (2) Chain linkage verifies as a continuation of a known head.
+    let head = ward_events::chain::ChainHead {
+        session,
+        genesis: prev,
+        next_seq: seq,
+        hash: prev,
+    };
+    let advanced = ward_events::chain::verify_from(head, std::slice::from_ref(&record)).unwrap();
+    assert_eq!(advanced.next_seq, seq + 1);
+    assert_eq!(advanced.hash, record.hash);
+
+    // (3) It decodes over the wire, its hash re-verified there too.
+    let frame = encode_record(&record).unwrap();
+    let (decoded, consumed) = decode_record(&frame).unwrap();
+    assert_eq!(consumed, frame.len());
+    assert_eq!(decoded, record);
+
+    // (4) It replays as the same plain four-field grant it always was --
+    // no `launch_seq`, because this variant never carried one and never
+    // will again.
+    match decoded.event {
+        WardEvent::CredentialGranted {
+            ref service,
+            expires,
+            delivery,
+            ..
+        } => {
+            assert_eq!(service.as_str(), "github");
+            assert_eq!(expires, Duration::from_secs(600));
+            assert_eq!(delivery, CredentialDelivery::ProxyInjected);
+        }
+        ref other => panic!("expected CredentialGranted, got {other:?}"),
+    }
 }

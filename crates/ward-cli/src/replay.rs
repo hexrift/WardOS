@@ -504,6 +504,9 @@ fn summary(event: &WardEvent) -> String {
             },
             if *degraded { " · degraded" } else { "" }
         ),
+        WardEvent::CredentialGrantedLaunch { launch_seq } => {
+            format!("launch_seq {launch_seq}")
+        }
         WardEvent::NetworkRequested { .. }
         | WardEvent::NetworkDenied { .. }
         | WardEvent::CapabilityRequested { .. }
