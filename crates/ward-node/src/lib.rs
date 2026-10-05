@@ -7,14 +7,21 @@
 //! * at protocol 1.2, read-only discovery or one task lifecycle request against
 //!   the node-owned [`task::TaskRegistry`]. Only `create` and `inspect` are
 //!   implemented; every other verb is refused explicitly (see [`task`]);
-//! * at protocol 1.3, the same, plus the `admit` verb, which is decoded but refused
-//!   as unsupported until issuer verification exists (ADR-0030).
+//! * at protocol 1.3, the same, plus the `admit` verb. A service built with
+//!   [`NodeService::with_admission`] verifies the signed envelope against its trusted
+//!   issuers, its node id, its clock and its durable state, and moves the task
+//!   `Created → Ready` (see [`admit`]); it then advertises `admit` in 1.3 capability
+//!   discovery. Without admission, `admit` is refused as unsupported.
 //!
-//! No task is executed yet, and remote transport is deliberately absent.
+//! No task is executed yet: `start` and `stop` stay unsupported, and remote transport is
+//! deliberately absent.
 
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod admit;
+pub mod issuer;
+pub mod state;
 pub mod task;
 #[cfg(test)]
 mod test_support;
@@ -28,12 +35,13 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use ward_node_protocol::{
-    CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse, NodeCapabilities,
-    SupportedProtocolRange, TaskLifecycleContext, WARD_NODE_PROTOCOL, negotiate,
-    supports_task_lifecycle,
+    CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse, LifecycleCapabilities,
+    NodeCapabilities, SupportedProtocolRange, TaskLifecycleContext, WARD_NODE_PROTOCOL, negotiate,
+    supports_task_admission, supports_task_lifecycle,
 };
 
-use crate::task::TaskRegistry;
+use crate::admit::NodeAdmission;
+use crate::task::{MAX_NODE_TASKS, TaskRegistry};
 
 /// Maximum bytes in one node-protocol JSON request, excluding the terminating newline.
 pub const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024;
@@ -87,6 +95,7 @@ pub enum NodeServiceError {
 pub struct NodeService {
     capabilities: NodeCapabilities,
     supported: SupportedProtocolRange,
+    admits: bool,
     tasks: Arc<Mutex<TaskRegistry>>,
 }
 
@@ -103,7 +112,31 @@ impl NodeService {
         Ok(Self {
             capabilities,
             supported: WARD_NODE_PROTOCOL,
+            admits: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::default())),
+        })
+    }
+
+    /// Create a service that admits signed envelopes through `admission` (protocol 1.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidCapabilities` if the capability document is not valid for
+    /// capability discovery in this build.
+    pub fn with_admission(
+        capabilities: NodeCapabilities,
+        admission: NodeAdmission,
+    ) -> Result<Self, NodeServiceError> {
+        CapabilityDiscoveryContext::new(capabilities.protocol())
+            .map_err(|_| NodeServiceError::InvalidCapabilities)?;
+        Ok(Self {
+            capabilities,
+            supported: WARD_NODE_PROTOCOL,
+            admits: true,
+            tasks: Arc::new(Mutex::new(TaskRegistry::with_admission(
+                MAX_NODE_TASKS,
+                admission,
+            ))),
         })
     }
 
@@ -187,7 +220,10 @@ impl NodeService {
             self.capabilities.credentials(),
             self.capabilities.snapshots(),
             self.capabilities.verifier(),
-            self.capabilities.lifecycle(),
+            LifecycleCapabilities {
+                admit: self.admits && supports_task_admission(protocol),
+                ..self.capabilities.lifecycle()
+            },
         )
         .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         let response = context
@@ -217,7 +253,7 @@ impl NodeService {
     }
 }
 
-/// Bind a local ward-node socket and serve connections indefinitely.
+/// Bind a local ward-node socket and serve connections for `service` indefinitely.
 ///
 /// Connections are handled sequentially in this initial endpoint. That deliberately caps
 /// active protocol handlers at one instead of allocating an unbounded thread per client.
@@ -229,8 +265,7 @@ impl NodeService {
 ///
 /// Returns if the listener cannot be created/configured. Existing socket paths are never
 /// removed automatically.
-pub fn serve_local(socket: &Path, capabilities: NodeCapabilities) -> Result<(), NodeServiceError> {
-    let service = NodeService::new(capabilities)?;
+pub fn serve_local(socket: &Path, service: &NodeService) -> Result<(), NodeServiceError> {
     let listener = bind_local(socket)?;
 
     for connection in listener.incoming() {
@@ -398,6 +433,7 @@ mod tests {
                 pause: true,
                 stop: true,
                 revoke: true,
+                admit: false,
             },
         )
         .unwrap()
@@ -957,6 +993,192 @@ mod tests {
         .unwrap();
         assert!(discovery.decode_response(line(&mut client).trim()).is_ok());
         worker.join().unwrap().unwrap();
+    }
+
+    struct LocalNode {
+        _dir: tempfile::TempDir,
+        socket: std::path::PathBuf,
+        service: NodeService,
+        worker: std::thread::JoinHandle<()>,
+    }
+
+    impl LocalNode {
+        /// Bind a real private socket and serve exactly `connections` connections.
+        fn serve(service: NodeService, connections: usize) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let socket = dir.path().join("node.sock");
+            let listener = bind_local(&socket).unwrap();
+            let served = service.clone();
+            let worker = std::thread::spawn(move || {
+                for connection in listener.incoming().take(connections) {
+                    served.serve_connection(connection.unwrap()).unwrap();
+                }
+            });
+            Self {
+                _dir: dir,
+                socket,
+                service,
+                worker,
+            }
+        }
+
+        /// One request on its own connection negotiated at `protocol`; the raw response.
+        fn request(&self, protocol: SupportedProtocolRange, request: &str) -> String {
+            let mut client = UnixStream::connect(&self.socket).unwrap();
+            let hello = HandshakeRequest::Hello { protocol };
+            writeln!(client, "{}", serde_json::to_string(&hello).unwrap()).unwrap();
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            let mut accepted = String::new();
+            reader.read_line(&mut accepted).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<HandshakeResponse>(accepted.trim()).unwrap(),
+                HandshakeResponse::Accepted { .. }
+            ));
+            writeln!(client, "{request}").unwrap();
+            let mut response = String::new();
+            reader.read_line(&mut response).unwrap();
+            response.trim().to_owned()
+        }
+
+        fn lifecycle(&self, request: &TaskLifecycleRequest) -> TaskLifecycleResponse {
+            let ctx = admission_context();
+            let raw = self.request(WARD_NODE_PROTOCOL, &serde_json::to_string(request).unwrap());
+            ctx.decode_response(&raw).unwrap()
+        }
+
+        fn join(self) {
+            self.worker.join().unwrap();
+        }
+    }
+
+    fn admission_context() -> TaskLifecycleContext {
+        TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap()
+    }
+
+    fn admitting_service(state: &std::path::Path) -> NodeService {
+        let clock = crate::test_support::FixedClock::at(crate::test_support::NOW);
+        NodeService::with_admission(
+            capabilities(),
+            crate::test_support::node_admission(state, &clock),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn one_three_admit_over_the_local_socket_moves_the_task_to_ready() {
+        let state = tempfile::tempdir().unwrap();
+        let node = LocalNode::serve(admitting_service(&state.path().join("state")), 5);
+        let ctx = admission_context();
+        let binding = lifecycle_binding();
+        let create = OperationId::new(1).unwrap();
+        let admit = OperationId::new(2).unwrap();
+        let envelope = ward_node_protocol::TaskAdmissionEnvelope::new(
+            crate::test_support::envelope_input(binding),
+        )
+        .unwrap();
+        let request = crate::test_support::signed_admit(ctx, admit, binding, &envelope);
+
+        assert_eq!(
+            node.lifecycle(&ctx.create(create, binding)),
+            ctx.accepted(create, binding, TaskLifecycleState::Created)
+        );
+        let accepted = node.lifecycle(&request);
+        assert_eq!(
+            accepted,
+            ctx.accepted(admit, binding, TaskLifecycleState::Ready)
+        );
+        assert_eq!(
+            node.lifecycle(&ctx.inspect(binding)),
+            ctx.inspected(binding, TaskLifecycleState::Ready)
+        );
+        assert_eq!(node.lifecycle(&request), accepted);
+        assert_eq!(
+            node.lifecycle(&ctx.start(OperationId::new(3).unwrap(), binding)),
+            ctx.rejected(
+                Some(OperationId::new(3).unwrap()),
+                binding,
+                TaskLifecycleRejectionReason::UnsupportedOperation
+            )
+        );
+        assert_eq!(
+            node.service
+                .tasks
+                .lock()
+                .unwrap()
+                .admitted(binding)
+                .unwrap()
+                .envelope(),
+            &envelope
+        );
+        node.join();
+    }
+
+    #[test]
+    fn one_three_refused_admit_over_the_local_socket_leaves_the_task_created() {
+        let state = tempfile::tempdir().unwrap();
+        let node = LocalNode::serve(admitting_service(&state.path().join("state")), 3);
+        let ctx = admission_context();
+        let binding = lifecycle_binding();
+        let admit = OperationId::new(2).unwrap();
+        let json = ward_node_protocol::AdmissionEnvelopeJson::encode(
+            &ward_node_protocol::TaskAdmissionEnvelope::new(crate::test_support::envelope_input(
+                binding,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let proof = crate::test_support::sign(&json, &crate::test_support::other_keypair());
+
+        node.lifecycle(&ctx.create(OperationId::new(1).unwrap(), binding));
+        assert_eq!(
+            node.lifecycle(&ctx.admit(admit, binding, json, proof).unwrap()),
+            ctx.rejected(
+                Some(admit),
+                binding,
+                TaskLifecycleRejectionReason::AuthorityDenied
+            )
+        );
+        assert_eq!(
+            node.lifecycle(&ctx.inspect(binding)),
+            ctx.inspected(binding, TaskLifecycleState::Created)
+        );
+        node.join();
+    }
+
+    #[test]
+    fn capability_discovery_advertises_admit_only_at_one_three_with_admission() {
+        let state = tempfile::tempdir().unwrap();
+        let admitting = LocalNode::serve(admitting_service(&state.path().join("state")), 3);
+        let plain = LocalNode::serve(NodeService::new(capabilities()).unwrap(), 3);
+
+        for minor in [1, 2] {
+            let protocol = SupportedProtocolRange::new(1, minor, minor).unwrap();
+            let request = serde_json::to_string(
+                &CapabilityDiscoveryContext::new(ProtocolVersion::new(1, minor))
+                    .unwrap()
+                    .request(),
+            )
+            .unwrap();
+            let advertised = admitting.request(protocol, &request);
+            assert_eq!(advertised, plain.request(protocol, &request));
+            assert!(
+                advertised.ends_with(r#""lifecycle":{"pause":true,"stop":true,"revoke":true}}}"#),
+                "{advertised}"
+            );
+        }
+
+        let one_three = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let request = serde_json::to_string(&one_three.request()).unwrap();
+        for (node, admit) in [(&admitting, true), (&plain, false)] {
+            let raw = node.request(WARD_NODE_PROTOCOL, &request);
+            let ward_node_protocol::CapabilityDiscoveryResponse::Capabilities {
+                capabilities: observed,
+            } = one_three.decode_response(&raw).unwrap();
+            assert_eq!(observed.lifecycle().admit, admit, "{raw}");
+        }
+        admitting.join();
+        plain.join();
     }
 
     #[test]

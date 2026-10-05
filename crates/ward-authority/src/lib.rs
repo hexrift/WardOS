@@ -588,10 +588,11 @@ pub struct DelegationBinding {
 
 /// Untrusted serialized authority envelope.
 ///
-/// Deserializing this value grants nothing. There is deliberately no promotion path
-/// from wire data to root authority in this slice. A delegated envelope must pass
+/// Deserializing this value grants nothing. A delegated envelope must pass
 /// `AuthorityLease::validate_delegated` with its trusted parent. Root authority is
-/// constructed only from non-deserializable trusted `AuthorityLeaseInput`.
+/// constructed from non-deserializable trusted `AuthorityLeaseInput`, or from wire data
+/// only through [`Self::into_issuer_verified_root`], whose caller must first have
+/// verified a trusted issuer's signature over the exact bytes that carried it.
 ///
 /// A trusted lease can be downgraded into this form to carry it inside a protocol
 /// message; its serialization is identical to the trusted lease's.
@@ -626,6 +627,74 @@ impl From<&AuthorityLease> for UntrustedAuthorityLease {
             expires_at_unix_ms: lease.expires_at_unix_ms,
             version: lease.version,
         }
+    }
+}
+
+impl UntrustedAuthorityLease {
+    /// Claimed lease identity.
+    #[must_use]
+    pub const fn id(&self) -> LeaseId {
+        self.id
+    }
+
+    /// Claimed delegation identity.
+    #[must_use]
+    pub const fn delegation_id(&self) -> DelegationId {
+        self.delegation_id
+    }
+
+    /// Claimed agent holding this lease.
+    #[must_use]
+    pub const fn subject(&self) -> AgentId {
+        self.subject
+    }
+
+    /// Claimed bound task.
+    #[must_use]
+    pub const fn task(&self) -> TaskId {
+        self.task
+    }
+
+    /// Claimed monotonic lineage version.
+    #[must_use]
+    pub const fn version(&self) -> LeaseVersion {
+        self.version
+    }
+
+    /// Promote a root-shaped wire lease whose carrying bytes a trusted issuer signed.
+    ///
+    /// This is the only path from wire data to root authority. The caller must already
+    /// have verified a signature by a configured, trusted issuer key over the exact bytes
+    /// this value was decoded from; holding the value alone proves nothing. The lease is
+    /// then held to every rule [`AuthorityLease::root`] applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityLeaseError::LineageMismatch`] for a delegated (non-root) wire
+    /// lease, and otherwise any error [`AuthorityLease::root`] returns.
+    pub fn into_issuer_verified_root(
+        self,
+        now_unix_ms: u64,
+        empty_policy: EmptyAuthorityPolicy,
+    ) -> Result<AuthorityLease, AuthorityLeaseError> {
+        if self.parent_lease_id.is_some() || self.delegated_by.is_some() {
+            return Err(AuthorityLeaseError::LineageMismatch);
+        }
+        AuthorityLease::root(
+            AuthorityLeaseInput {
+                id: self.id,
+                delegation_id: self.delegation_id,
+                issuer: self.issuer,
+                subject: self.subject,
+                task: self.task,
+                grants: self.grants,
+                issued_at_unix_ms: self.issued_at_unix_ms,
+                expires_at_unix_ms: self.expires_at_unix_ms,
+                version: self.version,
+            },
+            now_unix_ms,
+            empty_policy,
+        )
     }
 }
 
@@ -1248,6 +1317,78 @@ mod tests {
         let mut value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
         value["provider"] = serde_json::Value::String("model".into());
         assert!(serde_json::from_value::<UntrustedAuthorityLease>(value).is_err());
+    }
+
+    #[test]
+    fn issuer_verified_root_wire_is_held_to_every_root_rule() {
+        let root = root();
+        let wire = UntrustedAuthorityLease::from(&root);
+        assert_eq!(wire.id(), root.id());
+        assert_eq!(wire.delegation_id(), root.delegation_id());
+        assert_eq!(wire.subject(), root.subject());
+        assert_eq!(wire.task(), root.task());
+        assert_eq!(wire.version(), root.version());
+
+        assert_eq!(
+            wire.clone()
+                .into_issuer_verified_root(500, EmptyAuthorityPolicy::Reject),
+            Ok(root.clone())
+        );
+        assert_eq!(
+            wire.clone()
+                .into_issuer_verified_root(1_000, EmptyAuthorityPolicy::Reject),
+            Err(AuthorityLeaseError::Expired)
+        );
+        assert_eq!(
+            wire.into_issuer_verified_root(99, EmptyAuthorityPolicy::Reject),
+            Err(AuthorityLeaseError::NotYetValid)
+        );
+
+        let mut empty = serde_json::to_value(&root).unwrap();
+        empty["grants"] = serde_json::json!([]);
+        assert_eq!(
+            decode_wire(&empty).into_issuer_verified_root(500, EmptyAuthorityPolicy::Reject),
+            Err(AuthorityLeaseError::EmptyAuthorityNotAllowed)
+        );
+    }
+
+    #[test]
+    fn delegated_wire_cannot_be_promoted_as_an_issuer_verified_root() {
+        let root = root();
+        let child = root
+            .delegate(
+                DelegationInput {
+                    id: LeaseId::from_u128(2),
+                    delegation_id: DelegationId::from_u128(2),
+                    subject: AgentId::from_u128(2),
+                    task: root.task(),
+                    grants: GrantSet::new([CapabilityGrant::new(
+                        CapabilityName::new("repo.read").unwrap(),
+                        ResourceRef::new("repo:hexrift/WardOS").unwrap(),
+                        false,
+                    )])
+                    .unwrap(),
+                    issued_at_unix_ms: 200,
+                    expires_at_unix_ms: 900,
+                    version: LeaseVersion::new(2).unwrap(),
+                },
+                500,
+                EmptyAuthorityPolicy::Reject,
+            )
+            .unwrap();
+
+        assert_eq!(
+            UntrustedAuthorityLease::from(&child)
+                .into_issuer_verified_root(500, EmptyAuthorityPolicy::Reject),
+            Err(AuthorityLeaseError::LineageMismatch)
+        );
+
+        let mut half = serde_json::to_value(&root).unwrap();
+        half["delegated_by"] = serde_json::to_value(AgentId::from_u128(9)).unwrap();
+        assert_eq!(
+            decode_wire(&half).into_issuer_verified_root(500, EmptyAuthorityPolicy::Reject),
+            Err(AuthorityLeaseError::LineageMismatch)
+        );
     }
 
     #[test]

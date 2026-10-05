@@ -36,6 +36,7 @@ serde_yaml = "0.9"
 serde_json = "1"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 blake3 = "1"
+ring = { version = "0.17", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
