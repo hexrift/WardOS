@@ -262,7 +262,12 @@ import socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.settimeout(30)
 s.connect(sys.argv[1])
-s.sendall(sys.stdin.buffer.read())
+# The node closes an unlisted peer without reading it, which may happen before
+# this send has finished: a broken pipe here is the refusal under test.
+try:
+    s.sendall(sys.stdin.buffer.read())
+except (BrokenPipeError, ConnectionResetError):
+    pass
 out = b''
 try:
     while True:
