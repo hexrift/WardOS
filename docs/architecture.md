@@ -38,7 +38,7 @@ runtime primitives already implemented:
 | WardOS distribution | Fedora bootc desktop/reference host that packages the runtime and node | No — it is the reference environment |
 | Portable Ward runtime | Capability, snapshot, evidence, sandbox, egress, credential, intervention and verifier primitives | Yes |
 | `ward-node` | Long-lived host worker; owns task lifecycle and local enforcement for one or many tasks | Yes |
-| External control plane (not part of WardOS) | Remote identity/delegation, desired policy, placement, approvals/certification, registry and audit index; reaches nodes through the `ward-node` protocol and a transport-backed adapter (#332 slice 8) | No |
+| External control plane (not part of WardOS) | Remote identity/delegation, desired policy, placement, approvals/certification, registry and audit index; reaches nodes through the `ward-node` protocol via `ward-node-client` or the `ward-node-adapter` process (#332 slice 8) | No |
 
 ```text
 Developer / CI / API / Web
@@ -537,6 +537,20 @@ shows another state than the one recovered, and seals the log of a sealed task, 
 serves; a log that does not verify stops it. Logs are bounded at 256 KiB with room kept
 for the closing records, never hold workload output, and are never deleted by the node:
 evicting a sealed task leaves its sealed log in place for the operator.
+
+The control-plane side of the contract ships as `ward-node-client` (#332 slice 8;
+node-integration.md §11), which depends on `ward-node-protocol`, `ward-events` and
+`ward-authority` but never on `ward-daemon` or `ward-node`: a Unix-socket transport with
+the §3 bounds and timeouts, a client that negotiates 1.3 or later and checks every answer
+against its request, an issuer key read only from a private seed file that signs an
+envelope's exact bytes, a bounded envelope input, and a driver that runs one attempt
+`create → admit → start → inspect… → seal` with caller-supplied, replayable operation
+ids, revokes (never stops) on cancellation or an overrun budget, recovers a lost answer
+once by inspect-and-replay and otherwise reports `unknown`. The `ward-node-adapter`
+binary speaks the same over stdin/stdout JSON lines for control planes in other
+languages, transports pre-signed envelopes byte for byte so key custody stays outside
+WardOS, and turns `SIGTERM` into revoke-and-seal. Both run on the node's host as the
+node's uid; remote transport is #262.
 
 ---
 

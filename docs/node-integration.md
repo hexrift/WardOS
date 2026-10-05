@@ -1,7 +1,8 @@
 # ward-node integration contract for external control planes
 
 Status: living document. It describes the `ward-node` protocol 1.3 contract as
-implemented today (ADR-0030 steps 1–8).
+implemented today (ADR-0030 steps 1–9), and the client and process adapter that drive it
+(§11).
 
 This is the contract an adapter drives, in any language, to have a local `ward-node`
 admit, run, pause, stop, revoke and seal a task. Every protocol message below was
@@ -21,6 +22,10 @@ admission example is a working test vector (§7.4).
 - The node reads the capability manifest and honours only what it can enforce: every
   workload runs offline, so a manifest asking for egress is refused `unsupported_grant`
   at `admit` (§7.5) until the proxy-backed allowlist lands, never run offline silently.
+- WardOS ships one client for this contract: the `ward-node-client` crate (a transport,
+  a typed client, an issuer signer and a fail-closed attempt driver for Rust control
+  planes) and its `ward-node-adapter` binary (the same over stdin/stdout for control
+  planes in other languages), §11. Both run on the node's host, as the node's uid.
 - Not implemented yet: that allowlist, an event stream (`stream`), and any remote
   transport or mTLS. The only transport is a local Unix socket; remote transport and key
   bootstrap are #262.
@@ -1013,3 +1018,185 @@ returned.
 - **Disk.** The node never removes a workspace that ran (not on `stop`, `revoke`, `seal`,
   eviction or restart), so that an attempt is never started twice. Reclaim task-root
   space out of band, and only for attempt ids you will never send again.
+
+## 11. Client and adapter
+
+WardOS ships one implementation of this contract for the control-plane side, in the
+`ward-node-client` crate (`crates/ward-node-client`):
+
+- `UnixTransport`: the framing of §3 over the local socket, one connection per request,
+  both request lines written at once, both bounds (64 KiB each way) enforced, a `connect`
+  timeout (until the node has accepted the connection and answered the handshake) and a
+  `request` timeout (until the verb's answer; default 90 seconds, §3). EOF before the
+  handshake answer is `ClosedWithoutResponse`; EOF after it is "no response", which the
+  client reports for the verb as "unknown whether it took effect" (§10).
+- `Client`: negotiates once, offering 1.3 up to the highest minor this revision
+  implements (today 1.3–1.3), and refuses with a typed error a node that offers nothing
+  in that window (`HandshakeRejected`) or accepts a version below 1.3 (`ProtocolTooOld`).
+  Every later connection must be accepted at exactly the negotiated version. It reads the
+  capability document (§5) and sends `create`, `admit`, `start`, `pause`, `resume`,
+  `stop`, `revoke`, `seal` and `inspect` (§6), decoding each answer strictly and refusing
+  one that names another binding or operation id than the request.
+- `IssuerKey`: the control plane's Ed25519 issuer key, loaded from a 32-byte seed file
+  that must be a regular file of mode `0600` or `0400` (any other mode is refused), or
+  from seed bytes. It prints its public key and key id (§2.3) and the trust-store line
+  binding it to a principal (§2.2), and signs the exact bytes of a serialised envelope as
+  §7.4 prescribes; its unit test reproduces the §7.4 vector byte for byte.
+- `EnvelopeInput`: the envelope of §7.1 as the control plane writes it, with the
+  capability manifest given as its object (`{"network":"offline"}`, which is also the
+  value when it is left out) instead of hash and bytes. Building it refuses every value
+  outside §7.3, an envelope that would not fit the wire, and a lease that is not the
+  binding's lease, not bound to the binding's task, or not held by the envelope's agent,
+  before anything is signed. Nothing else has a default: authority, lease, workspace
+  (snapshot) and budget are the control plane's inputs.
+- `Driver::run_attempt`: `create` → `admit` → `start` → poll `inspect` → read the receipt
+  → `seal`, with the rules below, returning an `AttemptReport`.
+
+### 11.1 Operator requirements for a client host
+
+The client runs where the node runs, under the same Unix identity: the socket is mode
+`0600` in a `0700` directory and the state directory is `0700` (§2.1), so another uid
+cannot connect or read. The host needs bubblewrap with unprivileged user namespaces for
+the node to execute at all. `ward-node snapshot import` (§2.4) runs as the node's uid
+against the node's `--state-dir`; the id it prints is the envelope's `workload.snapshot`.
+Give `start`, `stop` and `revoke` a read timeout of 60 seconds or more (`start` waits up
+to 30 seconds for the spawn after copying the snapshot, `stop` and `revoke` up to 10
+seconds for the reap, §3); the adapter's `--timeout-ms` defaults to 90 000. Reading an
+attempt's evidence log (§6.5) needs the same uid and the node's `--task-root`.
+
+### 11.2 Fail-closed rules of the driver
+
+- **Operation ids are the caller's.** Every mutating verb takes its id from an
+  `OperationIds` scheme the caller supplies. The default scheme is `create` 1, `admit` 2,
+  `start` 3, `stop` 4, `revoke` 5, `seal` 6, with `pause`/`resume` counting up from 7;
+  `{"start_at": N}` shifts the whole scheme, and every id can be set explicitly.
+- **Replay never acts twice.** A control plane that restarts replays the run with the
+  same ids and the same signed bytes. The node answers each replayed id with the task's
+  current state and acts on nothing (§6.3); the replayed `admit` needs byte-identical
+  `envelope_json` and proof, which is why the adapter prints and sends exactly the bytes
+  it was given. A replay of a run that already ended sends `create`, `admit` and `seal`
+  (each answered `sealed`) and no `start`: there is nothing to start, and the workload
+  never runs again.
+- **Cancellation is `revoke`, never `stop`.** When the caller's lease or deadline is
+  withdrawn (`CancelToken`, or `SIGTERM` to the adapter), the driver revokes the attempt
+  (from `ready` without starting it, or killing a live workload) and seals it. The
+  revocation is durable: nothing under that lease, or a lease delegated from it, can be
+  admitted or started again (§10).
+- **The budget is bounded.** The driver polls `inspect` from `start` until an ended state
+  (`exited`, `stopped`, `revoked`, `sealed`), with bounded backoff: the interval starts at
+  `poll_interval` (default 250 ms) and doubles up to `max_poll_interval` (default 2 s).
+  A workload still running past its budget plus a grace (default 60 s) is revoked and the
+  report says `deadline_exceeded`.
+- **A lost answer is recovered once, as §10 says.** When a connection closes without an
+  answer or times out, the driver inspects, then replays the same request with the same
+  operation id, once. A second failure, or a connection that cannot be opened at all, ends
+  the run: the report has `outcome` `unknown`, `outcome_certain` `false` and the
+  `transport_error`; the driver never retries beyond that, never re-admits with another
+  envelope and never starts a second attempt (ADR-0030 §6). Replay the run with the same
+  ids once the node answers again.
+- **A refusal ends the run.** A `rejected` `create`, `admit`, `start` or `inspect` is
+  reported as `outcome` `{"refused": {"verb", "reason"}}` with nothing further sent; the
+  task stays where the node left it (`created` after a refused `admit`, `ready` after a
+  refused `start`), and the control plane decides whether to retry the verb or revoke. A
+  refused `revoke` or `seal` is recorded in `operations` with its reason.
+- **`unknown` means failed.** `outcome_certain` is `false` exactly when `outcome` is
+  `unknown` (the node's receipt was `unknown`, the transport failed, or the attempt never
+  ended). A control plane maps it to failed; it never infers success.
+
+### 11.3 The attempt report
+
+`done` carries the report; the same struct is `AttemptReport` in Rust. Field by field:
+
+| Field | Meaning |
+| --- | --- |
+| `binding` | The task, attempt and lease that ran. |
+| `final_state` | The last state the node reported, or `null` if no verb was answered. |
+| `outcome` | `completed`, `failed`, `unknown`, or `{"refused":{"verb":…,"reason":…}}`. |
+| `outcome_certain` | `false` exactly when `outcome` is `unknown`. |
+| `receipt` | The node's receipt outcome as inspected (§9), or `null`. |
+| `cause` | What ended the attempt, read from the evidence log when `task_root` is given and the log is readable; spelled as `ward-events` spells `NodeAttemptEnd` (`{"Exited":{"code":0}}`, `"BudgetExceeded"`, `"Killed"`, `"Lost"`, `"Ambiguous"`, `"NotStarted"`, `"Unconfirmed"`), else `null`. |
+| `sealed` | Whether the node confirmed `seal`. |
+| `cancelled` | Whether the run was cancelled and revoked. |
+| `deadline_exceeded` | Whether the workload outlived its budget plus the grace and was revoked. |
+| `evidence_log` | `<task-root>/<task>/<attempt>.evidence/events.log` when `task_root` is given, else `null`. |
+| `evidence_head` | The sealed log's head hash (64 hex digits) when the log is sealed, readable and verifies against its `HEAD`, else `null`. |
+| `operations` | Every mutating verb sent, in order, with its `operation_id` and the node's `state` (accepted) or `reason` (rejected); a verb whose answer never arrived has neither. |
+| `transport_error` | The transport failure that ended the run, or `null`. |
+
+### 11.4 The process adapter
+
+`ward-node-adapter --socket <path> [--timeout-ms 90000] [--connect-timeout-ms 10000]`
+reads one JSON command per line on stdin and writes one JSON event per line on stdout.
+Every output line carries `"schema":1`; stderr is diagnostics only. Commands:
+
+| Command | Answer |
+| --- | --- |
+| `{"cmd":"capabilities"}` | `{"event":"capabilities","protocol":{"major":1,"minor":3},"capabilities":{…}}` (the §5 document). |
+| `{"cmd":"run", …}` | The event stream below, ending in one `done`. |
+| `{"cmd":"revoke","operation_id":N,"binding":{…}}` | `{"event":"verb","verb":"revoke","operation_id":N,"result":"accepted","state":…}` or `…,"result":"rejected","reason":…}`. |
+| `{"cmd":"inspect","binding":{…}}` | `{"event":"inspected","state":…,"outcome":…}` or `{"event":"rejected","verb":"inspect","operation_id":null,"reason":…}`. |
+| anything else | `{"event":"error","error":"…"}`. |
+
+`run` takes the attempt in one of two forms, never a mixture:
+
+- **Pre-signed (the path for an external control plane):** `"envelope_json"` is the
+  serialised envelope as a JSON string and `"proof"` is `{"issuer_key_id","signature"}`
+  (§7.4). The control plane keeps its key and signs with its own library; the adapter
+  only transports, sending exactly the bytes it was given. The binding and budget are read
+  from those bytes, which must decode as one valid envelope (§7.3) or the command is an
+  `error` and nothing is sent.
+- **Signed here (a convenience for local use):** `"issuer_seed_file"` names the seed file
+  of an `IssuerKey` (mode `0600` or `0400`) and `"envelope"` is an `EnvelopeInput`
+  (§7.1 shape, manifest as its object or absent). The adapter builds, bounds and signs it.
+
+Optional fields: `"operation_ids"` (`{"start_at":N}` or every id spelled out, default
+the scheme of §11.2), `"poll_ms"`, `"max_poll_ms"`, `"grace_ms"` (defaults 250, 2000,
+60000) and `"task_root"` (the node's `--task-root`, to report the evidence log, its
+sealed head and the cause).
+
+One run, as the adapter writes it (the envelope string shortened):
+
+```json
+{"cmd":"run","envelope_json":"{\"binding\":{\"task\":\"task_01M45YYRG00001249248SK6H24\",…},…}","proof":{"issuer_key_id":"0871f3aa…","signature":"c2336bf7…"},"operation_ids":{"start_at":20},"poll_ms":250,"task_root":"/var/lib/ward-node/tasks"}
+```
+
+```json
+{"schema":1,"event":"state","verb":"create","operation_id":20,"state":"created"}
+{"schema":1,"event":"state","verb":"admit","operation_id":21,"state":"ready"}
+{"schema":1,"event":"admitted","envelope_json":"{\"binding\":{…},…}","proof":{"issuer_key_id":"0871f3aa…","signature":"c2336bf7…"}}
+{"schema":1,"event":"state","verb":"start","operation_id":22,"state":"running"}
+{"schema":1,"event":"receipt","state":"exited","outcome":"completed"}
+{"schema":1,"event":"state","verb":"seal","operation_id":25,"state":"sealed"}
+{"schema":1,"event":"evidence","path":"/var/lib/ward-node/tasks/task_01M45YYRG00001249248SK6H24/exec_01M45YYRG00005ANB6CSVQF248.evidence/events.log"}
+{"schema":1,"event":"done","report":{"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"final_state":"sealed","outcome":"completed","outcome_certain":true,"receipt":"completed","cause":{"Exited":{"code":0}},"sealed":true,"cancelled":false,"deadline_exceeded":false,"evidence_log":"/var/lib/ward-node/tasks/task_01M45YYRG00001249248SK6H24/exec_01M45YYRG00005ANB6CSVQF248.evidence/events.log","evidence_head":"3ac2d55f…","operations":[{"verb":"create","operation_id":20,"state":"created","reason":null},{"verb":"admit","operation_id":21,"state":"ready","reason":null},{"verb":"start","operation_id":22,"state":"running","reason":null},{"verb":"seal","operation_id":25,"state":"sealed","reason":null}],"transport_error":null}}
+```
+
+The stream may also carry `{"event":"rejected","verb":…,"operation_id":…,"reason":…}`
+for a refused verb and `{"event":"recovering","verb":…,"operation_id":…}` when a lost
+answer is being recovered (§11.2). The `admitted` event repeats the exact signed bytes
+and proof so a caller that signed here can persist them and replay after its own
+restart; a caller that pre-signed already holds them.
+
+`SIGTERM` or `SIGINT` during a `run` cancels it: the attempt is revoked and sealed, the
+`done` is written, and the adapter exits without reading further commands; while idle it
+exits at once. The exit status is 0 when every command was well formed and answered (an
+attempt that failed, was refused or ended `unknown` is still a clean answer: read `done`),
+1 when an `error` event was written (a malformed command, an unreachable node for
+`capabilities`, `revoke` or `inspect`, or a `run` refused before anything was sent), 2 for
+bad flags. A command line is at most 256 KiB.
+
+### 11.5 What an adapter cannot do yet
+
+- Workloads run offline: a manifest with `network.custom` is refused `unsupported_grant`
+  (§7.5), so nothing in the sandbox can reach a network service.
+- The workload's stdout and stderr are drained and not returned (§9); the protocol carries
+  no output.
+- The workspace is not exported: what the workload wrote stays under
+  `<task-root>/<task>/<attempt>/`, readable only on the host as the node's uid.
+- There is no event stream (`stream`) and no callback channel into the sandbox; progress
+  is what `inspect` reports.
+
+The honest integration shape today is therefore running governed tool actions and
+verification runs, an `argv` over a snapshot with a budget, through the node, reading the
+receipt and the evidence log, and not hosting a whole agent runtime whose conversation
+loop needs output, network or callbacks from inside the sandbox.
