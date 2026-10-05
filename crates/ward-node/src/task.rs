@@ -13,11 +13,18 @@
 //!   attempt, whose state and receipt are then no longer inspectable (ADR-0030 §6: a retry
 //!   is a new attempt with a new envelope, and the durable per-task admission version
 //!   keeps rising across attempts). While the current attempt is not finished, a new
-//!   attempt is refused [`TaskLifecycleRejectionReason::AttemptMismatch`].
+//!   attempt is refused [`TaskLifecycleRejectionReason::AttemptMismatch`]. The replaced
+//!   attempt id is first recorded durably in the node state
+//!   ([`crate::state::NodeState::retire_attempt`]); if that cannot be recorded (an I/O
+//!   failure, or the store at its bound) the new attempt is refused
+//!   [`TaskLifecycleRejectionReason::ResourceUnavailable`] and nothing changes. A `create`
+//!   naming a retired attempt is refused [`TaskLifecycleRejectionReason::StaleOperation`]
+//!   whatever the registry holds, also after a restart or an eviction, so a replaced
+//!   attempt is never registered, admitted or run again.
 //! * `inspect` reports the state the registry actually holds for that binding. At
-//!   protocol 1.3 an `exited` or `stopped` task also reports its receipt outcome; a 1.2
-//!   connection, which cannot represent `exited`, reads an exited task as `stopped` (its
-//!   workload is gone) and never sees an outcome.
+//!   protocol 1.3 an `exited`, `stopped`, `revoked` or `sealed` task also reports its
+//!   receipt outcome; a 1.2 connection, which cannot represent `exited`, reads an exited
+//!   task as `stopped` (its workload is gone) and never sees an outcome.
 //! * `admit` (protocol 1.3) moves a `Created` task with the exact binding to
 //!   [`TaskLifecycleState::Ready`] once [`NodeAdmission`] has verified its signed
 //!   envelope and durably recorded its version (ADR-0030 §2). The registry keeps the
@@ -36,7 +43,10 @@
 //!   receipt and is never re-run (ADR-0030 §6).
 //! * `stop` (protocol 1.3, with execution) moves a `Running` or `Paused` task to
 //!   [`TaskLifecycleState::Stopped`] once its reaper has killed and reaped the workload,
-//!   and a `Ready` task to `Stopped` without spawning anything.
+//!   and a `Ready` task to `Stopped` without spawning anything. Stopping or revoking a
+//!   `Paused` task continues its tree before the kill, so from then on the task reads
+//!   `Running` until the reaper records its end; while that kill is pending, `pause` and
+//!   `resume` are refused `invalid_state`.
 //! * `pause` (protocol 1.3, with execution) moves a `Running` task to
 //!   [`TaskLifecycleState::Paused`] only once the attempt's
 //!   [`crate::execution::WorkloadFreezer`] confirmed its whole process tree stopped. A freeze
@@ -45,7 +55,8 @@
 //!   `resume` moves a `Paused` task back to `Running` once the thaw is confirmed, and is
 //!   refused `resource_unavailable` with the task still `Paused` otherwise. The reaper keeps
 //!   watching a paused workload and the budget clock keeps running: a paused workload can
-//!   be stopped, revoked, or killed at its budget.
+//!   be stopped, revoked, or killed at its budget. An attempt applies at most
+//!   [`MAX_ATTEMPT_PAUSES`] pauses; a further `pause` is refused `resource_unavailable`.
 //! * `revoke` (protocol 1.3, with execution) moves a `Ready`, `Running` or `Paused` task to
 //!   [`TaskLifecycleState::Revoked`]. It first records the revocation of the binding's lease
 //!   at the node clock in the durable revocation store, so after a restart too no later
@@ -75,9 +86,15 @@
 //! release it only while the reaper kills and reaps, and the reaper records the outcome
 //! under the lock, so a client that disconnects mid-request never leaves a half-applied
 //! transition: the request is served to completion and its replay returns the result.
-//! Replaying the `start`, `stop`, `pause`, `resume`, `revoke` or `seal` that took effect is
-//! accepted with the task's current state and never acts twice; any other operation that
-//! the task's state does not allow is `invalid_state` with nothing changed.
+//!
+//! Every operation id an attempt applied is kept, per verb, for the attempt's lifetime, and
+//! a replay never acts twice. One rule covers all eight mutating verbs: replaying the
+//! latest operation of its verb that took effect on the attempt is accepted with the
+//! task's current state, however far the task has moved on since (`sealed`, for example);
+//! replaying one that a later operation of the same verb superseded (only `pause` and
+//! `resume` can take effect more than once) is refused
+//! [`TaskLifecycleRejectionReason::StaleOperation`]. Any other operation that the task's
+//! state does not allow is `invalid_state` with nothing changed.
 //!
 //! `stream` is answered with an explicit
 //! [`TaskLifecycleRejectionReason::UnsupportedOperation`] and never changes a task's state,
@@ -120,6 +137,14 @@ use crate::workspace::{WorkspaceError, discard};
 /// Default upper bound on tasks one node registry holds.
 pub const MAX_NODE_TASKS: usize = 1024;
 
+/// Upper bound on `pause` operations one execution attempt applies. Every applied
+/// operation id of an attempt is kept for the attempt's lifetime (one each for `create`,
+/// `admit`, `start`, `stop`, `revoke` and `seal`, and every `pause` and `resume`, of which
+/// there are never more than pauses), so a replay is always recognised; once this bound is
+/// reached a new `pause` is refused [`TaskLifecycleRejectionReason::ResourceUnavailable`]
+/// rather than forgetting an id.
+pub const MAX_ATTEMPT_PAUSES: usize = 128;
+
 /// The shared task registry is unavailable: an earlier panic poisoned its lock.
 #[derive(Clone, Copy, Debug, Error)]
 #[error("ward-node task registry is unavailable")]
@@ -138,8 +163,8 @@ struct NodeTask {
     started_by: Option<OperationId>,
     attempt: Option<Attempt>,
     stopped_by: Option<OperationId>,
-    paused_by: Option<OperationId>,
-    resumed_by: Option<OperationId>,
+    paused_by: Vec<OperationId>,
+    resumed_by: Vec<OperationId>,
     revoked_by: Option<OperationId>,
     sealed: Option<Sealed>,
     receipt: Option<TaskExecutionReceipt>,
@@ -510,6 +535,14 @@ impl TaskRegistry {
         operation_id: OperationId,
         binding: TaskBinding,
     ) -> TaskLifecycleResponse {
+        let refuse = |reason| context.rejected(Some(operation_id), binding, reason);
+        if self.admission.as_ref().is_some_and(|admission| {
+            admission
+                .state()
+                .is_retired_attempt(binding.task(), binding.attempt())
+        }) {
+            return refuse(Reason::StaleOperation);
+        }
         if let Some(task) = self.tasks.get(&binding.task()) {
             match task.matches(binding) {
                 Ok(()) if task.created_by == operation_id => {
@@ -519,14 +552,19 @@ impl TaskRegistry {
                         visible(context, task.state),
                     );
                 }
-                Ok(()) => {
-                    return context.rejected(
-                        Some(operation_id),
-                        binding,
-                        TaskLifecycleRejectionReason::InvalidState,
-                    );
-                }
-                Err(TaskLifecycleRejectionReason::AttemptMismatch) if finished(task.state) => {
+                Ok(()) => return refuse(Reason::InvalidState),
+                Err(Reason::AttemptMismatch) if finished(task.state) => {
+                    let current = task.binding;
+                    let Some(admission) = self.admission.as_mut() else {
+                        return refuse(Reason::ResourceUnavailable);
+                    };
+                    if admission
+                        .state_mut()
+                        .retire_attempt(current.task(), current.attempt())
+                        .is_err()
+                    {
+                        return refuse(Reason::ResourceUnavailable);
+                    }
                     if let Some(replaced) = self
                         .tasks
                         .insert(binding.task(), NodeTask::new(binding, operation_id))
@@ -535,7 +573,7 @@ impl TaskRegistry {
                     }
                     return context.accepted(operation_id, binding, TaskLifecycleState::Created);
                 }
-                Err(reason) => return context.rejected(Some(operation_id), binding, reason),
+                Err(reason) => return refuse(reason),
             }
         }
 
@@ -664,11 +702,14 @@ impl TaskRegistry {
         binding: TaskBinding,
     ) -> Result<State, Reason> {
         let task = self.executing_task(context, binding)?;
-        if task.paused_by == Some(operation_id) {
-            return Ok(task.state);
+        if let Some(replay) = replay(&task.paused_by, operation_id, task.state) {
+            return replay;
         }
         if task.state != State::Running {
             return Err(Reason::InvalidState);
+        }
+        if task.paused_by.len() >= MAX_ATTEMPT_PAUSES {
+            return Err(Reason::ResourceUnavailable);
         }
         let freezer = task
             .attempt
@@ -678,7 +719,7 @@ impl TaskRegistry {
             .ok_or(Reason::InvalidState)?;
         freezer.freeze().map_err(|_| Reason::ResourceUnavailable)?;
         task.state = State::Paused;
-        task.paused_by = Some(operation_id);
+        task.paused_by.push(operation_id);
         Ok(task.state)
     }
 
@@ -689,8 +730,8 @@ impl TaskRegistry {
         binding: TaskBinding,
     ) -> Result<State, Reason> {
         let task = self.executing_task(context, binding)?;
-        if task.resumed_by == Some(operation_id) {
-            return Ok(task.state);
+        if let Some(replay) = replay(&task.resumed_by, operation_id, task.state) {
+            return replay;
         }
         if task.state != State::Paused {
             return Err(Reason::InvalidState);
@@ -698,11 +739,12 @@ impl TaskRegistry {
         let freezer = task
             .attempt
             .as_ref()
+            .filter(|attempt| !attempt.stop.is_requested())
             .and_then(|attempt| attempt.freezer.as_ref())
             .ok_or(Reason::InvalidState)?;
         freezer.thaw().map_err(|_| Reason::ResourceUnavailable)?;
         task.state = State::Running;
-        task.resumed_by = Some(operation_id);
+        task.resumed_by.push(operation_id);
         Ok(task.state)
     }
 
@@ -899,26 +941,22 @@ impl TaskRegistry {
             Ok(task) => task,
             Err(reason) => return refuse(reason),
         };
+        if task.stopped_by == Some(operation_id) {
+            return ReapStep::Answer(context.accepted(operation_id, binding, task.state));
+        }
         match task.state {
-            TaskLifecycleState::Stopped if task.stopped_by == Some(operation_id) => {
-                ReapStep::Answer(context.accepted(operation_id, binding, task.state))
-            }
             TaskLifecycleState::Ready => {
                 task.stopped_by = Some(operation_id);
                 task.finish(TaskLifecycleState::Stopped, TaskExecutionOutcome::Failed);
                 ReapStep::Answer(context.accepted(operation_id, binding, task.state))
             }
-            TaskLifecycleState::Running | TaskLifecycleState::Paused => {
-                let paused = task.state == TaskLifecycleState::Paused;
-                match task.attempt.as_mut() {
-                    Some(attempt) => {
-                        attempt.stop_requested_by.get_or_insert(operation_id);
-                        attempt.end(paused);
-                        ReapStep::AwaitReap(Arc::clone(&attempt.reaped), stop_timeout)
-                    }
-                    None => refuse(Reason::InvalidState),
+            TaskLifecycleState::Running | TaskLifecycleState::Paused => match task.end_attempt() {
+                Some(attempt) => {
+                    attempt.stop_requested_by.get_or_insert(operation_id);
+                    ReapStep::AwaitReap(Arc::clone(&attempt.reaped), stop_timeout)
                 }
-            }
+                None => refuse(Reason::InvalidState),
+            },
             _ => refuse(Reason::InvalidState),
         }
     }
@@ -930,10 +968,7 @@ impl TaskRegistry {
         binding: TaskBinding,
     ) -> TaskLifecycleResponse {
         let reason = match self.task(binding) {
-            Some(task)
-                if task.state == TaskLifecycleState::Stopped
-                    && task.stopped_by == Some(operation_id) =>
-            {
+            Some(task) if task.stopped_by == Some(operation_id) => {
                 return context.accepted(operation_id, binding, task.state);
             }
             Some(task) if live(task.state) => Reason::ResourceUnavailable,
@@ -973,10 +1008,10 @@ impl TaskRegistry {
         let Some(task) = self.tasks.get_mut(&binding.task()) else {
             return refuse(Reason::TaskNotFound);
         };
-        let paused = task.state == State::Paused;
-        if let Some(attempt) = task.attempt.as_mut().filter(|_| live(task.state)) {
+        if live(task.state)
+            && let Some(attempt) = task.end_attempt()
+        {
             attempt.revoke_requested_by.get_or_insert(operation_id);
-            attempt.end(paused);
             return ReapStep::AwaitReap(Arc::clone(&attempt.reaped), stop_timeout);
         }
         task.revoked_by = Some(operation_id);
@@ -1142,16 +1177,20 @@ const fn finished(state: TaskLifecycleState) -> bool {
     )
 }
 
-impl Attempt {
-    /// Ask the reaper to kill and reap the workload, continuing a paused tree first so
-    /// nothing the kill misses is left stopped. `SIGKILL` ends a stopped process anyway, so
-    /// a thaw that cannot be confirmed does not hold the kill back.
-    fn end(&self, paused: bool) {
-        self.stop.request();
-        if paused && let Some(freezer) = &self.freezer {
-            let _ = freezer.thaw();
-        }
-    }
+/// The recorded result of replaying `operation_id` against the ids `applied` for one verb
+/// (oldest first): the task's current state for the latest, `stale_operation` for one a
+/// later operation of the verb superseded, and `None` for an id never applied.
+fn replay(
+    applied: &[OperationId],
+    operation_id: OperationId,
+    state: TaskLifecycleState,
+) -> Option<Result<TaskLifecycleState, TaskLifecycleRejectionReason>> {
+    let position = applied.iter().rposition(|id| *id == operation_id)?;
+    Some(if position + 1 == applied.len() {
+        Ok(state)
+    } else {
+        Err(TaskLifecycleRejectionReason::StaleOperation)
+    })
 }
 
 impl NodeTask {
@@ -1164,8 +1203,8 @@ impl NodeTask {
             started_by: None,
             attempt: None,
             stopped_by: None,
-            paused_by: None,
-            resumed_by: None,
+            paused_by: Vec::new(),
+            resumed_by: Vec::new(),
             revoked_by: None,
             sealed: None,
             receipt: None,
@@ -1180,6 +1219,23 @@ impl NodeTask {
             return Err(TaskLifecycleRejectionReason::LeaseMismatch);
         }
         Ok(())
+    }
+
+    /// Ask the reaper to kill and reap the live workload, continuing a paused tree first so
+    /// nothing the kill misses is left stopped. `SIGKILL` ends a stopped process anyway, so
+    /// a thaw that cannot be confirmed does not hold the kill back. A paused task reads
+    /// `Running` from here on: its tree has been continued and is being killed, and while
+    /// the kill is pending neither `pause` nor `resume` is accepted.
+    fn end_attempt(&mut self) -> Option<&mut Attempt> {
+        let attempt = self.attempt.as_mut()?;
+        attempt.stop.request();
+        if self.state == TaskLifecycleState::Paused {
+            if let Some(freezer) = &attempt.freezer {
+                let _ = freezer.thaw();
+            }
+            self.state = TaskLifecycleState::Running;
+        }
+        Some(attempt)
     }
 
     fn finish(&mut self, state: TaskLifecycleState, outcome: TaskExecutionOutcome) {
@@ -2015,10 +2071,11 @@ mod tests {
         };
 
         use crate::execution::{NodeExecution, WorkloadExit};
-        use crate::task::{MAX_NODE_TASKS, TaskRegistry};
+        use crate::task::{MAX_ATTEMPT_PAUSES, MAX_NODE_TASKS, TaskRegistry};
         use crate::test_support::{
             FAKE_PID, FakeFreeze, FakeLauncher, FakeSpawn, FakeStop, FixedClock, NOW,
-            envelope_input, eventually, lifecycle_binding, node_admission, signed_admit,
+            envelope_input, eventually, fill_revocations, lifecycle_binding, node_admission,
+            signed_admit,
         };
         use crate::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
 
@@ -2903,7 +2960,9 @@ mod tests {
             assert_eq!(node.outcome(), Some(Outcome::Failed));
             assert_eq!(
                 node.serve(ctx().inspect(binding)),
-                ctx().inspected(binding, State::Revoked)
+                ctx()
+                    .inspected_with_outcome(binding, State::Revoked, Outcome::Failed)
+                    .unwrap()
             );
             assert_eq!(node.tasks.lock().unwrap().running_pid(binding), None);
         }
@@ -3030,7 +3089,9 @@ mod tests {
                 );
                 assert_eq!(
                     node.serve(ctx().inspect(binding)),
-                    ctx().inspected(binding, State::Sealed)
+                    ctx()
+                        .inspected_with_outcome(binding, State::Sealed, outcome.unwrap())
+                        .unwrap()
                 );
                 assert_eq!(node.outcome(), outcome, "the receipt survives the seal");
             }
@@ -3074,6 +3135,365 @@ mod tests {
             }
             assert_eq!(node.state(), State::Sealed);
             assert_eq!(node.launcher.stopped(), 1);
+        }
+
+        #[test]
+        fn a_superseded_pause_or_resume_is_stale_and_never_acts_again() {
+            let binding = lifecycle_binding();
+            let node = Node::new();
+            node.paused();
+            for (request, operation, state) in [
+                (ctx().resume(op(55), binding), op(55), State::Running),
+                (ctx().pause(op(56), binding), op(56), State::Paused),
+                (ctx().resume(op(57), binding), op(57), State::Running),
+            ] {
+                assert_eq!(
+                    node.serve(request),
+                    ctx().accepted(operation, binding, state)
+                );
+            }
+            assert_eq!((node.launcher.freezes(), node.launcher.thaws()), (2, 2));
+
+            for (request, operation) in [
+                (ctx().pause(op(50), binding), op(50)),
+                (ctx().resume(op(55), binding), op(55)),
+            ] {
+                assert_eq!(
+                    node.serve(request),
+                    ctx().rejected(Some(operation), binding, Reason::StaleOperation),
+                    "a superseded operation is refused, never re-applied"
+                );
+            }
+            assert_eq!(node.state(), State::Running);
+            assert_eq!((node.launcher.freezes(), node.launcher.thaws()), (2, 2));
+
+            assert_eq!(
+                node.serve(ctx().pause(op(56), binding)),
+                ctx().accepted(op(56), binding, State::Running)
+            );
+            assert_eq!(
+                node.serve(ctx().resume(op(57), binding)),
+                ctx().accepted(op(57), binding, State::Running)
+            );
+            assert_eq!((node.launcher.freezes(), node.launcher.thaws()), (2, 2));
+        }
+
+        #[test]
+        fn every_applied_operation_replays_as_the_current_state_after_the_task_moved_on() {
+            let binding = lifecycle_binding();
+            let node = Node::new();
+            node.paused();
+            assert_eq!(
+                node.serve(ctx().resume(op(55), binding)),
+                ctx().accepted(op(55), binding, State::Running)
+            );
+            assert_eq!(
+                node.serve(ctx().stop(op(40), binding)),
+                ctx().accepted(op(40), binding, State::Stopped)
+            );
+            assert_eq!(
+                node.serve(ctx().seal(op(70), binding)),
+                ctx().accepted(op(70), binding, State::Sealed)
+            );
+            let effects = node.effects();
+            for (request, operation) in [
+                (ctx().create(op(10), binding), op(10)),
+                (
+                    signed_admit(ctx(), op(20), binding, &node.envelope()),
+                    op(20),
+                ),
+                (ctx().start(op(30), binding), op(30)),
+                (ctx().pause(op(50), binding), op(50)),
+                (ctx().resume(op(55), binding), op(55)),
+                (ctx().stop(op(40), binding), op(40)),
+                (ctx().seal(op(70), binding), op(70)),
+            ] {
+                assert_eq!(
+                    node.serve(request.clone()),
+                    ctx().accepted(operation, binding, State::Sealed),
+                    "{request:?}"
+                );
+            }
+            assert_eq!(node.effects(), effects, "a replay never acts");
+        }
+
+        #[test]
+        fn a_replaced_attempt_can_never_be_registered_again() {
+            let binding = lifecycle_binding();
+            let retry = TaskBinding::new(
+                binding.task(),
+                ExecutionAttemptId::from_u128(99),
+                binding.lease(),
+            );
+            let node = Node::with_capacity(1);
+            node.ready();
+            assert_eq!(
+                node.serve(ctx().stop(op(40), binding)),
+                ctx().accepted(op(40), binding, State::Stopped)
+            );
+            assert_eq!(
+                node.serve(ctx().create(op(80), retry)),
+                ctx().accepted(op(80), retry, State::Created)
+            );
+            assert_eq!(
+                node.serve(ctx().create(op(90), binding)),
+                ctx().rejected(Some(op(90)), binding, Reason::StaleOperation),
+                "while the new attempt is not finished"
+            );
+            assert_eq!(
+                node.serve(signed_admit(
+                    ctx(),
+                    op(81),
+                    retry,
+                    &node.envelope_for(retry, 2)
+                )),
+                ctx().accepted(op(81), retry, State::Ready)
+            );
+            assert_eq!(
+                node.serve(ctx().stop(op(82), retry)),
+                ctx().accepted(op(82), retry, State::Stopped)
+            );
+            for operation in [op(10), op(90)] {
+                assert_eq!(
+                    node.serve(ctx().create(operation, binding)),
+                    ctx().rejected(Some(operation), binding, Reason::StaleOperation),
+                    "once the new attempt is finished"
+                );
+            }
+            assert_eq!(
+                node.serve(ctx().inspect(retry)),
+                ctx()
+                    .inspected_with_outcome(retry, State::Stopped, Outcome::Failed)
+                    .unwrap()
+            );
+
+            let node = node.restart();
+            assert_eq!(
+                node.serve(ctx().create(op(90), binding)),
+                ctx().rejected(Some(op(90)), binding, Reason::StaleOperation),
+                "after a restart"
+            );
+            assert_eq!(
+                node.serve(ctx().inspect(binding)),
+                ctx().rejected(None, binding, Reason::TaskNotFound)
+            );
+
+            let Node {
+                _dir: dir, tasks, ..
+            } = node;
+            drop(tasks);
+            let node = Node::build(dir, 1, Duration::from_secs(10));
+            assert_eq!(
+                node.serve(ctx().create(op(91), retry)),
+                ctx().accepted(op(91), retry, State::Created)
+            );
+            assert_eq!(
+                node.serve(signed_admit(
+                    ctx(),
+                    op(92),
+                    retry,
+                    &node.envelope_for(retry, 3)
+                )),
+                ctx().accepted(op(92), retry, State::Ready)
+            );
+            node.serve(ctx().stop(op(93), retry));
+            assert_eq!(
+                node.serve(ctx().seal(op(94), retry)),
+                ctx().accepted(op(94), retry, State::Sealed)
+            );
+            let other = other_task(5);
+            assert_eq!(
+                node.serve(ctx().create(op(95), other)),
+                ctx().accepted(op(95), other, State::Created)
+            );
+            assert_eq!(
+                node.serve(ctx().inspect(retry)),
+                ctx().rejected(None, retry, Reason::TaskNotFound),
+                "evicted"
+            );
+            assert_eq!(
+                node.serve(ctx().create(op(96), binding)),
+                ctx().rejected(Some(op(96)), binding, Reason::StaleOperation),
+                "after eviction"
+            );
+            assert!(node.launcher.launches().is_empty());
+        }
+
+        #[test]
+        fn pauses_beyond_the_per_attempt_bound_are_refused_and_no_applied_id_is_forgotten() {
+            let binding = lifecycle_binding();
+            let node = Node::new();
+            node.running();
+            let pause = |index: usize| op(1_000 + u64::try_from(index).unwrap());
+            let resume = |index: usize| op(5_000 + u64::try_from(index).unwrap());
+            for index in 0..MAX_ATTEMPT_PAUSES {
+                assert_eq!(
+                    node.serve(ctx().pause(pause(index), binding)),
+                    ctx().accepted(pause(index), binding, State::Paused)
+                );
+                assert_eq!(
+                    node.serve(ctx().resume(resume(index), binding)),
+                    ctx().accepted(resume(index), binding, State::Running)
+                );
+            }
+            let effects = node.effects();
+            let next = pause(MAX_ATTEMPT_PAUSES);
+            assert_eq!(
+                node.serve(ctx().pause(next, binding)),
+                ctx().rejected(Some(next), binding, Reason::ResourceUnavailable)
+            );
+            for index in [0, MAX_ATTEMPT_PAUSES - 2] {
+                for (request, operation) in [
+                    (ctx().pause(pause(index), binding), pause(index)),
+                    (ctx().resume(resume(index), binding), resume(index)),
+                ] {
+                    assert_eq!(
+                        node.serve(request),
+                        ctx().rejected(Some(operation), binding, Reason::StaleOperation)
+                    );
+                }
+            }
+            let last = MAX_ATTEMPT_PAUSES - 1;
+            assert_eq!(
+                node.serve(ctx().pause(pause(last), binding)),
+                ctx().accepted(pause(last), binding, State::Running)
+            );
+            assert_eq!(
+                node.effects(),
+                effects,
+                "nothing was frozen or thawed again"
+            );
+            assert_eq!(
+                node.serve(ctx().stop(op(40), binding)),
+                ctx().accepted(op(40), binding, State::Stopped),
+                "stop is never held back by the bound"
+            );
+        }
+
+        #[test]
+        fn a_new_attempt_that_cannot_be_retired_durably_is_refused_and_changes_nothing() {
+            let binding = lifecycle_binding();
+            let retry = TaskBinding::new(
+                binding.task(),
+                ExecutionAttemptId::from_u128(99),
+                binding.lease(),
+            );
+            let node = Node::new();
+            node.drive(State::Exited);
+            std::fs::create_dir_all(
+                node.root
+                    .parent()
+                    .unwrap()
+                    .join("state")
+                    .join(crate::state::RETIRED_ATTEMPTS_FILE)
+                    .join("blocker"),
+            )
+            .unwrap();
+            assert_eq!(
+                node.serve(ctx().create(op(80), retry)),
+                ctx().rejected(Some(op(80)), retry, Reason::ResourceUnavailable)
+            );
+            node.assert_finished(State::Exited, Outcome::Completed);
+            assert_eq!(
+                node.serve(ctx().inspect(retry)),
+                ctx().rejected(None, retry, Reason::AttemptMismatch)
+            );
+        }
+
+        #[test]
+        fn a_revoke_that_would_overflow_the_revocation_store_is_refused_and_changes_nothing() {
+            let binding = lifecycle_binding();
+            let node = Node::new();
+            fill_revocations(&node.root.parent().unwrap().join("state"));
+            let node = node.restart();
+            node.running();
+            eventually(|| node.launcher.waiting() == 1);
+            assert_eq!(
+                node.serve(ctx().revoke(op(60), binding)),
+                ctx().rejected(Some(op(60)), binding, Reason::ResourceUnavailable)
+            );
+            assert_eq!(node.state(), State::Running);
+            assert_eq!(node.launcher.stopped(), 0);
+            assert!(!node.revoked_lease());
+            assert_eq!(
+                node.serve(ctx().stop(op(40), binding)),
+                ctx().accepted(op(40), binding, State::Stopped)
+            );
+            let node = node.restart();
+            assert_eq!(
+                node.serve(ctx().inspect(binding)),
+                ctx().rejected(None, binding, Reason::TaskNotFound),
+                "the node still starts on the full store"
+            );
+        }
+
+        #[test]
+        fn revoked_and_sealed_tasks_report_their_receipt_outcome() {
+            let binding = lifecycle_binding();
+            let node = Node::new();
+            node.drive(State::Revoked);
+            assert_eq!(
+                node.serve(ctx().inspect(binding)),
+                ctx()
+                    .inspected_with_outcome(binding, State::Revoked, Outcome::Failed)
+                    .unwrap()
+            );
+            node.serve(ctx().seal(op(70), binding));
+            assert_eq!(
+                node.serve(ctx().inspect(binding)),
+                ctx()
+                    .inspected_with_outcome(binding, State::Sealed, Outcome::Failed)
+                    .unwrap()
+            );
+
+            let node = Node::new();
+            node.drive(State::Sealed);
+            assert_eq!(
+                node.serve(ctx().inspect(binding)),
+                ctx()
+                    .inspected_with_outcome(binding, State::Sealed, Outcome::Completed)
+                    .unwrap()
+            );
+        }
+
+        #[test]
+        fn a_paused_task_whose_stop_times_out_reads_running_and_refuses_resume_and_pause() {
+            let binding = lifecycle_binding();
+            let node = Node::with_stop_timeout(Duration::from_millis(50));
+            node.paused();
+            node.launcher.set_on_stop(FakeStop::Ignore);
+            assert_eq!(
+                node.serve(ctx().stop(op(40), binding)),
+                ctx().rejected(Some(op(40)), binding, Reason::ResourceUnavailable)
+            );
+            assert!(
+                !node.launcher.frozen(),
+                "the tree was continued for the kill"
+            );
+            assert_eq!(
+                node.serve(ctx().inspect(binding)),
+                ctx().inspected(binding, State::Running),
+                "a continued tree that is being killed is not paused"
+            );
+            for (request, operation) in [
+                (ctx().resume(op(55), binding), op(55)),
+                (ctx().pause(op(56), binding), op(56)),
+            ] {
+                assert_eq!(
+                    node.serve(request),
+                    ctx().rejected(Some(operation), binding, Reason::InvalidState)
+                );
+            }
+            assert_eq!((node.launcher.freezes(), node.launcher.thaws()), (1, 1));
+            assert_eq!(node.state(), State::Running);
+
+            node.launcher.set_on_stop(FakeStop::Honour);
+            node.wait_for(State::Stopped);
+            assert_eq!(
+                node.serve(ctx().stop(op(40), binding)),
+                ctx().accepted(op(40), binding, State::Stopped)
+            );
+            node.assert_finished(State::Stopped, Outcome::Failed);
         }
 
         #[test]
@@ -3263,7 +3683,9 @@ mod tests {
             );
             assert_eq!(
                 node.serve(ctx().inspect(second)),
-                ctx().inspected(second, State::Sealed)
+                ctx()
+                    .inspected_with_outcome(second, State::Sealed, Outcome::Failed)
+                    .unwrap()
             );
             assert_eq!(
                 node.serve(ctx().create(op(40), fourth)),

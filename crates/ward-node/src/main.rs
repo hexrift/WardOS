@@ -3,7 +3,8 @@
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
 //! [--task-root <dir>]` serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
-//! admission version and revocation stores and the node's snapshot store (`cas`). Without
+//! admission version, revocation and retired-attempt stores and the node's snapshot store
+//! (`cas`). Without
 //! `--trusted-issuers` no issuer is trusted and every `admit` is refused; with it, each
 //! trusted key is bound to the one issuing principal (`prn_…`) whose leases it may sign. With
 //! `--task-root` (created mode 0700, refused if group- or world-accessible) the node starts
@@ -43,7 +44,7 @@ struct Cli {
     #[arg(long, required = true)]
     socket: Option<PathBuf>,
     /// Private node state directory (created mode 0700): pinned node id, last accepted
-    /// admission version per task, and known revocations.
+    /// admission version per task, known revocations and retired execution attempts.
     #[arg(long, required = true)]
     state_dir: Option<PathBuf>,
     /// This node's identity (`node_…`), the only audience it admits envelopes for.
