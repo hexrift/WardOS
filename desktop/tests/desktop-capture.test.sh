@@ -148,7 +148,7 @@ for want in 'exec-once = " cmd " >>" logs "/" name ".log 2>&1; echo \"exited $?\
   'assemble.py" check "$png"' 'assemble.py" describe "$logs/not-on-screen-$id.png"' 'ps -o pid,ppid,stat,etime,cmd -u' \
   "$trace_filter" 'layers [$(layers_seen)]' 'hyprctl dismissnotify' \
   'expect[tokyo]='"'"'--region 0,0,1920,32 --dominant "$(theme_token WARDOS_GROUND)"'"'"'' \
-  'layer_recreated waybar "$bar_was"' 'pid_gone "$swaybg_was"' 'wallpaper_is_not "$sha_was"'; do
+  'bar_ground_is "$(theme_token WARDOS_GROUND)"' 'pid_gone "$swaybg_was"' 'wallpaper_is_not "$sha_was"'; do
   grep -qF -- "$want" "$script" || fail "capture.sh does not have: $want"
 done
 for pkg in wl-clipboard cliphist dbus-daemon dbus-tools; do
@@ -157,6 +157,7 @@ done
 ! grep -qE '^[^#]*ward-shell worker' "$script" || fail "capture.sh must not start ward-shell worker itself (a tight loop with no session)"
 ! grep -q 'HYPRLAND_HEADLESS_ONLY=1' "$script" || fail "capture.sh must not set HYPRLAND_HEADLESS_ONLY: the DRM backend on vkms is the allocator"
 ! grep -qE 'hyprctl [a-z]+ -j [^|]*\| *jq' "$script" || fail "capture.sh pipes hyprctl straight into jq; use hypr_json, which checks for JSON first"
+! grep -q 'layer_recreated' "$script" || fail "capture.sh waits on the bar's layer addresses changing; Waybar may re-create its surface at the same address (run 9), wait on the bar's ground instead"
 grep -qx 'seatd' < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$cap/packages.txt") || fail "packages.txt lacks seatd"
 
 # drm_is, on a sysfs stand-in: a card is vkms's by driver name, by its device path (the

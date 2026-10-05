@@ -504,10 +504,12 @@ Escape would). Before every shot Hyprland's own notifications are dismissed
 for then; `hyprland-guiutils` is in the image now); a user clicks them away and they
 are not the desktop. The Tokyo Night scene waits for the switch itself, not the toast:
 the wallpaper re-drawn (its digest before and after is logged), swaybg replaced after
-that, Waybar's surface re-created on `SIGUSR2`, then a second for the re-render, and
-its shot's bar strip (the top 32 px, `window#waybar { background: @ground }`) must be
-dominated by the new theme's ground as the render has it (`assemble.py check --region
---dominant`). The whole frame cannot be the measure: the terminals of the `ward up` and
+that, the bar strip showing the new ground in a probe shot (the same `assemble.py
+check --region --dominant` the frame gets; Waybar re-creates its surface on `SIGUSR2`,
+but the new surface may take the old one's address, so the addresses are logged and
+not waited on), then a second for the re-render, and its shot's bar strip (the top
+32 px, `window#waybar { background: @ground }`) must be dominated by the new theme's
+ground as the render has it (`assemble.py check --region --dominant`). The whole frame cannot be the measure: the terminals of the `ward up` and
 `ward watch` scenes still cover most of it in Ward Dark, as open terminals do on any
 desktop (foot reads its colours once, at start), and the wallpaper shows only in the
 gaps. `assemble.py` makes the GIF from
