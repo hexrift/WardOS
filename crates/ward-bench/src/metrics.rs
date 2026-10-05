@@ -1,9 +1,11 @@
 //! The CI-measurable subset (#150): sandbox start, `ward status`, verifier
-//! spawn, and snapshot/digest work. Each metric calls straight into
+//! spawn, snapshot/digest work, observer event propagation and pause
+//! acknowledgement. Each metric calls straight into
 //! `ward-daemon`/`ward-snapshot`'s public API — the same code paths `ward
-//! run`/`ward status`/`ward verify` use — rather than shelling out, so a
-//! failure points at a real function instead of CLI plumbing, and no daemon
-//! process or terminal is needed.
+//! run`/`ward status`/`ward verify`/`ward pause` use — rather than shelling
+//! out, so a failure points at a real function instead of CLI plumbing, and
+//! no daemon process or terminal is needed: the two metrics that need a
+//! daemon serve it in-process.
 
 use std::path::Path;
 use std::sync::mpsc;
@@ -594,6 +596,187 @@ fn release_from(project: &Path, first: usize, end: usize) -> anyhow::Result<()> 
     Ok(())
 }
 
+const PAUSE_REASON: &str = "ward benchmark: pause acknowledgement";
+const RUNNING_MARKER: &str = "ward-bench-pause-running";
+const RUNNER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pause acknowledgement latency (ADR-0019 §3): from `client::pause` sending
+/// `Request::Pause` over the session's control socket — the exact call `ward
+/// pause` makes — to its answer carrying a confirmed `SessionPaused` record,
+/// with a real daemon (`daemon::serve`, in-process) and a still-running
+/// sandboxed command to freeze. That answer comes only once the tree is
+/// frozen and confirmed settled, the proxy marker written, the approvals held
+/// and the record appended. Every sample is followed by `client::resume`
+/// (untimed); an unsettled freeze or any record other than `SessionPaused` is
+/// a failure, never a sample. The command execs one long `sleep`, so nothing
+/// forks while it is sampled, and `ward stop`'s own termination ends it.
+#[must_use]
+pub fn pause_acknowledgement(
+    fixtures_root: &Path,
+    state: &Path,
+    warm_up_count: usize,
+    samples: usize,
+) -> Metric {
+    let id = "pause_acknowledgement";
+    let description = "`ward pause` request over the control socket to the confirmed \
+        `SessionPaused` answer, a running sandboxed command frozen; resumed after each";
+    let budget_row = Some("Pause acknowledgement");
+    let budget_ms = Some(100.0);
+    if !ward_daemon::sandbox::available() {
+        return Metric::unsupported(
+            id,
+            description,
+            budget_row,
+            budget_ms,
+            "bubblewrap is not installed, or cannot create a user namespace on this \
+             host (ward_daemon::sandbox::available() returned false); see \
+             docs/performance.md §5",
+        );
+    }
+    let result = pause_samples(
+        &fixtures_root.join("ci-subset"),
+        state,
+        warm_up_count,
+        samples,
+    );
+    finish(
+        &MetricMeta {
+            id,
+            description,
+            budget_row,
+            budget_ms,
+            fixture: "ci-subset",
+            run_kind: "warm",
+            warm_up: warm_up_count,
+        },
+        result,
+    )
+}
+
+fn pause_samples(
+    fixture: &Path,
+    state: &Path,
+    warm_up_count: usize,
+    samples: usize,
+) -> anyhow::Result<Samples> {
+    let project = tempfile::tempdir()?;
+    copy_tree(fixture, project.path())?;
+
+    let up = Session::start_in(project.path(), state).map_err(to_anyhow)?;
+    let session_id = up.id().to_owned();
+    up.persist_current().map_err(to_anyhow)?;
+    drop(up);
+    let served = {
+        let (state, session_id) = (state.to_path_buf(), session_id.clone());
+        std::thread::spawn(move || daemon::serve(&state, &session_id))
+    };
+    if !daemon::wait_until(daemon::STARTUP_TIMEOUT, || {
+        daemon::serving(state, &session_id) || served.is_finished()
+    }) || !daemon::serving(state, &session_id)
+    {
+        let served = served.is_finished().then(|| join_daemon(served));
+        let stopped = stop_current(project.path(), state);
+        served.transpose()?;
+        stopped?;
+        anyhow::bail!("the session daemon did not start serving");
+    }
+
+    let script = format!(": > /work/{RUNNING_MARKER}; exec sleep 600");
+    let runner = Session::open_current(project.path(), state)
+        .map_err(to_anyhow)
+        .and_then(|found| {
+            found.ok_or_else(|| anyhow::anyhow!("the persisted session is not current"))
+        })
+        .map(|mut session| {
+            std::thread::spawn(move || {
+                let _ended_by_the_stop = session.run(&["/bin/sh".into(), "-c".into(), script]);
+            })
+        });
+    let measured = match &runner {
+        Ok(runner) => time_pauses(
+            project.path(),
+            &daemon::socket_path(state, &session_id),
+            runner,
+            warm_up_count + samples,
+        ),
+        Err(e) => Err(anyhow::anyhow!(
+            "could not open the session to run in: {e:#}"
+        )),
+    };
+
+    let stopped = stop_current(project.path(), state);
+    if let Ok(ended) = &stopped {
+        if let Ok(runner) = runner {
+            runner
+                .join()
+                .map_err(|_| anyhow::anyhow!("the sandboxed command's thread panicked"))?;
+        }
+        join_daemon(served)?;
+        if measured.is_ok() && *ended == 0 {
+            anyhow::bail!("the sandboxed command was no longer running when the session stopped");
+        }
+    }
+    let durations = measured?;
+    stopped?;
+    Ok(Samples {
+        durations: durations.into_iter().skip(warm_up_count).collect(),
+        ..Default::default()
+    })
+}
+
+fn time_pauses(
+    project: &Path,
+    socket: &Path,
+    runner: &std::thread::JoinHandle<()>,
+    total: usize,
+) -> anyhow::Result<Vec<Duration>> {
+    let marker = project.join(RUNNING_MARKER);
+    if !daemon::wait_until(RUNNER_TIMEOUT, || marker.exists() || runner.is_finished())
+        || runner.is_finished()
+    {
+        anyhow::bail!("the sandboxed command did not start running");
+    }
+    let mut control = client::connect(socket).map_err(to_anyhow)?;
+    let mut durations = Vec::with_capacity(total);
+    for sample in 0..total {
+        let started = std::time::Instant::now();
+        let paused = client::pause(&mut control, PAUSE_REASON);
+        let elapsed = started.elapsed();
+        let resumed = client::resume(&mut control);
+        let paused = paused.map_err(|e| anyhow::anyhow!("pause {sample} was refused: {e}"))?;
+        if let Some(pending) = paused.unsettled {
+            anyhow::bail!("pause {sample} did not settle: {pending} process(es) still running");
+        }
+        if !matches!(paused.record.event, WardEvent::SessionPaused { .. }) {
+            anyhow::bail!("pause {sample} answered {:?}", paused.record.event);
+        }
+        let resumed = resumed.map_err(|e| anyhow::anyhow!("resume {sample} was refused: {e}"))?;
+        if !matches!(resumed.event, WardEvent::SessionResumed { .. }) {
+            anyhow::bail!("resume {sample} answered {:?}", resumed.event);
+        }
+        if runner.is_finished() {
+            anyhow::bail!("the sandboxed command ended during pause {sample}");
+        }
+        durations.push(elapsed);
+    }
+    Ok(durations)
+}
+
+fn stop_current(project: &Path, state: &Path) -> anyhow::Result<u32> {
+    Session::open_current(project, state)
+        .map_err(to_anyhow)?
+        .ok_or_else(|| anyhow::anyhow!("the persisted session is not current"))?
+        .stop(EndReason::UserStop)
+        .map_err(to_anyhow)
+}
+
+fn join_daemon(served: std::thread::JoinHandle<ward_daemon::Result<()>>) -> anyhow::Result<()> {
+    served
+        .join()
+        .map_err(|_| anyhow::anyhow!("the daemon thread panicked"))?
+        .map_err(to_anyhow)
+}
+
 fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
@@ -745,6 +928,37 @@ mod tests {
             }
             MetricStatus::NotImplemented => {
                 panic!("observer propagation is implemented by this slice")
+            }
+        }
+    }
+
+    #[test]
+    fn pause_acknowledgement_uses_the_real_control_path_or_reports_unsupported() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let metric = pause_acknowledgement(&fixtures_root(), state.path(), 1, 3);
+
+        assert_eq!(metric.id, "pause_acknowledgement");
+        assert_eq!(metric.budget_row.as_deref(), Some("Pause acknowledgement"));
+        assert_eq!(metric.budget_ms, Some(100.0));
+        if ward_daemon::sandbox::available() {
+            assert_eq!(metric.status, MetricStatus::Measured, "{metric:?}");
+        }
+        match metric.status {
+            MetricStatus::Measured => {
+                let measured = metric.stats.expect("measured");
+                assert_eq!(measured.samples, 3);
+                assert_eq!(measured.warm_up_discarded, 1);
+                assert!(measured.p50_ms > 0.0);
+                assert!(measured.p99_ms >= measured.p50_ms);
+            }
+            MetricStatus::Unsupported => {
+                assert!(
+                    metric.unmeasured_reason.is_some(),
+                    "unsupported measurements must explain why"
+                );
+            }
+            MetricStatus::NotImplemented => {
+                panic!("pause acknowledgement is implemented by this slice")
             }
         }
     }

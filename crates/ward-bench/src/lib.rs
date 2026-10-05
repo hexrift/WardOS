@@ -87,6 +87,12 @@ pub fn run_ci_subset(fixtures_root: &Path, options: Options) -> anyhow::Result<R
         options.warm_up,
         options.samples,
     ));
+    metrics.push(metrics::pause_acknowledgement(
+        fixtures_root,
+        state.path(),
+        options.warm_up,
+        options.samples,
+    ));
 
     metrics.extend(unsupported::not_implemented_metrics());
 
@@ -168,6 +174,32 @@ mod tests {
         assert_eq!(ts.as_bytes()[4], b'-');
         assert_eq!(ts.as_bytes()[7], b'-');
         assert_eq!(ts.as_bytes()[10], b'T');
+    }
+
+    #[test]
+    fn the_ci_subset_reports_pause_acknowledgement_once_and_every_id_once() {
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/fixtures");
+        let report = run_ci_subset(
+            &fixtures,
+            Options {
+                samples: 1,
+                warm_up: 0,
+            },
+        )
+        .expect("the subset runs");
+        let ids: Vec<&str> = report.metrics.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids.iter()
+                .filter(|id| **id == "pause_acknowledgement")
+                .count(),
+            1,
+            "{ids:?}"
+        );
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "duplicate metric id in {ids:?}");
     }
 
     #[test]
