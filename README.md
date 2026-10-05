@@ -275,6 +275,9 @@ that gate each phase.
 | [`docs/release-manifest.md`](docs/release-manifest.md) | The machine-readable release manifest format (ADR-0028) and its generator |
 | [`docs/compatibility.md`](docs/compatibility.md) | The `ward-node` protocol window, version skew and upgrade order for an external control plane |
 | [`docs/node-acceptance.md`](docs/node-acceptance.md) | The cross-system acceptance suite for the `ward-node` contract: each case, its pass criterion, how to run it, what it does not prove |
+| [`docs/node-integration-guide.md`](docs/node-integration-guide.md) | From an empty host to a verified `ward-node` attempt: install, issuer key and trust store, snapshot, one pre-signed run, receipt and evidence, failures, restarts |
+| [`docs/node-security-limitations.md`](docs/node-security-limitations.md) | What `ward-node` enforces and what it does not yet, each gap with its impact for a control plane, the mitigation today and the issue that closes it |
+| [`docs/node-release-readiness.md`](docs/node-release-readiness.md) | What CI proves about `ward-node` on every change, what a release publishes, what is not proven, and the checks before tagging |
 | [`docs/agent-integration.md`](docs/agent-integration.md) | How `ward claude` / `ward codex` compose the sandbox, proxy, credentials and hooks |
 | [`docs/design-language.md`](docs/design-language.md) | Visual and interaction identity of the WardOS desktop |
 | [`docs/desktop.md`](docs/desktop.md) | The desktop: commands, keys, menu, themes, packages, parity with Omarchy |
