@@ -169,8 +169,11 @@ fn a_truncated_or_oversized_response_fails_closed() {
         if index == 0 {
             writer.write_all(br#"{"response":"accepted""#).unwrap();
         } else {
-            writer.write_all(&vec![b'x'; MAX_LINE_BYTES + 1]).unwrap();
-            writer.write_all(b"\n").unwrap();
+            // The client closes the connection as soon as the line passes the
+            // bound, which may be before the fake node has written all of it: a
+            // broken pipe here is the behaviour under test, not a failure of it.
+            let _ = writer.write_all(&vec![b'x'; MAX_LINE_BYTES + 1]);
+            let _ = writer.write_all(b"\n");
         }
     });
     let transport = transport(&socket);
