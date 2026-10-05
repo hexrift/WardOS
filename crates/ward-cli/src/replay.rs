@@ -558,6 +558,26 @@ fn summary(event: &WardEvent) -> String {
             outcome.map_or_else(String::new, |o| format!(" · {}", o.as_str()))
         ),
         WardEvent::NodeAttemptSealed { operation } => format!("sealed · op {operation}"),
+        WardEvent::NodeAttemptOutputCollected {
+            stdout,
+            stderr,
+            files,
+        } => format!(
+            "output collected · stdout {} B (+{} dropped) · stderr {} B (+{} dropped) · {} file(s): {}",
+            stdout.returned,
+            stdout.dropped,
+            stderr.returned,
+            stderr.dropped,
+            files.len(),
+            files
+                .iter()
+                .map(|file| match file.digest {
+                    Some(digest) => format!("{} {} {}", file.path, file.status.as_str(), digest),
+                    None => format!("{} {}", file.path, file.status.as_str()),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         WardEvent::NetworkRequested { .. }
         | WardEvent::NetworkDenied { .. }
         | WardEvent::CapabilityRequested { .. }

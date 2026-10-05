@@ -72,6 +72,15 @@
 //!   receipt, and the reaper keeps killing.
 //! * `seal` (protocol 1.3, with execution) moves an `exited`, `stopped` or `revoked` task
 //!   to the terminal [`TaskLifecycleState::Sealed`]; the receipt is kept.
+//! * `result` (protocol 1.3, with execution that returns output,
+//!   [`crate::execution::NodeExecution::with_output_return`]) is read-only: for an
+//!   `exited`, `stopped`, `revoked` or `sealed` attempt whose reaper collected and stored
+//!   the output its manifest's `output` grant asked for ([`crate::output`]), it returns
+//!   that bounded result with the task's state. It is `unsupported_operation` on a node
+//!   that returns no output or below 1.3, `invalid_state` while the attempt has not
+//!   ended, and `resource_unavailable` when no stored result exists: the manifest asked
+//!   for none, the workload never ran or was lost, the node restarted before the output
+//!   was collected, or the collection could not be recorded in the evidence log.
 //!
 //! The reaper waits on the workload promptly and, when it ends, moves the task
 //! `Running → Exited` (or `Paused → Exited`) under the registry lock with a
@@ -169,10 +178,11 @@ use ward_events::{
     WardEvent,
 };
 use ward_node_protocol::{
-    AdmissionEnvelopeJson, IssuerProof, NetworkGrant, OperationId, TaskAdmissionEnvelope,
-    TaskBinding, TaskExecutionOutcome, TaskExecutionReceipt, TaskLifecycleContext,
-    TaskLifecycleRejectionReason, TaskLifecycleRequest, TaskLifecycleResponse, TaskLifecycleState,
-    TaskReceiptContext, supports_task_admission,
+    AdmissionEnvelopeJson, AttemptOutput, IssuerProof, NetworkGrant, OperationId,
+    TaskAdmissionEnvelope, TaskBinding, TaskExecutionOutcome, TaskExecutionReceipt,
+    TaskLifecycleContext, TaskLifecycleRejectionReason, TaskLifecycleRequest,
+    TaskLifecycleResponse, TaskLifecycleState, TaskReceiptContext, TaskResultResponse,
+    supports_task_admission,
 };
 
 use crate::admission::TrustedTaskAdmission;
@@ -181,8 +191,9 @@ use crate::egress::{AttemptEgress, DEFAULT_QUIESCE, Drained, overflow_marker};
 use crate::evidence::{AttemptEvidence, attempt_outcome, attempt_state};
 use crate::execution::{
     LaunchRequest, NodeExecution, SandboxLauncher, SpawnError, StopSignal, TaskLauncher,
-    WorkloadExit, WorkloadFreezer, WorkloadProcess,
+    WorkloadEnd, WorkloadExit, WorkloadFreezer, WorkloadProcess,
 };
+use crate::output::{AttemptOutputStore, CapturedStdio, collect, collected_event};
 use crate::records::{
     AdmitRecord, AuthorityRecord, RECORD_FORMAT, RecordedState, SealRecord, TaskRecord,
     TaskRecordError, TaskStore,
@@ -379,6 +390,26 @@ impl Evidence<'_> {
         })
     }
 
+    /// Record that `output` was collected for `binding`; a result the log will not bind
+    /// is removed from the store so it is never served.
+    fn record_output(self, binding: TaskBinding, output: &AttemptOutput) {
+        let Some(root) = self.0 else {
+            return;
+        };
+        let recorded =
+            collected_event(output).is_some_and(|event| self.append(binding, event).is_ok());
+        if !recorded {
+            let _ = AttemptOutputStore::new(root.dir(), binding).remove();
+        }
+    }
+
+    /// Remove a stored result of `binding` the log never bound.
+    fn unbind_output(self, binding: TaskBinding) {
+        if let Some(root) = self.0 {
+            let _ = AttemptOutputStore::new(root.dir(), binding).remove();
+        }
+    }
+
     fn seal(self, task: &NodeTask, ended: TaskLifecycleState) -> Result<(), Reason> {
         let (Some(root), Some(sealed)) = (self.0, task.sealed) else {
             return Ok(());
@@ -431,11 +462,17 @@ impl TaskRegistry {
         execution: Option<NodeExecution>,
     ) -> Result<Self, TaskRecordError> {
         let store = TaskStore::open(admission.state().dir())?;
-        let admission = admission.with_network_allowlist(
-            execution
-                .as_ref()
-                .is_some_and(NodeExecution::honours_network_allowlist),
-        );
+        let admission = admission
+            .with_network_allowlist(
+                execution
+                    .as_ref()
+                    .is_some_and(NodeExecution::honours_network_allowlist),
+            )
+            .with_output_return(
+                execution
+                    .as_ref()
+                    .is_some_and(NodeExecution::honours_output_return),
+            );
         let survivors: Arc<dyn TaskLauncher> = execution
             .as_ref()
             .map_or_else(|| Arc::new(SandboxLauncher), NodeExecution::launcher);
@@ -458,6 +495,7 @@ impl TaskRegistry {
                         task: task.binding.task(),
                         source,
                     })?;
+                reconcile_output(execution.task_root(), task.binding);
             }
             if let Some(sealed) = task.sealed {
                 seals = seals.max(sealed.order.saturating_add(1));
@@ -613,6 +651,50 @@ impl TaskRegistry {
                 Ok(lock()?.finish_revoke(context, operation_id, binding))
             }
             other => Ok(lock()?.handle(context, other)),
+        }
+    }
+
+    /// Serve one `result` request against the shared registry: the bounded output of the
+    /// ended attempt `binding` names, as its reaper stored it (see the module docs).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskRegistryUnavailable`] if the registry lock is poisoned.
+    pub fn result(
+        registry: &SharedRegistry,
+        context: TaskLifecycleContext,
+        binding: TaskBinding,
+    ) -> Result<TaskResultResponse, TaskRegistryUnavailable> {
+        let registry = registry.lock().map_err(|_| TaskRegistryUnavailable)?;
+        Ok(registry.result_of(context, binding))
+    }
+
+    fn result_of(&self, context: TaskLifecycleContext, binding: TaskBinding) -> TaskResultResponse {
+        let refuse = |reason| context.result_rejected(binding, reason);
+        let Some(execution) = self
+            .execution
+            .as_ref()
+            .filter(|execution| execution.honours_output_return())
+        else {
+            return refuse(Reason::UnsupportedOperation);
+        };
+        if self.admission.is_none() || !supports_task_admission(context.protocol()) {
+            return refuse(Reason::UnsupportedOperation);
+        }
+        let Some(task) = self.tasks.get(&binding.task()) else {
+            return refuse(Reason::TaskNotFound);
+        };
+        if let Err(reason) = task.matches(binding) {
+            return refuse(reason);
+        }
+        if !finished(task.state) {
+            return refuse(Reason::InvalidState);
+        }
+        match AttemptOutputStore::new(execution.task_root().dir(), binding).read() {
+            Ok(Some(output)) => context
+                .result_response(binding, task.state, output)
+                .unwrap_or_else(|_| refuse(Reason::ResourceUnavailable)),
+            Ok(None) | Err(_) => refuse(Reason::ResourceUnavailable),
         }
     }
 
@@ -1066,9 +1148,14 @@ impl TaskRegistry {
             workload.argv().args().to_vec(),
             Duration::from_millis(workload.wall_clock_budget_ms()),
         );
-        let request = match workload.capability_manifest().manifest().network() {
+        let manifest = workload.capability_manifest().manifest();
+        let request = match manifest.network() {
             NetworkGrant::Offline => request,
             NetworkGrant::Custom(allowlist) => request.with_allowlist(allowlist.clone()),
+        };
+        let request = match manifest.output() {
+            Some(output) => request.with_output(output.clone()),
+            None => request,
         };
         Ok(Prepared::Launch(
             request,
@@ -1131,14 +1218,15 @@ impl TaskRegistry {
                     return;
                 }
                 let egress = workload.egress();
-                let exit = workload.wait(&reaper.stop, &mut || {
+                let WorkloadEnd { exit, stdio } = workload.wait(&reaper.stop, &mut || {
                     reaper.drain(egress.as_deref());
                 });
                 let last = egress.as_deref().map(|egress| {
                     egress.quiesce(DEFAULT_QUIESCE);
                     egress.drain()
                 });
-                reaper.record(exit, last);
+                let output = collect_output(&request, exit, stdio);
+                reaper.record(exit, last, output.as_ref());
             });
 
         let spawned = match thread {
@@ -1353,6 +1441,7 @@ impl TaskRegistry {
         reaped: &Arc<Reaped>,
         exit: WorkloadExit,
         last: Option<Drained>,
+        output: Option<&AttemptOutput>,
     ) {
         let journal = Journal(self.store.as_ref());
         let evidence = Evidence::of(self.execution.as_ref());
@@ -1361,12 +1450,18 @@ impl TaskRegistry {
             .get_mut(&binding.task())
             .filter(|task| task.binding == binding && live(task.state))
         else {
+            if output.is_some() {
+                evidence.unbind_output(binding);
+            }
             return;
         };
         if let Some(last) = last {
             task.record_network(evidence, reaped, last);
         }
         task.record_network_gap(evidence, reaped);
+        if let Some(output) = output {
+            evidence.record_output(binding, output);
+        }
         if task.finish_attempt(exit, reaped) {
             let _ = journal.write(&task.record());
             let _ = evidence.append(binding, task.ended_event(attempt_end(exit)));
@@ -1429,16 +1524,54 @@ impl Reaper {
         }
     }
 
-    fn record(self, exit: WorkloadExit, last: Option<Drained>) {
+    fn record(self, exit: WorkloadExit, last: Option<Drained>, output: Option<&AttemptOutput>) {
         if let Some(registry) = self.registry.upgrade() {
             if let Ok(mut registry) = registry.lock() {
-                registry.record_exit(self.binding, &self.reaped, exit, last);
+                registry.record_exit(self.binding, &self.reaped, exit, last, output);
             }
             self.reaped.set();
             drop(registry);
         } else {
             self.reaped.set();
         }
+    }
+}
+
+/// Collect and durably store what `request`'s output grant asks for, on the reaper's
+/// thread once the workload has ended and been reaped; `None` when the launch had no
+/// grant, when the node lost track of the workload (its workspace is left unread), or
+/// when the result could not be stored (nothing is then served).
+fn collect_output(
+    request: &LaunchRequest,
+    exit: WorkloadExit,
+    stdio: CapturedStdio,
+) -> Option<AttemptOutput> {
+    let grant = request.output()?;
+    if exit == WorkloadExit::Lost {
+        return None;
+    }
+    let output = collect(request.workspace(), grant, stdio);
+    let store = AttemptOutputStore::beside(request.workspace())?;
+    store.write(&output).ok()?;
+    Some(output)
+}
+
+/// After a restart, remove a stored result of `binding` that its evidence log does not
+/// bind (the node died between storing and recording it), so it is never served.
+fn reconcile_output(root: &TaskRoot, binding: TaskBinding) {
+    let store = AttemptOutputStore::new(root.dir(), binding);
+    if !store.dir().join(crate::output::RESULT_FILE).exists() {
+        return;
+    }
+    let bound =
+        crate::evidence::verify(&crate::evidence::evidence_dir(root.dir(), binding), binding)
+            .is_ok_and(|log| {
+                log.records().iter().any(|record| {
+                    matches!(record.event, WardEvent::NodeAttemptOutputCollected { .. })
+                })
+            });
+    if !bound {
+        let _ = store.remove();
     }
 }
 
@@ -3043,7 +3176,7 @@ mod tests {
         use crate::test_support::{
             FAKE_PID, FakeFreeze, FakeLauncher, FakeSpawn, FakeStop, FixedClock, NOW,
             envelope_input, eventually, fake_process, fill_revocations, lifecycle_binding,
-            network_manifest, node_admission, signed_admit,
+            network_manifest, node_admission, output_manifest, signed_admit,
         };
         use crate::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
 
@@ -3067,6 +3200,7 @@ mod tests {
                     MAX_NODE_TASKS,
                     stop_timeout,
                     false,
+                    false,
                 )
             }
 
@@ -3075,6 +3209,7 @@ mod tests {
                     tempfile::tempdir().unwrap(),
                     capacity,
                     Duration::from_secs(10),
+                    false,
                     false,
                 )
             }
@@ -3085,6 +3220,17 @@ mod tests {
                     MAX_NODE_TASKS,
                     Duration::from_secs(10),
                     true,
+                    false,
+                )
+            }
+
+            fn with_output_return() -> Self {
+                Self::build(
+                    tempfile::tempdir().unwrap(),
+                    MAX_NODE_TASKS,
+                    Duration::from_secs(10),
+                    false,
+                    true,
                 )
             }
 
@@ -3093,6 +3239,7 @@ mod tests {
                 capacity: usize,
                 stop_timeout: Duration,
                 network_allowlist: bool,
+                output_return: bool,
             ) -> Self {
                 let state = dir.path().join("state");
                 let clock = FixedClock::at(NOW);
@@ -3110,7 +3257,8 @@ mod tests {
                     Arc::new(launcher.clone()),
                 )
                 .with_stop_timeout(stop_timeout)
-                .with_network_allowlist(network_allowlist);
+                .with_network_allowlist(network_allowlist)
+                .with_output_return(output_return);
                 let tasks = Arc::new(Mutex::new(
                     TaskRegistry::with_execution(capacity, admission, execution).unwrap(),
                 ));
@@ -3127,11 +3275,29 @@ mod tests {
             /// Drop the registry, as a node restart does, and serve again over the same
             /// state directory and task root.
             fn restart(self) -> Self {
+                self.restart_with_output_return(false)
+            }
+
+            fn restart_with_output_return(self, output_return: bool) -> Self {
                 let Self {
                     _dir: dir, tasks, ..
                 } = self;
                 drop(tasks);
-                Self::build(dir, MAX_NODE_TASKS, Duration::from_secs(10), false)
+                Self::build(
+                    dir,
+                    MAX_NODE_TASKS,
+                    Duration::from_secs(10),
+                    false,
+                    output_return,
+                )
+            }
+
+            fn result(&self) -> ward_node_protocol::TaskResultResponse {
+                TaskRegistry::result(&self.tasks, ctx(), lifecycle_binding()).unwrap()
+            }
+
+            fn output_store(&self) -> crate::output::AttemptOutputStore {
+                crate::output::AttemptOutputStore::new(&self.root, lifecycle_binding())
             }
 
             fn serve(&self, request: TaskLifecycleRequest) -> TaskLifecycleResponse {
@@ -3290,6 +3456,337 @@ mod tests {
             let offline = Node::with_network_allowlist();
             offline.running();
             assert_eq!(offline.launcher.launches()[0].allowlist(), None);
+        }
+
+        fn output_grant_launch(node: &Node, manifest: ward_node_protocol::CapabilityManifestBytes) {
+            let binding = lifecycle_binding();
+            node.ready_with(&node.envelope_with(manifest));
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().accepted(op(30), binding, State::Running)
+            );
+        }
+
+        fn returned(
+            response: &ward_node_protocol::TaskResultResponse,
+        ) -> (State, &ward_node_protocol::AttemptOutput) {
+            match response {
+                ward_node_protocol::TaskResultResponse::Result { state, output, .. } => {
+                    (*state, output)
+                }
+                other @ ward_node_protocol::TaskResultResponse::Rejected { .. } => {
+                    panic!("result refused: {other:?}")
+                }
+            }
+        }
+
+        #[test]
+        fn an_output_grant_is_honoured_only_by_a_node_returning_output_within_the_ceilings() {
+            let binding = lifecycle_binding();
+            let plain = Node::new();
+            plain.serve(ctx().create(op(10), binding));
+            assert_eq!(
+                plain.serve(signed_admit(
+                    ctx(),
+                    op(20),
+                    binding,
+                    &plain.envelope_with(output_manifest(16, &["out.txt"], 1024))
+                )),
+                ctx().rejected(Some(op(20)), binding, Reason::UnsupportedGrant)
+            );
+            assert_eq!(plain.state(), State::Created);
+            assert_eq!(plain.evidence(), Vec::new());
+            assert!(!plain.root.join(binding.task().to_string()).exists());
+
+            let returning = Node::with_output_return();
+            returning.serve(ctx().create(op(10), binding));
+            for over in [
+                output_manifest(
+                    ward_node_protocol::MAX_OUTPUT_STDIO_BYTES + 1,
+                    &["out.txt"],
+                    1024,
+                ),
+                output_manifest(
+                    16,
+                    &["out.txt"],
+                    ward_node_protocol::MAX_OUTPUT_FILES_BYTES + 1,
+                ),
+            ] {
+                assert_eq!(
+                    returning.serve(signed_admit(
+                        ctx(),
+                        op(20),
+                        binding,
+                        &returning.envelope_with(over)
+                    )),
+                    ctx().rejected(Some(op(20)), binding, Reason::UnsupportedGrant),
+                    "above the ceilings the grant is refused, consuming no version"
+                );
+            }
+            output_grant_launch(
+                &returning,
+                output_manifest(
+                    ward_node_protocol::MAX_OUTPUT_STDIO_BYTES,
+                    &["out.txt"],
+                    ward_node_protocol::MAX_OUTPUT_FILES_BYTES,
+                ),
+            );
+            let launches = returning.launcher.launches();
+            assert_eq!(launches.len(), 1);
+            assert_eq!(
+                launches[0]
+                    .output()
+                    .map(ward_node_protocol::OutputGrant::stdio_bytes),
+                Some(ward_node_protocol::MAX_OUTPUT_STDIO_BYTES)
+            );
+
+            let offline = Node::with_output_return();
+            offline.running();
+            assert_eq!(offline.launcher.launches()[0].output(), None);
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn an_ended_attempts_output_is_collected_stored_recorded_and_returned() {
+            let node = Node::with_output_return();
+            let binding = lifecycle_binding();
+            node.launcher
+                .set_stdio(b"0123456789abcdef-and-more", b"err");
+            output_grant_launch(
+                &node,
+                output_manifest(16, &["out.txt", "sub/deep.txt", "nope.txt"], 1024),
+            );
+            eventually(|| node.launcher.waiting() == 1);
+            assert_eq!(
+                node.result(),
+                ctx().result_rejected(binding, Reason::InvalidState),
+                "no result while the attempt runs"
+            );
+            assert!(node.output_store().read().unwrap().is_none());
+
+            std::fs::write(node.workspace().join("out.txt"), b"all done\n").unwrap();
+            std::fs::create_dir(node.workspace().join("sub")).unwrap();
+            std::fs::write(node.workspace().join("sub/deep.txt"), b"deep").unwrap();
+            node.launcher.exit(WorkloadExit::Exited { code: Some(0) });
+            node.wait_for(State::Exited);
+            node.assert_finished(State::Exited, Outcome::Completed);
+
+            let response = node.result();
+            let (state, output) = returned(&response);
+            assert_eq!(state, State::Exited);
+            assert_eq!(output.stdout().content(), b"0123456789abcdef");
+            assert_eq!(output.stdout().dropped(), 9);
+            assert_eq!(output.stderr().content(), b"err");
+            assert_eq!(output.stderr().dropped(), 0);
+            let files: Vec<(&str, &ward_node_protocol::OutputFileStatus)> = output
+                .files()
+                .iter()
+                .map(|file| (file.path.as_str(), &file.status))
+                .collect();
+            assert_eq!(
+                files,
+                [
+                    (
+                        "out.txt",
+                        &ward_node_protocol::OutputFileStatus::Returned {
+                            size: 9,
+                            digest: ward_events::Blake3Hash::hash(b"all done\n"),
+                            content: b"all done\n".to_vec(),
+                        }
+                    ),
+                    (
+                        "sub/deep.txt",
+                        &ward_node_protocol::OutputFileStatus::Returned {
+                            size: 4,
+                            digest: ward_events::Blake3Hash::hash(b"deep"),
+                            content: b"deep".to_vec(),
+                        }
+                    ),
+                    (
+                        "nope.txt",
+                        &ward_node_protocol::OutputFileStatus::Skipped(
+                            ward_node_protocol::OutputFileSkip::Missing
+                        )
+                    ),
+                ]
+            );
+            assert_eq!(node.output_store().read().unwrap().as_ref(), Some(output));
+            assert_eq!(
+                mode(node.output_store().dir()),
+                0o700,
+                "the output directory is private"
+            );
+            assert_eq!(
+                mode(&node.output_store().dir().join(crate::output::RESULT_FILE)),
+                0o600
+            );
+            assert!(
+                !node.workspace().join("result.json").exists(),
+                "nothing is written into the workspace"
+            );
+
+            let events = node.evidence();
+            assert_eq!(events.len(), 4, "{events:?}");
+            assert_eq!(
+                events[2],
+                crate::output::collected_event(output).unwrap(),
+                "the collection is recorded, with every digest, before the end"
+            );
+            assert!(matches!(
+                events[3],
+                WardEvent::NodeAttemptEnded {
+                    state: NodeAttemptState::Exited,
+                    outcome: NodeAttemptOutcome::Completed,
+                    ..
+                }
+            ));
+
+            assert_eq!(
+                node.serve(ctx().seal(op(60), binding)),
+                ctx().accepted(op(60), binding, State::Sealed)
+            );
+            let after_seal = node.result();
+            let (state, sealed) = returned(&after_seal);
+            assert_eq!(state, State::Sealed);
+            assert_eq!(sealed, output, "seal keeps the result");
+            assert_eq!(
+                node.result(),
+                node.result(),
+                "reading is read-only and repeatable"
+            );
+            assert!(node.evidence_log().is_sealed());
+            assert_eq!(node.evidence().len(), 5);
+        }
+
+        #[test]
+        fn the_stored_result_survives_a_restart_and_a_lost_workload_collects_nothing() {
+            let node = Node::with_output_return();
+            node.launcher.set_stdio(b"kept", b"");
+            output_grant_launch(&node, output_manifest(64, &["out.txt"], 64));
+            eventually(|| node.launcher.waiting() == 1);
+            std::fs::write(node.workspace().join("out.txt"), b"x").unwrap();
+            node.launcher.exit(WorkloadExit::Exited { code: Some(3) });
+            node.wait_for(State::Exited);
+            let before = node.result();
+            let (_, output) = returned(&before);
+            assert_eq!(output.stdout().content(), b"kept");
+
+            let node = node.restart_with_output_return(true);
+            node.assert_finished(State::Exited, Outcome::Failed);
+            assert_eq!(node.result(), before, "the result outlives the node");
+            let node = node.restart_with_output_return(false);
+            assert_eq!(
+                node.result(),
+                ctx().result_rejected(lifecycle_binding(), Reason::UnsupportedOperation),
+                "a node that returns no output serves no result, stored or not"
+            );
+
+            let lost = Node::with_output_return();
+            lost.launcher.set_stdio(b"gone", b"");
+            output_grant_launch(&lost, output_manifest(64, &["out.txt"], 64));
+            eventually(|| lost.launcher.waiting() == 1);
+            lost.launcher.exit(WorkloadExit::Lost);
+            lost.wait_for(State::Exited);
+            lost.assert_finished(State::Exited, Outcome::Unknown);
+            assert_eq!(
+                lost.result(),
+                ctx().result_rejected(lifecycle_binding(), Reason::ResourceUnavailable),
+                "a workload the node lost track of has its workspace left unread"
+            );
+            assert!(lost.output_store().read().unwrap().is_none());
+            assert_eq!(lost.evidence().len(), 3, "{:?}", lost.evidence());
+            lost.output_store()
+                .write(&ward_node_protocol::AttemptOutput::default())
+                .unwrap();
+            let lost = lost.restart_with_output_return(true);
+            assert_eq!(
+                lost.result(),
+                ctx().result_rejected(lifecycle_binding(), Reason::ResourceUnavailable),
+                "a stored result the log does not bind is removed at restart, never served"
+            );
+            assert!(lost.output_store().read().unwrap().is_none());
+
+            let recovered = Node::with_output_return();
+            output_grant_launch(&recovered, output_manifest(64, &["out.txt"], 64));
+            eventually(|| recovered.launcher.waiting() == 1);
+            let recovered = recovered.restart_with_output_return(true);
+            recovered.assert_finished(State::Exited, Outcome::Unknown);
+            assert_eq!(
+                recovered.result(),
+                ctx().result_rejected(lifecycle_binding(), Reason::ResourceUnavailable),
+                "an attempt recovered after a restart has no collected output"
+            );
+        }
+
+        #[test]
+        fn an_output_record_that_cannot_be_logged_is_not_served() {
+            let node = Node::with_output_return();
+            node.launcher.set_stdio(b"kept", b"");
+            output_grant_launch(&node, output_manifest(64, &["out.txt"], 64));
+            eventually(|| node.launcher.waiting() == 1);
+            std::fs::write(node.workspace().join("out.txt"), b"x").unwrap();
+            node.block_evidence();
+            node.launcher.exit(WorkloadExit::Exited { code: Some(0) });
+            node.wait_for(State::Exited);
+            node.unblock_evidence();
+            assert_eq!(
+                node.result(),
+                ctx().result_rejected(lifecycle_binding(), Reason::ResourceUnavailable),
+                "a result the log does not bind is not served"
+            );
+            assert!(node.output_store().read().unwrap().is_none());
+            assert_eq!(
+                node.serve(ctx().seal(op(60), lifecycle_binding())),
+                ctx().accepted(op(60), lifecycle_binding(), State::Sealed)
+            );
+            assert!(
+                node.evidence()
+                    .iter()
+                    .all(|event| !matches!(event, WardEvent::NodeAttemptOutputCollected { .. }))
+            );
+        }
+
+        #[test]
+        fn result_is_refused_without_output_return_for_unknown_tasks_and_without_a_grant() {
+            let plain = Node::new();
+            plain.running();
+            plain.launcher.exit(WorkloadExit::Exited { code: Some(0) });
+            plain.wait_for(State::Exited);
+            assert_eq!(
+                plain.result(),
+                ctx().result_rejected(lifecycle_binding(), Reason::UnsupportedOperation)
+            );
+
+            let node = Node::with_output_return();
+            assert_eq!(
+                node.result(),
+                ctx().result_rejected(lifecycle_binding(), Reason::TaskNotFound)
+            );
+            node.running();
+            let other = TaskBinding::new(
+                lifecycle_binding().task(),
+                ExecutionAttemptId::from_u128(80),
+                lifecycle_binding().lease(),
+            );
+            assert_eq!(
+                TaskRegistry::result(&node.tasks, ctx(), other).unwrap(),
+                ctx().result_rejected(other, Reason::AttemptMismatch)
+            );
+            node.launcher.exit(WorkloadExit::Exited { code: Some(0) });
+            node.wait_for(State::Exited);
+            assert_eq!(
+                node.result(),
+                ctx().result_rejected(lifecycle_binding(), Reason::ResourceUnavailable),
+                "an attempt admitted without an output grant has nothing to return"
+            );
+            assert!(node.output_store().read().unwrap().is_none());
+            assert_eq!(node.evidence().len(), 3);
+            let below = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+            assert_eq!(
+                TaskRegistry::result(&node.tasks, below, lifecycle_binding()).unwrap(),
+                below.result_rejected(lifecycle_binding(), Reason::UnsupportedOperation),
+                "below 1.3 there is no result"
+            );
         }
 
         fn ask_proxy(egress: &crate::egress::AttemptEgress, target: &str) -> String {
@@ -4534,7 +5031,7 @@ mod tests {
                 _dir: dir, tasks, ..
             } = node;
             drop(tasks);
-            let node = Node::build(dir, 1, Duration::from_secs(10), false);
+            let node = Node::build(dir, 1, Duration::from_secs(10), false, false);
             assert_eq!(
                 node.serve(ctx().seal(op(94), retry)),
                 ctx().accepted(op(94), retry, State::Sealed)

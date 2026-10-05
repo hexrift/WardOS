@@ -1,8 +1,8 @@
 # ADR-0030 — ward-node task admission, execution ownership and exit semantics
 
-Status: **Accepted; implemented under #332 slices 5–10 (tracked by #324, with #259
-and #262).** Steps 1–11 below are done; what the implementation does not enforce yet is
-[node-security-limitations.md](../node-security-limitations.md).
+Status: **Accepted; implemented under #332 slices 5–10 and stage 2 (tracked by #324,
+with #259 and #262).** Steps 1–13 below are done; what the implementation does not
+enforce yet is [node-security-limitations.md](../node-security-limitations.md).
 
 This records the decisions #326 asked for before `ward-node` may execute anything. It
 follows ADR-0029: the node is the trusted execution authority on its host, and an
@@ -143,7 +143,9 @@ their state, receipt and applied operation ids (#332 slice 7).
   allowlist; it does not grow by `ward-daemon`'s session machinery.
 - What is not enforced at this revision is stated, not implied: no remote transport or
   mTLS, egress only through a per-attempt proxy socket on a node that enabled it (no
-  in-sandbox relay, no credential), no result return, no callback channel, a receipt the protocol
+  in-sandbox relay, no credential), result return only as a declared, bounded result on a
+  node that enabled it (step 13: stream heads and exact workspace files, digests in the
+  evidence log, no workspace export and nothing streamed), no callback channel, a receipt the protocol
   does not bind to the evidence head, a manually bootstrapped trust store, same-uid
   co-location of client and node unless the operator lists the client uids the socket
   serves (a peer-credential check, the first local slice of #262), and no resource limit
@@ -251,7 +253,28 @@ TDD slices without guessing at semantics inside a feature PR.
     for the rest before the end record. Deferred: an in-sandbox loopback relay for
     `HTTP_PROXY` clients, and credential injection (#267).
 
-Steps 1–9 and 12 are written down as the external contract in
+13. Bounded result return (#332, the result half of stage 2): the manifest grammar gains
+    an optional `output` grant (the first `stdio_bytes` of each stream, up to 64 exact
+    relative workspace paths with `files_bytes` of content in all), honoured only on a
+    node started with `--output-return` and only within the node's ceilings (1 MiB per
+    stream, 8 MiB of files), otherwise `unsupported_grant`. The launcher keeps each
+    stream's head raw while the workload runs; the attempt's reaper collects the declared
+    files only once the workload has ended and been reaped, following no symlink and
+    reading nothing outside the workspace, stores the result in
+    `<task-root>/<task>/<attempt>.output/` (0700, 0600) with the node's atomic-write
+    discipline, and the registry records `NodeAttemptOutputCollected` — counts, sizes and
+    digests, never bytes — before the end record, removing a result the log will not
+    bind. A new read-only `result` request returns the stored result for an ended
+    attempt, with its own 16 MiB answer bound; the capability document carries an
+    `output` section only on such a node. All of it is additive within 1.3 rather than a
+    new minor, because the protected node tests pin the negotiated version at 1.3, and
+    the compatibility statement says what each addition means for an earlier peer. The
+    shipped client and adapter read the result after `seal` when the manifest granted
+    it, refusing to record a run as complete when the answer is lost. Deferred: a
+    workspace export as a content-addressed snapshot (`snapshots.read`, `snapshots.diff`)
+    and streamed output.
+
+Steps 1–9, 12 and 13 are written down as the external contract in
 [node-integration.md](../node-integration.md); step 10 is its acceptance,
-[node-acceptance.md](../node-acceptance.md), which step 12 extends; step 11 is the
-guide, the limitations and the release-readiness evidence beside them.
+[node-acceptance.md](../node-acceptance.md), which steps 12 and 13 extend; step 11 is
+the guide, the limitations and the release-readiness evidence beside them.

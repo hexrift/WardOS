@@ -235,7 +235,12 @@ wrong most often:
   `eb3e889be30ae8dd712a52c33e37aaca72e52ccff1aa770ecbd962d0cdb0d0c3`. It is the only
   manifest a node without `--network-allowlist` admits; with the flag,
   `{"network":{"custom":[hosts]}}` is admitted too and the workload reaches those hosts
-  through the proxy socket `WARD_PROXY_SOCKET` names (§7.5, §9).
+  through the proxy socket `WARD_PROXY_SOCKET` names (§7.5, §9). On a node started with
+  `--output-return`, a manifest may also carry
+  `"output":{"stdio_bytes":N,"files":["out/report.json",…],"files_bytes":M}` (at most
+  1 MiB per stream, 8 MiB of files, 64 exact relative paths): the report's `output` then
+  carries the first `N` bytes of stdout and stderr and the declared files with their
+  digests (§6.6, §7.5).
 - `version` is `1` for a task's first envelope and strictly higher than every version
   the node accepted for that task before, across attempts and restarts (§10).
 - `issued_at_unix_ms <= now < expires_at_unix_ms` at the node's clock, with margin.
@@ -275,6 +280,7 @@ The last line is the report (§11.3). Read these fields, in this order:
 | `receipt`, `cause` | The node's receipt and, from the evidence log, what ended the attempt (`{"Exited":{"code":0}}`, `"BudgetExceeded"`, `"Killed"`, …). |
 | `sealed`, `evidence_head` | `true` and a 64-hex head mean the driver sealed the task and verified the log against its `HEAD`. Keep the head with the report. |
 | `operations` | Every verb sent, its operation id and the node's answer: your audit trail of the run. |
+| `output` | On a node started with `--output-return` and an envelope whose manifest carried an `output` grant (§7.5): the first `stdio_bytes` of stdout and stderr with their dropped counts, and each declared workspace file's content and `BLAKE3` digest, or digest only past `files_bytes`, or why it was skipped (§6.6). Recompute the digests over what you received and compare them with the log's `NodeAttemptOutputCollected` record. `null` otherwise. |
 
 Then verify the log yourself, as the node's user, with the path the report gave:
 
@@ -283,12 +289,15 @@ $ ward replay --verify /var/lib/ward-node/tasks/task_01M45YYRG00001249248SK6H24/
 ```
 
 The log is the `ward-events` session-log format; its records are `NodeAttemptAdmitted`,
-`NodeAttemptLaunched`, any `NodeAttemptIntervened`, `NodeAttemptEnded` (or
-`NodeAttemptRecovered`) and `NodeAttemptSealed`, all with origin `node` (§6.5). The
+`NodeAttemptLaunched`, any `NodeAttemptIntervened`, `NodeAttemptOutputCollected` when
+output was granted, `NodeAttemptEnded` (or `NodeAttemptRecovered`) and
+`NodeAttemptSealed`, all with origin `node` (§6.5). The
 receipt is not carried over the socket together with the head
 (node-security-limitations.md §3.3), so the report's `evidence_head` and this
-verification are how a control plane binds the two. What the workload wrote is in
-`<task-root>/<task>/<attempt>/` on the host and nowhere else (§11.5).
+verification are how a control plane binds the two. What the workload wrote beyond the
+files the manifest declared is in `<task-root>/<task>/<attempt>/` on the host and
+nowhere else (§11.5); the declared files and the stream heads come back in the report's
+`output` when the node was started with `--output-return` (§6.6).
 
 ### 6.1 Answering who delegated what
 
@@ -320,7 +329,8 @@ Node-integration.md §10 is the full list; these are the cases every control pla
 | `rejected` at `admit` with `authority_denied` | Untrusted key, bad signature, malformed envelope, wrong audience, wrong issuer principal, or not yet valid (§8.1). Nothing changed, no version consumed. | Fix the envelope or the trust store; re-admit under the same version. |
 | `lease_expired`, `lease_revoked` | Validity or revocation, at the node clock (§8.3). | Issue a fresh lease (a revoked one, and anything delegated from it, is gone for good on that node). |
 | `stale_operation` at `admit` | The version is not above the last accepted for the task (§8.3). | Raise `version`; your per-task counter is behind the node's. |
-| `unsupported_grant` | The manifest asks for a grant this node does not honour (§7.5). No version consumed. | Re-admit with `{"network":"offline"}`, start the node with `--network-allowlist` if the workload needs egress, or do not run this workload here. |
+| `unsupported_grant` | The manifest asks for a grant this node does not honour (§7.5): a network allowlist on a node without `--network-allowlist`, an `output` grant on a node without `--output-return` or above its ceilings. No version consumed. | Re-admit with `{"network":"offline"}` and no `output`, start the node with `--network-allowlist` if the workload needs egress or `--output-return` if you need its output back, or do not run this workload here. |
+| `rejected` at `result` with `resource_unavailable` | No stored result for the ended attempt: the manifest carried no `output` grant, the attempt never ran or was lost, or the node restarted before collecting (§6.6). | Nothing to recover: read the workspace on the host if you need it, and declare the files next time. |
 | `resource_unavailable` at `start` | Snapshot missing from the store, workspace already exists, or the spawn failed; the task stays `ready`. | Import the snapshot (§4), or retry `start` with the same id; never reuse an attempt id. |
 | `done` with `outcome` `unknown` | Ambiguous launch, lost child, node restart mid-run, or a transport failure the driver could not recover (§11.2). | Treat as failed. Retry as a **new attempt**: `create` the same task under a new attempt id, `admit` a new envelope with a higher `version`, `start`. The old attempt never runs again. |
 | `recovering` events, then `done` | A lost answer was recovered by `inspect` and one replay of the same id (§11.2). | Nothing; this is the contract working. |

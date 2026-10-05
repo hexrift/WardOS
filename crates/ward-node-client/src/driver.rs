@@ -1,5 +1,9 @@
 //! The fail-closed attempt driver an external control plane needs (node-integration.md
-//! §6, §9, §10): `create` → `admit` → `start` → poll `inspect` → read the receipt → `seal`.
+//! §6, §9, §10): `create` → `admit` → `start` → poll `inspect` → read the receipt → `seal`,
+//! then `result` when the envelope's manifest granted `output` (§6.6): the sealed attempt's
+//! bounded stdout, stderr and declared files go into the report. A refused `result` is
+//! recorded and leaves the receipt as it was; a lost `result` answer is recovered once and
+//! otherwise ends the run `unknown`, like any other lost answer.
 //!
 //! Every mutating verb uses an operation id from a caller-supplied [`OperationIds`], so a
 //! control plane that restarts replays the same run with the same ids and the same signed
@@ -30,11 +34,11 @@ use thiserror::Error;
 use ward_events::log::{head_file_path, parse_head};
 use ward_events::{Blake3Hash, LogReader, NodeAttemptEnd, WardEvent};
 use ward_node_protocol::{
-    OperationId, TaskAdmissionEnvelope, TaskAdmissionError, TaskBinding, TaskExecutionOutcome,
-    TaskLifecycleRejectionReason, TaskLifecycleState,
+    AttemptOutput, OperationId, TaskAdmissionEnvelope, TaskAdmissionError, TaskBinding,
+    TaskExecutionOutcome, TaskLifecycleRejectionReason, TaskLifecycleState,
 };
 
-use crate::client::{Applied, Client, ClientError, Inspection, Verb};
+use crate::client::{Applied, Client, ClientError, Inspection, Resulted, Verb};
 use crate::issuer::{IssuerKey, IssuerKeyError, SignedEnvelope};
 use crate::transport::{Transport, TransportError};
 
@@ -310,6 +314,17 @@ pub enum AttemptEvent {
         /// The log path.
         path: PathBuf,
     },
+    /// The node returned the attempt's output (§6.6); the output itself is in the report.
+    Output {
+        /// Bytes of stdout returned.
+        stdout_bytes: u64,
+        /// Bytes of stderr returned.
+        stderr_bytes: u64,
+        /// Declared files reported.
+        files: usize,
+        /// Whether a stream was truncated or a file returned digest-only.
+        truncated: bool,
+    },
 }
 
 /// The result of a run, mapped for a control plane that must fail closed.
@@ -375,6 +390,10 @@ pub struct AttemptReport {
     pub operations: Vec<AppliedOperation>,
     /// The transport failure that ended the run, if one did.
     pub transport_error: Option<String>,
+    /// The attempt's bounded output (§6.6), when the envelope's manifest granted `output`
+    /// and the node returned it; `null` otherwise.
+    #[serde(default)]
+    pub output: Option<AttemptOutput>,
 }
 
 /// Drives attempts over one connected client.
@@ -422,6 +441,7 @@ impl<'a, T: Transport> Driver<'a, T> {
                 evidence_head: None,
                 operations: Vec::new(),
                 transport_error: None,
+                output: None,
             },
             refused: None,
         };
@@ -504,6 +524,62 @@ impl<T: Transport> Run<'_, T> {
                 self.report.final_state = Some(state);
             }
             Applied::Rejected { .. } => {}
+        }
+        if self.wants_output() {
+            self.result()?;
+        }
+        Ok(())
+    }
+
+    /// Whether the envelope's manifest granted `output`, so the node has a result to return.
+    fn wants_output(&self) -> bool {
+        self.request
+            .envelope
+            .envelope_json
+            .decode()
+            .is_ok_and(|envelope| {
+                envelope
+                    .workload()
+                    .capability_manifest()
+                    .manifest()
+                    .output()
+                    .is_some()
+            })
+    }
+
+    /// Read the sealed attempt's result (§6.6): once, with a lost answer recovered once.
+    fn result(&mut self) -> Result<(), Halt> {
+        let binding = self.request.binding;
+        let resulted = match self.client.result(binding) {
+            Ok(resulted) => resulted,
+            Err(error) if recoverable(&error) => {
+                (self.observe)(&AttemptEvent::Recovering {
+                    verb: Verb::Result,
+                    operation_id: self.ids.seal,
+                });
+                self.client
+                    .result(binding)
+                    .map_err(|error| self.halt(&error))?
+            }
+            Err(error) => return Err(self.halt(&error)),
+        };
+        match resulted {
+            Resulted::Result { output, .. } => {
+                (self.observe)(&AttemptEvent::Output {
+                    stdout_bytes: output.stdout().content().len() as u64,
+                    stderr_bytes: output.stderr().content().len() as u64,
+                    files: output.files().len(),
+                    truncated: output.truncated(),
+                });
+                self.report.output = Some(output);
+            }
+            Resulted::Rejected { reason } => {
+                (self.observe)(&AttemptEvent::Rejected {
+                    verb: Verb::Result,
+                    operation_id: None,
+                    reason,
+                });
+            }
         }
         Ok(())
     }

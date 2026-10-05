@@ -75,6 +75,12 @@ pub struct Outcome {
     pub stdout_bytes: u64,
     /// Total bytes the child wrote to stderr, before any truncation.
     pub stderr_bytes: u64,
+    /// Exactly the first bytes the child wrote to stdout, raw, up to the
+    /// [`raw_head`](Launch::raw_head) bound; empty when no bound was set.
+    pub stdout_raw_head: Vec<u8>,
+    /// Exactly the first bytes the child wrote to stderr, raw, up to the
+    /// [`raw_head`](Launch::raw_head) bound; empty when no bound was set.
+    pub stderr_raw_head: Vec<u8>,
     /// Whether `stdout` or `stderr` dropped bytes from the middle to stay in budget.
     pub truncated: bool,
     /// Full copies of lines whose start matched the capture's keep-prefix, taken from
@@ -222,6 +228,7 @@ pub struct Launch {
     stdio: StdioMode,
     budget: Option<Duration>,
     capture_bytes: Option<usize>,
+    raw_head_bytes: Option<usize>,
     keep_prefix: Option<String>,
     clear_env: bool,
     host_network: bool,
@@ -320,6 +327,8 @@ impl RunningLaunch {
             stderr: err.text,
             stdout_bytes: out.total,
             stderr_bytes: err.total,
+            stdout_raw_head: out.raw_head,
+            stderr_raw_head: err.raw_head,
             truncated: out.truncated || err.truncated,
             kept_lines,
             duration: self.start.elapsed(),
@@ -355,6 +364,7 @@ impl Launch {
             stdio: StdioMode::Capture,
             budget: None,
             capture_bytes: None,
+            raw_head_bytes: None,
             keep_prefix: None,
             clear_env: false,
             host_network: false,
@@ -456,6 +466,16 @@ impl Launch {
     #[must_use]
     pub fn capture_bytes(mut self, bytes: usize) -> Self {
         self.capture_bytes = Some(bytes);
+        self
+    }
+
+    /// Also keep exactly the first `bytes` of each stream, raw and unmarked, in
+    /// [`Outcome::stdout_raw_head`] and [`Outcome::stderr_raw_head`]; the rest is still
+    /// drained and counted in `stdout_bytes` and `stderr_bytes`. Independent of the
+    /// head-and-tail text capture.
+    #[must_use]
+    pub const fn raw_head(mut self, bytes: usize) -> Self {
+        self.raw_head_bytes = Some(bytes);
         self
     }
 
@@ -672,9 +692,13 @@ impl Launch {
         drop(admitted);
         let mut child = spawned?;
         let bound = self.capture_bytes;
+        let raw_head = self.raw_head_bytes;
         let keep = self.keep_prefix.clone();
-        let stdout = child.stdout.take().map(|r| drain(r, bound, keep.clone()));
-        let stderr = child.stderr.take().map(|r| drain(r, bound, keep));
+        let stdout = child
+            .stdout
+            .take()
+            .map(|r| drain(r, bound, raw_head, keep.clone()));
+        let stderr = child.stderr.take().map(|r| drain(r, bound, raw_head, keep));
         Ok(RunningLaunch {
             child,
             stdout,
@@ -695,6 +719,8 @@ struct StreamCapture {
     total: u64,
     /// Whether any bytes were dropped from the middle.
     truncated: bool,
+    /// Exactly the first bytes of the stream, raw, up to the raw-head bound.
+    raw_head: Vec<u8>,
     /// Full copies of lines that started with the keep-prefix, from the whole stream.
     kept_lines: Vec<String>,
 }
@@ -715,11 +741,12 @@ const MAX_LINE_SCAN: usize = 8 * 1024;
 fn drain<R: std::io::Read + Send + 'static>(
     mut r: R,
     bound: Option<usize>,
+    raw_head: Option<usize>,
     keep_prefix: Option<String>,
 ) -> std::thread::JoinHandle<StreamCapture> {
     std::thread::spawn(move || {
         if let Some(bound) = bound {
-            return drain_bounded(&mut r, bound, keep_prefix.as_deref());
+            return drain_bounded(&mut r, bound, raw_head, keep_prefix.as_deref());
         }
         // Unbounded: the original read-to-end behaviour for callers with no limit.
         let mut buf = Vec::new();
@@ -732,10 +759,12 @@ fn drain<R: std::io::Read + Send + 'static>(
                 push_kept_line(line.as_bytes(), prefix, &mut kept_lines, &mut kept_bytes);
             }
         }
+        let raw_head = raw_head.map_or_else(Vec::new, |head| buf[..buf.len().min(head)].to_vec());
         StreamCapture {
             total: buf.len() as u64,
             text,
             truncated: false,
+            raw_head,
             kept_lines,
         }
     })
@@ -746,11 +775,14 @@ fn drain<R: std::io::Read + Send + 'static>(
 fn drain_bounded<R: std::io::Read>(
     r: &mut R,
     bound: usize,
+    raw_head_bound: Option<usize>,
     keep_prefix: Option<&str>,
 ) -> StreamCapture {
     use std::fmt::Write as _;
     let tail_limit = (bound / 4).max(1);
     let head_limit = bound.saturating_sub(tail_limit);
+    let raw_head_limit = raw_head_bound.unwrap_or(0);
+    let mut raw_head: Vec<u8> = Vec::new();
     let mut head: Vec<u8> = Vec::new();
     let mut tail: VecDeque<u8> = VecDeque::new();
     let mut total: u64 = 0;
@@ -764,6 +796,10 @@ fn drain_bounded<R: std::io::Read>(
             Ok(0) => break,
             Ok(n) => {
                 total += n as u64;
+                if raw_head.len() < raw_head_limit {
+                    let take = n.min(raw_head_limit - raw_head.len());
+                    raw_head.extend_from_slice(&buf[..take]);
+                }
                 for &b in &buf[..n] {
                     if head.len() < head_limit {
                         head.push(b);
@@ -815,6 +851,7 @@ fn drain_bounded<R: std::io::Read>(
         text,
         total,
         truncated,
+        raw_head,
         kept_lines,
     }
 }
@@ -1203,7 +1240,7 @@ mod tests {
     fn bounded_capture_keeps_head_and_tail_and_counts_every_byte() {
         // 10 KiB of distinct content, captured within a 1 KiB budget.
         let input: Vec<u8> = (0..10_000u32).map(|i| b'a' + (i % 26) as u8).collect();
-        let cap = drain_bounded(&mut std::io::Cursor::new(input.clone()), 1024, None);
+        let cap = drain_bounded(&mut std::io::Cursor::new(input.clone()), 1024, None, None);
         assert!(cap.truncated);
         assert_eq!(
             cap.total, 10_000,
@@ -1229,7 +1266,12 @@ mod tests {
     #[test]
     fn bounded_capture_keeps_everything_under_budget() {
         let input = b"short and complete output\n".to_vec();
-        let cap = drain_bounded(&mut std::io::Cursor::new(input.clone()), 1 << 20, None);
+        let cap = drain_bounded(
+            &mut std::io::Cursor::new(input.clone()),
+            1 << 20,
+            None,
+            None,
+        );
         assert!(!cap.truncated);
         assert_eq!(cap.total, input.len() as u64);
         assert_eq!(cap.text.as_bytes(), &input[..]);
@@ -1242,7 +1284,12 @@ mod tests {
         let mut input = vec![b'x'; 4000];
         input.extend_from_slice(b"\ntest result: ok. 7 passed; 2 failed; 0 ignored\n");
         input.extend(std::iter::repeat_n(b'y', 4000));
-        let cap = drain_bounded(&mut std::io::Cursor::new(input), 1024, Some("test result:"));
+        let cap = drain_bounded(
+            &mut std::io::Cursor::new(input),
+            1024,
+            None,
+            Some("test result:"),
+        );
         assert!(cap.truncated);
         assert!(
             !cap.text.contains("test result:"),
@@ -1259,9 +1306,37 @@ mod tests {
         // 2-byte chars across an odd budget: must stay bounded and not panic on a
         // split char boundary (from_utf8_lossy handles the seam).
         let input = "é".repeat(5000).into_bytes();
-        let cap = drain_bounded(&mut std::io::Cursor::new(input.clone()), 999, None);
+        let cap = drain_bounded(&mut std::io::Cursor::new(input.clone()), 999, None, None);
         assert!(cap.truncated);
         assert_eq!(cap.total, input.len() as u64);
         assert!(cap.text.len() < 999 + 128);
+    }
+
+    #[test]
+    fn a_raw_head_keeps_exactly_the_first_bytes_and_counts_the_rest() {
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = "head -c 10000 /dev/zero | tr '\\0' 'a'; printf 'tail' >&2; head -c 3 /dev/zero | tr '\\0' 'b' >&2";
+        let out = Launch::new(dir.path(), vec!["sh".into(), "-c".into(), script.into()])
+            .capture_bytes(512)
+            .raw_head(4096)
+            .run()
+            .unwrap();
+        assert_eq!(out.code, Some(0));
+        assert_eq!(out.stdout_raw_head.len(), 4096);
+        assert!(out.stdout_raw_head.iter().all(|byte| *byte == b'a'));
+        assert_eq!(out.stdout_bytes, 10_000);
+        assert_eq!(out.stderr_raw_head, b"tailbbb");
+        assert_eq!(out.stderr_bytes, 7);
+        assert!(out.truncated, "the head-and-tail capture still truncates");
+
+        let none = Launch::new(dir.path(), vec!["sh".into(), "-c".into(), "echo hi".into()])
+            .capture_bytes(512)
+            .run()
+            .unwrap();
+        assert!(none.stdout_raw_head.is_empty(), "no raw head unless asked");
+        assert_eq!(none.stdout.trim(), "hi");
     }
 }

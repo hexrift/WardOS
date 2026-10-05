@@ -41,10 +41,10 @@ pub use event::{
     Acceptor, AgentIdentity, AgentKind, AgentState, CapabilityKind, CapabilityRequest, CaptureMode,
     ClaimKind, CredentialDelivery, Decision, DecisionSource, DeniedDst, DenyReason, DetailText,
     EndReason, EventKind, EventKindSet, ExitStatus, FileChangeKind, GrantScope, NameText,
-    NodeAttemptEnd, NodeAttemptOutcome, NodeAttemptState, NodeIntervention, ObserverSource,
-    PauseMethod, PayloadText, PolicySubject, ProcessRef, RevokeReason, Scope, ShortText,
-    SignatureBytes, SnapshotRole, StepStatus, TamperWardSig, VerifyRequester, VerifySummary,
-    WardEvent,
+    NodeAttemptEnd, NodeAttemptOutcome, NodeAttemptState, NodeIntervention, NodeOutputFile,
+    NodeOutputFileStatus, NodeOutputStream, ObserverSource, PauseMethod, PayloadText,
+    PolicySubject, ProcessRef, RevokeReason, Scope, ShortText, SignatureBytes, SnapshotRole,
+    StepStatus, TamperWardSig, VerifyRequester, VerifySummary, WardEvent,
 };
 pub use ids::{
     AgentId, AttemptId, Blake3Hash, DelegationId, ExecutionAttemptId, IdError, ImageDigest,

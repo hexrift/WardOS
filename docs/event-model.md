@@ -148,7 +148,8 @@ pub enum WardEvent {
     // node execution attempts (origin: Node; ADR-0030 §3, #332) — appended after
     // WorkloadsTerminated. Written only by ward-node, one log per admitted attempt at
     // <task-root>/<task>/<attempt>.evidence/events.log, never into a session log; see
-    // node-integration.md §6.5. Metadata only: workload output is never recorded.
+    // node-integration.md §6.5. Metadata only: workload output is never recorded (a
+    // returned result is recorded by its counts and digests, NodeAttemptOutputCollected).
     NodeAttemptAdmitted { task: TaskId, attempt: ExecutionAttemptId, lease: LeaseId,
                           session: SessionId, operation: u64, envelope: Blake3Hash,
                           issuer_key: Blake3Hash, version: u64 },
@@ -158,6 +159,15 @@ pub enum WardEvent {
                        end: NodeAttemptEnd, operation: Option<u64> },
     NodeAttemptRecovered { state: NodeAttemptState, outcome: Option<NodeAttemptOutcome> },
     NodeAttemptSealed { operation: u64 },  // the log is sealed after this record
+    // appended after NodeAttemptSealed (#332 stage 2, result return; node-integration.md
+    // §6.6): what the node collected for an attempt's `output` grant, right before its
+    // NodeAttemptEnded. Counts, sizes and BLAKE3 digests only, never the bytes.
+    NodeAttemptOutputCollected { stdout: NodeOutputStream, stderr: NodeOutputStream,
+                                 files: Vec<NodeOutputFile> },
+    // NodeOutputStream { returned: u64, dropped: u64 }
+    // NodeOutputFile { path: SandboxPath, size: u64, digest: Option<Blake3Hash>,
+    //                  status: NodeOutputFileStatus }   // Returned | DigestOnly | Missing
+    //                                                   // | NotARegularFile | TooLarge
 }
 ```
 

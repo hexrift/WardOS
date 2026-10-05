@@ -1,7 +1,8 @@
 # ward-node security limitations
 
 Status: living document. It is the security statement for the `ward-node` substrate as
-shipped at this revision (protocol 1.3, ADR-0030 steps 1–11, #332 slices 5–10): what the
+shipped at this revision (protocol 1.3 with its additive revisions, ADR-0030 steps 1–13,
+#332 slices 5–10 and stage 2): what the
 node enforces, what it does not, and what each gap means for an external control plane.
 The contract is [node-integration.md](node-integration.md), the proof of what is claimed
 here is [node-acceptance.md](node-acceptance.md), and what CI checks on every change is
@@ -39,11 +40,16 @@ code to find it.
 - **The workload is hostile.** It runs in a bubblewrap sandbox with its workspace as the
   only writable host path, no network but loopback (or, on a node started with
   `--network-allowlist`, the attempt's own egress proxy allowing exactly its manifest's
-  hosts), and an environment the node constructs from nothing (§9). The node's state, trust store, evidence logs and socket
-  are never visible to it.
+  hosts), and an environment the node constructs from nothing (§9). The node's state, trust store, evidence logs, stored
+  results and socket are never visible to it. What comes back out is only what the
+  manifest declared and only after the workload is gone: on a node started with
+  `--output-return`, the head of its stdout and stderr and the declared workspace files,
+  read without following anything outside the workspace (§6.6).
 - **Evidence is the node's.** One append-only, hash-chained `ward-events` log per
   attempt, written by the node alone, outside the sandbox's reach (§6.5). It records
-  what the node did and observed, never workload output.
+  what the node did and observed, never workload output itself: a returned result is
+  recorded by its counts and digests (`NodeAttemptOutputCollected`), so a control plane
+  can bind what it received to the sealed log.
 
 ## 2. What is enforced
 
@@ -64,7 +70,8 @@ under the merge gate.
 | Fail-closed recovery | After a restart an attempt that may have been executing is `exited`/`unknown`, its surviving tree is killed, and it is never re-run; `ready` tasks need a fresh `admit` under a higher version; a log or record that does not verify stops the node | acceptance `interruption_node_kill_recovers_exited_unknown_and_never_reruns`, `durable_records_survive_a_node_restart` |
 | Replay safety | Every applied `operation_id` is kept per attempt across restarts; a replay answers the current state and acts on nothing; a replaced attempt id is retired for good (§6.3) | acceptance `replay_after_a_client_restart_runs_nothing_twice`, `durable_records_survive_a_node_restart` |
 | Evidence logs | One hash-chained log per attempt, node-written, fsynced before the verb is answered, bounded at 256 KiB, sealed with `HEAD` by `seal`, verifiable with `ward replay --verify` (§6.5) | acceptance (every case verifies its log and `HEAD`); unit |
-| Manifest refusal | The capability manifest is one typed, bounded object; outside the grammar it fails decoding (`authority_denied`); inside it, any grant the node cannot enforce is `unsupported_grant` before the version is consumed (§7.5) | acceptance (authorization case); unit |
+| Manifest refusal | The capability manifest is one typed, bounded object; outside the grammar it fails decoding (`authority_denied`); inside it, any grant the node cannot enforce is `unsupported_grant` before the version is consumed (§7.5) | acceptance (authorization case; `output_return_refuses_escaping_paths_at_admit_and_follows_nothing`, `output_return_is_advertised_and_honoured_only_when_enabled`); unit |
+| Bounded result return | With `--output-return`, an `output` grant within the node's ceilings (1 MiB per stream, 8 MiB of file content, 64 exact relative paths) is honoured: the head of each stream is kept while the workload runs and the declared files are collected only once it has ended and been reaped, each path looked at without following a symlink, anything not a regular file reported and never read, a file past the budget digest-only, above 64 MiB neither read nor hashed; the result is stored 0600 in a 0700 directory beside the workspace and recorded with every digest in the evidence log before the end record, or not served at all (§6.6) | acceptance `output_return_delivers_bounded_stdio_and_files_with_matching_digests`, `output_return_marks_truncation_and_keeps_digests_right_past_the_budgets`, `output_return_refuses_escaping_paths_at_admit_and_follows_nothing`, `output_return_survives_a_node_restart_and_seal`; unit (`output`, `task`) |
 | Peer-credential gate | Every accepted connection's `SO_PEERCRED` uid is read before a byte of it; only the node's own uid and the `--client-uid` list are served, any other peer (root included) is closed unread, with the refusal reported on stderr at most once per uid per 10 s. The filesystem gates who can connect (socket 0600, or 0660 with `--client-group` in a 0750 group-owned directory), the credential check gates who is served (§2.1, §3) | unit (`peer`); `node_peer_uids_cli` (the second-uid cases run as root and skip unprivileged, with the reason) |
 | Bounded protocol surface | One request per connection, 64 KiB lines, 10 s request and answer deadlines, strict decoders that close the connection on anything malformed, bounded state files (8 MiB), bounded registry (1 024 tasks), bounded pauses (128) and retirements (256 per task) (§3, §6) | unit |
 | Fail-closed client | The shipped client and adapter never guess at a lost answer (inspect, replay once, then `unknown`), never re-admit or start a second attempt on their own, revoke rather than stop on cancellation, and transport a pre-signed envelope byte for byte (§11.2) | `ward-node-client` tests against a real node; acceptance (replay case through a new adapter process) |
@@ -91,7 +98,7 @@ known and recorded here, and no child issue has been opened for it at this revis
 | Limitation | Impact | Mitigation today | Closed by |
 | --- | --- | --- | --- |
 | **Egress through the proxy socket only, and only when enabled.** A `network.custom` manifest is honoured only on a node started with `--network-allowlist` (§2.1), and then as HTTP(S) through the attempt's proxy at `/run/ward/proxy.sock`: `CONNECT` tunnels and absolute-URI HTTP forwarding, host-level patterns, no loopback relay and no `HTTP_PROXY` inside the sandbox, no credential injected (§9). | A workload must speak to the Unix socket itself; a tool that only honours `HTTP_PROXY` cannot use the proxy yet. Patterns name hosts, not paths or methods. Nothing authenticates. | Give the workload a client that can address a Unix-socket proxy, or keep dependencies in the snapshot (`ward-node snapshot import`, §2.4) and do the rest on the control plane's side. | No issue yet for the in-sandbox relay (the per-session `ward-agent --relay` is not in the node tarball); [#267](https://github.com/hexrift/WardOS/issues/267) for credentials |
-| **No result return.** Stdout and stderr are drained and not returned; the workspace is not exported; the protocol carries neither (§9, §11.5). `snapshots.read` and `snapshots.diff` are `false` (§5). | A control plane learns only the receipt (`completed`, `failed`, `unknown`) and, on the host, the evidence log. What the workload produced stays in `<task-root>/<task>/<attempt>/`, readable only as the node's uid. | Read the workspace on the host as the node's uid (the acceptance suite does exactly this); design workloads whose exit status is the verdict, as the isolation probe does. | No issue yet (bounded output on `inspect`, or a workspace export as a content-addressed snapshot) |
+| **Result return is bounded, declared and only when enabled.** On a node started with `--output-return`, `result` returns the first 1 MiB of each of stdout and stderr (the head, never the tail), and only the files the manifest declared by exact relative path, up to 8 MiB of content in all with digests for the rest (§6.6, §7.5). Nothing streams while the attempt runs, there are no globs or directories, and the workspace is not exported: `snapshots.read` and `snapshots.diff` are `false` (§5). A node without the flag refuses the grant `unsupported_grant`. | A control plane gets what it asked for, bounded, after the attempt ended, bound to the sealed log by the digests of `NodeAttemptOutputCollected`; it does not get a live feed, a workspace diff or files it did not name. A workload the node lost track of, or an attempt the node restarted over, has no result (`resource_unavailable`). | Declare the files the workload is expected to write, and have it write a summary file for anything else; keep the exit status the verdict. For the rest of the workspace, read it on the host as the node's uid, as before. | No issue yet for a workspace export as a content-addressed snapshot (`snapshots.read`, `snapshots.diff`) or for streamed output |
 | **No in-sandbox callback channel.** `stream` is decoded but always `unsupported_operation`; there is no socket into the sandbox and no way for the workload to ask the control plane anything (§6.1, §11.5). | An agent runtime whose loop needs approvals, tool results or credentials from outside the sandbox cannot be hosted under the node yet. Progress is what `inspect` reports. | Run the agent loop on the control plane's side and use the node for the bounded, offline actions it delegates. | No issue yet (an action channel relayed to the control plane) |
 | **No credential injection.** `credentials.proxy_injection` and `scoped_http_gateway` are `false` (§5); no credential reaches a node workload by any route. | A workload cannot authenticate to anything, so an allowlist reaches only what needs no credential. | None inside the sandbox. | [#267](https://github.com/hexrift/WardOS/issues/267), now that the network allowlist is in place |
 | **Only a wall-clock budget.** There is no CPU, memory, pid or disk limit on a workload; the node creates no cgroup for it (architecture.md §3.11). The sandbox root, `/tmp`, `/home` and `/run` are RAM-backed tmpfs whose size the node does not bound. | A workload can exhaust the host's memory (through tmpfs writes or allocation), pids or disk under the task root for the length of its budget. Isolation holds; availability does not. | Run the node under a service manager with resource limits on its unit (for systemd, `MemoryMax=`, `TasksMax=`), which bound every workload the node spawns collectively; keep budgets short; put the task root on its own filesystem. | [#260](https://github.com/hexrift/WardOS/issues/260) |
@@ -115,10 +122,11 @@ known and recorded here, and no child issue has been opened for it at this revis
 
 Read together, the rows above give the honest integration shape of node-integration.md
 §11.5: bounded, snapshot-based actions and verification runs, offline unless the operator
-enabled the allowlist, driven from the node's host by a client the control plane trusts,
-with the receipt read from `inspect` and the proof read from the evidence log on the
-host. A control plane that needs more (a relay for ordinary HTTP clients, credentials,
-output, a conversation with the workload, a remote transport) is waiting on
-the issues named here, and should fail closed rather than approximate them: do not grant
-what the node cannot enforce, do not infer success from `unknown`, and do not carry a
-result the node never returned.
+enabled the allowlist, returning a declared, bounded result when the operator enabled
+that, driven from the node's host by a client the control plane trusts, with the receipt
+read from `inspect`, the result read from `result` and the proof read from the evidence
+log on the host. A control plane that needs more (a relay for ordinary HTTP clients,
+credentials, streamed output or a workspace export, a conversation with the workload, a
+remote transport) is waiting on the issues named here, and should fail closed rather than
+approximate them: do not grant what the node cannot enforce, do not infer success from
+`unknown`, and do not carry a result the node never returned.

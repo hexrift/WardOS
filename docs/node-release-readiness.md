@@ -24,7 +24,7 @@ which the workflow pins to the same version) on an x86_64 GitHub runner.
 | **Working isolation** | Installs bubblewrap, enables unprivileged user namespaces, and runs `bwrap --unshare-all … /bin/true`; the job fails if the sandbox cannot be created (#124). | Every bubblewrap-backed node test below ran for real on this runner, not as a skip. |
 | **The merge gate** | `scripts/verify/tamperward.sh` with `WARD_REQUIRE_ISOLATION=1`: `cargo metadata --locked` (the lockfile is consistent), `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -D warnings`, `cargo test --workspace --all-targets --all-features`, then `scripts/security-check/static.sh` and `scripts/security-check/tamperward-integration.sh`. | `ward-node-protocol`, `ward-node`, `ward-node-client` and `ward-launch` build warning-free and every one of their tests passes, including the socket, admission, transition-matrix, durability, evidence-log and manifest tests of `ward-node` and the real-node tests of `ward-node-client`, with isolation required (`crates/ward-sandbox/src/ci.rs`: a missing prerequisite is a failure, not a skip). The acceptance cases run here too, in parallel with the rest of the workspace. |
 | **Isolation evidence** | `cargo test -p ward-daemon --test e2e` once more, then `scripts/verify/check-isolation-evidence.sh` over its log, after the checker's own self-test. | The daemon's namespace, verifier-corpus and egress regressions each ran exactly once with `ok`; the names and counts go to the step summary. This is the session path's evidence; the node path's is the next row. |
-| **Acceptance verdicts** | `scripts/acceptance/node.test.sh`, then `scripts/acceptance/node.sh` with its table appended to the job's step summary (`tee -a "$GITHUB_STEP_SUMMARY"`). | The eight cases of [node-acceptance.md](node-acceptance.md) §2, run one at a time against a real node over its real socket, each with a named `PASS` and its time, and `acceptance: 8 passed, 0 failed`; the job fails when any case fails or none ran. The table is on the run's summary page, under the step "ward-node cross-system acceptance verdicts (#332 slice 9)". This is the completion gate's "final cross-system acceptance", on every pull request. |
+| **Acceptance verdicts** | `scripts/acceptance/node.test.sh`, then `scripts/acceptance/node.sh` with its table appended to the job's step summary (`tee -a "$GITHUB_STEP_SUMMARY"`). | The sixteen cases of [node-acceptance.md](node-acceptance.md) §2 (the eight of the main suite, the three network allowlist cases of §2.2 and the five result return cases of §2.3), run one at a time against a real node over its real socket, each with a named `PASS` and its time, and `acceptance: 16 passed, 0 failed`; the job fails when any case fails or none ran. The table is on the run's summary page, under the step "ward-node cross-system acceptance verdicts (#332 slice 9)". This is the completion gate's "final cross-system acceptance", on every pull request. |
 | **cargo-deny** (job `deny`) | `cargo deny check advisories licenses sources bans` against `deny.toml`. | No known advisory, no disallowed licence, no unknown registry or git source and no wildcard dependency in the node crates' dependency tree (`ring`, `nix`, `clap`, serde and the workspace crates). |
 | **docs links** (job `docs`) | `doc-links.py`, `doc-status.py`, `tamperward-signoff-doc.py`, `protocol-window.test.sh` and `protocol-window.py`. | Every relative link in the node documents resolves; no document claims a project phase of its own; and the protocol window `<!-- protocol-window: 1.0-1.3 -->` in [compatibility.md](compatibility.md) equals `WARD_NODE_PROTOCOL` in `ward-node-protocol`, so a minor cannot be added or retired without the compatibility document saying so in the same change (#275). |
 | **ward-bench** (job `benchmark`, measures, never gates) | `ward benchmark --json`, the CI-measurable subset of [performance.md](performance.md) §5, uploaded as an artifact for 90 days. | Nothing specific to the node: its metrics are the session path's (`sandbox_start`, `verifier_spawn`, `snapshot_*`, `observer_event_propagation`, `pause_acknowledgement`). `sandbox_start` and `snapshot_capture_*` measure the same `ward-launch` spawn and `ward-snapshot` capture the node uses, so a regression there is a regression for `start`; no threshold fails the job (#150). |
@@ -130,6 +130,13 @@ For the node this means:
   (node-acceptance.md §2.2). It does not prove a transfer with a real upstream (the
   allowed case accepts the proxy's `200` and `502` alike, and needs only name resolution
   on the runner), an in-sandbox relay for `HTTP_PROXY` clients, or any credential (#267).
+- **Result return beyond the declared, bounded result.** The suite proves that a node
+  started with `--output-return` returns exactly the stream heads and declared files the
+  manifest asked for, marks truncation, matches the digests on the host, refuses an
+  escaping path and follows no symlink, and keeps the result across a restart
+  (node-acceptance.md §2.3). It does not exercise the 1 MiB and 8 MiB ceilings
+  themselves (the unit tests do), a result near the 16 MiB answer bound, or a workspace
+  export, which does not exist (node-security-limitations.md §3.2).
 - **Load, capacity, concurrency.** One workload at a time; the registry, pause and
   state-file bounds are unit-tested, not exercised under load (#260).
 - **Clock skew.** Envelopes are signed at the node's own clock.
@@ -171,7 +178,7 @@ workflow.
    (§2); after the release, `jq .node_protocol_window` on
    `wardos-<version>-manifest.json` names the window the release PR announced.
 2. **The acceptance table.** The `verify` run on the release commit shows
-   `acceptance: 8 passed, 0 failed` in the step summary of "ward-node cross-system
+   `acceptance: 16 passed, 0 failed` in the step summary of "ward-node cross-system
    acceptance verdicts". Link that run from the release PR.
 3. **The contract's status line.** node-integration.md §1 names the protocol revision
    and the ADR-0030 steps the release implements, and every "not implemented yet" it

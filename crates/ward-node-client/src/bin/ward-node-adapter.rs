@@ -9,10 +9,13 @@
 //! * `{"cmd":"run", ...}` with a pre-signed envelope (`envelope_json` and `proof`, sent
 //!   byte for byte) or, as a convenience, `issuer_seed_file` and `envelope` to sign here,
 //!   plus optional `operation_ids`, `poll_ms`, `max_poll_ms`, `grace_ms` and `task_root`
-//!   → a stream of `state`, `rejected`, `admitted`, `recovering`, `receipt` and `evidence`
-//!   events and one final `done` with the attempt report;
+//!   → a stream of `state`, `rejected`, `admitted`, `recovering`, `receipt`, `evidence`
+//!   and, for a manifest with an `output` grant, `output` events and one final `done`
+//!   with the attempt report, which then carries the bounded output;
 //! * `{"cmd":"revoke","operation_id":N,"binding":{...}}` → `verb`;
-//! * `{"cmd":"inspect","binding":{...}}` → `inspected` or `rejected`.
+//! * `{"cmd":"inspect","binding":{...}}` → `inspected` or `rejected`;
+//! * `{"cmd":"result","binding":{...}}` → `result` (the state and the bounded output) or
+//!   `rejected`.
 //!
 //! A `SIGTERM` or `SIGINT` during a `run` cancels it: the attempt is revoked and sealed,
 //! `done` is written, and the adapter exits without reading further commands; while idle,
@@ -33,7 +36,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use ward_node_client::{
     Applied, AttemptRequest, CancelToken, Client, Driver, EnvelopeInput, Inspection, IssuerKey,
-    OperationIds, RunConfig, SignedEnvelope, Timeouts, UnixTransport,
+    OperationIds, Resulted, RunConfig, SignedEnvelope, Timeouts, UnixTransport,
 };
 use ward_node_protocol::{AdmissionEnvelopeJson, IssuerProof, OperationId, TaskBinding};
 
@@ -94,6 +97,14 @@ struct RevokeCommand {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InspectCommand {
+    #[serde(rename = "cmd")]
+    _cmd: String,
+    binding: TaskBinding,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultCommand {
     #[serde(rename = "cmd")]
     _cmd: String,
     binding: TaskBinding,
@@ -211,8 +222,9 @@ impl Adapter {
             "run" => self.run(line),
             "revoke" => self.revoke(line),
             "inspect" => self.inspect(line),
+            "result" => self.result(line),
             other => Err(format!(
-                "unknown command `{other}`; the commands are capabilities, run, revoke and inspect"
+                "unknown command `{other}`; the commands are capabilities, run, revoke, inspect and result"
             )),
         };
         if let Err(message) = result {
@@ -330,6 +342,28 @@ impl Adapter {
             Inspection::Rejected { reason } => json!({
                 "event": "rejected",
                 "verb": "inspect",
+                "operation_id": Value::Null,
+                "reason": reason,
+            }),
+        });
+        Ok(())
+    }
+}
+
+impl Adapter {
+    fn result(&self, line: &str) -> Result<(), String> {
+        let command = parse::<ResultCommand>(line)?;
+        let client = self.client()?;
+        let resulted = client
+            .result(command.binding)
+            .map_err(|error| error.to_string())?;
+        emit(match resulted {
+            Resulted::Result { state, output } => {
+                json!({"event": "result", "state": state, "output": output})
+            }
+            Resulted::Rejected { reason } => json!({
+                "event": "rejected",
+                "verb": "result",
                 "operation_id": Value::Null,
                 "reason": reason,
             }),

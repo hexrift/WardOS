@@ -16,11 +16,12 @@
 //! one spelling on the wire.
 //!
 //! The manifest bytes themselves are one JSON object in the grammar of
-//! [`CapabilityManifest`]: at this revision a single `network` grant, spelled as
-//! `ward-policy` spells its `network` capability (`"offline"`, or `{"custom": [hosts]}`
-//! in its host-pattern grammar). Bytes outside the grammar fail envelope decoding, so a
-//! node never admits a manifest it cannot read. Which decoded grants a node honours is
-//! the node's decision, made at `admit`.
+//! [`CapabilityManifest`]: a required `network` grant, spelled as `ward-policy` spells
+//! its `network` capability (`"offline"`, or `{"custom": [hosts]}` in its host-pattern
+//! grammar), and an optional `output` grant ([`OutputGrant`]: the stdio and workspace
+//! files to return). Bytes outside the grammar fail envelope decoding, so a node never
+//! admits a manifest it cannot read. Which decoded grants a node honours is the node's
+//! decision, made at `admit`.
 
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroU64;
@@ -31,6 +32,7 @@ use ward_authority::UntrustedAuthorityLease;
 use ward_events::{AgentId, Blake3Hash, NodeId, SessionId, SnapshotId};
 
 use crate::TaskBinding;
+use crate::output::{OutputError, OutputGrant, OutputGrantWire};
 
 /// Maximum number of ancestor leases one admission envelope may carry.
 pub const MAX_ADMISSION_LINEAGE: usize = 16;
@@ -72,6 +74,9 @@ pub enum TaskAdmissionError {
     InvalidHostPattern,
     /// A `custom` network grant lists the same pattern twice.
     DuplicateHost,
+    /// The `output` grant is outside its grammar (too many files, an invalid or repeated
+    /// path).
+    MalformedOutputGrant(OutputError),
     /// The wall-clock budget is zero.
     ZeroBudget,
     /// The admission version is zero.
@@ -105,6 +110,7 @@ impl Display for TaskAdmissionError {
             Self::TooManyHosts => "capability manifest host allowlist is too long",
             Self::InvalidHostPattern => "capability manifest host pattern is invalid",
             Self::DuplicateHost => "capability manifest host pattern is repeated",
+            Self::MalformedOutputGrant(_) => "capability manifest output grant is invalid",
             Self::ZeroBudget => "wall-clock budget must be non-zero",
             Self::ZeroVersion => "admission version must be non-zero",
             Self::LineageTooLong => "authority lineage is too long",
@@ -259,19 +265,32 @@ pub enum NetworkGrant {
 
 /// The decoded capability manifest of an admitted workload.
 ///
-/// This is the manifest grammar of protocol 1.3: exactly the field `network`, a
-/// [`NetworkGrant`]. Unknown fields, a repeated field, anything that is not one JSON
-/// object and any value outside the grammar fail decoding.
+/// This is the manifest grammar of protocol 1.3: the required field `network`, a
+/// [`NetworkGrant`], and the optional field `output`, an [`OutputGrant`] (absent means
+/// no output is returned). Unknown fields, a repeated field, anything that is not one
+/// JSON object and any value outside the grammar fail decoding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CapabilityManifest {
     network: NetworkGrant,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<OutputGrant>,
 }
 
 impl CapabilityManifest {
-    /// A manifest asking for exactly `network`.
+    /// A manifest asking for exactly `network`, returning no output.
     #[must_use]
     pub const fn new(network: NetworkGrant) -> Self {
-        Self { network }
+        Self {
+            network,
+            output: None,
+        }
+    }
+
+    /// The same manifest also asking for `output` to be returned.
+    #[must_use]
+    pub fn with_output(mut self, output: OutputGrant) -> Self {
+        self.output = Some(output);
+        self
     }
 
     /// Strictly decode manifest bytes.
@@ -290,7 +309,12 @@ impl CapabilityManifest {
                 NetworkGrant::Custom(HostAllowlist::new(patterns)?)
             }
         };
-        Ok(Self { network })
+        let output = wire
+            .output
+            .map(OutputGrant::try_from)
+            .transpose()
+            .map_err(TaskAdmissionError::MalformedOutputGrant)?;
+        Ok(Self { network, output })
     }
 
     /// The egress the manifest asks for.
@@ -298,12 +322,27 @@ impl CapabilityManifest {
     pub const fn network(&self) -> &NetworkGrant {
         &self.network
     }
+
+    /// The output the manifest asks the node to return, if any.
+    #[must_use]
+    pub const fn output(&self) -> Option<&OutputGrant> {
+        self.output.as_ref()
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CapabilityManifestWire {
     network: NetworkGrantWire,
+    #[serde(default, deserialize_with = "deserialize_present_output")]
+    output: Option<OutputGrantWire>,
+}
+
+fn deserialize_present_output<'de, D>(deserializer: D) -> Result<Option<OutputGrantWire>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    OutputGrantWire::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]

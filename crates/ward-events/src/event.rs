@@ -681,6 +681,58 @@ impl NodeIntervention {
     }
 }
 
+/// One captured output stream of a node execution attempt, as returned: how many bytes
+/// the node kept (the head) and how many it dropped past them. Never the bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeOutputStream {
+    /// Bytes returned to the control plane.
+    pub returned: u64,
+    /// Bytes the workload wrote past the returned head.
+    pub dropped: u64,
+}
+
+/// What the node found at a workspace path the manifest declared for return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeOutputFileStatus {
+    /// Returned whole, with its digest.
+    Returned,
+    /// Past the content budget: size and digest only.
+    DigestOnly,
+    /// No such path.
+    Missing,
+    /// A symlink, directory or other non-regular file; never followed or read.
+    NotARegularFile,
+    /// Larger than the node digests; neither read nor hashed.
+    TooLarge,
+}
+
+impl NodeOutputFileStatus {
+    /// Stable lowercase name, as the node protocol spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Returned => "returned",
+            Self::DigestOnly => "digest_only",
+            Self::Missing => "missing",
+            Self::NotARegularFile => "not_a_regular_file",
+            Self::TooLarge => "too_large",
+        }
+    }
+}
+
+/// One workspace file the manifest declared for return, as the node reported it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeOutputFile {
+    /// The declared path, relative to the workspace.
+    pub path: SandboxPath,
+    /// The file's size in bytes; `0` when there was nothing to size.
+    pub size: u64,
+    /// `BLAKE3-256` of the file, when it was read or digested.
+    pub digest: Option<Blake3Hash>,
+    /// What was found and what was returned.
+    pub status: NodeOutputFileStatus,
+}
+
 // ---------------------------------------------------------------------------------------
 // The catalogue
 // ---------------------------------------------------------------------------------------
@@ -1314,6 +1366,19 @@ pub enum WardEvent {
         /// The `seal` operation id.
         operation: u64,
     },
+    /// The node collected the attempt's bounded output after its workload ended, as the
+    /// manifest's `output` grant asked (#332 stage 2): how much of each stream it kept and
+    /// dropped, and each declared file's size, digest and status. Written before
+    /// `NodeAttemptEnded`; `result` returns exactly what this record digests, so a control
+    /// plane binds what it received to the sealed log. Never the output itself.
+    NodeAttemptOutputCollected {
+        /// The captured stdout.
+        stdout: NodeOutputStream,
+        /// The captured stderr.
+        stderr: NodeOutputStream,
+        /// The declared files, in declaration order.
+        files: Vec<NodeOutputFile>,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -1369,11 +1434,12 @@ pub enum EventKind {
     NodeAttemptEnded = 43,
     NodeAttemptRecovered = 44,
     NodeAttemptSealed = 45,
+    NodeAttemptOutputCollected = 46,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 46] = [
+    pub const ALL: [EventKind; 47] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -1420,6 +1486,7 @@ impl EventKind {
         EventKind::NodeAttemptEnded,
         EventKind::NodeAttemptRecovered,
         EventKind::NodeAttemptSealed,
+        EventKind::NodeAttemptOutputCollected,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
@@ -1478,6 +1545,7 @@ impl EventKind {
             EventKind::NodeAttemptEnded => "node_attempt_ended",
             EventKind::NodeAttemptRecovered => "node_attempt_recovered",
             EventKind::NodeAttemptSealed => "node_attempt_sealed",
+            EventKind::NodeAttemptOutputCollected => "node_attempt_output_collected",
         }
     }
 
@@ -1519,6 +1587,7 @@ impl EventKind {
                 | EventKind::NodeAttemptEnded
                 | EventKind::NodeAttemptRecovered
                 | EventKind::NodeAttemptSealed
+                | EventKind::NodeAttemptOutputCollected
         )
     }
 }
@@ -1712,6 +1781,7 @@ impl WardEvent {
             WardEvent::NodeAttemptEnded { .. } => EventKind::NodeAttemptEnded,
             WardEvent::NodeAttemptRecovered { .. } => EventKind::NodeAttemptRecovered,
             WardEvent::NodeAttemptSealed { .. } => EventKind::NodeAttemptSealed,
+            WardEvent::NodeAttemptOutputCollected { .. } => EventKind::NodeAttemptOutputCollected,
         }
     }
 

@@ -1,5 +1,6 @@
 //! A typed client over the node protocol: handshake (node-integration.md §4), capability
-//! discovery (§5) and the lifecycle verbs (§6), one connection per request.
+//! discovery (§5), the lifecycle verbs (§6) and the read-only `result` request (§6.6), one
+//! connection per request.
 //!
 //! The client offers the window [`PROTOCOL_WINDOW`]: from the first version with signed
 //! admission (1.3) up to the highest version this revision of `ward-node-protocol`
@@ -14,11 +15,12 @@ use std::fmt::{Display, Formatter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ward_node_protocol::{
-    CapabilityDiscoveryContext, CapabilityDiscoveryResponse, HandshakeRequest, HandshakeResponse,
-    NodeCapabilities, OperationId, ProtocolRejectionReason, ProtocolVersion,
-    SupportedProtocolRange, TASK_ADMISSION_PROTOCOL, TaskBinding, TaskExecutionOutcome,
-    TaskLifecycleContext, TaskLifecycleRejectionReason, TaskLifecycleRequest,
-    TaskLifecycleResponse, TaskLifecycleState, WARD_NODE_PROTOCOL, supports_task_admission,
+    AttemptOutput, CapabilityDiscoveryContext, CapabilityDiscoveryResponse, HandshakeRequest,
+    HandshakeResponse, MAX_RESULT_RESPONSE_BYTES, NodeCapabilities, OperationId,
+    ProtocolRejectionReason, ProtocolVersion, SupportedProtocolRange, TASK_ADMISSION_PROTOCOL,
+    TaskBinding, TaskExecutionOutcome, TaskLifecycleContext, TaskLifecycleRejectionReason,
+    TaskLifecycleRequest, TaskLifecycleResponse, TaskLifecycleState, TaskResultResponse,
+    WARD_NODE_PROTOCOL, supports_task_admission,
 };
 
 use crate::issuer::SignedEnvelope;
@@ -64,6 +66,8 @@ pub enum Verb {
     Seal,
     /// `inspect`.
     Inspect,
+    /// `result` (§6.6).
+    Result,
 }
 
 impl Verb {
@@ -81,6 +85,7 @@ impl Verb {
             Self::Revoke => "revoke",
             Self::Seal => "seal",
             Self::Inspect => "inspect",
+            Self::Result => "result",
         }
     }
 }
@@ -120,6 +125,24 @@ pub enum Inspection {
         outcome: Option<TaskExecutionOutcome>,
     },
     /// The node refused the inspection.
+    Rejected {
+        /// The typed refusal (§8.3).
+        reason: TaskLifecycleRejectionReason,
+    },
+}
+
+/// The node's answer to `result` (§6.6).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Resulted {
+    /// The ended attempt's bounded output, with the state it was read in.
+    Result {
+        /// The task's state: `exited`, `stopped`, `revoked` or `sealed`.
+        state: TaskLifecycleState,
+        /// The output.
+        output: AttemptOutput,
+    },
+    /// The node refused the request.
     Rejected {
         /// The typed refusal (§8.3).
         reason: TaskLifecycleRejectionReason,
@@ -449,6 +472,37 @@ impl<T: Transport> Client<T> {
         }
     }
 
+    /// `result`: the bounded output of an ended attempt admitted with an `output` grant
+    /// (§6.6), read within `MAX_RESULT_RESPONSE_BYTES` rather than the lifecycle line bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ClientError`] when the node cannot be reached or answers outside the
+    /// protocol; a typed refusal is `Ok(Resulted::Rejected)`.
+    pub fn result(&self, binding: TaskBinding) -> Result<Resulted, ClientError> {
+        let request = self
+            .lifecycle
+            .result(binding)
+            .map_err(|_| ClientError::Encoding)?;
+        let request = serde_json::to_string(&request).map_err(|_| ClientError::Encoding)?;
+        let response = self.send_bounded(Verb::Result, &request, MAX_RESULT_RESPONSE_BYTES)?;
+        match self.lifecycle.decode_result_response(&response) {
+            Ok(TaskResultResponse::Result {
+                binding: answered,
+                state,
+                output,
+                ..
+            }) if answered == binding => Ok(Resulted::Result { state, output }),
+            Ok(TaskResultResponse::Rejected {
+                binding: answered,
+                reason,
+                ..
+            }) if answered == binding => Ok(Resulted::Rejected { reason }),
+            Ok(_) => Err(ClientError::ResponseMismatch { verb: Verb::Result }),
+            Err(_) => Err(ClientError::MalformedResponse { verb: Verb::Result }),
+        }
+    }
+
     fn mutate(
         &self,
         verb: Verb,
@@ -481,10 +535,21 @@ impl<T: Transport> Client<T> {
     }
 
     fn send(&self, verb: Verb, request: &str) -> Result<String, ClientError> {
+        self.send_bounded(verb, request, crate::transport::MAX_LINE_BYTES)
+    }
+
+    fn send_bounded(
+        &self,
+        verb: Verb,
+        request: &str,
+        response_bound: usize,
+    ) -> Result<String, ClientError> {
         let Exchange {
             handshake,
             response,
-        } = self.transport.exchange(&self.hello, request)?;
+        } = self
+            .transport
+            .exchange_with_response_bound(&self.hello, request, response_bound)?;
         let accepted = accepted_version(&handshake)?;
         if accepted != self.negotiated {
             return Err(ClientError::ProtocolChanged {

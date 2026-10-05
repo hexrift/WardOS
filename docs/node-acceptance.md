@@ -13,19 +13,20 @@ replay path by the `ward-node-adapter` process. Nothing is mocked: the sandbox i
 bubblewrap, the workloads are real processes, the evidence logs are the node's own files.
 
 The suite is [`crates/ward-node-client/tests/acceptance.rs`](../crates/ward-node-client/tests/acceptance.rs)
-and, for the network allowlist (§2.2),
-[`crates/ward-node-client/tests/acceptance_network.rs`](../crates/ward-node-client/tests/acceptance_network.rs):
+and, for the network allowlist (§2.2) and result return (§2.3),
+[`crates/ward-node-client/tests/acceptance_network.rs`](../crates/ward-node-client/tests/acceptance_network.rs)
+and [`crates/ward-node-client/tests/acceptance_output.rs`](../crates/ward-node-client/tests/acceptance_output.rs):
 one `#[test]` per case, named exactly as in the tables below. The pass criterion of each
 case is written in the test file's `CASES` table and repeated here word for word; the
-tests `every_acceptance_case_is_documented` and `every_network_acceptance_case_is_documented`
-fail when the two drift apart. A case that passes prints one verdict line:
+tests `every_acceptance_case_is_documented`, `every_network_acceptance_case_is_documented`
+and `every_output_acceptance_case_is_documented` fail when the two drift apart. A case that passes prints one verdict line:
 
 ```text
 acceptance <case>: PASS in <ms> ms -- <criterion>
 ```
 
 [`scripts/acceptance/node.sh`](../scripts/acceptance/node.sh) runs exactly these cases,
-from both files, with isolation required (`WARD_REQUIRE_ISOLATION=1`, so a host without a working
+from all three files, with isolation required (`WARD_REQUIRE_ISOLATION=1`, so a host without a working
 bubblewrap fails instead of skipping), one case at a time so the verdict lines stay
 whole, and prints the verdicts (with the rest of the `cargo test` output, on stderr) and
 a summary table (on stdout, so it can be captured alone):
@@ -55,13 +56,14 @@ Together they cover the epic's completion gate: bounded execution (case 1), reco
 (cases 5 and 8), authorization failure (case 6) and replay safety (cases 7 and 8), with
 isolation (case 2) and interruption (cases 3 to 5) as the cross-system properties the
 slice is named for. The network allowlist cases of §2.2 extend isolation and interruption
-to an attempt with egress.
+to an attempt with egress; the result return cases of §2.3 prove the bounded result a
+control plane receives against the files on the host.
 
 ### 2.1 How each case reads its result
 
-The protocol carries no workload output and does not export the workspace
-(node-integration.md §11.5), so the cases read outcomes the way a control plane on the
-node's host can:
+The main suite's workloads are admitted without an `output` grant, so the protocol
+carries none of their output and does not export the workspace (node-integration.md
+§11.5); the cases read outcomes the way a control plane on the node's host can:
 
 - the receipt and state from `inspect` through the client, and the client's
   `AttemptReport` (`outcome`, `receipt`, `cause`, `evidence_head`, `operations`);
@@ -122,6 +124,30 @@ socket under `<task-root>/<task>/<attempt>.egress/`: `403` before the pause, `50
 ward` while paused with nothing recorded, `403` after resume, and no socket at all after
 `stop`. The third needs no workload.
 
+### 2.3 The result return cases
+
+The cases of `acceptance_output.rs` start the node with `--output-return`
+(node-integration.md §2.1) and admit manifests carrying an `output` grant (§7.5). The
+workloads are shell one-liners that print to both streams and write files into the
+workspace; the control plane reads the result through the driver's report and through
+`result` (§6.6), and the test compares it with the files in the workspace on the host and
+with the `NodeAttemptOutputCollected` record of the sealed log.
+
+| Case | Pass criterion |
+| --- | --- |
+| `output_return_delivers_bounded_stdio_and_files_with_matching_digests` | a workload admitted with an output grant on a node started with --output-return prints to both streams and writes files; the report carries exactly what it printed with dropped 0, each declared file's content and BLAKE3 digest equal to the file in the workspace on the host, a file past files_bytes digest-only with its true size, a missing path and a planted symlink skipped unread; the sealed log records NodeAttemptOutputCollected with the same digests right before NodeAttemptEnded; the result is stored mode 0600 in a 0700 directory beside the workspace and nothing is written into the workspace |
+| `output_return_marks_truncation_and_keeps_digests_right_past_the_budgets` | a workload writing past stdio_bytes on both streams and a file past files_bytes gets exactly the first stdio_bytes of each stream, truncated true and the exact dropped count, the file digest-only with its true size and digest, the evidence record agreeing on every count and digest, and result answering the same bytes after seal |
+| `output_return_refuses_escaping_paths_at_admit_and_follows_nothing` | a signed envelope whose manifest declares ../x or an absolute path is refused authority_denied at admit with no task directory created; a workload that plants a symlink to a host secret at one declared path and a symlink to a directory on another is reported not_a_regular_file for both, the host secret appears nowhere in the result or the log, and the attempt still completes |
+| `output_return_is_advertised_and_honoured_only_when_enabled` | a node started without --output-return carries no output section in its 1.3 capability document, refuses an output grant unsupported_grant with nothing materialised and answers result unsupported_operation; the same node started with it reports output.stdio and output.files true, and an attempt it admitted without the grant has no result (resource_unavailable) while its receipt is unchanged |
+| `output_return_survives_a_node_restart_and_seal` | after SIGKILL of the node and a restart with the flag, result answers the sealed attempt's output byte for byte as before the kill, the evidence log and HEAD still verify with the NodeAttemptOutputCollected record in place, and a client replay of the run with the same operation ids reports the same output without running anything |
+
+The escaping-path part of the third case cannot be built through the shipped client,
+whose manifest type refuses the path at construction; the test hand-crafts the envelope
+bytes (the valid manifest's hex and hash replaced by the escaping one's) and signs them,
+so what is proven is the node's own refusal of a signed envelope outside the grammar. The
+planted symlink names the host secret by its absolute host path, which the workload
+cannot read; the case proves the node never follows it when it collects.
+
 ## 3. Running it
 
 ```text
@@ -171,8 +197,10 @@ minute on a developer machine; each case prints its own time.
   its recording and its lifecycle through the Unix socket the sandbox is handed; they do
   not prove a workload tool that only speaks `HTTP_PROXY` can use it (the node path has no
   in-sandbox relay yet, node-integration.md §9), and no credential is injected (#267).
-- **No workspace export and no output.** What the workload wrote is read on the host as
-  the node's uid, which a remote control plane cannot do; the protocol carries neither.
+- **No workspace export, no streamed output.** The result return cases prove the bounded
+  result of §2.3 (declared files, stream heads); what a workload wrote beyond the files it
+  declared is still read on the host as the node's uid, which a remote control plane
+  cannot do, and nothing is carried while the attempt runs.
 - **No escape attempt beyond the probes.** The isolation case is a contract check of what
   the sandbox denies to an ordinary workload, not an adversarial escape suite; the
   kernel-level boundary tests of [experiments.md](experiments.md) E-01 and the

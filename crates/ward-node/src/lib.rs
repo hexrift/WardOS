@@ -25,6 +25,12 @@
 //!   content-addressed snapshot store — and `network.proxy_allowlist` only when its
 //!   execution honours a `network.custom` manifest through a per-attempt egress proxy
 //!   ([`egress`]), which is what makes `admit` accept one.
+//! * at protocol 1.3, a service whose execution returns output
+//!   ([`execution::NodeExecution::with_output_return`]) also serves the read-only `result`
+//!   request for an ended attempt admitted with an `output` grant: its bounded stdout,
+//!   stderr and declared workspace files, as the reaper collected and stored them
+//!   ([`output`]), and advertises `output` in 1.3 capability discovery. Any other node
+//!   refuses the grant `unsupported_grant` at `admit` and `result` as unsupported.
 //!
 //! A service built with admission keeps its task registry durable under the node state
 //! directory ([`records`]) and recovers it before it serves (see [`task`]), so a restart
@@ -60,6 +66,7 @@ pub mod egress;
 pub mod evidence;
 pub mod execution;
 pub mod issuer;
+pub mod output;
 pub mod peer;
 pub mod records;
 pub mod state;
@@ -79,8 +86,9 @@ use nix::unistd::{Gid, Uid};
 use thiserror::Error;
 use ward_node_protocol::{
     CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse, LifecycleCapabilities,
-    NamespaceCapabilities, NodeCapabilities, SupportedProtocolRange, TaskLifecycleContext,
-    WARD_NODE_PROTOCOL, negotiate, supports_task_admission, supports_task_lifecycle,
+    NamespaceCapabilities, NodeCapabilities, OutputCapabilities, SupportedProtocolRange,
+    TaskLifecycleContext, TaskResultRequest, WARD_NODE_PROTOCOL, negotiate,
+    supports_task_admission, supports_task_lifecycle,
 };
 
 use crate::admit::NodeAdmission;
@@ -163,6 +171,7 @@ pub enum NodeServiceError {
 ///
 /// Clones share one task registry, so a task created on one connection is visible to
 /// every later connection served by any clone.
+#[allow(clippy::struct_excessive_bools)] // one flag per operator-enabled capability
 #[derive(Clone)]
 pub struct NodeService {
     capabilities: NodeCapabilities,
@@ -170,6 +179,7 @@ pub struct NodeService {
     admits: bool,
     executes: bool,
     network_allowlist: bool,
+    output_return: bool,
     tasks: Arc<Mutex<TaskRegistry>>,
 }
 
@@ -189,6 +199,7 @@ impl NodeService {
             admits: false,
             executes: false,
             network_allowlist: false,
+            output_return: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::default())),
         })
     }
@@ -213,6 +224,7 @@ impl NodeService {
             admits: true,
             executes: false,
             network_allowlist: false,
+            output_return: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_admission(
                 MAX_NODE_TASKS,
                 admission,
@@ -237,12 +249,14 @@ impl NodeService {
         CapabilityDiscoveryContext::new(capabilities.protocol())
             .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         let network_allowlist = execution.honours_network_allowlist();
+        let output_return = execution.honours_output_return();
         Ok(Self {
             capabilities,
             supported: WARD_NODE_PROTOCOL,
             admits: true,
             executes: true,
             network_allowlist,
+            output_return,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_execution(
                 MAX_NODE_TASKS,
                 admission,
@@ -327,6 +341,7 @@ impl NodeService {
         let mut isolation = configured.isolation();
         let mut network = configured.network();
         let mut snapshots = configured.snapshots();
+        let mut output = OutputCapabilities::NONE;
         let lifecycle = if supports_task_admission(protocol) {
             isolation.namespaces = NamespaceCapabilities {
                 sandbox: self.executes,
@@ -335,6 +350,10 @@ impl NodeService {
             network.offline = self.executes;
             network.proxy_allowlist = self.executes && self.network_allowlist;
             snapshots.content_addressed = self.executes;
+            output = OutputCapabilities {
+                stdio: self.executes && self.output_return,
+                files: self.executes && self.output_return,
+            };
             LifecycleCapabilities {
                 admit: self.admits,
                 start: self.executes,
@@ -360,6 +379,7 @@ impl NodeService {
             configured.verifier(),
             lifecycle,
         )
+        .and_then(|capabilities| capabilities.with_output(output))
         .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         let response = context
             .response(capabilities)
@@ -375,6 +395,16 @@ impl NodeService {
     ) -> Result<(), NodeServiceError> {
         let context = TaskLifecycleContext::new(protocol)
             .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
+        if serde_json::from_str::<serde_json::Value>(request_line)
+            .is_ok_and(|value| value["request"] == "result")
+        {
+            let TaskResultRequest::Result { binding, .. } = context
+                .decode_result_request(request_line)
+                .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
+            let response = TaskRegistry::result(&self.tasks, context, binding)
+                .map_err(|_| NodeServiceError::TaskRegistryUnavailable)?;
+            return write_answer(stream, &response);
+        }
         let request = context
             .decode_request(request_line)
             .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
@@ -1564,6 +1594,7 @@ mod tests {
 
     struct Executing {
         _dir: tempfile::TempDir,
+        root: std::path::PathBuf,
         service: NodeService,
         launcher: crate::test_support::FakeLauncher,
         snapshot: ward_events::SnapshotId,
@@ -1574,17 +1605,32 @@ mod tests {
     }
 
     fn executing_service_with(configured: NodeCapabilities, stop_timeout: Duration) -> Executing {
-        executing_service_built(configured, stop_timeout, false)
+        executing_service_built(configured, stop_timeout, false, false)
     }
 
     fn executing_service_enforcing_a_network_allowlist() -> Executing {
-        executing_service_built(capabilities(), crate::execution::DEFAULT_STOP_TIMEOUT, true)
+        executing_service_built(
+            capabilities(),
+            crate::execution::DEFAULT_STOP_TIMEOUT,
+            true,
+            false,
+        )
+    }
+
+    fn executing_service_returning_output() -> Executing {
+        executing_service_built(
+            capabilities(),
+            crate::execution::DEFAULT_STOP_TIMEOUT,
+            false,
+            true,
+        )
     }
 
     fn executing_service_built(
         configured: NodeCapabilities,
         stop_timeout: Duration,
         network_allowlist: bool,
+        output_return: bool,
     ) -> Executing {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
@@ -1602,9 +1648,11 @@ mod tests {
             Arc::new(launcher.clone()),
         )
         .with_stop_timeout(stop_timeout)
-        .with_network_allowlist(network_allowlist);
+        .with_network_allowlist(network_allowlist)
+        .with_output_return(output_return);
         let service = NodeService::with_execution(configured, admission, execution).unwrap();
         Executing {
+            root: dir.path().join("tasks"),
             _dir: dir,
             service,
             launcher,
@@ -2147,5 +2195,145 @@ mod tests {
         ));
         accepted_client.shutdown(std::net::Shutdown::Write).unwrap();
         assert!(accepted.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn output_is_advertised_only_by_an_executing_node_returning_it_at_one_three() {
+        let returning = executing_service_returning_output();
+        let executing = executing_service();
+        let (raw, observed) = discovered(&returning.service, 3);
+        assert_eq!(
+            observed.output(),
+            ward_node_protocol::OutputCapabilities {
+                stdio: true,
+                files: true,
+            }
+        );
+        assert!(
+            raw.contains(r#""output":{"stdio":true,"files":true}"#),
+            "{raw}"
+        );
+        let (raw, observed) = discovered(&executing.service, 3);
+        assert_eq!(
+            observed.output(),
+            ward_node_protocol::OutputCapabilities::NONE
+        );
+        assert!(!raw.contains("output"), "{raw}");
+        for minor in [1, 2] {
+            assert_eq!(
+                discovered(&returning.service, minor).0,
+                discovered(&executing.service, minor).0,
+                "1.{minor}"
+            );
+        }
+        let state = tempfile::tempdir().unwrap();
+        let admitting = admitting_service(&state.path().join("state"));
+        assert!(!discovered(&admitting, 3).0.contains("output"));
+    }
+
+    #[test]
+    fn a_result_request_over_the_local_socket_returns_the_stored_output_or_a_typed_refusal() {
+        let returning = executing_service_returning_output();
+        let node = LocalNode::serve(returning.service.clone(), 5);
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let binding = TaskBinding::new(
+            TaskId::from_u128(7),
+            ExecutionAttemptId::from_u128(8),
+            LeaseId::from_u128(9),
+        );
+        let result_line = serde_json::to_string(&context.result(binding).unwrap()).unwrap();
+        let decode = |raw: &str| context.decode_result_response(raw).unwrap();
+
+        assert_eq!(
+            decode(&node.request(WARD_NODE_PROTOCOL, &result_line)),
+            context.result_rejected(binding, TaskLifecycleRejectionReason::TaskNotFound)
+        );
+        assert_eq!(
+            node.lifecycle(&context.create(OperationId::new(1).unwrap(), binding)),
+            context.accepted(
+                OperationId::new(1).unwrap(),
+                binding,
+                TaskLifecycleState::Created
+            )
+        );
+        let mut input = crate::test_support::envelope_input(binding);
+        crate::test_support::with_manifest(
+            &mut input,
+            crate::test_support::output_manifest(8, &["out.txt"], 64),
+        );
+        input.workload = ward_node_protocol::TaskWorkload::new(
+            input.workload.argv().clone(),
+            input.workload.capability_manifest().clone(),
+            returning.snapshot,
+            input.workload.wall_clock_budget_ms(),
+        )
+        .unwrap();
+        let envelope = ward_node_protocol::TaskAdmissionEnvelope::new(input).unwrap();
+        assert_eq!(
+            node.lifecycle(&crate::test_support::signed_admit(
+                context,
+                OperationId::new(2).unwrap(),
+                binding,
+                &envelope
+            )),
+            context.accepted(
+                OperationId::new(2).unwrap(),
+                binding,
+                TaskLifecycleState::Ready
+            )
+        );
+        returning.launcher.set_stdio(b"hello world", b"");
+        assert_eq!(
+            node.lifecycle(&context.start(OperationId::new(3).unwrap(), binding)),
+            context.accepted(
+                OperationId::new(3).unwrap(),
+                binding,
+                TaskLifecycleState::Running
+            )
+        );
+        crate::test_support::eventually(|| returning.launcher.waiting() == 1);
+        let workspace = returning
+            .root
+            .join(binding.task().to_string())
+            .join(binding.attempt().to_string());
+        std::fs::write(workspace.join("out.txt"), b"bye").unwrap();
+        returning
+            .launcher
+            .exit(crate::execution::WorkloadExit::Exited { code: Some(0) });
+        crate::test_support::eventually(|| {
+            crate::output::AttemptOutputStore::new(&returning.root, binding)
+                .read()
+                .unwrap()
+                .is_some()
+        });
+        let raw = node.request(WARD_NODE_PROTOCOL, &result_line);
+        assert!(
+            raw.starts_with(r#"{"response":"result","protocol":{"major":1,"minor":3},"binding":"#),
+            "{raw}"
+        );
+        match decode(&raw) {
+            ward_node_protocol::TaskResultResponse::Result { state, output, .. } => {
+                assert_eq!(state, TaskLifecycleState::Exited);
+                assert_eq!(output.stdout().content(), b"hello wo");
+                assert_eq!(output.stdout().dropped(), 3);
+                assert!(matches!(
+                    &output.files()[0].status,
+                    ward_node_protocol::OutputFileStatus::Returned { content, .. } if content == b"bye"
+                ));
+            }
+            other @ ward_node_protocol::TaskResultResponse::Rejected { .. } => {
+                panic!("{other:?}")
+            }
+        }
+        node.join();
+        // At 1.2 the verb is unknown: the connection closes with no answer.
+        let one_two = SupportedProtocolRange::new(1, 2, 2).unwrap();
+        let early = result_line.replace(r#""minor":3"#, r#""minor":2"#);
+        let (raw, served) = exchange(&returning.service, one_two, &early, REQUEST_TIMEOUT);
+        assert_eq!(raw, "");
+        assert!(matches!(
+            served,
+            Err(NodeServiceError::MalformedLifecycleRequest)
+        ));
     }
 }

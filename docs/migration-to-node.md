@@ -29,7 +29,7 @@ neither reads or converts the other's.
 | Approvals | Held by the daemon, answered by the user or the desktop (`agent-integration.md` §4.1) | None: there is no channel from the sandbox to anyone (node-security-limitations.md §3.2) |
 | Intervention | `ward pause`, `ward resume`, `ward stop`, `ward stop --restore-entry` ([ADR-0019](decisions/ADR-0019-authority-freshness-intervention.md) §3) | `pause`, `resume`, `stop`, `revoke` over the socket, each confirmed before it is answered (node-integration.md §6) |
 | Evidence | One session log, `~/.local/state/ward/sessions/<id>/events.log`, written only by that session's `wardd`, sealed with `HEAD` by `ward stop` | One evidence log per attempt, `<task-root>/<task>/<attempt>.evidence/events.log`, written only by the node, sealed with `HEAD` by `seal` (node-integration.md §6.5) |
-| Result | The worktree, the session log, the verifier's verdict | A receipt (`completed`, `failed`, `unknown`) on `inspect`; the workspace stays on the host, output is not returned |
+| Result | The worktree, the session log, the verifier's verdict | A receipt (`completed`, `failed`, `unknown`) on `inspect`; on a node started with `--output-return`, the bounded output the manifest asked for (the head of stdout and stderr, declared workspace files with digests) on `result` (node-integration.md §6.6); the rest of the workspace stays on the host |
 | Who reads it | `ward replay`, `ward watch`, the desktop's trust bar and panels, TamperWard over the control socket | `ward replay --verify` on the host as the node's uid; the control plane through `inspect` and the adapter's attempt report |
 | Identity on the host | The login user; everything under `~/.local/state/ward` | A system user of its own (`ward-node` in the guide), with state, task root and socket directory nothing else can read |
 | Where it is installed from | The runtime tarball `wardos-<version>-<arch>-linux.tar.gz`, `install.sh`, or the image | The node tarball `ward-node-<node version>-<arch>-linux.tar.gz` (the node train's own version, compatibility.md §6), installed by the operator; present in the image but not started there (node-release-readiness.md §2) |
@@ -44,7 +44,7 @@ neither reads or converts the other's.
 | `ward stop` | `stop`, then `seal` | `ward stop` terminates, confirms, records `WorkloadsTerminated`, `SessionEnded` and seals in one operation; on the node, `stop` ends the attempt with a `failed` receipt and `seal` is a separate verb |
 | No counterpart | `revoke` | Revocation is durable before the kill and refuses every later `admit` or `start` under the lease, across restarts (node-integration.md §2.5). The per-session equivalent is the user's own policy change, which applies to the next session only (G7) |
 | The seal at `ward stop` | `seal` | Both write `HEAD` and make the log read-only. The node also accepts `seal` from `exited` and `revoked` |
-| Session log | Attempt evidence log | Same `ward-events` format (§4.1). The session log carries the agent's claims, kernel, proxy and verifier facts and the user's decisions; the attempt log carries the six node records about admission, launch, intervention, end, recovery and seal, the proxy's verdicts as `NetworkRequested`/`NetworkDenied` with origin `node` when the attempt has egress, and never workload output |
+| Session log | Attempt evidence log | Same `ward-events` format (§4.1). The session log carries the agent's claims, kernel, proxy and verifier facts and the user's decisions; the attempt log carries the seven node records about admission, launch, intervention, output collection, end, recovery and seal, the proxy's verdicts as `NetworkRequested`/`NetworkDenied` with origin `node` when the attempt has egress, and never workload output itself (a returned result is recorded by its counts and digests) |
 | Policy manifest (`.ward/policy.yaml` merged into a capability manifest) | Capability manifest in the envelope | The envelope's manifest uses `ward-policy`'s spelling for `network`; `offline` is honoured everywhere and `custom` on a node with `--network-allowlist`. Filesystem, exec, credential and step-through policy have no envelope field yet |
 | Entry snapshot (session CAS) | Imported snapshot (node CAS) | Both are `ward-snapshot` content-addressed stores with 64-hex ids; the stores are separate (`~/.local/state/ward/cas` and `<state-dir>/cas`) |
 | `ward replay --verify` | `ward replay --verify` | The same command verifies both logs (§4.1) |
@@ -59,8 +59,10 @@ neither reads or converts the other's.
 - **Network.** Node workloads are offline. There is no egress proxy on the node path and
   no issue yet for one (§3).
 - **Result return.** A session leaves its worktree in place for the user. An attempt's
-  workspace stays under the task root, readable only as the node's uid; stdout and stderr
-  are drained. No issue yet (§3).
+  workspace stays under the task root, readable only as the node's uid; what comes back
+  over the protocol is the bounded result the manifest declared, on a node started with
+  `--output-return` (the head of stdout and stderr, exact declared files with digests;
+  node-integration.md §6.6), not a worktree or a workspace export (§3).
 - **The desktop.** The trust bar, the approval inbox, the session switcher and the
   observer read session descriptions and session logs through the per-session control
   socket (`desktop.md`). None of them reads an attempt evidence log or drives a node.
@@ -125,7 +127,7 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
 | --- | --- | --- | --- |
 | 0 (today) | Governed tool and verification runs: an argv over a snapshot, offline, with a budget, beside per-session development on the same host | A real node is driven over its socket through `ward-node-client` and `ward-node-adapter`; the acceptance suite proves bounded execution, isolation, interruption, authorization failure, replay safety and recovery (node-acceptance.md) | #332 slices 5 to 10 (done: #354, #356, #358, #359, #361, #362, #363, #366, #367, #368, #371, #373, #374) |
 | 1 | Task driving by an external control plane, as a uid of its own on the node's host, through the adapter | A control plane outside WardOS runs attempts end to end from its own identity without sharing the node's uid, reads receipts and verifies evidence logs, following the integration guide alone | The client-uid allowlist (#378, done) and node-integration-guide.md (#374, done); the control plane's side is outside WardOS. Remote transport, enrolment and key bootstrap remain [#262](https://github.com/hexrift/WardOS/issues/262) |
-| 2 | Producer tasks: workloads that fetch a dependency, call a provider or hand a result back | A manifest with `network.custom` is honoured through a node-owned egress proxy with the session proxy's rules; an attempt's output or workspace reaches the control plane in a bounded form the protocol carries; `network.proxy_allowlist` and `snapshots.read` or an output capability read `true` | The network half by #332 (`--network-allowlist`, node-integration.md §9; done); no issue yet for result return (node-security-limitations.md §3.2) |
+| 2 | Producer tasks: workloads that fetch a dependency, call a provider or hand a result back | A manifest with `network.custom` is honoured through a node-owned egress proxy with the session proxy's rules; an attempt's output or workspace reaches the control plane in a bounded form the protocol carries; `network.proxy_allowlist` and `snapshots.read` or an output capability read `true` | Both halves by #332: the network half (`--network-allowlist`, node-integration.md §9; done) and the result half (`--output-return`, the manifest's `output` grant, `result` and the `output` capability section, node-integration.md §6.6; done). A workspace export as a snapshot (`snapshots.read`) has no issue yet (node-security-limitations.md §3.2) |
 | 3 | A hosted agent runtime: the conversation loop inside the sandbox, with approvals and credentials as node capabilities | A workload can ask the control plane a question and get an answer through a channel relayed by the node; a credential reaches a workload only brokered, scoped and revocable, with `credentials.proxy_injection` or `scoped_http_gateway` `true`; approvals are a node-mediated hold rather than a per-session daemon hold | No issue yet for the in-sandbox action channel; [#267](https://github.com/hexrift/WardOS/issues/267) for credentials, after the allowlist; the fleet-wide intervention issue (#269) was closed as superseded by #332, so approvals as a node capability have no issue yet |
 | 4 | Local sessions themselves: the desktop reads attempt evidence and drives node tasks, `ward up` is a thin client of a local node, per-session `wardd` is retired | `ward up`, `ward pause`, `ward resume`, `ward stop`, `ward verify`, `ward watch` and the desktop behave as they do today against a local node with no remote control plane; the single evidence writer of a session is the node; no command falls back to an in-process writer | [#258](https://github.com/hexrift/WardOS/issues/258)'s open slices ("Multi-session ownership and restart recovery", "Preserve current local CLI behaviour through the node boundary"); ADR-0029's migration map rows for the CLI, the per-session writer and the desktop; [#260](https://github.com/hexrift/WardOS/issues/260) for the scheduler several sessions need. The local-and-remote CLI issue (#272) was closed as superseded by #332 |
 
@@ -163,14 +165,21 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
 
 ### 3.3 Stage 2: network grants and result return
 
-- **What changes.** The network half is in place: an envelope may name `network.custom`
-  and a node started with `--network-allowlist` runs the workload behind a node-owned
-  egress proxy with the same rules the session proxy applies today (allowlist, private
-  ranges denied, `CONNECT` pinned), reached through its Unix socket; the capability
-  document changes only by `network.proxy_allowlist` reading `true`, within 1.3
-  (compatibility.md §1). What remains is the result half: the protocol gains a bounded
-  way to return what the workload produced, an additive protocol minor: a node that gains
-  it raises `max_minor`, and an unchanged control plane keeps negotiating what it did.
+- **What changes.** Both halves are in place. The network half: an envelope may name
+  `network.custom` and a node started with `--network-allowlist` runs the workload behind
+  a node-owned egress proxy with the same rules the session proxy applies today
+  (allowlist, private ranges denied, `CONNECT` pinned), reached through its Unix socket;
+  the capability document changes only by `network.proxy_allowlist` reading `true`,
+  within 1.3 (compatibility.md §1). The result half: an envelope may carry an `output`
+  grant (the first `stdio_bytes` of each stream, exact declared workspace files up to
+  `files_bytes`), a node started with `--output-return` keeps the stream heads while the
+  workload runs, collects the files once it has ended, stores the result beside the
+  workspace, records it with every digest in the attempt log and returns it through the
+  read-only `result` request; the capability document gains an `output` section only on
+  such a node (node-integration.md §6.6). This landed additively within 1.3 rather than
+  as a new minor, because the protected node tests pin the negotiated version at 1.3;
+  an unchanged control plane keeps negotiating what it did and a node without the flag
+  emits exactly the earlier document.
 - **What stays compatible.** `{"network":"offline"}` envelopes, every verb, every attempt
   log already written. The node still refuses a grant it cannot enforce rather than
   running with less (node-integration.md §7.5), so a node without `--network-allowlist`
@@ -180,14 +189,14 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
   session proxy's evidence records (`NetworkRequested`, `NetworkDenied`, with
   `ObservationsDropped` for a gap) are reused in the attempt log with origin `node`
   (§4.1): no new catalogue variant, so a `ward` that reads attempt logs reads these too.
-- **Rollback.** Roll the node back to a release without the flag or the minor; the
-  control plane negotiates down to what the node serves, or is refused at the handshake
-  if its `min_minor` is above it (compatibility.md §4). Attempt logs with network records
-  read under any `ward` that reads attempt logs at all, since the kinds are the session
-  proxy's; logs with the result half's records, once it lands, need the newer `ward`
-  (§4.1).
-- **Issues.** #332 for the network half (done); none yet for result return, which
-  node-security-limitations.md §3.2 records as "no issue yet".
+- **Rollback.** Roll the node back to a release without the flags; a control plane that
+  still sends an `output` grant is then refused `unsupported_grant` (or `authority_denied`
+  by a node older than the grammar), never run with less (compatibility.md §4). Attempt
+  logs with network records read under any `ward` that reads attempt logs at all, since
+  the kinds are the session proxy's; logs with the result half's
+  `NodeAttemptOutputCollected` record need a `ward` at least this new (§4.1).
+- **Issues.** #332 for both halves (done). A workspace export as a snapshot and streamed
+  output have no issue yet (node-security-limitations.md §3.2).
 
 ### 3.4 Stage 3: a hosted agent runtime, with approvals and credentials as node capabilities
 
@@ -267,12 +276,14 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
   node-integration.md §6.5). `ward replay --verify` verifies either, and `ward replay
   --json` summarises the node records (`crates/ward-cli/src/replay.rs`,
   `a_node_attempt_evidence_log_verifies_and_summarises`).
-- **The node's records are additive.** The six `NodeAttempt*` kinds are appended at the
-  end of the catalogue, and `node` is the eighth origin, under the append-only rule of
-  event-model.md §3.1. Adding them changed how no earlier record encodes, so every session
-  log sealed by an earlier release still verifies under the current `ward`. An attempt
-  with egress also carries the session proxy's `NetworkRequested`, `NetworkDenied` and
-  `ObservationsDropped` kinds, with origin `node` and no new variant.
+- **The node's records are additive.** The seven `NodeAttempt*` kinds are appended at the
+  end of the catalogue (the six of admission, launch, intervention, end, recovery and
+  seal, then `NodeAttemptOutputCollected` for a returned result), and `node` is the eighth
+  origin, under the append-only rule of event-model.md §3.1. Adding them changed how no
+  earlier record encodes, so every session log sealed by an earlier release still
+  verifies under the current `ward`. An attempt with egress also carries the session
+  proxy's `NetworkRequested`, `NetworkDenied` and `ObservationsDropped` kinds, with origin
+  `node` and no new variant.
 - **An older `ward` cannot read an attempt log.** The event body is postcard, which names
   a variant by its declaration index, and the origin is encoded the same way; a `ward`
   built before the node kinds and the `node` origin existed has no variant for them and
