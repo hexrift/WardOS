@@ -273,6 +273,7 @@ that gate each phase.
 | [`docs/onboarding.md`](docs/onboarding.md) | Five minutes to a verified agent: boot, welcome, key, project, `ward claude`, `ward verify`, what the bar shows, what to do when something is denied |
 | [`docs/install.md`](docs/install.md) | Install on an existing Linux host, requirements, first project and session |
 | [`docs/release-manifest.md`](docs/release-manifest.md) | The machine-readable release manifest format (ADR-0028) and its generator |
+| [`docs/compatibility.md`](docs/compatibility.md) | The `ward-node` protocol window, version skew and upgrade order for an external control plane |
 | [`docs/agent-integration.md`](docs/agent-integration.md) | How `ward claude` / `ward codex` compose the sandbox, proxy, credentials and hooks |
 | [`docs/design-language.md`](docs/design-language.md) | Visual and interaction identity of the WardOS desktop |
 | [`docs/desktop.md`](docs/desktop.md) | The desktop: commands, keys, menu, themes, packages, parity with Omarchy |

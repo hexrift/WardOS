@@ -102,6 +102,10 @@ jobs:
       # (tamperward.yml); keep the two from drifting apart again (issue #320).
       - run: bash scripts/security-check/tamperward-signoff-doc.test.sh
       - run: python3 scripts/security-check/tamperward-signoff-doc.py
+      # The node protocol window documented for external control planes
+      # (docs/compatibility.md) equals WARD_NODE_PROTOCOL in ward-node-protocol (#275).
+      - run: bash scripts/security-check/protocol-window.test.sh
+      - run: python3 scripts/security-check/protocol-window.py
 
   # The host image (image/) cannot be built or booted here; keep it lintable instead.
   image-lint:

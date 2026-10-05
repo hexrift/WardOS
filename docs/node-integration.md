@@ -178,6 +178,9 @@ version. An adapter for this contract should offer exactly `min_minor` 3, `max_m
 and refuse anything else: at 1.2 the node has no `admit`, no `exited` and no outcome, and
 a 1.2 connection that sends `admit` is closed.
 
+The supported version skew between a node and a control plane, and the upgrade order,
+are in [compatibility.md](compatibility.md).
+
 ## 5. Capability discovery
 
 At 1.1 and later the one request may be discovery:
