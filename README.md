@@ -18,9 +18,10 @@ portable Ward runtime + `ward-node`**, driven where needed by an **external cont
 ([ADR-0029](docs/decisions/ADR-0029-product-split-fleet-trust-boundaries.md)). Local mode
 remains first-class and needs no remote service; an external control plane distributes
 bounded, expiring authority while enforcement, resource limits, credential isolation and
-evidence remain node-local. WardOS's side of that contract is tracked under
-[#332](https://github.com/hexrift/WardOS/issues/332) and is not claimed as delivered
-until its acceptance tests land.
+evidence remain node-local. The node's protocol for such a control plane is in
+[docs/node-integration.md](docs/node-integration.md). WardOS's side of that contract is
+tracked under [#332](https://github.com/hexrift/WardOS/issues/332) and is not claimed as
+delivered until its acceptance tests land.
 
 ![The WardOS desktop from boot to lock: the splash, autologin into Hyprland, the four steps of the first login (theme, a key kept on the host, a project, an agent), ward claude with the trust bar live, an approval answered from a notification, the command centre, a theme switch to Tokyo Night, the lock screen](assets/wardos-desktop.gif)
 
