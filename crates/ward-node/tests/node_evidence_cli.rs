@@ -293,6 +293,31 @@ fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+fn marker() -> String {
+    format!(
+        "ward-node-evidence-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+fn processes_with(marker: &str) -> usize {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().parse::<u32>().is_ok())
+        .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
+        .filter(|cmdline| {
+            cmdline
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes())
+        })
+        .count()
+}
+
 fn evidence_log(task_root: &Path) -> PathBuf {
     evidence::evidence_dir(task_root, binding()).join(evidence::EVIDENCE_LOG)
 }
@@ -444,14 +469,18 @@ fn a_node_killed_mid_run_continues_the_chain_with_one_recovery_record() {
     let snapshot = imported(dir.path());
     let task_root = dir.path().join("tasks");
     let node = Node::spawn(dir.path(), Some(&task_root));
-    let envelope =
-        node.admit_and_start(snapshot, "while :; do echo beat >> beats; sleep 0.1; done");
+    let marker = marker();
+    let envelope = node.admit_and_start(
+        snapshot,
+        &format!("while :; do echo beat >> beats; sleep 0.1; done; echo {marker}"),
+    );
     let beats = task_root
         .join(binding().task().to_string())
         .join(binding().attempt().to_string())
         .join("beats");
     eventually("the workload never started", || {
         std::fs::read_to_string(&beats).is_ok_and(|text| !text.is_empty())
+            && processes_with(&marker) >= 3
     });
     let (before, _) = verified(&task_root);
     assert_eq!(before.len(), 2);
@@ -460,6 +489,9 @@ fn a_node_killed_mid_run_continues_the_chain_with_one_recovery_record() {
 
     node.kill();
     let node = Node::spawn(dir.path(), Some(&task_root));
+    eventually("a workload process outlived its node", || {
+        processes_with(&marker) == 0
+    });
     let (after, head) = verified(&task_root);
     assert_eq!(
         &after[..2],
@@ -509,4 +541,5 @@ fn a_node_killed_mid_run_continues_the_chain_with_one_recovery_record() {
             TaskLifecycleRejectionReason::InvalidState
         )
     );
+    assert_eq!(processes_with(&marker), 0);
 }

@@ -15,8 +15,11 @@
 //! is stopped and adding nothing closes the set: nothing in it runs, so nothing can fork.
 //! A freeze that cannot be confirmed within the bound is thawed back and reported
 //! [`FreezeError::Unsettled`]. [`thaw_tree`] sends `SIGCONT` parents first and confirms
-//! no process of the tree is still stopped. [`kill_tree`] sends `SIGKILL`, children first,
-//! to every process of a tree found again from a recorded root, stopped ones included.
+//! no process of the tree is still stopped. [`kill_tree`] first closes the set of a tree
+//! found again from a recorded root the same way, stopping every process it finds until a
+//! rescan adds nothing, so a child forked while its parent was being signalled is held
+//! rather than orphaned, and only then sends `SIGKILL`, children first, stopped ones
+//! included.
 //!
 //! Only signals are used: a launch runs in its parent's cgroup and nothing here creates a
 //! delegated cgroup, so the cgroup v2 freezer is not available to it. The root is
@@ -147,10 +150,14 @@ pub fn thaw_tree(frozen: &FrozenTree, settle: Duration) -> bool {
 /// Kill every process of the tree under `root` with `SIGKILL`, children first, and confirm
 /// within `settle` that none of them still runs; a stopped process dies as it is.
 ///
-/// Each process is identified by its pid and start time, so nothing is signalled once its
-/// pid names another process: a `root` that is gone, or whose pid was reused, kills
-/// nothing and is trivially confirmed. Returns whether no process of the tree is left
-/// running (an ended process waiting to be reaped counts as ended).
+/// The tree is first stopped and rescanned until a rescan adds nothing, exactly as
+/// [`freeze_tree`] does, so a child forked while its parent was being signalled is found
+/// and killed too instead of escaping as an orphan; a tree that cannot be confirmed
+/// stopped within `settle` is killed as far as it is known. Each process is identified by
+/// its pid and start time, so nothing is signalled once its pid names another process: a
+/// `root` that is gone, or whose pid was reused, kills nothing and is trivially confirmed.
+/// Returns whether no process of the tree is left running (an ended process waiting to
+/// be reaped counts as ended).
 #[must_use]
 pub fn kill_tree(root: TreeRoot, settle: Duration) -> bool {
     kill_tree_with(Path::new("/proc"), root, settle, send)
@@ -248,14 +255,15 @@ fn kill_tree_with(
 ) -> bool {
     let mut known: Vec<TreeRoot> = Vec::new();
     let deadline = Instant::now().checked_add(settle);
+    let expired =
+        |deadline: Option<Instant>| deadline.is_none_or(|deadline| Instant::now() >= deadline);
+    let mut closed = false;
     loop {
-        if root.alive_in(proc) {
-            for pid in tree(proc, root.pid) {
-                if !known.iter().any(|process| process.pid == pid)
-                    && let Some(process) = TreeRoot::of_in(proc, pid)
-                {
-                    known.push(process);
-                }
+        if !closed {
+            closed = hold_tree(proc, root, &mut known, &mut signal) || expired(deadline);
+            if !closed {
+                std::thread::sleep(SETTLE_POLL);
+                continue;
             }
         }
         let running: Vec<u32> = known
@@ -269,11 +277,42 @@ fn kill_tree_with(
         for pid in running {
             signal(pid, Signal::SIGKILL);
         }
-        if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+        if expired(deadline) {
             return false;
         }
         std::thread::sleep(SETTLE_POLL);
     }
+}
+
+/// Stop every process of the tree under `root` that `known` does not hold yet, children
+/// first, and add it. True once the set is closed: every held process is stopped or gone
+/// and the rescan added nothing, so nothing in the tree runs that could fork. A root that
+/// has ended closes the set as it stands.
+fn hold_tree(
+    proc: &Path,
+    root: TreeRoot,
+    known: &mut Vec<TreeRoot>,
+    signal: &mut impl FnMut(u32, Signal),
+) -> bool {
+    if !root.alive_in(proc) {
+        return true;
+    }
+    let fresh: Vec<TreeRoot> = tree(proc, root.pid)
+        .into_iter()
+        .filter(|pid| !known.iter().any(|process| process.pid == *pid))
+        .filter_map(|pid| TreeRoot::of_in(proc, pid))
+        .collect();
+    for process in &fresh {
+        signal(process.pid, Signal::SIGSTOP);
+    }
+    let closed = fresh.is_empty()
+        && known
+            .iter()
+            .all(|process| stopped_or_gone(proc, process.pid));
+    let mut merged = fresh;
+    merged.append(known);
+    *known = merged;
+    closed
 }
 
 fn stopped(proc: &Path, pid: u32) -> bool {
@@ -501,6 +540,7 @@ mod tests {
             match signal {
                 Signal::SIGSTOP => self.set(pid, parent, 'T'),
                 Signal::SIGCONT => self.set(pid, parent, 'S'),
+                Signal::SIGKILL => self.remove(pid),
                 _ => {}
             }
         }
@@ -729,6 +769,41 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn kill_also_ends_a_child_forked_while_its_parent_was_being_signalled() {
+        let proc = FakeProc::new();
+        proc.set(1, 0, 'S');
+        proc.set(10, 1, 'S');
+        let root = TreeRoot::of_in(&proc.path(), 10).unwrap();
+        let forked = RefCell::new(false);
+        let sent = RefCell::new(Vec::new());
+        assert!(kill_tree_with(
+            &proc.path(),
+            root,
+            FREEZE_SETTLE,
+            |pid, signal| {
+                if pid == 10 && !forked.replace(true) {
+                    proc.set(14, 10, 'R');
+                }
+                sent.borrow_mut().push((pid, signal));
+                proc.signal(pid, signal);
+            }
+        ));
+        assert!(
+            read_stat(&proc.path(), 14).is_none(),
+            "the child forked under the root while it was being signalled was killed"
+        );
+        assert!(read_stat(&proc.path(), 10).is_none());
+        let killed: Vec<u32> = sent
+            .borrow()
+            .iter()
+            .filter(|(_, signal)| *signal == Signal::SIGKILL)
+            .map(|(pid, _)| *pid)
+            .collect();
+        assert_eq!(killed, vec![14, 10], "children first");
+        assert_eq!(proc.state(1), 'S', "outside the tree");
     }
 
     fn host_state(pid: u32) -> Option<char> {
