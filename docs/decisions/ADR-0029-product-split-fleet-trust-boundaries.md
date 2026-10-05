@@ -146,6 +146,8 @@ control plane.
 ## Migration map
 
 This ADR deliberately keeps working primitives and changes their ownership over time.
+The staged path this map implies, with what each stage changes, breaks and rolls back,
+is [migration-to-node.md](../migration-to-node.md).
 
 | Current component/path | Target owner | Migration |
 | --- | --- | --- |

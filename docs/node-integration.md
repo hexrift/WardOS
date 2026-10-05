@@ -38,6 +38,9 @@ admission example is a working test vector (§7.4).
   transport or mTLS. The only transport is a local Unix socket; remote transport and key
   bootstrap are #262. The full list, with what each gap means for a control plane, is
   [node-security-limitations.md](node-security-limitations.md) §3.
+- The per-session runtime (`ward up`, one `wardd` per session) is a separate mode on the
+  same host, with its own state, sockets and uid; how the two compare, coexist and
+  converge is [migration-to-node.md](migration-to-node.md).
 
 ## 2. Operator setup
 
