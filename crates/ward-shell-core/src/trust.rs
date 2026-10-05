@@ -10,7 +10,13 @@
 //! adds the agent and TamperWard segments as the stream reports them, and the
 //! verify segment from the first frame ([`TrustBar::new`]): a [`VerifyState`]
 //! that holds the stream's verdict against the worktree's digest (ADR-0019),
-//! so `VERIFY ✓` names a tree, not a moment.
+//! so `VERIFY ✓` names a tree, not a moment. [`TrustBar::new`] also carries
+//! [`Model::connected`](crate::feed::Model::connected) into its own `unknown`
+//! state (#138 item 5): a daemon connection lost without a confirmed seal
+//! renders as `UNKNOWN`, never as `SEALED` (a claim the session ended that
+//! nothing confirmed) and never silently as `LIVE` (stale state shown as
+//! current) — the same dimming `sealed` already gives every stream-derived
+//! segment but a verdict.
 
 use std::path::Path;
 
@@ -400,7 +406,7 @@ pub enum SegmentName {
     /// `VERIFY —` / `VERIFY ◐ 7c01a2b3` / `VERIFY ✓ 7c01a2b3` / `VERIFY ~ STALE`
     /// / `VERIFY ✗` ([`VerifyState`]).
     Verify,
-    /// `LIVE` / `SEALED`.
+    /// `LIVE` / `UNKNOWN` / `SEALED`.
     Daemon,
 }
 
@@ -496,10 +502,19 @@ pub struct TrustBar {
     /// The [`VerifyState`]'s segment: `VERIFY —` dim, `VERIFY ◐ 7c01a2b3`
     /// accent, `VERIFY ✓ 7c01a2b3` green, `VERIFY ~ STALE` amber, `VERIFY ✗` red.
     pub verified: Option<Segment>,
-    /// `LIVE` or `SEALED`, bold, in the state tone.
+    /// `LIVE`, `UNKNOWN` or `SEALED`, bold, in the state tone.
     pub daemon: Segment,
     /// The log is sealed: the marker is `■` and the state tone is dim.
     pub sealed: bool,
+    /// The daemon connection was lost without a confirmed seal (#138 item
+    /// 5, [`Model::connected`](crate::feed::Model::connected)): the marker
+    /// is `? ` and the state tone is warn. Never set alongside `sealed` —
+    /// once the log is confirmed sealed that is the render, regardless of
+    /// the connection's last-known state — so a reader can tell "the
+    /// session ended" from "this view lost the daemon and does not yet
+    /// know" apart, and the latter never keeps showing old state as if it
+    /// were still live (ADR-0019 fail-closed).
+    pub unknown: bool,
 }
 
 impl TrustBar {
@@ -528,18 +543,34 @@ impl TrustBar {
             verified: None,
             daemon: Segment::bold(state, tone),
             sealed,
+            unknown: false,
         }
     }
 
     /// The bar from the session facts and everything the stream has said: the
-    /// shell's bar.
+    /// shell's bar. `model.connected == false` without `model.sealed`
+    /// (#138 item 5) is its own explicit `unknown` state — the daemon word
+    /// reads `UNKNOWN` in the warn tone, never `LIVE` (a lie: no one knows
+    /// that right now) and never `SEALED` (a lie: the daemon never
+    /// confirmed the log actually ended) — and dims every other
+    /// stream-derived segment exactly as `sealed` already does, since a
+    /// disconnected viewer cannot vouch for them being current either; a
+    /// verdict is never dimmed by either state (only a fresher observation
+    /// withdraws it).
     #[must_use]
     pub fn new(header: &Header, model: &Model) -> Self {
         let state = &model.state;
+        let unknown = !model.sealed && !model.connected;
         let mut bar = Self::from_header(header, model.sealed);
+        bar.unknown = unknown;
+        if unknown {
+            bar.daemon = Segment::bold("UNKNOWN", Tone::Warn);
+            bar.network.tone = Tone::Dim;
+        }
+        let dim = model.sealed || unknown;
         bar.agent = state
             .agent
-            .map(|s| agent_segment(header, s, model.sealed, state.stop_incomplete));
+            .map(|s| agent_segment(header, s, dim, state.stop_incomplete));
         // Temporary authority shows while it exists (ADR-0019): on the network
         // segment's text and as a segment of its own. Kept incrementally on the
         // model rather than rescanned here (#138 item 4), so a session-scoped
@@ -547,7 +578,7 @@ impl TrustBar {
         // out of `model.records`.
         let authority = &model.authority;
         bar.network.text = network_segment_text(&header.network, authority);
-        bar.grants = grants_segment(authority, model.sealed);
+        bar.grants = grants_segment(authority, dim);
         bar.tamperward = match state.tamperward {
             TamperWard::Unknown => None,
             TamperWard::Clean => Some(Segment::new("TW ✓", Tone::Ok)),
@@ -563,7 +594,13 @@ impl TrustBar {
     /// hidden it is the one place the session's state still shows.
     #[must_use]
     pub fn mark(&self) -> Segment {
-        let tone = if self.sealed { Tone::Dim } else { Tone::Accent };
+        let tone = if self.sealed {
+            Tone::Dim
+        } else if self.unknown {
+            Tone::Warn
+        } else {
+            Tone::Accent
+        };
         Segment::bold("WARD", tone)
     }
 
@@ -601,7 +638,13 @@ impl TrustBar {
     #[must_use]
     pub fn row(&self) -> Vec<Segment> {
         let sep = || Segment::new(" │ ", Tone::Dim);
-        let marker = if self.sealed { "■ " } else { "● " };
+        let marker = if self.sealed {
+            "■ "
+        } else if self.unknown {
+            "? "
+        } else {
+            "● "
+        };
         let mut row = vec![
             Segment::new(marker, self.tone()),
             Segment::bold("WARD", Tone::Accent),
@@ -1485,5 +1528,63 @@ mod tests {
             bar.verified,
             Some(Segment::new("VERIFY ~ STALE", Tone::Warn))
         );
+    }
+
+    /// #138 item 5: a connection lost without a confirmed seal renders its
+    /// own `unknown` state, distinct from both `LIVE` and `SEALED` — dimming
+    /// every stream-derived segment exactly as `sealed` already does (never
+    /// a verdict), but never claiming `SEALED` (unconfirmed) and never
+    /// leaving the state marker/word reading `LIVE` (stale, shown as
+    /// current).
+    #[test]
+    fn a_disconnected_unsealed_session_reads_unknown_not_sealed_or_live() {
+        let h = header(NetworkCapability::Development);
+        let mut model = model_with(&sequence(), false);
+        for rec in wardd(&[verify_passed()]) {
+            model.apply(rec);
+        }
+        model.apply(records(&[(Origin::TamperWard, denied())]).remove(0));
+
+        let live = TrustBar::new(&h, &model);
+        assert!(!live.unknown);
+        assert!(!live.sealed);
+
+        model.mark_disconnected();
+        let bar = TrustBar::new(&h, &model);
+        assert!(bar.unknown, "a lost connection is not confirmed live");
+        assert!(!bar.sealed, "nor is it a confirmed seal");
+        assert_eq!(bar.tone(), Tone::Warn);
+        assert_eq!(bar.daemon, Segment::bold("UNKNOWN", Tone::Warn));
+        assert_eq!(bar.row()[0], Segment::new("? ", Tone::Warn));
+        assert_eq!(bar.mark(), Segment::bold("WARD", Tone::Warn));
+        assert_eq!(bar.network.tone, Tone::Dim, "dimmed like a sealed bar");
+        assert_eq!(
+            bar.agent.as_ref().unwrap().tone,
+            Tone::Dim,
+            "dimmed like a sealed bar"
+        );
+        assert_eq!(
+            bar.verified.as_ref().unwrap().tone,
+            Tone::Ok,
+            "a verdict is never dimmed by a lost connection either"
+        );
+        assert_eq!(bar.tamperward.as_ref().unwrap().tone, Tone::Ok);
+        assert!(bar.text().ends_with("│ TW ✓ │ VERIFY ✓ abababab │ UNKNOWN"));
+
+        // A confirmed seal always wins the render, even over a connection
+        // that was last known lost (#138 item 5: `sealed` is a daemon fact,
+        // `unknown` only this viewer's uncertainty).
+        model.seal();
+        let sealed = TrustBar::new(&h, &model);
+        assert!(sealed.sealed);
+        assert!(!sealed.unknown, "sealed is the more final, confirmed fact");
+        assert_eq!(sealed.daemon, Segment::bold("SEALED", Tone::Dim));
+
+        // Reconnecting clears it back to live.
+        model.mark_connected();
+        model.sealed = false;
+        let live_again = TrustBar::new(&h, &model);
+        assert!(!live_again.unknown);
+        assert_eq!(live_again.daemon, Segment::bold("LIVE", Tone::Warn));
     }
 }

@@ -1081,30 +1081,65 @@ pub fn watch_records(
     }
 }
 
-/// [`watch_records`] with a clock: `emit` gets `Some(record)` as each arrives
-/// and `None` whenever `tick` passes with nothing from the daemon, until the
-/// stream ends. The shell's bar re-reads the worktree on both, since an edit
-/// made outside the sandbox is a change the stream never reports (ADR-0019).
+/// What [`watch_records_ticking`] hands its callback for one step of the
+/// stream: a record, a quiet-tick wake-up, or the daemon's replay-complete
+/// boundary. One callback rather than a record callback plus a separate
+/// caught-up callback so a caller needs only one closure over its state
+/// (two `FnMut` closures over the same captures cannot coexist as two
+/// separate arguments to one call).
+#[derive(Debug)]
+pub enum WatchUpdate {
+    /// A record arrived.
+    Record(Box<EventRecord>),
+    /// `tick` passed with nothing from the daemon.
+    Tick,
+    /// The daemon's replay-complete marker (#138 item 1): every record this
+    /// subscription's backlog started with has now been delivered. Fired
+    /// exactly once, synchronously, the moment it is read — *before* this
+    /// function waits for anything further, not only after the stream
+    /// eventually ends.
+    ///
+    /// [`desktop/shell`'s `follow_loop`](../../../desktop/shell/src/main.rs)
+    /// is why this boundary is surfaced live rather than swallowed the way an
+    /// earlier revision of this function did (review 5337489166 of #329,
+    /// finding 2): a caller that renders "attached to the daemon" as soon as
+    /// `connect` finishes — before `Subscribe` is even sent, let alone this
+    /// marker reached — can show a stale, pre-reconnect projection as if it
+    /// were current. Getting this variant inline with the read loop lets
+    /// that caller keep the projection in its own explicit "unknown" state
+    /// for the whole reconnect-and-replay sequence and clear it only once
+    /// this arrives.
+    CaughtUp,
+}
+
+/// [`watch_records`] with a clock: `emit` gets one [`WatchUpdate`] per record, per
+/// quiet `tick`, and once at the replay-complete boundary, until the stream
+/// ends. The shell's bar re-reads the worktree on a record or a tick, since an
+/// edit made outside the sandbox is a change the stream never reports
+/// (ADR-0019).
 pub fn watch_records_ticking(
     mut sink: RemoteSink,
     from_seq: u64,
     tick: Duration,
-    mut emit: impl FnMut(Option<EventRecord>),
+    mut emit: impl FnMut(WatchUpdate),
 ) -> Result<WatchEnd> {
     sink.send(&Request::Subscribe { from_seq })?;
     let mut records = 0;
     loop {
         let response = match sink.next_within(tick)? {
             Next::Quiet => {
-                emit(None);
+                emit(WatchUpdate::Tick);
                 continue;
             }
             Next::Closed => None,
             Next::Response(response) => Some(response),
         };
-        match step(response, &mut records, &mut |rec| emit(Some(rec)))? {
+        match step(response, &mut records, &mut |rec| {
+            emit(WatchUpdate::Record(Box::new(rec)));
+        })? {
             Step::End(end) => return Ok(end),
-            Step::CaughtUp { .. } | Step::Continue => {}
+            Step::CaughtUp { .. } => emit(WatchUpdate::CaughtUp),
+            Step::Continue => {}
         }
     }
 }
