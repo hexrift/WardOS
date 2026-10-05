@@ -109,7 +109,8 @@ done < <(grep -oE '(hypr_run|menu_open) [a-z-]+' "$script" | awk '{ print $2 }' 
 # seatd for the seat aquamarine opens the card through; capture.sh picks the card by
 # driver and wants the DRM backend, not headless only.
 # shellcheck disable=SC2016  # grep patterns, not expansions
-for want in 'CAPTURE_DRM_DRIVER: vkms' 'modprobe "\$CAPTURE_DRM_DRIVER"' '--device /dev/dri' '-e CAPTURE_DRM_DRIVER' \
+for want in 'CAPTURE_DRM_DRIVER: vkms' 'before=\(/sys/class/drm/card\*\)' 'modprobe "\$CAPTURE_DRM_DRIVER"' 'echo "card=\$node" >>"\$GITHUB_OUTPUT"' \
+  'CAPTURE_DRM_CARD: \$\{\{ steps.drm.outputs.card \}\}' '--device /dev/dri' '-e CAPTURE_DRM_DRIVER -e CAPTURE_DRM_CARD' \
   'image/Containerfile' 'desktop/capture/ci-run.sh /w/capture-binaries /w/capture-out' \
   'name: wardos-desktop-capture$' 'name: wardos-desktop-capture-logs$'; do
   grep -qE -- "$want" "$workflow" || fail "desktop-capture.yml does not mention $want"
@@ -117,17 +118,46 @@ done
 ! grep -qE '^ *container:' "$workflow" || fail "desktop-capture.yml must not use a job container: the DRM node is loaded on the host first"
 # shellcheck disable=SC2016  # grep patterns, not expansions
 for want in desktop/capture/packages.txt image/coprs.txt image/install-desktop.sh 'SEATD_VTBOUND=0 seatd -u wardos -g wardos' \
-  'runuser -u wardos' 'LIBSEAT_BACKEND=seatd' desktop/capture/capture.sh 'chmod 0666 "\$\{nodes' 'kill "\$seatd_pid"' 'trap hand_back EXIT'; do
+  'runuser -u wardos' 'LIBSEAT_BACKEND=seatd' 'CAPTURE_DRM_CARD="\$\{CAPTURE_DRM_CARD:-\}"' desktop/capture/capture.sh \
+  'chmod 0666 "\$\{nodes' 'kill "\$seatd_pid"' 'trap hand_back EXIT'; do
   grep -qE -- "$want" "$ci_run" || fail "ci-run.sh does not mention $want"
 done
 # shellcheck disable=SC2016  # grep patterns, not expansions
-for want in 'AQ_DRM_DEVICES=\$\(drm_card "\$driver"\)' 'export AQ_DRM_DEVICES' 'GBM_ALWAYS_SOFTWARE=1' 'LIBGL_ALWAYS_SOFTWARE=1' \
+for want in 'AQ_DRM_DEVICES=\$CAPTURE_DRM_CARD' 'AQ_DRM_DEVICES=\$\(drm_card "\$driver"\)' 'export AQ_DRM_DEVICES' 'GBM_ALWAYS_SOFTWARE=1' 'LIBGL_ALWAYS_SOFTWARE=1' \
   'AQ_TRACE=1' 'HYPRLAND_TRACE=1' 'output create headless' 'monitor = , 1920x1080@60'; do
   grep -qE -- "$want" "$script" || fail "capture.sh does not mention $want"
 done
 ! grep -q 'HYPRLAND_HEADLESS_ONLY=1' "$script" || fail "capture.sh must not set HYPRLAND_HEADLESS_ONLY: the DRM backend on vkms is the allocator"
 ! grep -qE 'hyprctl [a-z]+ -j [^|]*\| *jq' "$script" || fail "capture.sh pipes hyprctl straight into jq; use hypr_json, which checks for JSON first"
 grep -qx 'seatd' < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$cap/packages.txt") || fail "packages.txt lacks seatd"
+
+# drm_is, on a sysfs stand-in: a card is vkms's by driver name, by its device path (the
+# faux bus of Linux 6.16+, where the driver reads faux_driver) or by its uevent, and the
+# runner's own adapter is none of those.
+sys="$TMP/sys/class/drm"
+for card in card0 card1 card2 card3; do mkdir -p "$sys/$card"; done
+mkdir -p "$TMP/sys/devices/faux/vkms" "$TMP/sys/bus/faux/drivers/faux_driver" "$TMP/sys/devices/platform/vkms" \
+  "$TMP/sys/bus/platform/drivers/vkms" "$TMP/sys/devices/pci0000:00/0000:00:08.0" "$TMP/sys/bus/pci/drivers/hyperv_drm" "$TMP/sys/devices/odd"
+ln -s ../../../../bus/faux/drivers/faux_driver "$TMP/sys/devices/faux/vkms/driver"
+ln -s ../../../../bus/platform/drivers/vkms "$TMP/sys/devices/platform/vkms/driver"
+ln -s ../../../../bus/pci/drivers/hyperv_drm "$TMP/sys/devices/pci0000:00/0000:00:08.0/driver"
+ln -s ../../../devices/faux/vkms "$sys/card0/device"
+ln -s ../../../devices/pci0000:00/0000:00:08.0 "$sys/card1/device"
+ln -s ../../../devices/platform/vkms "$sys/card2/device"
+ln -s ../../../devices/odd "$sys/card3/device"
+printf 'DRIVER=hyperv_drm\n' >"$TMP/sys/devices/pci0000:00/0000:00:08.0/uevent"
+printf 'MODALIAS=faux:vkms\n' >"$TMP/sys/devices/odd/uevent"
+probe() { # probe CARD DRIVER: drm_is with the stand-in sysfs
+  (
+    # shellcheck disable=SC1090  # the functions of capture.sh, up to its first command
+    eval "$(sed -n '/^drm_of() {/,/^}/p; /^drm_is() {/,/^}/p' "$script" | sed "s|/sys/class/drm|$sys|")"
+    drm_is "/dev/dri/$1" "$2"
+  )
+}
+probe card0 vkms || fail "drm_is misses the faux-bus vkms card (driver faux_driver, device …/faux/vkms)"
+probe card2 vkms || fail "drm_is misses the platform-bus vkms card (driver vkms)"
+probe card3 vkms || fail "drm_is misses a card whose uevent says MODALIAS=…vkms"
+if probe card1 vkms; then fail "drm_is takes the hyperv_drm adapter for vkms"; fi
 grep -q -- '--workflow desktop-capture.yml' "$cap/refresh.sh" || fail "refresh.sh names another workflow"
 grep -q -- '--name wardos-desktop-capture' "$cap/refresh.sh" || fail "refresh.sh names another artifact"
 ! grep -qE 'contents: *write' "$workflow" || fail "desktop-capture.yml must not write to the repository"

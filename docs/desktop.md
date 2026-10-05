@@ -462,8 +462,11 @@ everything on screen, plus `seatd`), places the tree with `image/install-desktop
 puts the checkout's `ward` binaries in `/usr/bin`, starts `seatd` as the seat (no VT, the
 socket owned by the session user; the image has logind for this), and runs
 [`desktop/capture/capture.sh`](../desktop/capture/capture.sh) as an unprivileged user
-with `LIBSEAT_BACKEND=seatd`. It picks the card whose driver is `vkms` from sysfs (never
-the runner's own adapter) as `AQ_DRM_DEVICES`, sets the user up as a first login leaves
+with `LIBSEAT_BACKEND=seatd`. The card the `modprobe` added is handed down as
+`CAPTURE_DRM_CARD` (sysfs may call its driver `faux_driver` rather than `vkms`, so the
+workflow compares the card list before and after); without it capture.sh picks the card
+that is vkms's by driver name, device path or uevent, never the runner's own adapter.
+That card is `AQ_DRM_DEVICES`. capture.sh sets the user up as a first login leaves
 it (every output at 1920x1080@60, Hyprland's debug log on, checked by
 `Hyprland --verify-config`), starts a session bus and the shipped Hyprland (Mesa's
 software rasteriser for EGL and, through `kms_swrast` on the card's dumb buffers, for

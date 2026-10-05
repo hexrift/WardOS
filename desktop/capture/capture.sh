@@ -9,7 +9,8 @@
 #
 # Runs as an unprivileged user (Hyprland refuses root) where image/install-desktop.sh
 # has placed desktop/ and ward, wardd, ward-shell and wardos-theme-render are on PATH,
-# with a KMS device of the CAPTURE_DRM_DRIVER driver (default vkms) in /dev/dri and a
+# with a KMS device in /dev/dri (CAPTURE_DRM_CARD, else the card sysfs attributes to the
+# CAPTURE_DRM_DRIVER driver, default vkms, by driver name, device path or uevent) and a
 # seat for it: seatd on ${SEATD_SOCK:-/run/seatd.sock} when LIBSEAT_BACKEND is seatd (CI:
 # ci-run.sh, in a container given the runner's vkms card). aquamarine opens the device
 # through the seat and allocates its buffers on it (AQ_DRM_DEVICES names it; a preset
@@ -259,17 +260,35 @@ scene_lock() {
 
 # --- the session --------------------------------------------------------------------
 
-# drm_card DRIVER: the /dev/dri/card* whose kernel driver is DRIVER (sysfs names it),
-# so the runner's own display adapter is never taken.
+# drm_of CARD: what sysfs says about /dev/dri/cardN: `<driver> (<device path>)`. The
+# driver is the device's driver link, else DRIVER= in its uevent; a driver on the faux
+# bus (vkms from Linux 6.16) reads `faux_driver`, so the device path is printed too.
+drm_of() {
+  local sys driver="" device=""
+  sys="/sys/class/drm/$(basename "$1")"
+  driver=$(basename "$(readlink -f "$sys/device/driver" 2>/dev/null)" 2>/dev/null) || driver=""
+  [[ -n $driver && $driver != / && $driver != . ]] || driver=$(sed -n 's/^DRIVER=//p' "$sys/device/uevent" 2>/dev/null || true)
+  device=$(readlink -f "$sys/device" 2>/dev/null) || device=""
+  printf '%s (%s)\n' "${driver:-?}" "${device:-?}"
+}
+
+# drm_is CARD DRIVER: the card is DRIVER's by its driver name, its device path (the faux
+# bus names the device /sys/devices/faux/vkms) or its uevent's DRIVER= or MODALIAS=.
+drm_is() {
+  local sys what
+  sys="/sys/class/drm/$(basename "$1")"
+  what=$(drm_of "$1")
+  [[ $what == "$2 ("* || $what == *"/$2"* || $what == *"/$2/"* ]] && return 0
+  grep -qE "^(DRIVER=$2|MODALIAS=.*$2)" "$sys/device/uevent" 2>/dev/null
+}
+
+# drm_card DRIVER: the /dev/dri/card* that is DRIVER's, so the runner's own display
+# adapter is never taken.
 drm_card() {
-  local card name
+  local card
   for card in /dev/dri/card*; do
     [[ -e $card ]] || continue
-    name=$(basename "$(readlink -f "/sys/class/drm/$(basename "$card")/device/driver" 2>/dev/null)" 2>/dev/null) || name=""
-    if [[ -z $name || $name == / ]]; then
-      name=$(sed -n 's/^DRIVER=//p' "/sys/class/drm/$(basename "$card")/device/uevent" 2>/dev/null || true)
-    fi
-    if [[ $name == "$1" ]]; then
+    if drm_is "$card" "$1"; then
       printf '%s\n' "$card"
       return 0
     fi
@@ -277,12 +296,12 @@ drm_card() {
   return 1
 }
 
-# drm_drivers: every card with its driver, for the start line and a failed pick.
-drm_drivers() {
+# drm_cards: every card with its driver and device, for the start line and a failed pick.
+drm_cards() {
   local card
   for card in /dev/dri/card*; do
     [[ -e $card ]] || continue
-    printf '%s=%s ' "$(basename "$card")" "$(basename "$(readlink -f "/sys/class/drm/$(basename "$card")/device/driver" 2>/dev/null)" 2>/dev/null || echo '?')"
+    printf '%s: %s; ' "$(basename "$card")" "$(drm_of "$card")"
   done
 }
 
@@ -361,11 +380,18 @@ unset WAYLAND_DISPLAY DISPLAY HYPRLAND_INSTANCE_SIGNATURE
 # backend is the one with an allocator, and the headless output is only the fallback.
 export LIBGL_ALWAYS_SOFTWARE=1 GBM_ALWAYS_SOFTWARE=1 AQ_TRACE=1 HYPRLAND_TRACE=1
 export LIBSEAT_BACKEND=${LIBSEAT_BACKEND:-seatd}
+# The card: the one the caller chose (CAPTURE_DRM_CARD, the workflow's: it saw which
+# card modprobe added), else the one sysfs attributes to $driver.
 if [[ -z ${AQ_DRM_DEVICES:-} ]]; then
-  AQ_DRM_DEVICES=$(drm_card "$driver") || die "no /dev/dri/card* driven by $driver (cards: $(drm_drivers)); the capture needs the vkms module loaded and /dev/dri passed in"
+  if [[ -n ${CAPTURE_DRM_CARD:-} ]]; then
+    [[ -e $CAPTURE_DRM_CARD ]] || die "CAPTURE_DRM_CARD=$CAPTURE_DRM_CARD is not a device here (cards: $(drm_cards))"
+    AQ_DRM_DEVICES=$CAPTURE_DRM_CARD
+  else
+    AQ_DRM_DEVICES=$(drm_card "$driver") || die "no /dev/dri/card* that is $driver's (cards: $(drm_cards)); the capture needs the vkms module loaded and /dev/dri passed in"
+  fi
 fi
 export AQ_DRM_DEVICES
-say "DRM device: $AQ_DRM_DEVICES ($driver; cards: $(drm_drivers))"
+say "DRM device: $AQ_DRM_DEVICES, $(drm_of "$AQ_DRM_DEVICES"); cards: $(drm_cards)"
 if [[ $LIBSEAT_BACKEND == seatd ]]; then
   wait_for "the seat (seatd on ${SEATD_SOCK:-/run/seatd.sock})" 20 test -S "${SEATD_SOCK:-/run/seatd.sock}" ||
     die "no seatd socket; aquamarine cannot open $AQ_DRM_DEVICES without a seat"
@@ -423,7 +449,7 @@ summary=$out/summary.md
 {
   echo "### Desktop capture"
   echo
-  echo "$(hyprctl version | sed -n 1p), output $output at 1920x1080 on $AQ_DRM_DEVICES ($driver), software GL."
+  echo "$(hyprctl version | sed -n 1p), output $output at 1920x1080 on $AQ_DRM_DEVICES ($(drm_of "$AQ_DRM_DEVICES")), software GL."
   echo
   if [[ -f $out/versions.txt ]]; then
     echo '```'

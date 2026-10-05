@@ -6,7 +6,8 @@
 # image/install-desktop.sh, the checkout's ward binaries in /usr/bin, the unprivileged
 # user `wardos`, a seat for it (seatd, no VT, the socket owned by that user: aquamarine
 # opens the card through libseat, and there is no logind here), then capture.sh as that
-# user, which picks the vkms card itself.
+# user, with the card the workflow chose (CAPTURE_DRM_CARD) or picking the vkms card
+# itself.
 #
 #   desktop/capture/ci-run.sh BINARIES OUT
 #
@@ -16,7 +17,7 @@
 # upload it; seatd is stopped on the way out too.
 set -euo pipefail
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
 die() {
   echo "ci-run.sh: $*" >&2
   exit 1
@@ -67,9 +68,10 @@ id wardos >/dev/null 2>&1 || useradd -m -s /bin/bash wardos
 chmod 0666 "${nodes[@]}"
 ls -l /dev/dri
 for card in /sys/class/drm/card*; do
-  [[ -e $card/device/driver ]] || continue
-  echo "$(basename "$card"): $(basename "$(readlink -f "$card/device/driver")")"
+  [[ -e $card/device ]] || continue
+  echo "$(basename "$card"): $(basename "$(readlink -f "$card/device/driver" 2>/dev/null)" 2>/dev/null || echo '?') ($(readlink -f "$card/device"))"
 done
+echo "CAPTURE_DRM_CARD=${CAPTURE_DRM_CARD:-} (unset: capture.sh picks the ${CAPTURE_DRM_DRIVER:-vkms} card itself)"
 chown wardos:wardos "$out"
 
 # The seat: seatd as root, not bound to a VT (SEATD_VTBOUND=0; the container has no
@@ -93,5 +95,6 @@ runuser -u wardos -- test -r "$sock" -a -w "$sock" || die "wardos cannot use $so
 
 runuser -u wardos -- env HOME=/home/wardos USER=wardos LANG=en_US.UTF-8 \
   LIBSEAT_BACKEND=seatd SEATD_SOCK="$sock" CAPTURE_DRM_DRIVER="${CAPTURE_DRM_DRIVER:-vkms}" \
+  CAPTURE_DRM_CARD="${CAPTURE_DRM_CARD:-}" \
   GITHUB_ACTIONS="${GITHUB_ACTIONS:-}" \
   "$root/desktop/capture/capture.sh" "$out"
