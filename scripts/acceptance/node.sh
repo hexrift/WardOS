@@ -7,10 +7,14 @@
 # crates/ward-node-client/tests/acceptance_output.rs; each writes its verdict as
 #   acceptance <case>: PASS in <ms> ms -- <criterion>
 # The cargo test output goes to stderr and only the table to stdout, so the table can be
-# captured on its own. Exit status: 0 when every case passed, 1 otherwise.
+# captured on its own. After the table, the Node.js reference control plane's acceptance
+# (scripts/acceptance/node-js.sh, docs/node-integration-from-nodejs.md) runs against a
+# real node under the same isolation requirement and adds its verdict lines. Exit status:
+# 0 when every case of both passed, 1 otherwise.
 #
 #   scripts/acceptance/node.sh            run the suite and print the table
 #   scripts/acceptance/node.sh --render F render the table from a saved cargo test log F
+#                                         (the Node.js acceptance is not run)
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -76,4 +80,8 @@ set +e
 cargo test -p ward-node-client --test acceptance --test acceptance_network --test acceptance_output -- --test-threads=1 --nocapture 2>&1 | tee "$log" >&2
 set -e
 
-render "$log"
+status=0
+render "$log" || status=$?
+echo
+bash scripts/acceptance/node-js.sh || status=1
+exit "$status"
