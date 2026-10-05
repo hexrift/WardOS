@@ -25,6 +25,7 @@ wardos/
 │   ├── node-integration.md        # the ward-node contract for external control planes
 │   ├── node-acceptance.md         # the cross-system acceptance suite that proves it
 │   ├── node-integration-guide.md  # an operator's walk from an empty host to a verified attempt
+│   ├── node-integration-from-nodejs.md # the same for a Node.js/TypeScript control plane (ai-institution #490)
 │   ├── node-security-limitations.md # what the node enforces and what it does not yet
 │   ├── node-release-readiness.md  # what CI proves about the node and what a release publishes
 │   ├── migration-to-node.md       # per-session wardd and ward-node side by side; the staged path and compatibility
@@ -91,9 +92,10 @@ wardos/
 │   ├── verify/                    # protected: tamperward.sh and delegates
 │   ├── security-check/            # protected: static.sh, tamperward-integration.sh
 │   ├── release/                   # release.yml's helpers: packaging, tag/version/asset binding, bash regressions
-│   └── acceptance/                # node.sh: the ward-node cross-system acceptance verdicts
+│   └── acceptance/                # node.sh: the ward-node cross-system acceptance verdicts; node-js.sh: the Node.js client against a real node
 └── examples/
-    └── ward-demo/                 # launch demo: failing tests + tempting shortcut
+    ├── ward-demo/                 # launch demo: failing tests + tempting shortcut
+    └── node-control-plane/        # reference ward-node control plane in plain Node.js, with its node --test suite
 ```
 
 ## As built (Phase 1–5)

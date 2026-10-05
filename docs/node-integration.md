@@ -10,7 +10,11 @@ attempt is [node-integration-guide.md](node-integration-guide.md); what the node
 not enforce yet, with the impact and the issue for each gap, is
 [node-security-limitations.md](node-security-limitations.md); what CI proves about all
 of this on every change and what a release publishes is
-[node-release-readiness.md](node-release-readiness.md).
+[node-release-readiness.md](node-release-readiness.md). A fourth, for a control plane
+written in Node.js or TypeScript, is
+[node-integration-from-nodejs.md](node-integration-from-nodejs.md): the control-plane side
+of this contract as a dependency-free reference client in `examples/node-control-plane`,
+held to the §7.4 vector and proven against a real node.
 
 This is the contract an adapter drives, in any language, to have a local `ward-node`
 admit, run, pause, stop, revoke and seal a task. Every protocol message below was
@@ -1292,6 +1296,14 @@ WardOS ships one implementation of this contract for the control-plane side, in 
 - `Driver::run_attempt`: `create` → `admit` → `start` → poll `inspect` → read the receipt
   → `seal` → `result` when the envelope's manifest carried an `output` grant, with the
   rules below, returning an `AttemptReport`.
+
+Beside the crate, `examples/node-control-plane` is a reference implementation of the
+control-plane side in plain Node.js (>= 22, no dependencies): ids and their derivation
+from a control plane's own ids (§7.2), the issuer key and proof with `node:crypto` (§2.3,
+§7.4, reproduced byte for byte in its tests), the envelope (§7), a durable per-task
+version (§7.3, §10), and the adapter conversation of §11.4 with cancellation, replay and
+the outcome mapping; `scripts/acceptance/node-js.sh` proves it against a real node. It
+is the worked example for [node-integration-from-nodejs.md](node-integration-from-nodejs.md).
 
 ### 11.1 Operator requirements for a client host
 

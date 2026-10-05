@@ -35,6 +35,12 @@ a summary table (on stdout, so it can be captured alone):
 scripts/acceptance/node.sh
 ```
 
+After the table, `node.sh` runs [`scripts/acceptance/node-js.sh`](../scripts/acceptance/node-js.sh),
+the acceptance of the Node.js reference control plane
+([node-integration-from-nodejs.md](node-integration-from-nodejs.md) §10) against a second
+real node, under the same isolation requirement; its five verdicts follow the table and a
+failure of either fails the run. The cases below are the Rust suite's.
+
 The cases also run, in parallel with the rest of the workspace, under the merge gate
 (`scripts/verify/tamperward.sh`, which CI runs with `WARD_REQUIRE_ISOLATION=1` and a
 working bubblewrap), so a pull request cannot merge with one of them red.
@@ -151,7 +157,8 @@ cannot read; the case proves the node never follows it when it collects.
 ## 3. Running it
 
 ```text
-scripts/acceptance/node.sh                      # the suite, isolation required
+scripts/acceptance/node.sh                      # the suite, isolation required, then node-js.sh
+scripts/acceptance/node-js.sh                   # the Node.js reference control plane alone (node-integration-from-nodejs.md §10)
 cargo test -p ward-node-client --test acceptance # the same cases, skipping without bubblewrap
 scripts/acceptance/node.test.sh                 # the runner's own rendering regressions
 ```

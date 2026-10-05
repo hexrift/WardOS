@@ -6,7 +6,9 @@ the work happens. Every command, flag and value here is the one the contract def
 the contract itself is [node-integration.md](node-integration.md), cited by section, and
 nothing here adds to it. What the node does not do yet is
 [node-security-limitations.md](node-security-limitations.md); read it before deciding
-what to put through the node.
+what to put through the node. A control plane written in Node.js or TypeScript has its
+own walk through the control-plane side, with a reference client and its acceptance:
+[node-integration-from-nodejs.md](node-integration-from-nodejs.md).
 
 The walk has two sides. The **operator** owns the host: the node binary, its user, its
 directories, its trust store and its snapshots. The **control plane** owns authority: the
@@ -248,7 +250,9 @@ wrong most often:
 Serialise once, sign those exact bytes with the issuer key (RFC 8032 Ed25519, no
 canonicalisation), and never re-serialise (§7.4). The §7.4 test vector, with its fixed
 timestamps, is what you check your encoder and signer against before signing a live
-envelope.
+envelope. In Node.js, `examples/node-control-plane/ward-node.mjs` does all of this with
+`node:crypto` alone and reproduces the vector in its tests
+([node-integration-from-nodejs.md](node-integration-from-nodejs.md) §5).
 
 Run it through the adapter in its pre-signed form, which sends your bytes unchanged and
 leaves key custody with you (§11.4). Give `task_root` so the report can read the evidence

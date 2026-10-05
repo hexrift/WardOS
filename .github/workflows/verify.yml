@@ -89,6 +89,11 @@ jobs:
       # re-runs exactly its cases, one at a time, for a named verdict per case and a summary
       # table (the runner sets WARD_REQUIRE_ISOLATION=1 itself), after the runner's own
       # rendering regressions; it fails the required job if a case did not pass or none ran.
+      # The Node.js reference control plane's acceptance (scripts/acceptance/node-js.sh,
+      # run by node.sh below) needs Node.js 22, the same pin tamperward.yml uses.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
       - name: ward-node cross-system acceptance verdicts (#332 slice 9)
         run: |
           set -euo pipefail
