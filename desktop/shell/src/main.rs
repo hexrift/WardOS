@@ -1615,7 +1615,7 @@ mod tests {
                                 reply(&mut writer, &Response::Record(Box::new(rec.clone())));
                             }
                             if seal {
-                                reply(&mut writer, &Response::Sealed { head });
+                                reply(&mut writer, &Response::Sealed { head, ended: None });
                             }
                             break;
                         }
@@ -1726,7 +1726,7 @@ mod tests {
                                 reply(&mut writer, &Response::Record(Box::new((*rec).clone())));
                             }
                             if last_connection {
-                                reply(&mut writer, &Response::Sealed { head });
+                                reply(&mut writer, &Response::Sealed { head, ended: None });
                             }
                             break;
                         }
@@ -1929,7 +1929,7 @@ mod tests {
                                 }
                                 let next_seq = matching.last().map_or(from_seq, |r| r.seq + 1);
                                 reply(&mut writer, &Response::CaughtUp { next_seq });
-                                reply(&mut writer, &Response::Sealed { head });
+                                reply(&mut writer, &Response::Sealed { head, ended: None });
                             } else {
                                 // Every connection but the last replays only
                                 // the next one record before dropping, the
@@ -2068,7 +2068,7 @@ mod tests {
                             seen += 1;
                             reply(&mut writer, &Response::CaughtUp { next_seq: from_seq });
                             if i + 1 == cycles {
-                                reply(&mut writer, &Response::Sealed { head });
+                                reply(&mut writer, &Response::Sealed { head, ended: None });
                             }
                             break;
                         }
@@ -2279,7 +2279,7 @@ mod tests {
                             reply(&mut writer, &Response::Record(Box::new(rec.clone())));
                         }
                         reply(&mut writer, &Response::CaughtUp { next_seq });
-                        reply(&mut writer, &Response::Sealed { head });
+                        reply(&mut writer, &Response::Sealed { head, ended: None });
                         break;
                     }
                     other => panic!("unexpected request: {other:?}"),

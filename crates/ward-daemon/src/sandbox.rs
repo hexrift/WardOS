@@ -461,7 +461,22 @@ impl Launch {
     /// the child has been reaped, which leaves the final flush unambiguously the
     /// caller's to do exactly once.
     pub fn run_observed(&self, on_tick: &mut dyn FnMut()) -> Result<Outcome> {
-        self.spawn()?.wait_observed(on_tick)
+        self.run_admitted(&mut || Ok(Box::new(())), on_tick)
+    }
+
+    /// [`run_observed`](Self::run_observed), with `admit` called immediately
+    /// before `bwrap` is spawned: an `Err` refuses the launch with nothing
+    /// spawned, and the guard an `Ok` returns is held across the spawn and
+    /// dropped as soon as it has returned — by then the sandbox's root has
+    /// exec'd and is visible in `/proc` with its command line. A session launch
+    /// passes [`crate::pause::admit_launch`], which is what serializes launch
+    /// admission with pause and stop (PR #253 review finding 2).
+    pub fn run_admitted(
+        &self,
+        admit: &mut dyn FnMut() -> Result<Box<dyn std::any::Any>>,
+        on_tick: &mut dyn FnMut(),
+    ) -> Result<Outcome> {
+        self.spawn_admitted(admit)?.wait_observed(on_tick)
     }
 
     /// Spawn the sandbox and return its owned, live child handle.
@@ -472,6 +487,19 @@ impl Launch {
     ///
     /// Returns an error for an empty command, invalid worktree, or failed spawn.
     pub fn spawn(&self) -> Result<RunningLaunch> {
+        self.spawn_admitted(&mut || Ok(Box::new(())))
+    }
+
+    /// [`spawn`](Self::spawn), with `admit` gating the spawn exactly as
+    /// [`run_admitted`](Self::run_admitted) describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `admit` refuses, or as [`spawn`](Self::spawn) does.
+    pub fn spawn_admitted(
+        &self,
+        admit: &mut dyn FnMut() -> Result<Box<dyn std::any::Any>>,
+    ) -> Result<RunningLaunch> {
         if self.argv.is_empty() {
             return Err(Error::Sandbox("empty command".into()));
         }
@@ -481,6 +509,7 @@ impl Launch {
             .map_err(|e| Error::io(&self.worktree, e))?;
         let mut cmd = Command::new("bwrap");
         cmd.args(self.args(&worktree));
+        let admitted = admit()?;
         let start = Instant::now();
         let deadline = self
             .budget
@@ -500,7 +529,9 @@ impl Launch {
         if self.stdio == StdioMode::Capture {
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
-        let mut child = cmd.spawn().map_err(launch_err)?;
+        let spawned = cmd.spawn().map_err(launch_err);
+        drop(admitted);
+        let mut child = spawned?;
         let bound = self.capture_bytes;
         let keep = self.keep_prefix.clone();
         let stdout = child.stdout.take().map(|r| drain(r, bound, keep.clone()));

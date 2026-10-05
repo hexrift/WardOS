@@ -1097,6 +1097,46 @@ pub enum WardEvent {
         /// exercises exactly that).
         launch_seq: u64,
     },
+
+    // -- intervention, continued (origin: Wardd; #145 item 5) --
+    /// `ward stop` (`Request::Stop`) terminated the session's sandboxed workloads
+    /// before evidence sealing: every process of the session's sandboxes was frozen
+    /// (or already was, from a pause), killed, and then watched for a bounded time
+    /// (`pause::STOP_SETTLE`) until it was confirmed gone. Appended only when there
+    /// was something to terminate — a stop with no sandbox running writes only the
+    /// usual `SessionEnded`, as before.
+    ///
+    /// A stop is confirmed only when `pending == 0 && barrier_confirmed`: every
+    /// process the stop found is gone *and* Ward proved the membership/fork barrier
+    /// stable before killing. `pending > 0` means the daemon could not confirm
+    /// that many processes ended within the bound (a process stuck in uninterruptible
+    /// sleep, typically). `barrier_confirmed == false` means the known PIDs may all
+    /// be gone but Ward could not prove that no process escaped the pre-kill set.
+    /// Either case is an incomplete stop: the log is **not** sealed, the session is
+    /// held for the stop as the safest state it can preserve, and a later `ward stop`
+    /// retries. A reader must never treat either incomplete shape as a completed stop
+    /// (#145 item 4, "do not report a full success after a partial operation").
+    ///
+    /// This is the explicit difference between stopping and log-only closure
+    /// (#145 item 5): `Request::Seal` still seals without touching a running
+    /// sandbox; `Request::Stop` does not seal until this confirmation holds.
+    ///
+    /// Appended after `CredentialGrantedLaunch` for the same reason every other
+    /// late variant is: postcard identifies variants by declaration index.
+    WorkloadsTerminated {
+        /// Processes the stop found and confirmed gone.
+        ended: u32,
+        /// Processes killed but not confirmed gone when the bound expired. Never
+        /// the pid list itself, for the same reason `SessionPauseUnsettled` keeps
+        /// only a count.
+        pending: u32,
+        /// Whether the pre-termination membership/fork barrier was confirmed
+        /// stable before any process was killed. A false value is an incomplete
+        /// stop even when `pending == 0`: Ward cannot prove that the known PID
+        /// set was closed, so the log must remain unsealed and the session stays
+        /// held for a retry.
+        barrier_confirmed: bool,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -1145,11 +1185,12 @@ pub enum EventKind {
     VerificationInterrupted = 36,
     VerificationTimedOut = 37,
     CredentialGrantedLaunch = 38,
+    WorkloadsTerminated = 39,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 39] = [
+    pub const ALL: [EventKind; 40] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -1189,6 +1230,7 @@ impl EventKind {
         EventKind::VerificationInterrupted,
         EventKind::VerificationTimedOut,
         EventKind::CredentialGrantedLaunch,
+        EventKind::WorkloadsTerminated,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
@@ -1240,6 +1282,7 @@ impl EventKind {
             EventKind::VerificationInterrupted => "verification_interrupted",
             EventKind::VerificationTimedOut => "verification_timed_out",
             EventKind::CredentialGrantedLaunch => "credential_granted_launch",
+            EventKind::WorkloadsTerminated => "workloads_terminated",
         }
     }
 
@@ -1274,6 +1317,7 @@ impl EventKind {
                 | EventKind::ObservationsDropped
                 | EventKind::SessionPauseUnsettled
                 | EventKind::CredentialGrantedLaunch
+                | EventKind::WorkloadsTerminated
         )
     }
 }
@@ -1460,6 +1504,7 @@ impl WardEvent {
             WardEvent::VerificationInterrupted { .. } => EventKind::VerificationInterrupted,
             WardEvent::VerificationTimedOut { .. } => EventKind::VerificationTimedOut,
             WardEvent::CredentialGrantedLaunch { .. } => EventKind::CredentialGrantedLaunch,
+            WardEvent::WorkloadsTerminated { .. } => EventKind::WorkloadsTerminated,
         }
     }
 
@@ -1491,9 +1536,9 @@ mod tests {
             assert_eq!(k.bit(), 1u64 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
-        // The catalogue is currently 39 kinds wide, well inside the `u64` backing's
+        // The catalogue is currently 40 kinds wide, well inside the `u64` backing's
         // 64-bit capacity -- so, unlike when the backing type was exactly saturated
-        // at `u32`, there IS a first unused bit right now (bit 39), and a value that
+        // at `u32`, there IS a first unused bit right now (bit 40), and a value that
         // sets it must be rejected as an unknown kind rather than silently accepted.
         // This is the same "no room past the known kinds to smuggle a bit through"
         // property `kind_bits_are_dense...`'s name promises, just checked against
@@ -1571,6 +1616,7 @@ mod tests {
         assert!(EventKind::SessionPaused.is_critical());
         assert!(EventKind::SessionPauseUnsettled.is_critical());
         assert!(EventKind::CredentialGrantedLaunch.is_critical());
+        assert!(EventKind::WorkloadsTerminated.is_critical());
         assert!(!EventKind::FileRead.is_critical());
         assert!(!EventKind::AgentClaim.is_critical());
     }
