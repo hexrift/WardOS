@@ -145,19 +145,34 @@ case "$source" in
     cmd+=(--build-arg "WARDOS_SOURCE=release"
       --build-arg "WARDOS_RELEASE=${release}"
       --build-arg "${sha_arg}=${sha}")
-    # The node tarball's checksum, the same way (issue #275). Releases up to v0.4.1 carry
-    # no node tarball; the Containerfile's release stage refuses to build an image without
-    # it (an image carries the node whichever stage it comes from), so a build of such a
-    # release stops there, at once, with that reason. The reason is said here too, and
+    # The node tarball (issue #275): the node train has a version of its own, so which
+    # node tarball a release carries is read from the release manifest
+    # (docs/release-manifest.md): the `ward-node` artifact for this architecture, its
+    # version and its digest. Releases up to v0.4.1 carry neither a manifest nor a node
+    # tarball; the Containerfile's release stage refuses to build an image without the
+    # node (an image carries the node whichever stage it comes from), so a build of such
+    # a release stops there, at once, with that reason. The reason is said here too, and
     # the decision stays the Containerfile's: a dry run (the "image lint" job's, against
     # the Containerfile default) still shows the command, and a hand-run `podman build`
     # meets the same refusal.
-    node_asset="ward-node-${release#v}-${arch}-linux.tar.gz.sha256"
-    node_sha=$(curl -fsSL "https://github.com/hexrift/WardOS/releases/download/${release}/${node_asset}" | awk '{print $1}') || true
-    if [[ "$node_sha" =~ ^[0-9a-f]{64}$ ]]; then
-      cmd+=(--build-arg "${node_sha_arg}=${node_sha}")
+    manifest_asset="wardos-${release#v}-manifest.json"
+    node_entry=$(curl -fsSL "https://github.com/hexrift/WardOS/releases/download/${release}/${manifest_asset}" 2>/dev/null |
+      python3 -c '
+import json, sys
+arch = sys.argv[1]
+manifest = json.load(sys.stdin)
+for artifact in manifest.get("artifacts", []):
+    if artifact.get("component") == "ward-node" and artifact.get("architecture") == arch:
+        print(artifact.get("version", ""), artifact.get("digest", "").removeprefix("sha256:"))
+        break
+' "$arch" 2>/dev/null) || true
+    node_version="${node_entry%% *}"
+    node_sha="${node_entry##* }"
+    if [[ "$node_version" =~ ^[0-9A-Za-z.+-]+$ && "$node_sha" =~ ^[0-9a-f]{64}$ ]]; then
+      cmd+=(--build-arg "WARDOS_NODE_VERSION=${node_version}"
+        --build-arg "${node_sha_arg}=${node_sha}")
     else
-      echo "build.sh: could not fetch the node checksum for release ${release} (${node_asset})" >&2
+      echo "build.sh: could not read the ${arch} node tarball's version and checksum from the release manifest of ${release} (${manifest_asset})" >&2
       echo "build.sh: releases up to v0.4.1 carry no node tarball; the release stage will refuse to build an image without the node: use a later release or --source checkout" >&2
     fi
     ;;

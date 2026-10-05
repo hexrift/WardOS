@@ -32,7 +32,7 @@ neither reads or converts the other's.
 | Result | The worktree, the session log, the verifier's verdict | A receipt (`completed`, `failed`, `unknown`) on `inspect`; the workspace stays on the host, output is not returned |
 | Who reads it | `ward replay`, `ward watch`, the desktop's trust bar and panels, TamperWard over the control socket | `ward replay --verify` on the host as the node's uid; the control plane through `inspect` and the adapter's attempt report |
 | Identity on the host | The login user; everything under `~/.local/state/ward` | A system user of its own (`ward-node` in the guide), with state, task root and socket directory nothing else can read |
-| Where it is installed from | The runtime tarball `wardos-<version>-<arch>-linux.tar.gz`, `install.sh`, or the image | The node tarball `ward-node-<version>-<arch>-linux.tar.gz`, installed by the operator; present in the image but not started there (node-release-readiness.md §2) |
+| Where it is installed from | The runtime tarball `wardos-<version>-<arch>-linux.tar.gz`, `install.sh`, or the image | The node tarball `ward-node-<node version>-<arch>-linux.tar.gz` (the node train's own version, compatibility.md §6), installed by the operator; present in the image but not started there (node-release-readiness.md §2) |
 
 ### 1.1 Equivalents
 

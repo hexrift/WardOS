@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Generate a release's machine-readable manifest (ADR-0028 §4, issue #148).
 #
-# Usage: generate-manifest.sh <tag> <commit> <dist-dir> [image-ref]
+# Usage: generate-manifest.sh [--node-version <node-version>] <tag> <commit> <dist-dir> [image-ref]
 #
+#   --node-version  the node train's own version, which names the node tarball and
+#                   is recorded per component (issue #275). The option may stand
+#                   anywhere; without it the version is this checkout's, read by
+#                   scripts/release/node-version.sh.
 #   <tag>        the release tag, e.g. v1.2.3 (same grammar as check-version.sh).
 #   <commit>     the full 40-hex-character source commit the release was built
 #                from (what check-tag-commit.sh already binds the tag to).
@@ -47,15 +51,44 @@
 #       protocol-window marker is absent, duplicated or malformed.
 set -euo pipefail
 
-tag="${1:?usage: generate-manifest.sh <tag> <commit> <dist-dir> [image-ref]}"
-commit="${2:?usage: generate-manifest.sh <tag> <commit> <dist-dir> [image-ref]}"
-dist_dir="${3:?usage: generate-manifest.sh <tag> <commit> <dist-dir> [image-ref]}"
-image_ref="${4:-}"
-
 die() {
   echo "generate-manifest: $*" >&2
   exit 1
 }
+
+usage="usage: generate-manifest.sh [--node-version <node-version>] <tag> <commit> <dist-dir> [image-ref]"
+node_version=""
+positional=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --node-version)
+      [[ $# -ge 2 ]] || die "$usage"
+      node_version="$2"
+      shift 2
+      ;;
+    --node-version=*)
+      node_version="${1#--node-version=}"
+      shift
+      ;;
+    --*) die "unknown option '$1'; $usage" ;;
+    *)
+      positional+=("$1")
+      shift
+      ;;
+  esac
+done
+[[ ${#positional[@]} -ge 3 && ${#positional[@]} -le 4 ]] || die "$usage"
+tag="${positional[0]}"
+commit="${positional[1]}"
+dist_dir="${positional[2]}"
+image_ref="${positional[3]:-}"
+# Without the option the node version is this checkout's, read the way the
+# protocol window is: from the repository the script lives in. The release
+# workflow passes the one its version job proved against the previous release.
+if [[ -z "$node_version" ]]; then
+  node_version="$(bash "$(dirname "${BASH_SOURCE[0]}")/node-version.sh" --root "$(dirname "${BASH_SOURCE[0]}")/../..")" ||
+    die "no --node-version given and this checkout's node version could not be read"
+fi
 
 command -v jq >/dev/null 2>&1 || die "jq is required"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
@@ -66,6 +99,12 @@ if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$
   die "not a valid v<semver> release tag: '$tag'"
 fi
 version="${tag#v}"
+
+# The node version has the same grammar without the leading v (node-version.sh
+# already proved it is the version both node crates carry).
+if [[ ! "$node_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+  die "not a SemVer node version (without the leading v): '$node_version'"
+fi
 
 # A full, lowercase git commit object id. A short hash or a symbolic ref
 # (HEAD, a branch name) is refused: the manifest must bind to the exact
@@ -134,24 +173,28 @@ for path in "${tarballs[@]}"; do
   name="$(basename "$path")"
 
   # Artifact names are produced by scripts/release/package.sh as
-  # <component>-<version>-<arch>-linux.tar.gz, one component per release train
-  # (issue #275): `wardos` is the runtime tarball, `ward-node` the node's.
-  # Matched by literal prefix/suffix (not a single regex split) so a version
-  # containing its own hyphens (a SemVer prerelease like "1.2.3-rc.1") can
-  # never be ambiguous with the arch segment. An artifact whose name doesn't
-  # carry *this* manifest's version at all -- left over from a different
-  # release in the same directory -- is a real hazard, not a cosmetic mismatch.
+  # <component>-<component version>-<arch>-linux.tar.gz, one component per
+  # release train (issue #275): `wardos` is the runtime tarball under the release
+  # version, `ward-node` the node's under the node version. Matched by literal
+  # prefix/suffix (not a single regex split) so a version containing its own
+  # hyphens (a SemVer prerelease like "1.2.3-rc.1") can never be ambiguous with
+  # the arch segment. An artifact whose name doesn't carry its train's version
+  # for *this* manifest -- left over from a different release in the same
+  # directory, or a node tarball mislabelled with the release version -- is a
+  # real hazard, not a cosmetic mismatch.
   suffix="-linux.tar.gz"
   component=""
-  for candidate in wardos ward-node; do
-    prefix="${candidate}-${version}-"
+  component_version=""
+  for candidate in "wardos:$version" "ward-node:$node_version"; do
+    prefix="${candidate%%:*}-${candidate#*:}-"
     if [[ "$name" == "$prefix"*"$suffix" ]]; then
-      component="$candidate"
+      component="${candidate%%:*}"
+      component_version="${candidate#*:}"
       break
     fi
   done
   if [[ -z "$component" ]]; then
-    die "artifact name does not match the expected {wardos,ward-node}-${version}-<arch>-linux.tar.gz pattern: '$name'"
+    die "artifact name is neither wardos-${version}-<arch>-linux.tar.gz nor ward-node-${node_version}-<arch>-linux.tar.gz: '$name'"
   fi
   arch="${name#"$prefix"}"
   arch="${arch%"$suffix"}"
@@ -180,10 +223,11 @@ for path in "${tarballs[@]}"; do
     jq -n \
       --arg name "$name" \
       --arg component "$component" \
+      --arg component_version "$component_version" \
       --arg arch "$arch" \
       --arg digest "sha256:$actual_digest" \
       --argjson size "$size_bytes" \
-      '{name: $name, component: $component, architecture: $arch, digest: $digest, size_bytes: $size}'
+      '{name: $name, component: $component, version: $component_version, architecture: $arch, digest: $digest, size_bytes: $size}'
   )"
   artifacts_json="$(jq -c --argjson a "$artifact_json" '. + [$a]' <<<"$artifacts_json")"
 done
@@ -198,6 +242,7 @@ jq -n \
   --arg schema_version "1" \
   --arg tag "$tag" \
   --arg version "$version" \
+  --arg node_version "$node_version" \
   --arg commit "$commit" \
   --arg generated_at "$generated_at" \
   --argjson artifacts "$artifacts_json" \
@@ -211,6 +256,10 @@ jq -n \
     version: $version,
     source_commit: $commit,
     generated_at: $generated_at,
+    components: {
+      wardos: {version: $version},
+      "ward-node": {version: $node_version}
+    },
     artifacts: $artifacts,
     node_protocol_window: {
       major: $window_major,

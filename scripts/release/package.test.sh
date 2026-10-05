@@ -13,9 +13,10 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 version="1.2.3"
+node_version="0.3.0"
 arch="x86_64"
 runtime="wardos-${version}-${arch}-linux"
-node="ward-node-${version}-${arch}-linux"
+node="ward-node-${node_version}-${arch}-linux"
 
 # fresh_case NAME -> a case dir with a complete fake build: every binary the two
 # trains ship under bin/, and the repository files the tarballs carry under src/.
@@ -41,7 +42,7 @@ listing() { tar -tzf "$1" | sed 's#/$##' | sort; }
 
 c="$(fresh_case complete)"
 expect_status 0 "a complete build packages both trains" \
-  bash "$sut" "$version" "$arch" "$c/bin" "$c/dist" "$c/src"
+  bash "$sut" "$version" "$node_version" "$arch" "$c/bin" "$c/dist" "$c/src"
 
 for name in "$runtime" "$node"; do
   [[ -f "$c/dist/$name.tar.gz" ]] || fail "complete: $name.tar.gz was not written"
@@ -85,41 +86,49 @@ mkdir -p "$c/unpack" && tar -C "$c/unpack" -xzf "$c/dist/$node.tar.gz"
 cmp -s "$c/bin/ward-node" "$c/unpack/$node/ward-node" || fail "node tarball: ward-node differs from the built binary"
 echo "ok   the node tarball's binaries are the built ones"
 
+# The two trains carry their own versions (issue #275): the node tarball is named by
+# the node version, never by the release's.
+[[ ! -e "$c/dist/ward-node-${version}-${arch}-linux.tar.gz" ]] ||
+  fail "complete: a node tarball was written under the release version"
+echo "ok   the node tarball is named by the node version"
+
 # The two trains together are exactly what check-release-set.sh accepts for the arch.
 expect_status 0 "the packaged set satisfies check-release-set.sh" \
-  bash "$RELEASE_DIR/check-release-set.sh" "$c/dist" "$version" "$arch"
+  bash "$RELEASE_DIR/check-release-set.sh" "$c/dist" "$version" "$node_version" "$arch"
 
 ### A build missing a binary fails before any tarball is written ################
 
 c="$(fresh_case no-node)"
 rm "$c/bin/ward-node"
 expect_status 1 "a build without ward-node is refused" \
-  bash "$sut" "$version" "$arch" "$c/bin" "$c/dist" "$c/src"
+  bash "$sut" "$version" "$node_version" "$arch" "$c/bin" "$c/dist" "$c/src"
 [[ -z "$(ls -A "$c/dist")" ]] || fail "no-node: something was written to dist despite the refusal"
 
 c="$(fresh_case no-adapter)"
 rm "$c/bin/ward-node-adapter"
 expect_status 1 "a build without ward-node-adapter is refused" \
-  bash "$sut" "$version" "$arch" "$c/bin" "$c/dist" "$c/src"
+  bash "$sut" "$version" "$node_version" "$arch" "$c/bin" "$c/dist" "$c/src"
 
 c="$(fresh_case no-ward)"
 rm "$c/bin/ward"
 expect_status 1 "a build without ward is refused" \
-  bash "$sut" "$version" "$arch" "$c/bin" "$c/dist" "$c/src"
+  bash "$sut" "$version" "$node_version" "$arch" "$c/bin" "$c/dist" "$c/src"
 [[ -z "$(ls -A "$c/dist")" ]] || fail "no-ward: something was written to dist despite the refusal"
 
 c="$(fresh_case no-license)"
 rm "$c/src/LICENSE"
 expect_status 1 "a source tree without LICENSE is refused" \
-  bash "$sut" "$version" "$arch" "$c/bin" "$c/dist" "$c/src"
+  bash "$sut" "$version" "$node_version" "$arch" "$c/bin" "$c/dist" "$c/src"
 
 # Guardrails: a malformed version or arch never becomes part of an asset name.
 c="$(fresh_case bad-version)"
 expect_status 1 "a non-semver version is refused" \
-  bash "$sut" "v1.2.3" "$arch" "$c/bin" "$c/dist" "$c/src"
+  bash "$sut" "v1.2.3" "$node_version" "$arch" "$c/bin" "$c/dist" "$c/src"
+expect_status 1 "a non-semver node version is refused" \
+  bash "$sut" "$version" "v0.3.0" "$arch" "$c/bin" "$c/dist" "$c/src"
 expect_status 1 "an arch with path characters is refused" \
-  bash "$sut" "$version" "../x" "$c/bin" "$c/dist" "$c/src"
+  bash "$sut" "$version" "$node_version" "../x" "$c/bin" "$c/dist" "$c/src"
 expect_status 1 "a missing bin dir is refused" \
-  bash "$sut" "$version" "$arch" "$work/does-not-exist" "$c/dist" "$c/src"
+  bash "$sut" "$version" "$node_version" "$arch" "$work/does-not-exist" "$c/dist" "$c/src"
 
 echo "PASS package.test.sh"

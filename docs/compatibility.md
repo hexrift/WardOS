@@ -92,14 +92,22 @@ The node protocol version and the WardOS release version are independent:
   minor, together with this document (the check above enforces that pairing). It
   never changes as a side effect of a release PR.
 - `ward-node` ships in every release as its own tarball,
-  `ward-node-<version>-<arch>-linux.tar.gz`
-  ([node-release-readiness.md](node-release-readiness.md) §2), under the WardOS
-  version; a node version of its own is still open
-  ([#275](https://github.com/hexrift/WardOS/issues/275)). Every release carries its
-  protocol window in the release manifest ([release-manifest.md](release-manifest.md)),
-  as `node_protocol_window`, read from the marker at the top of this document at the
-  release commit, so a control plane can read the window of a release without the
-  tarball or the source.
+  `ward-node-<node version>-<arch>-linux.tar.gz`
+  ([node-release-readiness.md](node-release-readiness.md) §2), under the **node
+  version**: the literal `version` of `crates/ward-node` and `crates/ward-node-client`,
+  which `ward-node --version` prints, independent of the WardOS version
+  ([#275](https://github.com/hexrift/WardOS/issues/275)). It moves exactly when the
+  node's inputs move: `scripts/release/node-version.sh` refuses a release whose node
+  changed since the previous release without a higher node version, and one whose
+  node version changed although nothing the node is built from did, so one node
+  version names one node source across releases. The protocol version is a third
+  thing: a node version may rise without a protocol change (a fix), and a protocol
+  minor arrives with a node version bump at the next release. Every release carries
+  its protocol window in the release manifest
+  ([release-manifest.md](release-manifest.md)), as `node_protocol_window`, read from
+  the marker at the top of this document at the release commit, and both trains'
+  versions under `components`, so a control plane can read the window and the node
+  version of a release without the tarball or the source.
 
 ## 7. What CI checks
 

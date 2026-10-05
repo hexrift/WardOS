@@ -53,31 +53,37 @@ attaches everything to one GitHub release bound to that commit (`check-tag-commi
 | Asset | Carries |
 | --- | --- |
 | `wardos-<version>-<arch>-linux.tar.gz` and `.sha256` | the runtime: `ward`, `wardd`, `ward-agent`, `ward-shell`, `wardos-theme-render`, `install.sh`, `README.md`, `LICENSE` and a copy of `docs/` |
-| `ward-node-<version>-<arch>-linux.tar.gz` and `.sha256` | the node: `ward-node`, `ward-node-adapter`, `LICENSE` and a copy of `docs/` |
-| `wardos-<version>-manifest.json` and `.sha256` | the release manifest ([release-manifest.md](release-manifest.md)): source commit, tag, every tarball with its component, architecture and digest, and the node protocol window |
+| `ward-node-<node version>-<arch>-linux.tar.gz` and `.sha256` | the node: `ward-node`, `ward-node-adapter`, `LICENSE` and a copy of `docs/` |
+| `wardos-<version>-manifest.json` and `.sha256` | the release manifest ([release-manifest.md](release-manifest.md)): source commit, tag, both trains' versions, every tarball with its component, version, architecture and digest, and the node protocol window |
 | `wardos-<version>-manifest.json.sigstore.json` | the manifest's Sigstore signature bundle, made by `release.yml` under its own identity on the release tag; verified offline by `scripts/release/verify-manifest.sh`. Absent on releases before the signing step (v0.4.1 and earlier) and on a run that was not on the tag (release-manifest.md) |
 
-`<version>` is the workspace version without the `v`; `<arch>` is the runner's
+`<version>` is the workspace version without the `v`; `<node version>` is the node
+train's own ([compatibility.md](compatibility.md) §6); `<arch>` is the runner's
 `uname -m`, `x86_64` or `aarch64`. Each `.sha256` is `sha256sum`'s line for its
 tarball (or the manifest), checked with `sha256sum -c` next to it.
 
 For the node this means:
 
 - **`ward-node` and `ward-node-adapter` are release artifacts**, in the node tarball,
-  for both architectures. Each prints the release version (`ward-node --version`,
-  `ward-node-adapter --version`), which the release checks before uploading, as it does
-  for `ward`. The two trains share the workspace version at this revision; a node
-  version of its own, moving independently of the runtime's, is the remaining part of
-  [#275](https://github.com/hexrift/WardOS/issues/275).
+  for both architectures. Each prints the node version (`ward-node --version`,
+  `ward-node-adapter --version`), which the release checks before uploading, as it
+  checks `ward` against the release version. The node version is the literal `version`
+  of `crates/ward-node` and `crates/ward-node-client`, set by
+  `scripts/release/prepare-version.sh <version> --node <node version>` in the release
+  PR; the release refuses to build when it did not move with the node's inputs since
+  the previous release, or moved although they did not
+  (`scripts/release/node-version.sh`; [compatibility.md](compatibility.md) §6, #275).
+  The manifest records it under `components["ward-node"].version`.
 - **The node is not part of `install.sh`**, which installs the session layer for one
   user. Installing the node tarball is the operator step of
   [node-integration-guide.md](node-integration-guide.md) §1.
 - **The image carries the node whichever way it is built.** `image/Containerfile`'s
   `builder` stage compiles `ward-node` and `ward-node-adapter` from the checkout (#306;
   the images CI publishes on every merge); its `release` stage downloads the node
-  tarball beside the runtime tarball, checks it against a pinned checksum
-  (`WARDOS_NODE_SHA256`, `WARDOS_NODE_SHA256_AARCH64`; `image/build.sh` fetches the
-  `.sha256` from the release, as it does the runtime's) and installs the same two
+  tarball beside the runtime tarball, named by the node version (`WARDOS_NODE_VERSION`),
+  checks it against a pinned checksum (`WARDOS_NODE_SHA256`,
+  `WARDOS_NODE_SHA256_AARCH64`; `image/build.sh` reads all three from the release
+  manifest) and installs the same two
   binaries. Both stages end with them in `/usr/bin`, which the host stage asserts. A
   release without a node tarball (every release up to v0.4.1) cannot feed a
   release-source image: the stage refuses rather than ship an image with no node, and

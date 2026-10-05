@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Package one architecture's release build into its two trains (issue #275).
 #
-# Usage: package.sh <version> <arch> <bin-dir> <dist-dir> [source-root]
+# Usage: package.sh <version> <node-version> <arch> <bin-dir> <dist-dir> [source-root]
 #
 #   <version>      the release version without the leading v (what check-version.sh
 #                  bound the tag to).
+#   <node-version> the node train's own version (what node-version.sh printed); the
+#                  node tarball is named by it, not by the release version.
 #   <arch>         the runner's `uname -m`; install.sh and the image's release stage
 #                  pick a tarball by it.
 #   <bin-dir>      where cargo put the release binaries (target/release).
@@ -13,14 +15,14 @@
 #   [source-root]  the checkout the installer, README, LICENSE and docs/ come from
 #                  (default: the current directory).
 #
-# Two tarballs, one checksum sidecar each, both named <train>-<version>-<arch>-linux:
+# Two tarballs, one checksum sidecar each, named <train>-<train version>-<arch>-linux:
 #
-#   wardos-…     the runtime: ward, wardd, ward-agent, ward-shell and
+#   wardos-…     the runtime, under the release version: ward, wardd, ward-agent, ward-shell and
 #                wardos-theme-render (the five the image's release stage expects,
 #                image/Containerfile; tarballs before v0.2 carried only the first
 #                three), install.sh, README.md, LICENSE and a copy of docs/.
-#   ward-node-…  the node: ward-node and ward-node-adapter, LICENSE and the same
-#                copy of docs/. No installer: the node is an operator install
+#   ward-node-…  the node, under the node version: ward-node and ward-node-adapter,
+#                LICENSE and the same copy of docs/. No installer: the node is an operator install
 #                (docs/node-integration-guide.md §1), not part of install.sh; the
 #                image's release stage installs the two binaries from this tarball.
 #
@@ -30,11 +32,13 @@
 # binary fails here, with the name, instead of shipping a tarball without it.
 set -euo pipefail
 
-version="${1:?usage: package.sh <version> <arch> <bin-dir> <dist-dir> [source-root]}"
-arch="${2:?usage: package.sh <version> <arch> <bin-dir> <dist-dir> [source-root]}"
-bin_dir="${3:?usage: package.sh <version> <arch> <bin-dir> <dist-dir> [source-root]}"
-dist_dir="${4:?usage: package.sh <version> <arch> <bin-dir> <dist-dir> [source-root]}"
-source_root="${5:-.}"
+usage="usage: package.sh <version> <node-version> <arch> <bin-dir> <dist-dir> [source-root]"
+version="${1:?$usage}"
+node_version="${2:?$usage}"
+arch="${3:?$usage}"
+bin_dir="${4:?$usage}"
+dist_dir="${5:?$usage}"
+source_root="${6:-.}"
 
 die() {
   echo "package: $*" >&2
@@ -45,6 +49,7 @@ die() {
 # becomes part of two asset names and must never carry a path or shell character.
 semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
 [[ "$version" =~ $semver_re ]] || die "not a SemVer version (without the leading v): '$version'"
+[[ "$node_version" =~ $semver_re ]] || die "not a SemVer node version (without the leading v): '$node_version'"
 [[ "$arch" =~ ^[A-Za-z0-9_]+$ ]] || die "not an architecture name: '$arch'"
 [[ -d "$bin_dir" ]] || die "no such binary directory: '$bin_dir'"
 [[ -d "$source_root" ]] || die "no such source root: '$source_root'"
@@ -85,4 +90,4 @@ package_train() {
 
 mkdir -p "$dist_dir"
 package_train "wardos-${version}-${arch}-linux" "${runtime_binaries[@]}" -- "${runtime_files[@]}"
-package_train "ward-node-${version}-${arch}-linux" "${node_binaries[@]}" -- "${node_files[@]}"
+package_train "ward-node-${node_version}-${arch}-linux" "${node_binaries[@]}" -- "${node_files[@]}"
