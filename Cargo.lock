@@ -2472,6 +2472,7 @@ name = "ward-node"
 version = "0.18.1"
 dependencies = [
  "clap",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

@@ -333,8 +333,8 @@ decodes the report against the expected binding and session; malformed data,
 unknown fields, and a mismatched identity are refused. The report contains no
 workload output or credential material.
 
-This is a contract only. The current `ward-node` task registry still supports
-`create` and `inspect`; it does not yet execute tasks or emit receipts. A future
+This is a contract only. The current `ward-node` task registry supports `create`,
+`inspect` and `admit`; it does not yet execute tasks or emit receipts. A future
 node implementation must bind admission, durable evidence, and recovery before a
 receipt can be treated as an authoritative execution result.
 
@@ -343,8 +343,9 @@ receipt can be treated as an authoritative execution result.
 `ward-node` can compare an exact task binding and expected agent with an already
 trusted `AuthorityLease`, its validated lineage, and locally known monotonic
 revocations. Inactive, mismatched, or revoked authority fails closed. This is a
-pure prerequisite check, not a way to promote inbound lease bytes into trust:
-the node still does not accept a workload, admit execution, or run `start`.
+pure prerequisite check, not a way to promote inbound lease bytes into trust: only
+`admit` promotes a lease, after verifying a trusted issuer's signature over the
+envelope that carried it (§3.11), and the node still does not run `start`.
 Execution-attempt identity remains bound by node-owned task state, not by the
 authority lease itself.
 
@@ -353,12 +354,13 @@ authority lease itself.
 After negotiation, the local node serves one request per connection. Protocol
 1.1 supports read-only capability discovery; 1.2 supports discovery or a task
 lifecycle request; 1.3 adds the `admit` verb and the `exited` state. Capability
-responses retain the same node facts while naming the exact negotiated version, and
-a 1.3 document advertises nothing new. Protocol 1.0 has no discovery endpoint. A 1.2
-connection refuses `admit` exactly like an unknown request and never carries
-`exited`.
+responses retain the same node facts while naming the exact negotiated version. A 1.3
+document adds `"admit":true` to `lifecycle` only when the node admits signed envelopes;
+1.1 and 1.2 documents never carry it and are byte-for-byte unchanged. Protocol 1.0 has
+no discovery endpoint. A 1.2 connection refuses `admit` exactly like an unknown request
+and never carries `exited`.
 
-### 3.11 Node admission and execution ownership (decided; protocol types only)
+### 3.11 Node admission and execution ownership (decided; admission implemented)
 
 [ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md) settles
 how the node will execute. Protocol 1.3 adds an `admit` verb carrying one signed,
@@ -372,9 +374,36 @@ The protocol 1.3 types exist in `ward-node-protocol`: `TaskAdmissionEnvelope`, t
 `admit` request and the `Exited` state. `admit` carries the envelope as the exact JSON
 bytes the issuer signed (at most 32 KiB) beside a detached proof (issuer key id and a
 64-byte Ed25519 signature, both hex); the envelope is decoded strictly only after the
-proof is checked. Admission itself is not implemented: `ward-node` answers `admit` with
-`unsupported_operation` and changes nothing, and no signature is verified yet. #324
-tracks the remaining slices.
+proof is checked.
+
+`ward-node` admits (ADR-0030 §2). It runs as
+
+```text
+ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
+```
+
+`--node-id` is the node's audience; the state directory (created mode 0700, refused if
+group- or world-accessible) pins it at first start and holds `admission-versions.json`
+(last accepted version per task) and `revocations.json` (known revocation facts), each
+replaced atomically (temporary file, fsync, rename). The trust-store file lists one hex
+Ed25519 issuer public key per line, optionally followed by its key id, with `#`
+comments; a key id is the `BLAKE3` hash of the 32-byte public key, so
+`ward-node issuer-key-id <hex-public-key>` prints the id a proof must name. A
+malformed, group- or world-writable trust store stops the node from starting; without
+one no issuer is trusted and every `admit` is `authority_denied`.
+
+`admit` needs a `created` task with the exact binding, then a trusted key id, a
+signature over exactly the envelope bytes, and only then a strict decode; the decoded
+binding must equal the request's and the audience must be this node; the envelope must
+be current at the node clock; its version must exceed the last durably accepted one;
+the lease and lineage are promoted only because the trusted issuer signed them and must
+pass the trusted task-authority check (§3.9); and no durable revocation may cover them.
+Each failure is a typed refusal (`task_not_found`, `attempt_mismatch`,
+`lease_mismatch`, `invalid_state`, `authority_denied`, `lease_expired`,
+`stale_operation`, `lease_revoked`) with no state change. On success the version is
+recorded durably and the task becomes `ready`, holding its admitted envelope; replaying
+the same operation returns the same result. Nothing executes yet: `start` and `stop`
+stay unsupported, and #324 tracks the remaining slices.
 
 ---
 

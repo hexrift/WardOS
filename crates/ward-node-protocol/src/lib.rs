@@ -3,8 +3,9 @@
 //!
 //! Protocol 1.0 negotiates a version, 1.1 adds read-only capability discovery, 1.2 adds
 //! the identity-only task lifecycle, and 1.3 adds the signed admission envelope (`admit`)
-//! and the `exited` state of ADR-0030. Issuer verification, execution and transport
-//! authentication belong to later slices of #324 and #262. Incompatible peers fail closed
+//! and the `exited` state of ADR-0030. Issuer verification is the node's (`ward-node`);
+//! execution and transport authentication belong to later slices of #324 and #262. A 1.3
+//! capability document may advertise `admit`. Incompatible peers fail closed
 //! rather than falling back to the per-session ward-daemon control protocol.
 
 #![forbid(unsafe_code)]
@@ -397,6 +398,7 @@ pub struct VerifierCapabilities {
 }
 
 /// Host-confirmed lifecycle operations available on a node.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LifecycleCapabilities {
@@ -406,10 +408,19 @@ pub struct LifecycleCapabilities {
     pub stop: bool,
     /// Temporary grants can be revoked by the host boundary.
     pub revoke: bool,
+    /// Signed admission envelopes are verified and admitted (`admit`). Protocol 1.3 and
+    /// later only: a document for an earlier version never carries this field, and a 1.3
+    /// document carries it only when it is `true`.
+    #[serde(default)]
+    pub admit: bool,
 }
 
 /// Trusted, read-only node facts exposed after a compatible handshake.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+///
+/// The `lifecycle.admit` field is version-gated on the wire: a 1.3 or later document carries
+/// `"admit":true` only when the node admits signed envelopes (absent means `false`), and a
+/// 1.1 or 1.2 document never carries it, so those stay byte-for-byte unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeCapabilities {
     protocol: ProtocolVersion,
     architecture: NodeArchitecture,
@@ -442,6 +453,9 @@ impl NodeCapabilities {
     ) -> Result<Self, NodeCapabilitiesError> {
         if !supports_capability_discovery(protocol) {
             return Err(NodeCapabilitiesError::ProtocolDoesNotSupportDiscovery);
+        }
+        if lifecycle.admit && !supports_task_admission(protocol) {
+            return Err(NodeCapabilitiesError::ProtocolDoesNotSupportAdmission);
         }
 
         Ok(Self {
@@ -517,6 +531,8 @@ impl NodeCapabilities {
 pub enum NodeCapabilitiesError {
     /// Capability discovery was attempted under a protocol version that does not support it.
     ProtocolDoesNotSupportDiscovery,
+    /// `admit` was advertised under a protocol version that predates task admission.
+    ProtocolDoesNotSupportAdmission,
 }
 
 impl Display for NodeCapabilitiesError {
@@ -525,13 +541,37 @@ impl Display for NodeCapabilitiesError {
             Self::ProtocolDoesNotSupportDiscovery => {
                 formatter.write_str("protocol version does not support capability discovery")
             }
+            Self::ProtocolDoesNotSupportAdmission => {
+                formatter.write_str("protocol version does not support task admission")
+            }
         }
     }
 }
 
 impl std::error::Error for NodeCapabilitiesError {}
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleCapabilitiesWire {
+    pause: bool,
+    stop: bool,
+    revoke: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_bool"
+    )]
+    admit: Option<bool>,
+}
+
+fn deserialize_present_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(Some)
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NodeCapabilitiesWire {
     protocol: ProtocolVersion,
@@ -542,11 +582,16 @@ struct NodeCapabilitiesWire {
     credentials: CredentialCapabilities,
     snapshots: SnapshotCapabilities,
     verifier: VerifierCapabilities,
-    lifecycle: LifecycleCapabilities,
+    lifecycle: LifecycleCapabilitiesWire,
 }
 
 impl NodeCapabilitiesWire {
-    fn into_capabilities(self) -> Result<NodeCapabilities, NodeCapabilitiesError> {
+    fn into_capabilities(self) -> Option<NodeCapabilities> {
+        let admit = match (supports_task_admission(self.protocol), self.lifecycle.admit) {
+            (true, admit) => admit.unwrap_or(false),
+            (false, None) => false,
+            (false, Some(_)) => return None,
+        };
         NodeCapabilities::new(
             self.protocol,
             self.architecture,
@@ -556,8 +601,39 @@ impl NodeCapabilitiesWire {
             self.credentials,
             self.snapshots,
             self.verifier,
-            self.lifecycle,
+            LifecycleCapabilities {
+                pause: self.lifecycle.pause,
+                stop: self.lifecycle.stop,
+                revoke: self.lifecycle.revoke,
+                admit,
+            },
         )
+        .ok()
+    }
+}
+
+impl Serialize for NodeCapabilities {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        NodeCapabilitiesWire {
+            protocol: self.protocol,
+            architecture: self.architecture,
+            capacity: self.capacity,
+            isolation: self.isolation,
+            network: self.network,
+            credentials: self.credentials,
+            snapshots: self.snapshots,
+            verifier: self.verifier,
+            lifecycle: LifecycleCapabilitiesWire {
+                pause: self.lifecycle.pause,
+                stop: self.lifecycle.stop,
+                revoke: self.lifecycle.revoke,
+                admit: self.lifecycle.admit.then_some(true),
+            },
+        }
+        .serialize(serializer)
     }
 }
 
@@ -710,7 +786,7 @@ impl CapabilityDiscoveryContext {
 
                 let capabilities = capabilities
                     .into_capabilities()
-                    .map_err(|_| CapabilityDiscoveryError::MalformedMessage)?;
+                    .ok_or(CapabilityDiscoveryError::MalformedMessage)?;
                 self.response(capabilities)
             }
         }
@@ -1889,6 +1965,7 @@ mod tests {
                 pause: false,
                 stop: false,
                 revoke: false,
+                admit: false,
             },
         )
         .unwrap()
@@ -1928,6 +2005,7 @@ mod tests {
                 pause: true,
                 stop: true,
                 revoke: true,
+                admit: false,
             },
         )
         .unwrap()
@@ -1986,6 +2064,93 @@ mod tests {
             serde_json::to_string(&response).unwrap(),
             r#"{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":1},"architecture":"aarch64","capacity":{"logical_cpus":64,"memory_bytes":137438953472},"isolation":{"namespaces":{"sandbox":true,"user_namespace":true},"backends":{"container":true,"microvm":true,"vm":true}},"network":{"offline":true,"proxy_allowlist":true},"credentials":{"proxy_injection":true,"scoped_http_gateway":true},"snapshots":{"content_addressed":true,"diff":true,"read":true},"verifier":{"isolated":true},"lifecycle":{"pause":true,"stop":true,"revoke":true}}}"#
         );
+    }
+
+    fn capabilities_at(minor: u16, admit: bool) -> NodeCapabilities {
+        let base = minimal_capabilities();
+        NodeCapabilities::new(
+            ProtocolVersion::new(1, minor),
+            base.architecture(),
+            base.capacity(),
+            base.isolation(),
+            base.network(),
+            base.credentials(),
+            base.snapshots(),
+            base.verifier(),
+            LifecycleCapabilities {
+                admit,
+                ..base.lifecycle()
+            },
+        )
+        .unwrap()
+    }
+
+    fn minimal_capabilities_json(minor: u16, lifecycle_tail: &str) -> String {
+        format!(
+            r#"{{"response":"capabilities","capabilities":{{"protocol":{{"major":1,"minor":{minor}}},"architecture":"x86_64","capacity":{{"logical_cpus":1,"memory_bytes":1024}},"isolation":{{"namespaces":{{"sandbox":false,"user_namespace":false}},"backends":{{"container":false,"microvm":false,"vm":false}}}},"network":{{"offline":false,"proxy_allowlist":false}},"credentials":{{"proxy_injection":false,"scoped_http_gateway":false}},"snapshots":{{"content_addressed":false,"diff":false,"read":false}},"verifier":{{"isolated":false}},"lifecycle":{{"pause":false,"stop":false,"revoke":false{lifecycle_tail}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn one_one_and_one_two_capability_documents_never_carry_admit() {
+        for minor in [1, 2] {
+            let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, minor)).unwrap();
+            let response = context.response(capabilities_at(minor, false)).unwrap();
+            let json = serde_json::to_string(&response).unwrap();
+            assert_eq!(json, minimal_capabilities_json(minor, ""));
+            assert_eq!(context.decode_response(&json).unwrap(), response);
+
+            assert_eq!(
+                NodeCapabilities::new(
+                    ProtocolVersion::new(1, minor),
+                    NodeArchitecture::X86_64,
+                    NodeCapacity::new(1, 1024).unwrap(),
+                    IsolationCapabilities::default(),
+                    NetworkCapabilities::default(),
+                    CredentialCapabilities::default(),
+                    SnapshotCapabilities::default(),
+                    VerifierCapabilities::default(),
+                    LifecycleCapabilities {
+                        admit: true,
+                        ..LifecycleCapabilities::default()
+                    },
+                ),
+                Err(NodeCapabilitiesError::ProtocolDoesNotSupportAdmission)
+            );
+
+            for tail in [r#","admit":false"#, r#","admit":true"#] {
+                assert_eq!(
+                    context.decode_response(&minimal_capabilities_json(minor, tail)),
+                    Err(CapabilityDiscoveryError::MalformedMessage),
+                    "a 1.{minor} document must not carry admit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_three_capability_document_carries_admit_only_when_supported() {
+        let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        for (admit, tail) in [(true, r#","admit":true"#), (false, "")] {
+            let response = context.response(capabilities_at(3, admit)).unwrap();
+            let json = serde_json::to_string(&response).unwrap();
+            assert_eq!(json, minimal_capabilities_json(3, tail));
+            let decoded = context.decode_response(&json).unwrap();
+            assert_eq!(decoded, response);
+            let CapabilityDiscoveryResponse::Capabilities { capabilities } = decoded;
+            assert_eq!(capabilities.lifecycle().admit, admit);
+        }
+        assert_eq!(
+            context.decode_response(&minimal_capabilities_json(3, r#","admit":false"#)),
+            context.response(capabilities_at(3, false))
+        );
+        for tail in [r#","admit":null"#, r#","admit":1"#] {
+            assert_eq!(
+                context.decode_response(&minimal_capabilities_json(3, tail)),
+                Err(CapabilityDiscoveryError::MalformedMessage),
+                "{tail}"
+            );
+        }
     }
 
     #[test]
