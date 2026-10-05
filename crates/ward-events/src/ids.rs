@@ -483,6 +483,12 @@ ulid_id!(
 );
 
 ulid_id!(
+    /// Execution node identifier for task audience binding.
+    NodeId,
+    "node_"
+);
+
+ulid_id!(
     /// Delegation edge identifier.
     DelegationId,
     "deleg_"
@@ -838,6 +844,7 @@ mod tests {
         let principal = PrincipalId::from_u128(raw);
         let agent = AgentId::from_u128(raw);
         let task = TaskId::from_u128(raw);
+        let node = NodeId::from_u128(raw);
         let delegation = DelegationId::from_u128(raw);
         let lease = LeaseId::from_u128(raw);
         let execution = ExecutionAttemptId::from_u128(raw);
@@ -845,6 +852,7 @@ mod tests {
         assert!(principal.to_string().starts_with("prn_"));
         assert!(agent.to_string().starts_with("agent_"));
         assert!(task.to_string().starts_with("task_"));
+        assert!(node.to_string().starts_with("node_"));
         assert!(delegation.to_string().starts_with("deleg_"));
         assert!(lease.to_string().starts_with("lease_"));
         assert!(execution.to_string().starts_with("exec_"));
@@ -855,6 +863,7 @@ mod tests {
         );
         assert_eq!(agent.to_string().parse::<AgentId>().unwrap(), agent);
         assert_eq!(task.to_string().parse::<TaskId>().unwrap(), task);
+        assert_eq!(node.to_string().parse::<NodeId>().unwrap(), node);
         assert_eq!(
             delegation.to_string().parse::<DelegationId>().unwrap(),
             delegation
@@ -868,6 +877,7 @@ mod tests {
         assert!(principal.to_string().parse::<AgentId>().is_err());
         assert!(agent.to_string().parse::<TaskId>().is_err());
         assert!(task.to_string().parse::<LeaseId>().is_err());
+        assert!(node.to_string().parse::<TaskId>().is_err());
 
         let bytes = postcard::to_allocvec(&execution).unwrap();
         assert_eq!(bytes.len(), 16);
