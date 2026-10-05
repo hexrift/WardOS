@@ -358,12 +358,13 @@ lifecycle request; 1.3 adds the `admit` verb, the `exited` state and the receipt
 outcome on `inspect`. Capability responses retain the same node facts while naming the
 exact negotiated version. A 1.3 document adds `"admit":true` to `lifecycle` only when the
 node admits signed envelopes, and advertises `stop` and `"start":true` together only
-when it executes (a 1.3 document with one but not the other is invalid); 1.1 and 1.2
+when it executes (a 1.3 document with one but not the other is invalid); a `ward-node`
+1.3 document sets `pause` and `revoke` exactly when it advertises `start`; 1.1 and 1.2
 documents never carry `admit` or `start` and are byte-for-byte unchanged. Protocol 1.0 has
 no discovery endpoint. A 1.2 connection refuses `admit` exactly like an unknown request
 and never carries `exited`.
 
-### 3.11 Node admission and execution ownership (decided; admission, start, stop and exit implemented)
+### 3.11 Node admission and execution ownership (decided; admission, start, stop, exit, pause, resume, revoke and seal implemented)
 
 [ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md) settles
 how the node will execute. The wire contract an external control plane drives is
@@ -446,13 +447,41 @@ effect returns the task's current state. 1.3 `inspect` of an `exited` or `stoppe
 adds `"outcome"`; a 1.2 connection reads an exited task as `stopped`. Serving never waits
 on a running workload.
 
+`pause` moves a `running` task to `paused` only once its whole process tree, rooted at
+the outer `bwrap`'s host pid (identified by pid and start time), is confirmed stopped:
+`SIGSTOP` children first, then a settle check bounded at 1 s that accepts a process only
+when it is stopped, ended, or held in vfork wait on a stopped child, rescans the tree and
+freezes anything forked meanwhile, until a rescan adds nothing. An unconfirmed freeze is
+continued back and refused `resource_unavailable` with the task `running`. `resume`
+sends `SIGCONT` parents first and answers `running` once nothing is still stopped. The
+freeze is signal-only (`ward_launch::freeze`): the node creates no delegated cgroup, so
+the cgroup v2 freezer is not used. The budget clock keeps running while paused, and a
+paused task can be stopped, revoked or killed at its budget (`SIGKILL` ends a stopped
+process). `revoke` (from `ready`, `running` or `paused`) first records the lease's
+revocation at the node clock in `revocations.json` (`resource_unavailable` with nothing
+changed if that fails), so no later `admit` or `start` under the lease or a lease
+delegated from it is accepted, across restarts; it then kills and reaps a live workload
+(continuing a paused tree first) and answers `revoked` with a `failed` receipt, or an
+`unknown` one if the reap is not confirmed within the stop timeout. `seal` moves an
+`exited`, `stopped` or `revoked` task to the terminal `sealed`. Every other verb in every
+state is `invalid_state` with nothing changed; replaying the operation that took effect
+returns the task's current state. Each transition is applied under the registry lock and
+served to completion even if the client disconnects. 1.2 connections are refused all four
+verbs as unsupported, and 1.3 inspect reports an outcome only for `exited` and `stopped`.
+
+A `create` with a new execution attempt for a known task is accepted only once the
+current attempt is `exited`, `stopped`, `revoked` or `sealed` (otherwise
+`attempt_mismatch`); it replaces that attempt, and the durable per-task admission version
+keeps rising across attempts. Sealed tasks do not count against the registry's capacity:
+a create that needs room evicts the task sealed longest ago, while its admission version
+and revocations stay in the node state.
+
 The registry is in memory: after a node restart a previously running attempt is unknown
 to the node, though its workspace still blocks a second start of the same attempt.
-Durable recovery is #332 slice 7. Dropping the registry stops and reaps every running
+Durable recovery is #332 slice 7. Dropping the registry stops and reaps every live
 workload, and a node that dies outright takes its sandboxes with it through bubblewrap's
 `--die-with-parent`, except in the brief window before a just-spawned sandbox has armed
-it. Per-attempt evidence logs, network grants, `pause`/`resume`, `revoke` and `seal` are
-later #324 slices.
+it. Per-attempt evidence logs and network grants are later slices.
 
 ---
 

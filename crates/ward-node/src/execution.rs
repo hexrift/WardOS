@@ -12,12 +12,24 @@
 //! network namespace holds only loopback. The envelope's capability manifest is not
 //! interpreted yet, so any network grant it carries is not honoured; the node fails closed
 //! to the least authority rather than guessing at a grant.
+//!
+//! `pause` and `resume` act on the running workload through its [`WorkloadFreezer`], which
+//! the reaper hands back with the spawned pid. The sandbox freezer stops the tree rooted at
+//! the outer `bwrap`'s host pid with `SIGSTOP`, children first, and reports it frozen only
+//! once the settle check in `ward_launch::freeze` confirms every process stopped (or ended,
+//! or held in vfork wait on a stopped child) within [`DEFAULT_FREEZE_SETTLE`]; otherwise it
+//! continues the tree again and refuses. Resuming sends `SIGCONT`, parents first, and
+//! confirms nothing is still stopped. There is no cgroup freezer: the node creates no
+//! delegated cgroup for a launch. The budget clock keeps running while a workload is
+//! paused (ADR-0030 §3: the budget is always enforced), and `SIGKILL` ends a stopped
+//! process as it is, so a paused workload can still be stopped or killed at its budget.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ward_launch::freeze::{FrozenTree, TreeRoot, freeze_tree, thaw_tree};
 use ward_launch::{Launch, RunningLaunch};
 use ward_snapshot::SnapshotStore;
 
@@ -28,6 +40,10 @@ pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default bound on how long `start` waits for the launcher to report a spawn.
 pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default bound on how long `pause` waits for a freeze, and `resume` for a thaw, to be
+/// confirmed.
+pub const DEFAULT_FREEZE_SETTLE: Duration = ward_launch::freeze::FREEZE_SETTLE;
 
 /// Bytes of each workload output stream the sandbox launcher retains (a head and a tail)
 /// before discarding it. Output is drained so a chatty workload never blocks on a pipe.
@@ -128,10 +144,38 @@ pub trait TaskLauncher: Send + Sync {
     fn launch(&self, request: &LaunchRequest) -> Result<Box<dyn RunningWorkload>, SpawnError>;
 }
 
+/// A freeze or thaw of a workload's process tree that could not be confirmed. A failed
+/// freeze has already continued whatever it stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreezeUnconfirmed;
+
+/// Stops and continues one running workload's process tree (`pause` and `resume`).
+///
+/// The registry calls it under its lock, so calls for one workload never overlap.
+pub trait WorkloadFreezer: Send + Sync + std::fmt::Debug {
+    /// Stop every process of the workload and confirm it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FreezeUnconfirmed`] if the freeze could not be confirmed; the workload
+    /// then runs as before.
+    fn freeze(&self) -> Result<(), FreezeUnconfirmed>;
+
+    /// Continue every process frozen by [`Self::freeze`] and confirm none is still stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FreezeUnconfirmed`] if that could not be confirmed.
+    fn thaw(&self) -> Result<(), FreezeUnconfirmed>;
+}
+
 /// A spawned workload, owned by its reaper. Dropping it kills and reaps it.
 pub trait RunningWorkload: Send {
     /// The host process id of the spawned workload.
     fn pid(&self) -> u32;
+
+    /// The freezer for this workload's process tree, shared with the registry.
+    fn freezer(&self) -> Arc<dyn WorkloadFreezer>;
 
     /// Wait until the workload ends, enforcing its budget, and kill and reap it as soon as
     /// `stop` is requested.
@@ -180,6 +224,14 @@ impl RunningWorkload for SandboxWorkload {
         self.0.id()
     }
 
+    fn freezer(&self) -> Arc<dyn WorkloadFreezer> {
+        Arc::new(SandboxFreezer {
+            root: self.0.tree_root(),
+            frozen: Mutex::new(None),
+            settle: DEFAULT_FREEZE_SETTLE,
+        })
+    }
+
     fn wait(self: Box<Self>, stop: &StopSignal) -> WorkloadExit {
         match self.0.wait_stoppable(&|| stop.is_requested()) {
             Ok(outcome) if outcome.stopped => WorkloadExit::Stopped,
@@ -190,8 +242,39 @@ impl RunningWorkload for SandboxWorkload {
     }
 }
 
+/// Freezes a sandbox's process tree by signal, rooted at its outer `bwrap`.
+#[derive(Debug)]
+struct SandboxFreezer {
+    root: Option<TreeRoot>,
+    frozen: Mutex<Option<FrozenTree>>,
+    settle: Duration,
+}
+
+impl WorkloadFreezer for SandboxFreezer {
+    fn freeze(&self) -> Result<(), FreezeUnconfirmed> {
+        let root = self.root.ok_or(FreezeUnconfirmed)?;
+        let mut frozen = self.frozen.lock().map_err(|_| FreezeUnconfirmed)?;
+        let tree = freeze_tree(root, self.settle).map_err(|_| FreezeUnconfirmed)?;
+        *frozen = Some(tree);
+        Ok(())
+    }
+
+    fn thaw(&self) -> Result<(), FreezeUnconfirmed> {
+        let mut frozen = self.frozen.lock().map_err(|_| FreezeUnconfirmed)?;
+        let Some(tree) = frozen.as_ref() else {
+            return Ok(());
+        };
+        if !thaw_tree(tree, self.settle) {
+            return Err(FreezeUnconfirmed);
+        }
+        *frozen = None;
+        Ok(())
+    }
+}
+
 /// What a node needs to execute admitted tasks: its task root, its snapshot store and a
-/// launcher. A node built with it advertises `start` and `stop` together at protocol 1.3.
+/// launcher. A node built with it advertises `start`, `stop`, `pause` and `revoke` together
+/// at protocol 1.3.
 pub struct NodeExecution {
     task_root: TaskRoot,
     snapshots: SnapshotStore,

@@ -12,14 +12,17 @@
 //!   issuers, its node id, its clock and its durable state, and moves the task
 //!   `Created → Ready` (see [`admit`]); it then advertises `admit` in 1.3 capability
 //!   discovery. Without admission, `admit` is refused as unsupported.
-//! * at protocol 1.3, a service built with [`NodeService::with_execution`] also starts
-//!   and stops admitted tasks in an offline sandbox over a node-allocated workspace, reaps
-//!   them on a node-owned thread and records `exited` with a receipt (see [`task`] and
-//!   [`execution`]). It advertises `start` and `stop` together in 1.3 capability
-//!   discovery; any other 1.3 node advertises neither. 1.1 and 1.2 documents are unchanged.
+//! * at protocol 1.3, a service built with [`NodeService::with_execution`] also starts,
+//!   pauses, resumes, stops, revokes and seals admitted tasks in an offline sandbox over a
+//!   node-allocated workspace, reaps them on a node-owned thread and records `exited` with
+//!   a receipt (see [`task`] and [`execution`]). It advertises `start`, `stop`, `pause`
+//!   and `revoke` together in 1.3 capability discovery (`resume` comes with `pause` and
+//!   `seal` with execution; the document has no flag for either); any other 1.3 node
+//!   advertises none of them. 1.1 and 1.2 documents are unchanged, and a 1.2 connection is
+//!   refused every one of these verbs as unsupported.
 //!
-//! `pause`, `resume`, `revoke` and `seal` stay unsupported, and remote transport is
-//! deliberately absent. Serving a lifecycle request never waits on a running workload.
+//! `stream` stays unsupported, and remote transport is deliberately absent. Serving a
+//! lifecycle request never waits on a running workload.
 
 #![forbid(unsafe_code)]
 
@@ -151,8 +154,8 @@ impl NodeService {
         })
     }
 
-    /// Create a service that admits signed envelopes through `admission` and starts and
-    /// stops admitted tasks through `execution` (protocol 1.3).
+    /// Create a service that admits signed envelopes through `admission` and executes
+    /// admitted tasks through `execution` (protocol 1.3).
     ///
     /// # Errors
     ///
@@ -255,7 +258,8 @@ impl NodeService {
                 admit: self.admits,
                 start: self.executes,
                 stop: self.executes,
-                ..configured
+                pause: self.executes,
+                revoke: self.executes,
             }
         } else {
             LifecycleCapabilities {
@@ -1016,9 +1020,11 @@ mod tests {
             LifecycleCapabilities {
                 stop: false,
                 start: false,
+                pause: false,
+                revoke: false,
                 ..service.capabilities.lifecycle()
             },
-            "a 1.3 node without execution advertises neither start nor stop"
+            "a 1.3 node without execution advertises none of start, stop, pause or revoke"
         );
         assert_eq!(observed.isolation(), service.capabilities.isolation());
         worker.join().unwrap().unwrap();
@@ -1303,8 +1309,8 @@ mod tests {
             assert_eq!(lifecycle.start, executes, "{raw}");
             assert_eq!(lifecycle.stop, executes, "{raw}");
             assert!(lifecycle.admit, "{raw}");
-            assert_eq!(lifecycle.pause, capabilities().lifecycle().pause);
-            assert_eq!(lifecycle.revoke, capabilities().lifecycle().revoke);
+            assert_eq!(lifecycle.pause, executes, "{raw}");
+            assert_eq!(lifecycle.revoke, executes, "{raw}");
         }
         executing_node.join();
         admitting.join();
@@ -1363,6 +1369,169 @@ mod tests {
         );
         assert_eq!(executing.launcher.stopped(), 1);
         node.join();
+    }
+
+    #[test]
+    fn capability_discovery_advertises_pause_and_revoke_only_at_one_three_with_execution() {
+        let executing = executing_service();
+        let base = capabilities();
+        let configured = NodeCapabilities::new(
+            base.protocol(),
+            base.architecture(),
+            base.capacity(),
+            base.isolation(),
+            base.network(),
+            base.credentials(),
+            base.snapshots(),
+            base.verifier(),
+            LifecycleCapabilities::default(),
+        )
+        .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let clock = crate::test_support::FixedClock::at(crate::test_support::NOW);
+        let quiet = NodeService::with_execution(
+            configured,
+            crate::test_support::node_admission(&state.path().join("state"), &clock),
+            NodeExecution::new(
+                crate::workspace::TaskRoot::open(&state.path().join("tasks")).unwrap(),
+                crate::workspace::open_snapshot_store(&state.path().join("state")).unwrap(),
+                Arc::new(executing.launcher.clone()),
+            ),
+        )
+        .unwrap();
+        let node = LocalNode::serve(quiet, 3);
+        for minor in [1, 2] {
+            let protocol = SupportedProtocolRange::new(1, minor, minor).unwrap();
+            let request = serde_json::to_string(
+                &CapabilityDiscoveryContext::new(ProtocolVersion::new(1, minor))
+                    .unwrap()
+                    .request(),
+            )
+            .unwrap();
+            assert!(
+                node.request(protocol, &request)
+                    .ends_with(r#""lifecycle":{"pause":false,"stop":false,"revoke":false}}}"#),
+                "1.{minor} documents are unchanged by execution"
+            );
+        }
+        let one_three = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let raw = node.request(
+            WARD_NODE_PROTOCOL,
+            &serde_json::to_string(&one_three.request()).unwrap(),
+        );
+        assert!(
+            raw.ends_with(
+                r#""lifecycle":{"pause":true,"stop":true,"revoke":true,"admit":true,"start":true}}}"#
+            ),
+            "{raw}"
+        );
+        node.join();
+    }
+
+    fn one_three_round_trip(
+        service: &NodeService,
+        request: &TaskLifecycleRequest,
+    ) -> TaskLifecycleResponse {
+        let (mut client, worker) = admission_connection(service);
+        writeln!(client, "{}", serde_json::to_string(request).unwrap()).unwrap();
+        let response = admission_context()
+            .decode_response(line(&mut client).trim())
+            .unwrap();
+        worker.join().unwrap().unwrap();
+        response
+    }
+
+    #[test]
+    fn a_transition_whose_client_disconnects_is_applied_whole_or_not_at_all() {
+        let executing = executing_service();
+        let service = &executing.service;
+        let ctx = admission_context();
+        let binding = lifecycle_binding();
+        let mut input = crate::test_support::envelope_input(binding);
+        input.workload = ward_node_protocol::TaskWorkload::new(
+            input.workload.argv().clone(),
+            input.workload.capability_manifest().clone(),
+            executing.snapshot,
+            60_000,
+        )
+        .unwrap();
+        let envelope = ward_node_protocol::TaskAdmissionEnvelope::new(input).unwrap();
+        one_three_round_trip(service, &ctx.create(OperationId::new(1).unwrap(), binding));
+        one_three_round_trip(
+            service,
+            &crate::test_support::signed_admit(
+                ctx,
+                OperationId::new(2).unwrap(),
+                binding,
+                &envelope,
+            ),
+        );
+        let start = OperationId::new(3).unwrap();
+        assert_eq!(
+            one_three_round_trip(service, &ctx.start(start, binding)),
+            ctx.accepted(start, binding, TaskLifecycleState::Running)
+        );
+        crate::test_support::eventually(|| executing.launcher.waiting() == 1);
+
+        let pause = OperationId::new(5).unwrap();
+        let request = serde_json::to_string(&ctx.pause(pause, binding)).unwrap();
+        let (mut client, worker) = admission_connection(service);
+        client
+            .write_all(&request.as_bytes()[..request.len() / 2])
+            .unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(client);
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(
+            one_three_round_trip(service, &ctx.inspect(binding)),
+            ctx.inspected(binding, TaskLifecycleState::Running),
+            "a request cut off before its newline is never applied"
+        );
+        assert_eq!(executing.launcher.freezes(), 0);
+
+        let (mut client, worker) = admission_connection(service);
+        writeln!(client, "{request}").unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(client);
+        let _ = worker.join().unwrap();
+        assert_eq!(
+            one_three_round_trip(service, &ctx.inspect(binding)),
+            ctx.inspected(binding, TaskLifecycleState::Paused),
+            "a complete request is applied whole although nobody read the answer"
+        );
+        assert_eq!(
+            one_three_round_trip(service, &ctx.pause(pause, binding)),
+            ctx.accepted(pause, binding, TaskLifecycleState::Paused)
+        );
+        assert_eq!(executing.launcher.freezes(), 1);
+
+        let revoke = OperationId::new(6).unwrap();
+        let (mut client, worker) = admission_connection(service);
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&ctx.revoke(revoke, binding)).unwrap()
+        )
+        .unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(client);
+        let _ = worker.join().unwrap();
+        assert_eq!(
+            one_three_round_trip(service, &ctx.revoke(revoke, binding)),
+            ctx.accepted(revoke, binding, TaskLifecycleState::Revoked)
+        );
+        assert_eq!(executing.launcher.stopped(), 1);
+        assert!(
+            service
+                .tasks
+                .lock()
+                .unwrap()
+                .admission()
+                .unwrap()
+                .state()
+                .revocation(binding.lease())
+                .is_some()
+        );
     }
 
     #[test]

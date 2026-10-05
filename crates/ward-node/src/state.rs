@@ -218,6 +218,16 @@ impl NodeState {
         &self.revocations
     }
 
+    /// The revocation fact recorded for `lease`, if any.
+    #[must_use]
+    pub fn revocation(&self, lease: LeaseId) -> Option<AuthorityRevocation> {
+        self.revocation_facts
+            .iter()
+            .rev()
+            .find(|fact| fact.lease_id() == lease)
+            .copied()
+    }
+
     /// Durably record one trusted revocation fact.
     ///
     /// Replaying the exact same fact changes nothing. A different fact for an already

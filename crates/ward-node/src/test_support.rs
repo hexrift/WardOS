@@ -246,10 +246,24 @@ pub enum FakeStop {
     Ignore,
 }
 
+/// Whether a fake freeze or thaw is confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeFreeze {
+    /// The host confirms it.
+    Confirm,
+    /// It cannot be confirmed: a freeze is continued back, a thaw leaves the tree stopped.
+    Unconfirmed,
+}
+
 #[derive(Debug)]
 struct FakeState {
     spawn: FakeSpawn,
     on_stop: FakeStop,
+    on_freeze: FakeFreeze,
+    on_thaw: FakeFreeze,
+    frozen: bool,
+    freezes: usize,
+    thaws: usize,
     exit: Option<crate::execution::WorkloadExit>,
     launches: Vec<crate::execution::LaunchRequest>,
     waiting: usize,
@@ -270,6 +284,11 @@ impl FakeLauncher {
             std::sync::Mutex::new(FakeState {
                 spawn: FakeSpawn::Spawn,
                 on_stop: FakeStop::Honour,
+                on_freeze: FakeFreeze::Confirm,
+                on_thaw: FakeFreeze::Confirm,
+                frozen: false,
+                freezes: 0,
+                thaws: 0,
                 exit: None,
                 launches: Vec::new(),
                 waiting: 0,
@@ -291,6 +310,29 @@ impl FakeLauncher {
     pub fn set_on_stop(&self, on_stop: FakeStop) {
         self.state().on_stop = on_stop;
         self.0.1.notify_all();
+    }
+
+    pub fn set_on_freeze(&self, on_freeze: FakeFreeze) {
+        self.state().on_freeze = on_freeze;
+    }
+
+    pub fn set_on_thaw(&self, on_thaw: FakeFreeze) {
+        self.state().on_thaw = on_thaw;
+    }
+
+    /// Whether the fake workload's tree is currently held stopped.
+    pub fn frozen(&self) -> bool {
+        self.state().frozen
+    }
+
+    /// Freeze attempts made.
+    pub fn freezes(&self) -> usize {
+        self.state().freezes
+    }
+
+    /// Thaw attempts made.
+    pub fn thaws(&self) -> usize {
+        self.state().thaws
     }
 
     /// Let the running fake workload end on its own with `exit`.
@@ -336,9 +378,46 @@ impl crate::execution::TaskLauncher for FakeLauncher {
 
 struct FakeWorkload(FakeLauncher);
 
+/// The fake workload's freezer: records attempts and answers as configured.
+#[derive(Debug)]
+struct FakeFreezer(FakeLauncher);
+
+impl crate::execution::WorkloadFreezer for FakeFreezer {
+    fn freeze(&self) -> Result<(), crate::execution::FreezeUnconfirmed> {
+        let mut state = self.0.state();
+        state.freezes += 1;
+        match state.on_freeze {
+            FakeFreeze::Confirm => {
+                state.frozen = true;
+                Ok(())
+            }
+            FakeFreeze::Unconfirmed => {
+                state.frozen = false;
+                Err(crate::execution::FreezeUnconfirmed)
+            }
+        }
+    }
+
+    fn thaw(&self) -> Result<(), crate::execution::FreezeUnconfirmed> {
+        let mut state = self.0.state();
+        state.thaws += 1;
+        match state.on_thaw {
+            FakeFreeze::Confirm => {
+                state.frozen = false;
+                Ok(())
+            }
+            FakeFreeze::Unconfirmed => Err(crate::execution::FreezeUnconfirmed),
+        }
+    }
+}
+
 impl crate::execution::RunningWorkload for FakeWorkload {
     fn pid(&self) -> u32 {
         FAKE_PID
+    }
+
+    fn freezer(&self) -> Arc<dyn crate::execution::WorkloadFreezer> {
+        Arc::new(FakeFreezer(self.0.clone()))
     }
 
     fn wait(

@@ -19,12 +19,14 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ward_authority::revocation::{AuthorityRevocations, LeaseLineage};
+use ward_authority::revocation::{
+    AuthorityRevocation, AuthorityRevocations, LeaseLineage, RevocationReason,
+};
 use ward_authority::{
     AuthorityLease, AuthorityLeaseError, DelegationBinding, EmptyAuthorityPolicy,
     UntrustedAuthorityLease,
 };
-use ward_events::NodeId;
+use ward_events::{LeaseId, NodeId};
 use ward_node_protocol::{
     AdmissionEnvelopeJson, IssuerProof, TaskAdmissionEnvelope, TaskBinding,
     TaskLifecycleRejectionReason,
@@ -224,6 +226,33 @@ impl NodeAdmission {
             .authority()
             .revalidate(self.state.revocations(), now)
             .map_err(|_| Reason::LeaseRevoked)
+    }
+
+    /// Durably revoke `lease` at the node clock, unless a revocation already in effect is
+    /// recorded for it. Every later admission or start under the lease, or under a lease
+    /// delegated from it, is then refused `lease_revoked`, across restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLifecycleRejectionReason::ResourceUnavailable`] if the revocation
+    /// cannot be persisted; nothing is recorded then.
+    pub fn revoke(&mut self, lease: LeaseId) -> Result<(), TaskLifecycleRejectionReason> {
+        let now = self.clock.now_unix_ms();
+        if self
+            .state
+            .revocation(lease)
+            .is_some_and(|fact| fact.revoked_at_unix_ms() <= now)
+        {
+            return Ok(());
+        }
+        match self.state.record_revocation(AuthorityRevocation::new(
+            lease,
+            now,
+            RevocationReason::Operator,
+        )) {
+            Ok(()) | Err(NodeStateError::RevocationConflict) => Ok(()),
+            Err(_) => Err(Reason::ResourceUnavailable),
+        }
     }
 
     /// Durably record a verified admission's version before the task changes state.

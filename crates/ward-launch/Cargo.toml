@@ -8,9 +8,11 @@ rust-version.workspace = true
 description = "WardOS: bubblewrap launch primitive shared by ward-daemon and ward-node"
 
 [dependencies]
+nix = { version = "0.30", features = ["signal"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # `ci::isolation_ready` gates the bwrap-backed unit tests exactly as before the move.
 ward-sandbox = { path = "../ward-sandbox", version = "0.18.0" }
 
