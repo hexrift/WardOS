@@ -506,15 +506,25 @@ fn a_pause_completes_promptly_while_subscribers_replay_a_long_log() {
         ));
     }
 
+    // Each subscriber says when its first record has arrived: by then its
+    // replay boundary is fixed, so the pause below lands after every boundary
+    // and while every replay is still in flight. Without this a subscriber
+    // that connected after the pause would replay the pause's record before
+    // its own boundary marker.
+    let (subscribed, all_subscribed) = std::sync::mpsc::channel::<()>();
     let subscribers: Vec<JoinHandle<Vec<Response>>> = (0..6)
         .map(|_| {
             let socket = socket.clone();
+            let subscribed = subscribed.clone();
             std::thread::spawn(move || {
                 let mut sub = RemoteSink::connect(&socket).unwrap();
                 sub.send(&Request::Subscribe { from_seq: 0 }).unwrap();
                 let mut seen = Vec::new();
                 loop {
                     let response = sub.next_response().unwrap().expect("open");
+                    if seen.is_empty() {
+                        let _ = subscribed.send(());
+                    }
                     // A slow consumer, so the replay is still in flight when
                     // the pause lands.
                     std::thread::sleep(Duration::from_micros(50));
@@ -530,7 +540,12 @@ fn a_pause_completes_promptly_while_subscribers_replay_a_long_log() {
             })
         })
         .collect();
-    std::thread::sleep(Duration::from_millis(30));
+    drop(subscribed);
+    for _ in 0..6 {
+        all_subscribed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("every subscriber's replay began");
+    }
     let started = Instant::now();
     let paused = client::pause(&mut control, "mid-replay").expect("pause");
     let took = started.elapsed();
