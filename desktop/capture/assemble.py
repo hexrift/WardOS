@@ -1,10 +1,13 @@
 """Check one capture shot, or assemble the shots into the README GIF (desktop/capture/capture.sh).
 
-  assemble.py check SHOT.png [--not-dominant #RRGGBB]
+  assemble.py check SHOT.png [--region X,Y,W,H] [--dominant #RRGGBB] [--not-dominant #RRGGBB]
                                              says what SHOT holds (size, colours, the dominant
                                              one) and fails unless it is 1920x1080 with
-                                             something on it whose dominant colour is not
-                                             the one given (a scene shot before it changed)
+                                             something on it; with a region (the bar, say)
+                                             its dominant colour is said too, and the
+                                             dominant colour of the region (else the shot)
+                                             must be / must not be the one given (a scene
+                                             shot before its theme reached the bar)
   assemble.py describe SHOT.png              the same line, never failing (a diagnostic shot)
   assemble.py gif SCENES.tsv FRAMES OUT.gif  one GIF frame per NN-<scene>.png in FRAMES, in
                                              scenes.tsv order, shown for that scene's ms;
@@ -27,42 +30,60 @@ def scenes(table):
     return rows
 
 
-def describe(shot):
-    """Print one line about the shot; return (size, flat, dominant colour as #rrggbb or None)."""
+def dominant_of(rgb):
+    """The most common colour as #rrggbb (None for an empty image) and its share in percent."""
+    counts = rgb.getcolors(rgb.size[0] * rgb.size[1]) or []
+    if not counts:
+        return None, 0, 0
+    n, (r, g, b) = max(counts)
+    return f"#{r:02x}{g:02x}{b:02x}", 100 * n // (rgb.size[0] * rgb.size[1]), len(counts)
+
+
+def describe(shot, region=None):
+    """Print one line about the shot (and one about the region, if any).
+
+    Returns (size, flat, dominant colour of the region, else of the shot)."""
     with Image.open(shot) as img:
         rgb = img.convert("RGB")
         size = rgb.size
-        counts = rgb.getcolors(size[0] * size[1]) or []
         lo, hi = rgb.convert("L").getextrema()
         flat = hi - lo < 16
-        colour = None
-        if counts:
-            n, (r, g, b) = max(counts)
-            colour = f"#{r:02x}{g:02x}{b:02x}"
-            dominant = f"{colour} ({100 * n // (size[0] * size[1])}%)"
-        else:
-            dominant = "?"
-        what = "one flat colour" if flat else f"{len(counts)} colours"
+        colour, share, n = dominant_of(rgb)
+        what = "one flat colour" if flat else f"{n} colours"
+        dominant = f"{colour} ({share}%)" if colour else "?"
         print(f"assemble: {shot}: {size[0]}x{size[1]}, {what}, dominant {dominant}, luma {lo}..{hi}")
+        if region:
+            x, y, w, h = region
+            colour, share, n = dominant_of(rgb.crop((x, y, x + w, y + h)))
+            print(f"assemble: {shot}: region {x},{y} {w}x{h}: {n} colours, dominant {colour} ({share}%)")
         return size, flat, colour
 
 
 def check(shot, flags):
-    not_dominant = None
-    match flags:
-        case []:
-            pass
-        case ["--not-dominant", colour]:
-            not_dominant = colour.lower()
-        case _:
-            sys.exit(__doc__)
-    size, flat, dominant = describe(shot)
+    region, must, must_not = None, None, None
+    while flags:
+        match flags:
+            case ["--region", spec, *rest]:
+                region = tuple(int(v) for v in spec.split(","))
+                if len(region) != 4:
+                    sys.exit(__doc__)
+            case ["--dominant", colour, *rest]:
+                must = colour.lower()
+            case ["--not-dominant", colour, *rest]:
+                must_not = colour.lower()
+            case _:
+                sys.exit(__doc__)
+        flags = rest
+    size, flat, dominant = describe(shot, region)
+    where = f"{shot}'s region {','.join(map(str, region))}" if region else shot
     if size != SHOT:
         sys.exit(f"assemble: {shot} is {size[0]}x{size[1]}, not {SHOT[0]}x{SHOT[1]}")
     if flat:
         sys.exit(f"assemble: {shot} is one flat colour; nothing was rendered")
-    if not_dominant and dominant == not_dominant:
-        sys.exit(f"assemble: {shot} is still dominated by {not_dominant}; the scene was shot before it changed")
+    if must and dominant != must:
+        sys.exit(f"assemble: {where} is dominated by {dominant}, not {must}; the scene was shot before it changed")
+    if must_not and dominant == must_not:
+        sys.exit(f"assemble: {where} is still dominated by {must_not}; the scene was shot before it changed")
 
 
 def gif(table, frames, out):

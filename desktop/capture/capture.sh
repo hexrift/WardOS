@@ -154,6 +154,11 @@ monitor_up() {
   output=$name
 }
 theme_is() { [[ $(cat "$HOME/.config/wardos/theme/current/id" 2>/dev/null) == "$1" ]]; }
+# theme_token NAME: the current render's value of a WARDOS_* token (colors.env).
+theme_token() { sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}\$/\1/p" "$HOME/.config/wardos/theme/current/colors.env" 2>/dev/null | head -n 1; }
+# wallpaper_sha: the rendered wallpaper's digest, to see it change under a theme switch.
+wallpaper_sha() { sha256sum "$HOME/.config/wardos/theme/current/background.png" 2>/dev/null | cut -d' ' -f1; }
+wallpaper_is_not() { [[ -n $(wallpaper_sha) && $(wallpaper_sha) != "$1" ]]; }
 session_live() {
   local status
   status=$(ward status "$project" 2>/dev/null) || return 1
@@ -271,16 +276,24 @@ scene_menu() { menu_open wardos-menu; }
 leave_menu() { menu_close; }
 
 # The switch is done when every component has taken the render, not when the toast is
-# up (run 7 shot the toast over a bar and a wallpaper still in Ward Dark): swaybg is
-# replaced (its pid goes), Waybar re-creates its surface on SIGUSR2 (new layer
-# addresses), then a second for the re-render. The shot's dominant colour must not be
-# the Ward Dark ground (expect[tokyo], checked by assemble.py).
+# up: the wallpaper is re-drawn (its digest changes; both are logged), swaybg is replaced
+# after that (its pid goes), Waybar re-creates its surface on SIGUSR2 (new layer
+# addresses), then a second for the re-render. What the shot proves is the bar: its strip
+# must be dominated by the new theme's ground (expect[tokyo], checked by assemble.py),
+# since the two foot terminals of the up and observer scenes still cover most of the
+# screen in Ward Dark, as open terminals do on any desktop (foot reads its colours once,
+# at start, and wardos-theme signals nothing to it), and the wallpaper shows only in the
+# gaps. Runs 7 and 8 were shot with the switch complete and failed a whole-frame check
+# on exactly that.
 scene_tokyo() {
-  local swaybg_was bar_was
+  local swaybg_was bar_was sha_was
   swaybg_was=$(pgrep -n -u "$UID" -x swaybg || true)
   bar_was=$(layer_addresses waybar)
+  sha_was=$(wallpaper_sha)
   hypr_run wardos-theme set tokyo-night
   wait_for "the Tokyo Night render" "$limit" theme_is tokyo-night
+  wait_for "the wallpaper to be re-drawn" "$limit" wallpaper_is_not "$sha_was"
+  say "wallpaper: $sha_was before, $(wallpaper_sha) after; ground $(theme_token WARDOS_GROUND)"
   wait_for "wardos-theme to finish" "$limit" idle wardos-theme
   wait_for "swaybg to be replaced" "$limit" pid_gone "$swaybg_was"
   wait_for "the wallpaper" "$limit" layer_up wallpaper
@@ -457,11 +470,13 @@ cd "$HOME"
 say "setting up $(id -un) as a first login leaves it"
 wardos-refresh --all >"$logs/refresh.log"
 wardos-theme render ward-dark
-# What each scene's shot must not be dominated by, for assemble.py check: the Tokyo Night
-# scene must have left the Ward Dark ground behind.
-ward_dark_ground=$(sed -n 's/^WARDOS_GROUND=//p' "$HOME/.config/wardos/theme/current/colors.env" | tr -d '"' | head -n 1)
+# What a scene's shot must show, for assemble.py check, evaluated once the scene is on
+# screen: the bar strip (Waybar, 32 px at the top, `window#waybar { background: @ground }`)
+# dominated by the theme's ground as the current render has it, so the Tokyo Night shot
+# is one of a bar that has taken the switch.
 declare -A expect=()
-[[ -z $ward_dark_ground ]] || expect[tokyo]="--not-dominant $ward_dark_ground"
+# shellcheck disable=SC2016  # evaluated by the scene loop, after the scene
+expect[tokyo]='--region 0,0,1920,32 --dominant "$(theme_token WARDOS_GROUND)"'
 for marker in first-run-done calibrate-done welcome-done; do
   date -u +%Y-%m-%dT%H:%M:%SZ >"$HOME/.config/wardos/$marker"
 done
@@ -547,7 +562,6 @@ while IFS=$'\t' read -r -u 3 id ms need what; do
   n=$((n + 1))
   png=$(printf '%s/%02d-%s.png' "$frames" "$n" "$id")
   say "scene $n, $id: $what"
-  read -ra checks <<<"${expect[$id]:-}"
   set +e
   (
     set -e
@@ -555,6 +569,8 @@ while IFS=$'\t' read -r -u 3 id ms need what; do
     sleep "$settle"
     dismiss
     grim -o "$output" "$png"
+    checks=()
+    eval "checks+=(${expect[$id]:-})"
     python3 "$here/assemble.py" check "$png" "${checks[@]}"
   )
   rc=$?

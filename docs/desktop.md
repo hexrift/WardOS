@@ -490,10 +490,16 @@ Escape would). Before every shot Hyprland's own notifications are dismissed
 (`hyprctl dismissnotify`): on 0.56 two overlay toasts appear at login, that
 `hyprland-guiutils` is not installed (the repositories' answer is in the job's
 `versions.txt`) and that the `.conf` config format goes in 0.57 (the Lua migration, left
-for then); a user clicks them away and they are not the desktop. The Tokyo Night scene
-waits for the switch itself, not the toast: swaybg replaced, Waybar's surface re-created
-on `SIGUSR2`, then a second for the re-render, and its shot must not be dominated by the
-Ward Dark ground (`assemble.py check --not-dominant`). `assemble.py` makes the GIF from
+for then; `hyprland-guiutils` is in the image now); a user clicks them away and they
+are not the desktop. The Tokyo Night scene waits for the switch itself, not the toast:
+the wallpaper re-drawn (its digest before and after is logged), swaybg replaced after
+that, Waybar's surface re-created on `SIGUSR2`, then a second for the re-render, and
+its shot's bar strip (the top 32 px, `window#waybar { background: @ground }`) must be
+dominated by the new theme's ground as the render has it (`assemble.py check --region
+--dominant`). The whole frame cannot be the measure: the terminals of the `ward up` and
+`ward watch` scenes still cover most of it in Ward Dark, as open terminals do on any
+desktop (foot reads its colours once, at start), and the wallpaper shows only in the
+gaps. `assemble.py` makes the GIF from
 the shots with each scene's milliseconds, 1280x720 and 128 colours. Every shot is described in
 the job log (size, how many colours, the dominant one), and a required scene that does
 not come up fails the job with a shot of what was on screen instead, every client's log,

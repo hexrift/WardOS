@@ -146,8 +146,9 @@ trace_filter="grep -v '\\[TRACE\\]'"
 for want in 'exec-once = " cmd " >>" logs "/" name ".log 2>&1; echo \"exited $?\" >>" logs "/" name ".log"' \
   'if (cmd == "waybar") cmd = "waybar -l debug"' 'if (name == "hypridle") { print "exec-once = true # hypridle' \
   'assemble.py" check "$png"' 'assemble.py" describe "$logs/not-on-screen-$id.png"' 'ps -o pid,ppid,stat,etime,cmd -u' \
-  "$trace_filter" 'layers [$(layers_seen)]' 'hyprctl dismissnotify' 'expect[tokyo]="--not-dominant $ward_dark_ground"' \
-  'layer_recreated waybar "$bar_was"' 'pid_gone "$swaybg_was"'; do
+  "$trace_filter" 'layers [$(layers_seen)]' 'hyprctl dismissnotify' \
+  'expect[tokyo]='"'"'--region 0,0,1920,32 --dominant "$(theme_token WARDOS_GROUND)"'"'"'' \
+  'layer_recreated waybar "$bar_was"' 'pid_gone "$swaybg_was"' 'wallpaper_is_not "$sha_was"'; do
   grep -qF -- "$want" "$script" || fail "capture.sh does not have: $want"
 done
 for pkg in wl-clipboard cliphist dbus-daemon dbus-tools; do
@@ -242,6 +243,14 @@ if python3 "$cap/assemble.py" check "$frames/01-${ids[0]}.png" --not-dominant '#
   fail "assemble.py check --not-dominant must refuse a shot still dominated by that colour"
 fi
 python3 "$cap/assemble.py" check "$frames/01-${ids[0]}.png" --not-dominant '#16161e' >/dev/null || fail "assemble.py check --not-dominant passes a shot dominated by another colour"
+# The region: the frame's bar strip is 100 px of accent on the ground; the strip alone is
+# the accent, the whole bar row is not.
+line=$(python3 "$cap/assemble.py" check "$frames/01-${ids[0]}.png" --region 0,0,100,32 --dominant '#7FA1C3') || fail "assemble.py check --region --dominant refused the accent strip"
+[[ $line == *"region 0,0 100x32: 1 colours, dominant #7fa1c3 (100%)"* ]] || fail "assemble.py check describes the region: $line"
+if python3 "$cap/assemble.py" check "$frames/01-${ids[0]}.png" --region 0,0,1920,32 --dominant '#7FA1C3' >/dev/null 2>&1; then
+  fail "assemble.py check --region --dominant must refuse a region dominated by another colour"
+fi
+if python3 "$cap/assemble.py" check "$frames/01-${ids[0]}.png" --region 0,0,100 >/dev/null 2>&1; then fail "assemble.py check takes a region of four numbers"; fi
 line=$(python3 "$cap/assemble.py" describe "$TMP/flat.png") || fail "assemble.py describe never fails"
 [[ $line == *"one flat colour, dominant #000000 (100%)"* ]] || fail "assemble.py describe names the flat colour: $line"
 python3 "$cap/assemble.py" gif "$table" "$frames" "$TMP/out.gif" >/dev/null

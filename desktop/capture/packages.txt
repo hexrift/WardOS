@@ -8,6 +8,7 @@
 # --- what is on screen (image/packages.txt) ------------------------------------------
 hyprland
 hyprlock
+hyprland-guiutils
 waybar
 mako
 libnotify
