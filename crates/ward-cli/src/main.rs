@@ -125,6 +125,11 @@ enum Command {
     Stop {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
+        /// The session id, instead of looking one up (#141: an immutable,
+        /// explicitly pinned target, as for `ward pause --session`). Refused,
+        /// with nothing stopped, when that session is not live.
+        #[arg(long)]
+        session: Option<String>,
         /// First write the entry snapshot over the worktree; what it replaces is
         /// kept under `.ward/restore-<ts>/` and the restore is recorded.
         #[arg(long)]
@@ -630,7 +635,11 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             grant,
             args,
         } => cmd_agent(&dir.unwrap_or_else(cwd), "codex", &args, &pass_env, &grant),
-        Command::Stop { dir, restore_entry } => cmd_stop(&dir.unwrap_or_else(cwd), restore_entry),
+        Command::Stop {
+            dir,
+            session,
+            restore_entry,
+        } => cmd_stop(&dir.unwrap_or_else(cwd), session.as_deref(), restore_entry),
         Command::Pause {
             dir,
             session,
@@ -1775,7 +1784,13 @@ fn pause_status_word(
 /// `\n` inside the string, so the record — read by `wardos-pause` with `jq`
 /// — always stays on the one line it was printed on, whatever the path holds.
 fn resolved_session_line(state: &Path, socket: &Path) -> Option<String> {
-    let id = socket.parent()?.file_name()?.to_str()?;
+    resolved_session_line_for(state, socket.parent()?.file_name()?.to_str()?)
+}
+
+/// The [`resolved_session_line`] record for session `id` itself: what `ward
+/// stop` prints for the session it reopened, which has no socket to name it
+/// when no daemon serves it.
+fn resolved_session_line_for(state: &Path, id: &str) -> Option<String> {
     let meta = SessionMeta::load(state, id).ok()?;
     let payload = serde_json::json!({ "id": id, "project": meta.project.display().to_string() });
     Some(format!("resolved-session: {payload}"))
@@ -1875,10 +1890,38 @@ fn cmd_resume(dir: &Path, session: Option<&str>) -> ward_daemon::Result<ExitCode
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_stop(dir: &Path, restore_entry: bool) -> ward_daemon::Result<ExitCode> {
-    let state = ward_daemon::session::state_root();
-    if let Some(session) = Session::open_current(dir, &state)? {
+fn cmd_stop(
+    dir: &Path,
+    session: Option<&str>,
+    restore_entry: bool,
+) -> ward_daemon::Result<ExitCode> {
+    stop_in(
+        dir,
+        &ward_daemon::session::state_root(),
+        session,
+        restore_entry,
+    )
+}
+
+/// `ward stop` against `state`: the pinned `session` when given — reopened by
+/// id, never re-resolved, and refused with nothing stopped when it is not live
+/// ([`Session::open_live`]) — else `dir`'s current session. Prints the
+/// `resolved-session:` record first, as `pause`/`resume` do (#330).
+fn stop_in(
+    dir: &Path,
+    state: &Path,
+    session: Option<&str>,
+    restore_entry: bool,
+) -> ward_daemon::Result<ExitCode> {
+    let session = match session {
+        Some(id) => Some(Session::open_live(state, id)?),
+        None => Session::open_current(dir, state)?,
+    };
+    if let Some(session) = session {
         let id = session.id().to_owned();
+        if let Some(line) = resolved_session_line_for(state, &id) {
+            println!("  {line}");
+        }
         // With a daemon serving, `stop` is a `Request::Stop` — sent only once the
         // daemon has confirmed it serves confirmed stop (PR #253 review finding
         // 1): the daemon ends the session's sandboxed processes and confirms they
@@ -1886,7 +1929,7 @@ fn cmd_stop(dir: &Path, restore_entry: bool) -> ward_daemon::Result<ExitCode> {
         // and exits; otherwise this process does the same itself. A stop that
         // cannot confirm the processes ended is refused with the daemon's own
         // account of what is left, and the log stays open.
-        let served = daemon::serving(&state, &id);
+        let served = daemon::serving(state, &id);
         let ended = if restore_entry {
             // Held for the stop by the daemon first, then the restore, then the
             // stop — one hold nothing else can release (see
@@ -1906,7 +1949,7 @@ fn cmd_stop(dir: &Path, restore_entry: bool) -> ward_daemon::Result<ExitCode> {
         } else {
             session.stop(EndReason::UserStop)?
         };
-        if served && !daemon::wait_stopped(&state, &id, daemon::STARTUP_TIMEOUT) {
+        if served && !daemon::wait_stopped(state, &id, daemon::STARTUP_TIMEOUT) {
             eprintln!("ward: wardd has not released {}", control_name(&id));
         }
         println!("{}", stopped_line(&id, ended));
@@ -2073,7 +2116,8 @@ mod tests {
     use super::{
         Cli, Command, SessionCmd, SnapshotCmd, WatchMode, approvals_all_line, desktop_command,
         observer_degraded_warning, on_path_in, pause_status_word, pending_all_line, pending_text,
-        resolved_session_line, stopped_line, unreachable_line, verb_program,
+        resolved_session_line, resolved_session_line_for, stop_in, stopped_line, unreachable_line,
+        verb_program,
     };
     use clap::Parser as _;
     use std::time::Duration;
@@ -2571,6 +2615,99 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// #141/#145: `ward stop --session <id>` pins the session exactly like
+    /// `pause`/`resume --session`, alongside `--restore-entry`.
+    #[test]
+    fn stop_session_parses() {
+        let cli = Cli::try_parse_from(["ward", "stop", "--session", "sess_pin"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Stop { session: Some(s), restore_entry: false, .. } if s == "sess_pin"
+        ));
+        let cli = Cli::try_parse_from([
+            "ward",
+            "stop",
+            "/p",
+            "--session",
+            "sess_pin",
+            "--restore-entry",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Stop { session: Some(s), restore_entry: true, .. } if s == "sess_pin"
+        ));
+        let cli = Cli::try_parse_from(["ward", "stop"]).unwrap();
+        assert!(matches!(cli.command, Command::Stop { session: None, .. }));
+    }
+
+    /// #141/#145: a pinned stop stops the named session even when run from
+    /// another project's directory, leaves that project's session alone, and
+    /// fails closed — touching nothing — for an id that is not live.
+    #[test]
+    fn stop_pinned_to_a_session_never_re_resolves_and_fails_closed() {
+        let state = tempfile::tempdir().unwrap();
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        let a = ward_daemon::Session::start_in(project_a.path(), state.path()).unwrap();
+        a.persist_current().unwrap();
+        let a_id = a.id().to_owned();
+        drop(a);
+        let b = ward_daemon::Session::start_in(project_b.path(), state.path()).unwrap();
+        b.persist_current().unwrap();
+        let b_id = b.id().to_owned();
+        drop(b);
+        let current = |dir: &std::path::Path| {
+            ward_daemon::SessionMeta::current(dir, state.path())
+                .unwrap()
+                .map(|m| m.id)
+        };
+
+        stop_in(project_b.path(), state.path(), Some(&a_id), false).unwrap();
+        assert_eq!(
+            current(project_a.path()),
+            None,
+            "the pinned session stopped"
+        );
+        assert_eq!(
+            current(project_b.path()).as_deref(),
+            Some(b_id.as_str()),
+            "the directory's own session is untouched"
+        );
+
+        let err = stop_in(project_b.path(), state.path(), Some(&a_id), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&a_id) && err.contains("not live"), "{err}");
+        let err = stop_in(project_b.path(), state.path(), Some("sess_missing"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no session sess_missing"), "{err}");
+        assert_eq!(
+            current(project_b.path()).as_deref(),
+            Some(b_id.as_str()),
+            "a refused pinned stop never falls back to the directory's session"
+        );
+    }
+
+    /// #330: the stop acknowledgement names the session by id, the same
+    /// `resolved-session:` record `pause`/`resume` print for their socket.
+    #[test]
+    fn resolved_session_line_for_an_id_matches_the_socket_form() {
+        let state = tempfile::tempdir().unwrap();
+        write_session(state.path(), "sess_a", std::path::Path::new("/p/a"), 1);
+        let socket = ward_daemon::session::session_dir(state.path(), "sess_a").join("control.sock");
+        assert_eq!(
+            resolved_session_line_for(state.path(), "sess_a"),
+            resolved_session_line(state.path(), &socket)
+        );
+        assert_eq!(
+            resolved_session_line_for(state.path(), "sess_a").unwrap(),
+            r#"resolved-session: {"id":"sess_a","project":"/p/a"}"#
+        );
+        assert!(resolved_session_line_for(state.path(), "sess_missing").is_none());
     }
 
     #[test]

@@ -143,9 +143,10 @@ do_pause_all() {
 # confirms it gone before sealing (#145 item 5). A stop the daemon could not confirm is
 # refused — the log stays open and the session is held paused — so it gets its own
 # critical notification carrying ward's account of what is left, never "Session stopped".
+# WARDOS_SESSION pins the stop exactly as it pins pause and resume (#141).
 do_stop() {
   local out
-  if out=$(ward stop "$@" "$project" 2>&1); then
+  if out=$(ward stop "${session_flag[@]}" "$@" "$project" 2>&1); then
     [[ -n $out ]] && printf '%s
 ' "$out"
     return 0
