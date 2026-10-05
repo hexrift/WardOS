@@ -1,5 +1,6 @@
-# What the desktop capture installs in its fedora:<release> container (capture.sh,
-# .github/workflows/desktop-capture.yml), after enabling the COPRs of image/coprs.txt.
+# What the desktop capture installs in its fedora:<release> container (ci-run.sh, for
+# capture.sh; .github/workflows/desktop-capture.yml), after enabling the COPRs of
+# image/coprs.txt.
 # One name per line. Every surface on screen comes from a package image/packages.txt
 # ships; a name it does not carry is marked `# capture:` with the reason
 # (desktop/tests/desktop-capture.test.sh checks both).

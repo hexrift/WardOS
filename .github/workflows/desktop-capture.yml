@@ -1,13 +1,13 @@
 # The README's desktop, captured for real (issue #84, docs/desktop.md "The README
-# animation"): the shipped Hyprland on a headless 1920x1080 output, software-rendered, in
-# the Fedora release the image pins, with Waybar, mako, fuzzel and foot from the image's
-# package set and the ward binaries of this checkout. desktop/capture/capture.sh drives
-# the scenes of desktop/capture/scenes.tsv through hyprctl dispatch and
-# wardos-menu-select, takes one grim shot per scene, and assembles the GIF; the GIF and
-# the shots are the artifact `wardos-desktop-capture`. Nothing here writes to the
-# repository: desktop/capture/refresh.sh brings a run's GIF into assets/ by hand.
-# Weekly on main, by hand (on a release tag too: `gh workflow run desktop-capture.yml
-# --ref vX.Y.Z`), and on pull requests that touch what is on screen.
+# animation"): the shipped Hyprland on a headless 1920x1080 output, software-rendered on
+# a virtual DRM node, in the Fedora release the image pins, with Waybar, mako, fuzzel and
+# foot from the image's package set and the ward binaries of this checkout.
+# desktop/capture/capture.sh drives the scenes of desktop/capture/scenes.tsv through
+# hyprctl dispatch and wardos-menu-select, takes one grim shot per scene, and assembles
+# the GIF; the GIF and the shots are the artifact `wardos-desktop-capture`. Nothing here
+# writes to the repository: desktop/capture/refresh.sh brings a run's GIF into assets/ by
+# hand. Weekly on main, by hand (on a release tag too: `gh workflow run
+# desktop-capture.yml --ref vX.Y.Z`), and on pull requests that touch what is on screen.
 name: desktop capture
 
 on:
@@ -56,50 +56,67 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # No GPU and no /dev/dri: Hyprland runs on aquamarine's headless backend
-  # (HYPRLAND_HEADLESS_ONLY=1) with Mesa's llvmpipe, as an unprivileged user. A scene that
-  # does not come up fails the job with Hyprland's log; it cannot go green without the shots.
+  # No GPU on the runner. aquamarine allocates its buffers on a DRM node even for headless
+  # outputs (a job container without /dev/dri dies in CBackend::create()), so the job runs
+  # on the host, loads a virtual node (vgem's render node, else vkms), and hands it to the
+  # Fedora container through --device. Inside, desktop/capture/ci-run.sh installs the
+  # image's stack and runs capture.sh as an unprivileged user: Hyprland on headless
+  # outputs (HYPRLAND_HEADLESS_ONLY=1), Mesa's software rasteriser for EGL and GBM. A
+  # scene that does not come up fails the job with Hyprland's log; it cannot go green
+  # without the shots.
   capture:
     name: desktop capture (Hyprland headless, Fedora)
     needs: binaries
     runs-on: ubuntu-latest
-    container: fedora:44
     timeout-minutes: 30
-    defaults:
-      run:
-        shell: bash
+    env:
+      # Tried in order; the first that gives a DRM node is used.
+      CAPTURE_DRM_MODULES: vgem vkms
     steps:
-      - name: Install git for checkout
-        run: dnf install -y --setopt=install_weak_deps=False git-core tar
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: desktop-capture-binaries
-          path: /tmp/capture-binaries
-      # The COPRs the image enables (image/coprs.txt), then the packages of
-      # desktop/capture/packages.txt: the image's own for everything on screen.
-      - name: Install the shipped desktop stack
+          path: capture-binaries
+      - name: A virtual DRM node (vgem, else vkms)
         run: |
           set -euo pipefail
-          source image/dnf-retry.sh
-          retry 3 5 dnf -y -q install dnf5-plugins
-          while read -r copr; do
-            retry 3 5 dnf -y -q copr enable "$copr"
-          done < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' image/coprs.txt)
-          mapfile -t pkgs < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' desktop/capture/packages.txt)
-          retry 3 5 dnf -y --setopt=install_weak_deps=False install "${pkgs[@]}"
-          rpm -q hyprland aquamarine waybar fuzzel mako foot grim
-      # The tree placed by the script the Containerfile runs, the checkout's binaries in
-      # /usr/bin as the image has them, and the unprivileged user the session runs as.
-      - name: Place the desktop and the binaries
-        run: |
-          set -euo pipefail
-          image/install-desktop.sh desktop /
-          install -m 0755 /tmp/capture-binaries/* /usr/bin/
-          useradd -m -s /bin/bash wardos
-          install -d -o wardos -g wardos capture-out
+          sudo apt-get update -q
+          sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" ||
+            echo "linux-modules-extra-$(uname -r) not installed; trying the modules already present"
+          shopt -s nullglob
+          node=""
+          for module in $CAPTURE_DRM_MODULES; do
+            sudo modprobe "$module" || { echo "modprobe $module failed"; continue; }
+            sudo udevadm settle || true
+            if [[ $module == vgem ]]; then found=(/dev/dri/renderD*); else found=(/dev/dri/renderD* /dev/dri/card*); fi
+            if [[ ${#found[@]} -gt 0 ]]; then
+              node="${found[0]} ($module)"
+              break
+            fi
+            echo "$module loaded but gave no usable node"
+          done
+          ls -l /dev/dri || true
+          if [[ -z $node ]]; then
+            echo "::error::no virtual DRM node: none of '$CAPTURE_DRM_MODULES' could be loaded or gave a node; Hyprland cannot allocate buffers without one" >&2
+            exit 1
+          fi
+          # llvmpipe exports its buffers as dma-bufs through udmabuf where it exists.
+          sudo modprobe udmabuf || echo "no udmabuf; Mesa falls back to shared memory"
+          echo "DRM node for the capture: $node"
+          { echo "DRM node for the capture: \`$node\`"; echo; } >>"$GITHUB_STEP_SUMMARY"
+      # The Fedora release the image pins (image/Containerfile's FROM line), as root with
+      # the node; ci-run.sh hands capture-out back to this user, failed or not.
       - name: Capture
-        run: runuser -u wardos -- env HOME=/home/wardos USER=wardos LANG=en_US.UTF-8 desktop/capture/capture.sh "$PWD/capture-out"
+        run: |
+          set -euo pipefail
+          release=$(sed -n 's|^FROM quay.io/fedora/fedora-bootc:\([0-9][0-9]*\)$|\1|p' image/Containerfile | head -n 1)
+          [[ $release =~ ^[0-9]+$ ]] || { echo "::error::no fedora-bootc:<release> FROM line in image/Containerfile" >&2; exit 1; }
+          devices=(--device /dev/dri)
+          if [[ -e /dev/udmabuf ]]; then devices+=(--device /dev/udmabuf); fi
+          docker run --rm "${devices[@]}" -v "$PWD:/w" -w /w \
+            -e GITHUB_ACTIONS -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            "fedora:$release" bash desktop/capture/ci-run.sh /w/capture-binaries /w/capture-out
       - name: Summary
         if: always()
         run: if [[ -f capture-out/summary.md ]]; then cat capture-out/summary.md >>"$GITHUB_STEP_SUMMARY"; fi

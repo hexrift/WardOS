@@ -2,8 +2,9 @@
 # The README capture (desktop/capture, issue #84), checked without a compositor: the scene
 # table is well-formed and matches capture.sh's scene functions and the storyboard's
 # durations, every package is the image's or says why not, every wardos-* command the
-# capture drives exists, the workflow and refresh.sh agree on names, and refresh.sh takes
-# the GIF from the right run. The capture itself runs in CI (desktop-capture.yml).
+# capture drives exists, the workflow, ci-run.sh and refresh.sh agree on names and on the
+# render node, and refresh.sh takes the GIF from the right run. The capture itself runs
+# in CI (desktop-capture.yml).
 # shellcheck source=desktop/tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 setup_env
@@ -11,16 +12,27 @@ setup_env
 cap="$test_root/desktop/capture"
 table="$cap/scenes.tsv"
 script="$cap/capture.sh"
+ci_run="$cap/ci-run.sh"
 story="$test_root/assets/storyboard/story.py"
 workflow="$test_root/.github/workflows/desktop-capture.yml"
 assert_file "$table"
 assert_file "$script"
+assert_file "$ci_run"
 assert_file "$workflow"
 
 "$script" --help | grep -q 'capture.sh OUT' || fail "capture.sh --help prints its usage"
 status=0
 "$script" >/dev/null 2>&1 || status=$?
 [[ $status -eq 2 ]] || fail "capture.sh without OUT exits 2, got $status"
+"$ci_run" --help | grep -q 'ci-run.sh BINARIES OUT' || fail "ci-run.sh --help prints its usage"
+status=0
+"$ci_run" only-one >/dev/null 2>&1 || status=$?
+[[ $status -eq 2 ]] || fail "ci-run.sh without BINARIES and OUT exits 2, got $status"
+if [[ $(id -u) -ne 0 ]]; then
+  status=0
+  "$ci_run" "$TMP" "$TMP/out" >/dev/null 2>&1 || status=$?
+  [[ $status -eq 1 ]] || fail "ci-run.sh refuses to run as an unprivileged user, got $status"
+fi
 
 # --- scenes.tsv ---------------------------------------------------------------------
 ids=()
@@ -80,6 +92,7 @@ for cmd in $cmds; do
   case "$cmd" in
     wardos-theme-render | ward | wardd | ward-shell)
       grep -q "target/release/$cmd$" "$workflow" || fail "desktop-capture.yml does not hand $cmd to the capture"
+      grep -q "\"\$bins\"/$cmd\b" "$ci_run" || fail "ci-run.sh does not install $cmd"
       grep -qx "name = \"$cmd\"" "$test_root"/desktop/*/Cargo.toml "$test_root"/crates/*/Cargo.toml ||
         fail "no crate builds $cmd"
       ;;
@@ -90,10 +103,20 @@ while read -r cmd; do
   grep -qx -- "$cmd" <<<"$cmds" || fail "capture.sh starts $cmd without checking for it first"
 done < <(grep -oE '(hypr_run|menu_open) [a-z-]+' "$script" | awk '{ print $2 }' | sort -u)
 
-# --- workflow and refresh.sh agree -------------------------------------------------------
-for want in desktop/capture/packages.txt desktop/capture/capture.sh image/coprs.txt \
-  image/install-desktop.sh 'name: wardos-desktop-capture$' 'container: fedora:'; do
+# --- workflow, ci-run.sh and refresh.sh agree --------------------------------------------
+# The job runs on the host so it can load a virtual DRM node and give it to the Fedora
+# container (a job container starts before any step could); ci-run.sh does the rest.
+# shellcheck disable=SC2016  # grep patterns, not expansions
+for want in 'CAPTURE_DRM_MODULES: vgem' 'modprobe "\$module"' '--device /dev/dri' 'image/Containerfile' \
+  'desktop/capture/ci-run.sh /w/capture-binaries /w/capture-out' 'name: wardos-desktop-capture$' \
+  'name: wardos-desktop-capture-logs$'; do
   grep -qE -- "$want" "$workflow" || fail "desktop-capture.yml does not mention $want"
+done
+! grep -qE '^ *container:' "$workflow" || fail "desktop-capture.yml must not use a job container: the DRM node is loaded on the host first"
+# shellcheck disable=SC2016  # grep patterns, not expansions
+for want in desktop/capture/packages.txt image/coprs.txt image/install-desktop.sh \
+  'runuser -u wardos' desktop/capture/capture.sh 'chmod 0666 "\$\{nodes' 'trap hand_back EXIT'; do
+  grep -qE -- "$want" "$ci_run" || fail "ci-run.sh does not mention $want"
 done
 grep -q -- '--workflow desktop-capture.yml' "$cap/refresh.sh" || fail "refresh.sh names another workflow"
 grep -q -- '--name wardos-desktop-capture' "$cap/refresh.sh" || fail "refresh.sh names another artifact"

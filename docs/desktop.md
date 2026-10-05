@@ -29,8 +29,8 @@ desktop/
   systemd/      user units (battery monitor, approval listener, swayosd)
   flatpaks.txt  default Flathub applications, one id per line with its purpose
   tests/        run.sh (shellcheck + every *.test.sh with a mocked PATH)
-  capture/      the README capture: capture.sh, scenes.tsv, assemble.py, refresh.sh and the
-                packages it installs (CI only, see "The README animation")
+  capture/      the README capture: capture.sh, ci-run.sh, scenes.tsv, assemble.py,
+                refresh.sh and the packages it installs (CI only, "The README animation")
   install.sh    apply the desktop on an existing Fedora (Workstation, Silverblue, Kinoite)
   shell/        the ward-shell binary (already present)
 ```
@@ -450,23 +450,29 @@ replaces it runs Hyprland headless in CI (issue #84, below); once a captured GIF
 taken its place, the storyboard directory goes.
 
 The capture is the workflow `desktop capture` (`.github/workflows/desktop-capture.yml`):
-weekly on `main`, by hand, and on pull requests that touch `desktop/` or `image/`. In the
-Fedora release the image pins, with the COPRs of `image/coprs.txt` and the packages of
-`desktop/capture/packages.txt` (the image's own for everything on screen), the tree is
-placed by `image/install-desktop.sh`, the `ward` binaries of the checkout go to
-`/usr/bin`, and [`desktop/capture/capture.sh`](../desktop/capture/capture.sh) runs as an
-unprivileged user. It sets the user up as a first login leaves it, starts a session bus
-and the shipped Hyprland on a headless 1920x1080 output (`HYPRLAND_HEADLESS_ONLY=1`,
-Mesa's llvmpipe; no GPU), and walks
+weekly on `main`, by hand, and on pull requests that touch `desktop/` or `image/`. The
+runner has no GPU, and aquamarine allocates its buffers on a DRM node even for headless
+outputs, so the job runs on the host, loads a virtual node (`vgem`'s render node, else
+`vkms`) and hands it with `--device /dev/dri` to a container of the Fedora release the
+image pins. There [`desktop/capture/ci-run.sh`](../desktop/capture/ci-run.sh) enables
+the COPRs of `image/coprs.txt`, installs `desktop/capture/packages.txt` (the image's own
+packages for everything on screen), places the tree with `image/install-desktop.sh`,
+puts the checkout's `ward` binaries in `/usr/bin`, and runs
+[`desktop/capture/capture.sh`](../desktop/capture/capture.sh) as an unprivileged user
+that may open the node. It sets the user up as a first login leaves it (with Hyprland's
+debug log on, checked by `Hyprland --verify-config`), starts a session bus and the
+shipped Hyprland on a headless 1920x1080 output (`HYPRLAND_HEADLESS_ONLY=1`, Mesa's
+software rasteriser for EGL and GBM, `AQ_TRACE`/`HYPRLAND_TRACE` on), and walks
 [`desktop/capture/scenes.tsv`](../desktop/capture/scenes.tsv). Each scene is started
 through `hyprctl dispatch exec` (the welcome steps, `wardos-launch run`, `wardos-menu`,
 `wardos-theme`, `wardos-power`), waited for in `hyprctl layers` and `hyprctl clients`
 rather than slept on, shot with `grim`, and closed again (a menu is cancelled the way
 Escape would). `assemble.py` makes the GIF from the shots with each scene's
 milliseconds, 1280x720 and 128 colours like the storyboard. A required scene that does
-not come up fails the job with Hyprland's log; the lock screen is optional and is left
-out, with a warning, when hyprlock cannot draw headless. The GIF and the shots are the
-artifact `wardos-desktop-capture`.
+not come up fails the job with Hyprland's log, the DRM nodes, the EGL vendor and any
+crash report; the lock screen is optional and is left out, with a warning, when
+hyprlock cannot draw headless. The GIF and the shots are the artifact
+`wardos-desktop-capture`, the logs on failure `wardos-desktop-capture-logs`.
 
 What it does not show, and why: the boot splash (Plymouth is not a compositor surface),
 anything an agent does (CI has no model key: the agent at work, an approval), `ward

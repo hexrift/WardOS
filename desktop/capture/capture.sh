@@ -8,17 +8,20 @@
 #   desktop/capture/capture.sh OUT
 #
 # Runs as an unprivileged user (Hyprland refuses root) where image/install-desktop.sh
-# has placed desktop/ and ward, wardd, ward-shell and wardos-theme-render are on PATH
-# (CI: .github/workflows/desktop-capture.yml). The user is first set up the way a first
-# login leaves it (wardos-refresh --all, the Ward Dark render, the onboarding markers,
-# an output line in ~/.config/hypr/monitors.conf, ~/ward-demo as a git repository);
-# then a session bus and Hyprland start. Writes OUT/frames/NN-<scene>.png,
-# OUT/wardos-desktop.gif, OUT/summary.md and OUT/logs/. A required scene that is not
-# on screen in time fails the run and prints Hyprland's log; an optional one (the lock
-# screen) is left out with a warning.
+# has placed desktop/ and ward, wardd, ward-shell and wardos-theme-render are on PATH,
+# with a DRM node in /dev/dri for aquamarine's buffers (CI: ci-run.sh, in a container
+# given the runner's vgem or vkms node). The user is first set up the way a first login
+# leaves it (wardos-refresh --all, the Ward Dark render, the onboarding markers, an
+# output line in ~/.config/hypr/monitors.conf, ~/ward-demo as a git repository), with
+# Hyprland's debug log switched on in ~/.config/hypr/hyprland.conf, and must pass
+# `Hyprland --verify-config`; then a session bus and Hyprland start. Writes
+# OUT/frames/NN-<scene>.png, OUT/wardos-desktop.gif, OUT/summary.md and OUT/logs/. A
+# required scene that is not on screen in time fails the run with Hyprland's log, the
+# DRM nodes and the EGL vendor; an optional one (the lock screen) is left out with a
+# warning.
 set -euo pipefail
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
 case "${1:-}" in
   -h | --help) usage; exit 0 ;;
   "") usage >&2; exit 2 ;;
@@ -249,6 +252,25 @@ session_command() {
   esac
 }
 
+# diagnose: what the renderer had to work with, for a failed run.
+diagnose() {
+  local report
+  echo "capture: the DRM nodes (ls -l /dev/dri), as $(id -un) in groups $(id -Gn):"
+  ls -l /dev/dri 2>&1 || true
+  if command -v eglinfo >/dev/null 2>&1; then
+    echo "capture: EGL (eglinfo -B, GBM and surfaceless platforms, LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE:-}):"
+    timeout 30 eglinfo -B -p gbm 2>&1 || true
+    timeout 30 eglinfo -B -p surfaceless 2>&1 || true
+  else
+    echo "capture: no eglinfo (egl-utils) to name the EGL vendor"
+  fi
+  for report in "$HOME"/.cache/hyprland/hyprlandCrashReport*.txt; do
+    [[ -f $report ]] || continue
+    echo "capture: Hyprland's crash report $report:"
+    cat "$report"
+  done
+}
+
 cleanup() {
   local status=$? pid
   trap - EXIT
@@ -258,11 +280,13 @@ cleanup() {
     hyprctl layers -j >"$logs/layers.json" 2>&1 || true
   fi
   cp "$XDG_RUNTIME_DIR"/hypr/*/hyprland.log "$logs/" 2>/dev/null || true
+  cp "$HOME"/.cache/hyprland/hyprlandCrashReport*.txt "$logs/" 2>/dev/null || true
   if ((status != 0)); then
     echo "capture: failed; Hyprland's log ($XDG_RUNTIME_DIR/hypr/*/hyprland.log), last 200 lines:" >&2
     tail -n 200 "$XDG_RUNTIME_DIR"/hypr/*/hyprland.log >&2 || echo "  (no log)" >&2
-    echo "capture: what the session's clients printed ($logs/hyprland.out), last 100 lines:" >&2
-    tail -n 100 "$logs/hyprland.out" >&2 || true
+    echo "capture: Hyprland's stdout and its clients' output ($logs/hyprland.out), last 200 lines:" >&2
+    tail -n 200 "$logs/hyprland.out" >&2 || true
+    diagnose 2>&1 | tee "$logs/diagnosis.txt" >&2
   fi
   ward stop "$project" >/dev/null 2>&1 || true
   if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then hyprctl dispatch exit >/dev/null 2>&1 || true; fi
@@ -279,7 +303,11 @@ chmod 0700 "$XDG_RUNTIME_DIR"
 export XDG_RUNTIME_DIR
 trap cleanup EXIT
 unset WAYLAND_DISPLAY DISPLAY HYPRLAND_INSTANCE_SIGNATURE
-export HYPRLAND_HEADLESS_ONLY=1 LIBGL_ALWAYS_SOFTWARE=1
+# Headless outputs only; Mesa's software rasteriser for EGL and, through kms_swrast,
+# for the GBM buffers aquamarine allocates on the node (vgem and vkms have no Mesa
+# driver of their own); aquamarine's and Hyprland's trace logging, so a backend or
+# renderer that fails says why.
+export HYPRLAND_HEADLESS_ONLY=1 LIBGL_ALWAYS_SOFTWARE=1 GBM_ALWAYS_SOFTWARE=1 AQ_TRACE=1 HYPRLAND_TRACE=1
 rm -rf "$frames" "$logs"
 mkdir -p "$frames" "$logs"
 cd "$HOME"
@@ -291,6 +319,16 @@ for marker in first-run-done calibrate-done welcome-done; do
   date -u +%Y-%m-%dT%H:%M:%SZ >"$HOME/.config/wardos/$marker"
 done
 printf 'monitor = %s, 1920x1080@60, 0x0, 1\n' "$output" >>"$HOME/.config/hypr/monitors.conf"
+# Hyprland logs nothing to its file by default (debug:disable_logs); the capture's
+# failure output needs the log, to the file and to stdout ($logs/hyprland.out).
+printf '\n# desktop/capture/capture.sh: the debug log for the capture\ndebug {\n    disable_logs = false\n    enable_stdout_logs = true\n}\n' \
+  >>"$HOME/.config/hypr/hyprland.conf"
+# Where Hyprland writes a crash report; it does not create the parent itself.
+mkdir -p "$HOME/.cache/hyprland"
+if ! verified=$(Hyprland --verify-config -c "$HOME/.config/hypr/hyprland.conf" 2>&1); then
+  printf '%s\n' "$verified" >&2
+  die "Hyprland --verify-config refuses the session's configuration"
+fi
 rm -rf "$project"
 cp -R "$root/examples/ward-demo" "$project"
 git -C "$project" init -q -b main
@@ -303,7 +341,7 @@ export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
 wait_for "the session bus" 20 test -S "$XDG_RUNTIME_DIR/bus" || die "the session bus did not start"
 
 read -ra session < <(session_command)
-say "starting ${session[*]} (HYPRLAND_HEADLESS_ONLY=1, software GL)"
+say "starting ${session[*]} (HYPRLAND_HEADLESS_ONLY=1, software GL, DRM nodes: $(cd /dev/dri 2>/dev/null && echo *))"
 "${session[@]}" >"$logs/hyprland.out" 2>&1 &
 hypr_pid=$!
 pids+=("$hypr_pid")
@@ -317,8 +355,14 @@ summary=$out/summary.md
 {
   echo "### Desktop capture"
   echo
-  echo "$(hyprctl version | sed -n 1p), headless $output 1920x1080, software GL."
+  echo "$(hyprctl version | sed -n 1p), headless $output 1920x1080, software GL, DRM nodes: $(cd /dev/dri && echo *)."
   echo
+  if [[ -f $out/versions.txt ]]; then
+    echo '```'
+    cat "$out/versions.txt"
+    echo '```'
+    echo
+  fi
   echo "| # | scene | ms | on screen | shot |"
   echo "| --- | --- | --- | --- | --- |"
 } >"$summary"
