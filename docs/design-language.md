@@ -405,7 +405,12 @@ appear only once the stream has said so, the verify segment is the eight-state m
 §11 (`VERIFY —` from the first frame, `◐`, `✓`, `~ STALE`, `✗`, `! ERROR`, `! CANCELLED`,
 `! INTERRUPTED`; `VerifyState` in `trust.rs`, fed by the stream's verdict and the worktree digest the shell observes
 through `Model::observe_worktree`), and a sealed log dims the state marker, the network
-word, the daemon word and the agent but never a verdict; the session panel (§6) as
+word, the daemon word and the agent but never a verdict; a daemon connection lost
+without a confirmed seal (#138 item 5) dims the same elements but reads its own third
+state, `? WARD … UNKNOWN` in the warn tone — never `LIVE` (stale, shown as current) and
+never `SEALED` (a claim about the daemon that connection never confirmed) — cleared the
+moment `bar --waybar --follow` reconnects, which it does from the last confirmed
+sequence rather than replaying the session from the start; the session panel (§6) as
 `Session` and `TamperWard` rows and the verify panel (§11) as `Verify` rows; the observer feed
 (§8), which is the `ward watch` TUI's `Model` moved here so the TUI and the shell share
 one implementation of the counters and the follow/scroll state (the TUI's bar is the

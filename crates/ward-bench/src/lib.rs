@@ -81,6 +81,12 @@ pub fn run_ci_subset(fixtures_root: &Path, options: Options) -> anyhow::Result<R
         metrics::snapshot_capture(fixtures_root, options.warm_up, options.samples);
     metrics.push(capture_cold);
     metrics.push(capture_warm);
+    metrics.push(metrics::observer_event_propagation(
+        fixtures_root,
+        state.path(),
+        options.warm_up,
+        options.samples,
+    ));
 
     metrics.extend(unsupported::not_implemented_metrics());
 

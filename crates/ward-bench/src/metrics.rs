@@ -6,8 +6,11 @@
 //! process or terminal is needed.
 
 use std::path::Path;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ward_daemon::{Session, SessionMeta, client, daemon};
+use ward_events::{EndReason, EventRecord, FileChangeKind, WardEvent};
 use ward_snapshot::{CaptureOptions, HashCache, SnapshotRole, SnapshotStore};
 
 use crate::report::{Metric, Stats};
@@ -409,6 +412,202 @@ fn capture_run(
     )
 }
 
+const OBSERVED_PREFIX: &str = "ward-bench-observed-";
+const RELEASE_PREFIX: &str = "ward-bench-release-";
+const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Producer-to-subscriber latency of a live file observation: the capture
+/// instant the watcher stamps on the observation (carried to the daemon as
+/// the append's `at` and recorded as `ts_mono` from the session's start), to
+/// the moment a real daemon `Subscribe` stream hands that record to a client. Each sample
+/// is one file created by a still-running sandboxed command that then blocks
+/// until the record has been received, so every sample is delivered live,
+/// before the command completes, over the production watcher → session drain
+/// → daemon single writer → subscriber path.
+#[must_use]
+pub fn observer_event_propagation(
+    fixtures_root: &Path,
+    state: &Path,
+    warm_up_count: usize,
+    samples: usize,
+) -> Metric {
+    let id = "observer_event_propagation";
+    let description = "inotify observation timestamp to daemon subscriber receive, \
+        live file writes from a running sandboxed command";
+    let budget_row = Some("Observer event propagation");
+    let budget_ms = Some(25.0);
+    if !ward_daemon::sandbox::available() {
+        return Metric::unsupported(
+            id,
+            description,
+            budget_row,
+            budget_ms,
+            "bubblewrap is not installed, or cannot create a user namespace on this \
+             host (ward_daemon::sandbox::available() returned false); see \
+             docs/performance.md §5",
+        );
+    }
+    let result = propagation_samples(
+        &fixtures_root.join("ci-subset"),
+        state,
+        warm_up_count,
+        samples,
+    );
+    finish(
+        &MetricMeta {
+            id,
+            description,
+            budget_row,
+            budget_ms,
+            fixture: "ci-subset",
+            run_kind: "warm",
+            warm_up: warm_up_count,
+        },
+        result,
+    )
+}
+
+fn propagation_samples(
+    fixture: &Path,
+    state: &Path,
+    warm_up_count: usize,
+    samples: usize,
+) -> anyhow::Result<Samples> {
+    let project = tempfile::tempdir()?;
+    copy_tree(fixture, project.path())?;
+
+    let up = Session::start_in(project.path(), state).map_err(to_anyhow)?;
+    let session_id = up.id().to_owned();
+    up.persist_current().map_err(to_anyhow)?;
+    drop(up);
+    let session_start = UNIX_EPOCH
+        + Duration::from_millis(
+            SessionMeta::load(state, &session_id)
+                .map_err(to_anyhow)?
+                .started_unix_ms,
+        );
+    let served = {
+        let (state, session_id) = (state.to_path_buf(), session_id.clone());
+        std::thread::spawn(move || daemon::serve(&state, &session_id))
+    };
+    if !daemon::wait_until(daemon::STARTUP_TIMEOUT, || {
+        daemon::serving(state, &session_id)
+    }) {
+        anyhow::bail!("the session daemon did not start serving");
+    }
+
+    let sink = client::connect(&daemon::socket_path(state, &session_id)).map_err(to_anyhow)?;
+    let (received, receipts) = mpsc::channel();
+    let subscriber = std::thread::spawn(move || {
+        client::watch_records(sink, 0, |record| {
+            let at = SystemTime::now();
+            if let Some(observed) = observed_index(&record) {
+                let _ = received.send((observed, session_start + record.ts_mono, at));
+            }
+        })
+    });
+
+    let total = warm_up_count + samples;
+    let script = format!(
+        "i=0; while [ $i -lt {total} ]; do \
+         : > /work/{OBSERVED_PREFIX}$i; \
+         while [ ! -e /work/{RELEASE_PREFIX}$i ]; do sleep 0.005; done; \
+         i=$((i+1)); done"
+    );
+    let mut session = Session::open_current(project.path(), state)
+        .map_err(to_anyhow)?
+        .ok_or_else(|| anyhow::anyhow!("the persisted session is not current"))?;
+    let runner = std::thread::spawn(move || {
+        let report = session.run(&["/bin/sh".into(), "-c".into(), script]);
+        (session, report)
+    });
+
+    let measured = collect_latencies(&receipts, project.path(), warm_up_count, total);
+    release_from(project.path(), 0, total)?;
+
+    let (session, report) = runner
+        .join()
+        .map_err(|_| anyhow::anyhow!("the sandboxed writer thread panicked"))?;
+    let report = report.map_err(to_anyhow)?;
+    session.stop(EndReason::UserStop).map_err(to_anyhow)?;
+    subscriber
+        .join()
+        .map_err(|_| anyhow::anyhow!("the subscriber thread panicked"))?
+        .map_err(to_anyhow)?;
+    served
+        .join()
+        .map_err(|_| anyhow::anyhow!("the daemon thread panicked"))?
+        .map_err(to_anyhow)?;
+    if report.code != Some(0) {
+        anyhow::bail!("the sandboxed writer exited with {:?}", report.code);
+    }
+    Ok(Samples {
+        durations: measured?,
+        ..Default::default()
+    })
+}
+
+fn collect_latencies(
+    receipts: &mpsc::Receiver<(usize, SystemTime, SystemTime)>,
+    project: &Path,
+    warm_up_count: usize,
+    total: usize,
+) -> anyhow::Result<Vec<Duration>> {
+    let mut durations = Vec::with_capacity(total.saturating_sub(warm_up_count));
+    for expected in 0..total {
+        let latency = loop {
+            let (observed, stamped, at) =
+                receipts.recv_timeout(OBSERVATION_TIMEOUT).map_err(|e| {
+                    anyhow::anyhow!("observation {expected} never reached the subscriber: {e}")
+                })?;
+            if observed != expected {
+                continue;
+            }
+            break at.duration_since(stamped).map_err(|e| {
+                anyhow::anyhow!("observation {expected} is stamped after it was received: {e}")
+            })?;
+        };
+        release_from(project, expected, expected + 1)?;
+        if expected >= warm_up_count {
+            durations.push(latency);
+        }
+    }
+    Ok(durations)
+}
+
+fn observed_index(record: &EventRecord) -> Option<usize> {
+    let WardEvent::FileModified { path, kind, .. } = &record.event else {
+        return None;
+    };
+    if *kind != FileChangeKind::Create {
+        return None;
+    }
+    let path = path.to_string();
+    let name = path.rsplit('/').next()?;
+    name.strip_prefix(OBSERVED_PREFIX)?.parse().ok()
+}
+
+fn release_from(project: &Path, first: usize, end: usize) -> anyhow::Result<()> {
+    for index in first..end {
+        std::fs::write(project.join(format!("{RELEASE_PREFIX}{index}")), b"")?;
+    }
+    Ok(())
+}
+
+fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
 /// The parts of a [`Metric`] that are fixed before it runs, bundled so
 /// [`finish`] does not need a long positional argument list.
 struct MetricMeta<'a> {
@@ -516,6 +715,37 @@ mod tests {
         ));
         if m.status == MetricStatus::Unsupported {
             assert!(m.unmeasured_reason.is_some());
+        }
+    }
+
+    #[test]
+    fn observer_event_propagation_uses_the_real_path_or_reports_unsupported() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let metric = observer_event_propagation(&fixtures_root(), state.path(), 1, 3);
+
+        if ward_daemon::sandbox::available() {
+            assert_eq!(metric.status, MetricStatus::Measured, "{metric:?}");
+        }
+        assert!(matches!(
+            metric.status,
+            MetricStatus::Measured | MetricStatus::Unsupported
+        ));
+        match metric.status {
+            MetricStatus::Measured => {
+                let measured = metric.stats.expect("measured");
+                assert_eq!(measured.samples, 3);
+                assert!(measured.p50_ms >= 0.0);
+                assert!(measured.p99_ms >= measured.p50_ms);
+            }
+            MetricStatus::Unsupported => {
+                assert!(
+                    metric.unmeasured_reason.is_some(),
+                    "unsupported measurements must explain why"
+                );
+            }
+            MetricStatus::NotImplemented => {
+                panic!("observer propagation is implemented by this slice")
+            }
         }
     }
 }

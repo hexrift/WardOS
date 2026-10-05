@@ -241,10 +241,15 @@ candidate the last `VerificationPassed` record names: `VERIFY —` never, `VERIF
 7c01a2b3` verifying, `VERIFY ✓ 7c01a2b3` the tree is that candidate, `VERIFY ~ STALE` it
 no longer is, `VERIFY ✗` it failed — but only when what is being rendered actually shows
 that state (`SegmentName::needs_freshness`, true only for the whole bar and `--segment
-verify`; #138 item 3). Five of the six `ward-shell bar --waybar --segment … --follow`
+verify`; #138 item 3). Six of the seven `ward-shell bar --waybar --segment … --follow`
 processes `config/waybar/config.jsonc` launches — `project`, `agent`, `network`,
-`grants` and `tamperward` — never touch the worktree at all; their text and tone come
-from the event stream alone. Only the sixth, `--segment verify`, does. In `--follow`
+`grants`, `tamperward` and `daemon` — never touch the worktree at all; their text and
+tone come from the event stream alone. Only the seventh, `--segment verify`, does. The
+`daemon` segment is the explicit connection-state module (#138 item 5): `LIVE` /
+`UNKNOWN` / `SEALED`, and every segment module — this one included — carries its own
+`unknown` CSS class distinct from its ordinary tone whenever the daemon connection is
+lost without a confirmed seal (`waybar.css`'s `.unknown` rule), not only the whole-bar
+module a real desktop does not actually run. In `--follow`
 mode, for a segment that does need it, the digest
 still runs unconditionally on every quiet tick (`--tick-ms`, 2000 by default), since an
 edit made outside the sandbox is a change the stream never reports — but a record no

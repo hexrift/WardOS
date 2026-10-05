@@ -8,12 +8,16 @@ name: tamperward
 # rewrite a trusted fixture, or tamper with CI/hooks is caught here rather than in
 # the booted result. A block clears ONLY via an out-of-band PR label applied by
 # someone with triage access or higher — never a file the PR itself can commit.
-# Preferred is the compact, head-bound token `tw1:<digest>` from
+# Use the compact, head-bound token `tw1:<digest>` from
 # `tamperward signoff-label --rule <rule> [--file <path>] --head <full-head-sha>`
-# (tamperward >= 2.33.0), which fits GitHub's 50-character label limit where the
-# legacy `tamperward:allow:<rule>@<head-sha>` spelling does not once the full
-# 40-char head SHA is appended; legacy labels remain accepted. The resolver step
-# below passes both spellings through.
+# (tamperward >= 2.33.0). This workflow always supplies TAMPERWARD_OOB_HEAD as the
+# full head SHA (below), and against a supplied head this CLI's legacy
+# `tamperward:allow:<rule>@<sha>` matcher requires an EXACT full 40-char SHA, not a
+# prefix — which cannot fit GitHub's 50-character label limit, so a legacy label can
+# never actually clear a check here (confirmed in practice on PR #318; see #320). The
+# resolver step below still parses a legacy-shaped label through to the CLI for
+# forward/backward compatibility, but it will not match anything against this
+# workflow's config: use `tw1:` labels only.
 #
 # labeled/unlabeled re-run the gate because the sign-off is read from the EVENT
 # payload: a label applied after a failure could otherwise never take effect, and
@@ -127,11 +131,12 @@ jobs:
           RULES="$(printf '%s' "$LABELS" | jq -r '.[] | if startswith("tamperward:allow:") then sub("^tamperward:allow:"; "") elif startswith("tw1:") then . else empty end' | paste -sd, -)"
           echo "rules=$RULES" >> "$GITHUB_OUTPUT"
       # A `verify` sign-off — the compact `tw1:` token from
-      # `tamperward signoff-label --rule verify --head <full-head-sha>`, or the
-      # legacy `tamperward:allow:verify@<head-sha>` label — accepts a MASKED_FAILURE
-      # a reviewer has read and judged (an intentional protected-fixture/test change
-      # where the base suite no longer applies); it clears nothing else — a red
-      # visible suite, or a run that could not verify, stays red whatever the labels say.
+      # `tamperward signoff-label --rule verify --head <full-head-sha>` (see the
+      # top-of-file note on why the legacy `tamperward:allow:verify@<sha>` label does
+      # not work here) — accepts a MASKED_FAILURE a reviewer has read and judged (an
+      # intentional protected-fixture/test change where the base suite no longer
+      # applies); it clears nothing else — a red visible suite, or a run that could
+      # not verify, stays red whatever the labels say.
       - name: Tamperward verify (pristine re-execution)
         env:
           TAMPERWARD_OOB_SIGNOFF: ${{ steps.oob.outputs.rules }}

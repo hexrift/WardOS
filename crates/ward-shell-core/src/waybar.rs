@@ -8,10 +8,21 @@
 //! the theme's `waybar.css` colours the glyph and the word and nothing else,
 //! plus the agent's state word on the agent module, the verify state's word
 //! (`never`, `verifying`, `stale`, `failed`) on the verify module and
-//! `live`/`sealed` on the whole-bar module. A segment the stream has not
-//! established, and every segment but the host mark when there is no session,
-//! is the empty module (`text: ""`, class `none`), which Waybar hides; the
-//! verify module is never empty with a session, since `VERIFY —` is a state.
+//! `live`/`unknown`/`sealed` on the whole-bar module. A segment module (one
+//! Waybar module per segment, as `desktop/config/waybar/config.jsonc` runs
+//! them, one `ward-shell bar --waybar --segment … --follow` process each)
+//! carries its own explicit `unknown` class too (#138 item 5, review
+//! 5337489166 of #329, finding 1) whenever [`TrustBar::unknown`] is set,
+//! alongside its ordinary tone/state class rather than folded into it — a
+//! stylesheet needs a class distinct from a tone a segment can carry for an
+//! unrelated reason (in particular `dim`, which a *sealed* bar already gives
+//! most segments) to style a lost connection distinctly from both `sealed`
+//! and an ordinary live state, on every module a real desktop actually runs,
+//! not only the one whole-bar module that desktop's shipped config does not.
+//! A segment the stream has not established, and every segment but the host
+//! mark when there is no session, is the empty module (`text: ""`, class
+//! `none`), which Waybar hides; the verify module is never empty with a
+//! session, since `VERIFY —` is a state.
 
 use serde::Serialize;
 
@@ -60,7 +71,16 @@ impl Module {
     #[must_use]
     pub fn bar(d: &SessionDescription, header: &Header, model: &Model, now_unix_ms: u64) -> Self {
         let bar = TrustBar::new(header, model, now_unix_ms);
-        let state = if bar.sealed { "sealed" } else { "live" };
+        // #138 item 5: a connection lost without a confirmed seal is its own
+        // `unknown` class, never folded into `sealed` (a claim the daemon
+        // never made) or left as `live` (stale state shown as current).
+        let state = if bar.sealed {
+            "sealed"
+        } else if bar.unknown {
+            "unknown"
+        } else {
+            "live"
+        };
         Self {
             text: bar.text(),
             tooltip: panel_text(&session_panel(d, model, now_unix_ms))
@@ -100,6 +120,21 @@ impl Module {
             }
             _ => {}
         }
+        // #138 item 5, review 5337489166 of #329, finding 1: a connection
+        // lost without a confirmed seal is its own state, distinct from
+        // every tone a segment can otherwise carry — including a tone
+        // (`dim`, in particular) a *sealed* bar already dims segments to, or
+        // one an unrelated live state can carry regardless. Every segment
+        // module carries this explicit `unknown` class of its own, exactly
+        // like the whole-bar module's `class[0]` already does, so a
+        // stylesheet can style the connection being lost distinctly from
+        // both "sealed" and "live" on every configured module — not only
+        // the one whole-bar module a shipped desktop may not even run
+        // (`desktop/config/waybar/config.jsonc` runs one process per
+        // segment, not the whole bar as one module).
+        if bar.unknown {
+            class.push("unknown".to_owned());
+        }
         Self {
             text: segment.text,
             tooltip: explanation(d, model, &bar, name, now_unix_ms),
@@ -118,7 +153,13 @@ fn explanation(
 ) -> String {
     let panel = session_panel(d, model, now_unix_ms);
     let row = |label: &str| panel_row(&panel, label);
-    let state = if bar.sealed { "sealed" } else { "live" };
+    let state = if bar.sealed {
+        "sealed"
+    } else if bar.unknown {
+        "unknown"
+    } else {
+        "live"
+    };
     let rows = match name {
         SegmentName::Mark => vec![
             Row::new("Session", d.session.clone(), Tone::Ink),
@@ -199,6 +240,14 @@ mod tests {
         let (d, header, mut model) = live();
         model.apply(wardd(&[ended()]).remove(0));
         model.seal();
+        (d, header, model)
+    }
+
+    /// #138 item 5: the connection was lost, and the daemon never confirmed
+    /// the log sealed — distinct from [`sealed`], which is a confirmed fact.
+    fn unknown() -> (SessionDescription, Header, Model) {
+        let (d, header, mut model) = live();
+        model.mark_disconnected();
         (d, header, model)
     }
 
@@ -390,6 +439,120 @@ mod tests {
                 .tooltip
                 .starts_with("Log        sealed\n")
         );
+    }
+
+    #[test]
+    fn the_whole_bar_module_reads_unknown_when_disconnected_without_a_seal() {
+        let (d, header, model) = unknown();
+        let module = Module::bar(&d, &header, &model, now(&d));
+        assert!(module.text.starts_with("? WARD"), "{}", module.text);
+        assert!(module.text.ends_with("│ UNKNOWN"), "{}", module.text);
+        assert_eq!(module.class, ["unknown", "restricted"]);
+    }
+
+    #[test]
+    fn every_segment_is_a_module_in_the_unknown_state() {
+        let (d, header, model) = unknown();
+        let module = |name| Module::segment(&d, &header, &model, name, now(&d));
+        // Review 5337489166 of #329, finding 1: every segment module carries
+        // its own `unknown` class, appended after its ordinary tone/state
+        // class(es), not folded into (or confused with) a tone — `dim` here
+        // is exactly the tone a *sealed* segment also carries (see
+        // `every_segment_is_a_module_in_the_sealed_state` below), so without
+        // this explicit class a stylesheet — and a reader — could not tell
+        // the two states' modules apart.
+        let cases = [
+            (SegmentName::Mark, "WARD", vec!["restricted", "unknown"]),
+            (
+                SegmentName::Session,
+                "sess_01J8ZK3…",
+                vec!["dim", "unknown"],
+            ),
+            (SegmentName::Project, "payments-api", vec!["ink", "unknown"]),
+            (
+                SegmentName::Agent,
+                "CLAUDE ● working",
+                vec!["dim", "working", "unknown"],
+            ),
+            (
+                SegmentName::Network,
+                "NET restricted (dev)",
+                vec!["dim", "unknown"],
+            ),
+            (
+                SegmentName::Credentials,
+                "CRED 0 granted",
+                vec!["ink", "unknown"],
+            ),
+            (SegmentName::Observer, "OBS live", vec!["ink", "unknown"]),
+            (SegmentName::Tamperward, "TW ✓", vec!["verified", "unknown"]),
+            (
+                SegmentName::Verify,
+                "VERIFY ✓ abababab",
+                vec!["verified", "unknown"],
+            ),
+            (
+                SegmentName::Daemon,
+                "UNKNOWN",
+                vec!["restricted", "unknown"],
+            ),
+        ];
+        for (name, text, class) in cases {
+            let m = module(name);
+            assert_eq!(m.text, text, "{name}");
+            assert_eq!(m.class, class, "{name}");
+        }
+        assert_eq!(
+            module(SegmentName::Mark).tooltip,
+            "Session   sess_01J8ZK3Q9X7VY2\nLog       unknown"
+        );
+        assert!(
+            module(SegmentName::Daemon)
+                .tooltip
+                .starts_with("Log        unknown\n")
+        );
+    }
+
+    /// Review 5337489166 of #329, finding 1: a single, real segment module —
+    /// as `desktop/config/waybar/config.jsonc` actually runs it, one process
+    /// per segment, never the whole-bar module — provably transitions
+    /// live → unknown → live/sealed as `Model::connected`/`Model::seal`
+    /// change, with `unknown` a class of its own at every step it applies,
+    /// never confused with `sealed`'s dimming even though both use `dim` as
+    /// a tone on this very segment.
+    #[test]
+    fn a_segment_module_transitions_live_unknown_then_live_or_sealed() {
+        let (d, header, mut model) = live();
+        let module = |m: &Model| Module::segment(&d, &header, m, SegmentName::Agent, now(&d));
+
+        let start = module(&model);
+        assert_eq!(start.text, "CLAUDE ● working");
+        assert_eq!(
+            start.class,
+            ["accent", "working"],
+            "live: no unknown, no sealed"
+        );
+
+        model.mark_disconnected();
+        let lost = module(&model);
+        assert_eq!(lost.class, ["dim", "working", "unknown"]);
+        assert_ne!(lost, start, "the module must actually change");
+
+        // Reconnecting clears `unknown` and restores the live render exactly.
+        model.mark_connected();
+        let recovered = module(&model);
+        assert_eq!(recovered, start, "back to exactly the live module");
+
+        // From `unknown`, a confirmed seal (never a reconnect) is the other
+        // way out: `sealed`, not `unknown` — and even though both dim this
+        // segment's tone to `dim`, only `sealed`'s module lacks the
+        // `unknown` class.
+        model.mark_disconnected();
+        assert_eq!(module(&model).class, ["dim", "working", "unknown"]);
+        model.seal();
+        let sealed = module(&model);
+        assert_eq!(sealed.class, ["dim", "working"], "sealed, not unknown");
+        assert_ne!(sealed.class, lost.class);
     }
 
     #[test]
