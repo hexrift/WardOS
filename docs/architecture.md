@@ -426,7 +426,8 @@ unrevoked (`lease_expired`, `lease_revoked`), allocates `<task-root>/<task>/<att
 (mode 0700, created once per attempt) and materialises the envelope's snapshot into it
 (`resource_unavailable` with nothing spawned if the store lacks it). No path comes from a
 request. The envelope's argv runs through `ward-launch` in an offline sandbox (no egress
-socket, loopback only) with the workspace as the only writable host path and the
+socket, loopback only) from an empty environment (`--clearenv`: none of the node's own
+variables reach the workload), with the workspace as the only writable host path and the
 envelope's budget enforced; the capability manifest is not interpreted yet, so network
 grants are not honoured. The node answers `running` only after a confirmed spawn with
 the host pid recorded. A clean spawn failure changes nothing; an ambiguous launch is

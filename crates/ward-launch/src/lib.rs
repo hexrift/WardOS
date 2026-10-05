@@ -221,6 +221,7 @@ pub struct Launch {
     budget: Option<Duration>,
     capture_bytes: Option<usize>,
     keep_prefix: Option<String>,
+    clear_env: bool,
 }
 
 /// A spawned sandbox whose child is owned until it is waited or dropped.
@@ -330,6 +331,7 @@ impl Launch {
             budget: None,
             capture_bytes: None,
             keep_prefix: None,
+            clear_env: false,
         }
     }
 
@@ -390,6 +392,14 @@ impl Launch {
         self
     }
 
+    /// Start the sandbox from an empty environment: none of the launching
+    /// process's variables reach it, only those set explicitly.
+    #[must_use]
+    pub const fn clear_env(mut self) -> Self {
+        self.clear_env = true;
+        self
+    }
+
     /// Inherit or capture stdio.
     #[must_use]
     pub fn stdio(mut self, stdio: StdioMode) -> Self {
@@ -428,6 +438,9 @@ impl Launch {
             a.extend(xs.iter().map(|x| (*x).to_string()));
         }
         let mut a: Vec<String> = Vec::new();
+        if self.clear_env {
+            push(&mut a, &["--clearenv"]);
+        }
         // Read-only system directories the toolchain needs; host home is never bound.
         // TLS trust roots are read-only system data the agent needs for HTTPS via CONNECT.
         for dir in SYSTEM_RO {
@@ -826,6 +839,22 @@ enum WaitEnd {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn clear_env_unsets_the_host_environment_before_any_sandbox_variable() {
+        let inherited = Launch::new("/tmp", vec!["true".into()]).env("FOO", "bar");
+        assert!(
+            !inherited
+                .args(Path::new("/tmp"))
+                .contains(&"--clearenv".to_string())
+        );
+        let cleared = inherited.clear_env();
+        let a = cleared.args(Path::new("/tmp"));
+        let clear = a.iter().position(|x| x == "--clearenv").unwrap();
+        let first_set = a.iter().position(|x| x == "--setenv").unwrap();
+        assert!(clear < first_set, "{a:?}");
+        assert!(a.join(" ").contains("--setenv FOO bar"));
+    }
 
     #[test]
     fn args_isolate_net_and_bind_egress_and_shim() {

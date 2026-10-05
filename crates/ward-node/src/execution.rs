@@ -159,13 +159,18 @@ impl SandboxLauncher {
 
 impl TaskLauncher for SandboxLauncher {
     fn launch(&self, request: &LaunchRequest) -> Result<Box<dyn RunningWorkload>, SpawnError> {
-        Launch::new(request.workspace(), request.argv().to_vec())
-            .budget(request.budget())
-            .capture_bytes(OUTPUT_CAPTURE_BYTES)
+        sandbox_launch(request)
             .spawn()
             .map(|running| Box::new(SandboxWorkload(running)) as Box<dyn RunningWorkload>)
             .map_err(|_| SpawnError::Refused)
     }
+}
+
+fn sandbox_launch(request: &LaunchRequest) -> Launch {
+    Launch::new(request.workspace(), request.argv().to_vec())
+        .budget(request.budget())
+        .capture_bytes(OUTPUT_CAPTURE_BYTES)
+        .clear_env()
 }
 
 struct SandboxWorkload(RunningLaunch);
@@ -259,5 +264,28 @@ impl NodeExecution {
     #[must_use]
     pub const fn spawn_timeout(&self) -> Duration {
         self.spawn_timeout
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn a_node_launch_never_inherits_the_node_environment() {
+        let request = LaunchRequest::new(
+            PathBuf::from("/tmp"),
+            vec!["true".into()],
+            Duration::from_secs(1),
+        );
+        let args = sandbox_launch(&request).args(Path::new("/tmp"));
+        let clear = args.iter().position(|a| a == "--clearenv");
+        let first_set = args.iter().position(|a| a == "--setenv");
+        assert!(
+            matches!((clear, first_set), (Some(c), Some(s)) if c < s),
+            "{args:?}"
+        );
     }
 }
