@@ -28,10 +28,13 @@
 //! * `admit` (protocol 1.3) moves a `Created` task with the exact binding to
 //!   [`TaskLifecycleState::Ready`] once [`NodeAdmission`] has verified its signed
 //!   envelope and durably recorded its version (ADR-0030 §2). The registry keeps the
-//!   admitted envelope and its trusted authority ([`AdmittedTask`]). Replaying the same
-//!   operation with the same envelope and proof returns the same `Ready` result; any
-//!   refusal leaves the task `Created`. A registry built without admission refuses
-//!   `admit` as unsupported.
+//!   admitted envelope and its trusted authority ([`AdmittedTask`]), and the task's
+//!   durable record keeps the verified authority chain ([`AuthorityRecord`]) beside the
+//!   envelope digest, written before the verb is answered, so `ward-node audit` can say
+//!   who delegated what to which task and when (#259). Replaying the same operation with
+//!   the same envelope and proof returns the same `Ready` result; any refusal leaves the
+//!   task `Created` with no authority recorded. A registry built without admission
+//!   refuses `admit` as unsupported.
 //! * `start` (protocol 1.3, a registry built [`TaskRegistry::with_execution`]) moves a
 //!   `Ready` task to [`TaskLifecycleState::Running`] (ADR-0030 §3). It rechecks at the
 //!   node clock that the admitted envelope and lease are unexpired and unrevoked, allocates
@@ -173,7 +176,8 @@ use crate::execution::{
     WorkloadExit, WorkloadFreezer, WorkloadProcess,
 };
 use crate::records::{
-    AdmitRecord, RECORD_FORMAT, RecordedState, SealRecord, TaskRecord, TaskRecordError, TaskStore,
+    AdmitRecord, AuthorityRecord, RECORD_FORMAT, RecordedState, SealRecord, TaskRecord,
+    TaskRecordError, TaskStore,
 };
 use crate::workspace::{TaskRoot, WorkspaceError, discard};
 
@@ -804,6 +808,7 @@ impl TaskRegistry {
             envelope,
             proof,
             session: verified.envelope().session(),
+            authority: Some(AuthorityRecord::of(&verified)),
         });
         journal.write(&ready.record())?;
         if let Err(reason) = admission.commit(&verified) {
@@ -1865,14 +1870,17 @@ mod tests {
     mod admit {
         #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-        use std::path::PathBuf;
+        use std::path::{Path, PathBuf};
 
+        use ring::signature::KeyPair;
         use ward_authority::revocation::{AuthorityRevocation, RevocationReason};
         use ward_authority::{
-            AuthorityLease, DelegationInput, EmptyAuthorityPolicy, LeaseVersion,
-            UntrustedAuthorityLease,
+            AuthorityLease, AuthorityLeaseInput, DelegationInput, EmptyAuthorityPolicy,
+            LeaseVersion, UntrustedAuthorityLease,
         };
-        use ward_events::{AgentId, DelegationId, ExecutionAttemptId, LeaseId, NodeId, TaskId};
+        use ward_events::{
+            AgentId, DelegationId, ExecutionAttemptId, LeaseId, NodeId, PrincipalId, TaskId,
+        };
         use ward_node_protocol::{
             AdmissionEnvelopeJson, AdmissionVersion, IssuerProof, IssuerSignature, OperationId,
             ProtocolVersion, TaskAdmissionAuthority, TaskAdmissionEnvelope,
@@ -1881,13 +1889,16 @@ mod tests {
         };
 
         use crate::admit::NodeAdmission;
-        use crate::issuer::TrustedIssuers;
+        use crate::audit::audit;
+        use crate::issuer::{IssuerPublicKey, TrustedIssuer, TrustedIssuers};
+        use crate::records::{AuthorityRecord, RecordedLease, RecordedState, TASKS_DIR, TaskStore};
         use crate::state::NodeState;
         use crate::task::{MAX_NODE_TASKS, TaskRegistry};
         use crate::test_support::{
-            FixedClock, NODE, NOW, envelope_input, issuer_keypair, lifecycle_binding,
-            network_manifest, node_admission, other_keypair, root_lease, sign, signed_admit,
-            to_hex, with_manifest,
+            FixedClock, ISSUER, NODE, NOW, envelope_input, envelope_input_issued_by,
+            issuer_keypair, issuer_public_key, lifecycle_binding, network_manifest, node_admission,
+            other_keypair, root_lease, sign, signed_admit, to_hex, trusted_root_lease,
+            with_manifest,
         };
 
         struct Node {
@@ -2644,6 +2655,221 @@ mod tests {
             )
             .unwrap();
             node.assert_refused(admit(&envelope(|_| {})), Reason::ResourceUnavailable);
+        }
+
+        #[test]
+        fn admit_records_the_authority_chain_durably_before_it_answers() {
+            let mut node = Node::new();
+            let binding = lifecycle_binding();
+            node.create(binding);
+            let (parent, child) = delegated();
+            let envelope = envelope(|input| input.authority = authority(&child, &[&parent]));
+            let store = TaskStore::open(&node.state_dir).unwrap();
+            let blocker = node
+                .state_dir
+                .join(TASKS_DIR)
+                .join(format!(".{}.json.tmp", binding.task()))
+                .join("blocker");
+            std::fs::create_dir_all(&blocker).unwrap();
+            node.assert_refused(admit(&envelope), Reason::ResourceUnavailable);
+            let record = store.read(binding.task()).unwrap().unwrap();
+            assert_eq!(record.state, RecordedState::Created);
+            assert_eq!(record.admitted, None);
+            std::fs::remove_dir_all(blocker.parent().unwrap()).unwrap();
+
+            assert_eq!(
+                node.registry.handle(ctx(), admit(&envelope)),
+                ctx().accepted(op(20), binding, TaskLifecycleState::Ready)
+            );
+            let record = store.read(binding.task()).unwrap().unwrap();
+            assert_eq!(record.state, RecordedState::Ready);
+            let admitted = record.admitted.unwrap();
+            assert_eq!(admitted.operation_id, op(20));
+            assert_eq!(
+                admitted.authority,
+                Some(AuthorityRecord {
+                    lease: RecordedLease::from(&child),
+                    lineage: vec![RecordedLease::from(&parent)],
+                    issued_at_unix_ms: 2_000,
+                    expires_at_unix_ms: 8_000,
+                    version: 1,
+                    admitted_at_unix_ms: NOW,
+                })
+            );
+
+            let audited = audit(
+                &node.state_dir,
+                binding.task(),
+                Some(binding.attempt()),
+                None,
+            )
+            .unwrap();
+            let chain = audited
+                .admitted
+                .as_ref()
+                .unwrap()
+                .authority
+                .as_ref()
+                .unwrap();
+            assert_eq!(chain.lease.issuer, ISSUER);
+            assert_eq!(chain.lease.subject, child.subject());
+            assert_eq!(chain.lease.delegated_by, Some(parent.subject()));
+            assert_eq!(chain.lineage[0].lease, parent.id());
+            let text = audited.to_string();
+            assert!(
+                text.contains(&format!(
+                    "agent {} delegated lease {} (delegation {}) to agent {} for task {}",
+                    parent.subject(),
+                    child.id(),
+                    child.delegation_id(),
+                    child.subject(),
+                    binding.task()
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "under principal {ISSUER} from lease {}",
+                    parent.id()
+                )),
+                "{text}"
+            );
+            assert!(text.contains("as version 1 at 1970-01-01T00:00:05.000Z (operation 20)"));
+            assert!(
+                audit(
+                    &node.state_dir,
+                    binding.task(),
+                    Some(ExecutionAttemptId::from_u128(99)),
+                    None
+                )
+                .is_err()
+            );
+        }
+
+        const OTHER: PrincipalId = PrincipalId::from_u128(9);
+
+        fn registry_trusting_two_principals(state_dir: &Path) -> TaskRegistry {
+            let other_key = IssuerPublicKey::from_bytes(
+                other_keypair().public_key().as_ref().try_into().unwrap(),
+            );
+            TaskRegistry::with_admission(
+                MAX_NODE_TASKS,
+                NodeAdmission::new(
+                    TrustedIssuers::new([
+                        TrustedIssuer::new(issuer_public_key(), ISSUER),
+                        TrustedIssuer::new(other_key, OTHER),
+                    ]),
+                    NodeState::open(state_dir, NODE).unwrap(),
+                    Box::new(FixedClock::at(NOW)),
+                ),
+            )
+            .unwrap()
+        }
+
+        fn envelope_json_issued_by_other(binding: TaskBinding) -> AdmissionEnvelopeJson {
+            let lease = AuthorityLease::root(
+                AuthorityLeaseInput {
+                    id: binding.lease(),
+                    delegation_id: DelegationId::from_u128(16),
+                    issuer: OTHER,
+                    subject: AgentId::from_u128(13),
+                    task: binding.task(),
+                    grants: trusted_root_lease().grants().clone(),
+                    issued_at_unix_ms: 1_000,
+                    expires_at_unix_ms: 9_000,
+                    version: LeaseVersion::new(1).unwrap(),
+                },
+                1_000,
+                EmptyAuthorityPolicy::Reject,
+            )
+            .unwrap();
+            let mut input = envelope_input_issued_by(binding, OTHER);
+            input.agent = AgentId::from_u128(13);
+            input.authority = authority(&lease, &[]);
+            AdmissionEnvelopeJson::encode(&TaskAdmissionEnvelope::new(input).unwrap()).unwrap()
+        }
+
+        #[test]
+        fn two_agents_cannot_reuse_each_others_authority_and_each_audits_to_its_own_principal() {
+            let dir = tempfile::tempdir().unwrap();
+            let state_dir = dir.path().join("state");
+            let mut registry = registry_trusting_two_principals(&state_dir);
+            let a = lifecycle_binding();
+            let b = TaskBinding::new(
+                TaskId::from_u128(17),
+                ExecutionAttemptId::from_u128(18),
+                LeaseId::from_u128(19),
+            );
+            let c = TaskBinding::new(
+                TaskId::from_u128(27),
+                ExecutionAttemptId::from_u128(28),
+                LeaseId::from_u128(29),
+            );
+            for binding in [a, b, c] {
+                assert_eq!(
+                    registry.handle(ctx(), ctx().create(op(10), binding)),
+                    ctx().accepted(op(10), binding, TaskLifecycleState::Created)
+                );
+            }
+
+            let envelope_a = envelope(|_| {});
+            let json_b = envelope_json_issued_by_other(b);
+            assert_eq!(
+                registry.handle(ctx(), signed_admit(ctx(), op(20), a, &envelope_a)),
+                ctx().accepted(op(20), a, TaskLifecycleState::Ready)
+            );
+            assert_eq!(
+                registry.handle(
+                    ctx(),
+                    ctx()
+                        .admit(op(21), b, json_b.clone(), sign(&json_b, &other_keypair()))
+                        .unwrap()
+                ),
+                ctx().accepted(op(21), b, TaskLifecycleState::Ready)
+            );
+
+            let chain = |binding: TaskBinding| {
+                let audited = audit(&state_dir, binding.task(), None, None).unwrap();
+                let chain = audited.admitted.unwrap().authority.unwrap();
+                (chain.lease.issuer, chain.lease.subject, chain.lease.lease)
+            };
+            assert_eq!(chain(a), (ISSUER, AgentId::from_u128(3), a.lease()));
+            assert_eq!(chain(b), (OTHER, AgentId::from_u128(13), b.lease()));
+
+            let borrowed = TaskBinding::new(c.task(), c.attempt(), a.lease());
+            let reused = TaskAdmissionEnvelope::new(envelope_input(borrowed)).unwrap();
+            for (request, envelope, reason) in [
+                (c, &reused, Reason::LeaseMismatch),
+                (borrowed, &reused, Reason::LeaseMismatch),
+                (
+                    TaskBinding::new(c.task(), a.attempt(), c.lease()),
+                    &reused,
+                    Reason::AttemptMismatch,
+                ),
+                (c, &envelope_a, Reason::AuthorityDenied),
+            ] {
+                assert_eq!(
+                    registry.handle(ctx(), signed_admit(ctx(), op(22), request, envelope)),
+                    ctx().rejected(Some(op(22)), request, reason)
+                );
+            }
+            let audit_c = audit(&state_dir, c.task(), Some(c.attempt()), None).unwrap();
+            assert!(audit_c.admitted.is_none());
+            assert!(audit_c.to_string().contains("was never admitted"));
+            assert_eq!(
+                registry.handle(ctx(), ctx().inspect(c)),
+                ctx().inspected(c, TaskLifecycleState::Created)
+            );
+            assert_eq!(
+                registry
+                    .admission()
+                    .unwrap()
+                    .state()
+                    .last_admitted_version(c.task()),
+                None
+            );
+            assert_eq!(chain(a), (ISSUER, AgentId::from_u128(3), a.lease()));
+            assert_eq!(chain(b), (OTHER, AgentId::from_u128(13), b.lease()));
         }
     }
 

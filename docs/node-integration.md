@@ -66,6 +66,15 @@ The node refuses to start on any unsafe or malformed input: a trust store, state
 task record it cannot parse, wrong permissions, a pinned id mismatch. It serves until
 killed.
 
+The same binary has three operator subcommands over local files; none speaks to the
+socket, and each runs as the node's uid:
+
+| Subcommand | Does |
+| --- | --- |
+| `ward-node issuer-key-id <hex-public-key>` | Prints the key id an issuer proof must name (§2.3). |
+| `ward-node snapshot import --state-dir <dir> <project-dir>` | Captures a project into the snapshot store and prints the id an envelope's `workload.snapshot` carries (§2.4). |
+| `ward-node audit --state-dir <dir> [--task-root <dir>] [--attempt <exec_…>] [--json] <task_…>` | Answers who delegated what authority to the task and when, from its durable record, and cross-checks the attempt's evidence log (§2.6). |
+
 ### 2.2 Trust store
 
 One issuer per line. Each line binds one Ed25519 public key to the one principal
@@ -155,6 +164,78 @@ node-owned: deleting the versions file would let old envelopes be replayed, dele
 retired attempt would let a replaced attempt be registered again (§6.1), deleting a
 revocation the node recorded would make that lease usable again, and deleting a task
 record forgets the task and the operation ids its attempt applied.
+
+### 2.6 Auditing an attempt: who delegated what
+
+```text
+$ ward-node audit --state-dir <dir> --task-root <task-root> task_01M45YYRG00001249248SK6H24
+agent agent_01M45YYRG00000000000000003 delegated lease lease_01M45YYRG00009K6DANAXVQK6C (delegation deleg_01M45YYRG000016NWVVWJ6HB70) to agent agent_01M43CJ1G0000DVQFEXVZZY001 for task task_01M45YYRG00001249248SK6H24 at 2026-10-05T12:00:00.000Z, expires 2026-10-05T13:00:00.000Z, under principal prn_01M1RQ16G00000Y3RF1W7GY3RF from lease lease_01M45YYRG00000000000000001
+grants: repo.read on repo:example/project
+lineage, root first:
+  lease lease_01M45YYRG00000000000000001 (delegation deleg_01M45YYRG00000000000000002) from principal prn_01M1RQ16G00000Y3RF1W7GY3RF to agent agent_01M45YYRG00000000000000003, valid 2026-10-05T12:00:00.000Z to 2026-10-05T14:00:00.000Z, grants: repo.read on repo:example/project (delegable)
+admitted by key 0871f3aabc26e4582c508af5c03884e6a96f0989d1dd8cfb49cd17ed25792433 as version 1 at 2026-10-05T12:03:12.418Z (operation 2); envelope <64 hex, the BLAKE3 digest of the envelope bytes> valid 2026-10-05T12:00:00.000Z to 2026-10-05T12:15:00.000Z, session sess_01M45YYRG0000FXQ5TK1V58CGG
+attempt exec_01M45YYRG00005ANB6CSVQF248: state sealed, receipt completed, evidence <task-root>/task_01M45YYRG00001249248SK6H24/exec_01M45YYRG00005ANB6CSVQF248.evidence/events.log: 4 records, head <64 hex>, sealed
+```
+
+The audit reads one file, the task's record in `<state-dir>/tasks/` (§6.4), and answers
+from it alone: no socket, no control plane. Since this revision the record keeps, beside
+the envelope digest, the authority chain the `admit` that took effect verified: the lease
+the binding names (its issuing principal, delegation id, subject agent, parent lease and
+delegating agent, grants, validity and version), every ancestor lease in the same terms,
+the envelope's validity and version, and the node clock at the admission, with the
+`admit` operation id and the issuer key id the record already held. The facts are written
+with the rest of the record before `admit` is answered (§6.4); a refused `admit` records
+nothing. The output is, line by line:
+
+1. who delegated what: for a root lease `principal prn_… delegated lease … to agent … for
+   task …`, for a delegated lease `agent … delegated lease … to agent … for task …, under
+   principal prn_… from lease …`, with the lease's validity. The `issuer` is the human or
+   service principal whose key signed the envelope (§2.2): a CI runner or other automation
+   is a service principal with a key and `prn_` of its own, so the line names it; the
+   `subject` is always the agent the authority was delegated to. The node records no
+   model or provider identity;
+2. the lease's grants, `capability on resource`, `(delegable)` where a child may receive
+   the grant;
+3. the lineage, root first, each ancestor with the principal or agent that delegated it,
+   its subject, validity and grants, so the contraction down the chain is visible; or
+   `lineage: none (root lease)`;
+4. the admission: the issuer key id, the envelope version, the node clock at the
+   admission, the `admit` operation id, the envelope digest and validity, the session;
+5. the attempt: its recorded state (§6.4; `launching` is a spawn in flight when the record
+   was last written), its receipt outcome (§9) or `none`, and its evidence log.
+
+Times print as UTC with millisecond precision. `--attempt <exec_…>` requires the record
+to hold that attempt: the record holds the task's current attempt only, and the node
+guesses nothing about a replaced one (its record went with the replacement, §6.1; its
+evidence log remains under its own id, §6.5), so another attempt is an error. `--task-root
+<dir>` verifies the attempt's evidence log as §6.5 does and then requires its
+`NodeAttemptAdmitted` record for the `admit` operation to agree with the record on binding,
+session, envelope digest, issuer key id and version; if the log is absent, does not
+verify, has no such record or differs, the last line ends `evidence disagrees with the
+record: <why>` and the command exits 1. Without `--task-root` the line ends `evidence not
+checked`; a never-admitted task with no log reads `absent`.
+
+A record written before this revision has no authority facts and reads `task … attempt …
+was admitted before authority facts were recorded (operation …, envelope …, key …,
+session …)`; a task that was never admitted reads `task … attempt … was never admitted`;
+a `ready` task a restart recovered has forgotten its admission (§6.4) and reads as never
+admitted until it is admitted again, while an attempt that was started keeps its chain for
+as long as its record exists. The audit fails closed: a state directory without `tasks/`,
+a records directory accessible to group or others, and a record that is absent, not a
+regular file, over 8 MiB, malformed, not the task's or holding more lineage (16) or
+grants than an envelope can carry, are each an error on stderr with exit 1, and nothing is
+created or written.
+
+`--json` prints the same facts as one object with `"schema":1`: `task`, `attempt`,
+`lease`, `state`, `receipt` (`null` or the outcome), `admitted` (`null`, or `operation`,
+`envelope`, `issuer_key`, `session` and `authority`, itself `null` for a pre-change record
+or `lease`, `lineage` (nearest parent first, as the envelope carries it), the envelope's
+`issued_at_unix_ms`, `expires_at_unix_ms` and `version`, and `admitted_at_unix_ms`; each
+lease is `lease`, `delegation`, `issuer`, `subject`, `parent_lease`, `delegated_by`,
+`grants`, `issued_at_unix_ms`, `expires_at_unix_ms`, `version`) and `evidence` (`null`
+without `--task-root`, else `log`, `verified` (`null`, or `records`, `head`, `sealed`) and
+`disagreement` (`null`, or why)). Times are Unix milliseconds, ids carry their prefixes
+and hashes are lowercase hex. The exit status is the text form's.
 
 ## 3. Transport framing
 
@@ -478,7 +559,9 @@ other verbs, `task_not_found` once the task is evicted); none of them acts.
 The node keeps one durable record per registered task in `<state-dir>/tasks/`. Every
 transition is written to it (temporary file, fsync, rename, directory fsync) before the
 node answers the verb; if that write fails, the verb is refused `resource_unavailable`
-and nothing changed (a `pause` or `resume` undoes its freeze or thaw first). `start`
+and nothing changed (a `pause` or `resume` undoes its freeze or thaw first). The record of
+an admitted attempt also keeps the authority chain its `admit` verified, which
+`ward-node audit` reads (§2.6). `start`
 records that it is about to spawn before it spawns, and the spawned process once the
 spawn is confirmed; if that second write fails, the node kills the workload and answers
 `accepted` with `exited` (`unknown`), as for an ambiguous launch.
@@ -578,7 +661,9 @@ or, in Rust, `ward_events::LogReader::open(path)?.verify_all()?` compared with
 `ward_events::log::parse_head` of `HEAD`, or `ward_node::evidence::verify(dir, binding)`,
 which also checks the genesis, the session id and that every record has origin `node`.
 `ward replay --json` prints one summary per record. The protocol does not carry the log
-or its head: `inspect` and receipts are unchanged.
+or its head: `inspect` and receipts are unchanged. To answer who delegated the authority
+the attempt ran under, and to check that the log's `NodeAttemptAdmitted` record agrees
+with the task's durable record, use `ward-node audit --task-root` (§2.6).
 
 Retention is the operator's: the node never deletes an evidence log. A sealed task
 evicted from the registry (§10, capacity) keeps its sealed log, and a replaced attempt
@@ -944,7 +1029,8 @@ connection never sees an outcome. A receipt survives a node restart (§6.4); it 
 when a new attempt replaces its attempt and when its sealed task is evicted: read the
 outcome before then.
 The attempt's evidence log (§6.5) records the same outcome in its `NodeAttemptEnded` or
-`NodeAttemptRecovered` record and outlives both.
+`NodeAttemptRecovered` record and outlives both. `ward-node audit` (§2.6) prints the
+receipt outcome beside the authority chain the attempt was admitted under.
 
 | Outcome | When |
 | --- | --- |

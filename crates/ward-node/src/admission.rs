@@ -127,6 +127,12 @@ impl TrustedTaskAdmission {
         self.identity
     }
 
+    /// The trusted lease this admission was bound under.
+    #[must_use]
+    pub const fn lease(&self) -> &AuthorityLease {
+        &self.lease
+    }
+
     /// Re-check the retained trusted authority against current time and revocations.
     ///
     /// A successful construction is deliberately not a permanent authorization:

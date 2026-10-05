@@ -282,6 +282,27 @@ receipt is not carried over the socket together with the head
 verification are how a control plane binds the two. What the workload wrote is in
 `<task-root>/<task>/<attempt>/` on the host and nowhere else (§11.5).
 
+### 6.1 Answering who delegated what
+
+The record the node keeps for the task answers, from the host alone, who delegated what
+authority to the attempt and when. As the node's user:
+
+```text
+$ ward-node audit --state-dir /var/lib/ward-node/state --task-root /var/lib/ward-node/tasks task_01M45YYRG00001249248SK6H24
+```
+
+The first line names the principal (`prn_…`: the principal your issuer key is bound to,
+§2; a CI runner is a service principal with a key and principal of its own) or, for a
+delegated lease, the agent that delegated it; the lease and delegation ids; the agent that
+holds the lease; the task; and the lease's validity. Then come its grants, its lineage root
+first with each ancestor's grants, the key id, version, node time and operation of the
+`admit`, and the attempt's state, receipt outcome and evidence log. With `--task-root` the
+log is verified and its `NodeAttemptAdmitted` record must agree with the task record, or
+the last line ends `evidence disagrees with the record` and the command exits 1. `--json`
+prints the same as one object (`"schema":1`). Keep the output with the report and the
+head: together they say what ran, under whose authority, and with what result
+(node-integration.md §2.6).
+
 ## 7. Handle failure the way the contract says
 
 Node-integration.md §10 is the full list; these are the cases every control plane meets.

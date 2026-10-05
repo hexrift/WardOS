@@ -563,7 +563,11 @@ with an `unknown` receipt, the process tree still rooted at its recorded process
 killed, and it is never re-run (its workspace also blocks a second start); a `ready` task
 becomes `created` and must be admitted again under a higher version; `created` and ended
 tasks keep their state and receipt; and every applied operation id survives, so replays
-answer as before and never act. Evicting a sealed task removes its record first.
+answer as before and never act. Evicting a sealed task removes its record first. The
+record of an admitted attempt also keeps the authority chain `admit` verified (lease,
+lineage, grants, validity, version and the node time), so `ward-node audit` answers who
+delegated what authority to which task and when from the record alone and cross-checks it
+against the attempt's evidence log (node-integration.md §2.6, #259).
 Dropping the registry stops and reaps every live workload, and a node that dies outright
 takes its sandboxes with it through bubblewrap's `--die-with-parent`, except in the brief
 window before a just-spawned sandbox has armed it. Network grants are a later slice.
