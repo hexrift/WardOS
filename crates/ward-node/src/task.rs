@@ -1886,7 +1886,8 @@ mod tests {
         use crate::task::{MAX_NODE_TASKS, TaskRegistry};
         use crate::test_support::{
             FixedClock, NODE, NOW, envelope_input, issuer_keypair, lifecycle_binding,
-            node_admission, other_keypair, root_lease, sign, signed_admit,
+            network_manifest, node_admission, other_keypair, root_lease, sign, signed_admit,
+            to_hex, with_manifest,
         };
 
         struct Node {
@@ -2290,6 +2291,95 @@ mod tests {
         }
 
         #[test]
+        fn a_manifest_asking_for_network_is_refused_unsupported_grant_and_consumes_no_version() {
+            let mut node = Node::new();
+            let binding = lifecycle_binding();
+            node.create(binding);
+            let network = envelope(|input| with_manifest(input, network_manifest()));
+
+            node.assert_refused(admit(&network), Reason::UnsupportedGrant);
+            node.assert_refused(admit(&network), Reason::UnsupportedGrant);
+            assert_eq!(node.state().last_admitted_version(binding.task()), None);
+
+            let offline = envelope(|_| {});
+            assert_eq!(
+                node.registry.handle(ctx(), admit(&offline)),
+                ctx().accepted(op(20), binding, TaskLifecycleState::Ready)
+            );
+            assert_eq!(
+                node.registry.admitted(binding).unwrap().envelope(),
+                &offline
+            );
+            assert_eq!(
+                node.state().last_admitted_version(binding.task()),
+                Some(AdmissionVersion::new(1).unwrap())
+            );
+
+            assert_eq!(
+                node.registry.handle(ctx(), admit(&network)),
+                ctx().rejected(Some(op(20)), binding, Reason::InvalidState)
+            );
+            assert_eq!(
+                node.registry.admitted(binding).unwrap().envelope(),
+                &offline
+            );
+        }
+
+        #[test]
+        fn an_unhonoured_grant_is_judged_only_once_authority_is_proven() {
+            let mut node = Node::new();
+            let binding = lifecycle_binding();
+            node.create(binding);
+            let network = envelope(|input| with_manifest(input, network_manifest()));
+            let json = AdmissionEnvelopeJson::encode(&network).unwrap();
+
+            let untrusted = ctx()
+                .admit(op(20), binding, json.clone(), sign(&json, &other_keypair()))
+                .unwrap();
+            node.assert_refused(untrusted, Reason::AuthorityDenied);
+
+            node.clock.set(8_000);
+            node.assert_refused(admit(&network), Reason::LeaseExpired);
+            node.clock.set(NOW);
+
+            node.assert_refused(
+                admit(&envelope(|input| {
+                    with_manifest(input, network_manifest());
+                    input.node = NodeId::from_u128(99);
+                })),
+                Reason::AuthorityDenied,
+            );
+            node.assert_refused(admit(&network), Reason::UnsupportedGrant);
+        }
+
+        #[test]
+        fn a_manifest_outside_the_grammar_is_a_malformed_envelope() {
+            let mut node = Node::new();
+            node.create(lifecycle_binding());
+            let json = AdmissionEnvelopeJson::encode(&envelope(|_| {})).unwrap();
+
+            for bytes in [
+                &b"{}"[..],
+                br#"{"network":"development"}"#,
+                br#"{"network":{"custom":[]}}"#,
+                br#"{"network":{"custom":["GitHub.com"]}}"#,
+                br#"{"network":"offline","filesystem":"rw"}"#,
+            ] {
+                let mut value: serde_json::Value = serde_json::from_slice(json.as_bytes()).unwrap();
+                value["workload"]["capability_manifest"] = serde_json::json!({
+                    "hash": ward_events::Blake3Hash::hash(bytes).to_hex(),
+                    "bytes": to_hex(bytes),
+                });
+                let altered = value.to_string();
+                let proof = sign(
+                    &AdmissionEnvelopeJson::new(altered.clone()).unwrap(),
+                    &issuer_keypair(),
+                );
+                node.assert_refused(raw_admit(&altered, proof), Reason::AuthorityDenied);
+            }
+        }
+
+        #[test]
         fn the_decoded_binding_must_equal_the_request_binding() {
             let mut node = Node::new();
             let binding = lifecycle_binding();
@@ -2582,7 +2672,7 @@ mod tests {
         use crate::test_support::{
             FAKE_PID, FakeFreeze, FakeLauncher, FakeSpawn, FakeStop, FixedClock, NOW,
             envelope_input, eventually, fake_process, fill_revocations, lifecycle_binding,
-            node_admission, signed_admit,
+            network_manifest, node_admission, signed_admit,
         };
         use crate::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
 
@@ -2657,6 +2747,14 @@ mod tests {
             }
 
             fn envelope(&self) -> TaskAdmissionEnvelope {
+                let input = envelope_input(lifecycle_binding());
+                self.envelope_with(input.workload.capability_manifest().clone())
+            }
+
+            fn envelope_with(
+                &self,
+                manifest: ward_node_protocol::CapabilityManifestBytes,
+            ) -> TaskAdmissionEnvelope {
                 let mut input = envelope_input(lifecycle_binding());
                 input.workload = ward_node_protocol::TaskWorkload::new(
                     WorkloadArgv::new(vec![
@@ -2665,7 +2763,7 @@ mod tests {
                         "echo ok > out.txt".to_owned(),
                     ])
                     .unwrap(),
-                    input.workload.capability_manifest().clone(),
+                    manifest,
                     self.snapshot,
                     45_000,
                 )
@@ -2747,6 +2845,36 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777
+        }
+
+        #[test]
+        fn a_refused_network_grant_materialises_nothing_and_leaves_no_evidence() {
+            let node = Node::new();
+            let binding = lifecycle_binding();
+            assert_eq!(
+                node.serve(ctx().create(op(10), binding)),
+                ctx().accepted(op(10), binding, State::Created)
+            );
+            let network = node.envelope_with(network_manifest());
+
+            assert_eq!(
+                node.serve(signed_admit(ctx(), op(20), binding, &network)),
+                ctx().rejected(Some(op(20)), binding, Reason::UnsupportedGrant)
+            );
+            assert_eq!(node.state(), State::Created);
+            assert!(node.launcher.launches().is_empty());
+            assert!(!node.root.join(binding.task().to_string()).exists());
+            assert_eq!(node.evidence(), Vec::new());
+            assert!(node.tasks.lock().unwrap().admitted(binding).is_none());
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().rejected(Some(op(30)), binding, Reason::InvalidState)
+            );
+
+            node.ready();
+            assert_eq!(node.evidence(), vec![node.admitted_event(20, 1)]);
+            assert!(!node.workspace().exists());
+            assert!(node.launcher.launches().is_empty());
         }
 
         #[test]
