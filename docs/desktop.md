@@ -439,15 +439,13 @@ tested with `cargo test`.
 
 ## The README animation
 
-`assets/wardos-desktop.gif` is a storyboard rendered from the shipped material (theme
-tokens and wallpaper from `wardos-theme-render`, the Waybar layout, `ward-shell`'s
-launcher and bar lines, real `ward` output), screenshotted with Chromium and assembled
-by [`assets/storyboard/`](../assets/storyboard/README.md). It is not a compositor
-capture, and the README says so under it. Decision: the first five minutes are worth
-showing now, and every string in the storyboard is one the desktop prints, so nothing
-in it can drift from the product without the tests noticing first. The capture that
-replaces it runs Hyprland on a virtual output in CI (issue #84, below); once a captured GIF has
-taken its place, the storyboard directory goes.
+`assets/wardos-desktop.gif` is a capture of the shipped desktop: Hyprland, Waybar,
+mako, fuzzel, foot and hyprlock running on a virtual output in CI, with this checkout's
+`ward`, `wardd` and `ward-shell`, walked from the first login to the lock screen (twelve
+scenes, 1280x720, about 24 s; the current GIF is 386 KB). Every pixel is the
+compositor's; nothing is drawn afterwards, and nothing in it can drift from the product
+without the capture noticing first. It replaced a storyboard rendered from the shipped
+material in a browser (issue #84), which went with it.
 
 The capture is the workflow `desktop capture` (`.github/workflows/desktop-capture.yml`):
 weekly on `main`, by hand, and on pull requests that touch `desktop/` or `image/`. The
@@ -489,7 +487,7 @@ through `hyprctl dispatch exec` (the welcome steps, `wardos-launch run`, `wardos
 `wardos-theme`, `wardos-power`), waited for in `hyprctl layers` and `hyprctl clients`
 rather than slept on, shot with `grim`, and closed again (a menu is cancelled the way
 Escape would). `assemble.py` makes the GIF from the shots with each scene's
-milliseconds, 1280x720 and 128 colours like the storyboard. Every shot is described in
+milliseconds, 1280x720 and 128 colours. Every shot is described in
 the job log (size, how many colours, the dominant one), and a required scene that does
 not come up fails the job with a shot of what was on screen instead, every client's log,
 `hyprctl` monitors, layers and clients, the processes, Hyprland's log without its trace

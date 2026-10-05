@@ -6,7 +6,7 @@
   assemble.py describe SHOT.png              the same line, never failing (a diagnostic shot)
   assemble.py gif SCENES.tsv FRAMES OUT.gif  one GIF frame per NN-<scene>.png in FRAMES, in
                                              scenes.tsv order, shown for that scene's ms;
-                                             1280x720, 128 colours, looped (as the storyboard)
+                                             1280x720, 128 colours, looped
 """
 import sys
 from pathlib import Path
@@ -20,7 +20,7 @@ def scenes(table):
     rows = []
     for line in Path(table).read_text(encoding="utf-8").splitlines():
         if line.strip() and not line.startswith("#"):
-            scene, ms, need, _story, _what = line.split("\t")
+            scene, ms, need, _what = line.split("\t")
             rows.append((scene, int(ms), need))
     return rows
 

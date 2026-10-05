@@ -23,9 +23,9 @@ evidence remain node-local. The node's protocol for such a control plane is in
 tracked under [#332](https://github.com/hexrift/WardOS/issues/332) and is not claimed as
 delivered until its acceptance tests land.
 
-![The WardOS desktop from boot to lock: the splash, autologin into Hyprland, the four steps of the first login (theme, a key kept on the host, a project, an agent), ward claude with the trust bar live, an approval answered from a notification, the command centre, a theme switch to Tokyo Night, the lock screen](assets/wardos-desktop.gif)
+![The WardOS desktop from the first login to the lock screen, captured from the shipped Hyprland: the trust bar with no session over the Ward Dark wallpaper, the four steps of the first login (a theme, a key kept on the host, a project, an agent), ward init and ward up on ward-demo in the terminal with the trust bar going live, the closing step, ward watch beside the session with the welcome toast, the command centre, a theme switch to Tokyo Night, the lock screen](assets/wardos-desktop.gif)
 
-<p align="center"><sub>Rendered from the shipped configs, theme tokens and real command output (<a href="assets/storyboard/">how</a>); a compositor capture is <a href="https://github.com/hexrift/WardOS/issues/84">#84</a>.</sub></p>
+<p align="center"><sub>Captured from the shipped Hyprland, Waybar, mako, fuzzel, foot and hyprlock on a virtual output in CI, every pixel the compositor's (<a href="docs/desktop.md#the-readme-animation">how</a>). Not shown: an agent at work, an approval and <code>ward verify</code>, since CI has no model key and no user namespaces.</sub></p>
 
 ```bash
 ward init            # policy, verifier config and TamperWard wiring for this directory

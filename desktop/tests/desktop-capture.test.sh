@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The README capture (desktop/capture, issue #84), checked without a compositor: the scene
-# table is well-formed and matches capture.sh's scene functions and the storyboard's
-# durations, every package is the image's or says why not, every wardos-* command the
+# table is well-formed and matches capture.sh's scene functions, every package is the
+# image's or says why not, every wardos-* command the
 # capture drives exists, the workflow, ci-run.sh and refresh.sh agree on names and on the
 # render node, and refresh.sh takes the GIF from the right run. The capture itself runs
 # in CI (desktop-capture.yml).
@@ -13,7 +13,6 @@ cap="$test_root/desktop/capture"
 table="$cap/scenes.tsv"
 script="$cap/capture.sh"
 ci_run="$cap/ci-run.sh"
-story="$test_root/assets/storyboard/story.py"
 workflow="$test_root/.github/workflows/desktop-capture.yml"
 docs="$test_root/docs/desktop.md"
 assert_file "$table"
@@ -41,8 +40,8 @@ total=0
 while IFS= read -r line; do
   [[ -z $line || $line == \#* ]] && continue
   IFS=$'\t' read -r -a f <<<"$line"
-  [[ ${#f[@]} -eq 5 ]] || fail "scenes.tsv: five tab-separated fields, got ${#f[@]}: $line"
-  id=${f[0]} ms=${f[1]} need=${f[2]} cap_story=${f[3]} what=${f[4]}
+  [[ ${#f[@]} -eq 4 ]] || fail "scenes.tsv: four tab-separated fields, got ${#f[@]}: $line"
+  id=${f[0]} ms=${f[1]} need=${f[2]} what=${f[3]}
   [[ $id =~ ^[a-z]+$ ]] || fail "scenes.tsv: scene id '$id' is not lower-case letters"
   for seen in "${ids[@]}"; do [[ $seen != "$id" ]] || fail "scenes.tsv: $id twice"; done
   ids+=("$id")
@@ -51,10 +50,6 @@ while IFS= read -r line; do
   [[ $need == required || $need == optional ]] || fail "scenes.tsv: $id need is '$need'"
   [[ -n $what ]] || fail "scenes.tsv: $id says nothing about what is on screen"
   grep -q "^scene_$id() " "$script" || fail "capture.sh has no scene_$id"
-  if [[ $cap_story != - && -f $story ]]; then
-    grep -qF "\"$cap_story\", $ms)" "$story" ||
-      fail "scenes.tsv: $id stands in for the storyboard frame '$cap_story', which story.py does not show for $ms ms"
-  fi
 done <"$table"
 [[ ${#ids[@]} -ge 8 ]] || fail "scenes.tsv: ${#ids[@]} scenes"
 [[ $(awk -F'\t' '!/^#/ && NF { print $3; exit }' "$table") == required ]] || fail "the first scene must be required"

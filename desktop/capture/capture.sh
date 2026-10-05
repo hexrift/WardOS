@@ -510,7 +510,7 @@ summary=$out/summary.md
 } >"$summary"
 
 n=0
-while IFS=$'\t' read -r -u 3 id ms need _story what; do
+while IFS=$'\t' read -r -u 3 id ms need what; do
   [[ -z $id || $id == \#* ]] && continue
   n=$((n + 1))
   png=$(printf '%s/%02d-%s.png' "$frames" "$n" "$id")
