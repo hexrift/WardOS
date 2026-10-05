@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::sync::{Arc, Mutex};
 
 use ward_daemon::control::{RemoteSink, Request, Response};
@@ -1588,9 +1589,9 @@ fn stop_restore_entry_through_the_daemon_pauses_restores_then_terminates() {
 
     let bin = tempfile::tempdir().unwrap();
     let bwrap = bin.path().join("bwrap");
-    fs::copy("/bin/sh", &bwrap).unwrap();
     let marker = format!("ward-stop-fake-{}", std::process::id());
-    let mut tree = std::process::Command::new(&bwrap)
+    let mut tree = std::process::Command::new("/bin/sh")
+        .arg0(&bwrap)
         .args(["-c", &format!("while :; do sleep 0.05; done # {marker}")])
         .arg(ward_daemon::session::run_dir_path(&session_id).join("proxy.sock"))
         .stdout(std::process::Stdio::null())
@@ -1636,13 +1637,12 @@ fn stop_restore_entry_through_the_daemon_pauses_restores_then_terminates() {
 }
 
 /// A process tree the daemon's scan recognises as `session_id`'s sandbox on
-/// any host (a copy of `sh` named `bwrap`, bound to the session's run
-/// directory), looping forever; its command line carries `marker`. The copy
-/// lives in `bin`, which must outlive the tree.
+/// any host (`sh` run with an `argv[0]` named `bwrap`, bound to the session's
+/// run directory), looping forever; its command line carries `marker`.
 fn fake_sandbox(bin: &std::path::Path, session_id: &str, marker: &str) -> std::process::Child {
     let bwrap = bin.join("bwrap");
-    fs::copy("/bin/sh", &bwrap).unwrap();
-    let tree = std::process::Command::new(&bwrap)
+    let tree = std::process::Command::new("/bin/sh")
+        .arg0(&bwrap)
         .args(["-c", &format!("while :; do sleep 0.05; done # {marker}")])
         .arg(ward_daemon::session::run_dir_path(session_id).join("proxy.sock"))
         .stdout(std::process::Stdio::null())
