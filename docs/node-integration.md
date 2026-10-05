@@ -1301,8 +1301,9 @@ Beside the crate, `examples/node-control-plane` is a reference implementation of
 control-plane side in plain Node.js (>= 22, no dependencies): ids and their derivation
 from a control plane's own ids (§7.2), the issuer key and proof with `node:crypto` (§2.3,
 §7.4, reproduced byte for byte in its tests), the envelope (§7), a durable per-task
-version (§7.3, §10), and the adapter conversation of §11.4 with cancellation, replay and
-the outcome mapping; `scripts/acceptance/node-js.sh` proves it against a real node. It
+version (§7.3, §10), the adapter conversation of §11.4 with cancellation, replay and
+the outcome mapping, and result return (§6.6, §7.5) with every returned digest verified;
+`scripts/acceptance/node-js.sh` proves it against a real node. It
 is the worked example for [node-integration-from-nodejs.md](node-integration-from-nodejs.md).
 
 ### 11.1 Operator requirements for a client host

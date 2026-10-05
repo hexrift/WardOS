@@ -6,7 +6,8 @@ TypeScript — concretely, the worker execution boundary of
 that wants `ward-node` to run its bounded workloads. It says what to install, what to
 keep where, how to derive the ids and the version, how to build and sign the envelope with
 `node:crypto`, how to spawn `ward-node-adapter` and speak its JSON lines, how to read the
-outcome, how to cancel and how to recover after a restart on either side. Every rule
+outcome, how to ask for and read back a bounded result, how to cancel and how to recover
+after a restart on either side. Every rule
 here is the contract's, [node-integration.md](node-integration.md), cited by section;
 nothing here adds to it. The reference implementation of everything below is
 [`examples/node-control-plane`](../examples/node-control-plane/README.md): a
@@ -19,7 +20,8 @@ change after the Rust acceptance suite ([node-acceptance.md](node-acceptance.md)
 The shape of the integration is the one of node-integration.md §11.5: the control plane
 keeps its agent loop and its authority on its own side, and hands the node one bounded,
 offline action at a time — an `argv` over a snapshot with a wall-clock budget — reading
-back the receipt and, on the host, the evidence log. What the node cannot do yet for
+back the receipt, the bounded output the manifest declared (§7.1 below) and, on the host, the
+evidence log. What the node cannot do yet for
 such a control plane is §11 below; read it before deciding which actions go through the
 node.
 
@@ -63,7 +65,9 @@ $ node examples/node-control-plane/control-plane.mjs capabilities --socket /run/
 {"protocol":{"major":1,"minor":3},…,"lifecycle":{"pause":true,"stop":true,"revoke":true,"admit":true,"start":true}}
 ```
 
-`lifecycle.start` must be `true` (§5).
+`lifecycle.start` must be `true` (§5). For result return (§7.1 below) start the node with
+`--output-return` as well; its document then also carries
+`"output":{"stdio":true,"files":true}`.
 
 ## 2. Key custody
 
@@ -213,7 +217,8 @@ const signed = signEnvelope(issuer, envelope);    // { envelope_json, proof, bin
 or lower-case id, a lease that is not the binding's lease or task or whose subject is not
 `agent`, an empty or oversized `argv`, a NUL, unsorted or duplicate grants, a budget below
 1, a snapshot that is not 64 lowercase hex digits, `expires_at <= issued_at`, a version
-below 1, a manifest outside §7.5's grammar, or an envelope over 32 KiB. It writes the keys
+below 1, a manifest outside §7.5's grammar or with an `output` grant above the node's
+ceilings (§7.1 below), or an envelope over 32 KiB. It writes the keys
 in the order the §7.4 vector has them; `serialiseEnvelope` is `JSON.stringify`, compact,
 which is also what the node's own encoder produces.
 
@@ -251,8 +256,8 @@ child.stdin.write(JSON.stringify({ cmd: "run", envelope_json: signed.envelope_js
 
 Rules of the conversation:
 
-- **One command, one answer stream.** `capabilities`, `inspect` and `revoke` answer with
-  one event each; `run` answers with a stream that ends in exactly one `done`. Do not send
+- **One command, one answer stream.** `capabilities`, `inspect`, `result` and `revoke`
+  answer with one event each; `run` answers with a stream that ends in exactly one `done`. Do not send
   the next command before the stream ended: during a `run` the adapter is driving the
   node and reads stdin only afterwards.
 - **Pre-signed only.** Send `envelope_json` (the signed string) and `proof`; never
@@ -290,21 +295,25 @@ One complete run, as the reference client logged it with `--trace` against a rea
 ```
 
 The stream may also carry `rejected` (a refused verb, with its reason), `recovering` (a
-lost answer being recovered by `inspect` and one replay, §11.2) and, for a cancelled or
-budget-killed attempt, a `receipt` with `revoked`/`failed` or `exited`/`failed`. The
-reference client's `Adapter` class is this conversation with a promise per command and an
-`onEvent` hook; `--trace` on the command line prints every line as above.
+lost answer being recovered by `inspect` and one replay, §11.2), `output` (the counts of
+a result read after `seal` when the manifest granted one; the bytes are in `done`, §7.1
+below) and, for a cancelled or budget-killed attempt, a `receipt` with `revoked`/`failed`
+or `exited`/`failed`. The reference client's `Adapter` class is this conversation with a
+promise per command and an `onEvent` hook; `--trace` on the command line prints every line
+as above.
 
 ## 7. Outcomes and their mapping
 
 The `done` event's `report` is the attempt report of §11.3. Read it in this order, and
 map it as the table says; the reference client's `outcomeOf(report)` does exactly this
 and returns `{outcome, certain, exitStatus, receipt, cause, finalState, sealed, cancelled,
-deadlineExceeded, evidenceLog, evidenceHead, refused, transportError, binding}`:
+deadlineExceeded, evidenceLog, evidenceHead, refused, transportError, output,
+outputMissing, binding}` (`output` and `outputMissing`: §7.1 below):
 
 | Report | Means | For ai-institution's execution receipt |
 | --- | --- | --- |
 | `outcome` `completed`, `outcome_certain` `true` | The sandbox exited 0 within its budget (§9); `cause` is `{"Exited":{"code":0}}` | A successful governed execution: `exitStatus` 0. The receipt's binding is the WardOS `binding`; keep `evidence_head` (the sealed log's head) and `evidence_log` as the adapter receipt id and the provenance pointer. |
+| `outcome` `completed`, the manifest granted `output`, `output` `null` (`outputMissing` `true`) | The workload exited 0, but its granted result did not come back: `result` was refused or its answer lost (§6.6) | **Not a success:** what the action ran to produce cannot be read. Retry as a new attempt (§9 below), or read the workspace on the host out of band. |
 | `outcome` `failed`, `cause` `{"Exited":{"code":N}}` | Non-zero exit | A failed execution with `exitStatus` N. |
 | `outcome` `failed`, `cause` `"BudgetExceeded"` | Killed at `wall_clock_budget_ms`, also while paused (§10) | A failed execution by deadline; no exit status. |
 | `outcome` `failed`, `cancelled` `true`, `cause` `"Killed"` or `"NotStarted"` | Revoked by the control plane (§8 below) | Cancelled; no exit status. The lease is revoked for good on this node. |
@@ -313,13 +322,84 @@ deadlineExceeded, evidenceLog, evidenceHead, refused, transportError, binding}`:
 | `deadline_exceeded` `true` | The workload outlived its budget plus the driver's grace and was revoked | Failed; the node's budget enforcement did not end it in time, which is worth an alert. |
 | `sealed` `false` | `seal` was refused or never answered | The task still counts against the node's 1 024 (§10); seal it from a later `inspect`/replay, or it is evicted when the registry fills. |
 
-Two things the report does not carry: the workload's output and its files (§11 below),
-and the receipt bound to the evidence head over the socket (node-security-limitations.md
-§3.3) — the binding exists on the host, which is why `evidence_head` from a run with
-`task_root` and `ward-node audit --task-root` are what close it.
+What the report does not carry: anything of the workload's output beyond what the
+manifest declared (§7.1 and §11 below), and the receipt bound to the evidence head over the
+socket (node-security-limitations.md §3.3) — the binding exists on the host, which is why
+`evidence_head` from a run with `task_root` and `ward-node audit --task-root` are what
+close it.
 
 The command line prints the outcome object as one JSON line and exits 0 only for
-`completed` and not cancelled, 1 for everything else, 2 for its own failure.
+`completed`, not cancelled and, when the manifest granted output, with the output back; 1
+for everything else; 2 for its own failure, a returned result that fails verification
+included.
+
+### 7.1 Result return
+
+A node started with `--output-return` (node-integration.md §2.1) returns a bounded result
+of an ended attempt when, and only when, the envelope's manifest asked for it (§6.6,
+§7.5). The capability document says whether it can: `output.stdio` and `output.files`
+both `true`; without them the section is absent and a manifest with an `output` grant is
+refused `unsupported_grant` at `admit`, with nothing run.
+
+**The grant** is part of the signed manifest, next to `network`:
+
+```json
+{"network":"offline","output":{"stdio_bytes":4096,"files":["out/report.json","coverage/summary.json"],"files_bytes":65536}}
+```
+
+`stdio_bytes` is how much of the *head* of each of stdout and stderr to keep;
+`files` are exact workspace paths (0–64, each 1–255 bytes of `a-z A-Z 0-9 . _ - /`,
+relative, no `.` or `..` component, no globs, no directories); `files_bytes` is the
+content budget for all of them together, taken in declaration order. The node honours at
+most 1 MiB (1 048 576) per stream and 8 MiB (8 388 608) of file content and refuses a
+larger grant `unsupported_grant`; `0` is a grant too (counts and digests only). With the
+reference client, `workload.manifest` takes the object, `outputGrant({stdioBytes, files,
+filesBytes})` builds it, and both refuse a path outside the grammar or a budget above the
+ceilings before anything is signed (`OUTPUT_CEILINGS` holds them); the command line takes
+`--stdio-bytes`, `--files` (repeatable, comma-separated) and `--files-bytes`.
+
+**What comes back.** After `seal` the adapter asks `result` once and `done`'s report
+carries `output` (§11.3), the §6.6 object: `stdout` and `stderr` as `{bytes, truncated,
+dropped, content_base64}` and one `files` entry per declared path, in declaration order.
+`{"cmd":"result","binding":{…}}` reads the same bytes again later, as often as needed,
+until the attempt is replaced (`Adapter.result(binding)`, `control-plane.mjs result`).
+Each file entry is one of three shapes:
+
+| Entry | Means |
+| --- | --- |
+| `{path, size, digest, truncated: false, content_base64}` | Returned whole: `size` bytes, `digest` the BLAKE3-256 of exactly those bytes. |
+| `{path, size, digest, truncated: true}` | Digest-only: the file was there and regular, but its content did not fit what was left of `files_bytes`; `size` and `digest` are still of the whole file. |
+| `{path, skipped}` | Not read: `missing` (nothing at the path), `not_a_regular_file` (a directory, a symlink or anything else, on the path or at it; nothing is followed) or `too_large` (above 64 MiB, neither read nor digested). |
+
+`truncated` on a stream means the workload wrote more than `stdio_bytes`: the first
+`bytes` are returned and `dropped` counts the rest, which is gone (no tail is kept).
+`truncated` on a file means digest-only. Neither is an error of the attempt; both say the
+grant was smaller than what the workload produced. Size the grant to the verdict the
+control plane needs (a JSON report, a summary), not to the workload's whole log.
+
+**Verify before use.** `decodeOutput` (and `outcomeOf`, which calls it) decodes the base64,
+checks that every count, flag and shape agrees with §6.6, recomputes BLAKE3-256 over each
+returned file's content and compares it with `digest`; a mismatch is refused (a
+`ContractError`, exit status 2 on the command line), never reported as the file. Given the
+grant the attempt was admitted under (`outcomeOf(report, {grant: outputGrantOf(signed.envelope_json)})`),
+it also holds the result to it: exactly the declared paths in order, no stream head above
+`stdio_bytes`, no more returned content than `files_bytes`. The same digests are recorded,
+without the bytes, in the sealed evidence log's `NodeAttemptOutputCollected` record
+(§6.5), so a check on the host that reads the log binds what the control plane received
+to what the node collected; the acceptance finds each returned digest in the sealed log. `writeReturnedFiles(dir, files)`
+(`--out-dir` on the command line) writes the returned files under one directory at their
+declared paths, mode 0600, refusing before anything is written a path that would leave the
+directory, cross a symlink in it or overwrite a file.
+
+**A missing or unknown output is not success.** When the grant asked for a result and
+`output` is `null` — the node refused `result` (`resource_unavailable`: the node lost
+track of the workload, restarted before collecting it, or could not store it), the answer
+was lost, or the attempt was refused or never ran — `outcomeOf` sets `outputMissing`, and
+the command line exits 1 even for a `completed` attempt: whatever the control plane ran
+the workload to learn cannot be read. An `unknown` outcome stays unknown whatever output it
+has. A file entry `skipped` or digest-only is a fact about the workspace, reported
+truthfully; whether a verdict file that came back `missing` fails the action is the
+control plane's policy, and the conservative reading is that it does.
 
 ## 8. Cancel
 
@@ -381,19 +461,30 @@ before replacing an attempt, because a new attempt discards the old receipt (§9
 ## 10. The proof
 
 ```bash
-cd examples/node-control-plane && node --test       # 22 cases, no node, no sandbox
-scripts/acceptance/node-js.sh                        # 5 cases against a real node; skips loudly without bubblewrap
+cd examples/node-control-plane && node --test       # 42 cases, no node, no sandbox
+scripts/acceptance/node-js.sh                        # 8 cases against a real node; skips loudly without bubblewrap
 WARD_REQUIRE_ISOLATION=1 scripts/acceptance/node-js.sh   # fail instead of skipping, as CI does
 ```
 
 The unit suite proves the §7.4 vector (the serialised bytes, the key id, the signature
 and the complete `admit` line), the id rendering and derivation, the version counter
-across a process restart, and the JSON-lines framing against a fake adapter that records
-every line. The acceptance starts a real node with the client's generated key in its
-trust store and proves `completes_and_seals`, `fails_with_exit_status`,
-`cancel_is_revoke_then_seal`, `replay_acts_on_nothing` and
-`version_is_held_strictly_increasing`, verifying every evidence log with `ward-node
-audit --task-root` (and `ward replay --verify` when a `ward` binary is at hand). It runs
+across a process restart, the JSON-lines framing against a fake adapter that records
+every line, and result return: the `output` grant's grammar and ceilings, decoding with
+every digest recomputed (a mismatch refused), the result held to its grant, a granted
+output that did not come back reported missing, and writing returned files without
+escaping their directory. The acceptance starts a real node with the client's generated
+key in its trust store and `--output-return` and proves `completes_and_seals`,
+`fails_with_exit_status`, `cancel_is_revoke_then_seal`, `replay_acts_on_nothing`,
+`version_is_held_strictly_increasing`,
+`output_returns_declared_content_with_matching_digests` (both streams and two declared
+files back byte for byte, each digest equal to BLAKE3-256 of the file on the host and in
+the sealed log, `--out-dir` holding them),
+`output_marks_truncation_past_the_budgets` (the heads with `truncated` and the dropped
+counts, a file past the budget digest-only with the host file's digest) and, against a
+second node without the flag, `output_grant_is_refused_without_the_flag`
+(`unsupported_grant`, reported `refused` and certain, not `unknown`), verifying every
+evidence log with `ward-node audit --task-root` (and `ward replay --verify` when a `ward`
+binary is at hand). It runs
 as part of `scripts/acceptance/node.sh` in CI, so the table in the verify job's summary
 ends with its verdicts; it passes as root and as an unprivileged user, which is how a
 control plane's user runs it.
@@ -404,12 +495,14 @@ Each of these is a row of [node-security-limitations.md](node-security-limitatio
 with its impact, the mitigation and the issue; this is the list for a Node.js control
 plane deciding what to put through the node today:
 
-- **Result return.** The workload's stdout and stderr are drained and not returned, and
-  the workspace is not exported (§9, §11.5). What a workload wrote is in
-  `<task-root>/<task>/<attempt>/` on the host, readable only as the node's uid. Bounded
-  output and a workspace export on `inspect`/`seal` are landing as protocol 1.4 in a
-  parallel pull request; until it merges, design workloads whose exit status is the
-  verdict (a verification run), and read artifacts on the host out of band.
+- **Output beyond the bounded result.** A result is the head of each stream up to 1 MiB
+  and the files the manifest declared by exact path, up to 8 MiB of content, read once
+  the attempt has ended (§7.1 above; node-integration.md §6.6). There is no tail, no streaming while the attempt
+  runs, no globs or directories and no workspace export (§11.5): what the workload wrote
+  beyond the declared files stays in `<task-root>/<task>/<attempt>/` on the host,
+  readable only as the node's uid. Design workloads to leave their verdict in a small
+  declared file (a JSON report) and their exit status, and read anything larger on the
+  host out of band.
 - **In-sandbox callbacks.** There is no channel from the workload to the control plane:
   no `stream`, no socket into the sandbox (§6.1, §11.5). An agent loop that needs tool
   results, model calls or approvals from outside the sandbox stays on the control plane;
@@ -451,6 +544,10 @@ behind an adapter:
 - [ ] The adapter spawned like TamperWard (§6): pre-signed `run`, `task_root`, a timeout
       above budget + grace + 90 s; one command at a time; `done` parsed into the outcome
       (§7); `unknown` mapped to failure.
+- [ ] Nodes started with `--output-return`, and each action's verdict file and stream
+      budget declared in its manifest's `output` grant within the ceilings (§7.1 above); every
+      returned file's digest verified before use; a granted output that is missing treated
+      as failure, never success.
 - [ ] The signed bytes, proof, ids and version persisted before the first send; replay on
       restart with the same adapter conversation (§9); no second attempt until the first is
       ended.
@@ -460,4 +557,5 @@ behind an adapter:
       status, the evidence log path and sealed head, so the verifier evidence package can
       bind the claim to it; `ward-node audit --json` as the operator's cross-check.
 - [ ] The limitations of §11 reflected in which actions are routed to the node: exit
-      status as verdict until result return lands; agent loops stay on the control plane.
+      status plus bounded declared outputs as the verdict; agent loops stay on the control
+      plane.

@@ -38,7 +38,10 @@ scripts/acceptance/node.sh
 After the table, `node.sh` runs [`scripts/acceptance/node-js.sh`](../scripts/acceptance/node-js.sh),
 the acceptance of the Node.js reference control plane
 ([node-integration-from-nodejs.md](node-integration-from-nodejs.md) §10) against a second
-real node, under the same isolation requirement; its five verdicts follow the table and a
+real node started with `--output-return` (and a third without it), under the same
+isolation requirement; its eight verdicts (five of the attempt's lifecycle, three of
+result return: declared content with digests the host agrees with, truncation past the
+budgets, and the refusal of a grant by a node without the flag) follow the table and a
 failure of either fails the run. The cases below are the Rust suite's.
 
 The cases also run, in parallel with the rest of the workspace, under the merge gate

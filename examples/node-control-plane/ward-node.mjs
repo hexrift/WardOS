@@ -14,6 +14,7 @@ import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, ran
 import {
   closeSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -21,7 +22,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 
 import { blake3Hex } from "./blake3.mjs";
@@ -37,12 +38,22 @@ export const OFFLINE_MANIFEST = Object.freeze({ network: "offline" });
 /** Every id prefix of §7.2. */
 export const ID_PREFIXES = Object.freeze(["task", "exec", "lease", "agent", "node", "sess", "deleg", "prn"]);
 
+/**
+ * What a node honours of an `output` grant (§6.6, §7.5): at most 1 MiB of each stream, 8
+ * MiB of file content in all, 64 declared paths of at most 255 bytes. A grant above these
+ * is refused `unsupported_grant` by every node, so the client refuses it before signing.
+ */
+export const OUTPUT_CEILINGS = Object.freeze({ stdioBytes: 1_048_576, filesBytes: 8_388_608, files: 64, pathBytes: 255 });
+
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const ID_BODY = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
 const HEX_32 = /^[0-9a-f]{64}$/;
 const CAPABILITY = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const RESOURCE = /^[\x21-\x7e]{1,256}$/;
 const HOST_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+const OUTPUT_PATH_COMPONENT = /^[A-Za-z0-9._-]+$/;
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const OUTPUT_SKIPS = Object.freeze(["missing", "not_a_regular_file", "too_large"]);
 const MAX_ENVELOPE_BYTES = 32768;
 const MAX_ARGV_ENTRY_BYTES = 4096;
 const MAX_ARGV_BYTES = 16384;
@@ -144,12 +155,8 @@ export function randomId(prefix) {
 // Capability manifest (§7.5)
 // ---------------------------------------------------------------------------------------
 
-function checkManifest(object) {
-  if (object === null || typeof object !== "object" || Array.isArray(object)) refuse("a manifest is one JSON object");
-  const keys = Object.keys(object);
-  if (keys.length !== 1 || keys[0] !== "network") refuse("a manifest has exactly the field `network`");
-  const network = object.network;
-  if (network === "offline") return;
+function checkNetwork(network) {
+  if (network === "offline") return network;
   if (network === null || typeof network !== "object" || Object.keys(network).join() !== "custom") {
     refuse("manifest `network` is \"offline\" or {\"custom\":[hosts]}");
   }
@@ -164,14 +171,103 @@ function checkManifest(object) {
       refuse(`manifest host ${JSON.stringify(host)} is not a lowercase DNS name or *.name pattern`);
     }
   }
+  return { custom: [...hosts] };
 }
 
-/** The manifest as the envelope carries it: hex bytes as sent and their BLAKE3-256 (§7.3). */
+/**
+ * A declared output path (§7.5): 1–255 bytes of `a-z A-Z 0-9 . _ - /`, relative to the
+ * workspace, no empty, `.` or `..` component, no leading, trailing or doubled `/`.
+ */
+function checkOutputPath(path, what) {
+  if (typeof path !== "string" || path.length === 0 || Buffer.byteLength(path, "utf8") > OUTPUT_CEILINGS.pathBytes) {
+    refuse(`${what} path ${JSON.stringify(path)} is 1 to ${OUTPUT_CEILINGS.pathBytes} bytes`);
+  }
+  for (const component of path.split("/")) {
+    if (component === "" || component === "." || component === ".." || !OUTPUT_PATH_COMPONENT.test(component)) {
+      refuse(`${what} path ${JSON.stringify(path)} is not a relative workspace path of a-z A-Z 0-9 . _ - / components without . or ..`);
+    }
+  }
+  return path;
+}
+
+function checkOutputPaths(files, what) {
+  if (!Array.isArray(files) || files.length > OUTPUT_CEILINGS.files) refuse(`${what} files lists 0 to ${OUTPUT_CEILINGS.files} paths`);
+  const paths = files.map((path) => checkOutputPath(path, what));
+  if (new Set(paths).size !== paths.length) refuse(`${what} files repeats a path`);
+  return paths;
+}
+
+function checkOutputBudget(value, name, ceiling) {
+  if (!Number.isSafeInteger(value) || value < 0) refuse(`output grant \`${name}\` is an integer >= 0`);
+  if (value > ceiling) refuse(`output grant \`${name}\` ${value} is above the ${ceiling} every node refuses as unsupported_grant`);
+  return value;
+}
+
+function checkOutputGrant(output) {
+  if (output === null || typeof output !== "object" || Array.isArray(output)) refuse("manifest `output` is one object");
+  const keys = Object.keys(output).sort().join();
+  if (keys !== "files,files_bytes,stdio_bytes") refuse("manifest `output` has exactly the fields stdio_bytes, files, files_bytes");
+  return {
+    stdio_bytes: checkOutputBudget(output.stdio_bytes, "stdio_bytes", OUTPUT_CEILINGS.stdioBytes),
+    files: checkOutputPaths(output.files, "output grant"),
+    files_bytes: checkOutputBudget(output.files_bytes, "files_bytes", OUTPUT_CEILINGS.filesBytes),
+  };
+}
+
+/**
+ * The §7.5 `output` grant in wire spelling from the control plane's words: the first
+ * `stdioBytes` of each of stdout and stderr, the declared `files` with up to `filesBytes`
+ * of content in all. Refused outside the grammar or above the node's ceilings.
+ */
+export function outputGrant({ stdioBytes, files, filesBytes }) {
+  return checkOutputGrant({ stdio_bytes: stdioBytes, files, files_bytes: filesBytes });
+}
+
+/** The manifest in canonical key order, refusing anything outside the §7.5 grammar. */
+function checkManifest(object) {
+  if (object === null || typeof object !== "object" || Array.isArray(object)) refuse("a manifest is one JSON object");
+  const keys = Object.keys(object);
+  if (!keys.includes("network") || keys.some((key) => key !== "network" && key !== "output")) {
+    refuse("a manifest has the field `network` and optionally `output`, nothing else");
+  }
+  const canonical = { network: checkNetwork(object.network) };
+  if (keys.includes("output")) canonical.output = checkOutputGrant(object.output);
+  return canonical;
+}
+
+/**
+ * The manifest as the envelope carries it: hex bytes as sent and their BLAKE3-256 (§7.3).
+ * The bytes are compact JSON with `network` first and `output`, when granted, second,
+ * whatever order the caller wrote the fields in, so one grant has one signed spelling.
+ */
 export function manifest(object = OFFLINE_MANIFEST) {
-  checkManifest(object);
-  const bytes = Buffer.from(JSON.stringify(object), "utf8");
+  const bytes = Buffer.from(JSON.stringify(checkManifest(object)), "utf8");
   if (bytes.length > MAX_MANIFEST_BYTES) refuse(`a manifest is at most ${MAX_MANIFEST_BYTES} bytes`);
   return { hash: blake3Hex(bytes), bytes: bytes.toString("hex") };
+}
+
+/**
+ * The `output` grant a signed envelope's manifest carries (wire spelling), or `null`
+ * without one: what a run of it must return. Takes the serialised envelope (`envelope_json`
+ * of a signed run or a run record) and reads the manifest from its exact bytes.
+ */
+export function outputGrantOf(envelopeJson) {
+  if (typeof envelopeJson !== "string") refuse("envelope_json is the serialised envelope");
+  let envelope;
+  try {
+    envelope = JSON.parse(envelopeJson);
+  } catch {
+    refuse("envelope_json is not JSON");
+  }
+  const hex = envelope?.workload?.capability_manifest?.bytes;
+  if (typeof hex !== "string" || !/^(?:[0-9a-f]{2})+$/.test(hex)) refuse("the envelope carries no manifest bytes");
+  let object;
+  try {
+    object = JSON.parse(Buffer.from(hex, "hex").toString("utf8"));
+  } catch {
+    refuse("the envelope's manifest is not JSON");
+  }
+  return checkManifest(object).output ?? null;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -677,6 +773,18 @@ export class Adapter {
   }
 
   /**
+   * `result` for the binding (§6.6), for a run driven elsewhere or read again later:
+   * {state, output} with the output decoded and every digest verified (`decodeOutput`),
+   * or a rejection {rejected: reason}. A `run` under an `output` grant needs no `result`
+   * of its own: the adapter reads it after `seal` and `done` carries it.
+   */
+  async result(binding) {
+    const event = await this.#one({ cmd: "result", binding }, ["result", "rejected"]);
+    if (event.event === "rejected") return { rejected: event.reason };
+    return { state: event.state, output: decodeOutput(event.output) };
+  }
+
+  /**
    * Drive one attempt with a pre-signed envelope: `create`, `admit`, `start`, poll, read the
    * receipt, `seal`. Resolves with every event and the `done` report once the adapter
    * writes it; `onEvent` sees each event as it arrives. Replaying with the same `signed`
@@ -716,6 +824,173 @@ export class Adapter {
 }
 
 // ---------------------------------------------------------------------------------------
+// The bounded result (§6.6)
+// ---------------------------------------------------------------------------------------
+
+function decodeBase64(text, what) {
+  if (typeof text !== "string" || !BASE64.test(text)) refuse(`${what} content_base64 is standard base64 with padding`);
+  return Buffer.from(text, "base64");
+}
+
+function checkCount(value, what) {
+  if (!Number.isSafeInteger(value) || value < 0) refuse(`${what} is an integer >= 0`);
+  return value;
+}
+
+function decodeStream(stream, what) {
+  if (stream === null || typeof stream !== "object" || Object.keys(stream).sort().join() !== "bytes,content_base64,dropped,truncated") {
+    refuse(`${what} is {bytes, truncated, dropped, content_base64}`);
+  }
+  const content = decodeBase64(stream.content_base64, what);
+  if (checkCount(stream.bytes, `${what} bytes`) !== content.length) refuse(`${what} bytes ${stream.bytes} is not the content's length ${content.length}`);
+  const dropped = checkCount(stream.dropped, `${what} dropped`);
+  if (stream.truncated !== (dropped > 0)) refuse(`${what} truncated is true exactly when dropped > 0`);
+  return { bytes: content.length, truncated: dropped > 0, dropped, content };
+}
+
+function decodeFile(file, index) {
+  if (file === null || typeof file !== "object") refuse(`output files[${index}] is an object`);
+  const path = checkOutputPath(file.path, `output files[${index}]`);
+  const keys = Object.keys(file).sort().join();
+  if (keys === "path,skipped") {
+    if (!OUTPUT_SKIPS.includes(file.skipped)) refuse(`${path} skipped is one of ${OUTPUT_SKIPS.join(", ")}`);
+    return { path, skipped: file.skipped };
+  }
+  if (keys === "digest,path,size,truncated") {
+    if (file.truncated !== true) refuse(`${path}: a file without content is digest-only, so truncated is true`);
+    if (typeof file.digest !== "string" || !HEX_32.test(file.digest)) refuse(`${path} digest is 64 lowercase hex digits`);
+    return { path, size: checkCount(file.size, `${path} size`), digest: file.digest, truncated: true };
+  }
+  if (keys !== "content_base64,digest,path,size,truncated") {
+    refuse(`${path}: an output file is {path, skipped}, {path, size, digest, truncated: true} or {path, size, digest, truncated: false, content_base64}`);
+  }
+  if (file.truncated !== false) refuse(`${path}: returned content is never truncated`);
+  if (typeof file.digest !== "string" || !HEX_32.test(file.digest)) refuse(`${path} digest is 64 lowercase hex digits`);
+  const content = decodeBase64(file.content_base64, path);
+  if (checkCount(file.size, `${path} size`) !== content.length) refuse(`${path} size ${file.size} is not the content's length ${content.length}`);
+  // The digest is recomputed over the bytes received; content whose digest disagrees is
+  // refused here, so nothing downstream ever sees it as the file the node collected.
+  const digest = blake3Hex(content);
+  if (digest !== file.digest) refuse(`${path}: the returned digest ${file.digest} is not the BLAKE3-256 of the returned content, ${digest}`);
+  return { path, size: content.length, digest, truncated: false, content };
+}
+
+/**
+ * Decode the `output` of a `result` answer or a `done` report (§6.6) into bytes, checking
+ * every count and flag and recomputing every returned file's BLAKE3-256 over its content;
+ * a result whose digests, sizes or shape disagree is refused. Streams are `{bytes,
+ * truncated, dropped, content}` (a Buffer, the head of the stream); files are `{path,
+ * size, digest, truncated: false, content}`, `{path, size, digest, truncated: true}` past
+ * the content budget, or `{path, skipped}`; `truncated` on the whole says whether any
+ * stream or file was cut. `null` and `undefined` (no output) decode to `null`. With the
+ * `grant` the attempt was admitted under (`outputGrantOf`), the result must also answer it:
+ * exactly the declared paths in order, and neither stream nor file content past its budget.
+ */
+export function decodeOutput(output, grant = null) {
+  if (output === null || output === undefined) return null;
+  if (typeof output !== "object" || Array.isArray(output) || Object.keys(output).sort().join() !== "files,stderr,stdout") {
+    refuse("an output is one object {stdout, stderr, files}");
+  }
+  const stdout = decodeStream(output.stdout, "output stdout");
+  const stderr = decodeStream(output.stderr, "output stderr");
+  if (!Array.isArray(output.files) || output.files.length > OUTPUT_CEILINGS.files) {
+    refuse(`output files lists 0 to ${OUTPUT_CEILINGS.files} entries`);
+  }
+  const files = output.files.map(decodeFile);
+  if (new Set(files.map((file) => file.path)).size !== files.length) refuse("output files repeats a path");
+  if (grant !== null && grant !== undefined) checkAgainstGrant({ stdout, stderr, files }, checkOutputGrant(grant));
+  const truncated = stdout.truncated || stderr.truncated || files.some((file) => file.truncated === true);
+  return { stdout, stderr, files, truncated };
+}
+
+/**
+ * A result answers its grant (§6.6): one entry per declared path in declaration order, no
+ * stream head longer than `stdio_bytes`, no more returned file content than `files_bytes`.
+ * A result that answers some other grant is not this attempt's and is refused.
+ */
+function checkAgainstGrant({ stdout, stderr, files }, grant) {
+  const paths = files.map((file) => file.path);
+  if (paths.length !== grant.files.length || paths.some((path, index) => path !== grant.files[index])) {
+    refuse(`output files ${JSON.stringify(paths)} are not the declared ${JSON.stringify(grant.files)} in order`);
+  }
+  for (const [name, stream] of [["stdout", stdout], ["stderr", stderr]]) {
+    if (stream.bytes > grant.stdio_bytes) refuse(`output ${name} returned ${stream.bytes} bytes, more than the granted ${grant.stdio_bytes}`);
+  }
+  const returnedBytes = files.reduce((sum, file) => sum + (file.content ? file.content.length : 0), 0);
+  if (returnedBytes > grant.files_bytes) refuse(`output files returned ${returnedBytes} bytes of content, more than the granted ${grant.files_bytes}`);
+}
+
+function lstatOrNull(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/**
+ * Visit the parent directories of `path` under `root`, outermost first: a symlink or a
+ * non-directory is refused (a symlink could lead outside `root`), and `create` is called
+ * for each one that does not exist yet.
+ */
+function walkParents(root, path, create) {
+  let ancestor = root;
+  for (const component of path.split("/").slice(0, -1)) {
+    ancestor = join(ancestor, component);
+    const stat = lstatOrNull(ancestor);
+    if (stat === null) create(ancestor);
+    else if (stat.isSymbolicLink()) refuse(`returned path ${JSON.stringify(path)} crosses a symlink at ${ancestor}`);
+    else if (!stat.isDirectory()) refuse(`returned path ${JSON.stringify(path)} crosses a non-directory at ${ancestor}`);
+  }
+}
+
+/**
+ * Write the returned files of a decoded output (those with content) under `dir` at their
+ * declared paths, creating directories as needed and never overwriting: each file is
+ * created `wx` with mode 0600. Every path is checked again here — the node already held
+ * it to the §7.5 grammar, but a path that would resolve outside `dir`, or that crosses a
+ * symlink inside it, or that already exists, is refused before anything is written.
+ * Returns `[{path, written}]`, the absolute path of each file written, in declaration
+ * order; digest-only and skipped files write nothing.
+ */
+export function writeReturnedFiles(dir, files) {
+  if (typeof dir !== "string" || dir.length === 0) refuse("the output directory is a non-empty path");
+  if (!Array.isArray(files)) refuse("the files are the `files` of a decoded output");
+  const root = resolve(dir);
+  const plan = [];
+  for (const file of files) {
+    if (file === null || typeof file !== "object") refuse("an output file is an object");
+    if (file.skipped !== undefined || file.truncated === true) continue;
+    if (!Buffer.isBuffer(file.content)) refuse(`${JSON.stringify(file.path)}: a returned file's content is a Buffer`);
+    const path = checkOutputPath(file.path, "returned");
+    if (isAbsolute(path) || path.includes("\\")) refuse(`returned path ${JSON.stringify(path)} is not relative`);
+    const target = resolve(root, path);
+    if (target !== join(root, path) || !target.startsWith(root + sep)) refuse(`returned path ${JSON.stringify(path)} escapes ${root}`);
+    plan.push({ path, target, content: file.content });
+  }
+  // Every target is checked before the first is written, so a refusal leaves nothing half done.
+  for (const { path, target } of plan) {
+    walkParents(root, path, () => {});
+    if (lstatOrNull(target) !== null) refuse(`returned path ${JSON.stringify(path)} already exists at ${target}`);
+  }
+  const written = [];
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  for (const { path, target, content } of plan) {
+    walkParents(root, path, (ancestor) => mkdirSync(ancestor, { mode: 0o700 }));
+    // `wx` is O_CREAT|O_EXCL: it neither overwrites nor follows a symlink planted at the target.
+    const fd = openSync(target, "wx", 0o600);
+    try {
+      writeFileSync(fd, content);
+    } finally {
+      closeSync(fd);
+    }
+    written.push({ path, written: target });
+  }
+  return written;
+}
+
+// ---------------------------------------------------------------------------------------
 // Outcomes (§9, §11.3)
 // ---------------------------------------------------------------------------------------
 
@@ -723,9 +998,16 @@ export class Adapter {
  * Map an attempt report (§11.3) to the outcome a control plane acts on. `outcome` is
  * `completed`, `failed`, `unknown` or `refused`; `certain` is false exactly for `unknown`,
  * which a control plane treats as failed and never as success; `exitStatus` is the
- * workload's exit status when the evidence log recorded one.
+ * workload's exit status when the evidence log recorded one; `output` is the bounded
+ * result decoded and verified by `decodeOutput`, `null` when none was granted or returned.
+ *
+ * Pass `grant`, the `output` grant the attempt was admitted under (`outputGrantOf` of its
+ * envelope_json), and the output is also held to it, and `outputMissing` is true when the
+ * grant asked for a result and none came back (the node refused `result`, the answer was
+ * lost, or the attempt never reached it). A completed attempt whose granted output is
+ * missing is not a success: what it was run for cannot be read.
  */
-export function outcomeOf(report) {
+export function outcomeOf(report, { grant = null } = {}) {
   if (report === null || typeof report !== "object") refuse("a report is an object");
   let outcome;
   let refused;
@@ -740,6 +1022,7 @@ export function outcomeOf(report) {
   }
   if (report.outcome_certain !== (outcome !== "unknown")) refuse("outcome_certain is false exactly when the outcome is unknown");
   const code = report.cause && typeof report.cause === "object" ? report.cause.Exited?.code : undefined;
+  const output = decodeOutput(report.output, grant);
   return {
     outcome,
     certain: report.outcome_certain,
@@ -754,6 +1037,8 @@ export function outcomeOf(report) {
     evidenceHead: report.evidence_head ?? null,
     refused,
     transportError: report.transport_error ?? null,
+    output,
+    outputMissing: grant !== null && output === null,
     binding: report.binding,
   };
 }
