@@ -2,8 +2,8 @@
 # desktop is in the image).
 #
 # Stages:
-#   1. `release` / `builder`  the ward binaries, from a checksum-verified release tarball
-#                             or compiled from this checkout (--build-arg WARDOS_SOURCE).
+#   1. `release` / `builder`  the ward binaries, from the checksum-verified tarballs of a
+#                             release or compiled from this checkout (--build-arg WARDOS_SOURCE).
 #   2. the host               Fedora bootc base, every package of image/packages.txt,
 #                             the binaries, the desktop tree (desktop/ placed by
 #                             image/install-desktop.sh), the WardOS system configuration,
@@ -11,39 +11,52 @@
 #
 # Nothing here fetches code over the network at build time except dnf from the Fedora
 # repositories, cargo from crates.io (locked to Cargo.lock, in the builder stage only:
-# the host has no compiler, ADR-0001) and the release tarball (checked against its
+# the host has no compiler, ADR-0001) and the release tarballs (each checked against its
 # recorded SHA-256). No secrets, no `curl | sh`.
 # Build with image/build.sh; turn into a disk with image/disk.sh; see image/README.md.
 
 # ---------------------------------------------------------------------------------------
-# Where the ward binaries come from. `release` (default) downloads a published release
-# tarball and checks its SHA-256, so the image is reproducible from a known version and
-# the tools and the image keep separate release cadences. `builder` compiles this
-# checkout instead (development images, the "image build" CI job).
+# Where the ward binaries come from. `release` (default) downloads the published
+# tarballs of a release and checks their SHA-256, so the image is reproducible from a
+# known version and the tools and the image keep separate release cadences. `builder`
+# compiles this checkout instead (development images, the "image build" CI job).
 ARG WARDOS_SOURCE=release
 ARG WARDOS_RELEASE=v0.4.1
 # One checksum per architecture the release ships: WARDOS_SHA256 is the x86_64
-# tarball's, WARDOS_SHA256_AARCH64 the aarch64 one's (v0.4.1 carries both, and
+# runtime tarball's, WARDOS_SHA256_AARCH64 the aarch64 one's (v0.4.1 carries both, and
 # build.sh fetches the one for --arch).
 ARG WARDOS_SHA256=8ed12f1dbf0b5cd4f5bb009773b5315ba658f51080ff646220d305a8b1f17930
 ARG WARDOS_SHA256_AARCH64=eceb8ef33a20a3bb34c02efc18578ea8217cd9ca32fef937c0e6c8bb0beecbfd
+# The same for the node tarball, ward-node-<version>-<arch>-linux (ward-node and
+# ward-node-adapter; scripts/release/package.sh, issue #275). Empty on purpose: releases
+# up to v0.4.1 carry no node tarball, and the release stage refuses to build without
+# its checksum rather than ship an image with no node, so a release build names a
+# release that has one and passes the checksum (build.sh fetches it beside the runtime's).
+ARG WARDOS_NODE_SHA256=
+ARG WARDOS_NODE_SHA256_AARCH64=
 
-# Stage 1a: a published release. The three host binaries are required; ward-shell and
-# wardos-theme-render are copied when the tarball has them (release tarballs from v0.2
-# carry both; earlier ones do not, and an image built from one has no shell surfaces).
-# The tarball is the one for the platform being built (`--platform linux/arm64` gives
-# TARGETARCH=arm64, hence the aarch64 tarball); the stage itself runs on the build
-# host's platform, since it only downloads and checks, and nothing here needs emulating.
+# Stage 1a: a published release, two tarballs of it. From the runtime tarball the three
+# host binaries are required and ward-shell and wardos-theme-render are copied when the
+# tarball has them (release tarballs from v0.2 carry both; earlier ones do not, and an
+# image built from one has no shell surfaces). From the node tarball ward-node and
+# ward-node-adapter are required, so a release-built image carries the node exactly as a
+# checkout-built one does; the stage fails without the tarball or its checksum (there is
+# no optional node and no silent fall-back to the builder stage). Both tarballs are the
+# ones for the platform being built (`--platform linux/arm64` gives TARGETARCH=arm64,
+# hence the aarch64 tarballs); the stage itself runs on the build host's platform, since
+# it only downloads and checks, and nothing here needs emulating.
 FROM --platform=$BUILDPLATFORM docker.io/library/alpine:3.20 AS release
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 ARG WARDOS_RELEASE
 ARG WARDOS_SHA256
 ARG WARDOS_SHA256_AARCH64
+ARG WARDOS_NODE_SHA256
+ARG WARDOS_NODE_SHA256_AARCH64
 ARG TARGETARCH
 WORKDIR /out
 RUN case "${TARGETARCH:-$(uname -m)}" in \
-      amd64 | x86_64) arch=x86_64; sha="${WARDOS_SHA256}" ;; \
-      arm64 | aarch64) arch=aarch64; sha="${WARDOS_SHA256_AARCH64}" ;; \
+      amd64 | x86_64) arch=x86_64; sha="${WARDOS_SHA256}"; node_sha="${WARDOS_NODE_SHA256}" ;; \
+      arm64 | aarch64) arch=aarch64; sha="${WARDOS_SHA256_AARCH64}"; node_sha="${WARDOS_NODE_SHA256_AARCH64}" ;; \
       *) echo "no WardOS release tarball for TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac \
     && if [ -z "$sha" ]; then \
@@ -51,16 +64,29 @@ RUN case "${TARGETARCH:-$(uname -m)}" in \
               "WARDOS_SHA256_AARCH64 (image/build.sh --arch does) or build with WARDOS_SOURCE=builder" >&2; \
          exit 1; \
        fi \
+    && if [ -z "$node_sha" ]; then \
+         echo "no checksum for the ${arch} node tarball of ${WARDOS_RELEASE}: releases up to v0.4.1 carry" \
+              "no node tarball, and an image is not built without the node; pass --build-arg" \
+              "WARDOS_NODE_SHA256 / WARDOS_NODE_SHA256_AARCH64 from a release that has one" \
+              "(image/build.sh does) or build with WARDOS_SOURCE=builder" >&2; \
+         exit 1; \
+       fi \
+    && base="https://github.com/hexrift/WardOS/releases/download/${WARDOS_RELEASE}" \
     && name="wardos-${WARDOS_RELEASE#v}-${arch}-linux" \
-    && wget -q "https://github.com/hexrift/WardOS/releases/download/${WARDOS_RELEASE}/${name}.tar.gz" \
+    && node="ward-node-${WARDOS_RELEASE#v}-${arch}-linux" \
+    && wget -q "${base}/${name}.tar.gz" \
+    && wget -q "${base}/${node}.tar.gz" \
     && echo "${sha}  ${name}.tar.gz" | sha256sum -c - \
+    && echo "${node_sha}  ${node}.tar.gz" | sha256sum -c - \
     && tar -xzf "${name}.tar.gz" \
+    && tar -xzf "${node}.tar.gz" \
     && mv "${name}/ward" "${name}/wardd" "${name}/ward-agent" /out/ \
+    && mv "${node}/ward-node" "${node}/ward-node-adapter" /out/ \
     && for optional in ward-shell wardos-theme-render; do \
          if [ -f "${name}/${optional}" ]; then mv "${name}/${optional}" /out/; \
          else echo "release ${WARDOS_RELEASE} has no ${optional} (expected from v0.2)"; fi; \
        done \
-    && rm -rf "${name}" "${name}.tar.gz"
+    && rm -rf "${name}" "${name}.tar.gz" "${node}" "${node}.tar.gz"
 
 # Stage 1b: build the binaries from this checkout.
 # The tag pins the same channel as rust-toolchain.toml (1.94.1); bump both together.
@@ -69,10 +95,12 @@ WORKDIR /src
 # The whole workspace, filtered by the repository's .containerignore (no target/, no .git).
 COPY . .
 # --locked refuses to touch Cargo.lock, so the image is built from exactly the dependency
-# set the repository reviewed. Checkout builds carry six host binaries: the three of the
-# secure-session layer, ward-node, the shell (desktop/shell) and the theme renderer
-# (desktop/theme). The release stage above remains backwards-compatible with historical
-# release tarballs that predate ward-node.
+# set the repository reviewed. Checkout builds carry seven host binaries: the three of
+# the secure-session layer, the node's two (ward-node from crates/ward-node,
+# ward-node-adapter from crates/ward-node-client, the same pair the release's node
+# tarball holds), the shell (desktop/shell) and the theme renderer (desktop/theme). The
+# release stage above remains backwards-compatible with historical runtime tarballs that
+# predate ward-shell; the node it always takes from the node tarball.
 # Cache mounts (BuildKit and buildah alike): the cargo registry and the target
 # directory survive between builds, so a rebuild recompiles only what changed. Nothing
 # from a cache mount lands in the image; the binaries are copied out within the step.
@@ -83,11 +111,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
       --package ward-daemon \
       --package ward-agent \
       --package ward-node \
+      --package ward-node-client \
       --package ward-shell \
       --package wardos-theme \
     && mkdir -p /out \
     && cp target/release/ward target/release/wardd target/release/ward-agent \
-          target/release/ward-node target/release/ward-shell target/release/wardos-theme-render /out/
+          target/release/ward-node target/release/ward-node-adapter \
+          target/release/ward-shell target/release/wardos-theme-render /out/
 
 # The chosen source, under one name for the host stage (a stage name, not an image;
 # hadolint cannot tell, hence the ignore).
@@ -171,9 +201,9 @@ RUN --mount=type=cache,target=/var/cache/libdnf5,sharing=locked \
     && du -sh /usr/lib/locale /usr/share/locale /usr/share/fonts \
     && rm -f /tmp/packages.txt /tmp/coprs.txt
 
-# The host binaries: ward, wardd, ward-agent (required), ward-shell and
-# wardos-theme-render (present from release v0.2 and in every checkout build). /usr is
-# the immutable, image-owned tree in bootc.
+# The host binaries: ward, wardd, ward-agent, ward-node and ward-node-adapter (required,
+# from either stage), ward-shell and wardos-theme-render (present from release v0.2 and
+# in every checkout build). /usr is the immutable, image-owned tree in bootc.
 COPY --from=binaries /out/ /usr/bin/
 
 # The desktop tree (docs/desktop.md §Layout): commands to /usr/bin, defaults to
@@ -184,6 +214,7 @@ COPY --from=binaries /out/ /usr/bin/
 # step here commits a multi-gigabyte layer, so steps are few.
 COPY image/install-desktop.sh desktop/ /tmp/stage/
 RUN test -x /usr/bin/ward && test -x /usr/bin/wardd && test -x /usr/bin/ward-agent \
+    && test -x /usr/bin/ward-node && test -x /usr/bin/ward-node-adapter \
     && ls -l /usr/bin/ward* \
     && /tmp/stage/install-desktop.sh /tmp/stage / \
     && rm -rf /tmp/stage

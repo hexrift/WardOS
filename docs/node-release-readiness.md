@@ -29,7 +29,7 @@ which the workflow pins to the same version) on an x86_64 GitHub runner.
 | **docs links** (job `docs`) | `doc-links.py`, `doc-status.py`, `tamperward-signoff-doc.py`, `protocol-window.test.sh` and `protocol-window.py`. | Every relative link in the node documents resolves; no document claims a project phase of its own; and the protocol window `<!-- protocol-window: 1.0-1.3 -->` in [compatibility.md](compatibility.md) equals `WARD_NODE_PROTOCOL` in `ward-node-protocol`, so a minor cannot be added or retired without the compatibility document saying so in the same change (#275). |
 | **ward-bench** (job `benchmark`, measures, never gates) | `ward benchmark --json`, the CI-measurable subset of [performance.md](performance.md) §5, uploaded as an artifact for 90 days. | Nothing specific to the node: its metrics are the session path's (`sandbox_start`, `verifier_spawn`, `snapshot_*`, `observer_event_propagation`, `pause_acknowledgement`). `sandbox_start` and `snapshot_capture_*` measure the same `ward-launch` spawn and `ward-snapshot` capture the node uses, so a regression there is a regression for `start`; no threshold fails the job (#150). |
 | **TamperWard gate** (`.github/workflows/tamperward.yml`) | The diff-time protected-surface check over the pull request's commit range, and `tamperward verify`, which re-runs the merge gate in a visible and a pristine copy. | A pull request that deletes, skips or weakens a node test, rewrites a fixture or edits CI is blocked until a human signs off out of band; the gate's own result cannot be manufactured by the change under test. |
-| **image** (`.github/workflows/image.yml`, on pull requests that touch `crates/**`) | Builds the bootc image, natively for x86_64 and aarch64, compiling `ward-node` from the checkout (`image/Containerfile`). | `ward-node` builds `--locked` for both architectures the image ships for. It is not started inside the image build. |
+| **image** (`.github/workflows/image.yml`, on pull requests that touch `crates/**`) | Builds the bootc image, natively for x86_64 and aarch64, compiling `ward-node` and `ward-node-adapter` from the checkout (`image/Containerfile`'s builder stage; the release stage, which takes them from the node tarball, needs a published release and is not run on pull requests). | `ward-node` and `ward-node-adapter` build `--locked` for both architectures the image ships for and are in the image's `/usr/bin` (the Containerfile asserts both, and the job runs `ward-node --help`). Neither is started as a service inside the image build. |
 | **release scripts** (job `release-scripts`) | `scripts/release/run.sh`: shellcheck and the bash regressions of every release helper. | The tag, version and asset binding of §2 behaves as documented, including the layout of the node tarball (`package.test.sh`) and the refusal to publish without it (`check-release-set.test.sh`). |
 
 The same `scripts/verify/tamperward.sh` runs locally; a green run there is a green run
@@ -68,10 +68,17 @@ For the node this means:
 - **The node is not part of `install.sh`**, which installs the session layer for one
   user. Installing the node tarball is the operator step of
   [node-integration-guide.md](node-integration-guide.md) §1.
-- **The images do not take the node from the release yet.** `image/Containerfile` builds
-  `ward-node` from the checkout (#306); its `release` stage copies the runtime tarball
-  only, so an image built from a release has no node until that stage learns the node
-  tarball (#275).
+- **The image carries the node whichever way it is built.** `image/Containerfile`'s
+  `builder` stage compiles `ward-node` and `ward-node-adapter` from the checkout (#306;
+  the images CI publishes on every merge); its `release` stage downloads the node
+  tarball beside the runtime tarball, checks it against a pinned checksum
+  (`WARDOS_NODE_SHA256`, `WARDOS_NODE_SHA256_AARCH64`; `image/build.sh` fetches the
+  `.sha256` from the release, as it does the runtime's) and installs the same two
+  binaries. Both stages end with them in `/usr/bin`, which the host stage asserts. A
+  release without a node tarball (every release up to v0.4.1) cannot feed a
+  release-source image: the stage refuses rather than ship an image with no node, and
+  never falls back to a checkout build on its own (`image/README.md` "Where the binaries
+  come from").
 - **The node documents ship in both tarballs**, as part of `docs/`, at the revision of
   the release commit.
 - **The protocol window of a release is the one in its source commit**

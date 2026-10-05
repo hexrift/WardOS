@@ -37,7 +37,12 @@ The checksum proves the tarball is the one CI attached to the release; releases 
 signed or provenance-verified yet (node-security-limitations.md §3.3, ADR-0028).
 Releases cut before this revision carry no node tarball. `install.sh`, the runtime's
 installer, does not install the node: it is a per-user install of the session layer,
-and the node is a service of the host.
+and the node is a service of the host. On a WardOS host the two binaries are already in
+the image, at `/usr/bin/ward-node` and `/usr/bin/ward-node-adapter`, whether the image
+was built from a release (`image/Containerfile`'s release stage installs the node
+tarball, checksum-checked) or from a checkout (the images CI publishes;
+[node-release-readiness.md](node-release-readiness.md) §2): skip the install above,
+and point the unit of §3 at `/usr/bin/ward-node`.
 
 Without a release for the commit you deploy, build the same two binaries from it with
 the pinned toolchain (`rust-toolchain.toml`), as the release does:

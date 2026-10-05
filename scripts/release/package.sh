@@ -21,7 +21,8 @@
 #                three), install.sh, README.md, LICENSE and a copy of docs/.
 #   ward-node-…  the node: ward-node and ward-node-adapter, LICENSE and the same
 #                copy of docs/. No installer: the node is an operator install
-#                (docs/node-integration-guide.md §1), not part of install.sh.
+#                (docs/node-integration-guide.md §1), not part of install.sh; the
+#                image's release stage installs the two binaries from this tarball.
 #
 # The sidecar is sha256sum's own line for the tarball, written next to it, so
 # `sha256sum -c <name>.tar.gz.sha256` verifies it wherever both are downloaded.
