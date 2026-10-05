@@ -146,7 +146,9 @@ bar clicks call it directly); `wardos-update --check` prints one Waybar JSON lin
 (`text`, `tooltip`, `class` `available` or empty); `wardos-screensaver` returns at once
 when `wardos-toggle screensaver` has switched it off (hypridle calls it at 2.5 min);
 `wardos-approve --watch` is the long-running listener behind `wardos-approve.service`;
-`wardos-battery-monitor` runs once per call, from its timer every 2 min;
+`ward-shell worker` is the long-running shared bar projection behind
+`wardos-shell-worker.service` (#138 item 2); `wardos-battery-monitor` runs once per call,
+from its timer every 2 min;
 `wardos-setup audio` opens `pulsemixer` when it is installed and `pavucontrol` otherwise
 (the image ships pavucontrol; pulsemixer is not packaged in Fedora). The image's firewall
 admits nothing inbound (`image/README.md` "Security posture"), so `wardos-share` is
@@ -274,6 +276,34 @@ as the number of protected files the verifier restored from the entry snapshot),
 `custom/ward-verify`'s `on-click` opens it in a `ward-session` foot window like the
 session panel. The change count needs the session CAS (`~/.local/state/ward/cas`); the
 state itself needs only the digest, so it is decided even without one.
+
+The six `ward-shell bar --waybar --segment … --follow` processes above are what
+`config/waybar/config.jsonc` launches, but while `wardos-shell-worker.service` is running
+none of them actually subscribes to the daemon or digests the worktree itself (#138 item
+2): each first asks that service's own socket (`ward-shell worker`, one request line
+naming its segment, or `bar` for the whole row) and, once it answers, just copies the
+`Module` JSON lines it sends to stdout — the worker is the one process that keeps the one
+`Snapshot`, the one daemon subscription and the one digest schedule (unconditional, since
+it cannot know in advance which of the six will connect) all six used to keep on their
+own, and a segment that connects mid-session gets the worker's current cached module at
+once, then only the lines that actually change afterwards. A process falls back to
+subscribing and digesting for itself — exactly the behaviour described above, unchanged —
+when nothing answers the worker within a handful of quick, bounded connect retries (the
+cold-start race between the unit starting, per `autostart.conf`'s ordering below, and a
+process's very first ask before the worker has bound its socket) followed by a short
+handshake timeout on a connection that did accept but never answered (wedged): the unit
+still not installed or restarting past that budget, or a caller that named an explicit
+`--dir` (the desktop-wide worker does not parameterise by one) or an explicit `--tick-ms`
+(the worker runs one fixed cadence for every segment, so it cannot honour a caller-chosen
+one — asking it anyway would silently turn that documented, tested option into a no-op).
+`desktop/hyprland/autostart.conf`'s `systemctl --user start` line names
+`wardos-shell-worker.service` alongside `wardos-approve.service` and the rest, before
+`waybar` execs, so the worker has as much of a head start on binding as that file can give
+it on the plain-`Hyprland` path (the systemd preset alone only reaches units through
+`graphical-session.target`, which a `uwsm start hyprland.desktop` session pulls in but a
+plain one does not) — the bounded connect retry above is what actually closes the
+remaining race, since a `systemctl start` that has returned only means the unit's process
+was forked, not that it has bound its socket yet.
 
 ## Keys
 
@@ -469,7 +499,7 @@ Then some (WardOS only):
 
 | Feature | Delivers | Delivered |
 | --- | --- | --- |
-| Agent state, network, TamperWard and verification in the bar | `ward-shell bar --waybar [--segment mark\|session\|project\|agent\|network\|grants\|credentials\|observer\|tamperward\|verify\|daemon] [--follow [--tick-ms N]]`, one JSON module per segment with the tone name and the agent or verify state word as classes; `launcher --lines` for the command centre | ✔ `ward-shell-core` `waybar::tests::every_segment_is_a_module_in_the_{live,sealed}_state`, `every_segment_is_the_empty_module_with_no_session_except_the_mark`, `trust::tests::every_segment_is_addressable_by_name_live_and_sealed`, `launcher::tests::lines_are_section_label_and_shell_command_for_a_described_session`; `ward-shell` `waybar_flags_parse_and_need_waybar` |
+| Agent state, network, TamperWard and verification in the bar | `ward-shell bar --waybar [--segment mark\|session\|project\|agent\|network\|grants\|credentials\|observer\|tamperward\|verify\|daemon] [--follow [--tick-ms N]]`, one JSON module per segment with the tone name and the agent or verify state word as classes; `launcher --lines` for the command centre. One shared per-session projection and subscription across the six segments (#138 item 2): `wardos-shell-worker.service` runs `ward-shell worker`, started before `waybar` on the plain-`Hyprland` path too (`autostart.conf`); it keeps the one `Snapshot`, the one daemon subscription and the one (unconditional) digest schedule; each `bar --waybar --follow` process asks it first (`relay_from_worker`, a request line naming its segment or `bar`, then the worker's own `Module` JSON lines copied straight to stdout), retrying a few times, quickly, before giving up on a cold-start race (the worker not bound yet) — and only subscribes and digests for itself, exactly as before this item, when nothing answers even after those retries, or answers but goes quiet (wedged, its own handshake timeout), or an explicit `--dir` (the worker does not serve one) or `--tick-ms` (the worker runs one fixed cadence for every segment, so honouring a caller's own would mean every other connected segment gets it too — asking anyway would silently turn that option into a no-op) was named | ✔ `ward-shell-core` `waybar::tests::every_segment_is_a_module_in_the_{live,sealed}_state`, `every_segment_is_the_empty_module_with_no_session_except_the_mark`, `trust::tests::every_segment_is_addressable_by_name_live_and_sealed`, `launcher::tests::lines_are_section_label_and_shell_command_for_a_described_session`; `ward-shell` `{waybar_flags_parse_and_need_waybar,the_worker_is_asked_only_with_no_explicit_dir_and_no_explicit_tick}`; `ward-shell` `worker::tests::{a_new_session_serves_the_cached_module_immediately_and_only_pushes_real_changes,every_segment_of_one_publish_shares_one_instant_and_one_snapshot,a_session_ending_closes_every_subscriber_and_a_later_one_gets_none,two_relay_clients_for_different_segments_each_get_only_their_own_updates,serve_session_publishes_every_segment_from_one_real_subscription,a_cold_start_race_still_converges_every_relay_client_onto_the_worker,relay_falls_back_when_{nothing_is_listening,the_worker_accepts_but_never_answers}}`; `configs.test.sh` (`wardos-shell-worker.service`, and that `autostart.conf` starts it before `waybar`) |
 | Verification bound to the snapshot it judged (ADR-0019 decision 1) | the eight-state `VERIFY` segment (`—` `◐` `✓` `~ STALE` `✗` `! ERROR` `! CANCELLED` `! INTERRUPTED`, #139) decided by digesting the worktree and comparing with the verified candidate; `ward-shell verify-panel` and the segment's click | ✔ `ward-snapshot` `digest_worktree`/`digest_manifest` (`tests/digest.rs`: `the_digest_is_the_id_a_capture_would_store_and_writes_nothing`, `the_hash_cache_makes_the_second_digest_cheap`); `ward-shell-core` `trust::tests::the_verify_segment_is_an_eight_state_machine_over_the_stream_and_the_worktree`, `panel::tests::the_verify_panel_holds_the_verdict_against_the_worktree`, `waybar::tests::the_verify_module_goes_stale_with_the_worktree_and_says_how_far`; `ward-shell` `the_verify_segment_follows_the_worktree_by_content`, `a_warm_digest_of_the_demo_is_within_the_bar_budget`; `ward-daemon` `verify_ignores_a_weakened_protected_test_and_passes_the_real_fix` (the record's candidate is the worktree's digest); `configs.test.sh` (the click) |
 | Approvals that separate the agent's claim from Ward's authority (ADR-0019) | `wardos-approve`, daemon hold on `ask` (`agent-integration.md` §4.1: `Request::Hold`/`Approve`/`Pending`, `ward session pending [--json] [--follow]`, `ward session approve`); the daemon derives `authority` (destination, network, method, credential, repository, lifetime) from the manifest, never from the agent's text; the notification is the three blocks of `design-language.md` §10 with the target in `<tt>`; `wardos-approve.service` is the listener | ✔ `ward-daemon` `approvals::tests::a_fetch_to_a_host_{with_a_credential_rule_derives_the_rule_and_the_grant_state,without_a_credential_rule_reports_the_proxys_verdict_and_no_credential}`, `approvals::tests::a_write_to_a_protected_path_is_refused_in_the_authority_and_a_plain_write_is_not`, `approvals::tests::a_command_shows_the_program_the_proxy_and_every_granted_credential`, `hooks::tests::a_held_ask_{waits_for_the_answer_and_relays_it,nobody_answers_is_denied_when_the_timeout_passes}`, `daemon::tests::a_held_approval_is_recorded_listed_answered_and_recorded_again`, `client::tests::{pending_and_approve_go_through_the_daemon,follow_pending_emits_what_is_pending_after_the_backlog_then_on_each_request}`; `desktop/tests/approve.test.sh` |
 | Every approval given a terminal record and a persistent, queryable lifecycle (#146 item 1; daemon slice, see the next row for the desktop-facing half) | a still-open approval released by the session ending now gets its own `CapabilityDecided` record (`by: SessionEnded`) appended *before* `SessionEnded` and the seal, instead of silently vanishing at the seal; `Request::Approvals` / `ward session approvals [--follow] [--all] [--json]` lists every approval the session has asked, pending or decided (`pending`\|`allowed`\|`allowed-session`\|`denied`\|`timed-out`\|`session-ended`), not only what is still open — a bounded in-memory history (`Approvals::HISTORY_CAP`, oldest dropped first), so a request survives a client missing or dismissing whatever first announced it, for the rest of the session | ✔ `ward-daemon` `approvals::tests::{closing_releases_every_open_question_and_refuses_new_ones,closing_leaves_an_uncollected_answer_alone,the_approvals_view_lists_pending_and_bounded_history_by_request_order,the_decided_history_is_bounded_oldest_dropped_first,outcomes_become_hook_responses_and_log_records}`, `daemon::tests::{a_held_approval_is_recorded_listed_answered_and_recorded_again,request_approvals_lists_pending_and_decided_oldest_asked_first}`, `control::tests::approval_requests_and_responses_round_trip_with_their_words`, `client::tests::pending_and_approve_go_through_the_daemon`; `ward-cli` `session_pending_and_grants_take_json_and_print_the_three_blocks` |

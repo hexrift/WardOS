@@ -1,0 +1,21 @@
+# WardOS — the shared per-session bar projection worker (#138 item 2, docs/desktop.md
+# §Commands). `ward-shell worker` subscribes to the daemon once, keeps one cache, and
+# serves every Waybar trust-bar segment's JSON from it over a local socket, instead of
+# each `ward-shell bar --waybar --segment … --follow` process (`config/waybar/config.jsonc`)
+# subscribing and digesting on its own; a segment falls back to doing that itself whenever
+# this unit is not running. It runs for the whole graphical session and is restarted if it
+# exits, the same as `wardos-approve.service`.
+[Unit]
+Description=WardOS shared bar projection worker
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=/usr/bin/ward-shell worker
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
