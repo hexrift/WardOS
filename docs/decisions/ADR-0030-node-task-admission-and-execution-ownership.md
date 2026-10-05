@@ -142,7 +142,9 @@ their state, receipt and applied operation ids (#332 slice 7).
 - What is not enforced at this revision is stated, not implied: no remote transport or
   mTLS, no network grants, no result return, no callback channel, a receipt the protocol
   does not bind to the evidence head, a manually bootstrapped trust store, same-uid
-  co-location of client and node, and no resource limit beyond the wall-clock budget.
+  co-location of client and node unless the operator lists the client uids the socket
+  serves (a peer-credential check, the first local slice of #262), and no resource limit
+  beyond the wall-clock budget.
   Each gap, its impact for a control plane, the mitigation available today and the
   issue that closes it is a row of
   [node-security-limitations.md](../node-security-limitations.md) §3.

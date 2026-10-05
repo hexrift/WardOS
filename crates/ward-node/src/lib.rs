@@ -37,6 +37,11 @@
 //! [`REQUEST_TIMEOUT`]; its answer is written within [`ANSWER_TIMEOUT`] of being ready, so
 //! a `stop` or `start` whose bounded work outlasts the request deadline is still answered.
 //!
+//! Every accepted connection is gated by its peer credentials before a byte of it is
+//! read ([`peer`]): the node's own uid and the uids its operator listed are served, any
+//! other peer is closed with nothing sent. The socket itself is private (0600) unless the
+//! operator shares it with a group (0660), see [`SocketAccess`].
+//!
 //! `stream` stays unsupported, and remote transport is deliberately absent. Serving a
 //! lifecycle request never waits on a running workload.
 
@@ -47,6 +52,7 @@ pub mod admit;
 pub mod evidence;
 pub mod execution;
 pub mod issuer;
+pub mod peer;
 pub mod records;
 pub mod state;
 pub mod task;
@@ -55,12 +61,13 @@ mod test_support;
 pub mod workspace;
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use nix::unistd::{Gid, Uid};
 use thiserror::Error;
 use ward_node_protocol::{
     CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse, LifecycleCapabilities,
@@ -70,6 +77,7 @@ use ward_node_protocol::{
 
 use crate::admit::NodeAdmission;
 use crate::execution::NodeExecution;
+use crate::peer::{ClientGroup, ClientUids, PeerGate};
 use crate::records::TaskRecordError;
 use crate::task::{MAX_NODE_TASKS, TaskRegistry};
 
@@ -122,6 +130,15 @@ pub enum NodeServiceError {
     /// Administrative socket parent directory is accessible to another Unix identity.
     #[error("ward-node socket parent directory must be private (mode 0700 or stricter)")]
     InsecureSocketDirectory,
+    /// With a client group, the socket parent directory is not owned by that group, is
+    /// writable by it, or is accessible to others.
+    #[error(
+        "ward-node socket parent directory must be owned by group {group} with mode 0750 or stricter"
+    )]
+    InsecureSharedSocketDirectory {
+        /// The client group the directory must be owned by.
+        group: u32,
+    },
     /// The request was not read within [`REQUEST_TIMEOUT`], or its answer not written
     /// within [`ANSWER_TIMEOUT`].
     #[error("ward-node connection exceeded its deadline")]
@@ -357,37 +374,101 @@ impl NodeService {
 ///
 /// Connections are handled sequentially in this initial endpoint. That deliberately caps
 /// active protocol handlers at one instead of allocating an unbounded thread per client.
-/// The socket is created mode 0600 so unprivileged sibling users cannot connect merely
-/// because they can name the path. This is a local bootstrap boundary, not the remote
-/// authenticated transport tracked by #262.
+/// Who may reach the node's socket and who is served on it.
+///
+/// Without a client group the socket is created mode 0600 in a directory that must be
+/// mode 0700 or stricter, so only the node's own uid can connect. With one, the socket is
+/// created mode 0660 owned by that group in a directory that must be owned by the same
+/// group with mode 0750 or stricter, so the group's members can connect too. Either way
+/// every connection is then gated by its peer credentials ([`peer::PeerGate`]): the
+/// node's own uid and the listed client uids are served, any other peer is closed with
+/// nothing sent. This is a local bootstrap boundary, not the remote authenticated
+/// transport tracked by #262.
+#[derive(Debug)]
+pub struct SocketAccess {
+    group: Option<Gid>,
+    gate: PeerGate,
+}
+
+impl SocketAccess {
+    /// A private socket served to the node's own uid alone.
+    #[must_use]
+    pub fn private() -> Self {
+        Self::new(None, ClientUids::empty())
+    }
+
+    /// A socket shared with `group`, if any, and served to the node's own uid and
+    /// `clients`.
+    #[must_use]
+    pub fn new(group: Option<ClientGroup>, clients: ClientUids) -> Self {
+        Self {
+            group: group.map(ClientGroup::gid),
+            gate: PeerGate::new(Uid::effective(), clients),
+        }
+    }
+}
+
+/// Serve the node protocol on a Unix socket at `socket` under `access`, forever.
+///
+/// A connection the gate refuses is closed before any of it is read and the refusal is
+/// reported on stderr, rate-limited per uid; nothing about it reaches the peer.
 ///
 /// # Errors
 ///
 /// Returns if the listener cannot be created/configured. Existing socket paths are never
 /// removed automatically.
-pub fn serve_local(socket: &Path, service: &NodeService) -> Result<(), NodeServiceError> {
-    let listener = bind_local(socket)?;
+pub fn serve_local(
+    socket: &Path,
+    service: &NodeService,
+    mut access: SocketAccess,
+) -> Result<(), NodeServiceError> {
+    let listener = bind_local(socket, access.group)?;
 
     for connection in listener.incoming() {
         let stream = connection?;
-        let _ = service.serve_connection(stream);
+        match access.gate.admit(&stream, Instant::now()) {
+            Ok(()) => {
+                let _ = service.serve_connection(stream);
+            }
+            Err(refusal) => {
+                drop(stream);
+                if let Some(line) = refusal.report() {
+                    let _ = writeln!(std::io::stderr().lock(), "{line}");
+                }
+            }
+        }
     }
 
     Ok(())
 }
 
-fn bind_local(socket: &Path) -> Result<UnixListener, NodeServiceError> {
+fn bind_local(socket: &Path, group: Option<Gid>) -> Result<UnixListener, NodeServiceError> {
     let parent = socket
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let metadata = std::fs::metadata(parent)?;
-    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(NodeServiceError::InsecureSocketDirectory);
+    let mode = metadata.permissions().mode();
+    match group {
+        None if !metadata.is_dir() || mode & 0o077 != 0 => {
+            return Err(NodeServiceError::InsecureSocketDirectory);
+        }
+        Some(gid) if !metadata.is_dir() || mode & 0o027 != 0 || metadata.gid() != gid.as_raw() => {
+            return Err(NodeServiceError::InsecureSharedSocketDirectory {
+                group: gid.as_raw(),
+            });
+        }
+        _ => {}
     }
 
     let listener = UnixListener::bind(socket)?;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    match group {
+        None => std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?,
+        Some(gid) => {
+            std::os::unix::fs::chown(socket, None, Some(gid.as_raw()))?;
+            std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
+        }
+    }
     Ok(listener)
 }
 
@@ -566,7 +647,7 @@ mod tests {
         let private = tempfile::tempdir().unwrap();
         std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = private.path().join("node.sock");
-        let listener = bind_local(&socket).unwrap();
+        let listener = bind_local(&socket, None).unwrap();
         assert_eq!(
             std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
             0o600
@@ -576,9 +657,51 @@ mod tests {
         let exposed = tempfile::tempdir().unwrap();
         std::fs::set_permissions(exposed.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(
-            bind_local(&exposed.path().join("node.sock")),
+            bind_local(&exposed.path().join("node.sock"), None),
             Err(NodeServiceError::InsecureSocketDirectory)
         ));
+    }
+
+    #[test]
+    fn a_shared_admin_socket_is_mode_0660_in_a_directory_owned_by_the_group() {
+        let gid = Gid::effective();
+        let shared = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(shared.path(), None, Some(gid.as_raw())).unwrap();
+        std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        let socket = shared.path().join("node.sock");
+        let listener = bind_local(&socket, Some(gid)).unwrap();
+        let metadata = std::fs::metadata(&socket).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
+        assert_eq!(metadata.gid(), gid.as_raw());
+        drop(listener);
+
+        let other_group = Gid::from_raw(gid.as_raw().wrapping_add(1));
+        assert!(matches!(
+            bind_local(&shared.path().join("other.sock"), Some(other_group)),
+            Err(NodeServiceError::InsecureSharedSocketDirectory { group }) if group == other_group.as_raw()
+        ));
+        for loose in [0o770, 0o755, 0o751, 0o705] {
+            std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(loose))
+                .unwrap();
+            assert!(
+                matches!(
+                    bind_local(&shared.path().join("other.sock"), Some(gid)),
+                    Err(NodeServiceError::InsecureSharedSocketDirectory { group }) if group == gid.as_raw()
+                ),
+                "mode {loose:o}"
+            );
+        }
+        std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(bind_local(&shared.path().join("other.sock"), Some(gid)).unwrap());
+        drop(bind_local(&shared.path().join("third.sock"), None).unwrap());
+
+        let error = NodeServiceError::InsecureSharedSocketDirectory { group: 7 };
+        assert!(error.to_string().contains("group 7"));
+        assert!(SocketAccess::private().group.is_none());
+        assert_eq!(
+            SocketAccess::new(Some(ClientGroup::parse("0").unwrap()), ClientUids::empty()).group,
+            Some(Gid::from_raw(0))
+        );
     }
 
     #[test]
@@ -1252,7 +1375,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let socket = dir.path().join("node.sock");
-            let listener = bind_local(&socket).unwrap();
+            let listener = bind_local(&socket, None).unwrap();
             let served = service.clone();
             let worker = std::thread::spawn(move || {
                 for connection in listener.incoming().take(connections) {
