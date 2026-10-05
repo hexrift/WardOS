@@ -13,14 +13,23 @@
 #                          how it was decided (read-only: there is nothing left to answer);
 #                          a pending row ends with the decision time the daemon reports
 #                          for it (#146 item 4): "42 s left, then denied", or "held while
-#                          paused · 42 s left once resumed" while its session is paused
+#                          paused · 42 s left once resumed" while its session is paused;
+#                          the terminal stays open on the outcome (wardos-launch run) —
+#                          the daemon's own confirmation, or its refusal (answered
+#                          elsewhere, timed out, unreachable) — rather than closing with
+#                          it; a live session whose approvals could not be listed is an
+#                          "unreachable" row naming the error, never a pending approval
 #   wardos-approve-inbox --help
 #
 # A missed or dismissed notification, or one wardos-approve --watch left unshown past
 # its WARDOS_APPROVE_MAX_NOTIFIERS bound, is never the only way to find or act on a
 # request: this is the same daemon-held, multiplexed list either way, reachable from
 # the command centre (SECURITY ▸ Approval inbox) and the keyboard (Super + Alt + A), not
-# only from whatever popup first announced a request. Needs jq.
+# only from whatever popup first announced a request. A listing that fails outright
+# says so through a read-only menu screen, not only a notification: wardos_notify is
+# best-effort and stays silent when notify-send is missing or cannot reach a running
+# notification service, which would otherwise make this exact failure invisible again
+# from the keybinding/command-centre path that has no stderr either. Needs jq.
 set -euo pipefail
 # shellcheck source=desktop/lib/wardos.sh disable=SC1091
 source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
@@ -34,7 +43,10 @@ wardos_help "$@"
 # to say whose request this is — then, for display only, the decision time in words
 # (mirroring Countdown::text: whole seconds rounded up), or "-" when the daemon
 # reports none (decided, or a daemon that predates #146 item 4). The daemon's own
-# figure as of this listing; nothing here computes a deadline of its own.
+# figure as of this listing; nothing here computes a deadline of its own. A session
+# `--all` could not ask arrives as {"session", "error"} (#141 finding 5): it has no
+# outcome, so read as an approval it would pass for a pending one with empty fields —
+# it is its own "unreachable" row instead, the error last, and never answerable.
 # shellcheck disable=SC2016  # this is a jq program; its $-expressions are jq's own
 # interpolation syntax, expanded by jq when it runs, not by this shell now
 fields='
@@ -58,20 +70,44 @@ fields='
     elif .outcome.answered == "allow-session" then "allowed-session"
     else "denied"
     end;
-  [.approval.id, state_word, .session, .project, .agent, .approval.tool,
-   .approval.authority.destination, decision_time] | @tsv'
+  def row:
+    [.approval.id, state_word, .session, .project, .agent, .approval.tool,
+     .approval.authority.destination, decision_time, "-"];
+  def unreachable:
+    ["-", "unreachable", .session, "-", "-", "-", "-", "-", .error];
+  if has("error") then unreachable else row end | @tsv'
 
-rows=$(ward session approvals --json --all | jq -r "$fields")
+# unavailable MESSAGE: the listing itself failed. Said on stderr, in a notification
+# when one can be shown, and — since wardos_notify sends nothing when notify-send is
+# missing or cannot reach a running notification service, and this is started from a
+# keybinding or the command centre, where stderr reaches no one either — in a
+# read-only menu screen too, the one surface this script's own menu action already
+# depends on. A failure, never an empty inbox.
+unavailable() {
+  echo "wardos-approve-inbox: $1" >&2
+  wardos_notify "Approval inbox unavailable" "$1" -u critical -t 8000
+  printf 'State        unavailable\nError        %s' "$1" \
+    | wardos_menu "Approval inbox unavailable" >/dev/null || true
+  exit 1
+}
+errors=$(mktemp)
+trap 'rm -f "$errors"' EXIT
+listing=$(ward session approvals --json --all 2>"$errors") ||
+  unavailable "$(tr '\n' ' ' <"$errors" | sed 's/ *$//')"
+rows=$(printf '%s' "$listing" | jq -r "$fields" 2>"$errors") ||
+  unavailable "unreadable approval listing: $(tr '\n' ' ' <"$errors" | sed 's/ *$//')"
 if [[ -z $rows ]]; then
   wardos_notify "No approvals" "nothing pending or recently decided, in any live session" -t 2500
   exit 0
 fi
 
-# Pending first (it needs a decision), each group in the order the daemon gave it
-# (oldest asked first) — a stable partition, not a re-sort.
+# Pending first (it needs a decision), then any session that could not be listed (it
+# may be holding pending ones this cannot see), then what was decided, each group in
+# the order the daemon gave it (oldest asked first) — a stable partition, not a re-sort.
 ordered=$(
   printf '%s\n' "$rows" | awk -F'\t' '$2 == "pending"'
-  printf '%s\n' "$rows" | awk -F'\t' '$2 != "pending"'
+  printf '%s\n' "$rows" | awk -F'\t' '$2 == "unreachable"'
+  printf '%s\n' "$rows" | awk -F'\t' '$2 != "pending" && $2 != "unreachable"'
 )
 
 # Every menu line carries its own row's full fields ahead of the human-readable
@@ -84,10 +120,14 @@ ordered=$(
 # opened terminal would no longer be a single, consistent record. Parsing the
 # exact line the person picked, instead of looking it up again by bare id, keeps
 # that record intact regardless of what else in $ordered shares its id. The decision
-# time (field 8) only ever joins the display column, never the parsed fields.
+# time (field 8) only ever joins the display column; the error (field 9, "-" on an
+# approval row) is carried as a parsed field of its own, for the unreachable summary.
 menu_lines=$(printf '%s\n' "$ordered" \
-  | awk -F'\t' '{ printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%-15s %s · %s · %s · %s · %s%s\n", \
-      $1, $2, $3, $4, $5, $6, $7, $2, $3, $4, $5, $6, $7, ($8 == "-" || $8 == "" ? "" : " · " $8) }')
+  | awk -F'\t' '$2 == "unreachable" {
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%-15s %s · approvals could not be listed: %s\n", \
+        $1, $2, $3, $4, $5, $6, $7, $9, $2, $3, $9; next }
+    { printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%-15s %s · %s · %s · %s · %s%s\n", \
+      $1, $2, $3, $4, $5, $6, $7, $9, $2, $3, $4, $5, $6, $7, ($8 == "-" || $8 == "" ? "" : " · " $8) }')
 chosen=$(printf '%s\n' "$menu_lines" | wardos_menu "Approvals") || exit 0
 id=$(printf '%s\n' "$chosen" | cut -f1)
 state=$(printf '%s\n' "$chosen" | cut -f2)
@@ -96,14 +136,25 @@ project=$(printf '%s\n' "$chosen" | cut -f4)
 agent=$(printf '%s\n' "$chosen" | cut -f5)
 tool=$(printf '%s\n' "$chosen" | cut -f6)
 destination=$(printf '%s\n' "$chosen" | cut -f7)
+error=$(printf '%s\n' "$chosen" | cut -f8)
+
+if [[ $state == unreachable ]]; then
+  # Nothing here can be answered, or even listed: read-only, like a decided row.
+  info=$(printf 'State        unreachable\nSession      %s\nError        %s' "$session" "$error")
+  printf '%s\n' "$info" | wardos_menu "Session $session · approvals not listed" >/dev/null || true
+  exit 0
+fi
 
 if [[ $state == pending ]]; then
   # Pin the terminal wardos-approve opens to this exact session (WARDOS_SESSION,
   # mirroring wardos-pause's own pinned target): the approval may belong to a
   # different session than $WARDOS_PROJECT's/the desktop's current selection, and
   # is always this row's own session, never one recovered by a second, ambiguous
-  # lookup on id alone.
-  WARDOS_SESSION=$session wardos_terminal_exec ward-approval wardos-approve "$id"
+  # lookup on id alone. Through wardos-launch run, so the window stays open on how it
+  # ended (#146 item 5): the daemon's own "approval <id> <decision>" once it has taken
+  # the answer, or its refusal — answered elsewhere, timed out, not reachable — with
+  # [failed, exit N], instead of closing with the outcome before anyone read it.
+  WARDOS_SESSION=$session wardos-launch run ward-approval wardos-approve "$id"
   exit 0
 fi
 

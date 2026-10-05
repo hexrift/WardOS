@@ -1,21 +1,35 @@
 //! Local ward-node service.
 //!
-//! The first service slice exposes only protocol negotiation and read-only node capability
-//! discovery. Task lifecycle and remote transport are deliberately absent.
+//! The service negotiates the node protocol, then serves exactly one request per
+//! connection:
+//!
+//! * at protocol 1.1, read-only node capability discovery;
+//! * at protocol 1.2, read-only discovery or one task lifecycle request against
+//!   the node-owned [`task::TaskRegistry`]. Only `create` and `inspect` are
+//!   implemented; every other verb is refused explicitly (see [`task`]).
+//!
+//! No task is executed yet, and remote transport is deliberately absent.
 
 #![forbid(unsafe_code)]
+
+pub mod admission;
+pub mod task;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use ward_node_protocol::{
     CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse, NodeCapabilities,
-    SupportedProtocolRange, WARD_NODE_PROTOCOL, negotiate,
+    SupportedProtocolRange, TaskLifecycleContext, WARD_NODE_PROTOCOL, negotiate,
+    supports_task_lifecycle,
 };
+
+use crate::task::TaskRegistry;
 
 /// Maximum bytes in one node-protocol JSON request, excluding the terminating newline.
 pub const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024;
@@ -35,6 +49,9 @@ pub enum NodeServiceError {
     /// Capability request did not satisfy the negotiated protocol context.
     #[error("ward-node capability request is invalid")]
     MalformedCapabilityRequest,
+    /// Task lifecycle request was malformed or not bound to the negotiated protocol.
+    #[error("ward-node task lifecycle request is invalid")]
+    MalformedLifecycleRequest,
     /// A request exceeded the fixed wire bound.
     #[error("ward-node request exceeds the maximum line size")]
     RequestTooLarge,
@@ -53,14 +70,20 @@ pub enum NodeServiceError {
     /// The absolute connection lifetime expired.
     #[error("ward-node connection exceeded its lifetime")]
     ConnectionDeadlineExceeded,
+    /// The node task registry lock was poisoned by an earlier panic.
+    #[error("ward-node task registry is unavailable")]
+    TaskRegistryUnavailable,
 }
 
-/// Read-only local node service for handshake and capability discovery.
+/// Local node service for handshake, capability discovery and the task registry.
+///
+/// Clones share one task registry, so a task created on one connection is visible to
+/// every later connection served by any clone.
 #[derive(Clone)]
 pub struct NodeService {
     capabilities: NodeCapabilities,
-    context: CapabilityDiscoveryContext,
     supported: SupportedProtocolRange,
+    tasks: Arc<Mutex<TaskRegistry>>,
 }
 
 impl NodeService {
@@ -71,21 +94,26 @@ impl NodeService {
     /// Returns `InvalidCapabilities` if the capability document is not valid for
     /// capability discovery in this build.
     pub fn new(capabilities: NodeCapabilities) -> Result<Self, NodeServiceError> {
-        let protocol = capabilities.protocol();
-        let context = CapabilityDiscoveryContext::new(protocol)
+        CapabilityDiscoveryContext::new(capabilities.protocol())
             .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         Ok(Self {
             capabilities,
-            context,
             supported: WARD_NODE_PROTOCOL,
+            tasks: Arc::new(Mutex::new(TaskRegistry::default())),
         })
     }
 
     /// Serve exactly one local protocol connection.
     ///
     /// The first request must be a handshake. Rejected handshakes receive a bounded
-    /// machine-readable response and close. Accepted connections may issue one read-only
-    /// capability-discovery request before closing.
+    /// machine-readable response and close. A connection accepted at the capability
+    /// negotiated protocol may issue one read-only capability-discovery request; a
+    /// connection accepted at 1.2 may instead issue one lifecycle request. The
+    /// connection then closes.
+    ///
+    /// A lifecycle request is applied to the registry before its response is written, so
+    /// a `create` whose client disconnects before reading the response still took effect;
+    /// the client recovers by replaying the same operation id or by inspecting.
     ///
     /// # Errors
     ///
@@ -118,19 +146,70 @@ impl NodeService {
             return Ok(());
         };
 
-        if protocol != self.context.protocol() {
+        if !ward_node_protocol::supports_capability_discovery(protocol) {
             return Ok(());
         }
 
         let request_line = read_request_line(&mut reader, deadline)?;
-        self.context
-            .decode_request(&request_line)
+        if serde_json::from_str::<serde_json::Value>(&request_line)
+            .is_ok_and(|value| value["request"] == "capabilities")
+        {
+            return self.serve_capabilities(&mut stream, protocol, &request_line, deadline);
+        }
+        if supports_task_lifecycle(protocol) {
+            return self.serve_lifecycle(&mut stream, protocol, &request_line, deadline);
+        }
+        Err(NodeServiceError::MalformedCapabilityRequest)
+    }
+
+    fn serve_capabilities(
+        &self,
+        stream: &mut UnixStream,
+        protocol: ward_node_protocol::ProtocolVersion,
+        request_line: &str,
+        deadline: Instant,
+    ) -> Result<(), NodeServiceError> {
+        let context = CapabilityDiscoveryContext::new(protocol)
             .map_err(|_| NodeServiceError::MalformedCapabilityRequest)?;
-        let response = self
-            .context
-            .response(self.capabilities)
+        context
+            .decode_request(request_line)
+            .map_err(|_| NodeServiceError::MalformedCapabilityRequest)?;
+        let capabilities = NodeCapabilities::new(
+            protocol,
+            self.capabilities.architecture(),
+            self.capabilities.capacity(),
+            self.capabilities.isolation(),
+            self.capabilities.network(),
+            self.capabilities.credentials(),
+            self.capabilities.snapshots(),
+            self.capabilities.verifier(),
+            self.capabilities.lifecycle(),
+        )
+        .map_err(|_| NodeServiceError::InvalidCapabilities)?;
+        let response = context
+            .response(capabilities)
             .map_err(|_| NodeServiceError::InvalidCapabilities)?;
-        write_json_line(&mut stream, &response, deadline)
+        write_json_line(stream, &response, deadline)
+    }
+
+    fn serve_lifecycle(
+        &self,
+        stream: &mut UnixStream,
+        protocol: ward_node_protocol::ProtocolVersion,
+        request_line: &str,
+        deadline: Instant,
+    ) -> Result<(), NodeServiceError> {
+        let context = TaskLifecycleContext::new(protocol)
+            .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
+        let request = context
+            .decode_request(request_line)
+            .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
+        let response = self
+            .tasks
+            .lock()
+            .map_err(|_| NodeServiceError::TaskRegistryUnavailable)?
+            .handle(context, request);
+        write_json_line(stream, &response, deadline)
     }
 }
 
@@ -270,12 +349,17 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
+    use ward_events::{ExecutionAttemptId, LeaseId, TaskId};
     use ward_node_protocol::{
         CapabilityDiscoveryContext, CredentialCapabilities, ExecutionBackendCapabilities,
         HandshakeRequest, HandshakeResponse, IsolationCapabilities, LifecycleCapabilities,
         NamespaceCapabilities, NetworkCapabilities, NodeArchitecture, NodeCapabilities,
         NodeCapacity, ProtocolRejectionReason, ProtocolVersion, SnapshotCapabilities,
         SupportedProtocolRange, VerifierCapabilities, WARD_NODE_PROTOCOL,
+    };
+    use ward_node_protocol::{
+        OperationId, TaskBinding, TaskLifecycleContext, TaskLifecycleRejectionReason,
+        TaskLifecycleRequest, TaskLifecycleResponse, TaskLifecycleState,
     };
 
     use super::*;
@@ -504,7 +588,7 @@ mod tests {
         let _: HandshakeResponse = serde_json::from_str(line(&mut client).trim()).unwrap();
 
         writeln!(client, "{{not-json").unwrap();
-        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let _ = client.shutdown(std::net::Shutdown::Write);
 
         assert!(matches!(
             worker.join().unwrap(),
@@ -534,6 +618,229 @@ mod tests {
             Err(NodeServiceError::RequestTooLarge)
         ));
         assert_eq!(line(&mut client), "");
+    }
+
+    fn lifecycle_binding() -> TaskBinding {
+        TaskBinding::new(
+            TaskId::from_u128(7),
+            ExecutionAttemptId::from_u128(8),
+            LeaseId::from_u128(9),
+        )
+    }
+
+    fn lifecycle_context() -> TaskLifecycleContext {
+        TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap()
+    }
+
+    /// Open a connection, negotiate 1.2 and return the client end plus the server worker.
+    fn lifecycle_connection(
+        service: &NodeService,
+    ) -> (
+        UnixStream,
+        std::thread::JoinHandle<Result<(), NodeServiceError>>,
+    ) {
+        let service = service.clone();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || service.serve_connection(server));
+
+        let hello = HandshakeRequest::Hello {
+            protocol: SupportedProtocolRange::new(1, 2, 2).unwrap(),
+        };
+        writeln!(client, "{}", serde_json::to_string(&hello).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<HandshakeResponse>(line(&mut client).trim()).unwrap(),
+            HandshakeResponse::Accepted {
+                protocol: ProtocolVersion::new(1, 2),
+            }
+        );
+        (client, worker)
+    }
+
+    #[test]
+    fn one_two_client_discovers_capabilities_without_registering_a_task() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let (mut client, worker) = lifecycle_connection(&service);
+        let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&context.request()).unwrap()
+        )
+        .unwrap();
+
+        let response = context.decode_response(line(&mut client).trim()).unwrap();
+        let ward_node_protocol::CapabilityDiscoveryResponse::Capabilities {
+            capabilities: observed,
+        } = response;
+        assert_eq!(observed.protocol(), ProtocolVersion::new(1, 2));
+        assert_eq!(observed.architecture(), service.capabilities.architecture());
+        assert_eq!(observed.capacity(), service.capabilities.capacity());
+        assert_eq!(observed.isolation(), service.capabilities.isolation());
+        assert_eq!(observed.network(), service.capabilities.network());
+        assert_eq!(observed.credentials(), service.capabilities.credentials());
+        assert_eq!(observed.snapshots(), service.capabilities.snapshots());
+        assert_eq!(observed.verifier(), service.capabilities.verifier());
+        assert_eq!(observed.lifecycle(), service.capabilities.lifecycle());
+        worker.join().unwrap().unwrap();
+        assert!(service.tasks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_two_capability_request_with_one_one_version_fails_closed() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let (mut client, worker) = lifecycle_connection(&service);
+        let one_one = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 1)).unwrap();
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&one_one.request()).unwrap()
+        )
+        .unwrap();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(NodeServiceError::MalformedCapabilityRequest)
+        ));
+        assert_eq!(line(&mut client), "");
+        assert!(service.tasks.lock().unwrap().is_empty());
+    }
+
+    /// One lifecycle request on its own 1.2 connection; returns the decoded response.
+    fn lifecycle_round_trip(
+        service: &NodeService,
+        request: TaskLifecycleRequest,
+    ) -> TaskLifecycleResponse {
+        let (mut client, worker) = lifecycle_connection(service);
+        writeln!(client, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+        let response = lifecycle_context()
+            .decode_response(line(&mut client).trim())
+            .unwrap();
+        worker.join().unwrap().unwrap();
+        response
+    }
+
+    #[test]
+    fn one_two_create_registers_a_node_task_that_a_later_connection_inspects() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let ctx = lifecycle_context();
+        let binding = lifecycle_binding();
+        let operation = OperationId::new(1).unwrap();
+
+        assert_eq!(
+            lifecycle_round_trip(&service, ctx.inspect(binding)),
+            ctx.rejected(None, binding, TaskLifecycleRejectionReason::TaskNotFound)
+        );
+        assert_eq!(
+            lifecycle_round_trip(&service, ctx.create(operation, binding)),
+            ctx.accepted(operation, binding, TaskLifecycleState::Created)
+        );
+        assert_eq!(
+            lifecycle_round_trip(&service, ctx.inspect(binding)),
+            ctx.inspected(binding, TaskLifecycleState::Created)
+        );
+    }
+
+    #[test]
+    fn one_two_start_is_refused_over_the_socket_and_the_task_stays_created() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let ctx = lifecycle_context();
+        let binding = lifecycle_binding();
+        let create = OperationId::new(1).unwrap();
+        let start = OperationId::new(2).unwrap();
+
+        lifecycle_round_trip(&service, ctx.create(create, binding));
+        assert_eq!(
+            lifecycle_round_trip(&service, ctx.start(start, binding)),
+            ctx.rejected(
+                Some(start),
+                binding,
+                TaskLifecycleRejectionReason::UnsupportedOperation
+            )
+        );
+        assert_eq!(
+            lifecycle_round_trip(&service, ctx.inspect(binding)),
+            ctx.inspected(binding, TaskLifecycleState::Created)
+        );
+    }
+
+    #[test]
+    fn create_applies_even_if_the_client_disconnects_before_reading_and_replays() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let ctx = lifecycle_context();
+        let binding = lifecycle_binding();
+        let operation = OperationId::new(1).unwrap();
+
+        let (mut client, worker) = lifecycle_connection(&service);
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&ctx.create(operation, binding)).unwrap()
+        )
+        .unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(client);
+        let _ = worker.join().unwrap();
+
+        assert_eq!(
+            lifecycle_round_trip(&service, ctx.create(operation, binding)),
+            ctx.accepted(operation, binding, TaskLifecycleState::Created)
+        );
+    }
+
+    #[test]
+    fn malformed_or_wrong_version_lifecycle_request_fails_closed_without_registering() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let binding = lifecycle_binding();
+        let operation = OperationId::new(1).unwrap();
+        let wrong_version = serde_json::to_string(&TaskLifecycleRequest::Create {
+            protocol: ProtocolVersion::new(1, 1),
+            operation_id: operation,
+            binding,
+        })
+        .unwrap();
+
+        for payload in ["{not-json".to_owned(), wrong_version] {
+            let (mut client, worker) = lifecycle_connection(&service);
+            writeln!(client, "{payload}").unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(NodeServiceError::MalformedLifecycleRequest)
+            ));
+            assert_eq!(line(&mut client), "");
+        }
+
+        let ctx = lifecycle_context();
+        assert_eq!(
+            lifecycle_round_trip(&service, ctx.inspect(binding)),
+            ctx.rejected(None, binding, TaskLifecycleRejectionReason::TaskNotFound)
+        );
+    }
+
+    #[test]
+    fn capability_discovery_at_one_one_is_unchanged_by_the_task_registry() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let ctx = lifecycle_context();
+        let binding = lifecycle_binding();
+        lifecycle_round_trip(&service, ctx.create(OperationId::new(1).unwrap(), binding));
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let discovery_service = service.clone();
+        let worker = std::thread::spawn(move || discovery_service.serve_connection(server));
+        let hello = HandshakeRequest::Hello {
+            protocol: SupportedProtocolRange::new(1, 1, 1).unwrap(),
+        };
+        writeln!(client, "{}", serde_json::to_string(&hello).unwrap()).unwrap();
+        let _: HandshakeResponse = serde_json::from_str(line(&mut client).trim()).unwrap();
+        let discovery = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 1)).unwrap();
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&discovery.request()).unwrap()
+        )
+        .unwrap();
+        assert!(discovery.decode_response(line(&mut client).trim()).is_ok());
+        worker.join().unwrap().unwrap();
     }
 
     #[test]
