@@ -32,6 +32,7 @@ priority when budgets conflict:
 | Entry snapshot stall (Btrfs path) | < 100 ms agent-visible freeze on a 200k-file worktree | freeze → thaw |
 | Verification startup | < 500 ms to verifier PID 1 (excluding materialisation of large trees, reported separately) | |
 | `ward status` | < 10 ms | wall time |
+| Pause acknowledgement | < 100 ms | `ward pause` request → confirmed `SessionPaused` answer over the session's control socket: sandbox frozen and settled, proxy closed, approvals held, record appended (ADR-0019 §3) |
 | Idle shell CPU | < 0.5 % | 60 s average, no agent |
 | Idle RAM (desktop ready, no agent) | < 700 MB | after login + 60 s |
 | Boot to login | < 4 s on reference NVMe hardware | firmware handoff → greeter |
@@ -101,9 +102,23 @@ process, with no daemon and no `ward` CLI subprocess in the timed path itself:
   a real daemon `Subscribe` stream (`daemon::serve` in-process, `client::watch_records`)
   hands the record over. The production path end to end — watcher, bounded queue, session live
   drain, the daemon's single writer, the subscriber — with no benchmark-only timestamp,
-  against "Observer event propagation" (§2). The one metric here that runs a daemon.
+  against "Observer event propagation" (§2).
+* **`pause_acknowledgement`** — `client::pause`, the control-socket call `ward pause`
+  makes, against a real daemon (`daemon::serve` in-process) while a sandboxed command is
+  running; each sample is the request to the daemon's answer carrying a confirmed
+  `SessionPaused` (the tree frozen and settled, the proxy marker written, approvals held,
+  the record appended), followed by an untimed `client::resume`. An unsettled freeze is a
+  failed run, never a sample. The command execs a single `sleep`, so nothing forks while
+  it is sampled, and the closing `ward stop` terminates it. Against "Pause
+  acknowledgement" (§2), a row added with this metric: ADR-0019 §3 makes pause one host
+  operation behind one key, and §2 had no budget for it; 100 ms keeps the confirmed
+  answer an order of magnitude inside `pause::FREEZE_SETTLE` (1 s), past which the
+  daemon records the pause as unsettled.
 
-`sandbox_start`, `verifier_spawn` and `observer_event_propagation` need a working bubblewrap and user namespace; where
+`observer_event_propagation` and `pause_acknowledgement` are the two metrics here that
+run a daemon.
+
+`sandbox_start`, `verifier_spawn`, `observer_event_propagation` and `pause_acknowledgement` need a working bubblewrap and user namespace; where
 that is unavailable (this repository's own nested dev sandbox, some hardened hosts) they
 report `status: "unsupported"` with a reason instead of failing the run or being
 silently dropped. Every `docs/performance.md` §2 budget this tool does not implement at
