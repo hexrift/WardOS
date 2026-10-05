@@ -359,10 +359,15 @@ outcome on `inspect`. Capability responses retain the same node facts while nami
 exact negotiated version. A 1.3 document adds `"admit":true` to `lifecycle` only when the
 node admits signed envelopes, and advertises `stop` and `"start":true` together only
 when it executes (a 1.3 document with one but not the other is invalid); a `ward-node`
-1.3 document sets `pause` and `revoke` exactly when it advertises `start`; 1.1 and 1.2
-documents never carry `admit` or `start` and are byte-for-byte unchanged. Protocol 1.0 has
-no discovery endpoint. A 1.2 connection refuses `admit` exactly like an unknown request
-and never carries `exited`.
+1.3 document sets `pause` and `revoke` exactly when it advertises `start`. Only an executing
+node's 1.3 document also reports the isolation its execution enforces
+(`isolation.namespaces.sandbox` and `user_namespace`, `network.offline`,
+`snapshots.content_addressed`); 1.1 and 1.2 documents never carry `admit` or `start` and
+are byte-for-byte unchanged. Protocol 1.0 has no discovery endpoint. A 1.2 connection
+refuses `admit` exactly like an unknown request and never carries `exited`. The
+handshake and request line must arrive within 10 seconds of accept; the answer is then
+written within 10 seconds of being ready, so a `start` or `stop` whose own bounded wait
+outlasts the request deadline is still answered.
 
 ### 3.11 Node admission and execution ownership (decided; admission, start, stop, exit, pause, resume, revoke and seal implemented)
 
@@ -390,15 +395,19 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issu
 `--node-id` is the node's audience; the state directory (created mode 0700, refused if
 group- or world-accessible) pins it at first start and holds `admission-versions.json`
 (last accepted version per task) and `revocations.json` (known revocation facts), each
-replaced atomically (temporary file, fsync, rename). The trust-store file lists one hex
-Ed25519 issuer public key per line, optionally followed by its key id, with `#`
-comments; a key id is the `BLAKE3` hash of the 32-byte public key, so
+replaced atomically (temporary file, fsync, rename). The trust-store file lists one
+issuer per line as `<public-key> [<key-id>] <prn_…>`: a lowercase hex Ed25519 public
+key, optionally its key id, and the one principal the key may issue authority as, with
+`#` comments; a key id is the `BLAKE3` hash of the 32-byte public key, so
 `ward-node issuer-key-id <hex-public-key>` prints the id a proof must name. A
-malformed, group- or world-writable trust store stops the node from starting; without
-one no issuer is trusted and every `admit` is `authority_denied`.
+malformed, group- or world-writable trust store, or a key bound to no principal, stops the
+node from starting; without one no issuer is trusted and every `admit` is
+`authority_denied`. Every hex value on the admission wire and in the trust store is
+lowercase only.
 
 `admit` needs a `created` task with the exact binding, then a trusted key id, a
-signature over exactly the envelope bytes, and only then a strict decode; the decoded
+signature over exactly the envelope bytes, and only then a strict decode; the root
+lease's issuer must be the principal the signing key is bound to; the decoded
 binding must equal the request's and the audience must be this node; the envelope must
 be current at the node clock; its version must exceed the last durably accepted one;
 the lease and lineage are promoted only because the trusted issuer signed them and must
@@ -412,14 +421,14 @@ the same operation returns the same result.
 The node executes admitted tasks when given a task root (ADR-0030 §3–§6):
 
 ```text
-ward-node snapshot import --state-dir <dir> <project-dir>     # prints blake3:<hex>
+ward-node snapshot import --state-dir <dir> <project-dir>     # prints the bare hex id
 ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
   --trusted-issuers <file> --task-root <dir>
 ```
 
 `snapshot import` captures a local directory into the node's content-addressed store
-(`<state-dir>/cas`) and prints the id an envelope names; it is an operator command over
-local files, not a socket verb. The task root is created mode 0700 and refused if group-
+(`<state-dir>/cas`) and prints its id as 64 lowercase hex digits, exactly the envelope's
+`workload.snapshot` value; it is an operator command over local files, not a socket verb. The task root is created mode 0700 and refused if group-
 or world-accessible, and the node refuses to serve with a task root when bubblewrap is
 unusable. Only then does a 1.3 capability document advertise `start` and `stop`.
 

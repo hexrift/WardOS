@@ -45,18 +45,36 @@ it cannot parse, wrong permissions, a pinned id mismatch. It serves until killed
 
 ### 2.2 Trust store
 
-One issuer per line: the 32-byte Ed25519 public key as 64 hex digits (either case),
-optionally followed by whitespace and the key id (64 hex digits), which must then equal
-the derived id. `#` starts a comment; blank lines are ignored.
+One issuer per line. Each line binds one Ed25519 public key to the one principal
+(`prn_…`) it may issue authority as:
+
+```text
+line       = [ws] [entry [ws]] ["#" comment]
+entry      = public-key ws [key-id ws] principal
+public-key = 64 lowercase hex digits: the 32-byte Ed25519 public key
+key-id     = 64 lowercase hex digits: the key id of §2.3, which must equal the derived id
+principal  = "prn_" + 26-character upper-case Crockford base32 ULID (§7.2)
+ws         = one or more spaces or tabs
+```
+
+`#` starts a comment that runs to the end of the line; blank and comment-only lines are
+ignored. The key id is optional and only checked; the principal is required.
 
 ```text
 # control-plane issuer (this is the test key of §7.4; never trust it in production)
-ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c 0871f3aabc26e4582c508af5c03884e6a96f0989d1dd8cfb49cd17ed25792433
+ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c 0871f3aabc26e4582c508af5c03884e6a96f0989d1dd8cfb49cd17ed25792433 prn_01M1RQ16G00000Y3RF1W7GY3RF
 ```
 
+A key signs only for its principal: `admit` is refused `authority_denied` unless the
+envelope's root lease names, as its `issuer`, the principal the signing key is bound to
+(§8.1). Several keys may be bound to the same principal (for rotation); one key is never
+bound to two.
+
 The file must be a regular file, not writable by group or others (`mode & 022 == 0`),
-at most 64 KiB and UTF-8. A malformed line, a mismatched key id or a duplicate key stops
-the node. The store is read once at start; a key change needs a restart.
+at most 64 KiB and UTF-8. A malformed line, a key bound to no principal (including a line
+in the earlier `<public-key> [<key-id>]` format), upper-case hex, a mismatched key id or
+a duplicate key stops the node. The store is read once at start; a key change needs a
+restart.
 
 ### 2.3 Issuer key id
 
@@ -68,21 +86,20 @@ $ ward-node issuer-key-id ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea
 0871f3aabc26e4582c508af5c03884e6a96f0989d1dd8cfb49cd17ed25792433
 ```
 
-Input that is not 64 hex digits exits non-zero.
+Input that is not 64 lowercase hex digits exits non-zero.
 
 ### 2.4 Importing a project snapshot
 
 ```text
 $ ward-node snapshot import --state-dir <dir> <project-dir>
-blake3:c19c769fdd8644df9167a36d0133289c9fa44a8c768cd0aafa1756a13fb3e33b
+c19c769fdd8644df9167a36d0133289c9fa44a8c768cd0aafa1756a13fb3e33b
 ```
 
 It captures `<project-dir>` (honouring `.gitignore`, including `.git`, at most 2 GiB)
-into `<state-dir>/cas` and prints one line, `blake3:` followed by 64 lowercase hex
-digits. Use the same `--state-dir` as the node. It is an operator command over local
-files, not a socket verb. **An envelope names the snapshot as the 64 hex digits without
-the `blake3:` prefix** (§7.3); a prefixed value fails envelope decoding, which the node
-reports only as `authority_denied`.
+into `<state-dir>/cas` and prints one line: the snapshot id as 64 lowercase hex digits,
+with no prefix. That line, without its newline, is exactly the value an envelope's
+`workload.snapshot` carries (§7.3); pass it through unchanged. Use the same
+`--state-dir` as the node. It is an operator command over local files, not a socket verb.
 
 ### 2.5 Revocations
 
@@ -107,10 +124,19 @@ are node-owned: deleting the versions file would let old envelopes be replayed.
   Open a new connection per request. Both lines may be written at once.
 - A request line is at most 64 KiB (65 536 bytes) excluding the newline; a longer line
   closes the connection.
-- The whole connection has a 10-second lifetime from accept, covering both reads, the
-  work and both writes. If it expires the node closes the connection without a response.
+- **Request deadline.** The handshake line, its response and the request line must all
+  complete within 10 seconds of accept. Partial progress does not extend it. If it
+  expires the node closes the connection without a response.
+- **Answer deadline.** Once a request is read, the verb runs to its own bound, which the
+  request deadline does not cut short, and the node then has a further 10 seconds to
+  write the answer, counted from when the answer is ready. A verb's answer can therefore
+  take longer than 10 seconds to arrive: `stop` waits up to 10 seconds for the reap,
+  `start` materialises the snapshot and then waits up to 30 seconds for the spawn, and
+  every other request is answered at once. Give `start` and `stop` a read timeout above
+  those bounds (for example 60 seconds plus the time to copy your largest snapshot).
 - Connections are served one at a time. Do not hold a connection open; an idle client
-  delays every other client by up to 10 seconds.
+  delays every other client by up to 10 seconds, and a `start` or `stop` delays them for
+  as long as it runs.
 - **Fail closed:** anything malformed (invalid JSON, an unknown or missing field, an
   unknown verb, a request whose `protocol` differs from the negotiated version, a value
   out of bounds) gets no response line: the node closes the connection. Only well-formed
@@ -156,7 +182,7 @@ A node started with `--trusted-issuers` and `--task-root` answers at 1.3 (capaci
 host's; the other values are what the node reports today):
 
 ```json
-{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":3},"architecture":"x86_64","capacity":{"logical_cpus":8,"memory_bytes":17179869184},"isolation":{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":false,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":false,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":true,"revoke":false,"admit":true,"start":true}}}
+{"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":3},"architecture":"x86_64","capacity":{"logical_cpus":8,"memory_bytes":17179869184},"isolation":{"namespaces":{"sandbox":true,"user_namespace":true},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":true,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":true,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":false,"stop":true,"revoke":false,"admit":true,"start":true}}}
 ```
 
 | Flag | Meaning at 1.3 |
@@ -165,12 +191,15 @@ host's; the other values are what the node reports today):
 | `lifecycle.start` | Present, and `true`, when the node executes admitted tasks (`--task-root` set, bubblewrap usable). Absent means `false`. |
 | `lifecycle.stop` | Always present. At 1.3 it equals `start`: the node never offers a way to begin execution without its own way to end it. |
 | `lifecycle.pause`, `lifecycle.revoke` | Always `false`; the verbs are not implemented. |
+| `isolation.namespaces.sandbox`, `isolation.namespaces.user_namespace` | `true` exactly when `lifecycle.start` is: every workload runs in a bubblewrap namespace sandbox inside its own user namespace. |
+| `network.offline` | `true` exactly when `lifecycle.start` is: every workload runs with no network but loopback. |
+| `snapshots.content_addressed` | `true` exactly when `lifecycle.start` is: workspaces are materialised from the node's content-addressed store (§2.4). |
 
-The other sections (`isolation`, `network`, `credentials`, `snapshots`, `verifier`) are
-reported `false` today even on an executing node, which does run workloads in an offline
-bubblewrap sandbox over its content-addressed store; decide whether a node executes from
-`lifecycle.start` only. 1.1 and 1.2 documents never carry `admit` or `start` and report
-`stop` as `false`.
+Everything else (`isolation.backends`, `network.proxy_allowlist`, `credentials`,
+`snapshots.diff`, `snapshots.read`, `verifier`) is `false`: the node offers none of it
+yet. 1.1 and 1.2 documents keep their earlier content: they never carry `admit` or
+`start`, report `stop` as `false`, and report the execution flags above as `false`,
+because a 1.1 or 1.2 connection cannot run anything.
 
 ## 6. Lifecycle verbs
 
@@ -341,8 +370,9 @@ refused at every level.
 | --- | --- |
 | Ids | Prefix + 26-character ULID in upper-case Crockford base32 (`0-9`, `A-Z` without `I`, `L`, `O`, `U`; first character `0`–`7`). Prefixes: `task_`, `exec_` (execution attempt), `lease_`, `agent_`, `node_`, `sess_`, `deleg_`, `prn_` (principal). Lower case is refused. |
 | Times | Unix milliseconds as JSON integers (`*_unix_ms`). `issued_at` is inclusive and `expires_at` exclusive; `expires_at` must be strictly greater. |
-| Hashes | 64 hex digits, no prefix: `capability_manifest.hash`, `snapshot`, `proof.issuer_key_id`. The node writes lower case and accepts either case. |
-| Byte strings | Lower-case hex only: `capability_manifest.bytes` (decoded bytes) and `proof.signature`. Upper case is refused. There is no base64 anywhere. |
+| Hashes | 64 lower-case hex digits, no prefix: `capability_manifest.hash`, `snapshot`, `proof.issuer_key_id`. |
+| Byte strings | Lower-case hex: `capability_manifest.bytes` (decoded bytes) and `proof.signature`. There is no base64 anywhere. |
+| Hex case | Every hex value, in the envelope, the proof and the trust store (§2.2), is written and accepted in lower case only, so a signed or hashed value has one spelling. An upper-case or mixed-case digit is refused: in the envelope it fails decoding (`authority_denied`), in the proof the request is malformed (no response, §3). |
 
 ### 7.3 Fields
 
@@ -356,7 +386,7 @@ refused at every level.
 | `authority.lineage` | Array of 0–16 ancestor leases, nearest parent first, ending at the root. Empty when `lease` is itself a root. Always present. |
 | `workload.argv` | Array of 1–256 strings; `argv[0]` (the program, resolved on the sandbox `PATH`) non-empty; each entry at most 4 096 bytes, all entries together at most 16 384 bytes; no NUL. Never truncated: anything over a bound is refused. |
 | `workload.capability_manifest` | `{"hash","bytes"}`: `bytes` is the hex of 1–8 192 manifest bytes and `hash` is `BLAKE3-256` of those decoded bytes. Required and hash-checked, but not interpreted yet: no grant in it is honoured. |
-| `workload.snapshot` | 64 hex digits: the id `ward-node snapshot import` printed, without `blake3:`. Must be in the node's store at `start`. |
+| `workload.snapshot` | 64 lower-case hex digits: exactly the line `ward-node snapshot import` printed (§2.4). Must be in the node's store at `start`. |
 | `workload.wall_clock_budget_ms` | Integer ≥ 1. Mandatory; the workload is killed when it is reached, measured from spawn. |
 | `issued_at_unix_ms`, `expires_at_unix_ms` | Envelope validity at the node clock, checked at `admit` and again at `start`. It does not bound a running workload; the budget does. |
 | `version` | Integer ≥ 1, strictly greater than the last version the node durably accepted for this **task** (not attempt), across restarts. |
@@ -366,7 +396,7 @@ A lease (`authority.lease` and each `lineage` entry):
 | Field | Type and bounds |
 | --- | --- |
 | `id`, `delegation_id` | `lease_…`, `deleg_…` |
-| `issuer` | `prn_…`, the root principal; identical along the lineage. It is not compared with the issuer key. |
+| `issuer` | `prn_…`, the root principal; identical along the lineage. The root lease's `issuer` must be the principal the signing key is bound to in the trust store (§2.2). |
 | `subject` | `agent_…`, the agent holding the lease. |
 | `task` | `task_…`; identical along the lineage. |
 | `parent_lease_id`, `delegated_by` | Both `null` for a root lease; for a delegated lease the parent's `id` and the parent's `subject`. |
@@ -474,7 +504,8 @@ The complete `admit` request line:
 
 Its timestamps are fixed (2026-10-05T12:00:00Z plus 15 minutes), so a live node refuses
 it as `lease_expired` after that window; use it to check your encoding and signature,
-then sign fresh envelopes. A node with this key in its trust store and `--node-id
+then sign fresh envelopes. A node with this key bound to
+`prn_01M1RQ16G00000Y3RF1W7GY3RF` in its trust store (the line of §2.2) and `--node-id
 node_01M3KY5QG0000028T5CY4TQKFF` admits an envelope built the same way with current
 timestamps.
 
@@ -494,14 +525,15 @@ changes (no version is consumed, nothing is materialised).
 | 5 | `proof.issuer_key_id` is in the trust store | `authority_denied` |
 | 6 | The signature verifies over the `envelope_json` bytes | `authority_denied` |
 | 7 | `envelope_json` decodes strictly (every field, bound and encoding of §7) | `authority_denied` |
-| 8 | Envelope `binding` equals the request's: task / attempt / lease | `authority_denied` / `attempt_mismatch` / `lease_mismatch` |
-| 9 | Envelope `node` is this node | `authority_denied` |
-| 10 | `issued_at_unix_ms <= now` / `now < expires_at_unix_ms` | `authority_denied` / `lease_expired` |
-| 11 | `version` is greater than the last accepted for the task | `stale_operation` |
-| 12 | The lineage promotes from its root: root shape, non-empty grants, every delegation rule of §7.3, each lease valid now | `lease_expired` for an expired lease, otherwise `authority_denied` |
-| 13 | Lease `task` / `id` / `subject` equal binding task / binding lease / `agent` | `authority_denied` / `lease_mismatch` / `authority_denied` |
-| 14 | No revocation (§2.5) covers the lease or an ancestor | `lease_revoked` |
-| 15 | The version is written durably | `resource_unavailable` (write failed) |
+| 8 | The root lease's `issuer` (the last `lineage` entry, or `authority.lease` when the lineage is empty) is the principal the signing key is bound to (§2.2) | `authority_denied` |
+| 9 | Envelope `binding` equals the request's: task / attempt / lease | `authority_denied` / `attempt_mismatch` / `lease_mismatch` |
+| 10 | Envelope `node` is this node | `authority_denied` |
+| 11 | `issued_at_unix_ms <= now` / `now < expires_at_unix_ms` | `authority_denied` / `lease_expired` |
+| 12 | `version` is greater than the last accepted for the task | `stale_operation` |
+| 13 | The lineage promotes from its root: root shape, non-empty grants, every delegation rule of §7.3, each lease valid now | `lease_expired` for an expired lease, otherwise `authority_denied` |
+| 14 | Lease `task` / `id` / `subject` equal binding task / binding lease / `agent` | `authority_denied` / `lease_mismatch` / `authority_denied` |
+| 15 | No revocation (§2.5) covers the lease or an ancestor | `lease_revoked` |
+| 16 | The version is written durably | `resource_unavailable` (write failed) |
 
 On success the task is `ready` and holds the envelope for `start`.
 
@@ -516,7 +548,8 @@ or the sandbox failing to spawn → `resource_unavailable` with the task still `
 `stop`: `unsupported_operation` without `--task-root`; then checks 1–2; replay; `ready`
 → `stopped`; `running` → kill, wait up to 10 seconds for the reap, then `stopped`, or
 `resource_unavailable` if still running, or `invalid_state` if the workload exited first;
-any other state → `invalid_state`.
+any other state → `invalid_state`. The answer is written after the wait, whatever it
+took (§3).
 
 `create`: checks 2 and the replay rule of §6.3; a node holding 1 024 tasks refuses a new
 one with `resource_unavailable`.
@@ -530,9 +563,9 @@ one with `resource_unavailable`.
 | `lease_mismatch` | The task is registered, or the envelope is bound, under another lease id, or the envelope's lease `id` is not the binding's lease. |
 | `lease_expired` | The envelope or a lease is past its expiry at the node clock. |
 | `lease_revoked` | A durable revocation covers the lease or an ancestor. |
-| `stale_operation` | The envelope version is not greater than the last accepted for the task. |
+| `stale_operation` | The request is stale. From `admit`: the envelope `version` is not greater than the last version the node durably accepted for the task (an old or replayed envelope, also after a restart). The protocol also reserves it for a mutating request whose `operation_id` was superseded by a later operation on the task; `ward-node` does not return it for that today. |
 | `invalid_state` | The task is not in a state that allows the verb, or another operation already did it. |
-| `authority_denied` | Untrusted key, bad signature, malformed envelope, wrong audience, not yet valid, or authority that does not cover the task or agent. |
+| `authority_denied` | Untrusted key, bad signature, malformed envelope, a root lease `issuer` that is not the principal bound to the signing key, wrong audience, not yet valid, or authority that does not cover the task or agent. |
 | `resource_unavailable` | Registry full, snapshot missing, workspace exists, spawn failed, state write failed, or stop not confirmed in time. |
 | `unsupported_operation` | The verb is not implemented, or not enabled on this node. |
 
@@ -555,13 +588,16 @@ returned.
 
 ## 10. Failure semantics an adapter must handle
 
-- **No response.** EOF without a response line is either a fail-closed malformed request
-  or the 10-second connection lifetime expiring. A `create`, `admit`, `start` or `stop`
-  may still have taken effect. Inspect, then replay with the same `operation_id`.
-- **Slow `start` and `stop`.** The spawn wait (up to 30 seconds) and the stop wait (up to
-  10 seconds) are longer than what remains of the 10-second connection lifetime, so a
-  `start` whose spawn is slow or a `stop` that times out is answered by EOF, not by
-  `resource_unavailable`. Poll `inspect`; replay a `stop` with the same `operation_id`.
+- **No response.** EOF without a response line is a fail-closed malformed request, the
+  10-second request deadline expiring before the request line arrived, or the answer
+  deadline expiring because the client did not read (§3). A `create`, `admit`, `start`
+  or `stop` may still have taken effect. Inspect, then replay with the same
+  `operation_id`.
+- **Slow `start` and `stop`.** A slow verb is answered, not cut off: a `start` whose
+  spawn is not confirmed within 30 seconds is answered `accepted` with `exited`
+  (ambiguous, below), and a `stop` whose reap is not confirmed within 10 seconds is
+  answered `resource_unavailable` (replay it with the same `operation_id`). Keep the
+  connection open and reading until the answer arrives (§3).
 - **Ambiguous launch.** `accepted` with `exited`, or `inspect` showing `exited` with
   `unknown`, means the attempt may have had effects. It is never re-run: its workspace
   exists, so any later `start` of the same attempt is refused. Retrying needs a new

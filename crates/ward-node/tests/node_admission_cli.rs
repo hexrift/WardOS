@@ -60,12 +60,20 @@ fn binding() -> TaskBinding {
 }
 
 fn signed_admit(context: TaskLifecycleContext, version: u64) -> TaskLifecycleRequest {
+    signed_admit_issued_by(context, version, PrincipalId::from_u128(2))
+}
+
+fn signed_admit_issued_by(
+    context: TaskLifecycleContext,
+    version: u64,
+    issuer: PrincipalId,
+) -> TaskLifecycleRequest {
     let now = now_ms();
     let lease = AuthorityLease::root(
         AuthorityLeaseInput {
             id: binding().lease(),
             delegation_id: DelegationId::from_u128(6),
-            issuer: PrincipalId::from_u128(2),
+            issuer,
             subject: AgentId::from_u128(3),
             task: binding().task(),
             grants: GrantSet::new([CapabilityGrant::new(
@@ -200,8 +208,9 @@ fn trust_store(dir: &Path, mode: u32) -> PathBuf {
     std::fs::write(
         &path,
         format!(
-            "# local issuer\n{}\n",
-            hex(key_pair().public_key().as_ref())
+            "# local issuer\n{} {}\n",
+            hex(key_pair().public_key().as_ref()),
+            PrincipalId::from_u128(2)
         ),
     )
     .unwrap();
@@ -343,4 +352,76 @@ fn ward_node_refuses_to_start_with_an_unsafe_trust_store_or_a_foreign_state_dir(
         .unwrap();
     assert!(!status.success());
     assert!(!dir.path().join("other.sock").exists());
+}
+
+#[test]
+fn ward_node_admits_only_leases_issued_by_the_principal_bound_to_the_signing_key() {
+    let dir = private_dir();
+    let issuers = trust_store(dir.path(), 0o600);
+    let node = Node::spawn(dir.path(), Some(&issuers));
+    let ctx = context();
+    node.lifecycle(&ctx.create(OperationId::new(1).unwrap(), binding()));
+
+    assert_eq!(
+        node.lifecycle(&signed_admit_issued_by(ctx, 1, PrincipalId::from_u128(9))),
+        ctx.rejected(
+            Some(OperationId::new(2).unwrap()),
+            binding(),
+            TaskLifecycleRejectionReason::AuthorityDenied
+        )
+    );
+    assert_eq!(
+        node.lifecycle(&ctx.inspect(binding())),
+        ctx.inspected(binding(), TaskLifecycleState::Created)
+    );
+    assert_eq!(
+        node.lifecycle(&signed_admit(ctx, 1)),
+        ctx.accepted(
+            OperationId::new(2).unwrap(),
+            binding(),
+            TaskLifecycleState::Ready
+        )
+    );
+}
+
+#[test]
+fn ward_node_refuses_to_start_with_a_trusted_key_bound_to_no_issuer() {
+    let dir = private_dir();
+    let path = dir.path().join("trusted-issuers");
+    std::fs::write(
+        &path,
+        format!("{}\n", hex(key_pair().public_key().as_ref())),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ward-node"))
+        .arg("--socket")
+        .arg(dir.path().join("node.sock"))
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .arg("--node-id")
+        .arg(NODE.to_string())
+        .arg("--trusted-issuers")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("ward-node served with a trusted key bound to no issuer");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("MissingIssuer { line: 1 }"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!dir.path().join("node.sock").exists());
 }

@@ -20,6 +20,13 @@
 //!   `seal` with execution; the document has no flag for either); any other 1.3 node
 //!   advertises none of them. 1.1 and 1.2 documents are unchanged, and a 1.2 connection is
 //!   refused every one of these verbs as unsupported.
+//!   Only such a node also advertises, at 1.3, the isolation its execution enforces: the
+//!   namespace sandbox and its user namespace, the offline network and the
+//!   content-addressed snapshot store.
+//!
+//! A connection's request (handshake and request line) must arrive within
+//! [`REQUEST_TIMEOUT`]; its answer is written within [`ANSWER_TIMEOUT`] of being ready, so
+//! a `stop` or `start` whose bounded work outlasts the request deadline is still answered.
 //!
 //! `stream` stays unsupported, and remote transport is deliberately absent. Serving a
 //! lifecycle request never waits on a running workload.
@@ -46,8 +53,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use ward_node_protocol::{
     CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse, LifecycleCapabilities,
-    NodeCapabilities, SupportedProtocolRange, TaskLifecycleContext, WARD_NODE_PROTOCOL, negotiate,
-    supports_task_admission, supports_task_lifecycle,
+    NamespaceCapabilities, NodeCapabilities, SupportedProtocolRange, TaskLifecycleContext,
+    WARD_NODE_PROTOCOL, negotiate, supports_task_admission, supports_task_lifecycle,
 };
 
 use crate::admit::NodeAdmission;
@@ -57,8 +64,21 @@ use crate::task::{MAX_NODE_TASKS, TaskRegistry};
 /// Maximum bytes in one node-protocol JSON request, excluding the terminating newline.
 pub const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024;
 
-/// Per-read/per-write bound for a local node protocol connection.
-pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Absolute bound, from accept, on reading one request: the handshake line, the
+/// handshake answer and the request line must all complete within it. Partial progress
+/// never extends it, so a slow or idle client cannot hold the single-threaded server for
+/// longer.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on writing a request's answer, counted from the moment the answer is ready.
+///
+/// The work a verb does between reading its request and answering is bounded by the
+/// verb itself, not by [`REQUEST_TIMEOUT`]: `stop` waits at most its stop timeout
+/// ([`execution::DEFAULT_STOP_TIMEOUT`]) and `start` materialises a size-bounded snapshot
+/// and then waits at most its spawn timeout ([`execution::DEFAULT_SPAWN_TIMEOUT`]); every
+/// other verb answers at once. A verb that takes longer than [`REQUEST_TIMEOUT`] is
+/// therefore still answered.
+pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Local ward-node protocol failure.
 #[derive(Debug, Error)]
@@ -90,8 +110,9 @@ pub enum NodeServiceError {
     /// Administrative socket parent directory is accessible to another Unix identity.
     #[error("ward-node socket parent directory must be private (mode 0700 or stricter)")]
     InsecureSocketDirectory,
-    /// The absolute connection lifetime expired.
-    #[error("ward-node connection exceeded its lifetime")]
+    /// The request was not read within [`REQUEST_TIMEOUT`], or its answer not written
+    /// within [`ANSWER_TIMEOUT`].
+    #[error("ward-node connection exceeded its deadline")]
     ConnectionDeadlineExceeded,
     /// The node task registry lock was poisoned by an earlier panic.
     #[error("ward-node task registry is unavailable")]
@@ -189,6 +210,10 @@ impl NodeService {
     /// connection accepted at 1.2 or later may instead issue one lifecycle request. The
     /// connection then closes.
     ///
+    /// The handshake, its answer and the request line must complete within
+    /// [`REQUEST_TIMEOUT`] of the call. The request's answer is then written within
+    /// [`ANSWER_TIMEOUT`] of being ready, however long the verb's own bounded work took.
+    ///
     /// A lifecycle request is applied to the registry before its response is written, so
     /// a `create` whose client disconnects before reading the response still took effect;
     /// the client recovers by replaying the same operation id or by inspecting.
@@ -198,17 +223,15 @@ impl NodeService {
     /// Returns an explicit bounded protocol/I/O error. No error path falls back to the
     /// per-session ward-daemon control protocol.
     pub fn serve_connection(&self, stream: UnixStream) -> Result<(), NodeServiceError> {
-        self.serve_connection_with_lifetime(stream, CONNECTION_TIMEOUT)
+        self.serve_connection_with_lifetime(stream, REQUEST_TIMEOUT)
     }
 
     fn serve_connection_with_lifetime(
         &self,
         mut stream: UnixStream,
-        lifetime: Duration,
+        request_timeout: Duration,
     ) -> Result<(), NodeServiceError> {
-        let deadline = Instant::now()
-            .checked_add(lifetime)
-            .ok_or(NodeServiceError::ConnectionDeadlineExceeded)?;
+        let deadline = deadline_after(request_timeout)?;
 
         let reader_stream = stream.try_clone()?;
         let mut reader = BufReader::new(reader_stream);
@@ -232,10 +255,10 @@ impl NodeService {
         if serde_json::from_str::<serde_json::Value>(&request_line)
             .is_ok_and(|value| value["request"] == "capabilities")
         {
-            return self.serve_capabilities(&mut stream, protocol, &request_line, deadline);
+            return self.serve_capabilities(&mut stream, protocol, &request_line);
         }
         if supports_task_lifecycle(protocol) {
-            return self.serve_lifecycle(&mut stream, protocol, &request_line, deadline);
+            return self.serve_lifecycle(&mut stream, protocol, &request_line);
         }
         Err(NodeServiceError::MalformedCapabilityRequest)
     }
@@ -245,15 +268,23 @@ impl NodeService {
         stream: &mut UnixStream,
         protocol: ward_node_protocol::ProtocolVersion,
         request_line: &str,
-        deadline: Instant,
     ) -> Result<(), NodeServiceError> {
         let context = CapabilityDiscoveryContext::new(protocol)
             .map_err(|_| NodeServiceError::MalformedCapabilityRequest)?;
         context
             .decode_request(request_line)
             .map_err(|_| NodeServiceError::MalformedCapabilityRequest)?;
-        let configured = self.capabilities.lifecycle();
+        let configured = self.capabilities;
+        let mut isolation = configured.isolation();
+        let mut network = configured.network();
+        let mut snapshots = configured.snapshots();
         let lifecycle = if supports_task_admission(protocol) {
+            isolation.namespaces = NamespaceCapabilities {
+                sandbox: self.executes,
+                user_namespace: self.executes,
+            };
+            network.offline = self.executes;
+            snapshots.content_addressed = self.executes;
             LifecycleCapabilities {
                 admit: self.admits,
                 start: self.executes,
@@ -265,25 +296,25 @@ impl NodeService {
             LifecycleCapabilities {
                 admit: false,
                 start: false,
-                ..configured
+                ..configured.lifecycle()
             }
         };
         let capabilities = NodeCapabilities::new(
             protocol,
-            self.capabilities.architecture(),
-            self.capabilities.capacity(),
-            self.capabilities.isolation(),
-            self.capabilities.network(),
-            self.capabilities.credentials(),
-            self.capabilities.snapshots(),
-            self.capabilities.verifier(),
+            configured.architecture(),
+            configured.capacity(),
+            isolation,
+            network,
+            configured.credentials(),
+            snapshots,
+            configured.verifier(),
             lifecycle,
         )
         .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         let response = context
             .response(capabilities)
             .map_err(|_| NodeServiceError::InvalidCapabilities)?;
-        write_json_line(stream, &response, deadline)
+        write_answer(stream, &response)
     }
 
     fn serve_lifecycle(
@@ -291,7 +322,6 @@ impl NodeService {
         stream: &mut UnixStream,
         protocol: ward_node_protocol::ProtocolVersion,
         request_line: &str,
-        deadline: Instant,
     ) -> Result<(), NodeServiceError> {
         let context = TaskLifecycleContext::new(protocol)
             .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
@@ -300,7 +330,7 @@ impl NodeService {
             .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
         let response = TaskRegistry::serve(&self.tasks, context, request)
             .map_err(|_| NodeServiceError::TaskRegistryUnavailable)?;
-        write_json_line(stream, &response, deadline)
+        write_answer(stream, &response)
     }
 }
 
@@ -408,6 +438,19 @@ fn write_json_line(
     writer.write_all(b"\n").map_err(map_timeout)?;
     writer.flush().map_err(map_timeout)?;
     Ok(())
+}
+
+fn write_answer(
+    writer: &mut UnixStream,
+    value: &impl serde::Serialize,
+) -> Result<(), NodeServiceError> {
+    write_json_line(writer, value, deadline_after(ANSWER_TIMEOUT)?)
+}
+
+fn deadline_after(timeout: Duration) -> Result<Instant, NodeServiceError> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or(NodeServiceError::ConnectionDeadlineExceeded)
 }
 
 fn remaining_until(deadline: Instant) -> Result<Duration, NodeServiceError> {
@@ -1026,7 +1069,14 @@ mod tests {
             },
             "a 1.3 node without execution advertises none of start, stop, pause or revoke"
         );
-        assert_eq!(observed.isolation(), service.capabilities.isolation());
+        assert_eq!(
+            observed.isolation(),
+            IsolationCapabilities {
+                namespaces: NamespaceCapabilities::default(),
+                ..service.capabilities.isolation()
+            },
+            "a 1.3 node without execution advertises no execution sandbox"
+        );
         worker.join().unwrap().unwrap();
         assert!(service.tasks.lock().unwrap().is_empty());
     }
@@ -1251,6 +1301,10 @@ mod tests {
     }
 
     fn executing_service() -> Executing {
+        executing_service_with(capabilities(), crate::execution::DEFAULT_STOP_TIMEOUT)
+    }
+
+    fn executing_service_with(configured: NodeCapabilities, stop_timeout: Duration) -> Executing {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         let clock = crate::test_support::FixedClock::at(crate::test_support::NOW);
@@ -1265,8 +1319,9 @@ mod tests {
             crate::workspace::TaskRoot::open(&dir.path().join("tasks")).unwrap(),
             snapshots,
             Arc::new(launcher.clone()),
-        );
-        let service = NodeService::with_execution(capabilities(), admission, execution).unwrap();
+        )
+        .with_stop_timeout(stop_timeout);
+        let service = NodeService::with_execution(configured, admission, execution).unwrap();
         Executing {
             _dir: dir,
             service,
@@ -1369,6 +1424,214 @@ mod tests {
         );
         assert_eq!(executing.launcher.stopped(), 1);
         node.join();
+    }
+
+    /// One request on its own connection negotiated at `protocol`, whose request deadline
+    /// is `request_timeout`; the raw response line and how serving ended.
+    fn exchange(
+        service: &NodeService,
+        protocol: SupportedProtocolRange,
+        request: &str,
+        request_timeout: Duration,
+    ) -> (String, Result<(), NodeServiceError>) {
+        let service = service.clone();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            service.serve_connection_with_lifetime(server, request_timeout)
+        });
+        let hello = HandshakeRequest::Hello { protocol };
+        writeln!(client, "{}", serde_json::to_string(&hello).unwrap()).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<HandshakeResponse>(line(&mut client).trim()).unwrap(),
+            HandshakeResponse::Accepted { .. }
+        ));
+        writeln!(client, "{request}").unwrap();
+        let response = line(&mut client);
+        (response.trim().to_owned(), worker.join().unwrap())
+    }
+
+    fn runnable_admit(executing: &Executing, binding: TaskBinding) -> TaskLifecycleRequest {
+        let mut input = crate::test_support::envelope_input(binding);
+        input.workload = ward_node_protocol::TaskWorkload::new(
+            input.workload.argv().clone(),
+            input.workload.capability_manifest().clone(),
+            executing.snapshot,
+            60_000,
+        )
+        .unwrap();
+        let envelope = ward_node_protocol::TaskAdmissionEnvelope::new(input).unwrap();
+        crate::test_support::signed_admit(
+            admission_context(),
+            OperationId::new(2).unwrap(),
+            binding,
+            &envelope,
+        )
+    }
+
+    #[test]
+    fn a_stop_whose_reap_outlasts_the_request_deadline_still_gets_its_answer() {
+        let executing = executing_service_with(capabilities(), Duration::from_secs(10));
+        let ctx = admission_context();
+        let binding = lifecycle_binding();
+        let request_timeout = Duration::from_millis(100);
+        let lifecycle = |request: &TaskLifecycleRequest| {
+            let (raw, served) = exchange(
+                &executing.service,
+                WARD_NODE_PROTOCOL,
+                &serde_json::to_string(request).unwrap(),
+                request_timeout,
+            );
+            (ctx.decode_response(&raw), served)
+        };
+        let start = OperationId::new(3).unwrap();
+        let stop = OperationId::new(4).unwrap();
+
+        lifecycle(&ctx.create(OperationId::new(1).unwrap(), binding))
+            .1
+            .unwrap();
+        lifecycle(&runnable_admit(&executing, binding)).1.unwrap();
+        assert_eq!(
+            lifecycle(&ctx.start(start, binding)).0.unwrap(),
+            ctx.accepted(start, binding, TaskLifecycleState::Running)
+        );
+
+        executing
+            .launcher
+            .set_on_stop(crate::test_support::FakeStop::Ignore);
+        let launcher = executing.launcher.clone();
+        let reap_after = request_timeout * 4;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(reap_after);
+            launcher.set_on_stop(crate::test_support::FakeStop::Honour);
+        });
+        let asked = Instant::now();
+        let (answer, served) = lifecycle(&ctx.stop(stop, binding));
+        assert!(asked.elapsed() >= reap_after, "the reap was not slow");
+        release.join().unwrap();
+        assert_eq!(
+            answer.expect("a slow stop is answered, not closed"),
+            ctx.accepted(stop, binding, TaskLifecycleState::Stopped)
+        );
+        served.unwrap();
+        assert_eq!(executing.launcher.stopped(), 1);
+    }
+
+    fn conservative_capabilities() -> NodeCapabilities {
+        NodeCapabilities::new(
+            ProtocolVersion::new(1, 1),
+            NodeArchitecture::X86_64,
+            NodeCapacity::new(8, 16 * 1024 * 1024 * 1024).unwrap(),
+            IsolationCapabilities::default(),
+            NetworkCapabilities::default(),
+            CredentialCapabilities::default(),
+            SnapshotCapabilities::default(),
+            VerifierCapabilities::default(),
+            LifecycleCapabilities::default(),
+        )
+        .unwrap()
+    }
+
+    fn discovered(service: &NodeService, minor: u16) -> (String, NodeCapabilities) {
+        let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, minor)).unwrap();
+        let (raw, served) = exchange(
+            service,
+            SupportedProtocolRange::new(1, minor, minor).unwrap(),
+            &serde_json::to_string(&context.request()).unwrap(),
+            REQUEST_TIMEOUT,
+        );
+        served.unwrap();
+        let ward_node_protocol::CapabilityDiscoveryResponse::Capabilities { capabilities } =
+            context.decode_response(&raw).unwrap();
+        (raw, capabilities)
+    }
+
+    #[test]
+    fn an_executing_node_advertises_the_isolation_it_enforces_only_at_one_three() {
+        let executing = executing_service_with(
+            conservative_capabilities(),
+            crate::execution::DEFAULT_STOP_TIMEOUT,
+        );
+        let state = tempfile::tempdir().unwrap();
+        let clock = crate::test_support::FixedClock::at(crate::test_support::NOW);
+        let admitting = NodeService::with_admission(
+            conservative_capabilities(),
+            crate::test_support::node_admission(&state.path().join("state"), &clock),
+        )
+        .unwrap();
+        let plain = NodeService::new(conservative_capabilities()).unwrap();
+
+        let observed = discovered(&executing.service, 3).1;
+        assert_eq!(
+            observed.isolation(),
+            IsolationCapabilities {
+                namespaces: NamespaceCapabilities {
+                    sandbox: true,
+                    user_namespace: true,
+                },
+                backends: ExecutionBackendCapabilities::default(),
+            }
+        );
+        assert_eq!(
+            observed.network(),
+            NetworkCapabilities {
+                offline: true,
+                proxy_allowlist: false,
+            }
+        );
+        assert_eq!(
+            observed.snapshots(),
+            SnapshotCapabilities {
+                content_addressed: true,
+                diff: false,
+                read: false,
+            }
+        );
+        assert_eq!(observed.credentials(), CredentialCapabilities::default());
+        assert_eq!(observed.verifier(), VerifierCapabilities::default());
+        assert!(observed.lifecycle().start && observed.lifecycle().stop);
+
+        for service in [&admitting, &plain] {
+            let observed = discovered(service, 3).1;
+            assert_eq!(observed.isolation(), IsolationCapabilities::default());
+            assert_eq!(observed.network(), NetworkCapabilities::default());
+            assert_eq!(observed.snapshots(), SnapshotCapabilities::default());
+        }
+
+        for minor in [1, 2] {
+            let (raw, observed) = discovered(&executing.service, minor);
+            assert_eq!(raw, discovered(&plain, minor).0, "1.{minor}");
+            assert_eq!(observed.isolation(), IsolationCapabilities::default());
+            assert_eq!(observed.network(), NetworkCapabilities::default());
+            assert_eq!(observed.snapshots(), SnapshotCapabilities::default());
+        }
+    }
+
+    #[test]
+    fn a_node_that_does_not_execute_never_advertises_execution_isolation_at_one_three() {
+        let state = tempfile::tempdir().unwrap();
+        let clock = crate::test_support::FixedClock::at(crate::test_support::NOW);
+        let admitting = NodeService::with_admission(
+            capabilities(),
+            crate::test_support::node_admission(&state.path().join("state"), &clock),
+        )
+        .unwrap();
+        let observed = discovered(&admitting, 3).1;
+        assert_eq!(
+            observed.isolation().namespaces,
+            NamespaceCapabilities::default()
+        );
+        assert!(!observed.network().offline);
+        assert!(!observed.snapshots().content_addressed);
+        assert_eq!(
+            observed.isolation().backends,
+            capabilities().isolation().backends
+        );
+        assert_eq!(observed.credentials(), capabilities().credentials());
+        assert_eq!(observed.verifier(), capabilities().verifier());
+        assert_eq!(
+            discovered(&admitting, 1).1.isolation(),
+            capabilities().isolation()
+        );
     }
 
     #[test]
