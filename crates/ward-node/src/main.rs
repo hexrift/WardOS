@@ -1,7 +1,8 @@
 //! Local Ward node service executable.
 //!
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
-//! [--task-root <dir>]` serves the local node protocol. `--node-id` is this node's
+//! [--task-root <dir>] [--client-uid <uid>]… [--client-group <group>]` serves the local
+//! node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
 //! admission version, revocation and retired-attempt stores, one record per registered task
 //! (`tasks`, from which a restarted node recovers its registry) and the node's snapshot
@@ -10,7 +11,11 @@
 //! trusted key is bound to the one issuing principal (`prn_…`) whose leases it may sign. With
 //! `--task-root` (created mode 0700, refused if group- or world-accessible) the node starts
 //! and stops admitted tasks in a bubblewrap sandbox over workspaces it allocates there; it
-//! refuses to run when the sandbox is unavailable.
+//! refuses to run when the sandbox is unavailable. The socket is served to the node's own
+//! uid and to each `--client-uid` (a uid or user name); every other peer is closed without
+//! a response. With `--client-group` the socket is created mode 0660 owned by that group,
+//! in a directory owned by it with mode 0750 or stricter, so a client of another uid can
+//! connect at all; without it the socket is mode 0600 in a 0700 directory as before.
 //!
 //! `ward-node snapshot import --state-dir <dir> <project-dir>` captures a local directory
 //! into the node's snapshot store and prints its id as 64 lowercase hex characters with no
@@ -27,9 +32,10 @@ use ward_events::NodeId;
 use ward_node::admit::{NodeAdmission, SystemClock};
 use ward_node::execution::{NodeExecution, SandboxLauncher};
 use ward_node::issuer::{IssuerKeyParseError, IssuerPublicKey, TrustedIssuers};
+use ward_node::peer::{ClientGroup, ClientUids};
 use ward_node::state::{NodeState, open_private_dir};
 use ward_node::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
-use ward_node::{NodeService, serve_local};
+use ward_node::{NodeService, SocketAccess, serve_local};
 use ward_node_protocol::{
     CredentialCapabilities, ExecutionBackendCapabilities, IsolationCapabilities,
     LifecycleCapabilities, NamespaceCapabilities, NetworkCapabilities, NodeArchitecture,
@@ -61,6 +67,16 @@ struct Cli {
     /// workspace. With it the node starts and stops admitted tasks; without it, it does not.
     #[arg(long)]
     task_root: Option<PathBuf>,
+    /// A uid, or user name, served on the socket besides the node's own; repeatable. Any
+    /// other peer is closed without a response. Being served grants no authority: `admit`
+    /// still needs a trusted signature.
+    #[arg(long = "client-uid", value_name = "UID")]
+    client_uid: Vec<String>,
+    /// Share the socket with this group (a gid or group name): the socket is created mode
+    /// 0660 owned by it, and its parent directory must be owned by it with mode 0750 or
+    /// stricter. Needs at least one `--client-uid`. Without it the socket is mode 0600.
+    #[arg(long, value_name = "GROUP", requires = "client_uid")]
+    client_group: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -115,6 +131,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(io::Error::other("--socket, --state-dir and --node-id are required").into());
     };
 
+    let clients = ClientUids::parse(&cli.client_uid)?;
+    let client_group = cli
+        .client_group
+        .as_deref()
+        .map(ClientGroup::parse)
+        .transpose()?;
     let issuers = match cli.trusted_issuers {
         Some(path) => TrustedIssuers::load(&path)?,
         None => TrustedIssuers::empty(),
@@ -147,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         None => NodeService::with_admission(capabilities, admission)?,
     };
-    serve_local(&socket, &service)?;
+    serve_local(&socket, &service, SocketAccess::new(client_group, clients))?;
     Ok(())
 }
 
@@ -298,5 +320,39 @@ mod tests {
             }) if state_dir == Path::new("d") && project_dir == Path::new("p")
         ));
         assert!(Cli::try_parse_from(["ward-node", "snapshot", "import", "p"]).is_err());
+    }
+
+    #[test]
+    fn client_uids_repeat_and_a_client_group_needs_at_least_one_of_them() {
+        let node = NodeId::from_u128(4).to_string();
+        let serve = [
+            "ward-node",
+            "--socket",
+            "s",
+            "--state-dir",
+            "d",
+            "--node-id",
+            &node,
+        ];
+        let cli = Cli::try_parse_from(serve).expect("serve");
+        assert!(cli.client_uid.is_empty());
+        assert_eq!(cli.client_group, None);
+
+        let cli = Cli::try_parse_from(serve.iter().copied().chain([
+            "--client-uid",
+            "1000",
+            "--client-uid",
+            "control-plane",
+            "--client-group",
+            "ward-clients",
+        ]))
+        .expect("serve with clients");
+        assert_eq!(cli.client_uid, ["1000", "control-plane"]);
+        assert_eq!(cli.client_group.as_deref(), Some("ward-clients"));
+
+        assert!(Cli::try_parse_from(serve.iter().copied().chain(["--client-group", "g"])).is_err());
+        let cli = Cli::try_parse_from(serve.iter().copied().chain(["--client-uid", "0"]))
+            .expect("a client uid alone");
+        assert_eq!(cli.client_group, None);
     }
 }

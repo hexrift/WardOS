@@ -11,7 +11,8 @@ what to put through the node.
 The walk has two sides. The **operator** owns the host: the node binary, its user, its
 directories, its trust store and its snapshots. The **control plane** owns authority: the
 issuer key, the envelopes it signs and the attempt it drives. At this revision both run
-on the same host, as the same uid (node-integration.md §11.1); the control plane proper
+on the same host, as the node's uid or as a uid the node is told to serve
+(node-integration.md §11.1); the control plane proper
 may be elsewhere, but whatever it uses to reach the node runs here.
 
 ## 1. Operator: install the node
@@ -62,7 +63,8 @@ with a task root.
 Give the node its own user and three private directories: the node's state, its task
 root and the directory that holds its socket. The node creates the first two mode 0700
 and refuses them if group- or world-accessible; the socket's parent directory must
-already exist with no group or other bits (§2.1):
+already exist with no group or other bits (§2.1). If the adapter is to run as a user of
+its own rather than as `ward-node`, §3 names the two flags and the group that allow it:
 
 ```bash
 useradd --system --home-dir /var/lib/ward-node --shell /usr/sbin/nologin ward-node
@@ -144,13 +146,45 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
+To run the adapter as a user of its own, so that a compromised adapter cannot read the
+node's state, records or evidence logs, create a group for the socket, put the adapter's
+user in it, give the socket directory to that group and name the user to the node. The
+node then serves its own uid and `ward-adapter` and closes every other connection unread
+(node-integration.md §2.1, §3); the state directory and task root stay 0700:
+
+```bash
+groupadd --system ward-clients
+useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin --groups ward-clients ward-adapter
+```
+
+```ini
+[Service]
+User=ward-node
+Group=ward-clients
+RuntimeDirectory=ward-node
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/bin/ward-node \
+  --socket /run/ward-node/node.sock \
+  --state-dir /var/lib/ward-node/state \
+  --node-id node_01M3KY5QG0000028T5CY4TQKFF \
+  --trusted-issuers /etc/ward-node/trusted-issuers \
+  --task-root /var/lib/ward-node/tasks \
+  --client-group ward-clients \
+  --client-uid ward-adapter
+```
+
+`Group=` makes `RuntimeDirectory=` create `/run/ward-node` as `ward-node:ward-clients`,
+which with `RuntimeDirectoryMode=0750` is exactly what `--client-group` requires; the
+socket comes up `0660 ward-node:ward-clients`. Listing a uid grants it no authority:
+`admit` still needs a signature from the trust store.
+
 `KillMode=control-group` is what closes the die-with-parent window on a unit restart
 (node-security-limitations.md §3.2); add `MemoryMax=` and `TasksMax=` to bound what the
 node's workloads can take from the host, since the node sets no resource limit of its
 own. The node never removes an existing socket path: delete a stale one before a
 restart, or let `RuntimeDirectory=` recreate the directory.
 
-Check it from the host, as the node's user:
+Check it from the host, as the node's user (or as a listed client user):
 
 ```text
 $ WARD_NODE_SOCKET=/run/ward-node/node.sock ward doctor      # the ward-node line reads protocol_compatible

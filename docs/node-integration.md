@@ -32,7 +32,8 @@ admission example is a working test vector (§7.4).
 - WardOS ships one client for this contract: the `ward-node-client` crate (a transport,
   a typed client, an issuer signer and a fail-closed attempt driver for Rust control
   planes) and its `ward-node-adapter` binary (the same over stdin/stdout for control
-  planes in other languages), §11. Both run on the node's host, as the node's uid.
+  planes in other languages), §11. Both run on the node's host, as the node's uid or as
+  a uid the node's operator listed with `--client-uid` (§2.1, §11.1).
 - Not implemented yet: that allowlist, an event stream (`stream`), and any remote
   transport or mTLS. The only transport is a local Unix socket; remote transport and key
   bootstrap are #262. The full list, with what each gap means for a control plane, is
@@ -44,16 +45,19 @@ admission example is a working test vector (§7.4).
 
 ```text
 ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
-  [--trusted-issuers <file>] [--task-root <dir>]
+  [--trusted-issuers <file>] [--task-root <dir>] \
+  [--client-uid <uid>]… [--client-group <group>]
 ```
 
 | Flag | Required | Meaning |
 | --- | --- | --- |
-| `--socket` | yes | Unix socket to serve. Its parent directory must exist and have no group or other permission bits (0700 or stricter). The socket is created mode 0600. An existing path is never removed: delete a stale socket before restarting. |
+| `--socket` | yes | Unix socket to serve. Its parent directory must exist and have no group or other permission bits (0700 or stricter); the socket is created mode 0600. With `--client-group` the directory must instead be owned by that group with no group-write and no other bits (0750 or stricter), and the socket is created mode 0660 owned by that group. An existing path is never removed: delete a stale socket before restarting. |
 | `--state-dir` | yes | Node-owned state, created mode 0700 if absent and refused if group- or world-accessible. Holds `node-id`, `admission-versions.json`, `revocations.json`, `retired-attempts.json`, the snapshot store `cas/` and `tasks/`, one record per registered task (`<task>.json`, mode 0600, in a directory created mode 0700) from which a restarted node recovers its registry (§6.4). |
 | `--node-id` | yes | The node's audience id (`node_` + 26-character ULID). Pinned in `<state-dir>/node-id` at first start; a later start with another id is refused. Envelopes must name exactly this id. |
 | `--trusted-issuers` | no | Trust store (§2.2). Without it no issuer is trusted and every `admit` is refused `authority_denied`. |
 | `--task-root` | no | Directory under which the node allocates workspaces and keeps each admitted attempt's evidence log (§6.5), created mode 0700 and refused if group- or world-accessible or not a real directory. With it the node executes (`start`, `pause`, `resume`, `stop`, `revoke`, `seal`); the node refuses to start if bubblewrap is unusable. Without it, all six are `unsupported_operation` and no evidence log is kept. |
+| `--client-uid` | no | A uid (decimal) or user name the node serves on its socket besides its own uid; repeatable, resolved once at start (an unknown name or a uid listed twice refuses to start). The node reads every connection's peer credentials before it reads a byte and closes a connection from any other uid without a response (§3). Root is not exempt. Being served grants no authority: `admit` still needs a trusted signature (§8.1). |
+| `--client-group` | no | A gid or group name to share the socket with: the socket is created mode 0660 owned by it, and its parent directory must be owned by it with mode 0750 or stricter. Needs at least one `--client-uid`; a member of the group that is not a listed uid can connect but is closed unread. Without it the socket is 0600 and only the node's uid (or root) can connect, whatever `--client-uid` says. The state directory and task root stay 0700 either way: a listed client can speak to the node, not read its state. |
 
 The node refuses to start on any unsafe or malformed input: a trust store, state file or
 task record it cannot parse, wrong permissions, a pinned id mismatch. It serves until
@@ -173,6 +177,12 @@ record forgets the task and the operation ids its attempt applied.
 - Connections are served one at a time. Do not hold a connection open; an idle client
   delays every other client by up to 10 seconds, and a `start`, `stop`, `revoke`,
   `pause` or `resume` delays them for as long as it runs.
+- **Peer check before any byte.** The node reads each connection's peer credentials
+  (`SO_PEERCRED`) before reading from it. A peer whose uid is neither the node's own nor
+  listed with `--client-uid` (§2.1) is closed without a response: it sees EOF (or a reset,
+  if it had already written) and nothing else, indistinguishable on the wire from the
+  fail-closed closes below. The node reports the refusal on stderr with the uid, at most
+  once per uid per 10 seconds, with the count of refusals it did not report.
 - **Fail closed:** anything malformed (invalid JSON, an unknown or missing field, an
   unknown verb, a request whose `protocol` differs from the negotiated version, a value
   out of bounds) gets no response line: the node closes the connection. Only well-formed
@@ -1063,15 +1073,21 @@ WardOS ships one implementation of this contract for the control-plane side, in 
 
 ### 11.1 Operator requirements for a client host
 
-The client runs where the node runs, under the same Unix identity: the socket is mode
-`0600` in a `0700` directory and the state directory is `0700` (§2.1), so another uid
-cannot connect or read. The host needs bubblewrap with unprivileged user namespaces for
-the node to execute at all. `ward-node snapshot import` (§2.4) runs as the node's uid
+The client runs where the node runs, under the node's own Unix identity or under a uid
+the operator listed with `--client-uid`. Without `--client-group` the socket is mode
+`0600` in a `0700` directory, so only the node's uid can connect; with it the socket is
+`0660` in a `0750` directory owned by that group, so the group's members can connect,
+and the node then serves only its own uid and the listed uids, closing every other peer
+unread (§2.1, §3). The state directory and task root are `0700` either way: a listed
+client can speak to the node but cannot read its state, its records or its evidence
+logs, which is the point of running it as a second user. The host needs bubblewrap with
+unprivileged user namespaces for the node to execute at all. `ward-node snapshot import` (§2.4) runs as the node's uid
 against the node's `--state-dir`; the id it prints is the envelope's `workload.snapshot`.
 Give `start`, `stop` and `revoke` a read timeout of 60 seconds or more (`start` waits up
 to 30 seconds for the spawn after copying the snapshot, `stop` and `revoke` up to 10
 seconds for the reap, §3); the adapter's `--timeout-ms` defaults to 90 000. Reading an
-attempt's evidence log (§6.5) needs the same uid and the node's `--task-root`.
+attempt's evidence log (§6.5) needs the node's uid (a listed client uid is not enough)
+and the node's `--task-root`.
 
 ### 11.2 Fail-closed rules of the driver
 
