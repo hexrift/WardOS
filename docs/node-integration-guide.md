@@ -18,8 +18,12 @@ may be elsewhere, but whatever it uses to reach the node runs here.
 ## 1. Operator: install the node
 
 Every release attaches a node tarball per architecture with its checksum,
-`ward-node-<version>-<arch>-linux.tar.gz` and `.sha256`, next to the runtime tarball
-([node-release-readiness.md](node-release-readiness.md) §2); `<arch>` is what
+`ward-node-<node version>-<arch>-linux.tar.gz` and `.sha256`, next to the runtime
+tarball ([node-release-readiness.md](node-release-readiness.md) §2). `<node version>`
+is the node train's own version, not the release's: the release manifest
+`wardos-<version>-manifest.json` names it under `components["ward-node"].version`, and
+it stays the same across releases that change nothing the node is built from
+([compatibility.md](compatibility.md) §6). `<arch>` is what
 `uname -m` prints on the host, `x86_64` or `aarch64`. It carries `ward-node`,
 `ward-node-adapter`, `LICENSE` and the documents, built from the release commit with
 the pinned toolchain and `--locked`. Download both files from the
@@ -27,11 +31,12 @@ the pinned toolchain and `--locked`. Download both files from the
 before unpacking it, and install the two binaries:
 
 ```bash
-version=0.19.0; arch="$(uname -m)"                            # the release you deploy
+arch="$(uname -m)"
+version="$(jq -r '.components["ward-node"].version' wardos-0.19.0-manifest.json)"  # the release you deploy
 sha256sum -c "ward-node-${version}-${arch}-linux.tar.gz.sha256"   # "OK", or stop here
 tar -xzf "ward-node-${version}-${arch}-linux.tar.gz"
 install -m 0755 "ward-node-${version}-${arch}-linux"/{ward-node,ward-node-adapter} /usr/local/bin/
-ward-node --version                                            # "ward-node 0.19.0"
+ward-node --version                                            # "ward-node <node version>"
 ```
 
 The checksum proves the tarball is the one CI attached to the release; releases are not

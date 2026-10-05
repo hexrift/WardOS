@@ -1,7 +1,7 @@
 # Release: build the Linux binaries for x86_64 and aarch64, each natively on a runner
 # of that architecture (no cross toolchain), package them as two trains per
-# architecture -- the runtime tarball with the installer, and the node tarball
-# (issue #275) -- and attach every tarball, its checksum and the release manifest
+# architecture -- the runtime tarball with the installer under the release version,
+# and the node tarball under the node train's own version (issue #275) -- and attach every tarball, its checksum and the release manifest
 # (docs/release-manifest.md), signed keyless with this workflow's identity when the
 # run is on the release tag (ADR-0028, issue #148), to one GitHub release.
 # Runs on a v* tag push, or by hand with a version (then the workflow creates the
@@ -33,8 +33,13 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
+      node_version: ${{ steps.node_version.outputs.node_version }}
     steps:
+      # Full history with tags: the node version is held against the previous
+      # release tag below.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Resolve version
         id: version
         # The dispatch input (or the pushed ref) reaches Bash through an env
@@ -63,6 +68,27 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.tag }}
         run: bash scripts/release/check-version.sh "$TAG"
+      # The node train has a version of its own (issue #275): both node crates
+      # carry it, and against the previous release it moved exactly when the
+      # node's inputs moved (scripts/release/node-version.sh, covered by
+      # node-version.test.sh). A node change shipped under an old node version,
+      # or a node version revved by a release that changed nothing the node is
+      # built from, is rejected here before any build runs. The first release
+      # with the node train has no previous node version to compare with.
+      - name: Node version moved with the node
+        id: node_version
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          previous="$(git describe --tags --abbrev=0 --match 'v*' --exclude "$TAG" 2>/dev/null || true)"
+          if [[ -n "$previous" ]]; then
+            node_version="$(bash scripts/release/node-version.sh --since "$previous")"
+          else
+            node_version="$(bash scripts/release/node-version.sh)"
+            echo "no previous release tag: the node ships as $node_version without a comparison"
+          fi
+          echo "node_version=$node_version" >> "$GITHUB_OUTPUT"
 
   # One job per architecture, on a runner of that architecture: the binaries are built
   # and smoke-tested natively, and the tarball names carry `uname -m` of the machine
@@ -81,6 +107,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      NODE_VERSION: ${{ needs.version.outputs.node_version }}
       ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v7
@@ -101,24 +128,26 @@ jobs:
         # Two tarballs with their .sha256 sidecars (scripts/release/package.sh, covered
         # by package.test.sh): wardos-<version>-<arch>-linux with the five binaries the
         # image's release stage expects, install.sh, README.md, LICENSE and docs/; and
-        # ward-node-<version>-<arch>-linux with ward-node, ward-node-adapter, LICENSE
-        # and docs/. A build missing a binary fails here, not in the smoke step.
+        # ward-node-<node version>-<arch>-linux with ward-node, ward-node-adapter,
+        # LICENSE and docs/ (#275). A build missing a binary fails here, not in the
+        # smoke step.
         run: |
           set -euo pipefail
-          bash scripts/release/package.sh "$VERSION" "$ARCH" target/release dist
+          bash scripts/release/package.sh "$VERSION" "$NODE_VERSION" "$ARCH" target/release dist
           ls -la dist
       - name: Smoke the packaged binaries
         run: |
           set -euo pipefail
           dir="dist/wardos-${VERSION}-${ARCH}-linux"
-          node="dist/ward-node-${VERSION}-${ARCH}-linux"
-          # The compiled binaries must report the version this release is labelled
-          # with. A tarball whose `ward` (or `ward-node`) was built from other source is
+          node="dist/ward-node-${NODE_VERSION}-${ARCH}-linux"
+          # The compiled binaries must report the version their train is labelled
+          # with: `ward` the release version, the node binaries the node version. A
+          # tarball whose `ward` (or `ward-node`) was built from other source is
           # rejected here, before the artifact is uploaded (upload-artifact runs after
           # this step).
           bash scripts/release/check-binary-version.sh "$VERSION" "${dir}/ward"
-          bash scripts/release/check-binary-version.sh "$VERSION" "${node}/ward-node"
-          bash scripts/release/check-binary-version.sh "$VERSION" "${node}/ward-node-adapter"
+          bash scripts/release/check-binary-version.sh "$NODE_VERSION" "${node}/ward-node"
+          bash scripts/release/check-binary-version.sh "$NODE_VERSION" "${node}/ward-node-adapter"
           "${dir}/wardd" --help >/dev/null
           "${dir}/ward-agent" --help >/dev/null
           "${dir}/ward-shell" --help >/dev/null
@@ -156,6 +185,7 @@ jobs:
     env:
       TAG: ${{ needs.version.outputs.tag }}
       VERSION: ${{ needs.version.outputs.version }}
+      NODE_VERSION: ${{ needs.version.outputs.node_version }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -172,20 +202,21 @@ jobs:
           # architecture that uploaded anything (scripts/release/check-release-set.sh,
           # covered by check-release-set.test.sh). A misnamed or missing node tarball
           # fails the release here, before anything is created or uploaded.
-          bash scripts/release/check-release-set.sh dist "$VERSION" x86_64
+          bash scripts/release/check-release-set.sh dist "$VERSION" "$NODE_VERSION" x86_64
           arch=x86_64
           if [[ -f "dist/wardos-${VERSION}-aarch64-linux.tar.gz" ]]; then arch=both; fi
           echo "disk_arch=$arch" >> "$GITHUB_OUTPUT"
           # The release manifest (docs/release-manifest.md), generated from the set
           # just verified so it can only name artifacts that were checked, with the
-          # node protocol window of this commit's docs/compatibility.md (#275). Its
+          # node protocol window of this commit's docs/compatibility.md and the node
+          # train's own version (#275). Its
           # timestamp is the source commit's, not the run's, so a retry at the same
           # commit reproduces the manifest byte for byte and the reconciliation
           # below treats it like any other asset. The .sha256 sidecar follows the
           # tarballs' convention (sha256sum's line, checked with `sha256sum -c`).
           manifest="wardos-${VERSION}-manifest.json"
           GENERATE_MANIFEST_NOW="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ "$GITHUB_SHA")" \
-            bash scripts/release/generate-manifest.sh "$TAG" "$GITHUB_SHA" dist >"$manifest"
+            bash scripts/release/generate-manifest.sh --node-version "$NODE_VERSION" "$TAG" "$GITHUB_SHA" dist >"$manifest"
           mv "$manifest" "dist/$manifest"
           (cd dist && sha256sum "$manifest" >"$manifest.sha256")
           cat "dist/$manifest"

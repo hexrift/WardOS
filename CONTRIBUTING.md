@@ -71,7 +71,18 @@ the same script runs in CI, so a green run locally is a green run there.
 
 WardOS follows [Semantic Versioning](https://semver.org): `MAJOR.MINOR.PATCH`. The
 single source of truth is `version` under `[workspace.package]` in the root
-[`Cargo.toml`](Cargo.toml); every crate inherits it.
+[`Cargo.toml`](Cargo.toml); every crate inherits it except the node train.
+
+**The node train has a version of its own** (issue #275). `crates/ward-node` and
+`crates/ward-node-client` carry a literal `version` that `ward-node --version` prints
+and that names the node tarball, `ward-node-<node version>-<arch>-linux.tar.gz`. It
+moves exactly when the node's inputs move: the crates in the node's dependency
+closure (without their tests), the locked third-party packages of that closure, the
+toolchain and the release profile. A release that changes none of them ships the same
+node version again; one that changes any of them must raise it.
+`scripts/release/node-version.sh` enforces both directions against the previous
+release tag, in `prepare-version.sh` and in the release workflow before anything is
+built ([`docs/compatibility.md`](docs/compatibility.md) §6).
 
 **Normal pull requests are version-neutral.** Feature, fix, refactor, test and
 documentation PRs do not bump the workspace version merely because they change
@@ -84,8 +95,11 @@ release is cut:
 
 1. Create a release branch from current `main` (for example
    `release/v0.19.0`).
-2. Run `scripts/release/prepare-version.sh 0.19.0`. The helper updates the root
-   workspace version, all versioned internal path dependencies and `Cargo.lock`,
+2. Run `scripts/release/prepare-version.sh 0.19.0`, with `--node 0.2.0` when the node
+   changed since the previous release (the helper says so if it did and no `--node` was
+   given, and refuses `--node` when nothing the node is built from changed). The helper
+   updates the root workspace version, all versioned internal path dependencies, the
+   node version in both node crates and the requirements on them, and `Cargo.lock`,
    then verifies that Cargo metadata is locked and internally consistent.
 3. Open a PR whose only purpose is preparing that release, let the normal Verify,
    TamperWard and image gates run on its exact head, and merge it.
@@ -116,9 +130,9 @@ window marker agrees with the code, the acceptance table is green on the release
 the status line of `docs/node-integration.md` §1 names what ships, the limitations list
 is current, the documents are in both tarballs, and the node binaries build `--locked`
 on the release PR's head (the release workflow then packages them as the node tarball,
-`ward-node-<version>-<arch>-linux.tar.gz`, beside the runtime tarball, and records the
-protocol window in the release manifest, `wardos-<version>-manifest.json`;
-[`docs/release-manifest.md`](docs/release-manifest.md)).
+`ward-node-<node version>-<arch>-linux.tar.gz`, beside the runtime tarball, and records
+the protocol window and both trains' versions in the release manifest,
+`wardos-<version>-manifest.json`; [`docs/release-manifest.md`](docs/release-manifest.md)).
 
 Choose the release number from the set of changes being released:
 

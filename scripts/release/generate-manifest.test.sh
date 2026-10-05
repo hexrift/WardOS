@@ -26,6 +26,7 @@ trap 'rm -rf "$work"' EXIT
 commit="0123456789abcdef0123456789abcdef01234567"
 tag="v1.2.3"
 version="1.2.3"
+node_version="0.3.0"
 
 # fresh_case NAME -> makes $work/NAME/dist and echoes the case dir.
 fresh_case() {
@@ -48,7 +49,7 @@ add_artifact() {
 # $version/$ARCH (issue #275).
 add_node_artifact() {
   local dist="$1" arch="$2"
-  local name="ward-node-${version}-${arch}-linux.tar.gz"
+  local name="ward-node-${node_version}-${arch}-linux.tar.gz"
   printf '%s' "node-payload-$arch" >"$dist/$name"
   (cd "$dist" && sha256sum "$name" >"$name.sha256")
 }
@@ -58,7 +59,7 @@ add_node_artifact() {
 c="$(fresh_case valid)"
 add_artifact "$c/dist" x86_64
 add_artifact "$c/dist" aarch64
-out="$(GENERATE_MANIFEST_NOW=2026-01-01T00:00:00Z bash "$sut" "$tag" "$commit" "$c/dist")"
+out="$(GENERATE_MANIFEST_NOW=2026-01-01T00:00:00Z bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist")"
 echo "$out" | jq -e . >/dev/null || fail "valid case: output is not valid JSON"
 [[ "$(jq -r .tag <<<"$out")" == "$tag" ]] || fail "valid case: wrong tag"
 [[ "$(jq -r .version <<<"$out")" == "$version" ]] || fail "valid case: wrong version"
@@ -90,14 +91,14 @@ echo "ok   valid fixture release produces a correct manifest"
 
 # Determinism: the same inputs, generated twice, produce byte-identical JSON
 # (modulo generated_at, pinned above) -- glob/filesystem order must not leak in.
-out2="$(GENERATE_MANIFEST_NOW=2026-01-01T00:00:00Z bash "$sut" "$tag" "$commit" "$c/dist")"
+out2="$(GENERATE_MANIFEST_NOW=2026-01-01T00:00:00Z bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist")"
 [[ "$out" == "$out2" ]] || fail "valid case: two runs over identical inputs produced different manifests"
 echo "ok   generation is deterministic across repeated runs"
 
 # Optional image reference is carried through untouched.
 c="$(fresh_case with-image-ref)"
 add_artifact "$c/dist" x86_64
-out="$(bash "$sut" "$tag" "$commit" "$c/dist" "quay.io/hexrift/wardos:$tag")"
+out="$(bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist" "quay.io/hexrift/wardos:$tag")"
 [[ "$(jq -r '.image.bootc_reference' <<<"$out")" == "quay.io/hexrift/wardos:$tag" ]] ||
   fail "image-ref case: bootc_reference not carried through"
 echo "ok   an explicit image reference is recorded"
@@ -118,19 +119,19 @@ write_doc() {
 c="$(fresh_case window)"
 add_artifact "$c/dist" x86_64
 doc="$(write_doc window-plain '<!-- protocol-window: 2.1-2.4 -->')"
-out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist")"
+out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist")"
 [[ "$(jq -c '.node_protocol_window' <<<"$out")" == '{"major":2,"min_minor":1,"max_minor":4}' ]] ||
   fail "window case: marker 2.1-2.4 not recorded as major 2, minors 1-4"
 echo "ok   the protocol window is read from the compatibility document's marker"
 
 doc="$(write_doc window-wrapped '<!--protocol-window:' '  1.0-1.3' '-->')"
-out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist")"
+out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist")"
 [[ "$(jq -c '.node_protocol_window' <<<"$out")" == '{"major":1,"min_minor":0,"max_minor":3}' ]] ||
   fail "window case: a marker wrapped over lines is not read like protocol-window.py reads it"
 echo "ok   a line-wrapped marker parses the way protocol-window.py reads it"
 
 doc="$(write_doc window-single-minor '<!-- protocol-window: 1.3-1.3 -->')"
-out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist")"
+out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist")"
 [[ "$(jq -c '.node_protocol_window' <<<"$out")" == '{"major":1,"min_minor":3,"max_minor":3}' ]] ||
   fail "window case: a one-minor window is not recorded"
 echo "ok   a one-minor window is recorded"
@@ -139,22 +140,22 @@ echo "ok   a one-minor window is recorded"
 # manifest produced: the field is never guessed or defaulted.
 doc="$(write_doc window-absent 'No marker in this document.')"
 expect_status 1 "a compatibility document without a marker is refused" \
-  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist"
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 doc="$(write_doc window-duplicate '<!-- protocol-window: 1.0-1.3 -->' '<!-- protocol-window: 1.0-1.3 -->')"
 expect_status 1 "two markers are refused" \
-  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist"
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 doc="$(write_doc window-malformed '<!-- protocol-window: 1.0 to 1.3 -->')"
 expect_status 1 "a marker that is not M.a-M.b is refused" \
-  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist"
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 doc="$(write_doc window-cross-major '<!-- protocol-window: 1.0-2.3 -->')"
 expect_status 1 "a window spanning two majors is refused" \
-  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist"
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 doc="$(write_doc window-inverted '<!-- protocol-window: 1.3-1.0 -->')"
 expect_status 1 "an inverted window is refused" \
-  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist"
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 expect_status 1 "a missing compatibility document is refused" \
-  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$work/no-such-doc.md" bash "$sut" "$tag" "$commit" "$c/dist"
-out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$(write_doc window-absent-again 'No marker.')" bash "$sut" "$tag" "$commit" "$c/dist" 2>/dev/null || true)"
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$work/no-such-doc.md" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
+out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$(write_doc window-absent-again 'No marker.')" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist" 2>/dev/null || true)"
 [[ -z "$out" ]] || fail "window case: a refused run must print no manifest at all"
 echo "ok   a refused window produces no manifest"
 
@@ -164,63 +165,84 @@ echo "ok   a refused window produces no manifest"
 c="$(fresh_case node-train)"
 add_artifact "$c/dist" x86_64
 add_node_artifact "$c/dist" x86_64
-out="$(bash "$sut" "$tag" "$commit" "$c/dist")"
+out="$(bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist")"
 [[ "$(jq -r '.artifacts | length' <<<"$out")" == "2" ]] || fail "node-train case: expected 2 artifacts"
-node_entry="$(jq -c '.artifacts[] | select(.name == "ward-node-1.2.3-x86_64-linux.tar.gz")' <<<"$out")"
+node_entry="$(jq -c '.artifacts[] | select(.name == "ward-node-0.3.0-x86_64-linux.tar.gz")' <<<"$out")"
 [[ -n "$node_entry" ]] || fail "node-train case: the node tarball is not in the manifest"
 [[ "$(jq -r .component <<<"$node_entry")" == "ward-node" ]] || fail "node-train case: wrong component for the node tarball"
 [[ "$(jq -r .architecture <<<"$node_entry")" == "x86_64" ]] || fail "node-train case: wrong architecture for the node tarball"
 [[ "$(jq -r .digest <<<"$node_entry")" \
-  == "sha256:$(sha256sum "$c/dist/ward-node-1.2.3-x86_64-linux.tar.gz" | awk '{print $1}')" ]] ||
+  == "sha256:$(sha256sum "$c/dist/ward-node-0.3.0-x86_64-linux.tar.gz" | awk '{print $1}')" ]] ||
   fail "node-train case: the node tarball's digest does not match its bytes"
 [[ "$(jq -r '.artifacts[] | select(.name == "wardos-1.2.3-x86_64-linux.tar.gz") | .component' <<<"$out")" == "wardos" ]] ||
   fail "node-train case: the runtime tarball's component is not wardos"
+[[ "$(jq -r .version <<<"$node_entry")" == "$node_version" ]] || fail "node-train case: the node tarball's version is not the node version"
+[[ "$(jq -r '.artifacts[] | select(.name == "wardos-1.2.3-x86_64-linux.tar.gz") | .version' <<<"$out")" == "$version" ]] ||
+  fail "node-train case: the runtime tarball's version is not the release version"
+[[ "$(jq -c .components <<<"$out")" == "{\"wardos\":{\"version\":\"$version\"},\"ward-node\":{\"version\":\"$node_version\"}}" ]] ||
+  fail "node-train case: components does not name both trains' versions"
 echo "ok   the node tarball is recorded as its own component"
+
+# The node train's version is its own (issue #275): a node tarball named by the
+# release version is a leftover or a mislabelled build, and the node version must
+# always be given and be SemVer.
+c="$(fresh_case node-under-release-version)"
+add_artifact "$c/dist" x86_64
+printf 'node' >"$c/dist/ward-node-${version}-x86_64-linux.tar.gz"
+(cd "$c/dist" && sha256sum "ward-node-${version}-x86_64-linux.tar.gz" >"ward-node-${version}-x86_64-linux.tar.gz.sha256")
+expect_status 1 "a node tarball named by the release version is refused" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
+c="$(fresh_case node-version-default)"
+add_artifact "$c/dist" x86_64
+out="$(bash "$sut" "$tag" "$commit" "$c/dist")" || fail "node-version-default: refused"
+[[ "$(jq -r '.components["ward-node"].version' <<<"$out")" == "$(bash "$RELEASE_DIR/node-version.sh" --root "$RELEASE_DIR/../..")" ]] ||
+  fail "node-version-default: without --node-version the checkout's node version is not used"
+echo "ok   without --node-version the checkout's node version is recorded"
+expect_status 1 "a node version that is not SemVer is refused" bash "$sut" --node-version "v0.3.0" "$tag" "$commit" "$c/dist"
 
 # A node tarball that no longer matches its sidecar is refused like any other.
 c="$(fresh_case node-digest-mismatch)"
 add_artifact "$c/dist" x86_64
 add_node_artifact "$c/dist" x86_64
-printf 'TAMPERED-NODE\n' >"$c/dist/ward-node-${version}-x86_64-linux.tar.gz"
-expect_status 1 "a node tarball that no longer matches its own sidecar is refused" bash "$sut" "$tag" "$commit" "$c/dist"
+printf 'TAMPERED-NODE\n' >"$c/dist/ward-node-${node_version}-x86_64-linux.tar.gz"
+expect_status 1 "a node tarball that no longer matches its own sidecar is refused" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 
 ### Rejections #################################################################
 
 # Empty dist dir: no artifacts at all -> completeness failure.
 c="$(fresh_case empty)"
-expect_status 1 "empty dist dir is refused" bash "$sut" "$tag" "$commit" "$c/dist"
+expect_status 1 "empty dist dir is refused" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 
 # Missing dist dir entirely.
-expect_status 1 "missing dist dir is refused" bash "$sut" "$tag" "$commit" "$work/does-not-exist"
+expect_status 1 "missing dist dir is refused" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$work/does-not-exist"
 
 # Malformed tag (not v<semver>).
 c="$(fresh_case bad-tag)"
 add_artifact "$c/dist" x86_64
-expect_status 1 "malformed tag is refused" bash "$sut" "1.2.3" "$commit" "$c/dist"
+expect_status 1 "malformed tag is refused" bash "$sut" --node-version "$node_version" "1.2.3" "$commit" "$c/dist"
 expect_status 1 "tag with shell metacharacters is refused" \
-  bash "$sut" 'v1.2.3; touch pwned' "$commit" "$c/dist"
+  bash "$sut" --node-version "$node_version" 'v1.2.3; touch pwned' "$commit" "$c/dist"
 
 # Malformed / short / symbolic commit.
-expect_status 1 "short commit sha is refused" bash "$sut" "$tag" "abc123" "$c/dist"
-expect_status 1 "symbolic ref instead of a commit sha is refused" bash "$sut" "$tag" "HEAD" "$c/dist"
+expect_status 1 "short commit sha is refused" bash "$sut" --node-version "$node_version" "$tag" "abc123" "$c/dist"
+expect_status 1 "symbolic ref instead of a commit sha is refused" bash "$sut" --node-version "$node_version" "$tag" "HEAD" "$c/dist"
 
 # Artifact whose filename's version segment doesn't match the tag: a
 # leftover artifact from a different release must not be folded in.
 c="$(fresh_case wrong-version)"
 printf 'BYTES\n' >"$c/dist/wardos-9.9.9-x86_64-linux.tar.gz"
 (cd "$c/dist" && sha256sum wardos-9.9.9-x86_64-linux.tar.gz >wardos-9.9.9-x86_64-linux.tar.gz.sha256)
-expect_status 1 "artifact naming a different version is refused" bash "$sut" "$tag" "$commit" "$c/dist"
+expect_status 1 "artifact naming a different version is refused" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 
 # Missing checksum sidecar for an otherwise-valid tarball.
 c="$(fresh_case missing-sidecar)"
 printf 'BYTES\n' >"$c/dist/wardos-${version}-x86_64-linux.tar.gz"
-expect_status 1 "artifact with no checksum sidecar is refused" bash "$sut" "$tag" "$commit" "$c/dist"
+expect_status 1 "artifact with no checksum sidecar is refused" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 
 # Orphaned sidecar with no matching tarball.
 c="$(fresh_case orphan-sidecar)"
 add_artifact "$c/dist" x86_64
 echo "deadbeef  wardos-${version}-aarch64-linux.tar.gz" >"$c/dist/wardos-${version}-aarch64-linux.tar.gz.sha256"
-expect_status 1 "a checksum sidecar with no matching artifact is refused" bash "$sut" "$tag" "$commit" "$c/dist"
+expect_status 1 "a checksum sidecar with no matching artifact is refused" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 
 # Digest mismatch: the sidecar was not regenerated after the bytes changed --
 # exactly the "one byte changed after download" acceptance case, but caught
@@ -228,18 +250,18 @@ expect_status 1 "a checksum sidecar with no matching artifact is refused" bash "
 c="$(fresh_case digest-mismatch)"
 add_artifact "$c/dist" x86_64
 printf 'TAMPERED-BYTES\n' >"$c/dist/wardos-${version}-x86_64-linux.tar.gz"
-expect_status 1 "a tarball that no longer matches its own sidecar is refused" bash "$sut" "$tag" "$commit" "$c/dist"
+expect_status 1 "a tarball that no longer matches its own sidecar is refused" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 
 # Corrupt sidecar contents (not a valid hex digest).
 c="$(fresh_case corrupt-sidecar)"
 printf 'BYTES\n' >"$c/dist/wardos-${version}-x86_64-linux.tar.gz"
 echo "not-a-digest" >"$c/dist/wardos-${version}-x86_64-linux.tar.gz.sha256"
-expect_status 1 "a sidecar without a valid sha256 hex digest is refused" bash "$sut" "$tag" "$commit" "$c/dist"
+expect_status 1 "a sidecar without a valid sha256 hex digest is refused" bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist"
 
 # Image reference with embedded whitespace (would otherwise corrupt the field).
 c="$(fresh_case bad-image-ref)"
 add_artifact "$c/dist" x86_64
 expect_status 1 "an image reference containing whitespace is refused" \
-  bash "$sut" "$tag" "$commit" "$c/dist" "quay.io/hexrift/wardos:$tag extra"
+  bash "$sut" --node-version "$node_version" "$tag" "$commit" "$c/dist" "quay.io/hexrift/wardos:$tag extra"
 
 echo "PASS generate-manifest.test.sh"

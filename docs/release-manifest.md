@@ -15,9 +15,14 @@ status.
 ## Generating a manifest
 
 ```
-generate-manifest.sh <tag> <commit> <dist-dir> [image-ref]
+generate-manifest.sh [--node-version <node-version>] <tag> <commit> <dist-dir> [image-ref]
 ```
 
+- `--node-version` — the node train's own version (issue #275), which names the node
+  tarball and is recorded under `components` and on the node artifact. The release
+  workflow passes the version its `version` job proved against the previous release
+  with `scripts/release/node-version.sh`; without the option the generator reads this
+  checkout's node version through the same script.
 - `<tag>` — the release tag, e.g. `v1.2.3` (same grammar `check-version.sh` enforces).
 - `<commit>` — the full 40-character source commit the release was built from (what
   `check-tag-commit.sh` already binds the tag to).
@@ -37,9 +42,10 @@ window is read from (default: the repository's `docs/compatibility.md`, found
 relative to the script).
 
 Every input is validated before any output is produced. An artifact whose name
-doesn't carry this manifest's own version or one of the two release trains
-(`wardos-<version>-<arch>-linux.tar.gz`, the runtime, and
-`ward-node-<version>-<arch>-linux.tar.gz`, the node; issue #275), a tarball with no
+doesn't carry its train's version for this manifest or one of the two release trains
+(`wardos-<version>-<arch>-linux.tar.gz`, the runtime under the release version, and
+`ward-node-<node-version>-<arch>-linux.tar.gz`, the node under the node version;
+issue #275), a tarball with no
 checksum sidecar (or a sidecar with no matching tarball), or a sidecar whose recorded
 digest doesn't match the artifact's actual bytes are all refused with a specific,
 actionable message — never silently dropped from the manifest or silently trusted. So
@@ -57,10 +63,15 @@ full set of fixtures this covers.
   "version": "1.2.3",
   "source_commit": "<40-hex-character commit sha>",
   "generated_at": "<UTC ISO-8601 timestamp>",
+  "components": {
+    "wardos": { "version": "1.2.3" },
+    "ward-node": { "version": "0.3.0" }
+  },
   "artifacts": [
     {
-      "name": "ward-node-1.2.3-x86_64-linux.tar.gz",
+      "name": "ward-node-0.3.0-x86_64-linux.tar.gz",
       "component": "ward-node",
+      "version": "0.3.0",
       "architecture": "x86_64",
       "digest": "sha256:<hex>",
       "size_bytes": 1234567
@@ -68,6 +79,7 @@ full set of fixtures this covers.
     {
       "name": "wardos-1.2.3-x86_64-linux.tar.gz",
       "component": "wardos",
+      "version": "1.2.3",
       "architecture": "x86_64",
       "digest": "sha256:<hex>",
       "size_bytes": 12345678
@@ -99,7 +111,13 @@ full set of fixtures this covers.
 byte-identical manifests, independent of filesystem/glob ordering. `component` is the
 release train the artifact belongs to, taken from its name: `wardos` for the runtime
 tarball, `ward-node` for the node tarball
-([node-release-readiness.md](node-release-readiness.md) §2).
+([node-release-readiness.md](node-release-readiness.md) §2); `version` is that train's
+version, which the name carries. `components` names both trains' versions once: the
+top-level `version` is the release's (the runtime's, the image's and the tag's), and
+`components["ward-node"].version` is the node train's own
+([compatibility.md](compatibility.md) §6; issue #275), which may stay the same across
+releases that change nothing the node is built from. `image/build.sh` reads the node
+tarball a release carries from here.
 
 `node_protocol_window` is the `ward-node` protocol window the release serves
 ([compatibility.md](compatibility.md) §1; issue #275), in the shape of the `supported`
