@@ -333,7 +333,7 @@ fn write_footer(report: &mut Report, json: bool) {
     );
 }
 
-fn failure_text(f: &Failure) -> String {
+pub(crate) fn failure_text(f: &Failure) -> String {
     match f {
         Failure::Broken { seq, reason } => format!("chain BROKEN at seq {seq}: {reason}"),
         Failure::Empty => "chain BROKEN: log is empty".to_owned(),
@@ -348,7 +348,7 @@ fn failure_text(f: &Failure) -> String {
     }
 }
 
-const fn sealed_label(s: Sealed) -> &'static str {
+pub(crate) const fn sealed_label(s: Sealed) -> &'static str {
     match s {
         Sealed::Absent => "absent",
         Sealed::Matches => "matches",

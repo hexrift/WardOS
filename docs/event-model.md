@@ -279,7 +279,12 @@ sess_01J…   payments-api   Claude Code   2026-09-07 22:14 → 22:18   VERIFIED
  entry   blake3:9f1c…   candidate  blake3:77ab…   accepted  blake3:77ab…
 ```
 
-with `--json` for tooling and `--verify` to check the chain and anchors offline.
+with `--json` for tooling, `--verify` to check the chain and anchors offline, and
+`--stats` for the approval-load statistics of experiment E-13
+([`experiments.md`](experiments.md)): every `CapabilityRequested` paired to its terminal
+outcome by identity, a still-pending request reported as censored rather than decided,
+and a figure the log cannot support reported as unmeasured; `--stats --json` is one
+versioned object.
 
 ## 9. Live ingestion and bounded buffering
 

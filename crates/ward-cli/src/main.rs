@@ -22,6 +22,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod init;
 mod replay;
+mod replay_stats;
 mod tui;
 mod vault;
 use ward_daemon::approvals::ApprovalDecision;
@@ -200,6 +201,10 @@ enum Command {
         /// Emit one JSON object per record.
         #[arg(long)]
         json: bool,
+        /// Print E-13 approval-load statistics for the log instead of its rows
+        /// (`docs/experiments.md` E-13); with `--json`, one versioned object.
+        #[arg(long, conflicts_with = "verify")]
+        stats: bool,
     },
     /// Session facts for TamperWard (`docs/tamperward-integration.md` §2).
     #[command(subcommand)]
@@ -660,15 +665,12 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Doctor => Ok(cmd_doctor()),
         Command::Ready { dir, agent } => Ok(cmd_ready(&dir.unwrap_or_else(cwd), agent)),
         Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
-        Command::Replay { log, verify, json } => {
-            let report = replay::replay(&log, replay::Options { verify, json })?;
-            print!("{}", report.output);
-            Ok(if report.ok() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
-        }
+        Command::Replay {
+            log,
+            verify,
+            json,
+            stats,
+        } => cmd_replay(&log, replay::Options { verify, json }, stats),
         Command::Session(cmd) => cmd_session(cmd),
         Command::Snapshot(SnapshotCmd::Create { dir, role }) => {
             cmd_snapshot_create(&dir.unwrap_or_else(cwd), role.into())
@@ -705,6 +707,24 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         } => cmd_benchmark(fixtures.as_deref(), json.as_deref(), samples, warm_up),
         Command::Desktop(argv) => cmd_desktop(&argv),
     }
+}
+
+/// `ward replay`: rows, a verdict, or (with `--stats`) the E-13 statistics; the exit
+/// code says whether the log verified.
+fn cmd_replay(log: &Path, opts: replay::Options, stats: bool) -> ward_daemon::Result<ExitCode> {
+    let (ok, output) = if stats {
+        let out = replay_stats::run(log, opts.json)?;
+        (out.ok, out.output)
+    } else {
+        let report = replay::replay(log, opts)?;
+        (report.ok(), report.output)
+    };
+    print!("{output}");
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 /// `ward session <…>`: session facts for TamperWard, and the approvals/grants

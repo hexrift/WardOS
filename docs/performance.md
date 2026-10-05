@@ -151,10 +151,13 @@ acceptance both say to introduce a gate only after variance is measured across e
 real runs, not before. `--samples`/`--warm-up` default to §3's own 20/3; `--fixtures`
 points at a fixtures root other than `benchmarks/fixtures` (rarely needed).
 
-Not yet implemented, and deliberately out of this pass: opt-in replay statistics for
-E-13 (`docs/experiments.md`), the E-14 counterbalanced usability study, and any
-hardware/compositor measurement (reuse #84 for compositor evidence, #99 for reference
-hardware).
+`ward replay --stats` (the opt-in E-13 approval-load statistics, `docs/experiments.md`
+E-13) is implemented in `ward-cli` separately from this runner: it reads one session log
+and reports, as text or versioned JSON, prompts per agent-hour, decision latency,
+repeated requests, session grants, expiries and censored requests, with the same
+`unmeasured` honesty as this report. Not yet implemented, and deliberately out of this
+pass: the E-14 counterbalanced usability study, and any hardware/compositor measurement
+(reuse #84 for compositor evidence, #99 for reference hardware).
 
 ## 6. Installer performance plan (Phase 8, after correctness)
 

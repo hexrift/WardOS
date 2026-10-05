@@ -130,7 +130,7 @@ ward pause    examples/ward-demo    # freeze the agents as one operation: proces
 ward resume   examples/ward-demo    # let them continue
 ward stop     examples/ward-demo    # end every sandboxed process (confirmed gone), then seal the log; the workspace stays
 ward stop     examples/ward-demo --restore-entry   # …holding the session frozen for the stop first, then writing the entry snapshot back over the worktree (.ward/restore-<ts>/ keeps what it replaced)
-ward replay   <events.log>          # replay any sealed session (--verify, --json)
+ward replay   <events.log>          # replay any sealed session (--verify, --json, --stats for E-13 approval load)
 ward session describe examples/ward-demo   # the session's immutable facts for TamperWard (--json)
 ward session pending   examples/ward-demo  # held approvals: destination · requested by agent · Ward will allow (--json)
 ward session approvals examples/ward-demo  # every approval asked, pending or decided (state, id, tool, destination; --json)
