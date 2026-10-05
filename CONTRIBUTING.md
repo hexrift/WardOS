@@ -101,7 +101,10 @@ release is cut:
 5. Verify the published manifest: `gh release download v0.19.0 --pattern
    'wardos-0.19.0-manifest.json*'`, then `scripts/release/verify-manifest.sh
    wardos-0.19.0-manifest.json wardos-0.19.0-manifest.json.sigstore.json --tag v0.19.0`
-   must end with `state=provenance-verified`; record that line in the release PR.
+   must end with `state=provenance-verified`; record that line in the release PR. Then
+   the install path, with `cosign` installed: `./install.sh --version v0.19.0
+   --require-provenance --prefix "$(mktemp -d)"` must end with
+   `install: provenance-verified` ([`docs/install.md`](docs/install.md) §1).
 6. Capture the released desktop for the README: `gh workflow run desktop-capture.yml
    --ref v0.19.0`, and once that run is green, `desktop/capture/refresh.sh --ref v0.19.0`
    puts its GIF in `assets/wardos-desktop.gif` for a pull request (no workflow writes to

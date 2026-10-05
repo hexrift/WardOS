@@ -137,7 +137,8 @@ Before anything is published, the release job runs the verifier below on its own
 signature, so a policy that does not match what the workflow actually produces fails
 the job on the runner rather than every user's check. Releases published before the
 signing step existed (v0.4.1 and earlier) carry no bundle; the verifier reports
-`provenance-missing` for them and they remain checksum-only.
+`provenance-missing` for them, and `install.sh` installs them checksum-only and says so
+([install.md](install.md) §1).
 
 `generated_at` of a published manifest is the source commit's committer time, not the
 run's clock: a retry of the release workflow at the same commit must reproduce every
@@ -229,8 +230,15 @@ jq -r '.artifacts[] | (.digest | sub("^sha256:"; "")) + "  " + .name' \
 `source_commit` must equal the commit the release's tag resolves to
 (`git rev-parse <tag>^{commit}`). The verifier itself reaches you through the
 repository — clone it at the tag, or read the one-command form above and type it; the
-tarballs do not carry `scripts/` — and ADR-0028's "Trust roots and bootstrap" keeps
-shipping the verifier and the Sigstore trusted root on the image as open work.
+tarballs do not carry `scripts/`. `install.sh` does the same on your behalf: it fetches
+`scripts/release/verify-manifest.sh` at the release tag (through the contents API when a
+token is set), the channel the installer itself arrives through rather than the tarball
+it is about to check, runs it with `--tag` beside the downloaded manifest, bundle and
+tarball, keeps its cause and exit code on a refusal, and installs checksum-only, saying
+so, when the verifier cannot run or the release has no bundle ([install.md](install.md)
+§1; `--require-provenance` refuses instead). ADR-0028's "Trust roots and bootstrap"
+keeps shipping the verifier and the Sigstore trusted root on the image, and a first-trust
+step for the downloaded installer, as open work.
 
 ## What the signature proves, and what it does not
 
@@ -246,9 +254,10 @@ what the build's inputs were: that is the SLSA provenance attestation of ADR-002
 `attestation_ref` and `builder` are filled in only when a real attestation exists, and
 since the manifest is signed after it is generated, nothing in it can reference its own
 bundle. The tarballs and the OCI image are not signed individually (ADR-0028 §3 for
-them is open), and the image is not covered by the manifest's signature at all. Neither
-`install.sh`, the image's release stage nor `desktop/bin/wardos-update` runs the
-verifier yet: the install and update paths remain checksum-only until ADR-0028 §5's
+them is open), and the image is not covered by the manifest's signature at all. `install.sh`
+runs the verifier and reports ADR-0028 §5's states up to `provenance-verified`
+([install.md](install.md) §1); the image's release stage and `desktop/bin/wardos-update`
+do not yet, so the image and update paths remain checksum-only until the rest of that
 state machine is wired (issue #148), and a `provenance-verified` manifest says nothing
 about the boot chain (ADR-0028 §6). The signing step runs for the first time on the
 first `v*` tag released after it landed; until that release exists, no published

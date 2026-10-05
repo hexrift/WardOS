@@ -55,8 +55,9 @@ theme, a key, a project and an agent. To *try* it without giving up a machine, b
 is an installer that erases the target disk
 ([which image to use](image/README.md#three-kinds-of-image-which-one-and-the-one-that-erases-a-disk)). The convenient development installer,
 `curl -fsSL https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | bash`,
-does the three steps above for you and runs `ward doctor`; it is a shell script fetched
-from `main`, so read it first ([`docs/install.md`](docs/install.md)).
+does the three steps above for you, verifies the release against its signed manifest
+when it has one (`--require-provenance` to insist), and runs `ward doctor`; it is a
+shell script fetched from `main`, so read it first ([`docs/install.md`](docs/install.md)).
 
 Then, in any project, five commands and about five minutes
 ([`docs/onboarding.md`](docs/onboarding.md)):

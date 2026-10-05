@@ -29,9 +29,9 @@ it. The release manifest that records every tarball's digest is signed by the re
 workflow under its own identity and can be verified offline before unpacking
 ([`release-manifest.md`](release-manifest.md) "Verifying a release"; the first signed
 release is the first `v*` tag after that step landed — v0.4.1 and earlier carry no
-signature). The trust policy is [`ADR-0028`](decisions/ADR-0028-release-provenance-and-trusted-updates.md);
-this install path and `install.sh` do not run the verifier yet and remain checksum-only
-on their own.
+signature). The trust policy is [`ADR-0028`](decisions/ADR-0028-release-provenance-and-trusted-updates.md).
+Done by hand, the four lines above are checksum-only unless you run the verifier
+beside them; `install.sh` below runs it for you and says what it proved.
 
 **The OS image** is the other way in: on a machine of its own, boot it and the tools,
 the agents, TamperWard and the desktop are already there (§6, [`image/README.md`](../image/README.md)).
@@ -42,16 +42,50 @@ the agents, TamperWard and the desktop are already there (§6, [`image/README.md
 curl -fsSL https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | bash
 ```
 
-It resolves the latest release, downloads the tarball for this machine's architecture,
-verifies its SHA-256 against the `.sha256` from the same release, installs the three
-binaries into `~/.local/bin`, and runs `ward doctor`. Use `--prefix /usr/local` for a
-system-wide install, `--version v0.2.0` to pin. It is a script fetched from `main` and
-run unread, which is why it is not the headline: read it, or run `./install.sh` from
-an unpacked tarball, where it installs the files next to it and fetches nothing.
+It resolves the latest release, downloads the release manifest with its `.sha256` and
+its Sigstore bundle, then the tarball for this machine's architecture with its
+`.sha256`, verifies the release (below), installs the three binaries into
+`~/.local/bin`, and runs `ward doctor`. Use `--prefix /usr/local` for a system-wide
+install, `--version v0.2.0` to pin, `--require-provenance` to refuse anything short of
+a verified release, `--trusted-root FILE` to hand cosign a Sigstore trusted root on a
+machine that cannot refresh its TUF cache. It is a script fetched from `main` and run
+unread, which is why it is not the headline: read it, or run `./install.sh` from an
+unpacked tarball, where it installs the files next to it, fetches nothing, and ends
+with `install: unverified` — the verification was yours, with the commands above.
 
 No token is needed. For a private fork, export `GITHUB_TOKEN` (or `GH_TOKEN`) with
-read access first; the installer then fetches the release assets through the GitHub
-API with it.
+read access first; the installer then fetches the release assets, and the verifier,
+through the GitHub API with it.
+
+**What `install.sh` verifies, and says.** Before it installs a downloaded release it
+walks ADR-0028 §5's states and prints each one it reaches, in the ADR's words, so the
+terminal or a log shows what was proven; the last line is `install: <state reached>`.
+
+| Line | Meaning |
+| --- | --- |
+| `downloaded …` | the manifest, its `.sha256` and its bundle; then the tarball and its `.sha256` |
+| `digest-checked (manifest)` | the manifest's `.sha256` agrees with its bytes |
+| `digest-checked (tarball)` | the tarball's `.sha256` agrees, and the tarball hashes to the digest the manifest records for it — a tarball the manifest does not vouch for is refused (`digest-mismatch`) even when its own sidecar agrees |
+| `provenance-verified` | [`scripts/release/verify-manifest.sh`](../scripts/release/verify-manifest.sh) of the release's own tag passed: the manifest was signed by `hexrift/WardOS`'s release workflow on this tag, and the tarball's digest is in it. The verifier is fetched from the repository at the release tag — the channel `install.sh` itself arrives through, not the tarball it is about to check — and needs `cosign` (v3) and `jq` on the host |
+| `provenance-missing` | the release has no manifest (every release up to v0.4.1) or no bundle (a manifest published by a run that was not on its tag); the install goes on **checksum-only**, said on stderr |
+| `verifier-unavailable` | `cosign` is not installed, the verifier could not be fetched, or cosign has no Sigstore trusted root; the install goes on **checksum-only**, said on stderr |
+| `verification-failed (<cause>)` | the manifest or the tarball does not hold up; nothing is installed |
+
+Checksum-only means exactly what §1's first command proves: the bytes are the ones the
+release attached, and nothing about who built them. `install.sh` never calls such an
+install verified: its last line reads `install: checksum-only (verifier-unavailable:
+cosign-missing)`, `install: checksum-only (provenance-missing: no-manifest)` and so on,
+and `--require-provenance` turns both checksum-only states into refusals. A real
+`provenance-verified` can only come from a release that carries a signed manifest, which
+is the first `v*` tag after the signing step landed; until it exists, every install is
+checksum-only and says so. The exit codes name the cause: 0 installed; 1 no such release,
+no tarball for this architecture, or a download failed; 2 usage; 3 verifier-unavailable
+and 4 provenance-missing, refused by `--require-provenance`; 5 `issuer-mismatch`, 6
+`identity-mismatch`, 7 `manifest-altered`, 8 `digest-mismatch`, 10 `wrong-release`, 11
+`trusted-root-unavailable` (with `--require-provenance`) — the verifier's own codes
+([`release-manifest.md`](release-manifest.md) "Verifying a release"); 12
+`malformed-manifest`. `scripts/release/install.test.sh` holds every row above against a
+fixture release and a fake `cosign`.
 
 ## 2. Host requirements
 
