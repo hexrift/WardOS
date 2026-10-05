@@ -185,9 +185,51 @@ sandbox running, unobserved: a log-only closure presented as a stop. Now:
   only owner. No new event kind: a capture's hold is the host pausing the session, and
   `SessionPaused`/`SessionResumed` record it as such.
 
-Still open under #145: the persisted `Pausing`/`Stopping`/`Incomplete` lifecycle as an
-explicit state machine (the stop marker, the intent file and the in-memory hold are its
-precursors, not that state machine). The
+* **The explicit lifecycle (#145 item 1).** The session's state is one enum,
+  `pause::Lifecycle`: `Running → Pausing → Paused → Resuming → Running`,
+  `Running | Paused → Stopping → Stopped`, and `Incomplete`, what a pause or a stop that
+  could not be confirmed leaves (an unsettled freeze, a component that did not
+  acknowledge, processes a stop could not confirm ended) until a retry confirms an
+  outcome; it is never reported as `Paused` or `Stopped`. The state is derived from the
+  durable records already there — the intent file for the operations in flight (a
+  resume now records its own, `Verb::Resume`, so a daemon restarted between a
+  resume's marker clearing and its thaw finishes the release instead of leaving a
+  frozen tree with nothing saying so), the pause and stop markers, the owners, the
+  log's last hold record (`pause::lifecycle_on_disk`) — so a reader with no daemon
+  derives the same state the daemon serves. Every transition is decided in one table,
+  `pause::transition`, by the daemon (`Served::enter`) and by launch admission alike: a
+  request that is not valid in the current state is refused naming the state (`Resume`
+  while `Stopping`, `Pause` while `Stopped`), in the words clients already read where
+  those existed. The daemon serves the state on its own lane (`Request::Lifecycle`,
+  answered from what it last published, never behind its mutex), so a pause blocked on
+  a component's acknowledgement reads `pausing` meanwhile; `ward pause --status --json`
+  carries it as `lifecycle` beside the fields it always had, and `ward status`, `ward
+  pause`, `ward resume` and `ward stop` end with the state reached.
+* **Host-owned launch handles, admission serialised (#145 item 2).** Every launch has
+  a stable handle from its admission — the sequence number of its own `CommandStarted`,
+  assigned by the daemon's single writer before any `bwrap` spawns — recorded in
+  `sessions/<id>/launches.json` with how it ended (finished, aborted, or the connection
+  gone with neither, which the log alone cannot say), so a restarted daemon knows every
+  launch it ever admitted and does not reopen one whose client is gone. Admission is
+  the lifecycle's `Launch` transition under the session lock pause and stop take:
+  admitted only while `Running`, refused naming the state while an operation is in
+  flight (`Pausing`, `Resuming`, `Stopping`), held (`Paused`, `Incomplete`) or ended; a
+  launch refused after its `CommandStarted` is recorded as `LaunchAborted` with the
+  refusal, as before. No new event kind.
+* **Progress as it happens, and interventions that do not wait (#145 item 8).** A
+  connection that asks (`Request::ReportProgress`) is answered one `Response::Progress`
+  line per component as it confirms — the processes, then the egress proxy, the
+  approvals and the credentials in hold order (the reverse on a resume; the termination
+  first on a stop) — before the operation's own answer; `ward pause`, `ward resume` and
+  `ward stop` print each line the moment it arrives and the lifecycle state last. A
+  connection that never asks gets the one answer it always got. Verification and event
+  replay run in the client, not the daemon; what could delay an intervention inside the
+  daemon was a subscriber's replay, which read the whole log under the daemon's mutex.
+  The boundary and the live channel are now fixed under the mutex and the log is read
+  with it released, so a pause lands while replays are still being read and every
+  subscriber still sees the whole replay, the marker and the pause's record after it.
+
+The
 fork barrier is confirmed only when every known process is frozen and a stable
 rescan closes the membership set within `pause::FREEZE_SETTLE`. A failed late cgroup
 migration invalidates that barrier and falls back to `SIGSTOP`; a timeout remains a

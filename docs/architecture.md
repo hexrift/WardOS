@@ -215,7 +215,7 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > per-session process that owns the session's hash chain and log writer and serves the
 > control socket `<state>/sessions/<ID>/control.sock` (mode 0600, JSON lines:
 > `append`, `evidence`, `sync`, `seal`, `stop`, `describe`, `subscribe`, `ping`, `hold`,
-> `approve`, `pending`, `pause`, `resume`).
+> `approve`, `pending`, `pause`, `resume`, `lifecycle`, `report_progress`).
 > `ward up` spawns it detached and `ward stop` sends `stop`; every other command adopts
 > the socket when a `ping` is answered and writes the log in-process otherwise. The
 > daemon runs as the session owner, not yet as a `ward` system user with the capability
@@ -332,6 +332,28 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > `wardos-pause` (`Super + Shift + P`) is that request plus the exits menu; the bar's
 > agent segment reads `PAUSED` in the denied tone while the marker stands. The
 > security model's G13 states what a pause holds and what it cannot recall.
+>
+> **The lifecycle is explicit (#145 items 1, 2 and 8).** One state, `pause::Lifecycle`
+> — `running → pausing → paused → resuming → running`, `running | paused → stopping →
+> stopped`, and `incomplete` for a pause or a stop that could not be confirmed until a
+> retry confirms an outcome (never reported as `paused` or `stopped`) — derived from the
+> records above (the intent file, which a resume now writes too; the markers; the
+> owners; the log's last hold record; `pause::lifecycle_on_disk`) so a reader with no
+> daemon derives what the daemon serves. Every transition is decided in one table
+> (`pause::transition`): a request outside its state is refused naming the state. The
+> daemon serves the state on its own lane (`lifecycle`, answered from what it last
+> published, never behind its mutex, so a pause waiting on a component reads `pausing`
+> meanwhile); `ward pause --status --json` carries it as `lifecycle` beside `status`,
+> `unconfirmed` and `held_by`, and `ward status`, `ward pause`, `ward resume` and
+> `ward stop` end with the state reached. Launch admission is that lifecycle's `Launch`
+> transition under the session lock: admitted only while running, refused naming the
+> state otherwise; every launch has a stable host-owned handle (its `CommandStarted`
+> seq) registered in `sessions/<id>/launches.json` with how it ended, read back by a
+> restarted daemon. A connection that asks (`report_progress`) hears one `progress`
+> line per component as it confirms before the operation's answer, which `ward pause`,
+> `ward resume` and `ward stop` print as they arrive; a subscriber's replay is read
+> with the daemon's mutex released (its boundary fixed under it), so an intervention
+> never waits behind it.
 
 ### 3.2 `ward` CLI
 

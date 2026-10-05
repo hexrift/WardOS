@@ -52,6 +52,7 @@
 //! (and is ended by it) or never spawns.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -143,6 +144,15 @@ pub enum Verb {
         /// The process taking it.
         capturer: Capturer,
     },
+    /// `ward resume` releasing the user's hold (#145 item 1, the `Resuming`
+    /// state): recorded before the first component is released, cleared once
+    /// `SessionResumed` is on the log or the release was taken back. A daemon
+    /// that finds it finishes the release from what `/proc` shows, so a tree
+    /// left frozen by a resume that died between clearing the marker and
+    /// thawing is not frozen for ever with nothing saying so. Appended after
+    /// the shipped variants: an intent written by this daemon reads back on
+    /// one that predates it only by its own, older verbs.
+    Resume,
 }
 
 /// The durable intent of one lifecycle operation (see [`INTENT`]).
@@ -404,6 +414,400 @@ pub fn clear_held_by(state: &Path, session: &str) -> Result<()> {
     }
 }
 
+/// The session's lifecycle (#145 item 1), as one explicit state: what the
+/// markers, the intent and the log's last hold record implied separately
+/// until now. `Running → Pausing → Paused → Resuming → Running`;
+/// `Running | Paused → Stopping → Stopped`; and [`Incomplete`](Self::Incomplete),
+/// what a pause or a stop that could not be confirmed leaves behind until a
+/// retry (`ward resume` for a pause, `ward stop` for either) confirms an
+/// outcome. The state is derived from the durable records
+/// ([`lifecycle_on_disk`]) — the intent file ([`INTENT`]) for the operations
+/// in flight, the pause marker ([`MARKER`]), the stop marker
+/// ([`STOP_MARKER`]), the owners ([`HELD_BY`]) and the log's last hold record
+/// — so a reader with no daemon derives the same state the daemon serves
+/// (`Request::Lifecycle`), and every transition is decided by one table
+/// ([`transition`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lifecycle {
+    /// Nothing holds the session; launches are admitted.
+    Running,
+    /// A pause (or a capture's hold) has begun and has not reached its record.
+    Pausing,
+    /// A confirmed hold is in force: the freeze settled and every component
+    /// acknowledged (`SessionPaused`).
+    Paused,
+    /// `ward resume` is releasing the hold, component by component.
+    Resuming,
+    /// A stop has begun — its intent recorded, or the session held for it
+    /// (`HoldForStop`, confirmed) — and the log is not sealed yet.
+    Stopping,
+    /// The log is sealed: the session ended.
+    Stopped,
+    /// A pause or a stop could not be confirmed and recovery is required: an
+    /// unsettled freeze, a component that did not acknowledge, or processes a
+    /// stop could not confirm ended. The session is held in the safest state
+    /// it could reach; this is never reported as `Paused` or `Stopped`.
+    Incomplete,
+}
+
+impl Lifecycle {
+    /// Every state, in the order of the lifecycle.
+    pub const ALL: [Self; 7] = [
+        Self::Running,
+        Self::Pausing,
+        Self::Paused,
+        Self::Resuming,
+        Self::Stopping,
+        Self::Stopped,
+        Self::Incomplete,
+    ];
+
+    /// The state's name in `ward pause --status --json`, `ward status` and
+    /// every refusal.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Pausing => "pausing",
+            Self::Paused => "paused",
+            Self::Resuming => "resuming",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+            Self::Incomplete => "incomplete",
+        }
+    }
+
+    /// The state [`as_str`](Self::as_str) names.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_str() == name.trim())
+    }
+
+    /// An operation is in flight: its intent is recorded and its outcome is
+    /// not. Only a reader outside the daemon observes these (the daemon
+    /// serves one lifecycle operation at a time).
+    #[must_use]
+    pub const fn in_flight(self) -> bool {
+        matches!(self, Self::Pausing | Self::Resuming)
+    }
+
+    /// Whether a sandbox launch may be admitted in this state: only while
+    /// running (#145 item 2).
+    #[must_use]
+    pub const fn admits_launch(self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    /// Whether a hold is in force (the marker stands, the approvals are held).
+    #[must_use]
+    pub const fn holds(self) -> bool {
+        matches!(self, Self::Paused | Self::Stopping | Self::Incomplete)
+    }
+}
+
+impl fmt::Display for Lifecycle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A lifecycle operation a request asks for ([`transition`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation {
+    /// `ward pause` (`Request::Pause`).
+    Pause,
+    /// `ward resume` (`Request::Resume`).
+    Resume,
+    /// `ward stop` (`Request::Stop`), first attempt or retry.
+    Stop,
+    /// `ward stop --restore-entry`'s hold (`Request::HoldForStop`).
+    HoldForStop,
+    /// A snapshot capture's hold (`Request::HoldForCapture`).
+    HoldForCapture,
+    /// A sandbox launch ([`admit_launch`]).
+    Launch,
+}
+
+impl Operation {
+    /// The operation's name in refusals.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Stop => "stop",
+            Self::HoldForStop => "hold for stop",
+            Self::HoldForCapture => "hold for capture",
+            Self::Launch => "launch",
+        }
+    }
+
+    /// The state the session is in while this operation runs from a state
+    /// that admits it as a transition (not a layering over a hold in force).
+    #[must_use]
+    pub const fn enters(self) -> Lifecycle {
+        match self {
+            Self::Pause | Self::HoldForCapture => Lifecycle::Pausing,
+            Self::Resume => Lifecycle::Resuming,
+            Self::Stop | Self::HoldForStop => Lifecycle::Stopping,
+            Self::Launch => Lifecycle::Running,
+        }
+    }
+}
+
+/// The refusal a resume gets while a stop of the session has begun.
+#[must_use]
+pub fn stop_begun_refusal(session: &str) -> String {
+    format!(
+        "a stop of session {session} has begun and not completed: its sandboxed processes are \
+         held for that stop (some may already have been killed), so `ward resume` cannot \
+         release them. Run `ward stop` to finish it"
+    )
+}
+
+/// The refusal a resume gets when only captures hold the session.
+#[must_use]
+pub fn held_for_capture_refusal(session: &str, capture: &Capturer) -> String {
+    format!(
+        "session {session} is held for capture by operation {} (pid {}), not a user pause: `ward \
+         resume` releases only a user's pause, and the capture releases its hold when it \
+         finishes",
+        capture.op, capture.pid
+    )
+}
+
+/// The refusal a launch gets while an operation is in flight or the session
+/// is held, naming the state (#145 item 2): [`PAUSED_REFUSAL`] and
+/// [`STOPPED_REFUSAL`] for the states those name, else the state's own word.
+#[must_use]
+pub fn launch_refusal(state: Lifecycle) -> String {
+    match state {
+        Lifecycle::Paused | Lifecycle::Incomplete => PAUSED_REFUSAL.to_owned(),
+        Lifecycle::Stopping | Lifecycle::Stopped => STOPPED_REFUSAL.to_owned(),
+        Lifecycle::Running | Lifecycle::Pausing | Lifecycle::Resuming => {
+            format!("session is {state} by ward; nothing new can start in it until that completes")
+        }
+    }
+}
+
+/// The one transition table (#145 item 1): what `op` does to a session in
+/// `state` whose hold has `holders`, for `session`. `Ok(entered)` is the state
+/// the session is in while the operation runs — the transient state
+/// ([`Operation::enters`]) for a transition, `state` itself for an operation
+/// that joins a hold in force without changing it (a capture over a pause, a
+/// stop's hold over a pause, a user's pause over a capture's hold, a retried
+/// stop over an incomplete one). `Err` is the refusal, naming the state. The
+/// daemon (`Served::enter`) and launch admission ([`admit_launch`]) both
+/// decide here; nothing else decides whether an operation is valid.
+///
+/// The words some refusals use are the ones clients and the desktop already
+/// read (`already paused`, `not paused`, `log is sealed`, the stop-begun and
+/// held-for-capture refusals), so every existing reader keeps working.
+pub fn transition(
+    session: &str,
+    state: Lifecycle,
+    holders: &Holders,
+    op: Operation,
+) -> Result<Lifecycle> {
+    use Lifecycle as L;
+    use Operation as O;
+    let refuse = |text: String| Err(Error::Daemon(text));
+    if op == O::Launch {
+        return if state.admits_launch() {
+            Ok(L::Running)
+        } else {
+            Err(Error::Sandbox(launch_refusal(state)))
+        };
+    }
+    if state == L::Stopped {
+        return refuse("log is sealed".to_owned());
+    }
+    let held = holders.user || holders.stop || !holders.captures.is_empty();
+    match (state, op) {
+        (L::Running, O::Resume) => refuse("not paused".to_owned()),
+        (L::Running, _) => Ok(op.enters()),
+        // An operation in flight, observed from outside the daemon: nothing
+        // else may begin until it reaches its outcome.
+        (L::Pausing | L::Resuming, _) => refuse(format!(
+            "session {session} is {state}: a {} cannot begin until that operation has reached \
+             its outcome (its intent is recorded; a daemon restarted on the session finishes \
+             it)",
+            op.as_str()
+        )),
+        // A stop has begun (the stop marker) and nothing holds the session in
+        // this daemon's memory: a stop that could not take its hold, or a
+        // restarted daemon reading the marker. Only a stop goes on from here.
+        (L::Stopping | L::Paused | L::Incomplete, O::Stop | O::HoldForStop) => Ok(L::Stopping),
+        (L::Stopping, O::Resume) => refuse(stop_begun_refusal(session)),
+        (L::Stopping, O::Pause) if !held => refuse(format!(
+            "session {session} is stopping: a stop has begun and not completed, so a pause \
+             cannot be taken. Run `ward stop` to finish it"
+        )),
+        (L::Stopping, O::HoldForCapture) if !held => refuse(format!(
+            "session {session} is stopping: a stop has begun and not completed, so nothing can \
+             be captured from it"
+        )),
+        // A hold in force: the user's, a capture's, a stop's, confirmed or not.
+        (L::Paused | L::Incomplete | L::Stopping, O::Pause) => {
+            if holders.user || holders.stop {
+                refuse("already paused".to_owned())
+            } else {
+                // Layered over a capture's hold: no transition, the hold stands.
+                Ok(state)
+            }
+        }
+        (L::Paused | L::Incomplete, O::Resume) => {
+            if holders.stop {
+                refuse(stop_begun_refusal(session))
+            } else if let (false, Some(capture)) = (holders.user, holders.captures.first()) {
+                refuse(held_for_capture_refusal(session, capture))
+            } else {
+                Ok(L::Resuming)
+            }
+        }
+        (L::Paused | L::Incomplete | L::Stopping, O::HoldForCapture) => Ok(state),
+        (L::Stopped, _) | (_, O::Launch) => unreachable!("decided above"),
+    }
+}
+
+/// The lifecycle as a reader sees it (#145 item 1): the state, what is
+/// uncertain about it, the operation in flight, who holds the session and
+/// which launches are open. Serialised into `ward pause --status --json`'s
+/// `lifecycle` field and `Response::Lifecycle`; every field but `state` is
+/// optional on the wire, so a reader of an older daemon's answer, or a newer
+/// daemon's, reads it the same.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleReport {
+    /// The state.
+    pub state: Lifecycle,
+    /// What the state cannot confirm (`Incomplete`: the component or the
+    /// processes), or the reason of the operation in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The id of the operation in flight ([`Intent::op`]), while one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    /// Who holds the session, in [`Holders::owners`] order; empty while running.
+    #[serde(default)]
+    pub held_by: Vec<Owner>,
+    /// The handles of every launch admitted and not yet ended
+    /// ([`crate::launches`]).
+    #[serde(default)]
+    pub open_launches: Vec<u64>,
+}
+
+impl LifecycleReport {
+    /// A report of `state` with nothing else known.
+    #[must_use]
+    pub const fn of(state: Lifecycle) -> Self {
+        Self {
+            state,
+            detail: None,
+            op: None,
+            held_by: Vec::new(),
+            open_launches: Vec::new(),
+        }
+    }
+
+    /// `paused`, `incomplete (egress proxy (no acknowledgement within 2s))`,
+    /// `pausing (looks wrong)`: the state and its detail, for a status line.
+    #[must_use]
+    pub fn text(&self) -> String {
+        match &self.detail {
+            Some(detail) if !detail.is_empty() => format!("{} ({detail})", self.state),
+            _ => self.state.to_string(),
+        }
+    }
+}
+
+/// The lifecycle `session`'s durable records show, without reading its log
+/// (#145 item 1): the intent names an operation in flight (`Pausing` for a
+/// pause or a capture's hold, `Resuming`, `Stopping`); a sealed log is
+/// `Stopped`; the stop marker is `Stopping`; the pause marker is `Paused`;
+/// nothing is `Running`. `Paused` and `Stopping` here may read `Incomplete`
+/// once the log is consulted ([`lifecycle_on_disk`]); for admission that
+/// difference does not matter (neither admits a launch). Cheap: a few
+/// `stat`s, so every launch can afford it under the session lock.
+pub fn lifecycle_marks(state: &Path, session: &str) -> Result<(Lifecycle, Option<Intent>)> {
+    if let Some(intent) = read_intent(state, session)? {
+        let lifecycle = match intent.verb {
+            Verb::Pause { .. } | Verb::Capture { .. } => Lifecycle::Pausing,
+            Verb::Resume => Lifecycle::Resuming,
+            Verb::Stop { .. } => Lifecycle::Stopping,
+        };
+        return Ok((lifecycle, Some(intent)));
+    }
+    let log = session_dir(state, session).join("events.log");
+    if ward_events::log::head_file_path(&log).exists() {
+        return Ok((Lifecycle::Stopped, None));
+    }
+    if stop_begun(state, session) {
+        return Ok((Lifecycle::Stopping, None));
+    }
+    if marker_path(state, session).exists() {
+        return Ok((Lifecycle::Paused, None));
+    }
+    Ok((Lifecycle::Running, None))
+}
+
+/// The lifecycle `session`'s durable records show, for a reader with no
+/// daemon (`ward pause --status`, `ward status`): [`lifecycle_marks`] refined
+/// by the log — a hold whose last record is unconfirmed (`SessionPauseUnsettled`,
+/// or a `WorkloadsTerminated` with pending processes or an unconfirmed
+/// barrier; [`acks::unconfirmed_detail`]) is `Incomplete`, with that detail —
+/// and completed with the owners and the open launches
+/// ([`crate::launches::read`]). A session whose log does not exist yet reads
+/// from its marks alone.
+pub fn lifecycle_on_disk(state: &Path, session: &str) -> Result<LifecycleReport> {
+    let (mut lifecycle, intent) = lifecycle_marks(state, session)?;
+    let log = session_dir(state, session).join("events.log");
+    let mut detail = None;
+    let mut op = None;
+    match intent {
+        Some(intent) => {
+            op = Some(intent.op);
+            detail = match intent.verb {
+                Verb::Pause { reason } | Verb::Capture { reason, .. } => Some(reason),
+                Verb::Stop { .. } | Verb::Resume => None,
+            };
+        }
+        None if lifecycle.holds() => {
+            let unconfirmed = match acks::unconfirmed_detail(&log) {
+                Ok(detail) => detail,
+                Err(_) if !log.exists() => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(unconfirmed) = unconfirmed {
+                lifecycle = Lifecycle::Incomplete;
+                detail = Some(unconfirmed);
+            }
+        }
+        None => {}
+    }
+    let held_by = if marker_path(state, session).exists() {
+        let mut holders = read_held_by(state, session)?.unwrap_or_else(Holders::for_user);
+        holders.prune_dead(Path::new("/proc"));
+        if stop_begun(state, session) {
+            holders.stop = true;
+        }
+        holders.owners()
+    } else {
+        Vec::new()
+    };
+    let open_launches = crate::launches::read(state, session)?
+        .open()
+        .map(|l| l.handle)
+        .collect();
+    Ok(LifecycleReport {
+        state: lifecycle,
+        detail,
+        op,
+        held_by,
+        open_launches,
+    })
+}
+
 /// What a hold could not confirm, in words: its pending processes, the
 /// component that did not acknowledge, or both.
 #[must_use]
@@ -476,13 +880,29 @@ pub fn admit_launch(state: &Path, session: &str) -> Result<Flock<std::fs::File>>
             "launch admission for session {session} could not take the session lock: {e}"
         ))
     })?;
-    if stop_begun(state, session) {
-        return Err(Error::Sandbox(STOPPED_REFUSAL.into()));
-    }
-    if marker_path(state, session).exists() {
-        return Err(Error::Sandbox(PAUSED_REFUSAL.into()));
-    }
+    launch_admission(state, session)?;
     Ok(lock)
+}
+
+/// The admission decision alone (#145 item 2), from the session's durable
+/// records ([`lifecycle_marks`]) through the one transition table
+/// ([`transition`]): admitted only while the session is `Running`; refused,
+/// naming the state, while an operation is in flight (`Pausing`, `Resuming`,
+/// `Stopping`) or a hold stands (`Paused`, `Incomplete`) or the session ended.
+/// [`admit_launch`] decides this under the session lock; `Session::launch`
+/// asks it once more, unlocked, before anything is recorded, so a refusal
+/// costs nothing. Fails closed: records that cannot be read refuse the launch.
+pub fn launch_admission(state: &Path, session: &str) -> Result<()> {
+    let (lifecycle, _) = lifecycle_marks(state, session).map_err(|e| {
+        Error::Sandbox(format!(
+            "launch admission for session {session} could not read the session's lifecycle: {e}"
+        ))
+    })?;
+    let holders = read_held_by(state, session)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    transition(session, lifecycle, &holders, Operation::Launch).map(drop)
 }
 
 /// What a freeze holds, so it can be thawed or killed later.
@@ -3095,5 +3515,382 @@ mod tests {
         assert!(!marker_path(state.path(), session).exists());
         assert_eq!(read_held_by(state.path(), session).unwrap(), None);
         assert!(!intent_path(state.path(), session).exists());
+    }
+
+    /// #145 item 1: the one transition table. Every state is tried against
+    /// every operation, with the hold's owners where they decide.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn the_transition_table_admits_refuses_and_names_the_state() {
+        use Lifecycle as L;
+        use Operation as O;
+        let none = Holders::default();
+        let user = Holders::for_user();
+        let stop = Holders::for_stop();
+        let capture = Holders::for_capture(Capturer {
+            op: "op1".into(),
+            pid: 7,
+            started: "1".into(),
+            reason: capture_reason("test"),
+        });
+        let refusal = |state, holders: &Holders, op| {
+            transition("sess_t", state, holders, op)
+                .unwrap_err()
+                .to_string()
+        };
+        // Running: a pause, a stop, a hold and a launch begin; nothing to resume.
+        assert_eq!(
+            transition("sess_t", L::Running, &none, O::Pause).unwrap(),
+            L::Pausing
+        );
+        assert_eq!(
+            transition("sess_t", L::Running, &none, O::Stop).unwrap(),
+            L::Stopping
+        );
+        assert_eq!(
+            transition("sess_t", L::Running, &none, O::HoldForStop).unwrap(),
+            L::Stopping
+        );
+        assert_eq!(
+            transition("sess_t", L::Running, &none, O::HoldForCapture).unwrap(),
+            L::Pausing
+        );
+        assert_eq!(
+            transition("sess_t", L::Running, &none, O::Launch).unwrap(),
+            L::Running
+        );
+        assert!(refusal(L::Running, &none, O::Resume).ends_with("not paused"));
+        // Paused by the user: no second pause, a resume, a stop, a capture layers.
+        assert!(refusal(L::Paused, &user, O::Pause).ends_with("already paused"));
+        assert_eq!(
+            transition("sess_t", L::Paused, &user, O::Resume).unwrap(),
+            L::Resuming
+        );
+        assert_eq!(
+            transition("sess_t", L::Paused, &user, O::Stop).unwrap(),
+            L::Stopping
+        );
+        assert_eq!(
+            transition("sess_t", L::Paused, &user, O::HoldForCapture).unwrap(),
+            L::Paused
+        );
+        assert!(refusal(L::Paused, &user, O::Launch).contains(PAUSED_REFUSAL));
+        // Held only for a capture: the user's pause layers over it, a resume
+        // has nothing of the user's to release.
+        assert_eq!(
+            transition("sess_t", L::Paused, &capture, O::Pause).unwrap(),
+            L::Paused
+        );
+        let held = refusal(L::Paused, &capture, O::Resume);
+        assert!(
+            held.contains("held for capture by operation op1 (pid 7)"),
+            "{held}"
+        );
+        assert!(held.contains("not a user pause"), "{held}");
+        // Held for a stop (confirmed): only the stop goes on.
+        assert!(refusal(L::Stopping, &stop, O::Pause).ends_with("already paused"));
+        let begun = refusal(L::Stopping, &stop, O::Resume);
+        assert!(begun.contains("has begun and not completed"), "{begun}");
+        assert!(begun.contains("cannot release"), "{begun}");
+        assert_eq!(
+            transition("sess_t", L::Stopping, &stop, O::Stop).unwrap(),
+            L::Stopping
+        );
+        assert_eq!(
+            transition("sess_t", L::Stopping, &stop, O::HoldForStop).unwrap(),
+            L::Stopping
+        );
+        assert_eq!(
+            transition("sess_t", L::Stopping, &stop, O::HoldForCapture).unwrap(),
+            L::Stopping
+        );
+        assert!(refusal(L::Stopping, &stop, O::Launch).contains(STOPPED_REFUSAL));
+        // A stop begun with no hold in force (the marker alone): the stop
+        // retries; a pause or a capture is refused naming the state.
+        assert_eq!(
+            transition("sess_t", L::Stopping, &none, O::Stop).unwrap(),
+            L::Stopping
+        );
+        let stopping = refusal(L::Stopping, &none, O::Pause);
+        assert!(
+            stopping.contains("session sess_t is stopping"),
+            "{stopping}"
+        );
+        assert!(refusal(L::Stopping, &none, O::HoldForCapture).contains("is stopping"),);
+        assert!(refusal(L::Stopping, &none, O::Resume).contains("has begun and not completed"));
+        // Incomplete: an unconfirmed pause resumes or stops; an unconfirmed
+        // stop only stops.
+        assert_eq!(
+            transition("sess_t", L::Incomplete, &user, O::Resume).unwrap(),
+            L::Resuming
+        );
+        assert_eq!(
+            transition("sess_t", L::Incomplete, &user, O::Stop).unwrap(),
+            L::Stopping
+        );
+        assert!(refusal(L::Incomplete, &user, O::Pause).ends_with("already paused"));
+        assert!(refusal(L::Incomplete, &stop, O::Resume).contains("has begun and not completed"));
+        assert_eq!(
+            transition("sess_t", L::Incomplete, &stop, O::Stop).unwrap(),
+            L::Stopping
+        );
+        assert!(refusal(L::Incomplete, &stop, O::Launch).contains(PAUSED_REFUSAL));
+        // In flight (observed from outside the daemon): nothing begins.
+        for state in [L::Pausing, L::Resuming] {
+            for op in [
+                O::Pause,
+                O::Resume,
+                O::Stop,
+                O::HoldForStop,
+                O::HoldForCapture,
+            ] {
+                let text = refusal(state, &none, op);
+                assert!(
+                    text.contains(&format!("session sess_t is {state}")),
+                    "{state} {op:?}: {text}"
+                );
+                assert!(text.contains(op.as_str()), "{text}");
+            }
+            let launch = refusal(state, &none, O::Launch);
+            assert!(launch.contains(&format!("session is {state}")), "{launch}");
+        }
+        // Stopped: the log is sealed; nothing at all.
+        for op in [
+            O::Pause,
+            O::Resume,
+            O::Stop,
+            O::HoldForStop,
+            O::HoldForCapture,
+        ] {
+            assert!(
+                refusal(L::Stopped, &none, op).ends_with("log is sealed"),
+                "{op:?}"
+            );
+        }
+        assert!(refusal(L::Stopped, &none, O::Launch).contains(STOPPED_REFUSAL));
+        // The words and the shape every reader relies on.
+        for state in L::ALL {
+            assert_eq!(L::parse(state.as_str()), Some(state));
+            assert_eq!(state.to_string(), state.as_str());
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{}\"", state.as_str())
+            );
+            assert_eq!(state.admits_launch(), state == L::Running);
+        }
+        assert_eq!(L::parse("frozen"), None);
+        assert!(L::Pausing.in_flight() && L::Resuming.in_flight());
+        assert!(!L::Stopping.in_flight() && !L::Paused.in_flight());
+        assert!(L::Paused.holds() && L::Incomplete.holds() && L::Stopping.holds());
+        assert!(!L::Running.holds() && !L::Stopped.holds());
+        for op in [
+            O::Pause,
+            O::Resume,
+            O::Stop,
+            O::HoldForStop,
+            O::HoldForCapture,
+            O::Launch,
+        ] {
+            assert!(!op.as_str().is_empty());
+        }
+        assert_eq!(O::Pause.enters(), L::Pausing);
+        assert_eq!(O::HoldForCapture.enters(), L::Pausing);
+        assert_eq!(O::Resume.enters(), L::Resuming);
+        assert_eq!(O::Stop.enters(), L::Stopping);
+        assert_eq!(O::HoldForStop.enters(), L::Stopping);
+        assert_eq!(O::Launch.enters(), L::Running);
+        assert_eq!(launch_refusal(L::Running), launch_refusal(L::Running));
+    }
+
+    /// #145 item 1: the lifecycle a reader with no daemon derives from the
+    /// records, record by record — and that `Incomplete` is what an
+    /// unconfirmed hold reads, never `paused` or `stopped`.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn the_lifecycle_on_disk_is_derived_from_the_records() {
+        use ward_events::{Blake3Hash, Origin, SessionId};
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session) = (dir.path(), "sess_life");
+        let session_path = session_dir(state, session);
+        fs::create_dir_all(&session_path).unwrap();
+        let report = |expected: Lifecycle| {
+            let report = lifecycle_on_disk(state, session).unwrap();
+            assert_eq!(report.state, expected, "{report:?}");
+            report
+        };
+        // Nothing recorded, no log yet: running.
+        let running = report(Lifecycle::Running);
+        assert_eq!(running, LifecycleReport::of(Lifecycle::Running));
+        assert_eq!(running.text(), "running");
+        assert!(launch_admission(state, session).is_ok());
+        // Each intent names an operation in flight, and refuses a launch.
+        let pause = Intent::begin(Verb::Pause {
+            reason: "looks wrong".into(),
+        })
+        .unwrap();
+        write_intent(state, session, &pause).unwrap();
+        let pausing = report(Lifecycle::Pausing);
+        assert_eq!(pausing.op.as_deref(), Some(pause.op.as_str()));
+        assert_eq!(pausing.detail.as_deref(), Some("looks wrong"));
+        assert_eq!(pausing.text(), "pausing (looks wrong)");
+        let refused = launch_admission(state, session).unwrap_err().to_string();
+        assert!(refused.contains("session is pausing"), "{refused}");
+        write_intent(state, session, &Intent::begin(Verb::Resume).unwrap()).unwrap();
+        let resuming = report(Lifecycle::Resuming);
+        assert_eq!(resuming.detail, None);
+        assert!(
+            launch_admission(state, session)
+                .unwrap_err()
+                .to_string()
+                .contains("session is resuming")
+        );
+        write_intent(
+            state,
+            session,
+            &Intent::begin(Verb::Stop {
+                reason: EndReason::UserStop,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        report(Lifecycle::Stopping);
+        assert!(
+            launch_admission(state, session)
+                .unwrap_err()
+                .to_string()
+                .contains(STOPPED_REFUSAL)
+        );
+        let capturer = Capturer {
+            op: "cap".into(),
+            pid: 1,
+            started: "x".into(),
+            reason: capture_reason("test"),
+        };
+        write_intent(
+            state,
+            session,
+            &Intent::begin(Verb::Capture {
+                reason: capture_reason("test"),
+                capturer,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            report(Lifecycle::Pausing).detail.as_deref(),
+            Some("ward capture: test")
+        );
+        clear_intent(state, session).unwrap();
+        // A marker with no log yet: paused, held by the user.
+        write_marker(state, session, "looks wrong").unwrap();
+        let paused = report(Lifecycle::Paused);
+        assert_eq!(paused.held_by, [Owner::User]);
+        assert_eq!(paused.detail, None);
+        assert!(
+            launch_admission(state, session)
+                .unwrap_err()
+                .to_string()
+                .contains(PAUSED_REFUSAL)
+        );
+        // The log's last hold record decides between paused and incomplete.
+        let log_path = session_path.join("events.log");
+        let mut log = crate::control::LocalLog::create(
+            &log_path,
+            SessionId::from_u128(3),
+            Blake3Hash::from_bytes([3; 32]),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        let mut append = |event: WardEvent| {
+            crate::control::Sink::append(
+                &mut log,
+                Origin::Wardd,
+                event,
+                std::time::SystemTime::now(),
+            )
+            .unwrap();
+        };
+        append(WardEvent::SessionPauseUnsettled {
+            method: PauseMethod::Sigstop,
+            reason: ShortText::new("looks wrong"),
+            pending: 2,
+        });
+        let incomplete = report(Lifecycle::Incomplete);
+        assert_eq!(
+            incomplete.detail.as_deref(),
+            Some("2 process(es) not confirmed stopped")
+        );
+        assert_eq!(
+            incomplete.text(),
+            "incomplete (2 process(es) not confirmed stopped)"
+        );
+        assert_eq!(incomplete.held_by, [Owner::User]);
+        append(WardEvent::SessionPaused {
+            method: PauseMethod::Sigstop,
+            reason: ShortText::new("looks wrong"),
+        });
+        report(Lifecycle::Paused);
+        // A stop that could not confirm termination: incomplete, held for the
+        // stop; its retry's confirmed record makes it stopping.
+        write_stop_marker(state, session).unwrap();
+        write_held_by(state, session, &Holders::for_stop()).unwrap();
+        append(WardEvent::WorkloadsTerminated {
+            ended: 1,
+            pending: 1,
+            barrier_confirmed: true,
+        });
+        let stop_incomplete = report(Lifecycle::Incomplete);
+        assert_eq!(
+            stop_incomplete.detail.as_deref(),
+            Some("1 process(es) not confirmed ended")
+        );
+        assert_eq!(stop_incomplete.held_by, [Owner::Stop]);
+        append(WardEvent::WorkloadsTerminated {
+            ended: 2,
+            pending: 0,
+            barrier_confirmed: true,
+        });
+        assert_eq!(report(Lifecycle::Stopping).held_by, [Owner::Stop]);
+        // The seal ends it.
+        crate::control::Sink::stop(Box::new(log), EndReason::UserStop).unwrap();
+        let stopped = report(Lifecycle::Stopped);
+        assert_eq!(stopped.text(), "stopped");
+        assert!(
+            launch_admission(state, session)
+                .unwrap_err()
+                .to_string()
+                .contains(STOPPED_REFUSAL)
+        );
+        // The report's wire shape: `state` always, the rest only when set.
+        assert_eq!(
+            serde_json::to_string(&LifecycleReport::of(Lifecycle::Running)).unwrap(),
+            r#"{"state":"running","held_by":[],"open_launches":[]}"#
+        );
+        let back: LifecycleReport = serde_json::from_str(r#"{"state":"incomplete"}"#).unwrap();
+        assert_eq!(back, LifecycleReport::of(Lifecycle::Incomplete));
+        assert_eq!(
+            serde_json::to_string(&stop_incomplete).unwrap(),
+            r#"{"state":"incomplete","detail":"1 process(es) not confirmed ended","held_by":["stop"],"open_launches":[]}"#
+        );
+    }
+
+    /// An intent, an owners record or a register that cannot be read refuses
+    /// a launch rather than admitting it on a guess.
+    #[test]
+    fn unreadable_records_refuse_a_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session) = (dir.path(), "sess_bad");
+        fs::create_dir_all(session_dir(state, session)).unwrap();
+        fs::write(intent_path(state, session), b"{").unwrap();
+        let refused = launch_admission(state, session).unwrap_err().to_string();
+        assert!(
+            refused.contains("could not read the session's lifecycle"),
+            "{refused}"
+        );
+        assert!(lifecycle_on_disk(state, session).is_err());
+        fs::remove_file(intent_path(state, session)).unwrap();
+        assert!(launch_admission(state, session).is_ok());
+        fs::write(crate::launches::path(state, session), b"{").unwrap();
+        assert!(lifecycle_on_disk(state, session).is_err());
     }
 }

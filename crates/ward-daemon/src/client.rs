@@ -163,6 +163,21 @@ pub fn resume(sink: &mut RemoteSink) -> Result<EventRecord> {
     expect_record(sink.call(&Request::Resume)?)
 }
 
+/// The session's lifecycle (#145 item 1): the daemon's own answer
+/// (`Request::Lifecycle`, served on its own lane) when it serves one, else
+/// what the session's records show ([`pause::lifecycle_on_disk`]) — the same
+/// derivation, so a daemon that predates the request is read the same way.
+pub fn lifecycle(
+    sink: &mut RemoteSink,
+    state: &Path,
+    session: &str,
+) -> Result<crate::pause::LifecycleReport> {
+    match sink.lifecycle()? {
+        Some(report) => Ok(report),
+        None => crate::pause::lifecycle_on_disk(state, session),
+    }
+}
+
 /// One session's outcome from [`pause_all`].
 #[derive(Debug)]
 pub struct SessionPauseResult {

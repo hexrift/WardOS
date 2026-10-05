@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,9 @@ pub struct Session {
     /// recomputed from the log at open time ([`crate::attempt::next_attempt_id`]),
     /// so it stays correct across process restarts without its own counter file.
     next_attempt: AttemptId,
+    /// Where a daemonless stop reports its termination step (#145 item 8),
+    /// once [`set_progress`](Self::set_progress) installed one.
+    progress: Option<Arc<Mutex<crate::control::OnProgress>>>,
     /// Cancellation handle for the next/current `verify()` call (#139). A fresh,
     /// never-cancelled token by default; [`Session::begin_verify_cancel`] replaces
     /// it with one the caller can hold onto and cancel from elsewhere.
@@ -358,6 +362,7 @@ impl Session {
             log_path,
             // A brand-new log has no attempts to have left dangling.
             next_attempt: AttemptId::new(1),
+            progress: None,
             cancel: CancelToken::new(),
             min_free_bytes: crate::space::min_free_bytes(),
         };
@@ -441,6 +446,7 @@ impl Session {
             worktree,
             entry_snapshot: meta.entry_snapshot,
             next_attempt: next_attempt_id(&log_path),
+            progress: None,
             cancel: CancelToken::new(),
             // Carried over from the record written at session start, never
             // recomputed from the (possibly since-reopened) live worktree.
@@ -1453,13 +1459,38 @@ impl Session {
     /// [`pause::admit_launch`], re-run under the session lock immediately before
     /// the sandbox is spawned — only the cheap, early refusal.
     fn refuse_while_paused(&self) -> Result<()> {
-        if pause::stop_begun(&self.state, &self.session_str) {
-            return Err(Error::Sandbox(pause::STOPPED_REFUSAL.into()));
+        pause::launch_admission(&self.state, &self.session_str)
+    }
+
+    /// Report each component of the lifecycle operations this session
+    /// performs — `ward stop`'s termination and acknowledgements — through
+    /// `on_progress` as it happens (#145 item 8): forwarded to the daemon's
+    /// per-connection progress when one serves the session
+    /// (`Request::ReportProgress`), reported by this process for the
+    /// termination it does itself otherwise.
+    pub fn set_progress(&mut self, on_progress: crate::control::OnProgress) {
+        let shared = Arc::new(Mutex::new(on_progress));
+        let forwarded = Arc::clone(&shared);
+        self.sink
+            .set_progress(Box::new(move |p: &crate::control::Progress| {
+                if let Ok(mut on_progress) = forwarded.lock() {
+                    on_progress(p);
+                }
+            }));
+        self.progress = Some(shared);
+    }
+
+    /// Report one step of a termination this process performs itself.
+    fn report_progress(&self, component: &str, confirmed: bool, detail: String) {
+        if let Some(on_progress) = &self.progress
+            && let Ok(mut on_progress) = on_progress.lock()
+        {
+            on_progress(&crate::control::Progress {
+                component: component.to_owned(),
+                confirmed,
+                detail,
+            });
         }
-        if self.paused() {
-            return Err(Error::Sandbox(pause::PAUSED_REFUSAL.into()));
-        }
-        Ok(())
     }
 
     /// Materialise the entry snapshot over the worktree (`ward stop
@@ -1718,6 +1749,18 @@ impl Session {
     /// the refused path is testable without a process that survives `SIGKILL`.
     fn record_termination(&mut self, outcome: &pause::Termination) -> Result<u32> {
         let (ended, pending) = (outcome.ended, outcome.pending());
+        self.report_progress(
+            crate::control::Progress::PROCESSES,
+            pending == 0 && outcome.barrier_confirmed,
+            format!(
+                "{ended} ended, {pending} pending, barrier {}",
+                if outcome.barrier_confirmed {
+                    "confirmed"
+                } else {
+                    "not confirmed"
+                }
+            ),
+        );
         if !outcome.barrier_confirmed {
             let marker = pause::write_marker(
                 &self.state,

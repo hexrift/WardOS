@@ -164,10 +164,16 @@ enum Command {
         /// died mid-way and no daemon has reconciled the session since).
         #[arg(long, conflicts_with = "all")]
         status: bool,
-        /// With `--status`: one JSON object, `{status, unconfirmed, held_by}`, where
-        /// `unconfirmed` names what the current hold could not confirm (#145
-        /// item 3: `egress proxy (no acknowledgement within 2s)`, `2 process(es)
-        /// not confirmed stopped`) or is `null`.
+        /// With `--status`: one JSON object, `{status, unconfirmed, held_by,
+        /// lifecycle}`, where `unconfirmed` names what the current hold could
+        /// not confirm (#145 item 3: `egress proxy (no acknowledgement within
+        /// 2s)`, `2 process(es) not confirmed stopped`) or is `null`, and
+        /// `lifecycle` is the explicit state (#145 item 1): `{state, detail,
+        /// op, held_by, open_launches}` with `state` one of `running`,
+        /// `pausing`, `paused`, `resuming`, `stopping`, `stopped` or
+        /// `incomplete` — the last for a hold that could not be confirmed,
+        /// never reported as paused or stopped. Fields are only added, never
+        /// renamed.
         #[arg(long, requires = "status")]
         json: bool,
         /// Pause every live session, not just one (#141 item 5: "Pause all
@@ -1707,6 +1713,9 @@ fn cmd_status(dir: &Path) -> ward_daemon::Result<ExitCode> {
         println!("{}", render::session_status_line(Some(meta.started_ago())));
         let control = daemon::serving(&state, &meta.id).then(|| control_name(&meta.id));
         println!("{}", render::daemon_status_line(control.as_deref()));
+        // #145 item 1: the explicit lifecycle, from the session's own records.
+        let lifecycle = ward_daemon::pause::lifecycle_on_disk(&state, &meta.id)?;
+        println!("{}", render::lifecycle_line(&lifecycle));
     } else {
         println!("{}", render::session_status_line(None));
         println!("  run `ward up {}` to start one", dir.display());
@@ -1959,7 +1968,7 @@ fn cmd_pause(
         if json {
             println!(
                 "{}",
-                serde_json::json!({ "status": word, "unconfirmed": unconfirmed, "held_by": held_by })
+                pause_status_json(dir, &state, session, word, unconfirmed.as_deref(), &held_by)?
             );
         } else {
             println!("{word}");
@@ -2007,6 +2016,8 @@ fn cmd_pause(
         println!("  {line}");
     }
     let mut sink = client::connect(&socket)?;
+    // #145 item 8: each component as it confirms, the moment it does.
+    let _ = sink.set_progress(Box::new(print_progress));
     let outcome = client::pause(&mut sink, reason.unwrap_or_default())?;
     if let Some(row) = render::observer_row(&outcome.record) {
         println!("{row}");
@@ -2018,10 +2029,62 @@ fn cmd_pause(
     for line in pause_uncertainty_lines(outcome.unsettled, outcome.unconfirmed.as_deref()) {
         println!("  {line}");
     }
+    print_lifecycle(&mut sink, &state, &socket);
     println!(
         "  `ward resume` continues; `ward stop` keeps the workspace; `ward stop --restore-entry` restores the entry state"
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// `ward pause --status --json`'s one object (#145 items 3, 6 and 1): the
+/// word, what is unconfirmed, who holds the session — and, added beside them,
+/// the explicit lifecycle. Fields are only ever added here, never renamed:
+/// `wardos-pause` and the shell read this.
+fn pause_status_json(
+    dir: &Path,
+    state: &Path,
+    session: Option<&str>,
+    word: &str,
+    unconfirmed: Option<&str>,
+    held_by: &[ward_daemon::pause::Owner],
+) -> ward_daemon::Result<serde_json::Value> {
+    let meta = match session {
+        Some(id) => SessionMeta::load(state, id).ok(),
+        None => SessionMeta::current(dir, state)?,
+    };
+    let lifecycle = match meta {
+        Some(meta) => Some(ward_daemon::pause::lifecycle_on_disk(state, &meta.id)?),
+        None => None,
+    };
+    Ok(serde_json::json!({
+        "status": word,
+        "unconfirmed": unconfirmed,
+        "held_by": held_by,
+        "lifecycle": lifecycle,
+    }))
+}
+
+/// One progress line, printed as the daemon reports it (#145 item 8).
+fn print_progress(progress: &ward_daemon::control::Progress) {
+    println!("{}", render::progress_line(progress));
+    let _ = std::io::stdout().flush();
+}
+
+/// The last line of `ward pause`, `ward resume` and `ward stop`: the
+/// lifecycle state the session reached (#145 item 1), from the daemon when it
+/// serves it, else from the session's records.
+fn print_lifecycle(sink: &mut ward_daemon::control::RemoteSink, state: &Path, socket: &Path) {
+    let Some(id) = socket
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+    else {
+        return;
+    };
+    match client::lifecycle(sink, state, id) {
+        Ok(report) => println!("{}", render::lifecycle_line(&report)),
+        Err(e) => println!("  lifecycle: unknown ({e})"),
+    }
 }
 
 /// `ward resume`: the daemon reverses the pause and answers with its record.
@@ -2032,6 +2095,7 @@ fn cmd_resume(dir: &Path, session: Option<&str>) -> ward_daemon::Result<ExitCode
         println!("  {line}");
     }
     let mut sink = client::connect(&socket)?;
+    let _ = sink.set_progress(Box::new(print_progress));
     let record = client::resume(&mut sink)?;
     if let Some(row) = render::observer_row(&record) {
         println!("{row}");
@@ -2039,6 +2103,7 @@ fn cmd_resume(dir: &Path, session: Option<&str>) -> ward_daemon::Result<ExitCode
     if let Some(note) = resume_note(&record.event) {
         println!("  {note}");
     }
+    print_lifecycle(&mut sink, &state, &socket);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2069,11 +2134,13 @@ fn stop_in(
         Some(id) => Some(Session::open_live(state, id)?),
         None => Session::open_current(dir, state)?,
     };
-    if let Some(session) = session {
+    if let Some(mut session) = session {
         let id = session.id().to_owned();
         if let Some(line) = resolved_session_line_for(state, &id) {
             println!("  {line}");
         }
+        // #145 item 8: the termination and each component as it confirms.
+        session.set_progress(Box::new(print_progress));
         // With a daemon serving, `stop` is a `Request::Stop` — sent only once the
         // daemon has confirmed it serves confirmed stop (PR #253 review finding
         // 1): the daemon ends the session's sandboxed processes and confirms they
@@ -2082,7 +2149,7 @@ fn stop_in(
         // cannot confirm the processes ended is refused with the daemon's own
         // account of what is left, and the log stays open.
         let served = daemon::serving(state, &id);
-        let ended = if restore_entry {
+        let stopped = if restore_entry {
             // Held for the stop by the daemon first, then the restore, then the
             // stop — one hold nothing else can release (see
             // `Session::stop_restoring_entry`).
@@ -2097,14 +2164,32 @@ fn stop_in(
                     report.snapshot
                 ),
             }
-            ended
+            Ok(ended)
         } else {
-            session.stop(EndReason::UserStop)?
+            session.stop(EndReason::UserStop)
+        };
+        // The lifecycle the stop left (#145 item 1): `stopped` once sealed;
+        // what the records show — `incomplete`, held for the stop — when it
+        // was refused, printed before the refusal itself.
+        let ended = match stopped {
+            Ok(ended) => ended,
+            Err(e) => {
+                if let Ok(report) = ward_daemon::pause::lifecycle_on_disk(state, &id) {
+                    println!("{}", render::lifecycle_line(&report));
+                }
+                return Err(e);
+            }
         };
         if served && !daemon::wait_stopped(state, &id, daemon::STARTUP_TIMEOUT) {
             eprintln!("ward: wardd has not released {}", control_name(&id));
         }
         println!("{}", stopped_line(&id, ended));
+        println!(
+            "{}",
+            render::lifecycle_line(&ward_daemon::pause::LifecycleReport::of(
+                ward_daemon::pause::Lifecycle::Stopped
+            ))
+        );
     } else {
         println!("{}", render::session_status_line(None));
     }
@@ -2370,9 +2455,10 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
         Cli, Command, SessionCmd, SnapshotCmd, WatchMode, approvals_all_line, desktop_command,
-        observer_degraded_warning, on_path_in, pause_status, pause_uncertainty_lines,
-        pending_all_line, pending_text, resolved_session_line, resolved_session_line_for,
-        resume_note, stop_in, stopped_line, unreachable_line, verb_program,
+        observer_degraded_warning, on_path_in, pause_status, pause_status_json,
+        pause_uncertainty_lines, pending_all_line, pending_text, resolved_session_line,
+        resolved_session_line_for, resume_note, stop_in, stopped_line, unreachable_line,
+        verb_program,
     };
     use clap::Parser as _;
     use std::time::Duration;
@@ -3338,5 +3424,79 @@ mod tests {
             paused_for: std::time::Duration::from_secs(1),
         };
         assert_eq!(resume_note(&resumed), None);
+    }
+
+    /// #145 item 1: `ward pause --status --json` carries the explicit
+    /// lifecycle beside the fields it always had — added, never renamed — and
+    /// an unconfirmed hold reads `incomplete` there while the legacy word
+    /// still reads `paused`.
+    #[test]
+    fn pause_status_json_carries_the_lifecycle_beside_the_legacy_fields() {
+        use ward_daemon::control::Sink as _;
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let worktree = project.path().canonicalize().unwrap();
+        write_session(state.path(), "sess_a", &worktree, 1);
+        let status = |session: Option<&str>| {
+            let (word, unconfirmed, held_by) =
+                pause_status(project.path(), state.path(), session).unwrap();
+            pause_status_json(
+                project.path(),
+                state.path(),
+                session,
+                word,
+                unconfirmed.as_deref(),
+                &held_by,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            status(Some("sess_a")).to_string(),
+            r#"{"held_by":[],"lifecycle":{"held_by":[],"open_launches":[],"state":"running"},"status":"running","unconfirmed":null}"#
+        );
+        assert_eq!(
+            status(Some("sess_missing")).to_string(),
+            r#"{"held_by":[],"lifecycle":null,"status":"none","unconfirmed":null}"#
+        );
+        let log_path = ward_daemon::session::session_dir(state.path(), "sess_a").join("events.log");
+        let mut log = ward_daemon::control::LocalLog::create(
+            &log_path,
+            ward_events::SessionId::from_u128(1),
+            ward_events::Blake3Hash::from_bytes([3; 32]),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        log.append(
+            ward_events::Origin::Wardd,
+            ward_events::WardEvent::SessionPauseUnsettled {
+                method: ward_events::PauseMethod::Sigstop,
+                reason: ward_events::ShortText::new("looks wrong"),
+                pending: 2,
+            },
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        ward_daemon::pause::write_marker(state.path(), "sess_a", "looks wrong").unwrap();
+        let json = status(Some("sess_a"));
+        assert_eq!(json["status"], "paused", "the legacy word is unchanged");
+        assert_eq!(json["unconfirmed"], "2 process(es) not confirmed stopped");
+        assert_eq!(json["lifecycle"]["state"], "incomplete");
+        assert_eq!(
+            json["lifecycle"]["detail"],
+            "2 process(es) not confirmed stopped"
+        );
+        assert_eq!(json["lifecycle"]["held_by"], serde_json::json!(["user"]));
+        ward_daemon::pause::write_intent(
+            state.path(),
+            "sess_a",
+            &ward_daemon::pause::Intent::begin(ward_daemon::pause::Verb::Resume).unwrap(),
+        )
+        .unwrap();
+        let json = status(Some("sess_a"));
+        assert_eq!(json["status"], "unconfirmed");
+        assert_eq!(json["lifecycle"]["state"], "resuming");
+        assert!(json["lifecycle"]["op"].is_string());
+        let cli = Cli::try_parse_from(["ward", "status"]).unwrap();
+        assert!(matches!(cli.command, Command::Status { dir: None }));
     }
 }

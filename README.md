@@ -129,8 +129,8 @@ ward claude   examples/ward-demo --grant github   # …and git/API calls to GitH
 ward status   examples/ward-demo    # the security panel for the active session
 ward verify   examples/ward-demo    # trusted verifier: protected tests from the entry snapshot
 ward selftest examples/ward-demo    # prove the isolation (38 hostile probes; none reaches its target)
-ward pause    examples/ward-demo    # freeze the agents as one operation: processes, network, credentials, approvals (--reason, --status)
-ward resume   examples/ward-demo    # let them continue
+ward pause    examples/ward-demo    # freeze the agents as one operation: processes, network, credentials, approvals (--reason, --status); each component is reported as it confirms, the last line is the lifecycle state
+ward resume   examples/ward-demo    # let them continue (the same per-component lines, in release order)
 ward stop     examples/ward-demo    # end every sandboxed process (confirmed gone), then seal the log; the workspace stays
 ward stop     examples/ward-demo --restore-entry   # …holding the session frozen for the stop first, then writing the entry snapshot back over the worktree (.ward/restore-<ts>/ keeps what it replaced)
 ward replay   <events.log>          # replay any sealed session (--verify, --json, --stats for E-13 approval load)
