@@ -234,6 +234,13 @@ pub struct SessionState {
     /// component that did not acknowledge it, or the processes not confirmed
     /// stopped. `None` once the hold is confirmed or released.
     pub unconfirmed: Option<Unconfirmed>,
+    /// The only thing holding the session is a snapshot capture's hold (#145
+    /// item 6: its `SessionPaused` carries a `ward capture` reason,
+    /// `ward_daemon::pause::is_capture_reason`); the bar reads `PAUSED
+    /// (capture)`. A user's pause recorded over it is the user's; the record
+    /// a `ward resume` leaves when the capture still holds is the capture's
+    /// again.
+    pub held_for_capture: bool,
 }
 
 /// What an unsettled hold leaves uncertain, as its record names it.
@@ -270,10 +277,16 @@ impl SessionState {
     pub fn apply(&mut self, rec: &EventRecord) {
         match &rec.event {
             WardEvent::AgentStateChanged { state } => self.agent = Some(*state),
-            WardEvent::SessionPaused { .. } => {
-                self.before_pause = self.agent;
+            WardEvent::SessionPaused { reason, .. } => {
+                if !matches!(
+                    self.agent,
+                    Some(AgentState::Paused | AgentState::PauseUnsettled)
+                ) {
+                    self.before_pause = self.agent;
+                }
                 self.agent = Some(AgentState::Paused);
                 self.unconfirmed = None;
+                self.held_for_capture = ward_daemon::pause::is_capture_reason(reason.as_str());
             }
             // PR #207 review finding 1: the daemon now appends this *instead of*
             // `SessionPaused` whenever the freeze could not be confirmed settled —
@@ -294,6 +307,7 @@ impl SessionState {
                 }
                 self.agent = Some(AgentState::PauseUnsettled);
                 self.unconfirmed = Some(Unconfirmed::of(reason.as_str(), *pending));
+                self.held_for_capture = false;
             }
             // #145 item 5: a `ward stop` the daemon refused because it could not
             // confirm every sandboxed process ended leaves the session held
@@ -328,6 +342,7 @@ impl SessionState {
                 self.before_pause = None;
                 self.stop_incomplete = false;
                 self.unconfirmed = None;
+                self.held_for_capture = false;
             }
             WardEvent::VerificationAttemptStarted { .. } => {
                 self.verification = Verification::Preparing;
@@ -1634,5 +1649,45 @@ mod tests {
         assert_ne!(model.state.agent, Some(AgentState::Finished));
         model.apply(wardd(&[agent(AgentState::Finished)]).remove(0));
         assert_eq!(model.state.agent, Some(AgentState::Finished));
+    }
+
+    /// #145 item 6: a hold a snapshot capture takes reads as held for the
+    /// capture while that is the only owner; a user's pause over it is the
+    /// user's; the record a `ward resume` leaves when the capture still holds
+    /// reads as the capture's again; the release restores what the agent said
+    /// before any of it.
+    #[test]
+    fn a_capture_hold_is_paused_for_capture_until_a_user_pause_or_the_release() {
+        let capture = WardEvent::SessionPaused {
+            method: ward_events::PauseMethod::Sigstop,
+            reason: ward_events::ShortText::new(&ward_daemon::pause::capture_reason(
+                "candidate snapshot",
+            )),
+        };
+        let mut model = Model::new(false);
+        model.apply(wardd(&[agent(AgentState::Working)]).remove(0));
+        assert!(!model.state.held_for_capture);
+
+        model.apply(wardd(std::slice::from_ref(&capture)).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::Paused));
+        assert!(model.state.held_for_capture);
+
+        model.apply(wardd(&[paused()]).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::Paused));
+        assert!(!model.state.held_for_capture, "the user holds it now");
+
+        model.apply(wardd(&[capture]).remove(0));
+        assert!(model.state.held_for_capture, "the user's layer is gone");
+
+        model.apply(wardd(&[resumed()]).remove(0));
+        assert!(!model.state.held_for_capture);
+        assert_eq!(
+            model.state.agent,
+            Some(AgentState::Working),
+            "three hold records over one another did not lose what the agent said"
+        );
+
+        model.apply(wardd(&[pause_unsettled()]).remove(0));
+        assert!(!model.state.held_for_capture);
     }
 }

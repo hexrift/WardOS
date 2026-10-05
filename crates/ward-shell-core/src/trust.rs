@@ -574,9 +574,15 @@ impl TrustBar {
             bar.network.tone = Tone::Dim;
         }
         let dim = model.sealed || unknown;
-        bar.agent = state
-            .agent
-            .map(|s| agent_segment(header, s, dim, state.stop_incomplete));
+        bar.agent = state.agent.map(|s| {
+            agent_segment(
+                header,
+                s,
+                dim,
+                state.stop_incomplete,
+                state.held_for_capture,
+            )
+        });
         // Temporary authority shows while it exists (ADR-0019): on the network
         // segment's text and as a segment of its own. Kept incrementally on the
         // model rather than rescanned here (#138 item 4), so a session-scoped
@@ -698,12 +704,16 @@ impl TrustBar {
 /// same word as a confirmed pause — in the warn tone [`agent_tone`] already gives
 /// [`AgentState::PauseUnsettled`]. A stop the host refused and that has not been
 /// completed since (`stop_incomplete`, PR #253 review finding 5) reads `STOP?`:
-/// the session is held for that stop, which `ward resume` cannot release.
+/// the session is held for that stop, which `ward resume` cannot release. A
+/// session held only by a snapshot capture's hold (`held_for_capture`, #145
+/// item 6) reads `PAUSED (capture)`: a confirmed hold, which `ward resume`
+/// does not release either, that the capture releases when it finishes.
 fn agent_segment(
     header: &Header,
     state: AgentState,
     sealed: bool,
     stop_incomplete: bool,
+    held_for_capture: bool,
 ) -> Segment {
     let name = header
         .agent
@@ -712,6 +722,7 @@ fn agent_segment(
     let tone = if sealed { Tone::Dim } else { agent_tone(state) };
     let word = match state {
         AgentState::PauseUnsettled if stop_incomplete => "STOP?",
+        AgentState::Paused if held_for_capture => "PAUSED (capture)",
         AgentState::Paused => "PAUSED",
         AgentState::PauseUnsettled => "PAUSED?",
         other => agent_word(other),
@@ -1639,5 +1650,35 @@ mod tests {
         let live_again = TrustBar::new(&h, &model, 0);
         assert!(!live_again.unknown);
         assert_eq!(live_again.daemon, Segment::bold("LIVE", Tone::Warn));
+    }
+
+    /// #145 item 6: the agent segment names the capture while a snapshot
+    /// capture is the only thing holding the session, and reads plain
+    /// `PAUSED` once the user's pause is layered over it.
+    #[test]
+    fn the_agent_segment_names_a_hold_that_is_only_a_captures() {
+        let capture = WardEvent::SessionPaused {
+            method: ward_events::PauseMethod::Sigstop,
+            reason: ward_events::ShortText::new(&ward_daemon::pause::capture_reason(
+                "candidate snapshot",
+            )),
+        };
+        let h = header(NetworkCapability::Offline);
+        let mut model = Model::new(false);
+        model.apply(wardd(&[agent(AgentState::Working)]).remove(0));
+        model.apply(wardd(&[capture]).remove(0));
+        let segment = TrustBar::new(&h, &model, 0).agent.unwrap();
+        assert_eq!(segment.text, "CLAUDE ‖ PAUSED (capture)");
+        assert_eq!(segment.tone, Tone::Deny);
+        model.apply(wardd(&[paused()]).remove(0));
+        assert_eq!(
+            TrustBar::new(&h, &model, 0).agent.unwrap().text,
+            "CLAUDE ‖ PAUSED"
+        );
+        model.apply(wardd(&[resumed()]).remove(0));
+        assert_eq!(
+            TrustBar::new(&h, &model, 0).agent.unwrap().text,
+            "CLAUDE ● working"
+        );
     }
 }

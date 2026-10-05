@@ -177,6 +177,16 @@ pub struct RunReport {
     pub stderr: String,
 }
 
+/// The hold a capture keeps on the session for its length
+/// ([`Session::hold_for_capture`], #145 item 6): the daemon's, by operation
+/// id, when one serves the session; this process's own otherwise; nothing
+/// when nothing of the session runs.
+enum CaptureHold {
+    Nothing,
+    Daemon { socket: PathBuf, op: String },
+    Local(pause::LocalCaptureHold),
+}
+
 /// What `ward stop --restore-entry` reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreReport {
@@ -486,24 +496,32 @@ impl Session {
     }
 
     /// Capture the worktree into the session CAS under `role` and record it
-    /// (`ward snapshot create`). The sandbox is frozen for the length of the
-    /// walk ([`freeze_for_capture`](Self::freeze_for_capture), ST-018) so no
-    /// agent write can interleave with it; the recorded stall is how long the
-    /// capture held the tree still.
+    /// (`ward snapshot create`). The sandbox is held still for the length of
+    /// the walk ([`hold_for_capture`](Self::hold_for_capture), ST-018, #145
+    /// item 6) so no agent write can interleave with it, and `SnapshotCreated`
+    /// lands while the hold stands, between the records of the hold and of
+    /// its release; the recorded stall is how long the capture itself held
+    /// the tree still.
     pub fn snapshot(&mut self, role: SnapshotRole) -> Result<SnapshotMeta> {
         // Low-space preflight (#151 item 6): refuse before the walk starts,
         // not partway through it. Never deletes anything on a trip — see
         // `crate::space`'s own doc comment.
         crate::space::check(&self.state, self.min_free_bytes)?;
         let store = crate::snapshot::open_store(&self.state)?;
-        let guard = self.freeze_for_capture();
+        let hold = self.hold_for_capture(&format!("{} snapshot", role.as_str()))?;
         let started = Instant::now();
-        let meta = store
+        let captured = store
             .capture(&self.worktree, role, CaptureOptions::default())
-            .map_err(|e| Error::Snapshot(e.to_string()))?;
+            .map_err(|e| Error::Snapshot(e.to_string()));
         let stall = started.elapsed();
-        drop(guard);
-        self.emit(
+        let meta = match captured {
+            Ok(meta) => meta,
+            Err(e) => {
+                self.release_capture(hold)?;
+                return Err(e);
+            }
+        };
+        let recorded = self.emit(
             Origin::Wardd,
             WardEvent::SnapshotCreated {
                 role: ev_role(role),
@@ -513,16 +531,81 @@ impl Session {
                 capture: ev_capture(meta.capture_mode),
                 stall,
             },
-        )?;
+        );
+        let released = self.release_capture(hold);
+        recorded?;
+        released?;
         Ok(meta)
     }
 
-    /// Freeze the session's sandbox for the length of a capture so no agent
-    /// write interleaves with the walk (ST-018, `docs/security-model.md` G5/G9):
-    /// the returned guard holds the freeze and thaws when it drops. A no-op when
-    /// no sandbox of the session is running, and it leaves a user pause in place.
-    fn freeze_for_capture(&self) -> pause::CaptureFreeze {
-        pause::CaptureFreeze::acquire(&self.state, &self.session_str)
+    /// Hold the session's sandbox still for the length of a capture, so no
+    /// agent write interleaves with the walk (ST-018, `docs/security-model.md`
+    /// G5/G9), and only from confirmed quiescence (#145 item 6): the freeze
+    /// settled and every component acknowledged, the state a `SessionPaused`
+    /// records. The hold is the capture's own, released by
+    /// [`release_capture`](Self::release_capture) and by nothing else — a
+    /// user's `ward resume` leaves it, and its release leaves a user's pause.
+    /// With a daemon serving, the daemon takes it (`Request::HoldForCapture`),
+    /// since the approvals it must hold and the owners of the session's hold
+    /// are its; otherwise this process does ([`pause::LocalCaptureHold`]). A
+    /// session with nothing running is held by nothing. Refused — nothing
+    /// captured, nothing held — when quiescence cannot be confirmed, or when
+    /// the daemon serving the session predates the hold.
+    fn hold_for_capture(&mut self, what: &str) -> Result<CaptureHold> {
+        use crate::control::{FEATURE_CAPTURE_HOLD, Request, Response};
+        let reason = pause::capture_reason(what);
+        if !self.sink.ends_workloads() {
+            let (state, session) = (self.state.clone(), self.session_str.clone());
+            return pause::LocalCaptureHold::take(&state, &session, &reason, |event| {
+                self.emit(Origin::Wardd, event)
+            })
+            .map(|hold| hold.map_or(CaptureHold::Nothing, CaptureHold::Local));
+        }
+        let socket = session_dir(&self.state, &self.session_str).join(SOCKET_NAME);
+        let mut control = RemoteSink::connect(&socket).ok_or_else(|| {
+            Error::Daemon(format!(
+                "{}: the session daemon did not answer; nothing was captured",
+                socket.display()
+            ))
+        })?;
+        control.require(FEATURE_CAPTURE_HOLD, "nothing was captured")?;
+        match control.call(&Request::HoldForCapture {
+            reason,
+            pid: std::process::id(),
+            started: pause::own_start_time(),
+        })? {
+            Response::HeldForCapture { op: Some(op) } => Ok(CaptureHold::Daemon { socket, op }),
+            Response::HeldForCapture { op: None } => Ok(CaptureHold::Nothing),
+            Response::Error(e) => Err(Error::Daemon(e)),
+            other => Err(Error::Daemon(format!("unexpected response {other:?}"))),
+        }
+    }
+
+    /// Release the hold [`hold_for_capture`](Self::hold_for_capture) took: the
+    /// session's hold loses this capture, and when no owner remains the
+    /// sandbox runs again and `SessionResumed` is recorded.
+    fn release_capture(&mut self, hold: CaptureHold) -> Result<()> {
+        use crate::control::{Request, Response};
+        match hold {
+            CaptureHold::Nothing => Ok(()),
+            CaptureHold::Local(hold) => hold.release(|event| self.emit(Origin::Wardd, event)),
+            CaptureHold::Daemon { socket, op } => {
+                let mut control = RemoteSink::connect(&socket).ok_or_else(|| {
+                    Error::Daemon(format!(
+                        "{}: the session daemon did not answer, so the capture's hold on \
+                         session {} could not be released; a daemon restarted on it \
+                         releases the hold",
+                        socket.display(),
+                        self.session_str
+                    ))
+                })?;
+                match control.call(&Request::ReleaseCapture { op })? {
+                    Response::Record(_) | Response::Ok => Ok(()),
+                    Response::Error(e) => Err(Error::Daemon(e)),
+                    other => Err(Error::Daemon(format!("unexpected response {other:?}"))),
+                }
+            }
+        }
     }
 
     /// Paths `TamperWard` protects (`protected.tests` in `.tamperward/config.yml`),
@@ -1086,12 +1169,13 @@ impl Session {
                 .parse()
                 .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
             let scratch_root = run_dir(&self.session_str)?;
-            // Freeze the agent only for the candidate capture inside `prepare`; the
+            // Hold the agent only for the candidate capture inside `prepare`; the
             // verifier itself runs from the CAS, not the worktree (ST-018, G5/G9).
-            let prepared = {
-                let _freeze = self.freeze_for_capture();
-                verify::prepare(&store, &self.worktree, entry, &scratch_root)?
-            };
+            let hold = self.hold_for_capture("candidate snapshot for verification")?;
+            let prepared = verify::prepare(&store, &self.worktree, entry, &scratch_root);
+            let released = self.release_capture(hold);
+            let prepared = prepared?;
+            released?;
             Ok((entry, scratch_root, prepared))
         })();
         let (entry, scratch_root, prepared) = match prep {
@@ -1342,10 +1426,41 @@ impl Session {
             .entry_snapshot
             .parse()
             .map_err(|e: ward_snapshot::SnapshotError| Error::Snapshot(e.to_string()))?;
-        // Freeze the agent across the whole restore: the candidate capture must
+        // Hold the agent across the whole restore: the candidate capture must
         // be atomic (ST-018, G5/G9) and the worktree must not change under the
         // rewrite that follows it.
-        let _freeze = self.freeze_for_capture();
+        let hold = self.hold_for_capture("entry restore")?;
+        let restored = self.restore_entry_held(&store, entry);
+        let released = self.release_capture(hold);
+        let (files, backup_rel) = restored?;
+        released?;
+        let backup_text = if files == 0 {
+            String::new()
+        } else {
+            backup_rel.clone()
+        };
+        self.emit(
+            Origin::Wardd,
+            WardEvent::EntryRestored {
+                snapshot: ev_snapshot(entry),
+                files: files as u64,
+                backup: ShortText::new(&backup_text),
+            },
+        )?;
+        Ok(RestoreReport {
+            snapshot: entry.to_string(),
+            files,
+            backup: (files > 0).then_some(backup_rel),
+        })
+    }
+
+    /// The rewrite of [`restore_entry`](Self::restore_entry), under its hold:
+    /// how many paths differed and where what they replaced went.
+    fn restore_entry_held(
+        &self,
+        store: &SnapshotStore,
+        entry: ward_snapshot::SnapshotId,
+    ) -> Result<(usize, String)> {
         let now = store
             .store_snapshot(
                 &self.worktree,
@@ -1385,27 +1500,10 @@ impl Session {
         for rel in diff.changed.iter().chain(&diff.removed) {
             if let Some(item) = manifest.get(rel) {
                 let path = self.worktree.join(restore_path(rel)?);
-                write_entry_item(&store, entry, item, &path)?;
+                write_entry_item(store, entry, item, &path)?;
             }
         }
-        let backup_text = if files == 0 {
-            String::new()
-        } else {
-            backup_rel.clone()
-        };
-        self.emit(
-            Origin::Wardd,
-            WardEvent::EntryRestored {
-                snapshot: ev_snapshot(entry),
-                files: files as u64,
-                backup: ShortText::new(&backup_text),
-            },
-        )?;
-        Ok(RestoreReport {
-            snapshot: entry.to_string(),
-            files,
-            backup: (files > 0).then_some(backup_rel),
-        })
+        Ok((files, backup_rel))
     }
 
     /// End the session, seal the log, and clear the project's current pointer.
@@ -3692,5 +3790,31 @@ mod tests {
         let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
         assert!(at("WorkloadsTerminated") < at("EntryRestored"), "{kinds:?}");
         assert!(at("EntryRestored") < at("SessionEnded"), "{kinds:?}");
+    }
+
+    /// #145 item 6 without a daemon: `ward snapshot create` holds the running
+    /// sandbox for the capture under its own hold, records the hold around
+    /// the snapshot, and lets the sandbox continue afterwards.
+    #[test]
+    fn a_daemonless_snapshot_holds_the_sandbox_for_the_capture_and_records_it() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("a.txt"), "entry\n").unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        let log = session.log_path();
+        let mut sandbox = pause::FakeSandbox::spawn_for(session.id());
+
+        let meta = session.snapshot(SnapshotRole::Candidate).unwrap();
+        assert!(meta.entries >= 1);
+        assert!(sandbox.running(), "the sandbox continues after the capture");
+        assert!(!pause::marker_path(state.path(), session.id()).exists());
+        assert_eq!(
+            pause::read_held_by(state.path(), session.id()).unwrap(),
+            None
+        );
+        let kinds = kinds_in(&log);
+        let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
+        assert!(at("SessionPaused") < at("SnapshotCreated"), "{kinds:?}");
+        assert!(at("SnapshotCreated") < at("SessionResumed"), "{kinds:?}");
     }
 }

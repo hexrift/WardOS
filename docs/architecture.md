@@ -300,7 +300,26 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > `unconfirmed`, never `paused` on the strength of the marker or `running` for the lack
 > of one; `ward pause --status --json` adds `unconfirmed`, what the log's last hold
 > record could not confirm (the component, or the processes), and the bar's agent
-> segment explains its `PAUSED?` with the same word on hover. `seal`
+> segment explains its `PAUSED?` with the same word on hover. A snapshot capture
+> (`ward snapshot create`, `ward verify`'s candidate, the restore's own capture; #145
+> item 6) proceeds only from confirmed quiescence, under a hold of its own: with a
+> daemon serving, `Request::HoldForCapture` freezes the sandboxes (or reuses the hold
+> already in force, reconfirming its freeze stable), writes the marker, holds the
+> approvals, collects the same component acknowledgements, and appends `SessionPaused`
+> with a `ward capture: …` reason when nothing held the session before — or refuses the
+> capture, with nothing held and nothing recorded, when the freeze is unsettled or a
+> component does not acknowledge, naming it; without a daemon this process takes the
+> same hold (`pause::LocalCaptureHold`). Every hold has owners, recorded beside the
+> marker (`sessions/<id>/held_by.json`: user, capture, stop): `ward resume` releases
+> only the user's layer — a hold a capture also owns stays, marker, approvals and freeze,
+> and the record answered is the `SessionPaused` that says what still holds; a hold only
+> captures own is refused (`held for capture by <op>, not a user pause`) — and
+> `Request::ReleaseCapture` releases only the capture's, leaving a user's pause in place;
+> the freeze thaws and the marker clears, with `SessionResumed`, only when no owner
+> remains. A stop takes over whatever holds the session. `ward pause --status --json`
+> carries `held_by`, the bar reads `PAUSED (capture)` while a capture is the only owner,
+> and a restarted daemon releases a hold whose only owner is a capture whose process is
+> gone (the capture cannot complete) while adopting one the user also holds. `seal`
 > stays the separate, log-only closure: it never touches a running sandbox. A client
 > sends `Stop` only to a daemon whose `Request::Capabilities` names confirmed stop, and
 > requires the answer to acknowledge it; an older daemon is refused with nothing sent.
@@ -363,7 +382,11 @@ implement semantic policy; it forwards observations and executes decisions.
 Rust desktop components on Hyprland (ADR-0007, [`design-language.md`](design-language.md)):
 top bar, launcher/command centre, agent activity panel, approval surface, verification
 phase display, settings. Consumes events from `wardd` over the same subscription API as
-`ward watch`; has no privileged filesystem access.
+`ward watch`; has no privileged filesystem access. The bar's agent segment shows the
+daemon-confirmed hold state of the exact session, from the log alone: `PAUSED` for a
+confirmed hold, `PAUSED?` for one the daemon could not confirm (the component on hover),
+`STOP?` for an incomplete stop, and `PAUSED (capture)` while a snapshot capture's hold is
+the only thing holding the session (#145 item 6).
 
 ### 3.7 Event bus and evidence log
 

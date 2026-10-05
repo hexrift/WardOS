@@ -159,6 +159,32 @@ sandbox running, unobserved: a log-only closure presented as a stop. Now:
   pause. `ward pause` prints the unconfirmed component, `ward pause --status --json`
   carries it, and the trust bar's agent segment names it on hover.
 
+* **Capture from confirmed quiescence, and hold ownership (#145 item 6).** A snapshot
+  capture — `ward snapshot create`, `ward verify`'s candidate, the restore's own
+  capture — proceeds only from the state a `SessionPaused` records: the freeze settled
+  and every component acknowledged. The hold it takes is its own, not a bare freeze
+  (`CaptureFreeze`, which #235 made survive a concurrent pause, stays the primitive
+  underneath): with a daemon serving, `Request::HoldForCapture` takes it — freezing the
+  sandboxes or reusing and reconfirming the hold in force, writing the marker, holding
+  the approvals, collecting the acknowledgements — and appends `SessionPaused` with a
+  `ward capture: …` reason when nothing held the session before; without a daemon the
+  capturing process takes the same hold. Quiescence that cannot be confirmed refuses
+  the capture with the reason and the component: nothing is captured, nothing is
+  recorded, and only what the capture itself took is released. Every hold on a session
+  has owners — user, capture, stop — recorded durably beside the marker
+  (`sessions/<id>/held_by.json`), and a release never lifts another owner's hold:
+  `ward resume` releases only the user's layer (a hold a capture also owns stays, and
+  the record answered says what still holds; a hold only captures own is refused as
+  `held for capture by <op>, not a user pause`), `Request::ReleaseCapture` releases
+  only the capture's (a user's pause taken before it stays in place), a stop's is the
+  stop's alone; the freeze thaws and the marker clears, with `SessionResumed`, only when
+  no owner remains. Restart reconciliation reads the owners back: a hold whose only
+  owner is a capture whose process is gone is released (the capture cannot complete),
+  one the user also holds is adopted as the user's. `ward pause --status --json`
+  carries `held_by`, and the trust bar reads `PAUSED (capture)` while a capture is the
+  only owner. No new event kind: a capture's hold is the host pausing the session, and
+  `SessionPaused`/`SessionResumed` record it as such.
+
 Still open under #145: the persisted `Pausing`/`Stopping`/`Incomplete` lifecycle as an
 explicit state machine (the stop marker, the intent file and the in-memory hold are its
 precursors, not that state machine). The

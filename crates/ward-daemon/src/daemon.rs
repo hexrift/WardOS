@@ -416,29 +416,25 @@ struct Subscription {
     live: Option<(Receiver<Delivery>, Sender<Delivery>)>,
 }
 
-/// A pause in force: what was frozen, since when, and what holds it.
+/// A pause in force: what was frozen, since when, and who holds it.
 struct Paused {
     frozen: Frozen,
     since: Instant,
-    hold: Hold,
+    /// Who holds the session (#145 item 6), mirrored durably in
+    /// [`pause::HELD_BY`]: `ward resume` releases only the user's layer, a
+    /// capture's hold is released by its [`Request::ReleaseCapture`] (or by
+    /// reconciliation once the capturer is gone), and a stop's — a
+    /// `HoldForStop` waiting for its `Stop` (PR #253 review finding 3), or a
+    /// `Stop` refused because it could not confirm termination (finding 5),
+    /// whose held processes may already have taken an irreversible `SIGKILL`
+    /// — only by a stop (or a log-only `Seal`). The freeze is thawed and the
+    /// marker cleared only when no owner remains.
+    holders: pause::Holders,
     /// Processes a stop already ended and confirmed gone but has not recorded
     /// yet, because a component did not confirm the hold before
     /// `WorkloadsTerminated` could be appended (#145 item 3): carried into the
     /// retry's record, so the count on the log is the whole stop's.
     ended: u32,
-}
-
-/// What a [`Paused`] is holding the session for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Hold {
-    /// `ward pause`: released by `ward resume`.
-    Pause,
-    /// A stop that has begun and not completed: a `HoldForStop` waiting for its
-    /// `Stop` (PR #253 review finding 3), or a `Stop` that was refused because
-    /// it could not confirm termination (finding 5) — whose held processes may
-    /// already have taken an irreversible `SIGKILL`. Never released by `ward
-    /// resume`; only a stop (or a log-only `Seal`) ends it.
-    Stop,
 }
 
 /// What [`Served::pause`] produced: the one terminal record the pause attempt
@@ -607,19 +603,6 @@ impl Served {
         }
     }
 
-    /// What a hold could not confirm, in words: its pending processes, the
-    /// component that did not acknowledge, or both.
-    fn uncertainty(unsettled: Option<u32>, unconfirmed: Option<&Acknowledgement>) -> String {
-        let mut parts = Vec::new();
-        if let Some(pending) = unsettled {
-            parts.push(format!("{pending} process(es) still pending"));
-        }
-        if let Some(ack) = unconfirmed {
-            parts.push(format!("{} unconfirmed", ack.text()));
-        }
-        parts.join("; ")
-    }
-
     /// A connection id used for requests that do not come from a real client
     /// connection dispatched by [`serve`] (`Self::append`, and the daemon's
     /// own tests): see [`Self::handle_conn`]'s doc comment.
@@ -697,8 +680,27 @@ impl Served {
                     features: vec![
                         control::FEATURE_STOP_TERMINATES.into(),
                         control::FEATURE_STOP_HOLD.into(),
+                        control::FEATURE_CAPTURE_HOLD.into(),
                     ],
                 },
+                false,
+            ),
+            Request::HoldForCapture {
+                reason,
+                pid,
+                started,
+            } => (
+                self.hold_for_capture(&reason, (pid, started)).map_or_else(
+                    |e| Response::Error(refusal(e)),
+                    |op| Response::HeldForCapture { op },
+                ),
+                false,
+            ),
+            Request::ReleaseCapture { op } => (
+                self.release_capture(&op).map_or_else(
+                    |e| Response::Error(refusal(e)),
+                    |record| record.map_or(Response::Ok, |r| Response::Record(Box::new(r))),
+                ),
                 false,
             ),
             Request::HoldForStop { reason } => (
@@ -717,6 +719,7 @@ impl Served {
                 if let Some(paused) = self.paused.take() {
                     pause::kill_frozen(&paused.frozen);
                     let _ = pause::clear_marker(&self.state, &self.session);
+                    let _ = pause::clear_held_by(&self.state, &self.session);
                 }
                 self.handle_conn(conn, Request::Seal)
             }
@@ -1158,8 +1161,11 @@ impl Served {
         if self.log.is_none() {
             return Err(Error::Daemon("log is sealed".into()));
         }
-        if self.paused.is_some() {
-            return Err(Error::Daemon("already paused".into()));
+        if let Some(paused) = self.paused.as_mut() {
+            paused.holders.prune_dead(Path::new("/proc"));
+            if paused.holders.user || paused.holders.stop {
+                return Err(Error::Daemon("already paused".into()));
+            }
         }
         let reason = pause::reason_text(reason);
         self.record_intent(pause::Verb::Pause {
@@ -1169,9 +1175,23 @@ impl Served {
         // freeze and the marker write so a capture's own marker check or thaw can
         // never straddle this pause taking hold.
         let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
-        let frozen = pause::freeze(&self.session);
-        if let Err(e) = pause::write_marker(&self.state, &self.session, &reason) {
-            pause::thaw(&frozen);
+        let layered = self.paused.take();
+        let (frozen, since, before, ended) = match layered {
+            Some(paused) => (paused.frozen, paused.since, paused.holders, paused.ended),
+            None => (
+                pause::freeze(&self.session),
+                Instant::now(),
+                pause::Holders::default(),
+                0,
+            ),
+        };
+        let fresh = before.is_empty();
+        let mut holders = before.clone();
+        holders.user = true;
+        let marked = pause::write_marker(&self.state, &self.session, &reason)
+            .and_then(|()| pause::write_held_by(&self.state, &self.session, &holders));
+        if let Err(e) = marked {
+            self.take_back_user_layer(fresh, frozen, since, before, ended);
             let _ = pause::clear_intent(&self.state, &self.session);
             return Err(e);
         }
@@ -1192,9 +1212,7 @@ impl Served {
                 // without a durable `SessionPaused` record, the log never
                 // agrees the session was paused at all, so nothing else about
                 // it should stand either.
-                self.approvals.set_paused(false);
-                let _ = pause::clear_marker(&self.state, &self.session);
-                pause::thaw(&frozen);
+                self.take_back_user_layer(fresh, frozen, since, before, ended);
                 let _ = pause::clear_intent(&self.state, &self.session);
                 return Err(e);
             }
@@ -1216,9 +1234,9 @@ impl Served {
                 // append failure (#194).
                 self.paused = Some(Paused {
                     frozen,
-                    since: Instant::now(),
-                    hold: Hold::Pause,
-                    ended: 0,
+                    since,
+                    holders,
+                    ended,
                 });
                 return Err(Error::Daemon(format!(
                     "the pause of session {} could not be confirmed settled ({}), and \
@@ -1226,22 +1244,53 @@ impl Served {
                      marker is held and approvals stay frozen regardless, but the log \
                      may not reflect the unsettled pause",
                     self.session,
-                    Self::uncertainty(unsettled, unconfirmed.as_ref())
+                    pause::uncertainty(unsettled, unconfirmed.as_ref())
                 )));
             }
         };
         let _ = pause::clear_intent(&self.state, &self.session);
         self.paused = Some(Paused {
             frozen,
-            since: Instant::now(),
-            hold: Hold::Pause,
-            ended: 0,
+            since,
+            holders,
+            ended,
         });
         Ok(PauseOutcome {
             record: Box::new(record),
             unsettled,
             unconfirmed: unconfirmed.map(|a| a.text()),
         })
+    }
+
+    /// Undo a user's pause that did not complete: when it was the only hold
+    /// (`fresh`), everything it did; when it was layered over a capture's hold,
+    /// only its own layer — the marker is rewritten with the capture's reason,
+    /// the owners restored, nothing thawed and the approvals kept held.
+    fn take_back_user_layer(
+        &mut self,
+        fresh: bool,
+        frozen: Frozen,
+        since: Instant,
+        before: pause::Holders,
+        ended: u32,
+    ) {
+        if fresh {
+            self.approvals.set_paused(false);
+            let _ = pause::clear_marker(&self.state, &self.session);
+            let _ = pause::clear_held_by(&self.state, &self.session);
+            pause::thaw(&frozen);
+            return;
+        }
+        if let Some(reason) = before.captures.first().map(|c| c.reason.clone()) {
+            let _ = pause::write_marker(&self.state, &self.session, &reason);
+        }
+        let _ = pause::write_held_by(&self.state, &self.session, &before);
+        self.paused = Some(Paused {
+            frozen,
+            since,
+            holders: before,
+            ended,
+        });
     }
 
     /// Record durably that `verb` has begun for this session (#145 item 7):
@@ -1259,24 +1308,32 @@ impl Served {
     /// 3): release the credentials and the approvals, clear the marker the
     /// proxies read, confirm each release before the next
     /// ([`Self::confirm_one`]), thaw the processes last, append
-    /// `SessionResumed`. A release that is not confirmed is taken back — the
-    /// marker rewritten with the pause's reason, the approvals held again,
-    /// nothing thawed — and the resume is refused naming the component, so the
-    /// session is never half-resumed with a proxy still refusing traffic while
-    /// the daemon believes it runs.
+    /// `SessionResumed` ([`Self::release_hold`]). A release that is not
+    /// confirmed is taken back — the marker rewritten with the pause's
+    /// reason, the approvals held again, nothing thawed — and the resume is
+    /// refused naming the component, so the session is never half-resumed
+    /// with a proxy still refusing traffic while the daemon believes it runs.
     ///
-    /// Refused while the session is held for a stop ([`Hold::Stop`]), and once
-    /// a stop of it has begun at all (the on-disk stop marker, which outlives
-    /// a daemon restart): a `HoldForStop` must stay in force until its stop
-    /// (PR #253 review finding 3), and a refused stop's remaining processes
-    /// have already been sent `SIGKILL` — releasing them as though they were an
+    /// Releases only the user's layer (#145 item 6): a hold a capture also
+    /// owns stays — marker, held approvals, freeze — and the record answered
+    /// is the `SessionPaused` that says what still holds; a hold only
+    /// captures own is refused, since no user pause is there to release. A
+    /// capture whose process is gone owns nothing any more, so a hold left
+    /// only to such captures is released outright: reconciliation after its
+    /// owners are gone, not a user pause being lifted.
+    ///
+    /// Refused while the session is held for a stop, and once a stop of it
+    /// has begun at all (the on-disk stop marker, which outlives a daemon
+    /// restart): a `HoldForStop` must stay in force until its stop (PR #253
+    /// review finding 3), and a refused stop's remaining processes have
+    /// already been sent `SIGKILL` — releasing them as though they were an
     /// ordinary pause would present a half-killed session as resumable
     /// execution (finding 5). A stop is retried with `ward stop`.
     fn resume(&mut self) -> Result<Box<EventRecord>> {
-        let Some(hold) = self.paused.as_ref().map(|p| p.hold) else {
+        let Some(held_for_stop) = self.paused.as_ref().map(|p| p.holders.stop) else {
             return Err(Error::Daemon("not paused".into()));
         };
-        if hold == Hold::Stop || pause::stop_begun(&self.state, &self.session) {
+        if held_for_stop || pause::stop_begun(&self.state, &self.session) {
             return Err(Error::Daemon(format!(
                 "a stop of session {} has begun and not completed: its sandboxed processes \
                  are held for that stop (some may already have been killed), so `ward \
@@ -1288,9 +1345,47 @@ impl Served {
         // marker check or thaw can never straddle this resume's marker clear and
         // thaw.
         let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
-        let Some(paused) = self.paused.take() else {
+        let Some(mut paused) = self.paused.take() else {
             return Err(Error::Daemon("not paused".into()));
         };
+        let pruned = paused.holders.prune_dead(Path::new("/proc"));
+        if let Some(capture) = paused.holders.captures.first().cloned() {
+            if !paused.holders.user {
+                if pruned {
+                    let _ = pause::write_held_by(&self.state, &self.session, &paused.holders);
+                }
+                self.paused = Some(paused);
+                return Err(Error::Daemon(format!(
+                    "session {} is held for capture by operation {} (pid {}), not a user pause: \
+                     `ward resume` releases only a user's pause, and the capture releases its \
+                     hold when it finishes",
+                    self.session, capture.op, capture.pid
+                )));
+            }
+            paused.holders.user = false;
+            let relabelled = pause::write_held_by(&self.state, &self.session, &paused.holders)
+                .and_then(|()| pause::write_marker(&self.state, &self.session, &capture.reason));
+            if let Err(e) = relabelled {
+                paused.holders.user = true;
+                self.paused = Some(paused);
+                return Err(e);
+            }
+            let method = paused.frozen.method;
+            self.paused = Some(paused);
+            let record = self.append(Self::hold_record(method, &capture.reason, None, None))?;
+            return Ok(Box::new(record));
+        }
+        self.release_hold(paused).map(Box::new)
+    }
+
+    /// End a hold no owner keeps any more, in the reverse of the order it was
+    /// taken (#145 item 3): release the credentials and the approvals, clear
+    /// the marker, confirm each before the next, thaw last, and append
+    /// `SessionResumed`. A release a component does not confirm is taken
+    /// back — `paused` restored as given, marker rewritten, approvals held —
+    /// and refused naming the component. Called under
+    /// [`pause::lock_pause_freeze`].
+    fn release_hold(&mut self, paused: Paused) -> Result<EventRecord> {
         let marker = pause::marker_path(&self.state, &self.session);
         let marker_reason =
             pause::reason_text(&std::fs::read_to_string(&marker).unwrap_or_default());
@@ -1324,10 +1419,174 @@ impl Served {
                 ))
             )));
         }
+        let _ = pause::clear_held_by(&self.state, &self.session);
         pause::thaw(&paused.frozen);
         let paused_for = paused.since.elapsed();
-        let record = self.append(WardEvent::SessionResumed { paused_for })?;
-        Ok(Box::new(record))
+        self.append(WardEvent::SessionResumed { paused_for })
+    }
+
+    /// `Request::HoldForCapture` (#145 item 6): hold the session for a
+    /// snapshot capture from confirmed quiescence. Always uses
+    /// [`pause::freeze_for_capture`] / [`pause::stabilize`]; see
+    /// [`Self::hold_for_capture_with`].
+    fn hold_for_capture(&mut self, reason: &str, by: (u32, String)) -> Result<Option<String>> {
+        self.hold_for_capture_with(reason, by, pause::freeze_for_capture, pause::stabilize)
+    }
+
+    /// [`Self::hold_for_capture`], with the freeze injectable (a test needs an
+    /// unsettled outcome no real process can produce on demand).
+    ///
+    /// Under [`pause::lock_pause_freeze`]: a hold already in force (the user's,
+    /// a stop's, another capture's) is reused — its freeze confirmed stable
+    /// again, every component asked again — and this capture is added to its
+    /// owners, with no record of its own: the session's hold is recorded
+    /// already, and the capture must never take it over. Otherwise the
+    /// capture's intent is recorded, the sandboxes are frozen, the marker
+    /// written, the approvals held, the owners written, every component asked,
+    /// and — only when the freeze settled and every component acknowledged —
+    /// `SessionPaused` is appended with the capture's reason and the intent
+    /// cleared. A session with nothing running is held by nothing (`Ok(None)`).
+    ///
+    /// When quiescence cannot be confirmed the capture is refused
+    /// ([`pause::capture_refusal`]) with nothing recorded: a fresh hold is
+    /// undone whole, a reused one loses only this capture. Nothing may be
+    /// captured from a state that would record `SessionPauseUnsettled`.
+    fn hold_for_capture_with(
+        &mut self,
+        reason: &str,
+        by: (u32, String),
+        freeze: impl FnOnce(&str) -> (Frozen, bool),
+        restabilize: impl FnOnce(&str, Frozen) -> (Frozen, bool),
+    ) -> Result<Option<String>> {
+        if self.log.is_none() {
+            return Err(Error::Daemon("log is sealed".into()));
+        }
+        let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
+        let op = crate::ids::new_operation_id()?;
+        let capturer = pause::Capturer {
+            op: op.clone(),
+            pid: by.0,
+            started: by.1,
+            reason: reason.to_owned(),
+        };
+        if let Some(paused) = self.paused.take() {
+            let (frozen, stable) = restabilize(&self.session, paused.frozen);
+            let unsettled = if stable {
+                None
+            } else {
+                Some(pause::unsettled_count(&frozen, false).unwrap_or(0))
+            };
+            let before = paused.holders.clone();
+            let mut holders = before.clone();
+            holders.add_capture(capturer);
+            self.paused = Some(Paused {
+                frozen,
+                since: paused.since,
+                holders,
+                ended: paused.ended,
+            });
+            let acks = self.confirm_components(Phase::Held);
+            let unconfirmed = acks::first_unconfirmed(&acks);
+            if unsettled.is_some() || unconfirmed.is_some() {
+                if let Some(p) = self.paused.as_mut() {
+                    p.holders = before;
+                }
+                return Err(pause::capture_refusal(
+                    &self.session,
+                    unsettled,
+                    unconfirmed,
+                ));
+            }
+            if let Some(p) = self.paused.as_ref()
+                && let Err(e) = pause::write_held_by(&self.state, &self.session, &p.holders)
+            {
+                if let Some(p) = self.paused.as_mut() {
+                    p.holders = before;
+                }
+                return Err(e);
+            }
+            return Ok(Some(op));
+        }
+        self.record_intent(pause::Verb::Capture {
+            reason: reason.to_owned(),
+            capturer: capturer.clone(),
+        })?;
+        let (frozen, stable) = freeze(&self.session);
+        if frozen.pids.is_empty() {
+            let _ = pause::clear_intent(&self.state, &self.session);
+            return Ok(None);
+        }
+        let holders = pause::Holders::for_capture(capturer);
+        let take_back = |this: &mut Self, frozen: &Frozen| {
+            this.approvals.set_paused(false);
+            let _ = pause::clear_held_by(&this.state, &this.session);
+            let _ = pause::clear_marker(&this.state, &this.session);
+            pause::thaw(frozen);
+            let _ = pause::clear_intent(&this.state, &this.session);
+        };
+        let marked = pause::write_marker(&self.state, &self.session, reason)
+            .and_then(|()| pause::write_held_by(&self.state, &self.session, &holders));
+        if let Err(e) = marked {
+            take_back(self, &frozen);
+            return Err(e);
+        }
+        self.approvals.set_paused(true);
+        let acks = self.confirm_components(Phase::Held);
+        let unconfirmed = acks::first_unconfirmed(&acks);
+        let unsettled = if stable {
+            None
+        } else {
+            Some(pause::unsettled_count(&frozen, false).unwrap_or(0))
+        };
+        if unsettled.is_some() || unconfirmed.is_some() {
+            let refusal = pause::capture_refusal(&self.session, unsettled, unconfirmed);
+            take_back(self, &frozen);
+            return Err(refusal);
+        }
+        if let Err(e) = self.append(Self::hold_record(frozen.method, reason, None, None)) {
+            take_back(self, &frozen);
+            return Err(e);
+        }
+        let _ = pause::clear_intent(&self.state, &self.session);
+        self.paused = Some(Paused {
+            frozen,
+            since: Instant::now(),
+            holders,
+            ended: 0,
+        });
+        Ok(Some(op))
+    }
+
+    /// `Request::ReleaseCapture` (#145 item 6): the capture of operation `op`
+    /// lets go of the session. Other owners keep the hold as it is (`Ok(None)`,
+    /// nothing recorded); the last owner's release ends it
+    /// ([`Self::release_hold`]) and the `SessionResumed` is returned. A hold
+    /// `op` does not own — released already, or ended by a stop — is nothing
+    /// to release.
+    fn release_capture(&mut self, op: &str) -> Result<Option<EventRecord>> {
+        if !self
+            .paused
+            .as_ref()
+            .is_some_and(|p| p.holders.captures.iter().any(|c| c.op == op))
+        {
+            return Ok(None);
+        }
+        let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
+        let Some(paused) = self.paused.take() else {
+            return Ok(None);
+        };
+        let mut remaining = paused.holders.clone();
+        remaining.remove_capture(op);
+        remaining.prune_dead(Path::new("/proc"));
+        if remaining.is_empty() {
+            return self.release_hold(paused).map(Some);
+        }
+        let written = pause::write_held_by(&self.state, &self.session, &remaining);
+        self.paused = Some(Paused {
+            holders: remaining,
+            ..paused
+        });
+        written.map(|()| None)
     }
 
     /// `Request::HoldForStop` (PR #253 review finding 3): make the session
@@ -1353,7 +1612,7 @@ impl Served {
     /// unsettled) without a new record; otherwise the sandboxes are frozen now,
     /// the marker is written, the approvals are held and `SessionPaused` (or
     /// `SessionPauseUnsettled`) is appended, exactly as `ward pause` records
-    /// one. Either way the result is a [`Hold::Stop`], which `Resume` refuses.
+    /// one. Either way the result is a stop's hold ([`pause::Holders::stop`]), which `Resume` refuses.
     /// Returns `Some(pending)` when the freeze could not be confirmed stable in
     /// time — the hold still stands, and a caller that needs quiescence (a
     /// restore) must not proceed on it.
@@ -1386,13 +1645,17 @@ impl Served {
                 pause::write_marker(&self.state, &self.session, &pause::reason_text(reason))
             };
             self.approvals.set_paused(true);
+            let mut holders = paused.holders;
+            holders.stop = true;
+            let owners = pause::write_held_by(&self.state, &self.session, &holders);
             self.paused = Some(Paused {
                 frozen,
                 since: paused.since,
-                hold: Hold::Stop,
+                holders,
                 ended: paused.ended,
             });
             marker?;
+            owners?;
             let _ = pause::clear_intent(&self.state, &self.session);
             let acks = self.confirm_components(Phase::Held);
             if let Some(ack) = acks::first_unconfirmed(&acks) {
@@ -1416,12 +1679,15 @@ impl Served {
             Some(pause::unsettled_count(&frozen, false).unwrap_or(0))
         };
         let method = frozen.method;
+        let holders = pause::Holders::for_stop();
+        let owners = pause::write_held_by(&self.state, &self.session, &holders);
         self.paused = Some(Paused {
             frozen,
             since: Instant::now(),
-            hold: Hold::Stop,
+            holders,
             ended: 0,
         });
+        owners?;
         let acks = self.confirm_components(Phase::Held);
         let unconfirmed = acks::first_unconfirmed(&acks).cloned();
         let event = Self::hold_record(method, &reason, unsettled, unconfirmed.as_ref());
@@ -1469,7 +1735,7 @@ impl Served {
     /// When termination cannot be confirmed within [`pause::STOP_SETTLE`], the
     /// stop is refused rather than reported as done (#145 item 4): the log is
     /// not sealed, `Finished` is not recorded, and the session is held for the
-    /// stop ([`Hold::Stop`]) — the marker written so every proxy refuses, the
+    /// stop ([`pause::Holders::stop`]) — the marker written so every proxy refuses, the
     /// approvals held, the processes still present kept as the hold's freeze.
     /// `WorkloadsTerminated { pending }` records the partial outcome. That is
     /// an incomplete stop, not a pause: `ward resume` refuses it, and a later
@@ -1588,7 +1854,7 @@ impl Served {
         })?;
         let held = self.paused.take();
         let since = held.as_ref().map(|p| p.since);
-        let retrying_incomplete_stop = held.as_ref().is_some_and(|p| p.hold == Hold::Stop);
+        let retrying_incomplete_stop = held.as_ref().is_some_and(|p| p.holders.stop);
         let carried = held.as_ref().map_or(0, |p| p.ended);
         if !pause::marker_path(&self.state, &self.session).exists() {
             pause::write_marker(&self.state, &self.session, pause::STOP_REASON).map_err(|e| {
@@ -1612,6 +1878,7 @@ impl Served {
             // Nothing is left for the marker to hold back. (Idempotent when
             // there never was a marker.)
             let _ = pause::clear_marker(&self.state, &self.session);
+            let _ = pause::clear_held_by(&self.state, &self.session);
             if ended > 0 || retrying_incomplete_stop {
                 self.append(WardEvent::WorkloadsTerminated {
                     ended,
@@ -1637,10 +1904,11 @@ impl Served {
             &pause::stop_hold_reason(pending),
         )
         .err();
+        let _ = pause::write_held_by(&self.state, &self.session, &pause::Holders::for_stop());
         self.paused = Some(Paused {
             frozen: remaining,
             since: since.unwrap_or_else(Instant::now),
-            hold: Hold::Stop,
+            holders: pause::Holders::for_stop(),
             ended: 0,
         });
         // Persist the incomplete result even when no currently-known PID remains:
@@ -1694,6 +1962,7 @@ impl Served {
         use std::fmt::Write as _;
         let reason = acks::unconfirmed_reason(pause::STOP_REASON, ack);
         let marker = pause::write_marker(&self.state, &self.session, &reason).err();
+        let _ = pause::write_held_by(&self.state, &self.session, &pause::Holders::for_stop());
         self.paused = Some(Paused {
             frozen: Frozen {
                 method,
@@ -1701,7 +1970,7 @@ impl Served {
                 cgroup: None,
             },
             since: since.unwrap_or_else(Instant::now),
-            hold: Hold::Stop,
+            holders: pause::Holders::for_stop(),
             ended,
         });
         let logged = self
@@ -1763,10 +2032,16 @@ impl Served {
     ///   log already carries it. It is recorded as unsettled whenever the
     ///   freeze cannot be confirmed: never a confirmed `SessionPaused` that
     ///   was not observed.
+    /// * A capture intent (#145 item 6): the hold's taking was interrupted,
+    ///   so that capture cannot complete; it is forgotten, and the hold is
+    ///   released unless another owner remains.
     /// * No intent but a marker: a hold that completed before the previous
-    ///   process died. It is adopted the same way, so `resume` and `stop`
-    ///   work on it; a hold the log already records gets no second record.
-    ///   The stop marker decides whether it is a [`Hold::Stop`].
+    ///   process died. Its owners are read back ([`pause::HELD_BY`]; a marker
+    ///   with none recorded is the user's), a capture whose process is gone
+    ///   is forgotten, and what remains is adopted the same way, so `resume`
+    ///   and `stop` work on it; a hold the log already records gets no
+    ///   second record. The stop marker makes it a stop's. A hold no owner
+    ///   remains for is released ([`Self::release_orphaned_hold`]).
     fn reconcile_lifecycle_with(
         &mut self,
         freeze: impl FnOnce(&str) -> (Frozen, bool),
@@ -1787,7 +2062,9 @@ impl Served {
             }) => {
                 if marker.exists() {
                     let (reason, since) = marker_facts(&marker);
-                    self.adopt_hold(&reason, since, true, freeze)?;
+                    let mut holders = self.recorded_holders()?;
+                    holders.stop = true;
+                    self.adopt_hold(&reason, since, true, holders, freeze)?;
                 }
                 let (response, sealed) = self.stop(Self::INTERNAL_CONN, reason, terminate);
                 if pause::intent_path(&self.state, &self.session).exists() {
@@ -1808,39 +2085,86 @@ impl Served {
                 started_unix_ms,
                 ..
             }) => {
+                let mut holders = self.recorded_holders()?;
+                holders.user = true;
                 self.adopt_hold(
                     &pause::reason_text(&reason),
                     instant_at(started_unix_ms),
                     tail.held,
+                    holders,
                     freeze,
                 )?;
                 pause::clear_intent(&self.state, &self.session)?;
                 Ok(false)
             }
+            Some(pause::Intent {
+                verb: pause::Verb::Capture { capturer, .. },
+                started_unix_ms,
+                ..
+            }) => {
+                let mut holders = self.recorded_holders()?;
+                holders.remove_capture(&capturer.op);
+                let (reason, since) = if marker.exists() {
+                    marker_facts(&marker)
+                } else {
+                    (capturer.reason, instant_at(started_unix_ms))
+                };
+                if holders.is_empty() {
+                    self.release_orphaned_hold(since, tail.held, freeze)?;
+                } else {
+                    self.adopt_hold(&reason, since, tail.held, holders, freeze)?;
+                }
+                pause::clear_intent(&self.state, &self.session)?;
+                Ok(false)
+            }
             None if marker.exists() => {
                 let (reason, since) = marker_facts(&marker);
-                self.adopt_hold(&reason, since, tail.held, freeze)?;
+                let holders = self.recorded_holders()?;
+                if holders.is_empty() {
+                    self.release_orphaned_hold(since, tail.held, freeze)?;
+                } else {
+                    self.adopt_hold(&reason, since, tail.held, holders, freeze)?;
+                }
                 Ok(false)
             }
             None => Ok(false),
         }
     }
 
+    /// Who the previous process recorded as holding the session
+    /// ([`pause::HELD_BY`]), less every capture whose process is gone; a
+    /// marker with no owners recorded is the user's, and the stop marker
+    /// makes any hold a stop's.
+    fn recorded_holders(&self) -> Result<pause::Holders> {
+        let mut holders = pause::read_held_by(&self.state, &self.session)?.unwrap_or_else(|| {
+            if pause::marker_path(&self.state, &self.session).exists() {
+                pause::Holders::for_user()
+            } else {
+                pause::Holders::default()
+            }
+        });
+        holders.prune_dead(Path::new("/proc"));
+        if pause::stop_begun(&self.state, &self.session) {
+            holders.stop = true;
+        }
+        Ok(holders)
+    }
+
     /// Put the session's sandboxes under this daemon's own hold, from what
     /// `/proc` shows now: `freeze` finds and freezes every process (one already
     /// stopped stays so) and says whether that confirmed stable. The marker is
-    /// written with `reason` if it is not there, the approvals are held, the
-    /// components asked to confirm again (#145 item 3), and — unless
-    /// `recorded` says the log already carries it and every component confirmed
-    /// — exactly one terminal record is appended: `SessionPaused` when
-    /// confirmed, `SessionPauseUnsettled` naming the pending count or the
-    /// unconfirmed component otherwise. The hold is a [`Hold::Stop`] once a
-    /// stop has begun ([`pause::stop_begun`]).
+    /// written with `reason` if it is not there, the owners (`holders`)
+    /// written, the approvals are held, the components asked to confirm again
+    /// (#145 item 3), and — unless `recorded` says the log already carries it
+    /// and every component confirmed — exactly one terminal record is
+    /// appended: `SessionPaused` when confirmed, `SessionPauseUnsettled`
+    /// naming the pending count or the unconfirmed component otherwise.
     fn adopt_hold(
         &mut self,
         reason: &str,
         since: Instant,
         recorded: bool,
+        holders: pause::Holders,
         freeze: impl FnOnce(&str) -> (Frozen, bool),
     ) -> Result<()> {
         let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
@@ -1848,12 +2172,8 @@ impl Served {
         if !pause::marker_path(&self.state, &self.session).exists() {
             pause::write_marker(&self.state, &self.session, reason)?;
         }
+        pause::write_held_by(&self.state, &self.session, &holders)?;
         self.approvals.set_paused(true);
-        let hold = if pause::stop_begun(&self.state, &self.session) {
-            Hold::Stop
-        } else {
-            Hold::Pause
-        };
         let acks = self.confirm_components(Phase::Held);
         let unconfirmed = acks::first_unconfirmed(&acks);
         if !recorded || unconfirmed.is_some() {
@@ -1867,10 +2187,45 @@ impl Served {
         self.paused = Some(Paused {
             frozen,
             since,
-            hold,
+            holders,
             ended: 0,
         });
         Ok(())
+    }
+
+    /// Release a hold no owner remains for (#145 item 6): a capture's whose
+    /// process is gone, so the capture cannot complete and nothing else could
+    /// ever release it. What `/proc` shows frozen is thawed through the same
+    /// confirmed release a resume performs ([`Self::release_hold`]), and
+    /// `SessionResumed` is appended when the log says the session is held. A
+    /// release a component does not confirm leaves the hold standing with no
+    /// owner, which the next `ward resume` releases the same way.
+    fn release_orphaned_hold(
+        &mut self,
+        since: Instant,
+        recorded: bool,
+        freeze: impl FnOnce(&str) -> (Frozen, bool),
+    ) -> Result<()> {
+        let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
+        let (frozen, _) = freeze(&self.session);
+        let paused = Paused {
+            frozen,
+            since,
+            holders: pause::Holders::default(),
+            ended: 0,
+        };
+        if !recorded {
+            self.approvals.set_paused(false);
+            let _ = pause::clear_marker(&self.state, &self.session);
+            let _ = pause::clear_held_by(&self.state, &self.session);
+            pause::thaw(&paused.frozen);
+            return Ok(());
+        }
+        self.approvals.set_paused(true);
+        match self.release_hold(paused) {
+            Ok(_) | Err(Error::Daemon(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Start a subscription from `from_seq`: everything in the log so far, and a
@@ -2490,7 +2845,7 @@ mod tests {
             ended: 0,
             frozen: held.clone(),
             since: Instant::now(),
-            hold: Hold::Pause,
+            holders: pause::Holders::for_user(),
         });
         pause::write_marker(dir.path(), "sess_9", "looks wrong").unwrap();
         let mut given = None;
@@ -2558,7 +2913,11 @@ mod tests {
             assert!(served.log.is_some(), "the log is still open");
             let paused = served.paused.as_ref().unwrap();
             assert_eq!(paused.frozen, stuck, "held over exactly what is left");
-            assert_eq!(paused.hold, Hold::Stop, "an incomplete stop, not a pause");
+            assert_eq!(
+                paused.holders.owners(),
+                [pause::Owner::Stop],
+                "an incomplete stop, not a pause"
+            );
             assert!(served.approvals.paused(), "approvals held");
             assert_eq!(
                 served.approvals.pending().len(),
@@ -2661,7 +3020,10 @@ mod tests {
             "{message}"
         );
         assert!(served.log.is_some());
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::Stop])
+        );
         assert!(pause::marker_path(dir.path(), "sess_9").exists());
 
         let replay = served.subscribe(0).unwrap().replay;
@@ -2847,7 +3209,10 @@ mod tests {
         });
         assert!(matches!(response, Response::Error(_)), "{response:?}");
         assert!(!done);
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::Stop])
+        );
         assert!(!pause::intent_path(dir.path(), "sess_9").exists());
     }
 
@@ -2872,7 +3237,10 @@ mod tests {
             "ops asked\n"
         );
         assert!(served.approvals.paused());
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Pause));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::User])
+        );
         assert!(!pause::intent_path(dir.path(), "sess_9").exists());
         let replay = served.subscribe(0).unwrap().replay;
         assert!(matches!(
@@ -2926,7 +3294,7 @@ mod tests {
         ));
         let paused = served.paused.as_ref().unwrap();
         assert_eq!(paused.frozen, stuck(77), "held over what was found");
-        assert_eq!(paused.hold, Hold::Pause);
+        assert_eq!(paused.holders.owners(), [pause::Owner::User]);
         assert!(!pause::intent_path(dir.path(), "sess_9").exists());
     }
 
@@ -3078,7 +3446,7 @@ mod tests {
         assert!(!sealed);
         assert!(served.log.is_some());
         let paused = served.paused.as_ref().unwrap();
-        assert_eq!(paused.hold, Hold::Stop);
+        assert_eq!(paused.holders.owners(), [pause::Owner::Stop]);
         assert_eq!(paused.frozen, stuck(77));
         assert!(served.approvals.paused());
         assert!(
@@ -3151,7 +3519,10 @@ mod tests {
             kinds_of(&mut served),
             ["AgentStateChanged", "SessionPaused"]
         );
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Pause));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::User])
+        );
         assert!(served.approvals.paused());
         assert_eq!(served.last_agent_state, Some(AgentState::Working));
         assert!(matches!(
@@ -3188,7 +3559,7 @@ mod tests {
         assert!(!sealed);
         assert_eq!(kinds_of(&mut served), ["WorkloadsTerminated"]);
         let paused = served.paused.as_ref().unwrap();
-        assert_eq!(paused.hold, Hold::Stop);
+        assert_eq!(paused.holders.owners(), [pause::Owner::Stop]);
         assert_eq!(paused.frozen, stuck(77));
         assert!(matches!(
             served.handle(Request::Resume).0,
@@ -3302,7 +3673,10 @@ mod tests {
             before,
             "the refused resume records nothing"
         );
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::Stop])
+        );
         assert!(served.approvals.paused());
         assert!(pause::marker_path(dir.path(), "sess_9").exists());
 
@@ -3506,7 +3880,7 @@ mod tests {
             sandbox.frozen_by(&paused.frozen),
             "frozen by the hold itself"
         );
-        assert_eq!(paused.hold, Hold::Stop);
+        assert_eq!(paused.holders.owners(), [pause::Owner::Stop]);
         assert!(paused.frozen.pids.contains(&sandbox.root()));
         assert!(pause::stop_begun(dir.path(), &sandbox.session));
         assert_eq!(kinds_of(&mut served), ["SessionPaused"]);
@@ -3572,7 +3946,8 @@ mod tests {
     }
 
     /// A `HoldForStop` on a session the user has already paused takes that
-    /// pause over (no second record) and makes it unreleasable.
+    /// pause over (no second record) and makes it unreleasable: the stop joins
+    /// the owners, and a stop's hold is not `ward resume`'s to release.
     #[test]
     fn hold_for_stop_takes_over_a_pause_in_force() {
         let dir = tempfile::tempdir().unwrap();
@@ -3593,7 +3968,10 @@ mod tests {
                 .0,
             Response::HeldForStop { unsettled: None }
         ));
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::User, pause::Owner::Stop])
+        );
         assert_eq!(kinds_of(&mut served), ["SessionPaused"]);
         assert!(matches!(
             served.handle(Request::Resume).0,
@@ -3626,7 +4004,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unsettled, Some(1));
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::Stop])
+        );
         assert_eq!(kinds_of(&mut served), ["SessionPauseUnsettled"]);
         // Never signal this test process: forget the injected freeze.
         served.paused = None;
@@ -3657,7 +4038,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unsettled, Some(0));
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::Stop])
+        );
         let replay = served.subscribe(0).unwrap().replay;
         assert!(matches!(
             replay.last().map(|r| &r.event),
@@ -6191,7 +6575,10 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "looks wrong\n");
         assert!(served.approvals.paused());
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Pause));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::User])
+        );
         assert!(!pause::intent_path(dir.path(), "sess_9").exists());
         assert_eq!(
             scripted.calls(),
@@ -6311,7 +6698,10 @@ mod tests {
             "the marker is back"
         );
         assert!(served.approvals.paused(), "the approvals are held again");
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Pause));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::User])
+        );
         assert_eq!(kinds_of(&mut served), ["SessionPaused"], "nothing recorded");
 
         scripted.refuse(
@@ -6378,7 +6768,7 @@ mod tests {
                 if reason.as_str() == format!("ward stop - unconfirmed: {PROXY_UNCONFIRMED}")
         ));
         let held = served.paused.as_ref().unwrap();
-        assert_eq!(held.hold, Hold::Stop);
+        assert_eq!(held.holders.owners(), [pause::Owner::Stop]);
         assert_eq!(held.ended, 3, "carried into the retry");
         assert!(held.frozen.pids.is_empty());
         assert!(served.approvals.paused());
@@ -6465,7 +6855,10 @@ mod tests {
             err.contains("credentials (1 grant(s) still active)"),
             "{err}"
         );
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::Stop])
+        );
         assert!(served.approvals.paused());
         let last = served.subscribe(0).unwrap().replay.pop().unwrap();
         assert!(matches!(
@@ -6529,7 +6922,10 @@ mod tests {
             WardEvent::SessionPauseUnsettled { reason, pending: 0, .. }
                 if reason.as_str() == format!("ops asked - unconfirmed: {PROXY_UNCONFIRMED}")
         ));
-        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Pause));
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::User])
+        );
         assert_eq!(
             std::fs::read_to_string(pause::marker_path(dir.path(), "sess_9")).unwrap(),
             "ops asked\n"
@@ -6558,5 +6954,547 @@ mod tests {
             ],
             "the log's confirmed hold is qualified by what this daemon cannot confirm"
         );
+    }
+
+    const CAPTURE_REASON: &str = "ward capture: test";
+
+    fn this_process() -> (u32, String) {
+        (std::process::id(), pause::own_start_time())
+    }
+
+    fn dead_capturer(op: &str) -> pause::Capturer {
+        pause::Capturer {
+            op: op.to_owned(),
+            pid: 999_999,
+            started: "0".to_owned(),
+            reason: CAPTURE_REASON.to_owned(),
+        }
+    }
+
+    /// A freeze holding this test process, confirmed stable: thawing it sends a
+    /// `SIGCONT` to a process that is not stopped, which does nothing.
+    fn own_process(_: &str) -> (Frozen, bool) {
+        (
+            Frozen {
+                method: ward_events::PauseMethod::Sigstop,
+                pids: vec![std::process::id()],
+                cgroup: None,
+            },
+            true,
+        )
+    }
+
+    fn unsettled_own_process(_: &str) -> (Frozen, bool) {
+        let (frozen, _) = own_process("");
+        (frozen, false)
+    }
+
+    fn restabilized(_: &str, frozen: Frozen) -> (Frozen, bool) {
+        (frozen, true)
+    }
+
+    fn held_by(dir: &Path) -> Option<pause::Holders> {
+        pause::read_held_by(dir, "sess_9").unwrap()
+    }
+
+    /// #145 item 6, against a real tree: a capture's hold freezes the sandbox,
+    /// writes the marker, holds the approvals, collects every acknowledgement
+    /// in hold order and records `SessionPaused` with the capture's reason;
+    /// its release thaws, clears and records `SessionResumed`.
+    #[test]
+    fn a_capture_hold_proceeds_from_a_settled_and_acknowledged_freeze() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sandbox = pause::FakeSandbox::spawn("sess_cap");
+        let mut served = fresh_served_as(dir.path(), &sandbox.session);
+        let scripted = Scripted::install(&mut served);
+        let marker = pause::marker_path(dir.path(), &sandbox.session);
+
+        let op = served
+            .hold_for_capture(CAPTURE_REASON, this_process())
+            .unwrap()
+            .expect("something ran, so something is held");
+        let paused = served.paused.as_ref().unwrap();
+        assert!(sandbox.frozen_by(&paused.frozen));
+        assert_eq!(paused.holders.owners(), [pause::Owner::Capture]);
+        assert_eq!(paused.holders.captures[0].op, op);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("{CAPTURE_REASON}\n")
+        );
+        assert!(served.approvals.paused());
+        assert_eq!(
+            pause::read_held_by(dir.path(), &sandbox.session)
+                .unwrap()
+                .map(|h| h.owners()),
+            Some(vec![pause::Owner::Capture])
+        );
+        assert!(!pause::intent_path(dir.path(), &sandbox.session).exists());
+        assert_eq!(
+            scripted.calls(),
+            [
+                (acks::Component::Proxy, acks::Phase::Held),
+                (acks::Component::Approvals, acks::Phase::Held),
+                (acks::Component::Credentials, acks::Phase::Held),
+            ]
+        );
+        assert_eq!(kinds_of(&mut served), ["SessionPaused"]);
+        let last = served.subscribe(0).unwrap().replay.pop().unwrap();
+        assert!(matches!(
+            &last.event,
+            WardEvent::SessionPaused { reason, .. } if reason.as_str() == CAPTURE_REASON
+        ));
+
+        let record = served
+            .release_capture(&op)
+            .unwrap()
+            .expect("the last owner's release is recorded");
+        assert!(matches!(record.event, WardEvent::SessionResumed { .. }));
+        assert!(served.paused.is_none());
+        assert!(!served.approvals.paused());
+        assert!(!marker.exists());
+        assert_eq!(
+            pause::read_held_by(dir.path(), &sandbox.session).unwrap(),
+            None
+        );
+        assert!(
+            crate::daemon::wait_until(Duration::from_secs(2), || !sandbox.stopped()),
+            "the tree runs again"
+        );
+        assert!(sandbox.running());
+        assert_eq!(kinds_of(&mut served), ["SessionPaused", "SessionResumed"]);
+        assert_eq!(
+            served.release_capture(&op).unwrap(),
+            None,
+            "a second release of the same operation is nothing"
+        );
+    }
+
+    /// #145 item 6: a capture is refused — nothing held, nothing recorded, and
+    /// only what the capture itself took released — when a component does not
+    /// acknowledge the hold, naming it, or when the freeze is not confirmed
+    /// settled, naming the pending count.
+    #[test]
+    fn a_capture_from_an_unconfirmed_freeze_is_refused_with_nothing_held_or_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        scripted.refuse(acks::Component::Proxy, acks::Phase::Held, proxy_timeout());
+        let marker = pause::marker_path(dir.path(), "sess_9");
+
+        let err = served
+            .hold_for_capture_with(CAPTURE_REASON, this_process(), own_process, restabilized)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nothing was captured"), "{err}");
+        assert!(err.contains(PROXY_UNCONFIRMED), "{err}");
+        assert!(served.paused.is_none());
+        assert!(!served.approvals.paused());
+        assert!(!marker.exists());
+        assert_eq!(held_by(dir.path()), None);
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+        assert!(kinds_of(&mut served).is_empty(), "nothing recorded");
+
+        scripted.relent();
+        let err = served
+            .hold_for_capture_with(
+                CAPTURE_REASON,
+                this_process(),
+                unsettled_own_process,
+                restabilized,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nothing was captured"), "{err}");
+        assert!(err.contains("1 process(es) still pending"), "{err}");
+        assert!(served.paused.is_none());
+        assert!(!marker.exists());
+        assert!(kinds_of(&mut served).is_empty());
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Error(e) if e == "not paused"
+        ));
+    }
+
+    /// #145 item 6: a capture over a user's pause reuses that quiescence but
+    /// must still confirm it; one that cannot is refused and leaves the user's
+    /// pause — marker, record, owners — untouched.
+    #[test]
+    fn a_capture_over_a_user_pause_that_cannot_be_reconfirmed_is_refused_leaving_the_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        served.pause_with("mine", |_| None).unwrap();
+        scripted.calls();
+        scripted.refuse(acks::Component::Proxy, acks::Phase::Held, proxy_timeout());
+
+        let err = served
+            .hold_for_capture_with(CAPTURE_REASON, this_process(), never_freezes, restabilized)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(PROXY_UNCONFIRMED), "{err}");
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::User])
+        );
+        assert_eq!(
+            held_by(dir.path()).map(|h| h.owners()),
+            Some(vec![pause::Owner::User])
+        );
+        assert_eq!(
+            std::fs::read_to_string(pause::marker_path(dir.path(), "sess_9")).unwrap(),
+            "mine\n"
+        );
+        assert!(served.approvals.paused());
+        assert_eq!(kinds_of(&mut served), ["SessionPaused"]);
+    }
+
+    /// #145 item 6: `ward resume` releases a user's pause, not a capture's hold.
+    #[test]
+    fn resume_refuses_a_hold_owned_only_by_a_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        Scripted::install(&mut served);
+        let op = served
+            .hold_for_capture_with(CAPTURE_REASON, this_process(), own_process, restabilized)
+            .unwrap()
+            .unwrap();
+        let marker = pause::marker_path(dir.path(), "sess_9");
+
+        let (response, _) = served.handle(Request::Resume);
+        assert!(
+            matches!(&response, Response::Error(e)
+                if e.contains(&format!("held for capture by operation {op}")) && e.contains("not a user pause")),
+            "{response:?}"
+        );
+        assert!(marker.exists());
+        assert!(served.approvals.paused());
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::Capture])
+        );
+        assert_eq!(kinds_of(&mut served), ["SessionPaused"], "nothing recorded");
+
+        assert!(matches!(
+            served.handle(Request::ReleaseCapture { op }).0,
+            Response::Record(r) if matches!(r.event, WardEvent::SessionResumed { .. })
+        ));
+        assert!(served.paused.is_none());
+        assert!(!marker.exists());
+    }
+
+    /// #145 item 6: a user pause layered over a capture is released by `ward
+    /// resume` alone — the marker, the held approvals and the freeze stay for
+    /// the capture, and the record says what still holds — and the capture's
+    /// release then ends the hold.
+    #[test]
+    fn resume_releases_only_the_users_layer_over_a_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        let op = served
+            .hold_for_capture_with(CAPTURE_REASON, this_process(), own_process, restabilized)
+            .unwrap()
+            .unwrap();
+        let marker = pause::marker_path(dir.path(), "sess_9");
+        scripted.calls();
+
+        let outcome = served.pause_with("mine", |_| None).unwrap();
+        assert!(matches!(
+            &outcome.record.event,
+            WardEvent::SessionPaused { reason, .. } if reason.as_str() == "mine"
+        ));
+        assert_eq!(outcome.unsettled, None);
+        assert_eq!(outcome.unconfirmed, None);
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::User, pause::Owner::Capture])
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "mine\n");
+        assert_eq!(
+            held_by(dir.path()).map(|h| h.owners()),
+            Some(vec![pause::Owner::User, pause::Owner::Capture])
+        );
+        assert_eq!(
+            scripted.calls(),
+            [
+                (acks::Component::Proxy, acks::Phase::Held),
+                (acks::Component::Approvals, acks::Phase::Held),
+                (acks::Component::Credentials, acks::Phase::Held),
+            ],
+            "the user's pause confirms the hold again"
+        );
+        assert!(matches!(
+            served.handle(Request::Pause { reason: String::new() }).0,
+            Response::Error(e) if e == "already paused"
+        ));
+
+        let record = served.resume().unwrap();
+        assert!(
+            matches!(
+                &record.event,
+                WardEvent::SessionPaused { reason, .. } if reason.as_str() == CAPTURE_REASON
+            ),
+            "{:?}",
+            record.event
+        );
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::Capture])
+        );
+        assert!(served.approvals.paused(), "held for the capture");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("{CAPTURE_REASON}\n"),
+            "the marker names what holds the session now"
+        );
+        assert_eq!(
+            held_by(dir.path()).map(|h| h.owners()),
+            Some(vec![pause::Owner::Capture])
+        );
+        assert!(scripted.calls().is_empty(), "nothing was released");
+        assert_eq!(
+            kinds_of(&mut served),
+            ["SessionPaused", "SessionPaused", "SessionPaused"]
+        );
+
+        let record = served.release_capture(&op).unwrap().unwrap();
+        assert!(matches!(record.event, WardEvent::SessionResumed { .. }));
+        assert!(served.paused.is_none());
+        assert!(!marker.exists());
+        assert_eq!(
+            scripted.calls(),
+            [
+                (acks::Component::Credentials, acks::Phase::Released),
+                (acks::Component::Approvals, acks::Phase::Released),
+                (acks::Component::Proxy, acks::Phase::Released),
+            ]
+        );
+    }
+
+    /// #145 item 6: a capture taken while the user holds the session takes no
+    /// record and no ownership of the pause; its release leaves the user's
+    /// pause exactly as it was.
+    #[test]
+    fn a_captures_release_leaves_the_users_pause_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        served.pause_with("mine", |_| None).unwrap();
+        scripted.calls();
+        let marker = pause::marker_path(dir.path(), "sess_9");
+
+        let op = served
+            .hold_for_capture_with(CAPTURE_REASON, this_process(), never_freezes, restabilized)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::User, pause::Owner::Capture])
+        );
+        assert_eq!(
+            scripted.calls(),
+            [
+                (acks::Component::Proxy, acks::Phase::Held),
+                (acks::Component::Approvals, acks::Phase::Held),
+                (acks::Component::Credentials, acks::Phase::Held),
+            ],
+            "the capture confirms the quiescence it reuses"
+        );
+        assert_eq!(kinds_of(&mut served), ["SessionPaused"], "no second record");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "mine\n");
+
+        assert_eq!(served.release_capture(&op).unwrap(), None);
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::User])
+        );
+        assert_eq!(
+            held_by(dir.path()).map(|h| h.owners()),
+            Some(vec![pause::Owner::User])
+        );
+        assert!(marker.exists());
+        assert!(served.approvals.paused());
+        assert!(scripted.calls().is_empty(), "nothing released");
+        assert_eq!(kinds_of(&mut served), ["SessionPaused"]);
+
+        let record = served.resume().unwrap();
+        assert!(matches!(record.event, WardEvent::SessionResumed { .. }));
+        assert!(served.paused.is_none());
+    }
+
+    /// A stop takes over whatever holds the session: a capture's hold included.
+    #[test]
+    fn a_stop_hold_takes_over_a_captures_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        Scripted::install(&mut served);
+        let op = served
+            .hold_for_capture_with(CAPTURE_REASON, this_process(), own_process, restabilized)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            served
+                .hold_for_stop_with("ward stop --restore-entry", never_freezes, restabilized)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::Capture, pause::Owner::Stop])
+        );
+        assert_eq!(kinds_of(&mut served), ["SessionPaused"]);
+        assert_eq!(served.release_capture(&op).unwrap(), None);
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::Stop])
+        );
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Error(e) if e.contains("has begun and not completed")
+        ));
+        let (response, done) =
+            served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
+                assert_eq!(
+                    held.map(|f| f.pids),
+                    Some(vec![std::process::id()]),
+                    "the stop ends exactly what the hold kept"
+                );
+                pause::Termination::confirmed(1)
+            });
+        assert!(done, "{response:?}");
+        assert!(matches!(response, Response::Sealed { ended: Some(1), .. }));
+    }
+
+    /// #145 item 6 meets item 7: a restarted daemon releases a hold whose only
+    /// owner is a capture whose process is gone (the capture cannot complete),
+    /// recording the release; one the user also holds is adopted as the
+    /// user's, the dead capture forgotten; a capture whose hold-taking was
+    /// interrupted is released whether or not it got as far as the marker.
+    #[test]
+    fn reconciliation_releases_an_orphaned_capture_hold_but_not_a_user_hold() {
+        let capture_paused = || WardEvent::SessionPaused {
+            method: ward_events::PauseMethod::Sigstop,
+            reason: ward_events::ShortText::new(CAPTURE_REASON),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut served = fresh_served(dir.path());
+            assert!(matches!(served.handle(append(0)).0, Response::Record(_)));
+            served.append(capture_paused()).unwrap();
+        }
+        pause::write_marker(dir.path(), "sess_9", CAPTURE_REASON).unwrap();
+        pause::write_held_by(
+            dir.path(),
+            "sess_9",
+            &pause::Holders::for_capture(dead_capturer("op_dead")),
+        )
+        .unwrap();
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let scripted = Scripted::install(&mut served);
+        assert!(
+            !served
+                .reconcile_lifecycle_with(no_sandbox, never_terminates)
+                .unwrap()
+        );
+        assert!(served.paused.is_none());
+        assert!(!served.approvals.paused());
+        assert!(!pause::marker_path(dir.path(), "sess_9").exists());
+        assert_eq!(held_by(dir.path()), None);
+        assert_eq!(
+            kinds_of(&mut served),
+            ["AgentStateChanged", "SessionPaused", "SessionResumed"]
+        );
+        assert_eq!(
+            scripted.calls(),
+            [
+                (acks::Component::Credentials, acks::Phase::Released),
+                (acks::Component::Approvals, acks::Phase::Released),
+                (acks::Component::Proxy, acks::Phase::Released),
+            ]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut served = fresh_served(dir.path());
+            assert!(matches!(served.handle(append(0)).0, Response::Record(_)));
+            served.pause_with("mine", |_| None).unwrap();
+        }
+        let mut holders = pause::Holders::for_user();
+        holders.add_capture(dead_capturer("op_dead"));
+        pause::write_held_by(dir.path(), "sess_9", &holders).unwrap();
+        let mut served = restarted_served(dir.path(), "sess_9");
+        Scripted::install(&mut served);
+        assert!(
+            !served
+                .reconcile_lifecycle_with(no_sandbox, never_terminates)
+                .unwrap()
+        );
+        assert_eq!(
+            served.paused.as_ref().map(|p| p.holders.owners()),
+            Some(vec![pause::Owner::User])
+        );
+        assert_eq!(
+            held_by(dir.path()).map(|h| h.owners()),
+            Some(vec![pause::Owner::User])
+        );
+        assert!(pause::marker_path(dir.path(), "sess_9").exists());
+        assert_eq!(
+            kinds_of(&mut served),
+            ["AgentStateChanged", "SessionPaused"]
+        );
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Record(r) if matches!(r.event, WardEvent::SessionResumed { .. })
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        started_log(dir.path());
+        pause::write_intent(
+            dir.path(),
+            "sess_9",
+            &pause::Intent::begin(pause::Verb::Capture {
+                reason: CAPTURE_REASON.to_owned(),
+                capturer: dead_capturer("op_cut"),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut served = restarted_served(dir.path(), "sess_9");
+        Scripted::install(&mut served);
+        assert!(
+            !served
+                .reconcile_lifecycle_with(no_sandbox, never_terminates)
+                .unwrap()
+        );
+        assert!(served.paused.is_none());
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+        assert_eq!(
+            kinds_of(&mut served),
+            ["AgentStateChanged"],
+            "a hold that never got to its record releases without one"
+        );
+    }
+
+    /// `ward resume` on a hold whose only owner is a capture whose process is
+    /// gone releases it: reconciliation after the owner is gone, not a user
+    /// pause being released.
+    #[test]
+    fn resume_releases_a_capture_hold_whose_capturer_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        Scripted::install(&mut served);
+        served
+            .hold_for_capture_with(CAPTURE_REASON, this_process(), own_process, restabilized)
+            .unwrap()
+            .unwrap();
+        if let Some(paused) = served.paused.as_mut() {
+            paused.holders.captures[0].pid = 999_999;
+            paused.holders.captures[0].started = "0".to_owned();
+        }
+        let record = served.resume().unwrap();
+        assert!(matches!(record.event, WardEvent::SessionResumed { .. }));
+        assert!(served.paused.is_none());
+        assert!(!pause::marker_path(dir.path(), "sess_9").exists());
     }
 }

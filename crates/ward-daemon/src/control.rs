@@ -161,6 +161,32 @@ pub enum Request {
         /// Why (recorded on the `SessionPaused` a fresh hold appends).
         reason: String,
     },
+    /// Hold the session for a snapshot capture (#145 item 6): the daemon
+    /// freezes the sandboxes (or reuses the hold already in force), writes the
+    /// marker, holds the approvals and confirms the freeze settled and every
+    /// component acknowledged — the state a `SessionPaused` records, which it
+    /// appends when nothing held the session before. Refused, with nothing
+    /// held and nothing recorded, when that quiescence cannot be confirmed.
+    /// The hold is the capture's own: `Resume` releases only a user's pause
+    /// over it, and [`Request::ReleaseCapture`] ends it. Answered with
+    /// [`Response::HeldForCapture`].
+    HoldForCapture {
+        /// The reason the hold is recorded under (`pause::capture_reason`).
+        reason: String,
+        /// The capturing process, so a daemon can tell when it is gone.
+        pid: u32,
+        /// That process's `/proc` start time (`pause::own_start_time`).
+        started: String,
+    },
+    /// Release the hold a [`Request::HoldForCapture`] took, by its operation
+    /// id: the session's owners lose the capture, and when none remains the
+    /// marker is cleared, the tree thawed and `SessionResumed` appended
+    /// ([`Response::Record`]); otherwise [`Response::Ok`], the hold standing
+    /// for whoever else owns it.
+    ReleaseCapture {
+        /// The operation [`Response::HeldForCapture`] named.
+        op: String,
+    },
 }
 
 /// [`Request::Capabilities`] feature: `Request::Stop` terminates the session's
@@ -169,6 +195,11 @@ pub enum Request {
 pub const FEATURE_STOP_TERMINATES: &str = "stop-terminates-workloads";
 /// [`Request::Capabilities`] feature: [`Request::HoldForStop`] is served.
 pub const FEATURE_STOP_HOLD: &str = "stop-hold";
+/// [`Request::Capabilities`] feature: [`Request::HoldForCapture`] and
+/// [`Request::ReleaseCapture`] are served (#145 item 6). A capture refuses to
+/// proceed through a daemon that does not name it: it could not confirm the
+/// quiescence the capture requires.
+pub const FEATURE_CAPTURE_HOLD: &str = "capture-hold";
 
 /// What the daemon answers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +249,14 @@ pub enum Response {
     Capabilities {
         /// Feature names ([`FEATURE_STOP_TERMINATES`], [`FEATURE_STOP_HOLD`]).
         features: Vec<String>,
+    },
+    /// A [`Request::HoldForCapture`] answered: the session is held for the
+    /// capture, from confirmed quiescence.
+    HeldForCapture {
+        /// The hold's operation id, for [`Request::ReleaseCapture`]; `None`
+        /// when nothing of the session runs and nothing holds it, so the
+        /// capture proceeds with nothing to release.
+        op: Option<String>,
     },
     /// A [`Request::HoldForStop`] answered: the session is held for its stop.
     HeldForStop {
@@ -786,7 +825,9 @@ pub fn handle_with(
         // A plain log connection neither terminates workloads on `Stop` nor
         // holds one: it serves no feature, exactly like an older daemon.
         | Request::Capabilities
-        | Request::HoldForStop { .. } => (
+        | Request::HoldForStop { .. }
+        | Request::HoldForCapture { .. }
+        | Request::ReleaseCapture { .. } => (
             Response::Error("not served on this connection".into()),
             false,
         ),
@@ -1352,5 +1393,44 @@ mod tests {
             RemoteSink::connect(&socket).is_none(),
             "nothing listens after seal"
         );
+    }
+
+    /// #145 item 6: a capture's hold and its release travel as their words, and
+    /// a plain log connection serves neither.
+    #[test]
+    fn capture_hold_requests_round_trip_and_are_not_served_on_a_log_connection() {
+        let hold = Request::HoldForCapture {
+            reason: "ward capture: candidate snapshot".into(),
+            pid: 7,
+            started: "12".into(),
+        };
+        let json = serde_json::to_string(&hold).unwrap();
+        assert_eq!(
+            json,
+            r#"{"req":"hold_for_capture","reason":"ward capture: candidate snapshot","pid":7,"started":"12"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), hold);
+        let release = Request::ReleaseCapture { op: "abc".into() };
+        assert_eq!(
+            serde_json::to_string(&release).unwrap(),
+            r#"{"req":"release_capture","op":"abc"}"#
+        );
+        for response in [
+            Response::HeldForCapture { op: None },
+            Response::HeldForCapture {
+                op: Some("abc".into()),
+            },
+        ] {
+            let json = serde_json::to_string(&response).unwrap();
+            assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), response);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Some(fresh(dir.path()));
+        for request in [hold, release] {
+            assert!(matches!(
+                handle(&mut log, request).0,
+                Response::Error(e) if e == "not served on this connection"
+            ));
+        }
     }
 }
