@@ -50,6 +50,10 @@ set -euo pipefail
 # shellcheck source=desktop/lib/wardos.sh disable=SC1091
 source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
   source /usr/lib/wardos/wardos.sh
+
+# The registry inspector; overridable like the verifier's COSIGN so a host without skopeo
+# and a test runner with one are told apart by what the script was given, not by PATH.
+SKOPEO=${SKOPEO:-skopeo}
 wardos_help "$@"
 
 json_string() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n'; }
@@ -157,14 +161,14 @@ image_label() {
     LABEL=${label_cache[$digest]}
     return 0
   fi
-  wardos_has skopeo || {
+  wardos_has "$SKOPEO" || {
     LABEL_NOTE="skopeo not installed"
     return 1
   }
   repo_ref=${ref%%@*}
   [[ ${repo_ref##*/} == *:* ]] && repo_ref=${repo_ref%:*}
   workdir
-  out=$(skopeo inspect --no-tags "docker://$repo_ref@$digest" 2>"$work/skopeo.err") || {
+  out=$("$SKOPEO" inspect --no-tags "docker://$repo_ref@$digest" 2>"$work/skopeo.err") || {
     LABEL_NOTE=$(head -n1 "$work/skopeo.err")
     [[ -n $LABEL_NOTE ]] || LABEL_NOTE="skopeo inspect failed"
     return 1

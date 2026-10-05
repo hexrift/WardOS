@@ -306,14 +306,16 @@ assert_line "^anti-rollback +not evaluated: candidate version 'abc1234' is not a
 assert_line "^manifest +not looked up: abc1234 is not a release tag"
 
 ### Without skopeo, bootc's own version fields are compared, and said to be. ########
-mv "$MOCK_DIR/skopeo" "$TMP/skopeo.away"
+# The host runner may have a real skopeo; the script reads the tool from $SKOPEO like
+# cosign from $COSIGN, so "not installed" is asserted without touching the host.
+export SKOPEO="$TMP/absent/skopeo"
 export SKOPEO_LABELS=""
 run --status
 assert_line "^booted +$ref@$booted_digest +44.20260901.0 \(bootc version; skopeo not installed\)"
 assert_line "^available +$cand_digest +44.20260908.0 "
 assert_line "^anti-rollback +allowed: candidate 44.20260908.0 is not lower than booted 44.20260901.0 \(bootc versions\)"
 assert_line "^manifest +not looked up: the candidate's WardOS version is unknown \(skopeo not installed\)"
-mv "$TMP/skopeo.away" "$MOCK_DIR/skopeo"
+unset SKOPEO
 export SKOPEO_FAIL="FATA[0000] pinging container registry quay.io: dial tcp: no such host"
 run --status
 assert_line "^anti-rollback +allowed: candidate 44.20260908.0 is not lower than booted 44.20260901.0 \(bootc versions\)"
