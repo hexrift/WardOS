@@ -194,9 +194,9 @@ pub fn freeze_confirmed(session: &str) -> (Frozen, bool) {
 /// order after them) and whether it was confirmed stable in time.
 ///
 /// The rescan is only trusted once everything known is stopped: a stopped
-/// process runs no code, so it cannot fork, and a child created by a fork that
-/// was already in flight still has that stopped parent as its parent, so the
-/// tree walk finds it. Membership is also taken from the sandbox's own pid
+/// process (or one held in vfork wait on a stopped child, #352) runs no code,
+/// so it cannot fork, and a child created by a fork that was already in flight
+/// still has that stopped parent as its parent, so the tree walk finds it. Membership is also taken from the sandbox's own pid
 /// namespace ([`sandbox_pids`]), which finds a child whose parent exited on its
 /// own and left it reparented outside the tree.
 #[must_use]
@@ -293,11 +293,12 @@ fn stabilize_with(
 }
 
 /// Wait until a freeze has actually taken hold: every process is stopped
-/// (`State: T`/`t`) or already gone. The cgroup freezer is synchronous —
-/// [`freeze_cgroup`] already waited on `cgroup.events` — so only the signal
-/// path polls, because `SIGSTOP` is delivered asynchronously and a capture that
-/// began the instant [`freeze`] returned could still race a not-yet-stopped
-/// process. Bounded by [`FREEZE_SETTLE`]; returns whether every pid settled.
+/// (`State: T`/`t`), held in vfork wait on a stopped child (#352), or already
+/// gone. The cgroup freezer is synchronous — [`freeze_cgroup`] already waited
+/// on `cgroup.events` — so only the signal path polls, because `SIGSTOP` is
+/// delivered asynchronously and a capture that began the instant [`freeze`]
+/// returned could still race a not-yet-stopped process. Bounded by
+/// [`FREEZE_SETTLE`]; returns whether every pid settled.
 #[must_use]
 pub fn wait_settled(frozen: &Frozen) -> bool {
     if frozen.method == PauseMethod::CgroupFreezer {
@@ -365,13 +366,28 @@ fn settle_outcome_with(
 }
 
 /// Whether `pid` is stopped (`SIGSTOP` took hold) or no longer runs: gone from
-/// `proc`, or a zombie / dead entry waiting only to be reaped (it runs no code,
-/// so it can neither fork nor stop).
+/// `proc`, a zombie / dead entry waiting only to be reaped (it runs no code,
+/// so it can neither fork nor stop), or held in vfork wait on a stopped child
+/// ([`frozen_from`], #352). A vfork hold is read once more after its children,
+/// so a child that `exec`ed and released it between the reads is not missed.
 fn stopped_or_gone(proc: &Path, pid: u32) -> bool {
-    match fs::read_to_string(proc.join(pid.to_string()).join("stat")) {
-        Ok(stat) => matches!(proc_state(&stat), Some('T' | 't' | 'Z' | 'X' | 'x')),
-        Err(_) => true,
+    let stat_path = proc.join(pid.to_string()).join("stat");
+    let Ok(stat) = fs::read_to_string(&stat_path) else {
+        return true;
+    };
+    let Some(target) = proc_facts(proc, pid, &stat) else {
+        return false;
+    };
+    if !in_vfork_wait(&target) {
+        return frozen_from(pid, &[target]);
     }
+    let mut facts = vec![target];
+    facts.extend(children_facts(proc, pid));
+    frozen_from(pid, &facts)
+        && fs::read_to_string(&stat_path)
+            .ok()
+            .and_then(|again| proc_facts(proc, pid, &again))
+            .is_some_and(|again| in_vfork_wait(&again))
 }
 
 /// The state character of a `/proc/<pid>/stat` line: the field after the
@@ -380,6 +396,98 @@ fn stopped_or_gone(proc: &Path, pid: u32) -> bool {
 fn proc_state(stat: &str) -> Option<char> {
     let rest = &stat[stat.rfind(')')? + 1..];
     rest.split_whitespace().next()?.chars().next()
+}
+
+/// What the settle check reads of one process from `/proc` (#352).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProcFacts {
+    pid: u32,
+    ppid: u32,
+    state: char,
+    threads: Option<u32>,
+    wchan: Option<String>,
+}
+
+/// The names `/proc/<pid>/wchan` gives a task waiting for its vfork child to
+/// `exec` or exit: `wait_for_vfork_done` itself, or `kernel_clone`, its caller,
+/// on kernels that inline it (6.x builds do). `kernel_clone` sleeps nowhere
+/// else itself, so a task in `D` there is in that wait.
+const VFORK_WAIT_WCHANS: [&str; 2] = ["wait_for_vfork_done", "kernel_clone"];
+
+/// The facts of `pid` from its `stat` line, plus its `wchan` when in `D`.
+fn proc_facts(proc: &Path, pid: u32, stat: &str) -> Option<ProcFacts> {
+    let state = proc_state(stat)?;
+    let parent = parent_of(stat)?;
+    let wchan = (state == 'D')
+        .then(|| fs::read_to_string(proc.join(pid.to_string()).join("wchan")).ok())
+        .flatten()
+        .map(|w| w.trim().to_owned());
+    Some(ProcFacts {
+        pid,
+        ppid: parent,
+        state,
+        threads: thread_count(stat),
+        wchan,
+    })
+}
+
+/// The `num_threads` field of a `/proc/<pid>/stat` line.
+fn thread_count(stat: &str) -> Option<u32> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(17)?.parse().ok()
+}
+
+/// Whether a `/proc` state runs no code: stopped, traced-stopped, zombie or dead.
+fn stopped_or_ended_state(state: char) -> bool {
+    matches!(state, 'T' | 't' | 'Z' | 'X' | 'x')
+}
+
+/// Whether `facts` show a single-threaded process in uninterruptible wait
+/// for a vfork child to `exec` or exit. A wait channel that could not be read
+/// (no permission, no `kallsyms`) never matches, nor does a process with more
+/// than one thread, whose other threads `stat` does not describe.
+fn in_vfork_wait(facts: &ProcFacts) -> bool {
+    facts.state == 'D'
+        && facts.threads == Some(1)
+        && facts
+            .wchan
+            .as_deref()
+            .is_some_and(|w| VFORK_WAIT_WCHANS.contains(&w))
+}
+
+/// Whether `pid` can make no progress, judged from `facts` (it and its
+/// children): it is gone, stopped or ended, or (#352) it is held in vfork
+/// wait and its children are all stopped or ended, at least one of them
+/// stopped. A vforked child stopped before `exec` keeps its parent in `D`
+/// until it continues, so that parent never reaches `T`; it runs no code
+/// either, and the `SIGSTOP` already sent to it stops it the moment the wait
+/// ends. Anything else in `D`, and any process with a child that still runs,
+/// is not frozen.
+fn frozen_from(pid: u32, facts: &[ProcFacts]) -> bool {
+    let Some(target) = facts.iter().find(|f| f.pid == pid) else {
+        return true;
+    };
+    if stopped_or_ended_state(target.state) {
+        return true;
+    }
+    if !in_vfork_wait(target) {
+        return false;
+    }
+    let mut children = facts.iter().filter(|f| f.ppid == pid && f.pid != pid);
+    children.clone().any(|c| matches!(c.state, 'T' | 't'))
+        && children.all(|c| stopped_or_ended_state(c.state))
+}
+
+/// The facts of every child of `parent` under `proc`.
+fn children_facts(proc: &Path, parent: u32) -> Vec<ProcFacts> {
+    proc_pids(proc)
+        .into_iter()
+        .filter(|&pid| pid != parent)
+        .filter_map(|pid| {
+            let stat = fs::read_to_string(proc.join(pid.to_string()).join("stat")).ok()?;
+            proc_facts(proc, pid, &stat).filter(|f| f.ppid == parent)
+        })
+        .collect()
 }
 
 /// Let a frozen tree run again.
@@ -1349,6 +1457,272 @@ mod tests {
         assert_eq!(proc_state("14 (a) b) S 7) t 13 1"), Some('t'));
         assert_eq!(proc_state("14 (x) R 1"), Some('R'));
         assert_eq!(proc_state("garbage"), None);
+    }
+
+    fn facts(pid: u32, parent: u32, state: char, wchan: Option<&str>) -> ProcFacts {
+        ProcFacts {
+            pid,
+            ppid: parent,
+            state,
+            threads: Some(1),
+            wchan: wchan.map(str::to_owned),
+        }
+    }
+
+    /// #352: a dash parent whose vforked child was stopped before `exec`
+    /// stays in `D` waiting for the vfork to complete and never reaches `T`.
+    /// Nothing in that pair can run, so the parent counts as frozen, whichever
+    /// name the kernel gives the wait (`kernel_clone` where it inlined it).
+    #[test]
+    fn a_vfork_parent_held_by_a_stopped_child_is_frozen() {
+        for wchan in VFORK_WAIT_WCHANS {
+            for child in ['T', 't'] {
+                let tree = [facts(10, 1, 'D', Some(wchan)), facts(11, 10, child, None)];
+                assert!(frozen_from(10, &tree), "{wchan} over a {child} child");
+            }
+        }
+        let with_a_reaped_sibling = [
+            facts(10, 1, 'D', Some("wait_for_vfork_done")),
+            facts(11, 10, 'T', None),
+            facts(12, 10, 'Z', None),
+        ];
+        assert!(frozen_from(10, &with_a_reaped_sibling));
+    }
+
+    /// The same parent while its vfork child still runs is not frozen: the
+    /// child can `exec` and release it at any moment.
+    #[test]
+    fn a_vfork_parent_whose_child_still_runs_is_not_frozen() {
+        for child in ['R', 'S', 'D'] {
+            let tree = [
+                facts(10, 1, 'D', Some("wait_for_vfork_done")),
+                facts(11, 10, child, Some("pipe_read")),
+            ];
+            assert!(!frozen_from(10, &tree), "a {child} child");
+        }
+        let one_child_still_runs = [
+            facts(10, 1, 'D', Some("kernel_clone")),
+            facts(11, 10, 'T', None),
+            facts(12, 10, 'R', None),
+        ];
+        assert!(!frozen_from(10, &one_child_still_runs));
+        let no_child_of_its_own = [
+            facts(10, 1, 'D', Some("wait_for_vfork_done")),
+            facts(11, 9, 'T', None),
+        ];
+        assert!(!frozen_from(10, &no_child_of_its_own));
+        let only_a_zombie = [
+            facts(10, 1, 'D', Some("wait_for_vfork_done")),
+            facts(11, 10, 'Z', None),
+        ];
+        assert!(!frozen_from(10, &only_a_zombie));
+    }
+
+    /// Uninterruptible sleep for anything other than a vfork, or with a wait
+    /// channel that cannot be read, is not frozen (fail closed).
+    #[test]
+    fn an_uninterruptible_wait_for_anything_else_is_not_frozen() {
+        for wchan in [Some("folio_wait_bit_common"), Some("0"), Some(""), None] {
+            let tree = [facts(10, 1, 'D', wchan), facts(11, 10, 'T', None)];
+            assert!(!frozen_from(10, &tree), "wchan {wchan:?}");
+        }
+        let mut threaded = facts(10, 1, 'D', Some("wait_for_vfork_done"));
+        threaded.threads = Some(2);
+        assert!(!frozen_from(
+            10,
+            &[threaded.clone(), facts(11, 10, 'T', None)]
+        ));
+        threaded.threads = None;
+        assert!(!frozen_from(10, &[threaded, facts(11, 10, 'T', None)]));
+    }
+
+    /// A running or sleeping process is never frozen, whatever its children do.
+    #[test]
+    fn a_running_process_is_not_frozen() {
+        for state in ['R', 'S', 'I', 'W'] {
+            let tree = [
+                facts(10, 1, state, Some("wait_for_vfork_done")),
+                facts(11, 10, 'T', None),
+            ];
+            assert!(!frozen_from(10, &tree), "state {state}");
+        }
+    }
+
+    /// A stopped, traced-stopped, zombie or dead process is frozen, and so is
+    /// one gone from `/proc`.
+    #[test]
+    fn a_stopped_ended_or_missing_process_is_frozen() {
+        for state in ['T', 't', 'Z', 'X', 'x'] {
+            assert!(frozen_from(10, &[facts(10, 1, state, None)]), "{state}");
+        }
+        assert!(frozen_from(10, &[facts(11, 10, 'R', None)]), "10 is gone");
+        assert!(frozen_from(10, &[]));
+    }
+
+    /// The settle check reads those facts from `/proc`: state, parent and
+    /// thread count from `stat`, the wait channel from `wchan`.
+    #[test]
+    fn the_settle_check_reads_a_vfork_hold_from_proc() {
+        let proc = tempfile::tempdir().unwrap();
+        let process = |pid: u32, parent: u32, state: char, threads: u32, wchan: Option<&str>| {
+            let dir = proc.path().join(pid.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("stat"),
+                format!(
+                    "{pid} (sh (x)) {state} {parent} {pid} {pid} 0 -1 4194560 1 0 0 0 0 0 0 0 \
+                     20 0 {threads} 0 1 2 3\n"
+                ),
+            )
+            .unwrap();
+            if let Some(wchan) = wchan {
+                fs::write(dir.join("wchan"), wchan).unwrap();
+            }
+        };
+        process(1, 0, 'S', 1, None);
+        process(10, 1, 'D', 1, Some("wait_for_vfork_done"));
+        process(11, 10, 'T', 1, None);
+        process(20, 1, 'D', 1, Some("kernel_clone"));
+        process(21, 20, 'S', 1, None);
+        process(30, 1, 'D', 1, None);
+        process(31, 30, 'T', 1, None);
+        process(40, 1, 'D', 3, Some("kernel_clone"));
+        process(41, 40, 'T', 1, None);
+        fs::write(proc.path().join("uptime"), "1 1\n").unwrap();
+
+        let stat = fs::read_to_string(proc.path().join("10/stat")).unwrap();
+        assert_eq!(
+            proc_facts(proc.path(), 10, &stat),
+            Some(ProcFacts {
+                pid: 10,
+                ppid: 1,
+                state: 'D',
+                threads: Some(1),
+                wchan: Some("wait_for_vfork_done".into()),
+            })
+        );
+        assert!(stopped_or_gone(proc.path(), 10), "held by a stopped child");
+        assert!(!stopped_or_gone(proc.path(), 20), "its child still sleeps");
+        assert!(!stopped_or_gone(proc.path(), 30), "wchan unreadable");
+        assert!(!stopped_or_gone(proc.path(), 40), "multi-threaded");
+        assert!(!stopped_or_gone(proc.path(), 1));
+        assert!(stopped_or_gone(proc.path(), 11));
+        assert!(stopped_or_gone(proc.path(), 99), "gone");
+        assert_eq!(
+            settle_outcome_with(
+                &Frozen {
+                    method: PauseMethod::Sigstop,
+                    pids: vec![11, 10],
+                    cgroup: None,
+                },
+                false,
+                |pid| stopped_or_gone(proc.path(), pid),
+            ),
+            None,
+            "the stopped child and its vfork parent settle the pause"
+        );
+    }
+
+    /// #352 on real processes: a dash loop whose vforked child is stopped
+    /// before `exec` leaves the shell in `D`, and a pause holding both settles.
+    /// The shell's `PATH` is long so the child spends long enough between
+    /// `vfork` and `exec` to be caught there; each attempt is confirmed from
+    /// `/proc` before anything is asserted, and a host without dash or a
+    /// readable wait channel skips.
+    #[test]
+    fn a_dash_parent_held_in_vfork_wait_on_a_stopped_child_settles() {
+        use std::process::{Child, Command, Stdio};
+        struct Reap(Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                for pid in tree(Path::new("/proc"), self.0.id()) {
+                    let _ = kill(Pid::from_raw(as_pid(pid)), Signal::SIGKILL);
+                }
+                let _ = self.0.wait();
+            }
+        }
+        let Some(dash) = ["/bin/dash", "/usr/bin/dash"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+        else {
+            eprintln!("skipped: no dash on this host");
+            return;
+        };
+        let proc = Path::new("/proc");
+        let long_path = (0..12_000)
+            .map(|i| format!("/nx{i}"))
+            .chain(["/usr/bin".to_owned(), "/bin".to_owned()])
+            .collect::<Vec<_>>()
+            .join(":");
+        let shell = Reap(
+            Command::new(dash)
+                .args(["-c", "while :; do uname; done"])
+                .env_clear()
+                .env("PATH", long_path)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let root = shell.0.id();
+        let in_vfork_wait_now = |pid: u32| {
+            fs::read_to_string(proc.join(pid.to_string()).join("stat"))
+                .ok()
+                .and_then(|stat| proc_facts(proc, pid, &stat))
+                .is_some_and(|f| {
+                    f.state == 'D'
+                        && f.wchan
+                            .as_deref()
+                            .is_some_and(|w| VFORK_WAIT_WCHANS.contains(&w))
+                })
+        };
+        let state = |pid: u32| {
+            fs::read_to_string(proc.join(pid.to_string()).join("stat"))
+                .ok()
+                .and_then(|s| proc_state(&s))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let held = loop {
+            if Instant::now() >= deadline {
+                break None;
+            }
+            if !in_vfork_wait_now(root) {
+                std::thread::yield_now();
+                continue;
+            }
+            let children: Vec<u32> = tree(proc, root)
+                .into_iter()
+                .filter(|&pid| pid != root)
+                .collect();
+            freeze_signals(&children);
+            let stopped = crate::daemon::wait_until(Duration::from_millis(200), || {
+                children.iter().all(|&pid| state(pid) == Some('T'))
+            });
+            if stopped && !children.is_empty() && in_vfork_wait_now(root) {
+                break Some(children);
+            }
+            for pid in &children {
+                let _ = kill(Pid::from_raw(as_pid(*pid)), Signal::SIGCONT);
+            }
+        };
+        let Some(children) = held else {
+            eprintln!("skipped: the shell was never seen waiting for a vfork child");
+            return;
+        };
+        let mut pids = children;
+        pids.push(root);
+        freeze_signals(&pids);
+        let frozen = Frozen {
+            method: PauseMethod::Sigstop,
+            pids,
+            cgroup: None,
+        };
+        assert_eq!(settle_outcome(&frozen), None, "the held pair settles");
+        assert_eq!(
+            state(root),
+            Some('D'),
+            "the shell never reached `T`: the vfork hold is what settled it"
+        );
+        assert!(stopped_or_gone(proc, root));
     }
 
     #[test]
