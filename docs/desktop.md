@@ -514,6 +514,13 @@ pull request:
 desktop/capture/refresh.sh [--ref vX.Y.Z | --run ID]
 ```
 
+For a host that cannot reach the artifact store (GitHub keeps artifacts on Azure blob
+storage), a run started by hand with `gh workflow run desktop-capture.yml -f
+inline_gif=true` also prints the GIF into the job log as one base64 line between
+`-----BEGIN WARDOS-DESKTOP-GIF-----` and `-----END WARDOS-DESKTOP-GIF-----`, with
+`size=<bytes> sha256=<hex>` on the line before to check the decode against; a GIF over
+2 MiB is left to the artifact and the step says so. Pull-request runs never inline.
+
 ## Parity
 
 Each Omarchy capability, and how WardOS delivers it. ✔ in the last column once the

@@ -15,6 +15,7 @@ script="$cap/capture.sh"
 ci_run="$cap/ci-run.sh"
 story="$test_root/assets/storyboard/story.py"
 workflow="$test_root/.github/workflows/desktop-capture.yml"
+docs="$test_root/docs/desktop.md"
 assert_file "$table"
 assert_file "$script"
 assert_file "$ci_run"
@@ -116,6 +117,16 @@ for want in 'CAPTURE_DRM_DRIVER: vkms' 'before=\(/sys/class/drm/card\*\)' 'modpr
   grep -qE -- "$want" "$workflow" || fail "desktop-capture.yml does not mention $want"
 done
 ! grep -qE '^ *container:' "$workflow" || fail "desktop-capture.yml must not use a job container: the DRM node is loaded on the host first"
+# The inline GIF: a workflow_dispatch input, off by default, never on a pull request; the
+# markers and the size/sha line a host without artifact access decodes against.
+# shellcheck disable=SC2016  # literal fragments of the workflow, not expansions
+for want in 'inline_gif:' 'type: boolean' 'default: false' \
+  "if: github.event_name == 'workflow_dispatch' && inputs.inline_gif" 'base64 -w0 "$gif"' \
+  'echo "-----BEGIN WARDOS-DESKTOP-GIF-----"' 'echo "-----END WARDOS-DESKTOP-GIF-----"' \
+  'echo "size=$size sha256=$(sha256sum "$gif" | cut -d'"'"' '"'"' -f1)"' 'size > 2 * 1024 * 1024'; do
+  grep -qF -- "$want" "$workflow" || fail "desktop-capture.yml does not have: $want"
+done
+grep -q 'BEGIN WARDOS-DESKTOP-GIF' "$docs" || fail "docs/desktop.md does not describe the inline GIF markers"
 # shellcheck disable=SC2016  # grep patterns, not expansions
 for want in desktop/capture/packages.txt image/coprs.txt image/install-desktop.sh 'SEATD_VTBOUND=0 seatd -u wardos -g wardos' \
   'runuser -u wardos' 'LIBSEAT_BACKEND=seatd' 'CAPTURE_DRM_CARD="\$\{CAPTURE_DRM_CARD:-\}"' desktop/capture/capture.sh \

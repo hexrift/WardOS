@@ -7,7 +7,9 @@
 # the GIF; the GIF and the shots are the artifact `wardos-desktop-capture`. Nothing here
 # writes to the repository: desktop/capture/refresh.sh brings a run's GIF into assets/ by
 # hand. Weekly on main, by hand (on a release tag too: `gh workflow run
-# desktop-capture.yml --ref vX.Y.Z`), and on pull requests that touch what is on screen.
+# desktop-capture.yml --ref vX.Y.Z`; with `-f inline_gif=true` the GIF is also printed
+# into the job log as base64, for a host that cannot reach the artifact store), and on
+# pull requests that touch what is on screen.
 name: desktop capture
 
 on:
@@ -21,6 +23,11 @@ on:
   schedule:
     - cron: "37 4 * * 1"
   workflow_dispatch:
+    inputs:
+      inline_gif:
+        description: "Also print the GIF into the job log as base64 (for a host that cannot reach the artifact store); refused over 2 MiB"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -140,6 +147,26 @@ jobs:
       - name: Summary
         if: always()
         run: if [[ -f capture-out/summary.md ]]; then cat capture-out/summary.md >>"$GITHUB_STEP_SUMMARY"; fi
+      # By hand only, never on a pull request: the GIF as one base64 line between the
+      # BEGIN and END markers, its size and SHA-256 on the line before, for a host that
+      # cannot reach the artifact store (refresh.sh --run ID reads it; the GIF, over
+      # 2 MiB, is left to the artifact, and the step says so).
+      - name: Inline the GIF
+        if: github.event_name == 'workflow_dispatch' && inputs.inline_gif
+        run: |
+          set -euo pipefail
+          gif=capture-out/wardos-desktop.gif
+          [[ -f $gif ]] || { echo "::error::no $gif to inline" >&2; exit 1; }
+          size=$(wc -c <"$gif")
+          if ((size > 2 * 1024 * 1024)); then
+            echo "::warning::wardos-desktop.gif is $size bytes, over the 2 MiB the log takes inline; take it from the wardos-desktop-capture artifact"
+            exit 0
+          fi
+          echo "size=$size sha256=$(sha256sum "$gif" | cut -d' ' -f1)"
+          echo "-----BEGIN WARDOS-DESKTOP-GIF-----"
+          base64 -w0 "$gif"
+          echo
+          echo "-----END WARDOS-DESKTOP-GIF-----"
       - uses: actions/upload-artifact@v7
         with:
           name: wardos-desktop-capture
