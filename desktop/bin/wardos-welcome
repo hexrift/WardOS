@@ -175,11 +175,15 @@ step_project() {
 # fix for every other gap, and it is where the verification boundary `ward ready` showed
 # as proposed but not accepted gets accepted — the terminal asks, a yes writes it (#147
 # item 2); nothing is accepted on the user's behalf by this script.
+# A non-blocking report goes on to offer_baseline below.
 # Returns failure only when the user chose not to start after seeing a blocking report.
 step_ready() {
-  local project=$1 agent=$2 choice
+  local project=$1 agent=$2 choice report
   wardos_has ward || return 0
-  ward ready "$project" --agent "$agent" >/dev/null 2>&1 && return 0
+  if report=$(ward ready "$project" --agent "$agent" 2>&1); then
+    offer_baseline "$project" "$agent" "$report"
+    return 0
+  fi
   in_terminal wardos-ready ward ready "$project" --agent "$agent" || true
   choice=$(ask "$project is not ready yet" "Start anyway" "Fix it first")
   case "$choice" in
@@ -187,6 +191,23 @@ step_ready() {
     "Fix it first") in_terminal wardos-init ward init "$project" || true ;;
   esac
   return 1
+}
+
+# offer_baseline PROJECT AGENT REPORT: #147 item 5. When the `ward ready` report shows no
+# baseline recorded for the project, or a stale one, ask once whether to run the project's
+# own tests now, offline, before the agent changes anything. Never silent and never by
+# default: only a yes runs `ward ready … --baseline`, in a terminal that shows the result.
+# A red baseline is the project's own pre-existing failure, not a reason to stop, so the
+# agent step continues either way. A current baseline (green or red) asks nothing.
+offer_baseline() {
+  local project=$1 agent=$2 report=$3 choice
+  # The row's name may follow a colour sequence (ESC [ … m); the detail says which state.
+  grep -Eq '^ *(.\[[0-9;]*m)?baseline .*(not run|stale)' <<<"$report" || return 0
+  choice=$(ask "Baseline · run the tests of $project once now, offline, before the agent changes anything?" \
+    "Run the baseline" "Not now")
+  [[ "$choice" == "Run the baseline" ]] || return 0
+  in_terminal wardos-ready ward ready "$project" --agent "$agent" --baseline ||
+    echo "wardos-welcome: the baseline could not run; \`ward ready --baseline\` retries it" >&2
 }
 
 step_agent() {
@@ -211,7 +232,26 @@ step_agent() {
     echo "wardos-welcome: starting the agent failed; open Agent again to retry" >&2
 }
 
+# answers_card: #147 item 7, the walkthrough's closing card. When the remembered project
+# has a session, the four E-14 answers WardOS recorded for it — what the agent can reach,
+# the credentials it can use, what it changed, whether the current candidate is verified —
+# each with its source, from `ward ready --answers --json`. Nothing without a session.
+answers_card() {
+  local project="" json session
+  local -a items
+  wardos_has ward && wardos_has jq || return 0
+  [[ -f "$project_file" ]] && project=$(head -n1 "$project_file")
+  [[ -n "$project" ]] || return 0
+  json=$(ward ready "$project" --answers --json 2>/dev/null) || return 0
+  session=$(jq -r '.session.id // empty' <<<"$json" 2>/dev/null) || return 0
+  [[ -n "$session" ]] || return 0
+  mapfile -t items < <(jq -r '.answers[] | "\(.question) \(.answer) · from \(.source)"' <<<"$json" 2>/dev/null)
+  [[ ${#items[@]} -gt 0 ]] || return 0
+  wardos_menu "What WardOS recorded · $session" "${items[@]}" "Done" >/dev/null || true
+}
+
 step_done() {
+  answers_card
   wardos_menu "You are set" \
     "Super + Space is everything: projects, agents, verify, apps" \
     "Super + K lists the keys" \

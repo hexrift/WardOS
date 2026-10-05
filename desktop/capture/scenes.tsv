@@ -11,6 +11,7 @@ project	1400	required	wardos-welcome project: the project menu
 init	2200	required	ward init ~/ward-demo in the terminal the project step opens
 agent	1400	required	wardos-welcome agent: the agent menu for ~/ward-demo
 up	2600	required	ward up ~/ward-demo in a terminal; the trust bar goes live
+answers	2400	required	wardos-welcome done: the four answers WardOS recorded for the live session (reach, credentials, changes, verified)
 done	2000	required	wardos-welcome done: the closing menu
 observer	2800	required	the command centre's Resume session: ward watch beside the session terminal, the welcome toast
 menu	2200	required	wardos-menu: the command centre with the live session

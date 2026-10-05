@@ -392,6 +392,9 @@ pub struct Outcome {
     pub output_bytes: u64,
     /// Whether `output` dropped bytes from the middle of the stream to stay in budget.
     pub output_truncated: bool,
+    /// The command's exit status when it exited on its own; `None` when it was killed
+    /// (by a signal, or at the budget). What `ward ready --baseline` names (#147).
+    pub exit_code: Option<i32>,
 }
 
 /// Run the verification command over the prepared tree, offline, with the host
@@ -469,6 +472,7 @@ pub fn execute_with(
         output,
         output_bytes: out.stdout_bytes + out.stderr_bytes,
         output_truncated: out.truncated || combined_over,
+        exit_code: out.code,
     })
 }
 

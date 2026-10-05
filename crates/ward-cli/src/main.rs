@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod answers;
 mod init;
 mod replay;
 mod replay_stats;
@@ -208,7 +209,8 @@ enum Command {
     /// Check what this host can give a session, with a fix for each gap.
     Doctor,
     /// Check whether this project can be verified before an agent starts: policy,
-    /// verifier config, its runtime and its protected paths, each with a fix (#147).
+    /// verifier config, its runtime, its protected paths, its prepared dependencies and
+    /// its last baseline, each with a fix (#147).
     Ready {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
@@ -218,8 +220,25 @@ enum Command {
         /// Print the verification boundary `ward init` would propose from the
         /// project's files (command, protected and read-only inputs, the evidence
         /// for each) and change nothing.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["baseline", "answers"])]
         propose: bool,
+        /// Run the accepted verification command once, offline, in the verifier's
+        /// sandbox, over the project's current tree (the entry state, before any agent
+        /// work), and record the result as the project's baseline. Refused while setup
+        /// is required. A red baseline is "ready, baseline failing", never setup
+        /// required; a later `ward ready` shows it and says when it is stale.
+        #[arg(long, conflicts_with = "answers")]
+        baseline: bool,
+        /// Answer the four E-14 questions from what WardOS recorded for the project's
+        /// session (live, else the last one): what the agent can reach, the credentials
+        /// it can use, what it changed, whether the current candidate is verified; each
+        /// with its source, `unknown` when nothing is recorded.
+        #[arg(long)]
+        answers: bool,
+        /// With `--answers`: one JSON object, `{project, session: {id, live} | null,
+        /// answers: [{key, question, answer, known, source, details}]}`.
+        #[arg(long, requires = "answers")]
+        json: bool,
     },
     /// Run the isolation self-tests against a real sandbox.
     Selftest {
@@ -697,11 +716,7 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Verify { dir } => cmd_verify(&dir.unwrap_or_else(cwd)),
         Command::Prepare { dir, rebuild } => Ok(cmd_prepare(&dir.unwrap_or_else(cwd), rebuild)),
         Command::Doctor => Ok(cmd_doctor()),
-        Command::Ready {
-            dir,
-            agent,
-            propose,
-        } => Ok(cmd_ready(dir, agent, propose)),
+        ready @ Command::Ready { .. } => Ok(cmd_ready(ready)),
         Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
         Command::Replay {
             log,
@@ -837,8 +852,26 @@ fn cmd_doctor() -> ExitCode {
 /// already does for its own "next" block. `--propose` prints only what `ward init`
 /// would propose from the project's files and touches nothing; it exits non-zero
 /// when nothing can be proposed, so the refusal and its reason are not mistaken for
-/// a boundary.
-fn cmd_ready(dir: Option<PathBuf>, agent: init::Agent, propose: bool) -> ExitCode {
+/// a boundary. `--baseline` first runs the accepted command over the current tree and
+/// records it (#147 item 5) — only once every row resolves, so a red result is the
+/// project's own and never a setup gap — then reports as usual. The exit code is the
+/// verdict's: non-zero only for a blocking one (a red baseline does not block), or
+/// when a requested baseline could not run.
+fn cmd_ready(command: Command) -> ExitCode {
+    let Command::Ready {
+        dir,
+        agent,
+        propose,
+        baseline,
+        answers,
+        json,
+    } = command
+    else {
+        return ExitCode::FAILURE;
+    };
+    if answers {
+        return cmd_answers(&dir.unwrap_or_else(cwd), json);
+    }
     let dir = &dir.unwrap_or_else(cwd);
     if propose {
         let survey = ward_daemon::verify_proposal::Survey::of(dir);
@@ -853,14 +886,73 @@ fn cmd_ready(dir: Option<PathBuf>, agent: init::Agent, propose: bool) -> ExitCod
     }
     let key_env = agent.key_env();
     let state = ward_daemon::session::state_root();
-    let mut report = ward_daemon::readiness::check(dir);
-    report.push(credential_row(key_env, &state));
+    let check = || {
+        let mut report = ward_daemon::readiness::check(dir);
+        report.push(credential_row(key_env, &state));
+        report
+    };
+    let mut report = check();
+    if baseline {
+        let refusal = if report.baseline.is_none() {
+            Some(
+                "no verification command is accepted, so there is nothing to run; `ward init \
+                 --accept-verify` accepts one"
+                    .to_owned(),
+            )
+        } else if report.verdict().blocks() {
+            Some(format!(
+                "{} first: a baseline over an unready setup would fail for the setup, not for the \
+                 project's tests; fix the rows marked FAIL, then run it again",
+                report.verdict().word()
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = refusal {
+            print!("{}", render::readiness_panel(&report));
+            eprintln!("ward ready: baseline not run: {why}");
+            return ExitCode::FAILURE;
+        }
+        let mut progress = |step: ward_daemon::baseline::Step, command: &str| match step {
+            ward_daemon::baseline::Step::Capturing => {
+                eprintln!("ward ready: baseline: capturing the current tree for `{command}`");
+            }
+            ward_daemon::baseline::Step::Running => eprintln!(
+                "ward ready: baseline: running `{command}` offline in the verifier's sandbox"
+            ),
+        };
+        if let Err(e) = ward_daemon::baseline::run(&state, dir, &mut progress) {
+            print!("{}", render::readiness_panel(&report));
+            eprintln!("ward ready: baseline not run: {e}");
+            return ExitCode::FAILURE;
+        }
+        report = check();
+    }
     print!("{}", render::readiness_panel(&report));
     if report.verdict().blocks() {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// `ward ready --answers [--json]`: the four E-14 answers for `dir` (#147 item 7), from
+/// what WardOS recorded. Reads only; always exits 0, since "unknown" is an answer.
+fn cmd_answers(dir: &Path, json: bool) -> ExitCode {
+    let state = ward_daemon::session::state_root();
+    let answers = answers::gather(dir, &state);
+    if json {
+        match serde_json::to_string_pretty(&answers) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                eprintln!("ward ready: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        print!("{}", answers::render(&answers));
+    }
+    ExitCode::SUCCESS
 }
 
 /// Whether `key_env` is set (environment, then `<state>/vault/<key_env>`), the same

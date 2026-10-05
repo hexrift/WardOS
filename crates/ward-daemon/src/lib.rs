@@ -20,6 +20,7 @@ pub mod acks;
 pub mod agents;
 pub mod approvals;
 pub mod attempt;
+pub mod baseline;
 pub mod client;
 pub mod control;
 pub mod daemon;

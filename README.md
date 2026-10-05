@@ -66,10 +66,12 @@ Then, in any project, six commands and about five minutes
 ward doctor                        # what this host can give a session, with a fix per gap
 ward vault set ANTHROPIC_API_KEY   # the model key, typed without echo, kept on the host
 ward init                          # policy, verifier config, TamperWard wiring; never overwrites yours; --accept-verify accepts the proposed verify command
-ward ready                         # is this project verifiable yet? policy, runtime, key, protected paths, dependencies prepared
+ward ready                         # is this project verifiable yet? policy, runtime, key, protected paths, dependencies prepared, last baseline
 ward prepare                       # the lockfile's dependency set, installed once, online, sealed for the offline verifier
+ward ready --baseline              # the project's own tests once, offline, before any agent work; red is "baseline failing", not setup required
 ward claude                        # Claude Code in the sandbox; the proxy injects the key
 ward verify                        # the protected tests, from the entry snapshot, offline
+ward ready --answers               # what the agent could reach, which credentials, what it changed, whether it is verified, each with its source
 ```
 
 ## See it running
@@ -120,7 +122,8 @@ an explicit `GAP` row (`ObservationsDropped`) beside the batch it belongs to.
 ```bash
 # the binaries: the release tarball (Get started), install.sh, or cargo build --release
 ward doctor                         # what this host can give a session, with a fix per gap
-ward ready    examples/ward-demo    # is this project verifiable yet? policy, runtime, key, protected paths, dependencies
+ward ready    examples/ward-demo    # is this project verifiable yet? policy, runtime, key, protected paths, dependencies, last baseline
+ward ready    examples/ward-demo --baseline   # run the verify command once over the entry state and record it (red = baseline failing)
 ward prepare  examples/ward-demo    # a Node/Python lockfile's dependency set, installed once online, sealed for the verifier (Cargo needs none)
 ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
 ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live observer
@@ -128,6 +131,7 @@ ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stay
 ward claude   examples/ward-demo --grant github   # …and git/API calls to GitHub through the proxy
 ward status   examples/ward-demo    # the security panel for the active session
 ward verify   examples/ward-demo    # trusted verifier: protected tests from the entry snapshot
+ward ready    examples/ward-demo --answers   # the four E-14 answers from the session's records: reach, credentials, changes, verified
 ward selftest examples/ward-demo    # prove the isolation (38 hostile probes; none reaches its target)
 ward pause    examples/ward-demo    # freeze the agents as one operation: processes, network, credentials, approvals (--reason, --status); each component is reported as it confirms, the last line is the lifecycle state
 ward resume   examples/ward-demo    # let them continue (the same per-component lines, in release order)

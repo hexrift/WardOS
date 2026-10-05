@@ -12,13 +12,17 @@
 //! structured report; the verification boundary proposed from lockfiles and test
 //! configuration and shown until a trusted user accepts it; the prepared dependency
 //! environment's state — prepared, stale, incomplete or never prepared, with its
-//! timings — as the `dependencies` row; Ready / Ready with limitations / Setup
-//! required / Verification unavailable). It does not run the configured command to
-//! distinguish a legitimate pre-existing failing test ("baseline failing") from a
-//! broken setup; that verdict is still a follow-up against #147.
+//! timings — as the `dependencies` row; Ready / Ready with limitations / Baseline
+//! failing / Setup required / Verification unavailable). The check itself never runs
+//! the project's command: it reads the last *baseline* recorded by an explicit `ward
+//! ready --baseline` ([`crate::baseline`]) and holds it against the project as it is
+//! now, so a legitimate pre-existing failing test is reported as "ready, baseline
+//! failing" — the environment is ready, the project's own tests are red — and never as
+//! setup required.
 
 use std::path::{Path, PathBuf};
 
+use crate::baseline;
 use crate::doctor::Status;
 use crate::prepare;
 use crate::verify;
@@ -83,7 +87,7 @@ pub struct Row {
 }
 
 impl Row {
-    fn new(name: &'static str, status: Status, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(name: &'static str, status: Status, detail: impl Into<String>) -> Self {
         Self {
             name,
             status,
@@ -92,8 +96,7 @@ impl Row {
     }
 }
 
-/// The report's overall outcome (#147's suggested five states, minus "baseline
-/// failing" — see the module doc for why that one needs a later PR).
+/// The report's overall outcome (#147's suggested five states).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Every row resolves; an agent can start and `ward verify` can run.
@@ -101,6 +104,11 @@ pub enum Verdict {
     /// Every row resolves well enough to proceed, with a documented degradation
     /// (e.g. nothing is listed under `protected.tests` yet).
     Limited,
+    /// Every row resolves well enough to proceed, and the baseline recorded for the
+    /// project's current tree is red: the accepted command, run offline in the
+    /// verifier's sandbox over the entry state, fails on its own (#147 item 5). A
+    /// pre-existing failure, not a setup gap: it does not block an agent.
+    BaselineFailing,
     /// A row that blocks a session is unresolved (missing runtime, unparsable
     /// policy or verifier config).
     SetupRequired,
@@ -118,6 +126,7 @@ impl Verdict {
         match self {
             Self::Ready => "ready",
             Self::Limited => "ready, with limitations",
+            Self::BaselineFailing => "ready, baseline failing",
             Self::SetupRequired => "setup required",
             Self::Unavailable => "verification unavailable",
         }
@@ -140,12 +149,27 @@ pub struct Report {
     /// What `ward init` would propose, present only while no verify command is
     /// accepted: the proposal itself, or why none can be made.
     pub survey: Option<verify_proposal::Survey>,
+    /// The last baseline held against the project as it is now, present once a
+    /// verify command is accepted (there is nothing to run before that).
+    pub baseline: Option<baseline::Status>,
     /// No verify command is configured and none proposed; see
     /// [`Verdict::Unavailable`].
     unavailable: bool,
 }
 
 impl Report {
+    /// A report with these rows and this baseline, for the renderer's tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(rows: Vec<Row>, baseline: Option<baseline::Status>) -> Self {
+        Self {
+            ecosystem: Ecosystem::Unknown,
+            rows,
+            survey: None,
+            baseline,
+            unavailable: false,
+        }
+    }
+
     /// Append a row a caller computed itself (the CLI adds the credential row,
     /// which needs to know which agent's key to look for — this crate does not).
     pub fn push(&mut self, row: Row) {
@@ -159,6 +183,12 @@ impl Report {
             Verdict::Unavailable
         } else if self.rows.iter().any(|r| r.status == Status::Fail) {
             Verdict::SetupRequired
+        } else if self
+            .baseline
+            .as_ref()
+            .is_some_and(baseline::Status::is_failing)
+        {
+            Verdict::BaselineFailing
         } else if self.rows.iter().any(|r| r.status == Status::Warn) {
             Verdict::Limited
         } else {
@@ -237,6 +267,7 @@ fn check_full(
         .as_ref()
         .is_some_and(|survey| survey.proposals.is_empty());
     rows.push(verify_row);
+    let mut baseline = None;
     if let Some(config) = &config {
         // The prepared dependency environment for the project's current inputs
         // (#147 items 3 and 6), resolved first: when one is ready, its `bin` is on
@@ -269,11 +300,20 @@ fn check_full(
         ));
         rows.push(protected_row(dir, config));
         rows.push(dependencies_row(&dependencies));
+        // The last baseline (#147 item 5), keyed by the tree, the prepared environment
+        // key these same inputs resolve to, and the command: read, never run here.
+        baseline = Some(baseline::status(
+            state,
+            dir,
+            &config.verify.command,
+            baseline::environment_key(&dependencies).as_deref(),
+        ));
     }
     Report {
         ecosystem,
         rows,
         survey,
+        baseline,
         unavailable,
     }
 }
@@ -2500,7 +2540,108 @@ mod tests {
     fn verdict_blocks_only_setup_required_and_unavailable() {
         assert!(!Verdict::Ready.blocks());
         assert!(!Verdict::Limited.blocks());
+        assert!(!Verdict::BaselineFailing.blocks());
         assert!(Verdict::SetupRequired.blocks());
         assert!(Verdict::Unavailable.blocks());
+        assert_eq!(Verdict::BaselineFailing.word(), "ready, baseline failing");
+    }
+
+    /// A project whose accepted command is `echo ok` (resolvable in the verifier's
+    /// system mounts) with one protected path present, and a state root holding a
+    /// baseline recorded for the project's current tree.
+    fn baselined(passed: bool) -> (tempfile::TempDir, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".ward/policy.yaml",
+            ward_policy::Policy::template(),
+        );
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "protected:\n  tests:\n    - tests/\nverify:\n  command: echo ok\n",
+        );
+        write(dir.path(), "tests/run.sh", "exit 1\n");
+        let tree = ward_snapshot::digest_worktree(
+            dir.path(),
+            verify::candidate_options(),
+            &mut ward_snapshot::HashCache::new(),
+        )
+        .unwrap()
+        .to_string();
+        let record = baseline::tests::record(&tree, None, "echo ok", passed);
+        baseline::save(state.path(), dir.path(), &record, &record.output_tail).unwrap();
+        (dir, state)
+    }
+
+    #[test]
+    fn a_current_red_baseline_is_baseline_failing_never_setup_required() {
+        let (dir, state) = baselined(false);
+        let report = check_in(dir.path(), state.path());
+        assert!(
+            report.rows.iter().all(|r| r.status != Status::Fail),
+            "{report:?}"
+        );
+        assert_eq!(report.verdict(), Verdict::BaselineFailing, "{report:?}");
+        assert!(!report.verdict().blocks());
+        assert!(report.baseline.as_ref().unwrap().is_failing());
+        // A limitation elsewhere (the credential row the CLI adds) does not hide it.
+        let mut report = report;
+        report.push(Row::new("credential", Status::Warn, "not set"));
+        assert_eq!(report.verdict(), Verdict::BaselineFailing);
+    }
+
+    #[test]
+    fn setup_required_outranks_a_red_baseline() {
+        let (dir, state) = baselined(false);
+        let mut report = check_in(dir.path(), state.path());
+        report.push(Row::new("credential", Status::Fail, "unreadable"));
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+    }
+
+    #[test]
+    fn a_current_green_baseline_leaves_the_verdict_alone() {
+        let (dir, state) = baselined(true);
+        let report = check_in(dir.path(), state.path());
+        assert!(matches!(
+            report.baseline,
+            Some(baseline::Status::Current(_))
+        ));
+        assert_eq!(report.verdict(), Verdict::Ready, "{report:?}");
+    }
+
+    #[test]
+    fn a_stale_red_baseline_is_history_not_a_verdict() {
+        let (dir, state) = baselined(false);
+        write(dir.path(), "src/new.rs", "fn fixed() {}\n");
+        let report = check_in(dir.path(), state.path());
+        assert!(
+            matches!(&report.baseline, Some(baseline::Status::Stale { why, .. }) if why.contains("tree changed")),
+            "{:?}",
+            report.baseline
+        );
+        assert_eq!(report.verdict(), Verdict::Ready, "{report:?}");
+    }
+
+    #[test]
+    fn no_baseline_is_not_run_and_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify:\n  command: echo ok\n",
+        );
+        let report = check_in(dir.path(), state.path());
+        assert_eq!(report.baseline, Some(baseline::Status::NotRun));
+        assert_eq!(report.verdict(), Verdict::Limited);
+        assert!(
+            !state.path().join(baseline::READINESS_DIR).exists(),
+            "a plain check records nothing"
+        );
+        // Nothing to run without an accepted command: no baseline line at all.
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(check_in(bare.path(), state.path()).baseline, None);
     }
 }

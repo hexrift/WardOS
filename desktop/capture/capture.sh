@@ -123,6 +123,12 @@ bar_ground_is() {
 }
 # pid_gone PID: the process is no longer there (swaybg is replaced, not reloaded).
 pid_gone() { [[ -n $1 ]] && ! kill -0 "$1" 2>/dev/null; }
+# fuzzel_other_than PID: a menu is running and it is not PID (the one just closed).
+fuzzel_other_than() {
+  local now
+  now=$(pgrep -n -u "$UID" -x fuzzel || true)
+  [[ -n $now && $now != "$1" ]]
+}
 # dismiss: Hyprland's own notifications (the overlay toasts top-right: on 0.56, that
 # hyprland-guiutils is not installed and that the .conf format goes in 0.57) are not the
 # desktop and a user clicks them away; no shot has one.
@@ -255,7 +261,20 @@ scene_up() {
   wait_for "the live trust bar" "$limit" bar_live
 }
 
-scene_done() { menu_open wardos-welcome "done"; }
+# The closing step shows the four answers first when the project has a session
+# (ward up ran in scene up), then the closing menu. Leaving the answers card is
+# escaping it and waiting for the next menu: a new fuzzel, not the one killed, on
+# screen. The done scene shoots that closing menu and closes it as before.
+scene_answers() { menu_open wardos-welcome "done"; }
+leave_answers() {
+  local card
+  card=$(pgrep -n -u "$UID" -x fuzzel || true)
+  pkill -u "$UID" -x fuzzel || true
+  wait_for "the answers card to close" 20 pid_gone "$card"
+  wait_for "the closing menu" "$limit" fuzzel_other_than "$card"
+  wait_for "the closing menu on screen" "$limit" layer_up launcher
+}
+scene_done() { wait_for "the closing menu" "$limit" layer_up launcher; }
 leave_done() {
   menu_close
   wait_for "the welcome toast" "$limit" layer_up notifications

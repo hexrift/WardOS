@@ -41,6 +41,48 @@ pub fn cat(state: &Path, id: SnapshotId, path: &Path) -> Result<Vec<u8>> {
         .map_err(|e| Error::Snapshot(e.to_string()))
 }
 
+/// The worktree as it is now, held against a stored snapshot (#147 item 7: "what did
+/// the agent change"). Digested with the capture options a session's entry snapshot and
+/// a verification candidate use, so the ids agree byte for byte; nothing is stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeChanges {
+    /// The id the worktree would get if captured now, as the log names snapshots; or why
+    /// it cannot be digested.
+    pub worktree: std::result::Result<ward_events::SnapshotId, String>,
+    /// The paths that differ from the stored snapshot; or why that cannot be said (the
+    /// worktree cannot be digested, or the snapshot is not in the store).
+    pub changes: std::result::Result<DiffReport, String>,
+}
+
+/// [`WorktreeChanges`] for `dir` against the stored snapshot `entry` (`blake3:…`).
+#[must_use]
+pub fn worktree_changes(state: &Path, entry: &str, dir: &Path) -> WorktreeChanges {
+    let now = ward_snapshot::digest_manifest(
+        dir,
+        crate::verify::candidate_options(),
+        &mut ward_snapshot::HashCache::new(),
+        &mut ward_snapshot::CaptureStats::default(),
+    )
+    .map_err(|e| format!("the worktree cannot be digested ({e})"));
+    let worktree = now
+        .as_ref()
+        .map(|m| crate::ids::ev_snapshot(m.id()))
+        .map_err(Clone::clone);
+    let changes = now.and_then(|now| {
+        let stored = parse_id(entry)
+            .and_then(|id| {
+                open_store(state)?
+                    .manifest(id)
+                    .map_err(|e| Error::Snapshot(e.to_string()))
+            })
+            .map_err(|e| {
+                format!("the entry snapshot {entry} cannot be read from the store ({e})")
+            })?;
+        Ok(DiffReport::from(&ManifestDiff::between(&stored, &now)))
+    });
+    WorktreeChanges { worktree, changes }
+}
+
 /// A [`ManifestDiff`] with paths as text, for rendering and JSON.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffReport {
@@ -90,6 +132,48 @@ mod tests {
         assert_eq!(a.to_string(), format!("blake3:{hex}"));
         assert!(parse_id(&hex[..12]).is_err(), "a prefix is not a lookup");
         assert!(parse_id("blake3:zz").is_err());
+    }
+
+    #[test]
+    fn worktree_changes_hold_the_worktree_against_a_stored_snapshot() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kept.txt"), "k\n").unwrap();
+        std::fs::write(dir.path().join("edited.txt"), "before\n").unwrap();
+        std::fs::write(dir.path().join("removed.txt"), "r\n").unwrap();
+        let entry = open_store(state.path())
+            .unwrap()
+            .store_snapshot(
+                dir.path(),
+                ward_snapshot::SnapshotRole::Entry,
+                crate::verify::candidate_options(),
+            )
+            .unwrap()
+            .to_string();
+        let same = worktree_changes(state.path(), &entry, dir.path());
+        assert!(same.changes.unwrap().is_empty());
+        assert_eq!(same.worktree.unwrap().to_string(), entry);
+
+        std::fs::write(dir.path().join("edited.txt"), "after\n").unwrap();
+        std::fs::remove_file(dir.path().join("removed.txt")).unwrap();
+        std::fs::write(dir.path().join("added.txt"), "a\n").unwrap();
+        let moved = worktree_changes(state.path(), &entry, dir.path());
+        let changes = moved.changes.unwrap();
+        assert_eq!(changes.added, ["added.txt"]);
+        assert_eq!(changes.changed, ["edited.txt"]);
+        assert_eq!(changes.removed, ["removed.txt"]);
+        assert_ne!(moved.worktree.unwrap().to_string(), entry);
+
+        let missing = worktree_changes(
+            state.path(),
+            &format!("blake3:{}", "ab".repeat(32)),
+            dir.path(),
+        );
+        assert!(missing.worktree.is_ok());
+        assert!(missing.changes.unwrap_err().contains("cannot be read"));
+        let gone = worktree_changes(state.path(), &entry, &dir.path().join("nowhere"));
+        assert!(gone.worktree.is_err());
+        assert!(gone.changes.unwrap_err().contains("cannot be digested"));
     }
 
     #[test]
