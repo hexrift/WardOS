@@ -3,7 +3,13 @@
 Status: living document. It describes the `ward-node` protocol 1.3 contract as
 implemented today (ADR-0030 steps 1–9), and the client and process adapter that drive it
 (§11). The cross-system acceptance suite that proves it against a real node (ADR-0030
-step 10, #332 slice 9) is [node-acceptance.md](node-acceptance.md).
+step 10, #332 slice 9) is [node-acceptance.md](node-acceptance.md). Three companion
+documents (ADR-0030 step 11, #332 slice 10): the walk from an empty host to a verified
+attempt is [node-integration-guide.md](node-integration-guide.md); what the node does
+not enforce yet, with the impact and the issue for each gap, is
+[node-security-limitations.md](node-security-limitations.md); what CI proves about all
+of this on every change and what a release publishes is
+[node-release-readiness.md](node-release-readiness.md).
 
 This is the contract an adapter drives, in any language, to have a local `ward-node`
 admit, run, pause, stop, revoke and seal a task. Every protocol message below was
@@ -29,7 +35,8 @@ admission example is a working test vector (§7.4).
   planes in other languages), §11. Both run on the node's host, as the node's uid.
 - Not implemented yet: that allowlist, an event stream (`stream`), and any remote
   transport or mTLS. The only transport is a local Unix socket; remote transport and key
-  bootstrap are #262.
+  bootstrap are #262. The full list, with what each gap means for a control plane, is
+  [node-security-limitations.md](node-security-limitations.md) §3.
 
 ## 2. Operator setup
 
@@ -1201,4 +1208,6 @@ bad flags. A command line is at most 256 KiB.
 The honest integration shape today is therefore running governed tool actions and
 verification runs, an `argv` over a snapshot with a budget, through the node, reading the
 receipt and the evidence log, and not hosting a whole agent runtime whose conversation
-loop needs output, network or callbacks from inside the sandbox.
+loop needs output, network or callbacks from inside the sandbox. Each of these gaps,
+with its impact, the mitigation available today and the issue that closes it, is a row
+of [node-security-limitations.md](node-security-limitations.md) §3.

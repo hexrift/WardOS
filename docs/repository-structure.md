@@ -24,6 +24,9 @@ wardos/
 │   ├── development-under-tamperward.md
 │   ├── node-integration.md        # the ward-node contract for external control planes
 │   ├── node-acceptance.md         # the cross-system acceptance suite that proves it
+│   ├── node-integration-guide.md  # an operator's walk from an empty host to a verified attempt
+│   ├── node-security-limitations.md # what the node enforces and what it does not yet
+│   ├── node-release-readiness.md  # what CI proves about the node and what a release publishes
 │   ├── design-language.md
 │   ├── performance.md
 │   ├── experiments.md

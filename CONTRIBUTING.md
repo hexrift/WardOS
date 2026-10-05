@@ -93,6 +93,13 @@ release is cut:
    the matching `v0.19.0` tag. The release workflow independently refuses a tag
    that does not exactly match the merged workspace version.
 
+If the release carries `ward-node` changes, the release PR also records the six checks
+of [`docs/node-release-readiness.md`](docs/node-release-readiness.md) §4: the protocol
+window marker agrees with the code, the acceptance table is green on the release commit,
+the status line of `docs/node-integration.md` §1 names what ships, the limitations list
+is current, the documents are in the tarball, and the node binaries build `--locked`
+from the tag.
+
 Choose the release number from the set of changes being released:
 
 * **PATCH** (`0.18.1` → `0.18.2`) — backwards-compatible fixes.

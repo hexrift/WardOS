@@ -144,6 +144,10 @@ minute on a developer machine; each case prints its own time.
 - **No TamperWard verdicts.** The suite says what the node did; whether a result is
   certified is the external control plane's decision (ADR-0029).
 
+Each of these, with its impact for a control plane and the issue that closes it, is a
+row of [node-security-limitations.md](node-security-limitations.md) §3; where this suite
+runs in CI and what else CI proves is [node-release-readiness.md](node-release-readiness.md).
+
 ## 5. Findings recorded by the suite
 
 - The environment a workload is exec'd with carries `PWD=/work` beside `HOME`, `PATH`

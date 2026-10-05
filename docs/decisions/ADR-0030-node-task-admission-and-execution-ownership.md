@@ -1,7 +1,8 @@
 # ADR-0030 — ward-node task admission, execution ownership and exit semantics
 
-Status: **Accepted; implementation tracked by #324 (with #259 and #262), under #332
-slices 5–9.**
+Status: **Accepted; implemented under #332 slices 5–10 (tracked by #324, with #259
+and #262).** Steps 1–11 below are done; what the implementation does not enforce yet is
+[node-security-limitations.md](../node-security-limitations.md).
 
 This records the decisions #326 asked for before `ward-node` may execute anything. It
 follows ADR-0029: the node is the trusted execution authority on its host, and an
@@ -138,6 +139,13 @@ their state, receipt and applied operation ids (#332 slice 7).
   private seed file; a pre-signed envelope is transported byte for byte.
 - The node's trusted computing base grows by a signature verifier and a durable
   revocation and version store, and does not grow by the daemon's network stack.
+- What is not enforced at this revision is stated, not implied: no remote transport or
+  mTLS, no network grants, no result return, no callback channel, a receipt the protocol
+  does not bind to the evidence head, a manually bootstrapped trust store, same-uid
+  co-location of client and node, and no resource limit beyond the wall-clock budget.
+  Each gap, its impact for a control plane, the mitigation available today and the
+  issue that closes it is a row of
+  [node-security-limitations.md](../node-security-limitations.md) §3.
 
 ## Performance consequences
 
@@ -215,6 +223,16 @@ TDD slices without guessing at semantics inside a feature PR.
     the merge gate with isolation required and through `scripts/acceptance/node.sh`,
     which prints one verdict per case.
 
+11. Integration documentation, security limitations and release-readiness evidence
+    (#332 slice 10): an operator and control-plane walk from an empty host to a
+    verified attempt ([node-integration-guide.md](../node-integration-guide.md)), the
+    security statement of what the node enforces and what it does not, each gap with
+    its impact, mitigation and closing issue
+    ([node-security-limitations.md](../node-security-limitations.md)), and the
+    statement of what CI proves on every change, what a release publishes and what is
+    not proven ([node-release-readiness.md](../node-release-readiness.md)).
+
 Steps 1–9 are written down as the external contract in
 [node-integration.md](../node-integration.md); step 10 is its acceptance,
-[node-acceptance.md](../node-acceptance.md).
+[node-acceptance.md](../node-acceptance.md); step 11 is the guide, the limitations and
+the release-readiness evidence beside them.

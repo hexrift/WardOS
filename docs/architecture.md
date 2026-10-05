@@ -575,7 +575,10 @@ once by inspect-and-replay and otherwise reports `unknown`. The `ward-node-adapt
 binary speaks the same over stdin/stdout JSON lines for control planes in other
 languages, transports pre-signed envelopes byte for byte so key custody stays outside
 WardOS, and turns `SIGTERM` into revoke-and-seal. Both run on the node's host as the
-node's uid; remote transport is #262.
+node's uid; remote transport is #262. What the node does not enforce at this revision,
+gap by gap, is [node-security-limitations.md](node-security-limitations.md); the walk
+from an empty host to a verified attempt is
+[node-integration-guide.md](node-integration-guide.md).
 
 ---
 
