@@ -63,6 +63,17 @@ pub enum Error {
 /// Daemon result alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl From<ward_launch::Error> for Error {
+    /// One to one: `ward-launch`'s two variants are this type's `Io` and
+    /// `Sandbox`, with the same messages, so the move changed no error text.
+    fn from(e: ward_launch::Error) -> Self {
+        match e {
+            ward_launch::Error::Io { path, source } => Self::Io { path, source },
+            ward_launch::Error::Sandbox(msg) => Self::Sandbox(msg),
+        }
+    }
+}
+
 impl Error {
     pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::Io {
