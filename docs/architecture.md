@@ -355,6 +355,17 @@ After negotiation, the local node serves one request per connection. Protocol
 lifecycle request. Capability responses retain the same node facts while naming
 the exact negotiated version. Protocol 1.0 has no discovery endpoint.
 
+### 3.11 Node admission and execution ownership (decided, not yet implemented)
+
+[ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md) settles
+how the node will execute. Protocol 1.3 adds an `admit` verb carrying one signed,
+audience-bound, versioned admission envelope (binding, agent, node, session, lease and
+lineage, workload, mandatory budget). The workspace is allocated by the node under its
+configured task root. The node owns spawn, reaping, budget enforcement and per-attempt
+evidence. `start` and `stop` ship together. Natural exit is a distinct `Exited` state
+with a real receipt, and an ambiguous launch is `Unknown` and never retried. None of this
+is implemented yet; #324 tracks the slices.
+
 ---
 
 ## 4. Session lifecycle
