@@ -407,7 +407,9 @@ pub struct LifecycleCapabilities {
     pub pause: bool,
     /// Running work can be stopped by the host boundary.
     pub stop: bool,
-    /// Temporary grants can be revoked by the host boundary.
+    /// The node serves `revoke`: it durably revokes a task's lease, so no later admission
+    /// or start under that lease (or a lease delegated from it) is accepted, and kills and
+    /// reaps the task's workload.
     pub revoke: bool,
     /// Signed admission envelopes are verified and admitted (`admit`). Protocol 1.3 and
     /// later only: a document for an earlier version never carries this field, and a 1.3
@@ -1012,9 +1014,8 @@ pub enum TaskLifecycleRejectionReason {
     ///   version the node durably accepted for the same task (an old or replayed
     ///   envelope, including after a node restart);
     /// * for any mutating verb, the request's idempotency id has already been superseded
-    ///   by a later operation on the task.
-    ///
-    /// `ward-node` currently returns it only in the first case, from `admit`.
+    ///   by a later operation on the task, or names an execution attempt that a later
+    ///   attempt of the task has replaced.
     StaleOperation,
     /// The task is not in a state that allows this operation.
     InvalidState,
@@ -1336,8 +1337,8 @@ pub enum TaskLifecycleResponse {
         binding: TaskBinding,
         /// The task's current lifecycle state.
         state: TaskLifecycleState,
-        /// The outcome of the attempt's execution receipt, for an `exited` or `stopped`
-        /// task that has one. Protocol 1.3 and later only.
+        /// The outcome of the attempt's execution receipt, for an `exited`, `stopped`,
+        /// `revoked` or `sealed` task that has one. Protocol 1.3 and later only.
         outcome: Option<TaskExecutionOutcome>,
     },
     /// The task's event stream is ready starting from a given sequence number.
@@ -1392,12 +1393,17 @@ impl TaskLifecycleResponse {
     }
 }
 
-/// Whether an inspect response at `protocol` may carry a receipt outcome for `state`.
+/// Whether an inspect response at `protocol` may carry a receipt outcome for `state`: at
+/// 1.3 and later, for a task whose attempt has ended (`exited`, `stopped`, `revoked` or
+/// `sealed`).
 const fn supports_outcome(protocol: ProtocolVersion, state: TaskLifecycleState) -> bool {
     supports_task_admission(protocol)
         && matches!(
             state,
-            TaskLifecycleState::Exited | TaskLifecycleState::Stopped
+            TaskLifecycleState::Exited
+                | TaskLifecycleState::Stopped
+                | TaskLifecycleState::Revoked
+                | TaskLifecycleState::Sealed
         )
 }
 
@@ -1792,7 +1798,8 @@ impl TaskLifecycleContext {
     /// # Errors
     ///
     /// Returns [`TaskLifecycleError::UnsupportedByProtocol`] before protocol 1.3, or for a
-    /// state other than [`TaskLifecycleState::Exited`] or [`TaskLifecycleState::Stopped`].
+    /// state other than [`TaskLifecycleState::Exited`], [`TaskLifecycleState::Stopped`],
+    /// [`TaskLifecycleState::Revoked`] or [`TaskLifecycleState::Sealed`].
     pub const fn inspected_with_outcome(
         self,
         binding: TaskBinding,
@@ -3004,6 +3011,24 @@ mod tests {
                 "stopped",
                 "failed",
             ),
+            (
+                TaskLifecycleState::Revoked,
+                TaskExecutionOutcome::Failed,
+                "revoked",
+                "failed",
+            ),
+            (
+                TaskLifecycleState::Revoked,
+                TaskExecutionOutcome::Completed,
+                "revoked",
+                "completed",
+            ),
+            (
+                TaskLifecycleState::Sealed,
+                TaskExecutionOutcome::Unknown,
+                "sealed",
+                "unknown",
+            ),
         ] {
             let response = context
                 .inspected_with_outcome(binding, state, outcome)
@@ -3033,8 +3058,6 @@ mod tests {
             TaskLifecycleState::Ready,
             TaskLifecycleState::Running,
             TaskLifecycleState::Paused,
-            TaskLifecycleState::Revoked,
-            TaskLifecycleState::Sealed,
         ] {
             assert_eq!(
                 one_three.inspected_with_outcome(binding, state, outcome),
@@ -3094,6 +3117,79 @@ mod tests {
                 context.decode_response(&raw),
                 Err(TaskLifecycleError::MalformedMessage),
                 "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn revoked_and_sealed_outcomes_are_one_three_only() {
+        let one_three = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let one_two = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        let binding = lifecycle_binding();
+        let outcome = TaskExecutionOutcome::Failed;
+        for state in [TaskLifecycleState::Revoked, TaskLifecycleState::Sealed] {
+            assert_eq!(
+                one_two.inspected_with_outcome(binding, state, outcome),
+                Err(TaskLifecycleError::UnsupportedByProtocol),
+                "{state:?}"
+            );
+            let forged = TaskLifecycleResponse::Inspected {
+                protocol: ProtocolVersion::new(1, 2),
+                binding,
+                state,
+                outcome: Some(outcome),
+            };
+            assert!(serde_json::to_string(&forged).is_err(), "{state:?}");
+            assert!(
+                one_three
+                    .inspected_with_outcome(binding, state, outcome)
+                    .is_ok()
+            );
+        }
+
+        for (context, raw) in [
+            (
+                one_two,
+                format!(
+                    r#"{{"response":"inspected","protocol":{{"major":1,"minor":2}},{BOUND_BINDING},"state":"revoked","outcome":"failed"}}"#
+                ),
+            ),
+            (
+                one_two,
+                format!(
+                    r#"{{"response":"inspected","protocol":{{"major":1,"minor":2}},{BOUND_BINDING},"state":"sealed","outcome":"completed"}}"#
+                ),
+            ),
+            (
+                one_three,
+                format!(
+                    r#"{{"response":"inspected","protocol":{{"major":1,"minor":3}},{BOUND_BINDING},"state":"paused","outcome":"failed"}}"#
+                ),
+            ),
+            (
+                one_three,
+                format!(
+                    r#"{{"response":"accepted","protocol":{{"major":1,"minor":3}},"operation_id":11,{BOUND_BINDING},"state":"sealed","outcome":"failed"}}"#
+                ),
+            ),
+        ] {
+            assert_eq!(
+                context.decode_response(&raw),
+                Err(TaskLifecycleError::MalformedMessage),
+                "{raw}"
+            );
+        }
+        for state in ["revoked", "sealed"] {
+            assert_eq!(
+                one_two.decode_response(&format!(
+                    r#"{{"response":"inspected","protocol":{{"major":1,"minor":2}},{BOUND_BINDING},"state":"{state}"}}"#
+                )),
+                Ok(one_two.inspected(binding, if state == "revoked" {
+                    TaskLifecycleState::Revoked
+                } else {
+                    TaskLifecycleState::Sealed
+                })),
+                "a 1.2 response without an outcome is unchanged"
             );
         }
     }

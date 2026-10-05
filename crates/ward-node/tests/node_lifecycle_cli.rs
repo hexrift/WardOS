@@ -484,7 +484,12 @@ fn ward_node_revokes_a_running_task_and_refuses_its_lease_after_a_restart() {
     wait_until_gone(&pids);
     assert_eq!(
         node.lifecycle(&ctx.inspect(binding())),
-        ctx.inspected(binding(), TaskLifecycleState::Revoked)
+        ctx.inspected_with_outcome(
+            binding(),
+            TaskLifecycleState::Revoked,
+            TaskExecutionOutcome::Failed
+        )
+        .unwrap()
     );
 
     drop(node);

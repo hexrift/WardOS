@@ -9,14 +9,22 @@
 //!   task, as `{"format":1,"versions":{"task_…":N}}`;
 //! * `revocations.json` — known lease revocation facts, as
 //!   `{"format":1,"revocations":[{"lease":"lease_…","revoked_at_unix_ms":N,"reason":"operator"}]}`
-//!   with reasons `operator`, `policy`, `delegation_revoked` or `security`.
+//!   with reasons `operator`, `policy`, `delegation_revoked` or `security`;
+//! * `retired-attempts.json` — per task, the execution attempts a later attempt replaced, as
+//!   `{"format":1,"attempts":{"task_…":["exec_…"]}}`. A retired attempt is never registered
+//!   again. At most [`MAX_RETIRED_ATTEMPTS_PER_TASK`] per task and [`MAX_RETIRED_ATTEMPTS`]
+//!   in all are kept; once a bound is reached, retiring another attempt is refused rather
+//!   than forgetting one.
 //!
 //! Every write goes to a temporary file in the same directory, is fsynced, renamed over
 //! the target and the directory is fsynced, so a crash leaves either the old or the new
 //! content. A store is updated on disk before the in-memory view, so a failed write
-//! changes nothing. Malformed or oversized files fail closed when the state is opened.
+//! changes nothing. Malformed or oversized files fail closed when the state is opened, so
+//! a write that would make a file larger than [`MAX_STATE_FILE_BYTES`] is refused
+//! ([`NodeStateError::StoreFull`]) with nothing changed: the node never writes a file it
+//! could not load again.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -25,7 +33,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ward_authority::revocation::{AuthorityRevocation, AuthorityRevocations, RevocationReason};
-use ward_events::{LeaseId, NodeId, TaskId};
+use ward_events::{ExecutionAttemptId, LeaseId, NodeId, TaskId};
 use ward_node_protocol::AdmissionVersion;
 
 /// File pinning the node identity inside the state directory.
@@ -34,8 +42,15 @@ pub const NODE_ID_FILE: &str = "node-id";
 pub const ADMISSION_VERSIONS_FILE: &str = "admission-versions.json";
 /// File holding known revocation facts.
 pub const REVOCATIONS_FILE: &str = "revocations.json";
-/// Maximum size in bytes of one state file.
+/// File holding, per task, the execution attempts a later attempt replaced.
+pub const RETIRED_ATTEMPTS_FILE: &str = "retired-attempts.json";
+/// Maximum size in bytes of one state file, enforced when it is loaded and when it is
+/// written.
 pub const MAX_STATE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum number of retired execution attempts recorded for one task.
+pub const MAX_RETIRED_ATTEMPTS_PER_TASK: usize = 256;
+/// Maximum number of retired execution attempts recorded across all tasks.
+pub const MAX_RETIRED_ATTEMPTS: usize = 65_536;
 
 const STATE_FORMAT: u32 = 1;
 
@@ -67,6 +82,10 @@ pub enum NodeStateError {
     /// lease, which is now unusable.
     #[error("conflicting revocation facts for one lease")]
     RevocationConflict,
+    /// The write would make the state file larger than [`MAX_STATE_FILE_BYTES`], or the
+    /// retired-attempt store is at one of its bounds; nothing was changed.
+    #[error("node state file {0} is full")]
+    StoreFull(&'static str),
 }
 
 /// Open (creating mode 0700 if absent) the private node state directory `dir`, without
@@ -102,6 +121,7 @@ pub struct NodeState {
     versions: BTreeMap<TaskId, AdmissionVersion>,
     revocation_facts: Vec<AuthorityRevocation>,
     revocations: AuthorityRevocations,
+    retired: BTreeMap<TaskId, BTreeSet<ExecutionAttemptId>>,
 }
 
 impl NodeState {
@@ -156,12 +176,26 @@ impl NodeState {
             }
         }
 
+        let retired = match read_state_file(dir, RETIRED_ATTEMPTS_FILE)? {
+            Some(text) => {
+                serde_json::from_str::<RetiredAttemptsFile>(&text)
+                    .ok()
+                    .filter(|file| {
+                        file.format == STATE_FORMAT && within_retired_bounds(&file.attempts)
+                    })
+                    .ok_or(NodeStateError::InvalidFile(RETIRED_ATTEMPTS_FILE))?
+                    .attempts
+            }
+            None => BTreeMap::new(),
+        };
+
         Ok(Self {
             dir: dir.to_path_buf(),
             node,
             versions,
             revocation_facts,
             revocations,
+            retired,
         })
     }
 
@@ -231,11 +265,14 @@ impl NodeState {
     /// Durably record one trusted revocation fact.
     ///
     /// Replaying the exact same fact changes nothing. A different fact for an already
-    /// revoked lease is persisted and marks that lease conflicted (and so unusable).
+    /// revoked lease is persisted and marks that lease conflicted (and so unusable). Facts
+    /// are never removed: once the store cannot take another fact within
+    /// [`MAX_STATE_FILE_BYTES`], the fact is refused rather than an older one dropped.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error (nothing changes), or
+    /// Returns [`NodeStateError::StoreFull`] when the store would exceed
+    /// [`MAX_STATE_FILE_BYTES`] or an I/O error (nothing changes either way), or
     /// [`NodeStateError::RevocationConflict`] after persisting a conflicting fact.
     pub fn record_revocation(
         &mut self,
@@ -269,6 +306,54 @@ impl NodeState {
     }
 }
 
+impl NodeState {
+    /// Whether `attempt` of `task` was replaced by a later attempt and so may never be
+    /// registered again.
+    #[must_use]
+    pub fn is_retired_attempt(&self, task: TaskId, attempt: ExecutionAttemptId) -> bool {
+        self.retired
+            .get(&task)
+            .is_some_and(|attempts| attempts.contains(&attempt))
+    }
+
+    /// Durably record that `attempt` of `task` has been replaced. Recording an attempt
+    /// that is already retired changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeStateError::StoreFull`] when `task` already has
+    /// [`MAX_RETIRED_ATTEMPTS_PER_TASK`] retired attempts or the store holds
+    /// [`MAX_RETIRED_ATTEMPTS`], or an I/O error; nothing changes on error.
+    pub fn retire_attempt(
+        &mut self,
+        task: TaskId,
+        attempt: ExecutionAttemptId,
+    ) -> Result<(), NodeStateError> {
+        if self.is_retired_attempt(task, attempt) {
+            return Ok(());
+        }
+        let mut attempts = self.retired.clone();
+        attempts.entry(task).or_default().insert(attempt);
+        if !within_retired_bounds(&attempts) {
+            return Err(NodeStateError::StoreFull(RETIRED_ATTEMPTS_FILE));
+        }
+        let file = RetiredAttemptsFile {
+            format: STATE_FORMAT,
+            attempts,
+        };
+        write_json(&self.dir, RETIRED_ATTEMPTS_FILE, &file)?;
+        self.retired = file.attempts;
+        Ok(())
+    }
+}
+
+fn within_retired_bounds(attempts: &BTreeMap<TaskId, BTreeSet<ExecutionAttemptId>>) -> bool {
+    attempts
+        .values()
+        .all(|retired| retired.len() <= MAX_RETIRED_ATTEMPTS_PER_TASK)
+        && attempts.values().map(BTreeSet::len).sum::<usize>() <= MAX_RETIRED_ATTEMPTS
+}
+
 fn read_state_file(dir: &Path, name: &'static str) -> Result<Option<String>, NodeStateError> {
     let path = dir.join(name);
     let metadata = match std::fs::symlink_metadata(&path) {
@@ -291,8 +376,15 @@ fn read_state_file(dir: &Path, name: &'static str) -> Result<Option<String>, Nod
         .map_err(|_| NodeStateError::InvalidFile(name))
 }
 
-fn write_json(dir: &Path, name: &str, value: &impl Serialize) -> Result<(), NodeStateError> {
+fn write_json(
+    dir: &Path,
+    name: &'static str,
+    value: &impl Serialize,
+) -> Result<(), NodeStateError> {
     let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_STATE_FILE_BYTES) {
+        return Err(NodeStateError::StoreFull(name));
+    }
     write_atomic(dir, name, &bytes)
 }
 
@@ -329,6 +421,13 @@ struct VersionsFile {
 struct RevocationsFile {
     format: u32,
     revocations: Vec<RevocationRecord>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredAttemptsFile {
+    format: u32,
+    attempts: BTreeMap<TaskId, BTreeSet<ExecutionAttemptId>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -534,6 +633,125 @@ mod tests {
     }
 
     #[test]
+    fn a_revocation_that_would_overflow_the_store_is_refused_and_the_node_still_starts() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("state");
+        drop(NodeState::open(&dir, node()).unwrap());
+        crate::test_support::fill_revocations(&dir);
+        let before = std::fs::read(dir.join(REVOCATIONS_FILE)).unwrap();
+        let lease = trusted_root_lease();
+
+        let mut state = NodeState::open(&dir, node()).unwrap();
+        assert!(matches!(
+            state.record_revocation(AuthorityRevocation::new(
+                lease.id(),
+                3_000,
+                RevocationReason::Operator
+            )),
+            Err(NodeStateError::StoreFull(REVOCATIONS_FILE))
+        ));
+        assert!(usable(&state, &lease, 5_000), "nothing was recorded");
+        assert!(state.revocation(lease.id()).is_none());
+        assert_eq!(std::fs::read(dir.join(REVOCATIONS_FILE)).unwrap(), before);
+        drop(state);
+
+        let state = NodeState::open(&dir, node()).unwrap();
+        assert!(usable(&state, &lease, 5_000));
+    }
+
+    fn attempt(value: u128) -> ExecutionAttemptId {
+        ExecutionAttemptId::from_u128(value)
+    }
+
+    #[test]
+    fn retired_attempts_are_durable_per_task_and_survive_restart() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("state");
+        let (task, other) = (TaskId::from_u128(7), TaskId::from_u128(8));
+
+        let mut state = NodeState::open(&dir, node()).unwrap();
+        assert!(!state.is_retired_attempt(task, attempt(1)));
+        state.retire_attempt(task, attempt(1)).unwrap();
+        state.retire_attempt(task, attempt(1)).unwrap();
+        state.retire_attempt(other, attempt(2)).unwrap();
+        assert!(state.is_retired_attempt(task, attempt(1)));
+        assert!(!state.is_retired_attempt(other, attempt(1)));
+        assert!(!state.is_retired_attempt(task, attempt(2)));
+        assert_eq!(mode(&dir.join(RETIRED_ATTEMPTS_FILE)), 0o600);
+        drop(state);
+
+        let state = NodeState::open(&dir, node()).unwrap();
+        assert!(state.is_retired_attempt(task, attempt(1)));
+        assert!(state.is_retired_attempt(other, attempt(2)));
+        assert!(!state.is_retired_attempt(task, attempt(2)));
+    }
+
+    #[test]
+    fn a_full_retired_attempt_store_refuses_rather_than_forgets() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("state");
+        let task = TaskId::from_u128(7);
+        let mut state = NodeState::open(&dir, node()).unwrap();
+        for value in 0..MAX_RETIRED_ATTEMPTS_PER_TASK {
+            state
+                .retire_attempt(task, attempt(u128::try_from(value).unwrap()))
+                .unwrap();
+        }
+        let next = attempt(u128::try_from(MAX_RETIRED_ATTEMPTS_PER_TASK).unwrap());
+        assert!(matches!(
+            state.retire_attempt(task, next),
+            Err(NodeStateError::StoreFull(RETIRED_ATTEMPTS_FILE))
+        ));
+        assert!(!state.is_retired_attempt(task, next));
+        assert!(state.is_retired_attempt(task, attempt(0)));
+        state.retire_attempt(task, attempt(0)).unwrap();
+        state
+            .retire_attempt(TaskId::from_u128(8), attempt(0))
+            .unwrap();
+        drop(state);
+
+        let attempts: BTreeMap<TaskId, BTreeSet<ExecutionAttemptId>> = (0..MAX_RETIRED_ATTEMPTS)
+            .map(|value| {
+                let value = u128::try_from(value).unwrap();
+                (
+                    TaskId::from_u128(1_000 + value),
+                    BTreeSet::from([attempt(value)]),
+                )
+            })
+            .collect();
+        write_json(
+            &dir,
+            RETIRED_ATTEMPTS_FILE,
+            &RetiredAttemptsFile {
+                format: STATE_FORMAT,
+                attempts,
+            },
+        )
+        .unwrap();
+        let mut state = NodeState::open(&dir, node()).unwrap();
+        assert!(matches!(
+            state.retire_attempt(task, attempt(1)),
+            Err(NodeStateError::StoreFull(RETIRED_ATTEMPTS_FILE))
+        ));
+        assert!(state.is_retired_attempt(TaskId::from_u128(1_000), attempt(0)));
+        assert!(!state.is_retired_attempt(task, attempt(1)));
+    }
+
+    #[test]
+    fn a_failed_retired_attempt_write_changes_nothing() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("state");
+        let task = TaskId::from_u128(7);
+        let mut state = NodeState::open(&dir, node()).unwrap();
+        std::fs::create_dir_all(dir.join(RETIRED_ATTEMPTS_FILE).join("blocker")).unwrap();
+        assert!(matches!(
+            state.retire_attempt(task, attempt(1)),
+            Err(NodeStateError::Io(_))
+        ));
+        assert!(!state.is_retired_attempt(task, attempt(1)));
+    }
+
+    #[test]
     fn malformed_or_oversized_state_files_fail_closed() {
         for (file, content) in [
             (ADMISSION_VERSIONS_FILE, "{not json".to_owned()),
@@ -555,6 +773,25 @@ mod tests {
                     .to_owned(),
             ),
             (NODE_ID_FILE, "not-a-node-id\n".to_owned()),
+            (
+                RETIRED_ATTEMPTS_FILE,
+                r#"{"format":2,"attempts":{}}"#.to_owned(),
+            ),
+            (
+                RETIRED_ATTEMPTS_FILE,
+                r#"{"format":1,"attempts":{"task_00000000000000000000000007":["lease_00000000000000000000000009"]}}"#
+                    .to_owned(),
+            ),
+            (
+                RETIRED_ATTEMPTS_FILE,
+                format!(
+                    r#"{{"format":1,"attempts":{{"task_00000000000000000000000007":[{}]}}}}"#,
+                    (0..=MAX_RETIRED_ATTEMPTS_PER_TASK)
+                        .map(|value| format!(r#""{}""#, attempt(u128::try_from(value).unwrap())))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            ),
             (
                 ADMISSION_VERSIONS_FILE,
                 " ".repeat(usize::try_from(MAX_STATE_FILE_BYTES).unwrap() + 1),

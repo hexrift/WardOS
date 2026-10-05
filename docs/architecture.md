@@ -394,8 +394,10 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issu
 
 `--node-id` is the node's audience; the state directory (created mode 0700, refused if
 group- or world-accessible) pins it at first start and holds `admission-versions.json`
-(last accepted version per task) and `revocations.json` (known revocation facts), each
-replaced atomically (temporary file, fsync, rename). The trust-store file lists one
+(last accepted version per task), `revocations.json` (known revocation facts) and
+`retired-attempts.json` (attempt ids a later attempt replaced), each replaced atomically
+(temporary file, fsync, rename) and never written larger than the 8 MiB the node accepts
+when it loads them (the write is refused instead). The trust-store file lists one
 issuer per line as `<public-key> [<key-id>] <prn_…>`: a lowercase hex Ed25519 public
 key, optionally its key id, and the one principal the key may issue authority as, with
 `#` comments; a key id is the `BLAKE3` hash of the 32-byte public key, so
@@ -452,8 +454,9 @@ answering `stopped` (a `ready` task stops without spawning); its receipt is `fai
 terminal state: `exited` if the workload had already exited (the stop is
 `invalid_state`), otherwise `stopped`. A stop not confirmed within its timeout is
 `resource_unavailable` and can be replayed. Replaying the `start` or `stop` that took
-effect returns the task's current state. 1.3 `inspect` of an `exited` or `stopped` task
-adds `"outcome"`; a 1.2 connection reads an exited task as `stopped`. Serving never waits
+effect returns the task's current state. 1.3 `inspect` of an `exited`, `stopped`,
+`revoked` or `sealed` task adds `"outcome"`; a 1.2 connection reads an exited task as
+`stopped`. Serving never waits
 on a running workload.
 
 `pause` moves a `running` task to `paused` only once its whole process tree, rooted at
@@ -473,10 +476,17 @@ delegated from it is accepted, across restarts; it then kills and reaps a live w
 (continuing a paused tree first) and answers `revoked` with a `failed` receipt, or an
 `unknown` one if the reap is not confirmed within the stop timeout. `seal` moves an
 `exited`, `stopped` or `revoked` task to the terminal `sealed`. Every other verb in every
-state is `invalid_state` with nothing changed; replaying the operation that took effect
-returns the task's current state. Each transition is applied under the registry lock and
-served to completion even if the client disconnects. 1.2 connections are refused all four
-verbs as unsupported, and 1.3 inspect reports an outcome only for `exited` and `stopped`.
+state is `invalid_state` with nothing changed. The node keeps every operation id an
+attempt applied (at most 128 pauses per attempt), so a replay never acts twice: replaying
+the latest operation of its verb returns the task's current state, and replaying a
+`pause` or `resume` that a later one superseded is `stale_operation`. A stop or revoke of
+a paused task continues its tree, after which the task reads `running` and refuses `pause`
+and `resume` until the kill lands. A retry under a new attempt id durably retires the
+replaced attempt id, which a later `create` is refused (`stale_operation`), across
+restarts and evictions. Each transition is applied under the registry lock and served to
+completion even if the client disconnects. 1.2 connections are refused all four verbs as
+unsupported, and 1.3 inspect reports an outcome once the attempt has ended (`exited`,
+`stopped`, `revoked` or `sealed`).
 
 A `create` with a new execution attempt for a known task is accepted only once the
 current attempt is `exited`, `stopped`, `revoked` or `sealed` (otherwise

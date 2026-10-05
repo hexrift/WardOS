@@ -481,3 +481,24 @@ pub fn eventually(mut done: impl FnMut() -> bool) {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
+
+/// Write a revocation store of distinct operator facts that fills
+/// [`crate::state::MAX_STATE_FILE_BYTES`] as far as whole records allow, as an operator
+/// edit made while the node is stopped; returns how many facts it holds.
+pub fn fill_revocations(state_dir: &Path) -> usize {
+    let record = |index: usize| {
+        format!(
+            r#"{{"lease":"{}","revoked_at_unix_ms":1000,"reason":"operator"}}"#,
+            ward_events::LeaseId::from_u128(u128::try_from(index).unwrap() + 1_000)
+        )
+    };
+    let (head, tail) = (r#"{"format":1,"revocations":["#, "]}");
+    let each = record(0).len() + 1;
+    let max = usize::try_from(crate::state::MAX_STATE_FILE_BYTES).unwrap();
+    let count = (max - head.len() - tail.len() + 1) / each;
+    let records: Vec<String> = (0..count).map(record).collect();
+    let file = format!("{head}{}{tail}", records.join(","));
+    assert!(file.len() <= max && file.len() + each > max);
+    std::fs::write(state_dir.join(crate::state::REVOCATIONS_FILE), file).unwrap();
+    count
+}
