@@ -290,6 +290,8 @@ struct FakeState {
     waiting: usize,
     stopped: usize,
     reaped: usize,
+    survivors: Vec<crate::execution::WorkloadProcess>,
+    blocked_on_launch: Option<std::path::PathBuf>,
 }
 
 /// A deterministic launcher: workloads end only when the test says so, or on stop.
@@ -298,6 +300,11 @@ pub struct FakeLauncher(Arc<(std::sync::Mutex<FakeState>, std::sync::Condvar)>);
 
 /// The host pid every fake workload reports.
 pub const FAKE_PID: u32 = 4242;
+
+/// The host process every fake workload reports it runs as.
+pub fn fake_process() -> crate::execution::WorkloadProcess {
+    crate::execution::WorkloadProcess::new(FAKE_PID, 77, "fake-boot".to_owned())
+}
 
 impl FakeLauncher {
     pub fn new() -> Self {
@@ -315,6 +322,8 @@ impl FakeLauncher {
                 waiting: 0,
                 stopped: 0,
                 reaped: 0,
+                survivors: Vec::new(),
+                blocked_on_launch: None,
             }),
             std::sync::Condvar::new(),
         )))
@@ -380,6 +389,16 @@ impl FakeLauncher {
     pub fn reaped(&self) -> usize {
         self.state().reaped
     }
+
+    /// Survivors of a restart the registry asked this launcher to end.
+    pub fn survivors(&self) -> Vec<crate::execution::WorkloadProcess> {
+        self.state().survivors.clone()
+    }
+
+    /// While spawning the next workload, also create the directory `path`.
+    pub fn block_on_launch(&self, path: std::path::PathBuf) {
+        self.state().blocked_on_launch = Some(path);
+    }
 }
 
 impl crate::execution::TaskLauncher for FakeLauncher {
@@ -389,11 +408,18 @@ impl crate::execution::TaskLauncher for FakeLauncher {
     ) -> Result<Box<dyn crate::execution::RunningWorkload>, crate::execution::SpawnError> {
         let mut state = self.state();
         state.launches.push(request.clone());
+        if let Some(path) = state.blocked_on_launch.take() {
+            std::fs::create_dir_all(path).unwrap();
+        }
         match state.spawn {
             FakeSpawn::Spawn => Ok(Box::new(FakeWorkload(self.clone()))),
             FakeSpawn::Refuse => Err(crate::execution::SpawnError::Refused),
             FakeSpawn::Ambiguous => Err(crate::execution::SpawnError::Ambiguous),
         }
+    }
+
+    fn end_survivor(&self, process: &crate::execution::WorkloadProcess) {
+        self.state().survivors.push(process.clone());
     }
 }
 
@@ -435,6 +461,10 @@ impl crate::execution::WorkloadFreezer for FakeFreezer {
 impl crate::execution::RunningWorkload for FakeWorkload {
     fn pid(&self) -> u32 {
         FAKE_PID
+    }
+
+    fn process(&self) -> Option<crate::execution::WorkloadProcess> {
+        Some(fake_process())
     }
 
     fn freezer(&self) -> Arc<dyn crate::execution::WorkloadFreezer> {

@@ -334,9 +334,9 @@ unknown fields, and a mismatched identity are refused. The report contains no
 workload output or credential material.
 
 `ward-node` records a receipt for every attempt it starts or stops (§3.11) and reports
-its outcome through 1.3 `inspect`. The receipt is held in memory only: durable
-evidence and recovery must still be bound before a receipt can be treated as an
-authoritative execution result.
+its outcome through 1.3 `inspect`. The receipt's outcome is kept in the task's durable
+record and survives a node restart (§3.11); durable per-attempt evidence must still be
+bound before a receipt can be treated as an authoritative execution result.
 
 ### 3.9 Trusted task-authority check
 
@@ -369,7 +369,7 @@ handshake and request line must arrive within 10 seconds of accept; the answer i
 written within 10 seconds of being ready, so a `start` or `stop` whose own bounded wait
 outlasts the request deadline is still answered.
 
-### 3.11 Node admission and execution ownership (decided; admission, start, stop, exit, pause, resume, revoke and seal implemented)
+### 3.11 Node admission and execution ownership (decided; admission, start, stop, exit, pause, resume, revoke, seal and restart recovery implemented)
 
 [ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md) settles
 how the node will execute. The wire contract an external control plane drives is
@@ -394,8 +394,9 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issu
 
 `--node-id` is the node's audience; the state directory (created mode 0700, refused if
 group- or world-accessible) pins it at first start and holds `admission-versions.json`
-(last accepted version per task), `revocations.json` (known revocation facts) and
-`retired-attempts.json` (attempt ids a later attempt replaced), each replaced atomically
+(last accepted version per task), `revocations.json` (known revocation facts),
+`retired-attempts.json` (attempt ids a later attempt replaced) and `tasks/` (one record
+per registered task, below), each replaced atomically
 (temporary file, fsync, rename) and never written larger than the 8 MiB the node accepts
 when it loads them (the write is refused instead). The trust-store file lists one
 issuer per line as `<public-key> [<key-id>] <prn_…>`: a lowercase hex Ed25519 public
@@ -495,12 +496,24 @@ keeps rising across attempts. Sealed tasks do not count against the registry's c
 a create that needs room evicts the task sealed longest ago, while its admission version
 and revocations stay in the node state.
 
-The registry is in memory: after a node restart a previously running attempt is unknown
-to the node, though its workspace still blocks a second start of the same attempt.
-Durable recovery is #332 slice 7. Dropping the registry stops and reaps every live
-workload, and a node that dies outright takes its sandboxes with it through bubblewrap's
-`--die-with-parent`, except in the brief window before a just-spawned sandbox has armed
-it. Per-attempt evidence logs and network grants are later slices.
+The registry is durable (#332 slice 7). Every task has a record in
+`<state-dir>/tasks/<task>.json` (mode 0600, atomic replace, at most 8 MiB, a format
+field), and every transition is written to it before it is answered; a failed write
+refuses the verb `resource_unavailable` with nothing changed. `start` records a launch
+intent before it spawns and the spawned host process (pid, `/proc` start time and boot
+id) once the spawn is confirmed. A restarted node loads the records (a malformed,
+oversized or unexpected entry, or more records than the registry holds, stops it) and
+records every recovered change before it serves: an attempt that may have been executing
+(launching, `running`, `paused`, or a stop or revoke awaiting its reap) becomes `exited`
+with an `unknown` receipt, the process tree still rooted at its recorded process is
+killed, and it is never re-run (its workspace also blocks a second start); a `ready` task
+becomes `created` and must be admitted again under a higher version; `created` and ended
+tasks keep their state and receipt; and every applied operation id survives, so replays
+answer as before and never act. Evicting a sealed task removes its record first.
+Dropping the registry stops and reaps every live workload, and a node that dies outright
+takes its sandboxes with it through bubblewrap's `--die-with-parent`, except in the brief
+window before a just-spawned sandbox has armed it. Per-attempt evidence logs and network
+grants are later slices.
 
 ---
 

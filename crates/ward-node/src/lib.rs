@@ -24,6 +24,11 @@
 //!   namespace sandbox and its user namespace, the offline network and the
 //!   content-addressed snapshot store.
 //!
+//! A service built with admission keeps its task registry durable under the node state
+//! directory ([`records`]) and recovers it before it serves (see [`task`]), so a restart
+//! forgets no task, receipt or applied operation and never re-runs an attempt that may
+//! have been executing.
+//!
 //! A connection's request (handshake and request line) must arrive within
 //! [`REQUEST_TIMEOUT`]; its answer is written within [`ANSWER_TIMEOUT`] of being ready, so
 //! a `stop` or `start` whose bounded work outlasts the request deadline is still answered.
@@ -37,6 +42,7 @@ pub mod admission;
 pub mod admit;
 pub mod execution;
 pub mod issuer;
+pub mod records;
 pub mod state;
 pub mod task;
 #[cfg(test)]
@@ -59,6 +65,7 @@ use ward_node_protocol::{
 
 use crate::admit::NodeAdmission;
 use crate::execution::NodeExecution;
+use crate::records::TaskRecordError;
 use crate::task::{MAX_NODE_TASKS, TaskRegistry};
 
 /// Maximum bytes in one node-protocol JSON request, excluding the terminating newline.
@@ -117,6 +124,9 @@ pub enum NodeServiceError {
     /// The node task registry lock was poisoned by an earlier panic.
     #[error("ward-node task registry is unavailable")]
     TaskRegistryUnavailable,
+    /// The durable task records could not be recovered at start.
+    #[error("ward-node task records could not be recovered: {0}")]
+    TaskRecords(#[from] TaskRecordError),
 }
 
 /// Local node service for handshake, capability discovery and the task registry.
@@ -151,12 +161,14 @@ impl NodeService {
         })
     }
 
-    /// Create a service that admits signed envelopes through `admission` (protocol 1.3).
+    /// Create a service that admits signed envelopes through `admission` (protocol 1.3),
+    /// recovering its task registry from the node state directory.
     ///
     /// # Errors
     ///
     /// Returns `InvalidCapabilities` if the capability document is not valid for
-    /// capability discovery in this build.
+    /// capability discovery in this build, and `TaskRecords` if the task records cannot
+    /// be recovered.
     pub fn with_admission(
         capabilities: NodeCapabilities,
         admission: NodeAdmission,
@@ -171,17 +183,19 @@ impl NodeService {
             tasks: Arc::new(Mutex::new(TaskRegistry::with_admission(
                 MAX_NODE_TASKS,
                 admission,
-            ))),
+            )?)),
         })
     }
 
     /// Create a service that admits signed envelopes through `admission` and executes
-    /// admitted tasks through `execution` (protocol 1.3).
+    /// admitted tasks through `execution` (protocol 1.3), recovering its task registry from
+    /// the node state directory.
     ///
     /// # Errors
     ///
     /// Returns `InvalidCapabilities` if the capability document is not valid for
-    /// capability discovery in this build.
+    /// capability discovery in this build, and `TaskRecords` if the task records cannot
+    /// be recovered.
     pub fn with_execution(
         capabilities: NodeCapabilities,
         admission: NodeAdmission,
@@ -198,7 +212,7 @@ impl NodeService {
                 MAX_NODE_TASKS,
                 admission,
                 execution,
-            ))),
+            )?)),
         })
     }
 

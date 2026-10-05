@@ -16,6 +16,9 @@
 //!   in all are kept; once a bound is reached, retiring another attempt is refused rather
 //!   than forgetting one.
 //!
+//! The same directory holds the node's snapshot store (`cas/`) and one record per
+//! registered task (`tasks/`, [`crate::records`]), written with the same discipline.
+//!
 //! Every write goes to a temporary file in the same directory, is fsynced, renamed over
 //! the target and the directory is fsynced, so a crash leaves either the old or the new
 //! content. A store is updated on disk before the in-memory view, so a failed write
@@ -355,25 +358,45 @@ fn within_retired_bounds(attempts: &BTreeMap<TaskId, BTreeSet<ExecutionAttemptId
 }
 
 fn read_state_file(dir: &Path, name: &'static str) -> Result<Option<String>, NodeStateError> {
-    let path = dir.join(name);
-    let metadata = match std::fs::symlink_metadata(&path) {
+    match read_bounded(&dir.join(name))? {
+        StoredFile::Absent => Ok(None),
+        StoredFile::Invalid => Err(NodeStateError::InvalidFile(name)),
+        StoredFile::Bytes(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| NodeStateError::InvalidFile(name)),
+    }
+}
+
+/// What [`read_bounded`] found at a state path.
+pub(crate) enum StoredFile {
+    /// Nothing is there.
+    Absent,
+    /// Not a regular file, or larger than [`MAX_STATE_FILE_BYTES`].
+    Invalid,
+    /// The file's bytes.
+    Bytes(Vec<u8>),
+}
+
+/// Read the regular file at `path` if it is at most [`MAX_STATE_FILE_BYTES`].
+pub(crate) fn read_bounded(path: &Path) -> std::io::Result<StoredFile> {
+    let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StoredFile::Absent);
+        }
+        Err(error) => return Err(error),
     };
     if !metadata.is_file() || metadata.len() > MAX_STATE_FILE_BYTES {
-        return Err(NodeStateError::InvalidFile(name));
+        return Ok(StoredFile::Invalid);
     }
-    let file = File::open(&path)?;
     let mut bytes = Vec::new();
-    file.take(MAX_STATE_FILE_BYTES + 1)
+    File::open(path)?
+        .take(MAX_STATE_FILE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > usize::try_from(MAX_STATE_FILE_BYTES).unwrap_or(usize::MAX) {
-        return Err(NodeStateError::InvalidFile(name));
+        return Ok(StoredFile::Invalid);
     }
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|_| NodeStateError::InvalidFile(name))
+    Ok(StoredFile::Bytes(bytes))
 }
 
 fn write_json(
@@ -385,10 +408,12 @@ fn write_json(
     if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_STATE_FILE_BYTES) {
         return Err(NodeStateError::StoreFull(name));
     }
-    write_atomic(dir, name, &bytes)
+    Ok(write_atomic(dir, name, &bytes)?)
 }
 
-fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), NodeStateError> {
+/// Durably replace `dir/name` with `bytes`: write a temporary file in `dir`, fsync it,
+/// rename it over the target and fsync `dir`, so a crash leaves the old or the new content.
+pub(crate) fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     let temporary = dir.join(format!(".{name}.tmp"));
     let written = (|| {
         let mut file = OpenOptions::new()
@@ -406,7 +431,7 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), NodeStateErr
     if written.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
-    written.map_err(NodeStateError::from)
+    written
 }
 
 #[derive(Serialize, Deserialize)]

@@ -23,13 +23,21 @@
 //! delegated cgroup for a launch. The budget clock keeps running while a workload is
 //! paused (ADR-0030 §3: the budget is always enforced), and `SIGKILL` ends a stopped
 //! process as it is, so a paused workload can still be stopped or killed at its budget.
+//!
+//! Each spawned workload reports the host process it runs as ([`WorkloadProcess`]): its
+//! pid, the start time `/proc` gives it and the boot it started in. The registry records it
+//! durably, and after a node restart asks the launcher to end any survivor
+//! ([`TaskLauncher::end_survivor`]). The sandbox launcher kills, with `SIGKILL`, the tree
+//! still rooted at a process with exactly that identity, stopped processes included, and
+//! never signals a pid that now names another process or one from an earlier boot.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ward_launch::freeze::{FrozenTree, TreeRoot, freeze_tree, thaw_tree};
+use serde::{Deserialize, Serialize};
+use ward_launch::freeze::{FrozenTree, TreeRoot, freeze_tree, kill_tree, thaw_tree};
 use ward_launch::{Launch, RunningLaunch};
 use ward_snapshot::SnapshotStore;
 
@@ -44,6 +52,12 @@ pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default bound on how long `pause` waits for a freeze, and `resume` for a thaw, to be
 /// confirmed.
 pub const DEFAULT_FREEZE_SETTLE: Duration = ward_launch::freeze::FREEZE_SETTLE;
+
+/// Bound on how long ending a survivor of a node restart waits for its tree to die.
+pub const DEFAULT_SURVIVOR_SETTLE: Duration = ward_launch::freeze::FREEZE_SETTLE;
+
+/// Where the host's boot id is read: it changes at every boot.
+const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 
 /// Bytes of each workload output stream the sandbox launcher retains (a head and a tail)
 /// before discarding it. Output is drained so a chatty workload never blocks on a pipe.
@@ -130,6 +144,47 @@ impl StopSignal {
     }
 }
 
+/// The host process a workload was spawned as, identified by its pid, the start time
+/// `/proc` reports for it and the boot it started in, so that neither a pid reused later
+/// nor one from an earlier boot is ever taken for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadProcess {
+    pid: u32,
+    start_time: u64,
+    boot: String,
+}
+
+impl WorkloadProcess {
+    /// The process `pid`, started at `start_time` (clock ticks since boot) during `boot`.
+    #[must_use]
+    pub const fn new(pid: u32, start_time: u64, boot: String) -> Self {
+        Self {
+            pid,
+            start_time,
+            boot,
+        }
+    }
+
+    /// The host pid.
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// The start time `/proc` reported, in clock ticks since boot.
+    #[must_use]
+    pub const fn start_time(&self) -> u64 {
+        self.start_time
+    }
+
+    /// The boot id of the boot the process started in.
+    #[must_use]
+    pub fn boot(&self) -> &str {
+        &self.boot
+    }
+}
+
 /// The launch port: spawns one workload.
 ///
 /// The registry calls it on the attempt's own reaper thread, which then waits on the
@@ -142,6 +197,11 @@ pub trait TaskLauncher: Send + Sync {
     /// Returns [`SpawnError::Refused`] when nothing was spawned, and
     /// [`SpawnError::Ambiguous`] when a process may have started.
     fn launch(&self, request: &LaunchRequest) -> Result<Box<dyn RunningWorkload>, SpawnError>;
+
+    /// End whatever still runs of a workload spawned as `process` by a node that has since
+    /// restarted, and wait a bounded time for it to die. A process that no longer has
+    /// exactly that identity is never signalled.
+    fn end_survivor(&self, process: &WorkloadProcess);
 }
 
 /// A freeze or thaw of a workload's process tree that could not be confirmed. A failed
@@ -173,6 +233,9 @@ pub trait WorkloadFreezer: Send + Sync + std::fmt::Debug {
 pub trait RunningWorkload: Send {
     /// The host process id of the spawned workload.
     fn pid(&self) -> u32;
+
+    /// The host process the workload runs as, if `/proc` identifies it.
+    fn process(&self) -> Option<WorkloadProcess>;
 
     /// The freezer for this workload's process tree, shared with the registry.
     fn freezer(&self) -> Arc<dyn WorkloadFreezer>;
@@ -208,6 +271,22 @@ impl TaskLauncher for SandboxLauncher {
             .map(|running| Box::new(SandboxWorkload(running)) as Box<dyn RunningWorkload>)
             .map_err(|_| SpawnError::Refused)
     }
+
+    fn end_survivor(&self, process: &WorkloadProcess) {
+        if current_boot().as_deref() == Some(process.boot()) {
+            let _ = kill_tree(
+                TreeRoot::recorded(process.pid(), process.start_time()),
+                DEFAULT_SURVIVOR_SETTLE,
+            );
+        }
+    }
+}
+
+fn current_boot() -> Option<String> {
+    std::fs::read_to_string(BOOT_ID)
+        .ok()
+        .map(|boot| boot.trim().to_owned())
+        .filter(|boot| !boot.is_empty())
 }
 
 fn sandbox_launch(request: &LaunchRequest) -> Launch {
@@ -222,6 +301,15 @@ struct SandboxWorkload(RunningLaunch);
 impl RunningWorkload for SandboxWorkload {
     fn pid(&self) -> u32 {
         self.0.id()
+    }
+
+    fn process(&self) -> Option<WorkloadProcess> {
+        let root = self.0.tree_root()?;
+        Some(WorkloadProcess::new(
+            root.pid(),
+            root.start_time(),
+            current_boot()?,
+        ))
     }
 
     fn freezer(&self) -> Arc<dyn WorkloadFreezer> {
@@ -355,6 +443,26 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn a_survivor_is_ended_only_under_its_recorded_identity_from_this_boot() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .spawn()
+            .unwrap();
+        let root = TreeRoot::of(child.id()).unwrap();
+        let boot = current_boot().unwrap();
+        for stranger in [
+            WorkloadProcess::new(root.pid(), root.start_time(), "another-boot".to_owned()),
+            WorkloadProcess::new(root.pid(), root.start_time() + 1, boot.clone()),
+        ] {
+            SandboxLauncher.end_survivor(&stranger);
+            assert!(child.try_wait().unwrap().is_none(), "{stranger:?}");
+        }
+
+        SandboxLauncher.end_survivor(&WorkloadProcess::new(root.pid(), root.start_time(), boot));
+        assert_eq!(child.wait().unwrap().code(), None);
+    }
 
     #[test]
     fn a_node_launch_never_inherits_the_node_environment() {

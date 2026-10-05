@@ -88,7 +88,13 @@ reaper records the attempt's `TaskExecutionReceipt` (#333):
 An attempt whose launch outcome is ambiguous (an error after a possible exec, or a node
 restart while `Running`) is recorded `Unknown`. Any surviving process in its workspace is
 killed, and the attempt is never re-run. Retrying needs a new execution attempt and a new
-envelope. Recovering or resuming across a node restart is #332 slice 7.
+envelope. Across a node restart the node recovers every task from a durable per-task
+record written before each transition is answered, with a launch intent written before
+each spawn: an attempt that may have been executing (launching, `Running`, `Paused`, or a
+stop or revoke awaiting its reap) becomes `Exited` with an `Unknown` receipt and any
+survivor of its recorded process is killed; it is never resumed or re-run. A `Ready` task
+becomes `Created` again and must be re-admitted under a higher version; ended tasks keep
+their state, receipt and applied operation ids (#332 slice 7).
 
 ## Alternatives
 
@@ -152,8 +158,13 @@ TDD slices without guessing at semantics inside a feature PR.
    enforcement.
 5. `pause`/`resume`, `revoke` and `seal`; the full invalid-transition matrix; disconnect
    during a transition.
+6. Durable task records and recovery across a node restart (#332 slice 7): every
+   transition recorded before it is answered, a launch intent before every spawn, and on
+   restart ambiguous attempts recovered `Exited`/`Unknown` with survivors killed and
+   never re-run, `Ready` tasks `Created` again, and ended tasks, receipts and replays
+   preserved.
 
-Steps 1–5 are written down as the external contract in
+Steps 1–6 are written down as the external contract in
 [node-integration.md](../node-integration.md).
 
 Cross-system acceptance — isolation, interruption, no duplicate effect — is #332 slice 9.
