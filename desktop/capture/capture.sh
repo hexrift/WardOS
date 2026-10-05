@@ -68,17 +68,22 @@ done
 # wait_for WHAT SECONDS CMD…: poll CMD until it succeeds; false after SECONDS, or as soon
 # as Hyprland is gone, saying which.
 wait_for() {
-  local what=$1 secs=$2 end
+  local what=$1 secs=$2 start=$SECONDS end told
   shift 2
   end=$((SECONDS + secs))
+  told=$SECONDS
   until "$@"; do
     if [[ -n $hypr_pid ]] && ! kill -0 "$hypr_pid" 2>/dev/null; then
       echo "capture: Hyprland exited while waiting for $what" >&2
       return 1
     fi
     if ((SECONDS >= end)); then
-      echo "capture: timed out after ${secs}s waiting for $what" >&2
+      echo "capture: timed out after ${secs}s waiting for $what; layers [$(layers_seen)], clients [$(clients_seen)]" >&2
       return 1
+    fi
+    if ((SECONDS - told >= 10)); then
+      say "still waiting for $what ($((SECONDS - start))s): layers [$(layers_seen)], clients [$(clients_seen)]"
+      told=$SECONDS
     fi
     sleep 0.2
   done
@@ -93,6 +98,10 @@ hypr_json() {
   [[ $answer == [\[\{]* ]] || return 1
   jq "$@" <<<"$answer" 2>/dev/null
 }
+# layers_seen / clients_seen: every layer-shell namespace and every window class on
+# screen now, for the waits' progress lines.
+layers_seen() { hypr_json layers -r '[.. | objects | .namespace? // empty] | unique | join(" ")' 2>/dev/null || true; }
+clients_seen() { hypr_json clients -r '[.[] | .class] | join(" ")' 2>/dev/null || true; }
 # shellcheck disable=SC2016  # $ns is jq's
 layer_up() { hypr_json layers -e --arg ns "$1" '[.. | objects | .namespace? // empty] | index($ns) != null' >/dev/null; }
 layer_gone() { ! layer_up "$1"; }
@@ -320,23 +329,43 @@ session_command() {
 
 # diagnose: what the renderer had to work with, for a failed run.
 diagnose() {
-  local report
-  echo "capture: the DRM nodes (ls -l /dev/dri), as $(id -un) in groups $(id -Gn):"
+  local report log hlog
+  for log in "$logs"/*.log; do
+    [[ -f $log && $log != "$logs/hyprland.log" ]] || continue
+    echo "capture: ---- $(basename "$log") ($(wc -l <"$log") lines; last 40) ----"
+    tail -n 40 "$log"
+  done
+  echo "capture: ---- hyprctl monitors / layers / clients ----"
+  hypr_json monitors -c '.' || echo "  (no answer)"
+  hypr_json layers -c '.' || echo "  (no answer)"
+  hypr_json clients -c '[.[] | {class, title, mapped, workspace: .workspace.name, at, size}]' || echo "  (no answer)"
+  echo "capture: ---- processes of $(id -un) ----"
+  ps -o pid,ppid,stat,etime,cmd -u "$(id -un)" 2>&1 || true
+  for hlog in "$XDG_RUNTIME_DIR"/hypr/*/hyprland.log; do
+    [[ -f $hlog ]] || continue
+    echo "capture: ---- Hyprland's log without TRACE ($hlog, last 200 of $(grep -cv '\[TRACE\]' "$hlog" || true) lines; the whole log is logs/hyprland.log) ----"
+    grep -v '\[TRACE\]' "$hlog" | tail -n 200
+    echo "capture: ---- Hyprland's log, last 40 TRACE lines ----"
+    grep '\[TRACE\]' "$hlog" | tail -n 40
+  done
+  echo "capture: ---- Hyprland's stdout ($logs/hyprland.out, last 40 lines without TRACE) ----"
+  grep -v '\[TRACE\]' "$logs/hyprland.out" 2>/dev/null | tail -n 40 || true
+  echo "capture: ---- the DRM nodes (ls -l /dev/dri), as $(id -un) in groups $(id -Gn) ----"
   ls -l /dev/dri 2>&1 || true
   if command -v eglinfo >/dev/null 2>&1; then
-    echo "capture: EGL (eglinfo -B, GBM and surfaceless platforms, LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE:-}):"
+    echo "capture: ---- EGL (eglinfo -B, GBM and surfaceless platforms, LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE:-}) ----"
     timeout 30 eglinfo -B -p gbm 2>&1 || true
     timeout 30 eglinfo -B -p surfaceless 2>&1 || true
   else
     echo "capture: no eglinfo (egl-utils) to name the EGL vendor"
   fi
   if [[ -f $out/seatd.log ]]; then
-    echo "capture: seatd's log ($out/seatd.log):"
+    echo "capture: ---- seatd's log ($out/seatd.log) ----"
     tail -n 50 "$out/seatd.log"
   fi
   for report in "$HOME"/.cache/hyprland/hyprlandCrashReport*.txt; do
     [[ -f $report ]] || continue
-    echo "capture: Hyprland's crash report $report:"
+    echo "capture: ---- Hyprland's crash report $report ----"
     cat "$report"
   done
 }
@@ -352,10 +381,7 @@ cleanup() {
   cp "$XDG_RUNTIME_DIR"/hypr/*/hyprland.log "$logs/" 2>/dev/null || true
   cp "$HOME"/.cache/hyprland/hyprlandCrashReport*.txt "$logs/" 2>/dev/null || true
   if ((status != 0)); then
-    echo "capture: failed; Hyprland's log ($XDG_RUNTIME_DIR/hypr/*/hyprland.log), last 200 lines:" >&2
-    tail -n 200 "$XDG_RUNTIME_DIR"/hypr/*/hyprland.log >&2 || echo "  (no log)" >&2
-    echo "capture: Hyprland's stdout and its clients' output ($logs/hyprland.out), last 200 lines:" >&2
-    tail -n 200 "$logs/hyprland.out" >&2 || true
+    echo "capture: failed; what the session looked like:" >&2
     diagnose 2>&1 | tee "$logs/diagnosis.txt" >&2
   fi
   ward stop "$project" >/dev/null 2>&1 || true
@@ -409,6 +435,16 @@ done
 # Every output at 1920x1080@60: vkms's Virtual-1, or the headless fallback. The later
 # catch-all line replaces the shipped `preferred` one.
 printf 'monitor = , 1920x1080@60, auto, 1\n' >>"$HOME/.config/hypr/monitors.conf"
+# The clients start as on the image, from autostart.conf's exec-once lines (waybar, mako,
+# the theme re-apply that starts swaybg, wardos-first-run; hypridle and cliphist are not
+# installed here), each line's output going to logs/<command>.log instead of Hyprland's
+# stdout, which the trace log would drown it in. The user's copy of the file is what
+# Hyprland reads; the commands themselves are untouched.
+awk -v logs="$logs" '/^exec-once = / {
+  cmd = substr($0, 13); split(cmd, w, " "); name = w[1]; sub(/.*\//, "", name)
+  print "exec-once = " cmd " >>" logs "/" name ".log 2>&1"; next
+} { print }' "$HOME/.config/hypr/autostart.conf" >"$HOME/.config/hypr/autostart.conf.capture" &&
+  mv "$HOME/.config/hypr/autostart.conf.capture" "$HOME/.config/hypr/autostart.conf"
 # Hyprland logs nothing to its file by default (debug:disable_logs); the capture's
 # failure output needs the log, to the file and to stdout ($logs/hyprland.out).
 printf '\n# desktop/capture/capture.sh: the debug log for the capture\ndebug {\n    disable_logs = false\n    enable_stdout_logs = true\n}\n' \
@@ -437,6 +473,10 @@ hypr_pid=$!
 pids+=("$hypr_pid")
 wait_for "Hyprland's socket" "$limit" hypr_ready || die "Hyprland did not come up"
 say "$(hyprctl version | sed -n 1p), instance $HYPRLAND_INSTANCE_SIGNATURE on $WAYLAND_DISPLAY"
+# There is no systemd here, so the exec-once systemctl line only logs its failure and the
+# units it would start do not run: the bar's segments subscribe to the daemon themselves,
+# as they do whenever wardos-shell-worker.service is down (desktop/systemd/user), and no
+# approval listener, polkit agent or on-screen display is needed for the scenes.
 if ! wait_for "the $driver output at 1920x1080" 20 monitor_up; then
   say "no $driver output; creating the headless output $headless instead"
   created=$(hyprctl output create headless "$headless" 2>&1) || true
@@ -486,7 +526,9 @@ while IFS=$'\t' read -r -u 3 id ms need _story what; do
     say "optional scene $id was not on screen; left out"
   else
     printf '| %s | %s | %s | %s | not on screen |\n' "$n" "$id" "$ms" "$what" >>"$summary"
-    grim -o "$output" "$logs/not-on-screen-$id.png" 2>/dev/null || true
+    if grim -o "$output" "$logs/not-on-screen-$id.png" 2>/dev/null; then
+      python3 "$here/assemble.py" describe "$logs/not-on-screen-$id.png" || true
+    fi
     die "scene $id was not on screen (what the output showed instead: logs/not-on-screen-$id.png)"
   fi
   printf '| %s | %s | %s | %s | %s |\n' "$n" "$id" "$ms" "$what" "$result" >>"$summary"

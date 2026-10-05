@@ -471,15 +471,26 @@ it (every output at 1920x1080@60, Hyprland's debug log on, checked by
 `Hyprland --verify-config`), starts a session bus and the shipped Hyprland (Mesa's
 software rasteriser for EGL and, through `kms_swrast` on the card's dumb buffers, for
 GBM; `AQ_TRACE`/`HYPRLAND_TRACE` on), waits for the vkms output and creates a headless
-one only when none appears, and walks
+one only when none appears. The clients start as on the image, from the user's copy of
+`autostart.conf`: `exec-once = waybar`, `exec-once = mako`, the theme re-apply that
+starts swaybg, `wardos-first-run`; the capture only sends each line's output to its own
+`logs/<command>.log`. There is no systemd user session in the container, so the
+`systemctl --user` line fails and logs that, and the units it would start do not run:
+the bar's segments subscribe to the daemon themselves, as they do whenever
+`wardos-shell-worker.service` is down, and the approval listener, the polkit agent and
+swayosd are not needed for the scenes (hypridle and cliphist are not installed there).
+Then it walks
 [`desktop/capture/scenes.tsv`](../desktop/capture/scenes.tsv). Each scene is started
 through `hyprctl dispatch exec` (the welcome steps, `wardos-launch run`, `wardos-menu`,
 `wardos-theme`, `wardos-power`), waited for in `hyprctl layers` and `hyprctl clients`
 rather than slept on, shot with `grim`, and closed again (a menu is cancelled the way
 Escape would). `assemble.py` makes the GIF from the shots with each scene's
-milliseconds, 1280x720 and 128 colours like the storyboard. A required scene that does
-not come up fails the job with Hyprland's log, the DRM nodes, the EGL vendor, seatd's
-log and any crash report; the lock screen is optional and is left out, with a warning,
+milliseconds, 1280x720 and 128 colours like the storyboard. Every shot is described in
+the job log (size, how many colours, the dominant one), and a required scene that does
+not come up fails the job with a shot of what was on screen instead, every client's log,
+`hyprctl` monitors, layers and clients, the processes, Hyprland's log without its trace
+lines (plus the last forty of them), the DRM nodes, the EGL vendor, seatd's log and any
+crash report; the lock screen is optional and is left out, with a warning,
 when hyprlock cannot draw there. The GIF and the shots are the artifact
 `wardos-desktop-capture`, the logs on failure `wardos-desktop-capture-logs`.
 

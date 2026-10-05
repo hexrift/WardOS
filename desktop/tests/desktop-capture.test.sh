@@ -127,6 +127,19 @@ for want in 'AQ_DRM_DEVICES=\$CAPTURE_DRM_CARD' 'AQ_DRM_DEVICES=\$\(drm_card "\$
   'AQ_TRACE=1' 'HYPRLAND_TRACE=1' 'output create headless' 'monitor = , 1920x1080@60'; do
   grep -qE -- "$want" "$script" || fail "capture.sh does not mention $want"
 done
+# The clients start from the shipped autostart.conf, each exec-once logging to its own
+# file; a failed scene's shot and every scene's shot are described; the failure output
+# has the client logs, hyprctl, the processes and Hyprland's log without TRACE. The
+# shell worker is never started by hand: with no session it logs its "no session" line
+# without pause (it is systemd's to restart every two seconds), which filled a disk.
+trace_filter="grep -v '\\[TRACE\\]'"
+# shellcheck disable=SC2016  # literal fragments of the script, not expansions
+for want in 'exec-once = " cmd " >>" logs "/" name ".log 2>&1' \
+  'assemble.py" check "$png"' 'assemble.py" describe "$logs/not-on-screen-$id.png"' 'ps -o pid,ppid,stat,etime,cmd -u' \
+  "$trace_filter" 'layers [$(layers_seen)]'; do
+  grep -qF -- "$want" "$script" || fail "capture.sh does not have: $want"
+done
+! grep -qE '^[^#]*ward-shell worker' "$script" || fail "capture.sh must not start ward-shell worker itself (a tight loop with no session)"
 ! grep -q 'HYPRLAND_HEADLESS_ONLY=1' "$script" || fail "capture.sh must not set HYPRLAND_HEADLESS_ONLY: the DRM backend on vkms is the allocator"
 ! grep -qE 'hyprctl [a-z]+ -j [^|]*\| *jq' "$script" || fail "capture.sh pipes hyprctl straight into jq; use hypr_json, which checks for JSON first"
 grep -qx 'seatd' < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$cap/packages.txt") || fail "packages.txt lacks seatd"
@@ -208,8 +221,11 @@ for i, r in enumerate(rows, 1):
     img.save(f"{sys.argv[2]}/{i:02d}-{r[0]}.png")
 Image.new("RGB", (1920, 1080), (0, 0, 0)).save(f"{sys.argv[2]}/../flat.png")
 EOF
-python3 "$cap/assemble.py" check "$frames/01-${ids[0]}.png" || fail "assemble.py check refused a real-looking shot"
+line=$(python3 "$cap/assemble.py" check "$frames/01-${ids[0]}.png") || fail "assemble.py check refused a real-looking shot"
+[[ $line == *"1920x1080, 2 colours, dominant #0e0f11 ("* ]] || fail "assemble.py check describes the shot: $line"
 if python3 "$cap/assemble.py" check "$TMP/flat.png" 2>/dev/null; then fail "assemble.py check must refuse a flat frame"; fi
+line=$(python3 "$cap/assemble.py" describe "$TMP/flat.png") || fail "assemble.py describe never fails"
+[[ $line == *"one flat colour, dominant #000000 (100%)"* ]] || fail "assemble.py describe names the flat colour: $line"
 python3 "$cap/assemble.py" gif "$table" "$frames" "$TMP/out.gif" >/dev/null
 want=$(awk -F'\t' '!/^#/ && NF && $3 == "required" { printf "%s%s", s, $2; s = "," }' "$table")
 got=$(python3 -c '

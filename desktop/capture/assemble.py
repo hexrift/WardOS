@@ -1,6 +1,9 @@
 """Check one capture shot, or assemble the shots into the README GIF (desktop/capture/capture.sh).
 
-  assemble.py check SHOT.png                 fails unless SHOT is 1920x1080 with something on it
+  assemble.py check SHOT.png                 says what SHOT holds (size, colours, the dominant
+                                             one) and fails unless it is 1920x1080 with
+                                             something on it
+  assemble.py describe SHOT.png              the same line, never failing (a diagnostic shot)
   assemble.py gif SCENES.tsv FRAMES OUT.gif  one GIF frame per NN-<scene>.png in FRAMES, in
                                              scenes.tsv order, shown for that scene's ms;
                                              1280x720, 128 colours, looped (as the storyboard)
@@ -22,13 +25,30 @@ def scenes(table):
     return rows
 
 
-def check(shot):
+def describe(shot):
+    """Print one line about the shot; return (size, flat)."""
     with Image.open(shot) as img:
-        if img.size != SHOT:
-            sys.exit(f"assemble: {shot} is {img.size[0]}x{img.size[1]}, not {SHOT[0]}x{SHOT[1]}")
-        lo, hi = img.convert("L").getextrema()
-        if hi - lo < 16:
-            sys.exit(f"assemble: {shot} is one flat colour; nothing was rendered")
+        rgb = img.convert("RGB")
+        size = rgb.size
+        counts = rgb.getcolors(size[0] * size[1]) or []
+        lo, hi = rgb.convert("L").getextrema()
+        flat = hi - lo < 16
+        if counts:
+            n, (r, g, b) = max(counts)
+            dominant = f"#{r:02x}{g:02x}{b:02x} ({100 * n // (size[0] * size[1])}%)"
+        else:
+            dominant = "?"
+        what = "one flat colour" if flat else f"{len(counts)} colours"
+        print(f"assemble: {shot}: {size[0]}x{size[1]}, {what}, dominant {dominant}, luma {lo}..{hi}")
+        return size, flat
+
+
+def check(shot):
+    size, flat = describe(shot)
+    if size != SHOT:
+        sys.exit(f"assemble: {shot} is {size[0]}x{size[1]}, not {SHOT[0]}x{SHOT[1]}")
+    if flat:
+        sys.exit(f"assemble: {shot} is one flat colour; nothing was rendered")
 
 
 def gif(table, frames, out):
@@ -52,6 +72,8 @@ if __name__ == "__main__":
     match sys.argv[1:]:
         case ["check", shot]:
             check(shot)
+        case ["describe", shot]:
+            describe(shot)
         case ["gif", table, frames, out]:
             gif(table, frames, out)
         case _:
