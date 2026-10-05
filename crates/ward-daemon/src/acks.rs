@@ -282,7 +282,7 @@ impl Registration {
 }
 
 /// The `starttime` field of `/proc/<pid>/stat`, as written.
-fn start_time(proc: &Path, pid: u32) -> Option<String> {
+pub(crate) fn start_time(proc: &Path, pid: u32) -> Option<String> {
     let stat = fs::read_to_string(proc.join(pid.to_string()).join("stat")).ok()?;
     let rest = &stat[stat.rfind(')')? + 1..];
     rest.split_whitespace().nth(19).map(str::to_owned)

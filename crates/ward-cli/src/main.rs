@@ -30,7 +30,7 @@ use ward_daemon::{
     GcOptions, Session, SessionMeta, SnapshotRole, client, daemon, render, retention, selftest,
     snapshot, usage,
 };
-use ward_events::{EndReason, LogReader};
+use ward_events::{EndReason, LogReader, WardEvent};
 
 #[derive(Parser)]
 #[command(
@@ -164,7 +164,7 @@ enum Command {
         /// died mid-way and no daemon has reconciled the session since).
         #[arg(long, conflicts_with = "all")]
         status: bool,
-        /// With `--status`: one JSON object, `{status, unconfirmed}`, where
+        /// With `--status`: one JSON object, `{status, unconfirmed, held_by}`, where
         /// `unconfirmed` names what the current hold could not confirm (#145
         /// item 3: `egress proxy (no acknowledgement within 2s)`, `2 process(es)
         /// not confirmed stopped`) or is `null`.
@@ -1797,7 +1797,11 @@ fn cmd_run(dir: &Path, argv: &[String]) -> ward_daemon::Result<ExitCode> {
 /// hold could not confirm ([`ward_daemon::acks::unconfirmed_detail`], read
 /// from the session's own log, #145 item 3): the component that did not
 /// acknowledge it, or the processes not confirmed stopped; `None` for a
-/// confirmed hold, a released one, or no session. Needs no daemon.
+/// confirmed hold, a released one, or no session — and who holds it (#145
+/// item 6, [`ward_daemon::pause::Holders`]): the user, a capture, a stop, in
+/// that order; a marker with no owners recorded is the user's, a capture
+/// whose process is gone holds nothing, and nothing holds a running session.
+/// Needs no daemon.
 ///
 /// A pinned `--session` reads that session's own marker, through
 /// [`SessionMeta::load`] — never `dir`'s current session — so a no-argument
@@ -1808,7 +1812,7 @@ fn pause_status(
     dir: &Path,
     state: &Path,
     session: Option<&str>,
-) -> ward_daemon::Result<(&'static str, Option<String>)> {
+) -> ward_daemon::Result<(&'static str, Option<String>, Vec<ward_daemon::pause::Owner>)> {
     let meta = match session {
         Some(id) => match SessionMeta::load(state, id) {
             Ok(meta) => Some(meta),
@@ -1822,14 +1826,23 @@ fn pause_status(
         None => SessionMeta::current(dir, state)?,
     };
     let Some(meta) = meta else {
-        return Ok(("none", None));
+        return Ok(("none", None, Vec::new()));
     };
+    let marker = ward_daemon::pause::marker_path(state, &meta.id).exists();
     let word = if ward_daemon::pause::intent_path(state, &meta.id).exists() {
         "unconfirmed"
-    } else if ward_daemon::pause::marker_path(state, &meta.id).exists() {
+    } else if marker {
         "paused"
     } else {
         "running"
+    };
+    let held_by = if marker {
+        let mut holders = ward_daemon::pause::read_held_by(state, &meta.id)?
+            .unwrap_or_else(ward_daemon::pause::Holders::for_user);
+        holders.prune_dead(Path::new("/proc"));
+        holders.owners()
+    } else {
+        Vec::new()
     };
     let log = ward_daemon::session::session_dir(state, &meta.id).join("events.log");
     let unconfirmed = match ward_daemon::acks::unconfirmed_detail(&log) {
@@ -1837,7 +1850,25 @@ fn pause_status(
         Err(_) if !log.exists() => None,
         Err(e) => return Err(e),
     };
-    Ok((word, unconfirmed))
+    Ok((word, unconfirmed, held_by))
+}
+
+/// The line `ward resume` prints under its row when the record it answered
+/// with is not the release but what still holds the session (#145 item 6): a
+/// capture's hold, which the user's resume leaves in place.
+fn resume_note(event: &WardEvent) -> Option<String> {
+    match event {
+        WardEvent::SessionPaused { reason, .. }
+            if ward_daemon::pause::is_capture_reason(reason.as_str()) =>
+        {
+            Some(
+                "your pause is released; the session stays held for the capture until it \
+                 finishes"
+                    .to_owned(),
+            )
+        }
+        _ => None,
+    }
 }
 
 /// The line `ward pause` prints under its row when the daemon could not confirm
@@ -1913,11 +1944,11 @@ fn cmd_pause(
 ) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     if status {
-        let (word, unconfirmed) = pause_status(dir, &state, session)?;
+        let (word, unconfirmed, held_by) = pause_status(dir, &state, session)?;
         if json {
             println!(
                 "{}",
-                serde_json::json!({ "status": word, "unconfirmed": unconfirmed })
+                serde_json::json!({ "status": word, "unconfirmed": unconfirmed, "held_by": held_by })
             );
         } else {
             println!("{word}");
@@ -1993,6 +2024,9 @@ fn cmd_resume(dir: &Path, session: Option<&str>) -> ward_daemon::Result<ExitCode
     let record = client::resume(&mut sink)?;
     if let Some(row) = render::observer_row(&record) {
         println!("{row}");
+    }
+    if let Some(note) = resume_note(&record.event) {
+        println!("  {note}");
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -2223,11 +2257,12 @@ mod tests {
     use super::{
         Cli, Command, SessionCmd, SnapshotCmd, WatchMode, approvals_all_line, desktop_command,
         observer_degraded_warning, on_path_in, pause_status, pause_uncertainty_lines,
-        pending_all_line, pending_text, resolved_session_line, resolved_session_line_for, stop_in,
-        stopped_line, unreachable_line, verb_program,
+        pending_all_line, pending_text, resolved_session_line, resolved_session_line_for,
+        resume_note, stop_in, stopped_line, unreachable_line, verb_program,
     };
     use clap::Parser as _;
     use std::time::Duration;
+    use ward_events::WardEvent;
 
     fn sample_report(observer_degraded: bool) -> ward_daemon::RunReport {
         ward_daemon::RunReport {
@@ -2949,7 +2984,7 @@ mod tests {
         write_session(state.path(), "sess_a", &worktree, 1);
         assert_eq!(
             pause_status(project.path(), state.path(), Some("sess_a")).unwrap(),
-            ("running", None),
+            ("running", None, Vec::new()),
             "no log yet"
         );
         let log_path = ward_daemon::session::session_dir(state.path(), "sess_a").join("events.log");
@@ -2980,7 +3015,7 @@ mod tests {
         )
         .unwrap();
         ward_daemon::pause::write_marker(state.path(), "sess_a", "looks wrong").unwrap();
-        let (word, unconfirmed) =
+        let (word, unconfirmed, _) =
             pause_status(project.path(), state.path(), Some("sess_a")).unwrap();
         assert_eq!(word, "paused");
         assert_eq!(
@@ -3002,11 +3037,11 @@ mod tests {
         ward_daemon::pause::clear_marker(state.path(), "sess_a").unwrap();
         assert_eq!(
             pause_status(project.path(), state.path(), Some("sess_a")).unwrap(),
-            ("running", None)
+            ("running", None, Vec::new())
         );
         assert_eq!(
             pause_status(project.path(), state.path(), Some("sess_missing")).unwrap(),
-            ("none", None)
+            ("none", None, Vec::new())
         );
         let cli = Cli::try_parse_from(["ward", "pause", "--status", "--json"]).unwrap();
         assert!(matches!(
@@ -3111,5 +3146,83 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
         assert_eq!(value["session"], "sess_broken");
         assert!(value["error"].as_str().unwrap().contains("not ready"));
+    }
+
+    /// #145 item 6: `--status --json` says who holds the session — the user,
+    /// a capture, a stop — from the owners the daemon records beside the
+    /// marker; a marker with no owners recorded is the user's (an older
+    /// hold); a capture whose process is gone is not an owner any more.
+    #[test]
+    fn pause_status_json_lists_who_holds_the_session() {
+        use ward_daemon::pause::{Capturer, Holders, Owner};
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let worktree = project.path().canonicalize().unwrap();
+        write_session(state.path(), "sess_a", &worktree, 1);
+        let status = || pause_status(project.path(), state.path(), Some("sess_a")).unwrap();
+        assert_eq!(status(), ("running", None, Vec::new()));
+
+        ward_daemon::pause::write_marker(state.path(), "sess_a", "because").unwrap();
+        assert_eq!(status(), ("paused", None, vec![Owner::User]));
+
+        let live = Capturer {
+            op: "op_live".into(),
+            pid: std::process::id(),
+            started: ward_daemon::pause::own_start_time(),
+            reason: ward_daemon::pause::capture_reason("candidate snapshot"),
+        };
+        let dead = Capturer {
+            op: "op_dead".into(),
+            pid: 999_999,
+            started: "0".into(),
+            reason: ward_daemon::pause::capture_reason("candidate snapshot"),
+        };
+        ward_daemon::pause::write_held_by(
+            state.path(),
+            "sess_a",
+            &Holders::for_capture(live.clone()),
+        )
+        .unwrap();
+        assert_eq!(status(), ("paused", None, vec![Owner::Capture]));
+        let mut both = Holders::for_user();
+        both.add_capture(live);
+        ward_daemon::pause::write_held_by(state.path(), "sess_a", &both).unwrap();
+        let (word, unconfirmed, held_by) = status();
+        assert_eq!(
+            serde_json::json!({ "status": word, "unconfirmed": unconfirmed, "held_by": held_by })
+                .to_string(),
+            r#"{"held_by":["user","capture"],"status":"paused","unconfirmed":null}"#
+        );
+        ward_daemon::pause::write_held_by(state.path(), "sess_a", &Holders::for_capture(dead))
+            .unwrap();
+        assert_eq!(
+            status(),
+            ("paused", None, Vec::new()),
+            "a capture whose process is gone holds nothing"
+        );
+        ward_daemon::pause::write_held_by(state.path(), "sess_a", &Holders::for_stop()).unwrap();
+        assert_eq!(status(), ("paused", None, vec![Owner::Stop]));
+    }
+
+    /// #145 item 6: `ward resume` with a capture still holding prints the record
+    /// of what still holds and says so.
+    #[test]
+    fn resume_explains_a_hold_that_stays_for_a_capture() {
+        let still_held = WardEvent::SessionPaused {
+            method: ward_events::PauseMethod::Sigstop,
+            reason: ward_events::ShortText::new(&ward_daemon::pause::capture_reason(
+                "candidate snapshot",
+            )),
+        };
+        assert_eq!(
+            resume_note(&still_held).as_deref(),
+            Some(
+                "your pause is released; the session stays held for the capture until it finishes"
+            )
+        );
+        let resumed = WardEvent::SessionResumed {
+            paused_for: std::time::Duration::from_secs(1),
+        };
+        assert_eq!(resume_note(&resumed), None);
     }
 }

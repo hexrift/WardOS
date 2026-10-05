@@ -119,14 +119,22 @@ do_pause() {
 
 # A resume the daemon refuses — a stop of the session has begun and not completed, so its
 # held processes (some possibly already killed) are not an ordinary pause to release (PR #253
-# review findings 3 and 5) — gets its own critical notification with ward's words, never
-# "Agents resumed", and the exit fails.
+# review findings 3 and 5), or only a snapshot capture holds the session (#145 item 6) — gets
+# its own critical notification with ward's words, never "Agents resumed", and the exit
+# fails. A resume that released the user's pause while a capture still holds the session
+# (`ward resume` says so under its row) is not "Agents resumed" either.
 do_resume() {
   local out resolved
   if out=$(ward resume "${session_flag[@]}" "$project" 2>&1); then
     [[ -n $out ]] && printf '%s\n' "$out"
     resolved=$(resolved_project "$out")
     resolved=${resolved%$'\x1e'}
+    if [[ $out == *"stays held for the capture"* ]]; then
+      [[ -n $resolved ]] && resolved="$resolved · "
+      wardos_notify "Agents still held for capture" \
+        "${resolved}your pause is released · the capture releases the hold when it finishes" -t 4000
+      return 0
+    fi
     wardos_notify "Agents resumed" "$resolved" -t 2000
     return 0
   fi

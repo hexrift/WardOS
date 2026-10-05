@@ -33,6 +33,17 @@
 //! once its outcome is on the log, so a daemon started on the session finishes
 //! what a previous process left unfinished (`crate::daemon::serve`).
 //!
+//! **Hold ownership** ([`Holders`], #145 item 6): a hold on the session has
+//! owners — the user (`ward pause`), a snapshot capture, a stop — recorded
+//! durably beside the marker ([`HELD_BY`]). `ward resume` releases only the
+//! user's layer; a capture's hold is released by the capture that took it, or
+//! by reconciliation once its process is gone; a stop's only by the stop. The
+//! marker, the held approvals and the freeze stand while any owner remains.
+//! A capture ([`LocalCaptureHold`] here; `Request::HoldForCapture` when a
+//! daemon serves the session) proceeds only from confirmed quiescence: the
+//! freeze settled and every component acknowledged, the state a `SessionPaused`
+//! records.
+//!
 //! **Launch admission** ([`admit_launch`], PR #253 review finding 2) takes the
 //! same session lock ([`lock_pause_freeze`]) pause, resume, stop and the
 //! capture freeze take, and holds it across the `bwrap` spawn; the stop marker
@@ -49,8 +60,9 @@ use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
-use ward_events::{EndReason, PauseMethod};
+use ward_events::{EndReason, PauseMethod, ShortText, WardEvent};
 
+use crate::acks::{self, Acknowledger, Phase};
 use crate::error::{Error, Result};
 use crate::session::{run_dir_path, session_dir};
 
@@ -119,6 +131,17 @@ pub enum Verb {
     Stop {
         /// The reason `SessionEnded` carries.
         reason: EndReason,
+    },
+    /// A snapshot capture taking its hold (#145 item 6): recorded only while
+    /// the hold is being taken, cleared once the marker and the owners are
+    /// written. A daemon that finds it releases that capture's hold: a hold
+    /// whose taking was interrupted cannot be the quiescence any capture
+    /// proceeds from.
+    Capture {
+        /// The reason the hold's record carries.
+        reason: String,
+        /// The process taking it.
+        capturer: Capturer,
     },
 }
 
@@ -190,6 +213,240 @@ pub fn clear_intent(state: &Path, session: &str) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::io(&path, e)),
     }
+}
+
+/// File name of the hold's owners inside `sessions/<id>/` (#145 item 6):
+/// written beside the marker whenever the owners change, removed with it. A
+/// marker with no owners recorded is a hold from before owners were recorded,
+/// and is the user's.
+pub const HELD_BY: &str = "held_by.json";
+
+/// Who holds a session paused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Owner {
+    /// `ward pause`: released by `ward resume`.
+    User,
+    /// A snapshot capture: released by the capture when it finishes, or by
+    /// reconciliation once the capturing process is gone.
+    Capture,
+    /// A stop that has begun and not completed: released only by the stop.
+    Stop,
+}
+
+impl Owner {
+    /// The owner's name in `ward pause --status --json`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Capture => "capture",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+/// One capture holding the session: its operation, the process taking it
+/// (pid and `/proc` start time, so a reused pid is not mistaken for it) and
+/// the reason its hold is recorded under.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capturer {
+    /// The operation's id ([`crate::ids::new_operation_id`]).
+    pub op: String,
+    /// The capturing process.
+    pub pid: u32,
+    /// Its `/proc/<pid>/stat` start time, as written.
+    pub started: String,
+    /// The reason the hold's record carries ([`capture_reason`]).
+    pub reason: String,
+}
+
+impl Capturer {
+    /// Whether the capturing process still exists.
+    #[must_use]
+    pub fn alive(&self, proc: &Path) -> bool {
+        acks::start_time(proc, self.pid).as_deref() == Some(self.started.as_str())
+    }
+}
+
+/// The `/proc` start time of this process, as [`Capturer::started`] records it.
+#[must_use]
+pub fn own_start_time() -> String {
+    acks::start_time(Path::new("/proc"), std::process::id()).unwrap_or_default()
+}
+
+/// The owners of a session's hold (#145 item 6). Empty means nothing holds it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Holders {
+    /// `ward pause` holds it.
+    #[serde(default)]
+    pub user: bool,
+    /// A stop has begun and holds it.
+    #[serde(default)]
+    pub stop: bool,
+    /// Every capture holding it.
+    #[serde(default)]
+    pub captures: Vec<Capturer>,
+}
+
+impl Holders {
+    /// The user's pause alone.
+    #[must_use]
+    pub const fn for_user() -> Self {
+        Self {
+            user: true,
+            stop: false,
+            captures: Vec::new(),
+        }
+    }
+
+    /// A stop alone.
+    #[must_use]
+    pub const fn for_stop() -> Self {
+        Self {
+            user: false,
+            stop: true,
+            captures: Vec::new(),
+        }
+    }
+
+    /// One capture alone.
+    #[must_use]
+    pub fn for_capture(capturer: Capturer) -> Self {
+        Self {
+            user: false,
+            stop: false,
+            captures: vec![capturer],
+        }
+    }
+
+    /// Nothing holds the session.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.user && !self.stop && self.captures.is_empty()
+    }
+
+    /// Only captures hold the session: what `ward resume` cannot release.
+    #[must_use]
+    pub fn held_only_for_capture(&self) -> bool {
+        !self.user && !self.stop && !self.captures.is_empty()
+    }
+
+    /// The owners, user first, then capture (once, however many), then stop.
+    #[must_use]
+    pub fn owners(&self) -> Vec<Owner> {
+        let mut owners = Vec::new();
+        if self.user {
+            owners.push(Owner::User);
+        }
+        if !self.captures.is_empty() {
+            owners.push(Owner::Capture);
+        }
+        if self.stop {
+            owners.push(Owner::Stop);
+        }
+        owners
+    }
+
+    /// Add a capture.
+    pub fn add_capture(&mut self, capturer: Capturer) {
+        self.captures.push(capturer);
+    }
+
+    /// Remove the capture of operation `op`; whether it was there.
+    pub fn remove_capture(&mut self, op: &str) -> bool {
+        let before = self.captures.len();
+        self.captures.retain(|c| c.op != op);
+        self.captures.len() != before
+    }
+
+    /// Forget every capture whose process is gone; whether any was.
+    pub fn prune_dead(&mut self, proc: &Path) -> bool {
+        let before = self.captures.len();
+        self.captures.retain(|c| c.alive(proc));
+        self.captures.len() != before
+    }
+}
+
+/// The owners file of `session` (see [`HELD_BY`]).
+#[must_use]
+pub fn held_by_path(state: &Path, session: &str) -> PathBuf {
+    session_dir(state, session).join(HELD_BY)
+}
+
+/// Record who holds `session`.
+pub fn write_held_by(state: &Path, session: &str, holders: &Holders) -> Result<()> {
+    let path = held_by_path(state, session);
+    let bytes = serde_json::to_vec(holders).map_err(|e| Error::Events(format!("held_by: {e}")))?;
+    fs::write(&path, bytes).map_err(|e| Error::io(&path, e))
+}
+
+/// Who holds `session`, as recorded; `None` when nothing is recorded.
+pub fn read_held_by(state: &Path, session: &str) -> Result<Option<Holders>> {
+    let path = held_by_path(state, session);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io(&path, e)),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| Error::Daemon(format!("{}: unreadable hold owners: {e}", path.display())))
+}
+
+/// Remove `session`'s owners record; one already gone is fine.
+pub fn clear_held_by(state: &Path, session: &str) -> Result<()> {
+    let path = held_by_path(state, session);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::io(&path, e)),
+    }
+}
+
+/// What a hold could not confirm, in words: its pending processes, the
+/// component that did not acknowledge, or both.
+#[must_use]
+pub fn uncertainty(unsettled: Option<u32>, unconfirmed: Option<&acks::Acknowledgement>) -> String {
+    let mut parts = Vec::new();
+    if let Some(pending) = unsettled {
+        parts.push(format!("{pending} process(es) still pending"));
+    }
+    if let Some(ack) = unconfirmed {
+        parts.push(format!("{} unconfirmed", ack.text()));
+    }
+    parts.join("; ")
+}
+
+/// The refusal a capture answers with when the session's quiescence could not
+/// be confirmed (#145 item 6): nothing is captured, and only what the capture
+/// itself took is released.
+#[must_use]
+pub fn capture_refusal(
+    session: &str,
+    unsettled: Option<u32>,
+    unconfirmed: Option<&acks::Acknowledgement>,
+) -> Error {
+    Error::Daemon(format!(
+        "capture of session {session} refused: its quiescence could not be confirmed ({}); \
+         nothing was captured, and only the hold the capture itself took was released",
+        uncertainty(unsettled, unconfirmed)
+    ))
+}
+
+/// The reason every capture's hold is recorded under begins with this.
+pub const CAPTURE_REASON: &str = "ward capture";
+
+/// The reason a capture's hold records: `ward capture: <what>`.
+#[must_use]
+pub fn capture_reason(what: &str) -> String {
+    format!("{CAPTURE_REASON}: {what}")
+}
+
+/// Whether a hold record's reason is a capture's ([`capture_reason`]).
+#[must_use]
+pub fn is_capture_reason(reason: &str) -> bool {
+    reason.starts_with(CAPTURE_REASON)
 }
 
 /// The reason the marker carries while a stop holds the session's components
@@ -287,6 +544,36 @@ pub fn freeze_confirmed(session: &str) -> (Frozen, bool) {
             cgroup: None,
         },
     )
+}
+
+/// [`freeze_confirmed`] for a capture's hold (#145 item 6): a session with no
+/// sandbox process running is not touched at all — no cgroup created, nothing
+/// signalled — and an empty, confirmed freeze says so, so the capture holds
+/// nothing and records nothing for an idle session.
+#[must_use]
+pub fn freeze_for_capture(session: &str) -> (Frozen, bool) {
+    let idle = || {
+        (
+            Frozen {
+                method: PauseMethod::Sigstop,
+                pids: Vec::new(),
+                cgroup: None,
+            },
+            true,
+        )
+    };
+    if sandbox_pids(Path::new("/proc"), session).is_empty() {
+        return idle();
+    }
+    let (frozen, stable) = freeze_confirmed(session);
+    if frozen.pids.is_empty() {
+        thaw(&frozen);
+        if let Some(dir) = &frozen.cgroup {
+            let _ = fs::remove_dir(dir);
+        }
+        return idle();
+    }
+    (frozen, stable)
 }
 
 /// Make `frozen` a closed, confirmed freeze of `session` (PR #253 review
@@ -899,22 +1186,42 @@ impl CaptureFreeze {
     /// effort — e.g. the session directory has since been removed), this falls
     /// back to the plain, unlocked check rather than refusing to capture.
     pub fn acquire(state: &Path, session: &str) -> Self {
+        Self::acquire_confirmed(state, session).0
+    }
+
+    /// [`acquire`](Self::acquire), also saying whether the session is confirmed
+    /// quiescent (#145 item 6): `None` once every sandbox process is confirmed
+    /// stopped or gone — the freeze this guard took settled, or the one a
+    /// marker already in place stands for reads so from `/proc` — else how
+    /// many are not, as [`settle_outcome`] counts them.
+    pub fn acquire_confirmed(state: &Path, session: &str) -> (Self, Option<u32>) {
         let dir = session_dir(state, session);
         let _lock = lock_pause_freeze(&dir);
+        let proc = Path::new("/proc");
         if marker_path(state, session).exists() {
-            return Self {
+            let pending = sandbox_pids(proc, session)
+                .into_iter()
+                .filter(|&pid| !stopped_or_gone(proc, pid))
+                .count();
+            return (
+                Self {
+                    state: state.to_path_buf(),
+                    session: session.to_owned(),
+                    frozen: None,
+                },
+                u32::try_from(pending).ok().filter(|&n| n > 0),
+            );
+        }
+        let (frozen, stable) = freeze_confirmed(session);
+        let unsettled = unsettled_count(&frozen, stable);
+        (
+            Self {
                 state: state.to_path_buf(),
                 session: session.to_owned(),
-                frozen: None,
-            };
-        }
-        let frozen = freeze(session);
-        let _ = wait_settled(&frozen);
-        Self {
-            state: state.to_path_buf(),
-            session: session.to_owned(),
-            frozen: Some(frozen),
-        }
+                frozen: Some(frozen),
+            },
+            unsettled,
+        )
     }
 
     /// How the sandbox was frozen, or `None` when the guard holds nothing (the
@@ -947,6 +1254,209 @@ impl Drop for CaptureFreeze {
             return;
         }
         thaw(&frozen);
+    }
+}
+
+/// A capture's hold on a session no daemon serves (#145 item 6): the hold
+/// `Request::HoldForCapture` takes in the daemon, taken in this process. The
+/// capture proceeds only from confirmed quiescence — the freeze settled and
+/// every component acknowledged ([`acks`]) — and the hold is the capture's
+/// own: recorded among the session's [`Holders`], released by
+/// [`release`](Self::release) alone. A hold already standing (a marker from a
+/// user's pause) is reused, not taken over: the capture is added to its owners
+/// and its release leaves that hold in place. A session with nothing running
+/// holds nothing.
+#[derive(Debug)]
+#[must_use = "the hold lasts only while the guard is held; release it to record the release"]
+pub struct LocalCaptureHold {
+    state: PathBuf,
+    session: String,
+    freeze: Option<CaptureFreeze>,
+    op: String,
+    first: bool,
+    since: Instant,
+    method: Option<PauseMethod>,
+    released: bool,
+}
+
+impl LocalCaptureHold {
+    /// Hold `session` for a capture under `reason` ([`capture_reason`]),
+    /// recording `SessionPaused` through `append` when nothing held it before.
+    /// `Ok(None)` when nothing of the session runs and nothing holds it.
+    pub fn take(
+        state: &Path,
+        session: &str,
+        reason: &str,
+        append: impl FnMut(WardEvent) -> Result<()>,
+    ) -> Result<Option<Self>> {
+        if !marker_path(state, session).exists()
+            && sandbox_pids(Path::new("/proc"), session).is_empty()
+        {
+            return Ok(None);
+        }
+        let mut live = acks::Live::new();
+        Self::take_with(
+            state,
+            session,
+            reason,
+            CaptureFreeze::acquire_confirmed,
+            &mut live,
+            append,
+        )
+    }
+
+    /// [`take`](Self::take) with the freeze and the components injectable, for
+    /// the same reason `Served::pause_with`'s settle check is.
+    pub(crate) fn take_with(
+        state: &Path,
+        session: &str,
+        reason: &str,
+        acquire: impl FnOnce(&Path, &str) -> (CaptureFreeze, Option<u32>),
+        acknowledger: &mut dyn Acknowledger,
+        mut append: impl FnMut(WardEvent) -> Result<()>,
+    ) -> Result<Option<Self>> {
+        let op = crate::ids::new_operation_id()?;
+        let capturer = Capturer {
+            op: op.clone(),
+            pid: std::process::id(),
+            started: own_start_time(),
+            reason: reason.to_owned(),
+        };
+        write_intent(
+            state,
+            session,
+            &Intent::begin(Verb::Capture {
+                reason: reason.to_owned(),
+                capturer: capturer.clone(),
+            })?,
+        )?;
+        let (mut freeze, unsettled) = acquire(state, session);
+        let first = freeze.frozen.is_some();
+        if freeze.frozen.as_ref().is_some_and(|f| f.pids.is_empty()) {
+            let _ = clear_intent(state, session);
+            return Ok(None);
+        }
+        let mut hold = Self {
+            state: state.to_path_buf(),
+            session: session.to_owned(),
+            method: freeze.method(),
+            freeze: None,
+            op,
+            first,
+            since: Instant::now(),
+            released: false,
+        };
+        let marked = (|| {
+            if first {
+                write_marker(state, session, reason)?;
+            }
+            let mut holders = read_held_by(state, session)?.unwrap_or_else(|| {
+                if first {
+                    Holders::default()
+                } else {
+                    Holders::for_user()
+                }
+            });
+            holders.add_capture(capturer);
+            write_held_by(state, session, &holders)
+        })();
+        if let Err(e) = marked {
+            hold.take_back(&mut freeze);
+            return Err(e);
+        }
+        let approvals = crate::approvals::Approvals::new();
+        approvals.set_paused(true);
+        let site = acks::Site {
+            state,
+            session,
+            approvals: &approvals,
+        };
+        let acked = acks::collect(acknowledger, Phase::Held, &site);
+        let unconfirmed = acks::first_unconfirmed(&acked);
+        if unsettled.is_some() || unconfirmed.is_some() {
+            hold.take_back(&mut freeze);
+            return Err(capture_refusal(session, unsettled, unconfirmed));
+        }
+        if first
+            && let Some(method) = hold.method
+            && let Err(e) = append(WardEvent::SessionPaused {
+                method,
+                reason: ShortText::new(reason),
+            })
+        {
+            hold.take_back(&mut freeze);
+            return Err(e);
+        }
+        let _ = clear_intent(state, session);
+        hold.freeze = Some(freeze);
+        Ok(Some(hold))
+    }
+
+    /// How the sandbox was frozen, or `None` when a hold already in place
+    /// holds it.
+    #[must_use]
+    pub fn method(&self) -> Option<PauseMethod> {
+        self.method
+    }
+
+    /// Release the capture's hold: the session's owners lose this capture, and
+    /// when none remains the marker is cleared, the tree thawed and
+    /// `SessionResumed` recorded through `append`.
+    pub fn release(mut self, mut append: impl FnMut(WardEvent) -> Result<()>) -> Result<()> {
+        self.released = true;
+        let Some(mut freeze) = self.freeze.take() else {
+            return Ok(());
+        };
+        let last = self.let_go(&mut freeze)?;
+        if last && self.first {
+            append(WardEvent::SessionResumed {
+                paused_for: self.since.elapsed(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Remove this capture from the owners; when it was the last, clear the
+    /// marker and thaw what `freeze` holds. Returns whether it was the last.
+    fn let_go(&self, freeze: &mut CaptureFreeze) -> Result<bool> {
+        let dir = session_dir(&self.state, &self.session);
+        let _lock = lock_pause_freeze(&dir).ok();
+        let mut holders = read_held_by(&self.state, &self.session)?.unwrap_or_else(|| {
+            if self.first {
+                Holders::default()
+            } else {
+                Holders::for_user()
+            }
+        });
+        holders.remove_capture(&self.op);
+        if !holders.is_empty() {
+            write_held_by(&self.state, &self.session, &holders)?;
+            return Ok(false);
+        }
+        clear_held_by(&self.state, &self.session)?;
+        clear_marker(&self.state, &self.session)?;
+        if let Some(frozen) = freeze.frozen.take() {
+            thaw(&frozen);
+        }
+        Ok(true)
+    }
+
+    /// Undo a hold that did not complete: only what this capture took.
+    fn take_back(&mut self, freeze: &mut CaptureFreeze) {
+        self.released = true;
+        let _ = self.let_go(freeze);
+        let _ = clear_intent(&self.state, &self.session);
+    }
+}
+
+impl Drop for LocalCaptureHold {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Some(mut freeze) = self.freeze.take() {
+            let _ = self.let_go(&mut freeze);
+        }
     }
 }
 
@@ -2384,5 +2894,203 @@ mod tests {
             Some('T'),
             "the pause landed first: the guard's drop must not have thawed it"
         );
+    }
+
+    #[test]
+    fn holders_name_their_owners_in_order_round_trip_and_forget_dead_capturers() {
+        let live = Capturer {
+            op: "op_live".into(),
+            pid: std::process::id(),
+            started: own_start_time(),
+            reason: "ward capture: test".into(),
+        };
+        let dead = Capturer {
+            op: "op_dead".into(),
+            pid: 999_999,
+            started: "0".into(),
+            reason: "ward capture: test".into(),
+        };
+        assert!(Holders::default().is_empty());
+        assert_eq!(Holders::for_user().owners(), [Owner::User]);
+        assert_eq!(Holders::for_stop().owners(), [Owner::Stop]);
+        let mut holders = Holders::for_capture(dead.clone());
+        assert_eq!(holders.owners(), [Owner::Capture]);
+        assert!(holders.held_only_for_capture());
+        holders.add_capture(live.clone());
+        holders.user = true;
+        holders.stop = true;
+        assert_eq!(
+            holders.owners(),
+            [Owner::User, Owner::Capture, Owner::Stop],
+            "user, capture, stop"
+        );
+        assert!(!holders.held_only_for_capture());
+        let json = serde_json::to_string(&holders).unwrap();
+        assert_eq!(serde_json::from_str::<Holders>(&json).unwrap(), holders);
+        assert!(holders.prune_dead(Path::new("/proc")));
+        assert_eq!(holders.captures, std::slice::from_ref(&live));
+        assert!(
+            !holders.prune_dead(Path::new("/proc")),
+            "nothing more to forget"
+        );
+        assert!(holders.remove_capture("op_live"));
+        assert!(!holders.remove_capture("op_live"));
+        assert_eq!(holders.owners(), [Owner::User, Owner::Stop]);
+        for owner in [Owner::User, Owner::Capture, Owner::Stop] {
+            assert_eq!(
+                serde_json::to_string(&owner).unwrap(),
+                format!("\"{}\"", owner.as_str())
+            );
+        }
+
+        let state = tempfile::tempdir().unwrap();
+        let session = "sess_holders";
+        fs::create_dir_all(session_dir(state.path(), session)).unwrap();
+        assert_eq!(read_held_by(state.path(), session).unwrap(), None);
+        write_held_by(state.path(), session, &holders).unwrap();
+        assert_eq!(read_held_by(state.path(), session).unwrap(), Some(holders));
+        clear_held_by(state.path(), session).unwrap();
+        assert_eq!(read_held_by(state.path(), session).unwrap(), None);
+        clear_held_by(state.path(), session).unwrap();
+        assert!(is_capture_reason(&capture_reason("candidate snapshot")));
+        assert!(!is_capture_reason("ward pause"));
+    }
+
+    /// #145 item 6 without a daemon: a capture's hold freezes the tree, writes
+    /// the marker and the owners, confirms the proxy and records `SessionPaused`
+    /// with the capture's reason; its release thaws, clears and records
+    /// `SessionResumed`. A session with nothing running holds nothing.
+    #[test]
+    fn a_local_capture_hold_freezes_marks_records_and_releases() {
+        let state = tempfile::tempdir().unwrap();
+        let mut sandbox = FakeSandbox::spawn("sess_lcap");
+        let session = sandbox.session.clone();
+        fs::create_dir_all(session_dir(state.path(), &session)).unwrap();
+        let mut events = Vec::new();
+        let reason = capture_reason("test");
+
+        let hold = LocalCaptureHold::take(state.path(), &session, &reason, |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap()
+        .expect("something runs, so something is held");
+        assert!(sandbox.stopped() || hold.method() == Some(PauseMethod::CgroupFreezer));
+        assert_eq!(
+            fs::read_to_string(marker_path(state.path(), &session)).unwrap(),
+            format!("{reason}\n")
+        );
+        let holders = read_held_by(state.path(), &session).unwrap().unwrap();
+        assert_eq!(holders.owners(), [Owner::Capture]);
+        assert_eq!(holders.captures[0].pid, std::process::id());
+        assert!(!intent_path(state.path(), &session).exists());
+        assert!(matches!(
+            events.as_slice(),
+            [WardEvent::SessionPaused { reason: r, .. }] if r.as_str() == reason
+        ));
+
+        hold.release(|e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!marker_path(state.path(), &session).exists());
+        assert_eq!(read_held_by(state.path(), &session).unwrap(), None);
+        assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
+            !sandbox.stopped()
+        }));
+        assert!(sandbox.running());
+        assert!(matches!(
+            events.as_slice(),
+            [
+                WardEvent::SessionPaused { .. },
+                WardEvent::SessionResumed { .. }
+            ]
+        ));
+
+        let mut none = Vec::new();
+        let idle = LocalCaptureHold::take(state.path(), "sess_idle_cap", &reason, |e| {
+            none.push(e);
+            Ok(())
+        })
+        .unwrap();
+        assert!(idle.is_none());
+        assert!(none.is_empty());
+    }
+
+    /// Without a daemon, a capture whose freeze is not confirmed settled, or
+    /// whose proxy does not acknowledge, is refused: nothing recorded, no
+    /// marker left, and only the freeze the capture itself took is released.
+    #[test]
+    fn a_local_capture_that_cannot_confirm_quiescence_is_refused_and_leaves_nothing() {
+        struct Silent;
+        impl crate::acks::Acknowledger for Silent {
+            fn confirm(
+                &mut self,
+                component: crate::acks::Component,
+                _: crate::acks::Phase,
+                _: &crate::acks::Site<'_>,
+            ) -> crate::acks::Outcome {
+                if component == crate::acks::Component::Proxy {
+                    crate::acks::Outcome::TimedOut {
+                        after: Duration::from_secs(2),
+                    }
+                } else {
+                    crate::acks::Outcome::Acknowledged
+                }
+            }
+        }
+        let state = tempfile::tempdir().unwrap();
+        let session = "sess_lcap_refused";
+        fs::create_dir_all(session_dir(state.path(), session)).unwrap();
+        let own = || CaptureFreeze {
+            state: state.path().to_path_buf(),
+            session: session.to_owned(),
+            frozen: Some(Frozen {
+                method: PauseMethod::Sigstop,
+                pids: vec![std::process::id()],
+                cgroup: None,
+            }),
+        };
+        let mut events = Vec::new();
+
+        let err = LocalCaptureHold::take_with(
+            state.path(),
+            session,
+            "ward capture: test",
+            |_, _| (own(), Some(1)),
+            &mut crate::acks::Live::new(),
+            |e| {
+                events.push(e);
+                Ok(())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nothing was captured"), "{err}");
+        assert!(err.contains("1 process(es) still pending"), "{err}");
+
+        let err = LocalCaptureHold::take_with(
+            state.path(),
+            session,
+            "ward capture: test",
+            |_, _| (own(), None),
+            &mut Silent,
+            |e| {
+                events.push(e);
+                Ok(())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nothing was captured"), "{err}");
+        assert!(
+            err.contains("egress proxy (no acknowledgement within 2s)"),
+            "{err}"
+        );
+        assert!(events.is_empty(), "nothing recorded");
+        assert!(!marker_path(state.path(), session).exists());
+        assert_eq!(read_held_by(state.path(), session).unwrap(), None);
+        assert!(!intent_path(state.path(), session).exists());
     }
 }
