@@ -7,6 +7,14 @@
 //! installed (a minimal `.tamperward.yml` when it is not). Every file is written only
 //! when absent, so the command is idempotent and never overwrites a file the user
 //! wrote; `--dry-run` reports the plan and touches nothing.
+//!
+//! The verification boundary — the command `ward verify` runs and the paths it
+//! restores — is proposed from the project's lockfiles and test configuration
+//! ([`ward_daemon::verify_proposal`], #147 item 2) and written *active* only when a trusted user
+//! accepts it: `--accept-verify`, or a yes at the terminal. Without that it is written
+//! commented out, so nothing the project's files merely suggest ever runs in the
+//! verifier on the strength of a guess; `ward ready` then says the command is not
+//! accepted and shows the same proposal.
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -15,7 +23,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::ValueEnum;
-use ward_daemon::verify_proposal::{self, Proposal};
+use ward_daemon::verify::CONFIG_PATH;
+use ward_daemon::verify_proposal::{Input, Proposal, Survey};
 use ward_daemon::{Error, Result, gateway};
 use ward_policy::Policy;
 
@@ -26,6 +35,15 @@ fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Error {
         source,
     }
 }
+
+/// The line that marks a verifier config or TamperWard policy as `ward init`'s own
+/// unaccepted proposal: the only kind of existing file acceptance may replace.
+const PROPOSED_MARKER: &str = "# Proposed by `ward init`, not accepted.";
+
+/// The question asked at a terminal when one boundary is proposed and none accepted.
+const ACCEPT_PROMPT: &str = "Accept this verification boundary? It becomes verify.command and \
+                             protected.tests in .tamperward/config.yml; nothing runs before \
+                             you accept. [y/N] ";
 
 /// The agent the closing "next" block names, and whose key is looked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -54,9 +72,7 @@ impl Agent {
     }
 }
 
-/// What `ward init` was asked to do. Everything the command reads from its
-/// environment (PATH, the key variable, the state root) arrives here as a value, so
-/// the tests drive it without touching the process environment.
+/// Everything `ward init` reads from its environment, gathered by the caller.
 pub struct Options {
     /// The directory to make a project; the argument as typed, for the "next" block.
     pub dir: PathBuf,
@@ -72,6 +88,20 @@ pub struct Options {
     pub state: PathBuf,
     /// Whether the agent's key variable is set on the host.
     pub key_in_env: bool,
+    /// Who may accept the proposed verification boundary during this run.
+    pub accept: Accept,
+}
+
+/// Who may accept the proposed verification boundary during a run.
+#[derive(Clone, Copy)]
+pub enum Accept {
+    /// `--accept-verify`: the one proposal, without a question.
+    Flag,
+    /// Ask at the terminal, with this function, when exactly one is proposed.
+    Ask(fn(&str) -> bool),
+    /// Nobody: no flag, and stdin or stdout is not a terminal, so a script never
+    /// blocks on a question.
+    Nobody,
 }
 
 /// What happened to one item of the plan.
@@ -79,6 +109,9 @@ pub struct Options {
 enum Outcome {
     /// The file was written (or, dry: would be).
     Written,
+    /// The unaccepted proposal `ward init` wrote earlier was replaced by the accepted
+    /// boundary (or, dry: would be).
+    Accepted,
     /// The file was already there and left as it is.
     Kept,
     /// Nothing to do, with the reason.
@@ -87,7 +120,24 @@ enum Outcome {
     Note(String),
 }
 
+/// How the proposed verification boundary ended up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Acceptance {
+    /// Written active, with this command: `--accept-verify`, or yes at the terminal.
+    Accepted(String),
+    /// One proposal, written commented out.
+    Proposed,
+    /// Several proposals, all commented out; none chosen for the user.
+    Several,
+    /// Nothing could be proposed; the key is left for the user to fill.
+    Nothing,
+    /// The verifier config already existed and was not `ward init`'s own unaccepted
+    /// proposal: the user's file, left alone.
+    Kept,
+}
+
 /// One row of the report.
+#[derive(Debug)]
 struct Step {
     label: &'static str,
     path: String,
@@ -95,9 +145,11 @@ struct Step {
 }
 
 /// The result of `ward init`: the rows, and what to do next.
+#[derive(Debug)]
 pub struct Report {
     steps: Vec<Step>,
-    proposals: Vec<Proposal>,
+    survey: Survey,
+    acceptance: Acceptance,
     next: Vec<(String, &'static str)>,
     dry_run: bool,
     dir: PathBuf,
@@ -118,29 +170,43 @@ impl Report {
             let outcome = match &s.outcome {
                 Outcome::Written if self.dry_run => "would write".to_owned(),
                 Outcome::Written => "written".to_owned(),
+                Outcome::Accepted if self.dry_run => "would accept".to_owned(),
+                Outcome::Accepted => "accepted".to_owned(),
                 Outcome::Kept => "already there, left as is".to_owned(),
                 Outcome::Skipped(why) => format!("skipped · {why}"),
                 Outcome::Note(text) => text.clone(),
             };
             let _ = writeln!(out, "  {:<11} {:<width$}  {outcome}", s.label, s.path);
         }
-        if !self.proposals.is_empty() {
-            let _ = writeln!(out, "\nVerify command, from the project's files");
-            let width = self
-                .proposals
-                .iter()
-                .map(|p| p.command.len())
-                .max()
-                .unwrap_or(0);
-            for p in &self.proposals {
-                let _ = writeln!(out, "  {:<width$}   {}", p.command, p.evidence.join(" · "));
-            }
-            if self.proposals.len() > 1 {
-                let _ = writeln!(
-                    out,
-                    "  several match: none was chosen; uncomment one in {}",
-                    ward_daemon::verify::CONFIG_PATH
-                );
+        if self.acceptance != Acceptance::Kept {
+            let _ = write!(out, "\n{}", self.survey.render());
+            let would = if self.dry_run { "would be " } else { "" };
+            match &self.acceptance {
+                Acceptance::Accepted(command) => {
+                    let _ = writeln!(
+                        out,
+                        "  accepted: `{command}` {would}written to {CONFIG_PATH} as verify.command, its protected inputs as protected.tests"
+                    );
+                }
+                Acceptance::Proposed => {
+                    let _ = writeln!(
+                        out,
+                        "  not accepted: {would}written commented out; nothing runs until a trusted user accepts it with `ward init --accept-verify`"
+                    );
+                }
+                Acceptance::Several => {
+                    let _ = writeln!(
+                        out,
+                        "  several match: none accepted; `ward init --accept-verify` needs one, so uncomment one in {CONFIG_PATH}"
+                    );
+                }
+                Acceptance::Nothing => {
+                    let _ = writeln!(
+                        out,
+                        "  name the test command in {CONFIG_PATH} to make the project verifiable"
+                    );
+                }
+                Acceptance::Kept => {}
             }
         }
         let _ = writeln!(out, "\nNext");
@@ -163,7 +229,10 @@ pub fn run(opts: &Options) -> Result<Report> {
     } else {
         opts.dir.clone()
     };
-    let proposals = verify_proposal::propose(&dir);
+    let survey = Survey::of(&dir);
+    let config_path = dir.join(CONFIG_PATH);
+    let awaiting = awaiting_acceptance(&config_path);
+    let accepted = accepted_proposal(opts, &survey, awaiting)?;
     let mut steps = Vec::new();
 
     steps.push(Step {
@@ -180,49 +249,87 @@ pub fn run(opts: &Options) -> Result<Report> {
         path: ".gitignore".to_owned(),
         outcome: ignore_sessions(&dir, opts.dry_run)?,
     });
-    let verifier = write_new(
-        &dir.join(".tamperward/config.yml"),
-        &verifier_config(&proposals),
+    let verifier = write_boundary(
+        &config_path,
+        &verifier_config(&survey, accepted),
+        accepted.is_some(),
         opts.dry_run,
     )?;
-    let shown = if verifier == Outcome::Written {
-        proposals.clone()
-    } else {
-        Vec::new()
+    let acceptance = match (&verifier, accepted, survey.proposals.as_slice()) {
+        (Outcome::Kept | Outcome::Skipped(_) | Outcome::Note(_), _, _) => Acceptance::Kept,
+        (_, Some(p), _) => Acceptance::Accepted(p.command.clone()),
+        (_, None, []) => Acceptance::Nothing,
+        (_, None, [_]) => Acceptance::Proposed,
+        (_, None, _) => Acceptance::Several,
     };
-    steps.push(Step {
-        label: "verifier",
-        path: ".tamperward/config.yml".to_owned(),
-        outcome: match verifier {
-            Outcome::Written => Outcome::Note(format!(
-                "{} ({})",
-                if opts.dry_run {
-                    "would write"
-                } else {
-                    "written"
-                },
-                match proposals.as_slice() {
-                    [] => "no test command recognised: set verify.command".to_owned(),
-                    [only] => only.command.clone(),
-                    several => format!("{} candidates, none chosen", several.len()),
-                }
-            )),
-            other => other,
-        },
-    });
-    steps.push(tamperward_step(&dir, &proposals, opts)?);
+    steps.push(verifier_step(verifier, &acceptance, &survey, opts.dry_run));
+    steps.push(tamperward_step(&dir, &survey, accepted, opts)?);
+    let next = next_steps(opts, &acceptance);
+    Ok(Report {
+        steps,
+        survey,
+        acceptance,
+        next,
+        dry_run: opts.dry_run,
+        dir,
+    })
+}
 
+/// The verifier row of the report: what was written, and whether as an accepted
+/// boundary, an unaccepted proposal, several candidates or a blank to fill.
+fn verifier_step(verifier: Outcome, acceptance: &Acceptance, survey: &Survey, dry: bool) -> Step {
+    let would = |done: &str, would: &str| if dry { would } else { done }.to_owned();
+    let outcome = match verifier {
+        Outcome::Written => Outcome::Note(format!(
+            "{} ({})",
+            would("written", "would write"),
+            match acceptance {
+                Acceptance::Accepted(command) => format!("accepted: {command}"),
+                Acceptance::Proposed =>
+                    format!("proposed, not accepted: {}", survey.proposals[0].command),
+                Acceptance::Several =>
+                    format!("{} candidates, none accepted", survey.proposals.len()),
+                Acceptance::Nothing | Acceptance::Kept =>
+                    "no test command could be proposed: set verify.command".to_owned(),
+            }
+        )),
+        Outcome::Accepted => Outcome::Note(format!(
+            "{} ({}); replaces the proposal written earlier",
+            would("accepted", "would accept"),
+            match acceptance {
+                Acceptance::Accepted(command) => command.as_str(),
+                _ => "",
+            }
+        )),
+        other => other,
+    };
+    Step {
+        label: "verifier",
+        path: CONFIG_PATH.to_owned(),
+        outcome,
+    }
+}
+
+/// The closing "next" block: accepting the proposal while one waits, the key while
+/// none is stored, then the agent and the verifier.
+fn next_steps(opts: &Options, acceptance: &Acceptance) -> Vec<(String, &'static str)> {
     let key_in_vault =
         std::fs::read_to_string(gateway::vault_file(&opts.state, opts.agent.key_env()))
             .is_ok_and(|k| !k.trim().is_empty());
     let mut next = Vec::new();
+    let arg = dir_argument(&opts.dir);
+    if *acceptance == Acceptance::Proposed {
+        next.push((
+            format!("ward init --accept-verify{arg}"),
+            "accept the proposed verification boundary; nothing is verified before",
+        ));
+    }
     if !(opts.key_in_env || key_in_vault) {
         next.push((
             format!("ward vault set {}", opts.agent.key_env()),
             "the model key, kept on the host; the proxy injects it",
         ));
     }
-    let arg = dir_argument(&opts.dir);
     next.push((
         format!("ward {}{arg}", opts.agent.command()),
         "start the agent in the sandbox",
@@ -231,13 +338,131 @@ pub fn run(opts: &Options) -> Result<Report> {
         format!("ward verify{arg}"),
         "run the protected tests in the disposable verifier",
     ));
-    Ok(Report {
-        steps,
-        proposals: shown,
-        next,
-        dry_run: opts.dry_run,
-        dir,
-    })
+    next
+}
+
+/// The one proposal a trusted user accepted, if any: by `--accept-verify` (which
+/// refuses to pick among several or to accept nothing), or by answering yes at the
+/// terminal to the one proposal shown. Nothing is asked when the config is already
+/// the user's own, when there is no terminal, or on a dry run.
+fn accepted_proposal<'a>(
+    opts: &Options,
+    survey: &'a Survey,
+    awaiting: bool,
+) -> Result<Option<&'a Proposal>> {
+    if !awaiting {
+        return Ok(None);
+    }
+    if matches!(opts.accept, Accept::Flag) {
+        return match survey.proposals.as_slice() {
+            [one] => Ok(Some(one)),
+            [] => Err(Error::Project(format!(
+                "--accept-verify: no verification command can be proposed from {}'s files ({}); name it in {CONFIG_PATH}",
+                opts.dir.display(),
+                survey.declined.join("; ")
+            ))),
+            several => Err(Error::Project(format!(
+                "--accept-verify: several verification commands match ({}); uncomment the one to run in {CONFIG_PATH}",
+                several
+                    .iter()
+                    .map(|p| format!("`{}`", p.command))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        };
+    }
+    if let (Accept::Ask(ask), [one], false) =
+        (opts.accept, survey.proposals.as_slice(), opts.dry_run)
+    {
+        print!("{}", survey.render());
+        println!();
+        return Ok(ask(ACCEPT_PROMPT).then_some(one));
+    }
+    Ok(None)
+}
+
+/// Read the question's answer from the terminal: `y` or `yes`, case-insensitively,
+/// means yes; anything else, or no line at all, means no.
+pub fn ask_on_terminal(prompt: &str) -> bool {
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Whether a YAML text has an active (uncommented) `command:` key.
+fn has_active_command(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.trim_start().starts_with("command:"))
+}
+
+/// Whether the boundary at `path` is still waiting for acceptance: absent, or
+/// `ward init`'s own marked proposal with its command still commented out. Any other
+/// node — the user's file, a symlink, something unreadable — is not ours to replace.
+fn awaiting_acceptance(path: &Path) -> bool {
+    match path.symlink_metadata() {
+        Err(_) => true,
+        Ok(meta) if !meta.is_file() => false,
+        Ok(_) => std::fs::read_to_string(path)
+            .is_ok_and(|text| text.contains(PROPOSED_MARKER) && !has_active_command(&text)),
+    }
+}
+
+/// Write the boundary file at `path`: created when absent ([`write_new`]), replaced
+/// when `accept` and it is `ward init`'s own unaccepted proposal
+/// ([`replace_proposed`]), otherwise left as the user's.
+fn write_boundary(path: &Path, content: &str, accept: bool, dry: bool) -> Result<Outcome> {
+    if accept && path.symlink_metadata().is_ok() {
+        return replace_proposed(path, content, dry);
+    }
+    write_new(path, content, dry)
+}
+
+/// Replace the file at `path` with `content` when, read through the very fd that is
+/// then written, it is `ward init`'s marked proposal with no active command; `Kept`
+/// otherwise. The same open-once discipline as [`ignore_sessions`]: `O_NOFOLLOW`
+/// refuses a symlink, `O_NONBLOCK` and the regular-file check refuse a FIFO, the
+/// link count refuses a hard link to some other file.
+fn replace_proposed(path: &Path, content: &str, dry: bool) -> Result<Outcome> {
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(Error::Project(format!(
+                "{}: refusing to write through a symlink",
+                path.display()
+            )));
+        }
+        Err(e) => return Err(io(path, e)),
+    };
+    let meta = file.metadata().map_err(|e| io(path, e))?;
+    if !meta.is_file() || meta.nlink() != 1 {
+        return Err(Error::Project(format!(
+            "{}: refusing to read or write a non-regular or hard-linked file",
+            path.display()
+        )));
+    }
+    let mut existing = String::new();
+    file.read_to_string(&mut existing)
+        .map_err(|e| io(path, e))?;
+    if !existing.contains(PROPOSED_MARKER) || has_active_command(&existing) {
+        return Ok(Outcome::Kept);
+    }
+    if dry {
+        return Ok(Outcome::Accepted);
+    }
+    file.set_len(0).map_err(|e| io(path, e))?;
+    file.seek(SeekFrom::Start(0)).map_err(|e| io(path, e))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| io(path, e))?;
+    Ok(Outcome::Accepted)
 }
 
 /// The directory as it must be repeated on the next commands: nothing for `.`.
@@ -432,12 +657,45 @@ fn ignores_sessions(line: &str) -> bool {
     matches!(pattern, ".ward/sessions" | ".ward")
 }
 
+/// The YAML list items for a proposal's protected inputs, each with its evidence as
+/// a trailing comment, at `indent`.
+fn protected_items(inputs: &[Input], indent: &str) -> String {
+    let width = inputs.iter().map(|i| i.path.len()).max().unwrap_or(0);
+    let mut text = String::new();
+    for input in inputs {
+        let _ = writeln!(text, "{indent}- {:<width$}  # {}", input.path, input.why);
+    }
+    text
+}
+
+/// A comment block naming a proposal's read-only inputs and gaps, for the user to
+/// see beside the command; the verifier reads these files from the candidate as it
+/// is and never rewrites them, and the prepared-environment phase keys on them.
+fn inputs_comment(proposal: &Proposal) -> String {
+    let mut text = String::new();
+    if !proposal.read_only.is_empty() {
+        let _ = writeln!(
+            text,
+            "  # Read-only inputs, read by the verifier and never rewritten:"
+        );
+        for input in &proposal.read_only {
+            let _ = writeln!(text, "  #   {}  ({})", input.path, input.why);
+        }
+    }
+    for gap in &proposal.gaps {
+        let _ = writeln!(text, "  # Gap: {gap}");
+    }
+    text
+}
+
 /// `.tamperward/config.yml`, the verifier's view: the tests only it may judge, and
-/// the command it runs. The command is the one proposal read from the project's
-/// files ([`verify_proposal::propose`]), with its evidence beside it. With none, or
-/// with several to choose from, the key is left commented so `ward verify` says
-/// exactly what is missing and the user, not `ward init`, picks the command.
-fn verifier_config(proposals: &[Proposal]) -> String {
+/// the command it runs. Both come from the project's own files
+/// ([`Survey`]), with the evidence beside each, and are active only
+/// for the proposal a trusted user `accepted`. Otherwise the proposals are written
+/// commented out under [`PROPOSED_MARKER`], so `ward verify` says exactly what is
+/// missing, `ward ready` shows the proposal, and a later `ward init --accept-verify`
+/// can replace this file, and only this file, with the accepted boundary.
+fn verifier_config(survey: &Survey, accepted: Option<&Proposal>) -> String {
     let mut text = String::from(
         "# .tamperward/config.yml — what `ward verify` runs (written by `ward init`).\n\
          #\n\
@@ -445,29 +703,53 @@ fn verifier_config(proposals: &[Proposal]) -> String {
          # snapshot, so an agent that edits a test listed here only changes what the verifier\n\
          # restores. The command runs offline, in a disposable sandbox, at the root of the tree.\n\
          # Reference: docs/tamperward-integration.md §5.\n\
-         protected:\n  tests:\n    - tests/\n\
-         verify:\n",
+         protected:\n",
     );
-    match proposals {
-        [] => {
+    match (accepted, survey.proposals.as_slice()) {
+        (Some(p), _) => {
+            if p.protected.is_empty() {
+                text.push_str("  tests: []\n");
+            } else {
+                text.push_str("  tests:\n");
+                text.push_str(&protected_items(&p.protected, "    "));
+            }
             let _ = writeln!(
                 text,
-                "  # No test command recognised from this project's files: name the test command.\n  \
-                 # command: make test"
+                "verify:\n  # Accepted from {} (ward init --accept-verify).\n  command: {}",
+                p.evidence.join(", "),
+                p.command
+            );
+            text.push_str(&inputs_comment(p));
+        }
+        (None, []) => {
+            text.push_str("  tests: []\n");
+            for why in &survey.declined {
+                let _ = writeln!(text, "  # Cannot propose: {why}");
+            }
+            text.push_str(
+                "verify:\n  # No test command could be proposed from this project's files: name it.\n  \
+                 # command: <the command that runs this project's tests>\n",
             );
         }
-        [only] => {
+        (None, [only]) => {
+            text.push_str("  tests: []\n");
+            let _ = writeln!(text, "  {PROPOSED_MARKER}");
+            text.push_str(&protected_items(&only.protected, "  #   "));
             let _ = writeln!(
                 text,
-                "  # Proposed from {}.\n  command: {}",
+                "verify:\n  {PROPOSED_MARKER} From {}.\n  \
+                 # `ward init --accept-verify` writes it, or uncomment it to accept by hand.\n  \
+                 # command: {}",
                 only.evidence.join(", "),
                 only.command
             );
+            text.push_str(&inputs_comment(only));
         }
-        several => {
+        (None, several) => {
+            text.push_str("  tests: []\n");
             let _ = writeln!(
                 text,
-                "  # Several test commands match this project: uncomment the one to run."
+                "verify:\n  {PROPOSED_MARKER} Several test commands match this project: uncomment the one to run."
             );
             for p in several {
                 let _ = writeln!(
@@ -476,6 +758,7 @@ fn verifier_config(proposals: &[Proposal]) -> String {
                     p.evidence.join(", "),
                     p.command
                 );
+                text.push_str(&protected_items(&p.protected, "  #   protect: "));
             }
         }
     }
@@ -483,30 +766,64 @@ fn verifier_config(proposals: &[Proposal]) -> String {
     text
 }
 
+/// A TamperWard `tests:` pattern for one protected input: a directory covers
+/// everything under it.
+fn tamperward_pattern(input: &Input) -> String {
+    if input.path.ends_with('/') {
+        format!("'{}**'", input.path)
+    } else {
+        format!("'{}'", input.path)
+    }
+}
+
 /// TamperWard's own policy, written only when `tamperward` is not installed: enough
 /// for `tamperward check` to guard the tests once it is, and a pointer to the full
-/// wiring. `tamperward init` keeps this file when it runs later. The verify block is
-/// active only when exactly one command was proposed, as in [`verifier_config`].
-fn tamperward_policy(proposals: &[Proposal]) -> String {
+/// wiring. `tamperward init` keeps this file when it runs later. The tests and the
+/// verify block are active only for the `accepted` proposal, as in
+/// [`verifier_config`].
+fn tamperward_policy(survey: &Survey, accepted: Option<&Proposal>) -> String {
     let mut text = String::from(
         "# .tamperward.yml — TamperWard policy (written by `ward init`; TamperWard was not\n\
          # installed). Once it is (`npx tamperward init`, Node.js 20.19 or later; the WardOS\n\
          # image ships it), run `tamperward init`: it keeps this file and adds the Claude Code\n\
          # hooks, a pre-commit hook and a CI workflow.\n\
          version: 1\n\
-         protected:\n  tests: ['tests/**']\n",
+         protected:\n",
     );
-    match proposals {
-        [] => {
-            text.push_str(
-                "# verify:\n#   command: <the command that runs this project's tests>\n#   budget: 600\n",
+    let patterns = |p: &Proposal| {
+        p.protected
+            .iter()
+            .map(tamperward_pattern)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match (accepted, survey.proposals.as_slice()) {
+        (Some(p), _) => {
+            let _ = writeln!(
+                text,
+                "  tests: [{}]\nverify:\n  command: {}\n  budget: 600",
+                patterns(p),
+                p.command
             );
         }
-        [only] => {
-            let _ = writeln!(text, "verify:\n  command: {}\n  budget: 600", only.command);
+        (None, []) => {
+            text.push_str(
+                "  tests: []\n# verify:\n#   command: <the command that runs this project's tests>\n#   budget: 600\n",
+            );
         }
-        several => {
-            text.push_str("# Several test commands match this project: keep one.\n# verify:\n");
+        (None, [only]) => {
+            let _ = writeln!(
+                text,
+                "  tests: []\n{PROPOSED_MARKER}\n#   tests: [{}]\n# verify:\n#   command: {}\n#   budget: 600",
+                patterns(only),
+                only.command
+            );
+        }
+        (None, several) => {
+            let _ = writeln!(
+                text,
+                "  tests: []\n{PROPOSED_MARKER} Several test commands match this project: keep one.\n# verify:"
+            );
             for p in several {
                 let _ = writeln!(text, "#   command: {}", p.command);
             }
@@ -518,7 +835,12 @@ fn tamperward_policy(proposals: &[Proposal]) -> String {
 
 /// The TamperWard step: run `tamperward init --cwd <dir>` and show its output, or
 /// write the minimal policy and say how to get the rest.
-fn tamperward_step(dir: &Path, proposals: &[Proposal], opts: &Options) -> Result<Step> {
+fn tamperward_step(
+    dir: &Path,
+    survey: &Survey,
+    accepted: Option<&Proposal>,
+    opts: &Options,
+) -> Result<Step> {
     let path = ".tamperward.yml".to_owned();
     if opts.no_tamperward {
         return Ok(Step {
@@ -528,18 +850,18 @@ fn tamperward_step(dir: &Path, proposals: &[Proposal], opts: &Options) -> Result
         });
     }
     let Some(bin) = &opts.tamperward else {
-        let outcome = match write_new(
+        let would = if opts.dry_run { "would be " } else { "" };
+        let outcome = match write_boundary(
             &dir.join(&path),
-            &tamperward_policy(proposals),
+            &tamperward_policy(survey, accepted),
+            accepted.is_some(),
             opts.dry_run,
         )? {
             Outcome::Written => Outcome::Note(format!(
-                "tamperward not installed; minimal policy {}. `npx tamperward init` adds the hooks, pre-commit and CI",
-                if opts.dry_run {
-                    "would be written"
-                } else {
-                    "written"
-                }
+                "tamperward not installed; minimal policy {would}written. `npx tamperward init` adds the hooks, pre-commit and CI"
+            )),
+            Outcome::Accepted => Outcome::Note(format!(
+                "tamperward not installed; minimal policy {would}accepted, replacing the proposal written earlier"
             )),
             other => other,
         };
@@ -586,6 +908,8 @@ pub fn find_tamperward(path_var: &str) -> Option<PathBuf> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     fn options(dir: &Path, state: &Path) -> Options {
@@ -597,32 +921,300 @@ mod tests {
             dry_run: false,
             state: state.to_path_buf(),
             key_in_env: false,
+            accept: Accept::Nobody,
         }
+    }
+
+    fn accepting(dir: &Path, state: &Path) -> Options {
+        let mut opts = options(dir, state);
+        opts.accept = Accept::Flag;
+        opts
     }
 
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap_or_default()
     }
 
-    #[test]
-    fn writes_the_template_the_verifier_config_and_the_minimal_policy() {
+    fn cargo_project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        std::fs::create_dir(dir.path().join("tests")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn writes_the_template_the_accepted_verifier_config_and_the_minimal_policy() {
+        let dir = cargo_project();
         let state = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
-        let report = run(&options(dir.path(), state.path())).unwrap();
+        let report = run(&accepting(dir.path(), state.path())).unwrap();
         assert_eq!(
             read(&dir.path().join(".ward/policy.yaml")),
             Policy::template()
         );
         let verifier = read(&dir.path().join(".tamperward/config.yml"));
-        assert!(verifier.contains("command: cargo test"), "{verifier}");
+        assert!(
+            verifier.contains("\n  command: cargo test --locked\n"),
+            "{verifier}"
+        );
         assert!(verifier.contains("- tests/"), "{verifier}");
+        assert!(verifier.contains("Cargo.lock  (lockfile"), "{verifier}");
+        let config = ward_daemon::verify::Config::parse(&verifier).unwrap();
+        assert_eq!(config.protected.tests, ["tests/"]);
         let policy = read(&dir.path().join(".tamperward.yml"));
         assert!(policy.contains("tests: ['tests/**']"), "{policy}");
-        assert!(policy.contains("command: cargo test"), "{policy}");
+        assert!(
+            policy.contains("\n  command: cargo test --locked\n"),
+            "{policy}"
+        );
         let text = report.render();
         assert!(text.contains(".ward/policy.yaml"), "{text}");
         assert!(text.contains("npx tamperward init"), "{text}");
+        assert!(text.contains("accepted: `cargo test --locked`"), "{text}");
+        assert!(!text.contains("ward init --accept-verify"), "{text}");
+    }
+
+    #[test]
+    fn without_acceptance_the_boundary_is_written_commented_out_and_the_report_says_so() {
+        let dir = cargo_project();
+        let state = tempfile::tempdir().unwrap();
+        let text = run(&options(dir.path(), state.path())).unwrap().render();
+        let verifier = read(&dir.path().join(".tamperward/config.yml"));
+        assert!(verifier.contains(PROPOSED_MARKER), "{verifier}");
+        assert!(
+            verifier.contains("# command: cargo test --locked"),
+            "{verifier}"
+        );
+        assert!(verifier.contains("#   - tests/"), "{verifier}");
+        assert!(!has_active_command(&verifier), "{verifier}");
+        let err = ward_daemon::verify::Config::parse(&verifier)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("verify.command is empty"), "{err}");
+        let policy = read(&dir.path().join(".tamperward.yml"));
+        assert!(policy.contains("  tests: []\n"), "{policy}");
+        assert!(
+            policy.contains("#   command: cargo test --locked"),
+            "{policy}"
+        );
+        assert!(!has_active_command(&policy), "{policy}");
+        assert!(
+            text.contains("proposed, not accepted: cargo test --locked"),
+            "{text}"
+        );
+        assert!(text.contains("Proposed verification boundary"), "{text}");
+        assert!(text.contains("tests/"), "{text}");
+        assert!(text.contains("not accepted:"), "{text}");
+        assert!(text.contains("ward init --accept-verify"), "{text}");
+        let ready = ward_daemon::readiness::check(dir.path());
+        assert_eq!(
+            ready.verdict(),
+            ward_daemon::readiness::Verdict::SetupRequired
+        );
+    }
+
+    #[test]
+    fn accept_verify_replaces_the_unaccepted_proposal_but_never_the_users_file() {
+        let dir = cargo_project();
+        let state = tempfile::tempdir().unwrap();
+        run(&options(dir.path(), state.path())).unwrap();
+        let report = run(&accepting(dir.path(), state.path())).unwrap();
+        let verifier = read(&dir.path().join(".tamperward/config.yml"));
+        assert!(
+            verifier.contains("\n  command: cargo test --locked\n"),
+            "{verifier}"
+        );
+        assert!(!verifier.contains(PROPOSED_MARKER), "{verifier}");
+        let policy = read(&dir.path().join(".tamperward.yml"));
+        assert!(
+            policy.contains("\n  command: cargo test --locked\n"),
+            "{policy}"
+        );
+        let text = report.render();
+        assert!(
+            text.contains("replaces the proposal written earlier"),
+            "{text}"
+        );
+        assert_eq!(
+            report.acceptance,
+            Acceptance::Accepted("cargo test --locked".to_owned())
+        );
+        let ready = ward_daemon::readiness::check(dir.path());
+        assert!(ready.survey.is_none(), "{ready:?}");
+
+        let mine = "protected:\n  tests: []\nverify:\n  budget_secs: 5\n";
+        std::fs::write(dir.path().join(".tamperward/config.yml"), mine).unwrap();
+        let report = run(&accepting(dir.path(), state.path())).unwrap();
+        assert_eq!(read(&dir.path().join(".tamperward/config.yml")), mine);
+        assert_eq!(report.acceptance, Acceptance::Kept);
+        assert!(
+            !report.render().contains("Proposed verification"),
+            "{}",
+            report.render()
+        );
+
+        let by_hand = format!("{PROPOSED_MARKER}\nverify:\n  command: make check\n");
+        std::fs::write(dir.path().join(".tamperward/config.yml"), &by_hand).unwrap();
+        run(&accepting(dir.path(), state.path())).unwrap();
+        assert_eq!(
+            read(&dir.path().join(".tamperward/config.yml")),
+            by_hand,
+            "a proposal the user accepted by uncommenting is theirs now"
+        );
+    }
+
+    #[test]
+    fn accept_verify_refuses_to_pick_among_several_or_to_accept_nothing() {
+        let dir = cargo_project();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Makefile"), "test:\n\tcargo test\n").unwrap();
+        let err = run(&accepting(dir.path(), state.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("several verification commands match"), "{err}");
+        assert!(
+            err.contains("`cargo test --locked`") && err.contains("`make test`"),
+            "{err}"
+        );
+        assert!(
+            !dir.path().join(".ward").exists(),
+            "nothing is written on a refusal"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"tsc"}}"#,
+        )
+        .unwrap();
+        let err = run(&accepting(dir.path(), state.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no verification command can be proposed"),
+            "{err}"
+        );
+        assert!(err.contains("no scripts.test"), "{err}");
+    }
+
+    static ASKED: AtomicUsize = AtomicUsize::new(0);
+
+    fn say_yes(prompt: &str) -> bool {
+        assert!(prompt.contains("[y/N]"), "{prompt}");
+        ASKED.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn say_no(_: &str) -> bool {
+        ASKED.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+
+    #[test]
+    fn a_terminal_is_asked_once_and_only_a_yes_accepts() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = cargo_project();
+        let mut opts = options(dir.path(), state.path());
+        opts.accept = Accept::Ask(say_no);
+        let before = ASKED.load(Ordering::SeqCst);
+        let report = run(&opts).unwrap();
+        assert_eq!(ASKED.load(Ordering::SeqCst), before + 1);
+        assert_eq!(report.acceptance, Acceptance::Proposed);
+        assert!(!has_active_command(&read(
+            &dir.path().join(".tamperward/config.yml")
+        )));
+
+        opts.accept = Accept::Ask(say_yes);
+        let report = run(&opts).unwrap();
+        assert_eq!(ASKED.load(Ordering::SeqCst), before + 2);
+        assert_eq!(
+            report.acceptance,
+            Acceptance::Accepted("cargo test --locked".to_owned())
+        );
+        assert!(has_active_command(&read(
+            &dir.path().join(".tamperward/config.yml")
+        )));
+
+        let report = run(&opts).unwrap();
+        assert_eq!(
+            ASKED.load(Ordering::SeqCst),
+            before + 2,
+            "an accepted project is not asked again"
+        );
+        assert_eq!(report.acceptance, Acceptance::Kept);
+
+        let dir = cargo_project();
+        std::fs::write(dir.path().join("Makefile"), "test:\n\tcargo test\n").unwrap();
+        let mut opts = options(dir.path(), state.path());
+        opts.accept = Accept::Ask(say_yes);
+        let report = run(&opts).unwrap();
+        assert_eq!(
+            ASKED.load(Ordering::SeqCst),
+            before + 2,
+            "several candidates are never a question"
+        );
+        assert_eq!(report.acceptance, Acceptance::Several);
+
+        let dir = cargo_project();
+        let mut opts = options(dir.path(), state.path());
+        opts.accept = Accept::Ask(say_yes);
+        opts.dry_run = true;
+        run(&opts).unwrap();
+        assert_eq!(
+            ASKED.load(Ordering::SeqCst),
+            before + 2,
+            "a dry run asks nothing"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_acceptance_writes_nothing_and_says_what_it_would_do() {
+        let dir = cargo_project();
+        let state = tempfile::tempdir().unwrap();
+        let mut opts = accepting(dir.path(), state.path());
+        opts.dry_run = true;
+        let text = run(&opts).unwrap().render();
+        assert!(!dir.path().join(".tamperward").exists());
+        assert!(
+            text.contains("would write (accepted: cargo test --locked)"),
+            "{text}"
+        );
+        assert!(text.contains("would be written"), "{text}");
+
+        opts.dry_run = false;
+        opts.accept = Accept::Nobody;
+        run(&opts).unwrap();
+        opts.dry_run = true;
+        opts.accept = Accept::Flag;
+        let text = run(&opts).unwrap().render();
+        assert!(
+            text.contains("would accept (cargo test --locked)"),
+            "{text}"
+        );
+        assert!(!has_active_command(&read(
+            &dir.path().join(".tamperward/config.yml")
+        )));
+    }
+
+    #[test]
+    fn a_symlinked_proposal_is_left_alone_even_when_accepting() {
+        let dir = cargo_project();
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("config.yml");
+        std::fs::write(
+            &target,
+            format!("{PROPOSED_MARKER}\nverify:\n  # command: x\n"),
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join(".tamperward")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".tamperward/config.yml")).unwrap();
+        let report = run(&accepting(dir.path(), state.path())).unwrap();
+        assert_eq!(report.acceptance, Acceptance::Kept);
+        assert!(
+            read(&target).contains("# command: x"),
+            "the target is never rewritten"
+        );
     }
 
     #[test]
@@ -676,9 +1268,9 @@ mod tests {
     }
 
     #[test]
-    fn guesses_the_verify_command_from_the_build_files() {
+    fn the_proposed_command_is_active_only_once_accepted_for_every_ecosystem() {
         for (file, content, command) in [
-            ("Cargo.toml", "", "cargo test"),
+            ("Cargo.toml", "[package]\nname = \"app\"\n", "cargo test"),
             ("package.json", r#"{"scripts":{"test":"jest"}}"#, "npm test"),
             ("pyproject.toml", "[tool.pytest.ini_options]\n", "pytest"),
         ] {
@@ -688,7 +1280,17 @@ mod tests {
             run(&options(dir.path(), state.path())).unwrap();
             let verifier = read(&dir.path().join(".tamperward/config.yml"));
             assert!(
-                verifier.contains(&format!("command: {command}")),
+                verifier.contains(&format!("# command: {command}")),
+                "{file}: {verifier}"
+            );
+            assert!(
+                ward_daemon::verify::Config::parse(&verifier).is_err(),
+                "{file}: not accepted, so the verifier has no command"
+            );
+            run(&accepting(dir.path(), state.path())).unwrap();
+            let verifier = read(&dir.path().join(".tamperward/config.yml"));
+            assert!(
+                verifier.contains(&format!("\n  command: {command}\n")),
                 "{file}: {verifier}"
             );
             assert!(
@@ -700,8 +1302,13 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let text = run(&options(dir.path(), state.path())).unwrap().render();
         let verifier = read(&dir.path().join(".tamperward/config.yml"));
-        assert!(verifier.contains("# command: make test"), "{verifier}");
-        assert!(text.contains("no test command recognised"), "{text}");
+        assert!(verifier.contains("# command: <the command"), "{verifier}");
+        assert!(
+            verifier.contains("# Cannot propose: no manifest"),
+            "{verifier}"
+        );
+        assert!(text.contains("no test command could be proposed"), "{text}");
+        assert!(text.contains("cannot propose: no manifest"), "{text}");
         let err = ward_daemon::verify::Config::parse(&verifier)
             .unwrap_err()
             .to_string();
@@ -722,15 +1329,19 @@ mod tests {
             "lockfileVersion: '9.0'\n",
         )
         .unwrap();
+        std::fs::create_dir(dir.path().join("__tests__")).unwrap();
         let text = run(&options(dir.path(), state.path())).unwrap().render();
         let verifier = read(&dir.path().join(".tamperward/config.yml"));
-        assert!(verifier.contains("  command: pnpm test\n"), "{verifier}");
-        assert!(ward_daemon::verify::Config::parse(&verifier).is_ok());
+        assert!(verifier.contains("  # command: pnpm test\n"), "{verifier}");
+        assert!(verifier.contains("#   - __tests__/"), "{verifier}");
+        assert!(verifier.contains("pnpm-lock.yaml  (lockfile"), "{verifier}");
         let policy = read(&dir.path().join(".tamperward.yml"));
-        assert!(policy.contains("command: pnpm test"), "{policy}");
+        assert!(policy.contains("#   command: pnpm test"), "{policy}");
+        assert!(policy.contains("#   tests: ['__tests__/**']"), "{policy}");
         assert!(text.contains("pnpm test"), "{text}");
         assert!(text.contains("package.json scripts.test"), "{text}");
         assert!(text.contains("pnpm-lock.yaml"), "{text}");
+        assert!(text.contains("__tests__/"), "{text}");
     }
 
     #[test]
@@ -760,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn a_package_json_without_a_test_script_proposes_nothing() {
+    fn a_package_json_without_a_test_script_is_declined_with_the_reason() {
         let dir = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -770,8 +1381,19 @@ mod tests {
         .unwrap();
         let text = run(&options(dir.path(), state.path())).unwrap().render();
         let verifier = read(&dir.path().join(".tamperward/config.yml"));
-        assert!(verifier.contains("# command: make test"), "{verifier}");
-        assert!(text.contains("no test command recognised"), "{text}");
+        assert!(
+            verifier.contains("# Cannot propose: package.json has no scripts.test"),
+            "{verifier}"
+        );
+        assert!(
+            !verifier.contains("npm test"),
+            "no default guess: {verifier}"
+        );
+        assert!(
+            text.contains("cannot propose: package.json has no scripts.test"),
+            "{text}"
+        );
+        assert!(text.contains("no test command could be proposed"), "{text}");
     }
 
     #[test]

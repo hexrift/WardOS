@@ -869,6 +869,9 @@ pub fn readiness_panel(report: &crate::readiness::Report) -> String {
             r.name, r.detail
         );
     }
+    if let Some(survey) = &report.survey {
+        let _ = write!(s, "\n{}", survey.render());
+    }
     let verdict = report.verdict();
     let color = if verdict.blocks() { DENY } else { OK };
     let _ = write!(

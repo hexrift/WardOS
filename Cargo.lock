@@ -2438,6 +2438,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "thiserror 2.0.20",
+ "toml",
  "ward-agent",
  "ward-events",
  "ward-launch",

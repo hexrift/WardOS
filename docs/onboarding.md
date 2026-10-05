@@ -41,8 +41,8 @@ and Escape skips too.
 | --- | --- | --- |
 | Theme | lists `wardos-theme list`, applies your pick | `Super + Shift + T` cycles themes; `wardos-menu style theme` |
 | Keys | Anthropic or OpenAI: opens a terminal running `ward vault set NAME`; the key is typed there, never in a menu | `ward vault set NAME` in any terminal |
-| Project | a directory picker over `~` (up, into, a typed path, a new directory) or a repository URL to clone; then `ward init` in a terminal that shows its report | `ward init` in any directory |
-| Agent | `ward ready` checks the project first; a blocking gap shows its report and asks before continuing; then `ward claude` (or `ward codex`) there, and one line about the trust bar | `Super + Space` → Start Claude |
+| Project | a directory picker over `~` (up, into, a typed path, a new directory) or a repository URL to clone; then `ward init` in a terminal that shows its report and, when the project's files propose one verification boundary, asks whether to accept it | `ward init` in any directory |
+| Agent | `ward ready` checks the project first; a blocking gap shows its report and asks before continuing (`Fix it first` opens `ward init` in a terminal, where a proposed-but-unaccepted verification boundary is accepted); then `ward claude` (or `ward codex`) there, and one line about the trust bar | `Super + Space` → Start Claude |
 | Done | the card: `Super + Space` is everything, `Super + K` lists the keys, this document | — |
 
 The done step writes `~/.config/wardos/welcome-done`. Until it exists, the command
@@ -72,7 +72,7 @@ project, a shell history or a menu.
 
 ```bash
 cd ~/app
-ward init                            # or: ward init ~/app, --agent codex, --dry-run, --no-tamperward
+ward init                            # or: ward init ~/app, --accept-verify, --agent codex, --dry-run, --no-tamperward
 ```
 
 ```text
@@ -80,13 +80,25 @@ WARD init · /home/you/app
 
   policy      .ward/policy.yaml       written
   gitignore   .gitignore              .ward/sessions/ added
-  verifier    .tamperward/config.yml  written (cargo test)
+  verifier    .tamperward/config.yml  written (proposed, not accepted: cargo test --locked)
   tamperward  .tamperward.yml         tamperward init ran (its report is above)
 
+Proposed verification boundary, from the project's files (nothing was run)
+  command     cargo test --locked  Cargo.toml · Cargo.lock
+  protected   tests/               cargo integration tests directory
+  read-only   Cargo.toml           manifest
+              Cargo.lock           lockfile: pins the dependency set `--locked` checks
+  not accepted: written commented out; nothing runs until a trusted user accepts it with `ward init --accept-verify`
+
 Next
-  ward claude   start the agent in the sandbox
-  ward verify   run the protected tests in the disposable verifier
+  ward init --accept-verify   accept the proposed verification boundary; nothing is verified before
+  ward claude                 start the agent in the sandbox
+  ward verify                 run the protected tests in the disposable verifier
 ```
+
+In a terminal, `ward init` asks the question itself (`Accept this verification
+boundary? [y/N]`) when exactly one boundary is proposed; `y` writes it active, anything
+else leaves it as above. `--accept-verify` is the same yes for a script.
 
 What each line is:
 
@@ -97,16 +109,30 @@ What each line is:
   reviewable, and a line can only narrow, never widen.
 - `.gitignore` — one line for `.ward/sessions/`, added only in a git repository that
   does not ignore it yet.
-- `.tamperward/config.yml` — what `ward verify` runs: the protected tests (`tests/`)
-  and the command, proposed from the project's own files and shown with the evidence
-  for it: `Cargo.toml` (`cargo test`, `--locked` with a `Cargo.lock`, `--workspace`
-  for a `[workspace]`), a `package.json` `test` script run by the package manager its
-  lockfile names (`pnpm test`, `yarn test`, `npm test`), pytest configuration or a
-  pytest dependency (`pytest`), `go.mod` (`go test ./...`) or a Makefile `test`
-  target (`make test`). Nothing is executed to decide. A `package.json` without a
-  real `test` script proposes nothing; when several match, all are written commented
-  and none is chosen for you; without one the key is left commented and `ward
-  verify` says so.
+- `.tamperward/config.yml` — what `ward verify` runs: the protected inputs and the
+  command, proposed from the project's own files and shown with the evidence for each
+  (issue #147 item 2). The command: `Cargo.toml` (`cargo test`, `--locked` with a
+  `Cargo.lock`, `--workspace` for a `[workspace]`), a `package.json` `test` script run
+  by the package manager its lockfile names (`pnpm test`, `yarn test`, `npm test`),
+  pytest configuration or a pytest dependency (`pytest`), `go.mod` (`go test ./...`)
+  or a Makefile `test` target (`make test`). The protected inputs, restored from the
+  entry snapshot: `tests/` and every `[[test]]` path of a Cargo package and of each
+  workspace member; a Node project's `test/`, `tests/`, `__tests__/`, `spec/` and
+  runner configuration (`jest.config.*`, `vitest.config.*`, `.mocharc.*`, …); pytest's
+  configured `testpaths` wherever they are (so tests outside `tests/` are protected
+  and `tests/` is never assumed), the file holding the pytest section and
+  `conftest.py`. The read-only inputs, which the verifier reads and never rewrites:
+  the manifest and the lockfile (`Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml`,
+  `yarn.lock`, `poetry.lock`, `uv.lock`, `requirements*.txt`, `go.sum`); a missing
+  lockfile is named as a gap, not papered over. Nothing is executed to decide, and
+  nothing is accepted for you: the boundary is written active only on `--accept-verify`
+  or a yes at the terminal; otherwise it is written commented out and `ward ready`
+  reports `verification command not accepted` with the same proposal. A
+  `package.json` without a real `test` script, a bare `pyproject.toml` or a directory
+  with no manifest is `cannot propose: <why>`, never a default guess; when several
+  commands match, all are written commented, none is chosen, and `--accept-verify`
+  refuses to pick. `ward ready --propose` prints the proposal again for an existing
+  project and changes nothing.
 - `.tamperward.yml` and the rest of TamperWard's wiring — `tamperward init --cwd .`
   when TamperWard is installed (its own report is printed above ward's: the policy,
   the Claude Code hooks, a pre-commit hook, a CI workflow, all idempotent). Without

@@ -8,18 +8,21 @@
 //! exactly what `ward init` writes (`.ward/policy.yaml`, `.tamperward/config.yml`)
 //! and reporting whether it resolves, not merely whether the files exist.
 //!
-//! Scope: this covers items 1 and 5 of #147's suggested implementation (a structured
-//! report; Ready / Ready with limitations / Setup required / Verification
-//! unavailable). It does not run the guessed command to distinguish a legitimate
-//! pre-existing failing test ("baseline failing") from a broken setup, and it does
-//! not prepare or cache an isolated dependency environment (items 2–4, 6) — both are
-//! substantial follow-ups of their own (the second needs the same disposable-sandbox
-//! machinery `ward verify` already owns) and are left for later PRs against #147.
+//! Scope: this covers items 1, 2 and 5 of #147's suggested implementation (a
+//! structured report; the verification boundary proposed from lockfiles and test
+//! configuration and shown until a trusted user accepts it; Ready / Ready with
+//! limitations / Setup required / Verification unavailable). It does not run the
+//! configured command to distinguish a legitimate pre-existing failing test
+//! ("baseline failing") from a broken setup, and it does not prepare or cache an
+//! isolated dependency environment (items 3, 4 and 6) — both are substantial
+//! follow-ups of their own (the second needs the same disposable-sandbox machinery
+//! `ward verify` already owns) and are left for later PRs against #147.
 
 use std::path::{Path, PathBuf};
 
 use crate::doctor::Status;
 use crate::verify;
+use crate::verify_proposal;
 
 /// The build system a directory shows, for the report's header line only. `ward
 /// init` proposes its verify command from [`crate::verify_proposal`] instead, and the
@@ -101,9 +104,10 @@ pub enum Verdict {
     /// A row that blocks a session is unresolved (missing runtime, unparsable
     /// policy or verifier config).
     SetupRequired,
-    /// No verify command is configured at all, so readiness cannot be judged past
-    /// that point — distinct from `SetupRequired`, whose command exists but fails
-    /// one of its own preconditions.
+    /// No verify command is configured and none can be proposed from the project's
+    /// files, so readiness cannot be judged past that point — distinct from
+    /// `SetupRequired`, where a command exists but fails one of its own
+    /// preconditions, or a proposed one is waiting to be accepted.
     Unavailable,
 }
 
@@ -133,7 +137,11 @@ pub struct Report {
     pub ecosystem: Ecosystem,
     /// One row per check, in the order a user would fix them.
     pub rows: Vec<Row>,
-    /// No verify command is configured; see [`Verdict::Unavailable`].
+    /// What `ward init` would propose, present only while no verify command is
+    /// accepted: the proposal itself, or why none can be made.
+    pub survey: Option<verify_proposal::Survey>,
+    /// No verify command is configured and none proposed; see
+    /// [`Verdict::Unavailable`].
     unavailable: bool,
 }
 
@@ -202,8 +210,10 @@ fn check_with_dirs_and_roots(
 ) -> Report {
     let ecosystem = Ecosystem::detect(dir);
     let mut rows = vec![policy_row(dir)];
-    let (verify_row, config) = verify_row(dir);
-    let unavailable = config.is_none();
+    let (verify_row, config, survey) = verify_row(dir);
+    let unavailable = survey
+        .as_ref()
+        .is_some_and(|survey| survey.proposals.is_empty());
     rows.push(verify_row);
     if let Some(config) = &config {
         // The worktree itself is always bind-mounted at `/work`
@@ -227,6 +237,7 @@ fn check_with_dirs_and_roots(
     Report {
         ecosystem,
         rows,
+        survey,
         unavailable,
     }
 }
@@ -258,27 +269,18 @@ fn policy_row(dir: &Path) -> Row {
     }
 }
 
-/// The verify-config row, and the parsed config when one could be read — `None`
-/// triggers `Verdict::Unavailable` and skips the rows that need a real command
-/// (`runtime`, `protected paths`), tracked separately from a merely failing row so
-/// the two stay distinguishable in the overall verdict.
-fn verify_row(dir: &Path) -> (Row, Option<verify::Config>) {
+/// The verify-config row, the parsed config when one could be read, and otherwise
+/// the proposal `ward init` would make (#147 item 2). A config whose command is
+/// accepted gives `Some(config)`; a config that is unparsable fails on its own; an
+/// absent config, or one whose command is still commented out, is "not accepted"
+/// with the proposal beside it, and `Verdict::Unavailable` only when nothing can be
+/// proposed either — so a project `ward init` has described but nobody has accepted
+/// reads as setup required, with the one step that fixes it named.
+fn verify_row(dir: &Path) -> (Row, Option<verify::Config>, Option<verify_proposal::Survey>) {
     let path = dir.join(verify::CONFIG_PATH);
     let yaml = match std::fs::read_to_string(&path) {
-        Ok(y) => y,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return (
-                Row::new(
-                    "verify config",
-                    Status::Fail,
-                    format!(
-                        "{} not written yet; `ward init` proposes a command",
-                        verify::CONFIG_PATH
-                    ),
-                ),
-                None,
-            );
-        }
+        Ok(y) => Some(y),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             return (
                 Row::new(
@@ -287,30 +289,59 @@ fn verify_row(dir: &Path) -> (Row, Option<verify::Config>) {
                     format!("{}: {e}", verify::CONFIG_PATH),
                 ),
                 None,
+                None,
             );
         }
     };
-    match verify::Config::parse(&yaml) {
-        Ok(config) => {
+    match yaml.as_deref().map(verify::Config::parse) {
+        Some(Ok(config)) => {
             let row = Row::new(
                 "verify config",
                 Status::Ok,
                 format!("command: {}", config.verify.command),
             );
-            (row, Some(config))
+            return (row, Some(config), None);
         }
-        Err(_) => (
-            Row::new(
-                "verify config",
-                Status::Fail,
-                format!(
-                    "{} has no verify.command; name the test command before an agent starts",
-                    verify::CONFIG_PATH
+        Some(Err(e)) if !e.to_string().contains("verify.command is empty") => {
+            return (
+                Row::new(
+                    "verify config",
+                    Status::Fail,
+                    format!("{e}; the verifier cannot read its config"),
                 ),
-            ),
-            None,
-        ),
+                None,
+                None,
+            );
+        }
+        _ => {}
     }
+    let survey = verify_proposal::Survey::of(dir);
+    let detail = match survey.proposals.as_slice() {
+        [] => format!(
+            "{} {}; no command can be proposed from the project's files ({}); name the test command",
+            verify::CONFIG_PATH,
+            if yaml.is_some() {
+                "has no verify.command"
+            } else {
+                "not written yet"
+            },
+            survey.declined.join("; ")
+        ),
+        [one] => format!(
+            "verification command not accepted: `{}` is proposed below; `ward init --accept-verify` writes it",
+            one.command
+        ),
+        several => format!(
+            "verification command not accepted: {} candidates are proposed below; `ward init --accept-verify` needs one, or uncomment one in {}",
+            several.len(),
+            verify::CONFIG_PATH
+        ),
+    };
+    (
+        Row::new("verify config", Status::Fail, detail),
+        None,
+        Some(survey),
+    )
 }
 
 /// Shell syntax whose presence means `verify.command` is outside the narrow
@@ -1097,6 +1128,132 @@ mod tests {
         );
         let report = check(dir.path());
         assert_eq!(report.verdict(), Verdict::Unavailable);
+    }
+
+    #[test]
+    fn an_unaccepted_proposal_is_setup_required_with_the_proposal_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        std::fs::create_dir(dir.path().join("tests")).unwrap();
+
+        let report = check(dir.path());
+        assert_eq!(report.verdict(), Verdict::SetupRequired, "{report:?}");
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.name == "verify config")
+            .unwrap();
+        assert_eq!(row.status, Status::Fail);
+        assert!(row.detail.contains("not accepted"), "{}", row.detail);
+        assert!(
+            row.detail.contains("`cargo test --locked`"),
+            "{}",
+            row.detail
+        );
+        assert!(
+            row.detail.contains("ward init --accept-verify"),
+            "{}",
+            row.detail
+        );
+        let survey = report.survey.as_ref().unwrap();
+        assert_eq!(survey.proposals[0].command, "cargo test --locked");
+        assert!(
+            !report.rows.iter().any(|r| r.name == "runtime"),
+            "no accepted command, nothing to resolve"
+        );
+
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "protected:\n  tests: []\nverify:\n  # command: cargo test --locked\n  budget_secs: 600\n",
+        );
+        let report = check(dir.path());
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+        assert!(report.survey.is_some());
+        let panel = crate::render::readiness_panel(&report);
+        assert!(panel.contains("Proposed verification boundary"), "{panel}");
+        assert!(panel.contains("tests/"), "{panel}");
+        assert!(panel.contains("Cargo.lock"), "{panel}");
+        assert!(panel.contains("setup required"), "{panel}");
+
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "protected:\n  tests: [tests/]\nverify:\n  command: cargo test --locked\n",
+        );
+        let report = check(dir.path());
+        assert!(report.survey.is_none(), "{report:?}");
+        assert!(report.rows.iter().any(|r| r.name == "runtime"));
+        assert!(!crate::render::readiness_panel(&report).contains("Proposed"));
+    }
+
+    #[test]
+    fn nothing_to_propose_is_unavailable_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"tsc"}}"#,
+        )
+        .unwrap();
+        let report = check(dir.path());
+        assert_eq!(report.verdict(), Verdict::Unavailable);
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.name == "verify config")
+            .unwrap();
+        assert!(row.detail.contains("not written yet"), "{}", row.detail);
+        assert!(row.detail.contains("no scripts.test"), "{}", row.detail);
+        assert!(!row.detail.contains("npm test"), "{}", row.detail);
+        let panel = crate::render::readiness_panel(&report);
+        assert!(
+            panel.contains("cannot propose: package.json has no scripts.test"),
+            "{panel}"
+        );
+        assert!(panel.contains("verification unavailable"), "{panel}");
+
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "protected:\n  tests: []\n",
+        );
+        let report = check(dir.path());
+        assert_eq!(report.verdict(), Verdict::Unavailable);
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.name == "verify config")
+            .unwrap();
+        assert!(
+            row.detail.contains("has no verify.command"),
+            "{}",
+            row.detail
+        );
+    }
+
+    #[test]
+    fn a_malformed_verify_config_is_setup_required_not_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".tamperward/config.yml",
+            "verify: [not: a map\n",
+        );
+        let report = check(dir.path());
+        assert_eq!(report.verdict(), Verdict::SetupRequired);
+        assert!(report.survey.is_none());
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.name == "verify config")
+            .unwrap();
+        assert_eq!(row.status, Status::Fail);
+        assert!(
+            row.detail.contains("cannot read its config"),
+            "{}",
+            row.detail
+        );
     }
 
     #[test]

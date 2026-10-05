@@ -63,6 +63,11 @@ enum Command {
         /// Print what would be written and write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Accept the one verification boundary proposed from the project's files
+        /// (command, protected inputs) and write it active; without this, or a yes at
+        /// the terminal, it is written commented out and nothing runs.
+        #[arg(long)]
+        accept_verify: bool,
     },
     /// The keys the host keeps for the proxy (`$WARD_STATE_DIR/vault/<NAME>`, mode
     /// 0600). A stored value is never printed back.
@@ -194,6 +199,11 @@ enum Command {
         /// The agent whose key is checked.
         #[arg(long, value_enum, default_value_t = init::Agent::Claude)]
         agent: init::Agent,
+        /// Print the verification boundary `ward init` would propose from the
+        /// project's files (command, protected and read-only inputs, the evidence
+        /// for each) and change nothing.
+        #[arg(long)]
+        propose: bool,
     },
     /// Run the isolation self-tests against a real sandbox.
     Selftest {
@@ -627,12 +637,8 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             agent,
             no_tamperward,
             dry_run,
-        } => cmd_init(
-            dir.unwrap_or_else(|| PathBuf::from(".")),
-            agent,
-            no_tamperward,
-            dry_run,
-        ),
+            accept_verify,
+        } => cmd_init(dir, agent, no_tamperward, dry_run, accept_verify),
         Command::Vault(cmd) => cmd_vault(cmd),
         Command::Up { dir } => cmd_up(&dir.unwrap_or_else(cwd)),
         Command::Status { dir } => cmd_status(&dir.unwrap_or_else(cwd)),
@@ -674,7 +680,11 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         }
         Command::Verify { dir } => cmd_verify(&dir.unwrap_or_else(cwd)),
         Command::Doctor => Ok(cmd_doctor()),
-        Command::Ready { dir, agent } => Ok(cmd_ready(&dir.unwrap_or_else(cwd), agent)),
+        Command::Ready {
+            dir,
+            agent,
+            propose,
+        } => Ok(cmd_ready(dir, agent, propose)),
         Command::Selftest { dir } => cmd_selftest(&dir.unwrap_or_else(cwd)),
         Command::Replay {
             log,
@@ -807,8 +817,23 @@ fn cmd_doctor() -> ExitCode {
 
 /// `ward ready`: project-readiness checks (#147), plus the one row that needs to know
 /// which agent's key to look for — the same vault-then-environment lookup `ward init`
-/// already does for its own "next" block.
-fn cmd_ready(dir: &Path, agent: init::Agent) -> ExitCode {
+/// already does for its own "next" block. `--propose` prints only what `ward init`
+/// would propose from the project's files and touches nothing; it exits non-zero
+/// when nothing can be proposed, so the refusal and its reason are not mistaken for
+/// a boundary.
+fn cmd_ready(dir: Option<PathBuf>, agent: init::Agent, propose: bool) -> ExitCode {
+    let dir = &dir.unwrap_or_else(cwd);
+    if propose {
+        let survey = ward_daemon::verify_proposal::Survey::of(dir);
+        print!("{}", survey.render());
+        if survey.proposals.is_empty() {
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "  nothing is written by --propose; `ward init --accept-verify` accepts one proposal"
+        );
+        return ExitCode::SUCCESS;
+    }
     let key_env = agent.key_env();
     let state = ward_daemon::session::state_root();
     let mut report = ward_daemon::readiness::check(dir);
@@ -903,23 +928,33 @@ fn on_path_in(name: &str, path: &std::ffi::OsStr) -> bool {
 /// `ward init`: everything the command reads from its environment is gathered here
 /// and handed to [`init::run`] as values.
 fn cmd_init(
-    dir: PathBuf,
+    dir: Option<PathBuf>,
     agent: init::Agent,
     no_tamperward: bool,
     dry_run: bool,
+    accept_verify: bool,
 ) -> ward_daemon::Result<ExitCode> {
+    use std::io::IsTerminal as _;
     let key_env = match agent {
         init::Agent::Claude => "ANTHROPIC_API_KEY",
         init::Agent::Codex => "OPENAI_API_KEY",
     };
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let opts = init::Options {
-        dir,
+        dir: dir.unwrap_or_else(|| PathBuf::from(".")),
         agent,
         tamperward: init::find_tamperward(&std::env::var("PATH").unwrap_or_default()),
         no_tamperward,
         dry_run,
         state: ward_daemon::session::state_root(),
         key_in_env: std::env::var(key_env).is_ok_and(|v| !v.trim().is_empty()),
+        accept: if accept_verify {
+            init::Accept::Flag
+        } else if interactive {
+            init::Accept::Ask(init::ask_on_terminal)
+        } else {
+            init::Accept::Nobody
+        },
     };
     let report = init::run(&opts)?;
     print!("{}", report.render());
@@ -2211,6 +2246,40 @@ mod tests {
     fn observer_degraded_warning_only_fires_when_the_watch_was_degraded() {
         assert!(observer_degraded_warning(&sample_report(false)).is_none());
         assert!(observer_degraded_warning(&sample_report(true)).is_some());
+    }
+
+    #[test]
+    fn init_accept_verify_and_ready_propose_parse_and_default_off() {
+        assert!(matches!(
+            Cli::parse_from(["ward", "init"]).command,
+            Command::Init {
+                accept_verify: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            Cli::parse_from(["ward", "init", "--accept-verify", "/p"]).command,
+            Command::Init {
+                accept_verify: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            Cli::parse_from(["ward", "ready"]).command,
+            Command::Ready {
+                propose: false,
+                dir: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            Cli::parse_from(["ward", "ready", "/p", "--propose"]).command,
+            Command::Ready {
+                propose: true,
+                dir: Some(ref dir),
+                ..
+            } if dir == std::path::Path::new("/p")
+        ));
     }
 
     #[test]
