@@ -13,13 +13,14 @@ trusted state **outside the agent's authority**.
 
 WardOS is also being evolved into a local + distributed execution platform without
 discarding that workstation/runtime path. The target split is **WardOS distribution +
-portable Ward runtime + `ward-node` + optional Ward control plane**
+portable Ward runtime + `ward-node`**, driven where needed by an **external control plane
+(not part of WardOS)**
 ([ADR-0029](docs/decisions/ADR-0029-product-split-fleet-trust-boundaries.md)). Local mode
-remains first-class and needs no remote service; fleet coordination distributes bounded,
-expiring authority while enforcement, resource limits, credential isolation and evidence
-remain node-local. The fleet pieces are tracked under
-[#256](https://github.com/hexrift/WardOS/issues/256) and are not claimed as delivered
-until their acceptance tests land.
+remains first-class and needs no remote service; an external control plane distributes
+bounded, expiring authority while enforcement, resource limits, credential isolation and
+evidence remain node-local. WardOS's side of that contract is tracked under
+[#332](https://github.com/hexrift/WardOS/issues/332) and is not claimed as delivered
+until its acceptance tests land.
 
 ![The WardOS desktop from boot to lock: the splash, autologin into Hyprland, the four steps of the first login (theme, a key kept on the host, a project, an agent), ward claude with the trust bar live, an approval answered from a notification, the command centre, a theme switch to Tokyo Night, the lock screen](assets/wardos-desktop.gif)
 

@@ -30,21 +30,22 @@ The product is the *combination*, not any one component:
 
 The table above describes the **current local implementation**. The target architecture
 does not turn `wardd` into a remote monolith. ADR-0029 splits delivery and ownership
-into four explicit layers while preserving the runtime primitives already implemented:
+into four explicit layers, three shipped by WardOS and one external, while preserving the
+runtime primitives already implemented:
 
 | Layer | Role | Required for local mode? |
 | --- | --- | --- |
 | WardOS distribution | Fedora bootc desktop/reference host that packages the runtime and node | No — it is the reference environment |
 | Portable Ward runtime | Capability, snapshot, evidence, sandbox, egress, credential, intervention and verifier primitives | Yes |
 | `ward-node` | Long-lived host worker; owns task lifecycle and local enforcement for one or many tasks | Yes |
-| Ward control plane | Optional remote identity/delegation, desired policy, placement, approvals, registry and audit index | No |
+| External control plane (not part of WardOS) | Remote identity/delegation, desired policy, placement, approvals/certification, registry and audit index; reaches nodes through the `ward-node` protocol and a transport-backed adapter (#332 slice 8) | No |
 
 ```text
 Developer / CI / API / Web
           |
           v
-   Ward control plane
-   identity · policy · scheduling · approvals · audit index
+   External control plane (not part of WardOS)
+   identity · policy · scheduling · approvals/certification · audit index
           |
           | bounded, expiring task authority + lifecycle
           | events/evidence + health/capacity
@@ -58,7 +59,7 @@ task capsule                 trusted verifier /
 ```
 
 Local mode is a single-node deployment: the CLI and desktop talk to a local
-`ward-node`; no remote service is needed. The control plane distributes bounded
+`ward-node`; no remote service is needed. The external control plane distributes bounded
 authority but is never consulted for every filesystem/process/network action. During a
 partition the node may continue only inside authority it can validate locally; expiry,
 revocation already received, hard policy and resource limits continue to apply. Loss of
@@ -74,11 +75,12 @@ rules are normative in
 
 ## 2. Trust boundaries
 
-The five zones below describe the current local runtime. Under ADR-0029, the future
-control plane is a separate trusted coordination zone and `ward-node` becomes the
-node-local owner of the host-side interfaces currently attributed to `wardd`. Agent
-capsules remain untrusted and the verifier/TamperWard path remains outside agent
-authority. The control plane does not become the per-action enforcement point.
+The five zones below describe the current local runtime. Under ADR-0029, an external
+control plane, which WardOS does not build, is a separate trusted coordination zone and
+`ward-node` becomes the node-local owner of the host-side interfaces currently attributed
+to `wardd`. Agent capsules remain untrusted and the verifier/TamperWard path remains
+outside agent authority. The control plane does not become the per-action enforcement
+point.
 
 WardOS defines five trust zones for the current local implementation. Every data flow in
 the system crosses zero or one boundary, and every boundary crossing is mediated by a

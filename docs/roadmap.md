@@ -7,28 +7,34 @@ may overlap with experiments from the next.
 ## Fleet evolution — ordered by trust dependency
 
 [ADR-0029](decisions/ADR-0029-product-split-fleet-trust-boundaries.md) defines the
-architecture used by the fleet/control-plane work in #256. This is an evolution of the
-existing runtime, not a replacement for local WardOS use.
+architecture used by #332: WardOS becomes a reliable execution substrate with a stable
+contract for an external control plane, which WardOS does not build. This is an
+evolution of the existing runtime, not a replacement for local WardOS use.
 
 The implementation order is constrained by trust dependencies:
 
-1. **#257 boundary ADR** — distribution, portable runtime, `ward-node`, control plane,
-   partition semantics and migration rules.
+1. **#257 boundary ADR** — distribution, portable runtime, `ward-node`, the external
+   control-plane contract, partition semantics and migration rules.
 2. **#258 node extraction + #259 task/delegation identity** — move lifecycle behind a
    long-lived local worker and make authority explicit, expiring and task-bound.
 3. **#260 single-node scheduling/admission** — prove 25+ concurrent task capsules,
    resource accounting, backpressure and bounded verifier concurrency before any
-   distributed scheduler is trusted.
-4. **#261/#262 control-plane core and authenticated node enrolment**, followed by the P1
-   distributed policy/identity/credential/state/intervention/verification/observability
-   workstreams.
-5. **#274 fleet qualification** — security, chaos and load validation at 100+ concurrent
-   tasks before scale is treated as a delivered property.
+   external scheduler places work on a node.
+4. **#332 slices 1–7, execution substrate** — receipt (#333), trusted-lease predicate
+   (#335) and discovery 1.2 (#337) are done; then settled workload source, authenticated
+   lease delivery and node audience, launch ownership and natural exit before `start`
+   (#326, with #262); trusted task admission bound to the exact task, attempt, node,
+   agent, session and lease (with #324); receipts from actual admitted execution; durable
+   recovery and replay safety.
+5. **#332 slices 8–10, external control-plane adapter and acceptance** — a
+   transport-backed adapter over the existing node boundary, deterministic cross-system
+   acceptance for isolation, interruption and no duplicate effect, then integration docs,
+   security limitations and release-readiness evidence.
 
-Local mode remains a single-node deployment throughout. Kubernetes is a supported
-deployment target later (#273), never a dependency for local execution. TamperWard
-verification remains independent and is extended across nodes in #270 rather than
-folded into scheduler/control-plane convenience paths.
+Local mode remains a single-node deployment throughout. Kubernetes is never a dependency
+for local execution, and a reference Kubernetes deployment is out of scope. TamperWard
+verification remains independent; certifying results across nodes belongs to the
+external control plane rather than to scheduler/control-plane convenience paths.
 
 
 ## Phase 0 — Architecture (this repository, now)

@@ -30,7 +30,7 @@ Under the repository's TamperWard/CODEOWNERS split
 | A13 | Control channels (`wardd` socket, TamperWard socket, proxy, event subscription) | 0 | Confused-deputy and injection surface |
 | A14 | Boot chain, disk encryption keys, TPM state | 0 | Physical/offline integrity |
 | A15 | Node task leases, delegation lineage, revocation state and node identity | node trust domain | Defines which remote work a node may execute and for how long |
-| A16 | Control-plane worker/task/policy state | control-plane trust domain | Coordinates desired authority and placement across workers |
+| A16 | External control-plane worker/task/policy state (held outside WardOS) | control-plane trust domain | Coordinates desired authority and placement across workers |
 | A17 | Node-local durable event/evidence spool | node trust domain | Preserves audit continuity when the control plane is unavailable |
 | A18 | Other tasks' capsules, writable layers and task-scoped caches | untrusted task domains separated by node | Cross-task confidentiality/integrity on shared workers |
 
@@ -57,7 +57,7 @@ evil-maid attacks on a running/suspended machine, DMA attacks, speculative-execu
 channels, a compromised `wardd`/TamperWard/host root, a malicious *user*, supply-chain
 compromise of the WardOS image itself (mitigated by signing, not modelled as an attacker
 here), and denial of service by the agent against its own sandbox (bounded by cgroups, not
-prevented). A fully compromised fleet control plane or a root-compromised execution node
+prevented). A fully compromised external control plane or a root-compromised execution node
 is also outside the containment claim: ADR-0029 still requires nodes to validate bounded
 leases, expiry and hard local policy so remote compromise does not become ambient,
 unversioned authority.
@@ -84,8 +84,10 @@ WardOS assumes:
 Fleet mode adds two trusted-but-distinct administrative domains without changing the
 agent assumption:
 
-- **Ward control plane:** trusted to authenticate principals and issue bounded desired
-  authority, but not placed on the synchronous enforcement path for each agent action.
+- **External control plane (not part of WardOS):** trusted to authenticate principals
+  and issue bounded desired authority, but not placed on the synchronous enforcement path
+  for each agent action. WardOS reaches it only through the node protocol and a
+  transport-backed adapter (#332 slice 8).
 - **`ward-node`:** trusted to authenticate control-plane messages, validate task
   authority, enforce it locally, own task lifecycle/resource isolation and preserve
   evidence while disconnected.
@@ -153,7 +155,7 @@ Enumerated from the perspective of T1 (everything else is a subset).
 | O15 | A node accepts remote work only with authenticated, task-bound, unexpired and non-replayed authority; loss of the control plane never widens it | node protocol authentication + lease/audience/version/expiry validation (#258/#259) |
 | O16 | One task cannot reuse another task's identity, credentials, writable cache trust or execution boundary | task identity/delegation binding + per-task isolation + scoped caches (#259/#260) |
 | O17 | CPU/RAM/PIDs/disk pressure from agent tasks cannot starve node enforcement or verifier capacity without visible admission/backpressure | cgroup/resource enforcement + scheduler reservations/admission (#260) |
-| O18 | Control-plane partitions or upload failures do not silently erase audit/evidence continuity | durable bounded node spool + explicit pressure/failure state (#268/#271) |
+| O18 | Control-plane partitions or upload failures do not silently erase audit/evidence continuity | durable bounded node spool + explicit pressure/failure state (#332 slice 7) |
 
 ---
 
