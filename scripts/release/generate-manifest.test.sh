@@ -79,6 +79,13 @@ echo "$out" | jq -e . >/dev/null || fail "valid case: output is not valid JSON"
   fail "valid case: rollback_supported should default true"
 [[ "$(jq -r '.image.bootc_reference' <<<"$out")" == "null" ]] ||
   fail "valid case: image.bootc_reference should be null when not given"
+# The window comes from the repository's own compatibility document (issue
+# #275): the same marker protocol-window.py holds equal to WARD_NODE_PROTOCOL.
+repo_marker="$(grep -o -E '<!--[[:space:]]*protocol-window:[^>]*-->' "$RELEASE_DIR/../../docs/compatibility.md")"
+[[ "$repo_marker" =~ ([0-9]+)\.([0-9]+)-([0-9]+)\.([0-9]+) ]] || fail "valid case: could not read the repository's protocol-window marker"
+[[ "$(jq -c '.node_protocol_window' <<<"$out")" \
+  == "{\"major\":${BASH_REMATCH[1]},\"min_minor\":${BASH_REMATCH[2]},\"max_minor\":${BASH_REMATCH[4]}}" ]] ||
+  fail "valid case: node_protocol_window does not restate docs/compatibility.md's marker"
 echo "ok   valid fixture release produces a correct manifest"
 
 # Determinism: the same inputs, generated twice, produce byte-identical JSON
@@ -94,6 +101,62 @@ out="$(bash "$sut" "$tag" "$commit" "$c/dist" "quay.io/hexrift/wardos:$tag")"
 [[ "$(jq -r '.image.bootc_reference' <<<"$out")" == "quay.io/hexrift/wardos:$tag" ]] ||
   fail "image-ref case: bootc_reference not carried through"
 echo "ok   an explicit image reference is recorded"
+
+### The node protocol window (issue #275) ####################################
+
+# The window is read from the compatibility document's marker with the grammar
+# of scripts/security-check/protocol-window.py: exactly one marker, one major,
+# a non-inverted minor range, whitespace and line wrapping tolerated.
+# write_doc NAME MARKER... -> a stand-in compatibility document holding the
+# given marker text(s); echoes its path.
+write_doc() {
+  local path="$work/$1.md"
+  shift
+  { echo "# Compatibility"; echo; printf '%s\n' "$@"; echo; echo "Body."; } >"$path"
+  printf '%s' "$path"
+}
+c="$(fresh_case window)"
+add_artifact "$c/dist" x86_64
+doc="$(write_doc window-plain '<!-- protocol-window: 2.1-2.4 -->')"
+out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist")"
+[[ "$(jq -c '.node_protocol_window' <<<"$out")" == '{"major":2,"min_minor":1,"max_minor":4}' ]] ||
+  fail "window case: marker 2.1-2.4 not recorded as major 2, minors 1-4"
+echo "ok   the protocol window is read from the compatibility document's marker"
+
+doc="$(write_doc window-wrapped '<!--protocol-window:' '  1.0-1.3' '-->')"
+out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist")"
+[[ "$(jq -c '.node_protocol_window' <<<"$out")" == '{"major":1,"min_minor":0,"max_minor":3}' ]] ||
+  fail "window case: a marker wrapped over lines is not read like protocol-window.py reads it"
+echo "ok   a line-wrapped marker parses the way protocol-window.py reads it"
+
+doc="$(write_doc window-single-minor '<!-- protocol-window: 1.3-1.3 -->')"
+out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist")"
+[[ "$(jq -c '.node_protocol_window' <<<"$out")" == '{"major":1,"min_minor":3,"max_minor":3}' ]] ||
+  fail "window case: a one-minor window is not recorded"
+echo "ok   a one-minor window is recorded"
+
+# Anything protocol-window.py would refuse is refused here too, with no
+# manifest produced: the field is never guessed or defaulted.
+doc="$(write_doc window-absent 'No marker in this document.')"
+expect_status 1 "a compatibility document without a marker is refused" \
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist"
+doc="$(write_doc window-duplicate '<!-- protocol-window: 1.0-1.3 -->' '<!-- protocol-window: 1.0-1.3 -->')"
+expect_status 1 "two markers are refused" \
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist"
+doc="$(write_doc window-malformed '<!-- protocol-window: 1.0 to 1.3 -->')"
+expect_status 1 "a marker that is not M.a-M.b is refused" \
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist"
+doc="$(write_doc window-cross-major '<!-- protocol-window: 1.0-2.3 -->')"
+expect_status 1 "a window spanning two majors is refused" \
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist"
+doc="$(write_doc window-inverted '<!-- protocol-window: 1.3-1.0 -->')"
+expect_status 1 "an inverted window is refused" \
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$doc" bash "$sut" "$tag" "$commit" "$c/dist"
+expect_status 1 "a missing compatibility document is refused" \
+  env GENERATE_MANIFEST_COMPATIBILITY_DOC="$work/no-such-doc.md" bash "$sut" "$tag" "$commit" "$c/dist"
+out="$(GENERATE_MANIFEST_COMPATIBILITY_DOC="$(write_doc window-absent-again 'No marker.')" bash "$sut" "$tag" "$commit" "$c/dist" 2>/dev/null || true)"
+[[ -z "$out" ]] || fail "window case: a refused run must print no manifest at all"
+echo "ok   a refused window produces no manifest"
 
 # The node train (issue #275): ward-node-<version>-<arch>-linux.tar.gz is an
 # artifact of the same release, recorded under its own component next to the

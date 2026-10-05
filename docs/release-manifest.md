@@ -4,10 +4,11 @@ This is the machine-readable manifest format decided in
 [ADR-0028](decisions/ADR-0028-release-provenance-and-trusted-updates.md) §4, and the
 generator that produces it: [`scripts/release/generate-manifest.sh`](../scripts/release/generate-manifest.sh).
 
-This document covers the manifest format and its generator only. It does not cover
-signing, attestation, or update verification — see "What this is not" below and
-issue [#148](https://github.com/hexrift/WardOS/issues/148) for the rest of that
-work's status.
+This document covers the manifest format, its generator, and how a release publishes
+and an operator verifies it. It does not cover signing, attestation, or update
+verification — see "What this is not" below and issue
+[#148](https://github.com/hexrift/WardOS/issues/148) for the rest of that work's
+status.
 
 ## Generating a manifest
 
@@ -26,7 +27,12 @@ generate-manifest.sh <tag> <commit> <dist-dir> [image-ref]
 
 The manifest is printed to stdout as JSON. The generator does not write, upload, sign
 or attest anything; it only assembles and validates fields already available once a
-release's artifacts exist.
+release's artifacts exist. Two environment variables exist for the release workflow
+and the tests: `GENERATE_MANIFEST_NOW` pins `generated_at` (the workflow sets it to
+the source commit's committer time, see below), and
+`GENERATE_MANIFEST_COMPATIBILITY_DOC` names the compatibility document the protocol
+window is read from (default: the repository's `docs/compatibility.md`, found
+relative to the script).
 
 Every input is validated before any output is produced. An artifact whose name
 doesn't carry this manifest's own version or one of the two release trains
@@ -34,7 +40,9 @@ doesn't carry this manifest's own version or one of the two release trains
 `ward-node-<version>-<arch>-linux.tar.gz`, the node; issue #275), a tarball with no
 checksum sidecar (or a sidecar with no matching tarball), or a sidecar whose recorded
 digest doesn't match the artifact's actual bytes are all refused with a specific,
-actionable message — never silently dropped from the manifest or silently trusted. See
+actionable message — never silently dropped from the manifest or silently trusted. So
+is a compatibility document whose protocol-window marker is absent, duplicated or
+malformed: the window is never guessed or defaulted. See
 [`generate-manifest.test.sh`](../scripts/release/generate-manifest.test.sh) for the
 full set of fixtures this covers.
 
@@ -63,6 +71,11 @@ full set of fixtures this covers.
       "size_bytes": 12345678
     }
   ],
+  "node_protocol_window": {
+    "major": 1,
+    "min_minor": 0,
+    "max_minor": 3
+  },
   "image": {
     "bootc_reference": "quay.io/hexrift/wardos:v1.2.3" // or null
   },
@@ -86,6 +99,49 @@ release train the artifact belongs to, taken from its name: `wardos` for the run
 tarball, `ward-node` for the node tarball
 ([node-release-readiness.md](node-release-readiness.md) §2).
 
+`node_protocol_window` is the `ward-node` protocol window the release serves
+([compatibility.md](compatibility.md) §1; issue #275), in the shape of the `supported`
+range a node answers a `hello` with: one `major`, and the minors `min_minor` through
+`max_minor`. It is read from the `<!-- protocol-window: M.a-M.b -->` marker of
+`docs/compatibility.md` at the release commit — the same marker
+`scripts/security-check/protocol-window.py` holds equal to `WARD_NODE_PROTOCOL` on
+every pull request — never from a second hand-maintained copy, so the manifest, the
+document and the code of a release name one window. A control plane can compare the
+field against the range it offers before it connects (compatibility.md §3).
+
+## The published manifest
+
+The release workflow (`.github/workflows/release.yml`, job `release`) generates the
+manifest only after `check-release-set.sh` has verified the complete artifact set, from
+that verified `dist/` directory, so the manifest can never name an artifact that was not
+checked. It attaches two more assets to the release, next to the tarballs:
+
+| Asset | Carries |
+| --- | --- |
+| `wardos-<version>-manifest.json` | the manifest above |
+| `wardos-<version>-manifest.json.sha256` | `sha256sum`'s line for it, like every tarball's sidecar |
+
+`generated_at` of a published manifest is the source commit's committer time, not the
+run's clock: a retry of the release workflow at the same commit must reproduce every
+asset byte for byte (ADR-0028 §4), and the manifest is reconciled like the tarballs by
+`download-published.sh` and `check-assets.sh` — identical is a no-op, different bytes
+are refused before anything is overwritten.
+
+To verify a release from its manifest, download the assets into one directory and run:
+
+```
+sha256sum -c wardos-<version>-manifest.json.sha256
+jq -r '.artifacts[] | (.digest | sub("^sha256:"; "")) + "  " + .name' \
+  wardos-<version>-manifest.json | sha256sum -c
+```
+
+The first line checks the manifest against its sidecar; the second checks every
+artifact the manifest names against the digest it records, and `sha256sum -c` fails on
+an artifact that is missing or does not match. `source_commit` must equal the commit
+the release's tag resolves to (`git rev-parse <tag>^{commit}`). Like the `.sha256`
+sidecars, this proves the bytes are the ones CI attached, not who built them: see the
+next section.
+
 ## What this is not
 
 This manifest's `provenance` object is an explicit, honest placeholder, not partial
@@ -101,8 +157,6 @@ a hand-written copy) is a follow-up change to this generator, not a schema break
 
 Also not covered here, and tracked separately under issue #148:
 
-- Actually wiring this generator into `.github/workflows/release.yml` and publishing
-  the manifest as a release asset.
 - Generating or verifying the provenance attestation itself (Sigstore/cosign,
   workflow-identity OIDC policy).
 - The installer/update verifier that reads a manifest and a real attestation and

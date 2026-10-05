@@ -126,6 +126,28 @@ expect_status 10 "a release with no matching asset signals upload" \
   reconcile "$c/local" "$c/published"
 unset FAKE_VIEW_RC FAKE_ASSETS FAKE_SRC
 
+# The release manifest (generate-manifest.sh, issue #275) is pulled for
+# comparison like a tarball: listed, it must download; its download failing
+# fails closed.
+manifest="wardos-1.2.3-manifest.json"
+c="$(fresh_case manifest-published)"
+printf '{"schema_version":1}\n' >"$c/local/$manifest"; cp "$c/local/$manifest" "$c/remote/$manifest"
+printf 'MANIFEST-SUM\n' >"$c/local/$manifest.sha256"; cp "$c/local/$manifest.sha256" "$c/remote/$manifest.sha256"
+export FAKE_VIEW_RC=0 FAKE_ASSETS="$tarball
+$checksum
+$manifest
+$manifest.sha256" FAKE_SRC="$c/remote"
+expect_status 0 "a published manifest and its sidecar are pulled and compare identical" \
+  reconcile "$c/local" "$c/published"
+[[ -e "$c/published/$manifest" && -e "$c/published/$manifest.sha256" ]] ||
+  fail "manifest case: the published manifest and sidecar were not pulled for comparison"
+unset FAKE_VIEW_RC FAKE_ASSETS FAKE_SRC
+c="$(fresh_case manifest-download-fail)"
+printf '{"schema_version":1}\n' >"$c/local/$manifest"; cp "$c/local/$manifest" "$c/remote/$manifest"
+expect_status 1 "download failure of a listed manifest fails closed" \
+  env GH="$GH" FAKE_VIEW_RC=0 FAKE_ASSETS="$manifest" FAKE_DOWNLOAD_RC=1 FAKE_SRC="$c/remote" \
+  bash "$sut" v1.2.3 "$c/local" "$c/published"
+
 # Missing local dir is an error, not a silent empty pass.
 expect_status 1 "missing local dir rejected" \
   env GH="$GH" FAKE_ASSETS="" bash "$sut" v1.2.3 "$work/does-not-exist" "$work/pub"

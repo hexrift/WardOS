@@ -30,7 +30,7 @@ which the workflow pins to the same version) on an x86_64 GitHub runner.
 | **ward-bench** (job `benchmark`, measures, never gates) | `ward benchmark --json`, the CI-measurable subset of [performance.md](performance.md) §5, uploaded as an artifact for 90 days. | Nothing specific to the node: its metrics are the session path's (`sandbox_start`, `verifier_spawn`, `snapshot_*`, `observer_event_propagation`, `pause_acknowledgement`). `sandbox_start` and `snapshot_capture_*` measure the same `ward-launch` spawn and `ward-snapshot` capture the node uses, so a regression there is a regression for `start`; no threshold fails the job (#150). |
 | **TamperWard gate** (`.github/workflows/tamperward.yml`) | The diff-time protected-surface check over the pull request's commit range, and `tamperward verify`, which re-runs the merge gate in a visible and a pristine copy. | A pull request that deletes, skips or weakens a node test, rewrites a fixture or edits CI is blocked until a human signs off out of band; the gate's own result cannot be manufactured by the change under test. |
 | **image** (`.github/workflows/image.yml`, on pull requests that touch `crates/**`) | Builds the bootc image, natively for x86_64 and aarch64, compiling `ward-node` and `ward-node-adapter` from the checkout (`image/Containerfile`'s builder stage; the release stage, which takes them from the node tarball, needs a published release and is not run on pull requests). | `ward-node` and `ward-node-adapter` build `--locked` for both architectures the image ships for and are in the image's `/usr/bin` (the Containerfile asserts both, and the job runs `ward-node --help`). Neither is started as a service inside the image build. |
-| **release scripts** (job `release-scripts`) | `scripts/release/run.sh`: shellcheck and the bash regressions of every release helper. | The tag, version and asset binding of §2 behaves as documented, including the layout of the node tarball (`package.test.sh`) and the refusal to publish without it (`check-release-set.test.sh`). |
+| **release scripts** (job `release-scripts`) | `scripts/release/run.sh`: shellcheck and the bash regressions of every release helper. | The tag, version and asset binding of §2 behaves as documented, including the layout of the node tarball (`package.test.sh`), the refusal to publish without it (`check-release-set.test.sh`) and the manifest's protocol window, read from compatibility.md's marker and refused when the marker is absent or malformed (`generate-manifest.test.sh`). |
 
 The same `scripts/verify/tamperward.sh` runs locally; a green run there is a green run
 in CI (CONTRIBUTING.md). What CI adds is the proof that isolation was required, the
@@ -44,18 +44,19 @@ refuses a tag that does not equal the workspace version of the source commit
 toolchain of `rust-toolchain.toml` and `--locked`, packages two trains per architecture
 (`scripts/release/package.sh`), smokes every packaged binary (`check-binary-version.sh`
 and `--help`), refuses to publish unless both trains and their checksums are present for
-every architecture that built (`check-release-set.sh`), and attaches everything to one
-GitHub release bound to that commit (`check-tag-commit.sh`, `check-assets.sh` on a
-retry):
+every architecture that built (`check-release-set.sh`), generates the release manifest
+from that verified set (`generate-manifest.sh`), and attaches everything to one GitHub
+release bound to that commit (`check-tag-commit.sh`, `check-assets.sh` on a retry):
 
 | Asset | Carries |
 | --- | --- |
 | `wardos-<version>-<arch>-linux.tar.gz` and `.sha256` | the runtime: `ward`, `wardd`, `ward-agent`, `ward-shell`, `wardos-theme-render`, `install.sh`, `README.md`, `LICENSE` and a copy of `docs/` |
 | `ward-node-<version>-<arch>-linux.tar.gz` and `.sha256` | the node: `ward-node`, `ward-node-adapter`, `LICENSE` and a copy of `docs/` |
+| `wardos-<version>-manifest.json` and `.sha256` | the release manifest ([release-manifest.md](release-manifest.md)): source commit, tag, every tarball with its component, architecture and digest, and the node protocol window |
 
 `<version>` is the workspace version without the `v`; `<arch>` is the runner's
 `uname -m`, `x86_64` or `aarch64`. Each `.sha256` is `sha256sum`'s line for its
-tarball, checked with `sha256sum -c` next to it.
+tarball (or the manifest), checked with `sha256sum -c` next to it.
 
 For the node this means:
 
@@ -81,10 +82,13 @@ For the node this means:
   come from").
 - **The node documents ship in both tarballs**, as part of `docs/`, at the revision of
   the release commit.
-- **The protocol window of a release is the one in its source commit**
-  (compatibility.md §6). The release manifest
-  ([release-manifest.md](release-manifest.md)) records the node tarball as its own
-  component, not the window.
+- **The protocol window of a release is recorded in its manifest.** The manifest's
+  `node_protocol_window` is read from the `<!-- protocol-window -->` marker of
+  compatibility.md at the release commit, the marker the `docs` job holds equal to
+  `WARD_NODE_PROTOCOL` (§1), so the window a release states is the one its node
+  serves (compatibility.md §6). A control plane reads it from the release before
+  connecting; the generator refuses to produce a manifest when the marker is absent
+  or malformed.
 - **The release run does not re-run the acceptance suite.** The evidence for a release
   commit is the `verify` run on that commit (every push to `main` runs it), not the
   release workflow.
@@ -130,6 +134,9 @@ workflow.
    agree (the `docs` job is green on the release commit), and compatibility.md §1 lists
    every minor the release serves. If the window moved since the last release, the
    release PR says so, and compatibility.md §4 tells control planes the upgrade order.
+   The release workflow then records that marker's window in the published manifest
+   (§2); after the release, `jq .node_protocol_window` on
+   `wardos-<version>-manifest.json` names the window the release PR announced.
 2. **The acceptance table.** The `verify` run on the release commit shows
    `acceptance: 8 passed, 0 failed` in the step summary of "ward-node cross-system
    acceptance verdicts". Link that run from the release PR.

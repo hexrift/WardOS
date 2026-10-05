@@ -95,9 +95,11 @@ The node protocol version and the WardOS release version are independent:
   `ward-node-<version>-<arch>-linux.tar.gz`
   ([node-release-readiness.md](node-release-readiness.md) §2), under the WardOS
   version; a node version of its own is still open
-  ([#275](https://github.com/hexrift/WardOS/issues/275)). Neither the tarball nor the
-  release manifest ([release-manifest.md](release-manifest.md)) records the protocol
-  window; the window of a release is the one in its source commit.
+  ([#275](https://github.com/hexrift/WardOS/issues/275)). Every release carries its
+  protocol window in the release manifest ([release-manifest.md](release-manifest.md)),
+  as `node_protocol_window`, read from the marker at the top of this document at the
+  release commit, so a control plane can read the window of a release without the
+  tarball or the source.
 
 ## 7. What CI checks
 
