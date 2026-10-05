@@ -43,7 +43,7 @@ and Escape skips too.
 | Keys | Anthropic or OpenAI: opens a terminal running `ward vault set NAME`; the key is typed there, never in a menu | `ward vault set NAME` in any terminal |
 | Project | a directory picker over `~` (up, into, a typed path, a new directory) or a repository URL to clone; then `ward init` in a terminal that shows its report and, when the project's files propose one verification boundary, asks whether to accept it | `ward init` in any directory |
 | Agent | `ward ready` checks the project first; a blocking gap shows its report and asks before continuing (`Fix it first` opens `ward init` in a terminal, where a proposed-but-unaccepted verification boundary is accepted); then `ward claude` (or `ward codex`) there, and one line about the trust bar | `Super + Space` → Start Claude |
-| Done | the card: `Super + Space` is everything, `Super + K` lists the keys, this document | — |
+| Done | the card: `Super + Space` is everything, `Super + K` lists the keys, `Super + Shift + Escape` (or `POWER` in the bar) locks, suspends or shuts down, this document | — |
 
 The done step writes `~/.config/wardos/welcome-done`. Until it exists, the command
 centre (`Super + Space`) opens on `WELCOME  Start here` whenever there is no live

@@ -215,9 +215,10 @@ step_done() {
   wardos_menu "You are set" \
     "Super + Space is everything: projects, agents, verify, apps" \
     "Super + K lists the keys" \
+    "Super + Shift + Escape, or POWER in the bar: lock, suspend, shut down" \
     "docs/onboarding.md is the five-minute path" \
     "Done" >/dev/null || true
-  wardos_notify "Welcome to WardOS" "Super + Space is everything · Super + K lists the keys · docs/onboarding.md"
+  wardos_notify "Welcome to WardOS" "Super + Space is everything · Super + K lists the keys · Super + Shift + Escape or POWER in the bar to shut down · docs/onboarding.md"
   mkdir -p "$(dirname "$marker")"
   date -u +%Y-%m-%dT%H:%M:%SZ >"$marker"
 }

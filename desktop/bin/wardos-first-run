@@ -79,6 +79,13 @@ if [[ ! -e "$marker" || "${1:-}" == --force ]]; then
     wardos_notify "Terminal apps not registered" "Run 'wardos-tui install --defaults' in a terminal"
 
   wardos-keys
+  # One pointer, once, after the keys viewer closes so it is on screen when the user is
+  # (#99: the first boot on the reference laptop could not find the command centre or a
+  # way to shut down, and did not know the bar). Not the "Welcome to WardOS" greeting —
+  # that stays the walkthrough's (E-09, one sender).
+  wardos_notify "Three things to know" \
+    "Super + Space is the command centre: agents, apps, settings · Super + Shift + Escape, or POWER at the right of the bar: lock, suspend, shut down · The row at the top is the trust bar: project, agent, network, verification" \
+    -t 15000
 fi
 
 # Resumable onboarding stages, offered on every login until each records its own completion

@@ -30,6 +30,18 @@ welcome_line=$(grep -n '^wardos-welcome $' "$MOCK_LOG" | head -n1 | cut -d: -f1)
 # first-run does not send the "Welcome to WardOS" greeting: the walkthrough (wardos-welcome)
 # is its single sender, so the reference laptop's duplicate toast cannot recur (E-09).
 assert_not_logged 'Welcome to WardOS'
+# What it does send, once, after the keys viewer (#99): one pointer naming the command
+# centre, the power menu (its key and the bar's POWER cell) and the trust bar — the three
+# things the first boot on the reference laptop could not find. Calm words, no
+# exclamation marks (design-language.md §9).
+assert_logged '^notify-send -a WardOS .*Super \+ Space'
+assert_logged '^notify-send -a WardOS .*Super \+ Shift \+ Escape.*POWER'
+assert_logged '^notify-send -a WardOS .*trust bar'
+grep '^notify-send' "$MOCK_LOG" | grep -q '!' && fail "no exclamation marks in a notification"
+pointer_at=$(grep -nE '^notify-send -a WardOS .*Super \+ Shift \+ Escape' "$MOCK_LOG" | head -1 | cut -d: -f1)
+keys_at=$(grep -n '^wardos-keys $' "$MOCK_LOG" | head -1 | cut -d: -f1)
+[[ -n "$pointer_at" && -n "$keys_at" && "$pointer_at" -gt "$keys_at" ]] ||
+  fail "the pointer is sent after the keys viewer closes, so it is on screen when the user is; log: $(cat "$MOCK_LOG")"
 # The walkthrough comes after the keys, once the marker is written. (The detached
 # `ward doctor` above may land anywhere in the log, so assert order against the keys line,
 # not that wardos-welcome is the very last line.)
@@ -50,6 +62,7 @@ assert_not_logged '^wardos-keys'
 assert_not_logged '^wardos-webapp'
 assert_not_logged '^wardos-tui'
 assert_not_logged '^ward doctor$'
+assert_not_logged 'Super \+ Shift \+ Escape'  # the pointer is part of the one-time init
 assert_logged '^wardos-calibrate $'
 assert_logged '^wardos-welcome $'
 wardos-first-run --force

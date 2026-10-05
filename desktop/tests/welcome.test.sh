@@ -32,6 +32,8 @@ assert_logged "^wardos-launch run wardos-agent ward claude $HOME/work/app$"
 assert_logged '^notify-send -a WardOS .*trust bar'
 grep -q 'trust bar' <<<"$out" || fail "the trust bar is explained on stdout too; got: $out"
 assert_logged '^notify-send -a WardOS .*Welcome to WardOS.*Super \+ Space'
+# The closing card names the way out too (#99: the first boot could not find it).
+assert_logged '^notify-send -a WardOS .*Welcome to WardOS.*Super \+ Shift \+ Escape'
 assert_file "$marker"
 assert_eq "$(cat "$project_file")" "$HOME/work/app"
 grep -q 'sk-' "$MOCK_LOG" && fail "no key value ever passes through a menu or a mock"

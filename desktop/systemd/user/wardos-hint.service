@@ -1,0 +1,20 @@
+# WardOS — the empty-workspace hint (docs/desktop.md §Commands, #99).
+#
+# `wardos-hint --watch` follows Hyprland's event socket and, on a change to one of the
+# three named workspaces (1 code, 2 agent, 3 web) that has no window, says what starts
+# there and how — once per workspace per login, through mako. It runs for the whole
+# graphical session, like the approval listener, and is restarted if it exits; without
+# a session there is no socket to follow, so it is bound to graphical-session.target.
+[Unit]
+Description=WardOS empty-workspace hint
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wardos-hint --watch
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

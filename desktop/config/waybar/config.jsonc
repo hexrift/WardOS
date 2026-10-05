@@ -24,7 +24,8 @@
     "battery",
     "cpu",
     "memory",
-    "clock"
+    "clock",
+    "custom/ward-power"
   ],
 
   "custom/ward-mark": {
@@ -83,7 +84,8 @@
   },
 
   "hyprland/workspaces": {
-    "format": "{name}",
+    "format": "{id} {icon}",
+    "format-icons": { "code": "code", "agent": "agent", "web": "web", "default": "" },
     "on-click": "activate",
     "on-scroll-up": "hyprctl dispatch workspace e-1",
     "on-scroll-down": "hyprctl dispatch workspace e+1",
@@ -163,5 +165,10 @@
       }
     },
     "on-click": "wardos-setup timezone"
+  },
+  "custom/ward-power": {
+    "format": "POWER",
+    "tooltip-format": "Lock, suspend, relaunch, restart or shut down. Super + Shift + Escape, or SYSTEM ▸ Power in the command centre.",
+    "on-click": "wardos-power menu"
   }
 }

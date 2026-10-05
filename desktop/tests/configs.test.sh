@@ -174,7 +174,23 @@ assert c["modules-left"] == want, c["modules-left"]
 assert c["custom/ward-network"]["on-click"] == "foot --app-id ward-authority -e sh -c 'ward-shell authority-panel; read -r _'", c["custom/ward-network"]["on-click"]
 assert c["custom/ward-grants"]["on-click"] == "wardos-grants", c["custom/ward-grants"]["on-click"]
 assert c["modules-center"] == ["hyprland/workspaces"]
-assert c["modules-right"][0] == "custom/ward-update" and c["modules-right"][-1] == "clock"
+# #99: a power cell closes the right group, after the clock, so a working lock / suspend /
+# shut down path is visible in the bar and not only behind Super + Shift + Escape. It opens
+# wardos-power's own menu (its confirmations and actions unchanged) and its tooltip names
+# the key and the menu path.
+assert c["modules-right"][0] == "custom/ward-update" and c["modules-right"][-2:] == ["clock", "custom/ward-power"], c["modules-right"]
+power = c["custom/ward-power"]
+assert power["on-click"] == "wardos-power menu", power["on-click"]
+assert power["format"] == "POWER", power["format"]
+assert "Super + Shift + Escape" in power["tooltip-format"] and "SYSTEM" in power["tooltip-format"], power["tooltip-format"]
+assert "exec" not in power, "the power cell is static text, no process behind it"
+# #99: the workspace labels read as numbered workspaces (`1 code`, `2 agent`, `3 web`, a
+# free one as its number alone), never as three app names to click: the number is the
+# Super + 1/2/3 key, the word is the Hyprland defaultName of looknfeel.conf.
+ws = c["hyprland/workspaces"]
+assert ws["format"] == "{id} {icon}", ws["format"]
+assert ws["format-icons"] == {"code": "code", "agent": "agent", "web": "web", "default": ""}, ws["format-icons"]
+assert ws["persistent-workspaces"] == {"1": [], "2": [], "3": []}
 for name in want[1:]:
     m = c[name]
     assert m["exec"] == f"ward-shell bar --waybar --segment {name.split('/ward-')[1]} --follow", m["exec"]
@@ -192,6 +208,21 @@ PY
 for cls in working waiting blocked verifying finished verified restricted denied unknown; do
   grep -q "\.$cls\b" "$root/config/waybar/style.css" || fail "waybar/style.css has no .$cls rule"
 done
+# The power cell is a cell like the others (padded, in the muted system group) and, being
+# the last one, the cell without a right border (#99).
+python3 - "$root/config/waybar/style.css" <<'PY' || fail "waybar/style.css: the power cell is not a cell, or does not close the bar"
+import re, sys
+css = open(sys.argv[1]).read()
+# The rule whose selector list names the power cell along with the clock: the cell geometry.
+cells = [m for m in re.finditer(r"([^{}]*)\{([^}]*)\}", css) if "#custom-ward-power" in m.group(1) and "#clock" in m.group(1)]
+assert cells, "the power cell is not in the cell list with the clock"
+assert "padding: 0 8px" in cells[0].group(2) and "border-bottom: 2px solid transparent" in cells[0].group(2), cells[0].group(2)
+# The rule for exactly that one selector (comments stripped), not a list it is part of.
+plain = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+own = lambda sel: [m.group(2) for m in re.finditer(r"([^{}]*)\{([^}]*)\}", plain) if m.group(1).strip() == sel]
+assert own("#custom-ward-power") and "border-right: none" in own("#custom-ward-power")[0], "the last cell has no right border"
+assert own("#clock") and "border-right: none" not in own("#clock")[0], "the clock is no longer the last cell"
+PY
 grep -Eq 'gradient\(|box-shadow:[^;]*[0-9]' "$root/config/waybar/style.css" && fail "waybar/style.css: no gradients, no shadows (§3, §5)"
 # The bar is 32 px tall, its cells are padded on the 8 px grid, the system group is
 # words (no icon-font glyphs anywhere in a format), and battery state is a 2 px marker
@@ -278,6 +309,40 @@ for want in 'match:class ^(wardos-welcome)$, float on' 'match:class ^(wardos-wel
   grep -qF "windowrule = $want" "$win" || fail "windows.conf lacks '$want'"
 done
 grep -Eq '^(windowrulev2|layerrule = [^m])' "$win" && fail "windows.conf: a rule in the form Hyprland 0.56 rejects"
+# --- tool dialogs (#99): a tool opened from the bar or the menu (the audio mixer, the
+# network and Bluetooth editors, the portal pickers, a wardos-* terminal that runs an
+# install, an update, a setup step or About) is a floating, sized, centred window on the
+# workspace it was asked for, never a tile that re-arranges the editor and never a window
+# sent to another workspace. Every `float on` match therefore also places its window
+# (`center on` or `move`), except a tile-only rule, and no dialog match carries a
+# `workspace` effect.
+for want in 'match:class ^(org.pulseaudio.pavucontrol|pavucontrol)$, size 800 560' \
+  'match:class ^(nm-connection-editor|blueman-manager)$, size 800 560' \
+  'match:class ^(nm-connection-editor|blueman-manager)$, center on' \
+  'match:class ^(xdg-desktop-portal-gtk|xdg-desktop-portal-hyprland|hyprland-share-picker)$, size 800 560' \
+  'match:class ^(wardos-(install|remove|update|setup|about|passwd))$, float on' \
+  'match:class ^(wardos-(install|remove|update|setup|about|passwd))$, size 1000 700' \
+  'match:class ^(wardos-(install|remove|update|setup|about|passwd))$, center on'; do
+  grep -qF "windowrule = $want" "$win" || fail "windows.conf lacks '$want'"
+done
+python3 - "$win" <<'PY' || fail "windows.conf: a floating rule that does not place its window, or a dialog sent elsewhere"
+import re, sys
+rules = {}
+for line in open(sys.argv[1]):
+    m = re.match(r"windowrule = (match:\S+ \S+), (\S+)(?: (.*))?$", line.strip())
+    if m:
+        rules.setdefault(m.group(1), set()).add(m.group(2))
+errors = []
+for match, effects in rules.items():
+    if "float" in effects and not ({"center", "move"} & effects):
+        errors.append(f"{match}: floats but is not placed (center or move)")
+    if "float" in effects and "workspace" in effects:
+        errors.append(f"{match}: a floating dialog must open where it was asked for, not on another workspace")
+    if "size" in effects and "float" not in effects:
+        errors.append(f"{match}: sized but not floating")
+print("\n".join(errors), file=sys.stderr)
+sys.exit(1 if errors else 0)
+PY
 
 # --- emoji list: `<emoji> <name>` per line, a few hundred lines -----------------
 [[ $(wc -l <"$root/config/fuzzel/emoji.txt") -ge 250 ]] || fail "emoji.txt is too short"
@@ -334,6 +399,13 @@ unit_has "$root/systemd/user/swayosd.service" 'ExecStart=.*swayosd-server --styl
 unit_has "$root/systemd/user/wardos-battery-monitor.timer" 'OnUnitActiveSec=2min'
 unit_has "$root/systemd/user/wardos-shell-worker.service" 'ExecStart=.*ward-shell worker'
 unit_has "$root/systemd/user/wardos-shell-worker.service" 'WantedBy=graphical-session.target'
+# The empty-workspace hint (#99) follows Hyprland's event socket for the whole session,
+# like the approval listener; it is bound to the graphical session and restarted if it
+# exits.
+unit_has "$root/systemd/user/wardos-hint.service" 'ExecStart=.*wardos-hint --watch'
+unit_has "$root/systemd/user/wardos-hint.service" 'PartOf=graphical-session.target'
+unit_has "$root/systemd/user/wardos-hint.service" 'Restart=on-failure'
+unit_has "$root/systemd/user/wardos-hint.service" 'WantedBy=graphical-session.target'
 
 # --- autostart: the shared bar worker is actually started on the plain-Hyprland path ---
 # (review finding 1 on #331): the systemd preset (image/install-desktop.sh) only reaches
@@ -352,6 +424,9 @@ start_line=$(grep '^exec-once = systemctl --user start ' "$autostart") \
   || fail "autostart.conf has no 'systemctl --user start' line"
 grep -qw 'wardos-shell-worker.service' <<<"$start_line" \
   || fail "autostart.conf's systemctl start line does not start wardos-shell-worker.service: $start_line"
+# The hint listener (#99) is started on the same line, for the same plain-Hyprland reason.
+grep -qw 'wardos-hint.service' <<<"$start_line" \
+  || fail "autostart.conf's systemctl start line does not start wardos-hint.service: $start_line"
 start_line_no=$(grep -n '^exec-once = systemctl --user start ' "$autostart" | cut -d: -f1)
 waybar_line_no=$(grep -n '^exec-once = waybar$' "$autostart" | cut -d: -f1)
 [[ -n $waybar_line_no ]] || fail "autostart.conf has no 'exec-once = waybar' line"
