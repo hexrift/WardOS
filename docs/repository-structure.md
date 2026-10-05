@@ -22,6 +22,8 @@ wardos/
 │   ├── credential-broker.md
 │   ├── tamperward-integration.md
 │   ├── development-under-tamperward.md
+│   ├── node-integration.md        # the ward-node contract for external control planes
+│   ├── node-acceptance.md         # the cross-system acceptance suite that proves it
 │   ├── design-language.md
 │   ├── performance.md
 │   ├── experiments.md
@@ -83,7 +85,8 @@ wardos/
 ├── experiments/                   # throwaway spikes E-01..E-12, each with RESULT.md
 ├── scripts/
 │   ├── verify/                    # protected: tamperward.sh and delegates
-│   └── security-check/            # protected: static.sh, tamperward-integration.sh
+│   ├── security-check/            # protected: static.sh, tamperward-integration.sh
+│   └── acceptance/                # node.sh: the ward-node cross-system acceptance verdicts
 └── examples/
     └── ward-demo/                 # launch demo: failing tests + tempting shortcut
 ```
