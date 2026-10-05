@@ -13,8 +13,8 @@
 //! The primitive lives in its own crate so that both `ward-daemon` (which
 //! re-exports it unchanged as `ward_daemon::sandbox`) and `ward-node` can launch,
 //! own and reap a sandbox without the node depending on the daemon (ADR-0030 §3).
-//! It deliberately depends on nothing beyond the standard library and
-//! `thiserror`: no policy, proxy, TLS or network stack.
+//! It deliberately depends on nothing beyond the standard library, `thiserror` and
+//! `nix` (for the signals [`freeze`] sends): no policy, proxy, TLS or network stack.
 
 #![forbid(unsafe_code)]
 #![allow(
@@ -24,6 +24,8 @@
     clippy::module_name_repetitions,
     clippy::struct_field_names
 )]
+
+pub mod freeze;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -240,6 +242,13 @@ impl RunningLaunch {
     #[must_use]
     pub fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// The spawned child as the root of its process tree, for [`freeze`]; `None` if
+    /// `/proc` no longer shows it.
+    #[must_use]
+    pub fn tree_root(&self) -> Option<freeze::TreeRoot> {
+        freeze::TreeRoot::of(self.child.id())
     }
 
     /// Wait for the child and collect its bounded outcome.
