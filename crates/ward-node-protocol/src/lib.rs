@@ -1,10 +1,11 @@
-//! ward-node-protocol: dependency-light protocol contracts shared by a future
-//! ward-node and its local or remote clients.
+//! ward-node-protocol: dependency-light protocol contracts shared by ward-node and its
+//! local or remote clients.
 //!
-//! This crate starts with version negotiation only. Task identity, authority leases,
-//! authentication, lifecycle operations and transport belong to later slices of #258,
-//! #259 and #262. Incompatible peers fail closed rather than falling back to the
-//! per-session ward-daemon control protocol.
+//! Protocol 1.0 negotiates a version, 1.1 adds read-only capability discovery, 1.2 adds
+//! the identity-only task lifecycle, and 1.3 adds the signed admission envelope (`admit`)
+//! and the `exited` state of ADR-0030. Issuer verification, execution and transport
+//! authentication belong to later slices of #324 and #262. Incompatible peers fail closed
+//! rather than falling back to the per-session ward-daemon control protocol.
 
 #![forbid(unsafe_code)]
 
@@ -33,9 +34,9 @@ use ward_events::{ExecutionAttemptId, LeaseId, TaskId};
 
 /// The node protocol version currently implemented by this revision.
 ///
-/// Minor versions are backwards-compatible within one major version. The initial
-/// implementation supports only 1.0; later compatible additions widen the supported
-/// minor range explicitly.
+/// Minor versions are backwards-compatible within one major version; each compatible
+/// addition widens the supported minor range explicitly. This revision supports 1.0
+/// through 1.3.
 pub const WARD_NODE_PROTOCOL: SupportedProtocolRange = SupportedProtocolRange::valid(1, 0, 3);
 
 /// The first protocol version that supports node capability discovery.

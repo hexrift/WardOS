@@ -31,9 +31,12 @@ task `Created → Ready`; a 1.2 connection never sees the verb.
 
 ### 2. Admission requires a trusted issuer proof
 
-An envelope is admitted only with a detached Ed25519 signature over its canonical
-postcard encoding, made by an issuer key in the node's configured trust store. The node
-checks, before anything is materialised or spawned:
+An envelope is admitted only with a detached Ed25519 signature over the exact envelope
+bytes carried on the wire (the UTF-8 bytes of the `admit` request's `envelope_json`
+string value), made by an issuer key in the node's configured trust store. Signing the
+transmitted bytes rather than a re-encoding means an issuer in any language signs what it
+sends, with no canonicalisation step. The node verifies the signature over those bytes
+before it decodes them, then checks, before anything is materialised or spawned:
 
 1. the signature against a trusted issuer key;
 2. the audience is this node's `NodeId`;
