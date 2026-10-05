@@ -1099,7 +1099,162 @@ fn gc_objects(s: &mut String, objects: &[ward_snapshot::gc::PlannedObject]) {
 /// `pub(crate)` so `doctor`'s storage check can format the same numbers the
 /// same way `ward snapshot usage`/`gc` already do, rather than a second
 /// formatter drifting from this one.
-pub(crate) fn human_bytes(bytes: u64) -> String {
+/// A duration for a report: `312 ms` under a second, `4.2 s` under a minute,
+/// `2 min 05 s` beyond.
+#[must_use]
+pub fn human_duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else if ms < 60_000 {
+        format!("{:.1} s", d.as_secs_f64())
+    } else {
+        let secs = d.as_secs();
+        format!("{} min {:02} s", secs / 60, secs % 60)
+    }
+}
+
+/// A Unix timestamp as a UTC calendar date, `YYYY-MM-DD`.
+#[must_use]
+pub fn human_date(unix_secs: u64) -> String {
+    // Civil-from-days (Howard Hinnant's algorithm), so no clock library is needed.
+    let days = i64::try_from(unix_secs / 86_400).unwrap_or(i64::MAX) + 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The `ward prepare` panel (#147 items 3, 4 and 6): what was installed from which
+/// inputs, for which runtime and platform, under which key, with what network, how it
+/// ended and how long it took — the record, laid out.
+#[must_use]
+pub fn prepare_panel(done: &crate::prepare::Done, verify_note: Option<&str>) -> String {
+    let (record, dir, verdict) = prepare_verdict(done);
+    let mut s = format!(
+        "{ACCENT}WARD{RESET} {INK}prepare{RESET}  {DIM}{} · key {}{RESET}\n",
+        record.ecosystem,
+        &record.key[..12.min(record.key.len())]
+    );
+    for input in &record.inputs {
+        let _ = writeln!(
+            s,
+            "  {INK}{:<10}{RESET} {:<22} {DIM}blake3 {}{RESET}",
+            "input",
+            input.path,
+            &input.digest[..12.min(input.digest.len())]
+        );
+    }
+    let _ = writeln!(
+        s,
+        "  {INK}{:<10}{RESET} {} {} {DIM}({}){RESET}",
+        "runtime",
+        record.runtime.program,
+        record.runtime.version,
+        record.runtime.host_path.display()
+    );
+    let _ = writeln!(s, "  {INK}{:<10}{RESET} {}", "platform", record.platform);
+    if let Some(registry) = record
+        .settings
+        .npm_registry
+        .as_deref()
+        .or(record.settings.pip_index_url.as_deref())
+    {
+        let _ = writeln!(s, "  {INK}{:<10}{RESET} {registry}", "registry");
+    }
+    let _ = writeln!(
+        s,
+        "  {INK}{:<10}{RESET} {}",
+        "command",
+        record.command.join(" ")
+    );
+    let _ = writeln!(
+        s,
+        "  {INK}{:<10}{RESET} {DIM}{}{RESET}",
+        "network", record.network
+    );
+    let _ = writeln!(
+        s,
+        "  {INK}{:<10}{RESET} {DIM}{}{RESET}",
+        "where",
+        dir.display()
+    );
+    if let Some(note) = verify_note {
+        let _ = writeln!(s, "  {INK}{:<10}{RESET} {DIM}{note}{RESET}", "verify");
+    }
+    let _ = writeln!(s, "  {verdict}");
+    s
+}
+
+/// The record and directory a [`crate::prepare::Done`] carries, and its verdict line.
+fn prepare_verdict(
+    done: &crate::prepare::Done,
+) -> (&crate::prepare::Record, &std::path::Path, String) {
+    use crate::prepare::{Done, Outcome};
+    let ms = |ms: Option<u64>| {
+        ms.map_or_else(
+            || "-".to_owned(),
+            |ms| human_duration(std::time::Duration::from_millis(ms)),
+        )
+    };
+    match done {
+        Done::Reused(p) => (
+            &p.record,
+            &p.dir,
+            format!(
+                "{OK}already prepared{RESET} {DIM}· warm {}{RESET}",
+                p.warm.map_or_else(|| "-".to_owned(), human_duration)
+            ),
+        ),
+        Done::Prepared(p) => (
+            &p.record,
+            &p.dir,
+            format!(
+                "{OK}✓ PREPARED{RESET} {DIM}· cold {} · attempt {}{RESET}",
+                ms(p.record.cold_ms),
+                p.record.attempt
+            ),
+        ),
+        Done::Failed { record, dir } => {
+            let how = match record.outcome {
+                Outcome::Incomplete if record.timed_out => "was killed at its budget".to_owned(),
+                Outcome::Incomplete => record.exit_code.map_or_else(
+                    || "was killed".to_owned(),
+                    |c| format!("was interrupted (exit {c})"),
+                ),
+                _ => format!(
+                    "exited {}",
+                    record
+                        .exit_code
+                        .map_or_else(|| "by signal".to_owned(), |c| c.to_string())
+                ),
+            };
+            let (mark, fix) = if record.outcome == Outcome::Incomplete {
+                ("! INCOMPLETE", "run `ward prepare` again")
+            } else {
+                ("✗ FAILED", "fix the cause and run `ward prepare` again")
+            };
+            (
+                record,
+                dir,
+                format!(
+                    "{DENY}{mark}{RESET} {DIM}· attempt {} {how}; nothing of it is used; {fix}{RESET}",
+                    record.attempt
+                ),
+            )
+        }
+    }
+}
+
+/// A byte count in binary units with one decimal (`38.2 MiB`).
+#[must_use]
+pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut whole = bytes;
     let mut tenths = 0u64;
@@ -1129,6 +1284,14 @@ pub fn verify_report(r: &crate::session::VerifyReport) -> String {
             s,
             "  {WARN}restored{RESET} {INK}{rel}{RESET} {DIM}(pristine copy; worktree edit ignored){RESET}"
         );
+    }
+    if let Some(dependencies) = &r.dependencies {
+        let (color, text) = match dependencies.strip_prefix("dependencies: ") {
+            Some(text) if text.starts_with("prepared") => (OK, text),
+            Some(text) => (WARN, text),
+            None => (WARN, dependencies.as_str()),
+        };
+        let _ = writeln!(s, "  {color}dependencies{RESET} {DIM}{text}{RESET}");
     }
     if r.passed {
         let _ = writeln!(
@@ -1520,6 +1683,51 @@ mod tests {
     }
 
     #[test]
+    fn human_duration_and_date_read_as_a_report_would_show_them() {
+        assert_eq!(
+            human_duration(std::time::Duration::from_millis(312)),
+            "312 ms"
+        );
+        assert_eq!(
+            human_duration(std::time::Duration::from_millis(4200)),
+            "4.2 s"
+        );
+        assert_eq!(
+            human_duration(std::time::Duration::from_secs(125)),
+            "2 min 05 s"
+        );
+        assert_eq!(human_date(0), "1970-01-01");
+        assert_eq!(human_date(1_759_622_400), "2025-10-05");
+        assert_eq!(human_date(951_782_400), "2000-02-29");
+    }
+
+    #[test]
+    fn verify_report_shows_the_dependency_line_in_the_right_tone() {
+        let mut report = crate::session::VerifyReport {
+            candidate: "abababababababab".to_owned(),
+            passed: true,
+            timed_out: None,
+            summary: ward_events::VerifySummary::default(),
+            restored: Vec::new(),
+            dependencies: Some(
+                "dependencies: prepared 0123456789ab (node-npm) mounted read-only".to_owned(),
+            ),
+            output: String::new(),
+        };
+        let text = plain(&verify_report(&report));
+        assert!(
+            text.contains("dependencies prepared 0123456789ab (node-npm) mounted read-only"),
+            "{text}"
+        );
+        report.dependencies =
+            Some("dependencies: not mounted: stale: package-lock.json changed".to_owned());
+        let text = plain(&verify_report(&report));
+        assert!(text.contains("dependencies not mounted: stale"), "{text}");
+        report.dependencies = None;
+        assert!(!plain(&verify_report(&report)).contains("dependencies"));
+    }
+
+    #[test]
     fn human_bytes_scales_binary_units_with_one_decimal() {
         assert_eq!(human_bytes(0), "0 B");
         assert_eq!(human_bytes(512), "512 B");
@@ -1731,6 +1939,7 @@ mod tests {
             timed_out: Some(600),
             summary: ward_events::VerifySummary::default(),
             restored: Vec::new(),
+            dependencies: None,
             output: "verifier budget of 600s exceeded; killed\n".to_owned(),
         };
         let text = plain(&verify_report(&report));

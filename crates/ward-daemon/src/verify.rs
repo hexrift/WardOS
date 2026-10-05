@@ -395,8 +395,23 @@ pub struct Outcome {
 }
 
 /// Run the verification command over the prepared tree, offline, with the host
-/// toolchains read-only.
+/// toolchains read-only and no prepared dependency environment.
 pub fn execute(v: &Verification) -> Result<Outcome> {
+    execute_with(v, None)
+}
+
+/// [`execute`], mounting a prepared dependency environment (#147 item 3) read-only
+/// beside the candidate when the session found one whose key matches the
+/// candidate's own inputs ([`crate::prepare::lookup`]): `node_modules` at
+/// `/work/node_modules`, a Python target directory under `/run/verifier/deps` named by
+/// `PYTHONPATH`, its `bin` first on `PATH`. The sandbox is otherwise the same — every
+/// namespace unshared, no egress — so a missing or stale environment means the command
+/// runs without its dependencies and fails on its own terms, never that anything is
+/// fetched.
+pub fn execute_with(
+    v: &Verification,
+    dependencies: Option<&crate::prepare::Prepared>,
+) -> Result<Outcome> {
     let argv = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
@@ -411,10 +426,18 @@ pub fn execute(v: &Verification) -> Result<Outcome> {
         .capture_bytes(MAX_OUTPUT_BYTES / 2)
         .keep_lines("test result:")
         .budget(Duration::from_secs(v.config.verify.budget_secs));
-    for (k, val) in Toolchains::detect().env() {
+    let toolchains = Toolchains::detect();
+    let mut env = toolchains.env();
+    if let Some(deps) = dependencies {
+        deps.apply_env(&mut env);
+    }
+    for (k, val) in env {
         launch = launch.env(k, val);
     }
-    launch = Toolchains::detect().mount(launch);
+    launch = toolchains.mount(launch);
+    if let Some(deps) = dependencies {
+        launch = deps.mount(launch);
+    }
     let out = launch.run()?;
     let combined = format!("{}{}", out.stdout, out.stderr);
     let combined_over = combined.len() > MAX_OUTPUT_BYTES;

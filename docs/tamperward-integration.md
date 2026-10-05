@@ -191,6 +191,18 @@ TamperWard control plane over its socket (the decision today is `wardd`'s readin
 the config), the semantic rules (`test-skip`, `assertion-weakening`), and the verifier
 image (ADR-0004 addendum).
 
+A Node or Python project's dependencies reach the verifier through `ward prepare`
+(#147 items 3, 4 and 6; [`ward_daemon::prepare`](../crates/ward-daemon/src/prepare.rs)),
+the one phase that fetches: the lockfile's install, with no scripts, in the verifier's
+sandbox with the host network asked for explicitly on the launch and recorded in the
+environment's `prepared.json`, into `<state>/prepared/<key>/` — keyed by the input
+digests, the runtime's version, the platform and the registry — sealed read-only on
+success. `ward verify` records a `VerificationProgress` step `dependencies: prepared
+<key> (<ecosystem>) mounted read-only` when the candidate's own lockfile resolves to a
+complete environment, or `dependencies: not mounted: <stale | incomplete | never
+prepared …>` (status `Fail`, the verifier still offline and fetching nothing) when it
+does not; `ward ready`'s `dependencies` row says the same before the agent starts.
+
 ## 7. Open questions for TamperWard (to settle before Phase 3)
 
 1. Does TamperWard want to supply the trusted test bundle as a snapshot ID (WardOS

@@ -27,6 +27,9 @@ rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The prepare/verify end-to-end tests need the sandbox and skip (or, under
+# WARD_REQUIRE_ISOLATION, fail) through the same gate as the daemon's own suite.
+ward-sandbox = { path = "../ward-sandbox", version = "0.18.0" }
 
 [lints]
 workspace = true

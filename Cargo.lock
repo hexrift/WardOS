@@ -2420,6 +2420,7 @@ dependencies = [
  "ward-daemon",
  "ward-events",
  "ward-policy",
+ "ward-sandbox",
  "ward-shell-core",
 ]
 

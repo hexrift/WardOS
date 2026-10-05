@@ -189,6 +189,16 @@ enum Command {
         /// Project directory (default: current).
         dir: Option<PathBuf>,
     },
+    /// Prepare the dependency environment the lockfile pins, once, online, into a
+    /// sealed directory the offline verifier mounts read-only (#147). Requires the
+    /// accepted verification boundary (`ward init --accept-verify`).
+    Prepare {
+        /// Project directory (default: current).
+        dir: Option<PathBuf>,
+        /// Discard a complete environment for the current inputs and install it again.
+        #[arg(long)]
+        rebuild: bool,
+    },
     /// Check what this host can give a session, with a fix for each gap.
     Doctor,
     /// Check whether this project can be verified before an agent starts: policy,
@@ -679,6 +689,7 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             cmd_resume(&dir.unwrap_or_else(cwd), session.as_deref())
         }
         Command::Verify { dir } => cmd_verify(&dir.unwrap_or_else(cwd)),
+        Command::Prepare { dir, rebuild } => Ok(cmd_prepare(&dir.unwrap_or_else(cwd), rebuild)),
         Command::Doctor => Ok(cmd_doctor()),
         Command::Ready {
             dir,
@@ -2165,6 +2176,109 @@ fn cmd_verify(dir: &Path) -> ward_daemon::Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// `ward prepare`: the explicit, online dependency-preparation phase (#147 items 3, 4
+/// and 6). Refuses before anything runs unless the verification boundary is accepted;
+/// declines a project with nothing pinned; otherwise installs the lockfile's dependency
+/// set in the verifier's sandbox with the host network, streaming progress to stderr,
+/// and prints the record. Exit 0 when a complete environment exists afterwards (newly
+/// installed or reused), 1 otherwise.
+fn cmd_prepare(dir: &Path, rebuild: bool) -> ExitCode {
+    use ward_daemon::prepare::{self, Done, Lookup, Plan};
+    let state = ward_daemon::session::state_root();
+    let config_path = dir.join(ward_daemon::verify::CONFIG_PATH);
+    let accepted = match std::fs::read_to_string(&config_path) {
+        Ok(yaml) => ward_daemon::verify::Config::parse(&yaml).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "{} not written yet",
+            ward_daemon::verify::CONFIG_PATH
+        )),
+        Err(e) => Err(format!("{}: {e}", ward_daemon::verify::CONFIG_PATH)),
+    };
+    if let Err(why) = accepted {
+        eprintln!(
+            "ward prepare: the verification boundary is not accepted ({why}); `ward init \
+             --accept-verify` writes it, and nothing is installed before that"
+        );
+        return ExitCode::FAILURE;
+    }
+    let settings = prepare::Settings::from_env();
+    let recipe = match prepare::plan(dir, &settings) {
+        Plan::Recipe(recipe) => recipe,
+        Plan::NotNeeded(why) => {
+            println!("ward prepare: nothing to prepare: {why}");
+            return ExitCode::SUCCESS;
+        }
+        Plan::Declined(why) => {
+            eprintln!("ward prepare: cannot prepare: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let toolchains = ward_daemon::verify::Toolchains::detect();
+    let runtime = match prepare::runtime_identity(recipe.ecosystem, &toolchains.search_dirs()) {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("ward prepare: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let platform = prepare::platform();
+    let command = recipe.ecosystem.install_argv(&recipe).join(" ");
+    let request = prepare::Request {
+        state: &state,
+        dir,
+        recipe: &recipe,
+        runtime: &runtime,
+        platform: &platform,
+        rebuild,
+    };
+    let mut progress = |p: &prepare::Progress| {
+        eprintln!(
+            "ward prepare: {command} · {} · {} files · {}{}",
+            render::human_duration(p.elapsed),
+            p.files,
+            render::human_bytes(p.bytes),
+            if p.attempt > 1 {
+                format!(" · attempt {}", p.attempt)
+            } else {
+                String::new()
+            }
+        );
+    };
+    let done = match prepare::run(&request, &mut progress) {
+        Ok(done) => done,
+        Err(e) => {
+            eprintln!("ward prepare: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Say where the verifier will see it, judged the same way `ward ready` does.
+    let verify_note = match prepare::lookup(&state, dir, &settings, &toolchains.search_dirs()) {
+        Lookup::Ready(env) => Some(format!(
+            "`ward verify` mounts it read-only at {} (looked up in {})",
+            env.ecosystem.sandbox_tree(),
+            env.warm
+                .map_or_else(|| "-".to_owned(), render::human_duration)
+        )),
+        Lookup::Missing { reason, .. } => {
+            Some(format!("`ward verify` will not mount it: {reason}"))
+        }
+        _ => None,
+    };
+    print!("{}", render::prepare_panel(&done, verify_note.as_deref()));
+    match done {
+        Done::Reused(_) | Done::Prepared(_) => ExitCode::SUCCESS,
+        Done::Failed { record, .. } => {
+            if !record.output_tail.trim().is_empty() {
+                eprintln!("ward prepare: the installer's output ends:");
+                for line in record.output_tail.lines() {
+                    eprintln!("  {line}");
+                }
+            }
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn cmd_selftest(dir: &Path) -> ward_daemon::Result<ExitCode> {

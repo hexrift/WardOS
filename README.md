@@ -59,14 +59,15 @@ does the three steps above for you, verifies the release against its signed mani
 when it has one (`--require-provenance` to insist), and runs `ward doctor`; it is a
 shell script fetched from `main`, so read it first ([`docs/install.md`](docs/install.md)).
 
-Then, in any project, five commands and about five minutes
+Then, in any project, six commands and about five minutes
 ([`docs/onboarding.md`](docs/onboarding.md)):
 
 ```bash
 ward doctor                        # what this host can give a session, with a fix per gap
 ward vault set ANTHROPIC_API_KEY   # the model key, typed without echo, kept on the host
 ward init                          # policy, verifier config, TamperWard wiring; never overwrites yours; --accept-verify accepts the proposed verify command
-ward ready                         # is this project verifiable yet? policy, runtime, key, protected paths
+ward ready                         # is this project verifiable yet? policy, runtime, key, protected paths, dependencies prepared
+ward prepare                       # the lockfile's dependency set, installed once, online, sealed for the offline verifier
 ward claude                        # Claude Code in the sandbox; the proxy injects the key
 ward verify                        # the protected tests, from the entry snapshot, offline
 ```
@@ -119,7 +120,8 @@ an explicit `GAP` row (`ObservationsDropped`) beside the batch it belongs to.
 ```bash
 # the binaries: the release tarball (Get started), install.sh, or cargo build --release
 ward doctor                         # what this host can give a session, with a fix per gap
-ward ready    examples/ward-demo    # is this project verifiable yet? policy, runtime, key, protected paths
+ward ready    examples/ward-demo    # is this project verifiable yet? policy, runtime, key, protected paths, dependencies
+ward prepare  examples/ward-demo    # a Node/Python lockfile's dependency set, installed once online, sealed for the verifier (Cargo needs none)
 ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
 ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live observer
 ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stays on the host

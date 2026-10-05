@@ -6,7 +6,7 @@ that `ward verify` has judged, what the screen shows at each step, and what to d
 something is denied. The commands are the contract; the desktop only wraps them.
 
 ```text
-boot → welcome → ward vault set → ward init → ward claude → ward verify
+boot → welcome → ward vault set → ward init → ward prepare → ward claude → ward verify
 ```
 
 ## 0. Boot, or install
@@ -92,6 +92,7 @@ Proposed verification boundary, from the project's files (nothing was run)
 
 Next
   ward init --accept-verify   accept the proposed verification boundary; nothing is verified before
+  ward prepare                install the dependency set the lockfile pins, once, online, for the verifier
   ward claude                 start the agent in the sandbox
   ward verify                 run the protected tests in the disposable verifier
 ```
@@ -169,7 +170,56 @@ write under `step_through`), a notification appears; answer from the keyboard wi
 or is refused. `ward watch` in a second terminal is the same log as a full-screen
 observer.
 
-## 5. Verify (`ward verify`)
+## 5. Prepare dependencies (`ward prepare`)
+
+```bash
+ward ready                           # dependencies: never prepared; `ward prepare` installs …
+ward prepare                         # once, online; --rebuild discards and installs again
+```
+
+The verifier is offline (ADR-0004), so a Node or Python project's dependency set has to
+exist before `ward verify` can run its tests. `ward prepare` is the one explicit phase
+that fetches anything (issue #147 items 3, 4 and 6). It reads the lockfile and the
+manifest beside it (`package-lock.json`/`npm-shrinkwrap.json`, `pnpm-lock.yaml` or
+`yarn.lock` with `package.json`, plus `.npmrc` when present; `requirements*.txt`), runs
+the manager's install for exactly that lockfile with no scripts — `npm ci
+--ignore-scripts`, `pnpm install --frozen-lockfile --ignore-scripts`, `yarn install
+--frozen-lockfile --ignore-scripts`, `python3 -m pip install --target` — inside the
+same bubblewrap sandbox and toolchain view the verifier uses, with one difference: the
+launch asks for the host's network namespace, and only for this phase. The project is
+not mounted at all; the install sees a copy of its inputs and writes only into the
+environment's own directory under the state root, `<state>/prepared/<key>/stage/`,
+which is sealed read-only on success. Progress (elapsed time, files, bytes) streams to
+stderr about once a second; the panel afterwards shows the inputs and their digests,
+the runtime and platform, the command, the network note, where the environment is and
+the cold timing.
+
+`<key>` is a digest over the ecosystem and manager, the content digests of the inputs,
+the runtime's `--version` as the *verifier* would run it (`node`, `python3`, resolved in
+the verifier's own search directories, never your shell's `PATH`), the platform
+(architecture, libc, OS release) and the configured registry (`NPM_CONFIG_REGISTRY`,
+`PIP_INDEX_URL`). Change any of them and the environment is a different key: the old
+one is left untouched and `ward ready`'s `dependencies` row reads `stale:
+package-lock.json changed since 63080ebb75af was prepared` (or `runtime changed (node
+v22.0.0 → v24.0.0)`, `platform changed`), each ending in "run `ward prepare`", and the
+verdict is `setup required` until you prepare again. The same row says `never
+prepared`, `incomplete: attempt 1 … did not finish` (the installer was killed or ran
+past its 30-minute budget) or `failed: attempt 1 … exited 1` (its output is kept in
+`prepared.json` and printed), and once ready `prepared 63080ebb75af (node-npm) · warm
+1 ms · cold 41.2 s on 2026-10-05` — the warm figure is this lookup, the cold one the
+recorded install. An incomplete or failed environment is never mounted; the next `ward
+prepare` removes its partial tree, starts from scratch and counts the attempt. A second
+`ward prepare` on unchanged inputs answers `already prepared · warm <1 ms`.
+
+Three things `ward prepare` refuses to guess: it runs nothing until the verification
+boundary is accepted (`ward init --accept-verify`); a `package.json` without a lockfile,
+or a Python project with only `poetry.lock`, `uv.lock` or `Pipfile.lock`, is
+`cannot prepare: <why>` and the row reads `FAIL` with the same reason (export to
+`requirements.txt` to prepare from); and a Cargo project needs no environment at all —
+the verifier already mounts the host's `~/.cargo/registry` read-only and `cargo test
+--locked` resolves offline from it — so the row is `OK none to prepare: cargo: …`.
+
+## 6. Verify (`ward verify`)
 
 ```bash
 ward verify
@@ -177,7 +227,13 @@ ward verify
 
 The worktree is snapshotted as a candidate; every protected test and the verify config
 are taken from the *entry* snapshot, not the worktree; the command runs offline in a
-disposable sandbox; the verdict is recorded in the session log. The bar shows
+disposable sandbox, with the prepared dependency environment whose key matches the
+candidate's own lockfile mounted read-only beside it (`node_modules` at
+`/work/node_modules`; a Python target directory under `/run/verifier/deps`, named by
+`PYTHONPATH`, its `bin` first on `PATH`) — the report and the log carry a
+`dependencies` line saying what was mounted, or why nothing was (`not mounted: stale:
+…`), and the verifier fetches nothing either way; the verdict is recorded in the
+session log. The bar shows
 `VERIFY ◐ 7c01a2b3`, then `VERIFY ✓ 7c01a2b3` (green) or `VERIFY ✗` (red), and the
 command exits 0 or 1. The green is bound to that candidate: edit anything afterwards and
 the segment reads `VERIFY ~ STALE` (amber) until the next `ward verify`; clicking it shows
@@ -222,6 +278,11 @@ and the rule, so the first step is always to read it.
 - **`ward verify` fails although the agent's tests passed.** The verifier ran the
   protected tests as they were at session start. Compare: `ward snapshot diff <entry>
   <candidate>` names what changed, `ward snapshot cat` shows the pristine file.
+- **`ward verify` cannot find a module or a test runner.** The verifier is offline and
+  mounts only a prepared environment whose key matches the candidate's lockfile; its
+  `dependencies` line says why none was (`never prepared`, `stale: package-lock.json
+  changed`, `incomplete`). `ward prepare` is the fix, and the only place a fetch happens
+  (§5).
 - **`ward claude` refuses to start.** `ward doctor`: bubblewrap, user namespaces,
   Landlock, the state directory's path length, the agents, TamperWard and the keys, each
   with its fix.

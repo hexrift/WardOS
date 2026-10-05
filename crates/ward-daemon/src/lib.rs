@@ -34,6 +34,7 @@ pub mod ids;
 pub mod node_readiness;
 pub mod observe;
 pub mod pause;
+pub mod prepare;
 pub mod readiness;
 pub mod reclaim;
 pub mod registry;
