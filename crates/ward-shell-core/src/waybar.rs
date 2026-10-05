@@ -180,7 +180,11 @@ fn explanation(
         )],
         SegmentName::Agent => {
             let word = model.state.agent.map_or("unknown", agent_word);
-            vec![row("Agent"), Row::new("State", word, Tone::Ink)]
+            let mut rows = vec![row("Agent"), Row::new("State", word, Tone::Ink)];
+            if let Some(unconfirmed) = model.state.unconfirmed {
+                rows.push(Row::new("Unconfirmed", unconfirmed.text(), Tone::Warn));
+            }
+            rows
         }
         // The network and grants modules explain themselves with the
         // authority panel (ADR-0019), which their click opens in full.
@@ -225,7 +229,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::feed::fixtures::{
-        agent, denied, edited, ended, model_with, records, sequence, snapshot, verify_passed, wardd,
+        agent, denied, edited, ended, model_with, paused, records, sequence, snapshot,
+        verify_passed, wardd,
     };
     use crate::trust::fixtures::description;
     use ward_events::{AgentState, Origin, WardEvent};
@@ -257,6 +262,45 @@ mod tests {
 
     fn now(d: &SessionDescription) -> u64 {
         d.started_unix_ms + (12 * 60 + 43) * 1000
+    }
+
+    /// #145 item 3: the agent segment's hover names the component a
+    /// `PAUSED?` hold could not confirm, and nothing for a confirmed pause.
+    #[test]
+    fn the_agent_segment_explains_an_unconfirmed_component_on_hover() {
+        use ward_daemon::acks::{ACK_TIMEOUT, Acknowledgement, Component, Outcome};
+        let d = description(NetworkCapability::Offline);
+        let header = Header::from_description(&d);
+        let proxy = Acknowledgement {
+            component: Component::Proxy,
+            outcome: Outcome::TimedOut { after: ACK_TIMEOUT },
+        };
+        let named = WardEvent::SessionPauseUnsettled {
+            method: ward_events::PauseMethod::Sigstop,
+            reason: ward_events::ShortText::new(&ward_daemon::acks::unconfirmed_reason(
+                "looks wrong",
+                &proxy,
+            )),
+            pending: 0,
+        };
+        let model = model_with(&[agent(AgentState::Working), named], false);
+        let module = Module::segment(&d, &header, &model, SegmentName::Agent, 0);
+        assert!(module.text.ends_with("PAUSED?"), "{}", module.text);
+        assert!(
+            module
+                .tooltip
+                .lines()
+                .any(|l| l.starts_with("Unconfirmed") && l.ends_with("egress proxy")),
+            "{}",
+            module.tooltip
+        );
+        let model = model_with(&[agent(AgentState::Working), paused()], false);
+        let module = Module::segment(&d, &header, &model, SegmentName::Agent, 0);
+        assert!(
+            !module.tooltip.contains("Unconfirmed"),
+            "{}",
+            module.tooltip
+        );
     }
 
     #[test]

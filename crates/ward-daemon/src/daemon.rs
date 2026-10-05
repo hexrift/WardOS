@@ -43,9 +43,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ward_events::{
-    EventRecord, LogReader, Origin, Pid, RevokeReason, ServiceId, ShortText, WardEvent,
+    EventRecord, LogReader, Origin, PauseMethod, Pid, RevokeReason, ServiceId, ShortText, WardEvent,
 };
 
+use crate::acks::{self, Acknowledgement, Acknowledger, Phase};
 use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
 use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
 use crate::error::{Error, Result};
@@ -420,6 +421,11 @@ struct Paused {
     frozen: Frozen,
     since: Instant,
     hold: Hold,
+    /// Processes a stop already ended and confirmed gone but has not recorded
+    /// yet, because a component did not confirm the hold before
+    /// `WorkloadsTerminated` could be appended (#145 item 3): carried into the
+    /// retry's record, so the count on the log is the whole stop's.
+    ended: u32,
 }
 
 /// What a [`Paused`] is holding the session for.
@@ -449,6 +455,7 @@ enum Hold {
 struct PauseOutcome {
     record: Box<EventRecord>,
     unsettled: Option<u32>,
+    unconfirmed: Option<String>,
 }
 
 /// The daemon's shared state: the log, the session facts, the subscribers, the
@@ -465,6 +472,9 @@ struct Served {
     state: PathBuf,
     session: String,
     paused: Option<Paused>,
+    /// Confirms each component of a hold (#145 item 3): the real registrations
+    /// and approvals ([`acks::Live`]) outside tests.
+    acks: Box<dyn Acknowledger>,
     /// Launches (`CommandStarted`) seen so far whose terminal record
     /// (`CommandFinished` or `LaunchAborted`) has not landed yet: the id of
     /// the connection whose request appended the `CommandStarted` (see
@@ -538,9 +548,76 @@ impl Served {
             state,
             session,
             paused: None,
+            acks: Box::new(acks::Live::new()),
             open_launches: Vec::new(),
             last_agent_state: None,
         }
+    }
+
+    /// Ask every component to confirm `phase` (#145 item 3), in hold order for
+    /// [`Phase::Held`] and release order for [`Phase::Released`]. The daemon
+    /// has already acted — marker written or cleared, approvals held or
+    /// released — when this asks; each answer is a bounded read-back.
+    fn confirm_components(&mut self, phase: Phase) -> Vec<Acknowledgement> {
+        let site = acks::Site {
+            state: &self.state,
+            session: &self.session,
+            approvals: &self.approvals,
+        };
+        acks::collect(self.acks.as_mut(), phase, &site)
+    }
+
+    /// One component's confirmation of `phase`: a single step of a release.
+    fn confirm_one(&mut self, component: acks::Component, phase: Phase) -> Acknowledgement {
+        let site = acks::Site {
+            state: &self.state,
+            session: &self.session,
+            approvals: &self.approvals,
+        };
+        Acknowledgement {
+            component,
+            outcome: self.acks.confirm(component, phase, &site),
+        }
+    }
+
+    /// The one terminal record of a hold: `SessionPaused` only when the freeze
+    /// settled (`unsettled` is `None`) and every component confirmed;
+    /// `SessionPauseUnsettled` otherwise, its `pending` the freeze's count (zero
+    /// when only a component is unconfirmed) and its `reason` naming the first
+    /// unconfirmed component ([`acks::unconfirmed_reason`]).
+    fn hold_record(
+        method: PauseMethod,
+        reason: &str,
+        unsettled: Option<u32>,
+        unconfirmed: Option<&Acknowledgement>,
+    ) -> WardEvent {
+        match (unsettled, unconfirmed) {
+            (None, None) => WardEvent::SessionPaused {
+                method,
+                reason: ShortText::new(reason),
+            },
+            (pending, ack) => WardEvent::SessionPauseUnsettled {
+                method,
+                reason: ShortText::new(&ack.map_or_else(
+                    || reason.to_owned(),
+                    |a| acks::unconfirmed_reason(reason, a),
+                )),
+                pending: pending.unwrap_or(0),
+            },
+        }
+    }
+
+    /// What a hold could not confirm, in words: its pending processes, the
+    /// component that did not acknowledge, or both.
+    fn uncertainty(unsettled: Option<u32>, unconfirmed: Option<&Acknowledgement>) -> String {
+        let mut parts = Vec::new();
+        if let Some(pending) = unsettled {
+            parts.push(format!("{pending} process(es) still pending"));
+        }
+        if let Some(ack) = unconfirmed {
+            parts.push(format!("{} unconfirmed", ack.text()));
+        }
+        parts.join("; ")
     }
 
     /// A connection id used for requests that do not come from a real client
@@ -605,6 +682,7 @@ impl Served {
                     |outcome| Response::Paused {
                         record: outcome.record,
                         unsettled: outcome.unsettled,
+                        unconfirmed: outcome.unconfirmed,
                     },
                 ),
                 false,
@@ -1099,81 +1177,70 @@ impl Served {
         }
         self.approvals.set_paused(true);
         // The marker and the held approvals already stand — the safest state #145
-        // item 4 asks for — before the settle check even runs, and stay that way
-        // regardless of its answer or of whether the terminal record below makes it
-        // onto the log.
+        // item 4 asks for — before the settle check or any component is asked,
+        // and stay that way regardless of the answers or of whether the terminal
+        // record below makes it onto the log.
+        let acks = self.confirm_components(Phase::Held);
+        let unconfirmed = acks::first_unconfirmed(&acks).cloned();
         let unsettled = settle(&frozen);
-        let record = match unsettled {
-            None => match append(
-                self,
-                WardEvent::SessionPaused {
-                    method: frozen.method,
-                    reason: ShortText::new(&reason),
-                },
-            ) {
-                Ok(record) => record,
-                Err(e) => {
-                    // Byte-for-byte the same rollback this append has always had:
-                    // without a durable `SessionPaused` record, the log never
-                    // agrees the session was paused at all, so nothing else about
-                    // it should stand either.
-                    self.approvals.set_paused(false);
-                    let _ = pause::clear_marker(&self.state, &self.session);
-                    pause::thaw(&frozen);
-                    let _ = pause::clear_intent(&self.state, &self.session);
-                    return Err(e);
-                }
-            },
-            Some(pending) => match append(
-                self,
-                WardEvent::SessionPauseUnsettled {
-                    method: frozen.method,
-                    reason: ShortText::new(&reason),
-                    pending,
-                },
-            ) {
-                Ok(record) => record,
-                Err(e) => {
-                    // PR #207 review finding 2: unlike the settled branch above, an
-                    // unsettled pause's marker/approvals/frozen tree are never
-                    // rolled back for a failure of *this* append — they are already
-                    // the safest achievable state, independent of whether the log
-                    // can also say so, and a real, correct freeze must not be undone
-                    // over a log-only failure (e.g. storage exhaustion). `self.paused`
-                    // is still recorded (unlike the early-return above) so `ward
-                    // resume` remains able to release the freeze even though the log
-                    // does not, yet or ever, agree the pause happened. What must not
-                    // happen is silently discarding the failure the way `let _ =
-                    // self.append(...)` used to: the caller has to learn the durable
-                    // history may not actually contain the unsettled record it is
-                    // about to be told happened, exactly the fold
-                    // `Session::verify_prepared` already does for its own terminal-
-                    // append failure (#194).
-                    self.paused = Some(Paused {
-                        frozen,
-                        since: Instant::now(),
-                        hold: Hold::Pause,
-                    });
-                    return Err(Error::Daemon(format!(
-                        "the freeze for session {} could not be confirmed settled \
-                         ({pending} process(es) still pending), and the record of \
-                         that could not be written to the log ({e}); the marker is \
-                         held and approvals stay frozen regardless, but the log may \
-                         not reflect the unsettled pause",
-                        self.session
-                    )));
-                }
-            },
+        let event = Self::hold_record(frozen.method, &reason, unsettled, unconfirmed.as_ref());
+        let confirmed = matches!(event, WardEvent::SessionPaused { .. });
+        let record = match append(self, event) {
+            Ok(record) => record,
+            Err(e) if confirmed => {
+                // Byte-for-byte the same rollback this append has always had:
+                // without a durable `SessionPaused` record, the log never
+                // agrees the session was paused at all, so nothing else about
+                // it should stand either.
+                self.approvals.set_paused(false);
+                let _ = pause::clear_marker(&self.state, &self.session);
+                pause::thaw(&frozen);
+                let _ = pause::clear_intent(&self.state, &self.session);
+                return Err(e);
+            }
+            Err(e) => {
+                // PR #207 review finding 2: unlike the settled branch above, an
+                // unsettled pause's marker/approvals/frozen tree are never
+                // rolled back for a failure of *this* append — they are already
+                // the safest achievable state, independent of whether the log
+                // can also say so, and a real, correct freeze must not be undone
+                // over a log-only failure (e.g. storage exhaustion). `self.paused`
+                // is still recorded (unlike the early-return above) so `ward
+                // resume` remains able to release the freeze even though the log
+                // does not, yet or ever, agree the pause happened. What must not
+                // happen is silently discarding the failure the way `let _ =
+                // self.append(...)` used to: the caller has to learn the durable
+                // history may not actually contain the unsettled record it is
+                // about to be told happened, exactly the fold
+                // `Session::verify_prepared` already does for its own terminal-
+                // append failure (#194).
+                self.paused = Some(Paused {
+                    frozen,
+                    since: Instant::now(),
+                    hold: Hold::Pause,
+                    ended: 0,
+                });
+                return Err(Error::Daemon(format!(
+                    "the pause of session {} could not be confirmed settled ({}), and \
+                     the record of that could not be written to the log ({e}); the \
+                     marker is held and approvals stay frozen regardless, but the log \
+                     may not reflect the unsettled pause",
+                    self.session,
+                    Self::uncertainty(unsettled, unconfirmed.as_ref())
+                )));
+            }
         };
         let _ = pause::clear_intent(&self.state, &self.session);
         self.paused = Some(Paused {
             frozen,
             since: Instant::now(),
             hold: Hold::Pause,
+            ended: 0,
         });
         Ok(PauseOutcome {
             record: Box::new(record),
             unsettled,
+            unconfirmed: unconfirmed.map(|a| a.text()),
         })
     }
 
@@ -1188,8 +1255,15 @@ impl Served {
         pause::write_intent(&self.state, &self.session, &pause::Intent::begin(verb)?)
     }
 
-    /// Reverse [`Self::pause`]: release the approvals, open the proxy, thaw
-    /// the processes, append `SessionResumed`.
+    /// Reverse [`Self::pause`] in the reverse of the order it held (#145 item
+    /// 3): release the credentials and the approvals, clear the marker the
+    /// proxies read, confirm each release before the next
+    /// ([`Self::confirm_one`]), thaw the processes last, append
+    /// `SessionResumed`. A release that is not confirmed is taken back — the
+    /// marker rewritten with the pause's reason, the approvals held again,
+    /// nothing thawed — and the resume is refused naming the component, so the
+    /// session is never half-resumed with a proxy still refusing traffic while
+    /// the daemon believes it runs.
     ///
     /// Refused while the session is held for a stop ([`Hold::Stop`]), and once
     /// a stop of it has begun at all (the on-disk stop marker, which outlives
@@ -1199,10 +1273,10 @@ impl Served {
     /// ordinary pause would present a half-killed session as resumable
     /// execution (finding 5). A stop is retried with `ward stop`.
     fn resume(&mut self) -> Result<Box<EventRecord>> {
-        let Some(paused) = self.paused.as_ref() else {
+        let Some(hold) = self.paused.as_ref().map(|p| p.hold) else {
             return Err(Error::Daemon("not paused".into()));
         };
-        if paused.hold == Hold::Stop || pause::stop_begun(&self.state, &self.session) {
+        if hold == Hold::Stop || pause::stop_begun(&self.state, &self.session) {
             return Err(Error::Daemon(format!(
                 "a stop of session {} has begun and not completed: its sandboxed processes \
                  are held for that stop (some may already have been killed), so `ward \
@@ -1214,17 +1288,44 @@ impl Served {
         // marker check or thaw can never straddle this resume's marker clear and
         // thaw.
         let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
-        // Clear the on-disk pause marker FIRST. The session proxies read it to refuse
-        // egress, so it is the load-bearing part of a resume: if it fails we must leave
-        // the session fully paused (marker present, approvals held, processes frozen)
-        // and return the error, not half-resume into a state where the proxy still
-        // refuses traffic while the daemon believes it is running (which a later
-        // Resume would reject as "not paused"). Nothing is mutated before this succeeds.
-        pause::clear_marker(&self.state, &self.session)?;
+        let Some(paused) = self.paused.take() else {
+            return Err(Error::Daemon("not paused".into()));
+        };
+        let marker = pause::marker_path(&self.state, &self.session);
+        let marker_reason =
+            pause::reason_text(&std::fs::read_to_string(&marker).unwrap_or_default());
         self.approvals.set_paused(false);
+        for component in acks::Component::release_order() {
+            if component == acks::Component::Proxy
+                && let Err(e) = pause::clear_marker(&self.state, &self.session)
+            {
+                self.approvals.set_paused(true);
+                self.paused = Some(paused);
+                return Err(e);
+            }
+            let ack = self.confirm_one(component, Phase::Released);
+            if ack.confirmed() {
+                continue;
+            }
+            self.approvals.set_paused(true);
+            self.paused = Some(paused);
+            let rewritten = (component == acks::Component::Proxy)
+                .then(|| pause::write_marker(&self.state, &self.session, &marker_reason).err())
+                .flatten();
+            return Err(Error::Daemon(format!(
+                "resume of session {} is refused: {} did not confirm its release, so the \
+                 session stays paused (marker held, approvals held, processes frozen){}. \
+                 Run `ward resume` again",
+                self.session,
+                ack.text(),
+                rewritten.map_or_else(String::new, |e| format!(
+                    "; the marker could not be rewritten ({e}), so the proxies may have \
+                     released"
+                ))
+            )));
+        }
         pause::thaw(&paused.frozen);
         let paused_for = paused.since.elapsed();
-        self.paused = None;
         let record = self.append(WardEvent::SessionResumed { paused_for })?;
         Ok(Box::new(record))
     }
@@ -1289,9 +1390,14 @@ impl Served {
                 frozen,
                 since: paused.since,
                 hold: Hold::Stop,
+                ended: paused.ended,
             });
             marker?;
             let _ = pause::clear_intent(&self.state, &self.session);
+            let acks = self.confirm_components(Phase::Held);
+            if let Some(ack) = acks::first_unconfirmed(&acks) {
+                return Err(self.hold_unconfirmed(ack));
+            }
             return Ok(unsettled);
         }
         let reason = pause::reason_text(reason);
@@ -1314,18 +1420,11 @@ impl Served {
             frozen,
             since: Instant::now(),
             hold: Hold::Stop,
+            ended: 0,
         });
-        let event = match unsettled {
-            None => WardEvent::SessionPaused {
-                method,
-                reason: ShortText::new(&reason),
-            },
-            Some(pending) => WardEvent::SessionPauseUnsettled {
-                method,
-                reason: ShortText::new(&reason),
-                pending,
-            },
-        };
+        let acks = self.confirm_components(Phase::Held);
+        let unconfirmed = acks::first_unconfirmed(&acks).cloned();
+        let event = Self::hold_record(method, &reason, unsettled, unconfirmed.as_ref());
         // The hold is never undone for a log-only failure: it is the safest
         // state, and the stop that follows ends it.
         self.append(event).map_err(|e| {
@@ -1336,7 +1435,21 @@ impl Served {
             ))
         })?;
         let _ = pause::clear_intent(&self.state, &self.session);
-        Ok(unsettled)
+        match unconfirmed {
+            Some(ack) => Err(self.hold_unconfirmed(&ack)),
+            None => Ok(unsettled),
+        }
+    }
+
+    /// The refusal a hold for a stop answers with when a component did not
+    /// confirm it: the hold stands, and nothing may rely on it as quiescence.
+    fn hold_unconfirmed(&self, ack: &Acknowledgement) -> Error {
+        Error::Daemon(format!(
+            "session {} is held for its stop, but {} did not confirm the hold; nothing \
+             was restored. Run `ward stop --restore-entry` again, or `ward stop`",
+            self.session,
+            ack.text()
+        ))
     }
 
     /// `Request::Stop` (#145 item 5): stop is termination of the session's
@@ -1437,6 +1550,13 @@ impl Served {
 
     /// The termination half of [`Self::stop`]: returns how many processes ended,
     /// or the refusal once the session has been put in its held-for-stop state.
+    /// The marker is written (if a pause's does not stand already) and the
+    /// approvals held before anything is killed, so every proxy refuses during
+    /// the kill and can acknowledge that it does; once every process is
+    /// confirmed gone, every component must confirm the hold (#145 item 3,
+    /// [`Self::confirm_components`]) before `WorkloadsTerminated` is appended —
+    /// a stop is not confirmed by process termination alone — and one that does
+    /// not refuses the stop ([`Self::hold_for_unconfirmed_stop`]).
     /// That hold and its `WorkloadsTerminated` record are the attempt's durable
     /// outcome, so the stop's intent is cleared with them: a restart adopts the
     /// hold rather than terminating again on its own, and the user's retry does
@@ -1469,13 +1589,28 @@ impl Served {
         let held = self.paused.take();
         let since = held.as_ref().map(|p| p.since);
         let retrying_incomplete_stop = held.as_ref().is_some_and(|p| p.hold == Hold::Stop);
+        let carried = held.as_ref().map_or(0, |p| p.ended);
+        if !pause::marker_path(&self.state, &self.session).exists() {
+            pause::write_marker(&self.state, &self.session, pause::STOP_REASON).map_err(|e| {
+                Error::Daemon(format!(
+                    "stop could not close session {}'s proxies ({e}); nothing was terminated \
+                     and the log is not sealed",
+                    self.session
+                ))
+            })?;
+        }
+        self.approvals.set_paused(true);
         let outcome = terminate(&self.session, held.map(|p| p.frozen));
-        let ended = outcome.ended;
+        let ended = outcome.ended.saturating_add(carried);
         let pending = outcome.pending();
         let barrier_confirmed = outcome.barrier_confirmed;
         let Some(remaining) = outcome.remaining else {
-            // Everything the stop found is gone: nothing is left for the marker
-            // to hold back. (Idempotent when there never was a marker.)
+            let acks = self.confirm_components(Phase::Held);
+            if let Some(ack) = acks::first_unconfirmed(&acks) {
+                return Err(self.hold_for_unconfirmed_stop(ack, outcome.method, since, ended));
+            }
+            // Nothing is left for the marker to hold back. (Idempotent when
+            // there never was a marker.)
             let _ = pause::clear_marker(&self.state, &self.session);
             if ended > 0 || retrying_incomplete_stop {
                 self.append(WardEvent::WorkloadsTerminated {
@@ -1502,11 +1637,11 @@ impl Served {
             &pause::stop_hold_reason(pending),
         )
         .err();
-        self.approvals.set_paused(true);
         self.paused = Some(Paused {
             frozen: remaining,
             since: since.unwrap_or_else(Instant::now),
             hold: Hold::Stop,
+            ended: 0,
         });
         // Persist the incomplete result even when no currently-known PID remains:
         // barrier uncertainty is itself evidence. Replay/restart must still know
@@ -1539,6 +1674,62 @@ impl Served {
             marker.as_ref(),
             logged.as_ref(),
         )))
+    }
+
+    /// A stop whose processes are all confirmed gone but whose hold a component
+    /// did not confirm (#145 item 3): the session is held for the stop over
+    /// nothing — stop marker, pause marker naming the component, approvals
+    /// held — `SessionPauseUnsettled` records the hold and what is uncertain
+    /// about it, the `ended` count is carried into the retry's
+    /// `WorkloadsTerminated` (none is appended now: the stop is not confirmed),
+    /// and the refusal names the component. A hold whose record could not be
+    /// written keeps the intent, so a restart records it.
+    fn hold_for_unconfirmed_stop(
+        &mut self,
+        ack: &Acknowledgement,
+        method: PauseMethod,
+        since: Option<Instant>,
+        ended: u32,
+    ) -> Error {
+        use std::fmt::Write as _;
+        let reason = acks::unconfirmed_reason(pause::STOP_REASON, ack);
+        let marker = pause::write_marker(&self.state, &self.session, &reason).err();
+        self.paused = Some(Paused {
+            frozen: Frozen {
+                method,
+                pids: Vec::new(),
+                cgroup: None,
+            },
+            since: since.unwrap_or_else(Instant::now),
+            hold: Hold::Stop,
+            ended,
+        });
+        let logged = self
+            .append(Self::hold_record(
+                method,
+                pause::STOP_REASON,
+                None,
+                Some(ack),
+            ))
+            .err();
+        if logged.is_none() {
+            let _ = pause::clear_intent(&self.state, &self.session);
+        }
+        let mut message = format!(
+            "stop ended every sandboxed process of session {} ({ended}), but {} did not \
+             confirm the hold, so the stop is not confirmed: the log is not sealed and the \
+             session is held for the stop (proxy closed, approvals held, no new launch \
+             admitted; `ward resume` cannot release it). Run `ward stop` again to retry",
+            self.session,
+            ack.text()
+        );
+        if let Some(e) = marker {
+            let _ = write!(message, "; the pause marker could not be written ({e})");
+        }
+        if let Some(e) = logged {
+            let _ = write!(message, "; the record of this could not be written ({e})");
+        }
+        Error::Daemon(message)
     }
 
     /// Reconcile the lifecycle a previous process of this session left behind
@@ -1638,11 +1829,13 @@ impl Served {
     /// Put the session's sandboxes under this daemon's own hold, from what
     /// `/proc` shows now: `freeze` finds and freezes every process (one already
     /// stopped stays so) and says whether that confirmed stable. The marker is
-    /// written with `reason` if it is not there, the approvals are held, and —
-    /// unless `recorded` says the log already carries it — exactly one
-    /// terminal record is appended: `SessionPaused` when confirmed,
-    /// `SessionPauseUnsettled` with the pending count otherwise. The hold is a
-    /// [`Hold::Stop`] once a stop has begun ([`pause::stop_begun`]).
+    /// written with `reason` if it is not there, the approvals are held, the
+    /// components asked to confirm again (#145 item 3), and — unless
+    /// `recorded` says the log already carries it and every component confirmed
+    /// — exactly one terminal record is appended: `SessionPaused` when
+    /// confirmed, `SessionPauseUnsettled` naming the pending count or the
+    /// unconfirmed component otherwise. The hold is a [`Hold::Stop`] once a
+    /// stop has begun ([`pause::stop_begun`]).
     fn adopt_hold(
         &mut self,
         reason: &str,
@@ -1661,24 +1854,21 @@ impl Served {
         } else {
             Hold::Pause
         };
-        if !recorded {
-            let event = match pause::unsettled_count(&frozen, stable) {
-                None => WardEvent::SessionPaused {
-                    method: frozen.method,
-                    reason: ShortText::new(reason),
-                },
-                Some(pending) => WardEvent::SessionPauseUnsettled {
-                    method: frozen.method,
-                    reason: ShortText::new(reason),
-                    pending,
-                },
-            };
-            self.append(event)?;
+        let acks = self.confirm_components(Phase::Held);
+        let unconfirmed = acks::first_unconfirmed(&acks);
+        if !recorded || unconfirmed.is_some() {
+            self.append(Self::hold_record(
+                frozen.method,
+                reason,
+                pause::unsettled_count(&frozen, stable),
+                unconfirmed,
+            ))?;
         }
         self.paused = Some(Paused {
             frozen,
             since,
             hold,
+            ended: 0,
         });
         Ok(())
     }
@@ -2297,6 +2487,7 @@ mod tests {
             cgroup: None,
         };
         served.paused = Some(Paused {
+            ended: 0,
             frozen: held.clone(),
             since: Instant::now(),
             hold: Hold::Pause,
@@ -2351,6 +2542,7 @@ mod tests {
                     ended: 3,
                     remaining: Some(stuck),
                     barrier_confirmed: true,
+                    method: ward_events::PauseMethod::Sigstop,
                 }
             })
         };
@@ -2457,6 +2649,7 @@ mod tests {
                     ended: 2,
                     remaining: Some(empty_hold.clone()),
                     barrier_confirmed: false,
+                    method: ward_events::PauseMethod::Sigstop,
                 }
             });
         let Response::Error(message) = response else {
@@ -2649,6 +2842,7 @@ mod tests {
                 ended: 1,
                 remaining: Some(stuck(77)),
                 barrier_confirmed: true,
+                method: ward_events::PauseMethod::Sigstop,
             }
         });
         assert!(matches!(response, Response::Error(_)), "{response:?}");
@@ -2878,6 +3072,7 @@ mod tests {
                 ended: 1,
                 remaining: Some(stuck(77)),
                 barrier_confirmed: true,
+                method: ward_events::PauseMethod::Sigstop,
             })
             .unwrap();
         assert!(!sealed);
@@ -2980,6 +3175,7 @@ mod tests {
                     ended: 1,
                     remaining: Some(stuck(77)),
                     barrier_confirmed: true,
+                    method: ward_events::PauseMethod::Sigstop,
                 }
             });
             assert!(matches!(response, Response::Error(_)));
@@ -3082,6 +3278,7 @@ mod tests {
                     ended: 2,
                     remaining: Some(stuck),
                     barrier_confirmed: true,
+                    method: ward_events::PauseMethod::Sigstop,
                 }
             })
         };
@@ -3501,7 +3698,9 @@ mod tests {
             })
             .0
         {
-            Response::Paused { record, unsettled } => (*record, unsettled),
+            Response::Paused {
+                record, unsettled, ..
+            } => (*record, unsettled),
             other => panic!("{other:?}"),
         };
         assert_eq!(
@@ -5908,5 +6107,456 @@ mod tests {
         })
         .unwrap();
         daemon.join().unwrap().unwrap();
+    }
+
+    /// A stand-in for the components (#145 item 3): every confirmation is
+    /// recorded in the order asked, and the one `(component, phase)` named in
+    /// `refuse` answers `outcome` instead of acknowledging.
+    #[derive(Clone)]
+    struct Scripted {
+        refuse: Arc<Mutex<Option<(acks::Component, acks::Phase, acks::Outcome)>>>,
+        calls: Arc<Mutex<Vec<(acks::Component, acks::Phase)>>>,
+    }
+
+    impl Scripted {
+        fn install(served: &mut Served) -> Self {
+            let scripted = Self {
+                refuse: Arc::new(Mutex::new(None)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            };
+            served.acks = Box::new(scripted.clone());
+            scripted
+        }
+
+        fn refuse(&self, component: acks::Component, phase: acks::Phase, outcome: acks::Outcome) {
+            *self.refuse.lock().unwrap() = Some((component, phase, outcome));
+        }
+
+        fn relent(&self) {
+            *self.refuse.lock().unwrap() = None;
+        }
+
+        fn calls(&self) -> Vec<(acks::Component, acks::Phase)> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    impl acks::Acknowledger for Scripted {
+        fn confirm(
+            &mut self,
+            component: acks::Component,
+            phase: acks::Phase,
+            _: &acks::Site<'_>,
+        ) -> acks::Outcome {
+            self.calls.lock().unwrap().push((component, phase));
+            match &*self.refuse.lock().unwrap() {
+                Some((c, p, outcome)) if *c == component && *p == phase => outcome.clone(),
+                _ => acks::Outcome::Acknowledged,
+            }
+        }
+    }
+
+    fn proxy_timeout() -> acks::Outcome {
+        acks::Outcome::TimedOut {
+            after: Duration::from_secs(2),
+        }
+    }
+
+    const PROXY_UNCONFIRMED: &str = "egress proxy (no acknowledgement within 2s)";
+
+    /// #145 item 3: the freeze settles but the proxy never acknowledges. The
+    /// pause holds everything it would have held, is recorded as unsettled
+    /// naming the proxy with `pending: 0`, and the response says so; the
+    /// components were asked in hold order after the marker and the approvals
+    /// were already in place.
+    #[test]
+    fn a_pause_whose_proxy_does_not_acknowledge_is_unsettled_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        scripted.refuse(acks::Component::Proxy, acks::Phase::Held, proxy_timeout());
+        let marker = pause::marker_path(dir.path(), "sess_9");
+
+        let outcome = served.pause_with("looks wrong", |_| None).unwrap();
+        assert_eq!(outcome.unsettled, None, "the freeze itself settled");
+        assert_eq!(outcome.unconfirmed.as_deref(), Some(PROXY_UNCONFIRMED));
+        assert!(
+            matches!(
+                &outcome.record.event,
+                WardEvent::SessionPauseUnsettled { reason, pending: 0, .. }
+                    if reason.as_str() == format!("looks wrong - unconfirmed: {PROXY_UNCONFIRMED}")
+            ),
+            "{:?}",
+            outcome.record.event
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "looks wrong\n");
+        assert!(served.approvals.paused());
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Pause));
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+        assert_eq!(
+            scripted.calls(),
+            [
+                (acks::Component::Proxy, acks::Phase::Held),
+                (acks::Component::Approvals, acks::Phase::Held),
+                (acks::Component::Credentials, acks::Phase::Held),
+            ],
+            "every component is asked, in hold order, even after the first refusal"
+        );
+        assert_eq!(kinds_of(&mut served), ["SessionPauseUnsettled"]);
+        assert!(matches!(
+            served.handle(Request::Pause { reason: String::new() }).0,
+            Response::Error(e) if e == "already paused"
+        ));
+    }
+
+    /// #145 item 3: the approvals answer with an error (the hold did not take).
+    /// The record names them; the freeze's own pending count, when there is
+    /// one, is kept beside the component.
+    #[test]
+    fn a_pause_whose_approvals_do_not_confirm_is_unsettled_naming_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        scripted.refuse(
+            acks::Component::Approvals,
+            acks::Phase::Held,
+            acks::Outcome::Error("hold not applied".into()),
+        );
+        let outcome = served.pause_with("", |_| Some(2)).unwrap();
+        assert_eq!(outcome.unsettled, Some(2));
+        assert_eq!(
+            outcome.unconfirmed.as_deref(),
+            Some("approvals (hold not applied)")
+        );
+        assert!(matches!(
+            &outcome.record.event,
+            WardEvent::SessionPauseUnsettled { reason, pending: 2, .. }
+                if reason.as_str() == "ward pause - unconfirmed: approvals (hold not applied)"
+        ));
+        assert_eq!(
+            acks::unconfirmed_detail(&served.log_path)
+                .unwrap()
+                .as_deref(),
+            Some("approvals (hold not applied)")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        scripted.refuse(acks::Component::Proxy, acks::Phase::Held, proxy_timeout());
+        let err = served
+            .pause_with_appending(
+                "looks wrong",
+                |_| Some(1),
+                |_, _| Err(Error::Daemon("simulated log failure".into())),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1 process(es) still pending"), "{err}");
+        assert!(
+            err.contains(&format!("{PROXY_UNCONFIRMED} unconfirmed")),
+            "{err}"
+        );
+        assert!(served.paused.is_some());
+    }
+
+    /// #145 item 3: a resume releases in the reverse of the hold order —
+    /// credentials, approvals, then the proxy once the marker is gone — and
+    /// confirms each before the next.
+    #[test]
+    fn resume_releases_the_components_in_reverse_order_and_confirms_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        served.pause_with("", |_| None).unwrap();
+        scripted.calls();
+        let record = served.resume().unwrap();
+        assert!(matches!(record.event, WardEvent::SessionResumed { .. }));
+        assert_eq!(
+            scripted.calls(),
+            [
+                (acks::Component::Credentials, acks::Phase::Released),
+                (acks::Component::Approvals, acks::Phase::Released),
+                (acks::Component::Proxy, acks::Phase::Released),
+            ]
+        );
+        assert!(!pause::marker_path(dir.path(), "sess_9").exists());
+        assert!(!served.approvals.paused());
+        assert!(served.paused.is_none());
+    }
+
+    /// #145 item 3: a release the proxy does not confirm is taken back — the
+    /// marker rewritten with the pause's reason, the approvals held again,
+    /// nothing thawed, no record — and the resume is refused naming it; the
+    /// next resume, confirmed, releases.
+    #[test]
+    fn a_resume_whose_proxy_does_not_confirm_release_keeps_the_session_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        served.pause_with("looks wrong", |_| None).unwrap();
+        let marker = pause::marker_path(dir.path(), "sess_9");
+        scripted.refuse(
+            acks::Component::Proxy,
+            acks::Phase::Released,
+            proxy_timeout(),
+        );
+
+        let err = served.resume().unwrap_err().to_string();
+        assert!(err.contains("resume of session sess_9 is refused"), "{err}");
+        assert!(err.contains(PROXY_UNCONFIRMED), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "looks wrong\n",
+            "the marker is back"
+        );
+        assert!(served.approvals.paused(), "the approvals are held again");
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Pause));
+        assert_eq!(kinds_of(&mut served), ["SessionPaused"], "nothing recorded");
+
+        scripted.refuse(
+            acks::Component::Approvals,
+            acks::Phase::Released,
+            acks::Outcome::Error("hold not released".into()),
+        );
+        let err = served.resume().unwrap_err().to_string();
+        assert!(err.contains("approvals (hold not released)"), "{err}");
+        assert!(marker.exists(), "the marker was never cleared");
+        assert!(served.approvals.paused());
+
+        scripted.relent();
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Record(_)
+        ));
+        assert!(!marker.exists());
+        assert!(!served.approvals.paused());
+        assert_eq!(kinds_of(&mut served), ["SessionPaused", "SessionResumed"]);
+    }
+
+    /// #145 item 3: a stop whose processes are all confirmed gone but whose
+    /// proxy does not acknowledge the hold is refused, never sealed:
+    /// `WorkloadsTerminated` is not appended, the session is held for the stop
+    /// over nothing with `SessionPauseUnsettled` naming the proxy, `resume`
+    /// refuses it, and the retry — once the proxy confirms — records the whole
+    /// stop's ended count and seals.
+    #[test]
+    fn a_stop_waits_for_every_component_before_recording_termination() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        assert!(matches!(served.handle(append(0)).0, Response::Record(_)));
+        let scripted = Scripted::install(&mut served);
+        scripted.refuse(acks::Component::Proxy, acks::Phase::Held, proxy_timeout());
+        let marker = pause::marker_path(dir.path(), "sess_9");
+
+        let (response, done) =
+            served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
+                assert_eq!(held, None);
+                assert!(
+                    marker.exists(),
+                    "the marker closes the proxies before anything is killed"
+                );
+                pause::Termination::confirmed(3)
+            });
+        let Response::Error(message) = response else {
+            panic!("{response:?}");
+        };
+        assert!(!done);
+        assert!(message.contains("(3)"), "{message}");
+        assert!(message.contains(PROXY_UNCONFIRMED), "{message}");
+        assert!(message.contains("not sealed"), "{message}");
+        assert!(served.log.is_some());
+        assert_eq!(
+            kinds_of(&mut served),
+            ["AgentStateChanged", "SessionPauseUnsettled"],
+            "no WorkloadsTerminated before the components confirm"
+        );
+        let last = served.subscribe(0).unwrap().replay.pop().unwrap();
+        assert!(matches!(
+            &last.event,
+            WardEvent::SessionPauseUnsettled { reason, pending: 0, .. }
+                if reason.as_str() == format!("ward stop - unconfirmed: {PROXY_UNCONFIRMED}")
+        ));
+        let held = served.paused.as_ref().unwrap();
+        assert_eq!(held.hold, Hold::Stop);
+        assert_eq!(held.ended, 3, "carried into the retry");
+        assert!(held.frozen.pids.is_empty());
+        assert!(served.approvals.paused());
+        assert!(pause::stop_begun(dir.path(), "sess_9"));
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+        assert!(
+            std::fs::read_to_string(&marker)
+                .unwrap()
+                .starts_with("ward stop - unconfirmed: egress proxy"),
+            "the marker names what holds the session"
+        );
+        assert_eq!(
+            scripted.calls(),
+            [
+                (acks::Component::Proxy, acks::Phase::Held),
+                (acks::Component::Approvals, acks::Phase::Held),
+                (acks::Component::Credentials, acks::Phase::Held),
+            ]
+        );
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Error(e) if e.contains("has begun and not completed")
+        ));
+
+        scripted.relent();
+        let (response, done) =
+            served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
+                assert_eq!(held.map(|f| f.pids), Some(Vec::new()));
+                pause::Termination::nothing()
+            });
+        assert!(
+            matches!(response, Response::Sealed { ended: Some(3), .. }),
+            "{response:?}"
+        );
+        assert!(done);
+        assert!(!marker.exists());
+        let records: Vec<_> = LogReader::open(&served.log_path)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .collect();
+        let kinds: Vec<String> = records
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "AgentStateChanged",
+                "SessionPauseUnsettled",
+                "WorkloadsTerminated",
+                "AgentStateChanged",
+                "SessionEnded"
+            ]
+        );
+        assert!(matches!(
+            records[2].event,
+            WardEvent::WorkloadsTerminated {
+                ended: 3,
+                pending: 0,
+                barrier_confirmed: true
+            }
+        ));
+    }
+
+    /// #145 item 3: a hold for a stop whose component does not confirm is
+    /// refused — nothing may be restored over it — but the hold stands and its
+    /// record names the component; the stop then finishes it once confirmed.
+    #[test]
+    fn a_hold_for_stop_whose_component_does_not_confirm_is_refused_but_stands() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        scripted.refuse(
+            acks::Component::Credentials,
+            acks::Phase::Held,
+            acks::Outcome::Error("1 grant(s) still active".into()),
+        );
+        let err = served
+            .hold_for_stop_with("ward stop --restore-entry", no_sandbox, |_, f| (f, true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nothing was restored"), "{err}");
+        assert!(
+            err.contains("credentials (1 grant(s) still active)"),
+            "{err}"
+        );
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert!(served.approvals.paused());
+        let last = served.subscribe(0).unwrap().replay.pop().unwrap();
+        assert!(matches!(
+            &last.event,
+            WardEvent::SessionPauseUnsettled { reason, pending: 0, .. }
+                if reason.as_str()
+                    == "ward stop --restore-entry - unconfirmed: credentials (1 grant(s) still active)"
+        ));
+
+        let err = served
+            .hold_for_stop_with("ward stop --restore-entry", no_sandbox, |_, f| (f, true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("credentials"), "{err}");
+        assert_eq!(
+            kinds_of(&mut served),
+            ["SessionPauseUnsettled"],
+            "no second record"
+        );
+
+        scripted.relent();
+        assert_eq!(
+            served
+                .hold_for_stop_with("ward stop --restore-entry", no_sandbox, |_, f| (f, true))
+                .unwrap(),
+            None
+        );
+        let (response, done) = served.handle(Request::Stop {
+            reason: EndReason::UserStop,
+        });
+        assert!(done, "{response:?}");
+    }
+
+    /// #145 item 3 meets item 7: a restarted daemon finishing an interrupted
+    /// pause collects the acknowledgements again, so a proxy that does not
+    /// answer makes the reconciled record unsettled naming it, never a
+    /// confirmed `SessionPaused`; and a completed pause the log records as
+    /// confirmed, whose proxy the restarted daemon cannot confirm, gets the
+    /// one record that says so.
+    #[test]
+    fn reconciliation_re_collects_the_acknowledgements() {
+        let dir = tempfile::tempdir().unwrap();
+        started_log(dir.path());
+        pause::write_intent(dir.path(), "sess_9", &pause_intent("ops asked")).unwrap();
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let scripted = Scripted::install(&mut served);
+        scripted.refuse(acks::Component::Proxy, acks::Phase::Held, proxy_timeout());
+        assert!(
+            !served
+                .reconcile_lifecycle_with(no_sandbox, never_terminates)
+                .unwrap()
+        );
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+        assert_eq!(
+            kinds_of(&mut served),
+            ["AgentStateChanged", "SessionPauseUnsettled"]
+        );
+        let last = served.subscribe(0).unwrap().replay.pop().unwrap();
+        assert!(matches!(
+            &last.event,
+            WardEvent::SessionPauseUnsettled { reason, pending: 0, .. }
+                if reason.as_str() == format!("ops asked - unconfirmed: {PROXY_UNCONFIRMED}")
+        ));
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Pause));
+        assert_eq!(
+            std::fs::read_to_string(pause::marker_path(dir.path(), "sess_9")).unwrap(),
+            "ops asked\n"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut served = fresh_served(dir.path());
+            assert!(matches!(served.handle(append(0)).0, Response::Record(_)));
+            served.pause_with("ops asked", |_| None).unwrap();
+        }
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let scripted = Scripted::install(&mut served);
+        scripted.refuse(acks::Component::Proxy, acks::Phase::Held, proxy_timeout());
+        assert!(
+            !served
+                .reconcile_lifecycle_with(no_sandbox, never_terminates)
+                .unwrap()
+        );
+        assert_eq!(
+            kinds_of(&mut served),
+            [
+                "AgentStateChanged",
+                "SessionPaused",
+                "SessionPauseUnsettled"
+            ],
+            "the log's confirmed hold is qualified by what this daemon cannot confirm"
+        );
     }
 }

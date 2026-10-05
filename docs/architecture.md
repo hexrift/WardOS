@@ -232,8 +232,22 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > `SIGSTOP`, children first, otherwise; it then writes `sessions/<id>/paused`, which
 > every proxy of the session polls and refuses on (`503 paused by ward`, no credential
 > injected, established relays hold their bytes); it holds the approvals (timeouts stop,
-> answers are refused, new questions wait); and it appends `SessionPaused { method,
-> reason }`. `resume` reverses the order and appends `SessionResumed`. A launch while
+> answers are refused, new questions wait); it then collects a bounded acknowledgement
+> from every component that must hold (#145 item 3, `ward_daemon::acks`): each egress
+> registers itself under `sessions/<id>/proxies/` and rewrites its entry (`running` /
+> `paused`) only once its flag is actually set, so the daemon waits up to
+> `acks::ACK_TIMEOUT` (2 s) until every registration whose process is alive reads
+> `paused`; the approvals and the grants they carry are read back in-process (hold
+> applied, every open question's clock standing, no grant still `Active`). Only when the
+> freeze settled *and* every component acknowledged does it append `SessionPaused {
+> method, reason }`; otherwise `SessionPauseUnsettled`, whose `reason` names the first
+> unconfirmed component (` - unconfirmed: egress proxy (no acknowledgement within 2s)`)
+> and whose `pending` is the freeze's own count (zero when only a component is
+> unconfirmed), and `Response::Paused { unconfirmed }` says the same to the client.
+> `resume` releases in the reverse order — credentials, approvals, then the marker —
+> confirming each before the next and thawing last; a release that is not confirmed is
+> taken back (marker rewritten, approvals held again, nothing thawed) and the resume is
+> refused naming the component, so the session is never half-resumed. A launch while
 > paused is refused — at the start of the launch, and again under the session lock
 > immediately before the `bwrap` spawn (`pause::admit_launch`), which is held across
 > the spawn, so launch admission and pause/stop are one serialized lifecycle operation.
@@ -243,7 +257,11 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > the pause's freeze), confirms the freeze stable before anything is killed (the fork
 > barrier: every held process stopped and a rescan — by `bwrap` tree and by the
 > sandbox's pid namespace — finding nothing new), kills every process, watches until
-> each is confirmed gone (bounded by `pause::STOP_SETTLE`), appends
+> each is confirmed gone (bounded by `pause::STOP_SETTLE`), collects the same component
+> acknowledgements for the hold it keeps over the termination (the marker is written
+> before the kill so every proxy refuses and can say so; a component that does not
+> confirm refuses the stop with the session held for it, `SessionPauseUnsettled` naming
+> the component and the ended count carried into the retry's record), appends
 > `WorkloadsTerminated { ended, pending: 0, barrier_confirmed: true }` (including a
 > zero-ended retry that closes a previously incomplete stop), and only then records the
 > agent `Finished`, closes the approvals, appends `SessionEnded` and seals; the
@@ -269,7 +287,9 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > recorded, as a refused stop is); a pause is finished from what `/proc` shows now
 > (frozen, marker, approvals held) and recorded as `SessionPaused` only when the freeze
 > is confirmed, `SessionPauseUnsettled` otherwise, and only when the log does not
-> already carry it. A marker with no intent is a hold that completed before the
+> already carry it, re-collecting the component acknowledgements (a hold the log
+> records as confirmed whose components the restarted daemon cannot confirm gets the one
+> `SessionPauseUnsettled` that says so). A marker with no intent is a hold that completed before the
 > previous process died: the daemon adopts it the same way, as a hold for the stop when
 > the stop marker exists, so `ward resume` and `ward stop` work on it where a restarted
 > daemon used to answer `not paused`. An intent it cannot read, or a stop it cannot
@@ -278,7 +298,9 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > retries over the hold; `ward pause` is told the session is already paused. While an
 > intent exists `ward pause --status` (and so `wardos-pause --status`) reads
 > `unconfirmed`, never `paused` on the strength of the marker or `running` for the lack
-> of one. `seal`
+> of one; `ward pause --status --json` adds `unconfirmed`, what the log's last hold
+> record could not confirm (the component, or the processes), and the bar's agent
+> segment explains its `PAUSED?` with the same word on hover. `seal`
 > stays the separate, log-only closure: it never touches a running sandbox. A client
 > sends `Stop` only to a daemon whose `Request::Capabilities` names confirmed stop, and
 > requires the answer to acknowledge it; an older daemon is refused with nothing sent.

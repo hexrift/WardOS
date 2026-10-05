@@ -14,7 +14,8 @@
 #                           scope from pausing this one), one result line each
 #   wardos-pause --status   print paused, unconfirmed, running or none for this session
 #                           (for the bar); unconfirmed: a pause or stop began and its
-#                           outcome is not recorded yet
+#                           outcome is not recorded yet. `ward pause --status --json`
+#                           adds what a hold could not confirm (#145 item 3)
 #   wardos-pause --help
 #
 # "This session" is WARDOS_SESSION's when set (an immutable, explicitly pinned id — a
@@ -86,9 +87,11 @@ resolved_project() {
 # approvals stay suspended, but not every sandboxed process is confirmed stopped yet —
 # `ward-daemon::pause::FREEZE_SETTLE`): #233's fix is to say so here rather than show
 # the same "processes frozen" text either way, since this is the one notification most
-# users actually see for a keybind-triggered pause with no terminal visible.
+# users actually see for a keybind-triggered pause with no terminal visible. A pause a
+# component did not acknowledge (#145 item 3: `paused, but unconfirmed: egress proxy
+# (…)`) is just as unconfirmed, and the notification names the component.
 do_pause() {
-  local out resolved
+  local out resolved unconfirmed_re='paused, but unconfirmed: ([^(]+)'
   out=$(ward pause "${session_flag[@]}" "$project")
   # Captured to read the outcome below; still shown to a terminal user as before.
   [[ -n $out ]] && printf '%s\n' "$out"
@@ -100,6 +103,12 @@ do_pause() {
     [[ $pending != 1 ]] && plural="es"
     wardos_notify "AGENTS PAUSING" \
       "${resolved}network closed · credential grants suspended · $pending process$plural not yet confirmed stopped · workspace retained" \
+      -u critical
+  elif [[ $out =~ $unconfirmed_re ]]; then
+    local component=${BASH_REMATCH[1]}
+    component=${component%"${component##*[! ]}"}
+    wardos_notify "AGENTS PAUSING" \
+      "${resolved}processes frozen · $component not yet confirmed · workspace retained" \
       -u critical
   else
     wardos_notify "AGENTS PAUSED" \

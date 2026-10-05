@@ -4,7 +4,10 @@
 //! The proxy lives in the `ward` process that launched the sandbox, not in the
 //! daemon, so a pause (ADR-0019 §3) reaches it through a file: the egress
 //! watches the session's pause marker ([`Egress::watch_marker`]) and flips the
-//! proxy's paused flag as the marker comes and goes.
+//! proxy's paused flag as the marker comes and goes — and acknowledges each
+//! flip through its registration under the session's `proxies/` directory
+//! ([`crate::acks`], #145 item 3), which is what lets the daemon confirm the
+//! proxy holds before it records a pause as confirmed.
 //!
 //! The recorder is deliberately the cheapest thing a proxy thread can do with a
 //! decision: one lock, one length comparison, one push into a bounded queue
@@ -38,6 +41,7 @@ use ward_proxy::{
     SystemResolver,
 };
 
+use crate::acks::Registration;
 use crate::error::{Error, Result};
 use crate::observe::{Bounded, DEFAULT_CAPACITY, Drained, Observation, overflow_marker};
 
@@ -205,6 +209,7 @@ pub struct Egress {
     recorder: Arc<Recorder>,
     watcher: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     revoke_watcher: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    registration: Option<Arc<Registration>>,
 }
 
 impl Egress {
@@ -257,15 +262,29 @@ impl Egress {
             recorder,
             watcher: None,
             revoke_watcher: None,
+            registration: None,
         })
     }
 
     /// Pause the proxy while `marker` exists and resume it when it is gone,
     /// checked every [`MARKER_POLL`] until the egress stops. A marker already
-    /// there starts the proxy paused.
-    pub fn watch_marker(&mut self, marker: PathBuf) {
+    /// there starts the proxy paused. Every state the proxy takes is
+    /// acknowledged through this egress's registration in the `proxies/`
+    /// directory beside the marker ([`crate::acks::Registration`]), written
+    /// only once the flag is actually set, so the daemon's confirmation of the
+    /// proxy component never runs ahead of the proxy itself. An egress that
+    /// cannot register would be invisible to that confirmation, so it does not
+    /// start.
+    pub fn watch_marker(&mut self, marker: PathBuf) -> Result<()> {
         let handle = Arc::clone(&self.handle);
-        handle.set_paused(marker.exists());
+        let paused = marker.exists();
+        handle.set_paused(paused);
+        let proxies = marker
+            .parent()
+            .map(|dir| dir.join(crate::acks::PROXIES_DIR))
+            .ok_or_else(|| Error::Sandbox("the pause marker has no directory".into()))?;
+        let registration = Arc::new(Registration::register(&proxies, paused)?);
+        let acknowledge = Arc::clone(&registration);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
@@ -274,10 +293,13 @@ impl Egress {
                 let paused = marker.exists();
                 if paused != handle.paused() {
                     handle.set_paused(paused);
+                    let _ = acknowledge.set(paused);
                 }
             }
         });
         self.watcher = Some((stop, thread));
+        self.registration = Some(registration);
+        Ok(())
     }
 
     /// Watch `dir` (`crate::revoke::dir_path`) for pending revoke markers,
@@ -407,11 +429,15 @@ impl Egress {
         self.handle.active_connections()
     }
 
-    /// Stop the proxy and remove the socket.
+    /// Stop the proxy and remove the socket, and the registration the
+    /// daemon's confirmation of the proxy component would otherwise wait on.
     pub fn stop(self) {
         if let Some((stop, thread)) = self.watcher {
             stop.store(true, Ordering::Release);
             let _ = thread.join();
+        }
+        if let Some(registration) = self.registration {
+            registration.remove();
         }
         if let Some((stop, thread)) = self.revoke_watcher {
             stop.store(true, Ordering::Release);
@@ -523,16 +549,39 @@ mod tests {
         let marker = dir.path().join("paused");
         let mut egress =
             Egress::start(dir.path(), &NetworkCapability::Offline, Vec::new()).unwrap();
-        egress.watch_marker(marker.clone());
+        egress.watch_marker(marker.clone()).unwrap();
         assert!(!egress.paused());
+        let proxies = dir.path().join(crate::acks::PROXIES_DIR);
+        let registered = || {
+            std::fs::read_dir(&proxies)
+                .unwrap()
+                .flatten()
+                .map(|e| std::fs::read_to_string(e.path()).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            registered()[0].starts_with("running\n"),
+            "{:?}",
+            registered()
+        );
         std::fs::write(&marker, "why\n").unwrap();
         assert!(crate::daemon::wait_until(Duration::from_secs(2), || egress.paused()));
+        assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
+            registered()[0].starts_with("paused\n")
+        }));
         std::fs::remove_file(&marker).unwrap();
         assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
             !egress.paused()
         }));
+        assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
+            registered()[0].starts_with("running\n")
+        }));
         egress.stop();
         assert!(!dir.path().join("proxy.sock").exists());
+        assert!(
+            registered().is_empty(),
+            "the registration leaves with the egress"
+        );
     }
 
     /// #245, proven where the daemon's marker file actually meets the proxy:
@@ -1065,6 +1114,7 @@ mod tests {
             recorder,
             watcher: None,
             revoke_watcher: None,
+            registration: None,
         };
 
         let asking = {

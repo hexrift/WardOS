@@ -116,6 +116,9 @@ pub struct PauseResult {
     pub record: EventRecord,
     /// `Some(pending)` when the freeze could not be confirmed within the bound.
     pub unsettled: Option<u32>,
+    /// The component that did not confirm the hold (#145 item 3), named as the
+    /// record's reason names it; `None` when every component acknowledged.
+    pub unconfirmed: Option<String>,
 }
 
 /// Before this type existed, `ward_daemon::client::pause` returned a bare
@@ -140,9 +143,14 @@ pub fn pause(sink: &mut RemoteSink, reason: &str) -> Result<PauseResult> {
     match sink.call(&Request::Pause {
         reason: reason.to_owned(),
     })? {
-        Response::Paused { record, unsettled } => Ok(PauseResult {
+        Response::Paused {
+            record,
+            unsettled,
+            unconfirmed,
+        } => Ok(PauseResult {
             record: *record,
             unsettled,
+            unconfirmed,
         }),
         Response::Error(e) => Err(Error::Project(e)),
         other => Err(Error::Project(format!("unexpected response {other:?}"))),
@@ -2159,6 +2167,7 @@ mod tests {
                                         &Response::Paused {
                                             record: Box::new(rec.clone()),
                                             unsettled: None,
+                                            unconfirmed: None,
                                         },
                                     );
                                 }

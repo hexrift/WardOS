@@ -16,6 +16,7 @@
     clippy::struct_field_names
 )]
 
+pub mod acks;
 pub mod agents;
 pub mod approvals;
 pub mod attempt;

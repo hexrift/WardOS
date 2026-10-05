@@ -33,7 +33,8 @@ pub mod waybar;
 pub use authority::{Authority, authority_panel, grants_segment, network_segment_text};
 pub use digest::{Decision, DigestGate};
 pub use feed::{
-    Counters, Model, SessionState, TamperWard, Verdict, Verification, Worktree, counters_text,
+    Counters, Model, SessionState, TamperWard, Unconfirmed, Verdict, Verification, Worktree,
+    counters_text,
 };
 pub use launcher::{Command, Entry, Launcher, LineContext, Section, SessionCard, quote};
 pub use panel::{Group, duration_text, panel_text, session_panel, verify_panel};

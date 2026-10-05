@@ -192,6 +192,10 @@ pub fn clear_intent(state: &Path, session: &str) -> Result<()> {
     }
 }
 
+/// The reason the marker carries while a stop holds the session's components
+/// for the termination it confirms (#145 item 3).
+pub const STOP_REASON: &str = "ward stop";
+
 /// The refusal a launch gets while the session is paused.
 pub const PAUSED_REFUSAL: &str = "session is paused by ward; `ward resume` before running anything";
 /// The refusal a launch gets once a stop of the session has begun.
@@ -635,6 +639,10 @@ pub const STOP_SETTLE: Duration = Duration::from_secs(2);
 /// What [`terminate`] achieved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Termination {
+    /// How the processes were frozen before the kill: what a hold over what is
+    /// left records ([`PauseMethod::Sigstop`] when nothing ran, the method a
+    /// freeze of nothing would have used).
+    pub method: PauseMethod,
     /// Processes found (in the freeze, or by a rescan while waiting) and
     /// confirmed gone — exited, or a zombie waiting only to be reaped.
     pub ended: u32,
@@ -652,6 +660,7 @@ impl Termination {
     #[must_use]
     pub const fn nothing() -> Self {
         Self {
+            method: PauseMethod::Sigstop,
             ended: 0,
             remaining: None,
             barrier_confirmed: true,
@@ -663,6 +672,7 @@ impl Termination {
     #[must_use]
     pub const fn confirmed(ended: u32) -> Self {
         Self {
+            method: PauseMethod::Sigstop,
             ended,
             remaining: None,
             barrier_confirmed: true,
@@ -746,6 +756,7 @@ pub fn terminate(session: &str, held: Option<Frozen>) -> Termination {
         }
     });
     Termination {
+        method: frozen.method,
         ended,
         // An unconfirmed barrier is itself an incomplete stop even when every
         // currently known pid subsequently died. Preserve an empty hold in that

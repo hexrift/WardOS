@@ -229,6 +229,40 @@ pub struct SessionState {
     /// its held processes may already have taken `SIGKILL`. The bar reads
     /// `STOP?`, never `PAUSED`/`PAUSED?`.
     pub stop_incomplete: bool,
+    /// What the current hold could not confirm (#145 item 3), while
+    /// [`AgentState::PauseUnsettled`] stands from a `SessionPauseUnsettled`: the
+    /// component that did not acknowledge it, or the processes not confirmed
+    /// stopped. `None` once the hold is confirmed or released.
+    pub unconfirmed: Option<Unconfirmed>,
+}
+
+/// What an unsettled hold leaves uncertain, as its record names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unconfirmed {
+    /// This many sandboxed processes had not confirmed stopped.
+    Processes(u32),
+    /// This component did not acknowledge the hold.
+    Component(ward_daemon::acks::Component),
+}
+
+impl Unconfirmed {
+    /// What a `SessionPauseUnsettled { reason, pending }` leaves unconfirmed.
+    #[must_use]
+    pub fn of(reason: &str, pending: u32) -> Self {
+        match ward_daemon::acks::unconfirmed_in(reason) {
+            Some((component, _)) => Self::Component(component),
+            None => Self::Processes(pending),
+        }
+    }
+
+    /// `egress proxy`, or `2 processes`: the word for the bar's explanation.
+    #[must_use]
+    pub fn text(self) -> String {
+        match self {
+            Self::Processes(n) => format!("{n} process{}", if n == 1 { "" } else { "es" }),
+            Self::Component(c) => c.as_str().to_owned(),
+        }
+    }
 }
 
 impl SessionState {
@@ -239,6 +273,7 @@ impl SessionState {
             WardEvent::SessionPaused { .. } => {
                 self.before_pause = self.agent;
                 self.agent = Some(AgentState::Paused);
+                self.unconfirmed = None;
             }
             // PR #207 review finding 1: the daemon now appends this *instead of*
             // `SessionPaused` whenever the freeze could not be confirmed settled —
@@ -248,9 +283,17 @@ impl SessionState {
             // fix did, by leaving it unhandled and falling through to `_ => {}`,
             // which simply kept whatever `self.agent` already was) is exactly the
             // false-confirmation bug #145 is about.
-            WardEvent::SessionPauseUnsettled { .. } => {
-                self.before_pause = self.agent;
+            WardEvent::SessionPauseUnsettled {
+                reason, pending, ..
+            } => {
+                if !matches!(
+                    self.agent,
+                    Some(AgentState::Paused | AgentState::PauseUnsettled)
+                ) {
+                    self.before_pause = self.agent;
+                }
                 self.agent = Some(AgentState::PauseUnsettled);
+                self.unconfirmed = Some(Unconfirmed::of(reason.as_str(), *pending));
             }
             // #145 item 5: a `ward stop` the daemon refused because it could not
             // confirm every sandboxed process ended leaves the session held
@@ -272,14 +315,19 @@ impl SessionState {
                 }
                 self.agent = Some(AgentState::PauseUnsettled);
                 self.stop_incomplete = true;
+                self.unconfirmed = (*pending > 0).then_some(Unconfirmed::Processes(*pending));
             }
-            WardEvent::WorkloadsTerminated { .. } => self.stop_incomplete = false,
+            WardEvent::WorkloadsTerminated { .. } => {
+                self.stop_incomplete = false;
+                self.unconfirmed = None;
+            }
             // Only a daemon that predates PR #253 lets a refused stop be
             // resumed; read what it says.
             WardEvent::SessionResumed { .. } => {
                 self.agent = self.before_pause;
                 self.before_pause = None;
                 self.stop_incomplete = false;
+                self.unconfirmed = None;
             }
             WardEvent::VerificationAttemptStarted { .. } => {
                 self.verification = Verification::Preparing;
@@ -1277,6 +1325,59 @@ mod tests {
             model.state.agent,
             Some(AgentState::Working),
             "resume restores what the agent said last before the (unsettled) pause"
+        );
+    }
+
+    /// #145 item 3: an unsettled pause says what it could not confirm — the
+    /// component its reason names, else its pending processes — for as long as
+    /// the hold stands, and nothing once it is confirmed or released.
+    #[test]
+    fn an_unconfirmed_component_is_named_until_the_hold_is_confirmed_or_released() {
+        use ward_daemon::acks::{ACK_TIMEOUT, Acknowledgement, Component, Outcome};
+        let mut model = Model::new(false);
+        for rec in wardd(&[agent(AgentState::Working)]) {
+            model.apply(rec);
+        }
+        assert_eq!(model.state.unconfirmed, None);
+        model.apply(wardd(&[pause_unsettled()]).remove(0));
+        assert_eq!(model.state.unconfirmed, Some(Unconfirmed::Processes(2)));
+        assert_eq!(Unconfirmed::Processes(2).text(), "2 processes");
+        assert_eq!(Unconfirmed::Processes(1).text(), "1 process");
+
+        let proxy = Acknowledgement {
+            component: Component::Proxy,
+            outcome: Outcome::TimedOut { after: ACK_TIMEOUT },
+        };
+        let named = WardEvent::SessionPauseUnsettled {
+            method: ward_events::PauseMethod::Sigstop,
+            reason: ward_events::ShortText::new(&ward_daemon::acks::unconfirmed_reason(
+                "looks wrong",
+                &proxy,
+            )),
+            pending: 0,
+        };
+        model.apply(wardd(&[named]).remove(0));
+        assert_eq!(model.state.agent, Some(AgentState::PauseUnsettled));
+        assert_eq!(
+            model.state.unconfirmed,
+            Some(Unconfirmed::Component(Component::Proxy))
+        );
+        assert_eq!(
+            model.state.unconfirmed.map(Unconfirmed::text).as_deref(),
+            Some("egress proxy")
+        );
+        model.apply(wardd(&[resumed()]).remove(0));
+        assert_eq!(
+            model.state.agent,
+            Some(AgentState::Working),
+            "a second unsettled record over the first did not lose what the agent said"
+        );
+        assert_eq!(model.state.unconfirmed, None);
+
+        model.apply(wardd(&[paused()]).remove(0));
+        assert_eq!(
+            model.state.unconfirmed, None,
+            "a confirmed pause has nothing unconfirmed"
         );
     }
 
