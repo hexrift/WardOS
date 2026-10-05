@@ -150,8 +150,10 @@ For the node this means:
   `verifier-unavailable` for a checksum-only install it never calls verified, refusals
   under the verifier's own exit codes ([install.md](install.md) §1). That covers the
   runtime tarball only: the node tarball is an operator install, the image's release
-  stage and `wardos-update` do not run the verifier, and the tarballs carry no signature
-  of their own. The signing step has run on no published release yet (v0.4.1 is the
+  stage does not run the verifier, `wardos-update` runs it only on the release manifest
+  of the candidate image's version — evidence about that release's tarballs, shown next
+  to the image's own `provenance-missing` (desktop.md "Update states") — and the
+  tarballs carry no signature of their own. The signing step has run on no published release yet (v0.4.1 is the
   latest), so `install.sh` has installed nothing as `provenance-verified` either; the
   first `v*` tag after it landed exercises both for real, and §4 says what to check then.
 

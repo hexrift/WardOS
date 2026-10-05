@@ -274,9 +274,12 @@ since the manifest is signed after it is generated, nothing in it can reference 
 bundle. The tarballs and the OCI image are not signed individually (ADR-0028 §3 for
 them is open), and the image is not covered by the manifest's signature at all. `install.sh`
 runs the verifier and reports ADR-0028 §5's states up to `provenance-verified`
-([install.md](install.md) §1); the image's release stage and `desktop/bin/wardos-update`
-do not yet, so the image and update paths remain checksum-only until the rest of that
-state machine is wired (issue #148), and a `provenance-verified` manifest says nothing
-about the boot chain (ADR-0028 §6). The signing step runs for the first time on the
+([install.md](install.md) §1); `desktop/bin/wardos-update` fetches and verifies the
+manifest of the candidate image's version when that release publishes one and shows its
+state as evidence about that release's tarballs, next to the image's own
+`provenance-missing` ([desktop.md](desktop.md) "Update states"); the image's release
+stage does not run it, so the image path remains checksum-only until the image is signed
+and covered (issue #148), and a `provenance-verified` manifest says nothing about the
+boot chain (ADR-0028 §6). The signing step runs for the first time on the
 first `v*` tag released after it landed; until that release exists, no published
 release is signed.

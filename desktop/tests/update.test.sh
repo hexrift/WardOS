@@ -5,7 +5,13 @@
 source "$(dirname "$0")/lib.sh"
 setup_env
 for c in sudo flatpak wardos-refresh wardos-theme git notify-send; do mock "$c"; done
-mock bootc 'case "$*" in "upgrade --check") printf "%s\n" "$BOOTC_CHECK" ;; esac'
+# bootc answers `upgrade --check` with $BOOTC_CHECK and `status --json` with a booted
+# deployment and the candidate it found; skopeo and curl (the states of
+# update-states.test.sh) are kept off the network here.
+mock bootc 'case "$*" in "upgrade --check") printf "%s\n" "$BOOTC_CHECK" ;; "status --json") printf "%s\n" "$BOOTC_STATUS" ;; esac'
+mock skopeo 'exit 1'
+mock curl 'exit 6'
+export BOOTC_STATUS='{"status": {"booted": {"image": {"image": {"image": "quay.io/hexrift/wardos:latest"}, "imageDigest": "sha256:0000", "version": "44.20260901.0"}, "cachedUpdate": {"image": {"image": "quay.io/hexrift/wardos:latest"}, "imageDigest": "sha256:1111", "version": "44.20260908.0"}}}}'
 
 wardos-update --help | grep -q '^Usage' || fail "--help prints the usage block"
 
@@ -18,6 +24,8 @@ rm "$MOCK_DIR/bootc"
 assert_eq "$(wardos-update --check)" '{"text": "", "tooltip": "bootc is not installed", "class": ""}'
 mock bootc 'case "$*" in "upgrade --check") echo "a \"quoted\" line" ;; esac'
 assert_eq "$(wardos-update --check)" '{"text": "", "tooltip": "a \"quoted\" line", "class": ""}'
+mock bootc 'case "$*" in "upgrade --check") printf "%s\n" "$BOOTC_CHECK" ;; "status --json") printf "%s\n" "$BOOTC_STATUS" ;; esac'
+export BOOTC_CHECK="Update available for: quay.io/hexrift/wardos:latest"
 
 # The parts, one at a time.
 wardos-update system >/dev/null

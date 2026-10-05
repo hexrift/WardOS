@@ -210,7 +210,15 @@ production image.) After you log in `uwsm` starts Hyprland,
 the configs and hands over to `wardos-welcome` (theme, key, first project, first agent;
 [`onboarding.md`](onboarding.md)),
 and Flathub plus `desktop/flatpaks.txt` arrive in the background. Updates:
-`wardos-update` (`bootc upgrade`; the previous deployment stays, `bootc rollback`).
+`wardos-update` (`bootc upgrade`, stage-only: the new image runs after a reboot you
+choose; the previous deployment stays, `bootc rollback`). `wardos-update --status` shows
+the booted, staged and available deployments by digest and version, the rollback
+deployment, the anti-rollback floor (a lower WardOS version is refused unless
+`--allow-rollback`; ADR-0028 §5) and what is verified — today the image is
+`provenance-missing`, not covered by the signed release manifest, and the manifest of the
+candidate's version is fetched and verified as evidence about that release — and says a
+network or registry failure as such, never as "no update" ([`desktop.md`](desktop.md)
+"Update states").
 The image has one browser (Chromium; Firefox is `wardos-install app
 org.mozilla.firefox`), no compiler (`wardos-install dev rust` puts a toolchain in your
 home for `ward verify`) and English locales; `image/README.md` "Size" says why.

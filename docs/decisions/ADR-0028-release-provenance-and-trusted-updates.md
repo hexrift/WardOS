@@ -100,14 +100,35 @@ causes as refusals under distinct exit codes ([`docs/install.md`](../install.md)
 `scripts/release/install.test.sh` covers this table's untouched, one-byte-changed,
 other-repository, missing-bundle and stale-trusted-root rows for it). The anti-rollback
 floor is not wired there: `install.sh` records no installed version to compare against,
-so the crate's decision has nothing to read yet. Still open: a SLSA provenance
-attestation for the tarballs and the OCI digest (point 1), signing the tarballs and the
-image themselves (point 3 for them), the rest of point 5's state machine — `staged`
-onwards, the anti-rollback floor, and `desktop/bin/wardos-update` and the image's
-release stage, which do not run the verifier — shipping the verifier and the Sigstore
-trusted root on the image and a first-trust step for the downloaded installer ("Trust
-roots and bootstrap" below; today `install.sh` and the verifier it fetches arrive
-through the same repository channel), and the boot-chain work of point 6. This ADR's own status stays Proposed until enough of the verification
+so the crate's decision has nothing to read yet. On the desktop update path (#148 item
+5), `desktop/bin/wardos-update --status` — and `system`, before it stages anything —
+shows point 5's states separately: `booted`, `staged`, `available` (bootc's candidate
+for the configured reference, by digest), `verified`, `manifest`, `rollback`,
+`anti-rollback` and `compatibility`, and reports a network, registry, verifier or bootc
+failure as an actionable state with its own exit code, never as "no update"
+([`docs/desktop.md`](../desktop.md) "Update states"; `desktop/tests/update-states.test.sh`).
+The anti-rollback floor is wired there: the candidate's WardOS version (the image's
+`org.wardos.version` label, read from the registry with `skopeo`; bootc's own version
+fields for both sides when it cannot) is compared with the booted one by a shell mirror
+of `check_anti_rollback` over the crate's version grammar — the crate stays the
+reference — and a lower version is refused unless `--allow-rollback` is given. The
+image itself is still not covered by the signed manifest (`image.bootc_reference` is a
+reference, not a digest, and only the tarballs are digest-bound), so the candidate's own
+provenance state is `provenance-missing`, said on every run and never called verified;
+what `wardos-update` can verify is the release manifest of the candidate's version,
+fetched from that release and checked with `verify-manifest.sh`, shown as evidence about
+that release's tarballs and never as the image's (a failed verification of it blocks
+staging; a missing one does not, unless `--require-provenance`). Updates stay stage-only
+with the reboot the user's. Still open: a SLSA provenance attestation for the tarballs
+and the OCI digest (point 1), signing the tarballs and the image themselves (point 3 for
+them) so that `provenance-verified` can apply to an image and its absence block
+staging, the rest of point 5's state machine — `health-checked`, `committed` and
+`rolled-back`, which need the boot-health work — the image's release stage, which does
+not run the verifier, a WardOS version bootc itself reports (today bootc's `version`
+field is the Fedora base image's label), shipping the verifier and the Sigstore trusted
+root on the image and a first-trust step for the downloaded installer ("Trust roots and
+bootstrap" below; today `install.sh` and the verifier it fetches arrive through the same
+repository channel), and the boot-chain work of point 6. This ADR's own status stays Proposed until enough of the verification
 contract below is real, wired together, and tested end-to-end; the signing step first
 runs on the first `v*` tag released after it landed.
 
