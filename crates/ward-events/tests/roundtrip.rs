@@ -16,9 +16,11 @@ use ward_events::event::{
     PolicySubject, ProcessRef, RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus,
     TamperWardSig, VerifyRequester, VerifySummary, WardEvent,
 };
+use ward_events::event::{NodeAttemptEnd, NodeAttemptOutcome, NodeAttemptState, NodeIntervention};
 use ward_events::ids::{
     AttemptId, Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
 };
+use ward_events::ids::{ExecutionAttemptId, LeaseId, TaskId};
 use ward_events::log::{FsyncPolicy, LogReader, LogWriter};
 use ward_events::origin::Origin;
 use ward_events::origin::OriginSet;
@@ -791,6 +793,50 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Node,
+            WardEvent::NodeAttemptAdmitted {
+                task: TaskId::from_u128(7),
+                attempt: ExecutionAttemptId::from_u128(8),
+                lease: LeaseId::from_u128(9),
+                session: SessionId::from_u128(5),
+                operation: 20,
+                envelope: Blake3Hash::hash(b"envelope"),
+                issuer_key: Blake3Hash::hash(b"issuer-key"),
+                version: 1,
+            },
+        ),
+        (
+            Origin::Node,
+            WardEvent::NodeAttemptLaunched {
+                operation: 30,
+                host_pid: 4242,
+            },
+        ),
+        (
+            Origin::Node,
+            WardEvent::NodeAttemptIntervened {
+                action: NodeIntervention::Pause,
+                operation: 40,
+            },
+        ),
+        (
+            Origin::Node,
+            WardEvent::NodeAttemptEnded {
+                state: NodeAttemptState::Exited,
+                outcome: NodeAttemptOutcome::Completed,
+                end: NodeAttemptEnd::Exited { code: Some(0) },
+                operation: None,
+            },
+        ),
+        (
+            Origin::Node,
+            WardEvent::NodeAttemptRecovered {
+                state: NodeAttemptState::Exited,
+                outcome: Some(NodeAttemptOutcome::Unknown),
+            },
+        ),
+        (Origin::Node, WardEvent::NodeAttemptSealed { operation: 50 }),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -1163,4 +1209,77 @@ fn workloads_terminated_round_trips_barrier_uncertainty() {
             barrier_confirmed: false
         }
     ));
+}
+
+/// #332: a node attempt's evidence records are enforcement facts written by `ward-node`,
+/// critical (fsynced at once), appended after every earlier kind, and kept out of the
+/// Quiet observer mode, whose fixture count above therefore does not move.
+#[test]
+fn node_attempt_kinds_are_critical_node_facts_appended_at_the_end() {
+    let kinds = [
+        (EventKind::NodeAttemptAdmitted, "node_attempt_admitted"),
+        (EventKind::NodeAttemptLaunched, "node_attempt_launched"),
+        (EventKind::NodeAttemptIntervened, "node_attempt_intervened"),
+        (EventKind::NodeAttemptEnded, "node_attempt_ended"),
+        (EventKind::NodeAttemptRecovered, "node_attempt_recovered"),
+        (EventKind::NodeAttemptSealed, "node_attempt_sealed"),
+    ];
+    for (offset, (kind, name)) in kinds.into_iter().enumerate() {
+        assert_eq!(kind.bit(), 1u64 << (40 + offset), "{name}");
+        assert_eq!(kind.name(), name);
+        assert!(kind.is_critical(), "{name}");
+        assert!(!Filter::quiet().kinds.contains(kind), "{name}");
+    }
+    assert_eq!(EventKind::ALL.len(), 46);
+    assert_eq!(Origin::Node.tag(), 8);
+    assert_eq!(Origin::from_tag(8), Some(Origin::Node));
+    assert_eq!(Origin::Node.label(), "node");
+    assert!(Origin::Node.is_enforcement_fact());
+    assert!(Filter::enforcement_facts().origins.contains(Origin::Node));
+}
+
+#[test]
+fn node_attempt_records_round_trip_and_a_tampered_one_breaks_the_chain() {
+    let session = SessionId::from_u128(8);
+    let mut chain = Chain::genesis(session, Blake3Hash::hash(b"binding"));
+    let events = [
+        WardEvent::NodeAttemptIntervened {
+            action: NodeIntervention::Resume,
+            operation: 41,
+        },
+        WardEvent::NodeAttemptEnded {
+            state: NodeAttemptState::Revoked,
+            outcome: NodeAttemptOutcome::Unknown,
+            end: NodeAttemptEnd::Unconfirmed,
+            operation: Some(60),
+        },
+        WardEvent::NodeAttemptRecovered {
+            state: NodeAttemptState::Created,
+            outcome: None,
+        },
+    ];
+    let mut records = Vec::new();
+    for event in events {
+        let record = chain
+            .append(Origin::Node, event, Timestamp::mono(Duration::from_secs(1)))
+            .unwrap();
+        let frame = encode_record(&record).unwrap();
+        let (decoded, consumed) = decode_record(&frame).unwrap();
+        assert_eq!(consumed, frame.len());
+        assert_eq!(decoded, record);
+        records.push(record);
+    }
+    assert_eq!(verify(&records).unwrap(), chain.head());
+
+    let mut tampered = records.clone();
+    tampered[1].event = WardEvent::NodeAttemptEnded {
+        state: NodeAttemptState::Revoked,
+        outcome: NodeAttemptOutcome::Failed,
+        end: NodeAttemptEnd::Killed,
+        operation: Some(60),
+    };
+    assert!(verify(&tampered).is_err());
+    let mut reorigined = records;
+    reorigined[0].origin = Origin::Wardd;
+    assert!(verify(&reorigined).is_err());
 }

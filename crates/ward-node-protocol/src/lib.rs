@@ -3,9 +3,10 @@
 //!
 //! Protocol 1.0 negotiates a version, 1.1 adds read-only capability discovery, 1.2 adds
 //! the identity-only task lifecycle, and 1.3 adds the signed admission envelope (`admit`),
-//! the `exited` state and the receipt outcome on `inspect` of ADR-0030. Issuer
-//! verification and execution are the node's (`ward-node`); transport authentication
-//! belongs to #262. A 1.3 capability document may advertise `admit`, and `start` and
+//! its typed capability manifest, the `exited` state and the receipt outcome on `inspect`
+//! of ADR-0030, and the `unsupported_grant` refusal of a manifest the node cannot honour.
+//! Issuer verification and execution are the node's (`ward-node`); transport
+//! authentication belongs to #262. A 1.3 capability document may advertise `admit`, and `start` and
 //! `stop` only together. Incompatible peers fail closed rather than falling back to the
 //! per-session ward-daemon control protocol.
 
@@ -17,10 +18,10 @@ mod receipt;
 mod test_fixtures;
 
 pub use admission::{
-    AdmissionEnvelopeJson, AdmissionVersion, CapabilityManifestBytes, IssuerProof, IssuerSignature,
-    MAX_ADMISSION_ENVELOPE_BYTES, MAX_ADMISSION_LINEAGE, TaskAdmissionAuthority,
-    TaskAdmissionEnvelope, TaskAdmissionEnvelopeInput, TaskAdmissionError, TaskWorkload,
-    WorkloadArgv,
+    AdmissionEnvelopeJson, AdmissionVersion, CapabilityManifest, CapabilityManifestBytes,
+    HostAllowlist, IssuerProof, IssuerSignature, MAX_ADMISSION_ENVELOPE_BYTES,
+    MAX_ADMISSION_LINEAGE, NetworkGrant, TaskAdmissionAuthority, TaskAdmissionEnvelope,
+    TaskAdmissionEnvelopeInput, TaskAdmissionError, TaskWorkload, WorkloadArgv,
 };
 pub use receipt::{
     TaskExecutionOutcome, TaskExecutionReceipt, TaskReceiptContext, TaskReceiptError,
@@ -1021,6 +1022,11 @@ pub enum TaskLifecycleRejectionReason {
     InvalidState,
     /// The bound authority lease does not grant this operation.
     AuthorityDenied,
+    /// The admission envelope's capability manifest asks for a grant this node cannot
+    /// honour, so the task was not admitted and no version was consumed. Protocol 1.3 and
+    /// later, from `admit` only; a node that honours only `offline` refuses every other
+    /// network grant this way.
+    UnsupportedGrant,
     /// A resource required to service the request is unavailable.
     ResourceUnavailable,
     /// The negotiated protocol version, or the node implementation serving it, does not
@@ -2517,6 +2523,10 @@ mod tests {
             (
                 TaskLifecycleRejectionReason::AuthorityDenied,
                 "authority_denied",
+            ),
+            (
+                TaskLifecycleRejectionReason::UnsupportedGrant,
+                "unsupported_grant",
             ),
             (
                 TaskLifecycleRejectionReason::ResourceUnavailable,

@@ -25,7 +25,7 @@ pub struct EventRecord {
     pub seq: u64,                 // dense, per session, assigned by wardd
     pub ts_mono: Duration,        // monotonic since session genesis, taken when the fact was captured
     pub ts_wall: Option<SystemTime>, // informational
-    pub origin: Origin,           // Kernel | Proxy | Wardd | Verifier | TamperWard | Agent | User
+    pub origin: Origin,           // Kernel | Proxy | Wardd | Verifier | TamperWard | Agent | User | Node
     pub prev: Blake3Hash,         // hash of previous record (genesis: hash of manifest)
     pub event: WardEvent,
     pub hash: Blake3Hash,         // BLAKE3(prev || seq || origin || event bytes)
@@ -33,7 +33,9 @@ pub struct EventRecord {
 ```
 
 `origin` is the single most important field. Only `Kernel`, `Proxy`, `Wardd`, `Verifier`,
-`TamperWard` and `User` records are **enforcement facts**. `Agent` records (from hooks and
+`TamperWard`, `User` and `Node` records are **enforcement facts**. `Node` (hash tag 8) is
+`ward-node`, the single writer of each execution attempt's evidence log (§3, ADR-0030 §3);
+it never appears in a session log. `Agent` records (from hooks and
 `ward-request`) are *claims*: useful for step-through UX and semantics, never used by
 `wardd` or the verifier to decide anything, and rendered with a distinct marker in the
 observer.
@@ -139,6 +141,20 @@ pub enum WardEvent {
     // The barrier-false/pending-zero shape is intentionally durable: replay after a
     // daemon restart must still show STOP? rather than losing the reason the stop is held.
     WorkloadsTerminated { ended: u32, pending: u32, barrier_confirmed: bool },
+
+    // node execution attempts (origin: Node; ADR-0030 §3, #332) — appended after
+    // WorkloadsTerminated. Written only by ward-node, one log per admitted attempt at
+    // <task-root>/<task>/<attempt>.evidence/events.log, never into a session log; see
+    // node-integration.md §6.5. Metadata only: workload output is never recorded.
+    NodeAttemptAdmitted { task: TaskId, attempt: ExecutionAttemptId, lease: LeaseId,
+                          session: SessionId, operation: u64, envelope: Blake3Hash,
+                          issuer_key: Blake3Hash, version: u64 },
+    NodeAttemptLaunched { operation: u64, host_pid: u32 },
+    NodeAttemptIntervened { action: NodeIntervention, operation: u64 },  // Pause | Resume
+    NodeAttemptEnded { state: NodeAttemptState, outcome: NodeAttemptOutcome,
+                       end: NodeAttemptEnd, operation: Option<u64> },
+    NodeAttemptRecovered { state: NodeAttemptState, outcome: Option<NodeAttemptOutcome> },
+    NodeAttemptSealed { operation: u64 },  // the log is sealed after this record
 }
 ```
 
@@ -279,7 +295,12 @@ sess_01J…   payments-api   Claude Code   2026-09-07 22:14 → 22:18   VERIFIED
  entry   blake3:9f1c…   candidate  blake3:77ab…   accepted  blake3:77ab…
 ```
 
-with `--json` for tooling and `--verify` to check the chain and anchors offline.
+with `--json` for tooling, `--verify` to check the chain and anchors offline, and
+`--stats` for the approval-load statistics of experiment E-13
+([`experiments.md`](experiments.md)): every `CapabilityRequested` paired to its terminal
+outcome by identity, a still-pending request reported as censored rather than decided,
+and a figure the log cannot support reported as unmeasured; `--stats --json` is one
+versioned object.
 
 ## 9. Live ingestion and bounded buffering
 

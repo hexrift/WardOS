@@ -29,6 +29,10 @@
 //! forgets no task, receipt or applied operation and never re-runs an attempt that may
 //! have been executing.
 //!
+//! A service built with execution is the single writer of one hash-chained evidence log
+//! per attempt it admits, beside the attempt's workspace under its task root
+//! ([`evidence`]); a restart reconciles every recovered attempt's log before it serves.
+//!
 //! A connection's request (handshake and request line) must arrive within
 //! [`REQUEST_TIMEOUT`]; its answer is written within [`ANSWER_TIMEOUT`] of being ready, so
 //! a `stop` or `start` whose bounded work outlasts the request deadline is still answered.
@@ -40,6 +44,7 @@
 
 pub mod admission;
 pub mod admit;
+pub mod evidence;
 pub mod execution;
 pub mod issuer;
 pub mod records;

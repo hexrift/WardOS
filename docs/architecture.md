@@ -349,6 +349,10 @@ One append-only, hash-chained log per session, owned by `ward` uid, stored under
 `/var/lib/ward/sessions/<id>/events.log`. Live subscribers receive the same records over
 a Unix socket. Details in [`event-model.md`](event-model.md).
 
+`ward-node` keeps the same format for each execution attempt it admits: one log per
+attempt, written only by the node, at `<task-root>/<task>/<attempt>.evidence/events.log`
+beside the attempt's workspace (§3.11, [node-integration.md](node-integration.md) §6.5).
+
 ### 3.8 Governed task receipt contract
 
 `ward-node-protocol` defines a bounded report for one task attempt. It uses the
@@ -360,8 +364,9 @@ workload output or credential material.
 
 `ward-node` records a receipt for every attempt it starts or stops (§3.11) and reports
 its outcome through 1.3 `inspect`. The receipt's outcome is kept in the task's durable
-record and survives a node restart (§3.11); durable per-attempt evidence must still be
-bound before a receipt can be treated as an authoritative execution result.
+record and survives a node restart (§3.11). The attempt's evidence log records the same
+outcome in a hash-chained, sealable log (§3.11); binding a receipt to that log's head, so
+that a receipt alone is an authoritative execution result, is not done yet.
 
 ### 3.9 Trusted task-authority check
 
@@ -467,8 +472,10 @@ unrevoked (`lease_expired`, `lease_revoked`), allocates `<task-root>/<task>/<att
 request. The envelope's argv runs through `ward-launch` in an offline sandbox (no egress
 socket, loopback only) from an empty environment (`--clearenv`: none of the node's own
 variables reach the workload), with the workspace as the only writable host path and the
-envelope's budget enforced; the capability manifest is not interpreted yet, so network
-grants are not honoured. The node answers `running` only after a confirmed spawn with
+envelope's budget enforced. The envelope's capability manifest is read at `admit`: a
+manifest asking for more than `offline` is refused `unsupported_grant` there, so every
+workload that starts runs under exactly what its manifest says (node-integration.md
+§7.5). The node answers `running` only after a confirmed spawn with
 the host pid recorded. A clean spawn failure changes nothing; an ambiguous launch is
 `exited` with an `unknown` receipt and is never re-run.
 
@@ -537,8 +544,24 @@ tasks keep their state and receipt; and every applied operation id survives, so 
 answer as before and never act. Evicting a sealed task removes its record first.
 Dropping the registry stops and reaps every live workload, and a node that dies outright
 takes its sandboxes with it through bubblewrap's `--die-with-parent`, except in the brief
-window before a just-spawned sandbox has armed it. Per-attempt evidence logs and network
-grants are later slices.
+window before a just-spawned sandbox has armed it. Network grants are a later slice.
+
+An executing node is the single evidence writer of every attempt it admits (ADR-0030 §3;
+ADR-0015 still governs session logs, written by `wardd`). Each attempt has one
+append-only `ward-events` log, `<task-root>/<task>/<attempt>.evidence/events.log`,
+beside its workspace and outside the sandbox's only writable mount, in directories created
+mode 0700. Its records have origin `node`, its session id carries the attempt id and its
+genesis is a hash of the binding: `NodeAttemptAdmitted` (envelope digest, issuer key id,
+version), `NodeAttemptLaunched` (host pid), `NodeAttemptIntervened` (pause or resume),
+`NodeAttemptEnded` (state, receipt outcome, cause, stop or revoke operation),
+`NodeAttemptRecovered` and `NodeAttemptSealed`, after which the log is sealed with its
+`HEAD`. Each record is fsynced after the task record and before the verb is answered; a
+failed append restores the task record and refuses the verb `resource_unavailable`. A
+restarted node cuts a torn final frame, records `NodeAttemptRecovered` wherever the log
+shows another state than the one recovered, and seals the log of a sealed task, before it
+serves; a log that does not verify stops it. Logs are bounded at 256 KiB with room kept
+for the closing records, never hold workload output, and are never deleted by the node:
+evicting a sealed task leaves its sealed log in place for the operator.
 
 ---
 

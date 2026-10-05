@@ -9,9 +9,9 @@
 //! A launch is built only from node-owned state: the workspace the node allocated under
 //! its task root ([`crate::workspace`]), the admitted envelope's argv and its mandatory
 //! wall-clock budget. The sandbox is offline: it never binds an egress socket, so its
-//! network namespace holds only loopback. The envelope's capability manifest is not
-//! interpreted yet, so any network grant it carries is not honoured; the node fails closed
-//! to the least authority rather than guessing at a grant.
+//! network namespace holds only loopback. That matches every admitted envelope's capability
+//! manifest, because `admit` ([`crate::admit`]) refuses any manifest asking for more than
+//! `offline`; the node never runs a workload under less than its manifest asked for.
 //!
 //! `pause` and `resume` act on the running workload through its [`WorkloadFreezer`], which
 //! the reaper hands back with the spawned pid. The sandbox freezer stops the tree rooted at
@@ -444,10 +444,23 @@ mod tests {
 
     use super::*;
 
+    fn sleeping(nap: &str) -> bool {
+        let cmdline = format!("sleep\0{nap}\0");
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
+            .any(|found| found == cmdline.as_bytes())
+    }
+
     #[test]
     fn a_survivor_is_ended_only_under_its_recorded_identity_from_this_boot() {
+        let nap = format!("30.{:06}", std::process::id() % 1_000_000);
         let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30 & wait"])
+            .args(["-c", &format!("sleep {nap} & wait")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
         let root = TreeRoot::of(child.id()).unwrap();
@@ -462,6 +475,14 @@ mod tests {
 
         SandboxLauncher.end_survivor(&WorkloadProcess::new(root.pid(), root.start_time(), boot));
         assert_eq!(child.wait().unwrap().code(), None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sleeping(&nap) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sleep forked under the survivor outlived it"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

@@ -14,6 +14,13 @@
 //! `capability_manifest.bytes`, `snapshot`, `issuer_key_id`, `signature`) is encoded and
 //! accepted in lowercase only, without a prefix, so a signed or hashed value has exactly
 //! one spelling on the wire.
+//!
+//! The manifest bytes themselves are one JSON object in the grammar of
+//! [`CapabilityManifest`]: at this revision a single `network` grant, spelled as
+//! `ward-policy` spells its `network` capability (`"offline"`, or `{"custom": [hosts]}`
+//! in its host-pattern grammar). Bytes outside the grammar fail envelope decoding, so a
+//! node never admits a manifest it cannot read. Which decoded grants a node honours is
+//! the node's decision, made at `admit`.
 
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroU64;
@@ -55,6 +62,16 @@ pub enum TaskAdmissionError {
     ManifestTooLarge,
     /// The capability manifest hash does not match its bytes.
     ManifestHashMismatch,
+    /// The capability manifest bytes are not exactly one object of the manifest grammar.
+    MalformedManifest,
+    /// A `custom` network grant lists no hosts; no egress is spelled `offline`.
+    EmptyHostAllowlist,
+    /// A `custom` network grant lists more than [`HostAllowlist::MAX_HOSTS`] hosts.
+    TooManyHosts,
+    /// A `custom` network grant entry is not a lowercase host or `*.` host pattern.
+    InvalidHostPattern,
+    /// A `custom` network grant lists the same pattern twice.
+    DuplicateHost,
     /// The wall-clock budget is zero.
     ZeroBudget,
     /// The admission version is zero.
@@ -83,6 +100,11 @@ impl Display for TaskAdmissionError {
             Self::EmptyManifest => "capability manifest is empty",
             Self::ManifestTooLarge => "capability manifest is too large",
             Self::ManifestHashMismatch => "capability manifest hash does not match its bytes",
+            Self::MalformedManifest => "capability manifest is not a valid manifest",
+            Self::EmptyHostAllowlist => "capability manifest host allowlist is empty",
+            Self::TooManyHosts => "capability manifest host allowlist is too long",
+            Self::InvalidHostPattern => "capability manifest host pattern is invalid",
+            Self::DuplicateHost => "capability manifest host pattern is repeated",
             Self::ZeroBudget => "wall-clock budget must be non-zero",
             Self::ZeroVersion => "admission version must be non-zero",
             Self::LineageTooLong => "authority lineage is too long",
@@ -159,22 +181,157 @@ impl<'de> Deserialize<'de> for WorkloadArgv {
     }
 }
 
-/// The serialized capability manifest the sandbox is built from, bound to its hash.
+/// An explicit egress allowlist: host patterns in `ward-policy`'s host grammar.
+///
+/// A pattern is a lowercase DNS name (`github.com`), or `*.` and a name
+/// (`*.crates.io`), which covers any name with at least one more label and never the
+/// name itself. Labels are 1–63 characters of `a-z 0-9 -`, neither starting nor ending
+/// with `-`; the name is at most [`Self::MAX_HOST_BYTES`]. Lowercase only, so a signed
+/// pattern has one spelling. The list is non-empty, has no repeated pattern and holds at
+/// most [`Self::MAX_HOSTS`] entries; order is kept as given.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct HostAllowlist(Vec<String>);
+
+impl HostAllowlist {
+    /// Maximum number of patterns.
+    pub const MAX_HOSTS: usize = 64;
+    /// Maximum bytes of a pattern's name, after any `*.` prefix.
+    pub const MAX_HOST_BYTES: usize = 253;
+
+    /// Validate an allowlist of host patterns.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty list, more than [`Self::MAX_HOSTS`] entries, an entry outside the
+    /// pattern grammar and a repeated entry.
+    pub fn new(patterns: Vec<String>) -> Result<Self, TaskAdmissionError> {
+        if patterns.is_empty() {
+            return Err(TaskAdmissionError::EmptyHostAllowlist);
+        }
+        if patterns.len() > Self::MAX_HOSTS {
+            return Err(TaskAdmissionError::TooManyHosts);
+        }
+        for (index, pattern) in patterns.iter().enumerate() {
+            if !is_host_pattern(pattern) {
+                return Err(TaskAdmissionError::InvalidHostPattern);
+            }
+            if patterns[..index].contains(pattern) {
+                return Err(TaskAdmissionError::DuplicateHost);
+            }
+        }
+        Ok(Self(patterns))
+    }
+
+    /// The patterns, in the order given.
+    #[must_use]
+    pub fn patterns(&self) -> &[String] {
+        &self.0
+    }
+}
+
+fn is_host_pattern(pattern: &str) -> bool {
+    let name = pattern.strip_prefix("*.").unwrap_or(pattern);
+    !name.is_empty()
+        && name.len() <= HostAllowlist::MAX_HOST_BYTES
+        && name.split('.').all(is_dns_label)
+}
+
+fn is_dns_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+}
+
+/// The egress a manifest asks for, spelled as `ward-policy` spells `network`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkGrant {
+    /// No network at all: `"offline"`.
+    Offline,
+    /// Egress to the listed hosts only: `{"custom": [patterns]}`.
+    Custom(HostAllowlist),
+}
+
+/// The decoded capability manifest of an admitted workload.
+///
+/// This is the manifest grammar of protocol 1.3: exactly the field `network`, a
+/// [`NetworkGrant`]. Unknown fields, a repeated field, anything that is not one JSON
+/// object and any value outside the grammar fail decoding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CapabilityManifest {
+    network: NetworkGrant,
+}
+
+impl CapabilityManifest {
+    /// A manifest asking for exactly `network`.
+    #[must_use]
+    pub const fn new(network: NetworkGrant) -> Self {
+        Self { network }
+    }
+
+    /// Strictly decode manifest bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskAdmissionError::MalformedManifest`] unless the bytes are exactly one
+    /// object of the grammar, and the [`HostAllowlist::new`] errors for a `custom` grant
+    /// whose list is invalid.
+    pub fn decode_json(bytes: &[u8]) -> Result<Self, TaskAdmissionError> {
+        let wire = serde_json::from_slice::<CapabilityManifestWire>(bytes)
+            .map_err(|_| TaskAdmissionError::MalformedManifest)?;
+        let network = match wire.network {
+            NetworkGrantWire::Offline => NetworkGrant::Offline,
+            NetworkGrantWire::Custom(patterns) => {
+                NetworkGrant::Custom(HostAllowlist::new(patterns)?)
+            }
+        };
+        Ok(Self { network })
+    }
+
+    /// The egress the manifest asks for.
+    #[must_use]
+    pub const fn network(&self) -> &NetworkGrant {
+        &self.network
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityManifestWire {
+    network: NetworkGrantWire,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NetworkGrantWire {
+    Offline,
+    Custom(Vec<String>),
+}
+
+/// The serialized capability manifest the sandbox is built from, bound to its hash and
+/// to its decoded [`CapabilityManifest`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityManifestBytes {
     hash: Blake3Hash,
     bytes: Vec<u8>,
+    manifest: CapabilityManifest,
 }
 
 impl CapabilityManifestBytes {
     /// Maximum serialized manifest size in bytes.
     pub const MAX_BYTES: usize = 8 * 1024;
 
-    /// Bind serialized manifest bytes to their `BLAKE3` hash.
+    /// Bind serialized manifest bytes to their `BLAKE3` hash and decode them strictly.
     ///
     /// # Errors
     ///
-    /// Rejects an empty or oversized manifest.
+    /// Rejects an empty or oversized manifest, and one outside the grammar of
+    /// [`CapabilityManifest::decode_json`].
     pub fn new(bytes: Vec<u8>) -> Result<Self, TaskAdmissionError> {
         if bytes.is_empty() {
             return Err(TaskAdmissionError::EmptyManifest);
@@ -182,10 +339,24 @@ impl CapabilityManifestBytes {
         if bytes.len() > Self::MAX_BYTES {
             return Err(TaskAdmissionError::ManifestTooLarge);
         }
+        let manifest = CapabilityManifest::decode_json(&bytes)?;
         Ok(Self {
             hash: Blake3Hash::hash(&bytes),
             bytes,
+            manifest,
         })
+    }
+
+    /// Serialize a manifest into the bytes an issuer hashes and signs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskAdmissionError::MalformedManifest`] if the manifest cannot be
+    /// encoded, or the [`Self::new`] errors for its bytes.
+    pub fn encode(manifest: &CapabilityManifest) -> Result<Self, TaskAdmissionError> {
+        let bytes =
+            serde_json::to_vec(manifest).map_err(|_| TaskAdmissionError::MalformedManifest)?;
+        Self::new(bytes)
     }
 
     /// `BLAKE3` hash of the serialized manifest.
@@ -198,6 +369,12 @@ impl CapabilityManifestBytes {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// The decoded manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
     }
 }
 
@@ -769,10 +946,10 @@ mod tests {
         proof, snapshot, trusted_lease, workload,
     };
     use crate::{
-        AdmissionEnvelopeJson, AdmissionVersion, CapabilityManifestBytes, IssuerProof,
-        IssuerSignature, MAX_ADMISSION_ENVELOPE_BYTES, MAX_ADMISSION_LINEAGE,
-        TaskAdmissionAuthority, TaskAdmissionEnvelope, TaskAdmissionError, TaskWorkload,
-        WorkloadArgv,
+        AdmissionEnvelopeJson, AdmissionVersion, CapabilityManifest, CapabilityManifestBytes,
+        HostAllowlist, IssuerProof, IssuerSignature, MAX_ADMISSION_ENVELOPE_BYTES,
+        MAX_ADMISSION_LINEAGE, NetworkGrant, TaskAdmissionAuthority, TaskAdmissionEnvelope,
+        TaskAdmissionError, TaskWorkload, WorkloadArgv,
     };
 
     fn decode(json: &str) -> Result<TaskAdmissionEnvelope, TaskAdmissionError> {
@@ -1043,8 +1220,17 @@ mod tests {
             CapabilityManifestBytes::new(vec![b'x'; CapabilityManifestBytes::MAX_BYTES + 1]),
             Err(TaskAdmissionError::ManifestTooLarge)
         );
-        assert!(
-            CapabilityManifestBytes::new(vec![b'x'; CapabilityManifestBytes::MAX_BYTES]).is_ok()
+        let at_bound = format!(
+            "{}{}",
+            std::str::from_utf8(MANIFEST_BYTES).unwrap(),
+            " ".repeat(CapabilityManifestBytes::MAX_BYTES - MANIFEST_BYTES.len())
+        );
+        assert_eq!(at_bound.len(), CapabilityManifestBytes::MAX_BYTES);
+        assert_eq!(
+            CapabilityManifestBytes::new(at_bound.into_bytes())
+                .unwrap()
+                .manifest(),
+            manifest().manifest()
         );
 
         let mut wrong_hash = envelope_value();
@@ -1275,6 +1461,233 @@ mod tests {
             assert!(
                 decode(&value.to_string()).is_err(),
                 "missing {field} must fail closed"
+            );
+        }
+    }
+    fn hosts(patterns: &[&str]) -> Result<HostAllowlist, TaskAdmissionError> {
+        HostAllowlist::new(
+            patterns
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
+        )
+    }
+
+    fn custom(patterns: &[&str]) -> CapabilityManifest {
+        CapabilityManifest::new(NetworkGrant::Custom(hosts(patterns).unwrap()))
+    }
+
+    fn manifest_bytes(raw: &str) -> Result<CapabilityManifestBytes, TaskAdmissionError> {
+        CapabilityManifestBytes::new(raw.as_bytes().to_vec())
+    }
+
+    fn envelope_with_manifest(bytes: &[u8]) -> String {
+        let mut value = envelope_value();
+        value["workload"]["capability_manifest"] = serde_json::json!({
+            "hash": Blake3Hash::hash(bytes).to_hex(),
+            "bytes": super::encode_hex(bytes),
+        });
+        value.to_string()
+    }
+
+    #[test]
+    fn capability_manifest_grammar_round_trips_in_ward_policy_spelling() {
+        let offline = CapabilityManifest::new(NetworkGrant::Offline);
+        let encoded = CapabilityManifestBytes::encode(&offline).unwrap();
+        assert_eq!(encoded.bytes(), MANIFEST_BYTES);
+        assert_eq!(encoded.hash(), Blake3Hash::hash(MANIFEST_BYTES));
+        assert_eq!(encoded.manifest(), &offline);
+        assert_eq!(encoded, manifest());
+        assert_eq!(manifest().manifest().network(), &NetworkGrant::Offline);
+
+        let allowlisted = custom(&["github.com", "*.crates.io"]);
+        let encoded = CapabilityManifestBytes::encode(&allowlisted).unwrap();
+        assert_eq!(
+            encoded.bytes(),
+            br#"{"network":{"custom":["github.com","*.crates.io"]}}"#
+        );
+        assert_eq!(encoded.manifest(), &allowlisted);
+        let NetworkGrant::Custom(allowlist) = encoded.manifest().network() else {
+            panic!("not an allowlist");
+        };
+        assert_eq!(allowlist.patterns(), ["github.com", "*.crates.io"]);
+        assert_eq!(
+            CapabilityManifestBytes::new(encoded.bytes().to_vec()).unwrap(),
+            encoded
+        );
+
+        let spaced =
+            manifest_bytes(r#" { "network" : { "custom" : [ "github.com" ] } } "#).unwrap();
+        assert_eq!(spaced.manifest(), &custom(&["github.com"]));
+        assert_eq!(
+            manifest_bytes(r#"{"network":{"custom":["*.crates.io","github.com"]}}"#)
+                .unwrap()
+                .manifest(),
+            &custom(&["*.crates.io", "github.com"])
+        );
+
+        let envelope = decode(&envelope_with_manifest(encoded.bytes())).unwrap();
+        assert_eq!(envelope.workload().capability_manifest(), &encoded);
+        assert_eq!(
+            decode(&serde_json::to_string(&envelope).unwrap()).unwrap(),
+            envelope
+        );
+    }
+
+    #[test]
+    fn capability_manifest_must_be_exactly_one_object_of_the_grammar() {
+        for raw in [
+            "not json",
+            "[]",
+            "null",
+            "\"offline\"",
+            "{}",
+            r#"{"network":"offline"}{}"#,
+            r#"{"network":"offline"} trailing"#,
+            r#"{"network":"offline","filesystem":"rw"}"#,
+            r#"{"network":"offline","network":"offline"}"#,
+            r#"{"network":"development"}"#,
+            r#"{"network":"unrestricted"}"#,
+            r#"{"network":"Offline"}"#,
+            r#"{"network":null}"#,
+            r#"{"network":true}"#,
+            r#"{"network":{}}"#,
+            r#"{"network":{"custom":"github.com"}}"#,
+            r#"{"network":{"custom":["github.com"],"offline":true}}"#,
+            r#"{"network":{"allow_hosts":["github.com"]}}"#,
+            r#"{"network":{"custom":[1]}}"#,
+            r#"{"network":{"custom":[null]}}"#,
+        ] {
+            assert_eq!(
+                manifest_bytes(raw),
+                Err(TaskAdmissionError::MalformedManifest),
+                "{raw}"
+            );
+            assert_eq!(
+                decode(&envelope_with_manifest(raw.as_bytes())),
+                Err(TaskAdmissionError::MalformedEnvelope),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            format!("{}", TaskAdmissionError::MalformedManifest),
+            "capability manifest is not a valid manifest"
+        );
+    }
+
+    #[test]
+    fn host_allowlist_is_non_empty_without_repeats_and_bounded() {
+        assert_eq!(hosts(&[]), Err(TaskAdmissionError::EmptyHostAllowlist));
+        assert_eq!(
+            hosts(&["github.com", "github.com"]),
+            Err(TaskAdmissionError::DuplicateHost)
+        );
+        assert_eq!(
+            hosts(&["*.crates.io", "github.com", "*.crates.io"]),
+            Err(TaskAdmissionError::DuplicateHost)
+        );
+        let many: Vec<String> = (0..=HostAllowlist::MAX_HOSTS)
+            .map(|index| format!("h{index}.example.com"))
+            .collect();
+        assert_eq!(
+            HostAllowlist::new(many.clone()),
+            Err(TaskAdmissionError::TooManyHosts)
+        );
+        assert_eq!(
+            HostAllowlist::new(many[..HostAllowlist::MAX_HOSTS].to_vec())
+                .unwrap()
+                .patterns()
+                .len(),
+            HostAllowlist::MAX_HOSTS
+        );
+
+        for (raw, error) in [
+            (
+                r#"{"network":{"custom":[]}}"#,
+                TaskAdmissionError::EmptyHostAllowlist,
+            ),
+            (
+                r#"{"network":{"custom":["github.com","github.com"]}}"#,
+                TaskAdmissionError::DuplicateHost,
+            ),
+            (
+                r#"{"network":{"custom":["GitHub.com"]}}"#,
+                TaskAdmissionError::InvalidHostPattern,
+            ),
+            (
+                &format!(r#"{{"network":{{"custom":{}}}}}"#, serde_json::json!(many)),
+                TaskAdmissionError::TooManyHosts,
+            ),
+        ] {
+            assert_eq!(manifest_bytes(raw), Err(error), "{raw}");
+            assert_eq!(
+                decode(&envelope_with_manifest(raw.as_bytes())),
+                Err(TaskAdmissionError::MalformedEnvelope),
+                "{raw}"
+            );
+            assert!(!format!("{error}").is_empty());
+        }
+    }
+
+    #[test]
+    fn host_patterns_follow_the_policy_host_grammar_in_lowercase() {
+        let label = "a".repeat(63);
+        let longest = format!(
+            "{label}.{label}.{label}.{}",
+            "b".repeat(HostAllowlist::MAX_HOST_BYTES - 3 * 64)
+        );
+        assert_eq!(longest.len(), HostAllowlist::MAX_HOST_BYTES);
+        for ok in [
+            "github.com",
+            "*.crates.io",
+            "localhost",
+            "a-b.c9.example",
+            "1.2.3.4",
+            "x.y.z.example.org",
+            "*.a",
+            longest.as_str(),
+            &format!("*.{longest}"),
+        ] {
+            assert_eq!(hosts(&[ok]).unwrap().patterns(), [ok], "{ok}");
+        }
+
+        let too_long_label = format!("{label}a.com");
+        let too_long = format!("{longest}c");
+        for bad in [
+            "",
+            "*",
+            "*.",
+            ".com",
+            "com.",
+            "github.com.",
+            "a..b",
+            "GitHub.com",
+            "-a.com",
+            "a-.com",
+            "a_b.com",
+            "a.com/path",
+            "a.com:443",
+            "*.*.com",
+            "**.com",
+            "a.*.com",
+            "*a.com",
+            "http://a.com",
+            " a.com",
+            "a.com ",
+            "héllo.com",
+            "a\0.com",
+            too_long_label.as_str(),
+            too_long.as_str(),
+        ] {
+            assert_eq!(
+                hosts(&[bad]),
+                Err(TaskAdmissionError::InvalidHostPattern),
+                "{bad:?}"
+            );
+            assert_eq!(
+                hosts(&["github.com", bad]),
+                Err(TaskAdmissionError::InvalidHostPattern),
+                "{bad:?}"
             );
         }
     }
