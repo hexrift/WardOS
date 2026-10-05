@@ -1810,7 +1810,10 @@ impl FakeSandbox {
         let session = session.to_owned();
         let bin = tempfile::tempdir().unwrap();
         let bwrap = bin.path().join("bwrap");
-        fs::copy("/bin/sh", &bwrap).unwrap();
+        // A symlink, not a copy: the sandbox is found by its command line's
+        // `bwrap` name, and a copied shell still open for writing in one test
+        // fails another test's exec with ETXTBSY when they fork concurrently.
+        std::os::unix::fs::symlink("/bin/sh", &bwrap).unwrap();
         let child = std::process::Command::new(&bwrap)
             .args(["-c", script])
             .arg(run_dir_path(&session).join("proxy.sock"))
