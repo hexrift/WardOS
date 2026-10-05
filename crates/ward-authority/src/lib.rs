@@ -592,7 +592,10 @@ pub struct DelegationBinding {
 /// from wire data to root authority in this slice. A delegated envelope must pass
 /// `AuthorityLease::validate_delegated` with its trusted parent. Root authority is
 /// constructed only from non-deserializable trusted `AuthorityLeaseInput`.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+///
+/// A trusted lease can be downgraded into this form to carry it inside a protocol
+/// message; its serialization is identical to the trusted lease's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UntrustedAuthorityLease {
     id: LeaseId,
@@ -606,6 +609,24 @@ pub struct UntrustedAuthorityLease {
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     version: LeaseVersion,
+}
+
+impl From<&AuthorityLease> for UntrustedAuthorityLease {
+    fn from(lease: &AuthorityLease) -> Self {
+        Self {
+            id: lease.id,
+            delegation_id: lease.delegation_id,
+            issuer: lease.issuer,
+            subject: lease.subject,
+            task: lease.task,
+            parent_lease_id: lease.parent_lease_id,
+            delegated_by: lease.delegated_by,
+            grants: lease.grants.clone(),
+            issued_at_unix_ms: lease.issued_at_unix_ms,
+            expires_at_unix_ms: lease.expires_at_unix_ms,
+            version: lease.version,
+        }
+    }
 }
 
 fn validate_lifetime(issued_at: u64, expires_at: u64) -> Result<(), AuthorityLeaseError> {
@@ -1227,5 +1248,41 @@ mod tests {
         let mut value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
         value["provider"] = serde_json::Value::String("model".into());
         assert!(serde_json::from_value::<UntrustedAuthorityLease>(value).is_err());
+    }
+
+    #[test]
+    fn trusted_lease_downgrades_to_an_identical_untrusted_wire_value() {
+        let root = root();
+        let child = root
+            .delegate(
+                DelegationInput {
+                    id: LeaseId::from_u128(2),
+                    delegation_id: DelegationId::from_u128(2),
+                    subject: AgentId::from_u128(2),
+                    task: root.task(),
+                    grants: GrantSet::new([CapabilityGrant::new(
+                        CapabilityName::new("repo.read").unwrap(),
+                        ResourceRef::new("repo:hexrift/WardOS").unwrap(),
+                        false,
+                    )])
+                    .unwrap(),
+                    issued_at_unix_ms: 200,
+                    expires_at_unix_ms: 900,
+                    version: LeaseVersion::new(2).unwrap(),
+                },
+                500,
+                EmptyAuthorityPolicy::Reject,
+            )
+            .unwrap();
+
+        for lease in [root, child] {
+            let trusted_json = serde_json::to_string(&lease).unwrap();
+            let untrusted = UntrustedAuthorityLease::from(&lease);
+            assert_eq!(serde_json::to_string(&untrusted).unwrap(), trusted_json);
+            assert_eq!(
+                serde_json::from_str::<UntrustedAuthorityLease>(&trusted_json).unwrap(),
+                untrusted
+            );
+        }
     }
 }

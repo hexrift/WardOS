@@ -6,7 +6,9 @@
 //! * at protocol 1.1, read-only node capability discovery;
 //! * at protocol 1.2, read-only discovery or one task lifecycle request against
 //!   the node-owned [`task::TaskRegistry`]. Only `create` and `inspect` are
-//!   implemented; every other verb is refused explicitly (see [`task`]).
+//!   implemented; every other verb is refused explicitly (see [`task`]);
+//! * at protocol 1.3, the same, plus the `admit` verb, which is decoded but refused
+//!   as unsupported until issuer verification exists (ADR-0030).
 //!
 //! No task is executed yet, and remote transport is deliberately absent.
 
@@ -14,6 +16,8 @@
 
 pub mod admission;
 pub mod task;
+#[cfg(test)]
+mod test_support;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -108,7 +112,7 @@ impl NodeService {
     /// The first request must be a handshake. Rejected handshakes receive a bounded
     /// machine-readable response and close. A connection accepted at the capability
     /// negotiated protocol may issue one read-only capability-discovery request; a
-    /// connection accepted at 1.2 may instead issue one lifecycle request. The
+    /// connection accepted at 1.2 or later may instead issue one lifecycle request. The
     /// connection then closes.
     ///
     /// A lifecycle request is applied to the registry before its response is written, so
@@ -489,7 +493,7 @@ mod tests {
                 ProtocolRejectionReason::MajorVersionMismatch,
             ),
             (
-                SupportedProtocolRange::new(1, 3, 4).unwrap(),
+                SupportedProtocolRange::new(1, 4, 5).unwrap(),
                 ProtocolRejectionReason::NoCommonMinor,
             ),
         ] {
@@ -706,6 +710,7 @@ mod tests {
     }
 
     /// One lifecycle request on its own 1.2 connection; returns the decoded response.
+    #[allow(clippy::needless_pass_by_value)]
     fn lifecycle_round_trip(
         service: &NodeService,
         request: TaskLifecycleRequest,
@@ -815,6 +820,117 @@ mod tests {
             lifecycle_round_trip(&service, ctx.inspect(binding)),
             ctx.rejected(None, binding, TaskLifecycleRejectionReason::TaskNotFound)
         );
+    }
+
+    /// Open a connection, negotiate 1.3 and return the client end plus the server worker.
+    fn admission_connection(
+        service: &NodeService,
+    ) -> (
+        UnixStream,
+        std::thread::JoinHandle<Result<(), NodeServiceError>>,
+    ) {
+        let service = service.clone();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || service.serve_connection(server));
+
+        let hello = HandshakeRequest::Hello {
+            protocol: WARD_NODE_PROTOCOL,
+        };
+        writeln!(client, "{}", serde_json::to_string(&hello).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<HandshakeResponse>(line(&mut client).trim()).unwrap(),
+            HandshakeResponse::Accepted {
+                protocol: ProtocolVersion::new(1, 3),
+            }
+        );
+        (client, worker)
+    }
+
+    #[test]
+    fn one_three_admit_is_refused_over_the_socket_and_the_task_stays_created() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let ctx = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let binding = lifecycle_binding();
+        let create = OperationId::new(1).unwrap();
+        let admit = OperationId::new(2).unwrap();
+
+        lifecycle_round_trip(&service, lifecycle_context().create(create, binding));
+
+        let (mut client, worker) = admission_connection(&service);
+        let request = crate::test_support::admit(ctx, admit, binding);
+        writeln!(client, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+        assert_eq!(
+            ctx.decode_response(line(&mut client).trim()).unwrap(),
+            ctx.rejected(
+                Some(admit),
+                binding,
+                TaskLifecycleRejectionReason::UnsupportedOperation
+            )
+        );
+        worker.join().unwrap().unwrap();
+
+        let (mut client, worker) = admission_connection(&service);
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&ctx.inspect(binding)).unwrap()
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.decode_response(line(&mut client).trim()).unwrap(),
+            ctx.inspected(binding, TaskLifecycleState::Created)
+        );
+        worker.join().unwrap().unwrap();
+        assert_eq!(service.tasks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn one_two_connection_refuses_admit_like_an_unknown_request() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let binding = lifecycle_binding();
+        let admit = crate::test_support::admit(
+            TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap(),
+            OperationId::new(2).unwrap(),
+            binding,
+        );
+        let one_three = serde_json::to_string(&admit).unwrap();
+        let claiming_one_two = one_three.replace(r#""minor":3"#, r#""minor":2"#);
+        let unknown = one_three.replace(r#""request":"admit""#, r#""request":"unknown""#);
+
+        for payload in [one_three, claiming_one_two, unknown] {
+            let (mut client, worker) = lifecycle_connection(&service);
+            writeln!(client, "{payload}").unwrap();
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(NodeServiceError::MalformedLifecycleRequest)
+            ));
+            assert_eq!(line(&mut client), "");
+        }
+        assert!(service.tasks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_three_client_discovers_the_same_capabilities() {
+        let service = NodeService::new(capabilities()).unwrap();
+        let (mut client, worker) = admission_connection(&service);
+        let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&context.request()).unwrap()
+        )
+        .unwrap();
+
+        let response = context.decode_response(line(&mut client).trim()).unwrap();
+        let ward_node_protocol::CapabilityDiscoveryResponse::Capabilities {
+            capabilities: observed,
+        } = response;
+        assert_eq!(observed.protocol(), ProtocolVersion::new(1, 3));
+        assert_eq!(observed.lifecycle(), service.capabilities.lifecycle());
+        assert_eq!(observed.isolation(), service.capabilities.isolation());
+        worker.join().unwrap().unwrap();
+        assert!(service.tasks.lock().unwrap().is_empty());
     }
 
     #[test]

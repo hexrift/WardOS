@@ -1,15 +1,25 @@
-//! ward-node-protocol: dependency-light protocol contracts shared by a future
-//! ward-node and its local or remote clients.
+//! ward-node-protocol: dependency-light protocol contracts shared by ward-node and its
+//! local or remote clients.
 //!
-//! This crate starts with version negotiation only. Task identity, authority leases,
-//! authentication, lifecycle operations and transport belong to later slices of #258,
-//! #259 and #262. Incompatible peers fail closed rather than falling back to the
-//! per-session ward-daemon control protocol.
+//! Protocol 1.0 negotiates a version, 1.1 adds read-only capability discovery, 1.2 adds
+//! the identity-only task lifecycle, and 1.3 adds the signed admission envelope (`admit`)
+//! and the `exited` state of ADR-0030. Issuer verification, execution and transport
+//! authentication belong to later slices of #324 and #262. Incompatible peers fail closed
+//! rather than falling back to the per-session ward-daemon control protocol.
 
 #![forbid(unsafe_code)]
 
+mod admission;
 mod receipt;
+#[cfg(test)]
+mod test_fixtures;
 
+pub use admission::{
+    AdmissionEnvelopeJson, AdmissionVersion, CapabilityManifestBytes, IssuerProof, IssuerSignature,
+    MAX_ADMISSION_ENVELOPE_BYTES, MAX_ADMISSION_LINEAGE, TaskAdmissionAuthority,
+    TaskAdmissionEnvelope, TaskAdmissionEnvelopeInput, TaskAdmissionError, TaskWorkload,
+    WorkloadArgv,
+};
 pub use receipt::{
     TaskExecutionOutcome, TaskExecutionReceipt, TaskReceiptContext, TaskReceiptError,
 };
@@ -18,21 +28,25 @@ use std::fmt::{Display, Formatter};
 use std::num::{NonZeroU16, NonZeroU64};
 
 use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::ser::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ward_events::{ExecutionAttemptId, LeaseId, TaskId};
 
 /// The node protocol version currently implemented by this revision.
 ///
-/// Minor versions are backwards-compatible within one major version. The initial
-/// implementation supports only 1.0; later compatible additions widen the supported
-/// minor range explicitly.
-pub const WARD_NODE_PROTOCOL: SupportedProtocolRange = SupportedProtocolRange::valid(1, 0, 2);
+/// Minor versions are backwards-compatible within one major version; each compatible
+/// addition widens the supported minor range explicitly. This revision supports 1.0
+/// through 1.3.
+pub const WARD_NODE_PROTOCOL: SupportedProtocolRange = SupportedProtocolRange::valid(1, 0, 3);
 
 /// The first protocol version that supports node capability discovery.
 pub const CAPABILITY_DISCOVERY_PROTOCOL: ProtocolVersion = ProtocolVersion::new(1, 1);
 
 /// The first protocol version that supports task lifecycle messages.
 pub const TASK_LIFECYCLE_PROTOCOL: ProtocolVersion = ProtocolVersion::new(1, 2);
+
+/// The first protocol version that supports task admission and the `exited` state.
+pub const TASK_ADMISSION_PROTOCOL: ProtocolVersion = ProtocolVersion::new(1, 3);
 
 /// One negotiated node protocol version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -743,6 +757,26 @@ pub const fn supports_task_lifecycle(protocol: ProtocolVersion) -> bool {
         && protocol.minor >= TASK_LIFECYCLE_PROTOCOL.minor
 }
 
+/// Whether a negotiated protocol version supports task admission and the `exited` state.
+#[must_use]
+pub const fn supports_task_admission(protocol: ProtocolVersion) -> bool {
+    protocol.major == TASK_ADMISSION_PROTOCOL.major
+        && protocol.minor >= TASK_ADMISSION_PROTOCOL.minor
+}
+
+const fn supports_state(protocol: ProtocolVersion, state: TaskLifecycleState) -> bool {
+    match state {
+        TaskLifecycleState::Exited => supports_task_admission(protocol),
+        TaskLifecycleState::Created
+        | TaskLifecycleState::Ready
+        | TaskLifecycleState::Running
+        | TaskLifecycleState::Paused
+        | TaskLifecycleState::Stopped
+        | TaskLifecycleState::Revoked
+        | TaskLifecycleState::Sealed => true,
+    }
+}
+
 /// Stable idempotency identity for one mutating lifecycle command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -836,6 +870,9 @@ pub enum TaskLifecycleState {
     Paused,
     /// The task's workloads have been terminated.
     Stopped,
+    /// The task's workload exited on its own, without an operator stop. Protocol 1.3 and
+    /// later only.
+    Exited,
     /// The task's authority lease has been revoked.
     Revoked,
     /// The task's evidence has been sealed; the task is terminal.
@@ -870,7 +907,7 @@ pub enum TaskLifecycleRejectionReason {
 }
 
 /// Version-bound task lifecycle request. Inbound data is decoded through `TaskLifecycleContext`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum TaskLifecycleRequest {
     /// Create the task's execution attempt.
@@ -881,6 +918,24 @@ pub enum TaskLifecycleRequest {
         operation_id: OperationId,
         /// The task/attempt/lease this command applies to.
         binding: TaskBinding,
+    },
+    /// Admit a created task's workload and authority. Protocol 1.3 and later only.
+    ///
+    /// The envelope travels as the exact bytes the issuer signed. A receiver verifies
+    /// `proof` over `envelope_json` before decoding it, and then requires the decoded
+    /// envelope's binding to equal `binding`.
+    Admit {
+        /// The negotiated protocol version this message is bound to.
+        #[serde(serialize_with = "serialize_admission_protocol")]
+        protocol: ProtocolVersion,
+        /// Idempotency identity for this mutating command.
+        operation_id: OperationId,
+        /// The task/attempt/lease this command applies to.
+        binding: TaskBinding,
+        /// The signed admission envelope, carried verbatim.
+        envelope_json: AdmissionEnvelopeJson,
+        /// Detached issuer proof over exactly `envelope_json`.
+        proof: IssuerProof,
     },
     /// Start the task's admitted execution attempt.
     Start {
@@ -954,10 +1009,25 @@ pub enum TaskLifecycleRequest {
     },
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_admission_protocol<S>(
+    protocol: &ProtocolVersion,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if !supports_task_admission(*protocol) {
+        return Err(S::Error::custom(TaskLifecycleError::UnsupportedByProtocol));
+    }
+    protocol.serialize(serializer)
+}
+
 impl TaskLifecycleRequest {
-    const fn protocol(self) -> ProtocolVersion {
-        match self {
+    const fn protocol(&self) -> ProtocolVersion {
+        match *self {
             Self::Create { protocol, .. }
+            | Self::Admit { protocol, .. }
             | Self::Start { protocol, .. }
             | Self::Pause { protocol, .. }
             | Self::Resume { protocol, .. }
@@ -977,6 +1047,13 @@ enum TaskLifecycleRequestWire {
         protocol: ProtocolVersion,
         operation_id: OperationId,
         binding: TaskBinding,
+    },
+    Admit {
+        protocol: ProtocolVersion,
+        operation_id: OperationId,
+        binding: TaskBinding,
+        envelope_json: AdmissionEnvelopeJson,
+        proof: IssuerProof,
     },
     Start {
         protocol: ProtocolVersion,
@@ -1030,6 +1107,19 @@ impl From<TaskLifecycleRequestWire> for TaskLifecycleRequest {
                 protocol,
                 operation_id,
                 binding,
+            },
+            TaskLifecycleRequestWire::Admit {
+                protocol,
+                operation_id,
+                binding,
+                envelope_json,
+                proof,
+            } => Self::Admit {
+                protocol,
+                operation_id,
+                binding,
+                envelope_json,
+                proof,
             },
             TaskLifecycleRequestWire::Start {
                 protocol,
@@ -1102,8 +1192,9 @@ impl From<TaskLifecycleRequestWire> for TaskLifecycleRequest {
 }
 
 /// Version-bound task lifecycle response. Inbound data is decoded through `TaskLifecycleContext`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "response", rename_all = "snake_case")]
+///
+/// A response whose state is not part of its protocol version does not serialize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskLifecycleResponse {
     /// The mutating command was accepted and applied.
     Accepted {
@@ -1156,9 +1247,30 @@ impl TaskLifecycleResponse {
             | Self::Rejected { protocol, .. } => protocol,
         }
     }
+
+    const fn state(self) -> Option<TaskLifecycleState> {
+        match self {
+            Self::Accepted { state, .. } | Self::Inspected { state, .. } => Some(state),
+            Self::StreamReady { .. } | Self::Rejected { .. } => None,
+        }
+    }
 }
 
-#[derive(Deserialize)]
+impl Serialize for TaskLifecycleResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if let Some(state) = self.state()
+            && !supports_state(self.protocol(), state)
+        {
+            return Err(S::Error::custom(TaskLifecycleError::UnsupportedByProtocol));
+        }
+        TaskLifecycleResponseWire::from(*self).serialize(serializer)
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(tag = "response", rename_all = "snake_case", deny_unknown_fields)]
 enum TaskLifecycleResponseWire {
     Accepted {
@@ -1183,6 +1295,53 @@ enum TaskLifecycleResponseWire {
         binding: TaskBinding,
         reason: TaskLifecycleRejectionReason,
     },
+}
+
+impl From<TaskLifecycleResponse> for TaskLifecycleResponseWire {
+    fn from(response: TaskLifecycleResponse) -> Self {
+        match response {
+            TaskLifecycleResponse::Accepted {
+                protocol,
+                operation_id,
+                binding,
+                state,
+            } => Self::Accepted {
+                protocol,
+                operation_id,
+                binding,
+                state,
+            },
+            TaskLifecycleResponse::Inspected {
+                protocol,
+                binding,
+                state,
+            } => Self::Inspected {
+                protocol,
+                binding,
+                state,
+            },
+            TaskLifecycleResponse::StreamReady {
+                protocol,
+                binding,
+                from_seq,
+            } => Self::StreamReady {
+                protocol,
+                binding,
+                from_seq,
+            },
+            TaskLifecycleResponse::Rejected {
+                protocol,
+                operation_id,
+                binding,
+                reason,
+            } => Self::Rejected {
+                protocol,
+                operation_id,
+                binding,
+                reason,
+            },
+        }
+    }
 }
 
 impl From<TaskLifecycleResponseWire> for TaskLifecycleResponse {
@@ -1278,6 +1437,30 @@ impl TaskLifecycleContext {
             operation_id,
             binding,
         }
+    }
+
+    /// Build a [`TaskLifecycleRequest::Admit`] bound to this context's protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLifecycleError::UnsupportedByProtocol`] before protocol 1.3.
+    pub fn admit(
+        self,
+        operation_id: OperationId,
+        binding: TaskBinding,
+        envelope_json: AdmissionEnvelopeJson,
+        proof: IssuerProof,
+    ) -> Result<TaskLifecycleRequest, TaskLifecycleError> {
+        if !supports_task_admission(self.protocol) {
+            return Err(TaskLifecycleError::UnsupportedByProtocol);
+        }
+        Ok(TaskLifecycleRequest::Admit {
+            protocol: self.protocol,
+            operation_id,
+            binding,
+            envelope_json,
+            proof,
+        })
     }
 
     /// Build a [`TaskLifecycleRequest::Start`] bound to this context's protocol.
@@ -1394,6 +1577,11 @@ impl TaskLifecycleContext {
         let request: TaskLifecycleRequest = serde_json::from_str::<TaskLifecycleRequestWire>(json)
             .map(Into::into)
             .map_err(|_| TaskLifecycleError::MalformedMessage)?;
+        if matches!(request, TaskLifecycleRequest::Admit { .. })
+            && !supports_task_admission(self.protocol)
+        {
+            return Err(TaskLifecycleError::MalformedMessage);
+        }
         if request.protocol() != self.protocol {
             return Err(TaskLifecycleError::ProtocolMismatch);
         }
@@ -1468,6 +1656,11 @@ impl TaskLifecycleContext {
             serde_json::from_str::<TaskLifecycleResponseWire>(json)
                 .map(Into::into)
                 .map_err(|_| TaskLifecycleError::MalformedMessage)?;
+        if let Some(state) = response.state()
+            && !supports_state(self.protocol, state)
+        {
+            return Err(TaskLifecycleError::MalformedMessage);
+        }
         if response.protocol() != self.protocol {
             return Err(TaskLifecycleError::ProtocolMismatch);
         }
@@ -1486,6 +1679,8 @@ pub enum TaskLifecycleError {
     ProtocolMismatch,
     /// The message could not be decoded from its wire format.
     MalformedMessage,
+    /// The operation or state is not part of the negotiated protocol version.
+    UnsupportedByProtocol,
 }
 
 impl Display for TaskLifecycleError {
@@ -1500,6 +1695,9 @@ impl Display for TaskLifecycleError {
             Self::ProtocolMismatch => formatter
                 .write_str("task lifecycle message protocol does not match negotiated protocol"),
             Self::MalformedMessage => formatter.write_str("task lifecycle message is invalid"),
+            Self::UnsupportedByProtocol => {
+                formatter.write_str("operation is not part of the negotiated protocol")
+            }
         }
     }
 }
@@ -1651,10 +1849,10 @@ mod tests {
     }
 
     #[test]
-    fn current_protocol_supports_one_zero_through_one_two() {
+    fn current_protocol_supports_one_zero_through_one_three() {
         assert_eq!(WARD_NODE_PROTOCOL.major(), 1);
         assert_eq!(WARD_NODE_PROTOCOL.min_minor(), 0);
-        assert_eq!(WARD_NODE_PROTOCOL.max_minor(), 2);
+        assert_eq!(WARD_NODE_PROTOCOL.max_minor(), 3);
     }
 
     fn minimal_capabilities() -> NodeCapabilities {
@@ -1883,7 +2081,7 @@ mod tests {
             Err(TaskLifecycleError::ProtocolDoesNotSupportLifecycle)
         );
         assert_eq!(
-            TaskLifecycleContext::new(ProtocolVersion::new(1, 3)),
+            TaskLifecycleContext::new(ProtocolVersion::new(1, 4)),
             Err(TaskLifecycleError::ProtocolOutsideSupportedRange)
         );
     }
@@ -2090,5 +2288,312 @@ mod tests {
     fn lifecycle_operation_id_must_be_non_zero() {
         assert_eq!(OperationId::new(0), Err(OperationIdError::Zero));
         assert_eq!(OperationId::new(1).unwrap().get(), 1);
+    }
+
+    fn admit_fixture(minor: u16) -> String {
+        format!(
+            r#"{{"request":"admit","protocol":{{"major":1,"minor":{minor}}},"operation_id":11,{BOUND_BINDING},"envelope_json":"{}","proof":{}}}"#,
+            test_fixtures::ENVELOPE_JSON.replace('"', "\\\""),
+            test_fixtures::PROOF_JSON
+        )
+    }
+
+    const BOUND_BINDING: &str = r#""binding":{"task":"task_00000000000000000000000007","attempt":"exec_00000000000000000000000008","lease":"lease_00000000000000000000000009"}"#;
+
+    fn envelope_json() -> AdmissionEnvelopeJson {
+        AdmissionEnvelopeJson::encode(&test_fixtures::envelope()).unwrap()
+    }
+
+    #[test]
+    fn task_admission_is_a_protocol_one_three_feature() {
+        assert_eq!(TASK_ADMISSION_PROTOCOL, ProtocolVersion::new(1, 3));
+        assert!(!supports_task_admission(ProtocolVersion::new(1, 1)));
+        assert!(!supports_task_admission(ProtocolVersion::new(1, 2)));
+        assert!(supports_task_admission(ProtocolVersion::new(1, 3)));
+        assert!(!supports_task_admission(ProtocolVersion::new(2, 3)));
+
+        let one_two = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        let one_three = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let operation = OperationId::new(11).unwrap();
+        let binding = lifecycle_binding();
+        let proof = test_fixtures::proof();
+
+        assert_eq!(
+            one_two.admit(operation, binding, envelope_json(), proof),
+            Err(TaskLifecycleError::UnsupportedByProtocol)
+        );
+        assert_eq!(
+            one_three.admit(operation, binding, envelope_json(), proof),
+            Ok(TaskLifecycleRequest::Admit {
+                protocol: ProtocolVersion::new(1, 3),
+                operation_id: operation,
+                binding,
+                envelope_json: envelope_json(),
+                proof,
+            })
+        );
+    }
+
+    #[test]
+    fn admit_request_wire_fixture_is_stable_at_one_three() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let request = context
+            .admit(
+                OperationId::new(11).unwrap(),
+                lifecycle_binding(),
+                envelope_json(),
+                test_fixtures::proof(),
+            )
+            .unwrap();
+        let fixture = admit_fixture(3);
+
+        assert_eq!(serde_json::to_string(&request).unwrap(), fixture);
+        let decoded = context.decode_request(&fixture).unwrap();
+        assert_eq!(decoded, request);
+
+        let TaskLifecycleRequest::Admit {
+            envelope_json,
+            proof,
+            ..
+        } = decoded
+        else {
+            panic!("admit must decode as admit");
+        };
+        assert_eq!(
+            envelope_json.as_bytes(),
+            test_fixtures::ENVELOPE_JSON.as_bytes()
+        );
+        assert_eq!(envelope_json.decode().unwrap(), test_fixtures::envelope());
+        assert_eq!(proof, test_fixtures::proof());
+    }
+
+    #[test]
+    fn one_two_context_refuses_admit_exactly_like_an_unknown_request() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        let unknown = format!(
+            r#"{{"request":"unknown","protocol":{{"major":1,"minor":2}},{BOUND_BINDING}}}"#
+        );
+        let unknown_error = context.decode_request(&unknown).unwrap_err();
+        assert_eq!(unknown_error, TaskLifecycleError::MalformedMessage);
+
+        for minor in [2, 3] {
+            assert_eq!(
+                context.decode_request(&admit_fixture(minor)),
+                Err(unknown_error),
+                "admit claiming 1.{minor} on a 1.2 connection"
+            );
+        }
+
+        let forged = TaskLifecycleRequest::Admit {
+            protocol: ProtocolVersion::new(1, 2),
+            operation_id: OperationId::new(11).unwrap(),
+            binding: lifecycle_binding(),
+            envelope_json: envelope_json(),
+            proof: test_fixtures::proof(),
+        };
+        assert!(
+            serde_json::to_string(&forged).is_err(),
+            "admit must not be representable on the 1.2 wire"
+        );
+    }
+
+    #[test]
+    fn admit_request_decode_refuses_unknown_fields_and_unbounded_parts() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(&admit_fixture(3)).unwrap();
+
+        let mut extra = fixture.clone();
+        extra["extra"] = serde_json::json!(true);
+        let mut decoded_envelope = fixture.clone();
+        decoded_envelope["envelope"] = serde_json::from_str(test_fixtures::ENVELOPE_JSON).unwrap();
+        let mut extra_proof = fixture.clone();
+        extra_proof["proof"]["algorithm"] = serde_json::json!("none");
+        let mut short_signature = fixture.clone();
+        short_signature["proof"]["signature"] = serde_json::json!("33");
+        let mut empty_envelope = fixture.clone();
+        empty_envelope["envelope_json"] = serde_json::json!("");
+        let mut oversized_envelope = fixture.clone();
+        oversized_envelope["envelope_json"] =
+            serde_json::json!(" ".repeat(MAX_ADMISSION_ENVELOPE_BYTES + 1));
+        let mut object_envelope = fixture.clone();
+        object_envelope["envelope_json"] =
+            serde_json::from_str(test_fixtures::ENVELOPE_JSON).unwrap();
+        let mut zero_operation = fixture.clone();
+        zero_operation["operation_id"] = serde_json::json!(0);
+
+        let mut cases = vec![
+            extra,
+            decoded_envelope,
+            extra_proof,
+            short_signature,
+            empty_envelope,
+            oversized_envelope,
+            object_envelope,
+            zero_operation,
+        ];
+        for field in ["binding", "envelope_json", "proof", "operation_id"] {
+            let mut missing = fixture.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            cases.push(missing);
+        }
+
+        for value in cases {
+            assert_eq!(
+                context.decode_request(&value.to_string()),
+                Err(TaskLifecycleError::MalformedMessage),
+                "{value}"
+            );
+        }
+
+        let one_three_claiming_one_two = admit_fixture(2);
+        assert_eq!(
+            context.decode_request(&one_three_claiming_one_two),
+            Err(TaskLifecycleError::ProtocolMismatch)
+        );
+    }
+
+    #[test]
+    fn admit_carries_envelope_bytes_opaquely_until_they_are_decoded() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(test_fixtures::ENVELOPE_JSON).unwrap();
+        invalid["workload"]["argv"] = serde_json::json!([]);
+        invalid["workspace"] = serde_json::json!("/srv/tasks/7");
+        let invalid = invalid.to_string();
+
+        let mut request: serde_json::Value = serde_json::from_str(&admit_fixture(3)).unwrap();
+        request["envelope_json"] = serde_json::json!(invalid);
+        let TaskLifecycleRequest::Admit { envelope_json, .. } =
+            context.decode_request(&request.to_string()).unwrap()
+        else {
+            panic!("admit must decode as admit");
+        };
+
+        assert_eq!(envelope_json.as_bytes(), invalid.as_bytes());
+        assert_eq!(
+            envelope_json.decode(),
+            Err(TaskAdmissionError::MalformedEnvelope)
+        );
+    }
+
+    #[test]
+    fn exited_state_has_stable_wire_at_one_three() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let binding = lifecycle_binding();
+        let operation = OperationId::new(11).unwrap();
+
+        let cases = [
+            (
+                context.accepted(operation, binding, TaskLifecycleState::Exited),
+                format!(
+                    r#"{{"response":"accepted","protocol":{{"major":1,"minor":3}},"operation_id":11,{BOUND_BINDING},"state":"exited"}}"#
+                ),
+            ),
+            (
+                context.inspected(binding, TaskLifecycleState::Exited),
+                format!(
+                    r#"{{"response":"inspected","protocol":{{"major":1,"minor":3}},{BOUND_BINDING},"state":"exited"}}"#
+                ),
+            ),
+        ];
+        for (response, expected) in cases {
+            assert_eq!(serde_json::to_string(&response).unwrap(), expected);
+            assert_eq!(context.decode_response(&expected).unwrap(), response);
+        }
+    }
+
+    #[test]
+    fn exited_state_is_neither_representable_nor_accepted_before_one_three() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        let binding = lifecycle_binding();
+        let operation = OperationId::new(11).unwrap();
+
+        for response in [
+            context.accepted(operation, binding, TaskLifecycleState::Exited),
+            context.inspected(binding, TaskLifecycleState::Exited),
+        ] {
+            assert!(
+                serde_json::to_string(&response).is_err(),
+                "{response:?} must not be representable on the 1.2 wire"
+            );
+        }
+
+        let unknown_state = format!(
+            r#"{{"response":"inspected","protocol":{{"major":1,"minor":2}},{BOUND_BINDING},"state":"vanished"}}"#
+        );
+        let unknown_error = context.decode_response(&unknown_state).unwrap_err();
+        assert_eq!(unknown_error, TaskLifecycleError::MalformedMessage);
+        for raw in [
+            format!(
+                r#"{{"response":"accepted","protocol":{{"major":1,"minor":2}},"operation_id":11,{BOUND_BINDING},"state":"exited"}}"#
+            ),
+            format!(
+                r#"{{"response":"inspected","protocol":{{"major":1,"minor":2}},{BOUND_BINDING},"state":"exited"}}"#
+            ),
+            format!(
+                r#"{{"response":"inspected","protocol":{{"major":1,"minor":3}},{BOUND_BINDING},"state":"exited"}}"#
+            ),
+        ] {
+            assert_eq!(context.decode_response(&raw), Err(unknown_error), "{raw}");
+        }
+
+        let stopped = context.inspected(binding, TaskLifecycleState::Stopped);
+        assert_eq!(
+            serde_json::to_string(&stopped).unwrap(),
+            format!(
+                r#"{{"response":"inspected","protocol":{{"major":1,"minor":2}},{BOUND_BINDING},"state":"stopped"}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn one_two_lifecycle_verbs_keep_their_wire_at_one_three() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let binding = lifecycle_binding();
+        let operation = OperationId::new(11).unwrap();
+
+        for (request, verb) in [
+            (context.create(operation, binding), "create"),
+            (context.start(operation, binding), "start"),
+            (context.pause(operation, binding), "pause"),
+            (context.resume(operation, binding), "resume"),
+            (context.stop(operation, binding), "stop"),
+            (context.revoke(operation, binding), "revoke"),
+            (context.seal(operation, binding), "seal"),
+        ] {
+            let expected = format!(
+                r#"{{"request":"{verb}","protocol":{{"major":1,"minor":3}},"operation_id":11,{BOUND_BINDING}}}"#
+            );
+            assert_eq!(serde_json::to_string(&request).unwrap(), expected);
+            assert_eq!(context.decode_request(&expected).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn capability_discovery_at_one_three_advertises_nothing_new() {
+        let one_one = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 1)).unwrap();
+        let one_three = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let minimal = minimal_capabilities();
+        let restamped = NodeCapabilities::new(
+            ProtocolVersion::new(1, 3),
+            minimal.architecture(),
+            minimal.capacity(),
+            minimal.isolation(),
+            minimal.network(),
+            minimal.credentials(),
+            minimal.snapshots(),
+            minimal.verifier(),
+            minimal.lifecycle(),
+        )
+        .unwrap();
+
+        let old = serde_json::to_string(&one_one.response(minimal).unwrap()).unwrap();
+        let new = serde_json::to_string(&one_three.response(restamped).unwrap()).unwrap();
+        assert_eq!(
+            new,
+            old.replace(r#""minor":1"#, r#""minor":3"#),
+            "a 1.3 capability document must not advertise admission or execution"
+        );
+        assert!(one_three.decode_response(&new).is_ok());
     }
 }
