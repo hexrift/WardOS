@@ -601,7 +601,9 @@ node's uid, or as a uid the operator lists for the socket (node-integration.md ย
 remote transport is #262. What the node does not enforce at this revision,
 gap by gap, is [node-security-limitations.md](node-security-limitations.md); the walk
 from an empty host to a verified attempt is
-[node-integration-guide.md](node-integration-guide.md).
+[node-integration-guide.md](node-integration-guide.md). How this node mode relates to
+the per-session `wardd` of ยง3.1, what the two share on one host and the staged path from
+one to the other is [migration-to-node.md](migration-to-node.md).
 
 ---
 

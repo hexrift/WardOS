@@ -27,6 +27,7 @@ wardos/
 │   ├── node-integration-guide.md  # an operator's walk from an empty host to a verified attempt
 │   ├── node-security-limitations.md # what the node enforces and what it does not yet
 │   ├── node-release-readiness.md  # what CI proves about the node and what a release publishes
+│   ├── migration-to-node.md       # per-session wardd and ward-node side by side; the staged path and compatibility
 │   ├── design-language.md
 │   ├── performance.md
 │   ├── experiments.md
