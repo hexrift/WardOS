@@ -33,6 +33,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
+# One run per pull request: a push to a pull request cancels the run it supersedes
+# (issue #391). A push to main is never cancelled.
+concurrency:
+  group: tamperward-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 

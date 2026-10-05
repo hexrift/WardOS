@@ -29,6 +29,13 @@ on:
       - ".dockerignore"
       - ".github/workflows/image.yml"
 
+# One run per pull request: a push to a pull request cancels the run it supersedes
+# (issue #391). A push to main is never cancelled: that run publishes the image. The
+# manifest job below keeps its own group, which serialises publication.
+concurrency:
+  group: image-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # `packages: write` is deliberately NOT granted here (#164 finding 2): `docker build`
   # runs an attacker-influenced Containerfile/build context, including on an internal
