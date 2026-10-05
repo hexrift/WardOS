@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::ValueEnum;
+use ward_daemon::verify_proposal::{self, Proposal};
 use ward_daemon::{Error, Result, gateway};
 use ward_policy::Policy;
 
@@ -73,38 +74,6 @@ pub struct Options {
     pub key_in_env: bool,
 }
 
-/// The build system a directory shows, which decides the verify command.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ecosystem {
-    Cargo,
-    Npm,
-    Python,
-    Unknown,
-}
-
-impl Ecosystem {
-    fn detect(dir: &Path) -> Self {
-        if dir.join("Cargo.toml").is_file() {
-            Self::Cargo
-        } else if dir.join("package.json").is_file() {
-            Self::Npm
-        } else if dir.join("pyproject.toml").is_file() {
-            Self::Python
-        } else {
-            Self::Unknown
-        }
-    }
-
-    const fn verify_command(self) -> Option<&'static str> {
-        match self {
-            Self::Cargo => Some("cargo test"),
-            Self::Npm => Some("npm test"),
-            Self::Python => Some("pytest"),
-            Self::Unknown => None,
-        }
-    }
-}
-
 /// What happened to one item of the plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Outcome {
@@ -128,6 +97,7 @@ struct Step {
 /// The result of `ward init`: the rows, and what to do next.
 pub struct Report {
     steps: Vec<Step>,
+    proposals: Vec<Proposal>,
     next: Vec<(String, &'static str)>,
     dry_run: bool,
     dir: PathBuf,
@@ -154,6 +124,25 @@ impl Report {
             };
             let _ = writeln!(out, "  {:<11} {:<width$}  {outcome}", s.label, s.path);
         }
+        if !self.proposals.is_empty() {
+            let _ = writeln!(out, "\nVerify command, from the project's files");
+            let width = self
+                .proposals
+                .iter()
+                .map(|p| p.command.len())
+                .max()
+                .unwrap_or(0);
+            for p in &self.proposals {
+                let _ = writeln!(out, "  {:<width$}   {}", p.command, p.evidence.join(" · "));
+            }
+            if self.proposals.len() > 1 {
+                let _ = writeln!(
+                    out,
+                    "  several match: none was chosen; uncomment one in {}",
+                    ward_daemon::verify::CONFIG_PATH
+                );
+            }
+        }
         let _ = writeln!(out, "\nNext");
         let width = self.next.iter().map(|(c, _)| c.len()).max().unwrap_or(0);
         for (command, why) in &self.next {
@@ -174,7 +163,7 @@ pub fn run(opts: &Options) -> Result<Report> {
     } else {
         opts.dir.clone()
     };
-    let ecosystem = Ecosystem::detect(&dir);
+    let proposals = verify_proposal::propose(&dir);
     let mut steps = Vec::new();
 
     steps.push(Step {
@@ -191,14 +180,20 @@ pub fn run(opts: &Options) -> Result<Report> {
         path: ".gitignore".to_owned(),
         outcome: ignore_sessions(&dir, opts.dry_run)?,
     });
+    let verifier = write_new(
+        &dir.join(".tamperward/config.yml"),
+        &verifier_config(&proposals),
+        opts.dry_run,
+    )?;
+    let shown = if verifier == Outcome::Written {
+        proposals.clone()
+    } else {
+        Vec::new()
+    };
     steps.push(Step {
         label: "verifier",
         path: ".tamperward/config.yml".to_owned(),
-        outcome: match write_new(
-            &dir.join(".tamperward/config.yml"),
-            &verifier_config(ecosystem),
-            opts.dry_run,
-        )? {
+        outcome: match verifier {
             Outcome::Written => Outcome::Note(format!(
                 "{} ({})",
                 if opts.dry_run {
@@ -206,14 +201,16 @@ pub fn run(opts: &Options) -> Result<Report> {
                 } else {
                     "written"
                 },
-                ecosystem
-                    .verify_command()
-                    .unwrap_or("no test command recognised: set verify.command")
+                match proposals.as_slice() {
+                    [] => "no test command recognised: set verify.command".to_owned(),
+                    [only] => only.command.clone(),
+                    several => format!("{} candidates, none chosen", several.len()),
+                }
             )),
             other => other,
         },
     });
-    steps.push(tamperward_step(&dir, ecosystem, opts)?);
+    steps.push(tamperward_step(&dir, &proposals, opts)?);
 
     let key_in_vault =
         std::fs::read_to_string(gateway::vault_file(&opts.state, opts.agent.key_env()))
@@ -236,6 +233,7 @@ pub fn run(opts: &Options) -> Result<Report> {
     ));
     Ok(Report {
         steps,
+        proposals: shown,
         next,
         dry_run: opts.dry_run,
         dir,
@@ -435,9 +433,11 @@ fn ignores_sessions(line: &str) -> bool {
 }
 
 /// `.tamperward/config.yml`, the verifier's view: the tests only it may judge, and
-/// the command it runs. The command is guessed from the build files; without one the
-/// key is left commented so `ward verify` says exactly what is missing.
-fn verifier_config(ecosystem: Ecosystem) -> String {
+/// the command it runs. The command is the one proposal read from the project's
+/// files ([`verify_proposal::propose`]), with its evidence beside it. With none, or
+/// with several to choose from, the key is left commented so `ward verify` says
+/// exactly what is missing and the user, not `ward init`, picks the command.
+fn verifier_config(proposals: &[Proposal]) -> String {
     let mut text = String::from(
         "# .tamperward/config.yml — what `ward verify` runs (written by `ward init`).\n\
          #\n\
@@ -448,16 +448,35 @@ fn verifier_config(ecosystem: Ecosystem) -> String {
          protected:\n  tests:\n    - tests/\n\
          verify:\n",
     );
-    match ecosystem.verify_command() {
-        Some(command) => {
-            let _ = writeln!(text, "  command: {command}");
-        }
-        None => {
+    match proposals {
+        [] => {
             let _ = writeln!(
                 text,
-                "  # No Cargo.toml, package.json or pyproject.toml here: name the test command.\n  \
+                "  # No test command recognised from this project's files: name the test command.\n  \
                  # command: make test"
             );
+        }
+        [only] => {
+            let _ = writeln!(
+                text,
+                "  # Proposed from {}.\n  command: {}",
+                only.evidence.join(", "),
+                only.command
+            );
+        }
+        several => {
+            let _ = writeln!(
+                text,
+                "  # Several test commands match this project: uncomment the one to run."
+            );
+            for p in several {
+                let _ = writeln!(
+                    text,
+                    "  # From {}:\n  # command: {}",
+                    p.evidence.join(", "),
+                    p.command
+                );
+            }
         }
     }
     text.push_str("  budget_secs: 600\n");
@@ -466,8 +485,9 @@ fn verifier_config(ecosystem: Ecosystem) -> String {
 
 /// TamperWard's own policy, written only when `tamperward` is not installed: enough
 /// for `tamperward check` to guard the tests once it is, and a pointer to the full
-/// wiring. `tamperward init` keeps this file when it runs later.
-fn tamperward_policy(ecosystem: Ecosystem) -> String {
+/// wiring. `tamperward init` keeps this file when it runs later. The verify block is
+/// active only when exactly one command was proposed, as in [`verifier_config`].
+fn tamperward_policy(proposals: &[Proposal]) -> String {
     let mut text = String::from(
         "# .tamperward.yml — TamperWard policy (written by `ward init`; TamperWard was not\n\
          # installed). Once it is (`npx tamperward init`, Node.js 20.19 or later; the WardOS\n\
@@ -476,14 +496,21 @@ fn tamperward_policy(ecosystem: Ecosystem) -> String {
          version: 1\n\
          protected:\n  tests: ['tests/**']\n",
     );
-    match ecosystem.verify_command() {
-        Some(command) => {
-            let _ = writeln!(text, "verify:\n  command: {command}\n  budget: 600");
-        }
-        None => {
+    match proposals {
+        [] => {
             text.push_str(
                 "# verify:\n#   command: <the command that runs this project's tests>\n#   budget: 600\n",
             );
+        }
+        [only] => {
+            let _ = writeln!(text, "verify:\n  command: {}\n  budget: 600", only.command);
+        }
+        several => {
+            text.push_str("# Several test commands match this project: keep one.\n# verify:\n");
+            for p in several {
+                let _ = writeln!(text, "#   command: {}", p.command);
+            }
+            text.push_str("#   budget: 600\n");
         }
     }
     text
@@ -491,7 +518,7 @@ fn tamperward_policy(ecosystem: Ecosystem) -> String {
 
 /// The TamperWard step: run `tamperward init --cwd <dir>` and show its output, or
 /// write the minimal policy and say how to get the rest.
-fn tamperward_step(dir: &Path, ecosystem: Ecosystem, opts: &Options) -> Result<Step> {
+fn tamperward_step(dir: &Path, proposals: &[Proposal], opts: &Options) -> Result<Step> {
     let path = ".tamperward.yml".to_owned();
     if opts.no_tamperward {
         return Ok(Step {
@@ -503,7 +530,7 @@ fn tamperward_step(dir: &Path, ecosystem: Ecosystem, opts: &Options) -> Result<S
     let Some(bin) = &opts.tamperward else {
         let outcome = match write_new(
             &dir.join(&path),
-            &tamperward_policy(ecosystem),
+            &tamperward_policy(proposals),
             opts.dry_run,
         )? {
             Outcome::Written => Outcome::Note(format!(
@@ -650,14 +677,14 @@ mod tests {
 
     #[test]
     fn guesses_the_verify_command_from_the_build_files() {
-        for (file, command) in [
-            ("Cargo.toml", "cargo test"),
-            ("package.json", "npm test"),
-            ("pyproject.toml", "pytest"),
+        for (file, content, command) in [
+            ("Cargo.toml", "", "cargo test"),
+            ("package.json", r#"{"scripts":{"test":"jest"}}"#, "npm test"),
+            ("pyproject.toml", "[tool.pytest.ini_options]\n", "pytest"),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join(file), "").unwrap();
+            std::fs::write(dir.path().join(file), content).unwrap();
             run(&options(dir.path(), state.path())).unwrap();
             let verifier = read(&dir.path().join(".tamperward/config.yml"));
             assert!(
@@ -679,6 +706,72 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("verify.command is empty"), "{err}");
+    }
+
+    #[test]
+    fn proposes_the_verify_command_from_the_project_files_and_shows_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+        let text = run(&options(dir.path(), state.path())).unwrap().render();
+        let verifier = read(&dir.path().join(".tamperward/config.yml"));
+        assert!(verifier.contains("  command: pnpm test\n"), "{verifier}");
+        assert!(ward_daemon::verify::Config::parse(&verifier).is_ok());
+        let policy = read(&dir.path().join(".tamperward.yml"));
+        assert!(policy.contains("command: pnpm test"), "{policy}");
+        assert!(text.contains("pnpm test"), "{text}");
+        assert!(text.contains("package.json scripts.test"), "{text}");
+        assert!(text.contains("pnpm-lock.yaml"), "{text}");
+    }
+
+    #[test]
+    fn several_candidates_are_all_shown_and_none_is_chosen_for_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        std::fs::write(dir.path().join("Makefile"), "test:\n\tcargo test\n").unwrap();
+        let text = run(&options(dir.path(), state.path())).unwrap().render();
+        let verifier = read(&dir.path().join(".tamperward/config.yml"));
+        assert!(
+            verifier.contains("# command: cargo test --locked"),
+            "{verifier}"
+        );
+        assert!(verifier.contains("# command: make test"), "{verifier}");
+        let err = ward_daemon::verify::Config::parse(&verifier)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("verify.command is empty"), "{err}");
+        let policy = read(&dir.path().join(".tamperward.yml"));
+        assert!(!policy.contains("\nverify:"), "{policy}");
+        assert!(policy.contains("#   command: make test"), "{policy}");
+        assert!(text.contains("cargo test --locked"), "{text}");
+        assert!(text.contains("test target in Makefile"), "{text}");
+        assert!(text.contains("uncomment one"), "{text}");
+    }
+
+    #[test]
+    fn a_package_json_without_a_test_script_proposes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"tsc"}}"#,
+        )
+        .unwrap();
+        let text = run(&options(dir.path(), state.path())).unwrap().render();
+        let verifier = read(&dir.path().join(".tamperward/config.yml"));
+        assert!(verifier.contains("# command: make test"), "{verifier}");
+        assert!(text.contains("no test command recognised"), "{text}");
     }
 
     #[test]

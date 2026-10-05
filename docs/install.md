@@ -88,8 +88,9 @@ ward verify                        # the protected tests, from the entry snapsho
 is absent, never a file you wrote, and reports each item (`written`, `already there,
 left as is`). The policy it writes is the secure default with a comment per block, so
 the file reads as a description of what the agent gets; the verifier config names the
-protected tests (`tests/`) and a command guessed from `Cargo.toml`, `package.json` or
-`pyproject.toml`; when `tamperward` is installed, `tamperward init --cwd DIR` wires
+protected tests (`tests/`) and the verify command proposed from the project's manifests,
+lockfiles and test configuration, with the files that justify it (several candidates are
+listed commented, for you to pick one); when `tamperward` is installed, `tamperward init --cwd DIR` wires
 its policy, the Claude Code hooks, a pre-commit hook and a CI workflow (`--no-tamperward`
 leaves that alone), and without it a minimal `.tamperward.yml` is written and the
 report says how to get the rest. `--agent codex` names Codex and its key in the closing
