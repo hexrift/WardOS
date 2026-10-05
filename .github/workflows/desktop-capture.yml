@@ -1,0 +1,119 @@
+# The README's desktop, captured for real (issue #84, docs/desktop.md "The README
+# animation"): the shipped Hyprland on a headless 1920x1080 output, software-rendered, in
+# the Fedora release the image pins, with Waybar, mako, fuzzel and foot from the image's
+# package set and the ward binaries of this checkout. desktop/capture/capture.sh drives
+# the scenes of desktop/capture/scenes.tsv through hyprctl dispatch and
+# wardos-menu-select, takes one grim shot per scene, and assembles the GIF; the GIF and
+# the shots are the artifact `wardos-desktop-capture`. Nothing here writes to the
+# repository: desktop/capture/refresh.sh brings a run's GIF into assets/ by hand.
+# Weekly on main, by hand (on a release tag too: `gh workflow run desktop-capture.yml
+# --ref vX.Y.Z`), and on pull requests that touch what is on screen.
+name: desktop capture
+
+on:
+  pull_request:
+    paths:
+      - "desktop/**"
+      - "image/**"
+      - "examples/ward-demo/**"
+      - "assets/wardos-desktop.gif"
+      - ".github/workflows/desktop-capture.yml"
+  schedule:
+    - cron: "37 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-capture-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The binaries on the runner, where the pinned toolchain and its cache already are; they
+  # link only glibc, so they run unchanged in the newer Fedora container below.
+  binaries:
+    name: desktop capture binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (2026-09-21)
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+      - run: cargo build --release --locked -p ward-cli -p ward-daemon -p ward-shell -p wardos-theme
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-capture-binaries
+          path: |
+            target/release/ward
+            target/release/wardd
+            target/release/ward-shell
+            target/release/wardos-theme-render
+          if-no-files-found: error
+          retention-days: 1
+
+  # No GPU and no /dev/dri: Hyprland runs on aquamarine's headless backend
+  # (HYPRLAND_HEADLESS_ONLY=1) with Mesa's llvmpipe, as an unprivileged user. A scene that
+  # does not come up fails the job with Hyprland's log; it cannot go green without the shots.
+  capture:
+    name: desktop capture (Hyprland headless, Fedora)
+    needs: binaries
+    runs-on: ubuntu-latest
+    container: fedora:44
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install git for checkout
+        run: dnf install -y --setopt=install_weak_deps=False git-core tar
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: desktop-capture-binaries
+          path: /tmp/capture-binaries
+      # The COPRs the image enables (image/coprs.txt), then the packages of
+      # desktop/capture/packages.txt: the image's own for everything on screen.
+      - name: Install the shipped desktop stack
+        run: |
+          set -euo pipefail
+          source image/dnf-retry.sh
+          retry 3 5 dnf -y -q install dnf5-plugins
+          while read -r copr; do
+            retry 3 5 dnf -y -q copr enable "$copr"
+          done < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' image/coprs.txt)
+          mapfile -t pkgs < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' desktop/capture/packages.txt)
+          retry 3 5 dnf -y --setopt=install_weak_deps=False install "${pkgs[@]}"
+          Hyprland --version | sed -n 1p
+      # The tree placed by the script the Containerfile runs, the checkout's binaries in
+      # /usr/bin as the image has them, and the unprivileged user the session runs as.
+      - name: Place the desktop and the binaries
+        run: |
+          set -euo pipefail
+          image/install-desktop.sh desktop /
+          install -m 0755 /tmp/capture-binaries/* /usr/bin/
+          useradd -m -s /bin/bash wardos
+          install -d -o wardos -g wardos capture-out
+      - name: Capture
+        run: runuser -u wardos -- env HOME=/home/wardos USER=wardos LANG=en_US.UTF-8 desktop/capture/capture.sh "$PWD/capture-out"
+      - name: Summary
+        if: always()
+        run: if [[ -f capture-out/summary.md ]]; then cat capture-out/summary.md >>"$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wardos-desktop-capture
+          path: |
+            capture-out/wardos-desktop.gif
+            capture-out/frames/
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: wardos-desktop-capture-logs
+          path: capture-out/
+          retention-days: 14

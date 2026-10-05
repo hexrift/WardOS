@@ -29,6 +29,8 @@ desktop/
   systemd/      user units (battery monitor, approval listener, swayosd)
   flatpaks.txt  default Flathub applications, one id per line with its purpose
   tests/        run.sh (shellcheck + every *.test.sh with a mocked PATH)
+  capture/      the README capture: capture.sh, scenes.tsv, assemble.py, refresh.sh and the
+                packages it installs (CI only, see "The README animation")
   install.sh    apply the desktop on an existing Fedora (Workstation, Silverblue, Kinoite)
   shell/        the ward-shell binary (already present)
 ```
@@ -55,7 +57,7 @@ a link to that directory (so `source = ./envs.conf` resolves), `config/` →
 `/usr/share/wardos/`, `systemd/user/` → `/usr/lib/systemd/user` with
 `/usr/lib/systemd/user-preset/90-wardos.preset` enabling every unit that has `[Install]`.
 Login is greetd, set up by the image itself (`image/rootfs/etc/greetd`), not by this
-step. `shell/`, `theme/` and `tests/` never land on the host. Every row is asserted by
+step. `shell/`, `theme/`, `tests/` and `capture/` never land on the host. Every row is asserted by
 `desktop/tests/install.test.sh` against a temp root.
 
 **First-boot provisioning ([ADR-0027](decisions/ADR-0027-first-boot-provisioning.md)).**
@@ -427,8 +429,8 @@ as fallbacks; and the `en_US` locale.
 
 `image/check-hyprland.sh` (CI job `hyprland config`) parses `desktop/hyprland/` with the
 Hyprland the image ships, so a removed or renamed option fails a pull request instead of
-showing in a booted desktop's error bar. `desktop/tests/run.sh` shellchecks `desktop/bin/*`, `desktop/lib/*`, `desktop/install.sh`
-and runs every `desktop/tests/*.test.sh`. A test puts a directory of mock commands
+showing in a booted desktop's error bar. `desktop/tests/run.sh` shellchecks `desktop/bin/*`, `desktop/lib/*`, `desktop/install.sh`,
+`desktop/capture/*.sh` and runs every `desktop/tests/*.test.sh`. A test puts a directory of mock commands
 first on `PATH` (each mock appends its arguments to `$MOCK_LOG`), sets
 `WARDOS_MENU_BACKEND=stdin` with `WARDOS_MENU_CHOICE=<answer>`, points `HOME` and `XDG_*`
 at a temp dir, and asserts on the log and the files written. Rust parts (the theme
@@ -444,8 +446,43 @@ by [`assets/storyboard/`](../assets/storyboard/README.md). It is not a composito
 capture, and the README says so under it. Decision: the first five minutes are worth
 showing now, and every string in the storyboard is one the desktop prints, so nothing
 in it can drift from the product without the tests noticing first. The capture that
-replaces it runs Hyprland headless in CI, issue #84; when it lands, the storyboard
-directory goes.
+replaces it runs Hyprland headless in CI (issue #84, below); once a captured GIF has
+taken its place, the storyboard directory goes.
+
+The capture is the workflow `desktop capture` (`.github/workflows/desktop-capture.yml`):
+weekly on `main`, by hand, and on pull requests that touch `desktop/` or `image/`. In the
+Fedora release the image pins, with the COPRs of `image/coprs.txt` and the packages of
+`desktop/capture/packages.txt` (the image's own for everything on screen), the tree is
+placed by `image/install-desktop.sh`, the `ward` binaries of the checkout go to
+`/usr/bin`, and [`desktop/capture/capture.sh`](../desktop/capture/capture.sh) runs as an
+unprivileged user. It sets the user up as a first login leaves it, starts a session bus
+and the shipped Hyprland on a headless 1920x1080 output (`HYPRLAND_HEADLESS_ONLY=1`,
+Mesa's llvmpipe; no GPU), and walks
+[`desktop/capture/scenes.tsv`](../desktop/capture/scenes.tsv). Each scene is started
+through `hyprctl dispatch exec` (the welcome steps, `wardos-launch run`, `wardos-menu`,
+`wardos-theme`, `wardos-power`), waited for in `hyprctl layers` and `hyprctl clients`
+rather than slept on, shot with `grim`, and closed again (a menu is cancelled the way
+Escape would). `assemble.py` makes the GIF from the shots with each scene's
+milliseconds, 1280x720 and 128 colours like the storyboard. A required scene that does
+not come up fails the job with Hyprland's log; the lock screen is optional and is left
+out, with a warning, when hyprlock cannot draw headless. The GIF and the shots are the
+artifact `wardos-desktop-capture`.
+
+What it does not show, and why: the boot splash (Plymouth is not a compositor surface),
+anything an agent does (CI has no model key: the agent at work, an approval), `ward
+verify` and its `STALE` (the verifier runs ward-demo's `cargo test` in a user namespace;
+the container has neither), and typed input (the capture presses no keys: the key
+prompt, a cloned repository). The session is `ward up` on a copy of `examples/ward-demo`,
+which needs no sandbox. Every pixel is the compositor's; nothing is drawn afterwards.
+
+No workflow writes to the repository. A maintainer brings a run's GIF into
+`assets/wardos-desktop.gif`, from the newest green run on `main` or from a release tag
+captured with `gh workflow run desktop-capture.yml --ref vX.Y.Z`, and commits it in a
+pull request:
+
+```sh
+desktop/capture/refresh.sh [--ref vX.Y.Z | --run ID]
+```
 
 ## Parity
 

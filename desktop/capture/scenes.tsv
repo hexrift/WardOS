@@ -1,0 +1,20 @@
+# The README capture, one row per scene, in order (desktop/capture/capture.sh runs
+# scene_<id>, shoots, then leave_<id> when there is one; assemble.py shows each shot for
+# its milliseconds). Tab-separated:
+#   id  ms  need  story  what
+# need: required fails the capture when the scene is not on screen in time; optional
+# leaves it out with a warning. story: the caption of the assets/storyboard/story.py
+# frame this scene replaces (its milliseconds must match, desktop-capture.test.sh), or -.
+# what: what is on screen, for the job summary.
+desktop	1500	required	First login · tty autologin straight into Hyprland; nothing to type	Hyprland after login: the trust bar with no session, the Ward Dark wallpaper
+theme	1800	required	wardos-welcome · step 1 of 4, a theme	wardos-welcome theme: the theme menu
+keys	1600	required	step 2 · a key, kept on the host	wardos-welcome keys: the keys menu, both keys not set
+project	1400	required	step 3 · a project	wardos-welcome project: the project menu
+init	2200	required	ward init · policy, verifier config and TamperWard wiring, idempotent	ward init ~/ward-demo in the terminal the project step opens
+agent	1400	required	step 4 · an agent	wardos-welcome agent: the agent menu for ~/ward-demo
+up	2600	required	ward claude · the sandbox, the proxy, the observer; the bar goes live	ward up ~/ward-demo in a terminal; the trust bar goes live
+done	2000	required	done · under five minutes from first login	wardos-welcome done: the closing menu
+observer	2800	required	working · the agent edits code; the protected test is refused; ward watch shows every row	the command centre's Resume session: ward watch beside the session terminal, the welcome toast
+menu	2200	required	Super + Space · the command centre: projects, agents, verify, apps	wardos-menu: the command centre with the live session
+tokyo	2400	required	Super + Shift + T · Tokyo Night; fourteen themes render into every component	wardos-theme set tokyo-night: bar, wallpaper and toast in Tokyo Night
+lock	2400	optional	Super + L · the lock screen	wardos-power lock: hyprlock
