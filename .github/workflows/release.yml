@@ -1,7 +1,8 @@
 # Release: build the Linux binaries for x86_64 and aarch64, each natively on a runner
 # of that architecture (no cross toolchain), package them as two trains per
 # architecture -- the runtime tarball with the installer, and the node tarball
-# (issue #275) -- and attach every tarball and its checksum to one GitHub release.
+# (issue #275) -- and attach every tarball, its checksum and the release manifest
+# (docs/release-manifest.md) to one GitHub release.
 # Runs on a v* tag push, or by hand with a version (then the workflow creates the
 # tag on the chosen ref).
 name: release
@@ -170,6 +171,19 @@ jobs:
           arch=x86_64
           if [[ -f "dist/wardos-${VERSION}-aarch64-linux.tar.gz" ]]; then arch=both; fi
           echo "disk_arch=$arch" >> "$GITHUB_OUTPUT"
+          # The release manifest (docs/release-manifest.md), generated from the set
+          # just verified so it can only name artifacts that were checked, with the
+          # node protocol window of this commit's docs/compatibility.md (#275). Its
+          # timestamp is the source commit's, not the run's, so a retry at the same
+          # commit reproduces the manifest byte for byte and the reconciliation
+          # below treats it like any other asset. The .sha256 sidecar follows the
+          # tarballs' convention (sha256sum's line, checked with `sha256sum -c`).
+          manifest="wardos-${VERSION}-manifest.json"
+          GENERATE_MANIFEST_NOW="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ "$GITHUB_SHA")" \
+            bash scripts/release/generate-manifest.sh "$TAG" "$GITHUB_SHA" dist >"$manifest"
+          mv "$manifest" "dist/$manifest"
+          (cd dist && sha256sum "$manifest" >"$manifest.sha256")
+          cat "dist/$manifest"
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -205,7 +219,7 @@ jobs:
           if [[ "$release_exists" == "true" ]]; then
               # The release exists and its tag provably binds to $GITHUB_SHA
               # (verified jointly above). Idempotent retry: before clobbering,
-              # pull the already-published tarballs and their .sha256
+              # pull the already-published tarballs, manifest and their .sha256
               # checksums and compare them byte-for-byte with what this run
               # rebuilt. A rebuild at the same commit must reproduce the
               # published bytes exactly: identical assets are a no-op (skip the
@@ -224,7 +238,8 @@ jobs:
               bash scripts/release/check-assets.sh dist published || arc=$?
               case "$arc" in
                 0)  echo "published assets are byte-identical; nothing to upload." ;;
-                10) gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber ;;
+                10) gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
+                      dist/*-manifest.json dist/*-manifest.json.sha256 --clobber ;;
                 *)  echo "refusing to overwrite the published release; see check-assets output above." >&2
                     exit 1 ;;
               esac
@@ -232,8 +247,9 @@ jobs:
               # No release yet, and the joint tag check above verified any
               # existing tag binds to $GITHUB_SHA (or is absent). --target binds a
               # new tag to this commit; the .sha256 assets record each tarball's
-              # checksum alongside it.
+              # (and the manifest's) checksum alongside it.
               gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
+                dist/*-manifest.json dist/*-manifest.json.sha256 \
                 --target "$GITHUB_SHA" --title "WardOS $TAG" --generate-notes
           fi
       # The disks for this release, for every architecture that has a tarball. A

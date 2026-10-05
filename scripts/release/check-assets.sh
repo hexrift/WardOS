@@ -10,8 +10,9 @@
 #
 # On an idempotent retry -- the tag already resolves to this build's commit -- a
 # rebuild must reproduce the published bytes exactly. For every *.tar.gz and
-# *.tar.gz.sha256 in <local-dir> that also exists in <published-dir>, the two
-# must be byte-identical. If any published counterpart differs, `gh release
+# *.tar.gz.sha256, and the release manifest *-manifest.json with its .sha256
+# (generate-manifest.sh), in <local-dir> that also exists in <published-dir>,
+# the two must be byte-identical. If any published counterpart differs, `gh release
 # upload --clobber` would silently replace a published artifact (and its
 # checksum) with different bytes -- refuse before the caller uploads anything.
 # Published assets the run is NOT replacing (e.g. a disk image, or another
@@ -37,7 +38,8 @@ for d in "$local_dir" "$published_dir"; do
 done
 
 shopt -s nullglob
-local_assets=("$local_dir"/*.tar.gz "$local_dir"/*.tar.gz.sha256)
+local_assets=("$local_dir"/*.tar.gz "$local_dir"/*.tar.gz.sha256
+  "$local_dir"/*-manifest.json "$local_dir"/*-manifest.json.sha256)
 shopt -u nullglob
 
 if [[ ${#local_assets[@]} -eq 0 ]]; then

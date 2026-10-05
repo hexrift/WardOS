@@ -4,7 +4,8 @@
 # Usage: download-published.sh <tag> <local-dir> <published-dir>
 #
 #   <tag>            the release tag whose assets are being reconciled.
-#   <local-dir>      the tarballs and .sha256 checksums this run built.
+#   <local-dir>      the tarballs, .sha256 checksums and release manifest
+#                    (*-manifest.json with its .sha256) this run built.
 #   <published-dir>  where the matching already-published assets are written for
 #                    check-assets.sh to compare (created if absent).
 #
@@ -70,7 +71,8 @@ main() {
   fi
 
   shopt -s nullglob
-  local locals=("$local_dir"/*.tar.gz "$local_dir"/*.tar.gz.sha256)
+  local locals=("$local_dir"/*.tar.gz "$local_dir"/*.tar.gz.sha256
+    "$local_dir"/*-manifest.json "$local_dir"/*-manifest.json.sha256)
   shopt -u nullglob
   if [[ ${#locals[@]} -eq 0 ]]; then
     echo "download-published: no local artifacts in '$local_dir'" >&2

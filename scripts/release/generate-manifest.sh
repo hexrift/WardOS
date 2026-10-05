@@ -14,7 +14,17 @@
 #                image counterpart (or the image workflow publishes its own).
 #
 # Prints the manifest as JSON on stdout. Nothing is written or uploaded here;
-# the caller decides where the manifest is published.
+# the caller decides where the manifest is published (the release workflow
+# attaches it as wardos-<version>-manifest.json with a .sha256 sidecar).
+#
+# The manifest also records the node protocol window this release serves
+# (issue #275): the `<!-- protocol-window: M.a-M.b -->` marker of
+# docs/compatibility.md, which scripts/security-check/protocol-window.py holds
+# equal to the WARD_NODE_PROTOCOL constant on every pull request. The marker is
+# parsed here with the same grammar as that check (exactly one marker, one
+# major, a non-inverted minor range) so the manifest can never state a window
+# the compatibility document does not. The document is found relative to this
+# script; GENERATE_MANIFEST_COMPATIBILITY_DOC overrides the path (tests).
 #
 # This does NOT sign or attest anything. ADR-0028's own "Scope of the
 # implementation" requires the release workflow, manifest format, and
@@ -32,7 +42,8 @@
 #
 # Exit codes:
 #   0   the manifest was generated and printed.
-#   1   an input was missing, malformed, incomplete or inconsistent.
+#   1   an input was missing, malformed, incomplete or inconsistent, or the
+#       protocol-window marker is absent, duplicated or malformed.
 set -euo pipefail
 
 tag="${1:?usage: generate-manifest.sh <tag> <commit> <dist-dir> [image-ref]}"
@@ -66,6 +77,35 @@ fi
 
 if [[ -n "$image_ref" ]] && [[ "$image_ref" =~ [[:space:]] ]]; then
   die "image reference must not contain whitespace: '$image_ref'"
+fi
+
+# The node protocol window, read from the compatibility document's single
+# machine-readable marker. Newlines are flattened first so a marker (or a
+# window) wrapped over lines parses the way protocol-window.py's DOTALL and \s
+# read it; the content of a well-formed marker never contains '>'.
+compat_doc="${GENERATE_MANIFEST_COMPATIBILITY_DOC:-$(dirname "${BASH_SOURCE[0]}")/../../docs/compatibility.md}"
+[[ -f "$compat_doc" ]] || die "compatibility document not found: '$compat_doc'"
+markers="$(tr '\n' ' ' <"$compat_doc" | grep -o -E '<!--[[:space:]]*protocol-window:[^>]*-->' || true)"
+marker_count="$(printf '%s\n' "$markers" | grep -c . || true)"
+if [[ "$marker_count" -eq 0 ]]; then
+  die "$compat_doc: no protocol-window marker found; state the window as '<!-- protocol-window: M.a-M.b -->'"
+elif [[ "$marker_count" -gt 1 ]]; then
+  die "$compat_doc: more than one protocol-window marker; keep exactly one"
+fi
+window="${markers#*protocol-window:}"
+window="${window%-->}"
+window="$(printf '%s' "$window" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+if [[ ! "$window" =~ ^([0-9]+)\.([0-9]+)-([0-9]+)\.([0-9]+)$ ]]; then
+  die "$compat_doc: malformed protocol-window marker '$window': expected 'M.a-M.b'"
+fi
+window_major="${BASH_REMATCH[1]}"
+window_min_minor="${BASH_REMATCH[2]}"
+window_max_minor="${BASH_REMATCH[4]}"
+if [[ "$window_major" != "${BASH_REMATCH[3]}" ]]; then
+  die "$compat_doc: malformed protocol-window marker '$window': a window spans one major"
+fi
+if ((10#$window_min_minor > 10#$window_max_minor)); then
+  die "$compat_doc: malformed protocol-window marker '$window': inverted range"
 fi
 
 shopt -s nullglob
@@ -161,6 +201,9 @@ jq -n \
   --arg generated_at "$generated_at" \
   --argjson artifacts "$artifacts_json" \
   --arg image_ref "$image_ref" \
+  --argjson window_major "$((10#$window_major))" \
+  --argjson window_min_minor "$((10#$window_min_minor))" \
+  --argjson window_max_minor "$((10#$window_max_minor))" \
   '{
     schema_version: ($schema_version | tonumber),
     tag: $tag,
@@ -168,6 +211,11 @@ jq -n \
     source_commit: $commit,
     generated_at: $generated_at,
     artifacts: $artifacts,
+    node_protocol_window: {
+      major: $window_major,
+      min_minor: $window_min_minor,
+      max_minor: $window_max_minor
+    },
     image: {
       bootc_reference: (if $image_ref == "" then null else $image_ref end)
     },
