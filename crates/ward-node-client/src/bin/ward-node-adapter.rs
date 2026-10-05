@@ -41,7 +41,7 @@ const SCHEMA: u64 = 1;
 const MAX_COMMAND_BYTES: usize = 256 * 1024;
 
 #[derive(Parser)]
-#[command(name = "ward-node-adapter")]
+#[command(name = "ward-node-adapter", version)]
 struct Cli {
     /// The node's Unix socket.
     #[arg(long)]

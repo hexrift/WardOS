@@ -92,17 +92,25 @@ artifacts_json="[]"
 for path in "${tarballs[@]}"; do
   name="$(basename "$path")"
 
-  # Artifact names are produced by release.yml as
-  # wardos-<version>-<arch>-linux.tar.gz. Matched by literal prefix/suffix
-  # (not a single regex split) so a version containing its own hyphens (a
-  # SemVer prerelease like "1.2.3-rc.1") can never be ambiguous with the
-  # arch segment. An artifact whose name doesn't carry *this* manifest's
-  # version at all -- left over from a different release in the same
-  # directory -- is a real hazard, not a cosmetic mismatch.
-  prefix="wardos-${version}-"
+  # Artifact names are produced by scripts/release/package.sh as
+  # <component>-<version>-<arch>-linux.tar.gz, one component per release train
+  # (issue #275): `wardos` is the runtime tarball, `ward-node` the node's.
+  # Matched by literal prefix/suffix (not a single regex split) so a version
+  # containing its own hyphens (a SemVer prerelease like "1.2.3-rc.1") can
+  # never be ambiguous with the arch segment. An artifact whose name doesn't
+  # carry *this* manifest's version at all -- left over from a different
+  # release in the same directory -- is a real hazard, not a cosmetic mismatch.
   suffix="-linux.tar.gz"
-  if [[ "$name" != "$prefix"*"$suffix" ]]; then
-    die "artifact name does not match the expected wardos-${version}-<arch>-linux.tar.gz pattern: '$name'"
+  component=""
+  for candidate in wardos ward-node; do
+    prefix="${candidate}-${version}-"
+    if [[ "$name" == "$prefix"*"$suffix" ]]; then
+      component="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$component" ]]; then
+    die "artifact name does not match the expected {wardos,ward-node}-${version}-<arch>-linux.tar.gz pattern: '$name'"
   fi
   arch="${name#"$prefix"}"
   arch="${arch%"$suffix"}"
@@ -130,10 +138,11 @@ for path in "${tarballs[@]}"; do
   artifact_json="$(
     jq -n \
       --arg name "$name" \
+      --arg component "$component" \
       --arg arch "$arch" \
       --arg digest "sha256:$actual_digest" \
       --argjson size "$size_bytes" \
-      '{name: $name, architecture: $arch, digest: $digest, size_bytes: $size}'
+      '{name: $name, component: $component, architecture: $arch, digest: $digest, size_bytes: $size}'
   )"
   artifacts_json="$(jq -c --argjson a "$artifact_json" '. + [$a]' <<<"$artifacts_json")"
 done

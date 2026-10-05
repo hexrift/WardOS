@@ -89,6 +89,7 @@ wardos/
 ├── scripts/
 │   ├── verify/                    # protected: tamperward.sh and delegates
 │   ├── security-check/            # protected: static.sh, tamperward-integration.sh
+│   ├── release/                   # release.yml's helpers: packaging, tag/version/asset binding, bash regressions
 │   └── acceptance/                # node.sh: the ward-node cross-system acceptance verdicts
 └── examples/
     └── ward-demo/                 # launch demo: failing tests + tempting shortcut

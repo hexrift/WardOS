@@ -16,9 +16,31 @@ may be elsewhere, but whatever it uses to reach the node runs here.
 
 ## 1. Operator: install the node
 
-`ward-node` and `ward-node-adapter` are not in the release tarball
-([node-release-readiness.md](node-release-readiness.md) §2). Build them from a tagged
-commit with the pinned toolchain (`rust-toolchain.toml`):
+Every release attaches a node tarball per architecture with its checksum,
+`ward-node-<version>-<arch>-linux.tar.gz` and `.sha256`, next to the runtime tarball
+([node-release-readiness.md](node-release-readiness.md) §2); `<arch>` is what
+`uname -m` prints on the host, `x86_64` or `aarch64`. It carries `ward-node`,
+`ward-node-adapter`, `LICENSE` and the documents, built from the release commit with
+the pinned toolchain and `--locked`. Download both files from the
+[release](https://github.com/hexrift/WardOS/releases) you deploy, check the tarball
+before unpacking it, and install the two binaries:
+
+```bash
+version=0.19.0; arch="$(uname -m)"                            # the release you deploy
+sha256sum -c "ward-node-${version}-${arch}-linux.tar.gz.sha256"   # "OK", or stop here
+tar -xzf "ward-node-${version}-${arch}-linux.tar.gz"
+install -m 0755 "ward-node-${version}-${arch}-linux"/{ward-node,ward-node-adapter} /usr/local/bin/
+ward-node --version                                            # "ward-node 0.19.0"
+```
+
+The checksum proves the tarball is the one CI attached to the release; releases are not
+signed or provenance-verified yet (node-security-limitations.md §3.3, ADR-0028).
+Releases cut before this revision carry no node tarball. `install.sh`, the runtime's
+installer, does not install the node: it is a per-user install of the session layer,
+and the node is a service of the host.
+
+Without a release for the commit you deploy, build the same two binaries from it with
+the pinned toolchain (`rust-toolchain.toml`), as the release does:
 
 ```bash
 git clone https://github.com/hexrift/WardOS && cd WardOS && git checkout <commit>   # the commit you deploy
@@ -26,10 +48,11 @@ cargo build --release --locked -p ward-node -p ward-node-client
 install -m 0755 target/release/ward-node target/release/ward-node-adapter /usr/local/bin/
 ```
 
-Record the commit you built; the protocol window a node serves is the one in its source
-commit ([compatibility.md](compatibility.md) §6). The host needs bubblewrap with
-unprivileged user namespaces ([install.md](install.md) §2); `bwrap --unshare-all` must
-work for the node's user, or the node refuses to start with a task root.
+Either way, record what you installed, the release or the commit; the protocol window a
+node serves is the one in its source commit ([compatibility.md](compatibility.md) §6).
+The host needs bubblewrap with unprivileged user namespaces ([install.md](install.md)
+§2); `bwrap --unshare-all` must work for the node's user, or the node refuses to start
+with a task root.
 
 Give the node its own user and three private directories: the node's state, its task
 root and the directory that holds its socket. The node creates the first two mode 0700
