@@ -16,10 +16,12 @@
 //! 8. the lease and lineage, promoted only because the trusted issuer signed them, pass
 //!    the trusted task-authority check ([`TrustedTaskAdmission`]) for the binding and agent;
 //! 9. no durable revocation covers the lease or its lineage;
-//! 10. every grant in the decoded capability manifest is one this node honours. Every
-//!     workload runs offline, so only `{"network":"offline"}` passes; any other network
-//!     grant is refused `unsupported_grant`, after authority is proven and before the
-//!     version is committed, so a refused grant consumes nothing.
+//! 10. every grant in the decoded capability manifest is one this node honours:
+//!     `{"network":"offline"}` always, and `{"network":{"custom":[…]}}` only on a node
+//!     that enforces a network allowlist ([`NodeAdmission::with_network_allowlist`], set by
+//!     the registry from its execution); any other grant is refused `unsupported_grant`,
+//!     after authority is proven and before the version is committed, so a refused grant
+//!     consumes nothing.
 //!
 //! Each failure is a typed [`TaskLifecycleRejectionReason`]. Task-registry checks
 //! (existence, exact binding, `Created` state) come first, in [`crate::task`].
@@ -107,6 +109,7 @@ pub struct NodeAdmission {
     issuers: TrustedIssuers,
     state: NodeState,
     clock: Box<dyn NodeClock>,
+    network_allowlist: bool,
 }
 
 impl std::fmt::Debug for NodeAdmission {
@@ -115,6 +118,7 @@ impl std::fmt::Debug for NodeAdmission {
             .debug_struct("NodeAdmission")
             .field("issuers", &self.issuers)
             .field("state", &self.state)
+            .field("network_allowlist", &self.network_allowlist)
             .finish_non_exhaustive()
     }
 }
@@ -127,7 +131,23 @@ impl NodeAdmission {
             issuers,
             state,
             clock,
+            network_allowlist: false,
         }
+    }
+
+    /// Whether a `{"network":{"custom":[…]}}` manifest is honoured (check 10). The task
+    /// registry sets this from its execution, so what `admit` accepts is exactly what
+    /// `start` enforces and the capability document advertises.
+    #[must_use]
+    pub const fn with_network_allowlist(mut self, enabled: bool) -> Self {
+        self.network_allowlist = enabled;
+        self
+    }
+
+    /// Whether a `{"network":{"custom":[…]}}` manifest is honoured.
+    #[must_use]
+    pub const fn honours_network_allowlist(&self) -> bool {
+        self.network_allowlist
     }
 
     /// This node's identity: the only audience it admits.
@@ -219,7 +239,10 @@ impl NodeAdmission {
         authority
             .revalidate(self.state.revocations(), now)
             .map_err(|_| Reason::LeaseRevoked)?;
-        check_grants(envelope.workload().capability_manifest().manifest())?;
+        check_grants(
+            envelope.workload().capability_manifest().manifest(),
+            self.network_allowlist,
+        )?;
 
         Ok(VerifiedAdmission {
             envelope,
@@ -366,9 +389,13 @@ const fn claimed_binding(wire: &UntrustedAuthorityLease) -> DelegationBinding {
     }
 }
 
-const fn check_grants(manifest: &CapabilityManifest) -> Result<(), Reason> {
+const fn check_grants(
+    manifest: &CapabilityManifest,
+    network_allowlist: bool,
+) -> Result<(), Reason> {
     match manifest.network() {
         NetworkGrant::Offline => Ok(()),
+        NetworkGrant::Custom(_) if network_allowlist => Ok(()),
         NetworkGrant::Custom(_) => Err(Reason::UnsupportedGrant),
     }
 }

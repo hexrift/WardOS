@@ -2486,6 +2486,7 @@ dependencies = [
  "ward-events",
  "ward-launch",
  "ward-node-protocol",
+ "ward-proxy",
  "ward-sandbox",
  "ward-snapshot",
 ]

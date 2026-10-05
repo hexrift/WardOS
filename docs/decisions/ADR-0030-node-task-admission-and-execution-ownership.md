@@ -109,8 +109,9 @@ their state, receipt and applied operation ids (#332 slice 7).
 - **Unsigned envelopes over the local socket in local mode.** Rejected. Local and remote
   admission would then differ semantically, and same-host processes could forge
   authority.
-- **`ward-node` depending on `ward-daemon`.** Rejected. It pulls the proxy, TLS stack and
-  session machinery into the node's trusted computing base.
+- **`ward-node` depending on `ward-daemon`.** Rejected. It pulls the session machinery
+  into the node's trusted computing base. For the network allowlist the node links
+  `ward-proxy` itself (step 12), the one crate the egress needs, not the daemon.
 
 ## Advantages
 
@@ -138,9 +139,11 @@ their state, receipt and applied operation ids (#332 slice 7).
   when the caller's lease or deadline is gone. Their issuer key is read only from a
   private seed file; a pre-signed envelope is transported byte for byte.
 - The node's trusted computing base grows by a signature verifier and a durable
-  revocation and version store, and does not grow by the daemon's network stack.
+  revocation and version store, and by `ward-proxy` for an attempt with a network
+  allowlist; it does not grow by `ward-daemon`'s session machinery.
 - What is not enforced at this revision is stated, not implied: no remote transport or
-  mTLS, no network grants, no result return, no callback channel, a receipt the protocol
+  mTLS, egress only through a per-attempt proxy socket on a node that enabled it (no
+  in-sandbox relay, no credential), no result return, no callback channel, a receipt the protocol
   does not bind to the evidence head, a manually bootstrapped trust store, same-uid
   co-location of client and node unless the operator lists the client uids the socket
   serves (a peer-credential check, the first local slice of #262), and no resource limit
@@ -189,9 +192,9 @@ TDD slices without guessing at semantics inside a feature PR.
    (`network`: `offline`, or a `custom` host allowlist in `ward-policy`'s spelling), a
    manifest outside the grammar fails envelope decoding, and `admit` refuses
    `unsupported_grant`, after authority is proven and before the version is committed,
-   any grant the node cannot enforce. Every workload runs offline, so only `offline` is
-   honoured until the proxy-backed allowlist lands; the node never runs a workload under
-   less than its manifest says.
+   any grant the node cannot enforce. `offline` is always honoured; `custom` is honoured
+   on a node started with `--network-allowlist` (step 12); the node never runs a workload
+   under less than its manifest says.
 
 9. A transport-backed client for the external control plane (#332 slice 8): the
    `ward-node-client` crate speaks the local socket framing with its bounds and
@@ -234,7 +237,21 @@ TDD slices without guessing at semantics inside a feature PR.
     statement of what CI proves on every change, what a release publishes and what is
     not proven ([node-release-readiness.md](../node-release-readiness.md)).
 
-Steps 1–9 are written down as the external contract in
+12. The network allowlist (#332): a node started with `--network-allowlist` honours a
+    `network.custom` manifest by running the attempt behind its own `ward-proxy`
+    instance — in the node process, on a Unix socket in the attempt's private egress
+    directory beside the workspace, bound at `/run/ward/proxy.sock` and named by
+    `WARD_PROXY_SOCKET`, `--unshare-net` unchanged — with a policy of exactly the
+    manifest's hosts and the session proxy's structural denies; it advertises
+    `network.proxy_allowlist` only then. The proxy pauses and resumes with the attempt
+    and is shut down by `stop`, `revoke`, the budget kill and the attempt's exit. The node
+    stays the attempt log's single writer: the attempt's reaper drains the proxy's
+    verdicts and the registry appends them as `NetworkRequested` and `NetworkDenied`
+    with origin `node`, at most 512 per attempt, with one `ObservationsDropped` marker
+    for the rest before the end record. Deferred: an in-sandbox loopback relay for
+    `HTTP_PROXY` clients, and credential injection (#267).
+
+Steps 1–9 and 12 are written down as the external contract in
 [node-integration.md](../node-integration.md); step 10 is its acceptance,
-[node-acceptance.md](../node-acceptance.md); step 11 is the guide, the limitations and
-the release-readiness evidence beside them.
+[node-acceptance.md](../node-acceptance.md), which step 12 extends; step 11 is the
+guide, the limitations and the release-readiness evidence beside them.

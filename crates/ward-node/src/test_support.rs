@@ -312,6 +312,7 @@ struct FakeState {
     reaped: usize,
     survivors: Vec<crate::execution::WorkloadProcess>,
     blocked_on_launch: Option<std::path::PathBuf>,
+    egress: Option<Arc<crate::egress::AttemptEgress>>,
 }
 
 /// A deterministic launcher: workloads end only when the test says so, or on stop.
@@ -344,6 +345,7 @@ impl FakeLauncher {
                 reaped: 0,
                 survivors: Vec::new(),
                 blocked_on_launch: None,
+                egress: None,
             }),
             std::sync::Condvar::new(),
         )))
@@ -419,6 +421,11 @@ impl FakeLauncher {
     pub fn block_on_launch(&self, path: std::path::PathBuf) {
         self.state().blocked_on_launch = Some(path);
     }
+
+    /// The real egress proxy the last allowlisted launch started, while its workload runs.
+    pub fn egress(&self) -> Option<Arc<crate::egress::AttemptEgress>> {
+        self.state().egress.clone()
+    }
 }
 
 impl crate::execution::TaskLauncher for FakeLauncher {
@@ -432,7 +439,14 @@ impl crate::execution::TaskLauncher for FakeLauncher {
             std::fs::create_dir_all(path).unwrap();
         }
         match state.spawn {
-            FakeSpawn::Spawn => Ok(Box::new(FakeWorkload(self.clone()))),
+            FakeSpawn::Spawn => {
+                let egress = request.allowlist().map(|allowlist| {
+                    let dir = crate::egress::egress_dir_beside(request.workspace()).unwrap();
+                    Arc::new(crate::egress::AttemptEgress::start(&dir, allowlist).unwrap())
+                });
+                state.egress.clone_from(&egress);
+                Ok(Box::new(FakeWorkload(self.clone(), egress)))
+            }
             FakeSpawn::Refuse => Err(crate::execution::SpawnError::Refused),
             FakeSpawn::Ambiguous => Err(crate::execution::SpawnError::Ambiguous),
         }
@@ -443,11 +457,20 @@ impl crate::execution::TaskLauncher for FakeLauncher {
     }
 }
 
-struct FakeWorkload(FakeLauncher);
+struct FakeWorkload(FakeLauncher, Option<Arc<crate::egress::AttemptEgress>>);
 
-/// The fake workload's freezer: records attempts and answers as configured.
+/// The fake workload's freezer: records attempts and answers as configured, pausing the
+/// launch's real egress proxy while the fake tree is held, as the sandbox freezer does.
 #[derive(Debug)]
-struct FakeFreezer(FakeLauncher);
+struct FakeFreezer(FakeLauncher, Option<Arc<crate::egress::AttemptEgress>>);
+
+impl FakeFreezer {
+    fn pause_egress(&self, paused: bool) {
+        if let Some(egress) = &self.1 {
+            egress.set_paused(paused);
+        }
+    }
+}
 
 impl crate::execution::WorkloadFreezer for FakeFreezer {
     fn freeze(&self) -> Result<(), crate::execution::FreezeUnconfirmed> {
@@ -456,6 +479,7 @@ impl crate::execution::WorkloadFreezer for FakeFreezer {
         match state.on_freeze {
             FakeFreeze::Confirm => {
                 state.frozen = true;
+                self.pause_egress(true);
                 Ok(())
             }
             FakeFreeze::Unconfirmed => {
@@ -471,6 +495,7 @@ impl crate::execution::WorkloadFreezer for FakeFreezer {
         match state.on_thaw {
             FakeFreeze::Confirm => {
                 state.frozen = false;
+                self.pause_egress(false);
                 Ok(())
             }
             FakeFreeze::Unconfirmed => Err(crate::execution::FreezeUnconfirmed),
@@ -488,12 +513,17 @@ impl crate::execution::RunningWorkload for FakeWorkload {
     }
 
     fn freezer(&self) -> Arc<dyn crate::execution::WorkloadFreezer> {
-        Arc::new(FakeFreezer(self.0.clone()))
+        Arc::new(FakeFreezer(self.0.clone(), self.1.clone()))
+    }
+
+    fn egress(&self) -> Option<Arc<crate::egress::AttemptEgress>> {
+        self.1.clone()
     }
 
     fn wait(
         self: Box<Self>,
         stop: &crate::execution::StopSignal,
+        on_tick: &mut dyn FnMut(),
     ) -> crate::execution::WorkloadExit {
         let (lock, ready) = &*self.0.0;
         let mut state = lock.lock().unwrap();
@@ -516,9 +546,13 @@ impl crate::execution::RunningWorkload for FakeWorkload {
                 .wait_timeout(state, std::time::Duration::from_millis(5))
                 .unwrap()
                 .0;
+            drop(state);
+            on_tick();
+            state = lock.lock().unwrap();
         };
         state.waiting -= 1;
         state.reaped += 1;
+        state.egress = None;
         exit
     }
 }

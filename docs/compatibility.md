@@ -21,7 +21,7 @@ fails CI when the two differ.
 | 1.0 | The `hello` handshake and version negotiation. No requests. | — |
 | 1.1 | Read-only capability discovery (`capabilities`). | `CAPABILITY_DISCOVERY_PROTOCOL` |
 | 1.2 | Identity-only task lifecycle: `create` and `inspect`. The execution verbs decode but are refused `unsupported_operation`; `admit` closes the connection. | `TASK_LIFECYCLE_PROTOCOL` |
-| 1.3 | Signed admission (`admit`) with its typed capability manifest, the `exited` state, the receipt outcome on `inspect`, and the execution verbs `start`, `stop`, `pause`, `resume`, `revoke`, `seal` ([ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md)). Additive within 1.3: the `unsupported_grant` rejection reason of an `admit` whose manifest the node cannot honour (node-integration.md §7.5). | `TASK_ADMISSION_PROTOCOL` |
+| 1.3 | Signed admission (`admit`) with its typed capability manifest, the `exited` state, the receipt outcome on `inspect`, and the execution verbs `start`, `stop`, `pause`, `resume`, `revoke`, `seal` ([ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md)). Additive within 1.3: the `unsupported_grant` rejection reason of an `admit` whose manifest the node cannot honour (node-integration.md §7.5), and `network.proxy_allowlist` reading `true` on a node started with `--network-allowlist`, which then admits a `network.custom` manifest (§5, §9); the flag has been in the document since 1.1 and the manifest grammar is unchanged. | `TASK_ADMISSION_PROTOCOL` |
 
 Each feature is gated on the **negotiated** version, not on what the node could serve:
 a 1.2 connection to a 1.3 node gets only the 1.2 features.

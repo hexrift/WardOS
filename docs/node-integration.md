@@ -26,17 +26,20 @@ admission example is a working test vector (§7.4).
   expiring authority: an admission envelope signed by an issuer key the node's operator
   configured ([ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md)).
   Reaching the socket proves nothing; a signature by a trusted key is required.
-- The node reads the capability manifest and honours only what it can enforce: every
-  workload runs offline, so a manifest asking for egress is refused `unsupported_grant`
-  at `admit` (§7.5) until the proxy-backed allowlist lands, never run offline silently.
+- The node reads the capability manifest and honours only what it can enforce: `offline`
+  always, and a `network.custom` host allowlist only on a node its operator started with
+  `--network-allowlist`, which then runs the workload behind a node-owned egress proxy
+  allowing exactly those hosts (§7.5, §9); any other grant is refused `unsupported_grant`
+  at `admit`, never run with less silently.
 - WardOS ships one client for this contract: the `ward-node-client` crate (a transport,
   a typed client, an issuer signer and a fail-closed attempt driver for Rust control
   planes) and its `ward-node-adapter` binary (the same over stdin/stdout for control
   planes in other languages), §11. Both run on the node's host, as the node's uid or as
   a uid the node's operator listed with `--client-uid` (§2.1, §11.1).
-- Not implemented yet: that allowlist, an event stream (`stream`), and any remote
-  transport or mTLS. The only transport is a local Unix socket; remote transport and key
-  bootstrap are #262. The full list, with what each gap means for a control plane, is
+- Not implemented yet: a loopback relay and `HTTP_PROXY` environment inside the sandbox
+  (the proxy is reached through its Unix socket, §9), credential injection (#267), an
+  event stream (`stream`), and any remote transport or mTLS. The only transport is a
+  local Unix socket; remote transport and key bootstrap are #262. The full list, with what each gap means for a control plane, is
   [node-security-limitations.md](node-security-limitations.md) §3.
 - The per-session runtime (`ward up`, one `wardd` per session) is a separate mode on the
   same host, with its own state, sockets and uid; how the two compare, coexist and
@@ -48,7 +51,7 @@ admission example is a working test vector (§7.4).
 
 ```text
 ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
-  [--trusted-issuers <file>] [--task-root <dir>] \
+  [--trusted-issuers <file>] [--task-root <dir>] [--network-allowlist] \
   [--client-uid <uid>]… [--client-group <group>]
 ```
 
@@ -59,6 +62,7 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | `--node-id` | yes | The node's audience id (`node_` + 26-character ULID). Pinned in `<state-dir>/node-id` at first start; a later start with another id is refused. Envelopes must name exactly this id. |
 | `--trusted-issuers` | no | Trust store (§2.2). Without it no issuer is trusted and every `admit` is refused `authority_denied`. |
 | `--task-root` | no | Directory under which the node allocates workspaces and keeps each admitted attempt's evidence log (§6.5), created mode 0700 and refused if group- or world-accessible or not a real directory. With it the node executes (`start`, `pause`, `resume`, `stop`, `revoke`, `seal`); the node refuses to start if bubblewrap is unusable. Without it, all six are `unsupported_operation` and no evidence log is kept. |
+| `--network-allowlist` | no | Honour a manifest's `network.custom` host allowlist (§7.5): the attempt runs behind a node-owned egress proxy allowing exactly those hosts, with IP literals, private ranges and the metadata endpoint always refused (§9), and the node reports `network.proxy_allowlist` `true` (§5). Needs `--task-root`. Without it every `network.custom` manifest is refused `unsupported_grant`. |
 | `--client-uid` | no | A uid (decimal) or user name the node serves on its socket besides its own uid; repeatable, resolved once at start (an unknown name or a uid listed twice refuses to start). The node reads every connection's peer credentials before it reads a byte and closes a connection from any other uid without a response (§3). Root is not exempt. Being served grants no authority: `admit` still needs a trusted signature (§8.1). |
 | `--client-group` | no | A gid or group name to share the socket with: the socket is created mode 0660 owned by it, and its parent directory must be owned by it with mode 0750 or stricter. Needs at least one `--client-uid`; a member of the group that is not a listed uid can connect but is closed unread. Without it the socket is 0600 and only the node's uid (or root) can connect, whatever `--client-uid` says. The state directory and task root stay 0700 either way: a listed client can speak to the node, not read its state. |
 
@@ -312,7 +316,8 @@ At 1.1 and later the one request may be discovery:
 ```
 
 A node started with `--trusted-issuers` and `--task-root` answers at 1.3 (capacity is the
-host's; the other values are what the node reports today):
+host's; the other values are what the node reports today; with `--network-allowlist` as
+well, `network.proxy_allowlist` reads `true`):
 
 ```json
 {"response":"capabilities","capabilities":{"protocol":{"major":1,"minor":3},"architecture":"x86_64","capacity":{"logical_cpus":8,"memory_bytes":17179869184},"isolation":{"namespaces":{"sandbox":true,"user_namespace":true},"backends":{"container":false,"microvm":false,"vm":false}},"network":{"offline":true,"proxy_allowlist":false},"credentials":{"proxy_injection":false,"scoped_http_gateway":false},"snapshots":{"content_addressed":true,"diff":false,"read":false},"verifier":{"isolated":false},"lifecycle":{"pause":true,"stop":true,"revoke":true,"admit":true,"start":true}}}
@@ -326,7 +331,7 @@ host's; the other values are what the node reports today):
 | `lifecycle.pause`, `lifecycle.revoke` | Always present. At 1.3 each is `true` exactly when `lifecycle.start` is: an executing node serves `pause` and `revoke`. The document has no flag for `resume` or `seal`; an executing node serves `resume` with `pause` and `seal` with `start`, and a node that advertises `start` `false` refuses all four `unsupported_operation`. |
 | `isolation.namespaces.sandbox`, `isolation.namespaces.user_namespace` | `true` exactly when `lifecycle.start` is: every workload runs in a bubblewrap namespace sandbox inside its own user namespace. |
 | `network.offline` | `true` exactly when `lifecycle.start` is: every workload runs with no network but loopback. |
-| `network.proxy_allowlist` | `false`: the node cannot enforce a host allowlist, so a manifest asking for one (`network.custom`, §7.5) is refused `unsupported_grant` at `admit`. |
+| `network.proxy_allowlist` | `true` exactly when `lifecycle.start` is and the node was started with `--network-allowlist` (§2.1): a manifest asking for a host allowlist (`network.custom`, §7.5) is then honoured through a per-attempt egress proxy (§9). Otherwise `false`, and such a manifest is refused `unsupported_grant` at `admit`. |
 | `snapshots.content_addressed` | `true` exactly when `lifecycle.start` is: workspaces are materialised from the node's content-addressed store (§2.4). |
 
 Everything else (`isolation.backends`, `credentials`, `snapshots.diff`,
@@ -623,6 +628,8 @@ task, attempt and lease ids as 16 big-endian bytes each. Records, in order:
 | `NodeAttemptAdmitted` | An `admit` took effect (again after a restart, under a higher version). | Task, attempt and lease ids, the receipt session, the `admit` operation id, the BLAKE3 digest of the exact envelope bytes, the issuer key id, the envelope version. |
 | `NodeAttemptLaunched` | `start` confirmed its spawn. | The `start` operation id and the host pid. |
 | `NodeAttemptIntervened` | A `pause` or `resume` took effect. | `pause` or `resume`, and the operation id. |
+| `NetworkRequested`, `NetworkDenied` | The attempt's egress proxy (§9: a `network.custom` manifest on a node with `--network-allowlist`) allowed or refused a destination. The node records the proxy's verdicts itself while the attempt runs, in the order they were made, at most 512 per attempt. | The destination host or literal and port; for an allow, the pinned addresses as the rule and the workload's host pid; for a denial, the reason (not allowlisted, private range). Never a request body. |
+| `ObservationsDropped` | Verdicts of the attempt's proxy could not be recorded: past the 512 bound, refused by the log's own bound, or still undecided when the attempt ended. One marker, before `NodeAttemptEnded`. | `source` `network`, the count and the bound. |
 | `NodeAttemptEnded` | The attempt ended: natural exit, budget kill, a lost child, an ambiguous launch, a `stop` or `revoke` (from `ready`, or with its kill reaped, or a revoke whose reap was not confirmed). | The state (`exited`, `stopped`, `revoked`), the receipt outcome, the cause (exit code, budget, killed, lost, ambiguous, not started, unconfirmed) and the `stop` or `revoke` operation id. |
 | `NodeAttemptRecovered` | The state the node holds differs from the state the log last shows: after a restart, before the node serves, and before sealing. | The state and outcome the node holds. |
 | `NodeAttemptSealed` | `seal` took effect; the log is then sealed. | The `seal` operation id. |
@@ -895,8 +902,10 @@ grammar, and anything that is not one object fail envelope decoding (`authority_
 
 The node honours a decoded grant only if its capability document (§5) says it can
 enforce it: `offline` always, `custom` only when `network.proxy_allowlist` is `true`,
-which no node reports yet. A manifest that asks for a grant the node does not honour is
-refused `unsupported_grant` (§8.1 step 16): the node refuses what it cannot enforce
+which a node started with `--network-allowlist` reports (§2.1); the workload then runs
+behind the attempt's own egress proxy allowing exactly the listed patterns (§9). A
+manifest that asks for a grant the node does not honour is refused `unsupported_grant`
+(§8.1 step 16): the node refuses what it cannot enforce
 rather than run the workload with less than its manifest says. The refusal comes after
 authority is proven and before the version is written, so it consumes no version;
 re-admit under the same version with a manifest the node honours.
@@ -907,13 +916,14 @@ re-admit under the same version with a manifest the node honours.
 
 Hex `7b226e6574776f726b223a226f66666c696e65227d`, `BLAKE3-256`
 `eb3e889be30ae8dd712a52c33e37aaca72e52ccff1aa770ecbd962d0cdb0d0c3`: the manifest of the
-§7.4 test vector, and the only manifest a node admits at this revision.
+§7.4 test vector, and the only manifest a node without `--network-allowlist` admits.
 
 ```json
 {"network":{"custom":["github.com","*.crates.io"]}}
 ```
 
-Decodes, and is refused `unsupported_grant` until the proxy-backed allowlist lands.
+Decodes; honoured on a node started with `--network-allowlist`, refused
+`unsupported_grant` on any other.
 
 ```json
 {"network":"development"}
@@ -947,7 +957,7 @@ changes (no version is consumed, nothing is materialised).
 | 13 | The lineage promotes from its root: root shape, non-empty grants, every delegation rule of §7.3, each lease valid now | `lease_expired` for an expired lease, otherwise `authority_denied` |
 | 14 | Lease `task` / `id` / `subject` equal binding task / binding lease / `agent` | `authority_denied` / `lease_mismatch` / `authority_denied` |
 | 15 | No revocation (§2.5) covers the lease or an ancestor | `lease_revoked` |
-| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): at this revision the manifest is `{"network":"offline"}` | `unsupported_grant` |
+| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5) | `unsupported_grant` |
 | 17 | The version is written durably | `resource_unavailable` (write failed) |
 
 On success the task is `ready` and holds the envelope for `start`.
@@ -1015,7 +1025,7 @@ task to evict it is refused `resource_unavailable`.
 | `stale_operation` | The request is stale and nothing was done. From `admit`: the envelope `version` is not greater than the last version the node durably accepted for the task (an old or replayed envelope, also after a restart). From `pause` or `resume`: the `operation_id` took effect earlier and a later operation of the same verb has superseded it (§6.3). From `create`: the attempt was replaced by a later attempt of the task and is retired (§6.1). |
 | `invalid_state` | The task is not in a state that allows the verb, or another operation already did it. |
 | `authority_denied` | Untrusted key, bad signature, malformed envelope (a capability manifest outside the grammar of §7.5 included), a root lease `issuer` that is not the principal bound to the signing key, wrong audience, not yet valid, or authority that does not cover the task or agent. |
-| `unsupported_grant` | From `admit` only: the envelope's capability manifest decodes but asks for a grant this node cannot honour (§7.5), here any `network` other than `offline`. The task stays `created` and no version is consumed; re-admit under the same version with a manifest the node honours. Protocol 1.3 and later. |
+| `unsupported_grant` | From `admit` only: the envelope's capability manifest decodes but asks for a grant this node cannot honour (§7.5), here a `network.custom` allowlist on a node without `--network-allowlist`. The task stays `created` and no version is consumed; re-admit under the same version with a manifest the node honours. Protocol 1.3 and later. |
 | `resource_unavailable` | Registry full with no sealed task to evict, snapshot missing, workspace exists, spawn failed, a state write failed or would exceed its bound (admission version, revocation, retired attempt or task record), an evidence record could not be appended (§6.5), stop not confirmed in time, a pause or resume not confirmed, or an attempt's 128 pauses used up. |
 | `unsupported_operation` | The verb is not implemented (`stream`), or not enabled on this node or connection (no `--task-root`, or protocol 1.2). |
 
@@ -1039,11 +1049,33 @@ receipt outcome beside the authority chain the attempt was admitted under.
 | `unknown` | `exited`: the launch was ambiguous (the spawn was not confirmed within 30 seconds, a process may have started before the launch failed, or the spawned process could not be recorded), the node lost the child while waiting, or the node restarted while the attempt may have been executing (§6.4). `stopped`: the child was lost while a stop was pending. `revoked`: the reap was not confirmed within 10 seconds, or the child was lost. |
 
 The workload runs in bubblewrap with the workspace bound writable at `/work` (its working
-directory), a private `/tmp` and `/home/agent`, read-only system directories, no network
-but loopback (what its manifest asked for, §7.5), and only `HOME`, `PATH`, `TERM` and
-`PWD` set (`PWD` is bubblewrap's, set to `/work` when it enters the working directory;
-nothing of the node's own environment is passed on). Output is drained and not
-returned.
+directory), a private `/tmp` and `/home/agent`, read-only system directories, a network
+namespace holding only loopback, and only `HOME`, `PATH`, `TERM` and `PWD` set (`PWD` is
+bubblewrap's, set to `/work` when it enters the working directory; nothing of the node's
+own environment is passed on). Output is drained and not returned.
+
+An `offline` manifest (§7.5) binds nothing else: there is no route off the host. A
+`network.custom` manifest, on a node started with `--network-allowlist` (§2.1), runs the
+attempt behind its own egress proxy: the node starts a `ward-proxy` instance for the
+attempt, in the node process and as the node's uid, listening on a Unix socket under
+`<task-root>/<task>/<attempt>.egress/` (mode 0700, beside the workspace, never inside
+it), binds that socket into the sandbox at `/run/ward/proxy.sock` and sets exactly one
+more variable, `WARD_PROXY_SOCKET=/run/ward/proxy.sock`. The proxy speaks `CONNECT
+host:port` (an opaque tunnel; TLS is never intercepted) and absolute-URI plain-HTTP
+forwarding, with the session proxy's rules
+([ADR-0014](decisions/ADR-0014-sandbox-egress-relay.md)): exactly the manifest's host
+patterns pass; IP literals, private, link-local, loopback, multicast and reserved ranges
+and the cloud metadata endpoint are refused whatever the allowlist says; every address a
+name resolves to is checked and the connection goes only to a checked address, so a
+rebinding answer gains nothing; a refusal is `403` with a fixed body that names no
+allowlist entry. Raw TCP, UDP and DNS still have no path: the network namespace is
+unchanged and the proxy is the one way out. Every verdict is recorded in the attempt's
+evidence log as `NetworkRequested` or `NetworkDenied` (§6.5). `pause` makes the proxy
+answer every new connection `503 paused by ward` and hold established relays until
+`resume`; `stop`, `revoke`, the budget kill and the attempt's own exit shut it down and
+unlink the socket; a node restart ends it with the node. There is no loopback relay and
+no `HTTP_PROXY` inside the sandbox yet: a workload reaches the proxy through the socket
+`WARD_PROXY_SOCKET` names. No credential is injected (#267).
 
 ## 10. Failure semantics an adapter must handle
 
@@ -1301,8 +1333,10 @@ bad flags. A command line is at most 256 KiB.
 
 ### 11.5 What an adapter cannot do yet
 
-- Workloads run offline: a manifest with `network.custom` is refused `unsupported_grant`
-  (§7.5), so nothing in the sandbox can reach a network service.
+- Egress is HTTP(S) through the attempt's proxy socket only, and only on a node started
+  with `--network-allowlist` (§7.5, §9): there is no loopback relay or `HTTP_PROXY` in
+  the sandbox, patterns are host-level, and no credential is injected (#267). On any
+  other node a manifest with `network.custom` is refused `unsupported_grant`.
 - The workload's stdout and stderr are drained and not returned (§9); the protocol carries
   no output.
 - The workspace is not exported: what the workload wrote stays under
@@ -1313,6 +1347,6 @@ bad flags. A command line is at most 256 KiB.
 The honest integration shape today is therefore running governed tool actions and
 verification runs, an `argv` over a snapshot with a budget, through the node, reading the
 receipt and the evidence log, and not hosting a whole agent runtime whose conversation
-loop needs output, network or callbacks from inside the sandbox. Each of these gaps,
+loop needs output, credentials or callbacks from inside the sandbox. Each of these gaps,
 with its impact, the mitigation available today and the issue that closes it, is a row
 of [node-security-limitations.md](node-security-limitations.md) §3.

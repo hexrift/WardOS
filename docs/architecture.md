@@ -421,7 +421,7 @@ handshake and request line must arrive within 10 seconds of accept; the answer i
 written within 10 seconds of being ready, so a `start` or `stop` whose own bounded wait
 outlasts the request deadline is still answered.
 
-### 3.11 Node admission and execution ownership (decided; admission, start, stop, exit, pause, resume, revoke, seal and restart recovery implemented)
+### 3.11 Node admission and execution ownership (decided; admission, start, stop, exit, pause, resume, revoke, seal, restart recovery and the network allowlist implemented)
 
 [ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md) settles
 how the node will execute. The wire contract an external control plane drives is
@@ -491,13 +491,20 @@ unusable. Only then does a 1.3 capability document advertise `start` and `stop`.
 unrevoked (`lease_expired`, `lease_revoked`), allocates `<task-root>/<task>/<attempt>/`
 (mode 0700, created once per attempt) and materialises the envelope's snapshot into it
 (`resource_unavailable` with nothing spawned if the store lacks it). No path comes from a
-request. The envelope's argv runs through `ward-launch` in an offline sandbox (no egress
-socket, loopback only) from an empty environment (`--clearenv`: none of the node's own
-variables reach the workload), with the workspace as the only writable host path and the
-envelope's budget enforced. The envelope's capability manifest is read at `admit`: a
-manifest asking for more than `offline` is refused `unsupported_grant` there, so every
+request. The envelope's argv runs through `ward-launch` in a sandbox whose network
+namespace holds only loopback, from an empty environment (`--clearenv`: none of the
+node's own variables reach the workload), with the workspace as the only writable host
+path and the envelope's budget enforced. The envelope's capability manifest is read at
+`admit` and honoured exactly: `offline` binds no egress socket; `network.custom`, on a
+node started with `--network-allowlist`, runs the attempt behind its own `ward-proxy`
+instance (in the node process, on a Unix socket under
+`<task-root>/<task>/<attempt>.egress/`, bound at `/run/ward/proxy.sock` and named by
+`WARD_PROXY_SOCKET`) allowing exactly the manifest's hosts with the session proxy's
+structural denies, paused with the attempt and shut down with it, every verdict a
+`node`-origin `NetworkRequested` or `NetworkDenied` record bounded at 512 per attempt;
+any grant the node cannot enforce is refused `unsupported_grant` at `admit`, so every
 workload that starts runs under exactly what its manifest says (node-integration.md
-§7.5). The node answers `running` only after a confirmed spawn with
+§7.5, §9). The node answers `running` only after a confirmed spawn with
 the host pid recorded. A clean spawn failure changes nothing; an ambiguous launch is
 `exited` with an `unknown` receipt and is never re-run.
 
