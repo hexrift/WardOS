@@ -78,6 +78,16 @@ jobs:
           }
           cat "$log"
           bash scripts/verify/check-isolation-evidence.sh "$log"
+      # The ward-node cross-system acceptance (docs/node-acceptance.md, #332 slice 9) ran
+      # above as part of the workspace tests, in parallel with everything else. This
+      # re-runs exactly its cases, one at a time, for a named verdict per case and a summary
+      # table (the runner sets WARD_REQUIRE_ISOLATION=1 itself), after the runner's own
+      # rendering regressions; it fails the required job if a case did not pass or none ran.
+      - name: ward-node cross-system acceptance verdicts (#332 slice 9)
+        run: |
+          set -euo pipefail
+          bash scripts/acceptance/node.test.sh
+          bash scripts/acceptance/node.sh | tee -a "$GITHUB_STEP_SUMMARY"
 
   deny:
     name: cargo-deny (advisories · licenses · sources)

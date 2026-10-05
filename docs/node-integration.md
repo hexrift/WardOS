@@ -2,7 +2,8 @@
 
 Status: living document. It describes the `ward-node` protocol 1.3 contract as
 implemented today (ADR-0030 steps 1–9), and the client and process adapter that drive it
-(§11).
+(§11). The cross-system acceptance suite that proves it against a real node (ADR-0030
+step 10, #332 slice 9) is [node-acceptance.md](node-acceptance.md).
 
 This is the contract an adapter drives, in any language, to have a local `ward-node`
 admit, run, pause, stop, revoke and seal a task. Every protocol message below was
@@ -933,8 +934,9 @@ The attempt's evidence log (§6.5) records the same outcome in its `NodeAttemptE
 
 The workload runs in bubblewrap with the workspace bound writable at `/work` (its working
 directory), a private `/tmp` and `/home/agent`, read-only system directories, no network
-but loopback (what its manifest asked for, §7.5), and only `HOME`, `PATH` and `TERM`
-set. Output is drained and not
+but loopback (what its manifest asked for, §7.5), and only `HOME`, `PATH`, `TERM` and
+`PWD` set (`PWD` is bubblewrap's, set to `/work` when it enters the working directory;
+nothing of the node's own environment is passed on). Output is drained and not
 returned.
 
 ## 10. Failure semantics an adapter must handle

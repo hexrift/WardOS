@@ -1,7 +1,7 @@
 # ADR-0030 — ward-node task admission, execution ownership and exit semantics
 
 Status: **Accepted; implementation tracked by #324 (with #259 and #262), under #332
-slices 5–8.**
+slices 5–9.**
 
 This records the decisions #326 asked for before `ward-node` may execute anything. It
 follows ADR-0029: the node is the trusted execution authority on its host, and an
@@ -196,7 +196,25 @@ TDD slices without guessing at semantics inside a feature PR.
    completion with a verifying evidence log, a replay that runs nothing twice, and a
    revocation that leaves no process behind.
 
-Steps 1–9 are written down as the external contract in
-[node-integration.md](../node-integration.md).
+10. Cross-system acceptance (#332 slice 9): a real node, driven over its real socket by
+    `ward-node-client` and by the `ward-node-adapter` process, proves the completion gate
+    of #332 as named, repeatable cases with their pass criteria stated in code and in
+    [node-acceptance.md](../node-acceptance.md): bounded execution (a budget kill and a
+    completion, each within a stated bound, with the cause in the evidence log),
+    isolation (an in-sandbox probe whose exit status is the verdict: no route off the
+    host, no read of a host secret, the node's state or its own evidence log, no write
+    into a bound host directory, nothing written to `/tmp` or `$HOME` on the host, the
+    contract's environment and nothing of the node's), interruption (`revoke` leaves no
+    process and a sealed log, `pause`/`resume` leave the workload alive, a node `SIGKILL`
+    recovers `Exited`/`Unknown` and never re-runs), authorization failure (an untrusted
+    key, an expired lease, a wrong audience, a network manifest, a stale version and a
+    revoked lease, each with the contract's reason and nothing materialised), replay
+    safety (the same operation ids from the same process and from a new adapter process
+    run nothing twice; a retired attempt is never re-created) and recovery (a sealed
+    attempt's receipt and evidence survive a restart and verify). The suite runs under
+    the merge gate with isolation required and through `scripts/acceptance/node.sh`,
+    which prints one verdict per case.
 
-Cross-system acceptance — isolation, interruption, no duplicate effect — is #332 slice 9.
+Steps 1–9 are written down as the external contract in
+[node-integration.md](../node-integration.md); step 10 is its acceptance,
+[node-acceptance.md](../node-acceptance.md).
