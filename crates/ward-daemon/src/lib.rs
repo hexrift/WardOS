@@ -47,6 +47,7 @@ pub mod snapshot;
 pub mod space;
 pub mod usage;
 pub mod verify;
+pub mod verify_proposal;
 pub mod watch;
 
 pub use describe::SessionDescription;

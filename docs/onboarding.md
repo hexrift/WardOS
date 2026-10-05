@@ -98,9 +98,15 @@ What each line is:
 - `.gitignore` — one line for `.ward/sessions/`, added only in a git repository that
   does not ignore it yet.
 - `.tamperward/config.yml` — what `ward verify` runs: the protected tests (`tests/`)
-  and the command, guessed from `Cargo.toml` (`cargo test`), `package.json` (`npm
-  test`) or `pyproject.toml` (`pytest`); without one the key is left commented and
-  `ward verify` says so.
+  and the command, proposed from the project's own files and shown with the evidence
+  for it: `Cargo.toml` (`cargo test`, `--locked` with a `Cargo.lock`, `--workspace`
+  for a `[workspace]`), a `package.json` `test` script run by the package manager its
+  lockfile names (`pnpm test`, `yarn test`, `npm test`), pytest configuration or a
+  pytest dependency (`pytest`), `go.mod` (`go test ./...`) or a Makefile `test`
+  target (`make test`). Nothing is executed to decide. A `package.json` without a
+  real `test` script proposes nothing; when several match, all are written commented
+  and none is chosen for you; without one the key is left commented and `ward
+  verify` says so.
 - `.tamperward.yml` and the rest of TamperWard's wiring — `tamperward init --cwd .`
   when TamperWard is installed (its own report is printed above ward's: the policy,
   the Claude Code hooks, a pre-commit hook, a CI workflow, all idempotent). Without

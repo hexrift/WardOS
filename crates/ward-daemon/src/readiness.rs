@@ -21,10 +21,10 @@ use std::path::{Path, PathBuf};
 use crate::doctor::Status;
 use crate::verify;
 
-/// The build system a directory shows: decides the guessed verify command `ward
-/// init` writes into `.tamperward/config.yml`. Only used for that guess and for the
-/// report's header line — the `runtime` row below checks the *configured* command,
-/// not this detection, so a project that overrides the guess is checked correctly.
+/// The build system a directory shows, for the report's header line only. `ward
+/// init` proposes its verify command from [`crate::verify_proposal`] instead, and the
+/// `runtime` row below checks the *configured* command, not this detection, so a
+/// project whose command differs from its manifest is checked correctly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ecosystem {
     /// `Cargo.toml` at the root.
@@ -49,17 +49,6 @@ impl Ecosystem {
             Self::Python
         } else {
             Self::Unknown
-        }
-    }
-
-    /// The command `ward init` guesses for this ecosystem.
-    #[must_use]
-    pub const fn verify_command(self) -> Option<&'static str> {
-        match self {
-            Self::Cargo => Some("cargo test"),
-            Self::Npm => Some("npm test"),
-            Self::Python => Some("pytest"),
-            Self::Unknown => None,
         }
     }
 
@@ -283,7 +272,7 @@ fn verify_row(dir: &Path) -> (Row, Option<verify::Config>) {
                     "verify config",
                     Status::Fail,
                     format!(
-                        "{} not written yet; `ward init` writes a guess",
+                        "{} not written yet; `ward init` proposes a command",
                         verify::CONFIG_PATH
                     ),
                 ),
