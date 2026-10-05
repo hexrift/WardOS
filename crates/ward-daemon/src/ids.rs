@@ -39,6 +39,14 @@ pub fn new_session_id() -> Result<SessionId, Error> {
         .map_err(|e| Error::Events(e.to_string()))
 }
 
+/// A fresh, time-ordered id for one lifecycle operation (a pause or a stop):
+/// the same ULID construction as [`new_session_id`], rendered as 32 hex digits.
+pub fn new_operation_id() -> Result<String, Error> {
+    ulid_u128()
+        .map(|id| format!("{id:032x}"))
+        .map_err(|e| Error::Events(e.to_string()))
+}
+
 /// A stable project id derived from the canonical project path.
 pub fn project_id_for(path: &std::path::Path) -> ProjectId {
     let digest = blake3::hash(path.to_string_lossy().as_bytes());

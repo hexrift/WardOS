@@ -253,7 +253,32 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > either known survivors (`pending > 0`) or an unconfirmed pre-kill membership barrier
 > (`barrier_confirmed: false`, even with `pending: 0`). Replay and the desktop therefore
 > keep showing `STOP?` across a daemon restart until a later `ward stop` records a
-> confirmed retry; `ward resume` refuses an incomplete stop. `seal`
+> confirmed retry; `ward resume` refuses an incomplete stop. Every pause and stop
+> records its intent first (#145 item 7): `sessions/<id>/intent.json` — the operation's
+> id, verb, reason and start time — is written durably (temp file, `fsync`, rename,
+> `fsync`) before any process is signalled or the lifecycle lock is taken, and removed
+> once the operation's outcome is on the log (`SessionPaused`/`SessionPauseUnsettled`;
+> the seal, or the refused stop's `WorkloadsTerminated`). A `wardd serve` starting on a
+> session directory reconciles before it accepts a connection: it reads the log back
+> (the last agent state, the launches still open, whether the log says the session is
+> held), then finishes what the intent names — a stop is finished exactly as a retry
+> would finish it (rescan, kill, confirm, `WorkloadsTerminated` with the real counts,
+> `LaunchAborted` for every launch still open, `Finished`, `SessionEnded`, seal, the
+> project's current pointer cleared, and the daemon exits; or, when termination cannot
+> be confirmed, the session is held for the stop with `WorkloadsTerminated { pending }`
+> recorded, as a refused stop is); a pause is finished from what `/proc` shows now
+> (frozen, marker, approvals held) and recorded as `SessionPaused` only when the freeze
+> is confirmed, `SessionPauseUnsettled` otherwise, and only when the log does not
+> already carry it. A marker with no intent is a hold that completed before the
+> previous process died: the daemon adopts it the same way, as a hold for the stop when
+> the stop marker exists, so `ward resume` and `ward stop` work on it where a restarted
+> daemon used to answer `not paused`. An intent it cannot read, or a stop it cannot
+> bring to either outcome, makes the daemon refuse to serve. A client retrying after the
+> restart observes the reconciled state: `ward stop` finds the session already ended, or
+> retries over the hold; `ward pause` is told the session is already paused. While an
+> intent exists `ward pause --status` (and so `wardos-pause --status`) reads
+> `unconfirmed`, never `paused` on the strength of the marker or `running` for the lack
+> of one. `seal`
 > stays the separate, log-only closure: it never touches a running sandbox. A client
 > sends `Stop` only to a daemon whose `Request::Capabilities` names confirmed stop, and
 > requires the answer to acknowledge it; an older daemon is refused with nothing sent.

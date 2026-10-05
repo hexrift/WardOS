@@ -152,7 +152,10 @@ enum Command {
         /// Why, in your words; recorded with the pause.
         #[arg(long)]
         reason: Option<String>,
-        /// Print `paused` or `running` for the current session and change nothing.
+        /// Print `paused`, `unconfirmed`, `running` or `none` for the current
+        /// session and change nothing. `unconfirmed`: a pause or stop began
+        /// and its outcome is not recorded yet (the daemon is still at it, or
+        /// died mid-way and no daemon has reconciled the session since).
         #[arg(long, conflicts_with = "all")]
         status: bool,
         /// Pause every live session, not just one (#141 item 5: "Pause all
@@ -1751,6 +1754,7 @@ fn pause_status_word(
         None => SessionMeta::current(dir, state)?,
     };
     Ok(match meta {
+        Some(meta) if ward_daemon::pause::intent_path(state, &meta.id).exists() => "unconfirmed",
         Some(meta) if ward_daemon::pause::marker_path(state, &meta.id).exists() => "paused",
         Some(_) => "running",
         None => "none",
@@ -1759,7 +1763,8 @@ fn pause_status_word(
 
 /// `ward pause`: one request to the daemon, which does the whole operation;
 /// the row it answers with is the record of it. `--status` reads the marker the
-/// daemon leaves for the proxies, so it needs no daemon. `--all` (#141 item 5)
+/// daemon leaves for the proxies, and the intent a pause or stop in flight
+/// leaves (`unconfirmed`), so it needs no daemon. `--all` (#141 item 5)
 /// is the other, explicit scope: every live session, one result line each,
 /// instead of the one `dir`/`--session` would resolve to.
 ///
@@ -2786,6 +2791,52 @@ mod tests {
             pause_status_word(project.path(), state.path(), Some("sess_missing")).unwrap(),
             "none",
             "a pinned id naming no session is `none`, not an error"
+        );
+    }
+
+    /// #145 item 7: a pause or stop that began and has no recorded outcome —
+    /// its intent is still on disk — is `unconfirmed`, never `paused` on the
+    /// strength of a marker alone, nor `running` because no marker is there yet.
+    #[test]
+    fn pause_status_word_is_unconfirmed_while_an_intent_has_no_outcome() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let worktree = project.path().canonicalize().unwrap();
+        write_session(state.path(), "sess_a", &worktree, 1);
+        write_session(state.path(), "sess_b", &worktree, 2);
+        let intent = |verb| ward_daemon::pause::Intent::begin(verb).unwrap();
+        ward_daemon::pause::write_marker(state.path(), "sess_a", "because").unwrap();
+        ward_daemon::pause::write_intent(
+            state.path(),
+            "sess_a",
+            &intent(ward_daemon::pause::Verb::Pause {
+                reason: "because".into(),
+            }),
+        )
+        .unwrap();
+        ward_daemon::pause::write_intent(
+            state.path(),
+            "sess_b",
+            &intent(ward_daemon::pause::Verb::Stop {
+                reason: ward_events::EndReason::UserStop,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            pause_status_word(project.path(), state.path(), Some("sess_a")).unwrap(),
+            "unconfirmed",
+            "a marker with an unfinished pause behind it is not `paused`"
+        );
+        assert_eq!(
+            pause_status_word(project.path(), state.path(), Some("sess_b")).unwrap(),
+            "unconfirmed",
+            "a stop in flight with no marker is not `running`"
+        );
+        ward_daemon::pause::clear_intent(state.path(), "sess_a").unwrap();
+        assert_eq!(
+            pause_status_word(project.path(), state.path(), Some("sess_a")).unwrap(),
+            "paused"
         );
     }
 
