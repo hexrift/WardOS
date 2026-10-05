@@ -572,6 +572,15 @@ mock ward 'case "$*" in "session pending --json "*) : ;; *) exit 1 ;; esac'
 out=$("$approve")
 assert_eq "$out" "  no pending approvals"
 assert_not_logged '^ward session approve'
+# Asked for one approval by id (how the inbox opens it) when nothing is pending any
+# more: that approval is not pending — an error, the same as when others still are,
+# never the "nothing to do" success above (#146: expiry before click).
+: >"$MOCK_LOG"
+err=$("$approve" 12 y 2>&1 >/dev/null) && fail "an id that is not pending is an error, even with none pending"
+assert_eq "$err" "wardos-approve: approval 12 is not pending"
+err=$("$approve" 12 2>&1 >/dev/null) && fail "an id that is not pending is an error, answer or not"
+assert_eq "$err" "wardos-approve: approval 12 is not pending"
+assert_not_logged '^ward session approve'
 
 # --- --watch: a second identical pending record delivered after the first popup
 # exits (its notify-send child is gone) but before its worker actually finishes
