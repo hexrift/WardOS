@@ -15,9 +15,10 @@ use ward_events::{
     SnapshotId, TaskId,
 };
 use ward_node_protocol::{
-    AdmissionEnvelopeJson, AdmissionVersion, CapabilityManifestBytes, IssuerProof, IssuerSignature,
-    OperationId, TaskAdmissionAuthority, TaskAdmissionEnvelope, TaskAdmissionEnvelopeInput,
-    TaskBinding, TaskLifecycleContext, TaskLifecycleRequest, TaskWorkload, WorkloadArgv,
+    AdmissionEnvelopeJson, AdmissionVersion, CapabilityManifest, CapabilityManifestBytes,
+    HostAllowlist, IssuerProof, IssuerSignature, NetworkGrant, OperationId, TaskAdmissionAuthority,
+    TaskAdmissionEnvelope, TaskAdmissionEnvelopeInput, TaskBinding, TaskLifecycleContext,
+    TaskLifecycleRequest, TaskWorkload, WorkloadArgv,
 };
 
 use crate::admit::{NodeAdmission, NodeClock};
@@ -132,6 +133,25 @@ pub fn envelope_input_issued_by(
         expires_at_unix_ms: 8_000,
         version: AdmissionVersion::new(1).unwrap(),
     }
+}
+
+/// A manifest asking for allowlisted egress, which no node honours yet.
+pub fn network_manifest() -> CapabilityManifestBytes {
+    CapabilityManifestBytes::encode(&CapabilityManifest::new(NetworkGrant::Custom(
+        HostAllowlist::new(vec!["github.com".to_owned(), "*.crates.io".to_owned()]).unwrap(),
+    )))
+    .unwrap()
+}
+
+/// Replace the manifest of `input`'s workload, keeping everything else.
+pub fn with_manifest(input: &mut TaskAdmissionEnvelopeInput, manifest: CapabilityManifestBytes) {
+    input.workload = TaskWorkload::new(
+        input.workload.argv().clone(),
+        manifest,
+        input.workload.snapshot(),
+        input.workload.wall_clock_budget_ms(),
+    )
+    .unwrap();
 }
 
 pub fn sign(json: &AdmissionEnvelopeJson, key_pair: &Ed25519KeyPair) -> IssuerProof {

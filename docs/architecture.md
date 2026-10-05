@@ -447,8 +447,10 @@ unrevoked (`lease_expired`, `lease_revoked`), allocates `<task-root>/<task>/<att
 request. The envelope's argv runs through `ward-launch` in an offline sandbox (no egress
 socket, loopback only) from an empty environment (`--clearenv`: none of the node's own
 variables reach the workload), with the workspace as the only writable host path and the
-envelope's budget enforced; the capability manifest is not interpreted yet, so network
-grants are not honoured. The node answers `running` only after a confirmed spawn with
+envelope's budget enforced. The envelope's capability manifest is read at `admit`: a
+manifest asking for more than `offline` is refused `unsupported_grant` there, so every
+workload that starts runs under exactly what its manifest says (node-integration.md
+§7.5). The node answers `running` only after a confirmed spawn with
 the host pid recorded. A clean spawn failure changes nothing; an ambiguous launch is
 `exited` with an `unknown` receipt and is never re-run.
 

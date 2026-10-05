@@ -9,9 +9,9 @@
 //! A launch is built only from node-owned state: the workspace the node allocated under
 //! its task root ([`crate::workspace`]), the admitted envelope's argv and its mandatory
 //! wall-clock budget. The sandbox is offline: it never binds an egress socket, so its
-//! network namespace holds only loopback. The envelope's capability manifest is not
-//! interpreted yet, so any network grant it carries is not honoured; the node fails closed
-//! to the least authority rather than guessing at a grant.
+//! network namespace holds only loopback. That matches every admitted envelope's capability
+//! manifest, because `admit` ([`crate::admit`]) refuses any manifest asking for more than
+//! `offline`; the node never runs a workload under less than its manifest asked for.
 //!
 //! `pause` and `resume` act on the running workload through its [`WorkloadFreezer`], which
 //! the reaper hands back with the spawned pid. The sandbox freezer stops the tree rooted at

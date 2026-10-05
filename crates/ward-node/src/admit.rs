@@ -15,7 +15,11 @@
 //! 7. the version is strictly greater than the last one durably accepted for the task;
 //! 8. the lease and lineage, promoted only because the trusted issuer signed them, pass
 //!    the trusted task-authority check ([`TrustedTaskAdmission`]) for the binding and agent;
-//! 9. no durable revocation covers the lease or its lineage.
+//! 9. no durable revocation covers the lease or its lineage;
+//! 10. every grant in the decoded capability manifest is one this node honours. Every
+//!     workload runs offline, so only `{"network":"offline"}` passes; any other network
+//!     grant is refused `unsupported_grant`, after authority is proven and before the
+//!     version is committed, so a refused grant consumes nothing.
 //!
 //! Each failure is a typed [`TaskLifecycleRejectionReason`]. Task-registry checks
 //! (existence, exact binding, `Created` state) come first, in [`crate::task`].
@@ -31,8 +35,8 @@ use ward_authority::{
 };
 use ward_events::{LeaseId, NodeId};
 use ward_node_protocol::{
-    AdmissionEnvelopeJson, IssuerProof, TaskAdmissionEnvelope, TaskBinding,
-    TaskLifecycleRejectionReason,
+    AdmissionEnvelopeJson, CapabilityManifest, IssuerProof, NetworkGrant, TaskAdmissionEnvelope,
+    TaskBinding, TaskLifecycleRejectionReason,
 };
 
 use crate::admission::{TaskAdmissionIdentity, TaskAuthorityError, TrustedTaskAdmission};
@@ -199,6 +203,7 @@ impl NodeAdmission {
         authority
             .revalidate(self.state.revocations(), now)
             .map_err(|_| Reason::LeaseRevoked)?;
+        check_grants(envelope.workload().capability_manifest().manifest())?;
 
         Ok(VerifiedAdmission {
             envelope,
@@ -340,6 +345,13 @@ const fn claimed_binding(wire: &UntrustedAuthorityLease) -> DelegationBinding {
         subject: wire.subject(),
         task: wire.task(),
         version: wire.version(),
+    }
+}
+
+const fn check_grants(manifest: &CapabilityManifest) -> Result<(), Reason> {
+    match manifest.network() {
+        NetworkGrant::Offline => Ok(()),
+        NetworkGrant::Custom(_) => Err(Reason::UnsupportedGrant),
     }
 }
 

@@ -169,8 +169,15 @@ TDD slices without guessing at semantics inside a feature PR.
    recovery after a restart and seal. Each record is durable before its verb is answered,
    a restarted node reconciles the log before it serves, and sealing the task seals the
    log.
+8. The capability manifest is read (#332): its bytes are one typed, bounded manifest
+   (`network`: `offline`, or a `custom` host allowlist in `ward-policy`'s spelling), a
+   manifest outside the grammar fails envelope decoding, and `admit` refuses
+   `unsupported_grant`, after authority is proven and before the version is committed,
+   any grant the node cannot enforce. Every workload runs offline, so only `offline` is
+   honoured until the proxy-backed allowlist lands; the node never runs a workload under
+   less than its manifest says.
 
-Steps 1–7 are written down as the external contract in
+Steps 1–8 are written down as the external contract in
 [node-integration.md](../node-integration.md).
 
 Cross-system acceptance — isolation, interruption, no duplicate effect — is #332 slice 9.
