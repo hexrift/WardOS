@@ -9,6 +9,11 @@
 //! This module only defines, bounds and structurally validates these values; issuer-proof
 //! verification, audience, expiry and replay checks belong to the node (ADR-0030 §2). The
 //! envelope never names a host path: the node allocates the workspace itself.
+//!
+//! Every hex value in the envelope and the proof (`capability_manifest.hash`,
+//! `capability_manifest.bytes`, `snapshot`, `issuer_key_id`, `signature`) is encoded and
+//! accepted in lowercase only, without a prefix, so a signed or hashed value has exactly
+//! one spelling on the wire.
 
 use std::fmt::{Display, Formatter};
 use std::num::NonZeroU64;
@@ -199,6 +204,7 @@ impl CapabilityManifestBytes {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CapabilityManifestBytesWire {
+    #[serde(deserialize_with = "deserialize_lower_hex_32")]
     hash: Blake3Hash,
     bytes: String,
 }
@@ -226,7 +232,7 @@ impl<'de> Deserialize<'de> for CapabilityManifestBytes {
             return Err(D::Error::custom(TaskAdmissionError::ManifestTooLarge));
         }
         let bytes = decode_hex(&wire.bytes)
-            .ok_or_else(|| D::Error::custom("capability manifest bytes are not hex"))?;
+            .ok_or_else(|| D::Error::custom("capability manifest bytes are not lowercase hex"))?;
         let manifest = Self::new(bytes).map_err(D::Error::custom)?;
         if manifest.hash != wire.hash {
             return Err(D::Error::custom(TaskAdmissionError::ManifestHashMismatch));
@@ -296,6 +302,7 @@ impl TaskWorkload {
 struct TaskWorkloadWire {
     argv: WorkloadArgv,
     capability_manifest: CapabilityManifestBytes,
+    #[serde(deserialize_with = "deserialize_lower_hex_snapshot")]
     snapshot: SnapshotId,
     wall_clock_budget_ms: u64,
 }
@@ -435,7 +442,7 @@ impl<'de> Deserialize<'de> for IssuerSignature {
         decode_hex(&hex)
             .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
             .map(Self)
-            .ok_or_else(|| D::Error::custom("issuer signature must be 64 hex-encoded bytes"))
+            .ok_or_else(|| D::Error::custom("issuer signature must be 64 bytes in lowercase hex"))
     }
 }
 
@@ -447,6 +454,7 @@ impl<'de> Deserialize<'de> for IssuerSignature {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssuerProof {
+    #[serde(deserialize_with = "deserialize_lower_hex_32")]
     issuer_key_id: Blake3Hash,
     signature: IssuerSignature,
 }
@@ -710,6 +718,24 @@ fn encode_hex(bytes: &[u8]) -> String {
         out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     out
+}
+
+fn deserialize_lower_hex_32<'de, D>(deserializer: D) -> Result<Blake3Hash, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let hex = String::deserialize(deserializer)?;
+    decode_hex(&hex)
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map(Blake3Hash::from_bytes)
+        .ok_or_else(|| D::Error::custom("expected 64 lowercase hex characters"))
+}
+
+fn deserialize_lower_hex_snapshot<'de, D>(deserializer: D) -> Result<SnapshotId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_lower_hex_32(deserializer).map(SnapshotId::new)
 }
 
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
@@ -1036,6 +1062,95 @@ mod tests {
         for value in [wrong_hash, odd_hex, not_hex, empty] {
             assert!(decode(&value.to_string()).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn every_hex_value_decodes_in_lowercase_only() {
+        let lower = "ab".repeat(32);
+        let manifest_hash = Blake3Hash::hash(MANIFEST_BYTES).to_hex();
+        let manifest_bytes = envelope_value()["workload"]["capability_manifest"]["bytes"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(manifest_hash.bytes().any(|c| c.is_ascii_lowercase()));
+        assert!(manifest_bytes.bytes().any(|c| c.is_ascii_lowercase()));
+
+        let envelope_with = |field: &str, value: &str| {
+            let mut envelope = envelope_value();
+            if field == "snapshot" {
+                envelope["workload"]["snapshot"] = serde_json::json!(value);
+            } else {
+                envelope["workload"]["capability_manifest"][field] = serde_json::json!(value);
+            }
+            envelope.to_string()
+        };
+        assert_eq!(
+            decode(&envelope_with("snapshot", &lower))
+                .unwrap()
+                .workload()
+                .snapshot(),
+            ward_events::SnapshotId::new(Blake3Hash::from_bytes([0xab; 32]))
+        );
+        assert!(decode(&envelope_with("hash", &manifest_hash)).is_ok());
+        assert!(decode(&envelope_with("bytes", &manifest_bytes)).is_ok());
+
+        let mixed = |hex: &str| {
+            let index = hex.find(|c: char| c.is_ascii_lowercase()).unwrap();
+            let mut out = hex.to_owned();
+            out.replace_range(index..=index, &hex[index..=index].to_ascii_uppercase());
+            out
+        };
+        for (field, value) in [
+            ("snapshot", lower.clone()),
+            ("hash", manifest_hash),
+            ("bytes", manifest_bytes),
+        ] {
+            for spelled in [value.to_ascii_uppercase(), mixed(&value)] {
+                assert!(
+                    decode(&envelope_with(field, &spelled)).is_err(),
+                    "{field} {spelled}"
+                );
+            }
+        }
+
+        let proof_with = |field: &str, value: &str| {
+            let mut proof = serde_json::from_str::<serde_json::Value>(PROOF_JSON).unwrap();
+            proof[field] = serde_json::json!(value);
+            serde_json::from_str::<IssuerProof>(&proof.to_string())
+        };
+        let signature = "ab".repeat(64);
+        assert_eq!(
+            proof_with("issuer_key_id", &lower).unwrap().issuer_key_id(),
+            Blake3Hash::from_bytes([0xab; 32])
+        );
+        assert!(proof_with("signature", &signature).is_ok());
+        for (field, value) in [("issuer_key_id", lower), ("signature", signature)] {
+            for spelled in [value.to_ascii_uppercase(), mixed(&value)] {
+                assert!(proof_with(field, &spelled).is_err(), "{field} {spelled}");
+            }
+        }
+
+        let encoded = serde_json::to_string(&IssuerProof::new(
+            Blake3Hash::from_bytes([0xab; 32]),
+            IssuerSignature::from_bytes([0xcd; 64]),
+        ))
+        .unwrap();
+        assert!(
+            !encoded.bytes().any(|c| c.is_ascii_uppercase()),
+            "{encoded}"
+        );
+        let workload = TaskWorkload::new(
+            argv(),
+            manifest(),
+            ward_events::SnapshotId::new(Blake3Hash::from_bytes([0xab; 32])),
+            1,
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&workload).unwrap();
+        assert!(
+            encoded.contains(&format!(r#""snapshot":"{}""#, "ab".repeat(32))),
+            "{encoded}"
+        );
     }
 
     #[test]

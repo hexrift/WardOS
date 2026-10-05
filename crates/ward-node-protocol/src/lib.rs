@@ -1006,7 +1006,15 @@ pub enum TaskLifecycleRejectionReason {
     LeaseExpired,
     /// The request's lease has been revoked.
     LeaseRevoked,
-    /// The request's idempotency id has already been superseded by a later operation.
+    /// The request is stale. It covers two cases:
+    ///
+    /// * for `admit`, the admission envelope's `version` is not greater than the last
+    ///   version the node durably accepted for the same task (an old or replayed
+    ///   envelope, including after a node restart);
+    /// * for any mutating verb, the request's idempotency id has already been superseded
+    ///   by a later operation on the task.
+    ///
+    /// `ward-node` currently returns it only in the first case, from `admit`.
     StaleOperation,
     /// The task is not in a state that allows this operation.
     InvalidState,
