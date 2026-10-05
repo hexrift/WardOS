@@ -256,7 +256,7 @@ struct Marker {
 /// `fsync` the regular file at `path` after writing `bytes` to it (truncating any
 /// existing content) — the first half of the durable write [`write_marker`] performs
 /// as write-temp / fsync / rename / fsync-directory.
-fn write_file_durably(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file_durably(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -271,7 +271,7 @@ fn write_file_durably(path: &Path, bytes: &[u8]) -> Result<()> {
 /// `fsync` a directory so a rename or unlink already applied to it survives a crash
 /// (POSIX only guarantees a directory entry change is durable once its directory's
 /// own fd has been synced, not merely the file that moved).
-fn sync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     let dir_file = std::fs::File::open(dir).map_err(|e| Error::io(dir, e))?;
     dir_file.sync_all().map_err(|e| Error::io(dir, e))
 }

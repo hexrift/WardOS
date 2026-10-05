@@ -12,7 +12,9 @@
 #                           Stop & restore entry state / Inspect activity
 #   wardos-pause pause-all  pause every live session (#141 item 5: a distinct, explicit
 #                           scope from pausing this one), one result line each
-#   wardos-pause --status   print paused, running or none for this session (for the bar)
+#   wardos-pause --status   print paused, unconfirmed, running or none for this session
+#                           (for the bar); unconfirmed: a pause or stop began and its
+#                           outcome is not recorded yet
 #   wardos-pause --help
 #
 # "This session" is WARDOS_SESSION's when set (an immutable, explicitly pinned id — a
@@ -33,7 +35,8 @@ project=${WARDOS_PROJECT:-$PWD}
 session_flag=()
 [[ -n ${WARDOS_SESSION:-} ]] && session_flag=(--session "$WARDOS_SESSION")
 
-# paused, running or none: the daemon's marker, read by `ward pause --status`.
+# paused, unconfirmed, running or none: the daemon's marker and the intent of a pause or
+# stop still in flight, read by `ward pause --status`.
 # WARDOS_SESSION pins which session's state this reads, same as every other
 # subcommand here (#141 finding 3: a no-argument toggle pinned to one session
 # must never inspect a different one just because they disagree).
@@ -190,7 +193,7 @@ case "${1:-}" in
         do_pause
         menu
         ;;
-      paused) menu ;;
+      paused | unconfirmed) menu ;;
       *) wardos_die "no agent session for $project (ward up)" ;;
     esac
     ;;

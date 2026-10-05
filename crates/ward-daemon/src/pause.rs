@@ -28,6 +28,11 @@
 //! the log only after that confirmation; a stop that could not confirm it is
 //! refused and the session is held for the stop instead.
 //!
+//! **Restart reconciliation** ([`INTENT`], #145 item 7): every pause and stop
+//! records its intent durably here before it signals anything, and removes it
+//! once its outcome is on the log, so a daemon started on the session finishes
+//! what a previous process left unfinished (`crate::daemon::serve`).
+//!
 //! **Launch admission** ([`admit_launch`], PR #253 review finding 2) takes the
 //! same session lock ([`lock_pause_freeze`]) pause, resume, stop and the
 //! capture freeze take, and holds it across the `bwrap` spawn; the stop marker
@@ -43,7 +48,8 @@ use std::time::{Duration, Instant};
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use ward_events::PauseMethod;
+use serde::{Deserialize, Serialize};
+use ward_events::{EndReason, PauseMethod};
 
 use crate::error::{Error, Result};
 use crate::session::{run_dir_path, session_dir};
@@ -88,6 +94,102 @@ pub fn write_stop_marker(state: &Path, session: &str) -> Result<()> {
 #[must_use]
 pub fn stop_begun(state: &Path, session: &str) -> bool {
     stop_marker_path(state, session).exists()
+}
+
+/// File name of the lifecycle intent inside `sessions/<id>/` (#145 item 7): the
+/// record that a pause or a stop has begun and has not yet reached its terminal
+/// record. Written durably (temp file, `fsync`, rename, `fsync` of the directory)
+/// before anything is signalled, and removed once the operation's outcome is on
+/// the log — `SessionPaused`/`SessionPauseUnsettled` for a pause, the seal or
+/// the refused stop's `WorkloadsTerminated` for a stop. A daemon starting on a
+/// session directory that still holds one finishes that operation before it
+/// serves ([`crate::daemon::serve`]).
+pub const INTENT: &str = "intent.json";
+
+/// Which operation an [`Intent`] records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum Verb {
+    /// `ward pause`, or the hold a stop takes before restoring the entry state.
+    Pause {
+        /// The reason the pause's record carries.
+        reason: String,
+    },
+    /// `ward stop`.
+    Stop {
+        /// The reason `SessionEnded` carries.
+        reason: EndReason,
+    },
+}
+
+/// The durable intent of one lifecycle operation (see [`INTENT`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Intent {
+    /// The operation's id ([`crate::ids::new_operation_id`]).
+    pub op: String,
+    /// When the operation began, milliseconds since the Unix epoch.
+    pub started_unix_ms: u64,
+    /// What it is.
+    #[serde(flatten)]
+    pub verb: Verb,
+}
+
+impl Intent {
+    /// A fresh intent for `verb`, beginning now.
+    pub fn begin(verb: Verb) -> Result<Self> {
+        Ok(Self {
+            op: crate::ids::new_operation_id()?,
+            started_unix_ms: crate::control::unix_ms(std::time::SystemTime::now()),
+            verb,
+        })
+    }
+}
+
+/// The intent file of `session` (see [`INTENT`]).
+#[must_use]
+pub fn intent_path(state: &Path, session: &str) -> PathBuf {
+    session_dir(state, session).join(INTENT)
+}
+
+/// Record `intent` for `session` durably: written to a private temp file beside
+/// [`intent_path`], `fsync`ed, renamed into place, and the directory `fsync`ed,
+/// so a crash at any point leaves either the previous intent or this one, never
+/// a partial file. Replaces an intent already there.
+pub fn write_intent(state: &Path, session: &str, intent: &Intent) -> Result<()> {
+    let path = intent_path(state, session);
+    let bytes = serde_json::to_vec(intent).map_err(|e| Error::Events(format!("intent: {e}")))?;
+    let tmp = path.with_extension("json.tmp");
+    crate::attempt::write_file_durably(&tmp, &bytes)?;
+    fs::rename(&tmp, &path).map_err(|e| Error::io(&path, e))?;
+    crate::attempt::sync_dir(&session_dir(state, session))
+}
+
+/// The intent recorded for `session`, if any. An intent that cannot be parsed is
+/// an error: a daemon must not serve a session whose last lifecycle operation it
+/// cannot name.
+pub fn read_intent(state: &Path, session: &str) -> Result<Option<Intent>> {
+    let path = intent_path(state, session);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io(&path, e)),
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+        Error::Daemon(format!(
+            "{}: unreadable lifecycle intent: {e}",
+            path.display()
+        ))
+    })
+}
+
+/// Remove `session`'s intent durably; one already gone is fine.
+pub fn clear_intent(state: &Path, session: &str) -> Result<()> {
+    let path = intent_path(state, session);
+    match fs::remove_file(&path) {
+        Ok(()) => crate::attempt::sync_dir(&session_dir(state, session)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::io(&path, e)),
+    }
 }
 
 /// The refusal a launch gets while the session is paused.

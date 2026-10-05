@@ -1442,6 +1442,7 @@ impl Session {
             },
         )?;
         self.sink.stop(reason)?;
+        let _ = pause::clear_intent(&self.state, &self.session_str);
         clear_current(&self.state, &self.project_id, &self.session_str)?;
         Ok(ended)
     }
@@ -1515,13 +1516,33 @@ impl Session {
     }
 
     /// The daemonless half of [`Self::stop`]: what `Served::stop` does for a
-    /// served session, in this process. The stop marker is written first, and
-    /// the termination runs, under the session lock every launch's admission
-    /// takes (PR #253 review finding 2), so no sandbox can be spawned past the
-    /// scan. With no daemon there is no pause state to hold, so an unconfirmed
-    /// termination writes the marker (every proxy of the session refuses) and
-    /// records `WorkloadsTerminated { pending }`, then refuses the stop.
+    /// served session, in this process. The stop's intent is recorded durably
+    /// first (#145 item 7: a `wardd` later started on this session finishes
+    /// the stop if this process dies mid-way); then the stop marker is written
+    /// and the termination runs, under the session lock every launch's
+    /// admission takes (PR #253 review finding 2), so no sandbox can be
+    /// spawned past the scan. With no daemon there is no pause state to hold,
+    /// so an unconfirmed termination writes the marker (every proxy of the
+    /// session refuses) and records `WorkloadsTerminated { pending }`, then
+    /// refuses the stop. Always uses [`pause::terminate`]; see
+    /// [`Self::end_workloads_here_with`].
     fn end_workloads_here(&mut self) -> Result<u32> {
+        self.end_workloads_here_with(pause::terminate)
+    }
+
+    /// [`Self::end_workloads_here`] with the termination injectable, for the
+    /// same reason `Served::stop`'s is.
+    fn end_workloads_here_with(
+        &mut self,
+        terminate: impl FnOnce(&str, Option<pause::Frozen>) -> pause::Termination,
+    ) -> Result<u32> {
+        pause::write_intent(
+            &self.state,
+            &self.session_str,
+            &pause::Intent::begin(pause::Verb::Stop {
+                reason: EndReason::UserStop,
+            })?,
+        )?;
         let outcome = {
             let _lock =
                 pause::lock_pause_freeze(&session_dir(&self.state, &self.session_str)).map_err(
@@ -1540,7 +1561,7 @@ impl Session {
                     self.session_str
                 ))
             })?;
-            pause::terminate(&self.session_str, None)
+            terminate(&self.session_str, None)
         };
         self.record_termination(&outcome)
     }
@@ -1567,6 +1588,9 @@ impl Session {
                     },
                 )
                 .err();
+            if logged.is_none() {
+                let _ = pause::clear_intent(&self.state, &self.session_str);
+            }
             return Err(Error::Daemon(pause::stop_refusal(
                 &self.session_str,
                 ended,
@@ -1614,6 +1638,9 @@ impl Session {
                 },
             )
             .err();
+        if logged.is_none() {
+            let _ = pause::clear_intent(&self.state, &self.session_str);
+        }
         Err(Error::Daemon(pause::stop_refusal(
             &self.session_str,
             ended,
@@ -1929,7 +1956,7 @@ fn write_current(state: &Path, project_id: &str, id: &str) -> Result<()> {
 
 /// Clear the current pointer, but only if it still names `id` (do not clobber a
 /// newer session that replaced this one).
-fn clear_current(state: &Path, project_id: &str, id: &str) -> Result<()> {
+pub(crate) fn clear_current(state: &Path, project_id: &str, id: &str) -> Result<()> {
     if read_current(state, project_id)?.as_deref() == Some(id) {
         let path = current_pointer(state, project_id);
         match std::fs::remove_file(&path) {
@@ -3501,6 +3528,56 @@ mod tests {
             kinds_in(&log).last().map(String::as_str),
             Some("SessionEnded")
         );
+    }
+
+    /// #145 item 7 without a daemon: the stop's intent is on disk before the
+    /// termination runs, cleared once the refusal's record is durable, and
+    /// cleared again once a confirmed stop seals.
+    #[test]
+    fn a_daemonless_stop_records_its_intent_before_terminating_and_clears_it_with_its_outcome() {
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut session = Session::start_in(project.path(), state.path()).unwrap();
+        let id = session.id().to_owned();
+        let intent = pause::intent_path(state.path(), &id);
+        let err = session
+            .end_workloads_here_with(|_, held| {
+                assert!(held.is_none());
+                let intent = pause::read_intent(state.path(), &id)
+                    .unwrap()
+                    .expect("the intent is durable before anything is killed");
+                assert_eq!(
+                    intent.verb,
+                    pause::Verb::Stop {
+                        reason: EndReason::UserStop
+                    }
+                );
+                pause::Termination {
+                    ended: 1,
+                    remaining: Some(pause::Frozen {
+                        method: ward_events::PauseMethod::Sigstop,
+                        pids: vec![999_999],
+                        cgroup: None,
+                    }),
+                    barrier_confirmed: true,
+                }
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1 ended, 1 still present"), "{err}");
+        assert!(!intent.exists(), "the refusal's record is the outcome");
+        assert_eq!(
+            session
+                .end_workloads_here_with(|_, _| pause::Termination::confirmed(1))
+                .unwrap(),
+            1
+        );
+        assert!(
+            intent.exists(),
+            "a confirmed termination still owes the seal"
+        );
+        assert_eq!(session.stop(EndReason::UserStop).unwrap(), 0);
+        assert!(!intent.exists());
     }
 
     /// Daemonless replay keeps the same durable incomplete-stop evidence as

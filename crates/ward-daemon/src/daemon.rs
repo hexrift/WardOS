@@ -133,8 +133,14 @@ pub fn newest_live(state: &Path) -> Result<Option<SessionMeta>> {
 ///
 /// Reads `session.json` for the start time, resumes the chain from the log,
 /// binds the socket (mode 0600, replacing a stale file nothing answers on),
-/// writes `wardd.pid`, and serves connections concurrently. Returns once the log
-/// is sealed and the socket and pid file are gone.
+/// writes `wardd.pid`, reconciles the lifecycle a previous process left
+/// behind (#145 item 7, [`Served::reconcile_lifecycle_with`]: an interrupted
+/// pause or stop is finished before a single connection is served, failing
+/// closed like the attempt reconciliation; a stop finished this way seals the
+/// log, clears the project's current pointer and returns at once, exactly as
+/// if the stop had been asked over the socket), and serves connections
+/// concurrently. Returns once the log is sealed and the socket and pid file
+/// are gone.
 pub fn serve(state: &Path, session: &str) -> Result<()> {
     let meta = SessionMeta::load(state, session)?;
     let dir = session_dir(state, session);
@@ -193,14 +199,26 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
         });
     }
 
-    let served = Arc::new(Mutex::new(Served::new(
+    let mut served = Served::new(
         log,
         log_path,
         description,
         deriver,
         state.to_path_buf(),
         session.to_owned(),
-    )));
+    );
+    let sealed = match served.reconcile_lifecycle() {
+        Ok(sealed) => sealed,
+        Err(e) => {
+            release_socket(&socket, bound_inode, &pid_file);
+            return Err(e);
+        }
+    };
+    if sealed {
+        release_socket(&socket, bound_inode, &pid_file);
+        return crate::session::clear_current(state, &meta.project_id, session);
+    }
+    let served = Arc::new(Mutex::new(served));
     let finished = Arc::new(AtomicBool::new(false));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
     let mut next_peer: u64 = 0;
@@ -240,12 +258,7 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
         }));
     }
     drop(listener);
-    // Only remove what this process bound: a successor that replaced a stale
-    // socket file owns the path now.
-    if std::fs::metadata(&socket).map(|m| m.ino()).ok() == bound_inode {
-        let _ = std::fs::remove_file(&socket);
-    }
-    let _ = std::fs::remove_file(&pid_file);
+    release_socket(&socket, bound_inode, &pid_file);
     // Idle connections are blocked reading their next request; end those reads
     // while letting a response still being written complete.
     for (_, peer) in lock(&served).peers.drain(..) {
@@ -255,6 +268,15 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
         let _ = worker.join();
     }
     Ok(())
+}
+
+/// Remove the socket this process bound (only that one: a successor that
+/// replaced a stale socket file owns the path now) and its pid file.
+fn release_socket(socket: &Path, bound_inode: Option<u64>, pid_file: &Path) {
+    if std::fs::metadata(socket).map(|m| m.ino()).ok() == bound_inode {
+        let _ = std::fs::remove_file(socket);
+    }
+    let _ = std::fs::remove_file(pid_file);
 }
 
 /// Bind the control socket at `path` with mode 0600.
@@ -998,12 +1020,13 @@ impl Served {
         Ok((record.seq, None))
     }
 
-    /// Pause the session (ADR-0019 §3), in this order: freeze the sandbox
-    /// processes, write the marker every proxy of the session refuses on (new
-    /// connections, new requests, credential injection), hold the approvals,
-    /// decide whether the freeze actually settled, and append exactly one
-    /// terminal record for it — `SessionPaused` when confirmed,
-    /// `SessionPauseUnsettled` otherwise. The processes are frozen first so
+    /// Pause the session (ADR-0019 §3), in this order: record the pause's
+    /// intent ([`Self::record_intent`]), freeze the sandbox processes, write
+    /// the marker every proxy of the session refuses on (new connections, new
+    /// requests, credential injection), hold the approvals, decide whether the
+    /// freeze actually settled, and append exactly one terminal record for it
+    /// — `SessionPaused` when confirmed, `SessionPauseUnsettled` otherwise —
+    /// after which the intent is cleared. The processes are frozen first so
     /// nothing can use the gap before the proxy notices the marker. Any failure
     /// before the terminal record is (successfully) recorded undoes what was
     /// done, so the session is either paused whole or not at all — see
@@ -1061,6 +1084,9 @@ impl Served {
             return Err(Error::Daemon("already paused".into()));
         }
         let reason = pause::reason_text(reason);
+        self.record_intent(pause::Verb::Pause {
+            reason: reason.clone(),
+        })?;
         // #234: the same lock `CaptureFreeze::acquire`/`Drop` take, held across the
         // freeze and the marker write so a capture's own marker check or thaw can
         // never straddle this pause taking hold.
@@ -1068,6 +1094,7 @@ impl Served {
         let frozen = pause::freeze(&self.session);
         if let Err(e) = pause::write_marker(&self.state, &self.session, &reason) {
             pause::thaw(&frozen);
+            let _ = pause::clear_intent(&self.state, &self.session);
             return Err(e);
         }
         self.approvals.set_paused(true);
@@ -1093,6 +1120,7 @@ impl Served {
                     self.approvals.set_paused(false);
                     let _ = pause::clear_marker(&self.state, &self.session);
                     pause::thaw(&frozen);
+                    let _ = pause::clear_intent(&self.state, &self.session);
                     return Err(e);
                 }
             },
@@ -1137,6 +1165,7 @@ impl Served {
                 }
             },
         };
+        let _ = pause::clear_intent(&self.state, &self.session);
         self.paused = Some(Paused {
             frozen,
             since: Instant::now(),
@@ -1146,6 +1175,17 @@ impl Served {
             record: Box::new(record),
             unsettled,
         })
+    }
+
+    /// Record durably that `verb` has begun for this session (#145 item 7):
+    /// see [`pause::INTENT`]. Called before any process is signalled, so a
+    /// daemon restarted after a crash anywhere after it finishes the operation
+    /// ([`Self::reconcile_lifecycle`]). The intent is cleared, best effort,
+    /// once the operation's terminal record is durable: a removal that fails
+    /// is untidy, never incorrect, since a restart then finds the log already
+    /// carrying the outcome and adopts it without a second record.
+    fn record_intent(&self, verb: pause::Verb) -> Result<()> {
+        pause::write_intent(&self.state, &self.session, &pause::Intent::begin(verb)?)
     }
 
     /// Reverse [`Self::pause`]: release the approvals, open the proxy, thaw
@@ -1201,7 +1241,9 @@ impl Served {
     /// [`Self::hold_for_stop`], with the freeze injectable (a test needs an
     /// unsettled outcome no real process can produce on demand).
     ///
-    /// Under [`pause::lock_pause_freeze`], in this order: the stop marker is
+    /// Under [`pause::lock_pause_freeze`], in this order: the hold's intent is
+    /// recorded (as a pause: that is what a restart finishes, as a hold for
+    /// the stop once the stop marker exists), the stop marker is
     /// written, so no launch is admitted from here on
     /// ([`pause::admit_launch`]); then the daemon's *own* view decides what is
     /// frozen — never the pause marker on disk, which a daemon restarted since
@@ -1224,6 +1266,9 @@ impl Served {
             return Err(Error::Daemon("log is sealed".into()));
         }
         let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
+        self.record_intent(pause::Verb::Pause {
+            reason: pause::reason_text(reason),
+        })?;
         pause::write_stop_marker(&self.state, &self.session)?;
         if let Some(paused) = self.paused.take() {
             let (frozen, stable) = restabilize(&self.session, paused.frozen);
@@ -1246,6 +1291,7 @@ impl Served {
                 hold: Hold::Stop,
             });
             marker?;
+            let _ = pause::clear_intent(&self.state, &self.session);
             return Ok(unsettled);
         }
         let reason = pause::reason_text(reason);
@@ -1289,6 +1335,7 @@ impl Served {
                 self.session
             ))
         })?;
+        let _ = pause::clear_intent(&self.state, &self.session);
         Ok(unsettled)
     }
 
@@ -1315,6 +1362,10 @@ impl Served {
     /// an incomplete stop, not a pause: `ward resume` refuses it, and a later
     /// `ward stop` retries from there.
     ///
+    /// The stop's intent ([`Self::record_intent`]) is durable before the
+    /// lifecycle lock is even taken, and cleared once the log is sealed (or,
+    /// in [`Self::end_workloads`], once the refused stop's hold is recorded).
+    ///
     /// `terminate` is injectable for the same reason [`Self::pause_with`]'s
     /// `settle` is: a real process that survives `SIGKILL` for the length of the
     /// bound (uninterruptible sleep) cannot be produced on demand by a test.
@@ -1328,6 +1379,17 @@ impl Served {
         // that exactly as it always has.
         if self.log.is_none() {
             return self.handle_appendable(conn, Request::Stop { reason });
+        }
+        if let Err(e) = self.record_intent(pause::Verb::Stop { reason }) {
+            return (
+                Response::Error(format!(
+                    "stop could not record its intent for session {} ({}); nothing was \
+                     terminated and the log is not sealed",
+                    self.session,
+                    refusal(e)
+                )),
+                false,
+            );
         }
         let ended = match self.end_workloads(terminate) {
             Ok(n) => n,
@@ -1359,19 +1421,27 @@ impl Served {
         }
         self.close_pending_approvals();
         match self.handle_appendable(conn, Request::Stop { reason }) {
-            (Response::Sealed { head, .. }, done) => (
-                Response::Sealed {
-                    head,
-                    ended: Some(ended),
-                },
-                done,
-            ),
+            (Response::Sealed { head, .. }, done) => {
+                let _ = pause::clear_intent(&self.state, &self.session);
+                (
+                    Response::Sealed {
+                        head,
+                        ended: Some(ended),
+                    },
+                    done,
+                )
+            }
             other => other,
         }
     }
 
     /// The termination half of [`Self::stop`]: returns how many processes ended,
     /// or the refusal once the session has been put in its held-for-stop state.
+    /// That hold and its `WorkloadsTerminated` record are the attempt's durable
+    /// outcome, so the stop's intent is cleared with them: a restart adopts the
+    /// hold rather than terminating again on its own, and the user's retry does
+    /// that. A hold whose record could not be written keeps the intent, so a
+    /// restart records it.
     fn end_workloads(
         &mut self,
         terminate: impl FnOnce(&str, Option<Frozen>) -> pause::Termination,
@@ -1449,6 +1519,9 @@ impl Served {
                 barrier_confirmed,
             })
             .err();
+        if logged.is_none() {
+            let _ = pause::clear_intent(&self.state, &self.session);
+        }
         let detail = if barrier_confirmed {
             "the stop is incomplete and the session is held for it (proxy closed, \
              approvals held, no new launch admitted; `ward resume` cannot release it). \
@@ -1468,6 +1541,148 @@ impl Served {
         )))
     }
 
+    /// Reconcile the lifecycle a previous process of this session left behind
+    /// (#145 item 7), before a single connection is served. Always uses the
+    /// real freeze and termination; see [`Self::reconcile_lifecycle_with`].
+    fn reconcile_lifecycle(&mut self) -> Result<bool> {
+        self.reconcile_lifecycle_with(pause::freeze_confirmed, pause::terminate)
+    }
+
+    /// [`Self::reconcile_lifecycle`] with the freeze and the termination
+    /// injectable, for the same reason [`Self::pause_with`]'s `settle` and
+    /// [`Self::stop`]'s `terminate` are.
+    ///
+    /// First the log is read back: the agent state it last recorded, the
+    /// launches it still has open, and whether it says the session is held
+    /// (`SessionPaused`/`SessionPauseUnsettled`, or an incomplete
+    /// `WorkloadsTerminated`, with no `SessionResumed` after). Then, in order
+    /// of what is on disk:
+    ///
+    /// * A stop intent ([`pause::INTENT`]): the stop is finished exactly as a
+    ///   client's retry would finish it — a hold the marker says is in force
+    ///   is rebuilt first, from what `/proc` shows now, so the stop retries
+    ///   over it — and the answer is whether that sealed the log. Returns an
+    ///   error, and leaves the intent, when the stop reached neither of its
+    ///   durable outcomes (sealed, or held with `WorkloadsTerminated`
+    ///   recorded): a daemon that cannot finish the session's last operation
+    ///   does not serve it as though it had.
+    /// * A pause intent: the pause is finished — the trees frozen (again, for
+    ///   anything already stopped), the marker written if it is not, the
+    ///   approvals held, and exactly one terminal record appended unless the
+    ///   log already carries it. It is recorded as unsettled whenever the
+    ///   freeze cannot be confirmed: never a confirmed `SessionPaused` that
+    ///   was not observed.
+    /// * No intent but a marker: a hold that completed before the previous
+    ///   process died. It is adopted the same way, so `resume` and `stop`
+    ///   work on it; a hold the log already records gets no second record.
+    ///   The stop marker decides whether it is a [`Hold::Stop`].
+    fn reconcile_lifecycle_with(
+        &mut self,
+        freeze: impl FnOnce(&str) -> (Frozen, bool),
+        terminate: impl FnOnce(&str, Option<Frozen>) -> pause::Termination,
+    ) -> Result<bool> {
+        let tail = read_log_tail(&self.log_path)?;
+        self.last_agent_state = tail.last_agent_state;
+        self.open_launches = tail
+            .open_launches
+            .into_iter()
+            .map(|(seq, pid)| (Self::INTERNAL_CONN, seq, pid))
+            .collect();
+        let marker = pause::marker_path(&self.state, &self.session);
+        match pause::read_intent(&self.state, &self.session)? {
+            Some(pause::Intent {
+                verb: pause::Verb::Stop { reason },
+                ..
+            }) => {
+                if marker.exists() {
+                    let (reason, since) = marker_facts(&marker);
+                    self.adopt_hold(&reason, since, true, freeze)?;
+                }
+                let (response, sealed) = self.stop(Self::INTERNAL_CONN, reason, terminate);
+                if pause::intent_path(&self.state, &self.session).exists() {
+                    let outcome = match response {
+                        Response::Error(e) => e,
+                        other => format!("unexpected response {other:?}"),
+                    };
+                    return Err(Error::Daemon(format!(
+                        "the stop of session {} that a previous process began could not be \
+                         finished: {outcome}",
+                        self.session
+                    )));
+                }
+                Ok(sealed)
+            }
+            Some(pause::Intent {
+                verb: pause::Verb::Pause { reason },
+                started_unix_ms,
+                ..
+            }) => {
+                self.adopt_hold(
+                    &pause::reason_text(&reason),
+                    instant_at(started_unix_ms),
+                    tail.held,
+                    freeze,
+                )?;
+                pause::clear_intent(&self.state, &self.session)?;
+                Ok(false)
+            }
+            None if marker.exists() => {
+                let (reason, since) = marker_facts(&marker);
+                self.adopt_hold(&reason, since, tail.held, freeze)?;
+                Ok(false)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Put the session's sandboxes under this daemon's own hold, from what
+    /// `/proc` shows now: `freeze` finds and freezes every process (one already
+    /// stopped stays so) and says whether that confirmed stable. The marker is
+    /// written with `reason` if it is not there, the approvals are held, and —
+    /// unless `recorded` says the log already carries it — exactly one
+    /// terminal record is appended: `SessionPaused` when confirmed,
+    /// `SessionPauseUnsettled` with the pending count otherwise. The hold is a
+    /// [`Hold::Stop`] once a stop has begun ([`pause::stop_begun`]).
+    fn adopt_hold(
+        &mut self,
+        reason: &str,
+        since: Instant,
+        recorded: bool,
+        freeze: impl FnOnce(&str) -> (Frozen, bool),
+    ) -> Result<()> {
+        let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
+        let (frozen, stable) = freeze(&self.session);
+        if !pause::marker_path(&self.state, &self.session).exists() {
+            pause::write_marker(&self.state, &self.session, reason)?;
+        }
+        self.approvals.set_paused(true);
+        let hold = if pause::stop_begun(&self.state, &self.session) {
+            Hold::Stop
+        } else {
+            Hold::Pause
+        };
+        if !recorded {
+            let event = match pause::unsettled_count(&frozen, stable) {
+                None => WardEvent::SessionPaused {
+                    method: frozen.method,
+                    reason: ShortText::new(reason),
+                },
+                Some(pending) => WardEvent::SessionPauseUnsettled {
+                    method: frozen.method,
+                    reason: ShortText::new(reason),
+                    pending,
+                },
+            };
+            self.append(event)?;
+        }
+        self.paused = Some(Paused {
+            frozen,
+            since,
+            hold,
+        });
+        Ok(())
+    }
+
     /// Start a subscription from `from_seq`: everything in the log so far, and a
     /// channel for what comes next. Called under the mutex so no append falls
     /// between the two.
@@ -1485,6 +1700,76 @@ impl Served {
         });
         Ok(Subscription { replay, live })
     }
+}
+
+/// What a daemon restarted on a session reads back from its log before it
+/// serves ([`Served::reconcile_lifecycle_with`]).
+struct LogTail {
+    /// The log says the session is held: its last hold record is a
+    /// `SessionPaused`/`SessionPauseUnsettled` or an incomplete
+    /// `WorkloadsTerminated`, with no `SessionResumed` or confirmed
+    /// `WorkloadsTerminated` after it.
+    held: bool,
+    /// The last `AgentStateChanged`.
+    last_agent_state: Option<ward_events::AgentState>,
+    /// Every `CommandStarted` (its seq and pid) without a `CommandFinished` or
+    /// `LaunchAborted` for the same pid after it.
+    open_launches: Vec<(u64, Pid)>,
+}
+
+fn read_log_tail(log_path: &Path) -> Result<LogTail> {
+    let mut tail = LogTail {
+        held: false,
+        last_agent_state: None,
+        open_launches: Vec::new(),
+    };
+    for record in LogReader::open(log_path)
+        .map_err(|e| Error::Events(e.to_string()))?
+        .map_while(std::result::Result::ok)
+    {
+        match record.event {
+            WardEvent::AgentStateChanged { state } => tail.last_agent_state = Some(state),
+            WardEvent::SessionPaused { .. } | WardEvent::SessionPauseUnsettled { .. } => {
+                tail.held = true;
+            }
+            WardEvent::SessionResumed { .. } => tail.held = false,
+            WardEvent::WorkloadsTerminated {
+                pending,
+                barrier_confirmed,
+                ..
+            } => tail.held = pending > 0 || !barrier_confirmed,
+            WardEvent::CommandStarted { pid, .. } => tail.open_launches.push((record.seq, pid)),
+            WardEvent::CommandFinished { pid, .. } | WardEvent::LaunchAborted { pid, .. } => {
+                if let Some(pos) = tail.open_launches.iter().rposition(|(_, p)| *p == pid) {
+                    tail.open_launches.remove(pos);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(tail)
+}
+
+/// What an on-disk pause marker says: its text as the hold's reason (the
+/// default when it is empty or unreadable), and when it was written.
+fn marker_facts(marker: &Path) -> (String, Instant) {
+    let reason = std::fs::read_to_string(marker).map_or_else(
+        |_| pause::DEFAULT_REASON.to_owned(),
+        |text| pause::reason_text(&text),
+    );
+    let since = std::fs::metadata(marker)
+        .and_then(|m| m.modified())
+        .map_or_else(|_| Instant::now(), |at| instant_at(control::unix_ms(at)));
+    (reason, since)
+}
+
+/// The monotonic instant `unix_ms` ago from now, or now when that is not
+/// representable.
+fn instant_at(unix_ms: u64) -> Instant {
+    let elapsed = control::unix_ms(SystemTime::now()).saturating_sub(unix_ms);
+    Instant::now()
+        .checked_sub(Duration::from_millis(elapsed))
+        .unwrap_or_else(Instant::now)
 }
 
 fn lock(served: &Mutex<Served>) -> MutexGuard<'_, Served> {
@@ -2224,6 +2509,539 @@ mod tests {
             records.last().map(|r| &r.event),
             Some(WardEvent::SessionEnded { .. })
         ));
+    }
+
+    /// `served`'s session as a daemon restarted on the same session directory
+    /// sees it: the log resumed from disk, nothing held in memory.
+    fn restarted_served(dir: &Path, session: &str) -> Served {
+        let log_path = dir.join("events.log");
+        let log = LocalLog::open(&log_path, SystemTime::now()).unwrap();
+        let deriver = Deriver::new(
+            ward_policy::default_manifest(),
+            Some("hexrift/WardOS".into()),
+            vec!["tests/security_expiry.rs".into()],
+        );
+        Served::new(
+            log,
+            log_path,
+            serde_json::json!({ "session": session }),
+            deriver,
+            dir.to_path_buf(),
+            session.to_owned(),
+        )
+    }
+
+    /// A session whose previous process recorded the agent `Working` and then
+    /// died: the log a restart resumes from.
+    fn started_log(dir: &Path) {
+        let mut served = fresh_served(dir);
+        assert!(matches!(served.handle(append(0)).0, Response::Record(_)));
+    }
+
+    fn no_sandbox(_: &str) -> (Frozen, bool) {
+        (
+            Frozen {
+                method: ward_events::PauseMethod::Sigstop,
+                pids: Vec::new(),
+                cgroup: None,
+            },
+            true,
+        )
+    }
+
+    fn never_freezes(_: &str) -> (Frozen, bool) {
+        panic!("a stop reconciliation freezes nothing itself")
+    }
+
+    fn never_terminates(_: &str, _: Option<Frozen>) -> pause::Termination {
+        panic!("a pause reconciliation terminates nothing")
+    }
+
+    fn stuck(pid: u32) -> Frozen {
+        Frozen {
+            method: ward_events::PauseMethod::Sigstop,
+            pids: vec![pid],
+            cgroup: None,
+        }
+    }
+
+    fn pause_intent(reason: &str) -> pause::Intent {
+        pause::Intent::begin(pause::Verb::Pause {
+            reason: reason.to_owned(),
+        })
+        .unwrap()
+    }
+
+    fn stop_intent() -> pause::Intent {
+        pause::Intent::begin(pause::Verb::Stop {
+            reason: EndReason::UserStop,
+        })
+        .unwrap()
+    }
+
+    /// #145 item 7: a pause's intent is durable before any process is
+    /// signalled — the settle check, which runs after the freeze, finds it on
+    /// disk naming the operation — and gone once the pause's record is.
+    #[test]
+    fn a_pause_records_its_intent_before_the_freeze_and_clears_it_with_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let outcome = served
+            .pause_with("ops asked", |_| {
+                let intent = pause::read_intent(dir.path(), "sess_9")
+                    .unwrap()
+                    .expect("the intent is on disk before the freeze is judged");
+                assert_eq!(
+                    intent.verb,
+                    pause::Verb::Pause {
+                        reason: "ops asked".into()
+                    }
+                );
+                assert_eq!(intent.op.len(), 32, "{intent:?}");
+                assert!(intent.started_unix_ms > 0);
+                None
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome.record.event,
+            WardEvent::SessionPaused { .. }
+        ));
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Record(_)
+        ));
+    }
+
+    /// A stop's intent is durable before termination begins and gone once the
+    /// log is sealed.
+    #[test]
+    fn a_stop_records_its_intent_before_terminating_and_clears_it_at_the_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let (response, done) = served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+            let intent = pause::read_intent(dir.path(), "sess_9")
+                .unwrap()
+                .expect("the intent is on disk before anything is killed");
+            assert_eq!(
+                intent.verb,
+                pause::Verb::Stop {
+                    reason: EndReason::UserStop
+                }
+            );
+            pause::Termination::confirmed(2)
+        });
+        assert!(matches!(response, Response::Sealed { ended: Some(2), .. }));
+        assert!(done);
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+    }
+
+    /// A refused stop has reached its durable outcome (`WorkloadsTerminated {
+    /// pending }`, the hold): its intent is cleared, so a restart adopts the
+    /// hold instead of terminating again on its own.
+    #[test]
+    fn a_refused_stop_clears_its_intent_once_the_hold_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let (response, done) = served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+            assert!(pause::intent_path(dir.path(), "sess_9").exists());
+            pause::Termination {
+                ended: 1,
+                remaining: Some(stuck(77)),
+                barrier_confirmed: true,
+            }
+        });
+        assert!(matches!(response, Response::Error(_)), "{response:?}");
+        assert!(!done);
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Stop));
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+    }
+
+    /// Restart during a pause, before the freeze was sent: the intent alone is
+    /// on disk. The restarted daemon finishes the pause — freezes, writes the
+    /// marker with the intended reason, holds the approvals, records exactly
+    /// one `SessionPaused` — and the retry and the resume behave as after an
+    /// uninterrupted pause.
+    #[test]
+    fn a_restart_during_a_pause_before_the_freeze_finishes_the_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        started_log(dir.path());
+        pause::write_intent(dir.path(), "sess_9", &pause_intent("ops asked")).unwrap();
+
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let sealed = served
+            .reconcile_lifecycle_with(no_sandbox, never_terminates)
+            .unwrap();
+        assert!(!sealed);
+        assert_eq!(
+            std::fs::read_to_string(pause::marker_path(dir.path(), "sess_9")).unwrap(),
+            "ops asked\n"
+        );
+        assert!(served.approvals.paused());
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Pause));
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+        let replay = served.subscribe(0).unwrap().replay;
+        assert!(matches!(
+            &replay.last().unwrap().event,
+            WardEvent::SessionPaused { reason, .. } if reason.as_str() == "ops asked"
+        ));
+        assert_eq!(
+            kinds_of(&mut served),
+            ["AgentStateChanged", "SessionPaused"]
+        );
+        assert!(matches!(
+            served.handle(Request::Pause { reason: String::new() }).0,
+            Response::Error(e) if e == "already paused"
+        ));
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Record(_)
+        ));
+        assert!(!pause::marker_path(dir.path(), "sess_9").exists());
+        assert_eq!(
+            kinds_of(&mut served),
+            ["AgentStateChanged", "SessionPaused", "SessionResumed"]
+        );
+    }
+
+    /// Restart during a pause after the freeze was sent (the marker is already
+    /// there) and with a process the restarted daemon cannot confirm stopped:
+    /// the pause is recorded as unsettled, naming what is pending — never as a
+    /// confirmed `SessionPaused` — and exactly once.
+    #[test]
+    fn a_restart_during_a_pause_after_the_freeze_records_what_it_cannot_confirm() {
+        let dir = tempfile::tempdir().unwrap();
+        started_log(dir.path());
+        pause::write_intent(dir.path(), "sess_9", &pause_intent("")).unwrap();
+        pause::write_marker(dir.path(), "sess_9", pause::DEFAULT_REASON).unwrap();
+
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let sealed = served
+            .reconcile_lifecycle_with(|_| (stuck(77), false), never_terminates)
+            .unwrap();
+        assert!(!sealed);
+        assert_eq!(
+            kinds_of(&mut served),
+            ["AgentStateChanged", "SessionPauseUnsettled"]
+        );
+        let replay = served.subscribe(0).unwrap().replay;
+        assert!(matches!(
+            &replay[1].event,
+            WardEvent::SessionPauseUnsettled { pending: 1, reason, .. }
+                if reason.as_str() == pause::DEFAULT_REASON
+        ));
+        let paused = served.paused.as_ref().unwrap();
+        assert_eq!(paused.frozen, stuck(77), "held over what was found");
+        assert_eq!(paused.hold, Hold::Pause);
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+    }
+
+    /// Restart during a stop before the kill (and before the stop marker): the
+    /// restarted daemon finishes the stop — terminates, records the real
+    /// counts, terminalizes the launch the log still had open, records
+    /// `Finished`, `SessionEnded`, seals — and leaves no intent behind.
+    #[test]
+    fn a_restart_during_a_stop_before_the_kill_finishes_the_stop() {
+        use ward_events::{BoundedArgv, Pid, SandboxPath, SandboxRoot};
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut served = fresh_served(dir.path());
+            assert!(matches!(served.handle(append(0)).0, Response::Record(_)));
+            served
+                .append(WardEvent::CommandStarted {
+                    pid: Pid::new(2).unwrap(),
+                    parent: Pid::new(1).unwrap(),
+                    argv: BoundedArgv::from_bytes([b"agent".as_slice()]),
+                    cwd: SandboxPath::new(SandboxRoot::Work, ".").unwrap(),
+                    exe_digest: None,
+                })
+                .unwrap();
+        }
+        pause::write_intent(dir.path(), "sess_9", &stop_intent()).unwrap();
+
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let sealed = served
+            .reconcile_lifecycle_with(never_freezes, |_, held| {
+                assert_eq!(held, None);
+                pause::Termination::confirmed(2)
+            })
+            .unwrap();
+        assert!(sealed);
+        assert!(served.log.is_none());
+        assert!(pause::stop_begun(dir.path(), "sess_9"));
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+        let records: Vec<_> = LogReader::open(&served.log_path)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .collect();
+        let kinds: Vec<String> = records
+            .iter()
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "AgentStateChanged",
+                "CommandStarted",
+                "WorkloadsTerminated",
+                "LaunchAborted",
+                "AgentStateChanged",
+                "SessionEnded"
+            ]
+        );
+        assert!(matches!(
+            records[2].event,
+            WardEvent::WorkloadsTerminated {
+                ended: 2,
+                pending: 0,
+                barrier_confirmed: true
+            }
+        ));
+        assert!(matches!(
+            records[4].event,
+            WardEvent::AgentStateChanged {
+                state: AgentState::Finished
+            }
+        ));
+        assert!(matches!(
+            records[5].event,
+            WardEvent::SessionEnded {
+                reason: EndReason::UserStop,
+                ..
+            }
+        ));
+    }
+
+    /// Restart after the stop's `WorkloadsTerminated` and `Finished` landed but
+    /// before the seal: nothing is terminated or recorded twice; only the
+    /// `SessionEnded` and the seal are still owed.
+    #[test]
+    fn a_restart_after_the_termination_record_but_before_the_seal_only_seals() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut served = fresh_served(dir.path());
+            assert!(matches!(served.handle(append(0)).0, Response::Record(_)));
+            served
+                .append(WardEvent::WorkloadsTerminated {
+                    ended: 2,
+                    pending: 0,
+                    barrier_confirmed: true,
+                })
+                .unwrap();
+            served
+                .append(WardEvent::AgentStateChanged {
+                    state: AgentState::Finished,
+                })
+                .unwrap();
+        }
+        pause::write_stop_marker(dir.path(), "sess_9").unwrap();
+        pause::write_intent(dir.path(), "sess_9", &stop_intent()).unwrap();
+
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let sealed = served
+            .reconcile_lifecycle_with(never_freezes, |_, held| {
+                assert_eq!(held, None);
+                pause::Termination::nothing()
+            })
+            .unwrap();
+        assert!(sealed);
+        let kinds: Vec<String> = LogReader::open(&served.log_path)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "AgentStateChanged",
+                "WorkloadsTerminated",
+                "AgentStateChanged",
+                "SessionEnded"
+            ]
+        );
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+    }
+
+    /// Reconciliation that cannot finish the stop leaves the session held for
+    /// it, exactly as a refused stop does: the uncertainty is recorded, the log
+    /// stays open, `resume` is refused, and the client's retry — which observes
+    /// the reconciled state rather than acting from scratch — finishes it.
+    #[test]
+    fn a_restart_whose_stop_cannot_confirm_termination_holds_the_session_until_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        started_log(dir.path());
+        pause::write_intent(dir.path(), "sess_9", &stop_intent()).unwrap();
+
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let sealed = served
+            .reconcile_lifecycle_with(never_freezes, |_, _| pause::Termination {
+                ended: 1,
+                remaining: Some(stuck(77)),
+                barrier_confirmed: true,
+            })
+            .unwrap();
+        assert!(!sealed);
+        assert!(served.log.is_some());
+        let paused = served.paused.as_ref().unwrap();
+        assert_eq!(paused.hold, Hold::Stop);
+        assert_eq!(paused.frozen, stuck(77));
+        assert!(served.approvals.paused());
+        assert!(
+            std::fs::read_to_string(pause::marker_path(dir.path(), "sess_9"))
+                .unwrap()
+                .starts_with("ward stop: 1 process(es) not confirmed ended")
+        );
+        assert_eq!(
+            kinds_of(&mut served),
+            ["AgentStateChanged", "WorkloadsTerminated"]
+        );
+        assert!(matches!(
+            served.subscribe(0).unwrap().replay[1].event,
+            WardEvent::WorkloadsTerminated {
+                ended: 1,
+                pending: 1,
+                barrier_confirmed: true
+            }
+        ));
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Error(e) if e.contains("has begun and not completed")
+        ));
+
+        let (response, done) =
+            served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
+                assert_eq!(held, Some(stuck(77)));
+                pause::Termination::confirmed(1)
+            });
+        assert!(matches!(response, Response::Sealed { ended: Some(1), .. }));
+        assert!(done);
+        let kinds: Vec<String> = LogReader::open(&served.log_path)
+            .unwrap()
+            .map_while(std::result::Result::ok)
+            .map(|r| format!("{:?}", r.event.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "AgentStateChanged",
+                "WorkloadsTerminated",
+                "WorkloadsTerminated",
+                "AgentStateChanged",
+                "SessionEnded"
+            ]
+        );
+    }
+
+    /// Restart after a completed pause: the log already says paused, the
+    /// marker stands, no intent is left. The restarted daemon takes the hold
+    /// over from what it observes, records nothing new, and `resume` works —
+    /// where before it answered "not paused" and nothing ever thawed the tree.
+    #[test]
+    fn a_restart_after_a_completed_pause_adopts_the_hold_without_a_second_record() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut served = fresh_served(dir.path());
+            assert!(matches!(served.handle(append(0)).0, Response::Record(_)));
+            served.pause_with("ops asked", |_| None).unwrap();
+        }
+        assert!(pause::marker_path(dir.path(), "sess_9").exists());
+
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let sealed = served
+            .reconcile_lifecycle_with(no_sandbox, never_terminates)
+            .unwrap();
+        assert!(!sealed);
+        assert_eq!(
+            kinds_of(&mut served),
+            ["AgentStateChanged", "SessionPaused"]
+        );
+        assert_eq!(served.paused.as_ref().map(|p| p.hold), Some(Hold::Pause));
+        assert!(served.approvals.paused());
+        assert_eq!(served.last_agent_state, Some(AgentState::Working));
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Record(_)
+        ));
+        assert!(!pause::marker_path(dir.path(), "sess_9").exists());
+        assert!(!served.approvals.paused());
+    }
+
+    /// Restart after a refused stop: the hold is adopted as a hold for the stop
+    /// (the stop marker says one began), nothing is recorded again, `resume`
+    /// stays refused and `stop` retries over what is held.
+    #[test]
+    fn a_restart_after_a_refused_stop_adopts_the_hold_for_the_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut served = fresh_served(dir.path());
+            let (response, _) = served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+                pause::Termination {
+                    ended: 1,
+                    remaining: Some(stuck(77)),
+                    barrier_confirmed: true,
+                }
+            });
+            assert!(matches!(response, Response::Error(_)));
+        }
+
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let sealed = served
+            .reconcile_lifecycle_with(|_| (stuck(77), false), never_terminates)
+            .unwrap();
+        assert!(!sealed);
+        assert_eq!(kinds_of(&mut served), ["WorkloadsTerminated"]);
+        let paused = served.paused.as_ref().unwrap();
+        assert_eq!(paused.hold, Hold::Stop);
+        assert_eq!(paused.frozen, stuck(77));
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Error(e) if e.contains("has begun and not completed")
+        ));
+        let (response, done) =
+            served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, held| {
+                assert_eq!(held, Some(stuck(77)));
+                pause::Termination::confirmed(1)
+            });
+        assert!(matches!(response, Response::Sealed { ended: Some(1), .. }));
+        assert!(done);
+    }
+
+    /// A session with nothing begun and nothing held reconciles to nothing:
+    /// no record, no hold, no marker.
+    #[test]
+    fn a_restart_with_nothing_in_flight_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut served = fresh_served(dir.path());
+            assert!(matches!(served.handle(append(0)).0, Response::Record(_)));
+        }
+        let mut served = restarted_served(dir.path(), "sess_9");
+        assert!(
+            !served
+                .reconcile_lifecycle_with(never_freezes, never_terminates)
+                .unwrap()
+        );
+        assert!(served.paused.is_none());
+        assert!(!served.approvals.paused());
+        assert_eq!(kinds_of(&mut served), ["AgentStateChanged"]);
+        assert_eq!(served.last_agent_state, Some(AgentState::Working));
+    }
+
+    /// An intent the daemon cannot read names an operation it cannot finish:
+    /// it refuses to serve rather than serve a session in an unknown state.
+    #[test]
+    fn an_unreadable_intent_refuses_to_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        started_log(dir.path());
+        std::fs::write(pause::intent_path(dir.path(), "sess_9"), b"{not json").unwrap();
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let err = served
+            .reconcile_lifecycle_with(never_freezes, never_terminates)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unreadable lifecycle intent"), "{err}");
+        assert!(served.paused.is_none());
     }
 
     /// The agent states the log recorded, in order.

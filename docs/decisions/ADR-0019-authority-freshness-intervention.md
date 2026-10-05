@@ -129,11 +129,20 @@ sandbox running, unobserved: a log-only closure presented as a stop. Now:
   nothing sent, and the user is told to end it so the client can stop the session
   itself.
 
-Still open under #145: the persisted `Pausing`/`Stopping`/`Incomplete` lifecycle (the
-stop marker and the in-memory stop hold are its stop-side precursors, not that state
-machine), reconciliation of an interrupted stop across a daemon restart (a restarted
-daemon refuses `resume` once the stop marker exists, but does not rebuild the hold's
-freeze until the next `stop`), and per-component acknowledgement from the proxy. The
+* **Restart reconciliation (#145 item 7).** Every pause and stop records its intent —
+  operation id, verb, reason, start time — durably in `sessions/<id>/intent.json`
+  before anything is signalled, and removes it once its outcome is on the log. A
+  `wardd` started on the session finishes that operation before serving: an
+  interrupted stop is finished as a retry would be (sealed, or held with
+  `WorkloadsTerminated { pending }` recorded), an interrupted pause is finished from
+  what `/proc` shows and recorded truthfully (`SessionPaused` only when the freeze is
+  confirmed), and a hold that had completed is adopted so `resume` and `stop` act on
+  it. A client's retry observes the reconciled state; `ward pause --status` reads
+  `unconfirmed` while an intent has no outcome.
+
+Still open under #145: the persisted `Pausing`/`Stopping`/`Incomplete` lifecycle as an
+explicit state machine (the stop marker, the intent file and the in-memory hold are its
+precursors, not that state machine), and per-component acknowledgement from the proxy. The
 fork barrier is confirmed only when every known process is frozen and a stable
 rescan closes the membership set within `pause::FREEZE_SETTLE`. A failed late cgroup
 migration invalidates that barrier and falls back to `SIGSTOP`; a timeout remains a
