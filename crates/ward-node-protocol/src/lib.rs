@@ -918,6 +918,12 @@ impl OperationId {
     }
 }
 
+impl From<NonZeroU64> for OperationId {
+    fn from(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+}
+
 /// Reasons [`OperationId::new`] can be refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationIdError {

@@ -13,6 +13,7 @@ members = [
     "crates/ward-daemon",
     "crates/ward-node-protocol",
     "crates/ward-node",
+    "crates/ward-node-client",
     "crates/ward-release-verify",
     "crates/ward-bench",
     "crates/ward-cli",

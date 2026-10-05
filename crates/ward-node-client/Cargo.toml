@@ -1,0 +1,36 @@
+[package]
+name = "ward-node-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WardOS: transport-backed ward-node client, issuer signer and process adapter for external control planes"
+
+[lib]
+name = "ward_node_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ward-node-adapter"
+path = "src/bin/ward-node-adapter.rs"
+
+[dependencies]
+clap = { workspace = true }
+nix = { version = "0.30", features = ["signal"] }
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ward-authority = { path = "../ward-authority", version = "0.18.0" }
+ward-events = { path = "../ward-events", version = "0.18.0" }
+ward-node-protocol = { path = "../ward-node-protocol", version = "0.18.0" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+ward-launch = { path = "../ward-launch", version = "0.18.0" }
+ward-node = { path = "../ward-node", version = "0.18.0" }
+ward-sandbox = { path = "../ward-sandbox", version = "0.18.0" }
+
+[lints]
+workspace = true

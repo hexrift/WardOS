@@ -1,7 +1,7 @@
 # ADR-0030 — ward-node task admission, execution ownership and exit semantics
 
 Status: **Accepted; implementation tracked by #324 (with #259 and #262), under #332
-slices 5–7.**
+slices 5–8.**
 
 This records the decisions #326 asked for before `ward-node` may execute anything. It
 follows ADR-0029: the node is the trusted execution authority on its host, and an
@@ -130,6 +130,12 @@ their state, receipt and applied operation ids (#332 slice 7).
 - Stale, replayed, revoked and foreign-audience envelopes are refused before any effect.
 - A compromised client can at most hold a stolen, still-valid, audience-bound envelope
   until it expires or is revoked.
+- The control-plane side fails closed too (step 9): the shipped client and adapter never
+  guess at a lost answer (they inspect and replay the same operation id once, then report
+  `unknown` for the caller to treat as failed), never re-admit under another envelope or
+  start a second attempt on their own, and withdraw authority with `revoke`, not `stop`,
+  when the caller's lease or deadline is gone. Their issuer key is read only from a
+  private seed file; a pre-signed envelope is transported byte for byte.
 - The node's trusted computing base grows by a signature verifier and a durable
   revocation and version store, and does not grow by the daemon's network stack.
 
@@ -177,7 +183,20 @@ TDD slices without guessing at semantics inside a feature PR.
    honoured until the proxy-backed allowlist lands; the node never runs a workload under
    less than its manifest says.
 
-Steps 1–8 are written down as the external contract in
+9. A transport-backed client for the external control plane (#332 slice 8): the
+   `ward-node-client` crate speaks the local socket framing with its bounds and
+   timeouts, negotiates 1.3 or later and refuses less, signs envelopes exactly as §7.4 of
+   the contract prescribes (reproducing its test vector), bounds the institution-owned
+   inputs before signing, and drives an attempt to its sealed end with caller-supplied,
+   replayable operation ids, revoking on cancellation or an overrun budget and reporting
+   `unknown` rather than retrying when the transport fails. Its `ward-node-adapter`
+   binary exposes the same over stdin/stdout JSON lines for control planes in other
+   languages, accepts pre-signed envelopes so key custody stays with the control plane,
+   and turns `SIGTERM` into revoke-and-seal. Both are tested against a real node:
+   completion with a verifying evidence log, a replay that runs nothing twice, and a
+   revocation that leaves no process behind.
+
+Steps 1–9 are written down as the external contract in
 [node-integration.md](../node-integration.md).
 
 Cross-system acceptance — isolation, interruption, no duplicate effect — is #332 slice 9.

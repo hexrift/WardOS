@@ -42,6 +42,9 @@ wardos/
 │   ├── ward-proxy/                # egress proxy: allowlist, private-range deny, injection
 │   ├── ward-sandbox/              # OCI spec generation, crun driver, cgroup/netns plumbing
 │   ├── ward-launch/               # bubblewrap launch primitive shared by ward-daemon and ward-node
+│   ├── ward-node-protocol/        # versioned ward-node/control-plane protocol types
+│   ├── ward-node/                 # `ward-node`: admission, lifecycle, local enforcement, evidence
+│   ├── ward-node-client/          # control-plane client, issuer signer, attempt driver; `ward-node-adapter`
 │   ├── ward-shell-core/           # Ward Shell view model (trust bar, feed, launcher, settings), no toolkit
 │   └── ward-bench/                # `ward benchmark`
 │
@@ -139,7 +142,10 @@ extracted piece would be called `ward`, with WardOS remaining the distribution.
 An external control plane is not built here (ADR-0029); it reaches `ward-node` only
 through the versioned node protocol, whose window is independent of the WardOS release
 version ([compatibility.md](compatibility.md)). A WardOS release therefore does not
-force a control-plane release unless the protocol window changes.
+force a control-plane release unless the protocol window changes. What WardOS does ship
+for that side is `ward-node-client` and its `ward-node-adapter` process
+([node-integration.md §11](node-integration.md)): a client of the protocol that runs on
+the node's host, never a control plane.
 
 ## Deviations from the brief and why
 
