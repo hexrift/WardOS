@@ -11,10 +11,12 @@ import { test } from "node:test";
 
 import {
   Adapter,
+  blake3Hex,
   buildEnvelope,
   issuerFromSeed,
   operationIds,
   outcomeOf,
+  outputGrantOf,
   rootLease,
   signEnvelope,
 } from "../ward-node.mjs";
@@ -26,7 +28,7 @@ const BINDING = {
   lease: "lease_01M45YYRG00009K6DANAXVQK6C",
 };
 
-function signed(argvTail = "true") {
+function signed(argvTail = "true", manifest = undefined) {
   const now = Date.now();
   const envelope = buildEnvelope({
     binding: BINDING,
@@ -45,6 +47,7 @@ function signed(argvTail = "true") {
     }),
     workload: {
       argv: ["sh", "-c", argvTail],
+      manifest,
       snapshot: "c19c769fdd8644df9167a36d0133289c9fa44a8c768cd0aafa1756a13fb3e33b",
       wallClockBudgetMs: 60_000,
     },
@@ -204,7 +207,7 @@ test("outcomeOf maps every report shape and never infers success from unknown", 
   const base = { binding: BINDING, final_state: "sealed", sealed: true, cancelled: false, deadline_exceeded: false, evidence_log: null, evidence_head: null, operations: [], transport_error: null };
   assert.deepEqual(
     outcomeOf({ ...base, outcome: "unknown", outcome_certain: false, receipt: "unknown", cause: "Ambiguous" }),
-    { outcome: "unknown", certain: false, receipt: "unknown", cause: "Ambiguous", exitStatus: undefined, finalState: "sealed", sealed: true, cancelled: false, deadlineExceeded: false, evidenceLog: null, evidenceHead: null, refused: undefined, transportError: null, binding: BINDING },
+    { outcome: "unknown", certain: false, receipt: "unknown", cause: "Ambiguous", exitStatus: undefined, finalState: "sealed", sealed: true, cancelled: false, deadlineExceeded: false, evidenceLog: null, evidenceHead: null, refused: undefined, transportError: null, output: null, outputMissing: false, binding: BINDING },
   );
   const refused = outcomeOf({ ...base, final_state: "created", sealed: false, outcome: { refused: { verb: "admit", reason: "authority_denied" } }, outcome_certain: true, receipt: null, cause: null });
   assert.equal(refused.outcome, "refused");
@@ -218,4 +221,83 @@ test("outcomeOf maps every report shape and never infers success from unknown", 
   assert.equal(lost.outcome, "unknown");
   assert.equal(lost.transportError, "connection closed without a response");
   assert.throws(() => outcomeOf({ ...base, outcome: "completed", outcome_certain: false, receipt: "completed", cause: null }), /certain/);
+});
+
+const OUTPUT_MANIFEST = { network: "offline", output: { stdio_bytes: 4096, files: ["out/report.json", "missing.txt"], files_bytes: 2048 } };
+
+test("a run under an output grant carries the result in done, decoded with its digests verified", async () => {
+  const request = signed("make test", OUTPUT_MANIFEST);
+  const { adapter, cleanup } = fakeAdapter();
+  try {
+    const seen = [];
+    const { report } = await adapter.run(request, { onEvent: (event) => seen.push(event.event) });
+    assert.deepEqual(seen, ["state", "state", "admitted", "state", "receipt", "state", "output", "done"]);
+    assert.equal(report.output.stdout.content_base64, Buffer.from("hello stdout\n").toString("base64"), "the report carries the wire form");
+    const outcome = outcomeOf(report, { grant: outputGrantOf(request.envelope_json) });
+    assert.equal(outcome.outcome, "completed");
+    assert.equal(outcome.outputMissing, false);
+    assert.deepEqual(outcome.output.stdout.content, Buffer.from("hello stdout\n"));
+    assert.deepEqual(outcome.output.stderr.content, Buffer.from("hello stderr\n"));
+    assert.equal(outcome.output.truncated, false);
+    assert.deepEqual(outcome.output.files.map((file) => file.path), ["out/report.json", "missing.txt"]);
+    assert.equal(outcome.output.files[0].content.toString(), "content of out/report.json\n");
+    assert.equal(outcome.output.files[0].digest, blake3Hex(outcome.output.files[0].content));
+    assert.deepEqual(outcome.output.files[1], { path: "missing.txt", skipped: "missing" });
+    assert.equal(await adapter.close(), 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a run without the grant has no output, and the adapter is never asked for one", async () => {
+  const { log, adapter, cleanup } = fakeAdapter();
+  try {
+    const request = signed();
+    const { events, report } = await adapter.run(request, {});
+    assert.ok(!events.some((event) => event.event === "output"));
+    assert.equal(outputGrantOf(request.envelope_json), null);
+    const outcome = outcomeOf(report, { grant: outputGrantOf(request.envelope_json) });
+    assert.equal(outcome.output, null);
+    assert.equal(outcome.outputMissing, false, "no grant, nothing missing");
+    assert.equal(await adapter.close(), 0);
+    assert.equal(receivedLines(log).length, 1, "result is the adapter's to ask, after seal, never a second command here");
+  } finally {
+    cleanup();
+  }
+});
+
+test("a returned file whose digest disagrees with its content is refused, not reported", async () => {
+  const request = signed("make test", OUTPUT_MANIFEST);
+  const { adapter, cleanup } = fakeAdapter({ FAKE_ADAPTER_CORRUPT_DIGEST: "1" });
+  try {
+    const { report } = await adapter.run(request, {});
+    assert.equal(report.outcome, "completed", "the wire report arrived");
+    assert.throws(() => outcomeOf(report), /digest/);
+    await assert.rejects(adapter.result(BINDING), /digest/);
+    assert.equal(await adapter.close(), 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("result is its own command, answered with the decoded output or a rejection", async () => {
+  const { log, adapter, cleanup } = fakeAdapter();
+  try {
+    const resulted = await adapter.result(BINDING);
+    assert.equal(resulted.state, "sealed");
+    assert.deepEqual(resulted.output.stdout.content, Buffer.from("hello stdout\n"));
+    assert.equal(resulted.output.files[0].content.toString(), "content of out/report.json\n");
+    assert.deepEqual(resulted.output.files[1], { path: "missing.txt", skipped: "missing" });
+    assert.equal(await adapter.close(), 0);
+    assert.deepEqual(receivedLines(log), [{ cmd: "result", binding: BINDING }]);
+  } finally {
+    cleanup();
+  }
+  const refused = fakeAdapter({ FAKE_ADAPTER_RESULT_REJECT: "resource_unavailable" });
+  try {
+    assert.deepEqual(await refused.adapter.result(BINDING), { rejected: "resource_unavailable" });
+    assert.equal(await refused.adapter.close(), 0);
+  } finally {
+    refused.cleanup();
+  }
 });

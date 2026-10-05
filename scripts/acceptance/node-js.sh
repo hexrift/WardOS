@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Acceptance of the Node.js reference control plane (examples/node-control-plane,
 # docs/node-integration-from-nodejs.md) against a real `ward-node`: the client generates
-# its issuer key, the node is started with that key in its trust store and a task root,
-# and every byte the client sends is validated by the node itself. One verdict line per
-# case on stdout,
+# its issuer key, the node is started with that key in its trust store, a task root and
+# --output-return, and every byte the client sends is validated by the node itself. A
+# second node without --output-return proves the refusal of an output grant. One verdict
+# line per case on stdout,
 #   node-js acceptance <case>: PASS|FAIL -- <what it proves>
 # then a summary; everything else goes to stderr. Exit status: 0 when every case passed
 # (or isolation is unavailable and not required, which prints SKIPPED), 1 otherwise.
@@ -74,12 +75,16 @@ fi
 work="$(mktemp -d)"
 chmod 700 "$work"
 node_pid=""
+plain_pid=""
 # shellcheck disable=SC2317  # reached through the EXIT trap
 cleanup() {
-  if [[ -n "$node_pid" ]]; then
-    kill "$node_pid" 2>/dev/null || true
-    wait "$node_pid" 2>/dev/null || true
-  fi
+  local pid
+  for pid in "$node_pid" "$plain_pid"; do
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -92,6 +97,33 @@ fail() { printf 'node-js acceptance %s: FAIL -- %s\n' "$1" "$2"; failed=$((faile
 # field <json-file> <js-expression-on-o>: one JSON value from a one-line JSON file.
 field() {
   node -e 'const o = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const v = eval(process.argv[2]); process.stdout.write(v === undefined ? "undefined" : JSON.stringify(v));' "$1" "$2"
+}
+
+# host_digest <file>: BLAKE3-256 of a file on the host, with the client's own BLAKE3, to
+# compare against the digest the node returned for the same file.
+host_digest() {
+  node --input-type=module -e 'import { readFileSync } from "node:fs"; import { blake3Hex } from "./examples/node-control-plane/blake3.mjs"; process.stdout.write(blake3Hex(readFileSync(process.argv[1])));' -- "$1"
+}
+
+# log_holds_digest <log> <hex>: whether the evidence log's bytes contain the 32-byte digest.
+log_holds_digest() {
+  node -e 'const fs = require("fs"); process.exit(fs.readFileSync(process.argv[1]).includes(Buffer.from(process.argv[2], "hex")) ? 0 : 1);' "$1" "$2" 2>/dev/null
+}
+
+# start_node <socket> <state-dir> <task-root> [flags…]: start a node, wait for its socket, print its pid.
+start_node() {
+  local socket=$1 state=$2 tasks=$3 pid
+  shift 3
+  "$WARD_NODE_BIN" --socket "$socket" --state-dir "$state" --node-id "$node_id" \
+    --trusted-issuers "$work/trusted-issuers" --task-root "$tasks" "$@" >>"$work/node.log" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 100); do
+    [[ -S "$socket" ]] && break
+    kill -0 "$pid" 2>/dev/null || { cat "$work/node.log" >&2; die "ward-node exited before serving"; }
+    sleep 0.1
+  done
+  [[ -S "$socket" ]] || die "ward-node did not bind its socket within 10 s"
+  echo "$pid"
 }
 
 # ---- the host: key, trust store, snapshot, node --------------------------------------------
@@ -114,20 +146,14 @@ echo "from the snapshot" >"$work/project/src/input.txt"
 snapshot="$("$WARD_NODE_BIN" snapshot import --state-dir "$work/state" "$work/project")"
 [[ "$snapshot" =~ ^[0-9a-f]{64}$ ]] || die "snapshot import printed no id: $snapshot"
 
-"$WARD_NODE_BIN" --socket "$work/node.sock" --state-dir "$work/state" --node-id "$node_id" \
-  --trusted-issuers "$work/trusted-issuers" --task-root "$work/tasks" >"$work/node.log" 2>&1 &
-node_pid=$!
-for _ in $(seq 1 100); do
-  [[ -S "$work/node.sock" ]] && break
-  kill -0 "$node_pid" 2>/dev/null || { cat "$work/node.log" >&2; die "ward-node exited before serving"; }
-  sleep 0.1
-done
-[[ -S "$work/node.sock" ]] || die "ward-node did not bind its socket within 10 s"
+node_pid="$(start_node "$work/node.sock" "$work/state" "$work/tasks" --output-return)"
 
 common=(--socket "$work/node.sock" --adapter "$WARD_NODE_ADAPTER_BIN")
 node "$client" capabilities "${common[@]}" >"$work/capabilities.json"
 [[ "$(field "$work/capabilities.json" 'o.lifecycle.start')" == "true" ]] \
   || die "the node does not execute here (lifecycle.start is not true): $(cat "$work/capabilities.json")"
+[[ "$(field "$work/capabilities.json" 'o.output?.stdio === true && o.output?.files === true')" == "true" ]] \
+  || die "a node started with --output-return does not report output.stdio and output.files: $(cat "$work/capabilities.json")"
 
 run_common=("${common[@]}" --key "$work/cp/issuer.pem" --principal acceptance-issuer --node "$node_id"
   --state-dir "$work/cp" --snapshot "$snapshot" --task-root "$work/tasks" --timeout-ms 90000)
@@ -296,6 +322,134 @@ if [[ -z "$problems" ]]; then
   pass version_is_held_strictly_increasing "a new attempt of a task under a reissued version 1 is refused stale_operation by the node with nothing run; with the durable counter it is admitted as version 2 and completes"
 else
   fail version_is_held_strictly_increasing "$problems"
+fi
+
+# ---- case 6: a declared result comes back exactly, with digests the host agrees with ----
+
+problems=""
+run "$work/run6.json" --task acc-task-6 --attempt acc-attempt-6a --budget-ms 60000 \
+  --stdio-bytes 4096 --files out/report.json,copy.txt --files missing.txt --files-bytes 2048 --out-dir "$work/out6" \
+  -- sh -c 'printf "hello stdout\n"; printf "hello stderr\n" >&2; mkdir -p out; printf "{\"ok\":true}" > out/report.json; cat src/input.txt > copy.txt'
+[[ "$status" == "0" ]] || problems+="exit status $status; "
+check 6 "$work/run6.json" 'o.outcome' '"completed"' "outcome"
+check 6 "$work/run6.json" 'o.exitStatus' '0' "exit status"
+check 6 "$work/run6.json" 'o.output.stdout' '{"bytes":13,"truncated":false,"dropped":0,"content_base64":"aGVsbG8gc3Rkb3V0Cg=="}' "stdout"
+check 6 "$work/run6.json" 'o.output.stderr' '{"bytes":13,"truncated":false,"dropped":0,"content_base64":"aGVsbG8gc3RkZXJyCg=="}' "stderr"
+check 6 "$work/run6.json" 'o.output.truncated' 'false' "nothing truncated"
+check 6 "$work/run6.json" 'o.outputMissing' 'false' "the granted output came back"
+check 6 "$work/run6.json" 'o.output.files.map(f => f.path).join()' '"out/report.json,copy.txt,missing.txt"' "files in declaration order"
+check 6 "$work/run6.json" 'o.output.files[2]' '{"path":"missing.txt","skipped":"missing"}' "missing file"
+check 6 "$work/run6.json" 'o.output.files[0].size' '11' "report size"
+check 6 "$work/run6.json" 'o.output.files[0].truncated' 'false' "report returned whole"
+check 6 "$work/run6.json" 'o.output.files[0].content_base64' 'undefined' "content written, not printed"
+check 6 "$work/run6.json" 'o.output.files[0].written' "\"$work/out6/out/report.json\"" "report written under --out-dir"
+check 6 "$work/run6.json" 'o.output.files[1].written' "\"$work/out6/copy.txt\"" "copy written under --out-dir"
+task6="$(field "$work/run6.json" 'o.binding.task' | tr -d '"')"
+attempt6="$(field "$work/run6.json" 'o.binding.attempt' | tr -d '"')"
+workspace6="$work/tasks/$task6/$attempt6"
+for path in out/report.json copy.txt; do
+  if [[ -f "$workspace6/$path" && -f "$work/out6/$path" ]]; then
+    cmp -s "$workspace6/$path" "$work/out6/$path" || problems+="$path written differs from the workspace file; "
+    [[ "$(stat -c %a "$work/out6/$path")" == "600" ]] || problems+="$path written with mode $(stat -c %a "$work/out6/$path"); "
+    expected6="$(host_digest "$workspace6/$path")"
+    check 6 "$work/run6.json" "o.output.files.find(f => f.path === \"$path\").digest" "\"$expected6\"" "$path digest equals the host file's"
+  else
+    problems+="$path is not both in the workspace and under --out-dir; "
+  fi
+done
+[[ "$(cat "$work/out6/copy.txt" 2>/dev/null)" == "from the snapshot" ]] || problems+="copy.txt is not the snapshot's input; "
+[[ ! -e "$work/out6/missing.txt" ]] || problems+="a skipped file was written; "
+log6="$(field "$work/run6.json" 'o.evidenceLog' | tr -d '"')"
+digest6="$(field "$work/run6.json" 'o.output.files[0].digest' | tr -d '"')"
+# The NodeAttemptOutputCollected record carries the digest's 32 bytes (never the content).
+log_holds_digest "$log6" "$digest6" || problems+="the node's evidence log does not record the returned digest; "
+grep -q 'hello stdout' "$log6" 2>/dev/null && problems+="the evidence log carries output bytes; "
+verify_log "$task6" "$log6" || problems+="the evidence log does not verify; "
+# Reading the result again answers the same bytes, verified the same way.
+status=0
+node "$client" result "${common[@]}" --task "$task6" --attempt "$attempt6" \
+  --lease "$(field "$work/run6.json" 'o.binding.lease' | tr -d '"')" >"$work/result6.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "0" ]] || problems+="result exit status $status; "
+check 6 "$work/result6.json" 'o.state' '"sealed"' "result state"
+check 6 "$work/result6.json" 'o.output.stdout' "$(field "$work/run6.json" 'o.output.stdout')" "result stdout equals the run's"
+check 6 "$work/result6.json" 'o.output.files.map(f => f.digest ?? f.skipped).join()' "$(field "$work/run6.json" 'o.output.files.map(f => f.digest ?? f.skipped).join()')" "result digests equal the run's"
+if [[ -z "$problems" ]]; then
+  pass output_returns_declared_content_with_matching_digests "a workload printing to both streams and writing two declared files returns exactly those bytes with dropped 0, each file's content equal to the file in the workspace on the host and its digest equal to the host file's BLAKE3-256 and recorded in the sealed log (which carries no output bytes), a missing path skipped, --out-dir holding the returned files mode 0600, and a later result answering the same bytes"
+else
+  fail output_returns_declared_content_with_matching_digests "$problems"
+fi
+
+# ---- case 7: past the budgets the heads come back with truncation marks -----------------
+
+problems=""
+run "$work/run7.json" --task acc-task-7 --attempt acc-attempt-7a --budget-ms 60000 \
+  --stdio-bytes 1000 --files large.bin --files-bytes 100 \
+  -- sh -c 'head -c 10000 /dev/zero | tr "\0" a; head -c 5000 /dev/zero | tr "\0" e >&2; head -c 4000 /dev/zero | tr "\0" f > large.bin'
+[[ "$status" == "0" ]] || problems+="exit status $status; "
+check 7 "$work/run7.json" 'o.outcome' '"completed"' "outcome"
+check 7 "$work/run7.json" 'o.output.stdout.bytes' '1000' "stdout head"
+check 7 "$work/run7.json" 'o.output.stdout.dropped' '9000' "stdout dropped"
+check 7 "$work/run7.json" 'o.output.stdout.truncated' 'true' "stdout truncated"
+check 7 "$work/run7.json" 'Buffer.from(o.output.stdout.content_base64, "base64").equals(Buffer.alloc(1000, "a"))' 'true' "stdout is the first 1000 bytes"
+check 7 "$work/run7.json" 'o.output.stderr.bytes' '1000' "stderr head"
+check 7 "$work/run7.json" 'o.output.stderr.dropped' '4000' "stderr dropped"
+check 7 "$work/run7.json" 'Buffer.from(o.output.stderr.content_base64, "base64").equals(Buffer.alloc(1000, "e"))' 'true' "stderr is the first 1000 bytes"
+check 7 "$work/run7.json" 'o.output.truncated' 'true' "result marked truncated"
+task7="$(field "$work/run7.json" 'o.binding.task' | tr -d '"')"
+attempt7="$(field "$work/run7.json" 'o.binding.attempt' | tr -d '"')"
+if [[ -f "$work/tasks/$task7/$attempt7/large.bin" ]]; then
+  expected7="$(host_digest "$work/tasks/$task7/$attempt7/large.bin")"
+  check 7 "$work/run7.json" 'o.output.files[0]' "{\"path\":\"large.bin\",\"size\":4000,\"digest\":\"$expected7\",\"truncated\":true}" "large.bin digest-only with its true size and the host file's digest"
+else
+  problems+="large.bin is not in the workspace; "
+fi
+verify_log "$task7" "$(field "$work/run7.json" 'o.evidenceLog' | tr -d '"')" || problems+="the evidence log does not verify; "
+if [[ -z "$problems" ]]; then
+  pass output_marks_truncation_past_the_budgets "a workload writing 10000 bytes to stdout, 5000 to stderr and a 4000-byte file under a grant of 1000 stream bytes and 100 file bytes gets exactly the first 1000 bytes of each stream with truncated true and dropped 9000 and 4000, and the file digest-only with its true size and the host file's digest"
+else
+  fail output_marks_truncation_past_the_budgets "$problems"
+fi
+
+# ---- case 8: without --output-return the grant is refused, and the client says so ------
+
+problems=""
+plain_snapshot="$("$WARD_NODE_BIN" snapshot import --state-dir "$work/plain-state" "$work/project")"
+plain_pid="$(start_node "$work/plain.sock" "$work/plain-state" "$work/plain-tasks")"
+plain_common=(--socket "$work/plain.sock" --adapter "$WARD_NODE_ADAPTER_BIN")
+node "$client" capabilities "${plain_common[@]}" >"$work/plain-capabilities.json"
+[[ "$(field "$work/plain-capabilities.json" 'o.output')" == "undefined" ]] || problems+="a node without the flag reports an output section; "
+status=0
+node "$client" run "${plain_common[@]}" --key "$work/cp/issuer.pem" --principal acceptance-issuer --node "$node_id" \
+  --state-dir "$work/cp" --snapshot "$plain_snapshot" --task-root "$work/plain-tasks" --timeout-ms 90000 \
+  --task acc-task-8 --attempt acc-attempt-8a --budget-ms 60000 --stdio-bytes 16 --files x --files-bytes 16 \
+  -- sh -c 'echo never' >"$work/run8.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "1" ]] || problems+="exit status $status, expected 1; "
+check 8 "$work/run8.json" 'o.outcome' '"refused"' "outcome"
+check 8 "$work/run8.json" 'o.certain' 'true' "a refusal is certain"
+check 8 "$work/run8.json" 'o.refused' '{"verb":"admit","reason":"unsupported_grant"}' "refusal"
+check 8 "$work/run8.json" 'o.finalState' '"created"' "task left created"
+check 8 "$work/run8.json" 'o.output' 'null' "no output"
+check 8 "$work/run8.json" 'o.outputMissing' 'true' "the granted output is missing"
+check 8 "$work/run8.json" 'o.operations.map(x => x.verb).join()' '"create,admit"' "nothing sent after the refusal"
+task8="$(field "$work/run8.json" 'o.binding.task' | tr -d '"')"
+[[ ! -e "$work/plain-tasks/$task8" ]] || problems+="a refused grant materialised a task directory; "
+status=0
+node "$client" result "${plain_common[@]}" --task "$task8" --attempt "$(field "$work/run8.json" 'o.binding.attempt' | tr -d '"')" \
+  --lease "$(field "$work/run8.json" 'o.binding.lease' | tr -d '"')" >"$work/result8.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "1" ]] || problems+="result exit status $status, expected 1; "
+check 8 "$work/result8.json" 'o.rejected' '"unsupported_operation"' "result refused on a node without the flag"
+# A grant above every node's ceilings is refused by the client before anything is signed or sent.
+status=0
+node "$client" run "${run_common[@]}" --task acc-task-8 --attempt acc-attempt-8b --budget-ms 60000 --stdio-bytes 1048577 \
+  -- sh -c 'echo never' >"$work/run8b.json" 2>"$work/run8b.err" || status=$?
+[[ "$status" == "2" ]] || problems+="over-ceiling exit status $status, expected 2; "
+grep -q 'unsupported_grant' "$work/run8b.err" || problems+="the client's refusal does not name unsupported_grant: $(cat "$work/run8b.err"); "
+[[ ! -s "$work/run8b.json" ]] || problems+="an over-ceiling grant printed an outcome; "
+[[ ! -e "$work/cp/runs/$(node "$client" derive-id exec acc-attempt-8b).json" ]] || problems+="an over-ceiling grant was recorded as a run; "
+if [[ -z "$problems" ]]; then
+  pass output_grant_is_refused_without_the_flag "a node started without --output-return reports no output capability and refuses an output grant unsupported_grant at admit with nothing run or materialised, which the client reports as refused (certain, not unknown) and exits 1; its result is unsupported_operation; and a grant above the ceilings is refused by the client before signing"
+else
+  fail output_grant_is_refused_without_the_flag "$problems"
 fi
 
 echo

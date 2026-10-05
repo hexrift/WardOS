@@ -2,12 +2,19 @@
 // it speaks the adapter's JSON-lines protocol on stdin/stdout, records every line it
 // received in FAKE_ADAPTER_LOG, and never touches a node. With FAKE_ADAPTER_HOLD=1 a
 // run stays `running` until SIGTERM, which it answers the way the real adapter does: the
-// attempt is revoked and sealed, `done` is written, and the process exits.
+// attempt is revoked and sealed, `done` is written, and the process exits. A manifest
+// with an `output` grant gets a canned result (§6.6) in `done` and through `result`;
+// FAKE_ADAPTER_CORRUPT_DIGEST=1 serves the first returned file with a digest that is not
+// its content's, and FAKE_ADAPTER_RESULT_REJECT=<reason> refuses `result` with it.
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
+import { blake3Hex } from "../blake3.mjs";
+
 const log = process.env.FAKE_ADAPTER_LOG;
 const hold = process.env.FAKE_ADAPTER_HOLD === "1";
+const corruptDigest = process.env.FAKE_ADAPTER_CORRUPT_DIGEST === "1";
+const resultReject = process.env.FAKE_ADAPTER_RESULT_REJECT;
 const socketFlag = process.argv.indexOf("--socket");
 const socket = socketFlag >= 0 ? process.argv[socketFlag + 1] : null;
 
@@ -30,11 +37,41 @@ const CAPABILITIES = {
 let failed = false;
 let running = null;
 
-function finish(binding, ids, state, outcome, cancelled, operations, evidence) {
+/** The canned §6.6 result for a grant: both streams printed once, every declared file but `missing.txt` returned. */
+function cannedOutput(grant) {
+  const stream = (text) => {
+    const content = Buffer.from(text);
+    return { bytes: content.length, truncated: false, dropped: 0, content_base64: content.toString("base64") };
+  };
+  let corrupted = !corruptDigest;
+  const files = grant.files.map((path) => {
+    if (path === "missing.txt") return { path, skipped: "missing" };
+    const content = Buffer.from(`content of ${path}\n`);
+    let digest = blake3Hex(content);
+    if (!corrupted) {
+      digest = blake3Hex(Buffer.from(`not ${path}`));
+      corrupted = true;
+    }
+    return { path, size: content.length, digest, truncated: false, content_base64: content.toString("base64") };
+  });
+  return { stdout: stream("hello stdout\n"), stderr: stream("hello stderr\n"), files };
+}
+
+function grantOf(envelope) {
+  const bytes = envelope.workload?.capability_manifest?.bytes;
+  if (typeof bytes !== "string") return null;
+  return JSON.parse(Buffer.from(bytes, "hex").toString("utf8")).output ?? null;
+}
+
+function finish(binding, ids, state, outcome, cancelled, operations, evidence, grant = null) {
   emit({ event: "receipt", state, outcome });
   operations.push({ verb: "seal", operation_id: ids.seal, state: "sealed", reason: null });
   emit({ event: "state", verb: "seal", operation_id: ids.seal, state: "sealed" });
   if (evidence) emit({ event: "evidence", path: evidence });
+  const output = grant ? cannedOutput(grant) : null;
+  if (output) {
+    emit({ event: "output", stdout_bytes: output.stdout.bytes, stderr_bytes: output.stderr.bytes, files: output.files.length, truncated: false });
+  }
   emit({
     event: "done",
     report: {
@@ -51,6 +88,7 @@ function finish(binding, ids, state, outcome, cancelled, operations, evidence) {
       evidence_head: evidence ? "3ac2d55f".padEnd(64, "0") : null,
       operations,
       transport_error: null,
+      output,
     },
   });
 }
@@ -86,6 +124,13 @@ lines.on("line", (line) => {
     case "revoke":
       emit({ event: "verb", verb: "revoke", operation_id: command.operation_id, result: "accepted", state: "revoked" });
       return;
+    case "result":
+      if (resultReject) {
+        emit({ event: "rejected", verb: "result", operation_id: null, reason: resultReject });
+        return;
+      }
+      emit({ event: "result", state: "sealed", output: cannedOutput({ files: ["out/report.json", "missing.txt"] }) });
+      return;
     case "run": {
       if (typeof command.envelope_json !== "string" || typeof command.proof?.signature !== "string") {
         failed = true;
@@ -117,12 +162,12 @@ lines.on("line", (line) => {
         return;
       }
       const exitStatus = envelope.workload.argv.at(-1) === "exit 3" ? 3 : 0;
-      finish(binding, ids, "exited", exitStatus === 0 ? "completed" : "failed", false, operations, evidence);
+      finish(binding, ids, "exited", exitStatus === 0 ? "completed" : "failed", false, operations, evidence, grantOf(envelope));
       return;
     }
     default:
       failed = true;
-      emit({ event: "error", error: `unknown command \`${command.cmd}\`` });
+      emit({ event: "error", error: `unknown command \`${command.cmd}\`; the commands are capabilities, run, revoke, inspect and result` });
   }
 });
 lines.on("close", () => process.exit(failed ? 1 : 0));

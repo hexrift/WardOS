@@ -11,6 +11,12 @@ export const OFFLINE_MANIFEST: Readonly<{ network: "offline" }>;
 /** Every id prefix of §7.2. */
 export const ID_PREFIXES: ReadonlyArray<IdPrefix>;
 
+/**
+ * What every node honours of an `output` grant (§6.6, §7.5): 1 MiB per stream, 8 MiB of
+ * file content, 64 paths of at most 255 bytes. A grant above these is refused before signing.
+ */
+export const OUTPUT_CEILINGS: Readonly<{ stdioBytes: 1048576; filesBytes: 8388608; files: 64; pathBytes: 255 }>;
+
 export type IdPrefix = "task" | "exec" | "lease" | "agent" | "node" | "sess" | "deleg" | "prn";
 
 /** `<prefix>_` and 26 upper-case Crockford base32 characters, first character 0–7 (§7.2). */
@@ -27,6 +33,9 @@ export type RejectionReason =
   | "resource_unavailable" | "unsupported_operation";
 
 export type Verb = "create" | "admit" | "start" | "pause" | "resume" | "stop" | "revoke" | "seal";
+
+/** The verbs a `rejected` event may name: the mutating verbs and the two read-only requests. */
+export type RejectedVerb = Verb | "inspect" | "result";
 
 export interface Binding {
   task: WardId<"task">;
@@ -55,7 +64,19 @@ export interface Lease {
   version: number;
 }
 
-export type Manifest = { network: "offline" } | { network: { custom: string[] } };
+/**
+ * The `output` grant of §7.5 in wire spelling: the first `stdio_bytes` of each of stdout
+ * and stderr, and the declared `files` (relative workspace paths, exact, 0–64, no repeats)
+ * with up to `files_bytes` of content in all. Honoured only by a node started with
+ * `--output-return` and within `OUTPUT_CEILINGS`; refused `unsupported_grant` otherwise.
+ */
+export interface OutputGrant {
+  stdio_bytes: number;
+  files: string[];
+  files_bytes: number;
+}
+
+export type Manifest = ({ network: "offline" } | { network: { custom: string[] } }) & { output?: OutputGrant };
 
 export interface ManifestBytes {
   /** BLAKE3-256 of `bytes`, 64 lowercase hex digits. */
@@ -140,6 +161,10 @@ export function randomId<P extends IdPrefix>(prefix: P): WardId<P>;
 
 export function blake3Hex(input: Uint8Array): string;
 export function manifest(object?: Manifest): ManifestBytes;
+/** The `output` grant a signed envelope's manifest carries, read from its exact bytes, or `null`. */
+export function outputGrantOf(envelopeJson: string): OutputGrant | null;
+/** The §7.5 grant from the control plane's words, refused outside the grammar or above the ceilings. */
+export function outputGrant(input: { stdioBytes: number; files: string[]; filesBytes: number }): OutputGrant;
 
 export class Issuer {
   private constructor(privateKey: unknown);
@@ -204,10 +229,76 @@ export function loadRunRecord(dir: string, attempt: WardId<"exec">): RunRecord &
 /** One event line of `ward-node-adapter` (§11.4). */
 export interface AdapterEvent {
   schema: 1;
-  event: "state" | "rejected" | "admitted" | "recovering" | "receipt" | "evidence" | "done"
-    | "capabilities" | "inspected" | "verb" | "error";
+  event: "state" | "rejected" | "admitted" | "recovering" | "receipt" | "evidence" | "output" | "done"
+    | "capabilities" | "inspected" | "result" | "verb" | "error";
   [field: string]: unknown;
 }
+
+/** One stream of a `result` as the wire carries it (§6.6): the head, base64 with padding. */
+export interface WireOutputStream {
+  bytes: number;
+  truncated: boolean;
+  dropped: number;
+  content_base64: string;
+}
+
+export type OutputFileSkip = "missing" | "not_a_regular_file" | "too_large";
+
+/** One declared file as the wire carries it (§6.6). */
+export type WireOutputFile =
+  | { path: string; size: number; digest: string; truncated: false; content_base64: string }
+  | { path: string; size: number; digest: string; truncated: true }
+  | { path: string; skipped: OutputFileSkip };
+
+/** The `output` of a `result` answer or a `done` report, undecoded (§6.6). */
+export interface WireOutput {
+  stdout: WireOutputStream;
+  stderr: WireOutputStream;
+  files: WireOutputFile[];
+}
+
+/** One stream decoded: `content` is the head of the stream, `dropped` the bytes past it. */
+export interface OutputStream {
+  bytes: number;
+  truncated: boolean;
+  dropped: number;
+  content: Buffer;
+}
+
+/**
+ * One declared file decoded. Returned content carries the digest the client recomputed
+ * over it; a file past `files_bytes` is digest-only with `truncated: true`; anything else
+ * is `skipped` with why. A digest that disagreed with its content never gets this far.
+ */
+export type OutputFile =
+  | { path: string; size: number; digest: string; truncated: false; content: Buffer }
+  | { path: string; size: number; digest: string; truncated: true }
+  | { path: string; skipped: OutputFileSkip };
+
+/** The bounded result of an ended attempt, decoded and verified (§6.6). */
+export interface AttemptOutput {
+  stdout: OutputStream;
+  stderr: OutputStream;
+  files: OutputFile[];
+  /** Whether a stream was cut or a file came back digest-only. */
+  truncated: boolean;
+}
+
+/**
+ * Decode a wire output, checking every count and flag and recomputing every returned
+ * file's BLAKE3-256; refuses a result whose digests, sizes or shape disagree, or, given the
+ * grant, that does not answer it (the declared paths in order, within both budgets).
+ * `null` in, `null` out.
+ */
+export function decodeOutput(output: WireOutput, grant?: OutputGrant | null): AttemptOutput;
+export function decodeOutput(output: null | undefined, grant?: OutputGrant | null): null;
+
+/**
+ * Write the returned files (those with content) under `dir` at their declared paths,
+ * `wx` and mode 0600, refusing a path that would leave `dir`, cross a symlink in it or
+ * overwrite anything before anything is written. Digest-only and skipped files write nothing.
+ */
+export function writeReturnedFiles(dir: string, files: OutputFile[]): Array<{ path: string; written: string }>;
 
 export interface Operation {
   verb: Verb;
@@ -220,7 +311,7 @@ export interface Operation {
 export interface AttemptReport {
   binding: Binding;
   final_state: LifecycleState | null;
-  outcome: ReceiptOutcome | { refused: { verb: Verb | "inspect"; reason: RejectionReason } };
+  outcome: ReceiptOutcome | { refused: { verb: RejectedVerb; reason: RejectionReason } };
   outcome_certain: boolean;
   receipt: ReceiptOutcome | null;
   cause: unknown;
@@ -231,6 +322,8 @@ export interface AttemptReport {
   evidence_head: string | null;
   operations: Operation[];
   transport_error: string | null;
+  /** The §6.6 output when the manifest granted it and the node returned it; else `null` (absent from an earlier adapter). */
+  output?: WireOutput | null;
 }
 
 export interface AdapterOptions {
@@ -261,6 +354,8 @@ export class Adapter {
   next(): Promise<AdapterEvent>;
   capabilities(): Promise<Record<string, unknown>>;
   inspect(binding: Binding): Promise<{ state: LifecycleState; outcome: ReceiptOutcome | null } | { rejected: RejectionReason }>;
+  /** `result` for the binding (§6.6): the decoded, verified output, or the node's refusal. */
+  result(binding: Binding): Promise<{ state: LifecycleState; output: AttemptOutput } | { rejected: RejectionReason }>;
   revoke(binding: Binding, operationId: number): Promise<
     | { result: "accepted"; state: LifecycleState; operation_id: number }
     | { result: "rejected"; reason: RejectionReason; operation_id: number }
@@ -287,7 +382,15 @@ export interface Outcome {
   evidenceHead: string | null;
   refused: { verb: string; reason: RejectionReason } | undefined;
   transportError: string | null;
+  /** The bounded result, decoded and verified, when granted and returned; `null` otherwise. */
+  output: AttemptOutput | null;
+  /** True when `outcomeOf` was given a grant and no output came back: never a success. */
+  outputMissing: boolean;
   binding: Binding;
 }
 
-export function outcomeOf(report: AttemptReport): Outcome;
+/**
+ * Map a report to the outcome a control plane acts on. With `grant` (`outputGrantOf` of the
+ * envelope) the output is held to it and `outputMissing` says a granted output did not come back.
+ */
+export function outcomeOf(report: AttemptReport, options?: { grant?: OutputGrant | null }): Outcome;

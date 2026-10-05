@@ -4,9 +4,12 @@
 // ai-institution adapter. The library is ward-node.mjs; this file is the command line
 // over it. Run `control-plane.mjs --help`.
 //
-// Exit status: 0 when the attempt completed; 1 when it failed, ended unknown, was refused
-// or was cancelled (the outcome object on stdout says which); 2 for a usage error or a
-// failure of the client itself (the message is on stderr).
+// Exit status: 0 when the attempt completed and, when the manifest granted output, its
+// output came back; 1 when it failed, ended unknown, was refused or was cancelled, or its
+// granted output did not come back (`outputMissing`; the outcome object on stdout says
+// which); 2 for a usage error or a failure of the client itself (the message is on
+// stderr), a returned result whose digests disagree with its content or its grant, or a
+// returned file that could not be written, included.
 
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -22,9 +25,12 @@ import {
   loadRunRecord,
   operationIds,
   outcomeOf,
+  outputGrant,
+  outputGrantOf,
   rootLease,
   saveRunRecord,
   signEnvelope,
+  writeReturnedFiles,
 } from "./ward-node.mjs";
 
 const USAGE = `usage: control-plane.mjs <command> [options]
@@ -41,16 +47,25 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                --snapshot <hex> --budget-ms <n> --task <caller-id> --attempt <caller-id>
                [--lease <caller-id>] [--agent <caller-id>] [--session <caller-id>]
                [--grant <capability>=<resource>]... [--task-root <dir>] [--valid-for-ms <n>]
+               [--stdio-bytes <n>] [--files <path>[,<path>...]]... [--files-bytes <n>] [--out-dir <dir>]
                [--cancel-after <ms>] [--adapter <bin>] [--timeout-ms <n>] [--trace] -- <argv>...
                Admit, start, watch and seal one attempt; print its outcome as one JSON line.
-               SIGINT or SIGTERM cancels it (revoke, then seal).
-  replay       --socket <path> --state-dir <dir> --attempt <exec_…> [--adapter <bin>] [--trace]
+               SIGINT or SIGTERM cancels it (revoke, then seal). Any of --stdio-bytes, --files
+               and --files-bytes puts an output grant in the manifest (the others default to 0
+               and none): the node, started with --output-return, returns the first n bytes of
+               stdout and of stderr and the declared files; the outcome's output carries them
+               with every digest verified, and --out-dir writes the returned files there.
+               A completed attempt whose granted output did not come back exits 1.
+  replay       --socket <path> --state-dir <dir> --attempt <exec_…> [--out-dir <dir>] [--adapter <bin>] [--trace]
                Resend a recorded run with the same bytes and operation ids; nothing acts twice.
   inspect      --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…>
+  result       --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…> [--out-dir <dir>]
+               Read an ended attempt's stored result again (its run must have carried the grant).
   revoke       --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…> --operation-id <n>
 
 An id option takes a WardOS id of the right prefix as is, and derives one from anything
-else with deriveId (docs/node-integration-from-nodejs.md §3).
+else with deriveId (docs/node-integration-from-nodejs.md §3). Output streams and, without
+--out-dir, returned file contents are printed as content_base64, the exact bytes.
 `;
 
 const OPTIONS = {
@@ -69,6 +84,10 @@ const OPTIONS = {
   grant: { type: "string", multiple: true },
   "task-root": { type: "string" },
   "valid-for-ms": { type: "string" },
+  "stdio-bytes": { type: "string" },
+  files: { type: "string", multiple: true },
+  "files-bytes": { type: "string" },
+  "out-dir": { type: "string" },
   "cancel-after": { type: "string" },
   adapter: { type: "string" },
   "timeout-ms": { type: "string" },
@@ -126,12 +145,47 @@ function grantsOf(values, task) {
   });
 }
 
+/** The manifest the flags ask for: offline, with an output grant when any output flag is given. */
+function manifestOf(values) {
+  if (values["stdio-bytes"] === undefined && values.files === undefined && values["files-bytes"] === undefined) return undefined;
+  return {
+    network: "offline",
+    output: outputGrant({
+      stdioBytes: integer(values, "stdio-bytes", 0),
+      files: (values.files ?? []).flatMap((entry) => entry.split(",")),
+      filesBytes: integer(values, "files-bytes", 0),
+    }),
+  };
+}
+
+/**
+ * The decoded output as the JSON line prints it: stream heads and, without `outDir`, file
+ * contents as content_base64 (the exact bytes); with `outDir` the returned files are
+ * written there first and the line names where (`written`) instead of carrying them.
+ */
+function renderOutput(output, outDir) {
+  if (output === null) return null;
+  const written = outDir === undefined ? new Map() : new Map(writeReturnedFiles(outDir, output.files).map((entry) => [entry.path, entry.written]));
+  const stream = ({ bytes, truncated, dropped, content }) => ({ bytes, truncated, dropped, content_base64: content.toString("base64") });
+  return {
+    stdout: stream(output.stdout),
+    stderr: stream(output.stderr),
+    truncated: output.truncated,
+    files: output.files.map((file) => {
+      if (file.skipped !== undefined || file.truncated) return file;
+      const { content, ...rest } = file;
+      return written.has(file.path) ? { ...rest, written: written.get(file.path) } : { ...rest, content_base64: content.toString("base64") };
+    }),
+  };
+}
+
 function emit(object) {
   process.stdout.write(`${JSON.stringify(object)}\n`);
 }
 
+/** 0 only for a completed, uncancelled attempt whose granted output, if any, came back. */
 function exitStatusOf(outcome) {
-  return outcome.outcome === "completed" && !outcome.cancelled ? 0 : 1;
+  return outcome.outcome === "completed" && !outcome.cancelled && !outcome.outputMissing ? 0 : 1;
 }
 
 /** Drive a run to its outcome, cancelling on SIGINT/SIGTERM and after `cancelAfterMs` if set. */
@@ -215,7 +269,7 @@ async function run(values, argv) {
       issuedAtUnixMs: now - 60_000,
       expiresAtUnixMs: now + validForMs + budgetMs,
     }),
-    workload: { argv, snapshot: need(values, "snapshot"), wallClockBudgetMs: budgetMs },
+    workload: { argv, manifest: manifestOf(values), snapshot: need(values, "snapshot"), wallClockBudgetMs: budgetMs },
     issuedAtUnixMs: now - 60_000,
     expiresAtUnixMs: now + validForMs,
     version,
@@ -245,8 +299,8 @@ async function run(values, argv) {
   } finally {
     await adapter.close();
   }
-  const outcome = { ...outcomeOf(report), version, operations: report.operations };
-  emit(outcome);
+  const outcome = { ...outcomeOf(report, { grant: outputGrantOf(signed.envelope_json) }), version, operations: report.operations };
+  emit({ ...outcome, output: renderOutput(outcome.output, values["out-dir"]) });
   return exitStatusOf(outcome);
 }
 
@@ -263,8 +317,13 @@ async function replay(values) {
   } finally {
     await adapter.close();
   }
-  const outcome = { ...outcomeOf(report), version: record.version, operations: report.operations, replayed: true };
-  emit(outcome);
+  const outcome = {
+    ...outcomeOf(report, { grant: outputGrantOf(record.envelope_json) }),
+    version: record.version,
+    operations: report.operations,
+    replayed: true,
+  };
+  emit({ ...outcome, output: renderOutput(outcome.output, values["out-dir"]) });
   return exitStatusOf(outcome);
 }
 
@@ -279,6 +338,22 @@ async function inspect(values) {
   } finally {
     await adapter.close();
   }
+  return 0;
+}
+
+async function result(values) {
+  const adapter = adapterOf(values);
+  let resulted;
+  try {
+    resulted = await adapter.result(bindingOf(values));
+  } finally {
+    await adapter.close();
+  }
+  if (resulted.rejected !== undefined) {
+    emit(resulted);
+    return 1;
+  }
+  emit({ state: resulted.state, output: renderOutput(resulted.output, values["out-dir"]) });
   return 0;
 }
 
@@ -315,6 +390,8 @@ async function main(args) {
       return replay(values);
     case "inspect":
       return inspect(values);
+    case "result":
+      return result(values);
     case "revoke":
       return revoke(values);
     default:
