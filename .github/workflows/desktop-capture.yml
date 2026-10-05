@@ -1,7 +1,7 @@
 # The README's desktop, captured for real (issue #84, docs/desktop.md "The README
-# animation"): the shipped Hyprland on a headless 1920x1080 output, software-rendered on
-# a virtual DRM node, in the Fedora release the image pins, with Waybar, mako, fuzzel and
-# foot from the image's package set and the ward binaries of this checkout.
+# animation"): the shipped Hyprland on a virtual 1920x1080 output (the vkms kernel
+# module's), software-rendered, in the Fedora release the image pins, with Waybar, mako,
+# fuzzel and foot from the image's package set and the ward binaries of this checkout.
 # desktop/capture/capture.sh drives the scenes of desktop/capture/scenes.tsv through
 # hyprctl dispatch and wardos-menu-select, takes one grim shot per scene, and assembles
 # the GIF; the GIF and the shots are the artifact `wardos-desktop-capture`. Nothing here
@@ -56,66 +56,64 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # No GPU on the runner. aquamarine allocates its buffers on a DRM node even for headless
-  # outputs (a job container without /dev/dri dies in CBackend::create()), so the job runs
-  # on the host, loads a virtual node (vgem's render node, else vkms), and hands it to the
-  # Fedora container through --device. Inside, desktop/capture/ci-run.sh installs the
-  # image's stack and runs capture.sh as an unprivileged user: Hyprland on headless
-  # outputs (HYPRLAND_HEADLESS_ONLY=1), Mesa's software rasteriser for EGL and GBM. A
-  # scene that does not come up fails the job with Hyprland's log; it cannot go green
-  # without the shots.
+  # No GPU on the runner. aquamarine gets its buffer allocator from its DRM backend, which
+  # needs a KMS device opened through a seat (a job container without /dev/dri dies in
+  # CBackend::create(), and HYPRLAND_HEADLESS_ONLY does not help: the headless backend has
+  # no allocator of its own). So the job runs on the host, loads vkms (a KMS device with a
+  # virtual connector; vgem is render-only and not in the Azure kernel's modules anyway),
+  # and hands /dev/dri to the Fedora container through --device. Inside,
+  # desktop/capture/ci-run.sh installs the image's stack, runs seatd for the seat, and
+  # runs capture.sh as an unprivileged user: Hyprland's DRM backend on the vkms card
+  # (AQ_DRM_DEVICES), Mesa's software rasteriser for EGL and GBM (kms_swrast on the
+  # card's dumb buffers). A scene that does not come up fails the job with Hyprland's
+  # log; it cannot go green without the shots.
   capture:
-    name: desktop capture (Hyprland headless, Fedora)
+    name: desktop capture (Hyprland on vkms, Fedora)
     needs: binaries
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # Tried in order; the first that gives a DRM node is used.
-      CAPTURE_DRM_MODULES: vgem vkms
+      # The virtual KMS driver whose card the capture uses (capture.sh finds the card by
+      # this driver name in sysfs, so the runner's own display adapter is never taken).
+      CAPTURE_DRM_DRIVER: vkms
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: desktop-capture-binaries
           path: capture-binaries
-      - name: A virtual DRM node (vgem, else vkms)
+      - name: A virtual KMS device (vkms)
         run: |
           set -euo pipefail
           sudo apt-get update -q
           sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" ||
             echo "linux-modules-extra-$(uname -r) not installed; trying the modules already present"
-          shopt -s nullglob
-          node=""
-          for module in $CAPTURE_DRM_MODULES; do
-            sudo modprobe "$module" || { echo "modprobe $module failed"; continue; }
-            sudo udevadm settle || true
-            if [[ $module == vgem ]]; then found=(/dev/dri/renderD*); else found=(/dev/dri/renderD* /dev/dri/card*); fi
-            if [[ ${#found[@]} -gt 0 ]]; then
-              node="${found[0]} ($module)"
-              break
-            fi
-            echo "$module loaded but gave no usable node"
-          done
+          sudo modprobe "$CAPTURE_DRM_DRIVER"
+          sudo udevadm settle || true
           ls -l /dev/dri || true
+          node=""
+          for card in /sys/class/drm/card*; do
+            [[ -e $card/device/driver ]] || continue
+            driver=$(basename "$(readlink -f "$card/device/driver")")
+            echo "$(basename "$card"): $driver"
+            if [[ $driver == "$CAPTURE_DRM_DRIVER" && -e /dev/dri/$(basename "$card") ]]; then node=/dev/dri/$(basename "$card"); fi
+          done
           if [[ -z $node ]]; then
-            echo "::error::no virtual DRM node: none of '$CAPTURE_DRM_MODULES' could be loaded or gave a node; Hyprland cannot allocate buffers without one" >&2
+            echo "::error::no /dev/dri/card* driven by $CAPTURE_DRM_DRIVER after modprobe; Hyprland has no KMS device to allocate on" >&2
             exit 1
           fi
-          # llvmpipe exports its buffers as dma-bufs through udmabuf where it exists.
-          sudo modprobe udmabuf || echo "no udmabuf; Mesa falls back to shared memory"
-          echo "DRM node for the capture: $node"
-          { echo "DRM node for the capture: \`$node\`"; echo; } >>"$GITHUB_STEP_SUMMARY"
+          echo "DRM device for the capture: $node ($CAPTURE_DRM_DRIVER)"
+          { echo "DRM device for the capture: \`$node\` ($CAPTURE_DRM_DRIVER)"; echo; } >>"$GITHUB_STEP_SUMMARY"
       # The Fedora release the image pins (image/Containerfile's FROM line), as root with
-      # the node; ci-run.sh hands capture-out back to this user, failed or not.
+      # every DRM node (capture.sh picks the vkms card by driver); ci-run.sh hands
+      # capture-out back to this user, failed or not.
       - name: Capture
         run: |
           set -euo pipefail
           release=$(sed -n 's|^FROM quay.io/fedora/fedora-bootc:\([0-9][0-9]*\)$|\1|p' image/Containerfile | head -n 1)
           [[ $release =~ ^[0-9]+$ ]] || { echo "::error::no fedora-bootc:<release> FROM line in image/Containerfile" >&2; exit 1; }
-          devices=(--device /dev/dri)
-          if [[ -e /dev/udmabuf ]]; then devices+=(--device /dev/udmabuf); fi
-          docker run --rm "${devices[@]}" -v "$PWD:/w" -w /w \
-            -e GITHUB_ACTIONS -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+          docker run --rm --device /dev/dri -v "$PWD:/w" -w /w \
+            -e GITHUB_ACTIONS -e CAPTURE_DRM_DRIVER -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             "fedora:$release" bash desktop/capture/ci-run.sh /w/capture-binaries /w/capture-out
       - name: Summary
         if: always()

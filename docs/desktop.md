@@ -446,32 +446,38 @@ by [`assets/storyboard/`](../assets/storyboard/README.md). It is not a composito
 capture, and the README says so under it. Decision: the first five minutes are worth
 showing now, and every string in the storyboard is one the desktop prints, so nothing
 in it can drift from the product without the tests noticing first. The capture that
-replaces it runs Hyprland headless in CI (issue #84, below); once a captured GIF has
+replaces it runs Hyprland on a virtual output in CI (issue #84, below); once a captured GIF has
 taken its place, the storyboard directory goes.
 
 The capture is the workflow `desktop capture` (`.github/workflows/desktop-capture.yml`):
 weekly on `main`, by hand, and on pull requests that touch `desktop/` or `image/`. The
-runner has no GPU, and aquamarine allocates its buffers on a DRM node even for headless
-outputs, so the job runs on the host, loads a virtual node (`vgem`'s render node, else
-`vkms`) and hands it with `--device /dev/dri` to a container of the Fedora release the
-image pins. There [`desktop/capture/ci-run.sh`](../desktop/capture/ci-run.sh) enables
-the COPRs of `image/coprs.txt`, installs `desktop/capture/packages.txt` (the image's own
-packages for everything on screen), places the tree with `image/install-desktop.sh`,
-puts the checkout's `ward` binaries in `/usr/bin`, and runs
+runner has no GPU, and aquamarine gets its buffer allocator from its DRM backend, which
+needs a KMS device opened through a seat (`HYPRLAND_HEADLESS_ONLY` does not help: the
+headless backend has no allocator of its own). So the job runs on the host, loads the
+`vkms` kernel module (a virtual KMS device with a `Virtual-1` connector) and hands
+`/dev/dri` with `--device` to a container of the Fedora release the image pins. There
+[`desktop/capture/ci-run.sh`](../desktop/capture/ci-run.sh) enables the COPRs of
+`image/coprs.txt`, installs `desktop/capture/packages.txt` (the image's own packages for
+everything on screen, plus `seatd`), places the tree with `image/install-desktop.sh`,
+puts the checkout's `ward` binaries in `/usr/bin`, starts `seatd` as the seat (no VT, the
+socket owned by the session user; the image has logind for this), and runs
 [`desktop/capture/capture.sh`](../desktop/capture/capture.sh) as an unprivileged user
-that may open the node. It sets the user up as a first login leaves it (with Hyprland's
-debug log on, checked by `Hyprland --verify-config`), starts a session bus and the
-shipped Hyprland on a headless 1920x1080 output (`HYPRLAND_HEADLESS_ONLY=1`, Mesa's
-software rasteriser for EGL and GBM, `AQ_TRACE`/`HYPRLAND_TRACE` on), and walks
+with `LIBSEAT_BACKEND=seatd`. It picks the card whose driver is `vkms` from sysfs (never
+the runner's own adapter) as `AQ_DRM_DEVICES`, sets the user up as a first login leaves
+it (every output at 1920x1080@60, Hyprland's debug log on, checked by
+`Hyprland --verify-config`), starts a session bus and the shipped Hyprland (Mesa's
+software rasteriser for EGL and, through `kms_swrast` on the card's dumb buffers, for
+GBM; `AQ_TRACE`/`HYPRLAND_TRACE` on), waits for the vkms output and creates a headless
+one only when none appears, and walks
 [`desktop/capture/scenes.tsv`](../desktop/capture/scenes.tsv). Each scene is started
 through `hyprctl dispatch exec` (the welcome steps, `wardos-launch run`, `wardos-menu`,
 `wardos-theme`, `wardos-power`), waited for in `hyprctl layers` and `hyprctl clients`
 rather than slept on, shot with `grim`, and closed again (a menu is cancelled the way
 Escape would). `assemble.py` makes the GIF from the shots with each scene's
 milliseconds, 1280x720 and 128 colours like the storyboard. A required scene that does
-not come up fails the job with Hyprland's log, the DRM nodes, the EGL vendor and any
-crash report; the lock screen is optional and is left out, with a warning, when
-hyprlock cannot draw headless. The GIF and the shots are the artifact
+not come up fails the job with Hyprland's log, the DRM nodes, the EGL vendor, seatd's
+log and any crash report; the lock screen is optional and is left out, with a warning,
+when hyprlock cannot draw there. The GIF and the shots are the artifact
 `wardos-desktop-capture`, the logs on failure `wardos-desktop-capture-logs`.
 
 What it does not show, and why: the boot splash (Plymouth is not a compositor surface),

@@ -104,20 +104,30 @@ while read -r cmd; do
 done < <(grep -oE '(hypr_run|menu_open) [a-z-]+' "$script" | awk '{ print $2 }' | sort -u)
 
 # --- workflow, ci-run.sh and refresh.sh agree --------------------------------------------
-# The job runs on the host so it can load a virtual DRM node and give it to the Fedora
-# container (a job container starts before any step could); ci-run.sh does the rest.
+# The job runs on the host so it can load vkms and give its card to the Fedora container
+# (a job container starts before any step could); ci-run.sh installs the stack and runs
+# seatd for the seat aquamarine opens the card through; capture.sh picks the card by
+# driver and wants the DRM backend, not headless only.
 # shellcheck disable=SC2016  # grep patterns, not expansions
-for want in 'CAPTURE_DRM_MODULES: vgem' 'modprobe "\$module"' '--device /dev/dri' 'image/Containerfile' \
-  'desktop/capture/ci-run.sh /w/capture-binaries /w/capture-out' 'name: wardos-desktop-capture$' \
-  'name: wardos-desktop-capture-logs$'; do
+for want in 'CAPTURE_DRM_DRIVER: vkms' 'modprobe "\$CAPTURE_DRM_DRIVER"' '--device /dev/dri' '-e CAPTURE_DRM_DRIVER' \
+  'image/Containerfile' 'desktop/capture/ci-run.sh /w/capture-binaries /w/capture-out' \
+  'name: wardos-desktop-capture$' 'name: wardos-desktop-capture-logs$'; do
   grep -qE -- "$want" "$workflow" || fail "desktop-capture.yml does not mention $want"
 done
 ! grep -qE '^ *container:' "$workflow" || fail "desktop-capture.yml must not use a job container: the DRM node is loaded on the host first"
 # shellcheck disable=SC2016  # grep patterns, not expansions
-for want in desktop/capture/packages.txt image/coprs.txt image/install-desktop.sh \
-  'runuser -u wardos' desktop/capture/capture.sh 'chmod 0666 "\$\{nodes' 'trap hand_back EXIT'; do
+for want in desktop/capture/packages.txt image/coprs.txt image/install-desktop.sh 'SEATD_VTBOUND=0 seatd -u wardos -g wardos' \
+  'runuser -u wardos' 'LIBSEAT_BACKEND=seatd' desktop/capture/capture.sh 'chmod 0666 "\$\{nodes' 'kill "\$seatd_pid"' 'trap hand_back EXIT'; do
   grep -qE -- "$want" "$ci_run" || fail "ci-run.sh does not mention $want"
 done
+# shellcheck disable=SC2016  # grep patterns, not expansions
+for want in 'AQ_DRM_DEVICES=\$\(drm_card "\$driver"\)' 'export AQ_DRM_DEVICES' 'GBM_ALWAYS_SOFTWARE=1' 'LIBGL_ALWAYS_SOFTWARE=1' \
+  'AQ_TRACE=1' 'HYPRLAND_TRACE=1' 'output create headless' 'monitor = , 1920x1080@60'; do
+  grep -qE -- "$want" "$script" || fail "capture.sh does not mention $want"
+done
+! grep -q 'HYPRLAND_HEADLESS_ONLY=1' "$script" || fail "capture.sh must not set HYPRLAND_HEADLESS_ONLY: the DRM backend on vkms is the allocator"
+! grep -qE 'hyprctl [a-z]+ -j [^|]*\| *jq' "$script" || fail "capture.sh pipes hyprctl straight into jq; use hypr_json, which checks for JSON first"
+grep -qx 'seatd' < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$cap/packages.txt") || fail "packages.txt lacks seatd"
 grep -q -- '--workflow desktop-capture.yml' "$cap/refresh.sh" || fail "refresh.sh names another workflow"
 grep -q -- '--name wardos-desktop-capture' "$cap/refresh.sh" || fail "refresh.sh names another artifact"
 ! grep -qE 'contents: *write' "$workflow" || fail "desktop-capture.yml must not write to the repository"

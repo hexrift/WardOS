@@ -26,8 +26,9 @@ jq
 python3
 
 # --- what only the capture needs ------------------------------------------------------
+seatd                 # capture: the seat aquamarine opens the vkms card through (logind's job on the image; the container has no logind session)
 mesa-libEGL           # capture: the EGL vendor llvmpipe renders through (a dependency on the image, weak here)
-mesa-libgbm           # capture: GBM for aquamarine (a dependency on the image)
+mesa-libgbm           # capture: GBM for aquamarine's buffers; mesa-dri-drivers above carries kms_swrast, the software path on the card's dumb buffers (a dependency on the image)
 xkeyboard-config      # capture: keymaps for Hyprland's input config (a dependency on the image)
 dbus-daemon           # capture: the session bus mako and notify-send need (systemd's user session on the image)
 python3-pillow        # capture: assemble.py writes the GIF

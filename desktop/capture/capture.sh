@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The README capture (issue #84, docs/desktop.md "The README animation"): the shipped
-# Hyprland on a headless 1920x1080 output, software-rendered, with the shipped Waybar,
-# mako, fuzzel and foot. Each scene of scenes.tsv is driven through `hyprctl dispatch`
+# Hyprland on a virtual 1920x1080 output (the vkms kernel module's; a headless one as the
+# fallback), software-rendered, with the shipped Waybar, mako, fuzzel and foot. Each scene of scenes.tsv is driven through `hyprctl dispatch`
 # and wardos-menu-select (fuzzel --dmenu), shot with grim, and assemble.py turns the
 # shots into the GIF. Nothing is drawn afterwards: every pixel is the compositor's.
 #
@@ -9,19 +9,22 @@
 #
 # Runs as an unprivileged user (Hyprland refuses root) where image/install-desktop.sh
 # has placed desktop/ and ward, wardd, ward-shell and wardos-theme-render are on PATH,
-# with a DRM node in /dev/dri for aquamarine's buffers (CI: ci-run.sh, in a container
-# given the runner's vgem or vkms node). The user is first set up the way a first login
-# leaves it (wardos-refresh --all, the Ward Dark render, the onboarding markers, an
-# output line in ~/.config/hypr/monitors.conf, ~/ward-demo as a git repository), with
-# Hyprland's debug log switched on in ~/.config/hypr/hyprland.conf, and must pass
-# `Hyprland --verify-config`; then a session bus and Hyprland start. Writes
-# OUT/frames/NN-<scene>.png, OUT/wardos-desktop.gif, OUT/summary.md and OUT/logs/. A
-# required scene that is not on screen in time fails the run with Hyprland's log, the
-# DRM nodes and the EGL vendor; an optional one (the lock screen) is left out with a
-# warning.
+# with a KMS device of the CAPTURE_DRM_DRIVER driver (default vkms) in /dev/dri and a
+# seat for it: seatd on ${SEATD_SOCK:-/run/seatd.sock} when LIBSEAT_BACKEND is seatd (CI:
+# ci-run.sh, in a container given the runner's vkms card). aquamarine opens the device
+# through the seat and allocates its buffers on it (AQ_DRM_DEVICES names it; a preset
+# value is kept), so the DRM backend is wanted, not headless only. The user is first set
+# up the way a first login leaves it (wardos-refresh --all, the Ward Dark render, the
+# onboarding markers, a 1920x1080@60 line in ~/.config/hypr/monitors.conf, ~/ward-demo
+# as a git repository), with Hyprland's debug log switched on in
+# ~/.config/hypr/hyprland.conf, and must pass `Hyprland --verify-config`; then a session
+# bus and Hyprland start. Writes OUT/frames/NN-<scene>.png, OUT/wardos-desktop.gif,
+# OUT/summary.md and OUT/logs/. A required scene that is not on screen in time fails the
+# run with Hyprland's log, the DRM nodes and the EGL vendor; an optional one (the lock
+# screen) is left out with a warning.
 set -euo pipefail
 
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
 case "${1:-}" in
   -h | --help) usage; exit 0 ;;
   "") usage >&2; exit 2 ;;
@@ -33,7 +36,9 @@ mkdir -p "$1"
 out=$(cd "$1" && pwd)
 frames=$out/frames
 logs=$out/logs
-output=WARD-1
+output=""
+headless=WARD-1
+driver=${CAPTURE_DRM_DRIVER:-vkms}
 limit=${WARDOS_CAPTURE_TIMEOUT:-60}
 settle=1
 project=$HOME/ward-demo
@@ -78,9 +83,20 @@ wait_for() {
   done
 }
 
-layer_up() { hyprctl layers -j 2>/dev/null | jq -e --arg ns "$1" '[.. | objects | .namespace? // empty] | index($ns) != null' >/dev/null; }
+# hypr_json REQUEST JQ-ARGS…: hyprctl's JSON answer through jq, nothing when hyprctl
+# fails or answers with an error line instead of JSON (the socket not up yet).
+hypr_json() {
+  local request=$1 answer
+  shift
+  answer=$(hyprctl "$request" -j 2>/dev/null) || return 1
+  [[ $answer == [\[\{]* ]] || return 1
+  jq "$@" <<<"$answer" 2>/dev/null
+}
+# shellcheck disable=SC2016  # $ns is jq's
+layer_up() { hypr_json layers -e --arg ns "$1" '[.. | objects | .namespace? // empty] | index($ns) != null' >/dev/null; }
 layer_gone() { ! layer_up "$1"; }
-clients() { hyprctl clients -j 2>/dev/null | jq --arg c "$1" '[.[] | select(.class == $c and .mapped)] | length'; }
+# shellcheck disable=SC2016  # $c is jq's
+clients() { hypr_json clients --arg c "$1" '[.[] | select(.class == $c and .mapped)] | length'; }
 client_up() {
   local n
   n=$(clients "$1")
@@ -100,9 +116,13 @@ running_for() {
   age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
   ((${age:-0} >= $2))
 }
+# monitor_up: an enabled 1920x1080 monitor (the vkms connector, or the headless one
+# created as the fallback); its name becomes $output for grim and the summary.
 monitor_up() {
-  hyprctl monitors -j 2>/dev/null |
-    jq -e --arg n "$output" 'any(.[]; .name == $n and .width == 1920 and .height == 1080)' >/dev/null
+  local name
+  name=$(hypr_json monitors -r 'first(.[] | select(.width == 1920 and .height == 1080 and (.disabled | not)) | .name) // empty') || return 1
+  [[ -n $name ]] || return 1
+  output=$name
 }
 theme_is() { [[ $(cat "$HOME/.config/wardos/theme/current/id" 2>/dev/null) == "$1" ]]; }
 session_live() {
@@ -129,7 +149,7 @@ bar_live() {
 # signature and Wayland display for hyprctl and grim.
 hypr_ready() {
   local inst
-  inst=$(hyprctl instances -j 2>/dev/null | jq -r 'first(.[] | "\(.instance) \(.wl_socket)") // empty') || return 1
+  inst=$(hypr_json instances -r 'first(.[] | "\(.instance) \(.wl_socket)") // empty') || return 1
   [[ -n $inst ]] || return 1
   read -r HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY <<<"$inst"
   export HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY
@@ -239,6 +259,33 @@ scene_lock() {
 
 # --- the session --------------------------------------------------------------------
 
+# drm_card DRIVER: the /dev/dri/card* whose kernel driver is DRIVER (sysfs names it),
+# so the runner's own display adapter is never taken.
+drm_card() {
+  local card name
+  for card in /dev/dri/card*; do
+    [[ -e $card ]] || continue
+    name=$(basename "$(readlink -f "/sys/class/drm/$(basename "$card")/device/driver" 2>/dev/null)" 2>/dev/null) || name=""
+    if [[ -z $name || $name == / ]]; then
+      name=$(sed -n 's/^DRIVER=//p' "/sys/class/drm/$(basename "$card")/device/uevent" 2>/dev/null || true)
+    fi
+    if [[ $name == "$1" ]]; then
+      printf '%s\n' "$card"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# drm_drivers: every card with its driver, for the start line and a failed pick.
+drm_drivers() {
+  local card
+  for card in /dev/dri/card*; do
+    [[ -e $card ]] || continue
+    printf '%s=%s ' "$(basename "$card")" "$(basename "$(readlink -f "/sys/class/drm/$(basename "$card")/device/driver" 2>/dev/null)" 2>/dev/null || echo '?')"
+  done
+}
+
 # The command the session entry starts (uwsm runs this entry on the image; there is no
 # systemd user session here), else Hyprland itself, as wardos-session falls back to.
 session_command() {
@@ -263,6 +310,10 @@ diagnose() {
     timeout 30 eglinfo -B -p surfaceless 2>&1 || true
   else
     echo "capture: no eglinfo (egl-utils) to name the EGL vendor"
+  fi
+  if [[ -f $out/seatd.log ]]; then
+    echo "capture: seatd's log ($out/seatd.log):"
+    tail -n 50 "$out/seatd.log"
   fi
   for report in "$HOME"/.cache/hyprland/hyprlandCrashReport*.txt; do
     [[ -f $report ]] || continue
@@ -303,11 +354,22 @@ chmod 0700 "$XDG_RUNTIME_DIR"
 export XDG_RUNTIME_DIR
 trap cleanup EXIT
 unset WAYLAND_DISPLAY DISPLAY HYPRLAND_INSTANCE_SIGNATURE
-# Headless outputs only; Mesa's software rasteriser for EGL and, through kms_swrast,
-# for the GBM buffers aquamarine allocates on the node (vgem and vkms have no Mesa
-# driver of their own); aquamarine's and Hyprland's trace logging, so a backend or
-# renderer that fails says why.
-export HYPRLAND_HEADLESS_ONLY=1 LIBGL_ALWAYS_SOFTWARE=1 GBM_ALWAYS_SOFTWARE=1 AQ_TRACE=1 HYPRLAND_TRACE=1
+# Mesa's software rasteriser for EGL and, through kms_swrast on the card's dumb
+# buffers, for the GBM buffers aquamarine allocates (vkms has no Mesa driver of its own);
+# the seat aquamarine opens the card through; aquamarine's and Hyprland's trace logging,
+# so a backend or renderer that fails says why. Not HYPRLAND_HEADLESS_ONLY: the DRM
+# backend is the one with an allocator, and the headless output is only the fallback.
+export LIBGL_ALWAYS_SOFTWARE=1 GBM_ALWAYS_SOFTWARE=1 AQ_TRACE=1 HYPRLAND_TRACE=1
+export LIBSEAT_BACKEND=${LIBSEAT_BACKEND:-seatd}
+if [[ -z ${AQ_DRM_DEVICES:-} ]]; then
+  AQ_DRM_DEVICES=$(drm_card "$driver") || die "no /dev/dri/card* driven by $driver (cards: $(drm_drivers)); the capture needs the vkms module loaded and /dev/dri passed in"
+fi
+export AQ_DRM_DEVICES
+say "DRM device: $AQ_DRM_DEVICES ($driver; cards: $(drm_drivers))"
+if [[ $LIBSEAT_BACKEND == seatd ]]; then
+  wait_for "the seat (seatd on ${SEATD_SOCK:-/run/seatd.sock})" 20 test -S "${SEATD_SOCK:-/run/seatd.sock}" ||
+    die "no seatd socket; aquamarine cannot open $AQ_DRM_DEVICES without a seat"
+fi
 rm -rf "$frames" "$logs"
 mkdir -p "$frames" "$logs"
 cd "$HOME"
@@ -318,7 +380,9 @@ wardos-theme render ward-dark
 for marker in first-run-done calibrate-done welcome-done; do
   date -u +%Y-%m-%dT%H:%M:%SZ >"$HOME/.config/wardos/$marker"
 done
-printf 'monitor = %s, 1920x1080@60, 0x0, 1\n' "$output" >>"$HOME/.config/hypr/monitors.conf"
+# Every output at 1920x1080@60: vkms's Virtual-1, or the headless fallback. The later
+# catch-all line replaces the shipped `preferred` one.
+printf 'monitor = , 1920x1080@60, auto, 1\n' >>"$HOME/.config/hypr/monitors.conf"
 # Hyprland logs nothing to its file by default (debug:disable_logs); the capture's
 # failure output needs the log, to the file and to stdout ($logs/hyprland.out).
 printf '\n# desktop/capture/capture.sh: the debug log for the capture\ndebug {\n    disable_logs = false\n    enable_stdout_logs = true\n}\n' \
@@ -341,21 +405,25 @@ export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
 wait_for "the session bus" 20 test -S "$XDG_RUNTIME_DIR/bus" || die "the session bus did not start"
 
 read -ra session < <(session_command)
-say "starting ${session[*]} (HYPRLAND_HEADLESS_ONLY=1, software GL, DRM nodes: $(cd /dev/dri 2>/dev/null && echo *))"
+say "starting ${session[*]} (AQ_DRM_DEVICES=$AQ_DRM_DEVICES, LIBSEAT_BACKEND=$LIBSEAT_BACKEND, software GL)"
 "${session[@]}" >"$logs/hyprland.out" 2>&1 &
 hypr_pid=$!
 pids+=("$hypr_pid")
 wait_for "Hyprland's socket" "$limit" hypr_ready || die "Hyprland did not come up"
 say "$(hyprctl version | sed -n 1p), instance $HYPRLAND_INSTANCE_SIGNATURE on $WAYLAND_DISPLAY"
-created=$(hyprctl output create headless "$output" 2>&1) || true
-[[ $created == ok* ]] || die "hyprctl output create headless $output: $created"
-wait_for "the 1920x1080 output $output" "$limit" monitor_up || die "the headless output did not come up"
+if ! wait_for "the $driver output at 1920x1080" 20 monitor_up; then
+  say "no $driver output; creating the headless output $headless instead"
+  created=$(hyprctl output create headless "$headless" 2>&1) || true
+  [[ $created == ok* ]] || die "hyprctl output create headless $headless: $created"
+  wait_for "the 1920x1080 output $headless" "$limit" monitor_up || die "the headless output did not come up"
+fi
+say "output $output at 1920x1080"
 
 summary=$out/summary.md
 {
   echo "### Desktop capture"
   echo
-  echo "$(hyprctl version | sed -n 1p), headless $output 1920x1080, software GL, DRM nodes: $(cd /dev/dri && echo *)."
+  echo "$(hyprctl version | sed -n 1p), output $output at 1920x1080 on $AQ_DRM_DEVICES ($driver), software GL."
   echo
   if [[ -f $out/versions.txt ]]; then
     echo '```'
