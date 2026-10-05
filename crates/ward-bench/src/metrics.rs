@@ -7,9 +7,9 @@
 
 use std::path::Path;
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ward_daemon::{Session, client, daemon};
+use ward_daemon::{Session, SessionMeta, client, daemon};
 use ward_events::{EndReason, EventRecord, FileChangeKind, WardEvent};
 use ward_snapshot::{CaptureOptions, HashCache, SnapshotRole, SnapshotStore};
 
@@ -416,9 +416,10 @@ const OBSERVED_PREFIX: &str = "ward-bench-observed-";
 const RELEASE_PREFIX: &str = "ward-bench-release-";
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Producer-to-subscriber latency of a live file observation: the inotify
-/// timestamp the watcher stamps on `EventRecord::ts_wall`, to the moment a
-/// real daemon `Subscribe` stream hands that record to a client. Each sample
+/// Producer-to-subscriber latency of a live file observation: the capture
+/// instant the watcher stamps on the observation (carried to the daemon as
+/// the append's `at` and recorded as `ts_mono` from the session's start), to
+/// the moment a real daemon `Subscribe` stream hands that record to a client. Each sample
 /// is one file created by a still-running sandboxed command that then blocks
 /// until the record has been received, so every sample is delivered live,
 /// before the command completes, over the production watcher → session drain
@@ -479,6 +480,12 @@ fn propagation_samples(
     let session_id = up.id().to_owned();
     up.persist_current().map_err(to_anyhow)?;
     drop(up);
+    let session_start = UNIX_EPOCH
+        + Duration::from_millis(
+            SessionMeta::load(state, &session_id)
+                .map_err(to_anyhow)?
+                .started_unix_ms,
+        );
     let served = {
         let (state, session_id) = (state.to_path_buf(), session_id.clone());
         std::thread::spawn(move || daemon::serve(&state, &session_id))
@@ -495,7 +502,7 @@ fn propagation_samples(
         client::watch_records(sink, 0, |record| {
             let at = SystemTime::now();
             if let Some(observed) = observed_index(&record) {
-                let _ = received.send((observed, record.ts_wall, at));
+                let _ = received.send((observed, session_start + record.ts_mono, at));
             }
         })
     });
@@ -541,7 +548,7 @@ fn propagation_samples(
 }
 
 fn collect_latencies(
-    receipts: &mpsc::Receiver<(usize, Option<SystemTime>, SystemTime)>,
+    receipts: &mpsc::Receiver<(usize, SystemTime, SystemTime)>,
     project: &Path,
     warm_up_count: usize,
     total: usize,
@@ -556,9 +563,6 @@ fn collect_latencies(
             if observed != expected {
                 continue;
             }
-            let stamped = stamped.ok_or_else(|| {
-                anyhow::anyhow!("observation {expected} carries no source timestamp")
-            })?;
             break at.duration_since(stamped).map_err(|e| {
                 anyhow::anyhow!("observation {expected} is stamped after it was received: {e}")
             })?;
@@ -719,6 +723,9 @@ mod tests {
         let state = tempfile::tempdir().expect("tempdir");
         let metric = observer_event_propagation(&fixtures_root(), state.path(), 1, 3);
 
+        if ward_daemon::sandbox::available() {
+            assert_eq!(metric.status, MetricStatus::Measured, "{metric:?}");
+        }
         assert!(matches!(
             metric.status,
             MetricStatus::Measured | MetricStatus::Unsupported

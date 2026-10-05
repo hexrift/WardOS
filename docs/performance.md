@@ -96,9 +96,10 @@ process, with no daemon and no `ward` CLI subprocess in the timed path itself:
   uses. Always measurable; no sandbox involved.
 * **`observer_event_propagation`** — a still-running sandboxed command creates one file
   per sample and blocks until that observation has reached a subscriber; each sample is
-  the inotify timestamp the watcher stamps on `EventRecord::ts_wall` to the moment a real
-  daemon `Subscribe` stream (`daemon::serve` in-process, `client::watch_records`) hands
-  the record over. The production path end to end — watcher, bounded queue, session live
+  the capture instant the watcher stamps on the observation (sent to the daemon as the
+  append's `at` and recorded as `ts_mono` from the session's recorded start) to the moment
+  a real daemon `Subscribe` stream (`daemon::serve` in-process, `client::watch_records`)
+  hands the record over. The production path end to end — watcher, bounded queue, session live
   drain, the daemon's single writer, the subscriber — with no benchmark-only timestamp,
   against "Observer event propagation" (§2). The one metric here that runs a daemon.
 
