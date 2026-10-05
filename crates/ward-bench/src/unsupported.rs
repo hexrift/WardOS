@@ -39,15 +39,6 @@ pub fn not_implemented_metrics() -> Vec<Metric> {
             "needs a real compositor session (Waybar); see #84",
         ),
         Metric::not_implemented(
-            "observer_event_propagation",
-            "kernel/proxy timestamp to subscriber receive (producer-to-subscriber \
-             latency, #150 item 4's second half)",
-            "Observer event propagation",
-            Some(25.0),
-            "needs a live subscriber over a real event stream; not implemented this \
-             pass (judged not cheap to add safely alongside the rest of this subset)",
-        ),
-        Metric::not_implemented(
             "project_warm_resume",
             "cd + `ward status` to READY",
             "Project environment warm resume",
