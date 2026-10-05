@@ -1,4 +1,5 @@
-//! Freezing and thawing one launch's process tree by signal (node `pause` and `resume`).
+//! Freezing and thawing one launch's process tree by signal (node `pause` and `resume`),
+//! and killing a tree that outlived the node that launched it (node recovery).
 //!
 //! The tree is rooted at the host pid of the launch's outer `bwrap`
 //! ([`RunningLaunch::tree_root`](crate::RunningLaunch::tree_root)) and found by walking
@@ -14,7 +15,8 @@
 //! is stopped and adding nothing closes the set: nothing in it runs, so nothing can fork.
 //! A freeze that cannot be confirmed within the bound is thawed back and reported
 //! [`FreezeError::Unsettled`]. [`thaw_tree`] sends `SIGCONT` parents first and confirms
-//! no process of the tree is still stopped.
+//! no process of the tree is still stopped. [`kill_tree`] sends `SIGKILL`, children first,
+//! to every process of a tree found again from a recorded root, stopped ones included.
 //!
 //! Only signals are used: a launch runs in its parent's cgroup and nothing here creates a
 //! delegated cgroup, so the cgroup v2 freezer is not available to it. The root is
@@ -62,14 +64,33 @@ impl TreeRoot {
         })
     }
 
+    /// A root recorded earlier from [`Self::of`], as its pid and start time.
+    #[must_use]
+    pub const fn recorded(pid: u32, start_time: u64) -> Self {
+        Self { pid, start_time }
+    }
+
     /// The root's host pid.
     #[must_use]
     pub const fn pid(self) -> u32 {
         self.pid
     }
 
+    /// The start time `/proc` reported for the root, in clock ticks since boot.
+    #[must_use]
+    pub const fn start_time(self) -> u64 {
+        self.start_time
+    }
+
     fn alive_in(self, proc: &Path) -> bool {
         read_stat(proc, self.pid).and_then(|stat| start_time(&stat)) == Some(self.start_time)
+    }
+
+    fn running_in(self, proc: &Path) -> bool {
+        read_stat(proc, self.pid).is_some_and(|stat| {
+            start_time(&stat) == Some(self.start_time)
+                && proc_state(&stat).is_some_and(|state| !matches!(state, 'Z' | 'X' | 'x'))
+        })
     }
 }
 
@@ -121,6 +142,18 @@ pub fn freeze_tree(root: TreeRoot, settle: Duration) -> Result<FrozenTree, Freez
 #[must_use]
 pub fn thaw_tree(frozen: &FrozenTree, settle: Duration) -> bool {
     thaw_tree_with(Path::new("/proc"), frozen, settle, send)
+}
+
+/// Kill every process of the tree under `root` with `SIGKILL`, children first, and confirm
+/// within `settle` that none of them still runs; a stopped process dies as it is.
+///
+/// Each process is identified by its pid and start time, so nothing is signalled once its
+/// pid names another process: a `root` that is gone, or whose pid was reused, kills
+/// nothing and is trivially confirmed. Returns whether no process of the tree is left
+/// running (an ended process waiting to be reaped counts as ended).
+#[must_use]
+pub fn kill_tree(root: TreeRoot, settle: Duration) -> bool {
+    kill_tree_with(Path::new("/proc"), root, settle, send)
 }
 
 fn send(pid: u32, signal: Signal) {
@@ -199,6 +232,42 @@ fn thaw_tree_with(
     loop {
         if pids.iter().all(|&pid| !stopped(proc, pid)) {
             return true;
+        }
+        if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
+            return false;
+        }
+        std::thread::sleep(SETTLE_POLL);
+    }
+}
+
+fn kill_tree_with(
+    proc: &Path,
+    root: TreeRoot,
+    settle: Duration,
+    mut signal: impl FnMut(u32, Signal),
+) -> bool {
+    let mut known: Vec<TreeRoot> = Vec::new();
+    let deadline = Instant::now().checked_add(settle);
+    loop {
+        if root.alive_in(proc) {
+            for pid in tree(proc, root.pid) {
+                if !known.iter().any(|process| process.pid == pid)
+                    && let Some(process) = TreeRoot::of_in(proc, pid)
+                {
+                    known.push(process);
+                }
+            }
+        }
+        let running: Vec<u32> = known
+            .iter()
+            .filter(|process| process.running_in(proc))
+            .map(|process| process.pid)
+            .collect();
+        if running.is_empty() {
+            return true;
+        }
+        for pid in running {
+            signal(pid, Signal::SIGKILL);
         }
         if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
             return false;
@@ -664,6 +733,37 @@ mod tests {
 
     fn host_state(pid: u32) -> Option<char> {
         read_stat(Path::new("/proc"), pid).and_then(|stat| proc_state(&stat))
+    }
+
+    #[test]
+    fn a_recorded_tree_is_killed_whole_only_while_its_root_keeps_its_start_time() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & sleep 30 & wait"])
+            .spawn()
+            .unwrap();
+        let root = TreeRoot::of(child.id()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tree(Path::new("/proc"), root.pid()).len() < 3 {
+            assert!(Instant::now() < deadline, "the children never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pids = tree(Path::new("/proc"), root.pid());
+        let ended = |pid: &u32| host_state(*pid).is_none_or(|state| state == 'Z');
+
+        let reused = TreeRoot::recorded(root.pid(), root.start_time() + 1);
+        assert!(kill_tree(reused, FREEZE_SETTLE));
+        assert!(
+            pids.iter().all(|pid| !ended(pid)),
+            "a pid naming another process is never signalled"
+        );
+
+        let frozen = freeze_tree(root, FREEZE_SETTLE).unwrap();
+        assert_eq!(frozen.pids().len(), 3);
+        let recorded = TreeRoot::recorded(root.pid(), root.start_time());
+        assert!(kill_tree(recorded, FREEZE_SETTLE));
+        assert!(pids.iter().all(ended), "{pids:?}");
+        assert_eq!(child.wait().unwrap().code(), None);
+        assert!(kill_tree(recorded, FREEZE_SETTLE));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Node-owned task registry for the task lifecycle protocol (#321, #324).
+//! Node-owned task registry for the task lifecycle protocol (#321, #324, #332).
 //!
 //! This slice binds [`TaskLifecycleRequest`]s to node-owned state. It implements:
 //!
@@ -102,23 +102,48 @@
 //! below protocol 1.3. The node does not accept a transition it cannot carry out, and it
 //! never reports one as applied.
 //!
-//! The registry is in memory and bounded by its capacity: a node restart forgets every
-//! task, including a running attempt (durable recovery is #332 slice 7). A `sealed` task
-//! does not count against the capacity: when a new task needs room, the task sealed
-//! longest ago is evicted (its durable admission version and any revocation stay in the
-//! node state); with no sealed task to evict, a full registry refuses a new `create` with
+//! The registry is bounded by its capacity. A `sealed` task does not count against the
+//! capacity: when a new task needs room, the task sealed longest ago is evicted, its record
+//! removed first (its durable admission version and any revocation stay in the node
+//! state); with no sealed task to evict, a full registry refuses a new `create` with
 //! [`TaskLifecycleRejectionReason::ResourceUnavailable`] rather than growing without limit.
 //! An attempt's workspace outlives a restart, so the same attempt is never started twice.
 //! Dropping the registry stops and reaps every live workload; a node process that dies
 //! outright takes its sandboxes with it (`--die-with-parent`).
+//!
+//! A registry that admits is durable: every task has a record ([`crate::records`]), and
+//! every transition is written to it before the in-memory view changes and before the
+//! verb is answered. A write that fails refuses the verb
+//! [`TaskLifecycleRejectionReason::ResourceUnavailable`] with nothing changed; `pause` and
+//! `resume` undo their freeze or thaw first. `start` records a launch intent before it
+//! spawns and the spawned host process once the spawn is confirmed; a spawn whose record
+//! cannot be written is killed and recorded `exited` with an `unknown` receipt. The reaper
+//! records how an attempt ended whether or not the record can be written; a record it
+//! could not write still reads as executing. A restarted node rebuilds the registry from
+//! the records, and records every recovered change, before it serves:
+//!
+//! * a `created` task is `created`. A `ready` task is `created` again and forgets its
+//!   admission: the node never starts on an admission it did not verify itself since it
+//!   started, and the admission version is durable, so the task is admitted again only
+//!   under a higher version;
+//! * an attempt recorded launching, `running` or `paused` (a pending `stop` or `revoke`
+//!   included) may have had effects: it becomes `exited` with an `unknown` receipt, any
+//!   survivor of its recorded workload process is killed, and it is never run again
+//!   (ADR-0030 §6);
+//! * an `exited`, `stopped`, `revoked` or `sealed` task keeps its state and receipt.
+//!
+//! The applied operation ids survive with their task, so a replay after a restart is
+//! answered as before and never acts: replaying the `start` of an attempt recovered as
+//! `exited` answers `exited` and spawns nothing.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use ward_events::TaskId;
+use ward_events::{Blake3Hash, TaskId};
 use ward_node_protocol::{
     AdmissionEnvelopeJson, IssuerProof, OperationId, TaskAdmissionEnvelope, TaskBinding,
     TaskExecutionOutcome, TaskExecutionReceipt, TaskLifecycleContext, TaskLifecycleRejectionReason,
@@ -129,8 +154,11 @@ use ward_node_protocol::{
 use crate::admission::TrustedTaskAdmission;
 use crate::admit::{NodeAdmission, VerifiedAdmission};
 use crate::execution::{
-    LaunchRequest, NodeExecution, SpawnError, StopSignal, TaskLauncher, WorkloadExit,
-    WorkloadFreezer,
+    LaunchRequest, NodeExecution, SandboxLauncher, SpawnError, StopSignal, TaskLauncher,
+    WorkloadExit, WorkloadFreezer, WorkloadProcess,
+};
+use crate::records::{
+    AdmitRecord, RECORD_FORMAT, RecordedState, SealRecord, TaskRecord, TaskRecordError, TaskStore,
 };
 use crate::workspace::{WorkspaceError, discard};
 
@@ -154,33 +182,29 @@ type Reason = TaskLifecycleRejectionReason;
 type State = TaskLifecycleState;
 type SharedRegistry = Arc<Mutex<TaskRegistry>>;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct NodeTask {
     binding: TaskBinding,
     state: TaskLifecycleState,
     created_by: OperationId,
+    admit: Option<AdmitRecord>,
     admitted: Option<AdmittedTask>,
     started_by: Option<OperationId>,
+    workspace: Option<PathBuf>,
     attempt: Option<Attempt>,
     stopped_by: Option<OperationId>,
     paused_by: Vec<OperationId>,
     resumed_by: Vec<OperationId>,
     revoked_by: Option<OperationId>,
-    sealed: Option<Sealed>,
+    sealed: Option<SealRecord>,
     receipt: Option<TaskExecutionReceipt>,
 }
 
-/// The `seal` that made a task terminal, and its order among seals for eviction.
-#[derive(Clone, Copy, Debug)]
-struct Sealed {
-    by: OperationId,
-    order: u64,
-}
-
 /// A spawned (or ambiguously spawned) attempt and the handles its reaper shares.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Attempt {
     pid: Option<u32>,
+    process: Option<WorkloadProcess>,
     freezer: Option<Arc<dyn WorkloadFreezer>>,
     stop: StopSignal,
     stop_requested_by: Option<OperationId>,
@@ -267,15 +291,34 @@ impl AdmittedTask {
     }
 }
 
-/// In-memory, bounded registry of node-owned tasks keyed by task identity.
+/// Bounded registry of node-owned tasks keyed by task identity, durable when it admits.
 #[derive(Debug)]
 pub struct TaskRegistry {
     tasks: HashMap<TaskId, NodeTask>,
     capacity: usize,
     admission: Option<NodeAdmission>,
     execution: Option<NodeExecution>,
+    store: Option<TaskStore>,
     seals: u64,
     retired: Vec<Attempt>,
+}
+
+/// Where a registry's task records go: nowhere for a registry without admission.
+#[derive(Clone, Copy)]
+struct Journal<'a>(Option<&'a TaskStore>);
+
+impl Journal<'_> {
+    fn write(self, record: &TaskRecord) -> Result<(), Reason> {
+        self.0.map_or(Ok(()), |store| {
+            store.write(record).map_err(|_| Reason::ResourceUnavailable)
+        })
+    }
+
+    fn remove(self, task: TaskId) -> Result<(), Reason> {
+        self.0.map_or(Ok(()), |store| {
+            store.remove(task).map_err(|_| Reason::ResourceUnavailable)
+        })
+    }
 }
 
 impl Default for TaskRegistry {
@@ -291,43 +334,84 @@ enum ReapStep {
 }
 
 impl TaskRegistry {
-    /// An empty registry that holds at most `capacity` tasks.
+    /// An empty, in-memory registry that holds at most `capacity` tasks.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::build(capacity, None, None)
-    }
-
-    fn build(
-        capacity: usize,
-        admission: Option<NodeAdmission>,
-        execution: Option<NodeExecution>,
-    ) -> Self {
         Self {
             tasks: HashMap::new(),
             capacity,
-            admission,
-            execution,
+            admission: None,
+            execution: None,
+            store: None,
             seals: 0,
             retired: Vec::new(),
         }
     }
 
-    /// An empty registry of at most `capacity` tasks that admits through `admission`.
-    #[must_use]
-    pub fn with_admission(capacity: usize, admission: NodeAdmission) -> Self {
-        Self::build(capacity, Some(admission), None)
+    /// The registry of at most `capacity` tasks recorded under the node state directory,
+    /// as recovered after a restart (see the module docs). Every survivor of an attempt
+    /// that may have been executing is ended through `survivors`, and every recovered
+    /// change is recorded before the registry is returned.
+    fn recover(
+        capacity: usize,
+        admission: NodeAdmission,
+        execution: Option<NodeExecution>,
+    ) -> Result<Self, TaskRecordError> {
+        let store = TaskStore::open(admission.state().dir())?;
+        let survivors: Arc<dyn TaskLauncher> = execution
+            .as_ref()
+            .map_or_else(|| Arc::new(SandboxLauncher), NodeExecution::launcher);
+        let mut tasks = HashMap::new();
+        let mut seals = 0;
+        for record in store.load(capacity)? {
+            let (task, changed) = NodeTask::recovered(record, survivors.as_ref());
+            if changed {
+                store.write(&task.record())?;
+            }
+            if let Some(sealed) = task.sealed {
+                seals = seals.max(sealed.order.saturating_add(1));
+            }
+            tasks.insert(task.binding.task(), task);
+        }
+        Ok(Self {
+            tasks,
+            capacity,
+            admission: Some(admission),
+            execution,
+            store: Some(store),
+            seals,
+            retired: Vec::new(),
+        })
     }
 
-    /// An empty registry of at most `capacity` tasks that admits through `admission` and
+    /// The registry of at most `capacity` tasks that admits through `admission`, recovered
+    /// from its task records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskRecordError`] when the task records cannot be read, are invalid or
+    /// more than `capacity`, or a recovered change cannot be recorded.
+    pub fn with_admission(
+        capacity: usize,
+        admission: NodeAdmission,
+    ) -> Result<Self, TaskRecordError> {
+        Self::recover(capacity, admission, None)
+    }
+
+    /// The registry of at most `capacity` tasks that admits through `admission` and
     /// starts, pauses, resumes, stops, revokes and seals admitted tasks through `execution`
-    /// (protocol 1.3).
-    #[must_use]
+    /// (protocol 1.3), recovered from its task records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskRecordError`] when the task records cannot be read, are invalid or
+    /// more than `capacity`, or a recovered change cannot be recorded.
     pub fn with_execution(
         capacity: usize,
         admission: NodeAdmission,
         execution: NodeExecution,
-    ) -> Self {
-        Self::build(capacity, Some(admission), Some(execution))
+    ) -> Result<Self, TaskRecordError> {
+        Self::recover(capacity, admission, Some(execution))
     }
 
     /// Whether this registry executes admitted tasks.
@@ -347,8 +431,8 @@ impl TaskRegistry {
         self.admission.as_mut()
     }
 
-    /// The admission held by the task `binding` names, if it is admitted under exactly
-    /// that binding.
+    /// The admission held by the task `binding` names, if it was admitted under exactly
+    /// that binding since this registry was built.
     #[must_use]
     pub fn admitted(&self, binding: TaskBinding) -> Option<&AdmittedTask> {
         self.task(binding).and_then(|task| task.admitted.as_ref())
@@ -565,10 +649,11 @@ impl TaskRegistry {
                     {
                         return refuse(Reason::ResourceUnavailable);
                     }
-                    if let Some(replaced) = self
-                        .tasks
-                        .insert(binding.task(), NodeTask::new(binding, operation_id))
-                    {
+                    let task = NodeTask::new(binding, operation_id);
+                    if let Err(reason) = Journal(self.store.as_ref()).write(&task.record()) {
+                        return refuse(reason);
+                    }
+                    if let Some(replaced) = self.tasks.insert(binding.task(), task) {
                         self.retire(replaced);
                     }
                     return context.accepted(operation_id, binding, TaskLifecycleState::Created);
@@ -585,12 +670,16 @@ impl TaskRegistry {
             );
         }
 
-        self.tasks
-            .insert(binding.task(), NodeTask::new(binding, operation_id));
+        let task = NodeTask::new(binding, operation_id);
+        if let Err(reason) = Journal(self.store.as_ref()).write(&task.record()) {
+            return refuse(reason);
+        }
+        self.tasks.insert(binding.task(), task);
         context.accepted(operation_id, binding, TaskLifecycleState::Created)
     }
 
-    /// Make room by forgetting the task sealed longest ago; false if none is sealed.
+    /// Make room by forgetting the task sealed longest ago, its record first; false if
+    /// none is sealed or its record cannot be removed.
     fn evict_oldest_sealed(&mut self) -> bool {
         let Some(oldest) = self
             .tasks
@@ -601,6 +690,9 @@ impl TaskRegistry {
         else {
             return false;
         };
+        if Journal(self.store.as_ref()).remove(oldest).is_err() {
+            return false;
+        }
         if let Some(evicted) = self.tasks.remove(&oldest) {
             self.retire(evicted);
         }
@@ -625,6 +717,7 @@ impl TaskRegistry {
         envelope_json: AdmissionEnvelopeJson,
         proof: IssuerProof,
     ) -> Result<TaskLifecycleState, TaskLifecycleRejectionReason> {
+        let journal = Journal(self.store.as_ref());
         let Some(admission) = self.admission.as_mut() else {
             return Err(TaskLifecycleRejectionReason::UnsupportedOperation);
         };
@@ -632,11 +725,10 @@ impl TaskRegistry {
             return Err(TaskLifecycleRejectionReason::TaskNotFound);
         };
         task.matches(binding)?;
-        if let Some(admitted) = &task.admitted
-            && admitted.operation_id == operation_id
-            && admitted.envelope_json == envelope_json
-            && admitted.proof == proof
-        {
+        let envelope = Blake3Hash::hash(envelope_json.as_bytes());
+        if task.admit.as_ref().is_some_and(|admit| {
+            admit.operation_id == operation_id && admit.envelope == envelope && admit.proof == proof
+        }) {
             return Ok(task.state);
         }
         if task.state != TaskLifecycleState::Created {
@@ -644,14 +736,26 @@ impl TaskRegistry {
         }
 
         let verified = admission.verify(binding, &envelope_json, &proof)?;
-        admission.commit(&verified)?;
-        task.state = TaskLifecycleState::Ready;
-        task.admitted = Some(AdmittedTask {
+        let mut ready = task.clone();
+        ready.state = TaskLifecycleState::Ready;
+        ready.admit = Some(AdmitRecord {
+            operation_id,
+            envelope,
+            proof,
+            session: verified.envelope().session(),
+        });
+        journal.write(&ready.record())?;
+        if let Err(reason) = admission.commit(&verified) {
+            let _ = journal.write(&task.record());
+            return Err(reason);
+        }
+        ready.admitted = Some(AdmittedTask {
             operation_id,
             envelope_json,
             proof,
             verified,
         });
+        *task = ready;
         Ok(task.state)
     }
 
@@ -675,12 +779,13 @@ impl TaskRegistry {
             .unwrap_or_else(|| context.inspected(task.binding, visible(context, task.state)))
     }
 
-    /// The task `binding` names, for a verb only an executing node serves at 1.3.
+    /// The task `binding` names and where its record goes, for a verb only an executing
+    /// node serves at 1.3.
     fn executing_task(
         &mut self,
         context: TaskLifecycleContext,
         binding: TaskBinding,
-    ) -> Result<&mut NodeTask, Reason> {
+    ) -> Result<(&mut NodeTask, Journal<'_>), Reason> {
         if self.execution.is_none()
             || self.admission.is_none()
             || !supports_task_admission(context.protocol())
@@ -692,7 +797,7 @@ impl TaskRegistry {
             .get_mut(&binding.task())
             .ok_or(Reason::TaskNotFound)?;
         task.matches(binding)?;
-        Ok(task)
+        Ok((task, Journal(self.store.as_ref())))
     }
 
     fn pause(
@@ -701,7 +806,7 @@ impl TaskRegistry {
         operation_id: OperationId,
         binding: TaskBinding,
     ) -> Result<State, Reason> {
-        let task = self.executing_task(context, binding)?;
+        let (task, journal) = self.executing_task(context, binding)?;
         if let Some(replay) = replay(&task.paused_by, operation_id, task.state) {
             return replay;
         }
@@ -711,15 +816,15 @@ impl TaskRegistry {
         if task.paused_by.len() >= MAX_ATTEMPT_PAUSES {
             return Err(Reason::ResourceUnavailable);
         }
-        let freezer = task
-            .attempt
-            .as_ref()
-            .filter(|attempt| !attempt.stop.is_requested())
-            .and_then(|attempt| attempt.freezer.as_ref())
-            .ok_or(Reason::InvalidState)?;
+        let freezer = task.freezer().ok_or(Reason::InvalidState)?;
         freezer.freeze().map_err(|_| Reason::ResourceUnavailable)?;
-        task.state = State::Paused;
-        task.paused_by.push(operation_id);
+        if let Err(reason) = task.commit(journal, |task| {
+            task.state = State::Paused;
+            task.paused_by.push(operation_id);
+        }) {
+            let _ = freezer.thaw();
+            return Err(reason);
+        }
         Ok(task.state)
     }
 
@@ -729,22 +834,22 @@ impl TaskRegistry {
         operation_id: OperationId,
         binding: TaskBinding,
     ) -> Result<State, Reason> {
-        let task = self.executing_task(context, binding)?;
+        let (task, journal) = self.executing_task(context, binding)?;
         if let Some(replay) = replay(&task.resumed_by, operation_id, task.state) {
             return replay;
         }
         if task.state != State::Paused {
             return Err(Reason::InvalidState);
         }
-        let freezer = task
-            .attempt
-            .as_ref()
-            .filter(|attempt| !attempt.stop.is_requested())
-            .and_then(|attempt| attempt.freezer.as_ref())
-            .ok_or(Reason::InvalidState)?;
+        let freezer = task.freezer().ok_or(Reason::InvalidState)?;
         freezer.thaw().map_err(|_| Reason::ResourceUnavailable)?;
-        task.state = State::Running;
-        task.resumed_by.push(operation_id);
+        if let Err(reason) = task.commit(journal, |task| {
+            task.state = State::Running;
+            task.resumed_by.push(operation_id);
+        }) {
+            let _ = freezer.freeze();
+            return Err(reason);
+        }
         Ok(task.state)
     }
 
@@ -755,18 +860,20 @@ impl TaskRegistry {
         binding: TaskBinding,
     ) -> Result<State, Reason> {
         let order = self.seals;
-        let task = self.executing_task(context, binding)?;
+        let (task, journal) = self.executing_task(context, binding)?;
         if task.sealed.is_some_and(|sealed| sealed.by == operation_id) {
             return Ok(task.state);
         }
         if !matches!(task.state, State::Exited | State::Stopped | State::Revoked) {
             return Err(Reason::InvalidState);
         }
-        task.state = State::Sealed;
-        task.sealed = Some(Sealed {
-            by: operation_id,
-            order,
-        });
+        task.commit(journal, |task| {
+            task.state = State::Sealed;
+            task.sealed = Some(SealRecord {
+                by: operation_id,
+                order,
+            });
+        })?;
         self.seals = order.saturating_add(1);
         Ok(State::Sealed)
     }
@@ -781,13 +888,8 @@ impl TaskRegistry {
         match self.prepare_start(context, operation_id, binding) {
             Ok(Prepared::Replay(state)) => context.accepted(operation_id, binding, state),
             Ok(Prepared::Launch(request, launcher, timeout)) => {
-                match self.launch(registry, binding, request, &launcher, timeout) {
-                    Ok(state) => {
-                        if let Some(task) = self.tasks.get_mut(&binding.task()) {
-                            task.started_by = Some(operation_id);
-                        }
-                        context.accepted(operation_id, binding, state)
-                    }
+                match self.launch(registry, operation_id, binding, request, &launcher, timeout) {
+                    Ok(state) => context.accepted(operation_id, binding, state),
                     Err(reason) => context.rejected(Some(operation_id), binding, reason),
                 }
             }
@@ -844,18 +946,32 @@ impl TaskRegistry {
         ))
     }
 
+    /// Record the launch intent, spawn, and record how the spawn went. A spawn whose
+    /// `running` record cannot be written is killed and recorded `exited` with an `unknown`
+    /// receipt, as is a clean refusal whose launch intent cannot be withdrawn: the durable
+    /// intent already makes the attempt ambiguous.
     fn launch(
         &mut self,
         registry: &SharedRegistry,
+        operation_id: OperationId,
         binding: TaskBinding,
         request: LaunchRequest,
         launcher: &Arc<dyn TaskLauncher>,
         spawn_timeout: Duration,
     ) -> Result<TaskLifecycleState, Reason> {
+        let journal = Journal(self.store.as_ref());
+        let workspace = request.workspace().to_path_buf();
+        let Some(task) = self.tasks.get_mut(&binding.task()) else {
+            discard(&workspace);
+            return Err(Reason::TaskNotFound);
+        };
+        if let Err(reason) = journal.write(&task.launching(operation_id, &workspace)) {
+            discard(&workspace);
+            return Err(reason);
+        }
         let stop = StopSignal::default();
         let done = Arc::new(Reaped::default());
         let (spawned_tx, spawned_rx) = sync_channel(1);
-        let workspace = request.workspace().to_path_buf();
         let reaper = Reaper {
             registry: Arc::downgrade(registry),
             binding,
@@ -875,7 +991,7 @@ impl TaskRegistry {
                     }
                 };
                 if spawned_tx
-                    .send(Ok((workload.pid(), workload.freezer())))
+                    .send(Ok((workload.pid(), workload.process(), workload.freezer())))
                     .is_err()
                 {
                     drop(workload);
@@ -885,34 +1001,39 @@ impl TaskRegistry {
                 let exit = workload.wait(&reaper.stop);
                 reaper.record(exit);
             });
-        if thread.is_err() {
-            discard(&workspace);
-            return Err(Reason::ResourceUnavailable);
-        }
 
-        let spawned = match spawned_rx.recv_timeout(spawn_timeout) {
-            Ok(Ok(spawned)) => Some(spawned),
-            Ok(Err(SpawnError::Refused)) => {
-                discard(&workspace);
-                return Err(Reason::ResourceUnavailable);
-            }
-            Ok(Err(SpawnError::Ambiguous))
-            | Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
+        let spawned = match thread {
+            Err(_) => Err(SpawnError::Refused),
+            Ok(_) => match spawned_rx.recv_timeout(spawn_timeout) {
+                Ok(spawned) => spawned,
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                    Err(SpawnError::Ambiguous)
+                }
+            },
         };
-        let task = self
-            .tasks
-            .get_mut(&binding.task())
-            .ok_or(Reason::TaskNotFound)?;
-        if spawned.is_none() {
-            stop.request();
-        }
+        let spawned = match spawned {
+            Ok(spawned) => Some(spawned),
+            Err(SpawnError::Refused) => {
+                discard(&workspace);
+                if journal.write(&task.record()).is_ok() {
+                    return Err(Reason::ResourceUnavailable);
+                }
+                None
+            }
+            Err(SpawnError::Ambiguous) => None,
+        };
         let running = spawned.is_some();
-        let (pid, freezer) =
-            spawned.map_or((None, None), |(pid, freezer)| (Some(pid), Some(freezer)));
+        let (pid, process, freezer) = spawned
+            .map_or((None, None, None), |(pid, process, freezer)| {
+                (Some(pid), process, Some(freezer))
+            });
+        task.started_by = Some(operation_id);
+        task.workspace = Some(workspace);
         task.attempt = Some(Attempt {
             pid,
+            process,
             freezer,
-            stop,
+            stop: stop.clone(),
             stop_requested_by: None,
             revoke_requested_by: None,
             reaped: done,
@@ -920,6 +1041,11 @@ impl TaskRegistry {
         if running {
             task.state = TaskLifecycleState::Running;
         } else {
+            stop.request();
+            task.finish(TaskLifecycleState::Exited, TaskExecutionOutcome::Unknown);
+        }
+        if journal.write(&task.record()).is_err() && running {
+            stop.request();
             task.finish(TaskLifecycleState::Exited, TaskExecutionOutcome::Unknown);
         }
         Ok(task.state)
@@ -937,19 +1063,21 @@ impl TaskRegistry {
             .execution
             .as_ref()
             .map_or(Duration::ZERO, NodeExecution::stop_timeout);
-        let task = match self.executing_task(context, binding) {
-            Ok(task) => task,
+        let (task, journal) = match self.executing_task(context, binding) {
+            Ok(found) => found,
             Err(reason) => return refuse(reason),
         };
         if task.stopped_by == Some(operation_id) {
             return ReapStep::Answer(context.accepted(operation_id, binding, task.state));
         }
         match task.state {
-            TaskLifecycleState::Ready => {
+            TaskLifecycleState::Ready => match task.commit(journal, |task| {
                 task.stopped_by = Some(operation_id);
                 task.finish(TaskLifecycleState::Stopped, TaskExecutionOutcome::Failed);
-                ReapStep::Answer(context.accepted(operation_id, binding, task.state))
-            }
+            }) {
+                Ok(()) => ReapStep::Answer(context.accepted(operation_id, binding, task.state)),
+                Err(reason) => refuse(reason),
+            },
             TaskLifecycleState::Running | TaskLifecycleState::Paused => match task.end_attempt() {
                 Some(attempt) => {
                     attempt.stop_requested_by.get_or_insert(operation_id);
@@ -990,7 +1118,7 @@ impl TaskRegistry {
             .as_ref()
             .map_or(Duration::ZERO, NodeExecution::stop_timeout);
         let task = match self.executing_task(context, binding) {
-            Ok(task) => task,
+            Ok((task, _)) => task,
             Err(reason) => return refuse(reason),
         };
         if task.revoked_by == Some(operation_id) {
@@ -1005,6 +1133,7 @@ impl TaskRegistry {
         if let Err(reason) = admission.revoke(binding.lease()) {
             return refuse(reason);
         }
+        let journal = Journal(self.store.as_ref());
         let Some(task) = self.tasks.get_mut(&binding.task()) else {
             return refuse(Reason::TaskNotFound);
         };
@@ -1014,9 +1143,13 @@ impl TaskRegistry {
             attempt.revoke_requested_by.get_or_insert(operation_id);
             return ReapStep::AwaitReap(Arc::clone(&attempt.reaped), stop_timeout);
         }
-        task.revoked_by = Some(operation_id);
-        task.finish(State::Revoked, TaskExecutionOutcome::Failed);
-        ReapStep::Answer(context.accepted(operation_id, binding, task.state))
+        match task.commit(journal, |task| {
+            task.revoked_by = Some(operation_id);
+            task.finish(State::Revoked, TaskExecutionOutcome::Failed);
+        }) {
+            Ok(()) => ReapStep::Answer(context.accepted(operation_id, binding, task.state)),
+            Err(reason) => refuse(reason),
+        }
     }
 
     fn finish_revoke(
@@ -1025,6 +1158,7 @@ impl TaskRegistry {
         operation_id: OperationId,
         binding: TaskBinding,
     ) -> TaskLifecycleResponse {
+        let journal = Journal(self.store.as_ref());
         let Some(task) = self
             .tasks
             .get_mut(&binding.task())
@@ -1040,14 +1174,22 @@ impl TaskRegistry {
             .as_ref()
             .is_some_and(|attempt| attempt.revoke_requested_by == Some(operation_id));
         if live(task.state) && requested {
-            task.revoked_by = Some(operation_id);
-            task.finish(State::Revoked, TaskExecutionOutcome::Unknown);
-            return context.accepted(operation_id, binding, task.state);
+            return match task.commit(journal, |task| {
+                task.revoked_by = Some(operation_id);
+                task.finish(State::Revoked, TaskExecutionOutcome::Unknown);
+            }) {
+                Ok(()) => context.accepted(operation_id, binding, task.state),
+                Err(reason) => context.rejected(Some(operation_id), binding, reason),
+            };
         }
         context.rejected(Some(operation_id), binding, Reason::InvalidState)
     }
 
+    /// Record how a live attempt ended. The reaper has observed the end, so the in-memory
+    /// state changes whether or not its record can be written; a record that cannot be
+    /// written still reads as executing and recovers as `exited` with an `unknown` receipt.
     fn record_exit(&mut self, binding: TaskBinding, reaped: &Arc<Reaped>, exit: WorkloadExit) {
+        let journal = Journal(self.store.as_ref());
         let Some(task) = self
             .tasks
             .get_mut(&binding.task())
@@ -1055,44 +1197,9 @@ impl TaskRegistry {
         else {
             return;
         };
-        let Some(attempt) = task
-            .attempt
-            .as_ref()
-            .filter(|attempt| Arc::ptr_eq(&attempt.reaped, reaped))
-        else {
-            return;
-        };
-        let stop_requested = attempt.stop.is_requested();
-        let stop_requested_by = attempt.stop_requested_by;
-        if let Some(revoked_by) = attempt.revoke_requested_by {
-            let outcome = match exit {
-                WorkloadExit::Lost => TaskExecutionOutcome::Unknown,
-                WorkloadExit::Exited { code: Some(0) } => TaskExecutionOutcome::Completed,
-                WorkloadExit::Stopped
-                | WorkloadExit::BudgetExceeded
-                | WorkloadExit::Exited { .. } => TaskExecutionOutcome::Failed,
-            };
-            task.revoked_by = Some(revoked_by);
-            task.finish(State::Revoked, outcome);
-            return;
+        if task.finish_attempt(exit, reaped) {
+            let _ = journal.write(&task.record());
         }
-        let (state, outcome) = match exit {
-            WorkloadExit::Stopped => (TaskLifecycleState::Stopped, TaskExecutionOutcome::Failed),
-            WorkloadExit::Lost if stop_requested => {
-                (TaskLifecycleState::Stopped, TaskExecutionOutcome::Unknown)
-            }
-            WorkloadExit::Lost => (TaskLifecycleState::Exited, TaskExecutionOutcome::Unknown),
-            WorkloadExit::Exited { code: Some(0) } => {
-                (TaskLifecycleState::Exited, TaskExecutionOutcome::Completed)
-            }
-            WorkloadExit::BudgetExceeded | WorkloadExit::Exited { .. } => {
-                (TaskLifecycleState::Exited, TaskExecutionOutcome::Failed)
-            }
-        };
-        if state == TaskLifecycleState::Stopped {
-            task.stopped_by = stop_requested_by;
-        }
-        task.finish(state, outcome);
     }
 }
 
@@ -1199,8 +1306,10 @@ impl NodeTask {
             binding,
             state: TaskLifecycleState::Created,
             created_by,
+            admit: None,
             admitted: None,
             started_by: None,
+            workspace: None,
             attempt: None,
             stopped_by: None,
             paused_by: Vec::new(),
@@ -1209,6 +1318,155 @@ impl NodeTask {
             sealed: None,
             receipt: None,
         }
+    }
+
+    /// The task a record describes, as a restarted node holds it, and whether that differs
+    /// from the record. A `ready` task is `created` again and forgets its admission. An
+    /// attempt that was launching, `running` or `paused` (a stop or revoke pending
+    /// included) may have had effects: it is `exited` with an `unknown` receipt and never
+    /// runs again. Any survivor of a recorded workload process is ended through
+    /// `survivors` first. Every other task keeps its state, receipt and applied operations.
+    fn recovered(record: TaskRecord, survivors: &dyn TaskLauncher) -> (Self, bool) {
+        if let Some(process) = &record.process {
+            survivors.end_survivor(process);
+        }
+        let mut task = Self {
+            binding: record.binding,
+            state: TaskLifecycleState::Created,
+            created_by: record.created_by,
+            admit: record.admitted,
+            admitted: None,
+            started_by: record.started_by,
+            workspace: record.workspace,
+            attempt: None,
+            stopped_by: record.stopped_by,
+            paused_by: record.paused_by,
+            resumed_by: record.resumed_by,
+            revoked_by: record.revoked_by,
+            sealed: record.sealed,
+            receipt: None,
+        };
+        let mut changed = record.process.is_some();
+        match record.state {
+            RecordedState::Created => {}
+            RecordedState::Ready => {
+                task.admit = None;
+                changed = true;
+            }
+            RecordedState::Launching | RecordedState::Running | RecordedState::Paused => {
+                task.finish(State::Exited, TaskExecutionOutcome::Unknown);
+                changed = true;
+            }
+            RecordedState::Stopped => task.ended(State::Stopped, record.outcome),
+            RecordedState::Exited => task.ended(State::Exited, record.outcome),
+            RecordedState::Revoked => task.ended(State::Revoked, record.outcome),
+            RecordedState::Sealed => task.ended(State::Sealed, record.outcome),
+        }
+        (task, changed)
+    }
+
+    /// This task's durable record.
+    fn record(&self) -> TaskRecord {
+        TaskRecord {
+            format: RECORD_FORMAT,
+            binding: self.binding,
+            state: self.state.into(),
+            created_by: self.created_by,
+            admitted: self.admit.clone(),
+            started_by: self.started_by,
+            stopped_by: self.stopped_by,
+            paused_by: self.paused_by.clone(),
+            resumed_by: self.resumed_by.clone(),
+            revoked_by: self.revoked_by,
+            sealed: self.sealed,
+            outcome: self.receipt.map(TaskExecutionReceipt::outcome),
+            workspace: self.workspace.clone(),
+            process: self
+                .attempt
+                .as_ref()
+                .and_then(|attempt| attempt.process.clone()),
+        }
+    }
+
+    /// The record of this `ready` task's launch intent: `operation_id` is starting it over
+    /// `workspace`, and nothing is confirmed spawned yet.
+    fn launching(&self, operation_id: OperationId, workspace: &Path) -> TaskRecord {
+        TaskRecord {
+            state: RecordedState::Launching,
+            started_by: Some(operation_id),
+            workspace: Some(workspace.to_path_buf()),
+            ..self.record()
+        }
+    }
+
+    /// Apply `change` once the changed task's record is durably written; on a failed write
+    /// nothing changes.
+    fn commit(
+        &mut self,
+        journal: Journal<'_>,
+        change: impl FnOnce(&mut Self),
+    ) -> Result<(), Reason> {
+        let mut changed = self.clone();
+        change(&mut changed);
+        journal.write(&changed.record())?;
+        *self = changed;
+        Ok(())
+    }
+
+    /// The freezer of this task's live workload, unless its kill is pending.
+    fn freezer(&self) -> Option<Arc<dyn WorkloadFreezer>> {
+        self.attempt
+            .as_ref()
+            .filter(|attempt| !attempt.stop.is_requested())
+            .and_then(|attempt| attempt.freezer.clone())
+    }
+
+    /// Record how this attempt's workload ended, as its reaper observed it; false if
+    /// `reaped` belongs to another attempt.
+    fn finish_attempt(&mut self, exit: WorkloadExit, reaped: &Arc<Reaped>) -> bool {
+        let Some(attempt) = self
+            .attempt
+            .as_mut()
+            .filter(|attempt| Arc::ptr_eq(&attempt.reaped, reaped))
+        else {
+            return false;
+        };
+        let stop_requested = attempt.stop.is_requested();
+        let stop_requested_by = attempt.stop_requested_by;
+        let revoke_requested_by = attempt.revoke_requested_by;
+        if exit != WorkloadExit::Lost {
+            attempt.process = None;
+        }
+        if let Some(revoked_by) = revoke_requested_by {
+            let outcome = match exit {
+                WorkloadExit::Lost => TaskExecutionOutcome::Unknown,
+                WorkloadExit::Exited { code: Some(0) } => TaskExecutionOutcome::Completed,
+                WorkloadExit::Stopped
+                | WorkloadExit::BudgetExceeded
+                | WorkloadExit::Exited { .. } => TaskExecutionOutcome::Failed,
+            };
+            self.revoked_by = Some(revoked_by);
+            self.finish(State::Revoked, outcome);
+            return true;
+        }
+        let (state, outcome) = match exit {
+            WorkloadExit::Stopped => (TaskLifecycleState::Stopped, TaskExecutionOutcome::Failed),
+            WorkloadExit::Lost if stop_requested => {
+                (TaskLifecycleState::Stopped, TaskExecutionOutcome::Unknown)
+            }
+            WorkloadExit::Lost => (TaskLifecycleState::Exited, TaskExecutionOutcome::Unknown),
+            WorkloadExit::Exited { code: Some(0) } => {
+                (TaskLifecycleState::Exited, TaskExecutionOutcome::Completed)
+            }
+            WorkloadExit::BudgetExceeded | WorkloadExit::Exited { .. } => {
+                (TaskLifecycleState::Exited, TaskExecutionOutcome::Failed)
+            }
+        };
+        if state == TaskLifecycleState::Stopped {
+            self.stopped_by = stop_requested_by;
+        }
+        self.finish(state, outcome);
+        true
     }
 
     fn matches(&self, binding: TaskBinding) -> Result<(), TaskLifecycleRejectionReason> {
@@ -1239,13 +1497,16 @@ impl NodeTask {
     }
 
     fn finish(&mut self, state: TaskLifecycleState, outcome: TaskExecutionOutcome) {
+        self.ended(state, Some(outcome));
+    }
+
+    fn ended(&mut self, state: TaskLifecycleState, outcome: Option<TaskExecutionOutcome>) {
         self.state = state;
-        if let Some(admitted) = &self.admitted {
-            self.receipt = Some(
-                TaskReceiptContext::new(self.binding, admitted.envelope().session())
-                    .receipt(outcome),
-            );
-        }
+        self.receipt = outcome.and_then(|outcome| {
+            self.admit
+                .as_ref()
+                .map(|admit| TaskReceiptContext::new(self.binding, admit.session).receipt(outcome))
+        });
     }
 }
 
@@ -1458,7 +1719,8 @@ mod tests {
                 let registry = TaskRegistry::with_admission(
                     MAX_NODE_TASKS,
                     node_admission(&state_dir, &clock),
-                );
+                )
+                .unwrap();
                 Self {
                     _dir: dir,
                     state_dir,
@@ -1478,7 +1740,8 @@ mod tests {
                 let registry = TaskRegistry::with_admission(
                     MAX_NODE_TASKS,
                     node_admission(&state_dir, &clock),
-                );
+                )
+                .unwrap();
                 Self {
                     _dir: dir,
                     state_dir,
@@ -1737,7 +2000,8 @@ mod tests {
                     NodeState::open(&dir.path().join("state"), NODE).unwrap(),
                     Box::new(clock),
                 ),
-            );
+            )
+            .unwrap();
             let binding = lifecycle_binding();
             registry.handle(ctx(), ctx().create(op(10), binding));
 
@@ -1928,7 +2192,7 @@ mod tests {
             );
 
             let mut node = node.restart();
-            assert!(node.registry.is_empty());
+            node.assert_untouched(binding);
             node.create(binding);
             for version in [1, 2] {
                 node.assert_refused(
@@ -2040,6 +2304,61 @@ mod tests {
         }
 
         #[test]
+        fn a_ready_task_recovers_as_created_and_is_admitted_again_only_with_a_higher_version() {
+            let mut node = Node::new();
+            let binding = lifecycle_binding();
+            node.create(binding);
+            let first = admit(&envelope(|_| {}));
+            assert_eq!(
+                node.registry.handle(ctx(), first.clone()),
+                ctx().accepted(op(20), binding, TaskLifecycleState::Ready)
+            );
+
+            let mut node = node.restart();
+            node.assert_untouched(binding);
+            node.create(binding);
+            node.assert_refused(first, Reason::StaleOperation);
+            let second = envelope(|input| input.version = AdmissionVersion::new(2).unwrap());
+            assert_eq!(
+                node.registry.handle(ctx(), admit(&second)),
+                ctx().accepted(op(20), binding, TaskLifecycleState::Ready)
+            );
+        }
+
+        #[test]
+        fn a_created_task_survives_a_restart_and_its_create_replays() {
+            let mut node = Node::new();
+            let binding = lifecycle_binding();
+            node.create(binding);
+            let mut node = node.restart();
+            assert_eq!(node.registry.len(), 1);
+            node.assert_untouched(binding);
+            node.create(binding);
+            assert_eq!(
+                node.registry.handle(ctx(), ctx().create(op(11), binding)),
+                ctx().rejected(Some(op(11)), binding, Reason::InvalidState)
+            );
+        }
+
+        #[test]
+        fn a_malformed_task_record_fails_the_registry_closed() {
+            let mut node = Node::new();
+            node.create(lifecycle_binding());
+            let record = node
+                .state_dir
+                .join(crate::records::TASKS_DIR)
+                .join(format!("{}.json", lifecycle_binding().task()));
+            std::fs::write(&record, b"{not json").unwrap();
+            assert!(matches!(
+                TaskRegistry::with_admission(
+                    MAX_NODE_TASKS,
+                    node_admission(&node.state_dir, &node.clock)
+                ),
+                Err(crate::records::TaskRecordError::InvalidRecord(_))
+            ));
+        }
+
+        #[test]
         fn a_failed_durable_version_write_refuses_and_leaves_the_task_created() {
             let mut node = Node::new();
             node.create(lifecycle_binding());
@@ -2074,8 +2393,8 @@ mod tests {
         use crate::task::{MAX_ATTEMPT_PAUSES, MAX_NODE_TASKS, TaskRegistry};
         use crate::test_support::{
             FAKE_PID, FakeFreeze, FakeLauncher, FakeSpawn, FakeStop, FixedClock, NOW,
-            envelope_input, eventually, fill_revocations, lifecycle_binding, node_admission,
-            signed_admit,
+            envelope_input, eventually, fake_process, fill_revocations, lifecycle_binding,
+            node_admission, signed_admit,
         };
         use crate::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
 
@@ -2122,9 +2441,9 @@ mod tests {
                     Arc::new(launcher.clone()),
                 )
                 .with_stop_timeout(stop_timeout);
-                let tasks = Arc::new(Mutex::new(TaskRegistry::with_execution(
-                    capacity, admission, execution,
-                )));
+                let tasks = Arc::new(Mutex::new(
+                    TaskRegistry::with_execution(capacity, admission, execution).unwrap(),
+                ));
                 Self {
                     _dir: dir,
                     root,
@@ -3275,7 +3594,13 @@ mod tests {
             );
             assert_eq!(
                 node.serve(ctx().inspect(binding)),
-                ctx().rejected(None, binding, Reason::TaskNotFound)
+                ctx().rejected(None, binding, Reason::AttemptMismatch)
+            );
+            assert_eq!(
+                node.serve(ctx().inspect(retry)),
+                ctx()
+                    .inspected_with_outcome(retry, State::Stopped, Outcome::Failed)
+                    .unwrap()
             );
 
             let Node {
@@ -3283,20 +3608,6 @@ mod tests {
             } = node;
             drop(tasks);
             let node = Node::build(dir, 1, Duration::from_secs(10));
-            assert_eq!(
-                node.serve(ctx().create(op(91), retry)),
-                ctx().accepted(op(91), retry, State::Created)
-            );
-            assert_eq!(
-                node.serve(signed_admit(
-                    ctx(),
-                    op(92),
-                    retry,
-                    &node.envelope_for(retry, 3)
-                )),
-                ctx().accepted(op(92), retry, State::Ready)
-            );
-            node.serve(ctx().stop(op(93), retry));
             assert_eq!(
                 node.serve(ctx().seal(op(94), retry)),
                 ctx().accepted(op(94), retry, State::Sealed)
@@ -3422,7 +3733,9 @@ mod tests {
             let node = node.restart();
             assert_eq!(
                 node.serve(ctx().inspect(binding)),
-                ctx().rejected(None, binding, Reason::TaskNotFound),
+                ctx()
+                    .inspected_with_outcome(binding, State::Stopped, Outcome::Failed)
+                    .unwrap(),
                 "the node still starts on the full store"
             );
         }
@@ -3519,10 +3832,13 @@ mod tests {
 
             let dir = tempfile::tempdir().unwrap();
             let clock = FixedClock::at(NOW);
-            let tasks = Arc::new(Mutex::new(TaskRegistry::with_admission(
-                MAX_NODE_TASKS,
-                node_admission(&dir.path().join("state"), &clock),
-            )));
+            let tasks = Arc::new(Mutex::new(
+                TaskRegistry::with_admission(
+                    MAX_NODE_TASKS,
+                    node_admission(&dir.path().join("state"), &clock),
+                )
+                .unwrap(),
+            ));
             TaskRegistry::serve(&tasks, ctx(), ctx().create(op(10), binding)).unwrap();
             let envelope = TaskAdmissionEnvelope::new(envelope_input(binding)).unwrap();
             TaskRegistry::serve(
@@ -3735,14 +4051,365 @@ mod tests {
             );
         }
 
+        impl Node {
+            fn state_dir(&self) -> PathBuf {
+                self.root.parent().unwrap().join("state")
+            }
+
+            fn record_path(&self, binding: TaskBinding) -> PathBuf {
+                self.state_dir()
+                    .join(crate::records::TASKS_DIR)
+                    .join(format!("{}.json", binding.task()))
+            }
+
+            fn record_blocker(&self) -> PathBuf {
+                self.state_dir()
+                    .join(crate::records::TASKS_DIR)
+                    .join(format!(".{}.json.tmp", lifecycle_binding().task()))
+                    .join("blocker")
+            }
+
+            fn block_records(&self) {
+                std::fs::create_dir_all(self.record_blocker()).unwrap();
+            }
+
+            fn unblock_records(&self) {
+                std::fs::remove_dir_all(self.record_blocker().parent().unwrap()).unwrap();
+            }
+        }
+
+        #[test]
+        fn a_running_or_paused_attempt_recovers_as_exited_unknown_and_never_runs_again() {
+            let binding = lifecycle_binding();
+            for executing in [State::Running, State::Paused] {
+                let node = Node::new();
+                node.drive(executing);
+                eventually(|| node.launcher.waiting() == 1);
+
+                let node = node.restart();
+                node.assert_finished(State::Exited, Outcome::Unknown);
+                assert_eq!(
+                    node.launcher.survivors(),
+                    vec![fake_process()],
+                    "{executing:?}: the survivor is ended by its recorded identity"
+                );
+                assert_eq!(
+                    node.serve(ctx().start(op(30), binding)),
+                    ctx().accepted(op(30), binding, State::Exited),
+                    "{executing:?}"
+                );
+                assert_eq!(
+                    node.serve(ctx().start(op(31), binding)),
+                    ctx().rejected(Some(op(31)), binding, Reason::InvalidState)
+                );
+                assert!(node.launcher.launches().is_empty(), "{executing:?}");
+
+                let node = node.restart();
+                node.assert_finished(State::Exited, Outcome::Unknown);
+                assert!(node.launcher.survivors().is_empty());
+                assert!(node.launcher.launches().is_empty());
+            }
+        }
+
+        #[test]
+        fn a_recorded_launch_intent_recovers_as_exited_unknown_without_a_spawn() {
+            let binding = lifecycle_binding();
+            let node = Node::new();
+            node.ready();
+            let store = crate::records::TaskStore::open(&node.state_dir()).unwrap();
+            let mut record = store.load(MAX_NODE_TASKS).unwrap().remove(0);
+            record.state = crate::records::RecordedState::Launching;
+            record.started_by = Some(op(30));
+            record.workspace = Some(node.workspace());
+            store.write(&record).unwrap();
+
+            let node = node.restart();
+            node.assert_finished(State::Exited, Outcome::Unknown);
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().accepted(op(30), binding, State::Exited)
+            );
+            assert!(node.launcher.launches().is_empty());
+            assert!(node.launcher.survivors().is_empty());
+        }
+
+        #[test]
+        fn a_spawn_whose_running_record_cannot_be_written_is_killed_and_ambiguous() {
+            let binding = lifecycle_binding();
+            let node = Node::new();
+            node.ready();
+            node.launcher.block_on_launch(node.record_blocker());
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().accepted(op(30), binding, State::Exited)
+            );
+            node.assert_finished(State::Exited, Outcome::Unknown);
+            eventually(|| node.launcher.stopped() == 1);
+            node.unblock_records();
+
+            let node = node.restart();
+            node.assert_finished(State::Exited, Outcome::Unknown);
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().accepted(op(30), binding, State::Exited)
+            );
+            assert!(node.launcher.launches().is_empty());
+        }
+
+        #[test]
+        fn ended_attempts_keep_their_state_receipt_and_replays_across_a_restart() {
+            let binding = lifecycle_binding();
+            for (ended, verb) in [
+                (State::Stopped, ctx().stop(op(40), binding)),
+                (State::Exited, ctx().start(op(30), binding)),
+                (State::Revoked, ctx().revoke(op(60), binding)),
+                (State::Sealed, ctx().seal(op(70), binding)),
+            ] {
+                let node = Node::new();
+                node.drive(ended);
+                let outcome = node.outcome().unwrap();
+
+                let node = node.restart();
+                node.assert_finished(ended, outcome);
+                assert_eq!(
+                    node.serve(verb.clone()),
+                    match verb {
+                        TaskLifecycleRequest::Stop { operation_id, .. }
+                        | TaskLifecycleRequest::Start { operation_id, .. }
+                        | TaskLifecycleRequest::Revoke { operation_id, .. }
+                        | TaskLifecycleRequest::Seal { operation_id, .. } =>
+                            ctx().accepted(operation_id, binding, ended),
+                        other => panic!("unexpected {other:?}"),
+                    },
+                    "{ended:?}"
+                );
+                assert!(node.launcher.survivors().is_empty(), "{ended:?}");
+                assert_eq!(node.effects(), (0, 0, 0, 0, ended == State::Revoked));
+            }
+        }
+
+        #[test]
+        fn every_applied_operation_replays_exactly_after_a_restart_and_never_acts() {
+            let binding = lifecycle_binding();
+            let node = Node::new();
+            node.paused();
+            for (request, operation, state) in [
+                (ctx().resume(op(55), binding), op(55), State::Running),
+                (ctx().pause(op(56), binding), op(56), State::Paused),
+                (ctx().resume(op(57), binding), op(57), State::Running),
+                (ctx().stop(op(40), binding), op(40), State::Stopped),
+                (ctx().seal(op(70), binding), op(70), State::Sealed),
+            ] {
+                assert_eq!(
+                    node.serve(request),
+                    ctx().accepted(operation, binding, state)
+                );
+            }
+
+            let node = node.restart();
+            for (request, operation) in [
+                (ctx().create(op(10), binding), op(10)),
+                (
+                    signed_admit(ctx(), op(20), binding, &node.envelope()),
+                    op(20),
+                ),
+                (ctx().start(op(30), binding), op(30)),
+                (ctx().pause(op(56), binding), op(56)),
+                (ctx().resume(op(57), binding), op(57)),
+                (ctx().stop(op(40), binding), op(40)),
+                (ctx().seal(op(70), binding), op(70)),
+            ] {
+                assert_eq!(
+                    node.serve(request.clone()),
+                    ctx().accepted(operation, binding, State::Sealed),
+                    "{request:?}"
+                );
+            }
+            for (request, operation) in [
+                (ctx().pause(op(50), binding), op(50)),
+                (ctx().resume(op(55), binding), op(55)),
+            ] {
+                assert_eq!(
+                    node.serve(request),
+                    ctx().rejected(Some(operation), binding, Reason::StaleOperation)
+                );
+            }
+            assert_eq!(node.effects(), (0, 0, 0, 0, false), "a replay never acts");
+        }
+
+        #[test]
+        fn a_revocation_recorded_before_a_restart_still_refuses_the_recovered_task() {
+            let binding = lifecycle_binding();
+            let node = Node::new();
+            node.ready();
+            node.tasks
+                .lock()
+                .unwrap()
+                .admission_mut()
+                .unwrap()
+                .state_mut()
+                .record_revocation(AuthorityRevocation::new(
+                    binding.lease(),
+                    4_000,
+                    RevocationReason::Operator,
+                ))
+                .unwrap();
+
+            let node = node.restart();
+            assert_eq!(node.state(), State::Created);
+            assert_eq!(
+                node.serve(signed_admit(
+                    ctx(),
+                    op(21),
+                    binding,
+                    &node.envelope_for(binding, 2)
+                )),
+                ctx().rejected(Some(op(21)), binding, Reason::LeaseRevoked)
+            );
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().rejected(Some(op(30)), binding, Reason::InvalidState)
+            );
+            assert!(node.launcher.launches().is_empty());
+        }
+
+        #[test]
+        fn a_failed_record_write_refuses_the_verb_and_changes_nothing() {
+            let binding = lifecycle_binding();
+            let node = Node::new();
+            node.block_records();
+            assert_eq!(
+                node.serve(ctx().create(op(10), binding)),
+                ctx().rejected(Some(op(10)), binding, Reason::ResourceUnavailable)
+            );
+            assert_eq!(
+                node.serve(ctx().inspect(binding)),
+                ctx().rejected(None, binding, Reason::TaskNotFound)
+            );
+            node.unblock_records();
+            assert_eq!(
+                node.serve(ctx().create(op(10), binding)),
+                ctx().accepted(op(10), binding, State::Created)
+            );
+
+            node.block_records();
+            assert_eq!(
+                node.serve(signed_admit(ctx(), op(20), binding, &node.envelope())),
+                ctx().rejected(Some(op(20)), binding, Reason::ResourceUnavailable)
+            );
+            assert_eq!(node.state(), State::Created);
+            assert_eq!(
+                node.tasks
+                    .lock()
+                    .unwrap()
+                    .admission()
+                    .unwrap()
+                    .state()
+                    .last_admitted_version(binding.task()),
+                None,
+                "a refused admit consumes no version"
+            );
+            node.unblock_records();
+            assert_eq!(
+                node.serve(signed_admit(ctx(), op(20), binding, &node.envelope())),
+                ctx().accepted(op(20), binding, State::Ready)
+            );
+
+            node.block_records();
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().rejected(Some(op(30)), binding, Reason::ResourceUnavailable)
+            );
+            assert_eq!(node.state(), State::Ready);
+            assert!(node.launcher.launches().is_empty());
+            assert!(!node.workspace().exists());
+            node.unblock_records();
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().accepted(op(30), binding, State::Running)
+            );
+            eventually(|| node.launcher.waiting() == 1);
+
+            node.block_records();
+            assert_eq!(
+                node.serve(ctx().pause(op(50), binding)),
+                ctx().rejected(Some(op(50)), binding, Reason::ResourceUnavailable)
+            );
+            assert_eq!(node.state(), State::Running);
+            assert!(!node.launcher.frozen(), "the freeze was continued back");
+            node.unblock_records();
+
+            node.launcher.exit(WorkloadExit::Exited { code: Some(0) });
+            node.wait_for(State::Exited);
+            node.block_records();
+            assert_eq!(
+                node.serve(ctx().seal(op(70), binding)),
+                ctx().rejected(Some(op(70)), binding, Reason::ResourceUnavailable)
+            );
+            node.assert_finished(State::Exited, Outcome::Completed);
+            node.unblock_records();
+            assert_eq!(
+                node.serve(ctx().seal(op(70), binding)),
+                ctx().accepted(op(70), binding, State::Sealed)
+            );
+        }
+
+        #[test]
+        fn a_ready_task_whose_stop_or_revoke_cannot_be_recorded_stays_ready() {
+            let binding = lifecycle_binding();
+            for request in [ctx().stop(op(40), binding), ctx().revoke(op(60), binding)] {
+                let node = Node::new();
+                node.ready();
+                node.block_records();
+                let (TaskLifecycleRequest::Stop { operation_id, .. }
+                | TaskLifecycleRequest::Revoke { operation_id, .. }) = request
+                else {
+                    panic!("stop or revoke");
+                };
+                assert_eq!(
+                    node.serve(request.clone()),
+                    ctx().rejected(Some(operation_id), binding, Reason::ResourceUnavailable),
+                    "{request:?}"
+                );
+                assert_eq!(node.state(), State::Ready);
+                assert!(node.outcome().is_none());
+            }
+        }
+
+        #[test]
+        fn eviction_removes_the_record_so_a_restart_does_not_bring_the_task_back() {
+            let node = Node::with_capacity(1);
+            let (first, second) = (other_task(1), other_task(2));
+            finish_and_seal(&node, first, 10);
+            assert!(node.record_path(first).exists());
+            assert_eq!(
+                node.serve(ctx().create(op(20), second)),
+                ctx().accepted(op(20), second, State::Created)
+            );
+            assert!(!node.record_path(first).exists());
+
+            let node = node.restart();
+            assert_eq!(
+                node.serve(ctx().inspect(first)),
+                ctx().rejected(None, first, Reason::TaskNotFound)
+            );
+            assert_eq!(
+                node.serve(ctx().inspect(second)),
+                ctx().inspected(second, State::Created)
+            );
+        }
+
         #[test]
         fn a_registry_without_execution_refuses_start_and_stop() {
             let dir = tempfile::tempdir().unwrap();
             let clock = FixedClock::at(NOW);
-            let tasks = Arc::new(Mutex::new(TaskRegistry::with_admission(
-                MAX_NODE_TASKS,
-                node_admission(&dir.path().join("state"), &clock),
-            )));
+            let tasks = Arc::new(Mutex::new(
+                TaskRegistry::with_admission(
+                    MAX_NODE_TASKS,
+                    node_admission(&dir.path().join("state"), &clock),
+                )
+                .unwrap(),
+            ));
             let binding = lifecycle_binding();
             TaskRegistry::serve(&tasks, ctx(), ctx().create(op(10), binding)).unwrap();
             let envelope = TaskAdmissionEnvelope::new(envelope_input(binding)).unwrap();
