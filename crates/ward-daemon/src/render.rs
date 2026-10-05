@@ -1425,6 +1425,49 @@ pub fn daemon_status_line(control: Option<&str>) -> String {
     }
 }
 
+/// One-line lifecycle for the status panel and the end of `ward pause`,
+/// `ward resume` and `ward stop` (#145 item 1): `lifecycle: paused · held by
+/// user`, `lifecycle: incomplete (egress proxy (no acknowledgement within 2s))
+/// · held by user · 1 launch open`, `lifecycle: running`. The state's tone is
+/// its meaning: running and stopped are plain, a confirmed hold is the denied
+/// tone the bar uses for `PAUSED`, an operation in flight and an incomplete one
+/// warn.
+#[must_use]
+pub fn lifecycle_line(report: &crate::pause::LifecycleReport) -> String {
+    use crate::pause::Lifecycle;
+    use std::fmt::Write as _;
+    let tone = match report.state {
+        Lifecycle::Running | Lifecycle::Stopped => INK,
+        Lifecycle::Paused | Lifecycle::Stopping => DENY,
+        Lifecycle::Pausing | Lifecycle::Resuming | Lifecycle::Incomplete => WARN,
+    };
+    let mut line = format!("  {DIM}lifecycle:{RESET} {tone}{}{RESET}", report.text());
+    if !report.held_by.is_empty() {
+        let owners: Vec<&str> = report.held_by.iter().map(|o| o.as_str()).collect();
+        let _ = write!(line, " {DIM}· held by {}{RESET}", owners.join(", "));
+    }
+    match report.open_launches.len() {
+        0 => {}
+        1 => {
+            let _ = write!(line, " {DIM}· 1 launch open{RESET}");
+        }
+        n => {
+            let _ = write!(line, " {DIM}· {n} launches open{RESET}");
+        }
+    }
+    line
+}
+
+/// One component's progress during a pause, a resume or a stop (#145 item
+/// 8), as `ward pause` prints it the moment it arrives: `  processes · 3
+/// frozen (sigstop), settled`, `  egress proxy · UNCONFIRMED: no
+/// acknowledgement within 2s` in the warning tone.
+#[must_use]
+pub fn progress_line(progress: &crate::control::Progress) -> String {
+    let tone = if progress.confirmed { INK } else { WARN };
+    format!("  {tone}{}{RESET}", progress.text())
+}
+
 fn human_ago(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -2045,5 +2088,77 @@ mod tests {
             .append(Origin::Verifier, event.clone(), Timestamp::default())
             .unwrap();
         cells_verb(&rec)
+    }
+
+    /// #145 items 1 and 8: the lifecycle line names the state, its detail,
+    /// the owners and the open launches; a progress line names the component
+    /// and marks an unconfirmed step.
+    #[test]
+    fn the_lifecycle_and_progress_lines_name_the_state_the_owners_and_the_step() {
+        use crate::pause::{Lifecycle, LifecycleReport, Owner};
+        let strip = |s: String| {
+            let mut out = String::new();
+            let mut chars = s.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for c in chars.by_ref() {
+                        if c == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        assert_eq!(
+            strip(lifecycle_line(&LifecycleReport::of(Lifecycle::Running))),
+            "  lifecycle: running"
+        );
+        let report = LifecycleReport {
+            state: Lifecycle::Incomplete,
+            detail: Some("egress proxy (no acknowledgement within 2s)".into()),
+            op: None,
+            held_by: vec![Owner::User, Owner::Capture],
+            open_launches: vec![4],
+        };
+        assert_eq!(
+            strip(lifecycle_line(&report)),
+            "  lifecycle: incomplete (egress proxy (no acknowledgement within 2s)) · held by \
+             user, capture · 1 launch open"
+        );
+        let report = LifecycleReport {
+            state: Lifecycle::Stopping,
+            detail: None,
+            op: Some("op".into()),
+            held_by: vec![Owner::Stop],
+            open_launches: vec![4, 9],
+        };
+        assert_eq!(
+            strip(lifecycle_line(&report)),
+            "  lifecycle: stopping · held by stop · 2 launches open"
+        );
+        for state in Lifecycle::ALL {
+            assert!(strip(lifecycle_line(&LifecycleReport::of(state))).contains(state.as_str()));
+        }
+        let progress = crate::control::Progress {
+            component: "approvals".into(),
+            confirmed: true,
+            detail: "acknowledged".into(),
+        };
+        assert_eq!(
+            strip(progress_line(&progress)),
+            "  approvals · acknowledged"
+        );
+        let progress = crate::control::Progress {
+            component: "egress proxy".into(),
+            confirmed: false,
+            detail: "no acknowledgement within 2s".into(),
+        };
+        assert_eq!(
+            strip(progress_line(&progress)),
+            "  egress proxy · UNCONFIRMED: no acknowledgement within 2s"
+        );
     }
 }

@@ -187,6 +187,23 @@ pub enum Request {
         /// The operation [`Response::HeldForCapture`] named.
         op: String,
     },
+    /// The session's lifecycle (#145 item 1): answered with
+    /// [`Response::Lifecycle`] from the daemon's own state, without waiting
+    /// behind the operation in flight — a pause blocked on a component's
+    /// acknowledgement answers `pausing` meanwhile, not after. A daemon that
+    /// predates the request rejects it as a bad request; a client then reads
+    /// the state from the session's records (`pause::lifecycle_on_disk`).
+    Lifecycle,
+    /// Ask for progress on this connection (#145 item 8): every `Pause`,
+    /// `Resume`, `Stop` and `HoldForStop` this connection sends from now on
+    /// is answered with one [`Response::Progress`] line per component as it
+    /// confirms — processes, then the egress proxy, the approvals and the
+    /// credentials in the order they are held or released — before the
+    /// request's own answer. Answered [`Response::Ok`]. A connection that
+    /// never asks gets exactly the one answer it always got, so every
+    /// existing client is unaffected; a daemon that predates this rejects
+    /// the request, which a client reads as "no progress", not a failure.
+    ReportProgress,
 }
 
 /// [`Request::Capabilities`] feature: `Request::Stop` terminates the session's
@@ -200,6 +217,46 @@ pub const FEATURE_STOP_HOLD: &str = "stop-hold";
 /// proceed through a daemon that does not name it: it could not confirm the
 /// quiescence the capture requires.
 pub const FEATURE_CAPTURE_HOLD: &str = "capture-hold";
+/// [`Request::Capabilities`] feature: [`Request::Lifecycle`] and
+/// [`Request::ReportProgress`] are served (#145 items 1 and 8).
+pub const FEATURE_LIFECYCLE: &str = "lifecycle";
+
+/// One component's progress during a pause, a resume or a stop (#145 item 8),
+/// sent as [`Response::Progress`] before the operation's own answer on a
+/// connection that asked ([`Request::ReportProgress`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    /// Which component: `processes`, or a component as
+    /// `crate::acks::Component::as_str` names it (`egress proxy`,
+    /// `approvals`, `credentials`).
+    pub component: String,
+    /// Whether the component confirmed the step.
+    pub confirmed: bool,
+    /// What happened, in words: `3 frozen (sigstop), settled`,
+    /// `acknowledged`, `no acknowledgement within 2s`, `released`.
+    pub detail: String,
+}
+
+/// Where progress lines go (#145 item 8): a callback a client installs
+/// ([`RemoteSink::set_progress`], `Session::set_progress`) or the daemon runs
+/// for the connection that asked.
+pub type OnProgress = Box<dyn FnMut(&Progress) + Send>;
+
+impl Progress {
+    /// The name of the processes step.
+    pub const PROCESSES: &str = "processes";
+
+    /// `processes · 3 frozen (sigstop), settled`: one line for a terminal.
+    #[must_use]
+    pub fn text(&self) -> String {
+        format!(
+            "{} · {}{}",
+            self.component,
+            if self.confirmed { "" } else { "UNCONFIRMED: " },
+            self.detail
+        )
+    }
+}
 
 /// What the daemon answers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +373,14 @@ pub enum Response {
     /// `Request::Revoke` answered (#245): what actually happened to the
     /// grant, not merely that the authority projection changed.
     Revoked(crate::approvals::RevokeOutcome),
+    /// [`Request::Lifecycle`] answered (#145 item 1): the session's state,
+    /// what is uncertain about it, the operation in flight, the owners of its
+    /// hold and the launches still open.
+    Lifecycle(crate::pause::LifecycleReport),
+    /// One component confirmed (or did not) during the operation this
+    /// connection asked for, on a connection that asked for progress (#145
+    /// item 8). Never the request's final answer: that follows.
+    Progress(Progress),
 }
 
 /// Where a session's events go.
@@ -374,6 +439,16 @@ pub trait Sink: Send {
     /// it has nothing to refresh and keeps this default no-op.
     fn resync(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    /// Report each component's progress through `on_progress` during the
+    /// lifecycle operations this sink performs (#145 item 8): a
+    /// [`RemoteSink`] asks its daemon ([`Request::ReportProgress`]) and
+    /// forwards every [`Response::Progress`] it reads; a [`LocalLog`] performs
+    /// none itself (the session does, in-process) and keeps this default,
+    /// which reports nothing.
+    fn set_progress(&mut self, on_progress: OnProgress) {
+        drop(on_progress);
     }
 }
 
@@ -520,6 +595,10 @@ fn parse_response(line: &str) -> Result<Response> {
 pub struct RemoteSink {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    /// Where a [`Response::Progress`] line goes (#145 item 8), once
+    /// [`Self::set_progress`] asked the daemon for them; a progress line read
+    /// with nothing installed is dropped, never mistaken for an answer.
+    progress: Option<OnProgress>,
 }
 
 impl RemoteSink {
@@ -531,6 +610,7 @@ impl RemoteSink {
         let mut sink = Self {
             reader: BufReader::new(stream),
             writer,
+            progress: None,
         };
         matches!(sink.call(&Request::Ping).ok()?, Response::Ok).then_some(sink)
     }
@@ -551,10 +631,21 @@ impl RemoteSink {
             .map_err(|e| Error::Sandbox(format!("control socket: {e}")))
     }
 
-    /// Read the next response line (a subscription yields many).
+    /// Read the next response line (a subscription yields many). A
+    /// [`Response::Progress`] line is handed to the progress callback
+    /// ([`Self::set_progress`]) and the read goes on to the answer behind it.
     pub fn read_response(&mut self) -> Result<Response> {
-        self.next_response()?
-            .ok_or_else(|| Error::Sandbox("control socket closed".into()))
+        loop {
+            match self.next_response()? {
+                Some(Response::Progress(progress)) => {
+                    if let Some(on_progress) = self.progress.as_mut() {
+                        on_progress(&progress);
+                    }
+                }
+                Some(response) => return Ok(response),
+                None => return Err(Error::Sandbox("control socket closed".into())),
+            }
+        }
     }
 
     /// Read the next response line, or `None` once the daemon has hung up (a
@@ -569,6 +660,32 @@ impl RemoteSink {
             return Ok(None);
         }
         parse_response(&line).map(Some)
+    }
+
+    /// Ask the daemon for per-component progress on this connection (#145
+    /// item 8, [`Request::ReportProgress`]) and hand every progress line to
+    /// `on_progress`. A daemon that does not serve the request (one that
+    /// predates it) reports nothing, which is not a failure: the operation's
+    /// own answer is unchanged either way.
+    pub fn set_progress(&mut self, on_progress: OnProgress) -> Result<()> {
+        match self.call(&Request::ReportProgress)? {
+            Response::Ok => {
+                self.progress = Some(on_progress);
+                Ok(())
+            }
+            Response::Error(_) => Ok(()),
+            other => Err(Error::Events(format!("unexpected response {other:?}"))),
+        }
+    }
+
+    /// The session's lifecycle as the daemon serves it (#145 item 1,
+    /// [`Request::Lifecycle`]); `None` from a daemon that predates it.
+    pub fn lifecycle(&mut self) -> Result<Option<crate::pause::LifecycleReport>> {
+        match self.call(&Request::Lifecycle)? {
+            Response::Lifecycle(report) => Ok(Some(report)),
+            Response::Error(_) => Ok(None),
+            other => Err(Error::Events(format!("unexpected response {other:?}"))),
+        }
     }
 
     /// Read the next response line, waiting at most `wait` for it: [`Next::Quiet`]
@@ -689,6 +806,12 @@ impl Sink for RemoteSink {
 
     fn ends_workloads(&self) -> bool {
         true
+    }
+
+    fn set_progress(&mut self, on_progress: OnProgress) {
+        // Best effort: a daemon that cannot be asked reports nothing, and the
+        // operation that follows answers exactly as it always did.
+        let _ = RemoteSink::set_progress(self, on_progress);
     }
 }
 
@@ -827,7 +950,9 @@ pub fn handle_with(
         | Request::Capabilities
         | Request::HoldForStop { .. }
         | Request::HoldForCapture { .. }
-        | Request::ReleaseCapture { .. } => (
+        | Request::ReleaseCapture { .. }
+        | Request::Lifecycle
+        | Request::ReportProgress => (
             Response::Error("not served on this connection".into()),
             false,
         ),
@@ -1432,5 +1557,178 @@ mod tests {
                 Response::Error(e) if e == "not served on this connection"
             ));
         }
+    }
+
+    /// #145 items 1 and 8 on the wire: the lifecycle request and the
+    /// progress opt-in round-trip as their words, a progress line and a
+    /// lifecycle answer round-trip, a lifecycle answer from an older daemon
+    /// (no optional fields) still reads, and neither request is served on a
+    /// plain log connection. A `RemoteSink` hands progress lines to its
+    /// callback and returns the answer behind them, and treats a daemon that
+    /// rejects the opt-in as reporting nothing.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn lifecycle_and_progress_round_trip_and_a_sink_reads_progress_before_the_answer() {
+        use crate::pause::{Lifecycle, LifecycleReport, Owner};
+        assert_eq!(
+            serde_json::to_string(&Request::Lifecycle).unwrap(),
+            r#"{"req":"lifecycle"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::ReportProgress).unwrap(),
+            r#"{"req":"report_progress"}"#
+        );
+        let progress = Progress {
+            component: Progress::PROCESSES.into(),
+            confirmed: true,
+            detail: "2 frozen (sigstop), settled".into(),
+        };
+        let json = serde_json::to_string(&Response::Progress(progress.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"resp":"progress","body":{"component":"processes","confirmed":true,"detail":"2 frozen (sigstop), settled"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&json).unwrap(),
+            Response::Progress(progress.clone())
+        );
+        assert_eq!(progress.text(), "processes · 2 frozen (sigstop), settled");
+        let unconfirmed = Progress {
+            component: "egress proxy".into(),
+            confirmed: false,
+            detail: "no acknowledgement within 2s".into(),
+        };
+        assert_eq!(
+            unconfirmed.text(),
+            "egress proxy · UNCONFIRMED: no acknowledgement within 2s"
+        );
+        let report = LifecycleReport {
+            state: Lifecycle::Incomplete,
+            detail: Some("egress proxy (no acknowledgement within 2s)".into()),
+            op: None,
+            held_by: vec![Owner::User],
+            open_launches: vec![4],
+        };
+        let json = serde_json::to_string(&Response::Lifecycle(report.clone())).unwrap();
+        assert_eq!(
+            json,
+            r#"{"resp":"lifecycle","body":{"state":"incomplete","detail":"egress proxy (no acknowledgement within 2s)","held_by":["user"],"open_launches":[4]}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&json).unwrap(),
+            Response::Lifecycle(report)
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(r#"{"resp":"lifecycle","body":{"state":"paused"}}"#)
+                .unwrap(),
+            Response::Lifecycle(LifecycleReport::of(Lifecycle::Paused))
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = Some(fresh(dir.path()));
+        for request in [Request::Lifecycle, Request::ReportProgress] {
+            assert!(matches!(
+                handle(&mut log, request).0,
+                Response::Error(e) if e == "not served on this connection"
+            ));
+        }
+
+        // A stand-in daemon: accepts the opt-in, then answers a pause with two
+        // progress lines before the record; a second connection rejects the
+        // opt-in as an older daemon would, and answers the lifecycle request
+        // as a bad request.
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let record_dir = tempfile::tempdir().unwrap();
+        let record = fresh(record_dir.path())
+            .append(Origin::Wardd, working(), SystemTime::now())
+            .unwrap();
+        let answered = record.clone();
+        let server = std::thread::spawn(move || {
+            let reply = |stream: &mut UnixStream, r: &Response| {
+                let mut b = serde_json::to_vec(r).unwrap();
+                b.push(b'\n');
+                stream.write_all(&b).unwrap();
+            };
+            for (n, stream) in listener.incoming().take(2).enumerate() {
+                let stream = stream.unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                for line in BufReader::new(stream)
+                    .lines()
+                    .map_while(std::result::Result::ok)
+                {
+                    match serde_json::from_str::<Request>(&line).unwrap() {
+                        Request::Ping => reply(&mut writer, &Response::Ok),
+                        Request::ReportProgress if n == 0 => reply(&mut writer, &Response::Ok),
+                        Request::ReportProgress | Request::Lifecycle => {
+                            reply(&mut writer, &Response::Error("bad request".into()));
+                        }
+                        Request::Pause { .. } => {
+                            reply(
+                                &mut writer,
+                                &Response::Progress(Progress {
+                                    component: Progress::PROCESSES.into(),
+                                    confirmed: true,
+                                    detail: "0 frozen (sigstop), settled".into(),
+                                }),
+                            );
+                            reply(
+                                &mut writer,
+                                &Response::Progress(Progress {
+                                    component: "egress proxy".into(),
+                                    confirmed: false,
+                                    detail: "no acknowledgement within 2s".into(),
+                                }),
+                            );
+                            reply(
+                                &mut writer,
+                                &Response::Paused {
+                                    record: Box::new(answered.clone()),
+                                    unsettled: None,
+                                    unconfirmed: Some(
+                                        "egress proxy (no acknowledgement within 2s)".into(),
+                                    ),
+                                },
+                            );
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                }
+            }
+        });
+        let mut sink = RemoteSink::connect(&socket).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let into = std::sync::Arc::clone(&seen);
+        RemoteSink::set_progress(
+            &mut sink,
+            Box::new(move |p: &Progress| into.lock().unwrap().push(p.text())),
+        )
+        .unwrap();
+        let answer = sink
+            .call(&Request::Pause {
+                reason: String::new(),
+            })
+            .unwrap();
+        assert!(
+            matches!(&answer, Response::Paused { record: r, .. } if **r == record),
+            "{answer:?}"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "processes · 0 frozen (sigstop), settled",
+                "egress proxy · UNCONFIRMED: no acknowledgement within 2s"
+            ]
+        );
+        drop(sink);
+        let mut older = RemoteSink::connect(&socket).unwrap();
+        RemoteSink::set_progress(&mut older, Box::new(|_| panic!("nothing is reported")))
+            .expect("a daemon that rejects the opt-in reports nothing, which is not a failure");
+        assert_eq!(
+            older.lifecycle().unwrap(),
+            None,
+            "an older daemon has no lifecycle"
+        );
+        drop(older);
+        server.join().unwrap();
     }
 }

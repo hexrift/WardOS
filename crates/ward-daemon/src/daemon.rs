@@ -48,9 +48,12 @@ use ward_events::{
 
 use crate::acks::{self, Acknowledgement, Acknowledger, Phase};
 use crate::approvals::{self, Approval, Approvals, Deriver, Outcome};
-use crate::control::{self, LocalLog, RemoteSink, Request, Response, SOCKET_NAME};
+use crate::control::{
+    self, LocalLog, OnProgress, Progress, RemoteSink, Request, Response, SOCKET_NAME,
+};
 use crate::error::{Error, Result};
-use crate::pause::{self, Frozen};
+use crate::launches::{self, LaunchState, Launches};
+use crate::pause::{self, Frozen, Lifecycle, LifecycleReport, Operation};
 use crate::revoke;
 use crate::session::{SessionMeta, protected_paths, session_dir};
 
@@ -219,6 +222,7 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
         release_socket(&socket, bound_inode, &pid_file);
         return crate::session::clear_current(state, &meta.project_id, session);
     }
+    let lane = Arc::clone(&served.lane);
     let served = Arc::new(Mutex::new(served));
     let finished = Arc::new(AtomicBool::new(false));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
@@ -237,10 +241,11 @@ pub fn serve(state: &Path, session: &str) -> Result<()> {
             lock(&served).peers.push((peer, clone));
         }
         let served = Arc::clone(&served);
+        let lane = Arc::clone(&lane);
         let finished = Arc::clone(&finished);
         let socket = socket.clone();
         workers.push(std::thread::spawn(move || {
-            let sealed = serve_stream(stream, &served, peer);
+            let sealed = serve_stream(stream, &served, &lane, peer);
             {
                 let mut served = lock(&served);
                 served.peers.retain(|(id, _)| *id != peer);
@@ -399,6 +404,10 @@ pub fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// A live subscription's channel and the sender its hang-up watcher ends it
+/// with ([`Served::begin_subscription`]).
+type LiveChannel = (Receiver<Delivery>, Sender<Delivery>);
+
 /// What a subscriber's channel carries.
 enum Delivery {
     /// A record appended after the subscription started.
@@ -413,7 +422,7 @@ struct Subscription {
     replay: Vec<EventRecord>,
     /// The live channel and a sender for the hang-up watcher; `None` when the log
     /// is already sealed and the replay is everything.
-    live: Option<(Receiver<Delivery>, Sender<Delivery>)>,
+    live: Option<LiveChannel>,
 }
 
 /// A pause in force: what was frozen, since when, and who holds it.
@@ -522,6 +531,25 @@ struct Served {
     /// confirmed (PR #253 review finding 5) — unless a client that predates
     /// that (0.18, which appended `Finished` before asking to stop) already has.
     last_agent_state: Option<ward_events::AgentState>,
+    /// The lifecycle this daemon last published (#145 item 1), read by
+    /// `Request::Lifecycle` on its own lane — never behind the daemon's
+    /// mutex, so a status request answers `pausing` *while* a pause waits on
+    /// a component rather than after it ([`serve_stream`]). Rewritten under
+    /// the mutex at every transition ([`Self::publish`]).
+    lane: Arc<Mutex<LifecycleReport>>,
+    /// Every launch this session admitted and how each stands (#145 item 2),
+    /// mirrored durably in [`launches::LAUNCHES`].
+    launches: Launches,
+    /// Where a lifecycle operation reports each component as it confirms
+    /// (#145 item 8): installed by the connection that asked for progress for
+    /// the length of its request, `None` otherwise.
+    progress: Option<OnProgress>,
+    /// What the hold in force (`paused`) could not confirm (#145 item 1): the
+    /// pending processes, the component that did not acknowledge, or what a
+    /// stop could not confirm ended — `None` for a confirmed hold. Set
+    /// wherever `paused` is, beside it; decides whether the lifecycle reads
+    /// `Paused`/`Stopping` or `Incomplete`.
+    held_unconfirmed: Option<String>,
 }
 
 impl Served {
@@ -547,7 +575,126 @@ impl Served {
             acks: Box::new(acks::Live::new()),
             open_launches: Vec::new(),
             last_agent_state: None,
+            lane: Arc::new(Mutex::new(LifecycleReport::of(Lifecycle::Running))),
+            launches: Launches::default(),
+            progress: None,
+            held_unconfirmed: None,
         }
+    }
+
+    /// The session's lifecycle from this daemon's own state (#145 item 1):
+    /// `Stopped` once the log is sealed; while a hold is in force, `Incomplete`
+    /// when it could not be confirmed, else `Stopping` for a stop's hold and
+    /// `Paused` for the user's or a capture's; `Stopping` when a stop has
+    /// begun (the stop marker) and nothing is held in memory — a stop that
+    /// could not take its hold, which only a retry goes on from; `Running`
+    /// otherwise. The transient states are what [`Self::enter`] publishes
+    /// while an operation runs; between operations the daemon is never in one.
+    fn lifecycle(&self) -> Lifecycle {
+        if self.log.is_none() {
+            return Lifecycle::Stopped;
+        }
+        // The stop marker outlives a daemon restart and makes any hold a
+        // stop's, as `resume` has always read it.
+        let stop_begun = pause::stop_begun(&self.state, &self.session);
+        match &self.paused {
+            Some(_) if self.held_unconfirmed.is_some() => Lifecycle::Incomplete,
+            Some(paused) if paused.holders.stop || stop_begun => Lifecycle::Stopping,
+            Some(_) => Lifecycle::Paused,
+            None if stop_begun => Lifecycle::Stopping,
+            None => Lifecycle::Running,
+        }
+    }
+
+    /// What the lifecycle lane reports: the state, what is uncertain about it,
+    /// the owners, and the handles still open.
+    fn report(&self) -> LifecycleReport {
+        LifecycleReport {
+            state: self.lifecycle(),
+            detail: self
+                .paused
+                .as_ref()
+                .and_then(|_| self.held_unconfirmed.clone()),
+            op: None,
+            held_by: self
+                .paused
+                .as_ref()
+                .map(|p| p.holders.owners())
+                .unwrap_or_default(),
+            open_launches: self.open_launches.iter().map(|(_, key, _)| *key).collect(),
+        }
+    }
+
+    /// Publish the lifecycle the daemon is in now ([`Self::report`]) to the
+    /// lane `Request::Lifecycle` reads.
+    fn publish(&self) {
+        *lock(&self.lane) = self.report();
+    }
+
+    /// Begin `op` (#145 item 1): decide, in the one transition table
+    /// ([`pause::transition`]), whether the session's state admits it — the
+    /// refusal names the state — and publish the transient state the session
+    /// is in while it runs, so a `Request::Lifecycle` meanwhile reads
+    /// `pausing`, `resuming` or `stopping`. Captures whose process is gone are
+    /// forgotten first, as they hold nothing. The operation's end republishes
+    /// the settled state ([`Self::publish`]).
+    fn enter(&mut self, op: Operation) -> Result<Lifecycle> {
+        if let Some(paused) = self.paused.as_mut() {
+            paused.holders.prune_dead(Path::new("/proc"));
+        }
+        let holders = self
+            .paused
+            .as_ref()
+            .map(|p| p.holders.clone())
+            .unwrap_or_default();
+        let entered = pause::transition(&self.session, self.lifecycle(), &holders, op)?;
+        let mut report = self.report();
+        report.state = entered;
+        *lock(&self.lane) = report;
+        Ok(entered)
+    }
+
+    /// Report one component's progress to the connection that asked for it
+    /// (#145 item 8); nothing when none did.
+    fn report_progress(&mut self, component: &str, confirmed: bool, detail: impl Into<String>) {
+        if let Some(on_progress) = self.progress.as_mut() {
+            on_progress(&Progress {
+                component: component.to_owned(),
+                confirmed,
+                detail: detail.into(),
+            });
+        }
+    }
+
+    /// The progress line for a freeze: how many were frozen, by what, and
+    /// whether it settled.
+    fn report_freeze(&mut self, frozen: &Frozen, unsettled: Option<u32>) {
+        let method = match frozen.method {
+            PauseMethod::CgroupFreezer => "cgroup freezer",
+            PauseMethod::Sigstop => "sigstop",
+        };
+        let detail = match unsettled {
+            None => format!("{} frozen ({method}), settled", frozen.pids.len()),
+            Some(pending) => format!(
+                "{} frozen ({method}), {pending} not confirmed stopped within {}s",
+                frozen.pids.len(),
+                pause::FREEZE_SETTLE.as_secs()
+            ),
+        };
+        self.report_progress(Progress::PROCESSES, unsettled.is_none(), detail);
+    }
+
+    /// The progress line for one component's acknowledgement.
+    fn report_ack(&mut self, ack: &Acknowledgement, phase: Phase) {
+        let detail = match (&ack.outcome, phase) {
+            (acks::Outcome::Acknowledged, Phase::Held) => "acknowledged".to_owned(),
+            (acks::Outcome::Acknowledged, Phase::Released) => "released".to_owned(),
+            (acks::Outcome::TimedOut { after }, _) => {
+                format!("no acknowledgement within {}s", after.as_secs())
+            }
+            (acks::Outcome::Error(reason), _) => reason.clone(),
+        };
+        self.report_progress(ack.component.as_str(), ack.confirmed(), detail);
     }
 
     /// Ask every component to confirm `phase` (#145 item 3), in hold order for
@@ -555,12 +702,14 @@ impl Served {
     /// has already acted — marker written or cleared, approvals held or
     /// released — when this asks; each answer is a bounded read-back.
     fn confirm_components(&mut self, phase: Phase) -> Vec<Acknowledgement> {
-        let site = acks::Site {
-            state: &self.state,
-            session: &self.session,
-            approvals: &self.approvals,
+        let order: Vec<acks::Component> = match phase {
+            Phase::Held => acks::Component::HOLD_ORDER.to_vec(),
+            Phase::Released => acks::Component::release_order().collect(),
         };
-        acks::collect(self.acks.as_mut(), phase, &site)
+        order
+            .into_iter()
+            .map(|component| self.confirm_one(component, phase))
+            .collect()
     }
 
     /// One component's confirmation of `phase`: a single step of a release.
@@ -570,10 +719,12 @@ impl Served {
             session: &self.session,
             approvals: &self.approvals,
         };
-        Acknowledgement {
+        let ack = Acknowledgement {
             component,
             outcome: self.acks.confirm(component, phase, &site),
-        }
+        };
+        self.report_ack(&ack, phase);
+        ack
     }
 
     /// The one terminal record of a hold: `SessionPaused` only when the freeze
@@ -600,6 +751,22 @@ impl Served {
                 )),
                 pending: pending.unwrap_or(0),
             },
+        }
+    }
+
+    /// What a hold could not confirm, in the words the log's own record
+    /// yields back ([`acks::unsettled_detail`]) — so the lifecycle the daemon
+    /// serves and the one a reader derives from the records agree: the
+    /// component that did not acknowledge, else the processes not confirmed
+    /// stopped; `None` for a confirmed hold.
+    fn hold_uncertainty(
+        unsettled: Option<u32>,
+        unconfirmed: Option<&Acknowledgement>,
+    ) -> Option<String> {
+        match (unsettled, unconfirmed) {
+            (_, Some(ack)) => Some(ack.text()),
+            (Some(pending), None) => Some(format!("{pending} process(es) not confirmed stopped")),
+            (None, None) => None,
         }
     }
 
@@ -681,10 +848,17 @@ impl Served {
                         control::FEATURE_STOP_TERMINATES.into(),
                         control::FEATURE_STOP_HOLD.into(),
                         control::FEATURE_CAPTURE_HOLD.into(),
+                        control::FEATURE_LIFECYCLE.into(),
                     ],
                 },
                 false,
             ),
+            // Served on its own lane by `serve_stream`, never behind this
+            // mutex; answered here too for a caller that holds it already.
+            Request::Lifecycle => (Response::Lifecycle(self.report()), false),
+            // Per-connection, decided in `serve_stream`; a caller with no
+            // connection has nothing to report to.
+            Request::ReportProgress => (Response::Ok, false),
             Request::HoldForCapture {
                 reason,
                 pid,
@@ -783,9 +957,13 @@ impl Served {
         };
         let launch_finished = match &other {
             Request::Append {
-                event: WardEvent::CommandFinished { pid, .. } | WardEvent::LaunchAborted { pid, .. },
+                event: WardEvent::CommandFinished { pid, .. },
                 ..
-            } => Some(*pid),
+            } => Some((*pid, LaunchState::Finished)),
+            Request::Append {
+                event: WardEvent::LaunchAborted { pid, .. },
+                ..
+            } => Some((*pid, LaunchState::Aborted)),
             _ => None,
         };
         let agent_state = match &other {
@@ -815,10 +993,14 @@ impl Served {
             }
             if let Some(pid) = launch_started {
                 // Keep the logical pid so a confirmed stop can terminalize any
-                // still-open launch before sealing the log.
+                // still-open launch before sealing the log. The record's seq
+                // is the launch's stable, host-owned handle (#145 item 2),
+                // registered durably from this moment.
                 self.open_launches.push((conn, record.seq, pid));
+                self.register_launch(record.seq, pid);
+                self.publish();
             }
-            if let Some(pid) = launch_finished
+            if let Some((pid, state)) = launch_finished
                 && let Some(pos) = self
                     .open_launches
                     .iter()
@@ -831,6 +1013,8 @@ impl Served {
                 // budget, or never got off the ground at all (`LaunchAborted`,
                 // PR #197 review finding 1).
                 self.approvals.retire_launch(key);
+                self.end_launch(key, state);
+                self.publish();
             }
         }
         if done {
@@ -1012,6 +1196,28 @@ impl Served {
         });
         for key in keys {
             self.approvals.mark_launch_unknown(key);
+            self.end_launch(key, LaunchState::Unknown);
+        }
+        self.publish();
+    }
+
+    /// Register launch `handle` as admitted (#145 item 2) and write the
+    /// register. The log already carries the launch's `CommandStarted`; the
+    /// register is the index beside it, so a failure to write it is untidy,
+    /// never incorrect, and is not allowed to fail the append it follows.
+    fn register_launch(&mut self, handle: u64, pid: Pid) {
+        self.launches
+            .admit(handle, pid, control::unix_ms(SystemTime::now()));
+        let _ = launches::write(&self.state, &self.session, &self.launches);
+    }
+
+    /// Record how launch `handle` ended in the register (#145 item 2).
+    fn end_launch(&mut self, handle: u64, state: LaunchState) {
+        if self
+            .launches
+            .end(handle, state, control::unix_ms(SystemTime::now()))
+        {
+            let _ = launches::write(&self.state, &self.session, &self.launches);
         }
     }
 
@@ -1156,17 +1362,23 @@ impl Served {
         &mut self,
         reason: &str,
         settle: impl FnOnce(&Frozen) -> Option<u32>,
+        append: impl FnMut(&mut Self, WardEvent) -> Result<EventRecord>,
+    ) -> Result<PauseOutcome> {
+        // #145 item 1: admitted (or refused, naming the state) by the one
+        // transition table; `pausing` is published while this runs.
+        self.enter(Operation::Pause)?;
+        let outcome = self.pause_entered(reason, settle, append);
+        self.publish();
+        outcome
+    }
+
+    /// [`Self::pause_with_appending`] once the transition is admitted.
+    fn pause_entered(
+        &mut self,
+        reason: &str,
+        settle: impl FnOnce(&Frozen) -> Option<u32>,
         mut append: impl FnMut(&mut Self, WardEvent) -> Result<EventRecord>,
     ) -> Result<PauseOutcome> {
-        if self.log.is_none() {
-            return Err(Error::Daemon("log is sealed".into()));
-        }
-        if let Some(paused) = self.paused.as_mut() {
-            paused.holders.prune_dead(Path::new("/proc"));
-            if paused.holders.user || paused.holders.stop {
-                return Err(Error::Daemon("already paused".into()));
-            }
-        }
         let reason = pause::reason_text(reason);
         self.record_intent(pause::Verb::Pause {
             reason: reason.clone(),
@@ -1176,6 +1388,7 @@ impl Served {
         // never straddle this pause taking hold.
         let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
         let layered = self.paused.take();
+        let layered_unconfirmed = self.held_unconfirmed.take();
         let (frozen, since, before, ended) = match layered {
             Some(paused) => (paused.frozen, paused.since, paused.holders, paused.ended),
             None => (
@@ -1191,7 +1404,7 @@ impl Served {
         let marked = pause::write_marker(&self.state, &self.session, &reason)
             .and_then(|()| pause::write_held_by(&self.state, &self.session, &holders));
         if let Err(e) = marked {
-            self.take_back_user_layer(fresh, frozen, since, before, ended);
+            self.take_back_user_layer(fresh, frozen, since, before, ended, layered_unconfirmed);
             let _ = pause::clear_intent(&self.state, &self.session);
             return Err(e);
         }
@@ -1199,12 +1412,16 @@ impl Served {
         // The marker and the held approvals already stand — the safest state #145
         // item 4 asks for — before the settle check or any component is asked,
         // and stay that way regardless of the answers or of whether the terminal
-        // record below makes it onto the log.
+        // record below makes it onto the log. The freeze is confirmed first,
+        // then each component in hold order, each reported as it answers
+        // (#145 item 8).
+        let unsettled = settle(&frozen);
+        self.report_freeze(&frozen, unsettled);
         let acks = self.confirm_components(Phase::Held);
         let unconfirmed = acks::first_unconfirmed(&acks).cloned();
-        let unsettled = settle(&frozen);
         let event = Self::hold_record(frozen.method, &reason, unsettled, unconfirmed.as_ref());
         let confirmed = matches!(event, WardEvent::SessionPaused { .. });
+        let uncertain = Self::hold_uncertainty(unsettled, unconfirmed.as_ref());
         let record = match append(self, event) {
             Ok(record) => record,
             Err(e) if confirmed => {
@@ -1212,7 +1429,7 @@ impl Served {
                 // without a durable `SessionPaused` record, the log never
                 // agrees the session was paused at all, so nothing else about
                 // it should stand either.
-                self.take_back_user_layer(fresh, frozen, since, before, ended);
+                self.take_back_user_layer(fresh, frozen, since, before, ended, layered_unconfirmed);
                 let _ = pause::clear_intent(&self.state, &self.session);
                 return Err(e);
             }
@@ -1232,6 +1449,7 @@ impl Served {
                 // about to be told happened, exactly the fold
                 // `Session::verify_prepared` already does for its own terminal-
                 // append failure (#194).
+                self.held_unconfirmed = uncertain;
                 self.paused = Some(Paused {
                     frozen,
                     since,
@@ -1249,6 +1467,7 @@ impl Served {
             }
         };
         let _ = pause::clear_intent(&self.state, &self.session);
+        self.held_unconfirmed = uncertain;
         self.paused = Some(Paused {
             frozen,
             since,
@@ -1273,6 +1492,7 @@ impl Served {
         since: Instant,
         before: pause::Holders,
         ended: u32,
+        unconfirmed: Option<String>,
     ) {
         if fresh {
             self.approvals.set_paused(false);
@@ -1285,6 +1505,7 @@ impl Served {
             let _ = pause::write_marker(&self.state, &self.session, &reason);
         }
         let _ = pause::write_held_by(&self.state, &self.session, &before);
+        self.held_unconfirmed = unconfirmed;
         self.paused = Some(Paused {
             frozen,
             since,
@@ -1301,7 +1522,9 @@ impl Served {
     /// is untidy, never incorrect, since a restart then finds the log already
     /// carrying the outcome and adopts it without a second record.
     fn record_intent(&self, verb: pause::Verb) -> Result<()> {
-        pause::write_intent(&self.state, &self.session, &pause::Intent::begin(verb)?)
+        let intent = pause::Intent::begin(verb)?;
+        lock(&self.lane).op = Some(intent.op.clone());
+        pause::write_intent(&self.state, &self.session, &intent)
     }
 
     /// Reverse [`Self::pause`] in the reverse of the order it held (#145 item
@@ -1330,17 +1553,18 @@ impl Served {
     /// ordinary pause would present a half-killed session as resumable
     /// execution (finding 5). A stop is retried with `ward stop`.
     fn resume(&mut self) -> Result<Box<EventRecord>> {
-        let Some(held_for_stop) = self.paused.as_ref().map(|p| p.holders.stop) else {
-            return Err(Error::Daemon("not paused".into()));
-        };
-        if held_for_stop || pause::stop_begun(&self.state, &self.session) {
-            return Err(Error::Daemon(format!(
-                "a stop of session {} has begun and not completed: its sandboxed processes \
-                 are held for that stop (some may already have been killed), so `ward \
-                 resume` cannot release them. Run `ward stop` to finish it",
-                self.session
-            )));
-        }
+        // #145 item 1: admitted (or refused, naming the state — `not paused`,
+        // the stop that has begun, the capture that holds it) by the one
+        // transition table; `resuming` is published while this runs.
+        self.enter(Operation::Resume)?;
+        let released = self.resume_entered();
+        self.publish();
+        released
+    }
+
+    /// [`Self::resume`] once the transition is admitted: the hold is the
+    /// user's (perhaps with captures under it).
+    fn resume_entered(&mut self) -> Result<Box<EventRecord>> {
         // #234: the same lock `pause`/`CaptureFreeze` take, so a capture's own
         // marker check or thaw can never straddle this resume's marker clear and
         // thaw.
@@ -1348,34 +1572,34 @@ impl Served {
         let Some(mut paused) = self.paused.take() else {
             return Err(Error::Daemon("not paused".into()));
         };
-        let pruned = paused.holders.prune_dead(Path::new("/proc"));
+        // The resume's intent (#145 items 1 and 7): durable before anything
+        // is released, so a daemon restarted after a death between the
+        // marker's clearing and the thaw finishes the release.
+        if let Err(e) = self.record_intent(pause::Verb::Resume) {
+            self.paused = Some(paused);
+            return Err(e);
+        }
         if let Some(capture) = paused.holders.captures.first().cloned() {
-            if !paused.holders.user {
-                if pruned {
-                    let _ = pause::write_held_by(&self.state, &self.session, &paused.holders);
-                }
-                self.paused = Some(paused);
-                return Err(Error::Daemon(format!(
-                    "session {} is held for capture by operation {} (pid {}), not a user pause: \
-                     `ward resume` releases only a user's pause, and the capture releases its \
-                     hold when it finishes",
-                    self.session, capture.op, capture.pid
-                )));
-            }
             paused.holders.user = false;
             let relabelled = pause::write_held_by(&self.state, &self.session, &paused.holders)
                 .and_then(|()| pause::write_marker(&self.state, &self.session, &capture.reason));
             if let Err(e) = relabelled {
                 paused.holders.user = true;
                 self.paused = Some(paused);
+                let _ = pause::clear_intent(&self.state, &self.session);
                 return Err(e);
             }
             let method = paused.frozen.method;
             self.paused = Some(paused);
             let record = self.append(Self::hold_record(method, &capture.reason, None, None))?;
+            let _ = pause::clear_intent(&self.state, &self.session);
             return Ok(Box::new(record));
         }
-        self.release_hold(paused).map(Box::new)
+        let released = self.release_hold(paused);
+        // The hold either released (recorded) or stands again: the resume has
+        // its outcome either way.
+        let _ = pause::clear_intent(&self.state, &self.session);
+        released.map(Box::new)
     }
 
     /// End a hold no owner keeps any more, in the reverse of the order it was
@@ -1421,6 +1645,11 @@ impl Served {
         }
         let _ = pause::clear_held_by(&self.state, &self.session);
         pause::thaw(&paused.frozen);
+        self.report_progress(
+            Progress::PROCESSES,
+            true,
+            format!("{} thawed", paused.frozen.pids.len()),
+        );
         let paused_for = paused.since.elapsed();
         self.append(WardEvent::SessionResumed { paused_for })
     }
@@ -1458,9 +1687,20 @@ impl Served {
         freeze: impl FnOnce(&str) -> (Frozen, bool),
         restabilize: impl FnOnce(&str, Frozen) -> (Frozen, bool),
     ) -> Result<Option<String>> {
-        if self.log.is_none() {
-            return Err(Error::Daemon("log is sealed".into()));
-        }
+        self.enter(Operation::HoldForCapture)?;
+        let held = self.hold_for_capture_entered(reason, by, freeze, restabilize);
+        self.publish();
+        held
+    }
+
+    /// [`Self::hold_for_capture_with`] once the transition is admitted.
+    fn hold_for_capture_entered(
+        &mut self,
+        reason: &str,
+        by: (u32, String),
+        freeze: impl FnOnce(&str) -> (Frozen, bool),
+        restabilize: impl FnOnce(&str, Frozen) -> (Frozen, bool),
+    ) -> Result<Option<String>> {
         let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
         let op = crate::ids::new_operation_id()?;
         let capturer = pause::Capturer {
@@ -1548,6 +1788,7 @@ impl Served {
             return Err(e);
         }
         let _ = pause::clear_intent(&self.state, &self.session);
+        self.held_unconfirmed = None;
         self.paused = Some(Paused {
             frozen,
             since: Instant::now(),
@@ -1564,6 +1805,13 @@ impl Served {
     /// `op` does not own — released already, or ended by a stop — is nothing
     /// to release.
     fn release_capture(&mut self, op: &str) -> Result<Option<EventRecord>> {
+        let released = self.release_capture_entered(op);
+        self.publish();
+        released
+    }
+
+    /// [`Self::release_capture`]; idempotent, so it needs no transition.
+    fn release_capture_entered(&mut self, op: &str) -> Result<Option<EventRecord>> {
         if !self
             .paused
             .as_ref()
@@ -1622,9 +1870,19 @@ impl Served {
         freeze: impl FnOnce(&str) -> (Frozen, bool),
         restabilize: impl FnOnce(&str, Frozen) -> (Frozen, bool),
     ) -> Result<Option<u32>> {
-        if self.log.is_none() {
-            return Err(Error::Daemon("log is sealed".into()));
-        }
+        self.enter(Operation::HoldForStop)?;
+        let held = self.hold_for_stop_entered(reason, freeze, restabilize);
+        self.publish();
+        held
+    }
+
+    /// [`Self::hold_for_stop_with`] once the transition is admitted.
+    fn hold_for_stop_entered(
+        &mut self,
+        reason: &str,
+        freeze: impl FnOnce(&str) -> (Frozen, bool),
+        restabilize: impl FnOnce(&str, Frozen) -> (Frozen, bool),
+    ) -> Result<Option<u32>> {
         let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
         self.record_intent(pause::Verb::Pause {
             reason: pause::reason_text(reason),
@@ -1648,6 +1906,8 @@ impl Served {
             let mut holders = paused.holders;
             holders.stop = true;
             let owners = pause::write_held_by(&self.state, &self.session, &holders);
+            self.report_freeze(&frozen, unsettled);
+            self.held_unconfirmed = Self::hold_uncertainty(unsettled, None);
             self.paused = Some(Paused {
                 frozen,
                 since: paused.since,
@@ -1659,6 +1919,7 @@ impl Served {
             let _ = pause::clear_intent(&self.state, &self.session);
             let acks = self.confirm_components(Phase::Held);
             if let Some(ack) = acks::first_unconfirmed(&acks) {
+                self.held_unconfirmed = Self::hold_uncertainty(unsettled, Some(ack));
                 return Err(self.hold_unconfirmed(ack));
             }
             return Ok(unsettled);
@@ -1681,6 +1942,8 @@ impl Served {
         let method = frozen.method;
         let holders = pause::Holders::for_stop();
         let owners = pause::write_held_by(&self.state, &self.session, &holders);
+        self.report_freeze(&frozen, unsettled);
+        self.held_unconfirmed = Self::hold_uncertainty(unsettled, None);
         self.paused = Some(Paused {
             frozen,
             since: Instant::now(),
@@ -1690,6 +1953,9 @@ impl Served {
         owners?;
         let acks = self.confirm_components(Phase::Held);
         let unconfirmed = acks::first_unconfirmed(&acks).cloned();
+        if unconfirmed.is_some() {
+            self.held_unconfirmed = Self::hold_uncertainty(unsettled, unconfirmed.as_ref());
+        }
         let event = Self::hold_record(method, &reason, unsettled, unconfirmed.as_ref());
         // The hold is never undone for a log-only failure: it is the safest
         // state, and the stop that follows ends it.
@@ -1759,6 +2025,23 @@ impl Served {
         if self.log.is_none() {
             return self.handle_appendable(conn, Request::Stop { reason });
         }
+        // #145 item 1: a stop is admitted from running, from paused and as the
+        // retry of an incomplete one; `stopping` is published while it runs.
+        if let Err(e) = self.enter(Operation::Stop) {
+            return (Response::Error(refusal(e)), false);
+        }
+        let stopped = self.stop_entered(conn, reason, terminate);
+        self.publish();
+        stopped
+    }
+
+    /// [`Self::stop`] once the transition is admitted.
+    fn stop_entered(
+        &mut self,
+        conn: u64,
+        reason: ward_events::EndReason,
+        terminate: impl FnOnce(&str, Option<Frozen>) -> pause::Termination,
+    ) -> (Response, bool) {
         if let Err(e) = self.record_intent(pause::Verb::Stop { reason }) {
             return (
                 Response::Error(format!(
@@ -1870,6 +2153,18 @@ impl Served {
         let ended = outcome.ended.saturating_add(carried);
         let pending = outcome.pending();
         let barrier_confirmed = outcome.barrier_confirmed;
+        self.report_progress(
+            Progress::PROCESSES,
+            outcome.remaining.is_none(),
+            format!(
+                "{ended} ended, {pending} pending, barrier {}",
+                if barrier_confirmed {
+                    "confirmed"
+                } else {
+                    "not confirmed"
+                }
+            ),
+        );
         let Some(remaining) = outcome.remaining else {
             let acks = self.confirm_components(Phase::Held);
             if let Some(ack) = acks::first_unconfirmed(&acks) {
@@ -1896,8 +2191,21 @@ impl Served {
             }
             return Ok(ended);
         };
-        // Not confirmed: hold the session for the stop over whatever is still
-        // there — an incomplete stop, not a pause.
+        Err(self.hold_for_incomplete_stop(remaining, since, ended, barrier_confirmed))
+    }
+
+    /// The refused half of [`Self::end_workloads`]: termination was not
+    /// confirmed, so the session is held for the stop over whatever is still
+    /// there (`remaining`) — an incomplete stop, not a pause — and
+    /// `WorkloadsTerminated { pending, barrier_confirmed }` records it durably.
+    fn hold_for_incomplete_stop(
+        &mut self,
+        remaining: Frozen,
+        since: Option<Instant>,
+        ended: u32,
+        barrier_confirmed: bool,
+    ) -> Error {
+        let pending = u32::try_from(remaining.pids.len()).unwrap_or(u32::MAX);
         let marker = pause::write_marker(
             &self.state,
             &self.session,
@@ -1905,6 +2213,11 @@ impl Served {
         )
         .err();
         let _ = pause::write_held_by(&self.state, &self.session, &pause::Holders::for_stop());
+        self.held_unconfirmed = Some(if pending > 0 {
+            format!("{pending} process(es) not confirmed ended")
+        } else {
+            "membership barrier unconfirmed".to_owned()
+        });
         self.paused = Some(Paused {
             frozen: remaining,
             since: since.unwrap_or_else(Instant::now),
@@ -1934,14 +2247,14 @@ impl Served {
              session is quiescent even though no known pid remains. The session is held \
              for the stop; `ward resume` cannot release it. Run `ward stop` again to retry"
         };
-        Err(Error::Daemon(pause::stop_refusal(
+        Error::Daemon(pause::stop_refusal(
             &self.session,
             ended,
             pending,
             detail,
             marker.as_ref(),
             logged.as_ref(),
-        )))
+        ))
     }
 
     /// A stop whose processes are all confirmed gone but whose hold a component
@@ -1973,6 +2286,7 @@ impl Served {
             holders: pause::Holders::for_stop(),
             ended,
         });
+        self.held_unconfirmed = Some(ack.text());
         let logged = self
             .append(Self::hold_record(
                 method,
@@ -2047,39 +2361,32 @@ impl Served {
         freeze: impl FnOnce(&str) -> (Frozen, bool),
         terminate: impl FnOnce(&str, Option<Frozen>) -> pause::Termination,
     ) -> Result<bool> {
+        let outcome = self.reconcile_entered(freeze, terminate);
+        self.publish();
+        outcome
+    }
+
+    /// [`Self::reconcile_lifecycle_with`]'s body; the lifecycle it leaves is
+    /// published whatever it returns.
+    fn reconcile_entered(
+        &mut self,
+        freeze: impl FnOnce(&str) -> (Frozen, bool),
+        terminate: impl FnOnce(&str, Option<Frozen>) -> pause::Termination,
+    ) -> Result<bool> {
         let tail = read_log_tail(&self.log_path)?;
         self.last_agent_state = tail.last_agent_state;
-        self.open_launches = tail
-            .open_launches
-            .into_iter()
-            .map(|(seq, pid)| (Self::INTERNAL_CONN, seq, pid))
-            .collect();
+        // The launch register (#145 item 2): every handle this session ever
+        // admitted. A launch the log still has open but the register says
+        // the connection abandoned (`Unknown`) is not reopened as though it
+        // were still confirmed running; everything else the log says is open
+        // is open.
+        self.read_launch_register(tail.open_launches)?;
         let marker = pause::marker_path(&self.state, &self.session);
         match pause::read_intent(&self.state, &self.session)? {
             Some(pause::Intent {
                 verb: pause::Verb::Stop { reason },
                 ..
-            }) => {
-                if marker.exists() {
-                    let (reason, since) = marker_facts(&marker);
-                    let mut holders = self.recorded_holders()?;
-                    holders.stop = true;
-                    self.adopt_hold(&reason, since, true, holders, freeze)?;
-                }
-                let (response, sealed) = self.stop(Self::INTERNAL_CONN, reason, terminate);
-                if pause::intent_path(&self.state, &self.session).exists() {
-                    let outcome = match response {
-                        Response::Error(e) => e,
-                        other => format!("unexpected response {other:?}"),
-                    };
-                    return Err(Error::Daemon(format!(
-                        "the stop of session {} that a previous process began could not be \
-                         finished: {outcome}",
-                        self.session
-                    )));
-                }
-                Ok(sealed)
-            }
+            }) => self.finish_stop(reason, tail.unconfirmed.as_deref(), freeze, terminate),
             Some(pause::Intent {
                 verb: pause::Verb::Pause { reason },
                 started_unix_ms,
@@ -2091,9 +2398,30 @@ impl Served {
                     &pause::reason_text(&reason),
                     instant_at(started_unix_ms),
                     tail.held,
+                    tail.unconfirmed.as_deref(),
                     holders,
                     freeze,
                 )?;
+                pause::clear_intent(&self.state, &self.session)?;
+                Ok(false)
+            }
+            // A resume died between its first release and its record (#145
+            // item 1): finished as the resume would have finished — every
+            // component confirmed released, the tree thawed, `SessionResumed`
+            // appended if the log still says held. A release a component does
+            // not confirm leaves the session held as the user's, for the next
+            // `ward resume` to retry; nothing is left frozen with no marker.
+            Some(pause::Intent {
+                verb: pause::Verb::Resume,
+                started_unix_ms,
+                ..
+            }) => {
+                let since = if marker.exists() {
+                    marker_facts(&marker).1
+                } else {
+                    instant_at(started_unix_ms)
+                };
+                self.finish_resume(since, tail.held, freeze)?;
                 pause::clear_intent(&self.state, &self.session)?;
                 Ok(false)
             }
@@ -2112,7 +2440,14 @@ impl Served {
                 if holders.is_empty() {
                     self.release_orphaned_hold(since, tail.held, freeze)?;
                 } else {
-                    self.adopt_hold(&reason, since, tail.held, holders, freeze)?;
+                    self.adopt_hold(
+                        &reason,
+                        since,
+                        tail.held,
+                        tail.unconfirmed.as_deref(),
+                        holders,
+                        freeze,
+                    )?;
                 }
                 pause::clear_intent(&self.state, &self.session)?;
                 Ok(false)
@@ -2123,12 +2458,75 @@ impl Served {
                 if holders.is_empty() {
                     self.release_orphaned_hold(since, tail.held, freeze)?;
                 } else {
-                    self.adopt_hold(&reason, since, tail.held, holders, freeze)?;
+                    self.adopt_hold(
+                        &reason,
+                        since,
+                        tail.held,
+                        tail.unconfirmed.as_deref(),
+                        holders,
+                        freeze,
+                    )?;
                 }
                 Ok(false)
             }
             None => Ok(false),
         }
+    }
+
+    /// Read the launch register back (#145 item 2) and merge it with the
+    /// launches the log still has open (`open`): a launch the register says
+    /// its connection abandoned (`Unknown`) is not reopened as though it were
+    /// still confirmed running, and a launch the log opened under a daemon
+    /// that predates the register is registered now.
+    fn read_launch_register(&mut self, open: Vec<(u64, Pid)>) -> Result<()> {
+        self.launches = launches::read(&self.state, &self.session)?;
+        self.open_launches = open
+            .into_iter()
+            .filter(|(seq, _)| self.launches.state_of(*seq) != Some(LaunchState::Unknown))
+            .map(|(seq, pid)| (Self::INTERNAL_CONN, seq, pid))
+            .collect();
+        for &(_, seq, pid) in &self.open_launches {
+            if self.launches.state_of(seq).is_none() {
+                self.launches
+                    .admit(seq, pid, control::unix_ms(SystemTime::now()));
+                let _ = launches::write(&self.state, &self.session, &self.launches);
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish a stop a previous process began (#145 item 7): a hold the marker
+    /// says is in force is rebuilt first, from what `/proc` shows now, so the
+    /// stop retries over it; then the stop runs exactly as a client's retry
+    /// would. Returns whether that sealed the log, or an error — the intent
+    /// left in place — when the stop reached neither of its durable outcomes.
+    fn finish_stop(
+        &mut self,
+        reason: ward_events::EndReason,
+        logged_uncertainty: Option<&str>,
+        freeze: impl FnOnce(&str) -> (Frozen, bool),
+        terminate: impl FnOnce(&str, Option<Frozen>) -> pause::Termination,
+    ) -> Result<bool> {
+        let marker = pause::marker_path(&self.state, &self.session);
+        if marker.exists() {
+            let (reason, since) = marker_facts(&marker);
+            let mut holders = self.recorded_holders()?;
+            holders.stop = true;
+            self.adopt_hold(&reason, since, true, logged_uncertainty, holders, freeze)?;
+        }
+        let (response, sealed) = self.stop(Self::INTERNAL_CONN, reason, terminate);
+        if pause::intent_path(&self.state, &self.session).exists() {
+            let outcome = match response {
+                Response::Error(e) => e,
+                other => format!("unexpected response {other:?}"),
+            };
+            return Err(Error::Daemon(format!(
+                "the stop of session {} that a previous process began could not be finished: \
+                 {outcome}",
+                self.session
+            )));
+        }
+        Ok(sealed)
     }
 
     /// Who the previous process recorded as holding the session
@@ -2164,6 +2562,7 @@ impl Served {
         reason: &str,
         since: Instant,
         recorded: bool,
+        logged_uncertainty: Option<&str>,
         holders: pause::Holders,
         freeze: impl FnOnce(&str) -> (Frozen, bool),
     ) -> Result<()> {
@@ -2174,16 +2573,23 @@ impl Served {
         }
         pause::write_held_by(&self.state, &self.session, &holders)?;
         self.approvals.set_paused(true);
+        let unsettled = pause::unsettled_count(&frozen, stable);
         let acks = self.confirm_components(Phase::Held);
         let unconfirmed = acks::first_unconfirmed(&acks);
         if !recorded || unconfirmed.is_some() {
             self.append(Self::hold_record(
                 frozen.method,
                 reason,
-                pause::unsettled_count(&frozen, stable),
+                unsettled,
                 unconfirmed,
             ))?;
         }
+        // What this hold cannot confirm (#145 item 1): what the daemon found
+        // now, or — when it found everything confirmed — what the log's own
+        // last hold record still says is uncertain, so the lifecycle never
+        // reads `paused` while the log reads unsettled.
+        self.held_unconfirmed = Self::hold_uncertainty(unsettled, unconfirmed)
+            .or_else(|| logged_uncertainty.map(str::to_owned));
         self.paused = Some(Paused {
             frozen,
             since,
@@ -2191,6 +2597,48 @@ impl Served {
             ended: 0,
         });
         Ok(())
+    }
+
+    /// Finish a resume a previous process began (#145 item 1): what `/proc`
+    /// shows of the session is taken as the user's hold — approvals held, the
+    /// marker rewritten if it is gone — and released through the same
+    /// confirmed release a resume performs ([`Self::release_hold`]),
+    /// appending `SessionResumed` only when the log still says held. A
+    /// release a component does not confirm leaves the session held as the
+    /// user's, which the next `ward resume` retries.
+    fn finish_resume(
+        &mut self,
+        since: Instant,
+        recorded: bool,
+        freeze: impl FnOnce(&str) -> (Frozen, bool),
+    ) -> Result<()> {
+        let _lock = pause::lock_pause_freeze(&session_dir(&self.state, &self.session))?;
+        let (frozen, _) = freeze(&self.session);
+        let paused = Paused {
+            frozen,
+            since,
+            holders: pause::Holders::for_user(),
+            ended: 0,
+        };
+        self.held_unconfirmed = None;
+        if !recorded {
+            // The log already says resumed: only the tree (and whatever the
+            // dying resume left) is to be let go.
+            self.approvals.set_paused(false);
+            let _ = pause::clear_marker(&self.state, &self.session);
+            let _ = pause::clear_held_by(&self.state, &self.session);
+            pause::thaw(&paused.frozen);
+            return Ok(());
+        }
+        if !pause::marker_path(&self.state, &self.session).exists() {
+            pause::write_marker(&self.state, &self.session, pause::DEFAULT_REASON)?;
+        }
+        pause::write_held_by(&self.state, &self.session, &paused.holders)?;
+        self.approvals.set_paused(true);
+        match self.release_hold(paused) {
+            Ok(_) | Err(Error::Daemon(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Release a hold no owner remains for (#145 item 6): a capture's whose
@@ -2214,6 +2662,7 @@ impl Served {
             holders: pause::Holders::default(),
             ended: 0,
         };
+        self.held_unconfirmed = None;
         if !recorded {
             self.approvals.set_paused(false);
             let _ = pause::clear_marker(&self.state, &self.session);
@@ -2230,21 +2679,50 @@ impl Served {
 
     /// Start a subscription from `from_seq`: everything in the log so far, and a
     /// channel for what comes next. Called under the mutex so no append falls
-    /// between the two.
+    /// between the two. What [`stream_subscription`] does in two steps, for
+    /// the daemon's own tests.
+    #[cfg(test)]
     fn subscribe(&mut self, from_seq: u64) -> Result<Subscription> {
-        let replay = LogReader::open(&self.log_path)
-            .map_err(|e| Error::Events(e.to_string()))?
-            .map_while(std::result::Result::ok)
-            .filter(|r| r.seq >= from_seq)
-            .collect();
-        let live = self.log.as_ref().map(|_| {
-            let (tx, rx) = channel();
-            let watcher = tx.clone();
-            self.subscribers.push(tx);
-            (rx, watcher)
-        });
+        let (boundary, live) = self.begin_subscription();
+        let replay = read_replay(&self.log_path, from_seq, boundary)?;
         Ok(Subscription { replay, live })
     }
+
+    /// Fix a subscription's boundary (#145 item 8): the sequence the next
+    /// record appended will get, and the live channel registered in the same
+    /// step, so every record before the boundary is in the log already and
+    /// every record from it on arrives through the channel — no gap, no
+    /// duplicate. Only this runs under the daemon's mutex; the replay itself
+    /// ([`read_replay`], as long as the log is) is read outside it, so a
+    /// subscriber replaying a long log never delays a pause or a stop waiting
+    /// on the mutex behind it. A sealed log has no live half: the boundary is
+    /// then the whole log.
+    fn begin_subscription(&mut self) -> (u64, Option<LiveChannel>) {
+        match self.log.as_ref() {
+            Some(log) => {
+                let boundary = log.next_seq();
+                let (tx, rx) = channel();
+                let watcher = tx.clone();
+                self.subscribers.push(tx);
+                (boundary, Some((rx, watcher)))
+            }
+            None => (u64::MAX, None),
+        }
+    }
+}
+
+/// The records of `log_path` with `from_seq <= seq < boundary`
+/// ([`Served::begin_subscription`]). Every record below the boundary was
+/// written whole before the boundary was fixed (the log writer writes each
+/// frame through to the file under the mutex), so a read after the mutex is
+/// released sees all of them; a frame still being written belongs to a record
+/// at or past the boundary, which the live channel delivers.
+fn read_replay(log_path: &Path, from_seq: u64, boundary: u64) -> Result<Vec<EventRecord>> {
+    Ok(LogReader::open(log_path)
+        .map_err(|e| Error::Events(e.to_string()))?
+        .map_while(std::result::Result::ok)
+        .filter(|r| r.seq >= from_seq && r.seq < boundary)
+        .collect())
 }
 
 /// What a daemon restarted on a session reads back from its log before it
@@ -2260,6 +2738,9 @@ struct LogTail {
     /// Every `CommandStarted` (its seq and pid) without a `CommandFinished` or
     /// `LaunchAborted` for the same pid after it.
     open_launches: Vec<(u64, Pid)>,
+    /// What the log's last hold record could not confirm
+    /// ([`acks::unsettled_detail`]), while `held`.
+    unconfirmed: Option<String>,
 }
 
 fn read_log_tail(log_path: &Path) -> Result<LogTail> {
@@ -2267,6 +2748,7 @@ fn read_log_tail(log_path: &Path) -> Result<LogTail> {
         held: false,
         last_agent_state: None,
         open_launches: Vec::new(),
+        unconfirmed: None,
     };
     for record in LogReader::open(log_path)
         .map_err(|e| Error::Events(e.to_string()))?
@@ -2274,15 +2756,36 @@ fn read_log_tail(log_path: &Path) -> Result<LogTail> {
     {
         match record.event {
             WardEvent::AgentStateChanged { state } => tail.last_agent_state = Some(state),
-            WardEvent::SessionPaused { .. } | WardEvent::SessionPauseUnsettled { .. } => {
+            WardEvent::SessionPaused { .. } => {
                 tail.held = true;
+                tail.unconfirmed = None;
             }
-            WardEvent::SessionResumed { .. } => tail.held = false,
+            WardEvent::SessionPauseUnsettled {
+                ref reason,
+                pending,
+                ..
+            } => {
+                tail.held = true;
+                tail.unconfirmed = Some(acks::unsettled_detail(reason.as_str(), pending));
+            }
+            WardEvent::SessionResumed { .. } => {
+                tail.held = false;
+                tail.unconfirmed = None;
+            }
             WardEvent::WorkloadsTerminated {
                 pending,
                 barrier_confirmed,
                 ..
-            } => tail.held = pending > 0 || !barrier_confirmed,
+            } => {
+                tail.held = pending > 0 || !barrier_confirmed;
+                tail.unconfirmed = if pending > 0 {
+                    Some(format!("{pending} process(es) not confirmed ended"))
+                } else if !barrier_confirmed {
+                    Some("membership barrier unconfirmed".to_owned())
+                } else {
+                    None
+                };
+            }
             WardEvent::CommandStarted { pid, .. } => tail.open_launches.push((record.seq, pid)),
             WardEvent::CommandFinished { pid, .. } | WardEvent::LaunchAborted { pid, .. } => {
                 if let Some(pos) = tail.open_launches.iter().rposition(|(_, p)| *p == pid) {
@@ -2317,8 +2820,8 @@ fn instant_at(unix_ms: u64) -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
-fn lock(served: &Mutex<Served>) -> MutexGuard<'_, Served> {
-    served.lock().unwrap_or_else(PoisonError::into_inner)
+fn lock<T>(shared: &Mutex<T>) -> MutexGuard<'_, T> {
+    shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The text of a refusal on the wire: the daemon's own errors without their
@@ -2343,12 +2846,19 @@ fn write_line(writer: &mut UnixStream, response: &Response) -> std::io::Result<(
 /// so a `CommandStarted`/`CredentialGranted`/`CommandFinished` this connection
 /// appends is attributed to and retired with this connection's own launch, never
 /// another connection's (PR #197 review, finding 2).
-fn serve_stream(stream: UnixStream, served: &Arc<Mutex<Served>>, conn: u64) -> bool {
+fn serve_stream(
+    stream: UnixStream,
+    served: &Arc<Mutex<Served>>,
+    lifecycle: &Arc<Mutex<LifecycleReport>>,
+    conn: u64,
+) -> bool {
     let Ok(mut writer) = stream.try_clone() else {
         return false;
     };
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
+    // #145 item 8: whether this connection asked for per-component progress.
+    let mut progress = false;
     loop {
         line.clear();
         // Bound each request line so a newline-less stream cannot grow `line`
@@ -2373,6 +2883,31 @@ fn serve_stream(stream: UnixStream, served: &Arc<Mutex<Served>>, conn: u64) -> b
                 timeout_secs,
             }) => (hold(served, &tool, &summary, &reason, timeout_secs), false),
             Ok(Request::Revoke { id }) => (revoke(served, id), false),
+            // The status lane (#145 item 1): answered from what the daemon
+            // last published, never behind its mutex, so a pause waiting on a
+            // component's acknowledgement answers `pausing` meanwhile.
+            Ok(Request::Lifecycle) => (Response::Lifecycle(lock(lifecycle).clone()), false),
+            Ok(Request::ReportProgress) => {
+                progress = true;
+                (Response::Ok, false)
+            }
+            Ok(
+                request @ (Request::Pause { .. }
+                | Request::Resume
+                | Request::Stop { .. }
+                | Request::HoldForStop { .. }),
+            ) if progress => {
+                let Ok(mut reporter) = writer.try_clone() else {
+                    return false;
+                };
+                let mut s = lock(served);
+                s.progress = Some(Box::new(move |p: &Progress| {
+                    let _ = write_line(&mut reporter, &Response::Progress(p.clone()));
+                }));
+                let answered = s.handle_conn(conn, request);
+                s.progress = None;
+                answered
+            }
             Ok(request) => lock(served).handle_conn(conn, request),
             Err(e) => (Response::Error(format!("bad request: {e}")), false),
         };
@@ -2591,12 +3126,32 @@ fn revoke_bounded_inner(
 /// client hangs up or the log is sealed.
 fn stream_subscription(
     reader: BufReader<UnixStream>,
-    mut writer: UnixStream,
+    writer: UnixStream,
     served: &Arc<Mutex<Served>>,
     from_seq: u64,
 ) {
-    let subscription = match lock(served).subscribe(from_seq) {
-        Ok(s) => s,
+    stream_subscription_with(reader, writer, served, from_seq, read_replay);
+}
+
+/// [`stream_subscription`] with the replay read injectable: the seam a test
+/// uses to hold a replay mid-read and prove a pause is not waiting behind it
+/// (#145 item 8). The boundary and the live channel are fixed under the
+/// mutex ([`Served::begin_subscription`]); the replay is read with it
+/// released.
+fn stream_subscription_with(
+    reader: BufReader<UnixStream>,
+    mut writer: UnixStream,
+    served: &Arc<Mutex<Served>>,
+    from_seq: u64,
+    read_replay: impl FnOnce(&Path, u64, u64) -> Result<Vec<EventRecord>>,
+) {
+    let (log_path, boundary, live) = {
+        let mut s = lock(served);
+        let (boundary, live) = s.begin_subscription();
+        (s.log_path.clone(), boundary, live)
+    };
+    let subscription = match read_replay(&log_path, from_seq, boundary) {
+        Ok(replay) => Subscription { replay, live },
         Err(e) => {
             let _ = write_line(&mut writer, &Response::Error(e.to_string()));
             return;
@@ -7496,5 +8051,576 @@ mod tests {
         assert!(matches!(record.event, WardEvent::SessionResumed { .. }));
         assert!(served.paused.is_none());
         assert!(!pause::marker_path(dir.path(), "sess_9").exists());
+    }
+
+    fn command_started(pid: u32) -> WardEvent {
+        use ward_events::{BoundedArgv, Pid, SandboxPath, SandboxRoot};
+        WardEvent::CommandStarted {
+            pid: Pid::new(pid).unwrap(),
+            parent: Pid::new(1).unwrap(),
+            argv: BoundedArgv::from_bytes([b"agent".as_slice()]),
+            cwd: SandboxPath::new(SandboxRoot::Work, ".").unwrap(),
+            exe_digest: None,
+        }
+    }
+
+    fn command_finished(pid: u32) -> WardEvent {
+        WardEvent::CommandFinished {
+            pid: ward_events::Pid::new(pid).unwrap(),
+            exit: ward_events::ExitStatus::Exited { code: 0 },
+            duration: Duration::from_millis(5),
+        }
+    }
+
+    fn appended(event: WardEvent) -> Request {
+        Request::Append {
+            origin: Origin::Kernel,
+            event,
+            at_unix_ms: 1,
+        }
+    }
+
+    fn lane_of(served: &Served) -> LifecycleReport {
+        lock(&served.lane).clone()
+    }
+
+    /// #145 item 1: the lifecycle is explicit and every request outside its
+    /// state is refused naming the state — in the words existing clients read
+    /// where those already existed (`already paused`, `not paused`, `log is
+    /// sealed`, the stop that has begun), and naming the state otherwise.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn the_lifecycle_is_explicit_and_requests_outside_their_state_are_refused_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        assert_eq!(served.lifecycle(), Lifecycle::Running);
+        assert_eq!(lane_of(&served), LifecycleReport::of(Lifecycle::Running));
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Error(e) if e == "not paused"
+        ));
+
+        assert!(matches!(
+            served
+                .handle(Request::Pause {
+                    reason: "looks wrong".into()
+                })
+                .0,
+            Response::Paused {
+                unsettled: None,
+                unconfirmed: None,
+                ..
+            }
+        ));
+        assert_eq!(served.lifecycle(), Lifecycle::Paused);
+        let lane = lane_of(&served);
+        assert_eq!(lane.state, Lifecycle::Paused);
+        assert_eq!(lane.held_by, [pause::Owner::User]);
+        assert_eq!(lane.detail, None);
+        assert!(matches!(
+            served.handle(Request::Pause { reason: String::new() }).0,
+            Response::Error(e) if e == "already paused"
+        ));
+        assert!(
+            pause::admit_launch(dir.path(), "sess_9")
+                .unwrap_err()
+                .to_string()
+                .contains(pause::PAUSED_REFUSAL)
+        );
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Record(_)
+        ));
+        assert_eq!(served.lifecycle(), Lifecycle::Running);
+        assert_eq!(lane_of(&served).state, Lifecycle::Running);
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+
+        // A stop has begun (its marker) and nothing is held in memory: a
+        // retry goes on; a pause, a resume and a capture are refused naming it.
+        pause::write_stop_marker(dir.path(), "sess_9").unwrap();
+        assert_eq!(served.lifecycle(), Lifecycle::Stopping);
+        // The marker makes even a user's hold a stop's, as `resume` always read it.
+        served.paused = Some(Paused {
+            frozen: no_sandbox("").0,
+            since: Instant::now(),
+            holders: pause::Holders::for_user(),
+            ended: 0,
+        });
+        assert_eq!(served.lifecycle(), Lifecycle::Stopping);
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Error(e) if e.contains("has begun and not completed")
+        ));
+        served.paused = None;
+        let (response, _) = served.handle(Request::Pause {
+            reason: String::new(),
+        });
+        assert!(
+            matches!(&response, Response::Error(e) if e.contains("session sess_9 is stopping")),
+            "{response:?}"
+        );
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Error(e) if e.contains("has begun and not completed")
+        ));
+        let (response, _) = served.handle(Request::HoldForCapture {
+            reason: pause::capture_reason("x"),
+            pid: std::process::id(),
+            started: pause::own_start_time(),
+        });
+        assert!(
+            matches!(&response, Response::Error(e) if e.contains("is stopping")),
+            "{response:?}"
+        );
+        assert!(matches!(
+            served
+                .handle(Request::Pause {
+                    reason: String::new()
+                })
+                .0,
+            Response::Error(_)
+        ));
+        let (response, done) = served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+            pause::Termination::confirmed(0)
+        });
+        assert!(matches!(response, Response::Sealed { ended: Some(0), .. }));
+        assert!(done);
+        assert_eq!(served.lifecycle(), Lifecycle::Stopped);
+        assert_eq!(lane_of(&served).state, Lifecycle::Stopped);
+        for request in [
+            Request::Pause {
+                reason: String::new(),
+            },
+            Request::Resume,
+            Request::HoldForStop {
+                reason: String::new(),
+            },
+            Request::HoldForCapture {
+                reason: String::new(),
+                pid: 1,
+                started: String::new(),
+            },
+        ] {
+            let (response, _) = served.handle(request.clone());
+            assert!(
+                matches!(&response, Response::Error(e) if e == "log is sealed"),
+                "{request:?}: {response:?}"
+            );
+        }
+    }
+
+    /// #145 item 1: a hold that could not be confirmed is `Incomplete` — in
+    /// memory, on the lane and on disk alike, naming what is uncertain — never
+    /// `Paused` or `Stopping`; the retry that confirms it moves on.
+    #[test]
+    fn an_unconfirmed_hold_is_incomplete_everywhere_until_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        // An unsettled freeze.
+        let outcome = served.pause_with("looks wrong", |_| Some(1)).unwrap();
+        assert_eq!(outcome.unsettled, Some(1));
+        assert_eq!(served.lifecycle(), Lifecycle::Incomplete);
+        let lane = lane_of(&served);
+        assert_eq!(lane.state, Lifecycle::Incomplete);
+        assert_eq!(
+            lane.detail.as_deref(),
+            Some("1 process(es) not confirmed stopped")
+        );
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Record(_)
+        ));
+        assert_eq!(served.lifecycle(), Lifecycle::Running);
+
+        // A component that does not acknowledge.
+        scripted.refuse(acks::Component::Proxy, acks::Phase::Held, proxy_timeout());
+        let outcome = served.pause_with("again", |_| None).unwrap();
+        assert_eq!(outcome.unconfirmed.as_deref(), Some(PROXY_UNCONFIRMED));
+        assert_eq!(served.lifecycle(), Lifecycle::Incomplete);
+        assert_eq!(lane_of(&served).detail.as_deref(), Some(PROXY_UNCONFIRMED));
+        scripted.relent();
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Record(_)
+        ));
+
+        // A stop that cannot confirm termination: incomplete, held for the
+        // stop, and the retry that confirms it ends the session.
+        let (response, done) = served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+            pause::Termination {
+                ended: 1,
+                remaining: Some(stuck(77)),
+                barrier_confirmed: true,
+                method: ward_events::PauseMethod::Sigstop,
+            }
+        });
+        assert!(matches!(response, Response::Error(_)));
+        assert!(!done);
+        assert_eq!(served.lifecycle(), Lifecycle::Incomplete);
+        let lane = lane_of(&served);
+        assert_eq!(lane.held_by, [pause::Owner::Stop]);
+        assert_eq!(
+            lane.detail.as_deref(),
+            Some("1 process(es) not confirmed ended")
+        );
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Error(e) if e.contains("has begun and not completed")
+        ));
+        let (response, done) = served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+            pause::Termination::confirmed(1)
+        });
+        assert!(matches!(response, Response::Sealed { ended: Some(1), .. }));
+        assert!(done);
+        assert_eq!(lane_of(&served).state, Lifecycle::Stopped);
+    }
+
+    /// A stand-in component that does not answer until told to: what a pause
+    /// waiting on the egress proxy looks like from the lane.
+    struct Blocking {
+        until: Receiver<()>,
+    }
+
+    impl acks::Acknowledger for Blocking {
+        fn confirm(
+            &mut self,
+            component: acks::Component,
+            phase: acks::Phase,
+            _: &acks::Site<'_>,
+        ) -> acks::Outcome {
+            if component == acks::Component::Proxy && phase == acks::Phase::Held {
+                self.until.recv().unwrap();
+            }
+            acks::Outcome::Acknowledged
+        }
+    }
+
+    /// #145 item 1: while a pause holds the daemon's mutex waiting on a
+    /// component, the lane already reads `pausing` with the operation named —
+    /// what `Request::Lifecycle` answers from, without the mutex.
+    #[test]
+    fn the_lane_reads_pausing_while_a_pause_waits_on_a_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let (release, until) = channel();
+        served.acks = Box::new(Blocking { until });
+        let lane = Arc::clone(&served.lane);
+        let served = Arc::new(Mutex::new(served));
+        let pausing = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || {
+                lock(&served).handle(Request::Pause {
+                    reason: "looks wrong".into(),
+                })
+            })
+        };
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                lock(&lane).state == Lifecycle::Pausing
+            }),
+            "{:?}",
+            lock(&lane)
+        );
+        let in_flight = lock(&lane).clone();
+        assert!(in_flight.op.is_some(), "{in_flight:?}");
+        assert!(
+            served.try_lock().is_err(),
+            "the pause holds the daemon's mutex meanwhile"
+        );
+        // The lane publishes `pausing` as soon as the transition is admitted;
+        // the intent the on-disk derivation reads is written a moment later in
+        // the same operation, so wait for it rather than assume both at once.
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                pause::lifecycle_on_disk(dir.path(), "sess_9")
+                    .is_ok_and(|on_disk| on_disk.state == Lifecycle::Pausing)
+            }),
+            "{:?}",
+            pause::lifecycle_on_disk(dir.path(), "sess_9")
+        );
+        release.send(()).unwrap();
+        assert!(matches!(pausing.join().unwrap().0, Response::Paused { .. }));
+        assert_eq!(lock(&lane).state, Lifecycle::Paused);
+        assert_eq!(lock(&lane).op, None);
+    }
+
+    /// #145 item 1: a resume records its intent before it releases anything,
+    /// a refused resume clears it with the hold standing, and a restart
+    /// mid-resume finishes the release — appending `SessionResumed` when the
+    /// log still says held, nothing when it already says resumed — so no tree
+    /// is left frozen with no marker saying so.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_resume_records_its_intent_and_a_restart_mid_resume_finishes_the_release() {
+        /// A component that reads the intent file back when asked to confirm
+        /// its release, and refuses.
+        struct Observing {
+            seen: Arc<Mutex<Option<pause::Intent>>>,
+            state: PathBuf,
+        }
+        impl acks::Acknowledger for Observing {
+            fn confirm(
+                &mut self,
+                _: acks::Component,
+                _: acks::Phase,
+                _: &acks::Site<'_>,
+            ) -> acks::Outcome {
+                *self.seen.lock().unwrap() = pause::read_intent(&self.state, "sess_9").unwrap();
+                acks::Outcome::Error("not yet".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        let scripted = Scripted::install(&mut served);
+        assert!(matches!(
+            served
+                .handle(Request::Pause {
+                    reason: String::new()
+                })
+                .0,
+            Response::Paused { .. }
+        ));
+        // The intent is on disk while the components are asked to release.
+        let seen = Arc::new(Mutex::new(None));
+        served.acks = Box::new(Observing {
+            seen: Arc::clone(&seen),
+            state: dir.path().to_path_buf(),
+        });
+        let (response, _) = served.handle(Request::Resume);
+        assert!(matches!(response, Response::Error(e) if e.contains("not yet")));
+        assert!(
+            matches!(
+                &*seen.lock().unwrap(),
+                Some(pause::Intent {
+                    verb: pause::Verb::Resume,
+                    ..
+                })
+            ),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        assert!(
+            !pause::intent_path(dir.path(), "sess_9").exists(),
+            "a refused resume has its outcome: the hold stands"
+        );
+        assert_eq!(served.lifecycle(), Lifecycle::Paused);
+        served.acks = Box::new(scripted);
+        assert!(matches!(
+            served.handle(Request::Resume).0,
+            Response::Record(_)
+        ));
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+
+        // A resume that died after clearing the marker, before the thaw and
+        // the record: the log says held, nothing on disk does.
+        assert!(matches!(
+            served
+                .handle(Request::Pause {
+                    reason: "again".into()
+                })
+                .0,
+            Response::Paused { .. }
+        ));
+        drop(served);
+        pause::write_intent(
+            dir.path(),
+            "sess_9",
+            &pause::Intent::begin(pause::Verb::Resume).unwrap(),
+        )
+        .unwrap();
+        pause::clear_marker(dir.path(), "sess_9").unwrap();
+        pause::clear_held_by(dir.path(), "sess_9").unwrap();
+        assert_eq!(
+            pause::lifecycle_on_disk(dir.path(), "sess_9")
+                .unwrap()
+                .state,
+            Lifecycle::Resuming
+        );
+        let mut served = restarted_served(dir.path(), "sess_9");
+        let sealed = served
+            .reconcile_lifecycle_with(no_sandbox, never_terminates)
+            .unwrap();
+        assert!(!sealed);
+        assert!(served.paused.is_none());
+        assert!(!served.approvals.paused());
+        assert!(!pause::marker_path(dir.path(), "sess_9").exists());
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+        assert_eq!(served.lifecycle(), Lifecycle::Running);
+        assert_eq!(lane_of(&served).state, Lifecycle::Running);
+        assert_eq!(
+            kinds_of(&mut served),
+            [
+                "SessionPaused",
+                "SessionResumed",
+                "SessionPaused",
+                "SessionResumed"
+            ]
+        );
+
+        // A resume that died after its record, before clearing its intent:
+        // nothing to append, the intent is cleared.
+        drop(served);
+        pause::write_intent(
+            dir.path(),
+            "sess_9",
+            &pause::Intent::begin(pause::Verb::Resume).unwrap(),
+        )
+        .unwrap();
+        let mut served = restarted_served(dir.path(), "sess_9");
+        assert!(
+            !served
+                .reconcile_lifecycle_with(no_sandbox, never_terminates)
+                .unwrap()
+        );
+        assert_eq!(kinds_of(&mut served).len(), 4, "no second SessionResumed");
+        assert!(!pause::intent_path(dir.path(), "sess_9").exists());
+        assert_eq!(served.lifecycle(), Lifecycle::Running);
+    }
+
+    /// #145 item 2: every launch has a stable handle from its admission — the
+    /// seq of its `CommandStarted` — recorded in the session's register with
+    /// how it ended, and a restarted daemon reads the register back: a launch
+    /// whose connection went away is not reopened as though it still ran.
+    #[test]
+    fn launch_handles_are_registered_from_admission_and_read_back_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let register = || launches::read(dir.path(), "sess_9").unwrap();
+        let first = {
+            let mut served = fresh_served(dir.path());
+            let Response::Record(started) = served.handle(appended(command_started(2))).0 else {
+                panic!("appended");
+            };
+            let first = started.seq;
+            assert_eq!(
+                register().open().map(|l| l.handle).collect::<Vec<_>>(),
+                [first]
+            );
+            assert_eq!(lane_of(&served).open_launches, [first]);
+            assert!(matches!(
+                served.handle(appended(command_finished(2))).0,
+                Response::Record(_)
+            ));
+            assert_eq!(register().state_of(first), Some(LaunchState::Finished));
+            assert!(lane_of(&served).open_launches.is_empty());
+
+            // A launch on a connection that then goes away.
+            let Response::Record(started) = served.handle_conn(7, appended(command_started(2))).0
+            else {
+                panic!("appended");
+            };
+            let abandoned = started.seq;
+            served.disconnect_open_launches(7);
+            assert_eq!(register().state_of(abandoned), Some(LaunchState::Unknown));
+            assert!(served.open_launches.is_empty());
+
+            // A launch still open when the daemon dies.
+            let Response::Record(started) = served.handle_conn(8, appended(command_started(3))).0
+            else {
+                panic!("appended");
+            };
+            assert_eq!(
+                register().open().map(|l| l.handle).collect::<Vec<_>>(),
+                [started.seq]
+            );
+            started.seq
+        };
+        let open = first;
+
+        let mut served = restarted_served(dir.path(), "sess_9");
+        assert!(
+            !served
+                .reconcile_lifecycle_with(no_sandbox, never_terminates)
+                .unwrap()
+        );
+        assert_eq!(
+            served
+                .open_launches
+                .iter()
+                .map(|(_, key, _)| *key)
+                .collect::<Vec<_>>(),
+            [open],
+            "the abandoned launch is not reopened"
+        );
+        assert_eq!(served.launches.launches.len(), 3);
+        assert_eq!(lane_of(&served).open_launches, [open]);
+        assert_eq!(
+            pause::lifecycle_on_disk(dir.path(), "sess_9")
+                .unwrap()
+                .open_launches,
+            [open]
+        );
+        // The stop terminalizes the open launch and the register says so.
+        let (response, done) = served.stop(Served::INTERNAL_CONN, EndReason::UserStop, |_, _| {
+            pause::Termination::confirmed(0)
+        });
+        assert!(matches!(response, Response::Sealed { .. }), "{response:?}");
+        assert!(done);
+        assert_eq!(register().state_of(open), Some(LaunchState::Aborted));
+        assert_eq!(register().open().count(), 0);
+    }
+
+    /// #145 item 8: a pause is not blocked behind a subscriber's replay. The
+    /// replay's boundary is fixed under the mutex and the log is read with it
+    /// released, so a pause landing while a replay is still being read
+    /// completes at once — and the subscriber still sees every record before
+    /// the boundary, the marker, and the pause's record live after it.
+    #[test]
+    fn a_pause_is_not_blocked_behind_a_subscribers_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+        for i in 0..5 {
+            assert!(matches!(served.handle(append(i)).0, Response::Record(_)));
+        }
+        let served = Arc::new(Mutex::new(served));
+        let (reading, started) = channel::<()>();
+        let (release, held) = channel::<()>();
+        let (daemon_end, client_end) = UnixStream::pair().unwrap();
+        let streaming = {
+            let served = Arc::clone(&served);
+            let writer = daemon_end.try_clone().unwrap();
+            std::thread::spawn(move || {
+                stream_subscription_with(
+                    BufReader::new(daemon_end),
+                    writer,
+                    &served,
+                    0,
+                    |path, from, boundary| {
+                        reading.send(()).unwrap();
+                        held.recv().unwrap();
+                        read_replay(path, from, boundary)
+                    },
+                );
+            })
+        };
+        started.recv().unwrap();
+        let asked = Instant::now();
+        let (response, _) = lock(&served).handle(Request::Pause {
+            reason: "mid-replay".into(),
+        });
+        assert!(matches!(response, Response::Paused { .. }), "{response:?}");
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "the pause did not wait for the replay: {:?}",
+            asked.elapsed()
+        );
+        release.send(()).unwrap();
+        let mut reader = BufReader::new(client_end.try_clone().unwrap());
+        let mut next = || {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<Response>(&line).unwrap()
+        };
+        for seq in 0..5 {
+            assert!(matches!(next(), Response::Record(r) if r.seq == seq));
+        }
+        assert!(matches!(next(), Response::CaughtUp { next_seq: 5 }));
+        assert!(matches!(
+            next(),
+            Response::Record(r) if r.seq == 5 && matches!(r.event, WardEvent::SessionPaused { .. })
+        ));
+        drop(client_end);
+        drop(reader);
+        streaming.join().unwrap();
     }
 }
