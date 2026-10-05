@@ -17,8 +17,17 @@
 //! session, or no daemon serving it, the text surfaces print [`NO_SESSION`],
 //! one line saying what to do next, and `bar --waybar` the empty module (the
 //! mark alone, dim).
+//!
+//! `bar --waybar --follow`, the mode Waybar's six trust-bar segments each run
+//! as their own process, tries the shared per-session worker ([`worker`],
+//! #138 item 2) before falling back to subscribing and digesting itself: one
+//! process keeps the one cache and the one daemon subscription all six
+//! segments used to keep independently, and every segment process becomes a
+//! thin relay of whatever that worker already computed.
 
 #![allow(clippy::missing_errors_doc, clippy::doc_markdown)]
+
+mod worker;
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -50,14 +59,16 @@ const SETTLE_MS: u64 = 250;
 /// How often `bar --follow` re-reads the worktree when the stream is quiet:
 /// an edit made outside the sandbox (the user's editor) is a change no record
 /// reports, and it must turn `VERIFY ✓` into `VERIFY ~ STALE` all the same.
-const TICK_MS: u64 = 2000;
+/// [`worker`] uses this same cadence for the one worktree it digests on
+/// behalf of every segment.
+pub(crate) const TICK_MS: u64 = 2000;
 
 /// The minimum time between two record-triggered digests (#138 item 3): a
 /// burst of records collapses into a bounded number of scans instead of one
 /// per record. A quiet tick always digests regardless of this interval — it
 /// is the safety net that catches an edit made outside the sandbox, which
 /// leaves no record for a burst to coalesce.
-const DIGEST_DEBOUNCE: Duration = Duration::from_millis(250);
+pub(crate) const DIGEST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// What the text surfaces say with no session: calm, and the two ways to get
 /// one (the command centre, or `ward init` then `ward claude` in a terminal),
@@ -97,9 +108,14 @@ enum Surface {
         #[arg(long, requires = "waybar")]
         follow: bool,
         /// Milliseconds between re-reads of the worktree while following and
-        /// the stream is quiet.
-        #[arg(long, requires = "follow", default_value_t = TICK_MS)]
-        tick_ms: u64,
+        /// the stream is quiet (default: `TICK_MS`, 2000). The shared worker
+        /// (#138 item 2) always runs on that default cadence — it cannot
+        /// honour a caller-chosen one, since it serves every connected
+        /// segment at once — so naming this explicitly bypasses the worker
+        /// and subscribes directly, the one way to actually get a different
+        /// tick; leaving it unset is what lets `--follow` use the worker.
+        #[arg(long, requires = "follow")]
+        tick_ms: Option<u64>,
     },
     /// The trust bar and the session panel behind its agent segment.
     Session,
@@ -139,26 +155,36 @@ enum Surface {
         #[arg(long)]
         lines: bool,
     },
+    /// The shared per-session projection worker (#138 item 2): subscribes to
+    /// the daemon once, keeps one cache, and serves every Waybar segment's
+    /// JSON from it over a local socket instead of each `bar --waybar
+    /// --follow` process subscribing and digesting on its own. Run by
+    /// `wardos-shell-worker.service`, not meant to be typed by a person —
+    /// hidden from `--help` accordingly.
+    #[command(hide = true)]
+    Worker,
 }
 
-/// A session as the shell sees it: its facts and its stream so far.
-struct Snapshot {
-    description: SessionDescription,
-    header: Header,
-    model: Model,
+/// A session as the shell sees it: its facts and its stream so far. Shared
+/// with [`worker`] (#138 item 2), which keeps exactly one of these per
+/// session instead of one per Waybar segment process.
+pub(crate) struct Snapshot {
+    pub(crate) description: SessionDescription,
+    pub(crate) header: Header,
+    pub(crate) model: Model,
 }
 
 /// The worktree reader behind the verify segment (ADR-0019 decision 1): a
 /// hash cache that stays warm across re-reads, and the session CAS the change
 /// count is diffed against. It never writes: the digest is the id the tree
 /// *would* get, computed the way `ward verify` captures a candidate.
-struct Digester {
+pub(crate) struct Digester {
     cache: HashCache,
     store: Option<SnapshotStore>,
 }
 
 impl Digester {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cache: HashCache::new(),
             store: SnapshotStore::open(state_root().join("cas")).ok(),
@@ -172,7 +198,7 @@ impl Digester {
     /// captured before the (possibly slow) digest, so a result — success or
     /// failure — that lost a race to a newer change is dropped rather than
     /// clobbering it.
-    fn observe(&mut self, s: &mut Snapshot) {
+    pub(crate) fn observe(&mut self, s: &mut Snapshot) {
         let opts = CaptureOptions {
             incremental: true,
             ..candidate_options()
@@ -212,13 +238,20 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     #[cfg(feature = "gui")]
     eprintln!("ward-shell: gui: toolkit pending E-10; printing the text surfaces");
+    // `--dir` unset is what every real Waybar segment and the worker itself
+    // both do (`config.jsonc`'s six `exec` lines never pass it): the common
+    // case the worker relay path is for. An explicit `--dir` names a
+    // specific project's session, which the desktop-wide worker does not
+    // parameterise by, so a caller that passed one keeps subscribing for
+    // itself ([`may_use_worker`] below), exactly as before this change.
+    let dir_given = cli.dir.is_some();
     let dir = cli.dir.unwrap_or_else(|| PathBuf::from("."));
     let settle = Duration::from_millis(cli.settle_ms);
     let surface = cli.surface.unwrap_or(Surface::Bar {
         waybar: false,
         segment: None,
         follow: false,
-        tick_ms: TICK_MS,
+        tick_ms: None,
     });
     let result = match surface {
         Surface::Bar {
@@ -231,10 +264,12 @@ fn main() -> ExitCode {
             settle,
             segment,
             follow,
-            Duration::from_millis(tick_ms),
+            Duration::from_millis(tick_ms.unwrap_or(TICK_MS)),
+            may_use_worker(dir_given, tick_ms),
         ),
         Surface::Launcher { query, lines: true } => launcher_lines(&dir, settle, &query),
         Surface::Switcher { lines } => switcher(settle, lines),
+        Surface::Worker => worker::run(&dir, &state_root(), settle),
         surface => text(&dir, settle, surface),
     };
     match result {
@@ -271,6 +306,23 @@ fn surface_text(snapshot: Option<&Snapshot>, surface: Surface) -> String {
     }
 }
 
+/// Whether `bar --waybar --follow` may ask the shared worker (#138 item 2)
+/// instead of subscribing for itself. Two things rule it out, each because
+/// the worker cannot honour what the caller asked for: an explicit `--dir`
+/// names a specific project's session, which the desktop-wide worker does
+/// not parameterise by (it always follows [`locate`]'s own default, "."); an
+/// explicit `--tick-ms` asks for a worktree re-read cadence, but the worker
+/// runs one cadence ([`TICK_MS`]) for every segment it serves at once and
+/// cannot honour a caller-chosen one. Silently relaying the worker's fixed
+/// cadence instead of the requested one would make `--tick-ms` — a
+/// documented, tested CLI option — a silent no-op once a worker happens to
+/// be running (review finding 2 on #331); bypassing the worker in that case
+/// keeps `--tick-ms` working exactly as it always has, through the
+/// unconditional direct-subscription path below.
+fn may_use_worker(dir_given: bool, tick_ms: Option<u64>) -> bool {
+    !dir_given && tick_ms.is_none()
+}
+
 /// `bar --waybar`: the module's JSON, once or on every change. Only a segment
 /// whose text or tone depends on freshness ([`SegmentName::needs_freshness`]:
 /// the whole bar, since it carries the verify segment, or `--segment verify`
@@ -289,13 +341,28 @@ fn surface_text(snapshot: Option<&Snapshot>, surface: Surface) -> String {
 /// confirmed match with evidence the tree may already differ; the socket is
 /// polled at least as often as that interval so the deadline itself gets a
 /// digest without needing another record.
+///
+/// With `--follow` and `may_worker` ([`may_use_worker`]), this first tries
+/// [`worker::relay_from_worker`] (#138 item 2): the shared worker, when one
+/// answers, already keeps the one cache and the one subscription this
+/// function's own logic below would otherwise duplicate per segment, so a
+/// live worker means this process never opens its own connection to the
+/// daemon or digests the worktree itself at all — it just copies the
+/// worker's lines to stdout. Everything below only ever runs when there is no
+/// worker to ask (not installed, mid-restart, an explicit `--dir`, or an
+/// explicit `--tick-ms`), which is also exactly what always ran before this
+/// change.
 fn waybar(
     dir: &Path,
     settle: Duration,
     segment: Option<SegmentName>,
     follow: bool,
     tick: Duration,
+    may_worker: bool,
 ) -> ward_daemon::Result<()> {
+    if follow && may_worker && worker::relay_from_worker(&state_root(), segment)? {
+        return Ok(());
+    }
     let Some(socket) = locate(dir)? else {
         return emit(&Module::none(segment));
     };
@@ -543,8 +610,9 @@ fn follow_loop(
 /// how often this function is called, which may be much more often than
 /// that, so the debounce deadline itself still gets serviced. Returns
 /// whether a scan actually ran, for tests. Factored out of the `--follow`
-/// closure so it is testable without a socket.
-fn observe_event(
+/// closure so it is testable without a socket; [`worker`]'s own session loop
+/// reuses it too, unchanged.
+pub(crate) fn observe_event(
     snapshot: &mut Snapshot,
     digester: Option<&mut Digester>,
     gate: &mut DigestGate,
@@ -573,11 +641,20 @@ fn observe_event(
     }
 }
 
-/// The whole bar or one segment of `s`.
+/// The whole bar or one segment of `s`, at the current instant.
 fn module(s: &Snapshot, segment: Option<SegmentName>) -> Module {
+    module_at(s, segment, now_unix_ms())
+}
+
+/// The whole bar or one segment of `s`, at a caller-given instant: what
+/// [`module`] delegates to with its own fresh [`now_unix_ms`], and what
+/// [`worker`] calls once per publish with one shared instant for every
+/// segment (#138 item 2's "same session id and state generation" acceptance
+/// criterion) instead of each segment computing its own.
+pub(crate) fn module_at(s: &Snapshot, segment: Option<SegmentName>, now_unix_ms: u64) -> Module {
     match segment {
-        Some(name) => Module::segment(&s.description, &s.header, &s.model, name, now_unix_ms()),
-        None => Module::bar(&s.description, &s.header, &s.model, now_unix_ms()),
+        Some(name) => Module::segment(&s.description, &s.header, &s.model, name, now_unix_ms),
+        None => Module::bar(&s.description, &s.header, &s.model, now_unix_ms),
     }
 }
 
@@ -697,7 +774,7 @@ fn switcher_binding(registry: &ward_daemon::registry::Registry, session: &str) -
 /// approvals are pending, and the verify segment's text — the same facts the
 /// bar shows for the selected session, just for every live one at once.
 fn switcher_label(snapshot: &Snapshot, pending: usize, selected: bool) -> String {
-    let bar = TrustBar::new(&snapshot.header, &snapshot.model);
+    let bar = TrustBar::new(&snapshot.header, &snapshot.model, now_unix_ms());
     let agent = bar
         .segment(SegmentName::Agent)
         .map_or_else(String::new, |s| s.text);
@@ -716,8 +793,10 @@ fn switcher_label(snapshot: &Snapshot, pending: usize, selected: bool) -> String
 
 /// The control socket of the session the shell shows: `dir`'s current one,
 /// else the newest one a daemon serves (the bar runs from home, not a
-/// project); `None` when there is neither (the reason goes to stderr).
-fn locate(dir: &Path) -> ward_daemon::Result<Option<PathBuf>> {
+/// project); `None` when there is neither (the reason goes to stderr). Also
+/// [`worker`]'s own way of finding the session to serve, with the same `dir`
+/// default ("."), so the two agree.
+pub(crate) fn locate(dir: &Path) -> ward_daemon::Result<Option<PathBuf>> {
     match client::desktop_socket(dir, &state_root(), None) {
         Ok(socket) => Ok(Some(socket)),
         Err(ward_daemon::Error::Project(reason)) => {
@@ -738,8 +817,9 @@ fn load(dir: &Path, settle: Duration) -> ward_daemon::Result<Option<Snapshot>> {
 }
 
 /// The session behind `socket`: its description and its stream so far, or
-/// `None` when nothing serves it.
-fn load_from(socket: &Path, settle: Duration) -> ward_daemon::Result<Option<Snapshot>> {
+/// `None` when nothing serves it. [`worker`] uses this to build the one
+/// [`Snapshot`] it shares.
+pub(crate) fn load_from(socket: &Path, settle: Duration) -> ward_daemon::Result<Option<Snapshot>> {
     let Ok(mut sink) = client::connect(socket) else {
         eprintln!("ward-shell: {}", client::NO_DAEMON);
         return Ok(None);
@@ -769,7 +849,7 @@ fn load_from(socket: &Path, settle: Duration) -> ward_daemon::Result<Option<Snap
 
 /// The text of one surface.
 fn render(s: &Snapshot, surface: Surface) -> String {
-    let bar = TrustBar::new(&s.header, &s.model).text();
+    let bar = TrustBar::new(&s.header, &s.model, now_unix_ms()).text();
     match surface {
         Surface::Bar { .. } => format!("{bar}\n"),
         Surface::Session => {
@@ -786,7 +866,11 @@ fn render(s: &Snapshot, surface: Surface) -> String {
         // `model.records`.
         Surface::AuthorityPanel => format!(
             "{bar}\n\n{}",
-            panel_text(&authority_panel(&s.description, &s.model.authority))
+            panel_text(&authority_panel(
+                &s.description,
+                &s.model.authority,
+                now_unix_ms()
+            ))
         ),
         Surface::Launcher { query, .. } => {
             let card = SessionCard::new(&s.description, &s.model);
@@ -811,10 +895,15 @@ fn render(s: &Snapshot, surface: Surface) -> String {
         Surface::Switcher { .. } => {
             unreachable!("Surface::Switcher is dispatched in main(), not through text()/render()")
         }
+        // Not a text surface at all: `main` dispatches it to `worker::run`
+        // directly instead.
+        Surface::Worker => {
+            unreachable!("Surface::Worker is dispatched in main(), not through text()/render()")
+        }
     }
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -870,7 +959,7 @@ mod tests {
                 waybar: true,
                 segment: Some(SegmentName::Agent),
                 follow: true,
-                tick_ms: TICK_MS,
+                tick_ms: None,
             })
         ));
         assert!(Cli::try_parse_from(["ward-shell", "bar", "--segment", "agent"]).is_err());
@@ -885,7 +974,10 @@ mod tests {
         ]);
         assert!(matches!(
             cli.surface,
-            Some(Surface::Bar { tick_ms: 500, .. })
+            Some(Surface::Bar {
+                tick_ms: Some(500),
+                ..
+            })
         ));
         assert!(
             Cli::try_parse_from(["ward-shell", "bar", "--waybar", "--tick-ms", "500"]).is_err(),
@@ -900,6 +992,42 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("unknown segment `clock`"), "{err}");
+    }
+
+    /// Review finding 2 on #331: a live shared worker runs one fixed cadence
+    /// ([`TICK_MS`]) for every segment it serves, so it must never be asked
+    /// on behalf of a caller who named a different one explicitly — that
+    /// would silently turn a documented, tested `--tick-ms` into a no-op the
+    /// moment a worker happens to be running. `waybar`'s own dispatch is
+    /// `follow && may_worker && worker::relay_from_worker(..)`: a boolean
+    /// short-circuit, so whether the worker is ever asked at all reduces
+    /// entirely to this function's result — proving it here, without a
+    /// socket, is a complete proof for every caller of `waybar`, the same
+    /// reasoning `observe_event`'s own doc comment gives for being factored
+    /// out ("testable without a socket"). [`worker::tests`] separately
+    /// proves `relay_from_worker` correctly relays a real listening worker's
+    /// lines once it *is* asked, so together these cover both halves of the
+    /// behaviour: the decision, and what the decision gates.
+    #[test]
+    fn the_worker_is_asked_only_with_no_explicit_dir_and_no_explicit_tick() {
+        assert!(
+            may_use_worker(false, None),
+            "the common case: no --dir, no --tick-ms"
+        );
+        assert!(
+            !may_use_worker(true, None),
+            "an explicit --dir names a session the desktop-wide worker doesn't serve"
+        );
+        assert!(
+            !may_use_worker(false, Some(TICK_MS)),
+            "even a --tick-ms equal to the worker's own default must still bypass it: \
+             the caller asked for a specific cadence explicitly, not 'whatever the default is'"
+        );
+        assert!(
+            !may_use_worker(false, Some(500)),
+            "a --tick-ms the worker cannot honour must bypass it"
+        );
+        assert!(!may_use_worker(true, Some(500)), "both reasons at once");
     }
 
     #[test]
@@ -917,7 +1045,7 @@ mod tests {
                 waybar: false,
                 segment: None,
                 follow: false,
-                tick_ms: TICK_MS,
+                tick_ms: None,
             },
             Surface::Session,
             Surface::VerifyPanel,
@@ -1074,7 +1202,7 @@ mod tests {
         // Verified, and the tree is the candidate: green, and the panel says 0 changes.
         let mut s = snapshot_on(work.path(), &[passed(candidate)]);
         digester.observe(&mut s);
-        let bar = TrustBar::new(&s.header, &s.model);
+        let bar = TrustBar::new(&s.header, &s.model, now_unix_ms());
         let verify = bar.segment(SegmentName::Verify).unwrap();
         assert_eq!(
             verify.text,
@@ -1089,7 +1217,7 @@ mod tests {
         std::fs::write(work.path().join("lib.rs"), "fn f() { g() }\n").unwrap();
         std::fs::write(work.path().join("new.rs"), "").unwrap();
         digester.observe(&mut s);
-        let bar = TrustBar::new(&s.header, &s.model);
+        let bar = TrustBar::new(&s.header, &s.model, now_unix_ms());
         let verify = bar.segment(SegmentName::Verify).unwrap();
         assert_eq!(verify.text, "VERIFY ~ STALE");
         assert_eq!(verify.tone, ward_shell_core::Tone::Warn);
@@ -1105,7 +1233,7 @@ mod tests {
         std::fs::remove_file(work.path().join("new.rs")).unwrap();
         digester.observe(&mut s);
         assert!(
-            TrustBar::new(&s.header, &s.model)
+            TrustBar::new(&s.header, &s.model, now_unix_ms())
                 .segment(SegmentName::Verify)
                 .unwrap()
                 .text
@@ -1322,7 +1450,7 @@ mod tests {
             false,
         ));
         assert!(
-            TrustBar::new(&s.header, &s.model)
+            TrustBar::new(&s.header, &s.model, now_unix_ms())
                 .segment(SegmentName::Verify)
                 .unwrap()
                 .text
@@ -1350,7 +1478,7 @@ mod tests {
         // keep asserting a confirmed match with evidence the tree may have
         // changed, before that debounced digest ever runs.
         assert_ne!(
-            TrustBar::new(&s.header, &s.model)
+            TrustBar::new(&s.header, &s.model, now_unix_ms())
                 .segment(SegmentName::Verify)
                 .unwrap()
                 .tone,
@@ -1376,7 +1504,7 @@ mod tests {
             "the debounce deadline itself must be scanned, not only another record or a forced tick"
         );
         assert_eq!(
-            TrustBar::new(&s.header, &s.model)
+            TrustBar::new(&s.header, &s.model, now_unix_ms())
                 .segment(SegmentName::Verify)
                 .unwrap()
                 .text,

@@ -118,7 +118,16 @@ pub enum WardEvent {
     // still not confirmed stopped when the daemon's settle bound expired.
     SessionPauseUnsettled { method: CgroupFreezer | Sigstop, reason: BoundedText, pending: u32 },
 
-    // Appended at the end of the catalogue (#145 item 5): `ward stop` terminated the
+    // credentials, continued (origin: Wardd; PR #318 review round 3) — appended at the
+    // end, not folded into CredentialGranted's own fields (see the wire compatibility
+    // rule below): attributes the CredentialGranted record immediately before it in
+    // the ordered stream to the open launch that grant belongs to. Always appended by
+    // wardd itself, as a second record in the same append call that just wrote the
+    // grant it attributes; absent when the daemon has no tracked launch to attribute
+    // that grant to.
+    CredentialGrantedLaunch { launch_seq: u64 },
+
+    // Appended after CredentialGrantedLaunch (#145 item 5): `ward stop` terminated the
     // session's sandboxed workloads before sealing — `ended` confirmed gone, `pending`
     // killed but not confirmed gone within `pause::STOP_SETTLE`, and
     // `barrier_confirmed` records whether the pre-kill membership/fork barrier was
@@ -142,6 +151,44 @@ Type notes:
 * `SandboxPath` is always relative to `/work` or `/env`; host paths never appear in
   events.
 * Secrets never appear: `CredentialGranted` carries scope and expiry, not the token.
+
+### 3.1 Wire compatibility
+
+The hash in every `EventRecord` (§2) covers the event's own encoded bytes
+(`BLAKE3(prev || seq || origin || event bytes)`), and `WardEvent` is encoded with
+postcard, which identifies an enum variant by its declaration index and encodes that
+variant's own fields **positionally** — there is no field name or tag on the wire, only
+field order. Two rules follow directly from that, and both are load-bearing for every
+already-persisted session log, not just newly written ones:
+
+1. **Never reorder or remove a variant, and never add, remove or reorder a field on a
+   variant that has already shipped.** Doing either changes what postcard produces for
+   every record of that kind — including one a session log already persisted under an
+   earlier build. `EventRecord::verify_hash` recomputes the hash from the record's
+   *current* decoded event, so a record whose bytes silently changed underneath it
+   fails verification and reads as tampered, even though nothing about the record
+   itself was ever touched. This is not merely a style preference: PR #318 briefly
+   added a field to the existing `CredentialGranted` variant (round 2 of that PR's
+   review) specifically to carry a launch identity, and that change alone was enough to
+   make a `wardd` built from it fail to verify session logs its own earlier builds had
+   already written and sealed. Round 3 reverted it in favor of the new-trailing-variant
+   pattern below, exactly the pattern `VerificationErrored`, `LaunchAborted`,
+   `ObservationsDropped`, `SessionPauseUnsettled` and the verification-attempt kinds
+   above already establish, and which PR #253's own `WorkloadsTerminated` addition
+   followed without incident.
+2. **A new capability is always a brand new variant, appended at the end of the
+   catalogue.** Appending never touches how any existing variant encodes, so it can
+   never invalidate a record any earlier build already wrote. `CredentialGrantedLaunch`
+   above is this rule applied to the exact case round 2 got wrong: rather than widening
+   `CredentialGranted` itself, the launch identity travels as its own trailing variant,
+   emitted as a second record immediately after the grant it attributes.
+
+A change of this kind needs no `WIRE_VERSION` bump (`ward-events::wire::WIRE_VERSION`):
+that constant guards the frame header, not the event catalogue, and the crate's own
+append-only convention is what keeps the catalogue itself backwards compatible without
+one. A change that cannot be made this way — reordering, removing, or changing an
+existing variant's own fields — is not a case this crate's wire format supports at all,
+and needs a version bump and an explicit migration, not a silent field change.
 
 ## 4. Capture sources (ADR-0011)
 

@@ -1055,6 +1055,49 @@ pub enum WardEvent {
         budget_secs: u64,
     },
 
+    // -- credentials, continued (origin: Wardd; PR #318 review round 3) --
+    /// Attributes the immediately preceding [`WardEvent::CredentialGranted`] record, in
+    /// this same session's ordered stream, to the open launch that grant belongs to.
+    ///
+    /// Always appended by `ward-daemon::daemon::Served::handle_appendable` as a second
+    /// record, in the very same call that just appended the `CredentialGranted` this
+    /// attributes — one call, one lock held throughout
+    /// (`Arc<Mutex<Served>>`/`daemon::lock`), so no other connection's request can ever
+    /// land a record between a grant and its own attribution. Emitted only when the
+    /// daemon can attribute that grant to one of its own tracked `open_launches`; when
+    /// it cannot (a credential granted outside any tracked launch — a `ward-cli` replay
+    /// fixture, or a grant this daemon build never tracks a launch for), no attribution
+    /// record follows at all, and a reader must treat the grant exactly as one with no
+    /// known launch identity.
+    ///
+    /// This exists as its own trailing variant, appended after every other kind rather
+    /// than as a new field on `CredentialGranted` itself — the shape PR #318 review
+    /// round 2 first landed and review round 3 required reverting — because postcard
+    /// identifies enum variants by declaration index and encodes each variant's own
+    /// fields positionally (see the module doc comment above). Adding a field to an
+    /// existing variant changes the bytes every previously persisted record of that
+    /// variant hashes over (`chain::EventRecord::hash`): a session log written before
+    /// the field existed would decode into the widened shape and re-encode to different
+    /// bytes, so `verify_hash` would report tampering on a record nothing had actually
+    /// touched. A trailing variant carries the same identity without touching
+    /// `CredentialGranted`'s own encoding at all — every record of that variant ever
+    /// persisted, on any log written by any version of this crate, hashes exactly as it
+    /// always did.
+    CredentialGrantedLaunch {
+        /// The launch's own `CommandStarted` record's sequence number
+        /// (`chain::EventRecord::seq`) — exactly the identity
+        /// `ward-daemon::approvals::Credential::launch_key` is keyed by and
+        /// `Served::open_launches` already stores as its own key. Two routes of the
+        /// same launch always share this value; a later, independent launch granting
+        /// the same service and permissions again always gets a different one, however
+        /// close together in time the two launches land — the exact case a
+        /// tolerance/window on the recorded instant cannot handle, since concurrent
+        /// launches can interleave (`daemon.rs`'s own
+        /// `concurrent_launches_on_different_connections_neither_share_nor_retire_each_others_grants`
+        /// exercises exactly that).
+        launch_seq: u64,
+    },
+
     // -- intervention, continued (origin: Wardd; #145 item 5) --
     /// `ward stop` (`Request::Stop`) terminated the session's sandboxed workloads
     /// before evidence sealing: every process of the session's sandboxes was frozen
@@ -1078,7 +1121,7 @@ pub enum WardEvent {
     /// (#145 item 5): `Request::Seal` still seals without touching a running
     /// sandbox; `Request::Stop` does not seal until this confirmation holds.
     ///
-    /// Appended at the end of the catalogue for the same reason every other
+    /// Appended after `CredentialGrantedLaunch` for the same reason every other
     /// late variant is: postcard identifies variants by declaration index.
     WorkloadsTerminated {
         /// Processes the stop found and confirmed gone.
@@ -1141,12 +1184,13 @@ pub enum EventKind {
     VerificationCancelled = 35,
     VerificationInterrupted = 36,
     VerificationTimedOut = 37,
-    WorkloadsTerminated = 38,
+    CredentialGrantedLaunch = 38,
+    WorkloadsTerminated = 39,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 39] = [
+    pub const ALL: [EventKind; 40] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -1185,6 +1229,7 @@ impl EventKind {
         EventKind::VerificationCancelled,
         EventKind::VerificationInterrupted,
         EventKind::VerificationTimedOut,
+        EventKind::CredentialGrantedLaunch,
         EventKind::WorkloadsTerminated,
     ];
 
@@ -1236,6 +1281,7 @@ impl EventKind {
             EventKind::VerificationCancelled => "verification_cancelled",
             EventKind::VerificationInterrupted => "verification_interrupted",
             EventKind::VerificationTimedOut => "verification_timed_out",
+            EventKind::CredentialGrantedLaunch => "credential_granted_launch",
             EventKind::WorkloadsTerminated => "workloads_terminated",
         }
     }
@@ -1270,6 +1316,7 @@ impl EventKind {
                 | EventKind::EntryRestored
                 | EventKind::ObservationsDropped
                 | EventKind::SessionPauseUnsettled
+                | EventKind::CredentialGrantedLaunch
                 | EventKind::WorkloadsTerminated
         )
     }
@@ -1456,6 +1503,7 @@ impl WardEvent {
             WardEvent::VerificationCancelled { .. } => EventKind::VerificationCancelled,
             WardEvent::VerificationInterrupted { .. } => EventKind::VerificationInterrupted,
             WardEvent::VerificationTimedOut { .. } => EventKind::VerificationTimedOut,
+            WardEvent::CredentialGrantedLaunch { .. } => EventKind::CredentialGrantedLaunch,
             WardEvent::WorkloadsTerminated { .. } => EventKind::WorkloadsTerminated,
         }
     }
@@ -1488,9 +1536,9 @@ mod tests {
             assert_eq!(k.bit(), 1u64 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
-        // The catalogue is currently 38 kinds wide, well inside the `u64` backing's
+        // The catalogue is currently 40 kinds wide, well inside the `u64` backing's
         // 64-bit capacity -- so, unlike when the backing type was exactly saturated
-        // at `u32`, there IS a first unused bit right now (bit 38), and a value that
+        // at `u32`, there IS a first unused bit right now (bit 40), and a value that
         // sets it must be rejected as an unknown kind rather than silently accepted.
         // This is the same "no room past the known kinds to smuggle a bit through"
         // property `kind_bits_are_dense...`'s name promises, just checked against
@@ -1567,6 +1615,7 @@ mod tests {
         assert!(EventKind::VerificationPassed.is_critical());
         assert!(EventKind::SessionPaused.is_critical());
         assert!(EventKind::SessionPauseUnsettled.is_critical());
+        assert!(EventKind::CredentialGrantedLaunch.is_critical());
         assert!(EventKind::WorkloadsTerminated.is_critical());
         assert!(!EventKind::FileRead.is_critical());
         assert!(!EventKind::AgentClaim.is_critical());

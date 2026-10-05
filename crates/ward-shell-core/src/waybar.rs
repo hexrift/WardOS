@@ -24,7 +24,7 @@
 //! `none`), which Waybar hides; the verify module is never empty with a
 //! session, since `VERIFY —` is a state.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use ward_daemon::describe::SessionDescription;
 
@@ -35,8 +35,12 @@ use crate::settings::{Row, rows_text};
 use crate::trust::{Header, SegmentName, TrustBar, agent_word, tone_name};
 use ward_daemon::render::Tone;
 
-/// One Waybar custom module's JSON (`return-type: json`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// One Waybar custom module's JSON (`return-type: json`). `Deserialize` is
+/// for the shared worker's own client relay (#138 item 2): a consumer that
+/// reads the worker's stream back as a typed value in a test, rather than
+/// forwarding its bytes verbatim the way `bar --waybar --follow`'s real
+/// relay path does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Module {
     /// The module's text; empty hides it.
     pub text: String,
@@ -70,7 +74,7 @@ impl Module {
     /// tooltip, `live`/`sealed` and the bar's state tone as classes.
     #[must_use]
     pub fn bar(d: &SessionDescription, header: &Header, model: &Model, now_unix_ms: u64) -> Self {
-        let bar = TrustBar::new(header, model);
+        let bar = TrustBar::new(header, model, now_unix_ms);
         // #138 item 5: a connection lost without a confirmed seal is its own
         // `unknown` class, never folded into `sealed` (a claim the daemon
         // never made) or left as `live` (stale state shown as current).
@@ -100,7 +104,7 @@ impl Module {
         name: SegmentName,
         now_unix_ms: u64,
     ) -> Self {
-        let bar = TrustBar::new(header, model);
+        let bar = TrustBar::new(header, model, now_unix_ms);
         let Some(segment) = bar.segment(name) else {
             return Self::none(Some(name));
         };
@@ -185,13 +189,17 @@ fn explanation(
         // visible even once the record that created it has aged out of
         // `model.records`.
         SegmentName::Network => {
-            let authority = authority_panel(d, &model.authority);
+            let authority = authority_panel(d, &model.authority, now_unix_ms);
             vec![
                 panel_row(&authority, "Network"),
                 panel_row(&authority, "Temporary grants"),
             ]
         }
-        SegmentName::Grants => authority_panel(d, &model.authority).swap_remove(1).rows,
+        SegmentName::Grants => {
+            authority_panel(d, &model.authority, now_unix_ms)
+                .swap_remove(1)
+                .rows
+        }
         SegmentName::Credentials => vec![row("Secrets")],
         SegmentName::Observer => vec![row("Observer")],
         SegmentName::Tamperward => vec![row("Policy"), row("Evidence")],

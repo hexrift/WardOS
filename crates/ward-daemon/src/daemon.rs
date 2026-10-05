@@ -643,6 +643,8 @@ impl Served {
     fn handle_appendable(&mut self, conn: u64, other: Request) -> (Response, bool) {
         let credential = match &other {
             Request::Append {
+                origin,
+                at_unix_ms,
                 event:
                     WardEvent::CredentialGranted {
                         service,
@@ -650,8 +652,9 @@ impl Served {
                         expires,
                         ..
                     },
-                ..
             } => Some((
+                *origin,
+                *at_unix_ms,
                 service.as_str().to_owned(),
                 scope.subject.as_str().to_owned(),
                 scope
@@ -704,29 +707,8 @@ impl Served {
             if agent_state.is_some() {
                 self.last_agent_state = agent_state;
             }
-            if let Some((service, subject, permissions, launch_key, expires)) = credential {
-                // The subject is the route's upstream, `host:port`.
-                let host = subject
-                    .rsplit_once(':')
-                    .map_or(subject.as_str(), |(h, _)| h);
-                let granted_at_unix_ms = control::unix_ms(SystemTime::now());
-                // The instant this credential's own recorded lifetime runs out
-                // (#140): `granted_at_unix_ms` plus the event's own `expires`,
-                // saturating rather than overflowing on a pathological huge
-                // duration — a credential that could never expire on its own
-                // maths is exactly the same as one this cannot compute a
-                // bound for at all.
-                let expires_at_unix_ms = u64::try_from(expires.as_millis())
-                    .ok()
-                    .map(|ms| granted_at_unix_ms.saturating_add(ms));
-                grant_id = Some(self.approvals.record_credential_with_expiry(
-                    &service,
-                    host,
-                    permissions,
-                    launch_key,
-                    granted_at_unix_ms,
-                    expires_at_unix_ms,
-                ));
+            if let Some(credential) = credential {
+                grant_id = Some(self.record_credential_grant(record, credential));
             }
             if let Some(pid) = launch_started {
                 // Keep the logical pid so a confirmed stop can terminalize any
@@ -762,6 +744,104 @@ impl Served {
             (response, _) => response,
         };
         (response, done)
+    }
+
+    /// Records the daemon-side bookkeeping for a `CredentialGranted` append
+    /// that `record` (just appended by [`Self::handle_appendable`]) carries:
+    /// the live `Approvals` grant, and, when this grant could be attributed
+    /// to a tracked launch, its own trailing `CredentialGrantedLaunch`
+    /// attribution record (PR #318 review round 3 — see
+    /// `WardEvent::CredentialGrantedLaunch`'s own doc comment for why this is
+    /// a second record rather than a field on `CredentialGranted` itself).
+    /// `credential` is `(origin, at_unix_ms, service, subject, permissions,
+    /// launch_key, expires)`, exactly as [`Self::handle_appendable`] read it
+    /// off the original `Request::Append` before that request was consumed.
+    /// Returns the grant id the client learns back through
+    /// `Response::Granted` (#245).
+    ///
+    /// Called from inside the same `handle_appendable` call that just
+    /// appended `record`, so still under the one lock that call already
+    /// holds (`Arc<Mutex<Served>>`, taken once per request in `serve_stream`
+    /// — see `lock`/`serve_stream`): no other connection's request can land a
+    /// record between the grant and this attribution.
+    fn record_credential_grant(
+        &mut self,
+        record: &EventRecord,
+        credential: (
+            Origin,
+            u64,
+            String,
+            String,
+            Vec<String>,
+            Option<u64>,
+            Duration,
+        ),
+    ) -> u64 {
+        let (origin, at_unix_ms, service, subject, permissions, launch_key, expires) = credential;
+        // The subject is the route's upstream, `host:port`.
+        let host = subject
+            .rsplit_once(':')
+            .map_or(subject.as_str(), |(h, _)| h);
+        // Read from the record this very append just committed rather than
+        // taking a second, independent `SystemTime::now()` (PR #318 review,
+        // finding 3): `LocalLog::append` (`control.rs`) now always stamps
+        // `ts_wall` with the daemon's own `SystemTime::now()` at the moment
+        // of append, so this and the persisted/replayed `EventRecord.ts_wall`
+        // the shell/desktop panel projection reads (`ward-shell-core::authority`)
+        // are the exact same instant, not two clock reads that a delayed
+        // append could pull apart. The fallback is defensive only —
+        // unreachable in practice post-fix, since every `Sink::append` path
+        // now populates `ts_wall` — so a `None` here (an older log format, or
+        // a `Sink` implementation this daemon does not control) still
+        // produces a sane bound instead of panicking or nonsense-dating the
+        // grant.
+        let granted_at_unix_ms = record
+            .ts_wall
+            .map_or_else(|| control::unix_ms(SystemTime::now()), control::unix_ms);
+        // The instant this credential's own recorded lifetime runs out
+        // (#140): `granted_at_unix_ms` plus the event's own `expires`,
+        // saturating rather than overflowing on a pathological huge duration
+        // — a credential that could never expire on its own maths is exactly
+        // the same as one this cannot compute a bound for at all.
+        let expires_at_unix_ms = u64::try_from(expires.as_millis())
+            .ok()
+            .map(|ms| granted_at_unix_ms.saturating_add(ms));
+        let grant_id = self.approvals.record_credential_with_expiry(
+            &service,
+            host,
+            permissions,
+            launch_key,
+            granted_at_unix_ms,
+            expires_at_unix_ms,
+        );
+        // Attribute this grant to its own launch on the wire, as a second,
+        // immediately-following record. Only emitted when this grant could be
+        // attributed to a tracked launch at all; when it could not
+        // (`launch_key` is `None`), no attribution record follows, exactly as
+        // a grant with no known launch identity looked before this variant
+        // existed.
+        if let Some(launch_seq) = launch_key {
+            let subscribers = &mut self.subscribers;
+            let attributed = control::handle_with(
+                &mut self.log,
+                Request::Append {
+                    origin,
+                    event: WardEvent::CredentialGrantedLaunch { launch_seq },
+                    at_unix_ms,
+                },
+                |record| {
+                    subscribers
+                        .retain(|s| s.send(Delivery::Record(Box::new(record.clone()))).is_ok());
+                },
+            );
+            debug_assert!(
+                matches!(attributed.0, Response::Record(_)),
+                "the log was just appended to successfully under the same lock; \
+                 a second append on the same session cannot fail here: {:?}",
+                attributed.0
+            );
+        }
+        grant_id
     }
 
     /// Close out every launch still open on `conn` once that connection's
@@ -3685,6 +3765,73 @@ mod tests {
         );
     }
 
+    /// PR #318 review, finding 3: `Credential::granted_at_unix_ms` (and so
+    /// its `expires_at_unix_ms`) must come from the same instant this
+    /// append's own `EventRecord.ts_wall` is persisted with — the exact
+    /// value `ward-shell-core::authority`'s panel projection reads back —
+    /// not from a second, independent `SystemTime::now()` read in
+    /// `Served::handle_appendable`. A delayed append (a client-supplied
+    /// `at_unix_ms` far in the past — a slow send, a busy socket) must not
+    /// be able to pull those two apart: both must still land at the
+    /// daemon's own real append-time clock, not the stale client capture
+    /// time.
+    #[test]
+    fn a_delayed_appends_stale_capture_time_does_not_skew_the_grants_own_deadline() {
+        use ward_events::{CredentialDelivery, NameText, Scope, ServiceId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(Mutex::new(fresh_served(dir.path())));
+        let granted = WardEvent::CredentialGranted {
+            service: ServiceId::new("github").unwrap(),
+            scope: Scope {
+                subject: ShortText::new("github.com:443"),
+                permissions: vec![NameText::new("contents:read")],
+            },
+            expires: Duration::from_secs(60),
+            delivery: CredentialDelivery::ProxyInjected,
+        };
+        let before = control::unix_ms(SystemTime::now());
+        // A capture time from decades before this append actually reaches
+        // the daemon: exactly the "delayed append" the review's finding 3
+        // describes, deliberately exaggerated so a bug that leaks this
+        // stale value into either clock read is unmistakable.
+        let (response, _) = lock(&served).handle(Request::Append {
+            origin: Origin::Wardd,
+            event: granted,
+            at_unix_ms: 0,
+        });
+        let after = control::unix_ms(SystemTime::now());
+        let record = match response {
+            Response::Granted { record, .. } => record,
+            other => panic!("{other:?}"),
+        };
+
+        // The persisted record's own wall clock is the daemon's real
+        // append-time instant, not the stale client-supplied capture time.
+        let ts_wall_ms = record
+            .ts_wall
+            .map(control::unix_ms)
+            .expect("ts_wall is now always populated on append");
+        assert!(
+            (before..=after).contains(&ts_wall_ms),
+            "ts_wall {ts_wall_ms} must fall within [{before}, {after}], not near 0"
+        );
+
+        // The daemon's own in-memory grant shares that exact same instant —
+        // read back from the record, not a second independent clock call.
+        let grants = match lock(&served).handle(Request::Grants).0 {
+            Response::Grants(g) => g,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(
+            grants[0].granted_at_unix_ms, ts_wall_ms,
+            "the daemon's own Credential and the persisted record must agree \
+             on the exact instant the credential was granted"
+        );
+        assert!((before..=after).contains(&grants[0].granted_at_unix_ms));
+    }
+
     /// A credential's grant id in a fresh `Served`, with a `CredentialGranted`
     /// already on the log (#245's test fixture, shared by the revoke tests
     /// below).
@@ -4266,6 +4413,115 @@ mod tests {
             served.approvals.grants().is_empty(),
             "A's own finish retires A's own credential: {:?}",
             served.approvals.grants()
+        );
+    }
+
+    /// PR #318 review round 3: a `CredentialGranted` this daemon can
+    /// attribute to a tracked launch is always immediately followed, in the
+    /// persisted log itself, by its own `WardEvent::CredentialGrantedLaunch`
+    /// record carrying that launch's own `CommandStarted` record's `seq` —
+    /// so a reader with no `conn` to key by (the shell/desktop panel's
+    /// `Authority` projection, replaying one session's own ordered records)
+    /// can still tell two routes of one launch apart from a later,
+    /// independent one, without `CredentialGranted` itself ever carrying
+    /// that identity (round 2's shape, reverted: a field on an existing
+    /// variant would have changed the hash of every `CredentialGranted`
+    /// record persisted before it existed). Two routes of the same launch
+    /// must share it even when their own appends land at genuinely distinct
+    /// wall-clock instants (a real `sleep` between them here, not an
+    /// artificial identical-instant shortcut); a later, independent launch
+    /// granting the same service and permissions again must get a different
+    /// one.
+    #[test]
+    fn credential_granted_is_followed_by_its_own_launch_attribution_record() {
+        use ward_events::{
+            BoundedArgv, CredentialDelivery, ExitStatus, NameText, Pid, SandboxPath, SandboxRoot,
+            Scope, ServiceId,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut served = fresh_served(dir.path());
+
+        let pid = Pid::new(2).unwrap();
+        let started = || WardEvent::CommandStarted {
+            pid,
+            parent: Pid::new(1).unwrap(),
+            argv: BoundedArgv::from_bytes([b"a".as_slice()]),
+            cwd: SandboxPath::new(SandboxRoot::Work, ".").unwrap(),
+            exe_digest: None,
+        };
+        let granted = |host: &str| WardEvent::CredentialGranted {
+            service: ServiceId::new("github").unwrap(),
+            scope: Scope {
+                subject: ShortText::new(&format!("{host}:443")),
+                permissions: vec![NameText::new("contents:read")],
+            },
+            expires: Duration::from_secs(60),
+            delivery: CredentialDelivery::ProxyInjected,
+        };
+        let finished = || WardEvent::CommandFinished {
+            pid,
+            exit: ExitStatus::Exited { code: 0 },
+            duration: Duration::from_secs(1),
+        };
+
+        let started_record = served.append(started()).unwrap();
+
+        // Two routes of the *same* launch, appended with a real, deliberate
+        // delay between them -- genuinely distinct wall-clock instants, not
+        // an identical one.
+        let route_a = served.append(granted("github.com")).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let route_b = served.append(granted("api.github.com")).unwrap();
+
+        assert_ne!(
+            route_a.ts_wall, route_b.ts_wall,
+            "the two routes really were appended at different instants"
+        );
+
+        served.append(finished()).unwrap();
+
+        // A later, independent launch granting the same service and
+        // permissions again must get a different launch_seq.
+        let started_again = served.append(started()).unwrap();
+        let route_c = served.append(granted("github.com")).unwrap();
+        served.append(finished()).unwrap();
+
+        // Read the whole persisted log back rather than trusting
+        // `served.append`'s own return value, which only ever answers with
+        // the record the client's own request appended, never the second,
+        // daemon-internal one that follows it.
+        let all = served.subscribe(0).unwrap().replay;
+        let launch_seq_after = |granted_seq: u64| -> u64 {
+            let attribution = all
+                .iter()
+                .find(|r| r.seq == granted_seq + 1)
+                .unwrap_or_else(|| panic!("no record follows CredentialGranted seq {granted_seq}"));
+            match attribution.event {
+                WardEvent::CredentialGrantedLaunch { launch_seq } => launch_seq,
+                ref other => panic!(
+                    "expected CredentialGrantedLaunch right after seq {granted_seq}, got {other:?}"
+                ),
+            }
+        };
+
+        assert_eq!(
+            launch_seq_after(route_a.seq),
+            started_record.seq,
+            "stamped from this launch's own CommandStarted record"
+        );
+        assert_eq!(
+            launch_seq_after(route_a.seq),
+            launch_seq_after(route_b.seq),
+            "two routes of one launch share one launch_seq even at genuinely \
+             distinct wall-clock instants"
+        );
+        assert_eq!(launch_seq_after(route_c.seq), started_again.seq);
+        assert_ne!(
+            launch_seq_after(route_c.seq),
+            launch_seq_after(route_a.seq),
+            "a later independent launch does not inherit the first launch's \
+             own launch_seq"
         );
     }
 

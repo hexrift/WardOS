@@ -861,6 +861,49 @@ pub(crate) mod fixtures {
         records(&events)
     }
 
+    /// [`wardd`], but every record also carries a wall clock: `start_unix_ms`
+    /// for the first record, one second later for each after it — the seam
+    /// the panel-expiry tests (#316) drive, since `records`/`wardd` leave
+    /// `ts_wall` unset (mono-only) and a [`WardEvent::CredentialGranted`]'s
+    /// expiry cannot be judged against a record with no wall clock at all.
+    pub fn wardd_at_wall(events: &[WardEvent], start_unix_ms: u64) -> Vec<EventRecord> {
+        let walls: Vec<u64> = (0..events.len() as u64)
+            .map(|i| start_unix_ms + i * 1000)
+            .collect();
+        wardd_at_walls(events, &walls)
+    }
+
+    /// [`wardd_at_wall`], but each record's wall clock is given explicitly
+    /// (`walls[i]` for `events[i]`) rather than derived by incrementing one
+    /// second per index: the seam the finding-2 panel-expiry tests (#316,
+    /// PR #318 review) drive, since telling apart "two routes one launch
+    /// granted at essentially the same instant" from "two independent
+    /// launches minutes apart" needs control over exactly how far apart two
+    /// records' own wall clocks land, not just that they are one second
+    /// apart every time. `mono` still increments by index either way, so
+    /// the chain's own ordering is unaffected.
+    pub fn wardd_at_walls(events: &[WardEvent], walls: &[u64]) -> Vec<EventRecord> {
+        assert_eq!(events.len(), walls.len(), "one wall time per event");
+        let mut chain = Chain::genesis(SessionId::from_u128(7), Blake3Hash::from_bytes([1; 32]));
+        events
+            .iter()
+            .zip(walls.iter())
+            .enumerate()
+            .map(|(i, (event, wall))| {
+                chain
+                    .append(
+                        Origin::Wardd,
+                        event.clone(),
+                        Timestamp {
+                            mono: Duration::from_secs(i as u64),
+                            wall: Some(std::time::UNIX_EPOCH + Duration::from_millis(*wall)),
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect()
+    }
+
     /// The §8 sequence the TUI tests use: two files, two commands, three
     /// network outcomes, one claim, one hidden kind.
     pub fn sequence() -> Vec<WardEvent> {
