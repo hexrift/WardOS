@@ -26,14 +26,15 @@
 # the compatibility document does not. The document is found relative to this
 # script; GENERATE_MANIFEST_COMPATIBILITY_DOC overrides the path (tests).
 #
-# This does NOT sign or attest anything. ADR-0028's own "Scope of the
-# implementation" requires the release workflow, manifest format, and
-# installer/update verifier to be independently testable, and that no code PR
-# claim existing releases are signed before the release workflow emits, and the
-# installer verifies, real provenance evidence. The `provenance` object below
-# is therefore always an explicit, honest placeholder: `status: "unavailable"`
-# and a note pointing at the still-open work. A caller must not post-process
-# this manifest to claim otherwise until a real attestation exists.
+# This does NOT sign or attest anything. The release workflow signs the printed
+# manifest afterwards, keyless with its own identity, into the sibling asset
+# wardos-<version>-manifest.json.sigstore.json (issue #148; verified offline by
+# verify-manifest.sh) -- a signature over these bytes, which is why nothing in
+# them can reference it. The `provenance` object below is about the SLSA
+# provenance attestation of ADR-0028 §4, which does not exist yet: it is an
+# explicit, honest placeholder, `status: "unavailable"` and a note saying what
+# does exist, and a caller must not post-process this manifest to claim
+# otherwise until a real attestation exists.
 #
 # Every input is validated before any JSON is produced -- a malformed tag or
 # commit, a missing/extra/mismatched artifact, or a digest that doesn't match
@@ -223,7 +224,7 @@ jq -n \
       status: "unavailable",
       attestation_ref: null,
       builder: null,
-      note: "No provenance attestation is generated or verified yet (ADR-0028, issue #148). This release remains checksum-only for publisher/workflow identity purposes."
+      note: "No SLSA provenance attestation is generated or verified yet (ADR-0028, issue #148). The release workflow signs this manifest keyless after generating it, when its run is on the release tag; the Sigstore bundle is the sibling asset wardos-\($version)-manifest.json.sigstore.json, verified offline by scripts/release/verify-manifest.sh (docs/release-manifest.md). The tarballs are bound to this manifest by digest only."
     },
     compatibility: {
       rollback_supported: true,

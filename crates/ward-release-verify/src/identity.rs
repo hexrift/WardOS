@@ -391,6 +391,51 @@ mod tests {
         ));
     }
 
+    /// `scripts/release/verify-manifest.sh` is the offline verifier an end-user machine
+    /// runs without a Rust toolchain, so it carries the pinned policy as its own three
+    /// shell literals and derives the expected identity itself. Read the script and hold
+    /// its literals, and the identity it derives, equal to this crate's constants and to
+    /// what `evaluate_identity` reconstructs, so the two cannot drift apart.
+    #[test]
+    fn verify_manifest_script_pins_the_same_policy() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/release/verify-manifest.sh"
+        );
+        let script = std::fs::read_to_string(path).unwrap();
+        let literal = |name: &str| {
+            let prefix = format!("\n{name}=\"");
+            let start = script.find(&prefix).unwrap() + prefix.len();
+            let end = script[start..].find('"').unwrap() + start;
+            &script[start..end]
+        };
+        assert_eq!(literal("PINNED_ISSUER"), PINNED_ISSUER);
+        assert_eq!(literal("PINNED_REPOSITORY"), PINNED_REPOSITORY);
+        assert_eq!(literal("PINNED_WORKFLOW"), PINNED_WORKFLOW);
+
+        // The script substitutes its (possibly overridden) policy values and the
+        // manifest's tag into this template; with the pinned values and a release tag
+        // the result must be exactly the SAN `evaluate_identity` accepts for that tag.
+        let template =
+            "https://github.com/${repository}/.github/workflows/${workflow}@refs/tags/${tag}";
+        assert!(
+            script.contains(&format!("expected_identity=\"{template}\"")),
+            "the script no longer derives the identity from the pinned template"
+        );
+        let san = template
+            .replace("${repository}", PINNED_REPOSITORY)
+            .replace("${workflow}", PINNED_WORKFLOW)
+            .replace("${tag}", "v1.2.3");
+        let claims = AttestationClaims {
+            issuer: PINNED_ISSUER,
+            signing_identity: &san,
+            repository: PINNED_REPOSITORY,
+            workflow: PINNED_WORKFLOW,
+            source_ref: "refs/tags/v1.2.3",
+        };
+        assert_eq!(evaluate_identity(&claims).unwrap().tag, "v1.2.3");
+    }
+
     #[test]
     fn wildcard_in_policy_is_not_matched_as_a_literal_asterisk() {
         // The ADR's `v*` is a description of "the actual tag", not a literal

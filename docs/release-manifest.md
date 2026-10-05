@@ -4,9 +4,11 @@ This is the machine-readable manifest format decided in
 [ADR-0028](decisions/ADR-0028-release-provenance-and-trusted-updates.md) §4, and the
 generator that produces it: [`scripts/release/generate-manifest.sh`](../scripts/release/generate-manifest.sh).
 
-This document covers the manifest format, its generator, and how a release publishes
-and an operator verifies it. It does not cover signing, attestation, or update
-verification — see "What this is not" below and issue
+This document covers the manifest format, its generator, how a release publishes and
+signs it, and how an operator verifies that signature offline with
+[`scripts/release/verify-manifest.sh`](../scripts/release/verify-manifest.sh). It does
+not cover a provenance attestation for the tarballs or the image, or update
+verification — see "What the signature proves, and what it does not" below and issue
 [#148](https://github.com/hexrift/WardOS/issues/148) for the rest of that work's
 status.
 
@@ -83,7 +85,7 @@ full set of fixtures this covers.
     "status": "unavailable",
     "attestation_ref": null,
     "builder": null,
-    "note": "No provenance attestation is generated or verified yet (ADR-0028, issue #148). This release remains checksum-only for publisher/workflow identity purposes."
+    "note": "No SLSA provenance attestation is generated or verified yet (ADR-0028, issue #148). The release workflow signs this manifest keyless after generating it, when its run is on the release tag; the Sigstore bundle is the sibling asset wardos-1.2.3-manifest.json.sigstore.json, verified offline by scripts/release/verify-manifest.sh (docs/release-manifest.md). The tarballs are bound to this manifest by digest only."
   },
   "compatibility": {
     "rollback_supported": true,
@@ -114,20 +116,109 @@ field against the range it offers before it connects (compatibility.md §3).
 The release workflow (`.github/workflows/release.yml`, job `release`) generates the
 manifest only after `check-release-set.sh` has verified the complete artifact set, from
 that verified `dist/` directory, so the manifest can never name an artifact that was not
-checked. It attaches two more assets to the release, next to the tarballs:
+checked. It then signs the manifest — keyless, with `cosign sign-blob --bundle` under
+the run's own GitHub Actions OIDC identity (the job holds `id-token: write` for that
+alone) — and attaches three more assets to the release, next to the tarballs:
 
 | Asset | Carries |
 | --- | --- |
 | `wardos-<version>-manifest.json` | the manifest above |
 | `wardos-<version>-manifest.json.sha256` | `sha256sum`'s line for it, like every tarball's sidecar |
+| `wardos-<version>-manifest.json.sigstore.json` | the Sigstore bundle of the manifest's signature: the Fulcio certificate naming the signing workflow and ref, the signature, and the Rekor transparency-log entry, in the format `cosign verify-blob --bundle` reads offline |
+
+The signature is made only when the run is on the release tag (`refs/tags/<tag>`),
+because that ref is part of the identity the certificate carries and the only kind of
+ref the pinned policy accepts (ADR-0028 §2; below). A `workflow_dispatch` run from a
+branch — the run that creates the tag in CONTRIBUTING.md's release steps — publishes
+the manifest unsigned and says so in its log; running `release.yml` again on the tag
+(`gh workflow run release.yml --ref <tag> -f version=<tag>`) signs it and uploads the
+bundle. Pushing the tag instead runs the workflow on it once, signing in the same run.
+Before anything is published, the release job runs the verifier below on its own fresh
+signature, so a policy that does not match what the workflow actually produces fails
+the job on the runner rather than every user's check. Releases published before the
+signing step existed (v0.4.1 and earlier) carry no bundle; the verifier reports
+`provenance-missing` for them and they remain checksum-only.
 
 `generated_at` of a published manifest is the source commit's committer time, not the
 run's clock: a retry of the release workflow at the same commit must reproduce every
 asset byte for byte (ADR-0028 §4), and the manifest is reconciled like the tarballs by
 `download-published.sh` and `check-assets.sh` — identical is a no-op, different bytes
-are refused before anything is overwritten.
+are refused before anything is overwritten. The bundle is the one asset that is never
+byte-compared: a keyless signature differs on every run that signs (its own
+certificate, Rekor entry and timestamp) even over identical manifest bytes. The rule
+`check-assets.sh` applies, with its tests: a bundle this run produced is uploaded with
+`--clobber` exactly when its manifest is already published byte-identical or not yet
+published; a manifest whose bytes differ refuses the whole run, bundle included; and a
+published bundle is left alone by a run that did not sign. A replaced bundle is a
+second valid signature over the same bytes, nothing more.
 
-To verify a release from its manifest, download the assets into one directory and run:
+## Verifying a release
+
+Download the manifest, its sidecar and its bundle, and whichever tarballs you intend
+to install, into one directory, and run the verifier from a checkout of the repository
+at the release tag:
+
+```
+gh release download <tag> --pattern 'wardos-<version>-manifest.json*' --pattern '*-<arch>-linux.tar.gz*'
+scripts/release/verify-manifest.sh wardos-<version>-manifest.json \
+  wardos-<version>-manifest.json.sigstore.json --tag <tag>
+```
+
+The verifier needs `cosign` (v3, the version the workflow signs with), `jq` and
+`sha256sum`, and no Rust toolchain. It checks, in this order and stopping at the first
+failure: that those tools are present; that the manifest parses and names a `v<semver>`
+release tag (the one `--tag` expects, and the one its own file name says); that the
+bundle exists; that the signature verifies for the OIDC issuer
+`https://token.actions.githubusercontent.com` and the exact identity
+`https://github.com/hexrift/WardOS/.github/workflows/release.yml@refs/tags/<tag>`,
+derived from the manifest's own `tag`; that the manifest's `.sha256`, when present
+beside it, agrees; and that every artifact present beside the manifest hashes to the
+digest the signed manifest records (and its own `.sha256`, when present, agrees). An
+artifact the manifest names but that is not beside it is reported and skipped, unless
+`--require-artifacts` makes its absence a failure. The identity is passed to cosign as
+an exact string, never a pattern, so a certificate for another tag, a branch, a pull
+request, another workflow or a literal `v*` cannot match the way a wildcard would — the
+same reconstruction [`crates/ward-release-verify`](../crates/ward-release-verify)
+performs for the update path, whose tests hold the script's three pinned literals equal
+to the crate's constants. `--identity-policy repository=<owner/repo>` (also `issuer=`
+and `workflow=`) exists for a fork verifying its own releases, not for making a WardOS
+release pass; `--trusted-root <file>` hands cosign a Sigstore trusted root on a machine
+that cannot refresh its TUF cache.
+
+The last line is one of ADR-0028's states, and the exit code names the cause:
+
+| Exit | Last line | Meaning |
+| --- | --- | --- |
+| 0 | `state=provenance-verified` | signed by the release workflow on this tag; every artifact present matches |
+| 2 | `cause=usage`, `cause=malformed-manifest` | bad arguments, or a manifest that is unreadable, not JSON, or whose `tag` is not a release tag |
+| 3 | `state=verifier-unavailable cause=cosign-missing` | `cosign` (or `jq`, `sha256sum`) is not installed; nothing was verified |
+| 4 | `cause=provenance-missing` | the bundle is absent or not JSON |
+| 5 | `cause=issuer-mismatch` | a valid signature whose certificate another OIDC issuer issued |
+| 6 | `cause=identity-mismatch` | a valid signature by another repository, workflow, ref or tag |
+| 7 | `cause=manifest-altered` | the bundle does not verify these manifest bytes under any identity |
+| 8 | `cause=digest-mismatch` | the `.sha256` sidecar, or an artifact beside the manifest, disagrees with the signed manifest |
+| 9 | `cause=incomplete-set` | `--require-artifacts` and a named artifact is absent |
+| 10 | `cause=wrong-release` | the manifest names another release than `--tag`, or than its file name |
+| 11 | `state=verifier-unavailable cause=trusted-root-unavailable` | cosign could not load the Sigstore trusted root (`cosign initialize`, or `--trusted-root`) |
+
+A signature failure is classified by re-running cosign, not by reading its message: the
+pinned check decides pass or fail, and on failure the bundle is re-checked against any
+identity and any issuer — if that fails too, the signature does not cover these bytes
+(7); if it passes, the bytes are intact and a third run with the pinned issuer alone
+tells identity (6) from issuer (5). Every run is a bundle verification against cosign's
+cached trusted root; nothing contacts Rekor or Fulcio.
+
+Without the script, the same signature check is one command, and the three strings it
+pins are the whole policy:
+
+```
+cosign verify-blob --bundle wardos-<version>-manifest.json.sigstore.json \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity 'https://github.com/hexrift/WardOS/.github/workflows/release.yml@refs/tags/<tag>' \
+  wardos-<version>-manifest.json
+```
+
+followed by the digest checks, which need no signature at all:
 
 ```
 sha256sum -c wardos-<version>-manifest.json.sha256
@@ -135,34 +226,30 @@ jq -r '.artifacts[] | (.digest | sub("^sha256:"; "")) + "  " + .name' \
   wardos-<version>-manifest.json | sha256sum -c
 ```
 
-The first line checks the manifest against its sidecar; the second checks every
-artifact the manifest names against the digest it records, and `sha256sum -c` fails on
-an artifact that is missing or does not match. `source_commit` must equal the commit
-the release's tag resolves to (`git rev-parse <tag>^{commit}`). Like the `.sha256`
-sidecars, this proves the bytes are the ones CI attached, not who built them: see the
-next section.
+`source_commit` must equal the commit the release's tag resolves to
+(`git rev-parse <tag>^{commit}`). The verifier itself reaches you through the
+repository — clone it at the tag, or read the one-command form above and type it; the
+tarballs do not carry `scripts/` — and ADR-0028's "Trust roots and bootstrap" keeps
+shipping the verifier and the Sigstore trusted root on the image as open work.
 
-## What this is not
+## What the signature proves, and what it does not
 
-This manifest's `provenance` object is an explicit, honest placeholder, not partial
-signing. `status` is always `"unavailable"` and `attestation_ref`/`builder` are always
-`null` until the release workflow actually generates a real attestation and the
-installer/updater actually verifies it — per ADR-0028's own "Scope of the
-implementation," a manifest generator existing here must not be read as, or produce
-output that implies, existing releases are signed. Once real provenance exists, this
-schema's `provenance` object is where it is expected to be recorded — filling in
-`status`, `attestation_ref` (the SLSA/in-toto provenance reference from ADR-0028 §4)
-and `builder` (the toolchain metadata *derived from* that attestation, per the ADR — not
-a hand-written copy) is a follow-up change to this generator, not a schema break.
+A pass proves that these manifest bytes were produced by `.github/workflows/release.yml`
+of `hexrift/WardOS`, running on the `v*` tag the manifest names, with a certificate
+Fulcio issued against GitHub Actions' OIDC token and an entry in Rekor — and that the
+tarballs beside it are the bytes that workflow run hashed into the manifest. Each
+tarball is bound to the signed manifest by its digest, and trusted exactly that far.
 
-Also not covered here, and tracked separately under issue #148:
-
-- Generating or verifying the provenance attestation itself (Sigstore/cosign,
-  workflow-identity OIDC policy).
-- The installer/update verifier that reads a manifest and a real attestation and
-  decides whether to stage an update (ADR-0028 §5's state machine).
-- Boot-chain / Secure Boot integration, which ADR-0028 §6 keeps a separate trust
-  boundary from release/artifact provenance.
-
-Current published releases remain checksum-only, as ADR-0028's own last line requires
-until the workflow emits, and the installer verifies, real provenance evidence.
+It does not prove that the tarballs were built reproducibly from `source_commit`, or
+what the build's inputs were: that is the SLSA provenance attestation of ADR-0028
+§1/§4, which the `provenance` object still reports as `unavailable` — `status`,
+`attestation_ref` and `builder` are filled in only when a real attestation exists, and
+since the manifest is signed after it is generated, nothing in it can reference its own
+bundle. The tarballs and the OCI image are not signed individually (ADR-0028 §3 for
+them is open), and the image is not covered by the manifest's signature at all. Neither
+`install.sh`, the image's release stage nor `desktop/bin/wardos-update` runs the
+verifier yet: the install and update paths remain checksum-only until ADR-0028 §5's
+state machine is wired (issue #148), and a `provenance-verified` manifest says nothing
+about the boot chain (ADR-0028 §6). The signing step runs for the first time on the
+first `v*` tag released after it landed; until that release exists, no published
+release is signed.

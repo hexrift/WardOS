@@ -294,9 +294,12 @@ by CI on every pull request. ST-018 waits on the pause primitive; ST-029 is ahea
 Signed releases are part of this phase's install story. The trust policy is recorded
 in [`ADR-0028`](decisions/ADR-0028-release-provenance-and-trusted-updates.md):
 workflow-bound provenance with a pinned repository/workflow identity and portable
-Sigstore evidence where needed, separate from the Secure Boot chain. Until the
-release workflow and verifier land, releases carry a checksum only and the README
-and install guide must continue to say so.
+Sigstore evidence where needed, separate from the Secure Boot chain. The release
+workflow signs the release manifest keyless and `scripts/release/verify-manifest.sh`
+verifies it offline against the pinned identity ([`release-manifest.md`](release-manifest.md));
+until the installer and updater run that verifier and the tarballs and image carry
+provenance of their own, the install path carries a checksum only and the README and
+install guide must continue to say so.
 
 ## Phase 8 — Installer optimisation
 

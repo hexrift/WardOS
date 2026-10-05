@@ -80,6 +80,51 @@ printf '{"a":1}\n' >"$c/local/$manifest"; cp "$c/local/$manifest" "$c/published/
 printf 'SUM\n' >"$c/local/$manifest.sha256"; cp "$c/local/$manifest.sha256" "$c/published/$manifest.sha256"
 expect_status 0 "an identical published manifest is a no-op" bash "$sut" "$c/local" "$c/published"
 
+# The manifest's Sigstore bundle (issue #148) is never byte-compared: a keyless
+# signature differs on every run that signs. A local bundle counts as "to
+# upload" whenever its manifest is identical or new -- so a retry that re-signs
+# an otherwise identical set exits 10, not 0 -- and a published bundle that
+# differs is not a conflict; but a manifest whose bytes differ refuses the run,
+# bundle included, and a bundle without its manifest beside it is an error. A
+# published bundle with no local counterpart (a run that did not sign) is left
+# alone like any other asset the run is not replacing.
+bundle="$manifest.sigstore.json"
+identical_set() { # DIR -> tarball, checksum, manifest and sidecar, all published byte-identical
+  printf 'BYTES\n' >"$1/local/$tarball";  cp "$1/local/$tarball"  "$1/published/$tarball"
+  printf 'SUM\n'   >"$1/local/$checksum"; cp "$1/local/$checksum" "$1/published/$checksum"
+  printf '{"a":1}\n' >"$1/local/$manifest"; cp "$1/local/$manifest" "$1/published/$manifest"
+  printf 'MSUM\n' >"$1/local/$manifest.sha256"; cp "$1/local/$manifest.sha256" "$1/published/$manifest.sha256"
+}
+c="$(fresh_case bundle-resigned-identical)"
+identical_set "$c"
+printf '{"rekor":"run-2"}\n' >"$c/local/$bundle"
+expect_status 10 "a re-signed bundle over an identical set signals upload" bash "$sut" "$c/local" "$c/published"
+c="$(fresh_case bundle-differs-from-published)"
+identical_set "$c"
+printf '{"rekor":"run-2"}\n' >"$c/local/$bundle"; printf '{"rekor":"run-1"}\n' >"$c/published/$bundle"
+expect_status 10 "a published bundle with different bytes is not a conflict" bash "$sut" "$c/local" "$c/published"
+out="$(bash "$sut" "$c/local" "$c/published" 2>&1 || true)"
+grep -q "never byte-compared" <<<"$out" ||
+  fail "bundle-differs: the output should say the bundle is never byte-compared"
+c="$(fresh_case bundle-with-new-manifest)"
+printf 'BYTES\n' >"$c/local/$tarball";  cp "$c/local/$tarball"  "$c/published/$tarball"
+printf '{"a":1}\n' >"$c/local/$manifest"; printf 'MSUM\n' >"$c/local/$manifest.sha256"
+printf '{"rekor":"run-1"}\n' >"$c/local/$bundle"
+expect_status 10 "a bundle with a not-yet-published manifest signals upload" bash "$sut" "$c/local" "$c/published"
+c="$(fresh_case bundle-with-conflicting-manifest)"
+identical_set "$c"
+printf '{"a":2}\n' >"$c/published/$manifest"
+printf '{"rekor":"run-2"}\n' >"$c/local/$bundle"
+expect_status 1 "a bundle whose manifest conflicts is refused with it" bash "$sut" "$c/local" "$c/published"
+c="$(fresh_case bundle-without-manifest)"
+printf 'BYTES\n' >"$c/local/$tarball"; printf 'SUM\n' >"$c/local/$checksum"
+printf '{"rekor":"run-1"}\n' >"$c/local/$bundle"
+expect_status 1 "a bundle without its manifest beside it is an error" bash "$sut" "$c/local" "$c/published"
+c="$(fresh_case published-bundle-not-resigned)"
+identical_set "$c"
+printf '{"rekor":"run-1"}\n' >"$c/published/$bundle"
+expect_status 0 "a published bundle is left alone when this run did not sign" bash "$sut" "$c/local" "$c/published"
+
 # Guardrails: empty local dir and missing dirs are errors, not silent passes.
 c="$(fresh_case empty)"
 expect_status 1 "empty local dir rejected" bash "$sut" "$c/local" "$c/published"
