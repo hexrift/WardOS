@@ -21,6 +21,8 @@ jetbrains-mono-fonts
 dejavu-sans-fonts
 dejavu-sans-mono-fonts
 glibc-langpack-en
+wl-clipboard
+cliphist
 git
 jq
 python3
@@ -30,7 +32,8 @@ seatd                 # capture: the seat aquamarine opens the vkms card through
 mesa-libEGL           # capture: the EGL vendor llvmpipe renders through (a dependency on the image, weak here)
 mesa-libgbm           # capture: GBM for aquamarine's buffers; mesa-dri-drivers above carries kms_swrast, the software path on the card's dumb buffers (a dependency on the image)
 xkeyboard-config      # capture: keymaps for Hyprland's input config (a dependency on the image)
-dbus-daemon           # capture: the session bus mako and notify-send need (systemd's user session on the image)
+dbus-daemon           # capture: the session bus mako and notify-send need (systemd's user session on the image), and the system bus ci-run.sh runs (dbus-broker's on the image)
+dbus-tools            # capture: dbus-uuidgen, the machine id the system bus is set up with
 python3-pillow        # capture: assemble.py writes the GIF
 procps-ng             # capture: pgrep, pkill and ps for the waits
 shadow-utils          # capture: useradd for the unprivileged session user

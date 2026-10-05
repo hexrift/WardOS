@@ -149,6 +149,12 @@ done
 assert_fragment() { grep -q "$2" "$root/config/$1" || fail "config/$1 does not include its theme fragment ($2)"; }
 assert_fragment waybar/style.css '@import "../wardos/theme/current/waybar.css"'
 assert_fragment mako/config 'include=~/.config/wardos/theme/current/mako.conf'
+# mako takes include= only in the global section: after a [criteria] it is "Failed to
+# parse option" and mako refuses the whole config (no notification daemon at login).
+include_at=$(grep -n '^include=' "$root/config/mako/config" | head -n 1 | cut -d: -f1)
+section_at=$(grep -n '^\[' "$root/config/mako/config" | head -n 1 | cut -d: -f1)
+[[ -n $include_at && -n $section_at && $include_at -lt $section_at ]] ||
+  fail "config/mako/config: include= (line ${include_at:-none}) must come before the first [criteria] (line ${section_at:-none})"
 assert_fragment fuzzel/fuzzel.ini 'include=~/.config/wardos/theme/current/fuzzel.ini'
 assert_fragment foot/foot.ini 'include=~/.config/wardos/theme/current/foot.ini'
 assert_fragment alacritty/alacritty.toml 'import = \["~/.config/wardos/theme/current/alacritty.toml"\]'

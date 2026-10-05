@@ -119,7 +119,8 @@ done
 # shellcheck disable=SC2016  # grep patterns, not expansions
 for want in desktop/capture/packages.txt image/coprs.txt image/install-desktop.sh 'SEATD_VTBOUND=0 seatd -u wardos -g wardos' \
   'runuser -u wardos' 'LIBSEAT_BACKEND=seatd' 'CAPTURE_DRM_CARD="\$\{CAPTURE_DRM_CARD:-\}"' desktop/capture/capture.sh \
-  'chmod 0666 "\$\{nodes' 'kill "\$seatd_pid"' 'trap hand_back EXIT'; do
+  'chmod 0666 "\$\{nodes' 'kill "\$seatd_pid"' 'trap hand_back EXIT' \
+  'dbus-daemon --system --nofork --nopidfile' '/run/dbus/system_bus_socket' 'kill "\$dbus_pid"'; do
   grep -qE -- "$want" "$ci_run" || fail "ci-run.sh does not mention $want"
 done
 # shellcheck disable=SC2016  # grep patterns, not expansions
@@ -128,16 +129,22 @@ for want in 'AQ_DRM_DEVICES=\$CAPTURE_DRM_CARD' 'AQ_DRM_DEVICES=\$\(drm_card "\$
   grep -qE -- "$want" "$script" || fail "capture.sh does not mention $want"
 done
 # The clients start from the shipped autostart.conf, each exec-once logging to its own
-# file; a failed scene's shot and every scene's shot are described; the failure output
-# has the client logs, hyprctl, the processes and Hyprland's log without TRACE. The
-# shell worker is never started by hand: with no session it logs its "no session" line
-# without pause (it is systemd's to restart every two seconds), which filled a disk.
+# file and its exit status after it (a killed Waybar leaves no other trace), Waybar at
+# debug level and hypridle's line a no-op, both for the capture only; a failed scene's
+# shot and every scene's shot are described; the failure output has the client logs,
+# hyprctl, the processes and Hyprland's log without TRACE. The shell worker is never
+# started by hand: with no session it logs its "no session" line without pause (it is
+# systemd's to restart every two seconds), which filled a disk.
 trace_filter="grep -v '\\[TRACE\\]'"
 # shellcheck disable=SC2016  # literal fragments of the script, not expansions
-for want in 'exec-once = " cmd " >>" logs "/" name ".log 2>&1' \
+for want in 'exec-once = " cmd " >>" logs "/" name ".log 2>&1; echo \"exited $?\" >>" logs "/" name ".log"' \
+  'if (cmd == "waybar") cmd = "waybar -l debug"' 'if (name == "hypridle") { print "exec-once = true # hypridle' \
   'assemble.py" check "$png"' 'assemble.py" describe "$logs/not-on-screen-$id.png"' 'ps -o pid,ppid,stat,etime,cmd -u' \
   "$trace_filter" 'layers [$(layers_seen)]'; do
   grep -qF -- "$want" "$script" || fail "capture.sh does not have: $want"
+done
+for pkg in wl-clipboard cliphist dbus-daemon dbus-tools; do
+  grep -qx "$pkg" < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$cap/packages.txt") || fail "packages.txt lacks $pkg (the shipped exec-once lines and the buses need it)"
 done
 ! grep -qE '^[^#]*ward-shell worker' "$script" || fail "capture.sh must not start ward-shell worker itself (a tight loop with no session)"
 ! grep -q 'HYPRLAND_HEADLESS_ONLY=1' "$script" || fail "capture.sh must not set HYPRLAND_HEADLESS_ONLY: the DRM backend on vkms is the allocator"

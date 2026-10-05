@@ -1,11 +1,17 @@
 # WardOS — notifications and approvals (docs/design-language.md §9, §10).
 #
 # Calm, top-right, under the bar, on the 8 px grid, 1 px border, no icons by default.
-# Colours, the font and the radius come from the theme fragment included at the end
-# (background-color, text-color, border-color, progress-color, font, border-radius).
+# Colours, the font and the radius come from the theme fragment included first
+# (background-color, text-color, border-color, progress-color, font, border-radius):
+# mako reads `include=` only in the global section, before the first [criteria] (an
+# include after one is "Failed to parse option" and the whole config is refused), and
+# the fragment's own [urgency=…] sections then come before the ones below, which add
+# to them (timeouts here, colours there) rather than replace them.
 # Approvals from wardos-approve use the `ward-approval` category: centred, they stay
 # until answered, and their timeout is a thin progress line, not a number (§10).
 # Denials (§9) are short and never urgent-red on the whole surface.
+
+include=~/.config/wardos/theme/current/mako.conf
 
 max-visible=4
 sort=-time
@@ -53,5 +59,3 @@ default-timeout=3000
 # Do-not-disturb mode set by `wardos-toggle notifications` (makoctl mode -s dnd).
 [mode=dnd]
 invisible=1
-
-include=~/.config/wardos/theme/current/mako.conf

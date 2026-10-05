@@ -5,16 +5,17 @@
 # and the packages of desktop/capture/packages.txt, the tree placed by
 # image/install-desktop.sh, the checkout's ward binaries in /usr/bin, the unprivileged
 # user `wardos`, a seat for it (seatd, no VT, the socket owned by that user: aquamarine
-# opens the card through libseat, and there is no logind here), then capture.sh as that
-# user, with the card the workflow chose (CAPTURE_DRM_CARD) or picking the vkms card
-# itself.
+# opens the card through libseat, and there is no logind here), a system bus (the
+# classic dbus-daemon; dbus-broker's under systemd on the image), then capture.sh as
+# that user, with the card the workflow chose (CAPTURE_DRM_CARD) or picking the vkms
+# card itself.
 #
 #   desktop/capture/ci-run.sh BINARIES OUT
 #
 # BINARIES holds ward, wardd, ward-shell and wardos-theme-render; OUT receives what
-# capture.sh writes and seatd's log. OUT is handed back to HOST_UID:HOST_GID (the
-# runner's user) and made readable on the way out, failed or not, so the host can
-# upload it; seatd is stopped on the way out too.
+# capture.sh writes and the logs of seatd and the system bus. OUT is handed back to
+# HOST_UID:HOST_GID (the runner's user) and made readable on the way out, failed or
+# not, so the host can upload it; seatd and the bus are stopped on the way out too.
 set -euo pipefail
 
 usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -34,8 +35,10 @@ mkdir -p "$2"
 out=$(cd "$2" && pwd)
 
 seatd_pid=""
+dbus_pid=""
 hand_back() {
   if [[ -n $seatd_pid ]]; then kill "$seatd_pid" 2>/dev/null || true; fi
+  if [[ -n $dbus_pid ]]; then kill "$dbus_pid" 2>/dev/null || true; fi
   chown -R "${HOST_UID:-0}:${HOST_GID:-0}" "$out" 2>/dev/null || true
   chmod -R a+rX "$out" 2>/dev/null || true
 }
@@ -73,6 +76,30 @@ for card in /sys/class/drm/card*; do
 done
 echo "CAPTURE_DRM_CARD=${CAPTURE_DRM_CARD:-} (unset: capture.sh picks the ${CAPTURE_DRM_DRIVER:-vkms} card itself)"
 chown wardos:wardos "$out"
+
+# The system bus, at its default address (/run/dbus/system_bus_socket), with nothing on
+# it: GTK and Waybar's bluetooth, network and battery modules ask it for BlueZ,
+# NetworkManager and UPower and get "no such service" answers, as on a machine without
+# them, instead of no bus at all (run 6: Waybar's last complaint before it went away was
+# `Unable to connect to the SYSTEM Bus!`). The classic daemon's system.conf runs it as
+# the `dbus` user, which the package's scriptlet creates; the machine id is its
+# dbus-uuidgen's.
+id dbus >/dev/null 2>&1 || useradd -r -s /sbin/nologin dbus
+dbus-uuidgen --ensure
+mkdir -p /run/dbus
+rm -f /run/dbus/system_bus_socket /run/dbus/pid
+dbus-daemon --system --nofork --nopidfile >"$out/dbus-system.log" 2>&1 &
+dbus_pid=$!
+for _ in $(seq 1 50); do
+  [[ -S /run/dbus/system_bus_socket ]] && break
+  kill -0 "$dbus_pid" 2>/dev/null || break
+  sleep 0.2
+done
+[[ -S /run/dbus/system_bus_socket ]] || {
+  cat "$out/dbus-system.log" >&2 || true
+  die "the system bus did not open /run/dbus/system_bus_socket"
+}
+runuser -u wardos -- test -r /run/dbus/system_bus_socket -a -w /run/dbus/system_bus_socket || die "wardos cannot use the system bus socket"
 
 # The seat: seatd as root, not bound to a VT (SEATD_VTBOUND=0; the container has no
 # /dev/tty0 and nothing to switch), its socket owned by the session user. libseat in

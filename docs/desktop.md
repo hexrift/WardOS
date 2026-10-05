@@ -472,14 +472,18 @@ it (every output at 1920x1080@60, Hyprland's debug log on, checked by
 software rasteriser for EGL and, through `kms_swrast` on the card's dumb buffers, for
 GBM; `AQ_TRACE`/`HYPRLAND_TRACE` on), waits for the vkms output and creates a headless
 one only when none appears. The clients start as on the image, from the user's copy of
-`autostart.conf`: `exec-once = waybar`, `exec-once = mako`, the theme re-apply that
-starts swaybg, `wardos-first-run`; the capture only sends each line's output to its own
-`logs/<command>.log`. There is no systemd user session in the container, so the
-`systemctl --user` line fails and logs that, and the units it would start do not run:
-the bar's segments subscribe to the daemon themselves, as they do whenever
-`wardos-shell-worker.service` is down, and the approval listener, the polkit agent and
-swayosd are not needed for the scenes (hypridle and cliphist are not installed there).
-Then it walks
+`autostart.conf`: `exec-once = waybar`, `exec-once = mako`, the `wl-paste … cliphist
+store` watchers, the theme re-apply that starts swaybg, `wardos-first-run`; the capture
+sends each line's output to its own `logs/<command>.log` with `exited <status>` after it
+when the command ends, runs Waybar with `-l debug`, and makes hypridle's line a no-op
+(its idle timer would lock the screen; the package is not installed there). There is no
+systemd user session in the container, so the `systemctl --user` line fails and logs
+that, and the units it would start do not run: the bar's segments subscribe to the
+daemon themselves, as they do whenever `wardos-shell-worker.service` is down, and the
+approval listener, the polkit agent and swayosd are not needed for the scenes. ci-run.sh
+runs a system bus with nothing on it (the classic `dbus-daemon --system`; dbus-broker's
+under systemd on the image), so Waybar's bluetooth, network and battery modules and GTK
+get "no such service" answers rather than no bus. Then it walks
 [`desktop/capture/scenes.tsv`](../desktop/capture/scenes.tsv). Each scene is started
 through `hyprctl dispatch exec` (the welcome steps, `wardos-launch run`, `wardos-menu`,
 `wardos-theme`, `wardos-power`), waited for in `hyprctl layers` and `hyprctl clients`

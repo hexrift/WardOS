@@ -19,7 +19,9 @@
 # onboarding markers, a 1920x1080@60 line in ~/.config/hypr/monitors.conf, ~/ward-demo
 # as a git repository), with Hyprland's debug log switched on in
 # ~/.config/hypr/hyprland.conf, and must pass `Hyprland --verify-config`; then a session
-# bus and Hyprland start. Writes OUT/frames/NN-<scene>.png, OUT/wardos-desktop.gif,
+# bus and Hyprland start (the system bus is the caller's: ci-run.sh runs one, so Waybar's
+# bluetooth, network and battery modules find a bus with no services on it rather than
+# none). Writes OUT/frames/NN-<scene>.png, OUT/wardos-desktop.gif,
 # OUT/summary.md and OUT/logs/. A required scene that is not on screen in time fails the
 # run with Hyprland's log, the DRM nodes and the EGL vendor; an optional one (the lock
 # screen) is left out with a warning.
@@ -57,7 +59,7 @@ die() {
 [[ $(id -u) -ne 0 ]] || die "run as an unprivileged user; Hyprland refuses root"
 missing=()
 for cmd in Hyprland hyprctl grim jq waybar mako fuzzel foot swaybg notify-send dbus-daemon \
-  pgrep pkill ps git python3 ward wardd ward-shell wardos-theme-render wardos-refresh \
+  wl-paste cliphist pgrep pkill ps git python3 ward wardd ward-shell wardos-theme-render wardos-refresh \
   wardos-theme wardos-welcome wardos-launch wardos-menu wardos-power; do
   command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
@@ -436,13 +438,19 @@ done
 # catch-all line replaces the shipped `preferred` one.
 printf 'monitor = , 1920x1080@60, auto, 1\n' >>"$HOME/.config/hypr/monitors.conf"
 # The clients start as on the image, from autostart.conf's exec-once lines (waybar, mako,
-# the theme re-apply that starts swaybg, wardos-first-run; hypridle and cliphist are not
-# installed here), each line's output going to logs/<command>.log instead of Hyprland's
-# stdout, which the trace log would drown it in. The user's copy of the file is what
-# Hyprland reads; the commands themselves are untouched.
+# the clipboard watchers, the theme re-apply that starts swaybg, wardos-first-run), each
+# line's output going to logs/<command>.log instead of Hyprland's stdout, which the
+# trace log would drown it in, followed by `exited <status>` when the command ends (128
+# plus the signal for one that was killed: Waybar went away after its start-up in run 6
+# with nothing in its log). The user's copy of the file is what Hyprland reads. Two
+# lines are changed for the capture only: Waybar gets `-l debug`, and hypridle's line
+# becomes a no-op (its idle timer would lock the screen mid-capture; the package is not
+# installed here).
 awk -v logs="$logs" '/^exec-once = / {
   cmd = substr($0, 13); split(cmd, w, " "); name = w[1]; sub(/.*\//, "", name)
-  print "exec-once = " cmd " >>" logs "/" name ".log 2>&1"; next
+  if (name == "hypridle") { print "exec-once = true # hypridle: left out of the capture"; next }
+  if (cmd == "waybar") cmd = "waybar -l debug"
+  print "exec-once = " cmd " >>" logs "/" name ".log 2>&1; echo \"exited $?\" >>" logs "/" name ".log"; next
 } { print }' "$HOME/.config/hypr/autostart.conf" >"$HOME/.config/hypr/autostart.conf.capture" &&
   mv "$HOME/.config/hypr/autostart.conf.capture" "$HOME/.config/hypr/autostart.conf"
 # Hyprland logs nothing to its file by default (debug:disable_logs); the capture's
