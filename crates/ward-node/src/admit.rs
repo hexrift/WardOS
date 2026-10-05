@@ -17,11 +17,14 @@
 //!    the trusted task-authority check ([`TrustedTaskAdmission`]) for the binding and agent;
 //! 9. no durable revocation covers the lease or its lineage;
 //! 10. every grant in the decoded capability manifest is one this node honours:
-//!     `{"network":"offline"}` always, and `{"network":{"custom":[…]}}` only on a node
+//!     `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only on a node
 //!     that enforces a network allowlist ([`NodeAdmission::with_network_allowlist`], set by
-//!     the registry from its execution); any other grant is refused `unsupported_grant`,
-//!     after authority is proven and before the version is committed, so a refused grant
-//!     consumes nothing.
+//!     the registry from its execution), and an `output` grant only on a node that returns
+//!     output ([`NodeAdmission::with_output_return`]) and only within its ceilings
+//!     ([`ward_node_protocol::MAX_OUTPUT_STDIO_BYTES`],
+//!     [`ward_node_protocol::MAX_OUTPUT_FILES_BYTES`]); any other grant is refused
+//!     `unsupported_grant`, after authority is proven and before the version is committed,
+//!     so a refused grant consumes nothing.
 //!
 //! Each failure is a typed [`TaskLifecycleRejectionReason`]. Task-registry checks
 //! (existence, exact binding, `Created` state) come first, in [`crate::task`].
@@ -110,6 +113,7 @@ pub struct NodeAdmission {
     state: NodeState,
     clock: Box<dyn NodeClock>,
     network_allowlist: bool,
+    output_return: bool,
 }
 
 impl std::fmt::Debug for NodeAdmission {
@@ -119,6 +123,7 @@ impl std::fmt::Debug for NodeAdmission {
             .field("issuers", &self.issuers)
             .field("state", &self.state)
             .field("network_allowlist", &self.network_allowlist)
+            .field("output_return", &self.output_return)
             .finish_non_exhaustive()
     }
 }
@@ -132,6 +137,7 @@ impl NodeAdmission {
             state,
             clock,
             network_allowlist: false,
+            output_return: false,
         }
     }
 
@@ -148,6 +154,21 @@ impl NodeAdmission {
     #[must_use]
     pub const fn honours_network_allowlist(&self) -> bool {
         self.network_allowlist
+    }
+
+    /// Whether a manifest's `output` grant is honoured, within the ceilings (check 10).
+    /// The task registry sets this from its execution, so what `admit` accepts is exactly
+    /// what the reaper collects and `result` returns.
+    #[must_use]
+    pub const fn with_output_return(mut self, enabled: bool) -> Self {
+        self.output_return = enabled;
+        self
+    }
+
+    /// Whether a manifest's `output` grant is honoured.
+    #[must_use]
+    pub const fn honours_output_return(&self) -> bool {
+        self.output_return
     }
 
     /// This node's identity: the only audience it admits.
@@ -242,6 +263,7 @@ impl NodeAdmission {
         check_grants(
             envelope.workload().capability_manifest().manifest(),
             self.network_allowlist,
+            self.output_return,
         )?;
 
         Ok(VerifiedAdmission {
@@ -392,11 +414,17 @@ const fn claimed_binding(wire: &UntrustedAuthorityLease) -> DelegationBinding {
 const fn check_grants(
     manifest: &CapabilityManifest,
     network_allowlist: bool,
+    output_return: bool,
 ) -> Result<(), Reason> {
     match manifest.network() {
-        NetworkGrant::Offline => Ok(()),
-        NetworkGrant::Custom(_) if network_allowlist => Ok(()),
-        NetworkGrant::Custom(_) => Err(Reason::UnsupportedGrant),
+        NetworkGrant::Offline => {}
+        NetworkGrant::Custom(_) if network_allowlist => {}
+        NetworkGrant::Custom(_) => return Err(Reason::UnsupportedGrant),
+    }
+    match manifest.output() {
+        None => Ok(()),
+        Some(output) if output_return && output.within_ceilings() => Ok(()),
+        Some(_) => Err(Reason::UnsupportedGrant),
     }
 }
 
@@ -558,5 +586,46 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn an_output_grant_is_honoured_only_when_enabled_and_within_the_ceilings() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = node_admission(&dir.path().join("state"), &FixedClock::at(NOW));
+        let returning = node_admission(&dir.path().join("returning"), &FixedClock::at(NOW))
+            .with_output_return(true);
+        assert!(!plain.honours_output_return());
+        assert!(returning.honours_output_return());
+        let with = |manifest| {
+            let mut input = envelope_input(lifecycle_binding());
+            crate::test_support::with_manifest(&mut input, manifest);
+            TaskAdmissionEnvelope::new(input).unwrap()
+        };
+        let modest = with(crate::test_support::output_manifest(1024, &["a"], 1024));
+        assert_eq!(
+            verify_signed(&plain, &modest, &issuer_keypair()).unwrap_err(),
+            Reason::UnsupportedGrant
+        );
+        assert!(verify_signed(&returning, &modest, &issuer_keypair()).is_ok());
+        for over in [
+            crate::test_support::output_manifest(
+                ward_node_protocol::MAX_OUTPUT_STDIO_BYTES + 1,
+                &[],
+                0,
+            ),
+            crate::test_support::output_manifest(
+                0,
+                &[],
+                ward_node_protocol::MAX_OUTPUT_FILES_BYTES + 1,
+            ),
+        ] {
+            assert_eq!(
+                verify_signed(&returning, &with(over), &issuer_keypair()).unwrap_err(),
+                Reason::UnsupportedGrant
+            );
+        }
+        let offline = TaskAdmissionEnvelope::new(envelope_input(lifecycle_binding())).unwrap();
+        assert!(verify_signed(&plain, &offline, &issuer_keypair()).is_ok());
+        assert!(verify_signed(&returning, &offline, &issuer_keypair()).is_ok());
     }
 }

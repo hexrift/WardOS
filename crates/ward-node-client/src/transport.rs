@@ -2,7 +2,10 @@
 //!
 //! One connection carries exactly one handshake line and at most one request line, each
 //! answered by one line; both request lines are written at once and the node closes the
-//! connection afterwards. Lines are bounded at [`MAX_LINE_BYTES`] in both directions. The
+//! connection afterwards. Lines are bounded at [`MAX_LINE_BYTES`] in both directions,
+//! except the answer to `result`, which the caller bounds itself
+//! ([`Transport::exchange_with_response_bound`]; `ward-node-protocol`'s
+//! `MAX_RESULT_RESPONSE_BYTES`) because it carries an attempt's output. The
 //! node answers nothing to a malformed request and simply closes, so EOF is a first-class
 //! result here: before the handshake answer it is [`TransportError::ClosedWithoutResponse`],
 //! after it an [`Exchange`] whose `response` is `None`, which the client reports as
@@ -72,8 +75,9 @@ pub enum TransportError {
     /// The node closed the connection in the middle of an answer line.
     #[error("the node closed the connection in the middle of a response line")]
     TruncatedResponse,
-    /// An answer line exceeds [`MAX_LINE_BYTES`].
-    #[error("a response line exceeds {MAX_LINE_BYTES} bytes")]
+    /// An answer line exceeds its bound ([`MAX_LINE_BYTES`], or the bound a
+    /// [`Transport::exchange_with_response_bound`] caller gave).
+    #[error("a response line exceeds its bound")]
     ResponseTooLong,
     /// An answer line is not UTF-8.
     #[error("a response line is not UTF-8")]
@@ -96,6 +100,23 @@ pub trait Transport {
     /// Returns a [`TransportError`] when the node could not be reached, did not answer the
     /// handshake, or answered outside the line bounds.
     fn exchange(&self, hello: &str, request: &str) -> Result<Exchange, TransportError>;
+
+    /// [`Self::exchange`], reading the request's answer up to `response_bound` bytes
+    /// instead of [`MAX_LINE_BYTES`]: for `result`, whose answer carries an attempt's
+    /// output. A transport that cannot read past [`MAX_LINE_BYTES`] keeps that bound.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::exchange`].
+    fn exchange_with_response_bound(
+        &self,
+        hello: &str,
+        request: &str,
+        response_bound: usize,
+    ) -> Result<Exchange, TransportError> {
+        let _ = response_bound;
+        self.exchange(hello, request)
+    }
 }
 
 /// The local Unix-socket transport.
@@ -162,12 +183,21 @@ fn read_line(
     reader: &mut BufReader<UnixStream>,
     timeout: Duration,
 ) -> Result<Option<String>, TransportError> {
+    read_bounded_line(reader, timeout, MAX_LINE_BYTES)
+}
+
+fn read_bounded_line(
+    reader: &mut BufReader<UnixStream>,
+    timeout: Duration,
+    bound: usize,
+) -> Result<Option<String>, TransportError> {
     reader
         .get_ref()
         .set_read_timeout(Some(timeout))
         .map_err(TransportError::Io)?;
     let mut buffer = Vec::new();
-    let limit = u64::try_from(MAX_LINE_BYTES + 1).map_err(|_| TransportError::ResponseTooLong)?;
+    let limit =
+        u64::try_from(bound.saturating_add(1)).map_err(|_| TransportError::ResponseTooLong)?;
     let read = match reader.by_ref().take(limit).read_until(b'\n', &mut buffer) {
         Ok(read) => read,
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => 0,
@@ -177,7 +207,7 @@ fn read_line(
         return Ok(None);
     }
     if buffer.last() != Some(&b'\n') {
-        return Err(if buffer.len() > MAX_LINE_BYTES {
+        return Err(if buffer.len() > bound {
             TransportError::ResponseTooLong
         } else {
             TransportError::TruncatedResponse
@@ -187,7 +217,7 @@ fn read_line(
     if buffer.last() == Some(&b'\r') {
         buffer.pop();
     }
-    if buffer.len() > MAX_LINE_BYTES {
+    if buffer.len() > bound {
         return Err(TransportError::ResponseTooLong);
     }
     String::from_utf8(buffer)
@@ -202,10 +232,19 @@ impl Transport for UnixTransport {
     }
 
     fn exchange(&self, hello: &str, request: &str) -> Result<Exchange, TransportError> {
+        self.exchange_with_response_bound(hello, request, MAX_LINE_BYTES)
+    }
+
+    fn exchange_with_response_bound(
+        &self,
+        hello: &str,
+        request: &str,
+        response_bound: usize,
+    ) -> Result<Exchange, TransportError> {
         let mut reader = self.connect(&[hello, request])?;
         let handshake = read_line(&mut reader, self.timeouts.connect)?
             .ok_or(TransportError::ClosedWithoutResponse)?;
-        let response = read_line(&mut reader, self.timeouts.request)?;
+        let response = read_bounded_line(&mut reader, self.timeouts.request, response_bound)?;
         Ok(Exchange {
             handshake,
             response,

@@ -1,7 +1,8 @@
 # ward-node integration contract for external control planes
 
 Status: living document. It describes the `ward-node` protocol 1.3 contract as
-implemented today (ADR-0030 steps 1–9), and the client and process adapter that drive it
+implemented today (ADR-0030 steps 1–9, 12 and 13: the network allowlist and bounded
+result return, both additive within 1.3), and the client and process adapter that drive it
 (§11). The cross-system acceptance suite that proves it against a real node (ADR-0030
 step 10, #332 slice 9) is [node-acceptance.md](node-acceptance.md). Three companion
 documents (ADR-0030 step 11, #332 slice 10): the walk from an empty host to a verified
@@ -27,10 +28,13 @@ admission example is a working test vector (§7.4).
   configured ([ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md)).
   Reaching the socket proves nothing; a signature by a trusted key is required.
 - The node reads the capability manifest and honours only what it can enforce: `offline`
-  always, and a `network.custom` host allowlist only on a node its operator started with
+  always, a `network.custom` host allowlist only on a node its operator started with
   `--network-allowlist`, which then runs the workload behind a node-owned egress proxy
-  allowing exactly those hosts (§7.5, §9); any other grant is refused `unsupported_grant`
-  at `admit`, never run with less silently.
+  allowing exactly those hosts (§7.5, §9), and an `output` grant only on a node started
+  with `--output-return`, which then keeps the head of the workload's stdout and stderr,
+  collects the declared workspace files once the attempt has ended and returns the bounded
+  result through `result` (§6.6, §7.5); any other grant is refused `unsupported_grant` at
+  `admit`, never run with less silently.
 - WardOS ships one client for this contract: the `ward-node-client` crate (a transport,
   a typed client, an issuer signer and a fail-closed attempt driver for Rust control
   planes) and its `ward-node-adapter` binary (the same over stdin/stdout for control
@@ -38,7 +42,9 @@ admission example is a working test vector (§7.4).
   a uid the node's operator listed with `--client-uid` (§2.1, §11.1).
 - Not implemented yet: a loopback relay and `HTTP_PROXY` environment inside the sandbox
   (the proxy is reached through its Unix socket, §9), credential injection (#267), an
-  event stream (`stream`), and any remote transport or mTLS. The only transport is a
+  event stream (`stream`), a workspace export as a snapshot (`snapshots.read` and
+  `snapshots.diff` stay `false`; `result` returns declared files only, §6.6), and any
+  remote transport or mTLS. The only transport is a
   local Unix socket; remote transport and key bootstrap are #262. The full list, with what each gap means for a control plane, is
   [node-security-limitations.md](node-security-limitations.md) §3.
 - The per-session runtime (`ward up`, one `wardd` per session) is a separate mode on the
@@ -51,7 +57,7 @@ admission example is a working test vector (§7.4).
 
 ```text
 ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
-  [--trusted-issuers <file>] [--task-root <dir>] [--network-allowlist] \
+  [--trusted-issuers <file>] [--task-root <dir>] [--network-allowlist] [--output-return] \
   [--client-uid <uid>]… [--client-group <group>]
 ```
 
@@ -63,6 +69,7 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | `--trusted-issuers` | no | Trust store (§2.2). Without it no issuer is trusted and every `admit` is refused `authority_denied`. |
 | `--task-root` | no | Directory under which the node allocates workspaces and keeps each admitted attempt's evidence log (§6.5), created mode 0700 and refused if group- or world-accessible or not a real directory. With it the node executes (`start`, `pause`, `resume`, `stop`, `revoke`, `seal`); the node refuses to start if bubblewrap is unusable. Without it, all six are `unsupported_operation` and no evidence log is kept. |
 | `--network-allowlist` | no | Honour a manifest's `network.custom` host allowlist (§7.5): the attempt runs behind a node-owned egress proxy allowing exactly those hosts, with IP literals, private ranges and the metadata endpoint always refused (§9), and the node reports `network.proxy_allowlist` `true` (§5). Needs `--task-root`. Without it every `network.custom` manifest is refused `unsupported_grant`. |
+| `--output-return` | no | Honour a manifest's `output` grant (§7.5): the node keeps the first `stdio_bytes` of the workload's stdout and stderr, collects the declared workspace files once the attempt has ended (relative paths only, nothing followed outside the workspace, bounded), stores the result in `<task-root>/<task>/<attempt>.output/` (§6.6) and returns it through `result`; the capability document then carries `output` with `stdio` and `files` `true` (§5). Needs `--task-root`. Without it every manifest with `output` is refused `unsupported_grant` and `result` is `unsupported_operation`. |
 | `--client-uid` | no | A uid (decimal) or user name the node serves on its socket besides its own uid; repeatable, resolved once at start (an unknown name or a uid listed twice refuses to start). The node reads every connection's peer credentials before it reads a byte and closes a connection from any other uid without a response (§3). Root is not exempt. Being served grants no authority: `admit` still needs a trusted signature (§8.1). |
 | `--client-group` | no | A gid or group name to share the socket with: the socket is created mode 0660 owned by it, and its parent directory must be owned by it with mode 0750 or stricter. Needs at least one `--client-uid`; a member of the group that is not a listed uid can connect but is closed unread. Without it the socket is 0600 and only the node's uid (or root) can connect, whatever `--client-uid` says. The state directory and task root stay 0700 either way: a listed client can speak to the node, not read its state. |
 
@@ -249,7 +256,9 @@ and hashes are lowercase hex. The exit status is the text form's.
   response, then at most one request line and its response. The node then closes it.
   Open a new connection per request. Both lines may be written at once.
 - A request line is at most 64 KiB (65 536 bytes) excluding the newline; a longer line
-  closes the connection.
+  closes the connection. Every answer line fits 64 KiB too, except the answer to `result`
+  (§6.6), which carries an attempt's bounded output and is at most 16 MiB
+  (16 777 216 bytes): read that one with the larger bound, as the shipped client does.
 - **Request deadline.** The handshake line, its response and the request line must all
   complete within 10 seconds of accept. Partial progress does not extend it. If it
   expires the node closes the connection without a response.
@@ -333,11 +342,12 @@ well, `network.proxy_allowlist` reads `true`):
 | `network.offline` | `true` exactly when `lifecycle.start` is: every workload runs with no network but loopback. |
 | `network.proxy_allowlist` | `true` exactly when `lifecycle.start` is and the node was started with `--network-allowlist` (§2.1): a manifest asking for a host allowlist (`network.custom`, §7.5) is then honoured through a per-attempt egress proxy (§9). Otherwise `false`, and such a manifest is refused `unsupported_grant` at `admit`. |
 | `snapshots.content_addressed` | `true` exactly when `lifecycle.start` is: workspaces are materialised from the node's content-addressed store (§2.4). |
+| `output.stdio`, `output.files` | Present, as `"output":{"stdio":true,"files":true}` after `verifier`, exactly when `lifecycle.start` is and the node was started with `--output-return` (§2.1): a manifest's `output` grant (§7.5) is then honoured and `result` returns an ended attempt's bounded stdout, stderr and declared files (§6.6). Otherwise the section is absent, which means both `false`, and such a manifest is refused `unsupported_grant` at `admit`. The section is new in this revision of 1.3: a strict decoder of an earlier 1.3 revision refuses a document that carries it, so start a node with `--output-return` only once every control plane that reads it is at this revision; a node without the flag emits exactly the earlier document. |
 
 Everything else (`isolation.backends`, `credentials`, `snapshots.diff`,
 `snapshots.read`, `verifier`) is `false`: the node offers none of it yet. 1.1 and 1.2
-documents keep their earlier content: they never carry `admit` or
-`start`, report `stop`, `pause` and `revoke` as `false`, and report the execution flags
+documents keep their earlier content: they never carry `admit`, `start` or `output`,
+report `stop`, `pause` and `revoke` as `false`, and report the execution flags
 above as `false`, because a 1.1 or 1.2 connection cannot run anything.
 
 ## 6. Lifecycle verbs
@@ -610,11 +620,13 @@ evidence log per attempt it admits:
 ```text
 <task-root>/<task>/<attempt>.evidence/events.log    the log (mode 0600; 0400 once sealed)
 <task-root>/<task>/<attempt>.evidence/HEAD          the sealed head, written by seal (0400)
+<task-root>/<task>/<attempt>.output/result.json     the stored result of an output grant (§6.6; mode 0600)
 ```
 
-The directory (mode 0700, like `<task-root>/<task>/`) sits beside the attempt's workspace
-`<task-root>/<task>/<attempt>/`, never inside it: the sandbox binds only the workspace,
-so the workload cannot reach its log. Nothing else writes it.
+The directories (mode 0700, like `<task-root>/<task>/`) sit beside the attempt's
+workspace `<task-root>/<task>/<attempt>/`, never inside it: the sandbox binds only the
+workspace, so the workload cannot reach its log or its stored result. Nothing else writes
+them.
 
 The log uses the `ward-events` session-log format unchanged (`event-model.md` §5):
 length-prefixed frames, each record hash-chained to the one before. Every record has
@@ -630,11 +642,13 @@ task, attempt and lease ids as 16 big-endian bytes each. Records, in order:
 | `NodeAttemptIntervened` | A `pause` or `resume` took effect. | `pause` or `resume`, and the operation id. |
 | `NetworkRequested`, `NetworkDenied` | The attempt's egress proxy (§9: a `network.custom` manifest on a node with `--network-allowlist`) allowed or refused a destination. The node records the proxy's verdicts itself while the attempt runs, in the order they were made, at most 512 per attempt. | The destination host or literal and port; for an allow, the pinned addresses as the rule and the workload's host pid; for a denial, the reason (not allowlisted, private range). Never a request body. |
 | `ObservationsDropped` | Verdicts of the attempt's proxy could not be recorded: past the 512 bound, refused by the log's own bound, or still undecided when the attempt ended. One marker, before `NodeAttemptEnded`. | `source` `network`, the count and the bound. |
+| `NodeAttemptOutputCollected` | The attempt was admitted with an `output` grant on a node started with `--output-return` (§6.6, §7.5), its workload ended and was reaped, and the node collected the output and stored it. One record, right before `NodeAttemptEnded`; never written for a workload the node lost track of. | For stdout and for stderr, the bytes returned and the bytes dropped past them; for every declared file, in declaration order, its workspace path, size, `BLAKE3-256` digest and status (`returned`, `digest_only`, `missing`, `not_a_regular_file`, `too_large`). Never the bytes. `result` returns exactly what this record digests. |
 | `NodeAttemptEnded` | The attempt ended: natural exit, budget kill, a lost child, an ambiguous launch, a `stop` or `revoke` (from `ready`, or with its kill reaped, or a revoke whose reap was not confirmed). | The state (`exited`, `stopped`, `revoked`), the receipt outcome, the cause (exit code, budget, killed, lost, ambiguous, not started, unconfirmed) and the `stop` or `revoke` operation id. |
 | `NodeAttemptRecovered` | The state the node holds differs from the state the log last shows: after a restart, before the node serves, and before sealing. | The state and outcome the node holds. |
 | `NodeAttemptSealed` | `seal` took effect; the log is then sealed. | The `seal` operation id. |
 
-Every record is metadata; workload output is never logged. A record is fsynced before the
+Every record is metadata; workload output is never logged (an output record carries
+counts, sizes and digests, never a byte of the output). A record is fsynced before the
 node answers its verb. If it cannot be appended, the verb is refused
 `resource_unavailable` and nothing changes: the task record written for it is restored,
 and a `pause` or `resume` undoes its freeze or thaw first. One exception is `admit`: its
@@ -672,10 +686,72 @@ or its head: `inspect` and receipts are unchanged. To answer who delegated the a
 the attempt ran under, and to check that the log's `NodeAttemptAdmitted` record agrees
 with the task's durable record, use `ward-node audit --task-root` (§2.6).
 
-Retention is the operator's: the node never deletes an evidence log. A sealed task
-evicted from the registry (§10, capacity) keeps its sealed log, and a replaced attempt
-keeps its log, sealed or not, under its own attempt id. Remove `<task-root>/<task>/`
-only once its logs have been read or archived.
+Retention is the operator's: the node never deletes an evidence log or a stored result.
+A sealed task evicted from the registry (§10, capacity) keeps its sealed log and its
+result, and a replaced attempt keeps both, sealed or not, under its own attempt id.
+Remove `<task-root>/<task>/` only once its logs have been read or archived.
+
+### 6.6 Result return
+
+A node started with `--output-return` (§2.1) honours a manifest's `output` grant (§7.5):
+while the workload runs the node keeps exactly the first `stdio_bytes` of its stdout and
+of its stderr (a head; everything past it is drained and counted), and once the workload
+has ended and been reaped — a natural exit, the budget kill, a `stop` or a `revoke` — the
+attempt's reaper collects the declared files from the workspace, stores the bounded
+result as `<task-root>/<task>/<attempt>.output/result.json` (§6.5) and records what it
+collected in the evidence log (`NodeAttemptOutputCollected`), before the end record.
+Nothing of the workspace is read while the attempt executes. The collection happens
+before the attempt's end is recorded, so a `stop` or `revoke` waiting for the reap (§3,
+§8.2) waits for it too; it is bounded by the grant and the ceilings below (reading and
+digesting at most 64 files of at most 64 MiB each), but a workload that leaves very large
+declared files can make a `stop` run into its 10-second bound and be answered
+`resource_unavailable` once; replay it.
+
+Collection never leaves the workspace and is bounded: each declared path is relative and
+in the grammar of §7.5, every component is looked at without following a symlink, and a
+symlink, a directory or any other non-regular file anywhere on the path is reported
+`not_a_regular_file` with nothing followed or read; a path with nothing at it is
+`missing`. A regular file is returned whole, with its size and `BLAKE3-256` digest, while
+it fits what is left of `files_bytes` (files are taken in declaration order), digest-only
+with `"truncated":true` once it does not, and `too_large` — neither read nor digested —
+above 64 MiB (67 108 864 bytes). Every size is the size the node read, every digest is of
+exactly the bytes a control plane can compare against the file on the host.
+
+`result` is read-only and has no `operation_id`. It is served for an `exited`, `stopped`,
+`revoked` or `sealed` task; `seal` keeps the result:
+
+```json
+{"request":"result","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"}}
+{"response":"result","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"state":"exited","output":{"stdout":{"bytes":13,"truncated":false,"dropped":0,"content_base64":"aGVsbG8gc3Rkb3V0Cg=="},"stderr":{"bytes":4,"truncated":true,"dropped":4996,"content_base64":"ZWVlZQ=="},"files":[{"path":"out/report.json","size":11,"digest":"<64 hex, BLAKE3-256 of the content>","truncated":false,"content_base64":"eyJvayI6dHJ1ZX0="},{"path":"big.bin","size":3000,"digest":"<64 hex>","truncated":true},{"path":"missing.txt","skipped":"missing"},{"path":"planted","skipped":"not_a_regular_file"}]}}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `state` | The task's state when the result was read: `exited`, `stopped`, `revoked` or `sealed`. |
+| `output.stdout`, `output.stderr` | `bytes`: the bytes returned, the length of `content_base64` decoded; `dropped`: the bytes the workload wrote past the returned head; `truncated`: `dropped > 0`; `content_base64`: the first `bytes` of the stream, standard base64 with padding. The head is returned, never the tail. |
+| `output.files[]` | One entry per declared path, in declaration order. A returned file: `size`, `digest` (64 lowercase hex, `BLAKE3-256`), `"truncated":false` and `content_base64`. A file past the content budget: `size`, `digest`, `"truncated":true` and no content. Anything else: `skipped`, one of `missing`, `not_a_regular_file`, `too_large`, and nothing else. |
+
+A `result` is refused with a `rejected` response whose `operation_id` is `null` (as for
+`inspect`): `unsupported_operation` on a node not started with `--output-return`, or on a
+connection below 1.3 (where the verb is unknown and the connection closes without an
+answer); `task_not_found`, `attempt_mismatch` and `lease_mismatch` as for every verb;
+`invalid_state` while the attempt is `created`, `ready`, `running` or `paused`; and
+`resource_unavailable` when no stored result exists for the ended attempt: its manifest
+carried no `output` grant, the attempt never ran (`stopped` or `revoked` from `ready`),
+the node lost track of its workload (receipt `unknown`; the workspace is left unread),
+the node restarted before the output was collected (also `unknown`), the result could
+not be stored, or its `NodeAttemptOutputCollected` record could not be appended — a
+result the log does not bind is removed rather than served, and a restarted node removes
+a stored result its log does not bind before it serves. A refused `result` changes
+nothing; the receipt and the evidence log stand.
+
+Reading is repeatable: the same request answers the same bytes until the attempt is
+replaced by a new attempt (§6.1), whose result then has its own directory, or the operator
+removes the task directory (§10). The stored result survives a node restart (§6.4). Over
+the socket a control plane binds what it received to the sealed log by the digests in
+`NodeAttemptOutputCollected`: recompute `BLAKE3-256` over each returned file's content and
+over the stream heads' lengths and compare them with the record, read as §6.5 says. The
+shipped client reads the result after `seal` and puts it in the report (§11.3).
 
 ## 7. The admission envelope
 
@@ -899,11 +975,17 @@ grammar, and anything that is not one object fail envelope decoding (`authority_
 | --- | --- |
 | `network` | Required. `"offline"`: no network. Or `{"custom": [patterns]}`: egress to the listed hosts only. The spelling is `ward-policy`'s `network` capability (`offline`, `!custom`). |
 | `network.custom` | 1–64 host patterns, no repeats, in `ward-policy`'s host grammar: a lowercase DNS name (`github.com`), or `*.` and a name (`*.crates.io`), which covers any name with at least one more label and never the name itself. Labels are 1–63 characters of `a-z 0-9 -`, neither starting nor ending with `-`; a name is at most 253 bytes. Lower case only, so a signed pattern has one spelling. |
+| `output` | Optional (new in this revision of 1.3; a node of an earlier revision fails to decode a manifest that carries it). `{"stdio_bytes": N, "files": [paths], "files_bytes": M}`, all three required: return the first `N` bytes of each of stdout and stderr, and the declared `files` with up to `M` bytes of content in all (§6.6). |
+| `output.stdio_bytes`, `output.files_bytes` | Integers ≥ 0. The grammar bounds neither; the node honours at most 1 MiB (1 048 576) per stream and 8 MiB (8 388 608) of file content, and refuses a larger grant `unsupported_grant`. `0` is a grant too: the streams come back empty with their dropped counts. |
+| `output.files` | 0–64 paths, no repeats, each 1–255 bytes of `a-z A-Z 0-9 . _ - /`, relative to the workspace root, with no empty, `.` or `..` component, no leading or trailing `/` and no `//`. Exact paths only: no globs, no directories. A path outside the grammar (`../x`, `/etc/passwd`, a space) fails envelope decoding. |
 
 The node honours a decoded grant only if its capability document (§5) says it can
 enforce it: `offline` always, `custom` only when `network.proxy_allowlist` is `true`,
-which a node started with `--network-allowlist` reports (§2.1); the workload then runs
-behind the attempt's own egress proxy allowing exactly the listed patterns (§9). A
+which a node started with `--network-allowlist` reports (§2.1), and `output` only when
+`output.stdio` and `output.files` are `true`, which a node started with
+`--output-return` reports, and only within the ceilings above; the workload then runs
+behind the attempt's own egress proxy allowing exactly the listed patterns (§9), and its
+output is kept and returned as §6.6 says. A
 manifest that asks for a grant the node does not honour is refused `unsupported_grant`
 (§8.1 step 16): the node refuses what it cannot enforce
 rather than run the workload with less than its manifest says. The refusal comes after
@@ -926,12 +1008,20 @@ Decodes; honoured on a node started with `--network-allowlist`, refused
 `unsupported_grant` on any other.
 
 ```json
+{"network":"offline","output":{"stdio_bytes":4096,"files":["out/report.json","big.bin"],"files_bytes":2048}}
+```
+
+Decodes; honoured on a node started with `--output-return`, refused `unsupported_grant`
+on any other, as is `{"stdio_bytes":1048577,…}` on every node.
+
+```json
 {"network":"development"}
 ```
 
 `ward-policy`'s presets are not in the grammar: the envelope fails decoding
-(`authority_denied`), as do `{}`, `{"network":{"custom":[]}}` and any manifest with a
-field other than `network`.
+(`authority_denied`), as do `{}`, `{"network":{"custom":[]}}`,
+`{"network":"offline","output":{"stdio_bytes":1,"files":["../x"],"files_bytes":1}}` and
+any manifest with a field other than `network` and `output`.
 
 ## 8. Verification order and rejection reasons
 
@@ -957,7 +1047,7 @@ changes (no version is consumed, nothing is materialised).
 | 13 | The lineage promotes from its root: root shape, non-empty grants, every delegation rule of §7.3, each lease valid now | `lease_expired` for an expired lease, otherwise `authority_denied` |
 | 14 | Lease `task` / `id` / `subject` equal binding task / binding lease / `agent` | `authority_denied` / `lease_mismatch` / `authority_denied` |
 | 15 | No revocation (§2.5) covers the lease or an ancestor | `lease_revoked` |
-| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5) | `unsupported_grant` |
+| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5), an `output` grant only when the node reports `output` and the grant is within the node's ceilings (§6.6) | `unsupported_grant` |
 | 17 | The version is written durably | `resource_unavailable` (write failed) |
 
 On success the task is `ready` and holds the envelope for `start`.
@@ -1023,11 +1113,11 @@ task to evict it is refused `resource_unavailable`.
 | `lease_expired` | The envelope or a lease is past its expiry at the node clock. |
 | `lease_revoked` | A durable revocation, from `revocations.json` or recorded by `revoke`, covers the lease or an ancestor. |
 | `stale_operation` | The request is stale and nothing was done. From `admit`: the envelope `version` is not greater than the last version the node durably accepted for the task (an old or replayed envelope, also after a restart). From `pause` or `resume`: the `operation_id` took effect earlier and a later operation of the same verb has superseded it (§6.3). From `create`: the attempt was replaced by a later attempt of the task and is retired (§6.1). |
-| `invalid_state` | The task is not in a state that allows the verb, or another operation already did it. |
+| `invalid_state` | The task is not in a state that allows the verb, or another operation already did it. From `result`: the attempt has not ended yet (§6.6). |
 | `authority_denied` | Untrusted key, bad signature, malformed envelope (a capability manifest outside the grammar of §7.5 included), a root lease `issuer` that is not the principal bound to the signing key, wrong audience, not yet valid, or authority that does not cover the task or agent. |
-| `unsupported_grant` | From `admit` only: the envelope's capability manifest decodes but asks for a grant this node cannot honour (§7.5), here a `network.custom` allowlist on a node without `--network-allowlist`. The task stays `created` and no version is consumed; re-admit under the same version with a manifest the node honours. Protocol 1.3 and later. |
-| `resource_unavailable` | Registry full with no sealed task to evict, snapshot missing, workspace exists, spawn failed, a state write failed or would exceed its bound (admission version, revocation, retired attempt or task record), an evidence record could not be appended (§6.5), stop not confirmed in time, a pause or resume not confirmed, or an attempt's 128 pauses used up. |
-| `unsupported_operation` | The verb is not implemented (`stream`), or not enabled on this node or connection (no `--task-root`, or protocol 1.2). |
+| `unsupported_grant` | From `admit` only: the envelope's capability manifest decodes but asks for a grant this node cannot honour (§7.5): a `network.custom` allowlist on a node without `--network-allowlist`, or an `output` grant on a node without `--output-return` or above its ceilings (§6.6). The task stays `created` and no version is consumed; re-admit under the same version with a manifest the node honours. Protocol 1.3 and later. |
+| `resource_unavailable` | Registry full with no sealed task to evict, snapshot missing, workspace exists, spawn failed, a state write failed or would exceed its bound (admission version, revocation, retired attempt or task record), an evidence record could not be appended (§6.5), stop not confirmed in time, a pause or resume not confirmed, or an attempt's 128 pauses used up. From `result`: no stored result exists for the ended attempt (§6.6). |
+| `unsupported_operation` | The verb is not implemented (`stream`), or not enabled on this node or connection (no `--task-root`, or protocol 1.2; `result` without `--output-return`). |
 
 ## 9. Receipts
 
@@ -1052,7 +1142,9 @@ The workload runs in bubblewrap with the workspace bound writable at `/work` (it
 directory), a private `/tmp` and `/home/agent`, read-only system directories, a network
 namespace holding only loopback, and only `HOME`, `PATH`, `TERM` and `PWD` set (`PWD` is
 bubblewrap's, set to `/work` when it enters the working directory; nothing of the node's
-own environment is passed on). Output is drained and not returned.
+own environment is passed on). Output is drained; without an `output` grant none of it
+is kept, and with one (on a node started with `--output-return`) the first `stdio_bytes`
+of each stream are kept and returned by `result` with the declared files (§6.6).
 
 An `offline` manifest (§7.5) binds nothing else: there is no route off the host. A
 `network.custom` manifest, on a node started with `--network-allowlist` (§2.1), runs the
@@ -1145,6 +1237,11 @@ no `HTTP_PROXY` inside the sandbox yet: a workload reaches the proxy through the
   Every successful `admit` consumes one; refused admits (`unsupported_grant` included) do
   not, except one refused `resource_unavailable` because its evidence record could not be
   appended (§6.5).
+- **A lost `result` answer.** `result` is read-only: ask again with the same request. It
+  answers the same bytes for as long as the attempt is registered, so there is nothing to
+  replay and nothing it can have changed. The shipped driver asks once more and otherwise
+  ends the run `unknown`, so a control plane that asked for output never records a run as
+  complete without it (§11.2).
 - **Clocks.** Validity is judged at the node clock at `admit` and at `start`; no other
   verb rechecks it. Leave margin for skew and for the delay between the two.
 - **Capacity.** The node holds at most 1 024 tasks. `exited`, `stopped` and `revoked`
@@ -1156,8 +1253,10 @@ no `HTTP_PROXY` inside the sandbox yet: a workload reaches the proxy through the
   only with a higher version. A new attempt of a known task replaces it in place and
   needs no room.
 - **Disk.** The node never removes a workspace that ran (not on `stop`, `revoke`, `seal`,
-  eviction or restart), so that an attempt is never started twice. Reclaim task-root
-  space out of band, and only for attempt ids you will never send again.
+  eviction or restart), so that an attempt is never started twice, and never removes a
+  stored result or an evidence log. Reclaim task-root space out of band, and only for
+  attempt ids you will never send again; a stored result is at most about 14 MiB (its
+  ceilings, base64-encoded).
 
 ## 11. Client and adapter
 
@@ -1175,8 +1274,9 @@ WardOS ships one implementation of this contract for the control-plane side, in 
   in that window (`HandshakeRejected`) or accepts a version below 1.3 (`ProtocolTooOld`).
   Every later connection must be accepted at exactly the negotiated version. It reads the
   capability document (§5) and sends `create`, `admit`, `start`, `pause`, `resume`,
-  `stop`, `revoke`, `seal` and `inspect` (§6), decoding each answer strictly and refusing
-  one that names another binding or operation id than the request.
+  `stop`, `revoke`, `seal`, `inspect` (§6) and `result` (§6.6, read within the 16 MiB
+  result bound rather than the 64 KiB line bound), decoding each answer strictly and
+  refusing one that names another binding or operation id than the request.
 - `IssuerKey`: the control plane's Ed25519 issuer key, loaded from a 32-byte seed file
   that must be a regular file of mode `0600` or `0400` (any other mode is refused), or
   from seed bytes. It prints its public key and key id (§2.3) and the trust-store line
@@ -1190,7 +1290,8 @@ WardOS ships one implementation of this contract for the control-plane side, in 
   before anything is signed. Nothing else has a default: authority, lease, workspace
   (snapshot) and budget are the control plane's inputs.
 - `Driver::run_attempt`: `create` → `admit` → `start` → poll `inspect` → read the receipt
-  → `seal`, with the rules below, returning an `AttemptReport`.
+  → `seal` → `result` when the envelope's manifest carried an `output` grant, with the
+  rules below, returning an `AttemptReport`.
 
 ### 11.1 Operator requirements for a client host
 
@@ -1248,6 +1349,13 @@ and the node's `--task-root`.
 - **`unknown` means failed.** `outcome_certain` is `false` exactly when `outcome` is
   `unknown` (the node's receipt was `unknown`, the transport failed, or the attempt never
   ended). A control plane maps it to failed; it never infers success.
+- **The result is read once, after the seal, and only when it was granted.** When the
+  envelope's manifest carries an `output` grant the driver sends `result` after `seal`
+  (also on a replay of a sealed run, which is why a replay reports the same output) and
+  puts the answer in the report's `output`; a refused `result` is recorded as a `rejected`
+  event with `output` `null` and leaves the receipt and outcome as they were; a lost
+  `result` answer is asked for once more and then ends the run `unknown`, like any other
+  lost answer (§10). Without the grant the driver never asks.
 
 ### 11.3 The attempt report
 
@@ -1268,6 +1376,7 @@ and the node's `--task-root`.
 | `evidence_head` | The sealed log's head hash (64 hex digits) when the log is sealed, readable and verifies against its `HEAD`, else `null`. |
 | `operations` | Every mutating verb sent, in order, with its `operation_id` and the node's `state` (accepted) or `reason` (rejected); a verb whose answer never arrived has neither. |
 | `transport_error` | The transport failure that ended the run, or `null`. |
+| `output` | The attempt's bounded output as `result` returned it (§6.6: `stdout`, `stderr`, `files`), when the envelope's manifest carried an `output` grant and the node returned it; `null` otherwise, also after a refused `result`. |
 
 ### 11.4 The process adapter
 
@@ -1281,6 +1390,7 @@ Every output line carries `"schema":1`; stderr is diagnostics only. Commands:
 | `{"cmd":"run", …}` | The event stream below, ending in one `done`. |
 | `{"cmd":"revoke","operation_id":N,"binding":{…}}` | `{"event":"verb","verb":"revoke","operation_id":N,"result":"accepted","state":…}` or `…,"result":"rejected","reason":…}`. |
 | `{"cmd":"inspect","binding":{…}}` | `{"event":"inspected","state":…,"outcome":…}` or `{"event":"rejected","verb":"inspect","operation_id":null,"reason":…}`. |
+| `{"cmd":"result","binding":{…}}` | `{"event":"result","state":…,"output":{…}}` (the §6.6 output) or `{"event":"rejected","verb":"result","operation_id":null,"reason":…}`. |
 | anything else | `{"event":"error","error":"…"}`. |
 
 `run` takes the attempt in one of two forms, never a mixture:
@@ -1318,8 +1428,11 @@ One run, as the adapter writes it (the envelope string shortened):
 ```
 
 The stream may also carry `{"event":"rejected","verb":…,"operation_id":…,"reason":…}`
-for a refused verb and `{"event":"recovering","verb":…,"operation_id":…}` when a lost
-answer is being recovered (§11.2). The `admitted` event repeats the exact signed bytes
+for a refused verb, `{"event":"recovering","verb":…,"operation_id":…}` when a lost
+answer is being recovered (§11.2), and, when the manifest granted `output`,
+`{"event":"output","stdout_bytes":…,"stderr_bytes":…,"files":…,"truncated":…}` once the
+result was read; the output itself is in `done`'s report (`output`, §11.3), not repeated
+in the stream. The `admitted` event repeats the exact signed bytes
 and proof so a caller that signed here can persist them and replay after its own
 restart; a caller that pre-signed already holds them.
 
@@ -1337,16 +1450,20 @@ bad flags. A command line is at most 256 KiB.
   with `--network-allowlist` (§7.5, §9): there is no loopback relay or `HTTP_PROXY` in
   the sandbox, patterns are host-level, and no credential is injected (#267). On any
   other node a manifest with `network.custom` is refused `unsupported_grant`.
-- The workload's stdout and stderr are drained and not returned (§9); the protocol carries
-  no output.
-- The workspace is not exported: what the workload wrote stays under
-  `<task-root>/<task>/<attempt>/`, readable only on the host as the node's uid.
+- Output comes back only as a bounded result on a node started with `--output-return`
+  (§6.6): the head of each stream up to 1 MiB and the files the manifest declared by exact
+  path, up to 8 MiB of content, with digests for the rest. There is no tail, no streaming
+  while the attempt runs, no globs or directories, and no workspace export: what the
+  workload wrote beyond the declared files stays under `<task-root>/<task>/<attempt>/`,
+  readable only on the host as the node's uid (`snapshots.read` and `snapshots.diff` are
+  `false`).
 - There is no event stream (`stream`) and no callback channel into the sandbox; progress
   is what `inspect` reports.
 
 The honest integration shape today is therefore running governed tool actions and
 verification runs, an `argv` over a snapshot with a budget, through the node, reading the
-receipt and the evidence log, and not hosting a whole agent runtime whose conversation
-loop needs output, credentials or callbacks from inside the sandbox. Each of these gaps,
+receipt, the bounded result and the evidence log, and not hosting a whole agent runtime
+whose conversation loop needs streamed output, credentials or callbacks from inside the
+sandbox. Each of these gaps,
 with its impact, the mitigation available today and the issue that closes it, is a row
 of [node-security-limitations.md](node-security-limitations.md) §3.

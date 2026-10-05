@@ -143,6 +143,29 @@ pub fn network_manifest() -> CapabilityManifestBytes {
     .unwrap()
 }
 
+/// An offline manifest also asking for `output`: the first `stdio_bytes` of each stream
+/// and the declared `files` up to `files_bytes` of content.
+pub fn output_manifest(
+    stdio_bytes: u64,
+    files: &[&str],
+    files_bytes: u64,
+) -> CapabilityManifestBytes {
+    CapabilityManifestBytes::encode(
+        &CapabilityManifest::new(NetworkGrant::Offline).with_output(
+            ward_node_protocol::OutputGrant::new(
+                stdio_bytes,
+                files
+                    .iter()
+                    .map(|path| ward_node_protocol::OutputPath::new(*path).unwrap())
+                    .collect(),
+                files_bytes,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap()
+}
+
 /// Replace the manifest of `input`'s workload, keeping everything else.
 pub fn with_manifest(input: &mut TaskAdmissionEnvelopeInput, manifest: CapabilityManifestBytes) {
     input.workload = TaskWorkload::new(
@@ -313,6 +336,7 @@ struct FakeState {
     survivors: Vec<crate::execution::WorkloadProcess>,
     blocked_on_launch: Option<std::path::PathBuf>,
     egress: Option<Arc<crate::egress::AttemptEgress>>,
+    stdio: (Vec<u8>, Vec<u8>),
 }
 
 /// A deterministic launcher: workloads end only when the test says so, or on stop.
@@ -346,6 +370,7 @@ impl FakeLauncher {
                 survivors: Vec::new(),
                 blocked_on_launch: None,
                 egress: None,
+                stdio: (Vec::new(), Vec::new()),
             }),
             std::sync::Condvar::new(),
         )))
@@ -426,6 +451,12 @@ impl FakeLauncher {
     pub fn egress(&self) -> Option<Arc<crate::egress::AttemptEgress>> {
         self.state().egress.clone()
     }
+
+    /// What the fake workload writes to stdout and stderr; its reaper gets the head the
+    /// launch's output grant asked for and the full byte count, as the sandbox does.
+    pub fn set_stdio(&self, stdout: &[u8], stderr: &[u8]) {
+        self.state().stdio = (stdout.to_vec(), stderr.to_vec());
+    }
 }
 
 impl crate::execution::TaskLauncher for FakeLauncher {
@@ -445,7 +476,11 @@ impl crate::execution::TaskLauncher for FakeLauncher {
                     Arc::new(crate::egress::AttemptEgress::start(&dir, allowlist).unwrap())
                 });
                 state.egress.clone_from(&egress);
-                Ok(Box::new(FakeWorkload(self.clone(), egress)))
+                Ok(Box::new(FakeWorkload(
+                    self.clone(),
+                    egress,
+                    request.output().cloned(),
+                )))
             }
             FakeSpawn::Refuse => Err(crate::execution::SpawnError::Refused),
             FakeSpawn::Ambiguous => Err(crate::execution::SpawnError::Ambiguous),
@@ -457,7 +492,11 @@ impl crate::execution::TaskLauncher for FakeLauncher {
     }
 }
 
-struct FakeWorkload(FakeLauncher, Option<Arc<crate::egress::AttemptEgress>>);
+struct FakeWorkload(
+    FakeLauncher,
+    Option<Arc<crate::egress::AttemptEgress>>,
+    Option<ward_node_protocol::OutputGrant>,
+);
 
 /// The fake workload's freezer: records attempts and answers as configured, pausing the
 /// launch's real egress proxy while the fake tree is held, as the sandbox freezer does.
@@ -524,7 +563,7 @@ impl crate::execution::RunningWorkload for FakeWorkload {
         self: Box<Self>,
         stop: &crate::execution::StopSignal,
         on_tick: &mut dyn FnMut(),
-    ) -> crate::execution::WorkloadExit {
+    ) -> crate::execution::WorkloadEnd {
         let (lock, ready) = &*self.0.0;
         let mut state = lock.lock().unwrap();
         state.waiting += 1;
@@ -553,7 +592,22 @@ impl crate::execution::RunningWorkload for FakeWorkload {
         state.waiting -= 1;
         state.reaped += 1;
         state.egress = None;
-        exit
+        let stream = |bytes: &[u8]| {
+            let head = self.2.as_ref().map_or(0, |grant| {
+                usize::try_from(grant.stdio_bytes()).unwrap_or(usize::MAX)
+            });
+            crate::output::CapturedStream {
+                head: bytes[..bytes.len().min(head)].to_vec(),
+                total: bytes.len() as u64,
+            }
+        };
+        crate::execution::WorkloadEnd {
+            exit,
+            stdio: crate::output::CapturedStdio {
+                stdout: stream(&state.stdio.0),
+                stderr: stream(&state.stdio.1),
+            },
+        }
     }
 }
 

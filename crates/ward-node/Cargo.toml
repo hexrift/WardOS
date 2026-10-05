@@ -16,6 +16,7 @@ name = "ward-node"
 path = "src/main.rs"
 
 [dependencies]
+blake3 = { workspace = true }
 clap = { workspace = true }
 nix = { version = "0.30", features = ["socket", "user"] }
 ring = { workspace = true }
@@ -30,6 +31,7 @@ ward-proxy = { path = "../ward-proxy", version = "0.18.0" }
 ward-snapshot = { path = "../ward-snapshot", version = "0.18.0" }
 
 [dev-dependencies]
+postcard = { workspace = true }
 tempfile = { workspace = true }
 # `ci::isolation_ready` gates the bwrap-backed tests, as in ward-launch.
 ward-sandbox = { path = "../ward-sandbox", version = "0.18.0" }

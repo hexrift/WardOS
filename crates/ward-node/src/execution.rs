@@ -8,7 +8,10 @@
 //!
 //! A launch is built only from node-owned state: the workspace the node allocated under
 //! its task root ([`crate::workspace`]), the admitted envelope's argv, its mandatory
-//! wall-clock budget and the host allowlist its manifest names, if any. The sandbox's
+//! wall-clock budget, the host allowlist its manifest names, if any, and the output grant
+//! its manifest carries, if any ([`LaunchRequest::output`]): the launcher then keeps
+//! exactly the first `stdio_bytes` of each stream raw ([`WorkloadEnd::stdio`]) for the
+//! reaper to return ([`crate::output`]), and still drains the rest. The sandbox's
 //! network namespace always holds only loopback. An offline manifest binds no egress
 //! socket. A `custom` manifest, which `admit` ([`crate::admit`]) accepts only on a node
 //! built [`NodeExecution::with_network_allowlist`], binds the attempt's own egress proxy
@@ -46,10 +49,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use ward_launch::freeze::{FrozenTree, TreeRoot, freeze_tree, kill_tree, thaw_tree};
 use ward_launch::{Launch, PROXY_SOCKET, RunningLaunch};
-use ward_node_protocol::HostAllowlist;
+use ward_node_protocol::{HostAllowlist, MAX_OUTPUT_STDIO_BYTES, OutputGrant};
 use ward_snapshot::SnapshotStore;
 
 use crate::egress::{AttemptEgress, PROXY_SOCKET_ENV, egress_dir_beside};
+use crate::output::{CapturedStdio, CapturedStream};
 use crate::workspace::TaskRoot;
 
 /// Default bound on how long `stop` waits for the reaper to confirm the kill and reap.
@@ -79,6 +83,7 @@ pub struct LaunchRequest {
     argv: Vec<String>,
     budget: Duration,
     allowlist: Option<HostAllowlist>,
+    output: Option<OutputGrant>,
 }
 
 impl LaunchRequest {
@@ -90,6 +95,7 @@ impl LaunchRequest {
             argv,
             budget,
             allowlist: None,
+            output: None,
         }
     }
 
@@ -98,6 +104,19 @@ impl LaunchRequest {
     pub fn with_allowlist(mut self, allowlist: HostAllowlist) -> Self {
         self.allowlist = Some(allowlist);
         self
+    }
+
+    /// The same launch keeping the output `output` asks for.
+    #[must_use]
+    pub fn with_output(mut self, output: OutputGrant) -> Self {
+        self.output = Some(output);
+        self
+    }
+
+    /// The output grant the admitted manifest carried; `None` when nothing is returned.
+    #[must_use]
+    pub const fn output(&self) -> Option<&OutputGrant> {
+        self.output.as_ref()
     }
 
     /// The host allowlist the admitted manifest named; `None` for an offline workload.
@@ -136,7 +155,7 @@ pub enum SpawnError {
 }
 
 /// How a running workload ended, as its reaper observed it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WorkloadExit {
     /// The workload ended on its own; `None` when a signal the node did not send ended it.
     Exited {
@@ -148,7 +167,18 @@ pub enum WorkloadExit {
     /// The node killed and reaped the workload because a stop was requested.
     Stopped,
     /// The node lost track of the workload; what happened cannot be established.
+    #[default]
     Lost,
+}
+
+/// How a workload ended and what of its stdio the launcher kept for the reaper.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkloadEnd {
+    /// How it ended.
+    pub exit: WorkloadExit,
+    /// The head of each stream, up to the launch's output grant, and the full byte counts;
+    /// empty when the launch had no output grant.
+    pub stdio: CapturedStdio,
 }
 
 /// A request to stop one running workload, shared by `stop`, its reaper and node shutdown.
@@ -270,8 +300,9 @@ pub trait RunningWorkload: Send {
     }
 
     /// Wait until the workload ends, enforcing its budget, and kill and reap it as soon as
-    /// `stop` is requested, calling `on_tick` between waits while it runs.
-    fn wait(self: Box<Self>, stop: &StopSignal, on_tick: &mut dyn FnMut()) -> WorkloadExit;
+    /// `stop` is requested, calling `on_tick` between waits while it runs. Hands back the
+    /// stdio the launch's output grant asked to keep.
+    fn wait(self: Box<Self>, stop: &StopSignal, on_tick: &mut dyn FnMut()) -> WorkloadEnd;
 }
 
 /// The bubblewrap launcher: an offline sandbox over the workspace (`ward-launch`).
@@ -332,6 +363,12 @@ fn sandbox_launch(request: &LaunchRequest, proxy_socket: Option<&Path>) -> Launc
         .budget(request.budget())
         .capture_bytes(OUTPUT_CAPTURE_BYTES)
         .clear_env();
+    let launch = match request.output() {
+        Some(output) => launch.raw_head(
+            usize::try_from(output.stdio_bytes().min(MAX_OUTPUT_STDIO_BYTES)).unwrap_or(usize::MAX),
+        ),
+        None => launch,
+    };
     match proxy_socket {
         Some(socket) => launch.egress(socket).env(PROXY_SOCKET_ENV, PROXY_SOCKET),
         None => launch,
@@ -370,15 +407,32 @@ impl RunningWorkload for SandboxWorkload {
         self.egress.clone()
     }
 
-    fn wait(self: Box<Self>, stop: &StopSignal, on_tick: &mut dyn FnMut()) -> WorkloadExit {
-        match self
+    fn wait(self: Box<Self>, stop: &StopSignal, on_tick: &mut dyn FnMut()) -> WorkloadEnd {
+        let Ok(outcome) = self
             .launch
             .wait_observed_stoppable(on_tick, &|| stop.is_requested())
-        {
-            Ok(outcome) if outcome.stopped => WorkloadExit::Stopped,
-            Ok(outcome) if outcome.timed_out => WorkloadExit::BudgetExceeded,
-            Ok(outcome) => WorkloadExit::Exited { code: outcome.code },
-            Err(_) => WorkloadExit::Lost,
+        else {
+            return WorkloadEnd::default();
+        };
+        let exit = if outcome.stopped {
+            WorkloadExit::Stopped
+        } else if outcome.timed_out {
+            WorkloadExit::BudgetExceeded
+        } else {
+            WorkloadExit::Exited { code: outcome.code }
+        };
+        WorkloadEnd {
+            exit,
+            stdio: CapturedStdio {
+                stdout: CapturedStream {
+                    head: outcome.stdout_raw_head,
+                    total: outcome.stdout_bytes,
+                },
+                stderr: CapturedStream {
+                    head: outcome.stderr_raw_head,
+                    total: outcome.stderr_bytes,
+                },
+            },
         }
     }
 }
@@ -431,8 +485,9 @@ impl WorkloadFreezer for SandboxFreezer {
 
 /// What a node needs to execute admitted tasks: its task root, its snapshot store and a
 /// launcher. A node built with it advertises `start`, `stop`, `pause` and `revoke` together
-/// at protocol 1.3, and `network.proxy_allowlist` only when built
-/// [`Self::with_network_allowlist`].
+/// at protocol 1.3, `network.proxy_allowlist` only when built
+/// [`Self::with_network_allowlist`], and `output` only when built
+/// [`Self::with_output_return`].
 pub struct NodeExecution {
     task_root: TaskRoot,
     snapshots: SnapshotStore,
@@ -440,6 +495,7 @@ pub struct NodeExecution {
     stop_timeout: Duration,
     spawn_timeout: Duration,
     network_allowlist: bool,
+    output_return: bool,
 }
 
 impl std::fmt::Debug for NodeExecution {
@@ -450,6 +506,7 @@ impl std::fmt::Debug for NodeExecution {
             .field("stop_timeout", &self.stop_timeout)
             .field("spawn_timeout", &self.spawn_timeout)
             .field("network_allowlist", &self.network_allowlist)
+            .field("output_return", &self.output_return)
             .finish_non_exhaustive()
     }
 }
@@ -470,6 +527,7 @@ impl NodeExecution {
             stop_timeout: DEFAULT_STOP_TIMEOUT,
             spawn_timeout: DEFAULT_SPAWN_TIMEOUT,
             network_allowlist: false,
+            output_return: false,
         }
     }
 
@@ -494,6 +552,23 @@ impl NodeExecution {
     #[must_use]
     pub const fn honours_network_allowlist(&self) -> bool {
         self.network_allowlist
+    }
+
+    /// Whether this node honours a manifest's `output` grant, returning an ended
+    /// attempt's bounded stdout, stderr and declared workspace files through `result`
+    /// ([`crate::output`]). Off, every manifest with `output` is refused
+    /// `unsupported_grant` at `admit`, `result` is `unsupported_operation` and the node
+    /// advertises no `output` section.
+    #[must_use]
+    pub const fn with_output_return(mut self, enabled: bool) -> Self {
+        self.output_return = enabled;
+        self
+    }
+
+    /// Whether this node honours a manifest's `output` grant.
+    #[must_use]
+    pub const fn honours_output_return(&self) -> bool {
+        self.output_return
     }
 
     /// The task root workspaces are allocated under.

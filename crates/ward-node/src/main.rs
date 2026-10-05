@@ -1,7 +1,8 @@
 //! Local Ward node service executable.
 //!
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
-//! [--task-root <dir>] [--network-allowlist] [--client-uid <uid>]… [--client-group <group>]`
+//! [--task-root <dir>] [--network-allowlist] [--output-return] [--client-uid <uid>]…
+//! [--client-group <group>]`
 //! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
 //! admission version, revocation and retired-attempt stores, one record per registered task
@@ -14,7 +15,11 @@
 //! refuses to run when the sandbox is unavailable. With `--network-allowlist` as well, a
 //! manifest naming `network.custom` is honoured through a per-attempt egress proxy and the
 //! node advertises `network.proxy_allowlist`; without it such a manifest is refused
-//! `unsupported_grant`. The socket is served to the node's own
+//! `unsupported_grant`. With `--output-return` as well, a manifest's `output` grant is
+//! honoured: the node keeps the head of the workload's stdout and stderr, collects the
+//! declared workspace files once the attempt has ended, stores the bounded result beside
+//! the workspace and returns it through `result`, advertising `output`; without it such a
+//! manifest is refused `unsupported_grant`. The socket is served to the node's own
 //! uid and to each `--client-uid` (a uid or user name); every other peer is closed without
 //! a response. With `--client-group` the socket is created mode 0660 owned by that group,
 //! in a directory owned by it with mode 0750 or stricter, so a client of another uid can
@@ -82,6 +87,14 @@ struct Cli {
     /// `unsupported_grant`.
     #[arg(long, requires = "task_root")]
     network_allowlist: bool,
+    /// Honour a manifest's `output` grant: keep the first `stdio_bytes` of the workload's
+    /// stdout and stderr, collect the declared workspace files once the attempt has ended
+    /// (relative paths only, nothing followed outside the workspace, bounded), store the
+    /// result beside the workspace and return it through `result`; advertise `output`.
+    /// Needs `--task-root`. Without it every manifest with `output` is refused
+    /// `unsupported_grant`.
+    #[arg(long, requires = "task_root")]
+    output_return: bool,
     /// A uid, or user name, served on the socket besides the node's own; repeatable. Any
     /// other peer is closed without a response. Being served grants no authority: `admit`
     /// still needs a trusted signature.
@@ -208,7 +221,8 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 open_snapshot_store(&state_dir)?,
                 Arc::new(SandboxLauncher),
             )
-            .with_network_allowlist(cli.network_allowlist),
+            .with_network_allowlist(cli.network_allowlist)
+            .with_output_return(cli.output_return),
         )?,
         None => NodeService::with_admission(capabilities, admission)?,
     };
@@ -393,6 +407,20 @@ mod tests {
             Cli::try_parse_from(serve.iter().copied().chain(["--network-allowlist"])).is_err(),
             "a network allowlist needs a task root"
         );
+        let cli = Cli::try_parse_from(serve.iter().copied().chain([
+            "--task-root",
+            "t",
+            "--output-return",
+        ]))
+        .expect("serve returning output");
+        assert!(cli.output_return);
+        assert!(!cli.network_allowlist);
+        assert!(
+            Cli::try_parse_from(serve.iter().copied().chain(["--output-return"])).is_err(),
+            "result return needs a task root"
+        );
+        let cli = Cli::try_parse_from(serve).expect("serve");
+        assert!(!cli.output_return);
 
         let cli = Cli::try_parse_from(["ward-node", "snapshot", "import", "--state-dir", "d", "p"])
             .expect("import");

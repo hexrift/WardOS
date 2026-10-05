@@ -21,7 +21,7 @@ fails CI when the two differ.
 | 1.0 | The `hello` handshake and version negotiation. No requests. | — |
 | 1.1 | Read-only capability discovery (`capabilities`). | `CAPABILITY_DISCOVERY_PROTOCOL` |
 | 1.2 | Identity-only task lifecycle: `create` and `inspect`. The execution verbs decode but are refused `unsupported_operation`; `admit` closes the connection. | `TASK_LIFECYCLE_PROTOCOL` |
-| 1.3 | Signed admission (`admit`) with its typed capability manifest, the `exited` state, the receipt outcome on `inspect`, and the execution verbs `start`, `stop`, `pause`, `resume`, `revoke`, `seal` ([ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md)). Additive within 1.3: the `unsupported_grant` rejection reason of an `admit` whose manifest the node cannot honour (node-integration.md §7.5), and `network.proxy_allowlist` reading `true` on a node started with `--network-allowlist`, which then admits a `network.custom` manifest (§5, §9); the flag has been in the document since 1.1 and the manifest grammar is unchanged. | `TASK_ADMISSION_PROTOCOL` |
+| 1.3 | Signed admission (`admit`) with its typed capability manifest, the `exited` state, the receipt outcome on `inspect`, and the execution verbs `start`, `stop`, `pause`, `resume`, `revoke`, `seal` ([ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md)). Additive within 1.3: the `unsupported_grant` rejection reason of an `admit` whose manifest the node cannot honour (node-integration.md §7.5), and `network.proxy_allowlist` reading `true` on a node started with `--network-allowlist`, which then admits a `network.custom` manifest (§5, §9); the flag has been in the document since 1.1 and the manifest grammar is unchanged. Additive within 1.3 at this revision, for result return (§6.6): the manifest's optional `output` grant (a node of an earlier revision fails to decode a manifest that carries it, `authority_denied`, and a node without `--output-return` refuses it `unsupported_grant`), the capability document's `output` section, which only a node started with `--output-return` emits (a strict 1.3 decoder of an earlier revision refuses a document that carries it, so enable the flag once the control planes are at this revision), the read-only `result` request (unknown to an earlier 1.3 node, which closes the connection without an answer, as for any unknown verb) and the `NodeAttemptOutputCollected` evidence record (appended at the end of the catalogue; a `ward` of an earlier release cannot read a log that carries it, migration-to-node.md §4.1). | `TASK_ADMISSION_PROTOCOL` |
 
 Each feature is gated on the **negotiated** version, not on what the node could serve:
 a 1.2 connection to a 1.3 node gets only the 1.2 features.
@@ -51,7 +51,9 @@ field) gets no response at all (node-integration.md §4).
   later**. Offer exactly the minors you implement, and act only on the version in the
   `accepted` response: if a node accepts a lower minor than you need, treat it as
   unusable rather than sending verbs it will refuse. node-integration.md §4 recommends
-  offering exactly 1.3–1.3 against this revision.
+  offering exactly 1.3–1.3 against this revision. Within 1.3, read the capability
+  document before relying on an addition of a later revision: ask for `result` only on
+  a node whose document carries `output` (§5), as the shipped driver does.
 - **Supported combinations.** Any node and control plane whose ranges share a major and
   overlap at a minor that has every feature the control plane uses. Everything else is
   refused at the handshake, before any authority is presented.

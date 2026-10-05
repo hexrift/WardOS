@@ -2,8 +2,9 @@
 # Runs the ward-node cross-system acceptance suite (docs/node-acceptance.md) against a
 # real node, with isolation required rather than skipped, and prints one verdict line per
 # case and a summary table. The cases are the #[test]s of
-# crates/ward-node-client/tests/acceptance.rs and, for the network allowlist,
-# crates/ward-node-client/tests/acceptance_network.rs; each writes its verdict as
+# crates/ward-node-client/tests/acceptance.rs and, for the network allowlist and result
+# return, crates/ward-node-client/tests/acceptance_network.rs and
+# crates/ward-node-client/tests/acceptance_output.rs; each writes its verdict as
 #   acceptance <case>: PASS in <ms> ms -- <criterion>
 # The cargo test output goes to stderr and only the table to stdout, so the table can be
 # captured on its own. Exit status: 0 when every case passed, 1 otherwise.
@@ -72,7 +73,7 @@ trap 'rm -f "$log"' EXIT
 
 export WARD_REQUIRE_ISOLATION=1
 set +e
-cargo test -p ward-node-client --test acceptance --test acceptance_network -- --test-threads=1 --nocapture 2>&1 | tee "$log" >&2
+cargo test -p ward-node-client --test acceptance --test acceptance_network --test acceptance_output -- --test-threads=1 --nocapture 2>&1 | tee "$log" >&2
 set -e
 
 render "$log"

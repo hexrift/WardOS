@@ -528,6 +528,12 @@ instance (in the node process, on a Unix socket under
 `WARD_PROXY_SOCKET`) allowing exactly the manifest's hosts with the session proxy's
 structural denies, paused with the attempt and shut down with it, every verdict a
 `node`-origin `NetworkRequested` or `NetworkDenied` record bounded at 512 per attempt;
+an `output` grant, on a node started with `--output-return`, makes the launcher keep the
+first `stdio_bytes` of each stream raw and the attempt's reaper collect the declared
+workspace files once the workload has ended and been reaped (no symlink followed,
+nothing read outside the workspace, bounded at 1 MiB per stream and 8 MiB of files),
+store the result in `<task-root>/<task>/<attempt>.output/` and record it with every
+digest before the end record, for the read-only `result` request to return;
 any grant the node cannot enforce is refused `unsupported_grant` at `admit`, so every
 workload that starts runs under exactly what its manifest says (node-integration.md
 §7.5, §9). The node answers `running` only after a confirmed spawn with
@@ -614,12 +620,18 @@ genesis is a hash of the binding: `NodeAttemptAdmitted` (envelope digest, issuer
 version), `NodeAttemptLaunched` (host pid), `NodeAttemptIntervened` (pause or resume),
 `NodeAttemptEnded` (state, receipt outcome, cause, stop or revoke operation),
 `NodeAttemptRecovered` and `NodeAttemptSealed`, after which the log is sealed with its
-`HEAD`. Each record is fsynced after the task record and before the verb is answered; a
+`HEAD`; an attempt admitted with an `output` grant on a node started with
+`--output-return` also records `NodeAttemptOutputCollected` (the counts of the stream
+heads kept and dropped, and each declared workspace file's size, digest and status)
+right before its end record, which binds the bounded result the node stores beside the
+workspace (`<attempt>.output/result.json`) and returns through `result` to the sealed
+log (node-integration.md §6.6). Each record is fsynced after the task record and before the verb is answered; a
 failed append restores the task record and refuses the verb `resource_unavailable`. A
 restarted node cuts a torn final frame, records `NodeAttemptRecovered` wherever the log
 shows another state than the one recovered, and seals the log of a sealed task, before it
 serves; a log that does not verify stops it. Logs are bounded at 256 KiB with room kept
-for the closing records, never hold workload output, and are never deleted by the node:
+for the closing records, never hold workload output itself (digests and counts of a
+returned result at most), and are never deleted by the node:
 evicting a sealed task leaves its sealed log in place for the operator.
 
 The control-plane side of the contract ships as `ward-node-client` (#332 slice 8;

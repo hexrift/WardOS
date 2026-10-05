@@ -16,7 +16,10 @@ use ward_events::event::{
     PolicySubject, ProcessRef, RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus,
     TamperWardSig, VerifyRequester, VerifySummary, WardEvent,
 };
-use ward_events::event::{NodeAttemptEnd, NodeAttemptOutcome, NodeAttemptState, NodeIntervention};
+use ward_events::event::{
+    NodeAttemptEnd, NodeAttemptOutcome, NodeAttemptState, NodeIntervention, NodeOutputFile,
+    NodeOutputFileStatus, NodeOutputStream,
+};
 use ward_events::ids::{
     AttemptId, Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
 };
@@ -837,6 +840,39 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
         ),
         (Origin::Node, WardEvent::NodeAttemptSealed { operation: 50 }),
         (
+            Origin::Node,
+            WardEvent::NodeAttemptOutputCollected {
+                stdout: NodeOutputStream {
+                    returned: 4096,
+                    dropped: 1024,
+                },
+                stderr: NodeOutputStream {
+                    returned: 12,
+                    dropped: 0,
+                },
+                files: vec![
+                    NodeOutputFile {
+                        path: path("out/report.json"),
+                        size: 2,
+                        digest: Some(Blake3Hash::hash(b"{}")),
+                        status: NodeOutputFileStatus::Returned,
+                    },
+                    NodeOutputFile {
+                        path: path("big.bin"),
+                        size: 3000,
+                        digest: Some(Blake3Hash::hash(b"big")),
+                        status: NodeOutputFileStatus::DigestOnly,
+                    },
+                    NodeOutputFile {
+                        path: path("missing.txt"),
+                        size: 0,
+                        digest: None,
+                        status: NodeOutputFileStatus::Missing,
+                    },
+                ],
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -1223,6 +1259,10 @@ fn node_attempt_kinds_are_critical_node_facts_appended_at_the_end() {
         (EventKind::NodeAttemptEnded, "node_attempt_ended"),
         (EventKind::NodeAttemptRecovered, "node_attempt_recovered"),
         (EventKind::NodeAttemptSealed, "node_attempt_sealed"),
+        (
+            EventKind::NodeAttemptOutputCollected,
+            "node_attempt_output_collected",
+        ),
     ];
     for (offset, (kind, name)) in kinds.into_iter().enumerate() {
         assert_eq!(kind.bit(), 1u64 << (40 + offset), "{name}");
@@ -1230,7 +1270,7 @@ fn node_attempt_kinds_are_critical_node_facts_appended_at_the_end() {
         assert!(kind.is_critical(), "{name}");
         assert!(!Filter::quiet().kinds.contains(kind), "{name}");
     }
-    assert_eq!(EventKind::ALL.len(), 46);
+    assert_eq!(EventKind::ALL.len(), 47);
     assert_eq!(Origin::Node.tag(), 8);
     assert_eq!(Origin::from_tag(8), Some(Origin::Node));
     assert_eq!(Origin::Node.label(), "node");

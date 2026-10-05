@@ -5,6 +5,9 @@
 //! the identity-only task lifecycle, and 1.3 adds the signed admission envelope (`admit`),
 //! its typed capability manifest, the `exited` state and the receipt outcome on `inspect`
 //! of ADR-0030, and the `unsupported_grant` refusal of a manifest the node cannot honour.
+//! Additive within 1.3 ([`output`]): the manifest's optional `output` grant, the
+//! capability document's `output` section and the read-only `result` request that
+//! returns an ended attempt's bounded stdout, stderr and declared workspace files.
 //! Issuer verification and execution are the node's (`ward-node`); transport
 //! authentication belongs to #262. A 1.3 capability document may advertise `admit`, and `start` and
 //! `stop` only together. Incompatible peers fail closed rather than falling back to the
@@ -13,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+mod output;
 mod receipt;
 #[cfg(test)]
 mod test_fixtures;
@@ -22,6 +26,12 @@ pub use admission::{
     HostAllowlist, IssuerProof, IssuerSignature, MAX_ADMISSION_ENVELOPE_BYTES,
     MAX_ADMISSION_LINEAGE, NetworkGrant, TaskAdmissionAuthority, TaskAdmissionEnvelope,
     TaskAdmissionEnvelopeInput, TaskAdmissionError, TaskWorkload, WorkloadArgv,
+};
+pub use output::{
+    AttemptOutput, MAX_OUTPUT_FILE_BYTES, MAX_OUTPUT_FILES, MAX_OUTPUT_FILES_BYTES,
+    MAX_OUTPUT_PATH_BYTES, MAX_OUTPUT_STDIO_BYTES, MAX_RESULT_RESPONSE_BYTES, OutputCapabilities,
+    OutputError, OutputFile, OutputFileSkip, OutputFileStatus, OutputGrant, OutputPath,
+    OutputStream, TaskResultRequest, TaskResultResponse, base64,
 };
 pub use receipt::{
     TaskExecutionOutcome, TaskExecutionReceipt, TaskReceiptContext, TaskReceiptError,
@@ -428,7 +438,10 @@ pub struct LifecycleCapabilities {
 ///
 /// The `lifecycle.admit` field is version-gated on the wire: a 1.3 or later document carries
 /// `"admit":true` only when the node admits signed envelopes (absent means `false`), and a
-/// 1.1 or 1.2 document never carries it, so those stay byte-for-byte unchanged.
+/// 1.1 or 1.2 document never carries it, so those stay byte-for-byte unchanged. The
+/// `output` section ([`OutputCapabilities`]) is gated the same way: a 1.3 or later
+/// document carries it only when the node returns something, and an earlier document
+/// never does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeCapabilities {
     protocol: ProtocolVersion,
@@ -440,6 +453,7 @@ pub struct NodeCapabilities {
     snapshots: SnapshotCapabilities,
     verifier: VerifierCapabilities,
     lifecycle: LifecycleCapabilities,
+    output: OutputCapabilities,
 }
 
 impl NodeCapabilities {
@@ -483,7 +497,27 @@ impl NodeCapabilities {
             snapshots,
             verifier,
             lifecycle,
+            output: OutputCapabilities::NONE,
         })
+    }
+
+    /// The same document advertising `output`: what of an attempt's output the node
+    /// returns. Protocol 1.3 and later only; a document for an earlier version may only
+    /// say it returns nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeCapabilitiesError::ProtocolDoesNotSupportOutput`] when `output`
+    /// advertises anything under a protocol version before 1.3.
+    pub const fn with_output(
+        mut self,
+        output: OutputCapabilities,
+    ) -> Result<Self, NodeCapabilitiesError> {
+        if output.any() && !supports_task_admission(self.protocol) {
+            return Err(NodeCapabilitiesError::ProtocolDoesNotSupportOutput);
+        }
+        self.output = output;
+        Ok(self)
     }
 
     /// Negotiated protocol version this document belongs to.
@@ -539,6 +573,12 @@ impl NodeCapabilities {
     pub const fn lifecycle(self) -> LifecycleCapabilities {
         self.lifecycle
     }
+
+    /// What of an attempt's output the node returns (`result`).
+    #[must_use]
+    pub const fn output(self) -> OutputCapabilities {
+        self.output
+    }
 }
 
 /// Invalid capability document.
@@ -553,6 +593,8 @@ pub enum NodeCapabilitiesError {
     /// A protocol 1.3 or later document advertised `start` without `stop`, or `stop`
     /// without `start`.
     UnpairedStartAndStop,
+    /// `output` was advertised under a protocol version that predates result return.
+    ProtocolDoesNotSupportOutput,
 }
 
 impl Display for NodeCapabilitiesError {
@@ -569,6 +611,9 @@ impl Display for NodeCapabilitiesError {
             }
             Self::UnpairedStartAndStop => {
                 formatter.write_str("start and stop must be advertised together")
+            }
+            Self::ProtocolDoesNotSupportOutput => {
+                formatter.write_str("protocol version does not support result return")
             }
         }
     }
@@ -614,13 +659,33 @@ struct NodeCapabilitiesWire {
     credentials: CredentialCapabilities,
     snapshots: SnapshotCapabilities,
     verifier: VerifierCapabilities,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_output_capabilities"
+    )]
+    output: Option<OutputCapabilities>,
     lifecycle: LifecycleCapabilitiesWire,
+}
+
+fn deserialize_present_output_capabilities<'de, D>(
+    deserializer: D,
+) -> Result<Option<OutputCapabilities>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    OutputCapabilities::deserialize(deserializer).map(Some)
 }
 
 impl NodeCapabilitiesWire {
     fn into_capabilities(self) -> Option<NodeCapabilities> {
         let admit = one_three_flag(self.protocol, self.lifecycle.admit)?;
         let start = one_three_flag(self.protocol, self.lifecycle.start)?;
+        let output = match (supports_task_admission(self.protocol), self.output) {
+            (true, Some(output)) => output,
+            (_, None) => OutputCapabilities::default(),
+            (false, Some(_)) => return None,
+        };
         NodeCapabilities::new(
             self.protocol,
             self.architecture,
@@ -638,6 +703,8 @@ impl NodeCapabilitiesWire {
                 start,
             },
         )
+        .ok()?
+        .with_output(output)
         .ok()
     }
 }
@@ -665,6 +732,7 @@ impl Serialize for NodeCapabilities {
             credentials: self.credentials,
             snapshots: self.snapshots,
             verifier: self.verifier,
+            output: self.output.any().then_some(self.output),
             lifecycle: LifecycleCapabilitiesWire {
                 pause: self.lifecycle.pause,
                 stop: self.lifecycle.stop,
@@ -3208,5 +3276,75 @@ mod tests {
                 "a 1.2 response without an outcome is unchanged"
             );
         }
+    }
+
+    #[test]
+    fn a_capability_document_carries_output_only_when_something_is_returned_at_one_three() {
+        let one_one = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 1)).unwrap();
+        let one_three = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let minimal = capabilities_at(3, false);
+        assert_eq!(minimal.output(), OutputCapabilities::default());
+        let plain = serde_json::to_string(&one_three.response(minimal).unwrap()).unwrap();
+        assert!(!plain.contains("output"), "{plain}");
+        let none = minimal.with_output(OutputCapabilities::default()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&one_three.response(none).unwrap()).unwrap(),
+            plain,
+            "nothing returned, nothing advertised"
+        );
+
+        let returning = minimal
+            .with_output(OutputCapabilities {
+                stdio: true,
+                files: true,
+            })
+            .unwrap();
+        let json = serde_json::to_string(&one_three.response(returning).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            plain.replace(
+                r#""verifier":{"isolated":false}"#,
+                r#""verifier":{"isolated":false},"output":{"stdio":true,"files":true}"#
+            )
+        );
+        match one_three.decode_response(&json).unwrap() {
+            CapabilityDiscoveryResponse::Capabilities { capabilities } => {
+                assert_eq!(capabilities, returning);
+                assert!(capabilities.output().any());
+            }
+        }
+        for minor in [1, 2] {
+            let early = capabilities_at(minor, false);
+            assert_eq!(
+                early.with_output(OutputCapabilities {
+                    stdio: true,
+                    files: false
+                }),
+                Err(NodeCapabilitiesError::ProtocolDoesNotSupportOutput)
+            );
+            assert_eq!(
+                early.with_output(OutputCapabilities::default()),
+                Ok(early),
+                "an early document may say it returns nothing"
+            );
+            let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, minor)).unwrap();
+            let early_json = json.replace(r#""minor":3"#, &format!(r#""minor":{minor}"#));
+            assert_eq!(
+                context.decode_response(&early_json),
+                Err(CapabilityDiscoveryError::MalformedMessage),
+                "a 1.{minor} document never carries output"
+            );
+        }
+        assert_eq!(
+            one_three.decode_response(
+                &json.replace(r#""files":true"#, r#""files":true,"workspace":true"#)
+            ),
+            Err(CapabilityDiscoveryError::MalformedMessage)
+        );
+        assert!(
+            one_one
+                .decode_response(&plain.replace(r#""minor":3"#, r#""minor":1"#))
+                .is_ok()
+        );
     }
 }
