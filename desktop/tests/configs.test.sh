@@ -164,18 +164,17 @@ import json, sys
 c = json.load(open(sys.argv[1]))
 want = ["custom/ward-mark", "custom/ward-project", "custom/ward-agent", "custom/ward-network", "custom/ward-grants", "custom/ward-tamperward", "custom/ward-verify", "custom/ward-daemon"]
 assert c["modules-left"] == want, c["modules-left"]
-# The network and grants segments open the authority panel (ADR-0019).
-for name in ("custom/ward-network", "custom/ward-grants"):
-    assert c[name]["on-click"] == "foot --app-id ward-authority -e sh -c 'ward-shell authority-panel; read -r _'", c[name]["on-click"]
+# Network keeps the read-only authority panel; grants opens the focused revoke picker (#317).
+assert c["custom/ward-network"]["on-click"] == "foot --app-id ward-authority -e sh -c 'ward-shell authority-panel; read -r _'", c["custom/ward-network"]["on-click"]
+assert c["custom/ward-grants"]["on-click"] == "wardos-grants", c["custom/ward-grants"]["on-click"]
 assert c["modules-center"] == ["hyprland/workspaces"]
 assert c["modules-right"][0] == "custom/ward-update" and c["modules-right"][-1] == "clock"
 for name in want[1:]:
     m = c[name]
     assert m["exec"] == f"ward-shell bar --waybar --segment {name.split('/ward-')[1]} --follow", m["exec"]
     assert m["return-type"] == "json" and m["restart-interval"] == 5
-    # network and grants open the authority panel (asserted above); the verify segment
-    # opens its own (ADR-0019: the verified candidate against the worktree); every other
-    # left segment opens the session panel.
+    # network opens the authority panel and grants opens wardos-grants (asserted above);
+    # the verify segment opens its own panel; every other left segment opens the session panel.
     if name in ("custom/ward-network", "custom/ward-grants"):
         continue
     panel = "verify-panel" if name == "custom/ward-verify" else "session"

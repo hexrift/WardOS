@@ -47,7 +47,8 @@ pub use event::{
 };
 pub use ids::{
     AgentId, AttemptId, Blake3Hash, DelegationId, ExecutionAttemptId, IdError, ImageDigest,
-    LeaseId, Pid, PrincipalId, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId, TaskId,
+    LeaseId, NodeId, Pid, PrincipalId, ProjectId, RuleRef, ServiceId, SessionId, SnapshotId,
+    TaskId,
 };
 pub use log::{FsyncDecider, FsyncPolicy, LogError, LogReader, LogWriter};
 pub use origin::{Origin, OriginSet};
