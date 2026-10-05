@@ -290,6 +290,17 @@ WARDOS_SESSION=sess_pinned WARDOS_MENU_CHOICE=Resume "$pause"
 assert_logged '^ward pause --session sess_pinned /home/dev/payments-api$'
 assert_logged '^ward resume --session sess_pinned /home/dev/payments-api$'
 
+# --- the stop exits honour WARDOS_SESSION too (#145, #141): `ward stop --session` stops
+# the pinned session, never whatever the directory or the selection resolves to ---
+: >"$MOCK_LOG"
+echo paused >"$WARD_STATE_FILE"
+WARDOS_SESSION=sess_pinned WARDOS_MENU_CHOICE='Stop & preserve workspace' "$pause"
+assert_logged '^ward stop --session sess_pinned /home/dev/payments-api$'
+: >"$MOCK_LOG"
+echo paused >"$WARD_STATE_FILE"
+WARDOS_SESSION=sess_pinned WARDOS_MENU_CHOICE='Stop & restore entry state' "$pause"
+assert_logged '^ward stop --session sess_pinned --restore-entry /home/dev/payments-api$'
+
 # --- --status honours WARDOS_SESSION too (#141 finding 3): the toggle's status read
 # is pinned exactly like pause and resume already are, not silently left to inspect
 # the project's current session instead ---

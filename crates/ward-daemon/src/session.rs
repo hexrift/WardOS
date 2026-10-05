@@ -371,6 +371,34 @@ impl Session {
         let Some(meta) = SessionMeta::current(project_dir, state)? else {
             return Ok(None);
         };
+        Self::reopen(meta, state).map(Some)
+    }
+
+    /// Reopen session `id` itself for a command pinned to it (#141: an
+    /// immutable, explicit target, never re-resolved from a directory or the
+    /// desktop selection), resuming its hash chain like
+    /// [`open_current`](Self::open_current). Fails closed when `id` names no
+    /// session, or one that is not live: no daemon serves it and it is no
+    /// longer its project's current session (it has stopped, or was replaced).
+    pub fn open_live(state: &Path, id: &str) -> Result<Self> {
+        let meta = match SessionMeta::load(state, id) {
+            Ok(meta) => meta,
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::Project(format!("no session {id}")));
+            }
+            Err(e) => return Err(e),
+        };
+        let current = read_current(state, &meta.project_id)?;
+        if current.as_deref() != Some(id) && !crate::daemon::serving(state, id) {
+            return Err(Error::Project(format!(
+                "session {id} is not live: no daemon serves it and it is not its project's \
+                 current session (it has stopped, or another session replaced it)"
+            )));
+        }
+        Self::reopen(meta, state)
+    }
+
+    fn reopen(meta: SessionMeta, state: &Path) -> Result<Self> {
         let worktree = meta.project.clone();
         let dir = session_dir(state, &meta.id);
         let log_path = dir.join("events.log");
@@ -395,7 +423,7 @@ impl Session {
         // process is still verifiably alive, so a second `ward` command merely
         // opening this session can no longer ever cut a live attempt short.
         crate::attempt::reconcile_dangling_attempts(&mut *sink, &dir)?;
-        Ok(Some(Self {
+        Ok(Self {
             manifest: meta.manifest,
             worktree,
             entry_snapshot: meta.entry_snapshot,
@@ -414,7 +442,7 @@ impl Session {
             state: state.to_path_buf(),
             log_path,
             min_free_bytes: crate::space::min_free_bytes(),
-        }))
+        })
     }
 
     /// Record this session as the project's current session: write its
@@ -3388,6 +3416,51 @@ mod tests {
         let kinds = kinds_in(&log);
         let at = |k: &str| kinds.iter().position(|x| x == k).unwrap();
         assert!(at("WorkloadsTerminated") < at("SessionEnded"), "{kinds:?}");
+    }
+
+    /// #141/#145: `Session::open_live` reopens exactly the pinned session —
+    /// never the project's current one or the desktop selection — and fails
+    /// closed for an id naming no session or one that is no longer live.
+    #[test]
+    fn open_live_reaches_only_the_pinned_live_session() {
+        let state = tempfile::tempdir().unwrap();
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        let a = Session::start_in(project_a.path(), state.path()).unwrap();
+        a.persist_current().unwrap();
+        let a_id = a.id().to_owned();
+        drop(a);
+        let b = Session::start_in(project_b.path(), state.path()).unwrap();
+        b.persist_current().unwrap();
+        let b_id = b.id().to_owned();
+        drop(b);
+
+        let pinned = Session::open_live(state.path(), &a_id).unwrap();
+        assert_eq!(pinned.id(), a_id);
+        assert_eq!(pinned.stop(EndReason::UserStop).unwrap(), 0);
+        assert!(
+            SessionMeta::current(project_a.path(), state.path())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            SessionMeta::current(project_b.path(), state.path())
+                .unwrap()
+                .unwrap()
+                .id,
+            b_id
+        );
+
+        let err = Session::open_live(state.path(), &a_id)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains(&a_id) && err.contains("not live"), "{err}");
+        let err = Session::open_live(state.path(), "sess_missing")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("no session sess_missing"), "{err}");
     }
 
     /// Without a daemon, a stop that cannot confirm termination is refused the
