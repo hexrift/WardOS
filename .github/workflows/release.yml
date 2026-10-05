@@ -2,7 +2,8 @@
 # of that architecture (no cross toolchain), package them as two trains per
 # architecture -- the runtime tarball with the installer, and the node tarball
 # (issue #275) -- and attach every tarball, its checksum and the release manifest
-# (docs/release-manifest.md) to one GitHub release.
+# (docs/release-manifest.md), signed keyless with this workflow's identity when the
+# run is on the release tag (ADR-0028, issue #148), to one GitHub release.
 # Runs on a v* tag push, or by hand with a version (then the workflow creates the
 # tag on the chosen ref).
 name: release
@@ -145,9 +146,13 @@ jobs:
     runs-on: ubuntu-latest
     # The only job here that publishes: `gh release create/upload` needs
     # contents:write, and dispatching disk.yml below needs actions:write (#164).
+    # id-token:write lets cosign fetch this run's OIDC token to sign the manifest
+    # keyless (#148); it mints no credential beyond that token and is scoped to
+    # this job, not the workflow.
     permissions:
       contents: write
       actions: write
+      id-token: write
     env:
       TAG: ${{ needs.version.outputs.tag }}
       VERSION: ${{ needs.version.outputs.version }}
@@ -184,6 +189,33 @@ jobs:
           mv "$manifest" "dist/$manifest"
           (cd dist && sha256sum "$manifest" >"$manifest.sha256")
           cat "dist/$manifest"
+      # Pinned by commit like the other third-party actions (#165). The installer's
+      # default cosign v3 writes `sign-blob --bundle` in the Sigstore bundle format
+      # that scripts/release/verify-manifest.sh reads.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign the manifest
+        run: |
+          set -euo pipefail
+          manifest="dist/wardos-${VERSION}-manifest.json"
+          bundle="$manifest.sigstore.json"
+          # Keyless, under this run's OIDC identity (id-token: write above): the
+          # certificate names this repository, this workflow file and this run's
+          # ref. The pinned policy (ADR-0028 §2; verify-manifest.sh and
+          # crates/ward-release-verify) accepts release.yml on refs/tags/<tag>
+          # only, so a run on any other ref -- a dispatch from a branch that
+          # creates the tag -- cannot produce an acceptable signature. It
+          # publishes the manifest unsigned and says so; re-running release.yml
+          # on the tag then signs it, and the reconciliation below uploads the
+          # bundle (CONTRIBUTING.md "Versioning").
+          if [[ "$GITHUB_REF" != "refs/tags/$TAG" ]]; then
+            echo "not signing: this run is on $GITHUB_REF, not refs/tags/$TAG; re-run release.yml on the tag to sign the manifest." >&2
+            exit 0
+          fi
+          cosign sign-blob --yes --bundle "$bundle" "$manifest"
+          # The fresh signature must satisfy the pinned policy an installer will
+          # apply, or nothing is published: a policy that does not match what this
+          # workflow actually produces is found here, on the runner, not by a user.
+          bash scripts/release/verify-manifest.sh "$manifest" "$bundle" --tag "$TAG" --require-artifacts
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -216,6 +248,15 @@ jobs:
           # tag-lookup error fails the job (fail closed).
           bash scripts/release/check-tag-commit.sh "$TAG" "$GITHUB_SHA" "$release_exists"
 
+          # The assets this run publishes. The signature bundle is there only
+          # when this run signed (nullglob: an unsigned run has none, and a
+          # literal pattern would fail the upload).
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.tar.gz.sha256
+            dist/*-manifest.json dist/*-manifest.json.sha256
+            dist/*-manifest.json.sigstore.json)
+          shopt -u nullglob
+
           if [[ "$release_exists" == "true" ]]; then
               # The release exists and its tag provably binds to $GITHUB_SHA
               # (verified jointly above). Idempotent retry: before clobbering,
@@ -224,7 +265,11 @@ jobs:
               # rebuilt. A rebuild at the same commit must reproduce the
               # published bytes exactly: identical assets are a no-op (skip the
               # upload), differing bytes are refused before anything is
-              # overwritten.
+              # overwritten. The signature bundle is the one asset never
+              # compared -- a keyless signature differs on every signing run --
+              # so check-assets uploads this run's bundle (exit 10) exactly when
+              # the manifest is identical or new, and refuses it with a manifest
+              # whose bytes differ.
               #
               # download-published.sh enumerates the release's real assets and
               # pulls exactly the expected ones, failing the job on any auth/API/
@@ -238,8 +283,7 @@ jobs:
               bash scripts/release/check-assets.sh dist published || arc=$?
               case "$arc" in
                 0)  echo "published assets are byte-identical; nothing to upload." ;;
-                10) gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
-                      dist/*-manifest.json dist/*-manifest.json.sha256 --clobber ;;
+                10) gh release upload "$TAG" "${assets[@]}" --clobber ;;
                 *)  echo "refusing to overwrite the published release; see check-assets output above." >&2
                     exit 1 ;;
               esac
@@ -248,8 +292,7 @@ jobs:
               # existing tag binds to $GITHUB_SHA (or is absent). --target binds a
               # new tag to this commit; the .sha256 assets record each tarball's
               # (and the manifest's) checksum alongside it.
-              gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
-                dist/*-manifest.json dist/*-manifest.json.sha256 \
+              gh release create "$TAG" "${assets[@]}" \
                 --target "$GITHUB_SHA" --title "WardOS $TAG" --generate-notes
           fi
       # The disks for this release, for every architecture that has a tarball. A

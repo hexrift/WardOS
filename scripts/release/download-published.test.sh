@@ -148,6 +148,26 @@ expect_status 1 "download failure of a listed manifest fails closed" \
   env GH="$GH" FAKE_VIEW_RC=0 FAKE_ASSETS="$manifest" FAKE_DOWNLOAD_RC=1 FAKE_SRC="$c/remote" \
   bash "$sut" v1.2.3 "$c/local" "$c/published"
 
+# The manifest's Sigstore bundle (issue #148) is never pulled: a keyless
+# signature differs on every run that signs, so there is nothing to compare,
+# and check-assets then counts the local bundle as an upload (exit 10) over an
+# otherwise identical set.
+bundle="$manifest.sigstore.json"
+c="$(fresh_case bundle-not-pulled)"
+printf '{"schema_version":1}\n' >"$c/local/$manifest"; cp "$c/local/$manifest" "$c/remote/$manifest"
+printf 'MANIFEST-SUM\n' >"$c/local/$manifest.sha256"; cp "$c/local/$manifest.sha256" "$c/remote/$manifest.sha256"
+printf '{"rekor":"run-2"}\n' >"$c/local/$bundle"; printf '{"rekor":"run-1"}\n' >"$c/remote/$bundle"
+export FAKE_VIEW_RC=0 FAKE_ASSETS="$tarball
+$checksum
+$manifest
+$manifest.sha256
+$bundle" FAKE_SRC="$c/remote"
+expect_status 10 "a published bundle is not pulled and the re-signed one signals upload" \
+  reconcile "$c/local" "$c/published"
+[[ ! -e "$c/published/$bundle" ]] || fail "bundle case: the published bundle must not be downloaded for comparison"
+[[ -e "$c/published/$manifest" ]] || fail "bundle case: the manifest itself must still be pulled"
+unset FAKE_VIEW_RC FAKE_ASSETS FAKE_SRC
+
 # Missing local dir is an error, not a silent empty pass.
 expect_status 1 "missing local dir rejected" \
   env GH="$GH" FAKE_ASSETS="" bash "$sut" v1.2.3 "$work/does-not-exist" "$work/pub"

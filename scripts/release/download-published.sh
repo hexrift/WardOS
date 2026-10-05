@@ -5,7 +5,9 @@
 #
 #   <tag>            the release tag whose assets are being reconciled.
 #   <local-dir>      the tarballs, .sha256 checksums and release manifest
-#                    (*-manifest.json with its .sha256) this run built.
+#                    (*-manifest.json with its .sha256) this run built; a
+#                    signature bundle beside them (*-manifest.json.sigstore.json)
+#                    is ignored here, see below.
 #   <published-dir>  where the matching already-published assets are written for
 #                    check-assets.sh to compare (created if absent).
 #
@@ -25,7 +27,13 @@
 #   * for each local artifact, if the release actually lists that asset we
 #     download exactly it, and a failed download of a listed asset is fatal;
 #   * a local artifact absent from the remote list is genuinely new -- it is left
-#     out of <published-dir> so check-assets counts it as an upload.
+#     out of <published-dir> so check-assets counts it as an upload;
+#   * the manifest's Sigstore bundle, *-manifest.json.sigstore.json (issue #148),
+#     is never downloaded: a keyless signature differs on every run that signs,
+#     so there is nothing to byte-compare. check-assets.sh uploads the run's
+#     bundle over the published one exactly when the manifest itself is
+#     published byte-identical or new, and refuses it together with a manifest
+#     whose bytes differ (its header states the rule).
 #
 # `gh` is invoked through $GH (default: gh) so the enumeration and download can be
 # exercised in isolation by the tests.
@@ -71,6 +79,7 @@ main() {
   fi
 
   shopt -s nullglob
+  # No *-manifest.json.sigstore.json here, on purpose (see the header).
   local locals=("$local_dir"/*.tar.gz "$local_dir"/*.tar.gz.sha256
     "$local_dir"/*-manifest.json "$local_dir"/*-manifest.json.sha256)
   shopt -u nullglob

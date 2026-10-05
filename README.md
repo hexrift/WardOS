@@ -200,8 +200,9 @@ from the desktop at a glance. In progress:
   hostile verifier corpus, nine hostile repositories run through the real verifier as
   the `verifier corpus` group (§6.2).
 * **One install path and one status.** The release tarball with its checksum is the
-  primary install; signed releases wait for a signing-key decision
-  ([`docs/roadmap.md`](docs/roadmap.md)).
+  primary install; the release manifest is signed keyless by the release workflow and
+  verifiable offline ([`docs/release-manifest.md`](docs/release-manifest.md)), and the
+  installer does not verify it yet ([`docs/roadmap.md`](docs/roadmap.md)).
 
 Delivered. The v0.2.0 release ships the five host binaries with the bootable disks
 attached; `ghcr.io/hexrift/wardos:latest` is rebuilt, linted and published on every

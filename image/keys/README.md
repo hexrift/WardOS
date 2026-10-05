@@ -21,7 +21,7 @@ control: the control is that the key is never a file on a developer machine to b
 | --- | --- | --- |
 | `wardos-uki.der`, `wardos-uki.pem` | X.509 certificate | the WardOS-signed UKI, enrolled into shim's MOK on install (`mokutil --import`) |
 | `wardos-modules.der` | X.509 certificate | out-of-tree kernel modules, if WardOS ever ships any (deferred) |
-| `wardos-image.pub` | sigstore/cosign public key, or the Fulcio identity if keyless signing is chosen | the OCI image at `bootc upgrade`/`switch` time, referenced from the image's `/etc/containers/policy.json` |
+| `wardos-image.pub` | *likely nothing*: [ADR-0028](../../docs/decisions/ADR-0028-release-provenance-and-trusted-updates.md) chose keyless workflow identity for release artifacts, and the release manifest is already signed that way, with no key file anywhere ([`docs/release-manifest.md`](../../docs/release-manifest.md)); for the OCI image, `/etc/containers/policy.json`'s sigstore entry would pin the Fulcio identity and OIDC issuer rather than a key. A cosign public key lands here only if a project-held key is ever adopted for an offline channel (ADR-0028 "Alternatives considered") | the OCI image at `bootc upgrade`/`switch` time, referenced from the image's `/etc/containers/policy.json` |
 | `SHA256SUMS` | text | fingerprints of every file above, so a reviewer can compare them with the ones printed at the release announcement |
 
 Each file arrives with the commit that starts using it: the certificate together with

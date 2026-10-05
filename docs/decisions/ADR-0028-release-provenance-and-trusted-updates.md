@@ -72,19 +72,32 @@ outside the GitHub release UI or API.
    transparency evidence are preferred; emergency recovery and policy rotation
    must be documented before they are automated.
 
-**Implementation note (§2, §5):** the pinned identity-policy matching described in
-point 2 above, and the anti-rollback floor described in point 5 and in the
-verification contract's step 5 below, are implemented as pure, offline,
-unit-tested decision logic in [`crates/ward-release-verify`](../../crates/ward-release-verify)
-(issue #148). That crate decides whether already-extracted, already-cryptographically-verified
-claims satisfy this policy, and separately whether a candidate version must be
-refused as a downgrade; it does not retrieve or cryptographically verify a real
-attestation, call Sigstore/cosign/Fulcio/Rekor, make any network/OIDC call, or wire
-either decision into `.github/workflows/release.yml`, `install.sh`, or
-`desktop/bin/wardos-update`. Point 4's manifest format is implemented separately by
-`scripts/release/generate-manifest.sh`. This ADR's own status stays Proposed until
-enough of the verification contract below is real, wired together, and tested
-end-to-end.
+**Implementation note (§2, §3, §4, §5):** the pinned identity-policy matching of point
+2 and the anti-rollback floor of point 5 (the verification contract's step 5 below) are
+implemented as pure, offline, unit-tested decision logic in
+[`crates/ward-release-verify`](../../crates/ward-release-verify) (issue #148): that
+crate decides whether already-extracted, already-cryptographically-verified claims
+satisfy this policy, and separately whether a candidate version must be refused as a
+downgrade. Point 4's manifest format is implemented by
+`scripts/release/generate-manifest.sh`. Point 2 now also has a producer and a verifier
+for the manifest: the release workflow signs the published manifest keyless
+(`cosign sign-blob --bundle`, under the run's own GitHub Actions identity, only when the
+run is on the release tag, since the ref is part of the identity) into the asset
+`wardos-<version>-manifest.json.sigstore.json` — point 3's portable bundle, for the
+manifest — and
+[`scripts/release/verify-manifest.sh`](../../scripts/release/verify-manifest.sh)
+verifies it offline against the pinned issuer and the exact identity derived from the
+manifest's own tag, then the artifact digests, ending in one of this ADR's states with a
+distinct exit code per failure cause ([`docs/release-manifest.md`](../release-manifest.md));
+the crate's tests hold the script's pinned literals equal to the crate's constants.
+Still open: a SLSA provenance attestation for the tarballs and the OCI digest (point 1),
+signing the tarballs and the image themselves (point 3 for them), wiring the verifier
+and the two decisions into `install.sh`, `desktop/bin/wardos-update` and the image's
+release stage as the state machine of point 5, shipping the verifier and the Sigstore
+trusted root on the image ("Trust roots and bootstrap" below), and the boot-chain work
+of point 6. This ADR's own status stays Proposed until enough of the verification
+contract below is real, wired together, and tested end-to-end; the signing step first
+runs on the first `v*` tag released after it landed.
 
 ## Verification contract
 

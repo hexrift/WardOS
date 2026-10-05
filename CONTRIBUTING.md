@@ -89,10 +89,20 @@ release is cut:
    then verifies that Cargo metadata is locked and internally consistent.
 3. Open a PR whose only purpose is preparing that release, let the normal Verify,
    TamperWard and image gates run on its exact head, and merge it.
-4. Dispatch [`.github/workflows/release.yml`](.github/workflows/release.yml) with
-   the matching `v0.19.0` tag. The release workflow independently refuses a tag
-   that does not exactly match the merged workspace version.
-5. Capture the released desktop for the README: `gh workflow run desktop-capture.yml
+4. Run [`.github/workflows/release.yml`](.github/workflows/release.yml) for the
+   matching `v0.19.0` tag. The release workflow independently refuses a tag that
+   does not exactly match the merged workspace version. Prefer pushing the tag
+   (`git tag v0.19.0 <merge commit> && git push origin v0.19.0`): the one run is
+   then on the tag and signs the release manifest under the workflow's tag
+   identity. A dispatch from a branch creates the tag and publishes the manifest
+   unsigned; `gh workflow run release.yml --ref v0.19.0 -f version=v0.19.0`
+   afterwards signs it, and its retry reconciliation uploads only the bundle
+   ([`docs/release-manifest.md`](docs/release-manifest.md)).
+5. Verify the published manifest: `gh release download v0.19.0 --pattern
+   'wardos-0.19.0-manifest.json*'`, then `scripts/release/verify-manifest.sh
+   wardos-0.19.0-manifest.json wardos-0.19.0-manifest.json.sigstore.json --tag v0.19.0`
+   must end with `state=provenance-verified`; record that line in the release PR.
+6. Capture the released desktop for the README: `gh workflow run desktop-capture.yml
    --ref v0.19.0`, and once that run is green, `desktop/capture/refresh.sh --ref v0.19.0`
    puts its GIF in `assets/wardos-desktop.gif` for a pull request (no workflow writes to
    the repository; [`docs/desktop.md`](docs/desktop.md#the-readme-animation)).

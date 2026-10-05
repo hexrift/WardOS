@@ -30,7 +30,7 @@ which the workflow pins to the same version) on an x86_64 GitHub runner.
 | **ward-bench** (job `benchmark`, measures, never gates) | `ward benchmark --json`, the CI-measurable subset of [performance.md](performance.md) §5, uploaded as an artifact for 90 days. | Nothing specific to the node: its metrics are the session path's (`sandbox_start`, `verifier_spawn`, `snapshot_*`, `observer_event_propagation`, `pause_acknowledgement`). `sandbox_start` and `snapshot_capture_*` measure the same `ward-launch` spawn and `ward-snapshot` capture the node uses, so a regression there is a regression for `start`; no threshold fails the job (#150). |
 | **TamperWard gate** (`.github/workflows/tamperward.yml`) | The diff-time protected-surface check over the pull request's commit range, and `tamperward verify`, which re-runs the merge gate in a visible and a pristine copy. | A pull request that deletes, skips or weakens a node test, rewrites a fixture or edits CI is blocked until a human signs off out of band; the gate's own result cannot be manufactured by the change under test. |
 | **image** (`.github/workflows/image.yml`, on pull requests that touch `crates/**`) | Builds the bootc image, natively for x86_64 and aarch64, compiling `ward-node` and `ward-node-adapter` from the checkout (`image/Containerfile`'s builder stage; the release stage, which takes them from the node tarball, needs a published release and is not run on pull requests). | `ward-node` and `ward-node-adapter` build `--locked` for both architectures the image ships for and are in the image's `/usr/bin` (the Containerfile asserts both, and the job runs `ward-node --help`). Neither is started as a service inside the image build. |
-| **release scripts** (job `release-scripts`) | `scripts/release/run.sh`: shellcheck and the bash regressions of every release helper. | The tag, version and asset binding of §2 behaves as documented, including the layout of the node tarball (`package.test.sh`), the refusal to publish without it (`check-release-set.test.sh`) and the manifest's protocol window, read from compatibility.md's marker and refused when the marker is absent or malformed (`generate-manifest.test.sh`). |
+| **release scripts** (job `release-scripts`) | `scripts/release/run.sh`: shellcheck and the bash regressions of every release helper. | The tag, version and asset binding of §2 behaves as documented, including the layout of the node tarball (`package.test.sh`), the refusal to publish without it (`check-release-set.test.sh`), the manifest's protocol window, read from compatibility.md's marker and refused when the marker is absent or malformed (`generate-manifest.test.sh`), the offline manifest verifier's verdicts and exit codes against a fake `cosign` — valid, wrong identity, wrong issuer, altered bytes, missing bundle, incomplete set, no cosign (`verify-manifest.test.sh`) — and the rule that the signature bundle is uploaded on a retry but never byte-compared (`check-assets.test.sh`, `download-published.test.sh`). |
 
 The same `scripts/verify/tamperward.sh` runs locally; a green run there is a green run
 in CI (CONTRIBUTING.md). What CI adds is the proof that isolation was required, the
@@ -45,14 +45,17 @@ toolchain of `rust-toolchain.toml` and `--locked`, packages two trains per archi
 (`scripts/release/package.sh`), smokes every packaged binary (`check-binary-version.sh`
 and `--help`), refuses to publish unless both trains and their checksums are present for
 every architecture that built (`check-release-set.sh`), generates the release manifest
-from that verified set (`generate-manifest.sh`), and attaches everything to one GitHub
-release bound to that commit (`check-tag-commit.sh`, `check-assets.sh` on a retry):
+from that verified set (`generate-manifest.sh`), signs it keyless under the workflow's
+own identity when the run is on the tag (`cosign sign-blob`; ADR-0028, #148), and
+attaches everything to one GitHub release bound to that commit (`check-tag-commit.sh`,
+`check-assets.sh` on a retry):
 
 | Asset | Carries |
 | --- | --- |
 | `wardos-<version>-<arch>-linux.tar.gz` and `.sha256` | the runtime: `ward`, `wardd`, `ward-agent`, `ward-shell`, `wardos-theme-render`, `install.sh`, `README.md`, `LICENSE` and a copy of `docs/` |
 | `ward-node-<version>-<arch>-linux.tar.gz` and `.sha256` | the node: `ward-node`, `ward-node-adapter`, `LICENSE` and a copy of `docs/` |
 | `wardos-<version>-manifest.json` and `.sha256` | the release manifest ([release-manifest.md](release-manifest.md)): source commit, tag, every tarball with its component, architecture and digest, and the node protocol window |
+| `wardos-<version>-manifest.json.sigstore.json` | the manifest's Sigstore signature bundle, made by `release.yml` under its own identity on the release tag; verified offline by `scripts/release/verify-manifest.sh`. Absent on releases before the signing step (v0.4.1 and earlier) and on a run that was not on the tag (release-manifest.md) |
 
 `<version>` is the workspace version without the `v`; `<arch>` is the runner's
 `uname -m`, `x86_64` or `aarch64`. Each `.sha256` is `sha256sum`'s line for its
@@ -92,9 +95,14 @@ For the node this means:
 - **The release run does not re-run the acceptance suite.** The evidence for a release
   commit is the `verify` run on that commit (every push to `main` runs it), not the
   release workflow.
-- **Checksum only.** A `.sha256` proves the bytes are the ones CI attached, not which
-  workflow or commit built them; that is ADR-0028 and #148, for the node as for the
-  runtime.
+- **Manifest signed; tarballs checksum-bound to it.** A `.sha256` proves a tarball's
+  bytes are the ones CI attached. The signed manifest proves which workflow, on which
+  tag of which repository, recorded that tarball's digest — `verify-manifest.sh`
+  checks the signature against the pinned identity and then the tarballs beside the
+  manifest against its digests (release-manifest.md). The node tarball is trusted
+  exactly as far as its digest in the signed manifest: it is not signed itself, and
+  nothing on the install path verifies it yet (§3); that is the rest of ADR-0028 and
+  #148, for the node as for the runtime.
 
 ## 3. What CI does not prove
 
@@ -123,6 +131,11 @@ For the node this means:
   report and that `--help` runs.
 - **TamperWard verdicts.** The suite says what the node did; certification is the
   external control plane's (ADR-0029).
+- **Verification on the install path.** `verify-manifest.sh` runs in the release job on
+  its own fresh signature and by an operator by hand; `install.sh`, the image's release
+  stage and `wardos-update` do not run it, and the tarballs carry no signature of their
+  own. The signing step has run on no published release yet (v0.4.1 is the latest); the
+  first `v*` tag after it landed exercises it for real, and §4 says what to check then.
 
 ## 4. Before tagging a release with node changes
 
@@ -154,3 +167,10 @@ workflow.
    and refuses to publish without both binaries); `ward-node`'s `--help` and
    `ward-node-adapter`'s `--help` print the flags of node-integration.md §2.1 and
    §11.4, and `--version` of each prints the version the tag will carry.
+7. **The manifest signature, after the release.** `gh release download <tag> --pattern
+   'wardos-<version>-manifest.json*'`, then `scripts/release/verify-manifest.sh
+   wardos-<version>-manifest.json wardos-<version>-manifest.json.sigstore.json --tag
+   <tag>` ends with `state=provenance-verified`; record that line in the release PR. A
+   release created by a dispatch from a branch has no bundle until `release.yml` runs on
+   the tag (release-manifest.md); `cause=provenance-missing` then means that run is
+   still owed, not that the release is bad.

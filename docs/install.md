@@ -24,10 +24,14 @@ binaries, only useful with the desktop of §6) and a copy of `install.sh`. `ward
 and `ward-node-adapter` are not in it: the node is a service of the host, released
 beside it as `ward-node-<version>-<arch>-linux.tar.gz` and installed by its operator
 ([`node-integration-guide.md`](node-integration-guide.md) §1), not by `install.sh`.
-The checksum proves the tarball is the one CI attached to the release; releases are not
-yet signed or provenance-verified. The planned trust policy is recorded in
-[`ADR-0028`](decisions/ADR-0028-release-provenance-and-trusted-updates.md); until its
-workflow and verifier land, this install path remains checksum-only.
+The checksum proves the tarball is the one CI attached to the release, not who built
+it. The release manifest that records every tarball's digest is signed by the release
+workflow under its own identity and can be verified offline before unpacking
+([`release-manifest.md`](release-manifest.md) "Verifying a release"; the first signed
+release is the first `v*` tag after that step landed — v0.4.1 and earlier carry no
+signature). The trust policy is [`ADR-0028`](decisions/ADR-0028-release-provenance-and-trusted-updates.md);
+this install path and `install.sh` do not run the verifier yet and remain checksum-only
+on their own.
 
 **The OS image** is the other way in: on a machine of its own, boot it and the tools,
 the agents, TamperWard and the desktop are already there (§6, [`image/README.md`](../image/README.md)).
