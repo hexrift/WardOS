@@ -153,4 +153,7 @@ TDD slices without guessing at semantics inside a feature PR.
 5. `pause`/`resume`, `revoke` and `seal`; the full invalid-transition matrix; disconnect
    during a transition.
 
+Steps 1–4 are written down as the external contract in
+[node-integration.md](../node-integration.md).
+
 Cross-system acceptance — isolation, interruption, no duplicate effect — is #332 slice 9.

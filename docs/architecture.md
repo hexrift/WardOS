@@ -366,7 +366,8 @@ and never carries `exited`.
 ### 3.11 Node admission and execution ownership (decided; admission, start, stop and exit implemented)
 
 [ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md) settles
-how the node will execute. Protocol 1.3 adds an `admit` verb carrying one signed,
+how the node will execute. The wire contract an external control plane drives is
+[node-integration.md](node-integration.md). Protocol 1.3 adds an `admit` verb carrying one signed,
 audience-bound, versioned admission envelope (binding, agent, node, session, lease and
 lineage, workload, mandatory budget). The workspace is allocated by the node under its
 configured task root. The node owns spawn, reaping, budget enforcement and per-attempt
