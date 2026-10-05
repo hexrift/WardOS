@@ -540,8 +540,9 @@ that spawn the built binary itself (`worker_idle.rs`: the worker with no session
 
 `assets/wardos-desktop.gif` is a capture of the shipped desktop: Hyprland, Waybar,
 mako, fuzzel, foot and hyprlock running on a virtual output in CI, with this checkout's
-`ward`, `wardd` and `ward-shell`, walked from the first login to the lock screen (twelve
-scenes, 1280x720, about 24 s; the current GIF is 386 KB). Every pixel is the
+`ward`, `wardd` and `ward-shell`, walked from the first login to the lock screen (thirteen
+scenes, 1280x720, about 26 s; the GIF in `assets/` predates the four-answers scene and
+is 386 KB). Every pixel is the
 compositor's; nothing is drawn afterwards, and nothing in it can drift from the product
 without the capture noticing first. It replaced a storyboard rendered from the shipped
 material in a browser (issue #84), which went with it.

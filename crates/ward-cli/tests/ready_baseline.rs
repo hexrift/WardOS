@@ -18,9 +18,20 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 const BIN: &str = env!("CARGO_BIN_EXE_ward");
+
+/// Writing an executable and spawning a process are never concurrent across
+/// the tests of this process: a fork in one test while another's copy of
+/// `ward` or fake tool is still open for writing fails that other's `exec`
+/// with `ETXTBSY`.
+static FORK: Mutex<()> = Mutex::new(());
+
+fn fork_lock() -> MutexGuard<'static, ()> {
+    FORK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The sandbox is a prerequisite of every baseline and session test here;
 /// `WARD_REQUIRE_ISOLATION` turns a skip into a failure, as in the daemon's own suite.
@@ -53,8 +64,11 @@ impl Fixture {
         std::fs::create_dir_all(state.path().join("cargo/bin")).unwrap();
         let bin_dir = tempfile::tempdir().unwrap();
         let bin = bin_dir.path().join("ward");
-        std::fs::copy(BIN, &bin).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        {
+            let _fork = fork_lock();
+            std::fs::copy(BIN, &bin).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         Self {
             dir,
             state,
@@ -87,6 +101,7 @@ impl Fixture {
     /// Place a fake tool where the verifier looks (`$CARGO_HOME/bin`).
     fn tool(&self, name: &str, script: &str) {
         let path = self.state.path().join("cargo/bin").join(name);
+        let _fork = fork_lock();
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -101,15 +116,22 @@ impl Fixture {
 
     /// `ward <args…>` exactly as given.
     fn raw(&self, args: &[&str]) -> Output {
-        Command::new(&self.bin)
-            .args(args)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", self.state.path())
-            .env("WARD_STATE_DIR", self.state.path())
-            .env("CARGO_HOME", self.state.path().join("cargo"))
-            .output()
-            .unwrap()
+        let child = {
+            let _fork = fork_lock();
+            Command::new(&self.bin)
+                .args(args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", self.state.path())
+                .env("WARD_STATE_DIR", self.state.path())
+                .env("CARGO_HOME", self.state.path().join("cargo"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        child.wait_with_output().unwrap()
     }
 
     /// Every baseline record under the state root.
