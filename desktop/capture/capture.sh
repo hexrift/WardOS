@@ -107,16 +107,19 @@ clients_seen() { hypr_json clients -r '[.[] | .class] | join(" ")' 2>/dev/null |
 # shellcheck disable=SC2016  # $ns is jq's
 layer_up() { hypr_json layers -e --arg ns "$1" '[.. | objects | .namespace? // empty] | index($ns) != null' >/dev/null; }
 layer_gone() { ! layer_up "$1"; }
-# layer_addresses NS: the addresses of NS's layer surfaces, sorted; a client that
-# re-creates its surface (Waybar on SIGUSR2) gets new ones.
+# layer_addresses NS: the addresses of NS's layer surfaces, sorted. Logged around a
+# theme switch for the record only: Waybar re-creates its surface on SIGUSR2, but the
+# new surface may land at the address the old one had (run 9 of #84 waited 60 s for an
+# address change that never came while the bar was already in Tokyo Night), so the
+# addresses prove nothing and nothing waits on them.
 # shellcheck disable=SC2016  # $ns is jq's
 layer_addresses() { hypr_json layers -r --arg ns "$1" '[.. | objects | select(.namespace? == $ns) | .address] | sort | join(" ")' 2>/dev/null || true; }
-# layer_recreated NS OLD: NS is on screen on other surfaces than OLD (layer_addresses
-# before the change).
-layer_recreated() {
-  local now
-  now=$(layer_addresses "$1")
-  [[ -n $now && $now != "$2" ]]
+# bar_ground_is COLOUR: the bar strip, shot now, is dominated by COLOUR -- the same
+# check assemble.py makes on the Tokyo frame (expect[tokyo]), so the wait and the
+# assertion cannot disagree. The probe shot goes to the logs, never among the frames.
+bar_ground_is() {
+  grim -o "$output" "$logs/bar-probe.png" 2>/dev/null || return 1
+  python3 "$here/assemble.py" check "$logs/bar-probe.png" --region 0,0,1920,32 --dominant "$1" >/dev/null 2>&1
 }
 # pid_gone PID: the process is no longer there (swaybg is replaced, not reloaded).
 pid_gone() { [[ -n $1 ]] && ! kill -0 "$1" 2>/dev/null; }
@@ -277,14 +280,15 @@ leave_menu() { menu_close; }
 
 # The switch is done when every component has taken the render, not when the toast is
 # up: the wallpaper is re-drawn (its digest changes; both are logged), swaybg is replaced
-# after that (its pid goes), Waybar re-creates its surface on SIGUSR2 (new layer
-# addresses), then a second for the re-render. What the shot proves is the bar: its strip
-# must be dominated by the new theme's ground (expect[tokyo], checked by assemble.py),
-# since the two foot terminals of the up and observer scenes still cover most of the
-# screen in Ward Dark, as open terminals do on any desktop (foot reads its colours once,
-# at start, and wardos-theme signals nothing to it), and the wallpaper shows only in the
-# gaps. Runs 7 and 8 were shot with the switch complete and failed a whole-frame check
-# on exactly that.
+# after that (its pid goes), and the bar shows the new ground (bar_ground_is: a probe
+# shot of its strip, checked the way the frame will be), then a second for the
+# re-render. What the shot proves is the bar: its strip must be dominated by the new
+# theme's ground (expect[tokyo], checked by assemble.py), since the two foot terminals
+# of the up and observer scenes still cover most of the screen in Ward Dark, as open
+# terminals do on any desktop (foot reads its colours once, at start, and wardos-theme
+# signals nothing to it), and the wallpaper shows only in the gaps. Runs 7 and 8 were
+# shot with the switch complete and failed a whole-frame check on exactly that; run 9
+# waited on the bar's layer addresses changing, which they need not (layer_addresses).
 scene_tokyo() {
   local swaybg_was bar_was sha_was
   swaybg_was=$(pgrep -n -u "$UID" -x swaybg || true)
@@ -297,7 +301,8 @@ scene_tokyo() {
   wait_for "wardos-theme to finish" "$limit" idle wardos-theme
   wait_for "swaybg to be replaced" "$limit" pid_gone "$swaybg_was"
   wait_for "the wallpaper" "$limit" layer_up wallpaper
-  wait_for "the bar to re-create its surface" "$limit" layer_recreated waybar "$bar_was"
+  wait_for "the bar to show the Tokyo Night ground" "$limit" bar_ground_is "$(theme_token WARDOS_GROUND)"
+  say "bar surfaces: [$bar_was] before, [$(layer_addresses waybar)] after"
   wait_for "the theme toast" "$limit" layer_up notifications
   sleep 1
   wait_for "the live trust bar" "$limit" bar_live
