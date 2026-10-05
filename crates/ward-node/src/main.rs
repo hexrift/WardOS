@@ -21,14 +21,19 @@
 //! into the node's snapshot store and prints its id as 64 lowercase hex characters with no
 //! prefix: exactly the value an admission envelope's `workload.snapshot` carries.
 //! `ward-node issuer-key-id <hex-public-key>` prints the key id an issuer proof must name
-//! for that Ed25519 public key.
+//! for that Ed25519 public key. `ward-node audit --state-dir <dir> <task_…> [--attempt
+//! <exec_…>] [--task-root <dir>] [--json]` answers, from the task's durable record, who
+//! delegated what authority to the task and when, and with `--task-root` cross-checks the
+//! attempt's evidence log; it exits non-zero when the record cannot be read or the
+//! evidence disagrees with it.
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use ward_events::NodeId;
+use ward_events::{ExecutionAttemptId, NodeId, TaskId};
 use ward_node::admit::{NodeAdmission, SystemClock};
 use ward_node::execution::{NodeExecution, SandboxLauncher};
 use ward_node::issuer::{IssuerKeyParseError, IssuerPublicKey, TrustedIssuers};
@@ -92,6 +97,24 @@ enum Command {
         #[command(subcommand)]
         command: SnapshotCommand,
     },
+    /// Answer who delegated what authority to a task and when, from its durable record.
+    Audit {
+        /// The node state directory holding the task records.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// The node's task root; with it the attempt's evidence log is verified and
+        /// cross-checked against the record, and a disagreement exits non-zero.
+        #[arg(long)]
+        task_root: Option<PathBuf>,
+        /// The execution attempt (`exec_…`) the record must hold; any other is an error.
+        #[arg(long)]
+        attempt: Option<ExecutionAttemptId>,
+        /// Print the audit as one JSON object (`"schema":1`) instead of text.
+        #[arg(long)]
+        json: bool,
+        /// The task (`task_…`) to audit.
+        task: TaskId,
+    },
 }
 
 #[derive(Subcommand)]
@@ -107,12 +130,12 @@ enum SnapshotCommand {
     },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::IssuerKeyId { public_key }) => {
             println!("{}", issuer_key_id(&public_key)?);
-            return Ok(());
+            return Ok(ExitCode::SUCCESS);
         }
         Some(Command::Snapshot {
             command:
@@ -122,7 +145,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
         }) => {
             println!("{}", import(&state_dir, &project_dir)?);
-            return Ok(());
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Command::Audit {
+            state_dir,
+            task_root,
+            attempt,
+            json,
+            task,
+        }) => {
+            return audit(&state_dir, task, attempt, task_root.as_deref(), json);
         }
         None => {}
     }
@@ -170,7 +202,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => NodeService::with_admission(capabilities, admission)?,
     };
     serve_local(&socket, &service, SocketAccess::new(client_group, clients))?;
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+fn audit(
+    state_dir: &Path,
+    task: TaskId,
+    attempt: Option<ExecutionAttemptId>,
+    task_root: Option<&Path>,
+    json: bool,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let audit = match ward_node::audit::audit(state_dir, task, attempt, task_root) {
+        Ok(audit) => audit,
+        Err(error) => {
+            eprintln!("ward-node audit: {error}");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string(&audit)?);
+    } else {
+        print!("{audit}");
+    }
+    Ok(if audit.evidence_agrees() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn import(state_dir: &Path, project_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -320,6 +378,62 @@ mod tests {
             }) if state_dir == Path::new("d") && project_dir == Path::new("p")
         ));
         assert!(Cli::try_parse_from(["ward-node", "snapshot", "import", "p"]).is_err());
+    }
+
+    #[test]
+    fn audit_needs_a_state_dir_and_a_task_and_takes_the_rest_optionally() {
+        let task = TaskId::from_u128(7).to_string();
+        let attempt = ExecutionAttemptId::from_u128(8).to_string();
+        let cli =
+            Cli::try_parse_from(["ward-node", "audit", "--state-dir", "d", &task]).expect("audit");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Audit {
+                ref state_dir,
+                task_root: None,
+                attempt: None,
+                json: false,
+                task: parsed,
+            }) if state_dir == Path::new("d") && parsed == TaskId::from_u128(7)
+        ));
+        let cli = Cli::try_parse_from([
+            "ward-node",
+            "audit",
+            "--state-dir",
+            "d",
+            "--task-root",
+            "t",
+            "--attempt",
+            &attempt,
+            "--json",
+            &task,
+        ])
+        .expect("audit with every option");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Audit {
+                ref task_root,
+                attempt: Some(parsed),
+                json: true,
+                ..
+            }) if task_root.as_deref() == Some(Path::new("t"))
+                && parsed == ExecutionAttemptId::from_u128(8)
+        ));
+        assert!(Cli::try_parse_from(["ward-node", "audit", &task]).is_err());
+        assert!(Cli::try_parse_from(["ward-node", "audit", "--state-dir", "d"]).is_err());
+        assert!(Cli::try_parse_from(["ward-node", "audit", "--state-dir", "d", "task-7"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ward-node",
+                "audit",
+                "--state-dir",
+                "d",
+                "--attempt",
+                &task,
+                &task
+            ])
+            .is_err()
+        );
     }
 
     #[test]

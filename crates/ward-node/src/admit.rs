@@ -65,11 +65,14 @@ impl NodeClock for SystemClock {
     }
 }
 
-/// An envelope that passed every admission check, with its trusted authority.
+/// An envelope that passed every admission check, with its trusted authority, the
+/// promoted ancestors that proved its contraction and the node time it was verified at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedAdmission {
     envelope: TaskAdmissionEnvelope,
     authority: TrustedTaskAdmission,
+    ancestors: Vec<AuthorityLease>,
+    verified_at_unix_ms: u64,
 }
 
 impl VerifiedAdmission {
@@ -83,6 +86,19 @@ impl VerifiedAdmission {
     #[must_use]
     pub const fn authority(&self) -> &TrustedTaskAdmission {
         &self.authority
+    }
+
+    /// The lease's promoted ancestors, nearest parent first and the root last; empty for a
+    /// root lease.
+    #[must_use]
+    pub fn ancestors(&self) -> &[AuthorityLease] {
+        &self.ancestors
+    }
+
+    /// The node clock, in Unix milliseconds, when the envelope was verified.
+    #[must_use]
+    pub const fn verified_at_unix_ms(&self) -> u64 {
+        self.verified_at_unix_ms
     }
 }
 
@@ -208,6 +224,8 @@ impl NodeAdmission {
         Ok(VerifiedAdmission {
             envelope,
             authority,
+            ancestors,
+            verified_at_unix_ms: now,
         })
     }
 
