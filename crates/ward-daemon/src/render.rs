@@ -869,17 +869,115 @@ pub fn readiness_panel(report: &crate::readiness::Report) -> String {
             r.name, r.detail
         );
     }
+    if let Some(baseline) = &report.baseline {
+        s.push_str(&baseline_lines(baseline));
+    }
     if let Some(survey) = &report.survey {
         let _ = write!(s, "\n{}", survey.render());
     }
     let verdict = report.verdict();
-    let color = if verdict.blocks() { DENY } else { OK };
+    let color = if verdict.blocks() {
+        DENY
+    } else if verdict == crate::readiness::Verdict::BaselineFailing {
+        WARN
+    } else {
+        OK
+    };
     let _ = write!(
         s,
         "\n  {INK}Overall{RESET}  {color}{}{RESET}\n",
         verdict.word()
     );
+    if verdict == crate::readiness::Verdict::BaselineFailing {
+        let _ = writeln!(
+            s,
+            "  {DIM}the environment is ready (no row above fails); the accepted command fails on \
+             the project's current tree before any agent work — a pre-existing failure, not a \
+             setup problem. An agent can start; `ward verify` judges its candidate by the same \
+             command.{RESET}"
+        );
+    }
     s
+}
+
+/// The `baseline` line of the `ward ready` panel (#147 item 5), in the rows' own
+/// layout: never run (how to run it), the current record (green, or red with how it
+/// ended, its counts and the tail of the recorded output), a stale one (what it was and
+/// what moved), or one that cannot be judged.
+fn baseline_lines(status: &crate::baseline::Status) -> String {
+    use crate::baseline::{Record, Status, TAIL_LINES};
+    let what = |r: &Record| {
+        let mut text = format!("{} over tree {}", r.ending(), r.short_tree());
+        if let Some(counts) = r.counts() {
+            let _ = write!(text, " · {counts}");
+        }
+        let _ = write!(
+            text,
+            " · {}",
+            r.environment.as_deref().map_or_else(
+                || "no prepared environment".to_owned(),
+                |k| format!("prepared {}", crate::baseline::short(k))
+            )
+        );
+        let _ = write!(
+            text,
+            " · {} on {}",
+            human_duration(std::time::Duration::from_millis(r.duration_ms)),
+            human_date(r.finished_at)
+        );
+        text
+    };
+    let line = |color: &str, word: &str, detail: &str| {
+        format!(
+            "  {INK}{:<16}{RESET}{color}{word:<5}{RESET} {DIM}{detail}{RESET}\n",
+            "baseline"
+        )
+    };
+    match status {
+        Status::NotRun => line(
+            DIM,
+            "—",
+            "not run; `ward ready --baseline` runs the accepted command once, offline, over this \
+             tree, before any agent work",
+        ),
+        Status::Current(r) if r.passed => line(OK, "OK", &format!("green: {}", what(r))),
+        Status::Current(r) => {
+            let mut out = line(WARN, "RED", &what(r));
+            let tail = r.tail_lines(TAIL_LINES);
+            if !tail.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  {DIM}{:<22}output ends ({} recorded{}):{RESET}",
+                    "",
+                    human_bytes(r.output_bytes),
+                    if r.output_truncated { ", capped" } else { "" }
+                );
+                for l in tail {
+                    let _ = writeln!(out, "  {DIM}{:<24}{l}{RESET}", "");
+                }
+            }
+            out
+        }
+        Status::Stale { record, why } => line(
+            WARN,
+            "STALE",
+            &format!(
+                "stale: last run {} ({}) over tree {} on {}; {why}; `ward ready --baseline` runs it again",
+                record.color(),
+                record.ending(),
+                record.short_tree(),
+                human_date(record.finished_at)
+            ),
+        ),
+        Status::Unknown { record, why } => line(
+            WARN,
+            "?",
+            &record.as_ref().map_or_else(
+                || why.clone(),
+                |r| format!("last run {} over tree {}; {why}", r.color(), r.short_tree()),
+            ),
+        ),
+    }
 }
 
 /// The `ward doctor` hardware baseline block (Hardware Baseline 1): what this machine
@@ -1499,6 +1597,123 @@ pub fn selftest_row(name: &str, verdict: &Verdict) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    fn ready_rows() -> Vec<crate::readiness::Row> {
+        use crate::doctor::Status;
+        vec![
+            crate::readiness::Row::new("policy", Status::Ok, ".ward/policy.yaml resolves"),
+            crate::readiness::Row::new("verify config", Status::Ok, "command: sh tests/run.sh"),
+        ]
+    }
+
+    const TREE: &str = "blake3:1a2b3c4d5e6f00000000000000000000000000000000000000000000000000ff";
+
+    #[test]
+    fn readiness_panel_says_a_baseline_was_not_run_and_how_to_run_it() {
+        use crate::baseline::Status;
+        let report = crate::readiness::Report::for_test(ready_rows(), Some(Status::NotRun));
+        let out = plain(&readiness_panel(&report));
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("baseline"))
+            .unwrap();
+        assert!(line.contains("not run"), "{line}");
+        assert!(line.contains("`ward ready --baseline`"), "{line}");
+        assert!(out.contains("Overall  ready\n"), "{out}");
+        // No accepted command: no baseline line at all.
+        let none = crate::readiness::Report::for_test(ready_rows(), None);
+        assert!(!plain(&readiness_panel(&none)).contains("baseline"));
+    }
+
+    #[test]
+    fn readiness_panel_names_what_a_red_baseline_failed_with_and_says_the_environment_is_ready() {
+        use crate::baseline::Status;
+        let record =
+            crate::baseline::tests::record(TREE, Some(&"ab".repeat(32)), "sh tests/run.sh", false);
+        let report = crate::readiness::Report::for_test(
+            ready_rows(),
+            Some(Status::Current(Box::new(record))),
+        );
+        let out = plain(&readiness_panel(&report));
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("baseline"))
+            .unwrap();
+        assert!(line.contains("RED"), "{line}");
+        assert!(line.contains("exit 1"), "{line}");
+        assert!(line.contains("1 of 2 tests failed"), "{line}");
+        assert!(
+            line.contains("1a2b3c4d5e6f"),
+            "the tree it ran over: {line}"
+        );
+        assert!(
+            line.contains("abababababab"),
+            "the prepared environment: {line}"
+        );
+        assert!(out.contains("output ends"), "{out}");
+        assert!(
+            out.contains("assertion failed: parse(\"1\") == Some(1)"),
+            "{out}"
+        );
+        assert!(out.contains("Overall  ready, baseline failing"), "{out}");
+        assert!(out.contains("the environment is ready"), "{out}");
+        assert!(!out.contains("setup required"), "{out}");
+    }
+
+    #[test]
+    fn readiness_panel_shows_a_green_stale_or_unknown_baseline_as_such() {
+        use crate::baseline::Status;
+        let green = crate::baseline::tests::record(TREE, None, "sh tests/run.sh", true);
+        let out = plain(&readiness_panel(&crate::readiness::Report::for_test(
+            ready_rows(),
+            Some(Status::Current(Box::new(green.clone()))),
+        )));
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("baseline"))
+            .unwrap();
+        assert!(line.contains("OK"), "{line}");
+        assert!(line.contains("green: exit 0"), "{line}");
+        assert!(line.contains("2 tests passed"), "{line}");
+        assert!(line.contains("no prepared environment"), "{line}");
+        assert!(!out.contains("output ends"), "{out}");
+
+        let red = crate::baseline::tests::record(TREE, None, "sh tests/run.sh", false);
+        let out = plain(&readiness_panel(&crate::readiness::Report::for_test(
+            ready_rows(),
+            Some(Status::Stale {
+                record: Box::new(red),
+                why: "the tree changed since (now 9f8e7d6c5b4a)".to_owned(),
+            }),
+        )));
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("baseline"))
+            .unwrap();
+        assert!(line.contains("STALE"), "{line}");
+        assert!(line.contains("stale: last run red"), "{line}");
+        assert!(line.contains("tree changed"), "{line}");
+        assert!(
+            line.contains("`ward ready --baseline` runs it again"),
+            "{line}"
+        );
+        assert!(!out.contains("baseline failing"), "{out}");
+        assert!(!out.contains("output ends"), "{out}");
+
+        let out = plain(&readiness_panel(&crate::readiness::Report::for_test(
+            ready_rows(),
+            Some(Status::Unknown {
+                record: Some(Box::new(green)),
+                why: "the tree cannot be digested now".to_owned(),
+            }),
+        )));
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("baseline"))
+            .unwrap();
+        assert!(line.contains("cannot be digested"), "{line}");
+        assert!(line.contains("last run green"), "{line}");
+    }
 
     fn plain(s: &str) -> String {
         // Strip SGR sequences so assertions see the text.

@@ -729,7 +729,12 @@ by a digest over the lockfile's content, the runtime's version, the platform and
 registry, installed once with the network and then sealed read-only; the verifier mounts
 it beside the candidate, `ward ready` reports it (`prepared`, `stale: lockfile changed`,
 `incomplete`, `never prepared`, with cold and warm timings) and nothing updates it in
-place — changed inputs are a new key.
+place — changed inputs are a new key. `ward ready --baseline`
+([`ward_daemon::baseline`](../crates/ward-daemon/src/baseline.rs)) runs the accepted
+command once through the same verifier path over the project's current tree, before any
+agent work, and records the result keyed by the tree digest, the prepared environment
+key and the command; a current red baseline is the `ready, baseline failing` verdict,
+never `setup required`.
 
 ---
 

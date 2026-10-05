@@ -6,7 +6,7 @@ that `ward verify` has judged, what the screen shows at each step, and what to d
 something is denied. The commands are the contract; the desktop only wraps them.
 
 ```text
-boot → welcome → ward vault set → ward init → ward prepare → ward claude → ward verify
+boot → welcome → ward vault set → ward init → ward prepare → ward ready --baseline → ward claude → ward verify → ward ready --answers
 ```
 
 ## 0. Boot, or install
@@ -42,8 +42,8 @@ and Escape skips too.
 | Theme | lists `wardos-theme list`, applies your pick | `Super + Shift + T` cycles themes; `wardos-menu style theme` |
 | Keys | Anthropic or OpenAI: opens a terminal running `ward vault set NAME`; the key is typed there, never in a menu | `ward vault set NAME` in any terminal |
 | Project | a directory picker over `~` (up, into, a typed path, a new directory) or a repository URL to clone; then `ward init` in a terminal that shows its report and, when the project's files propose one verification boundary, asks whether to accept it | `ward init` in any directory |
-| Agent | `ward ready` checks the project first; a blocking gap shows its report and asks before continuing (`Fix it first` opens `ward init` in a terminal, where a proposed-but-unaccepted verification boundary is accepted); then `ward claude` (or `ward codex`) there, and one line about the trust bar | `Super + Space` → Start Claude |
-| Done | the card: `Super + Space` is everything, `Super + K` lists the keys, `Super + Shift + Escape` (or `POWER` in the bar) locks, suspends or shuts down, this document | — |
+| Agent | `ward ready` checks the project first; a blocking gap shows its report and asks before continuing (`Fix it first` opens `ward init` in a terminal, where a proposed-but-unaccepted verification boundary is accepted); when the project is ready but has no baseline yet, or a stale one, it asks once whether to run its tests now (`Run the baseline` runs `ward ready --baseline` in a terminal, §5; `Not now` skips it); then `ward claude` (or `ward codex`) there, and one line about the trust bar | `Super + Space` → Start Claude; `ward ready --baseline` |
+| Done | when the project has a session, the four answers first (§7: what the agent can reach, the credentials it can use, what it changed, whether the current candidate is verified, each with where it comes from); then the card: `Super + Space` is everything, `Super + K` lists the keys, `Super + Shift + Escape` (or `POWER` in the bar) locks, suspends or shuts down, this document | `ward ready --answers` |
 
 The done step writes `~/.config/wardos/welcome-done`. Until it exists, the command
 centre (`Super + Space`) opens on `WELCOME  Start here` whenever there is no live
@@ -219,6 +219,48 @@ or a Python project with only `poetry.lock`, `uv.lock` or `Pipfile.lock`, is
 the verifier already mounts the host's `~/.cargo/registry` read-only and `cargo test
 --locked` resolves offline from it — so the row is `OK none to prepare: cargo: …`.
 
+### The baseline (`ward ready --baseline`)
+
+```bash
+ward ready --baseline                # once every row resolves: the project's own tests, before any agent work
+```
+
+Before an agent changes anything, it is worth knowing whether the project's tests pass
+as they are (issue #147 item 5). `ward ready --baseline` runs the accepted verification
+command once, exactly as `ward verify` would: the current tree is captured with the
+verifier's own capture options, materialised into a private scratch tree, the prepared
+environment whose key matches its lockfile is mounted read-only, and the command runs in
+the verifier's sandbox with no network. Nothing is written into the project. It is never
+part of a plain `ward ready`, and it refuses — recording nothing — while any row is
+`FAIL` (`baseline not run: setup required first`), so a red result is always the
+project's own and never a missing runtime or an unprepared dependency set; it also
+refuses while a session is live whose worktree has moved away from its entry snapshot,
+because a baseline is the state before any agent work.
+
+The result is recorded in the project's readiness state,
+`<state>/readiness/<digest of the project path>/baseline.json` (with the verifier's
+capped output beside it in `baseline-output.txt`), keyed by the tree digest, the prepared
+environment key from `ward prepare` and the command. Every later `ward ready` shows it
+as the `baseline` row without running anything:
+
+```text
+  baseline        —     not run; `ward ready --baseline` runs the accepted command once, offline, over this tree, before any agent work
+  baseline        OK    green: exit 0 over tree 1a2b3c4d5e6f · 12 tests passed · prepared 63080ebb75af · 3.1 s on 2026-10-05
+  baseline        RED   exit 1 over tree 1a2b3c4d5e6f · 1 of 12 tests failed · prepared 63080ebb75af · 3.4 s on 2026-10-05
+                        output ends (2.1 KiB recorded):
+                          thread 'parse::rejects_empty' panicked at src/parse.rs:41:9
+                          test result: FAILED. 11 passed; 1 failed
+  baseline        STALE stale: last run red (exit 1) over tree 1a2b3c4d5e6f on 2026-10-05; the tree changed since (now 9f8e7d6c5b4a); `ward ready --baseline` runs it again
+```
+
+A current red baseline makes the verdict **`ready, baseline failing`**: the environment
+is ready (no row fails) and the project's own tests are red before any agent work — a
+pre-existing failure, not an installation one, so it never reads `setup required` and
+does not block an agent (the exit code stays 0; fixing that test may well be the agent's
+task). A stale baseline — the tree, the prepared environment (`the prepared environment
+changed (63080ebb75af → 22b73786fa0f)`) or the command moved since — is history and
+changes no verdict; `ward ready --baseline` runs it again.
+
 ## 6. Verify (`ward verify`)
 
 ```bash
@@ -244,6 +286,33 @@ shortcut fails here even when the agent's own run passed.
 `ward stop` ends the agent's sandboxed processes, confirms they are gone, and then
 seals the log (`■ WARD … SEALED`); `ward replay <events.log> --verify`
 checks the chain later, anywhere.
+
+## 7. The four answers (`ward ready --answers`)
+
+```bash
+ward ready --answers                 # or --answers --json: {project, session, answers: [{key, question, answer, known, source, details}]}
+```
+
+After a task you should be able to say what the agent could reach, which credentials it
+could use, what it changed and whether the current state is verified — the four
+questions of experiment E-14 ([`experiments.md`](experiments.md)), and the end of
+onboarding (issue #147 item 7). `ward ready --answers` answers all four for the
+project's session (the live one, else the most recent one that ran there) from what
+WardOS recorded, and names the source of each:
+
+| Question | Answered from |
+| --- | --- |
+| What can the agent reach? | the session's capability manifest (`session.json`, resolved from the policy when it started) and the temporary grants in its log — the trust bar's authority panel: filesystem, network, grants, standing denials |
+| Which credentials can it use? | the `CredentialGranted` and `CredentialRevoked` records in its log, with scope, lifetime and expiry; `none` when nothing was granted |
+| What did it change? | its entry snapshot, from the CAS, against the worktree digested now: every path added, modified or removed |
+| Is the current candidate verified? | its last verification record held against that same digest — `yes` only while the worktree is the candidate that passed, byte for byte; `no: … changed since` once it moved, as the bar's `VERIFY ~ STALE` |
+
+An answer WardOS has no record for says `unknown` and why — no session has run in the
+project, the log cannot be read, the entry snapshot is no longer in the store, the
+worktree cannot be digested — rather than guessing from the policy file or the worktree
+alone. For an ended session, reach and credentials are reported as what held while it
+ran, and the changes include edits made since it ended. The welcome's done step shows
+the same four answers as its closing card when the project has a session (§1).
 
 ## What the bar shows at each step
 
