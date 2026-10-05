@@ -163,11 +163,35 @@ warnings habituate.
 **Method.** Every `CapabilityRequested` and `CapabilityDecided` record in the log,
 with the `NetworkDenied` and `CredentialGranted` records around them, over a corpus of
 real sessions: the maintainers' own development sessions first, then volunteered logs.
-The corpus is read with `ward replay --json` over each sealed log and the metrics are
-derived from the records, never from the observer's counters. The intended tool is
-`ward replay --stats`, which would print this list for one log or a directory of logs;
-it is not implemented, and the experiment does not wait for it (a script over
-`--json` is enough for the first corpus).
+The metrics are derived from the records, never from the observer's counters, by
+`ward replay --stats <events.log>` (`--json` for the versioned report, `schema_version`
+1), one log per invocation; a directory of logs is a shell loop. The tool's definitions,
+which this experiment uses as written:
+* a request is paired with its terminal `CapabilityDecided` record by its identity (the
+  capability kind and target, the key the daemon's hold remembers an `allow-session`
+  under), never by position or proximity; a decision matching no open request is
+  reported as unpaired and pairs with nothing, and when several identical requests are
+  open at once the outcome is counted but its latency is reported as ambiguous, not
+  guessed;
+* a *prompt* is a request a human was asked about: every request except one covered by
+  a standing `allow-session` for the same identity (the daemon answers those itself) and
+  one a policy rule or TamperWard settled;
+* a *decision* is a prompt the user allowed or denied; an ask that timed out
+  (`expired`), one the session ended on (`closed_at_session_end`) and one with no
+  terminal record by the end of the log (`censored`: still pending) each have their own
+  row and are never decisions and never in the latency figures;
+* decision time is `CapabilityRequested` to `CapabilityDecided` by the log's own
+  monotonic timestamps, p50/p99 under the [`performance.md`](performance.md) §3
+  percentile rule;
+* a *repeated request* is one whose identity an earlier `allow-once` in the session
+  already answered, counted until an `allow-session` for it stands;
+* agent-hours are the log's first to last record less the time between a pause record
+  (settled or unsettled) and the resume that ended it, so a paused session does not
+  dilute prompts per agent-hour;
+* a figure the log cannot support — requests caused by missing policy (needs the
+  policy), switches to unrestricted network (no record kind carries the mode), launches
+  outside `ward` (outside the log by definition), and any rate or percentile with
+  nothing to divide — is reported as `unmeasured` with a reason, never as zero.
 **Pass.** No target until the data exists.
 **What the result changes.** The profiles of decision `deferred` in ADR-0019 (which
 task-shaped network profiles exist, and what each asks); the step-through defaults
