@@ -92,6 +92,10 @@ release is cut:
 4. Dispatch [`.github/workflows/release.yml`](.github/workflows/release.yml) with
    the matching `v0.19.0` tag. The release workflow independently refuses a tag
    that does not exactly match the merged workspace version.
+5. Capture the released desktop for the README: `gh workflow run desktop-capture.yml
+   --ref v0.19.0`, and once that run is green, `desktop/capture/refresh.sh --ref v0.19.0`
+   puts its GIF in `assets/wardos-desktop.gif` for a pull request (no workflow writes to
+   the repository; [`docs/desktop.md`](docs/desktop.md#the-readme-animation)).
 
 If the release carries `ward-node` changes, the release PR also records the six checks
 of [`docs/node-release-readiness.md`](docs/node-release-readiness.md) §4: the protocol

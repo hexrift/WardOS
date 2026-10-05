@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 scripts=()
-for f in desktop/bin/* desktop/lib/* desktop/install.sh desktop/tests/*.sh; do
+for f in desktop/bin/* desktop/lib/* desktop/install.sh desktop/tests/*.sh desktop/capture/*.sh; do
   [[ -f "$f" ]] && scripts+=("$f")
 done
 if [[ ${#scripts[@]} -gt 0 ]]; then

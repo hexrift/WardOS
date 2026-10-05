@@ -39,6 +39,7 @@ librsvg2              # SVG loader so gtkgreet can draw the WardOS mark from the
 # --- compositor and session ---------------------------------------------------------
 hyprland              # the compositor (ADR-0007) (COPR mineiro/hyprland)
 hyprlock              # lock screen (COPR mineiro/hyprland)
+hyprland-guiutils     # the dialogs Hyprland opens itself (it warns at every login without it) (COPR mineiro/hyprland)
 hypridle              # idle management (lock, screen off, suspend) (COPR mineiro/hyprland)
 hyprpaper             # wallpaper daemon (image backgrounds; swaybg draws solid ones) (COPR mineiro/hyprland)
 hyprpicker            # colour picker (wardos-capture color) (COPR mineiro/hyprland)

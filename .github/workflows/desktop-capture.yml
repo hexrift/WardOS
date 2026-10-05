@@ -1,0 +1,183 @@
+# The README's desktop, captured for real (issue #84, docs/desktop.md "The README
+# animation"): the shipped Hyprland on a virtual 1920x1080 output (the vkms kernel
+# module's), software-rendered, in the Fedora release the image pins, with Waybar, mako,
+# fuzzel and foot from the image's package set and the ward binaries of this checkout.
+# desktop/capture/capture.sh drives the scenes of desktop/capture/scenes.tsv through
+# hyprctl dispatch and wardos-menu-select, takes one grim shot per scene, and assembles
+# the GIF; the GIF and the shots are the artifact `wardos-desktop-capture`. Nothing here
+# writes to the repository: desktop/capture/refresh.sh brings a run's GIF into assets/ by
+# hand. Weekly on main, by hand (on a release tag too: `gh workflow run
+# desktop-capture.yml --ref vX.Y.Z`; with `-f inline_gif=true` the GIF is also printed
+# into the job log as base64, for a host that cannot reach the artifact store), and on
+# pull requests that touch what is on screen.
+name: desktop capture
+
+on:
+  pull_request:
+    paths:
+      - "desktop/**"
+      - "image/**"
+      - "examples/ward-demo/**"
+      - "assets/wardos-desktop.gif"
+      - ".github/workflows/desktop-capture.yml"
+  schedule:
+    - cron: "37 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      inline_gif:
+        description: "Also print the GIF into the job log as base64 (for a host that cannot reach the artifact store); refused over 2 MiB"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-capture-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The binaries on the runner, where the pinned toolchain and its cache already are; they
+  # link only glibc, so they run unchanged in the newer Fedora container below.
+  binaries:
+    name: desktop capture binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (2026-09-21)
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+      - run: cargo build --release --locked -p ward-cli -p ward-daemon -p ward-shell -p wardos-theme
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-capture-binaries
+          path: |
+            target/release/ward
+            target/release/wardd
+            target/release/ward-shell
+            target/release/wardos-theme-render
+          if-no-files-found: error
+          retention-days: 1
+
+  # No GPU on the runner. aquamarine gets its buffer allocator from its DRM backend, which
+  # needs a KMS device opened through a seat (a job container without /dev/dri dies in
+  # CBackend::create(), and HYPRLAND_HEADLESS_ONLY does not help: the headless backend has
+  # no allocator of its own). So the job runs on the host, loads vkms (a KMS device with a
+  # virtual connector; vgem is render-only and not in the Azure kernel's modules anyway),
+  # and hands /dev/dri to the Fedora container through --device. Inside,
+  # desktop/capture/ci-run.sh installs the image's stack, runs seatd for the seat, and
+  # runs capture.sh as an unprivileged user: Hyprland's DRM backend on the vkms card
+  # (AQ_DRM_DEVICES), Mesa's software rasteriser for EGL and GBM (kms_swrast on the
+  # card's dumb buffers). A scene that does not come up fails the job with Hyprland's
+  # log; it cannot go green without the shots.
+  capture:
+    name: desktop capture (Hyprland on vkms, Fedora)
+    needs: binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The virtual KMS driver whose card the capture uses (capture.sh finds the card by
+      # this driver name in sysfs, so the runner's own display adapter is never taken).
+      CAPTURE_DRM_DRIVER: vkms
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: desktop-capture-binaries
+          path: capture-binaries
+      # The card modprobe adds is the vkms one (what sysfs calls its driver depends on the
+      # kernel: `vkms` on a platform bus, `faux_driver` on the faux bus from 6.16), so the
+      # card list is taken before and after, and the newcomer is what the capture gets
+      # (CAPTURE_DRM_CARD). Were vkms loaded already, the card with vkms in its device
+      # path or uevent stands in.
+      - name: A virtual KMS device (vkms)
+        id: drm
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" ||
+            echo "linux-modules-extra-$(uname -r) not installed; trying the modules already present"
+          shopt -s nullglob
+          before=(/sys/class/drm/card*)
+          sudo modprobe "$CAPTURE_DRM_DRIVER"
+          sudo udevadm settle || true
+          ls -l /dev/dri || true
+          node=""
+          for card in /sys/class/drm/card*; do
+            [[ -e $card/device ]] || continue
+            name=$(basename "$card")
+            driver=$(basename "$(readlink -f "$card/device/driver" 2>/dev/null)" 2>/dev/null || echo '?')
+            device=$(readlink -f "$card/device")
+            new=yes
+            for old in "${before[@]}"; do [[ $old != "$card" ]] || new=no; done
+            echo "$name: $driver ($device)${new/yes/, new}"
+            [[ -e /dev/dri/$name ]] || continue
+            if [[ $new == yes ]]; then
+              node=/dev/dri/$name
+            elif [[ -z $node ]] && { [[ $driver == "$CAPTURE_DRM_DRIVER" || $device == *"/$CAPTURE_DRM_DRIVER"* ]] ||
+              grep -qE "^(DRIVER=$CAPTURE_DRM_DRIVER|MODALIAS=.*$CAPTURE_DRM_DRIVER)" "$card/device/uevent" 2>/dev/null; }; then
+              node=/dev/dri/$name
+            fi
+          done
+          if [[ -z $node ]]; then
+            echo "::error::no /dev/dri/card* appeared for $CAPTURE_DRM_DRIVER after modprobe, and none is its by driver, device path or uevent; Hyprland has no KMS device to allocate on" >&2
+            exit 1
+          fi
+          echo "DRM device for the capture: $node ($CAPTURE_DRM_DRIVER)"
+          echo "card=$node" >>"$GITHUB_OUTPUT"
+          { echo "DRM device for the capture: \`$node\` ($CAPTURE_DRM_DRIVER)"; echo; } >>"$GITHUB_STEP_SUMMARY"
+      # The Fedora release the image pins (image/Containerfile's FROM line), as root with
+      # every DRM node and told which is the vkms card; ci-run.sh hands capture-out back
+      # to this user, failed or not.
+      - name: Capture
+        env:
+          CAPTURE_DRM_CARD: ${{ steps.drm.outputs.card }}
+        run: |
+          set -euo pipefail
+          [[ $CAPTURE_DRM_CARD == /dev/dri/card* ]] || { echo "::error::no DRM card from the step before" >&2; exit 1; }
+          release=$(sed -n 's|^FROM quay.io/fedora/fedora-bootc:\([0-9][0-9]*\)$|\1|p' image/Containerfile | head -n 1)
+          [[ $release =~ ^[0-9]+$ ]] || { echo "::error::no fedora-bootc:<release> FROM line in image/Containerfile" >&2; exit 1; }
+          docker run --rm --device /dev/dri -v "$PWD:/w" -w /w \
+            -e GITHUB_ACTIONS -e CAPTURE_DRM_DRIVER -e CAPTURE_DRM_CARD -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            "fedora:$release" bash desktop/capture/ci-run.sh /w/capture-binaries /w/capture-out
+      - name: Summary
+        if: always()
+        run: if [[ -f capture-out/summary.md ]]; then cat capture-out/summary.md >>"$GITHUB_STEP_SUMMARY"; fi
+      # By hand only, never on a pull request: the GIF as one base64 line between the
+      # BEGIN and END markers, its size and SHA-256 on the line before, for a host that
+      # cannot reach the artifact store (refresh.sh --run ID reads it; the GIF, over
+      # 2 MiB, is left to the artifact, and the step says so).
+      - name: Inline the GIF
+        if: github.event_name == 'workflow_dispatch' && inputs.inline_gif
+        run: |
+          set -euo pipefail
+          gif=capture-out/wardos-desktop.gif
+          [[ -f $gif ]] || { echo "::error::no $gif to inline" >&2; exit 1; }
+          size=$(wc -c <"$gif")
+          if ((size > 2 * 1024 * 1024)); then
+            echo "::warning::wardos-desktop.gif is $size bytes, over the 2 MiB the log takes inline; take it from the wardos-desktop-capture artifact"
+            exit 0
+          fi
+          echo "size=$size sha256=$(sha256sum "$gif" | cut -d' ' -f1)"
+          echo "-----BEGIN WARDOS-DESKTOP-GIF-----"
+          base64 -w0 "$gif"
+          echo
+          echo "-----END WARDOS-DESKTOP-GIF-----"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wardos-desktop-capture
+          path: |
+            capture-out/wardos-desktop.gif
+            capture-out/frames/
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: wardos-desktop-capture-logs
+          path: capture-out/
+          retention-days: 14
