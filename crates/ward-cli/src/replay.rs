@@ -524,6 +524,40 @@ fn summary(event: &WardEvent) -> String {
         WardEvent::CredentialGrantedLaunch { launch_seq } => {
             format!("launch_seq {launch_seq}")
         }
+        WardEvent::NodeAttemptAdmitted {
+            attempt,
+            operation,
+            envelope,
+            version,
+            ..
+        } => format!(
+            "{attempt} admitted · op {operation} · envelope {} · version {version}",
+            short_hex(&envelope.to_hex())
+        ),
+        WardEvent::NodeAttemptLaunched {
+            operation,
+            host_pid,
+        } => format!("launched · op {operation} · host pid {host_pid}"),
+        WardEvent::NodeAttemptIntervened { action, operation } => {
+            format!("{} · op {operation}", action.as_str())
+        }
+        WardEvent::NodeAttemptEnded {
+            state,
+            outcome,
+            end,
+            operation,
+        } => format!(
+            "{} · {} · {end:?}{}",
+            state.as_str(),
+            outcome.as_str(),
+            operation.map_or_else(String::new, |op| format!(" · op {op}"))
+        ),
+        WardEvent::NodeAttemptRecovered { state, outcome } => format!(
+            "recovered {}{}",
+            state.as_str(),
+            outcome.map_or_else(String::new, |o| format!(" · {}", o.as_str()))
+        ),
+        WardEvent::NodeAttemptSealed { operation } => format!("sealed · op {operation}"),
         WardEvent::NetworkRequested { .. }
         | WardEvent::NetworkDenied { .. }
         | WardEvent::CapabilityRequested { .. }
@@ -850,5 +884,86 @@ mod tests {
         assert!(footer.contains("10 records"));
         assert!(footer.contains("files changed 2 · commands 1 · network 1 allowed / 1 denied"));
         assert!(report.output.contains("START"));
+    }
+
+    #[test]
+    fn a_node_attempt_evidence_log_verifies_and_summarises() {
+        use ward_events::{
+            ExecutionAttemptId, LeaseId, NodeAttemptEnd, NodeAttemptOutcome, NodeAttemptState,
+            NodeIntervention, TaskId,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.log");
+        let mut chain = Chain::genesis(SessionId::from_u128(8), Blake3Hash::hash(b"binding"));
+        let mut w = LogWriter::create(&log, chain.head(), FsyncPolicy::Never).unwrap();
+        for event in [
+            WardEvent::NodeAttemptAdmitted {
+                task: TaskId::from_u128(7),
+                attempt: ExecutionAttemptId::from_u128(8),
+                lease: LeaseId::from_u128(9),
+                session: SessionId::from_u128(5),
+                operation: 2,
+                envelope: Blake3Hash::hash(b"envelope"),
+                issuer_key: Blake3Hash::hash(b"key"),
+                version: 1,
+            },
+            WardEvent::NodeAttemptLaunched {
+                operation: 3,
+                host_pid: 4242,
+            },
+            WardEvent::NodeAttemptIntervened {
+                action: NodeIntervention::Pause,
+                operation: 4,
+            },
+            WardEvent::NodeAttemptEnded {
+                state: NodeAttemptState::Stopped,
+                outcome: NodeAttemptOutcome::Failed,
+                end: NodeAttemptEnd::Killed,
+                operation: Some(6),
+            },
+            WardEvent::NodeAttemptRecovered {
+                state: NodeAttemptState::Stopped,
+                outcome: Some(NodeAttemptOutcome::Failed),
+            },
+            WardEvent::NodeAttemptSealed { operation: 7 },
+        ] {
+            let r = chain
+                .append(Origin::Node, event, Timestamp::default())
+                .unwrap();
+            w.append(&r).unwrap();
+        }
+        w.seal().unwrap();
+
+        let report = replay(&log, VERIFY).unwrap();
+        assert!(report.ok(), "{}", report.output);
+        assert_eq!(report.records, 6);
+        assert_eq!(report.sealed, Sealed::Matches);
+
+        let opts = Options {
+            verify: false,
+            json: true,
+        };
+        let rows: Vec<serde_json::Value> = replay(&log, opts)
+            .unwrap()
+            .output
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let summaries: Vec<&str> = rows
+            .iter()
+            .map(|r| r["summary"].as_str().unwrap())
+            .collect();
+        assert!(rows.iter().all(|r| r["origin"] == "node"));
+        assert!(
+            summaries[0].starts_with("exec_00000000000000000000000008 admitted · op 2 · envelope "),
+            "{}",
+            summaries[0]
+        );
+        assert!(summaries[0].ends_with(" · version 1"), "{}", summaries[0]);
+        assert_eq!(summaries[1], "launched · op 3 · host pid 4242");
+        assert_eq!(summaries[2], "pause · op 4");
+        assert_eq!(summaries[3], "stopped · failed · Killed · op 6");
+        assert_eq!(summaries[4], "recovered stopped · failed");
+        assert_eq!(summaries[5], "sealed · op 7");
     }
 }

@@ -60,6 +60,15 @@ pub enum TaskRecordError {
     /// The record would be larger than [`MAX_STATE_FILE_BYTES`]; nothing was written.
     #[error("task record for {0} is too large")]
     RecordTooLarge(TaskId),
+    /// A recovered attempt's evidence log could not be verified or brought in line with
+    /// its recovered state.
+    #[error("evidence log of {task} could not be recovered: {source}")]
+    Evidence {
+        /// The task whose attempt's log failed.
+        task: TaskId,
+        /// Why.
+        source: crate::evidence::EvidenceError,
+    },
 }
 
 /// A task's state as recorded: the lifecycle state, or a launch intent.

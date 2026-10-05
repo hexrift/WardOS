@@ -444,10 +444,23 @@ mod tests {
 
     use super::*;
 
+    fn sleeping(nap: &str) -> bool {
+        let cmdline = format!("sleep\0{nap}\0");
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
+            .any(|found| found == cmdline.as_bytes())
+    }
+
     #[test]
     fn a_survivor_is_ended_only_under_its_recorded_identity_from_this_boot() {
+        let nap = format!("30.{:06}", std::process::id() % 1_000_000);
         let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30 & wait"])
+            .args(["-c", &format!("sleep {nap} & wait")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
         let root = TreeRoot::of(child.id()).unwrap();
@@ -462,6 +475,14 @@ mod tests {
 
         SandboxLauncher.end_survivor(&WorkloadProcess::new(root.pid(), root.start_time(), boot));
         assert_eq!(child.wait().unwrap().code(), None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sleeping(&nap) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sleep forked under the survivor outlived it"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

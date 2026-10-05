@@ -12,7 +12,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::ids::{
-    AttemptId, Blake3Hash, ImageDigest, Pid, ProjectId, RuleRef, ServiceId, SnapshotId,
+    AttemptId, Blake3Hash, ExecutionAttemptId, ImageDigest, LeaseId, Pid, ProjectId, RuleRef,
+    ServiceId, SessionId, SnapshotId, TaskId,
 };
 use crate::text::{BoundedArgv, BoundedText, HostName, SandboxPath};
 
@@ -569,6 +570,115 @@ pub struct TamperWardSig {
     pub key_id: Blake3Hash,
     /// Signature bytes; the algorithm is bound to the key.
     pub signature: SignatureBytes,
+}
+
+// ---------------------------------------------------------------------------------------
+// Node execution attempts (ADR-0030 §3)
+// ---------------------------------------------------------------------------------------
+
+/// The lifecycle state `ward-node` holds an execution attempt in, as its evidence log
+/// records it. Mirrors the node protocol's task lifecycle states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeAttemptState {
+    /// Registered, not admitted.
+    Created,
+    /// Admitted under a verified envelope, nothing spawned.
+    Ready,
+    /// The workload was spawned and is running.
+    Running,
+    /// The workload's process tree is held stopped.
+    Paused,
+    /// The workload ended on its own, at its budget, or ambiguously.
+    Exited,
+    /// The node stopped the attempt.
+    Stopped,
+    /// The node revoked the attempt's lease and ended it.
+    Revoked,
+    /// The attempt is terminal and its evidence log sealed.
+    Sealed,
+}
+
+impl NodeAttemptState {
+    /// Stable lowercase name, as the node protocol spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Exited => "exited",
+            Self::Stopped => "stopped",
+            Self::Revoked => "revoked",
+            Self::Sealed => "sealed",
+        }
+    }
+}
+
+/// The receipt outcome of a node execution attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeAttemptOutcome {
+    /// The attempt completed: its workload exited 0 within its budget.
+    Completed,
+    /// The attempt did not complete and its workload is gone.
+    Failed,
+    /// The attempt may have had effects the node cannot confirm.
+    Unknown,
+}
+
+impl NodeAttemptOutcome {
+    /// Stable lowercase name, as the node protocol spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// What ended a node execution attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeAttemptEnd {
+    /// The workload exited on its own; `None` when a signal the node did not send ended it.
+    Exited {
+        /// The exit status code.
+        code: Option<i32>,
+    },
+    /// The node killed the workload at its wall-clock budget.
+    BudgetExceeded,
+    /// The node killed and reaped the workload for a `stop` or `revoke`.
+    Killed,
+    /// The node lost track of the workload.
+    Lost,
+    /// The spawn could not be confirmed, or its record could not be written; the
+    /// workload was killed.
+    Ambiguous,
+    /// The attempt was stopped or revoked before anything was spawned.
+    NotStarted,
+    /// The revocation's kill was requested but its reap was not confirmed in time.
+    Unconfirmed,
+}
+
+/// A `pause` or `resume` the node applied to a running attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeIntervention {
+    /// The workload's process tree was confirmed stopped.
+    Pause,
+    /// The workload's process tree was confirmed continued.
+    Resume,
+}
+
+impl NodeIntervention {
+    /// Stable lowercase name, as the node protocol spells the verb.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1137,6 +1247,69 @@ pub enum WardEvent {
         /// held for a retry.
         barrier_confirmed: bool,
     },
+
+    // -- node execution attempts (origin: Node; ADR-0030 §3, #332) --
+    /// `ward-node` admitted the attempt: the first record of the attempt's evidence log,
+    /// and of every later admission of it. Written only after the envelope verified and its
+    /// version was durably recorded.
+    NodeAttemptAdmitted {
+        /// The task.
+        task: TaskId,
+        /// The execution attempt.
+        attempt: ExecutionAttemptId,
+        /// The authority lease the attempt runs under.
+        lease: LeaseId,
+        /// The node session the attempt's receipt names.
+        session: SessionId,
+        /// The `admit` operation id.
+        operation: u64,
+        /// BLAKE3 digest of the exact envelope bytes the issuer signed.
+        envelope: Blake3Hash,
+        /// Identifier (hash) of the issuer key whose proof verified.
+        issuer_key: Blake3Hash,
+        /// The envelope's admission version.
+        version: u64,
+    },
+    /// The node confirmed the attempt's workload spawned.
+    NodeAttemptLaunched {
+        /// The `start` operation id.
+        operation: u64,
+        /// The host pid the workload was spawned as.
+        host_pid: u32,
+    },
+    /// The node applied a `pause` or `resume` to the running attempt.
+    NodeAttemptIntervened {
+        /// Which.
+        action: NodeIntervention,
+        /// The operation id.
+        operation: u64,
+    },
+    /// The attempt ended: its terminal state and receipt outcome, and what ended it.
+    NodeAttemptEnded {
+        /// `Exited`, `Stopped` or `Revoked`.
+        state: NodeAttemptState,
+        /// The receipt outcome.
+        outcome: NodeAttemptOutcome,
+        /// What ended it.
+        end: NodeAttemptEnd,
+        /// The `stop` or `revoke` operation that ended it, if one did.
+        operation: Option<u64>,
+    },
+    /// A restarted node recovered the attempt in this state before serving. An attempt that
+    /// may have been executing recovers `Exited` with an `Unknown` outcome and never runs
+    /// again; an admitted attempt recovers `Created`; any other state the node recorded but
+    /// this log does not yet show is carried over.
+    NodeAttemptRecovered {
+        /// The state the node holds the attempt in.
+        state: NodeAttemptState,
+        /// The receipt outcome, once the attempt ended.
+        outcome: Option<NodeAttemptOutcome>,
+    },
+    /// The attempt was sealed; the log is sealed after this record.
+    NodeAttemptSealed {
+        /// The `seal` operation id.
+        operation: u64,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -1186,11 +1359,17 @@ pub enum EventKind {
     VerificationTimedOut = 37,
     CredentialGrantedLaunch = 38,
     WorkloadsTerminated = 39,
+    NodeAttemptAdmitted = 40,
+    NodeAttemptLaunched = 41,
+    NodeAttemptIntervened = 42,
+    NodeAttemptEnded = 43,
+    NodeAttemptRecovered = 44,
+    NodeAttemptSealed = 45,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 40] = [
+    pub const ALL: [EventKind; 46] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -1231,6 +1410,12 @@ impl EventKind {
         EventKind::VerificationTimedOut,
         EventKind::CredentialGrantedLaunch,
         EventKind::WorkloadsTerminated,
+        EventKind::NodeAttemptAdmitted,
+        EventKind::NodeAttemptLaunched,
+        EventKind::NodeAttemptIntervened,
+        EventKind::NodeAttemptEnded,
+        EventKind::NodeAttemptRecovered,
+        EventKind::NodeAttemptSealed,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
@@ -1283,6 +1468,12 @@ impl EventKind {
             EventKind::VerificationTimedOut => "verification_timed_out",
             EventKind::CredentialGrantedLaunch => "credential_granted_launch",
             EventKind::WorkloadsTerminated => "workloads_terminated",
+            EventKind::NodeAttemptAdmitted => "node_attempt_admitted",
+            EventKind::NodeAttemptLaunched => "node_attempt_launched",
+            EventKind::NodeAttemptIntervened => "node_attempt_intervened",
+            EventKind::NodeAttemptEnded => "node_attempt_ended",
+            EventKind::NodeAttemptRecovered => "node_attempt_recovered",
+            EventKind::NodeAttemptSealed => "node_attempt_sealed",
         }
     }
 
@@ -1318,6 +1509,12 @@ impl EventKind {
                 | EventKind::SessionPauseUnsettled
                 | EventKind::CredentialGrantedLaunch
                 | EventKind::WorkloadsTerminated
+                | EventKind::NodeAttemptAdmitted
+                | EventKind::NodeAttemptLaunched
+                | EventKind::NodeAttemptIntervened
+                | EventKind::NodeAttemptEnded
+                | EventKind::NodeAttemptRecovered
+                | EventKind::NodeAttemptSealed
         )
     }
 }
@@ -1505,6 +1702,12 @@ impl WardEvent {
             WardEvent::VerificationTimedOut { .. } => EventKind::VerificationTimedOut,
             WardEvent::CredentialGrantedLaunch { .. } => EventKind::CredentialGrantedLaunch,
             WardEvent::WorkloadsTerminated { .. } => EventKind::WorkloadsTerminated,
+            WardEvent::NodeAttemptAdmitted { .. } => EventKind::NodeAttemptAdmitted,
+            WardEvent::NodeAttemptLaunched { .. } => EventKind::NodeAttemptLaunched,
+            WardEvent::NodeAttemptIntervened { .. } => EventKind::NodeAttemptIntervened,
+            WardEvent::NodeAttemptEnded { .. } => EventKind::NodeAttemptEnded,
+            WardEvent::NodeAttemptRecovered { .. } => EventKind::NodeAttemptRecovered,
+            WardEvent::NodeAttemptSealed { .. } => EventKind::NodeAttemptSealed,
         }
     }
 
@@ -1536,9 +1739,9 @@ mod tests {
             assert_eq!(k.bit(), 1u64 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
-        // The catalogue is currently 40 kinds wide, well inside the `u64` backing's
+        // The catalogue is currently 46 kinds wide, well inside the `u64` backing's
         // 64-bit capacity -- so, unlike when the backing type was exactly saturated
-        // at `u32`, there IS a first unused bit right now (bit 40), and a value that
+        // at `u32`, there IS a first unused bit right now (bit 46), and a value that
         // sets it must be rejected as an unknown kind rather than silently accepted.
         // This is the same "no room past the known kinds to smuggle a bit through"
         // property `kind_bits_are_dense...`'s name promises, just checked against
@@ -1617,6 +1820,8 @@ mod tests {
         assert!(EventKind::SessionPauseUnsettled.is_critical());
         assert!(EventKind::CredentialGrantedLaunch.is_critical());
         assert!(EventKind::WorkloadsTerminated.is_critical());
+        assert!(EventKind::NodeAttemptAdmitted.is_critical());
+        assert!(EventKind::NodeAttemptSealed.is_critical());
         assert!(!EventKind::FileRead.is_critical());
         assert!(!EventKind::AgentClaim.is_critical());
     }

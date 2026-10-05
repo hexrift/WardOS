@@ -468,7 +468,7 @@ impl Subscribe {
 
 /// Convenience: the enforcement-fact origins, for callers building filters.
 #[must_use]
-pub const fn enforcement_origins() -> [Origin; 6] {
+pub const fn enforcement_origins() -> [Origin; 7] {
     [
         Origin::Kernel,
         Origin::Proxy,
@@ -476,6 +476,7 @@ pub const fn enforcement_origins() -> [Origin; 6] {
         Origin::Verifier,
         Origin::TamperWard,
         Origin::User,
+        Origin::Node,
     ]
 }
 
@@ -701,7 +702,7 @@ mod tests {
         };
         assert!(Filter::live().matches(&file));
         assert!(!Filter::quiet().matches(&file));
-        assert_eq!(enforcement_origins().len(), 6);
+        assert_eq!(enforcement_origins().len(), 7);
         assert!(!enforcement_origins().contains(&Origin::Agent));
     }
 }

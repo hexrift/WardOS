@@ -1,7 +1,7 @@
 # ward-node integration contract for external control planes
 
 Status: living document. It describes the `ward-node` protocol 1.3 contract as
-implemented today (ADR-0030 steps 1–6).
+implemented today (ADR-0030 steps 1–7).
 
 This is the contract an adapter drives, in any language, to have a local `ward-node`
 admit, run, pause, stop, revoke and seal a task. Every protocol message below was
@@ -19,8 +19,7 @@ admission example is a working test vector (§7.4).
   configured ([ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md)).
   Reaching the socket proves nothing; a signature by a trusted key is required.
 - Not implemented yet: network grants from the capability manifest (every workload runs
-  offline), an event stream (`stream`), per-attempt evidence logs, and any remote
-  transport or mTLS. The only transport is a local Unix socket; remote transport and key
+  offline), an event stream (`stream`), and any remote transport or mTLS. The only transport is a local Unix socket; remote transport and key
   bootstrap are #262.
 
 ## 2. Operator setup
@@ -38,7 +37,7 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | `--state-dir` | yes | Node-owned state, created mode 0700 if absent and refused if group- or world-accessible. Holds `node-id`, `admission-versions.json`, `revocations.json`, `retired-attempts.json`, the snapshot store `cas/` and `tasks/`, one record per registered task (`<task>.json`, mode 0600, in a directory created mode 0700) from which a restarted node recovers its registry (§6.4). |
 | `--node-id` | yes | The node's audience id (`node_` + 26-character ULID). Pinned in `<state-dir>/node-id` at first start; a later start with another id is refused. Envelopes must name exactly this id. |
 | `--trusted-issuers` | no | Trust store (§2.2). Without it no issuer is trusted and every `admit` is refused `authority_denied`. |
-| `--task-root` | no | Directory under which the node allocates workspaces, created mode 0700 and refused if group- or world-accessible or not a real directory. With it the node executes (`start`, `pause`, `resume`, `stop`, `revoke`, `seal`); the node refuses to start if bubblewrap is unusable. Without it, all six are `unsupported_operation`. |
+| `--task-root` | no | Directory under which the node allocates workspaces and keeps each admitted attempt's evidence log (§6.5), created mode 0700 and refused if group- or world-accessible or not a real directory. With it the node executes (`start`, `pause`, `resume`, `stop`, `revoke`, `seal`); the node refuses to start if bubblewrap is unusable. Without it, all six are `unsupported_operation` and no evidence log is kept. |
 
 The node refuses to start on any unsafe or malformed input: a trust store, state file or
 task record it cannot parse, wrong permissions, a pinned id mismatch. It serves until
@@ -481,7 +480,80 @@ it serves its socket, and a control plane observes:
 A malformed, oversized or unexpected entry in `tasks/`, or more records than the registry
 holds (1 024), stops the node from starting. The node never writes more records than it
 loads: an evicted task's record is removed before the task that needed its room is
-recorded.
+recorded. Each recovered attempt's evidence log is also brought in line with its recovered
+state before the node serves (§6.5); a log that does not verify stops the node from
+starting.
+
+### 6.5 Evidence logs
+
+A node with a `--task-root` is the single writer of one append-only, hash-chained
+evidence log per attempt it admits:
+
+```text
+<task-root>/<task>/<attempt>.evidence/events.log    the log (mode 0600; 0400 once sealed)
+<task-root>/<task>/<attempt>.evidence/HEAD          the sealed head, written by seal (0400)
+```
+
+The directory (mode 0700, like `<task-root>/<task>/`) sits beside the attempt's workspace
+`<task-root>/<task>/<attempt>/`, never inside it: the sandbox binds only the workspace,
+so the workload cannot reach its log. Nothing else writes it.
+
+The log uses the `ward-events` session-log format unchanged (`event-model.md` §5):
+length-prefixed frames, each record hash-chained to the one before. Every record has
+origin `node`. The chain is bound to the attempt: its session id carries the execution
+attempt id's 128-bit value (`sess_` + the attempt's 26-character body), and its genesis
+hash is BLAKE3 over the bytes `ward-node attempt evidence v1` and a NUL, followed by the
+task, attempt and lease ids as 16 big-endian bytes each. Records, in order:
+
+| Record | Written when | Carries |
+| --- | --- | --- |
+| `NodeAttemptAdmitted` | An `admit` took effect (again after a restart, under a higher version). | Task, attempt and lease ids, the receipt session, the `admit` operation id, the BLAKE3 digest of the exact envelope bytes, the issuer key id, the envelope version. |
+| `NodeAttemptLaunched` | `start` confirmed its spawn. | The `start` operation id and the host pid. |
+| `NodeAttemptIntervened` | A `pause` or `resume` took effect. | `pause` or `resume`, and the operation id. |
+| `NodeAttemptEnded` | The attempt ended: natural exit, budget kill, a lost child, an ambiguous launch, a `stop` or `revoke` (from `ready`, or with its kill reaped, or a revoke whose reap was not confirmed). | The state (`exited`, `stopped`, `revoked`), the receipt outcome, the cause (exit code, budget, killed, lost, ambiguous, not started, unconfirmed) and the `stop` or `revoke` operation id. |
+| `NodeAttemptRecovered` | The state the node holds differs from the state the log last shows: after a restart, before the node serves, and before sealing. | The state and outcome the node holds. |
+| `NodeAttemptSealed` | `seal` took effect; the log is then sealed. | The `seal` operation id. |
+
+Every record is metadata; workload output is never logged. A record is fsynced before the
+node answers its verb. If it cannot be appended, the verb is refused
+`resource_unavailable` and nothing changes: the task record written for it is restored,
+and a `pause` or `resume` undoes its freeze or thaw first. One exception is `admit`: its
+evidence record is written after its version is durably recorded, so an `admit` refused
+this way still consumes its version, and the next `admit` needs a higher one. A replayed
+operation appends nothing. Events the node observes rather than serves are recorded as
+they happen, and a later restart reconciles any it could not append:
+
+- a `start` whose `NodeAttemptLaunched` cannot be appended kills the workload and is
+  answered `exited` (`unknown`), as for an ambiguous launch;
+- an end the reaper observed but could not append is recorded as `NodeAttemptRecovered`,
+  with the state and outcome the node holds, when the node next starts or before the
+  attempt is sealed, whichever comes first;
+- an attempt that may have been executing when the node died is recorded
+  `NodeAttemptRecovered` `exited` (`unknown`) before the restarted node serves.
+
+A crash can only leave a torn final frame that was never acknowledged; the restarted node
+cuts it off. Any other damage (a flipped byte, a foreign or reordered record, a `HEAD`
+that does not match) refuses every further append with `resource_unavailable` and stops a
+restarted node from starting. The log is bounded at 256 KiB; records that do not end an
+attempt are refused `resource_unavailable` once it would pass 240 KiB, so the records that
+end, recover and seal it always fit.
+
+To verify a log, as an operator or a control plane with access to the host:
+
+```text
+ward replay --verify <task-root>/<task>/<attempt>.evidence/events.log
+```
+
+or, in Rust, `ward_events::LogReader::open(path)?.verify_all()?` compared with
+`ward_events::log::parse_head` of `HEAD`, or `ward_node::evidence::verify(dir, binding)`,
+which also checks the genesis, the session id and that every record has origin `node`.
+`ward replay --json` prints one summary per record. The protocol does not carry the log
+or its head: `inspect` and receipts are unchanged.
+
+Retention is the operator's: the node never deletes an evidence log. A sealed task
+evicted from the registry (§10, capacity) keeps its sealed log, and a replaced attempt
+keeps its log, sealed or not, under its own attempt id. Remove `<task-root>/<task>/`
+only once its logs have been read or archived.
 
 ## 7. The admission envelope
 
@@ -784,7 +856,7 @@ task to evict it is refused `resource_unavailable`.
 | `stale_operation` | The request is stale and nothing was done. From `admit`: the envelope `version` is not greater than the last version the node durably accepted for the task (an old or replayed envelope, also after a restart). From `pause` or `resume`: the `operation_id` took effect earlier and a later operation of the same verb has superseded it (§6.3). From `create`: the attempt was replaced by a later attempt of the task and is retired (§6.1). |
 | `invalid_state` | The task is not in a state that allows the verb, or another operation already did it. |
 | `authority_denied` | Untrusted key, bad signature, malformed envelope, a root lease `issuer` that is not the principal bound to the signing key, wrong audience, not yet valid, or authority that does not cover the task or agent. |
-| `resource_unavailable` | Registry full with no sealed task to evict, snapshot missing, workspace exists, spawn failed, a state write failed or would exceed its bound (admission version, revocation, retired attempt or task record), stop not confirmed in time, a pause or resume not confirmed, or an attempt's 128 pauses used up. |
+| `resource_unavailable` | Registry full with no sealed task to evict, snapshot missing, workspace exists, spawn failed, a state write failed or would exceed its bound (admission version, revocation, retired attempt or task record), an evidence record could not be appended (§6.5), stop not confirmed in time, a pause or resume not confirmed, or an attempt's 128 pauses used up. |
 | `unsupported_operation` | The verb is not implemented (`stream`), or not enabled on this node or connection (no `--task-root`, or protocol 1.2). |
 
 ## 9. Receipts
@@ -796,6 +868,8 @@ receipt, so a sealed task reports the outcome its attempt ended with. A 1.1 or 1
 connection never sees an outcome. A receipt survives a node restart (§6.4); it is lost
 when a new attempt replaces its attempt and when its sealed task is evicted: read the
 outcome before then.
+The attempt's evidence log (§6.5) records the same outcome in its `NodeAttemptEnded` or
+`NodeAttemptRecovered` record and outlives both.
 
 | Outcome | When |
 | --- | --- |
@@ -873,7 +947,8 @@ returned.
 - **Versions.** Keep a durable, strictly increasing version per task in the control
   plane. It is per task, not per attempt: a new attempt's envelope needs a version higher
   than every one accepted for the task before, across attempts, evictions and restarts.
-  Every successful `admit` consumes one; refused admits do not.
+  Every successful `admit` consumes one; refused admits do not, except one refused
+  `resource_unavailable` because its evidence record could not be appended (§6.5).
 - **Clocks.** Validity is judged at the node clock at `admit` and at `start`; no other
   verb rechecks it. Leave margin for skew and for the delay between the two.
 - **Capacity.** The node holds at most 1 024 tasks. `exited`, `stopped` and `revoked`

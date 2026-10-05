@@ -11,7 +11,7 @@ use thiserror::Error;
 /// origins may be used by `wardd`, the verifier, or `TamperWard` to decide anything;
 /// [`Origin::Agent`] records are *claims* and are rendered with a distinct marker.
 ///
-/// The numeric tag returned by [`Origin::tag`] (1–7) is the byte that enters the record
+/// The numeric tag returned by [`Origin::tag`] (1–8) is the byte that enters the record
 /// hash; it is independent of serde's variant index so that the hash layout is stable
 /// even if the enum is ever reordered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -30,11 +30,14 @@ pub enum Origin {
     Agent,
     /// Explicit user actions (approvals, `ward stop`, `ward verify`).
     User,
+    /// `ward-node`, the single writer of each execution attempt's evidence log it admits
+    /// (ADR-0030 §3). Never appears in a `wardd` session log.
+    Node,
 }
 
 impl Origin {
     /// Every origin, in tag order.
-    pub const ALL: [Origin; 7] = [
+    pub const ALL: [Origin; 8] = [
         Origin::Kernel,
         Origin::Proxy,
         Origin::Wardd,
@@ -42,9 +45,10 @@ impl Origin {
         Origin::TamperWard,
         Origin::Agent,
         Origin::User,
+        Origin::Node,
     ];
 
-    /// Stable one-byte tag used in the record hash (1–7). Zero is never a valid tag.
+    /// Stable one-byte tag used in the record hash (1–8). Zero is never a valid tag.
     #[must_use]
     pub const fn tag(self) -> u8 {
         match self {
@@ -55,6 +59,7 @@ impl Origin {
             Origin::TamperWard => 5,
             Origin::Agent => 6,
             Origin::User => 7,
+            Origin::Node => 8,
         }
     }
 
@@ -69,6 +74,7 @@ impl Origin {
             5 => Some(Origin::TamperWard),
             6 => Some(Origin::Agent),
             7 => Some(Origin::User),
+            8 => Some(Origin::Node),
             _ => None,
         }
     }
@@ -92,6 +98,7 @@ impl Origin {
             Origin::TamperWard => "tamperward",
             Origin::Agent => "agent",
             Origin::User => "user",
+            Origin::Node => "node",
         }
     }
 }
@@ -116,7 +123,15 @@ pub struct UnknownOriginBits(pub u8);
 pub struct OriginSet(u8);
 
 impl OriginSet {
-    const MASK: u8 = 0b0111_1111;
+    const MASK: u8 = {
+        let mut mask = 0;
+        let mut index = 0;
+        while index < Origin::ALL.len() {
+            mask |= Self::bit(Origin::ALL[index]);
+            index += 1;
+        }
+        mask
+    };
 
     /// The empty set.
     pub const EMPTY: Self = Self(0);
@@ -184,7 +199,7 @@ impl fmt::Debug for OriginSet {
 impl TryFrom<u8> for OriginSet {
     type Error = UnknownOriginBits;
     fn try_from(bits: u8) -> Result<Self, UnknownOriginBits> {
-        if bits & !Self::MASK != 0 {
+        if bits & Self::MASK != bits {
             return Err(UnknownOriginBits(bits));
         }
         Ok(Self(bits))
@@ -225,7 +240,7 @@ mod tests {
             assert_eq!(Origin::from_tag(tag), Some(*o));
         }
         assert_eq!(Origin::from_tag(0), None);
-        assert_eq!(Origin::from_tag(8), None);
+        assert_eq!(Origin::from_tag(9), None);
     }
 
     #[test]
@@ -248,7 +263,11 @@ mod tests {
         let bytes = postcard::to_allocvec(&set).unwrap();
         assert_eq!(bytes, vec![set.bits()]);
         assert_eq!(postcard::from_bytes::<OriginSet>(&bytes).unwrap(), set);
-        assert!(postcard::from_bytes::<OriginSet>(&[0x80]).is_err());
-        assert_eq!(OriginSet::try_from(0xff), Err(UnknownOriginBits(0xff)));
+        assert_eq!(
+            postcard::from_bytes::<OriginSet>(&[0x80]).unwrap(),
+            OriginSet::only(Origin::Node)
+        );
+        assert_eq!(OriginSet::try_from(0xff), Ok(OriginSet::ALL));
+        assert!(OriginSet::enforcement_facts().contains(Origin::Node));
     }
 }

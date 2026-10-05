@@ -8,7 +8,7 @@
 //! offset  len  content
 //! 0       32   prev             hash of the previous record (genesis: manifest hash)
 //! 32       8   seq              u64, little-endian
-//! 40       1   origin.tag()     1 = Kernel … 7 = User (see `Origin::tag`)
+//! 40       1   origin.tag()     1 = Kernel … 8 = Node (see `Origin::tag`)
 //! 41       n   postcard(event)  the event body, postcard-encoded
 //! ```
 //!
