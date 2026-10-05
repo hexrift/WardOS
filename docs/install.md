@@ -90,10 +90,16 @@ ward verify                        # the protected tests, from the entry snapsho
 `ward init [DIR]` makes a directory a project and is safe to repeat: it writes only what
 is absent, never a file you wrote, and reports each item (`written`, `already there,
 left as is`). The policy it writes is the secure default with a comment per block, so
-the file reads as a description of what the agent gets; the verifier config names the
-protected tests (`tests/`) and the verify command proposed from the project's manifests,
-lockfiles and test configuration, with the files that justify it (several candidates are
-listed commented, for you to pick one); when `tamperward` is installed, `tamperward init --cwd DIR` wires
+the file reads as a description of what the agent gets; the verifier config carries the
+verification boundary proposed from the project's manifests, lockfiles and test
+configuration — the command, the protected inputs (test directories, `[[test]]` paths,
+pytest `testpaths`, runner configuration) and the read-only inputs (manifest, lockfile),
+each with the file or key that justifies it — written active only when you accept it
+(`--accept-verify`, or `y` at the terminal's question) and commented out otherwise, so
+`ward ready` says `verification command not accepted` until you do; several candidates
+are listed commented, for you to pick one, and a project whose files support none says
+`cannot propose: <why>`; `ward ready --propose` prints the proposal again without writing
+anything; when `tamperward` is installed, `tamperward init --cwd DIR` wires
 its policy, the Claude Code hooks, a pre-commit hook and a CI workflow (`--no-tamperward`
 leaves that alone), and without it a minimal `.tamperward.yml` is written and the
 report says how to get the rest. `--agent codex` names Codex and its key in the closing

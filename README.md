@@ -28,8 +28,8 @@ delivered until its acceptance tests land.
 <p align="center"><sub>Captured from the shipped Hyprland, Waybar, mako, fuzzel, foot and hyprlock on a virtual output in CI, every pixel the compositor's (<a href="docs/desktop.md#the-readme-animation">how</a>). Not shown: an agent at work, an approval and <code>ward verify</code>, since CI has no model key and no user namespaces.</sub></p>
 
 ```bash
-ward init            # policy, verifier config and TamperWard wiring for this directory
-ward ready           # is this project verifiable yet? policy, verifier config, runtime, key
+ward init            # policy, verifier config and TamperWard wiring; the verify command is proposed, accepted by you
+ward ready           # is this project verifiable yet? policy, verifier config (accepted?), runtime, key
 ward claude          # Claude Code in the sandbox; keys stay on the host
 ward verify          # the protected tests, in a disposable verifier, from the entry snapshot
 ```
@@ -64,7 +64,7 @@ Then, in any project, five commands and about five minutes
 ```bash
 ward doctor                        # what this host can give a session, with a fix per gap
 ward vault set ANTHROPIC_API_KEY   # the model key, typed without echo, kept on the host
-ward init                          # policy, verifier config, TamperWard wiring; never overwrites yours
+ward init                          # policy, verifier config, TamperWard wiring; never overwrites yours; --accept-verify accepts the proposed verify command
 ward ready                         # is this project verifiable yet? policy, runtime, key, protected paths
 ward claude                        # Claude Code in the sandbox; the proxy injects the key
 ward verify                        # the protected tests, from the entry snapshot, offline
