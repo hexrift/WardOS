@@ -2,10 +2,15 @@
 # Runs the ward-node cross-system acceptance suite (docs/node-acceptance.md) against a
 # real node, with isolation required rather than skipped, and prints one verdict line per
 # case and a summary table. The cases are the #[test]s of
-# crates/ward-node-client/tests/acceptance.rs and, for the network allowlist and result
-# return, crates/ward-node-client/tests/acceptance_network.rs and
-# crates/ward-node-client/tests/acceptance_output.rs; each writes its verdict as
+# crates/ward-node-client/tests/acceptance.rs and, for the network allowlist, result
+# return and capacity, crates/ward-node-client/tests/acceptance_network.rs,
+# crates/ward-node-client/tests/acceptance_output.rs and
+# crates/ward-node-client/tests/acceptance_capacity.rs; each writes its verdict as
 #   acceptance <case>: PASS in <ms> ms -- <criterion>
+# A case whose host prerequisite is optional and absent (the capacity suite's delegated
+# cgroup) writes instead
+#   acceptance <case>: SKIP -- <reason>
+# which the table shows as SKIP; it neither passes nor fails the run.
 # The cargo test output goes to stderr and only the table to stdout, so the table can be
 # captured on its own. After the table, the Node.js reference control plane's acceptance
 # (scripts/acceptance/node-js.sh, docs/node-integration-from-nodejs.md) runs against a
@@ -28,13 +33,16 @@ render() {
   echo
   printf '%-70s %-6s %s\n' "case" "result" "time"
   printf '%-70s %-6s %s\n' "----" "------" "----"
-  local passed=0 failed=0 listing=0
+  local passed=0 failed=0 skipped=0 listing=0
   while IFS= read -r line; do
     if [[ "$line" =~ acceptance\ ([a-z_]+):\ PASS\ in\ ([0-9]+)\ ms ]]; then
       name=${BASH_REMATCH[1]}
       ms=${BASH_REMATCH[2]}
       printf '%-70s %-6s %s ms\n' "$name" "PASS" "$ms"
       passed=$((passed + 1))
+    elif [[ "$line" =~ acceptance\ ([a-z_]+):\ SKIP\ --\ (.*)$ ]]; then
+      printf '%-70s %-6s %s\n' "${BASH_REMATCH[1]}" "SKIP" "${BASH_REMATCH[2]}"
+      skipped=$((skipped + 1))
     fi
   done <"$log"
   while IFS= read -r line; do
@@ -56,7 +64,11 @@ render() {
     echo "no acceptance case ran (bubblewrap missing, or the suite did not build)"
     status=1
   fi
-  echo "acceptance: $passed passed, $failed failed"
+  if [[ "$skipped" -eq 0 ]]; then
+    echo "acceptance: $passed passed, $failed failed"
+  else
+    echo "acceptance: $passed passed, $failed failed, $skipped skipped"
+  fi
   if [[ $status -eq 0 ]]; then
     verdict=PASS
   else
@@ -77,7 +89,7 @@ trap 'rm -f "$log"' EXIT
 
 export WARD_REQUIRE_ISOLATION=1
 set +e
-cargo test -p ward-node-client --test acceptance --test acceptance_network --test acceptance_output -- --test-threads=1 --nocapture 2>&1 | tee "$log" >&2
+cargo test -p ward-node-client --test acceptance --test acceptance_network --test acceptance_output --test acceptance_capacity -- --test-threads=1 --nocapture 2>&1 | tee "$log" >&2
 set -e
 
 status=0

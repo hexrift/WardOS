@@ -8,6 +8,10 @@
 //! Additive within 1.3 ([`output`]): the manifest's optional `output` grant, the
 //! capability document's `output` section and the read-only `result` request that
 //! returns an ended attempt's bounded stdout, stderr and declared workspace files.
+//! Additive within 1.3 as well (#260): the manifest's optional `resources` grant (cgroup
+//! limits on the attempt's process tree), the capability document's `resources` and
+//! `scheduling` sections, and the `capacity_exhausted` refusal of a `start` on a node at
+//! the capacity its operator configured.
 //! Issuer verification and execution are the node's (`ward-node`); transport
 //! authentication belongs to #262. A 1.3 capability document may advertise `admit`, and `start` and
 //! `stop` only together. Incompatible peers fail closed rather than falling back to the
@@ -18,6 +22,7 @@
 mod admission;
 mod output;
 mod receipt;
+mod resources;
 #[cfg(test)]
 mod test_fixtures;
 
@@ -35,6 +40,9 @@ pub use output::{
 };
 pub use receipt::{
     TaskExecutionOutcome, TaskExecutionReceipt, TaskReceiptContext, TaskReceiptError,
+};
+pub use resources::{
+    MAX_RESOURCE_PIDS, ResourceCapabilities, ResourceError, ResourceGrant, SchedulingCapabilities,
 };
 
 use std::fmt::{Display, Formatter};
@@ -454,6 +462,8 @@ pub struct NodeCapabilities {
     verifier: VerifierCapabilities,
     lifecycle: LifecycleCapabilities,
     output: OutputCapabilities,
+    resources: Option<ResourceCapabilities>,
+    scheduling: Option<SchedulingCapabilities>,
 }
 
 impl NodeCapabilities {
@@ -498,6 +508,8 @@ impl NodeCapabilities {
             verifier,
             lifecycle,
             output: OutputCapabilities::NONE,
+            resources: None,
+            scheduling: None,
         })
     }
 
@@ -517,6 +529,44 @@ impl NodeCapabilities {
             return Err(NodeCapabilitiesError::ProtocolDoesNotSupportOutput);
         }
         self.output = output;
+        Ok(self)
+    }
+
+    /// The same document advertising `resources`: that the node runs every attempt in a
+    /// cgroup of its own and accounts for it, and which limits it enforces. Protocol 1.3
+    /// and later only; `None` leaves the section out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeCapabilitiesError::ProtocolDoesNotSupportResources`] for a section
+    /// under a protocol version before 1.3.
+    pub const fn with_resources(
+        mut self,
+        resources: Option<ResourceCapabilities>,
+    ) -> Result<Self, NodeCapabilitiesError> {
+        if resources.is_some() && !supports_task_admission(self.protocol) {
+            return Err(NodeCapabilitiesError::ProtocolDoesNotSupportResources);
+        }
+        self.resources = resources;
+        Ok(self)
+    }
+
+    /// The same document advertising `scheduling`: how many attempts the node runs at
+    /// once, how many run now and the headroom it keeps. Protocol 1.3 and later only;
+    /// `None` leaves the section out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeCapabilitiesError::ProtocolDoesNotSupportResources`] for a section
+    /// under a protocol version before 1.3.
+    pub const fn with_scheduling(
+        mut self,
+        scheduling: Option<SchedulingCapabilities>,
+    ) -> Result<Self, NodeCapabilitiesError> {
+        if scheduling.is_some() && !supports_task_admission(self.protocol) {
+            return Err(NodeCapabilitiesError::ProtocolDoesNotSupportResources);
+        }
+        self.scheduling = scheduling;
         Ok(self)
     }
 
@@ -579,6 +629,20 @@ impl NodeCapabilities {
     pub const fn output(self) -> OutputCapabilities {
         self.output
     }
+
+    /// Which limits the node enforces on an attempt's process tree; `None` when it runs
+    /// no attempt in a cgroup of its own.
+    #[must_use]
+    pub const fn resources(self) -> Option<ResourceCapabilities> {
+        self.resources
+    }
+
+    /// How many attempts the node runs at once and runs now, and its headroom; `None` when
+    /// it does not bound how many run at once.
+    #[must_use]
+    pub const fn scheduling(self) -> Option<SchedulingCapabilities> {
+        self.scheduling
+    }
 }
 
 /// Invalid capability document.
@@ -595,6 +659,8 @@ pub enum NodeCapabilitiesError {
     UnpairedStartAndStop,
     /// `output` was advertised under a protocol version that predates result return.
     ProtocolDoesNotSupportOutput,
+    /// `resources` or `scheduling` was advertised under a protocol version before 1.3.
+    ProtocolDoesNotSupportResources,
 }
 
 impl Display for NodeCapabilitiesError {
@@ -614,6 +680,9 @@ impl Display for NodeCapabilitiesError {
             }
             Self::ProtocolDoesNotSupportOutput => {
                 formatter.write_str("protocol version does not support result return")
+            }
+            Self::ProtocolDoesNotSupportResources => {
+                formatter.write_str("protocol version does not support resource limits")
             }
         }
     }
@@ -665,7 +734,37 @@ struct NodeCapabilitiesWire {
         deserialize_with = "deserialize_present_output_capabilities"
     )]
     output: Option<OutputCapabilities>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_resource_capabilities"
+    )]
+    resources: Option<ResourceCapabilities>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_scheduling"
+    )]
+    scheduling: Option<SchedulingCapabilities>,
     lifecycle: LifecycleCapabilitiesWire,
+}
+
+fn deserialize_present_resource_capabilities<'de, D>(
+    deserializer: D,
+) -> Result<Option<ResourceCapabilities>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    ResourceCapabilities::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_present_scheduling<'de, D>(
+    deserializer: D,
+) -> Result<Option<SchedulingCapabilities>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    SchedulingCapabilities::deserialize(deserializer).map(Some)
 }
 
 fn deserialize_present_output_capabilities<'de, D>(
@@ -705,6 +804,10 @@ impl NodeCapabilitiesWire {
         )
         .ok()?
         .with_output(output)
+        .ok()?
+        .with_resources(self.resources)
+        .ok()?
+        .with_scheduling(self.scheduling)
         .ok()
     }
 }
@@ -733,6 +836,8 @@ impl Serialize for NodeCapabilities {
             snapshots: self.snapshots,
             verifier: self.verifier,
             output: self.output.any().then_some(self.output),
+            resources: self.resources,
+            scheduling: self.scheduling,
             lifecycle: LifecycleCapabilitiesWire {
                 pause: self.lifecycle.pause,
                 stop: self.lifecycle.stop,
@@ -1103,6 +1208,12 @@ pub enum TaskLifecycleRejectionReason {
     UnsupportedGrant,
     /// A resource required to service the request is unavailable.
     ResourceUnavailable,
+    /// The node is at the capacity its operator configured: a `start` would pass the bound
+    /// on attempts executing at once, or found the host's available memory or disk below
+    /// its floor. Nothing changed and the task stays `ready`; retry the same `start` once
+    /// an attempt has ended. Protocol 1.3 and later, from `start` only, and only on a node
+    /// that bounds what it runs at once (its capability document carries `scheduling`).
+    CapacityExhausted,
     /// The negotiated protocol version, or the node implementation serving it, does not
     /// support this operation. The request was not applied.
     UnsupportedOperation,
@@ -3346,5 +3457,104 @@ mod tests {
                 .decode_response(&plain.replace(r#""minor":3"#, r#""minor":1"#))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_capability_document_carries_resources_and_scheduling_only_when_set_at_one_three() {
+        let one_three = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let minimal = capabilities_at(3, false);
+        assert_eq!(minimal.resources(), None);
+        assert_eq!(minimal.scheduling(), None);
+        let plain = serde_json::to_string(&one_three.response(minimal).unwrap()).unwrap();
+        assert!(!plain.contains("resources"), "{plain}");
+        assert!(!plain.contains("scheduling"), "{plain}");
+
+        let resources = ResourceCapabilities {
+            cpu: true,
+            memory: false,
+            pids: true,
+        };
+        let scheduling = SchedulingCapabilities {
+            max_running: 25,
+            running: 2,
+            memory_floor_bytes: 0,
+            memory_available_bytes: 1024,
+            disk_floor_bytes: 4096,
+            disk_available_bytes: 8192,
+        };
+        let loaded = minimal
+            .with_resources(Some(resources))
+            .unwrap()
+            .with_scheduling(Some(scheduling))
+            .unwrap();
+        let json = serde_json::to_string(&one_three.response(loaded).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            plain.replace(
+                r#""verifier":{"isolated":false}"#,
+                r#""verifier":{"isolated":false},"resources":{"cpu":true,"memory":false,"pids":true},"scheduling":{"max_running":25,"running":2,"memory_floor_bytes":0,"memory_available_bytes":1024,"disk_floor_bytes":4096,"disk_available_bytes":8192}"#
+            )
+        );
+        match one_three.decode_response(&json).unwrap() {
+            CapabilityDiscoveryResponse::Capabilities { capabilities } => {
+                assert_eq!(capabilities, loaded);
+                assert_eq!(capabilities.resources(), Some(resources));
+                assert_eq!(capabilities.scheduling(), Some(scheduling));
+            }
+        }
+        for minor in [1, 2] {
+            let early = capabilities_at(minor, false);
+            assert_eq!(
+                early.with_resources(Some(resources)),
+                Err(NodeCapabilitiesError::ProtocolDoesNotSupportResources)
+            );
+            assert_eq!(
+                early.with_scheduling(Some(scheduling)),
+                Err(NodeCapabilitiesError::ProtocolDoesNotSupportResources)
+            );
+            assert_eq!(early.with_resources(None), Ok(early));
+            let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, minor)).unwrap();
+            let early_json = json.replace(r#""minor":3"#, &format!(r#""minor":{minor}"#));
+            assert_eq!(
+                context.decode_response(&early_json),
+                Err(CapabilityDiscoveryError::MalformedMessage),
+                "a 1.{minor} document never carries resources or scheduling"
+            );
+        }
+        for bad in [
+            json.replace(r#""pids":true}"#, r#""pids":true,"disk":true}"#),
+            json.replace(r#""running":2,"#, r#""running":2,"queued":1,"#),
+            json.replace(
+                r#""resources":{"cpu":true,"memory":false,"pids":true}"#,
+                r#""resources":null"#,
+            ),
+        ] {
+            assert_eq!(
+                one_three.decode_response(&bad),
+                Err(CapabilityDiscoveryError::MalformedMessage),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_exhausted_is_a_stable_rejection_reason() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let binding = TaskBinding::new(
+            TaskId::from_u128(7),
+            ExecutionAttemptId::from_u128(8),
+            LeaseId::from_u128(9),
+        );
+        let rejected = context.rejected(
+            Some(OperationId::new(3).unwrap()),
+            binding,
+            TaskLifecycleRejectionReason::CapacityExhausted,
+        );
+        let json = serde_json::to_string(&rejected).unwrap();
+        assert!(
+            json.ends_with(r#""reason":"capacity_exhausted"}"#),
+            "{json}"
+        );
+        assert_eq!(context.decode_response(&json).unwrap(), rejected);
     }
 }

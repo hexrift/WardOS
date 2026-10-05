@@ -13,20 +13,30 @@ replay path by the `ward-node-adapter` process. Nothing is mocked: the sandbox i
 bubblewrap, the workloads are real processes, the evidence logs are the node's own files.
 
 The suite is [`crates/ward-node-client/tests/acceptance.rs`](../crates/ward-node-client/tests/acceptance.rs)
-and, for the network allowlist (§2.2) and result return (§2.3),
-[`crates/ward-node-client/tests/acceptance_network.rs`](../crates/ward-node-client/tests/acceptance_network.rs)
-and [`crates/ward-node-client/tests/acceptance_output.rs`](../crates/ward-node-client/tests/acceptance_output.rs):
+and, for the network allowlist (§2.2), result return (§2.3) and capacity (§2.4),
+[`crates/ward-node-client/tests/acceptance_network.rs`](../crates/ward-node-client/tests/acceptance_network.rs),
+[`crates/ward-node-client/tests/acceptance_output.rs`](../crates/ward-node-client/tests/acceptance_output.rs)
+and [`crates/ward-node-client/tests/acceptance_capacity.rs`](../crates/ward-node-client/tests/acceptance_capacity.rs):
 one `#[test]` per case, named exactly as in the tables below. The pass criterion of each
 case is written in the test file's `CASES` table and repeated here word for word; the
-tests `every_acceptance_case_is_documented`, `every_network_acceptance_case_is_documented`
-and `every_output_acceptance_case_is_documented` fail when the two drift apart. A case that passes prints one verdict line:
+tests `every_acceptance_case_is_documented`, `every_network_acceptance_case_is_documented`,
+`every_output_acceptance_case_is_documented` and `every_capacity_acceptance_case_is_documented`
+fail when the two drift apart. A case that passes prints one verdict line:
 
 ```text
 acceptance <case>: PASS in <ms> ms -- <criterion>
 ```
 
+One case has an optional host prerequisite (§2.4: a cgroup v2 directory delegated to the
+test). Without it the case prints, and the runner's table shows, a skip with its reason
+instead of a verdict; it neither passes nor fails the run:
+
+```text
+acceptance <case>: SKIP -- <reason>
+```
+
 [`scripts/acceptance/node.sh`](../scripts/acceptance/node.sh) runs exactly these cases,
-from all three files, with isolation required (`WARD_REQUIRE_ISOLATION=1`, so a host without a working
+from all four files, with isolation required (`WARD_REQUIRE_ISOLATION=1`, so a host without a working
 bubblewrap fails instead of skipping), one case at a time so the verdict lines stay
 whole, and prints the verdicts (with the rest of the `cargo test` output, on stderr) and
 a summary table (on stdout, so it can be captured alone):
@@ -157,6 +167,37 @@ so what is proven is the node's own refusal of a signed envelope outside the gra
 planted symlink names the host secret by its absolute host path, which the workload
 cannot read; the case proves the node never follows it when it collects.
 
+### 2.4 The capacity cases
+
+The cases of `acceptance_capacity.rs` start the node with `--max-running`, and with
+`--cgroup-root` where a cgroup is delegated (node-integration.md §2.1), and drive many
+attempts at once (#260). They run one at a time even within their own binary, so no case
+measures another's load.
+
+| Case | Pass criterion |
+| --- | --- |
+| `capacity_runs_twenty_five_concurrent_sandboxes_within_the_running_bound` | a node started with --max-running 25 runs 25 CPU-burning sandboxes at once, every one inspected running with its process tree present, and reports scheduling.max_running 25 and running 25; while all 25 burn, every inspect and capability request is answered within 2 s; a 26th start is refused capacity_exhausted with the task still ready and no workspace, and the same start is accepted running once one attempt is stopped; every attempt then stops, seals with a verifying log and leaves no process, and running reads 0 |
+| `capacity_refuses_a_start_below_the_memory_or_disk_floor` | a node whose --memory-floor or --disk-floor is above what the host has available refuses start capacity_exhausted with the task still ready, nothing materialised and no evidence of a launch, and reports the floor above the available bytes in its scheduling section |
+| `capacity_resource_limits_are_refused_without_a_cgroup_root` | a node started without --cgroup-root carries no resources section in its 1.3 capability document and refuses a manifest with a resources grant unsupported_grant at admit with nothing materialised, while the same node admits and runs an offline manifest |
+| `capacity_cgroup_limits_hold_and_usage_is_recorded` | on a node started with --cgroup-root every attempt's sealed log records NodeAttemptResourceUsage with its CPU time right before NodeAttemptEnded and its task record carries the same usage; with the pids controller a workload forking past pids 8 is held at it (peak at most 8, forks refused counted); with the memory controller a workload allocating past memory_bytes is killed by the limit (outcome failed, oom kills counted, peak at most the limit); with the cpu controller a busy loop limited to 100 cpu_millis uses at most 0.3 s of CPU in 2 s; a limit the node has no controller for is refused unsupported_grant |
+
+The first case's workloads are shell busy loops (`while :; do :; done`), 25 of them on
+however many CPUs the host has (four on CI's runner); it prints how many requests it
+sent while they burned and the slowest answer, and asserts each `inspect` and
+capability request within 2 s. Each attempt's process tree (the outer `bwrap`, its
+namespace init and the shell) is counted in `/proc` by a marker unique to the run.
+
+The last case needs a cgroup v2 directory in which the test can create a child it then
+hands to the node as `--cgroup-root`: `WARD_NODE_CGROUP_ROOT`, or the host's cgroup2 mount
+when the test runs as root. Without one it prints `SKIP` with the reason. With one whose
+controllers include neither `pids` nor `memory` it still checks the accounting and the
+refusals, then prints `SKIP`, because no limit could be proven held. With
+`WARD_REQUIRE_CGROUP=1` either skip is a failure instead. Each limit is proven only where its
+controller is present, and the case prints which limits the kernel held: pids by a
+workload forking 32 sleeps under `pids` 8, memory by `dd` with a 256 MiB buffer under
+`memory_bytes` 32 MiB, CPU by a two-second busy loop under `cpu_millis` 100. CI's runner
+delegates no cgroup to the tests, so on CI this case is a `SKIP` row (§4).
+
 ## 3. Running it
 
 ```text
@@ -183,6 +224,10 @@ writable directory.
   one-liners and the beating and probing workloads are Python programs with no
   dependencies beyond the standard library.
 - A readable `/proc`: the cases count workload processes by marker there.
+- For the cgroup case of §2.4 only: a cgroup v2 directory the test may create a child in,
+  named by `WARD_NODE_CGROUP_ROOT` (or the cgroup2 mount when running as root), with the
+  `pids`, `memory` and `cpu` controllers enabled in its `cgroup.subtree_control` for the
+  limits to be proven; without it the case skips.
 - No network is needed by the main suite; its network probes expect connects to fail. The
   network allowlist's allowed-host case (§2.2) needs the host to resolve `example.com`
   (the proxy resolves the allowlisted name on the host before it decides); without name
@@ -215,8 +260,13 @@ minute on a developer machine; each case prints its own time.
   the sandbox denies to an ordinary workload, not an adversarial escape suite; the
   kernel-level boundary tests of [experiments.md](experiments.md) E-01 and the
   `ward-daemon` namespace, verifier and egress regressions are separate.
-- **No load, capacity or concurrency.** One workload at a time; the 1 024-task registry,
-  the 128-pause bound and the 8 MiB state files are unit-tested in `ward-node`, not here.
+- **Concurrency at 25, not at scale; limits only where a cgroup is delegated.** The
+  capacity cases run 25 sandboxes at once under CPU pressure; hundreds of attempts, host
+  memory pressure and single-attempt latency are not measured, and the 1 024-task
+  registry, the 128-pause bound and the 8 MiB state files are unit-tested in `ward-node`,
+  not here. On CI's runner no cgroup is delegated, so the kernel's enforcement of pids,
+  memory and CPU limits is not proven there (the case skips, visibly); it is proven on a
+  host that delegates one.
 - **No clock skew.** Envelopes are signed at the node's own clock.
 - **No TamperWard verdicts.** The suite says what the node did; whether a result is
   certified is the external control plane's decision (ADR-0029).

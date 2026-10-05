@@ -9,6 +9,7 @@ use core::time::Duration;
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 use ward_events::chain::{Chain, Timestamp, verify};
+use ward_events::event::NodeResourceUsage;
 use ward_events::event::{
     Acceptor, AgentIdentity, AgentKind, AgentState, CapabilityKind, CapabilityRequest, CaptureMode,
     ClaimKind, CredentialDelivery, Decision, DecisionSource, DeniedDst, DenyReason, EndReason,
@@ -873,6 +874,21 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Node,
+            WardEvent::NodeAttemptResourceUsage {
+                usage: NodeResourceUsage {
+                    cpu_millis_limit: Some(500),
+                    memory_limit_bytes: Some(64 * 1024 * 1024),
+                    pids_limit: None,
+                    cpu_usage_usec: Some(1_250_000),
+                    memory_peak_bytes: Some(48 * 1024 * 1024),
+                    pids_peak: Some(12),
+                    memory_oom_kills: Some(0),
+                    pids_max_events: None,
+                },
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -1263,6 +1279,10 @@ fn node_attempt_kinds_are_critical_node_facts_appended_at_the_end() {
             EventKind::NodeAttemptOutputCollected,
             "node_attempt_output_collected",
         ),
+        (
+            EventKind::NodeAttemptResourceUsage,
+            "node_attempt_resource_usage",
+        ),
     ];
     for (offset, (kind, name)) in kinds.into_iter().enumerate() {
         assert_eq!(kind.bit(), 1u64 << (40 + offset), "{name}");
@@ -1270,7 +1290,7 @@ fn node_attempt_kinds_are_critical_node_facts_appended_at_the_end() {
         assert!(kind.is_critical(), "{name}");
         assert!(!Filter::quiet().kinds.contains(kind), "{name}");
     }
-    assert_eq!(EventKind::ALL.len(), 47);
+    assert_eq!(EventKind::ALL.len(), 48);
     assert_eq!(Origin::Node.tag(), 8);
     assert_eq!(Origin::from_tag(8), Some(Origin::Node));
     assert_eq!(Origin::Node.label(), "node");

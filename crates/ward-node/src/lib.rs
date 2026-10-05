@@ -32,6 +32,14 @@
 //!   ([`output`]), and advertises `output` in 1.3 capability discovery. Any other node
 //!   refuses the grant `unsupported_grant` at `admit` and `result` as unsupported.
 //!
+//! * at protocol 1.3, a service whose execution runs attempts in cgroups
+//!   ([`cgroup`], `--cgroup-root`) honours a manifest's `resources` limits, records what
+//!   each attempt used and advertises `resources`; one whose execution bounds how many
+//!   attempts run at once ([`scheduling`], `--max-running`) refuses a `start` past the
+//!   bound or below its headroom floors `capacity_exhausted` and advertises `scheduling`,
+//!   read live. Any other node advertises neither and refuses every `resources` grant
+//!   `unsupported_grant`.
+//!
 //! A service built with admission keeps its task registry durable under the node state
 //! directory ([`records`]) and recovers it before it serves (see [`task`]), so a restart
 //! forgets no task, receipt or applied operation and never re-runs an attempt that may
@@ -62,6 +70,7 @@
 pub mod admission;
 pub mod admit;
 pub mod audit;
+pub mod cgroup;
 pub mod egress;
 pub mod evidence;
 pub mod execution;
@@ -69,6 +78,7 @@ pub mod issuer;
 pub mod output;
 pub mod peer;
 pub mod records;
+pub mod scheduling;
 pub mod state;
 pub mod task;
 #[cfg(test)]
@@ -342,6 +352,8 @@ impl NodeService {
         let mut network = configured.network();
         let mut snapshots = configured.snapshots();
         let mut output = OutputCapabilities::NONE;
+        let mut resources = None;
+        let mut scheduling = None;
         let lifecycle = if supports_task_admission(protocol) {
             isolation.namespaces = NamespaceCapabilities {
                 sandbox: self.executes,
@@ -354,6 +366,14 @@ impl NodeService {
                 stdio: self.executes && self.output_return,
                 files: self.executes && self.output_return,
             };
+            if self.executes {
+                let tasks = self
+                    .tasks
+                    .lock()
+                    .map_err(|_| NodeServiceError::TaskRegistryUnavailable)?;
+                resources = tasks.resource_capabilities();
+                scheduling = tasks.scheduling();
+            }
             LifecycleCapabilities {
                 admit: self.admits,
                 start: self.executes,
@@ -380,6 +400,8 @@ impl NodeService {
             lifecycle,
         )
         .and_then(|capabilities| capabilities.with_output(output))
+        .and_then(|capabilities| capabilities.with_resources(resources))
+        .and_then(|capabilities| capabilities.with_scheduling(scheduling))
         .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         let response = context
             .response(capabilities)
@@ -2335,5 +2357,78 @@ mod tests {
             served,
             Err(NodeServiceError::MalformedLifecycleRequest)
         ));
+    }
+
+    fn executing_service_scheduling(
+        scheduling: Option<crate::scheduling::SchedulingLimits>,
+        resources: Option<crate::cgroup::ResourceEnforcement>,
+    ) -> Executing {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let clock = crate::test_support::FixedClock::at(crate::test_support::NOW);
+        let admission = crate::test_support::node_admission(&state, &clock);
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("hello.txt"), b"hello").unwrap();
+        let snapshots = crate::workspace::open_snapshot_store(&state).unwrap();
+        let snapshot = crate::workspace::import_snapshot(&snapshots, &project).unwrap();
+        let launcher = crate::test_support::FakeLauncher::new();
+        let execution = NodeExecution::new(
+            crate::workspace::TaskRoot::open(&dir.path().join("tasks")).unwrap(),
+            snapshots,
+            Arc::new(launcher.clone()),
+        )
+        .with_scheduling(scheduling)
+        .with_resource_enforcement(resources);
+        let service = NodeService::with_execution(capabilities(), admission, execution).unwrap();
+        Executing {
+            root: dir.path().join("tasks"),
+            _dir: dir,
+            service,
+            launcher,
+            snapshot,
+        }
+    }
+
+    #[test]
+    fn scheduling_and_resources_are_advertised_only_when_configured_and_only_at_one_three() {
+        let plain = executing_service_scheduling(None, None);
+        let (raw, served) = discovered(&plain.service, 3);
+        assert!(
+            !raw.contains("scheduling") && !raw.contains("resources"),
+            "{raw}"
+        );
+        assert_eq!((served.scheduling(), served.resources()), (None, None));
+
+        let enforces = ward_node_protocol::ResourceCapabilities {
+            cpu: true,
+            memory: false,
+            pids: true,
+        };
+        let loaded = executing_service_scheduling(
+            crate::scheduling::SchedulingLimits::new(25, 0, 0),
+            Some(crate::cgroup::ResourceEnforcement::new(
+                enforces,
+                NodeCapacity::new(4, 1 << 33).unwrap(),
+            )),
+        );
+        let (raw, served) = discovered(&loaded.service, 3);
+        assert!(
+            raw.contains(r#""resources":{"cpu":true,"memory":false,"pids":true},"scheduling":{"max_running":25,"running":0,"#),
+            "{raw}"
+        );
+        assert_eq!(served.resources(), Some(enforces));
+        let scheduling = served.scheduling().unwrap();
+        assert_eq!((scheduling.max_running, scheduling.running), (25, 0));
+        assert!(scheduling.memory_available_bytes > 0);
+        for minor in [1, 2] {
+            let (raw, served) = discovered(&loaded.service, minor);
+            assert!(
+                !raw.contains("scheduling") && !raw.contains("resources"),
+                "{raw}"
+            );
+            assert_eq!((served.scheduling(), served.resources()), (None, None));
+        }
+        let _ = (&loaded.root, &loaded.launcher, loaded.snapshot);
     }
 }

@@ -582,8 +582,9 @@ when it is stopped, ended, or held in vfork wait on a stopped child, rescans the
 freezes anything forked meanwhile, until a rescan adds nothing. An unconfirmed freeze is
 continued back and refused `resource_unavailable` with the task `running`. `resume`
 sends `SIGCONT` parents first and answers `running` once nothing is still stopped. The
-freeze is signal-only (`ward_launch::freeze`): the node creates no delegated cgroup, so
-the cgroup v2 freezer is not used. The budget clock keeps running while paused, and a
+freeze is signal-only (`ward_launch::freeze`): the cgroup v2 freezer is not used, also
+on a node started with `--cgroup-root`, whose per-attempt cgroups (below) carry limits
+and accounting only. The budget clock keeps running while paused, and a
 paused task can be stopped, revoked or killed at its budget (`SIGKILL` ends a stopped
 process). `revoke` (from `ready`, `running` or `paused`) first records the lease's
 revocation at the node clock in `revocations.json` (`resource_unavailable` with nothing
@@ -647,7 +648,16 @@ version), `NodeAttemptLaunched` (host pid), `NodeAttemptIntervened` (pause or re
 heads kept and dropped, and each declared workspace file's size, digest and status)
 right before its end record, which binds the bounded result the node stores beside the
 workspace (`<attempt>.output/result.json`) and returns through `result` to the sealed
-log (node-integration.md §6.6). Each record is fsynced after the task record and before the verb is answered; a
+log (node-integration.md §6.6). On a node started with `--cgroup-root` (#260) every
+attempt runs in a cgroup of its own under that delegated cgroup v2 directory: the launch
+moves itself into `<cgroup-root>/<attempt>` before `bwrap` is executed, the manifest's
+`resources` limits (`cpu.max`, `memory.max` with no swap and a group OOM kill, `pids.max`)
+are written there first, and once the workload is reaped the node kills what is left,
+reads the kernel's counters into a `NodeAttemptResourceUsage` record (before the output
+and end records) and the task record's `usage`, and removes the cgroup. With
+`--max-running` the node executes at most that many attempts at once and refuses a
+`start` past it, or below a memory or disk floor, `capacity_exhausted` with the task still
+`ready`; it keeps no queue (node-integration.md §6.1, §8.2). Each record is fsynced after the task record and before the verb is answered; a
 failed append restores the task record and refuses the verb `resource_unavailable`. A
 restarted node cuts a torn final frame, records `NodeAttemptRecovered` wherever the log
 shows another state than the one recovered, and seals the log of a sealed task, before it

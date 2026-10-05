@@ -41,9 +41,12 @@
 //!   and materialises the attempt's workspace ([`crate::workspace`]), and spawns the
 //!   envelope's argv through the node's [`crate::execution::TaskLauncher`] on a node-owned
 //!   reaper thread. `Running` is reported only once the launcher confirmed a spawn and its
-//!   host pid is recorded. A clean pre-spawn failure refuses with no state change (the
-//!   workspace is removed); an ambiguous launch is recorded `exited` with an `unknown`
-//!   receipt and is never re-run (ADR-0030 §6).
+//!   host pid is recorded. On a node whose execution bounds how many attempts run at once
+//!   ([`crate::scheduling`]), a `start` past the bound or below a headroom floor is refused
+//!   [`TaskLifecycleRejectionReason::CapacityExhausted`] after the admission is revalidated
+//!   and before anything is materialised, with no state change. A clean pre-spawn failure
+//!   refuses with no state change (the workspace is removed); an ambiguous launch is
+//!   recorded `exited` with an `unknown` receipt and is never re-run (ADR-0030 §6).
 //! * `stop` (protocol 1.3, with execution) moves a `Running` or `Paused` task to
 //!   [`TaskLifecycleState::Stopped`] once its reaper has killed and reaped the workload,
 //!   and a `Ready` task to `Stopped` without spawning anything. Stopping or revoking a
@@ -174,15 +177,15 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use ward_events::{
-    Blake3Hash, NodeAttemptEnd, NodeAttemptOutcome, NodeIntervention, Pid, ProcessRef, TaskId,
-    WardEvent,
+    Blake3Hash, NodeAttemptEnd, NodeAttemptOutcome, NodeIntervention, NodeResourceUsage, Pid,
+    ProcessRef, TaskId, WardEvent,
 };
 use ward_node_protocol::{
     AdmissionEnvelopeJson, AttemptOutput, IssuerProof, NetworkGrant, OperationId,
-    TaskAdmissionEnvelope, TaskBinding, TaskExecutionOutcome, TaskExecutionReceipt,
-    TaskLifecycleContext, TaskLifecycleRejectionReason, TaskLifecycleRequest,
-    TaskLifecycleResponse, TaskLifecycleState, TaskReceiptContext, TaskResultResponse,
-    supports_task_admission,
+    ResourceCapabilities, SchedulingCapabilities, TaskAdmissionEnvelope, TaskBinding,
+    TaskExecutionOutcome, TaskExecutionReceipt, TaskLifecycleContext, TaskLifecycleRejectionReason,
+    TaskLifecycleRequest, TaskLifecycleResponse, TaskLifecycleState, TaskReceiptContext,
+    TaskResultResponse, supports_task_admission,
 };
 
 use crate::admission::TrustedTaskAdmission;
@@ -242,6 +245,7 @@ struct NodeTask {
     revoked_by: Option<OperationId>,
     sealed: Option<SealRecord>,
     receipt: Option<TaskExecutionReceipt>,
+    usage: Option<NodeResourceUsage>,
 }
 
 /// A spawned (or ambiguously spawned) attempt and the handles its reaper shares.
@@ -472,6 +476,11 @@ impl TaskRegistry {
                 execution
                     .as_ref()
                     .is_some_and(NodeExecution::honours_output_return),
+            )
+            .with_resource_enforcement(
+                execution
+                    .as_ref()
+                    .and_then(NodeExecution::resource_enforcement),
             );
         let survivors: Arc<dyn TaskLauncher> = execution
             .as_ref()
@@ -580,6 +589,44 @@ impl TaskRegistry {
     #[must_use]
     pub fn receipt(&self, binding: TaskBinding) -> Option<TaskExecutionReceipt> {
         self.task(binding).and_then(|task| task.receipt)
+    }
+
+    /// What the attempt `binding` names used, as measured from its cgroup once its
+    /// workload was reaped; `None` when it was not measured (or has not ended).
+    #[must_use]
+    pub fn usage(&self, binding: TaskBinding) -> Option<NodeResourceUsage> {
+        self.task(binding).and_then(|task| task.usage)
+    }
+
+    /// How many attempts execute now: spawned (or ambiguously spawned) and not yet reaped,
+    /// paused ones and ones whose kill is pending included, replaced attempts too.
+    #[must_use]
+    pub fn executing(&self) -> usize {
+        self.tasks
+            .values()
+            .filter_map(|task| task.attempt.as_ref())
+            .chain(self.retired.iter())
+            .filter(|attempt| !attempt.reaped.is_set())
+            .count()
+    }
+
+    /// The capability document's `scheduling` section, read now; `None` on a node that
+    /// does not bound how many attempts execute at once.
+    #[must_use]
+    pub fn scheduling(&self) -> Option<SchedulingCapabilities> {
+        let execution = self.execution.as_ref()?;
+        let limits = execution.scheduling()?;
+        Some(limits.report(self.executing(), execution.task_root().dir()))
+    }
+
+    /// The capability document's `resources` section; `None` on a node that runs no
+    /// attempt in a cgroup of its own.
+    #[must_use]
+    pub fn resource_capabilities(&self) -> Option<ResourceCapabilities> {
+        self.execution
+            .as_ref()
+            .and_then(NodeExecution::resource_enforcement)
+            .map(|enforcement| enforcement.enforces())
     }
 
     /// Number of tasks the registry currently holds, sealed ones included.
@@ -1133,6 +1180,9 @@ impl TaskRegistry {
             return Err(Reason::InvalidState);
         };
         admission.revalidate(&admitted.verified)?;
+        if let Some(limits) = execution.scheduling() {
+            limits.admit(self.executing(), execution.task_root().dir())?;
+        }
 
         let workload = admitted.envelope().workload();
         let workspace = execution
@@ -1155,6 +1205,10 @@ impl TaskRegistry {
         };
         let request = match manifest.output() {
             Some(output) => request.with_output(output.clone()),
+            None => request,
+        };
+        let request = match manifest.resources() {
+            Some(resources) => request.with_resources(*resources),
             None => request,
         };
         Ok(Prepared::Launch(
@@ -1218,7 +1272,7 @@ impl TaskRegistry {
                     return;
                 }
                 let egress = workload.egress();
-                let WorkloadEnd { exit, stdio } = workload.wait(&reaper.stop, &mut || {
+                let WorkloadEnd { exit, stdio, usage } = workload.wait(&reaper.stop, &mut || {
                     reaper.drain(egress.as_deref());
                 });
                 let last = egress.as_deref().map(|egress| {
@@ -1226,7 +1280,7 @@ impl TaskRegistry {
                     egress.drain()
                 });
                 let output = collect_output(&request, exit, stdio);
-                reaper.record(exit, last, output.as_ref());
+                reaper.record(exit, last, output.as_ref(), usage);
             });
 
         let spawned = match thread {
@@ -1431,7 +1485,9 @@ impl TaskRegistry {
     }
 
     /// Record how a live attempt ended, after the egress verdicts `last` its reaper drained
-    /// at the end and the gap marker they leave. The reaper has observed the end, so the
+    /// at the end and the gap marker they leave, and what it used (`usage`, measured from
+    /// its cgroup), which the task record keeps and the evidence log records before the
+    /// output and end records. The reaper has observed the end, so the
     /// in-memory state changes whether or not its record can be written; a record that
     /// cannot be written still reads as executing and recovers as `exited` with an `unknown`
     /// receipt.
@@ -1442,6 +1498,7 @@ impl TaskRegistry {
         exit: WorkloadExit,
         last: Option<Drained>,
         output: Option<&AttemptOutput>,
+        usage: Option<NodeResourceUsage>,
     ) {
         let journal = Journal(self.store.as_ref());
         let evidence = Evidence::of(self.execution.as_ref());
@@ -1459,6 +1516,14 @@ impl TaskRegistry {
             task.record_network(evidence, reaped, last);
         }
         task.record_network_gap(evidence, reaped);
+        let current = task
+            .attempt
+            .as_ref()
+            .is_some_and(|attempt| Arc::ptr_eq(&attempt.reaped, reaped));
+        if let Some(usage) = usage.filter(|_| current) {
+            task.usage = Some(usage);
+            let _ = evidence.append(binding, WardEvent::NodeAttemptResourceUsage { usage });
+        }
         if let Some(output) = output {
             evidence.record_output(binding, output);
         }
@@ -1524,12 +1589,22 @@ impl Reaper {
         }
     }
 
-    fn record(self, exit: WorkloadExit, last: Option<Drained>, output: Option<&AttemptOutput>) {
+    fn record(
+        self,
+        exit: WorkloadExit,
+        last: Option<Drained>,
+        output: Option<&AttemptOutput>,
+        usage: Option<NodeResourceUsage>,
+    ) {
         if let Some(registry) = self.registry.upgrade() {
             if let Ok(mut registry) = registry.lock() {
-                registry.record_exit(self.binding, &self.reaped, exit, last, output);
+                registry.record_exit(self.binding, &self.reaped, exit, last, output, usage);
+                // Under the lock that recorded the end, so whoever sees the attempt ended
+                // also sees its slot free (`executing`, `--max-running`).
+                self.reaped.set();
+            } else {
+                self.reaped.set();
             }
-            self.reaped.set();
             drop(registry);
         } else {
             self.reaped.set();
@@ -1656,6 +1731,7 @@ impl NodeTask {
             revoked_by: None,
             sealed: None,
             receipt: None,
+            usage: None,
         }
     }
 
@@ -1684,6 +1760,7 @@ impl NodeTask {
             revoked_by: record.revoked_by,
             sealed: record.sealed,
             receipt: None,
+            usage: record.usage,
         };
         let mut changed = record.process.is_some();
         match record.state {
@@ -1724,6 +1801,7 @@ impl NodeTask {
                 .attempt
                 .as_ref()
                 .and_then(|attempt| attempt.process.clone()),
+            usage: self.usage,
         }
     }
 

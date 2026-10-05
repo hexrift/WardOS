@@ -578,6 +578,21 @@ fn summary(event: &WardEvent) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        WardEvent::NodeAttemptResourceUsage { usage } => {
+            let value =
+                |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
+            format!(
+                "usage · cpu {} us (limit {} millicpu) · memory peak {} B (limit {} B) · pids peak {} (limit {}) · oom kills {} · pid-limit hits {}",
+                value(usage.cpu_usage_usec),
+                value(usage.cpu_millis_limit),
+                value(usage.memory_peak_bytes),
+                value(usage.memory_limit_bytes),
+                value(usage.pids_peak),
+                value(usage.pids_limit),
+                value(usage.memory_oom_kills),
+                value(usage.pids_max_events),
+            )
+        }
         WardEvent::NetworkRequested { .. }
         | WardEvent::NetworkDenied { .. }
         | WardEvent::CapabilityRequested { .. }
@@ -985,5 +1000,23 @@ mod tests {
         assert_eq!(summaries[3], "stopped · failed · Killed · op 6");
         assert_eq!(summaries[4], "recovered stopped · failed");
         assert_eq!(summaries[5], "sealed · op 7");
+    }
+
+    #[test]
+    fn a_node_usage_record_summarises_its_limits_and_counters() {
+        let usage = ward_events::NodeResourceUsage {
+            cpu_millis_limit: Some(500),
+            memory_limit_bytes: Some(67_108_864),
+            pids_limit: None,
+            cpu_usage_usec: Some(1_234_567),
+            memory_peak_bytes: Some(52_428_800),
+            pids_peak: None,
+            memory_oom_kills: Some(1),
+            pids_max_events: Some(0),
+        };
+        assert_eq!(
+            summary(&WardEvent::NodeAttemptResourceUsage { usage }),
+            "usage · cpu 1234567 us (limit 500 millicpu) · memory peak 52428800 B (limit 67108864 B) · pids peak - (limit -) · oom kills 1 · pid-limit hits 0"
+        );
     }
 }

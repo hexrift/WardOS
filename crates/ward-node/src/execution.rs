@@ -27,8 +27,9 @@
 //! `ward_launch::freeze` confirms every process stopped (or ended, or held in vfork wait on
 //! a stopped child) within [`DEFAULT_FREEZE_SETTLE`]; otherwise it continues the tree and
 //! the proxy again and refuses. Resuming sends `SIGCONT`, parents first, confirms nothing
-//! is still stopped, and then resumes the proxy. There is no cgroup freezer: the node creates no
-//! delegated cgroup for a launch. The budget clock keeps running while a workload is
+//! is still stopped, and then resumes the proxy. There is no cgroup freezer, also on a node
+//! whose launcher runs attempts in cgroups ([`crate::cgroup::CgroupLauncher`]): those
+//! cgroups carry limits and accounting only. The budget clock keeps running while a workload is
 //! paused (ADR-0030 §3: the budget is always enforced), and `SIGKILL` ends a stopped
 //! process as it is, so a paused workload can still be stopped or killed at its budget.
 //!
@@ -47,13 +48,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use ward_events::NodeResourceUsage;
 use ward_launch::freeze::{FrozenTree, TreeRoot, freeze_tree, kill_tree, thaw_tree};
 use ward_launch::{Launch, PROXY_SOCKET, RunningLaunch};
-use ward_node_protocol::{HostAllowlist, MAX_OUTPUT_STDIO_BYTES, OutputGrant};
+use ward_node_protocol::{HostAllowlist, MAX_OUTPUT_STDIO_BYTES, OutputGrant, ResourceGrant};
 use ward_snapshot::SnapshotStore;
 
+use crate::cgroup::ResourceEnforcement;
 use crate::egress::{AttemptEgress, PROXY_SOCKET_ENV, egress_dir_beside};
 use crate::output::{CapturedStdio, CapturedStream};
+use crate::scheduling::SchedulingLimits;
 use crate::workspace::TaskRoot;
 
 /// Default bound on how long `stop` waits for the reaper to confirm the kill and reap.
@@ -84,6 +88,7 @@ pub struct LaunchRequest {
     budget: Duration,
     allowlist: Option<HostAllowlist>,
     output: Option<OutputGrant>,
+    resources: Option<ResourceGrant>,
 }
 
 impl LaunchRequest {
@@ -96,6 +101,7 @@ impl LaunchRequest {
             budget,
             allowlist: None,
             output: None,
+            resources: None,
         }
     }
 
@@ -111,6 +117,21 @@ impl LaunchRequest {
     pub fn with_output(mut self, output: OutputGrant) -> Self {
         self.output = Some(output);
         self
+    }
+
+    /// The same launch with the cgroup limits `resources` asks for, which only a launcher
+    /// running attempts in cgroups ([`crate::cgroup::CgroupLauncher`]) enforces; `admit`
+    /// accepts such a manifest only on a node built with one.
+    #[must_use]
+    pub const fn with_resources(mut self, resources: ResourceGrant) -> Self {
+        self.resources = Some(resources);
+        self
+    }
+
+    /// The limits the admitted manifest asked for; `None` when it asked for none.
+    #[must_use]
+    pub const fn resources(&self) -> Option<&ResourceGrant> {
+        self.resources.as_ref()
     }
 
     /// The output grant the admitted manifest carried; `None` when nothing is returned.
@@ -179,6 +200,9 @@ pub struct WorkloadEnd {
     /// The head of each stream, up to the launch's output grant, and the full byte counts;
     /// empty when the launch had no output grant.
     pub stdio: CapturedStdio,
+    /// What the workload's process tree used, measured from the cgroup it ran in; `None`
+    /// when the launcher runs workloads in no cgroup of their own.
+    pub usage: Option<NodeResourceUsage>,
 }
 
 /// A request to stop one running workload, shared by `stop`, its reaper and node shutdown.
@@ -324,8 +348,13 @@ impl SandboxLauncher {
     }
 }
 
-impl TaskLauncher for SandboxLauncher {
-    fn launch(&self, request: &LaunchRequest) -> Result<Box<dyn RunningWorkload>, SpawnError> {
+impl SandboxLauncher {
+    /// Launch `request`, inside the cgroup directory `cgroup` when one is given (the
+    /// launch moves itself there before `bwrap` runs, [`ward_launch::Launch::cgroup`]).
+    pub(crate) fn launch_in(
+        request: &LaunchRequest,
+        cgroup: Option<&Path>,
+    ) -> Result<Box<dyn RunningWorkload>, SpawnError> {
         let egress = request
             .allowlist()
             .map(|allowlist| {
@@ -335,10 +364,19 @@ impl TaskLauncher for SandboxLauncher {
                     .map_err(|_| SpawnError::Refused)
             })
             .transpose()?;
-        let launch = sandbox_launch(request, egress.as_deref().map(AttemptEgress::socket))
-            .spawn()
-            .map_err(|_| SpawnError::Refused)?;
+        let launch = sandbox_launch(request, egress.as_deref().map(AttemptEgress::socket));
+        let launch = match cgroup {
+            Some(dir) => launch.cgroup(dir),
+            None => launch,
+        };
+        let launch = launch.spawn().map_err(|_| SpawnError::Refused)?;
         Ok(Box::new(SandboxWorkload { launch, egress }))
+    }
+}
+
+impl TaskLauncher for SandboxLauncher {
+    fn launch(&self, request: &LaunchRequest) -> Result<Box<dyn RunningWorkload>, SpawnError> {
+        Self::launch_in(request, None)
     }
 
     fn end_survivor(&self, process: &WorkloadProcess) {
@@ -433,6 +471,7 @@ impl RunningWorkload for SandboxWorkload {
                     total: outcome.stderr_bytes,
                 },
             },
+            usage: None,
         }
     }
 }
@@ -496,6 +535,8 @@ pub struct NodeExecution {
     spawn_timeout: Duration,
     network_allowlist: bool,
     output_return: bool,
+    scheduling: Option<SchedulingLimits>,
+    resources: Option<ResourceEnforcement>,
 }
 
 impl std::fmt::Debug for NodeExecution {
@@ -507,6 +548,8 @@ impl std::fmt::Debug for NodeExecution {
             .field("spawn_timeout", &self.spawn_timeout)
             .field("network_allowlist", &self.network_allowlist)
             .field("output_return", &self.output_return)
+            .field("scheduling", &self.scheduling)
+            .field("resources", &self.resources)
             .finish_non_exhaustive()
     }
 }
@@ -528,7 +571,45 @@ impl NodeExecution {
             spawn_timeout: DEFAULT_SPAWN_TIMEOUT,
             network_allowlist: false,
             output_return: false,
+            scheduling: None,
+            resources: None,
         }
+    }
+
+    /// Bound how many attempts execute at once and the host headroom `start` keeps
+    /// ([`crate::scheduling`]); `None`, the default, bounds nothing and the node
+    /// advertises no `scheduling` section.
+    #[must_use]
+    pub const fn with_scheduling(mut self, scheduling: Option<SchedulingLimits>) -> Self {
+        self.scheduling = scheduling;
+        self
+    }
+
+    /// The bound on attempts executing at once and the headroom `start` keeps, if any.
+    #[must_use]
+    pub const fn scheduling(&self) -> Option<SchedulingLimits> {
+        self.scheduling
+    }
+
+    /// Honour a manifest's `resources` grant as `resources` says: only on a node whose
+    /// launcher runs every attempt in a cgroup of its own
+    /// ([`crate::cgroup::CgroupLauncher`]), which also measures each attempt. `None`, the
+    /// default, refuses every such grant `unsupported_grant` and advertises no
+    /// `resources` section.
+    #[must_use]
+    pub const fn with_resource_enforcement(
+        mut self,
+        resources: Option<ResourceEnforcement>,
+    ) -> Self {
+        self.resources = resources;
+        self
+    }
+
+    /// What this node enforces on an attempt's process tree, if it runs attempts in
+    /// cgroups.
+    #[must_use]
+    pub const fn resource_enforcement(&self) -> Option<ResourceEnforcement> {
+        self.resources
     }
 
     /// Bound how long `stop` waits for the reaper to confirm the kill and reap.

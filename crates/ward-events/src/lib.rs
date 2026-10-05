@@ -42,9 +42,9 @@ pub use event::{
     ClaimKind, CredentialDelivery, Decision, DecisionSource, DeniedDst, DenyReason, DetailText,
     EndReason, EventKind, EventKindSet, ExitStatus, FileChangeKind, GrantScope, NameText,
     NodeAttemptEnd, NodeAttemptOutcome, NodeAttemptState, NodeIntervention, NodeOutputFile,
-    NodeOutputFileStatus, NodeOutputStream, ObserverSource, PauseMethod, PayloadText,
-    PolicySubject, ProcessRef, RevokeReason, Scope, ShortText, SignatureBytes, SnapshotRole,
-    StepStatus, TamperWardSig, VerifyRequester, VerifySummary, WardEvent,
+    NodeOutputFileStatus, NodeOutputStream, NodeResourceUsage, ObserverSource, PauseMethod,
+    PayloadText, PolicySubject, ProcessRef, RevokeReason, Scope, ShortText, SignatureBytes,
+    SnapshotRole, StepStatus, TamperWardSig, VerifyRequester, VerifySummary, WardEvent,
 };
 pub use ids::{
     AgentId, AttemptId, Blake3Hash, DelegationId, ExecutionAttemptId, IdError, ImageDigest,

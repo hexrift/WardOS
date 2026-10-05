@@ -168,6 +168,15 @@ pub enum WardEvent {
     // NodeOutputFile { path: SandboxPath, size: u64, digest: Option<Blake3Hash>,
     //                  status: NodeOutputFileStatus }   // Returned | DigestOnly | Missing
     //                                                   // | NotARegularFile | TooLarge
+    // appended after NodeAttemptOutputCollected (#260, node-integration.md §6.5): what the
+    // attempt's process tree used, read from the cgroup a node started with --cgroup-root
+    // ran it in, once reaped; before any NodeAttemptOutputCollected and NodeAttemptEnded.
+    // The kernel's counters only; a counter the host does not provide is None.
+    NodeAttemptResourceUsage { usage: NodeResourceUsage },
+    // NodeResourceUsage { cpu_millis_limit: Option<u64>, memory_limit_bytes: Option<u64>,
+    //                     pids_limit: Option<u64>, cpu_usage_usec: Option<u64>,
+    //                     memory_peak_bytes: Option<u64>, pids_peak: Option<u64>,
+    //                     memory_oom_kills: Option<u64>, pids_max_events: Option<u64> }
 }
 ```
 
