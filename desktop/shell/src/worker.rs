@@ -61,19 +61,26 @@ use ward_daemon::client::{self, WatchEnd, WatchUpdate};
 use ward_shell_core::{DigestGate, Module, SegmentName};
 
 use crate::{
-    DIGEST_DEBOUNCE, Digester, Snapshot, TICK_MS, load_from, locate, module_at, now_unix_ms,
-    observe_event,
+    DIGEST_DEBOUNCE, Digester, Located, Snapshot, TICK_MS, load_from, locate_quietly, module_at,
+    now_unix_ms, observe_event,
 };
 
 /// File name of the worker's socket, next to `sessions/` under the state
 /// directory.
 const SOCKET_NAME: &str = "shell-worker.sock";
 
-/// How often the worker looks for a session again while it has none — the
-/// same cadence Waybar's own `restart-interval: 5` (`config.jsonc`) already
-/// bounds a solo `bar --waybar --follow` process by today, since that is
-/// what re-locates it after every process exit.
-const NO_SESSION_POLL: Duration = Duration::from_secs(5);
+/// How often the worker looks for a session again while it has none, and
+/// how long it pauses after one ends before looking for the next: the same
+/// 2s `wardos-shell-worker.service`'s `RestartSec` would pace a worker that
+/// exited by, and inside Waybar's own `restart-interval: 5` (`config.jsonc`),
+/// so a session started while the bar's segments are being answered
+/// [`Module::none`] is being served by the time they ask again — the worker
+/// never asks faster than this, a session or not, which is what keeps a
+/// desktop with no session (a headless run, a machine before its first
+/// `ward up`) from becoming a spin on `locate`. A bounded poll rather than
+/// an inotify wake-up: liveness here is a socket answering, not a file
+/// appearing, and `ward-shell` carries no inotify binding of its own.
+const NO_SESSION_POLL: Duration = Duration::from_secs(2);
 
 /// How long [`relay_from_worker`] waits for the worker's first line before
 /// giving up on it and falling back to a direct subscription: generous next
@@ -219,12 +226,17 @@ fn io_err(path: &Path, source: std::io::Error) -> ward_daemon::Error {
 
 /// Run the worker forever: bind the socket, accept segment relay clients on
 /// their own threads, and keep one [`Snapshot`] fed from whichever session
-/// [`locate`] finds, looking again every [`NO_SESSION_POLL`] while there is
-/// none. Returns only if the socket itself cannot be bound — a one-time
-/// startup failure; anything that goes wrong with one session (`wardd`
-/// disappearing, a transient I/O error) is logged to stderr and the loop
-/// moves on to look for the next one, since a shared worker outliving any one
-/// session is the entire point of it existing.
+/// [`wait_for_session`] finds, looking again every [`NO_SESSION_POLL`] while
+/// there is none and pausing as long after one ends. Returns only if the
+/// socket itself cannot be bound — a one-time startup failure; anything that
+/// goes wrong with one session (`wardd` disappearing, a transient I/O error)
+/// is logged to stderr and the loop moves on to look for the next one, since
+/// a shared worker outliving any one session is the entire point of it
+/// existing. Waiting, not exiting: `wardos-shell-worker.service` is
+/// `Restart=on-failure`, pacing for a crash, and a worker that exited to get
+/// that pacing would spin unpaced anywhere else it is run (a headless
+/// desktop, a shell), while the segments it serves expect its socket to stay
+/// bound and answer [`Module::none`] for as long as there is nothing to show.
 pub(crate) fn run(dir: &Path, state: &Path, settle: Duration) -> ward_daemon::Result<()> {
     let shared = Shared::new();
     let listener = bind_socket(&socket_path(state))?;
@@ -233,20 +245,44 @@ pub(crate) fn run(dir: &Path, state: &Path, settle: Duration) -> ward_daemon::Re
         std::thread::spawn(move || accept_loop(&listener, &shared));
     }
     loop {
-        match locate(dir) {
-            Ok(Some(socket)) => {
-                if let Err(e) = serve_session(&socket, settle, &shared) {
-                    eprintln!("ward-shell: worker: {e}");
-                }
-                shared.end_session();
-            }
-            Ok(None) => shared.set_no_session(),
-            Err(e) => {
-                eprintln!("ward-shell: worker: {e}");
-                shared.set_no_session();
-            }
+        let socket = wait_for_session(
+            || locate_quietly(dir),
+            std::thread::sleep,
+            |line| eprintln!("ward-shell: {line}"),
+        );
+        if let Err(e) = serve_session(&socket, settle, &shared) {
+            eprintln!("ward-shell: worker: {e}");
         }
+        shared.end_session();
         std::thread::sleep(NO_SESSION_POLL);
+    }
+}
+
+/// Look for a session with `look` until one is found, pausing
+/// [`NO_SESSION_POLL`] through `pause` after every look that found none —
+/// never a spin, whatever `look` keeps answering. The reason there is no
+/// session, or the error looking failed with, goes to `log` when it first
+/// appears and again only when it changes, so a desktop with no session says
+/// so once rather than once per poll. `pause` and `log` are passed in so the
+/// loop's cadence and its output can be asserted without sleeping or
+/// capturing stderr.
+fn wait_for_session(
+    mut look: impl FnMut() -> ward_daemon::Result<Located>,
+    mut pause: impl FnMut(Duration),
+    mut log: impl FnMut(&str),
+) -> PathBuf {
+    let mut last_logged: Option<String> = None;
+    loop {
+        let message = match look() {
+            Ok(Located::Session(socket)) => return socket,
+            Ok(Located::NoSession(reason)) => reason,
+            Err(e) => format!("worker: {e}"),
+        };
+        if last_logged.as_deref() != Some(message.as_str()) {
+            log(&message);
+            last_logged = Some(message);
+        }
+        pause(NO_SESSION_POLL);
     }
 }
 
@@ -429,14 +465,6 @@ impl Shared {
     /// today) and go back to [`State::NoSession`] for the next `locate`.
     fn end_session(&self) {
         *self.lock() = State::NoSession;
-    }
-
-    /// Idempotent: a `locate` that found nothing while already showing none.
-    fn set_no_session(&self) {
-        let mut guard = self.lock();
-        if !matches!(&*guard, State::NoSession) {
-            *guard = State::NoSession;
-        }
     }
 
     /// Register `segment` for updates: `None` when there is no session (the
@@ -693,6 +721,82 @@ mod tests {
         );
         assert_eq!(parse_request(""), Request::Invalid);
         assert_eq!(parse_request("clock"), Request::Invalid);
+    }
+
+    /// The idle loop behind `run` while there is nothing to serve: one
+    /// bounded pause after every empty look (never a spin on `locate`), and
+    /// the reason said once, when it first appears — not once per poll, which
+    /// is a line every [`NO_SESSION_POLL`] for as long as the desktop has no
+    /// session, and a filled disk the moment the pause is ever lost.
+    #[test]
+    fn waiting_for_a_session_pauses_one_interval_per_empty_look_and_logs_the_reason_once() {
+        let reason = "no session for . and no live session anywhere; run `ward up` to start one";
+        let mut looks = 0;
+        let mut pauses = Vec::new();
+        let mut logged = Vec::new();
+        let socket = wait_for_session(
+            || {
+                looks += 1;
+                Ok(if looks < 4 {
+                    Located::NoSession(reason.to_owned())
+                } else {
+                    Located::Session(PathBuf::from("/state/sessions/s/control.sock"))
+                })
+            },
+            |pause| pauses.push(pause),
+            |line| logged.push(line.to_owned()),
+        );
+        assert_eq!(socket, PathBuf::from("/state/sessions/s/control.sock"));
+        assert_eq!(
+            pauses,
+            vec![NO_SESSION_POLL; 3],
+            "one bounded pause after each of the three empty looks, none after the hit"
+        );
+        assert_eq!(logged, vec![reason], "the reason once, not once per poll");
+    }
+
+    /// A reason or error that changes while waiting is news, and is logged
+    /// again — once per change — including the same reason coming back
+    /// after something else; the same one repeating is not.
+    #[test]
+    fn a_changed_reason_or_error_while_waiting_is_logged_once_per_change() {
+        let mut outcomes = vec![
+            Ok(Located::NoSession("nothing".to_owned())),
+            Ok(Located::NoSession("nothing".to_owned())),
+            Err(ward_daemon::Error::Daemon(
+                "sessions dir unreadable".to_owned(),
+            )),
+            Err(ward_daemon::Error::Daemon(
+                "sessions dir unreadable".to_owned(),
+            )),
+            Ok(Located::NoSession("nothing".to_owned())),
+            Ok(Located::Session(PathBuf::from("/s"))),
+        ]
+        .into_iter();
+        let mut pauses = 0;
+        let mut logged = Vec::new();
+        let socket = wait_for_session(
+            || {
+                outcomes
+                    .next()
+                    .expect("the session is found before the script runs out")
+            },
+            |_| pauses += 1,
+            |line| logged.push(line.to_owned()),
+        );
+        assert_eq!(socket, PathBuf::from("/s"));
+        assert_eq!(
+            pauses, 5,
+            "every empty or failed look is followed by one pause"
+        );
+        assert_eq!(
+            logged,
+            [
+                "nothing",
+                "worker: daemon: sessions dir unreadable",
+                "nothing"
+            ]
+        );
     }
 
     /// A fake worker: a bare listener that accepts and reads the request line

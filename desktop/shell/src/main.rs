@@ -791,18 +791,39 @@ fn switcher_label(snapshot: &Snapshot, pending: usize, selected: bool) -> String
     format!("{mark} {project}  {agent}  {pending}  {verify}")
 }
 
+/// What [`locate_quietly`] found: the session's control socket, or the
+/// reason there is none to show — which [`locate`] prints at once for the
+/// one-shot surfaces, and [`worker`] prints only when it changes, since it
+/// asks again every few seconds for as long as the desktop has no session.
+pub(crate) enum Located {
+    /// The control socket of the session to show.
+    Session(PathBuf),
+    /// No session for the directory and none live anywhere: the daemon's own
+    /// explanation, the text `locate` would have printed.
+    NoSession(String),
+}
+
 /// The control socket of the session the shell shows: `dir`'s current one,
 /// else the newest one a daemon serves (the bar runs from home, not a
 /// project); `None` when there is neither (the reason goes to stderr). Also
 /// [`worker`]'s own way of finding the session to serve, with the same `dir`
 /// default ("."), so the two agree.
 pub(crate) fn locate(dir: &Path) -> ward_daemon::Result<Option<PathBuf>> {
-    match client::desktop_socket(dir, &state_root(), None) {
-        Ok(socket) => Ok(Some(socket)),
-        Err(ward_daemon::Error::Project(reason)) => {
+    match locate_quietly(dir)? {
+        Located::Session(socket) => Ok(Some(socket)),
+        Located::NoSession(reason) => {
             eprintln!("ward-shell: {reason}");
             Ok(None)
         }
+    }
+}
+
+/// [`locate`] without the stderr line: the caller decides whether the reason
+/// there is no session is worth saying this time.
+pub(crate) fn locate_quietly(dir: &Path) -> ward_daemon::Result<Located> {
+    match client::desktop_socket(dir, &state_root(), None) {
+        Ok(socket) => Ok(Located::Session(socket)),
+        Err(ward_daemon::Error::Project(reason)) => Ok(Located::NoSession(reason)),
         Err(e) => Err(e),
     }
 }
