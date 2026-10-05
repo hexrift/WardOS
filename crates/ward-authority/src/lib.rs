@@ -643,6 +643,12 @@ impl UntrustedAuthorityLease {
         self.delegation_id
     }
 
+    /// Claimed root principal that issued this lease's lineage.
+    #[must_use]
+    pub const fn issuer(&self) -> PrincipalId {
+        self.issuer
+    }
+
     /// Claimed agent holding this lease.
     #[must_use]
     pub const fn subject(&self) -> AgentId {

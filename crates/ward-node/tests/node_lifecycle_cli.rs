@@ -143,7 +143,11 @@ fn trust_store(dir: &Path) -> PathBuf {
     let path = dir.join("trusted-issuers");
     std::fs::write(
         &path,
-        format!("{}\n", hex(key_pair().public_key().as_ref())),
+        format!(
+            "{} {}\n",
+            hex(key_pair().public_key().as_ref()),
+            PrincipalId::from_u128(2)
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();

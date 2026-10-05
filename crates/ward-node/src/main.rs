@@ -4,13 +4,15 @@
 //! [--task-root <dir>]` serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
 //! admission version and revocation stores and the node's snapshot store (`cas`). Without
-//! `--trusted-issuers` no issuer is trusted and every `admit` is refused. With
+//! `--trusted-issuers` no issuer is trusted and every `admit` is refused; with it, each
+//! trusted key is bound to the one issuing principal (`prn_…`) whose leases it may sign. With
 //! `--task-root` (created mode 0700, refused if group- or world-accessible) the node starts
 //! and stops admitted tasks in a bubblewrap sandbox over workspaces it allocates there; it
 //! refuses to run when the sandbox is unavailable.
 //!
 //! `ward-node snapshot import --state-dir <dir> <project-dir>` captures a local directory
-//! into the node's snapshot store and prints its id, the id an admission envelope names.
+//! into the node's snapshot store and prints its id as 64 lowercase hex characters with no
+//! prefix: exactly the value an admission envelope's `workload.snapshot` carries.
 //! `ward-node issuer-key-id <hex-public-key>` prints the key id an issuer proof must name
 //! for that Ed25519 public key.
 
@@ -47,7 +49,8 @@ struct Cli {
     /// This node's identity (`node_…`), the only audience it admits envelopes for.
     #[arg(long, required = true)]
     node_id: Option<NodeId>,
-    /// Trusted issuer public keys: one hex Ed25519 key per line, `#` comments allowed.
+    /// Trusted issuers: one `<public-key> [<key-id>] <prn_…>` per line, binding a lowercase
+    /// hex Ed25519 key to the one principal it may issue leases as; `#` comments allowed.
     /// Without it no issuer is trusted and every `admit` is refused.
     #[arg(long)]
     trusted_issuers: Option<PathBuf>,
@@ -61,7 +64,7 @@ struct Cli {
 enum Command {
     /// Print the issuer key id (BLAKE3 of the public key) for a hex Ed25519 public key.
     IssuerKeyId {
-        /// The 32-byte Ed25519 public key as 64 hex characters.
+        /// The 32-byte Ed25519 public key as 64 lowercase hex characters.
         public_key: String,
     },
     /// Manage the node's content-addressed snapshot store.
@@ -74,7 +77,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SnapshotCommand {
-    /// Capture a local directory into the node's snapshot store and print its id.
+    /// Capture a local directory into the node's snapshot store and print its id: 64
+    /// lowercase hex characters, exactly the envelope's `workload.snapshot` value.
     Import {
         /// Private node state directory (created mode 0700) holding the store.
         #[arg(long)]
@@ -147,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn import(state_dir: &Path, project_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
     open_private_dir(state_dir)?;
     let snapshots = open_snapshot_store(state_dir)?;
-    Ok(import_snapshot(&snapshots, project_dir)?.to_string())
+    Ok(import_snapshot(&snapshots, project_dir)?.hash().to_hex())
 }
 
 fn issuer_key_id(public_key: &str) -> Result<String, IssuerKeyParseError> {

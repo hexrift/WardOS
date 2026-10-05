@@ -21,7 +21,7 @@ use ward_node_protocol::{
 };
 
 use crate::admit::{NodeAdmission, NodeClock};
-use crate::issuer::{IssuerPublicKey, TrustedIssuers};
+use crate::issuer::{IssuerPublicKey, TrustedIssuer, TrustedIssuers};
 use crate::state::NodeState;
 
 /// Deterministic seed of the trusted test issuer key.
@@ -29,6 +29,9 @@ pub const ISSUER_SEED: [u8; 32] = [7; 32];
 
 /// Deterministic seed of an issuer key the node does not trust.
 pub const OTHER_SEED: [u8; 32] = [8; 32];
+
+/// The principal the trusted test issuer key is bound to, and that test leases name.
+pub const ISSUER: PrincipalId = PrincipalId::from_u128(2);
 
 /// The node identity every admission test runs as.
 pub const NODE: NodeId = NodeId::from_u128(4);
@@ -68,11 +71,20 @@ pub fn trusted_root_lease() -> AuthorityLease {
 }
 
 pub fn root_lease(binding: TaskBinding, issued_at: u64, expires_at: u64) -> AuthorityLease {
+    root_lease_issued_by(binding, ISSUER, issued_at, expires_at)
+}
+
+pub fn root_lease_issued_by(
+    binding: TaskBinding,
+    issuer: PrincipalId,
+    issued_at: u64,
+    expires_at: u64,
+) -> AuthorityLease {
     AuthorityLease::root(
         AuthorityLeaseInput {
             id: binding.lease(),
             delegation_id: DelegationId::from_u128(6),
-            issuer: PrincipalId::from_u128(2),
+            issuer,
             subject: AgentId::from_u128(3),
             task: binding.task(),
             grants: GrantSet::new([CapabilityGrant::new(
@@ -93,7 +105,15 @@ pub fn root_lease(binding: TaskBinding, issued_at: u64, expires_at: u64) -> Auth
 
 /// A valid envelope input for `binding`, addressed to [`NODE`], signed-ready.
 pub fn envelope_input(binding: TaskBinding) -> TaskAdmissionEnvelopeInput {
-    let lease = root_lease(binding, 1_000, 9_000);
+    envelope_input_issued_by(binding, ISSUER)
+}
+
+/// [`envelope_input`] whose root lease names `issuer` as its issuing principal.
+pub fn envelope_input_issued_by(
+    binding: TaskBinding,
+    issuer: PrincipalId,
+) -> TaskAdmissionEnvelopeInput {
+    let lease = root_lease_issued_by(binding, issuer, 1_000, 9_000);
     TaskAdmissionEnvelopeInput {
         binding,
         agent: AgentId::from_u128(3),
@@ -153,10 +173,11 @@ impl NodeClock for FixedClock {
     }
 }
 
-/// Admission for [`NODE`] trusting only the test issuer, with state under `dir`.
+/// Admission for [`NODE`] trusting only the test issuer key, bound to [`ISSUER`], with
+/// state under `dir`.
 pub fn node_admission(dir: &Path, clock: &FixedClock) -> NodeAdmission {
     NodeAdmission::new(
-        TrustedIssuers::new([issuer_public_key()]),
+        TrustedIssuers::new([TrustedIssuer::new(issuer_public_key(), ISSUER)]),
         NodeState::open(dir, NODE).unwrap(),
         Box::new(clock.clone()),
     )
