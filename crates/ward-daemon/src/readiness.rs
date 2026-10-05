@@ -8,19 +8,19 @@
 //! exactly what `ward init` writes (`.ward/policy.yaml`, `.tamperward/config.yml`)
 //! and reporting whether it resolves, not merely whether the files exist.
 //!
-//! Scope: this covers items 1, 2 and 5 of #147's suggested implementation (a
+//! Scope: this covers items 1, 2, 3, 5 and 6 of #147's suggested implementation (a
 //! structured report; the verification boundary proposed from lockfiles and test
-//! configuration and shown until a trusted user accepts it; Ready / Ready with
-//! limitations / Setup required / Verification unavailable). It does not run the
-//! configured command to distinguish a legitimate pre-existing failing test
-//! ("baseline failing") from a broken setup, and it does not prepare or cache an
-//! isolated dependency environment (items 3, 4 and 6) — both are substantial
-//! follow-ups of their own (the second needs the same disposable-sandbox machinery
-//! `ward verify` already owns) and are left for later PRs against #147.
+//! configuration and shown until a trusted user accepts it; the prepared dependency
+//! environment's state — prepared, stale, incomplete or never prepared, with its
+//! timings — as the `dependencies` row; Ready / Ready with limitations / Setup
+//! required / Verification unavailable). It does not run the configured command to
+//! distinguish a legitimate pre-existing failing test ("baseline failing") from a
+//! broken setup; that verdict is still a follow-up against #147.
 
 use std::path::{Path, PathBuf};
 
 use crate::doctor::Status;
+use crate::prepare;
 use crate::verify;
 use crate::verify_proposal;
 
@@ -175,8 +175,16 @@ impl Report {
 /// process's own `PATH`, which the verifier does not use.
 #[must_use]
 pub fn check(dir: &Path) -> Report {
+    check_in(dir, &crate::session::state_root())
+}
+
+/// [`check`] with the state root given, where the prepared dependency environments
+/// live (`<state>/prepared/`, [`crate::prepare`]): the `dependencies` row reads them,
+/// and the `runtime` row searches a ready environment's `bin` as the verifier will.
+#[must_use]
+pub fn check_in(dir: &Path, state: &Path) -> Report {
     let toolchains = verify::Toolchains::detect();
-    check_with_dirs_and_roots(dir, &toolchains.search_dirs(), &toolchains.mounts())
+    check_full(dir, state, &toolchains.search_dirs(), &toolchains.mounts())
 }
 
 /// [`check`], with the verifier's search directories given explicitly instead
@@ -196,6 +204,19 @@ fn check_with_dirs(dir: &Path, search_dirs: &[PathBuf]) -> Report {
     check_with_dirs_and_roots(dir, search_dirs, &[])
 }
 
+/// [`check_full`] with an empty, test-private state root: no prepared environment
+/// exists there, so these tests exercise the `runtime` row's own search exactly as
+/// before the `dependencies` row was added.
+#[cfg(test)]
+fn check_with_dirs_and_roots(
+    dir: &Path,
+    search_dirs: &[PathBuf],
+    mounts: &[verify::Mount],
+) -> Report {
+    let state = std::env::temp_dir().join("ward-readiness-tests-no-prepared-state");
+    check_full(dir, &state, search_dirs, mounts)
+}
+
 /// [`check`]'s real implementation: `search_dirs` is where a bare candidate is
 /// looked up (mirroring [`verify::Toolchains::search_dirs`]); `mounts` names
 /// the real host-to-sandbox mapping for whichever of those search dirs the
@@ -203,8 +224,9 @@ fn check_with_dirs(dir: &Path, search_dirs: &[PathBuf]) -> Report {
 /// search dir with no matching entry here is judged as its own, self-mapped
 /// boundary instead — see [`resolve_in_dirs`]'s doc for the full reasoning
 /// [`resolve_in_dirs`] uses this for).
-fn check_with_dirs_and_roots(
+fn check_full(
     dir: &Path,
+    state: &Path,
     search_dirs: &[PathBuf],
     mounts: &[verify::Mount],
 ) -> Report {
@@ -216,6 +238,14 @@ fn check_with_dirs_and_roots(
         .is_some_and(|survey| survey.proposals.is_empty());
     rows.push(verify_row);
     if let Some(config) = &config {
+        // The prepared dependency environment for the project's current inputs
+        // (#147 items 3 and 6), resolved first: when one is ready, its `bin` is on
+        // the verifier's `PATH` ahead of everything else and its tree is a mount of
+        // its own, so the `runtime` row judges the command against exactly what the
+        // verifier will see (a `pytest` installed by `ward prepare` resolves; one
+        // that is not prepared yet does not).
+        let dependencies = prepare::lookup(state, dir, &prepare::Settings::from_env(), search_dirs);
+        let mut all_dirs: Vec<PathBuf> = Vec::new();
         // The worktree itself is always bind-mounted at `/work`
         // (`sandbox::Launch::args`), regardless of which toolchain mounts
         // `mounts` carries — an absolute symlink hop naming it (see
@@ -225,14 +255,20 @@ fn check_with_dirs_and_roots(
             host: dir.to_path_buf(),
             sandbox: PathBuf::from(crate::sandbox::WORK_ROOT),
         }];
+        if let prepare::Lookup::Ready(env) = &dependencies {
+            all_dirs.extend(env.search_dirs());
+            all_mounts.extend(env.mounts());
+        }
+        all_dirs.extend_from_slice(search_dirs);
         all_mounts.extend_from_slice(mounts);
         rows.push(runtime_row(
             dir,
             &config.verify.command,
-            search_dirs,
+            &all_dirs,
             &all_mounts,
         ));
         rows.push(protected_row(dir, config));
+        rows.push(dependencies_row(&dependencies));
     }
     Report {
         ecosystem,
@@ -1036,6 +1072,53 @@ fn protected_row(dir: &Path, config: &verify::Config) -> Row {
             Status::Warn,
             format!("not yet on disk: {}", missing.join(", ")),
         )
+    }
+}
+
+/// The `dependencies` row (#147 items 3 and 6): whether the dependency set the
+/// project's lockfile pins is prepared for the verifier, and if not, which one step
+/// fixes it. A project that needs none (Cargo, which resolves from the host registry
+/// cache the verifier already mounts; no lockfile at all) is `Ok` with the reason; a
+/// ready environment shows its key, ecosystem, the measured warm lookup and the
+/// recorded cold install; everything else — never prepared, stale, incomplete, failed,
+/// declined, no runtime to key it to — blocks, naming `ward prepare` or what to add
+/// first. Reads records and asks the runtime its version; installs nothing.
+fn dependencies_row(lookup: &prepare::Lookup) -> Row {
+    match lookup {
+        prepare::Lookup::NotNeeded(why) => Row::new(
+            "dependencies",
+            Status::Ok,
+            format!("none to prepare: {why}"),
+        ),
+        prepare::Lookup::Ready(env) => Row::new(
+            "dependencies",
+            Status::Ok,
+            format!(
+                "{} · warm {} · cold {}{}",
+                env.summary(),
+                env.warm
+                    .map_or_else(|| "-".to_owned(), crate::render::human_duration),
+                env.record.cold_ms.map_or_else(
+                    || "-".to_owned(),
+                    |ms| crate::render::human_duration(std::time::Duration::from_millis(ms))
+                ),
+                env.record
+                    .finished_at
+                    .map(|at| format!(" on {}", crate::render::human_date(at)))
+                    .unwrap_or_default()
+            ),
+        ),
+        prepare::Lookup::Missing { reason, .. } => Row::new("dependencies", Status::Fail, reason),
+        prepare::Lookup::Declined(why) => Row::new(
+            "dependencies",
+            Status::Fail,
+            format!("{why}; `ward prepare` has nothing to install from"),
+        ),
+        prepare::Lookup::Unavailable(why) => Row::new(
+            "dependencies",
+            Status::Fail,
+            format!("{why}; `ward prepare` cannot key an environment"),
+        ),
     }
 }
 

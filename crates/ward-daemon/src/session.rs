@@ -203,6 +203,9 @@ pub struct VerifyReport {
     pub summary: VerifySummary,
     /// Protected paths the verifier took from the entry snapshot instead of the worktree.
     pub restored: Vec<String>,
+    /// The prepared dependency environment's state for this candidate (#147 item 3):
+    /// what was mounted, or why nothing was. `None` when the project needs none.
+    pub dependencies: Option<String>,
     /// The verifier's combined output.
     pub output: String,
 }
@@ -1265,7 +1268,52 @@ impl Session {
                 "verification was cancelled before the verifier command started".to_owned(),
             ));
         }
-        let outcome = verify::execute(prepared)?;
+        // The prepared dependency environment for *this candidate's* inputs (#147
+        // items 3-4): looked up from the materialised tree the verifier runs over, so
+        // a lockfile the agent edited resolves to a different key — and to "stale",
+        // never to the environment the old lockfile earned. Recorded as a progress
+        // step either way; the verifier itself stays offline and fetches nothing.
+        let dependencies = crate::prepare::lookup_in(
+            &self.state,
+            &prepared.scratch,
+            &self.worktree,
+            &crate::prepare::Settings::from_env(),
+            &verify::Toolchains::detect().search_dirs(),
+        );
+        let (mounted, dependency_note) = match &dependencies {
+            crate::prepare::Lookup::Ready(env) => (
+                Some(&**env),
+                Some((
+                    format!("dependencies: {} mounted read-only", env.summary()),
+                    StepStatus::Pass,
+                )),
+            ),
+            crate::prepare::Lookup::Missing { reason, .. } => (
+                None,
+                Some((
+                    format!("dependencies: not mounted: {reason}"),
+                    StepStatus::Fail,
+                )),
+            ),
+            crate::prepare::Lookup::Declined(why) | crate::prepare::Lookup::Unavailable(why) => (
+                None,
+                Some((
+                    format!("dependencies: not mounted: {why}"),
+                    StepStatus::Fail,
+                )),
+            ),
+            crate::prepare::Lookup::NotNeeded(_) => (None, None),
+        };
+        if let Some((step, status)) = &dependency_note {
+            self.emit(
+                Origin::Verifier,
+                WardEvent::VerificationProgress {
+                    step: ShortText::new(step),
+                    status: *status,
+                },
+            )?;
+        }
+        let outcome = verify::execute_with(prepared, mounted)?;
         let status = if outcome.passed {
             StepStatus::Pass
         } else {
@@ -1310,6 +1358,7 @@ impl Session {
             timed_out: outcome.timed_out.then_some(budget_secs),
             summary: outcome.summary,
             restored: prepared.restored.clone(),
+            dependencies: dependency_note.map(|(step, _)| step),
             output: outcome.output,
         })
     }

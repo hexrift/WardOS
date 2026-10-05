@@ -345,7 +345,10 @@ A fresh, disposable environment per verification (ADR-0004). Not a long-lived se
 * Own mount/PID/net/IPC/UTS/user namespaces. **No** shared writable path with the agent.
 * Inputs: verifier runtime image (ro, from host CAS), pristine snapshot (ro), candidate
   snapshot (ro), trusted test set (ro, provided by TamperWard from Zone 1, not from the
-  candidate), verification manifest.
+  candidate), verification manifest, and the prepared dependency environment (ro) whose
+  key matches the candidate's lockfile — built by `ward prepare`, the one explicit online
+  phase, sealed under `<state>/prepared/<key>/` and never written by agent or verifier
+  (#147; [ADR-0004](decisions/ADR-0004-verifier-isolation.md) addendum).
 * Output: a single signed result record appended to the evidence log by `wardd`, never
   written by the verifier directly to anything the agent can read.
 * Network: **none** by default. Optional allowlist only when the verification manifest
@@ -655,6 +658,14 @@ upper layer for toolchains and caches, keyed by project ID. Agent sessions mount
 is agent-writable and therefore untrusted; the verifier never mounts it. `ward up` builds
 it; `ward stop` leaves it in place; `ward clean` discards it. **[experiment E-06]** measures
 whether a suspended-sandbox (cgroup freezer) model beats rebuild-on-start.
+
+The verifier's dependencies are the other, separate tree: a **prepared environment**
+(`ward prepare`, [`ward_daemon::prepare`](../crates/ward-daemon/src/prepare.rs)), keyed
+by a digest over the lockfile's content, the runtime's version, the platform and the
+registry, installed once with the network and then sealed read-only; the verifier mounts
+it beside the candidate, `ward ready` reports it (`prepared`, `stale: lockfile changed`,
+`incomplete`, `never prepared`, with cold and warm timings) and nothing updates it in
+place — changed inputs are a new key.
 
 ---
 

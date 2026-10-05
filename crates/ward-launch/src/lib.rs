@@ -224,6 +224,7 @@ pub struct Launch {
     capture_bytes: Option<usize>,
     keep_prefix: Option<String>,
     clear_env: bool,
+    host_network: bool,
 }
 
 /// A spawned sandbox whose child is owned until it is waited or dropped.
@@ -341,6 +342,7 @@ impl Launch {
             capture_bytes: None,
             keep_prefix: None,
             clear_env: false,
+            host_network: false,
         }
     }
 
@@ -406,6 +408,23 @@ impl Launch {
     #[must_use]
     pub const fn clear_env(mut self) -> Self {
         self.clear_env = true;
+        self
+    }
+
+    /// Keep the host's network namespace instead of an isolated one, and bind the
+    /// host's resolver configuration (`/etc/resolv.conf`, `/etc/hosts`) read-only so
+    /// names resolve inside. Every other namespace and every filesystem rule stays as
+    /// it is: no host home, no secrets, `/tmp` and `/home` private.
+    ///
+    /// This exists for exactly one caller: `ward prepare`'s explicit, online
+    /// dependency-installation phase (`ward_daemon::prepare`, #147 item 4), which
+    /// runs a package manager over a copy of the lockfile with no agent process in
+    /// sight and records that it did. A session launch never sets it — the agent's
+    /// only way out stays the egress socket (ADR-0014) — and the verifier never sets
+    /// it either (ADR-0004: no network).
+    #[must_use]
+    pub const fn host_network(mut self) -> Self {
+        self.host_network = true;
         self
     }
 
@@ -484,8 +503,11 @@ impl Launch {
             ],
         );
         push(&mut a, &["--hostname", "ward-sandbox"]);
-        // The network namespace is always isolated: the only way out is the egress
-        // socket, and only when the session provides one (ADR-0014).
+        // The network namespace is isolated: the only way out is the egress socket,
+        // and only when the session provides one (ADR-0014). The one exception is a
+        // launch that asked for the host network explicitly (`host_network`, the
+        // online dependency-preparation phase of `ward prepare`); it also gets the
+        // host's resolver files, read-only, since nothing else under `/etc` is bound.
         push(
             &mut a,
             &[
@@ -494,9 +516,17 @@ impl Launch {
                 "--unshare-ipc",
                 "--unshare-uts",
                 "--unshare-cgroup-try",
-                "--unshare-net",
             ],
         );
+        if self.host_network {
+            for file in ["/etc/resolv.conf", "/etc/hosts"] {
+                if Path::new(file).exists() {
+                    push(&mut a, &["--ro-bind", file, file]);
+                }
+            }
+        } else {
+            push(&mut a, &["--unshare-net"]);
+        }
         push(&mut a, &["--die-with-parent", "--new-session"]);
         if let Some(sock) = &self.proxy_socket {
             push(&mut a, &["--bind", &sock.to_string_lossy(), PROXY_SOCKET]);
@@ -888,6 +918,37 @@ mod tests {
             a.contains("--dir /home/agent") && a.contains("--tmpfs /env"),
             "shim rw paths exist"
         );
+    }
+
+    #[test]
+    fn host_network_drops_only_the_net_unshare_and_binds_the_resolver() {
+        let isolated = Launch::new("/tmp", vec!["true".into()])
+            .args(Path::new("/tmp"))
+            .join(" ");
+        assert!(isolated.contains("--unshare-net"));
+        assert!(!isolated.contains("/etc/resolv.conf"));
+        let shared = Launch::new("/tmp", vec!["true".into()])
+            .host_network()
+            .args(Path::new("/tmp"))
+            .join(" ");
+        assert!(!shared.contains("--unshare-net"), "{shared}");
+        for kept in [
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--tmpfs /home",
+            "--tmpfs /tmp",
+        ] {
+            assert!(shared.contains(kept), "{kept} must survive: {shared}");
+        }
+        assert!(!shared.contains("/root"), "host home must never be bound");
+        if Path::new("/etc/resolv.conf").exists() {
+            assert!(
+                shared.contains("--ro-bind /etc/resolv.conf /etc/resolv.conf"),
+                "{shared}"
+            );
+        }
     }
 
     #[test]

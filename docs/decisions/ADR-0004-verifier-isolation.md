@@ -60,3 +60,24 @@ cgroup budget follow in Phase 4. The wall-clock budget is in: `verify.budget_sec
 its output; the output kept in the result document is capped at 1 MiB. Results reach
 `wardd` as the captured output of the one command; the summary is parsed from `test result:` lines and the output's BLAKE3 is the
 `result_hash` in the log.
+
+## Addendum (#147): prepared dependency environments
+
+The "pre-warmed cache" of the Disadvantages section exists for Node and Python
+(`ward_daemon::prepare`). `ward prepare` is the one explicit phase that fetches: it runs
+the manager's install for exactly the lockfile (`npm ci`, `pnpm install
+--frozen-lockfile`, `yarn install --frozen-lockfile`, each `--ignore-scripts`; `pip
+install --target`) in the verifier's own sandbox and toolchain view, with the host
+network namespace asked for by name on the launch (`Launch::host_network`, set nowhere
+else) and recorded in the environment's `prepared.json`, over a copy of the inputs,
+writing only `<state>/prepared/<key>/stage/`, which is sealed read-only on success. The
+key is a digest over ecosystem, input digests, the runtime's version as the verifier
+resolves it, the platform and the configured registry, so nothing is updated in place:
+changed inputs are a new key and the old environment reads as stale. The verifier mounts
+a complete, sealed environment whose key matches the *candidate's* lockfile read-only
+(`/work/node_modules`; `/run/verifier/deps/site-packages` on `PYTHONPATH`), records a
+`dependencies` progress step either way, and stays offline: a stale, incomplete or
+missing environment means the command runs without its dependencies, never that the
+verifier fetches. Cargo needs none, since `~/.cargo/registry` is already mounted. The
+project environment of architecture §4.1 is a different thing: agent-writable, and
+still never mounted by the verifier.
