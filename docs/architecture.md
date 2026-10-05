@@ -296,6 +296,37 @@ One append-only, hash-chained log per session, owned by `ward` uid, stored under
 `/var/lib/ward/sessions/<id>/events.log`. Live subscribers receive the same records over
 a Unix socket. Details in [`event-model.md`](event-model.md).
 
+### 3.8 Governed task receipt contract
+
+`ward-node-protocol` defines a bounded report for one task attempt. It uses the
+existing `TaskBinding` (task, execution attempt, authority lease), a WardOS
+session identity, and one outcome: `completed`, `failed`, or `unknown`. A receiver
+decodes the report against the expected binding and session; malformed data,
+unknown fields, and a mismatched identity are refused. The report contains no
+workload output or credential material.
+
+This is a contract only. The current `ward-node` task registry still supports
+`create` and `inspect`; it does not yet execute tasks or emit receipts. A future
+node implementation must bind admission, durable evidence, and recovery before a
+receipt can be treated as an authoritative execution result.
+
+### 3.9 Trusted task-authority check
+
+`ward-node` can compare an exact task binding and expected agent with an already
+trusted `AuthorityLease`, its validated lineage, and locally known monotonic
+revocations. Inactive, mismatched, or revoked authority fails closed. This is a
+pure prerequisite check, not a way to promote inbound lease bytes into trust:
+the node still does not accept a workload, admit execution, or run `start`.
+Execution-attempt identity remains bound by node-owned task state, not by the
+authority lease itself.
+
+### 3.10 Node protocol discovery
+
+After negotiation, the local node serves one request per connection. Protocol
+1.1 supports read-only capability discovery; 1.2 supports discovery or a task
+lifecycle request. Capability responses retain the same node facts while naming
+the exact negotiated version. Protocol 1.0 has no discovery endpoint.
+
 ---
 
 ## 4. Session lifecycle
