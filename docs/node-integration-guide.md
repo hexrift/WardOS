@@ -209,8 +209,9 @@ c19c769fdd8644df9167a36d0133289c9fa44a8c768cd0aafa1756a13fb3e33b
 
 It honours `.gitignore` (and includes `.git`), is bounded at 2 GiB, and is an operator
 command over local files, not a socket verb. Everything the workload needs must be in
-the snapshot: workloads run offline (§7.5), so a dependency that is not there is not
-fetched.
+the snapshot: workloads run offline unless the node was started with
+`--network-allowlist` and the manifest names the hosts to fetch from (§7.5, §9), so a
+dependency that is neither there nor reachable through the proxy is not fetched.
 
 ## 5. Control plane: build, sign and run one attempt
 
@@ -227,7 +228,9 @@ wrong most often:
 - `workload.capability_manifest.bytes` is the hex of `{"network":"offline"}` and `hash`
   its `BLAKE3-256`: `7b226e6574776f726b223a226f66666c696e65227d` and
   `eb3e889be30ae8dd712a52c33e37aaca72e52ccff1aa770ecbd962d0cdb0d0c3`. It is the only
-  manifest a node admits at this revision (§7.5).
+  manifest a node without `--network-allowlist` admits; with the flag,
+  `{"network":{"custom":[hosts]}}` is admitted too and the workload reaches those hosts
+  through the proxy socket `WARD_PROXY_SOCKET` names (§7.5, §9).
 - `version` is `1` for a task's first envelope and strictly higher than every version
   the node accepted for that task before, across attempts and restarts (§10).
 - `issued_at_unix_ms <= now < expires_at_unix_ms` at the node's clock, with margin.
@@ -312,7 +315,7 @@ Node-integration.md §10 is the full list; these are the cases every control pla
 | `rejected` at `admit` with `authority_denied` | Untrusted key, bad signature, malformed envelope, wrong audience, wrong issuer principal, or not yet valid (§8.1). Nothing changed, no version consumed. | Fix the envelope or the trust store; re-admit under the same version. |
 | `lease_expired`, `lease_revoked` | Validity or revocation, at the node clock (§8.3). | Issue a fresh lease (a revoked one, and anything delegated from it, is gone for good on that node). |
 | `stale_operation` at `admit` | The version is not above the last accepted for the task (§8.3). | Raise `version`; your per-task counter is behind the node's. |
-| `unsupported_grant` | The manifest asks for a grant this node does not honour (§7.5). No version consumed. | Re-admit with `{"network":"offline"}`, or do not run this workload here. |
+| `unsupported_grant` | The manifest asks for a grant this node does not honour (§7.5). No version consumed. | Re-admit with `{"network":"offline"}`, start the node with `--network-allowlist` if the workload needs egress, or do not run this workload here. |
 | `resource_unavailable` at `start` | Snapshot missing from the store, workspace already exists, or the spawn failed; the task stays `ready`. | Import the snapshot (§4), or retry `start` with the same id; never reuse an attempt id. |
 | `done` with `outcome` `unknown` | Ambiguous launch, lost child, node restart mid-run, or a transport failure the driver could not recover (§11.2). | Treat as failed. Retry as a **new attempt**: `create` the same task under a new attempt id, `admit` a new envelope with a higher `version`, `start`. The old attempt never runs again. |
 | `recovering` events, then `done` | A lost answer was recovered by `inspect` and one replay of the same id (§11.2). | Nothing; this is the contract working. |

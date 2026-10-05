@@ -7,19 +7,24 @@
 //! the bubblewrap primitive in `ward-launch`.
 //!
 //! A launch is built only from node-owned state: the workspace the node allocated under
-//! its task root ([`crate::workspace`]), the admitted envelope's argv and its mandatory
-//! wall-clock budget. The sandbox is offline: it never binds an egress socket, so its
-//! network namespace holds only loopback. That matches every admitted envelope's capability
-//! manifest, because `admit` ([`crate::admit`]) refuses any manifest asking for more than
-//! `offline`; the node never runs a workload under less than its manifest asked for.
+//! its task root ([`crate::workspace`]), the admitted envelope's argv, its mandatory
+//! wall-clock budget and the host allowlist its manifest names, if any. The sandbox's
+//! network namespace always holds only loopback. An offline manifest binds no egress
+//! socket. A `custom` manifest, which `admit` ([`crate::admit`]) accepts only on a node
+//! built [`NodeExecution::with_network_allowlist`], binds the attempt's own egress proxy
+//! ([`crate::egress`]) at [`ward_launch::PROXY_SOCKET`], named in
+//! [`crate::egress::PROXY_SOCKET_ENV`], with a policy of exactly the manifest's hosts; the
+//! node never runs a workload under less, or more, than its manifest asked for.
 //!
 //! `pause` and `resume` act on the running workload through its [`WorkloadFreezer`], which
-//! the reaper hands back with the spawned pid. The sandbox freezer stops the tree rooted at
-//! the outer `bwrap`'s host pid with `SIGSTOP`, children first, and reports it frozen only
-//! once the settle check in `ward_launch::freeze` confirms every process stopped (or ended,
-//! or held in vfork wait on a stopped child) within [`DEFAULT_FREEZE_SETTLE`]; otherwise it
-//! continues the tree again and refuses. Resuming sends `SIGCONT`, parents first, and
-//! confirms nothing is still stopped. There is no cgroup freezer: the node creates no
+//! the reaper hands back with the spawned pid. The sandbox freezer first pauses the
+//! attempt's egress proxy, if there is one, so no new connection is served while the tree
+//! is stopped, then stops the tree rooted at the outer `bwrap`'s host pid with `SIGSTOP`,
+//! children first, and reports it frozen only once the settle check in
+//! `ward_launch::freeze` confirms every process stopped (or ended, or held in vfork wait on
+//! a stopped child) within [`DEFAULT_FREEZE_SETTLE`]; otherwise it continues the tree and
+//! the proxy again and refuses. Resuming sends `SIGCONT`, parents first, confirms nothing
+//! is still stopped, and then resumes the proxy. There is no cgroup freezer: the node creates no
 //! delegated cgroup for a launch. The budget clock keeps running while a workload is
 //! paused (ADR-0030 §3: the budget is always enforced), and `SIGKILL` ends a stopped
 //! process as it is, so a paused workload can still be stopped or killed at its budget.
@@ -29,7 +34,9 @@
 //! durably, and after a node restart asks the launcher to end any survivor
 //! ([`TaskLauncher::end_survivor`]). The sandbox launcher kills, with `SIGKILL`, the tree
 //! still rooted at a process with exactly that identity, stopped processes included, and
-//! never signals a pid that now names another process or one from an earlier boot.
+//! never signals a pid that now names another process or one from an earlier boot. The
+//! egress proxy runs on threads of the node process and ends with it, so a restart leaves
+//! no proxy behind; a socket file left in the attempt's egress directory is inert.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,9 +45,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use ward_launch::freeze::{FrozenTree, TreeRoot, freeze_tree, kill_tree, thaw_tree};
-use ward_launch::{Launch, RunningLaunch};
+use ward_launch::{Launch, PROXY_SOCKET, RunningLaunch};
+use ward_node_protocol::HostAllowlist;
 use ward_snapshot::SnapshotStore;
 
+use crate::egress::{AttemptEgress, PROXY_SOCKET_ENV, egress_dir_beside};
 use crate::workspace::TaskRoot;
 
 /// Default bound on how long `stop` waits for the reaper to confirm the kill and reap.
@@ -69,17 +78,32 @@ pub struct LaunchRequest {
     workspace: PathBuf,
     argv: Vec<String>,
     budget: Duration,
+    allowlist: Option<HostAllowlist>,
 }
 
 impl LaunchRequest {
-    /// A launch of `argv` over the node-allocated `workspace`, killed at `budget`.
+    /// A launch of `argv` over the node-allocated `workspace`, killed at `budget`, offline.
     #[must_use]
     pub const fn new(workspace: PathBuf, argv: Vec<String>, budget: Duration) -> Self {
         Self {
             workspace,
             argv,
             budget,
+            allowlist: None,
         }
+    }
+
+    /// The same launch behind an egress proxy allowing exactly `allowlist`.
+    #[must_use]
+    pub fn with_allowlist(mut self, allowlist: HostAllowlist) -> Self {
+        self.allowlist = Some(allowlist);
+        self
+    }
+
+    /// The host allowlist the admitted manifest named; `None` for an offline workload.
+    #[must_use]
+    pub const fn allowlist(&self) -> Option<&HostAllowlist> {
+        self.allowlist.as_ref()
     }
 
     /// The node-allocated workspace bound writable into the sandbox.
@@ -240,9 +264,14 @@ pub trait RunningWorkload: Send {
     /// The freezer for this workload's process tree, shared with the registry.
     fn freezer(&self) -> Arc<dyn WorkloadFreezer>;
 
+    /// The egress proxy this workload runs behind, if its manifest named an allowlist.
+    fn egress(&self) -> Option<Arc<AttemptEgress>> {
+        None
+    }
+
     /// Wait until the workload ends, enforcing its budget, and kill and reap it as soon as
-    /// `stop` is requested.
-    fn wait(self: Box<Self>, stop: &StopSignal) -> WorkloadExit;
+    /// `stop` is requested, calling `on_tick` between waits while it runs.
+    fn wait(self: Box<Self>, stop: &StopSignal, on_tick: &mut dyn FnMut()) -> WorkloadExit;
 }
 
 /// The bubblewrap launcher: an offline sandbox over the workspace (`ward-launch`).
@@ -266,10 +295,19 @@ impl SandboxLauncher {
 
 impl TaskLauncher for SandboxLauncher {
     fn launch(&self, request: &LaunchRequest) -> Result<Box<dyn RunningWorkload>, SpawnError> {
-        sandbox_launch(request)
+        let egress = request
+            .allowlist()
+            .map(|allowlist| {
+                let dir = egress_dir_beside(request.workspace()).ok_or(SpawnError::Refused)?;
+                AttemptEgress::start(&dir, allowlist)
+                    .map(Arc::new)
+                    .map_err(|_| SpawnError::Refused)
+            })
+            .transpose()?;
+        let launch = sandbox_launch(request, egress.as_deref().map(AttemptEgress::socket))
             .spawn()
-            .map(|running| Box::new(SandboxWorkload(running)) as Box<dyn RunningWorkload>)
-            .map_err(|_| SpawnError::Refused)
+            .map_err(|_| SpawnError::Refused)?;
+        Ok(Box::new(SandboxWorkload { launch, egress }))
     }
 
     fn end_survivor(&self, process: &WorkloadProcess) {
@@ -289,22 +327,29 @@ fn current_boot() -> Option<String> {
         .filter(|boot| !boot.is_empty())
 }
 
-fn sandbox_launch(request: &LaunchRequest) -> Launch {
-    Launch::new(request.workspace(), request.argv().to_vec())
+fn sandbox_launch(request: &LaunchRequest, proxy_socket: Option<&Path>) -> Launch {
+    let launch = Launch::new(request.workspace(), request.argv().to_vec())
         .budget(request.budget())
         .capture_bytes(OUTPUT_CAPTURE_BYTES)
-        .clear_env()
+        .clear_env();
+    match proxy_socket {
+        Some(socket) => launch.egress(socket).env(PROXY_SOCKET_ENV, PROXY_SOCKET),
+        None => launch,
+    }
 }
 
-struct SandboxWorkload(RunningLaunch);
+struct SandboxWorkload {
+    launch: RunningLaunch,
+    egress: Option<Arc<AttemptEgress>>,
+}
 
 impl RunningWorkload for SandboxWorkload {
     fn pid(&self) -> u32 {
-        self.0.id()
+        self.launch.id()
     }
 
     fn process(&self) -> Option<WorkloadProcess> {
-        let root = self.0.tree_root()?;
+        let root = self.launch.tree_root()?;
         Some(WorkloadProcess::new(
             root.pid(),
             root.start_time(),
@@ -314,14 +359,22 @@ impl RunningWorkload for SandboxWorkload {
 
     fn freezer(&self) -> Arc<dyn WorkloadFreezer> {
         Arc::new(SandboxFreezer {
-            root: self.0.tree_root(),
+            root: self.launch.tree_root(),
             frozen: Mutex::new(None),
             settle: DEFAULT_FREEZE_SETTLE,
+            egress: self.egress.clone(),
         })
     }
 
-    fn wait(self: Box<Self>, stop: &StopSignal) -> WorkloadExit {
-        match self.0.wait_stoppable(&|| stop.is_requested()) {
+    fn egress(&self) -> Option<Arc<AttemptEgress>> {
+        self.egress.clone()
+    }
+
+    fn wait(self: Box<Self>, stop: &StopSignal, on_tick: &mut dyn FnMut()) -> WorkloadExit {
+        match self
+            .launch
+            .wait_observed_stoppable(on_tick, &|| stop.is_requested())
+        {
             Ok(outcome) if outcome.stopped => WorkloadExit::Stopped,
             Ok(outcome) if outcome.timed_out => WorkloadExit::BudgetExceeded,
             Ok(outcome) => WorkloadExit::Exited { code: outcome.code },
@@ -330,19 +383,33 @@ impl RunningWorkload for SandboxWorkload {
     }
 }
 
-/// Freezes a sandbox's process tree by signal, rooted at its outer `bwrap`.
+/// Freezes a sandbox's process tree by signal, rooted at its outer `bwrap`, with its egress
+/// proxy paused for as long as the tree is stopped.
 #[derive(Debug)]
 struct SandboxFreezer {
     root: Option<TreeRoot>,
     frozen: Mutex<Option<FrozenTree>>,
     settle: Duration,
+    egress: Option<Arc<AttemptEgress>>,
+}
+
+impl SandboxFreezer {
+    fn pause_egress(&self, paused: bool) {
+        if let Some(egress) = &self.egress {
+            egress.set_paused(paused);
+        }
+    }
 }
 
 impl WorkloadFreezer for SandboxFreezer {
     fn freeze(&self) -> Result<(), FreezeUnconfirmed> {
         let root = self.root.ok_or(FreezeUnconfirmed)?;
         let mut frozen = self.frozen.lock().map_err(|_| FreezeUnconfirmed)?;
-        let tree = freeze_tree(root, self.settle).map_err(|_| FreezeUnconfirmed)?;
+        self.pause_egress(true);
+        let tree = freeze_tree(root, self.settle).map_err(|_| {
+            self.pause_egress(false);
+            FreezeUnconfirmed
+        })?;
         *frozen = Some(tree);
         Ok(())
     }
@@ -350,25 +417,29 @@ impl WorkloadFreezer for SandboxFreezer {
     fn thaw(&self) -> Result<(), FreezeUnconfirmed> {
         let mut frozen = self.frozen.lock().map_err(|_| FreezeUnconfirmed)?;
         let Some(tree) = frozen.as_ref() else {
+            self.pause_egress(false);
             return Ok(());
         };
         if !thaw_tree(tree, self.settle) {
             return Err(FreezeUnconfirmed);
         }
         *frozen = None;
+        self.pause_egress(false);
         Ok(())
     }
 }
 
 /// What a node needs to execute admitted tasks: its task root, its snapshot store and a
 /// launcher. A node built with it advertises `start`, `stop`, `pause` and `revoke` together
-/// at protocol 1.3.
+/// at protocol 1.3, and `network.proxy_allowlist` only when built
+/// [`Self::with_network_allowlist`].
 pub struct NodeExecution {
     task_root: TaskRoot,
     snapshots: SnapshotStore,
     launcher: Arc<dyn TaskLauncher>,
     stop_timeout: Duration,
     spawn_timeout: Duration,
+    network_allowlist: bool,
 }
 
 impl std::fmt::Debug for NodeExecution {
@@ -378,6 +449,7 @@ impl std::fmt::Debug for NodeExecution {
             .field("task_root", &self.task_root)
             .field("stop_timeout", &self.stop_timeout)
             .field("spawn_timeout", &self.spawn_timeout)
+            .field("network_allowlist", &self.network_allowlist)
             .finish_non_exhaustive()
     }
 }
@@ -397,6 +469,7 @@ impl NodeExecution {
             launcher,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
             spawn_timeout: DEFAULT_SPAWN_TIMEOUT,
+            network_allowlist: false,
         }
     }
 
@@ -405,6 +478,22 @@ impl NodeExecution {
     pub const fn with_stop_timeout(mut self, timeout: Duration) -> Self {
         self.stop_timeout = timeout;
         self
+    }
+
+    /// Whether this node honours a `network.custom` manifest, running its workload behind
+    /// a per-attempt egress proxy ([`crate::egress`]). Off, every such manifest is refused
+    /// `unsupported_grant` at `admit` and the node advertises `network.proxy_allowlist`
+    /// `false`.
+    #[must_use]
+    pub const fn with_network_allowlist(mut self, enabled: bool) -> Self {
+        self.network_allowlist = enabled;
+        self
+    }
+
+    /// Whether this node honours a `network.custom` manifest.
+    #[must_use]
+    pub const fn honours_network_allowlist(&self) -> bool {
+        self.network_allowlist
     }
 
     /// The task root workspaces are allocated under.
@@ -492,12 +581,44 @@ mod tests {
             vec!["true".into()],
             Duration::from_secs(1),
         );
-        let args = sandbox_launch(&request).args(Path::new("/tmp"));
+        let args = sandbox_launch(&request, None).args(Path::new("/tmp"));
         let clear = args.iter().position(|a| a == "--clearenv");
         let first_set = args.iter().position(|a| a == "--setenv");
         assert!(
             matches!((clear, first_set), (Some(c), Some(s)) if c < s),
             "{args:?}"
+        );
+        let joined = args.join(" ");
+        assert!(!joined.contains(PROXY_SOCKET), "{joined}");
+        assert!(!joined.contains(PROXY_SOCKET_ENV), "{joined}");
+    }
+
+    #[test]
+    fn an_allowlisted_launch_binds_only_the_proxy_socket_and_names_it() {
+        let request = LaunchRequest::new(
+            PathBuf::from("/tmp"),
+            vec!["true".into()],
+            Duration::from_secs(1),
+        )
+        .with_allowlist(HostAllowlist::new(vec!["github.com".to_owned()]).unwrap());
+        let args = sandbox_launch(&request, Some(Path::new("/host/x.egress/proxy.sock")))
+            .args(Path::new("/tmp"));
+        let joined = args.join(" ");
+        assert!(joined.starts_with("--clearenv "), "{joined}");
+        assert!(
+            joined.contains("--bind /host/x.egress/proxy.sock /run/ward/proxy.sock"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--setenv WARD_PROXY_SOCKET /run/ward/proxy.sock"),
+            "{joined}"
+        );
+        assert!(joined.contains("--unshare-net"), "{joined}");
+        assert!(!joined.contains("--relay"), "{joined}");
+        assert!(!joined.contains("HTTP_PROXY"), "{joined}");
+        assert_eq!(
+            request.allowlist().map(HostAllowlist::patterns),
+            Some(&["github.com".to_owned()][..])
         );
     }
 }

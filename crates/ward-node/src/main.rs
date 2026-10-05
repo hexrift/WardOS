@@ -1,8 +1,8 @@
 //! Local Ward node service executable.
 //!
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
-//! [--task-root <dir>] [--client-uid <uid>]… [--client-group <group>]` serves the local
-//! node protocol. `--node-id` is this node's
+//! [--task-root <dir>] [--network-allowlist] [--client-uid <uid>]… [--client-group <group>]`
+//! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
 //! admission version, revocation and retired-attempt stores, one record per registered task
 //! (`tasks`, from which a restarted node recovers its registry) and the node's snapshot
@@ -11,7 +11,10 @@
 //! trusted key is bound to the one issuing principal (`prn_…`) whose leases it may sign. With
 //! `--task-root` (created mode 0700, refused if group- or world-accessible) the node starts
 //! and stops admitted tasks in a bubblewrap sandbox over workspaces it allocates there; it
-//! refuses to run when the sandbox is unavailable. The socket is served to the node's own
+//! refuses to run when the sandbox is unavailable. With `--network-allowlist` as well, a
+//! manifest naming `network.custom` is honoured through a per-attempt egress proxy and the
+//! node advertises `network.proxy_allowlist`; without it such a manifest is refused
+//! `unsupported_grant`. The socket is served to the node's own
 //! uid and to each `--client-uid` (a uid or user name); every other peer is closed without
 //! a response. With `--client-group` the socket is created mode 0660 owned by that group,
 //! in a directory owned by it with mode 0750 or stricter, so a client of another uid can
@@ -72,6 +75,13 @@ struct Cli {
     /// workspace. With it the node starts and stops admitted tasks; without it, it does not.
     #[arg(long)]
     task_root: Option<PathBuf>,
+    /// Honour a manifest's `network.custom` host allowlist by running the workload behind a
+    /// node-owned egress proxy allowing exactly those hosts (private ranges and the metadata
+    /// endpoint always refused), and advertise `network.proxy_allowlist`. Needs
+    /// `--task-root`. Without it every `network.custom` manifest is refused
+    /// `unsupported_grant`.
+    #[arg(long, requires = "task_root")]
+    network_allowlist: bool,
     /// A uid, or user name, served on the socket besides the node's own; repeatable. Any
     /// other peer is closed without a response. Being served grants no authority: `admit`
     /// still needs a trusted signature.
@@ -197,7 +207,8 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 task_root,
                 open_snapshot_store(&state_dir)?,
                 Arc::new(SandboxLauncher),
-            ),
+            )
+            .with_network_allowlist(cli.network_allowlist),
         )?,
         None => NodeService::with_admission(capabilities, admission)?,
     };
@@ -364,10 +375,24 @@ mod tests {
             "--node-id",
             &node,
         ];
-        assert_eq!(Cli::try_parse_from(serve).expect("serve").task_root, None);
+        let cli = Cli::try_parse_from(serve).expect("serve");
+        assert_eq!(cli.task_root, None);
+        assert!(!cli.network_allowlist);
         let cli = Cli::try_parse_from(serve.iter().copied().chain(["--task-root", "t"]))
             .expect("serve with a task root");
         assert_eq!(cli.task_root, Some(PathBuf::from("t")));
+        assert!(!cli.network_allowlist);
+        let cli = Cli::try_parse_from(serve.iter().copied().chain([
+            "--task-root",
+            "t",
+            "--network-allowlist",
+        ]))
+        .expect("serve with a network allowlist");
+        assert!(cli.network_allowlist);
+        assert!(
+            Cli::try_parse_from(serve.iter().copied().chain(["--network-allowlist"])).is_err(),
+            "a network allowlist needs a task root"
+        );
 
         let cli = Cli::try_parse_from(["ward-node", "snapshot", "import", "--state-dir", "d", "p"])
             .expect("import");

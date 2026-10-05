@@ -117,8 +117,13 @@ For the node this means:
   runner, nothing more.
 - **Remote transport, enrolment, rotation.** There is none to test
   ([node-security-limitations.md](node-security-limitations.md) §3.1, #262).
-- **Network grants.** The suite proves a network manifest is refused and an offline
-  workload has no route off the host; no allowlist exists to prove.
+- **Network grants beyond the proxy's verdicts.** The suite proves a network manifest is
+  refused on a node without `--network-allowlist`, that an offline workload has no route
+  off the host, and that an allowlisted attempt's proxy allows exactly the listed hosts,
+  refuses the rest, is recorded, and pauses and stops with the attempt
+  (node-acceptance.md §2.2). It does not prove a transfer with a real upstream (the
+  allowed case accepts the proxy's `200` and `502` alike, and needs only name resolution
+  on the runner), an in-sandbox relay for `HTTP_PROXY` clients, or any credential (#267).
 - **Load, capacity, concurrency.** One workload at a time; the registry, pause and
   state-file bounds are unit-tested, not exercised under load (#260).
 - **Clock skew.** Envelopes are signed at the node's own clock.

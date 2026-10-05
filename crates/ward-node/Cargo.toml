@@ -26,6 +26,7 @@ ward-authority = { path = "../ward-authority", version = "0.18.0" }
 ward-events = { path = "../ward-events", version = "0.18.0" }
 ward-launch = { path = "../ward-launch", version = "0.18.0" }
 ward-node-protocol = { path = "../ward-node-protocol", version = "0.18.0" }
+ward-proxy = { path = "../ward-proxy", version = "0.18.0" }
 ward-snapshot = { path = "../ward-snapshot", version = "0.18.0" }
 
 [dev-dependencies]

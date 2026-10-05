@@ -140,7 +140,13 @@
 //! `exited` answers `exited` and spawns nothing.
 //!
 //! An executing registry is also the single writer of each admitted attempt's evidence log
-//! ([`crate::evidence`]). Every transition's evidence record is appended after its task
+//! ([`crate::evidence`]). A `start` admitted with a `network.custom` manifest, on a node
+//! whose execution honours one, launches behind the attempt's egress proxy
+//! ([`crate::egress`]); its reaper drains the proxy's verdicts between waits and the
+//! registry appends each as a `NetworkRequested` or `NetworkDenied` record, at most
+//! [`MAX_ATTEMPT_NETWORK_RECORDS`] per attempt, with one `ObservationsDropped` marker before
+//! the attempt's end record for every verdict past that bound or that the recorder or the
+//! log could not take. Every transition's evidence record is appended after its task
 //! record is written and before the verb is answered; an append that fails restores the
 //! task record and refuses the verb [`TaskLifecycleRejectionReason::ResourceUnavailable`]
 //! with nothing changed (`pause` and `resume` undo their freeze or thaw first). An `admit`
@@ -159,17 +165,19 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use ward_events::{
-    Blake3Hash, NodeAttemptEnd, NodeAttemptOutcome, NodeIntervention, TaskId, WardEvent,
+    Blake3Hash, NodeAttemptEnd, NodeAttemptOutcome, NodeIntervention, Pid, ProcessRef, TaskId,
+    WardEvent,
 };
 use ward_node_protocol::{
-    AdmissionEnvelopeJson, IssuerProof, OperationId, TaskAdmissionEnvelope, TaskBinding,
-    TaskExecutionOutcome, TaskExecutionReceipt, TaskLifecycleContext, TaskLifecycleRejectionReason,
-    TaskLifecycleRequest, TaskLifecycleResponse, TaskLifecycleState, TaskReceiptContext,
-    supports_task_admission,
+    AdmissionEnvelopeJson, IssuerProof, NetworkGrant, OperationId, TaskAdmissionEnvelope,
+    TaskBinding, TaskExecutionOutcome, TaskExecutionReceipt, TaskLifecycleContext,
+    TaskLifecycleRejectionReason, TaskLifecycleRequest, TaskLifecycleResponse, TaskLifecycleState,
+    TaskReceiptContext, supports_task_admission,
 };
 
 use crate::admission::TrustedTaskAdmission;
 use crate::admit::{NodeAdmission, VerifiedAdmission};
+use crate::egress::{AttemptEgress, DEFAULT_QUIESCE, Drained, overflow_marker};
 use crate::evidence::{AttemptEvidence, attempt_outcome, attempt_state};
 use crate::execution::{
     LaunchRequest, NodeExecution, SandboxLauncher, SpawnError, StopSignal, TaskLauncher,
@@ -191,6 +199,12 @@ pub const MAX_NODE_TASKS: usize = 1024;
 /// reached a new `pause` is refused [`TaskLifecycleRejectionReason::ResourceUnavailable`]
 /// rather than forgetting an id.
 pub const MAX_ATTEMPT_PAUSES: usize = 128;
+
+/// Upper bound on the egress proxy verdicts (`NetworkRequested`, `NetworkDenied`) one
+/// execution attempt records in its evidence log. Past it, verdicts are counted and surfaced
+/// as one `ObservationsDropped` marker before the attempt's end record, so the log's own
+/// bound ([`crate::evidence::MAX_EVIDENCE_LOG_BYTES`]) always leaves room for that record.
+pub const MAX_ATTEMPT_NETWORK_RECORDS: usize = 512;
 
 /// The shared task registry is unavailable: an earlier panic poisoned its lock.
 #[derive(Clone, Copy, Debug, Error)]
@@ -229,6 +243,14 @@ struct Attempt {
     stop_requested_by: Option<OperationId>,
     revoke_requested_by: Option<OperationId>,
     reaped: Arc<Reaped>,
+    network: NetworkTally,
+}
+
+/// How many egress verdicts an attempt has recorded, and how many it could not.
+#[derive(Clone, Copy, Debug, Default)]
+struct NetworkTally {
+    recorded: usize,
+    dropped: u64,
 }
 
 /// Set by an attempt's reaper once the attempt's terminal state is recorded.
@@ -409,6 +431,11 @@ impl TaskRegistry {
         execution: Option<NodeExecution>,
     ) -> Result<Self, TaskRecordError> {
         let store = TaskStore::open(admission.state().dir())?;
+        let admission = admission.with_network_allowlist(
+            execution
+                .as_ref()
+                .is_some_and(NodeExecution::honours_network_allowlist),
+        );
         let survivors: Arc<dyn TaskLauncher> = execution
             .as_ref()
             .map_or_else(|| Arc::new(SandboxLauncher), NodeExecution::launcher);
@@ -1034,12 +1061,17 @@ impl TaskRegistry {
                 | WorkspaceError::AttemptExists
                 | WorkspaceError::Io(_) => Reason::ResourceUnavailable,
             })?;
+        let request = LaunchRequest::new(
+            workspace,
+            workload.argv().args().to_vec(),
+            Duration::from_millis(workload.wall_clock_budget_ms()),
+        );
+        let request = match workload.capability_manifest().manifest().network() {
+            NetworkGrant::Offline => request,
+            NetworkGrant::Custom(allowlist) => request.with_allowlist(allowlist.clone()),
+        };
         Ok(Prepared::Launch(
-            LaunchRequest::new(
-                workspace,
-                workload.argv().args().to_vec(),
-                Duration::from_millis(workload.wall_clock_budget_ms()),
-            ),
+            request,
             execution.launcher(),
             execution.spawn_timeout(),
         ))
@@ -1098,8 +1130,15 @@ impl TaskRegistry {
                     reaper.reaped.set();
                     return;
                 }
-                let exit = workload.wait(&reaper.stop);
-                reaper.record(exit);
+                let egress = workload.egress();
+                let exit = workload.wait(&reaper.stop, &mut || {
+                    reaper.drain(egress.as_deref());
+                });
+                let last = egress.as_deref().map(|egress| {
+                    egress.quiesce(DEFAULT_QUIESCE);
+                    egress.drain()
+                });
+                reaper.record(exit, last);
             });
 
         let spawned = match thread {
@@ -1136,6 +1175,7 @@ impl TaskRegistry {
             stop_requested_by: None,
             revoke_requested_by: None,
             reaped: done,
+            network: NetworkTally::default(),
         });
         Ok(task.record_spawn(journal, evidence, operation_id, pid))
     }
@@ -1288,10 +1328,32 @@ impl TaskRegistry {
         context.rejected(Some(operation_id), binding, Reason::InvalidState)
     }
 
-    /// Record how a live attempt ended. The reaper has observed the end, so the in-memory
-    /// state changes whether or not its record can be written; a record that cannot be
-    /// written still reads as executing and recovers as `exited` with an `unknown` receipt.
-    fn record_exit(&mut self, binding: TaskBinding, reaped: &Arc<Reaped>, exit: WorkloadExit) {
+    /// Record the egress verdicts `drained` of the live attempt `reaped` belongs to, as its
+    /// reaper drained them from the attempt's proxy, up to the attempt's bound.
+    fn record_network(&mut self, binding: TaskBinding, reaped: &Arc<Reaped>, drained: Drained) {
+        let evidence = Evidence::of(self.execution.as_ref());
+        let Some(task) = self
+            .tasks
+            .get_mut(&binding.task())
+            .filter(|task| task.binding == binding && live(task.state))
+        else {
+            return;
+        };
+        task.record_network(evidence, reaped, drained);
+    }
+
+    /// Record how a live attempt ended, after the egress verdicts `last` its reaper drained
+    /// at the end and the gap marker they leave. The reaper has observed the end, so the
+    /// in-memory state changes whether or not its record can be written; a record that
+    /// cannot be written still reads as executing and recovers as `exited` with an `unknown`
+    /// receipt.
+    fn record_exit(
+        &mut self,
+        binding: TaskBinding,
+        reaped: &Arc<Reaped>,
+        exit: WorkloadExit,
+        last: Option<Drained>,
+    ) {
         let journal = Journal(self.store.as_ref());
         let evidence = Evidence::of(self.execution.as_ref());
         let Some(task) = self
@@ -1301,6 +1363,10 @@ impl TaskRegistry {
         else {
             return;
         };
+        if let Some(last) = last {
+            task.record_network(evidence, reaped, last);
+        }
+        task.record_network_gap(evidence, reaped);
         if task.finish_attempt(exit, reaped) {
             let _ = journal.write(&task.record());
             let _ = evidence.append(binding, task.ended_event(attempt_end(exit)));
@@ -1346,10 +1412,27 @@ struct Reaper {
 }
 
 impl Reaper {
-    fn record(self, exit: WorkloadExit) {
+    /// Hand the verdicts the attempt's proxy made since the last drain to the registry,
+    /// which records them; nothing to hand over costs no lock.
+    fn drain(&self, egress: Option<&AttemptEgress>) {
+        let Some(egress) = egress else {
+            return;
+        };
+        let drained = egress.drain();
+        if drained.is_empty() {
+            return;
+        }
+        if let Some(registry) = self.registry.upgrade()
+            && let Ok(mut registry) = registry.lock()
+        {
+            registry.record_network(self.binding, &self.reaped, drained);
+        }
+    }
+
+    fn record(self, exit: WorkloadExit, last: Option<Drained>) {
         if let Some(registry) = self.registry.upgrade() {
             if let Ok(mut registry) = registry.lock() {
-                registry.record_exit(self.binding, &self.reaped, exit);
+                registry.record_exit(self.binding, &self.reaped, exit, last);
             }
             self.reaped.set();
             drop(registry);
@@ -1600,6 +1683,66 @@ impl NodeTask {
             }),
             end,
             operation: operation.map(OperationId::get),
+        }
+    }
+
+    /// Append the egress verdicts `drained` of this task's attempt `reaped` belongs to, up to
+    /// [`MAX_ATTEMPT_NETWORK_RECORDS`]; every verdict past the bound, refused by the
+    /// recorder, unrepresentable or refused by the log is counted for the gap marker.
+    fn record_network(&mut self, evidence: Evidence<'_>, reaped: &Arc<Reaped>, drained: Drained) {
+        let binding = self.binding;
+        let Some(attempt) = self
+            .attempt
+            .as_mut()
+            .filter(|attempt| Arc::ptr_eq(&attempt.reaped, reaped))
+        else {
+            return;
+        };
+        let tally = &mut attempt.network;
+        tally.dropped = tally.dropped.saturating_add(drained.dropped);
+        let by = attempt
+            .pid
+            .and_then(|pid| Pid::new(pid).ok())
+            .map(|pid| ProcessRef { pid, comm: None });
+        for decision in drained.decisions {
+            let event = by.as_ref().and_then(|by| decision.event(by));
+            let appended = match event {
+                Some(event) if tally.recorded < MAX_ATTEMPT_NETWORK_RECORDS => {
+                    evidence.append(binding, event).is_ok()
+                }
+                _ => false,
+            };
+            if appended {
+                tally.recorded += 1;
+            } else {
+                tally.dropped = tally.dropped.saturating_add(1);
+            }
+        }
+    }
+
+    /// Append the one `ObservationsDropped` marker for the egress verdicts of this task's
+    /// attempt `reaped` belongs to that could not be recorded, if any.
+    fn record_network_gap(&mut self, evidence: Evidence<'_>, reaped: &Arc<Reaped>) {
+        let binding = self.binding;
+        let Some(attempt) = self
+            .attempt
+            .as_mut()
+            .filter(|attempt| Arc::ptr_eq(&attempt.reaped, reaped))
+        else {
+            return;
+        };
+        if attempt.network.dropped == 0 {
+            return;
+        }
+        let dropped = std::mem::take(&mut attempt.network.dropped);
+        if evidence
+            .append(
+                binding,
+                overflow_marker(dropped, MAX_ATTEMPT_NETWORK_RECORDS),
+            )
+            .is_err()
+        {
+            attempt.network.dropped = dropped;
         }
     }
 
@@ -2894,7 +3037,9 @@ mod tests {
         };
 
         use crate::execution::{NodeExecution, WorkloadExit};
-        use crate::task::{MAX_ATTEMPT_PAUSES, MAX_NODE_TASKS, TaskRegistry};
+        use crate::task::{
+            MAX_ATTEMPT_NETWORK_RECORDS, MAX_ATTEMPT_PAUSES, MAX_NODE_TASKS, TaskRegistry,
+        };
         use crate::test_support::{
             FAKE_PID, FakeFreeze, FakeLauncher, FakeSpawn, FakeStop, FixedClock, NOW,
             envelope_input, eventually, fake_process, fill_revocations, lifecycle_binding,
@@ -2917,7 +3062,12 @@ mod tests {
             }
 
             fn with_stop_timeout(stop_timeout: Duration) -> Self {
-                Self::build(tempfile::tempdir().unwrap(), MAX_NODE_TASKS, stop_timeout)
+                Self::build(
+                    tempfile::tempdir().unwrap(),
+                    MAX_NODE_TASKS,
+                    stop_timeout,
+                    false,
+                )
             }
 
             fn with_capacity(capacity: usize) -> Self {
@@ -2925,10 +3075,25 @@ mod tests {
                     tempfile::tempdir().unwrap(),
                     capacity,
                     Duration::from_secs(10),
+                    false,
                 )
             }
 
-            fn build(dir: tempfile::TempDir, capacity: usize, stop_timeout: Duration) -> Self {
+            fn with_network_allowlist() -> Self {
+                Self::build(
+                    tempfile::tempdir().unwrap(),
+                    MAX_NODE_TASKS,
+                    Duration::from_secs(10),
+                    true,
+                )
+            }
+
+            fn build(
+                dir: tempfile::TempDir,
+                capacity: usize,
+                stop_timeout: Duration,
+                network_allowlist: bool,
+            ) -> Self {
                 let state = dir.path().join("state");
                 let clock = FixedClock::at(NOW);
                 let admission = node_admission(&state, &clock);
@@ -2944,7 +3109,8 @@ mod tests {
                     snapshots,
                     Arc::new(launcher.clone()),
                 )
-                .with_stop_timeout(stop_timeout);
+                .with_stop_timeout(stop_timeout)
+                .with_network_allowlist(network_allowlist);
                 let tasks = Arc::new(Mutex::new(
                     TaskRegistry::with_execution(capacity, admission, execution).unwrap(),
                 ));
@@ -2965,7 +3131,7 @@ mod tests {
                     _dir: dir, tasks, ..
                 } = self;
                 drop(tasks);
-                Self::build(dir, MAX_NODE_TASKS, Duration::from_secs(10))
+                Self::build(dir, MAX_NODE_TASKS, Duration::from_secs(10), false)
             }
 
             fn serve(&self, request: TaskLifecycleRequest) -> TaskLifecycleResponse {
@@ -3101,6 +3267,210 @@ mod tests {
             assert_eq!(node.evidence(), vec![node.admitted_event(20, 1)]);
             assert!(!node.workspace().exists());
             assert!(node.launcher.launches().is_empty());
+        }
+
+        #[test]
+        fn a_node_enforcing_a_network_allowlist_admits_a_custom_grant_and_launches_with_it() {
+            let node = Node::with_network_allowlist();
+            let binding = lifecycle_binding();
+            node.ready_with(&node.envelope_with(network_manifest()));
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().accepted(op(30), binding, State::Running)
+            );
+            let launches = node.launcher.launches();
+            assert_eq!(launches.len(), 1);
+            assert_eq!(
+                launches[0]
+                    .allowlist()
+                    .map(ward_node_protocol::HostAllowlist::patterns),
+                Some(&["github.com".to_owned(), "*.crates.io".to_owned()][..])
+            );
+
+            let offline = Node::with_network_allowlist();
+            offline.running();
+            assert_eq!(offline.launcher.launches()[0].allowlist(), None);
+        }
+
+        fn ask_proxy(egress: &crate::egress::AttemptEgress, target: &str) -> String {
+            use std::io::{Read as _, Write as _};
+            use std::os::unix::io::AsRawFd as _;
+            let dir = std::fs::File::open(egress.socket().parent().unwrap()).unwrap();
+            let mut stream = std::os::unix::net::UnixStream::connect(format!(
+                "/proc/self/fd/{}/{}",
+                dir.as_raw_fd(),
+                crate::egress::PROXY_SOCKET_FILE
+            ))
+            .unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .write_all(
+                    format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes(),
+                )
+                .unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+            }
+            String::from_utf8_lossy(&head).into_owned()
+        }
+
+        fn network_records(events: &[WardEvent]) -> usize {
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        WardEvent::NetworkDenied { .. } | WardEvent::NetworkRequested { .. }
+                    )
+                })
+                .count()
+        }
+
+        #[test]
+        fn an_allowlisted_attempt_records_each_proxy_verdict_as_node_and_pauses_its_proxy() {
+            let node = Node::with_network_allowlist();
+            let binding = lifecycle_binding();
+            node.ready_with(&node.envelope_with(network_manifest()));
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().accepted(op(30), binding, State::Running)
+            );
+            let egress = node
+                .launcher
+                .egress()
+                .expect("an allowlisted launch has a proxy");
+            assert_eq!(
+                egress.socket(),
+                crate::egress::egress_dir(&node.root, binding)
+                    .join(crate::egress::PROXY_SOCKET_FILE)
+            );
+            assert!(ask_proxy(&egress, "10.0.0.1:80").starts_with("HTTP/1.1 403"));
+            eventually(|| network_records(&node.evidence()) == 1);
+
+            assert_eq!(
+                node.serve(ctx().pause(op(40), binding)),
+                ctx().accepted(op(40), binding, State::Paused)
+            );
+            assert!(egress.paused());
+            assert!(ask_proxy(&egress, "10.0.0.1:80").starts_with("HTTP/1.1 503"));
+            assert_eq!(
+                node.serve(ctx().resume(op(50), binding)),
+                ctx().accepted(op(50), binding, State::Running)
+            );
+            assert!(!egress.paused());
+            assert!(ask_proxy(&egress, "169.254.169.254:80").starts_with("HTTP/1.1 403"));
+            eventually(|| network_records(&node.evidence()) == 2);
+
+            assert_eq!(
+                node.serve(ctx().stop(op(60), binding)),
+                ctx().accepted(op(60), binding, State::Stopped)
+            );
+            assert!(!egress.socket().exists());
+            assert!(node.launcher.egress().is_none());
+            let events = node.evidence();
+            assert_eq!(events.len(), 7, "{events:?}");
+            assert!(matches!(events[1], WardEvent::NodeAttemptLaunched { .. }));
+            assert!(matches!(
+                &events[2],
+                WardEvent::NetworkDenied {
+                    dst: ward_events::DeniedDst::Ip { port: 80, .. },
+                    reason: ward_events::DenyReason::NotAllowlisted
+                }
+            ));
+            assert!(matches!(
+                events[3],
+                WardEvent::NodeAttemptIntervened {
+                    action: NodeIntervention::Pause,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                events[4],
+                WardEvent::NodeAttemptIntervened {
+                    action: NodeIntervention::Resume,
+                    ..
+                }
+            ));
+            assert!(matches!(events[5], WardEvent::NetworkDenied { .. }));
+            assert!(matches!(
+                events[6],
+                WardEvent::NodeAttemptEnded {
+                    end: NodeAttemptEnd::Killed,
+                    ..
+                }
+            ));
+            for record in node.evidence_log().records() {
+                assert_eq!(record.origin, ward_events::Origin::Node);
+            }
+        }
+
+        #[test]
+        fn proxy_verdicts_past_the_attempt_bound_are_one_marker_before_the_end_record() {
+            let node = Node::with_network_allowlist();
+            let binding = lifecycle_binding();
+            node.ready_with(&node.envelope_with(network_manifest()));
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().accepted(op(30), binding, State::Running)
+            );
+            let reaped = {
+                let registry = node.tasks.lock().unwrap();
+                Arc::clone(
+                    &registry.tasks[&binding.task()]
+                        .attempt
+                        .as_ref()
+                        .unwrap()
+                        .reaped,
+                )
+            };
+            let verdict = |index: u16| crate::egress::NetworkDecision {
+                at: std::time::SystemTime::now(),
+                host: ward_proxy::Host::Name("denied.example".to_owned()),
+                port: index,
+                allowed: false,
+                reason: "host is not on the session allowlist".to_owned(),
+            };
+            let drained = crate::egress::Drained {
+                decisions: (1..=600).map(verdict).collect(),
+                dropped: 3,
+            };
+            node.tasks
+                .lock()
+                .unwrap()
+                .record_network(binding, &reaped, drained);
+            assert_eq!(
+                network_records(&node.evidence()),
+                MAX_ATTEMPT_NETWORK_RECORDS
+            );
+
+            node.launcher.exit(WorkloadExit::Exited { code: Some(0) });
+            node.wait_for(State::Exited);
+            let events = node.evidence();
+            let last = events.len() - 1;
+            assert_eq!(network_records(&events), MAX_ATTEMPT_NETWORK_RECORDS);
+            assert_eq!(
+                events[last - 1],
+                crate::egress::overflow_marker(91, MAX_ATTEMPT_NETWORK_RECORDS)
+            );
+            assert!(matches!(
+                events[last],
+                WardEvent::NodeAttemptEnded {
+                    end: NodeAttemptEnd::Exited { code: Some(0) },
+                    ..
+                }
+            ));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, WardEvent::ObservationsDropped { .. }))
+                    .count(),
+                1
+            );
+            assert!(node.evidence_log().records().len() < 600);
         }
 
         #[test]
@@ -4164,7 +4534,7 @@ mod tests {
                 _dir: dir, tasks, ..
             } = node;
             drop(tasks);
-            let node = Node::build(dir, 1, Duration::from_secs(10));
+            let node = Node::build(dir, 1, Duration::from_secs(10), false);
             assert_eq!(
                 node.serve(ctx().seal(op(94), retry)),
                 ctx().accepted(op(94), retry, State::Sealed)

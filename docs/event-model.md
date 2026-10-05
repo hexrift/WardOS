@@ -35,7 +35,10 @@ pub struct EventRecord {
 `origin` is the single most important field. Only `Kernel`, `Proxy`, `Wardd`, `Verifier`,
 `TamperWard`, `User` and `Node` records are **enforcement facts**. `Node` (hash tag 8) is
 `ward-node`, the single writer of each execution attempt's evidence log (§3, ADR-0030 §3);
-it never appears in a session log. `Agent` records (from hooks and
+it never appears in a session log. An attempt log may also carry `NetworkRequested`,
+`NetworkDenied` and `ObservationsDropped` records with origin `Node`, when the node ran
+the attempt behind its own egress proxy (node-integration.md §9): the node records the
+proxy's verdicts itself, as the attempt's single writer. `Agent` records (from hooks and
 `ward-request`) are *claims*: useful for step-through UX and semantics, never used by
 `wardd` or the verifier to decide anything, and rendered with a distinct marker in the
 observer.

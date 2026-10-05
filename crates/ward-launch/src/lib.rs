@@ -282,6 +282,21 @@ impl RunningLaunch {
         self.wait_for_end(&mut || {}, stop)
     }
 
+    /// [`wait_stoppable`](Self::wait_stoppable), calling `on_tick` between child status
+    /// polls as [`wait_observed`](Self::wait_observed) does, so a caller can both drain
+    /// its observers while the child runs and end it on request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if waiting for the child fails.
+    pub fn wait_observed_stoppable(
+        self,
+        on_tick: &mut dyn FnMut(),
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Outcome> {
+        self.wait_for_end(on_tick, stop)
+    }
+
     fn wait_for_end(
         mut self,
         on_tick: &mut dyn FnMut(),

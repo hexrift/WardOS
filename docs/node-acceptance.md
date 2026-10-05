@@ -12,18 +12,20 @@ its real Unix socket by the shipped control-plane client, `ward-node-client`, an
 replay path by the `ward-node-adapter` process. Nothing is mocked: the sandbox is
 bubblewrap, the workloads are real processes, the evidence logs are the node's own files.
 
-The suite is [`crates/ward-node-client/tests/acceptance.rs`](../crates/ward-node-client/tests/acceptance.rs):
-one `#[test]` per case, named exactly as in the table below. The pass criterion of each
+The suite is [`crates/ward-node-client/tests/acceptance.rs`](../crates/ward-node-client/tests/acceptance.rs)
+and, for the network allowlist (§2.2),
+[`crates/ward-node-client/tests/acceptance_network.rs`](../crates/ward-node-client/tests/acceptance_network.rs):
+one `#[test]` per case, named exactly as in the tables below. The pass criterion of each
 case is written in the test file's `CASES` table and repeated here word for word; the
-test `every_acceptance_case_is_documented` fails when the two drift apart. A case that
-passes prints one verdict line:
+tests `every_acceptance_case_is_documented` and `every_network_acceptance_case_is_documented`
+fail when the two drift apart. A case that passes prints one verdict line:
 
 ```text
 acceptance <case>: PASS in <ms> ms -- <criterion>
 ```
 
-[`scripts/acceptance/node.sh`](../scripts/acceptance/node.sh) runs exactly these cases
-with isolation required (`WARD_REQUIRE_ISOLATION=1`, so a host without a working
+[`scripts/acceptance/node.sh`](../scripts/acceptance/node.sh) runs exactly these cases,
+from both files, with isolation required (`WARD_REQUIRE_ISOLATION=1`, so a host without a working
 bubblewrap fails instead of skipping), one case at a time so the verdict lines stay
 whole, and prints the verdicts (with the rest of the `cargo test` output, on stderr) and
 a summary table (on stdout, so it can be captured alone):
@@ -52,7 +54,8 @@ working bubblewrap), so a pull request cannot merge with one of them red.
 Together they cover the epic's completion gate: bounded execution (case 1), recovery
 (cases 5 and 8), authorization failure (case 6) and replay safety (cases 7 and 8), with
 isolation (case 2) and interruption (cases 3 to 5) as the cross-system properties the
-slice is named for.
+slice is named for. The network allowlist cases of §2.2 extend isolation and interruption
+to an attempt with egress.
 
 ### 2.1 How each case reads its result
 
@@ -89,6 +92,36 @@ for the diagnostics. The probes, each a hole if it fails:
 | `pid.host` | The test process's pid is not visible in the workload's `/proc`. |
 | `cwd` | The working directory is `/work`. |
 
+### 2.2 The network allowlist cases
+
+The cases of `acceptance_network.rs` start the node with `--network-allowlist`
+(node-integration.md §2.1) and admit a manifest `{"network":{"custom":["example.com"]}}`
+(§7.5). The workload then runs behind the attempt's own egress proxy (§9), bound at
+`/run/ward/proxy.sock` and named by `WARD_PROXY_SOCKET`.
+
+| Case | Pass criterion |
+| --- | --- |
+| `network_allowlist_lets_only_listed_hosts_out_through_the_proxy` | a workload admitted with network.custom reaches the allowlisted host through the proxy socket at /run/ward/proxy.sock named by WARD_PROXY_SOCKET, and is refused 403 for a non-listed host, a private literal, a loopback literal and the metadata endpoint by CONNECT and by forward; raw TCP, UDP and DNS have no path and the sandbox has only lo; the environment is exactly the contract's plus WARD_PROXY_SOCKET; the attempt completes and its sealed log records one NetworkRequested allow and five NetworkDenied with origin node and no ObservationsDropped |
+| `network_allowlist_proxy_pauses_resumes_and_stops_with_the_attempt` | while the attempt is paused its proxy answers 503 paused by ward and records nothing, after resume it decides and records again, and after stop the proxy socket is gone, nothing accepts on it and no workload process is left; the sealed log shows the verdicts around the two interventions in order |
+| `network_allowlist_is_advertised_and_honoured_only_when_enabled` | a node started without --network-allowlist reports network.proxy_allowlist false and refuses a network.custom manifest unsupported_grant with nothing materialised; the same node started with it reports network.offline and network.proxy_allowlist true at 1.3 |
+
+The first case's probe runs inside the sandbox and makes its verdict the workload's exit
+status, as the isolation probe does; the test then reads its rows from the workspace. The
+probes, each a hole if it fails:
+
+| Probe | Checks |
+| --- | --- |
+| `env.socket`, `env.keys`, `proxy.socket` | `WARD_PROXY_SOCKET` is `/run/ward/proxy.sock`, a socket; the environment has no key outside `HOME`, `PATH`, `TERM`, `PWD` and `WARD_PROXY_SOCKET`. |
+| `proxy.allowed` | `CONNECT example.com:443` through the socket is answered `200` (the tunnel opened) or `502` (the proxy allowed it and the upstream was unreachable): allowed by policy either way, never `403`. The proxy's verdict, recorded as `NetworkRequested`, is what the case proves; a reply from the host is not required. |
+| `proxy.denied.host`, `proxy.denied.private`, `proxy.denied.loopback`, `proxy.denied.metadata`, `proxy.denied.metadata_forward` | `CONNECT` to `denied.example:443`, `10.255.255.1:80`, `127.0.0.1:80` and `169.254.169.254:80`, and a forwarded `GET http://169.254.169.254/latest/meta-data/`, are each answered `403`. |
+| `net.raw_tcp`, `net.raw_udp`, `net.dns` | A raw TCP connect to `1.1.1.1:80` fails, a UDP datagram to `1.1.1.1:53` cannot be sent, and `example.com` does not resolve inside the sandbox: the proxy is the only path out. |
+| `net.interfaces` | `/proc/net/dev` lists only `lo`. |
+
+The second case drives the proxy from the host, as the node's uid, through the attempt's
+socket under `<task-root>/<task>/<attempt>.egress/`: `403` before the pause, `503 paused by
+ward` while paused with nothing recorded, `403` after resume, and no socket at all after
+`stop`. The third needs no workload.
+
 ## 3. Running it
 
 ```text
@@ -114,7 +147,12 @@ writable directory.
   one-liners and the beating and probing workloads are Python programs with no
   dependencies beyond the standard library.
 - A readable `/proc`: the cases count workload processes by marker there.
-- No network is needed; the network probes expect connects to fail.
+- No network is needed by the main suite; its network probes expect connects to fail. The
+  network allowlist's allowed-host case (§2.2) needs the host to resolve `example.com`
+  (the proxy resolves the allowlisted name on the host before it decides); without name
+  resolution that one case skips, or fails under `WARD_REQUIRE_ISOLATION=1`. Whether the
+  host can then reach `example.com` does not matter: the case accepts the proxy's `200`
+  and its `502` alike, because the verdict, not the reply, is what it proves.
 
 ### 3.2 Time bounds
 
@@ -129,9 +167,10 @@ minute on a developer machine; each case prints its own time.
 
 - **No remote transport.** The only transport is the local Unix socket; nothing here
   exercises mTLS, key bootstrap or a control plane on another host (#262).
-- **No network grants.** Every workload runs offline. The suite proves a manifest asking
-  for network is refused and that an offline workload has no route off the host; it does
-  not prove an allowlist, because the node enforces none yet (node-integration.md §7.5).
+- **No loopback relay and no credential.** The network cases prove the proxy's verdicts,
+  its recording and its lifecycle through the Unix socket the sandbox is handed; they do
+  not prove a workload tool that only speaks `HTTP_PROXY` can use it (the node path has no
+  in-sandbox relay yet, node-integration.md §9), and no credential is injected (#267).
 - **No workspace export and no output.** What the workload wrote is read on the host as
   the node's uid, which a remote control plane cannot do; the protocol carries neither.
 - **No escape attempt beyond the probes.** The isolation case is a contract check of what

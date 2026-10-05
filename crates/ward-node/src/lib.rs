@@ -22,7 +22,9 @@
 //!   refused every one of these verbs as unsupported.
 //!   Only such a node also advertises, at 1.3, the isolation its execution enforces: the
 //!   namespace sandbox and its user namespace, the offline network and the
-//!   content-addressed snapshot store.
+//!   content-addressed snapshot store — and `network.proxy_allowlist` only when its
+//!   execution honours a `network.custom` manifest through a per-attempt egress proxy
+//!   ([`egress`]), which is what makes `admit` accept one.
 //!
 //! A service built with admission keeps its task registry durable under the node state
 //! directory ([`records`]) and recovers it before it serves (see [`task`]), so a restart
@@ -54,6 +56,7 @@
 pub mod admission;
 pub mod admit;
 pub mod audit;
+pub mod egress;
 pub mod evidence;
 pub mod execution;
 pub mod issuer;
@@ -166,6 +169,7 @@ pub struct NodeService {
     supported: SupportedProtocolRange,
     admits: bool,
     executes: bool,
+    network_allowlist: bool,
     tasks: Arc<Mutex<TaskRegistry>>,
 }
 
@@ -184,6 +188,7 @@ impl NodeService {
             supported: WARD_NODE_PROTOCOL,
             admits: false,
             executes: false,
+            network_allowlist: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::default())),
         })
     }
@@ -207,6 +212,7 @@ impl NodeService {
             supported: WARD_NODE_PROTOCOL,
             admits: true,
             executes: false,
+            network_allowlist: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_admission(
                 MAX_NODE_TASKS,
                 admission,
@@ -230,11 +236,13 @@ impl NodeService {
     ) -> Result<Self, NodeServiceError> {
         CapabilityDiscoveryContext::new(capabilities.protocol())
             .map_err(|_| NodeServiceError::InvalidCapabilities)?;
+        let network_allowlist = execution.honours_network_allowlist();
         Ok(Self {
             capabilities,
             supported: WARD_NODE_PROTOCOL,
             admits: true,
             executes: true,
+            network_allowlist,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_execution(
                 MAX_NODE_TASKS,
                 admission,
@@ -325,6 +333,7 @@ impl NodeService {
                 user_namespace: self.executes,
             };
             network.offline = self.executes;
+            network.proxy_allowlist = self.executes && self.network_allowlist;
             snapshots.content_addressed = self.executes;
             LifecycleCapabilities {
                 admit: self.admits,
@@ -1565,6 +1574,18 @@ mod tests {
     }
 
     fn executing_service_with(configured: NodeCapabilities, stop_timeout: Duration) -> Executing {
+        executing_service_built(configured, stop_timeout, false)
+    }
+
+    fn executing_service_enforcing_a_network_allowlist() -> Executing {
+        executing_service_built(capabilities(), crate::execution::DEFAULT_STOP_TIMEOUT, true)
+    }
+
+    fn executing_service_built(
+        configured: NodeCapabilities,
+        stop_timeout: Duration,
+        network_allowlist: bool,
+    ) -> Executing {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         let clock = crate::test_support::FixedClock::at(crate::test_support::NOW);
@@ -1580,7 +1601,8 @@ mod tests {
             snapshots,
             Arc::new(launcher.clone()),
         )
-        .with_stop_timeout(stop_timeout);
+        .with_stop_timeout(stop_timeout)
+        .with_network_allowlist(network_allowlist);
         let service = NodeService::with_execution(configured, admission, execution).unwrap();
         Executing {
             _dir: dir,
@@ -1863,6 +1885,37 @@ mod tests {
             assert_eq!(observed.isolation(), IsolationCapabilities::default());
             assert_eq!(observed.network(), NetworkCapabilities::default());
             assert_eq!(observed.snapshots(), SnapshotCapabilities::default());
+        }
+    }
+
+    #[test]
+    fn proxy_allowlist_is_advertised_only_by_an_executing_node_enforcing_one_at_one_three() {
+        let enforcing = executing_service_enforcing_a_network_allowlist();
+        let executing = executing_service();
+        let observed = discovered(&enforcing.service, 3).1;
+        assert_eq!(
+            observed.network(),
+            NetworkCapabilities {
+                offline: true,
+                proxy_allowlist: true,
+            }
+        );
+        assert!(
+            !discovered(&executing.service, 3)
+                .1
+                .network()
+                .proxy_allowlist
+        );
+        for minor in [1, 2] {
+            assert_eq!(
+                discovered(&enforcing.service, minor).0,
+                discovered(&executing.service, minor).0,
+                "1.{minor}"
+            );
+            assert_eq!(
+                discovered(&enforcing.service, minor).1.network(),
+                capabilities().network()
+            );
         }
     }
 

@@ -405,7 +405,7 @@ impl AttemptEvidence {
     }
 }
 
-fn private_dir(dir: &Path) -> Result<(), EvidenceError> {
+pub(crate) fn private_dir(dir: &Path) -> Result<(), EvidenceError> {
     match DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
