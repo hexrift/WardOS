@@ -69,6 +69,31 @@ pub enum NodeStateError {
     RevocationConflict,
 }
 
+/// Open (creating mode 0700 if absent) the private node state directory `dir`, without
+/// reading or pinning anything in it.
+///
+/// # Errors
+///
+/// Returns [`NodeStateError`] when `dir` is not a real directory or is accessible to
+/// group or others.
+pub fn open_private_dir(dir: &Path) -> Result<(), NodeStateError> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.is_dir() {
+        return Err(NodeStateError::NotADirectory);
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(NodeStateError::InsecureDirectory);
+    }
+    Ok(())
+}
+
 /// Durable, file-based node state: pinned identity, admission versions and revocations.
 #[derive(Debug)]
 pub struct NodeState {
@@ -87,20 +112,7 @@ impl NodeState {
     /// Returns [`NodeStateError`] when the directory is unsafe, pinned to another node or
     /// holds an invalid state file.
     pub fn open(dir: &Path, node: NodeId) -> Result<Self, NodeStateError> {
-        match std::fs::symlink_metadata(dir) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        let metadata = std::fs::symlink_metadata(dir)?;
-        if !metadata.is_dir() {
-            return Err(NodeStateError::NotADirectory);
-        }
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(NodeStateError::InsecureDirectory);
-        }
+        open_private_dir(dir)?;
 
         match read_state_file(dir, NODE_ID_FILE)? {
             Some(text) => {

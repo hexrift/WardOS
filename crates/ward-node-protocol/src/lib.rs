@@ -2,11 +2,12 @@
 //! local or remote clients.
 //!
 //! Protocol 1.0 negotiates a version, 1.1 adds read-only capability discovery, 1.2 adds
-//! the identity-only task lifecycle, and 1.3 adds the signed admission envelope (`admit`)
-//! and the `exited` state of ADR-0030. Issuer verification is the node's (`ward-node`);
-//! execution and transport authentication belong to later slices of #324 and #262. A 1.3
-//! capability document may advertise `admit`. Incompatible peers fail closed
-//! rather than falling back to the per-session ward-daemon control protocol.
+//! the identity-only task lifecycle, and 1.3 adds the signed admission envelope (`admit`),
+//! the `exited` state and the receipt outcome on `inspect` of ADR-0030. Issuer
+//! verification and execution are the node's (`ward-node`); transport authentication
+//! belongs to #262. A 1.3 capability document may advertise `admit`, and `start` and
+//! `stop` only together. Incompatible peers fail closed rather than falling back to the
+//! per-session ward-daemon control protocol.
 
 #![forbid(unsafe_code)]
 
@@ -413,6 +414,11 @@ pub struct LifecycleCapabilities {
     /// document carries it only when it is `true`.
     #[serde(default)]
     pub admit: bool,
+    /// Admitted tasks can be started (`start`). Protocol 1.3 and later only, and only
+    /// together with `stop`: a 1.3 document advertises both or neither, carrying
+    /// `"start":true` only when it is `true`; an earlier document never carries it.
+    #[serde(default)]
+    pub start: bool,
 }
 
 /// Trusted, read-only node facts exposed after a compatible handshake.
@@ -456,6 +462,12 @@ impl NodeCapabilities {
         }
         if lifecycle.admit && !supports_task_admission(protocol) {
             return Err(NodeCapabilitiesError::ProtocolDoesNotSupportAdmission);
+        }
+        if lifecycle.start && !supports_task_admission(protocol) {
+            return Err(NodeCapabilitiesError::ProtocolDoesNotSupportExecution);
+        }
+        if supports_task_admission(protocol) && lifecycle.start != lifecycle.stop {
+            return Err(NodeCapabilitiesError::UnpairedStartAndStop);
         }
 
         Ok(Self {
@@ -533,6 +545,11 @@ pub enum NodeCapabilitiesError {
     ProtocolDoesNotSupportDiscovery,
     /// `admit` was advertised under a protocol version that predates task admission.
     ProtocolDoesNotSupportAdmission,
+    /// `start` was advertised under a protocol version that predates node execution.
+    ProtocolDoesNotSupportExecution,
+    /// A protocol 1.3 or later document advertised `start` without `stop`, or `stop`
+    /// without `start`.
+    UnpairedStartAndStop,
 }
 
 impl Display for NodeCapabilitiesError {
@@ -543,6 +560,12 @@ impl Display for NodeCapabilitiesError {
             }
             Self::ProtocolDoesNotSupportAdmission => {
                 formatter.write_str("protocol version does not support task admission")
+            }
+            Self::ProtocolDoesNotSupportExecution => {
+                formatter.write_str("protocol version does not support task execution")
+            }
+            Self::UnpairedStartAndStop => {
+                formatter.write_str("start and stop must be advertised together")
             }
         }
     }
@@ -562,6 +585,12 @@ struct LifecycleCapabilitiesWire {
         deserialize_with = "deserialize_present_bool"
     )]
     admit: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_bool"
+    )]
+    start: Option<bool>,
 }
 
 fn deserialize_present_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
@@ -587,11 +616,8 @@ struct NodeCapabilitiesWire {
 
 impl NodeCapabilitiesWire {
     fn into_capabilities(self) -> Option<NodeCapabilities> {
-        let admit = match (supports_task_admission(self.protocol), self.lifecycle.admit) {
-            (true, admit) => admit.unwrap_or(false),
-            (false, None) => false,
-            (false, Some(_)) => return None,
-        };
+        let admit = one_three_flag(self.protocol, self.lifecycle.admit)?;
+        let start = one_three_flag(self.protocol, self.lifecycle.start)?;
         NodeCapabilities::new(
             self.protocol,
             self.architecture,
@@ -606,9 +632,19 @@ impl NodeCapabilitiesWire {
                 stop: self.lifecycle.stop,
                 revoke: self.lifecycle.revoke,
                 admit,
+                start,
             },
         )
         .ok()
+    }
+}
+
+/// A lifecycle flag that only protocol 1.3 and later documents may carry.
+const fn one_three_flag(protocol: ProtocolVersion, flag: Option<bool>) -> Option<bool> {
+    match (supports_task_admission(protocol), flag) {
+        (true, Some(flag)) => Some(flag),
+        (_, None) => Some(false),
+        (false, Some(_)) => None,
     }
 }
 
@@ -631,6 +667,7 @@ impl Serialize for NodeCapabilities {
                 stop: self.lifecycle.stop,
                 revoke: self.lifecycle.revoke,
                 admit: self.lifecycle.admit.then_some(true),
+                start: self.lifecycle.start.then_some(true),
             },
         }
         .serialize(serializer)
@@ -1291,6 +1328,9 @@ pub enum TaskLifecycleResponse {
         binding: TaskBinding,
         /// The task's current lifecycle state.
         state: TaskLifecycleState,
+        /// The outcome of the attempt's execution receipt, for an `exited` or `stopped`
+        /// task that has one. Protocol 1.3 and later only.
+        outcome: Option<TaskExecutionOutcome>,
     },
     /// The task's event stream is ready starting from a given sequence number.
     StreamReady {
@@ -1330,6 +1370,27 @@ impl TaskLifecycleResponse {
             Self::StreamReady { .. } | Self::Rejected { .. } => None,
         }
     }
+
+    const fn outcome_supported(self) -> bool {
+        match self {
+            Self::Inspected {
+                protocol,
+                state,
+                outcome: Some(_),
+                ..
+            } => supports_outcome(protocol, state),
+            _ => true,
+        }
+    }
+}
+
+/// Whether an inspect response at `protocol` may carry a receipt outcome for `state`.
+const fn supports_outcome(protocol: ProtocolVersion, state: TaskLifecycleState) -> bool {
+    supports_task_admission(protocol)
+        && matches!(
+            state,
+            TaskLifecycleState::Exited | TaskLifecycleState::Stopped
+        )
 }
 
 impl Serialize for TaskLifecycleResponse {
@@ -1340,6 +1401,9 @@ impl Serialize for TaskLifecycleResponse {
         if let Some(state) = self.state()
             && !supports_state(self.protocol(), state)
         {
+            return Err(S::Error::custom(TaskLifecycleError::UnsupportedByProtocol));
+        }
+        if !self.outcome_supported() {
             return Err(S::Error::custom(TaskLifecycleError::UnsupportedByProtocol));
         }
         TaskLifecycleResponseWire::from(*self).serialize(serializer)
@@ -1359,6 +1423,12 @@ enum TaskLifecycleResponseWire {
         protocol: ProtocolVersion,
         binding: TaskBinding,
         state: TaskLifecycleState,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_present_outcome"
+        )]
+        outcome: Option<TaskExecutionOutcome>,
     },
     StreamReady {
         protocol: ProtocolVersion,
@@ -1371,6 +1441,15 @@ enum TaskLifecycleResponseWire {
         binding: TaskBinding,
         reason: TaskLifecycleRejectionReason,
     },
+}
+
+fn deserialize_present_outcome<'de, D>(
+    deserializer: D,
+) -> Result<Option<TaskExecutionOutcome>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    TaskExecutionOutcome::deserialize(deserializer).map(Some)
 }
 
 impl From<TaskLifecycleResponse> for TaskLifecycleResponseWire {
@@ -1391,10 +1470,12 @@ impl From<TaskLifecycleResponse> for TaskLifecycleResponseWire {
                 protocol,
                 binding,
                 state,
+                outcome,
             } => Self::Inspected {
                 protocol,
                 binding,
                 state,
+                outcome,
             },
             TaskLifecycleResponse::StreamReady {
                 protocol,
@@ -1438,10 +1519,12 @@ impl From<TaskLifecycleResponseWire> for TaskLifecycleResponse {
                 protocol,
                 binding,
                 state,
+                outcome,
             } => Self::Inspected {
                 protocol,
                 binding,
                 state,
+                outcome,
             },
             TaskLifecycleResponseWire::StreamReady {
                 protocol,
@@ -1691,7 +1774,32 @@ impl TaskLifecycleContext {
             protocol: self.protocol,
             binding,
             state,
+            outcome: None,
         }
+    }
+
+    /// Build a [`TaskLifecycleResponse::Inspected`] carrying the outcome of the attempt's
+    /// execution receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLifecycleError::UnsupportedByProtocol`] before protocol 1.3, or for a
+    /// state other than [`TaskLifecycleState::Exited`] or [`TaskLifecycleState::Stopped`].
+    pub const fn inspected_with_outcome(
+        self,
+        binding: TaskBinding,
+        state: TaskLifecycleState,
+        outcome: TaskExecutionOutcome,
+    ) -> Result<TaskLifecycleResponse, TaskLifecycleError> {
+        if !supports_outcome(self.protocol, state) {
+            return Err(TaskLifecycleError::UnsupportedByProtocol);
+        }
+        Ok(TaskLifecycleResponse::Inspected {
+            protocol: self.protocol,
+            binding,
+            state,
+            outcome: Some(outcome),
+        })
     }
 
     /// Build a [`TaskLifecycleResponse::StreamReady`] bound to this context's protocol.
@@ -1735,6 +1843,9 @@ impl TaskLifecycleContext {
         if let Some(state) = response.state()
             && !supports_state(self.protocol, state)
         {
+            return Err(TaskLifecycleError::MalformedMessage);
+        }
+        if !response.outcome_supported() {
             return Err(TaskLifecycleError::MalformedMessage);
         }
         if response.protocol() != self.protocol {
@@ -1966,6 +2077,7 @@ mod tests {
                 stop: false,
                 revoke: false,
                 admit: false,
+                start: false,
             },
         )
         .unwrap()
@@ -2006,6 +2118,7 @@ mod tests {
                 stop: true,
                 revoke: true,
                 admit: false,
+                start: false,
             },
         )
         .unwrap()
@@ -2760,5 +2873,220 @@ mod tests {
             "a 1.3 capability document must not advertise admission or execution"
         );
         assert!(one_three.decode_response(&new).is_ok());
+    }
+
+    fn capabilities_with_lifecycle(
+        minor: u16,
+        lifecycle: LifecycleCapabilities,
+    ) -> Result<NodeCapabilities, NodeCapabilitiesError> {
+        let base = minimal_capabilities();
+        NodeCapabilities::new(
+            ProtocolVersion::new(1, minor),
+            base.architecture(),
+            base.capacity(),
+            base.isolation(),
+            base.network(),
+            base.credentials(),
+            base.snapshots(),
+            base.verifier(),
+            lifecycle,
+        )
+    }
+
+    fn executing(start: bool, stop: bool) -> LifecycleCapabilities {
+        LifecycleCapabilities {
+            stop,
+            start,
+            ..LifecycleCapabilities::default()
+        }
+    }
+
+    #[test]
+    fn start_is_advertised_only_at_one_three_and_only_paired_with_stop() {
+        for minor in [1, 2] {
+            assert_eq!(
+                capabilities_with_lifecycle(minor, executing(true, true)),
+                Err(NodeCapabilitiesError::ProtocolDoesNotSupportExecution)
+            );
+            assert!(capabilities_with_lifecycle(minor, executing(false, true)).is_ok());
+        }
+        for (start, stop) in [(true, false), (false, true)] {
+            assert_eq!(
+                capabilities_with_lifecycle(3, executing(start, stop)),
+                Err(NodeCapabilitiesError::UnpairedStartAndStop),
+                "start={start} stop={stop}"
+            );
+        }
+        assert!(capabilities_with_lifecycle(3, executing(true, true)).is_ok());
+        assert!(capabilities_with_lifecycle(3, executing(false, false)).is_ok());
+    }
+
+    #[test]
+    fn one_three_capability_document_carries_start_with_stop() {
+        let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let executes = capabilities_with_lifecycle(3, executing(true, true)).unwrap();
+        let response = context.response(executes).unwrap();
+        let json = serde_json::to_string(&response).unwrap();
+        let expected = minimal_capabilities_json(3, r#","start":true"#).replace(
+            r#""pause":false,"stop":false"#,
+            r#""pause":false,"stop":true"#,
+        );
+        assert_eq!(json, expected);
+        let decoded = context.decode_response(&json).unwrap();
+        assert_eq!(decoded, response);
+        let CapabilityDiscoveryResponse::Capabilities { capabilities } = decoded;
+        assert!(capabilities.lifecycle().start && capabilities.lifecycle().stop);
+
+        let stop_only = minimal_capabilities_json(3, "").replace(
+            r#""pause":false,"stop":false"#,
+            r#""pause":false,"stop":true"#,
+        );
+        for raw in [
+            stop_only,
+            minimal_capabilities_json(3, r#","start":true"#),
+            minimal_capabilities_json(3, r#","start":null"#),
+            minimal_capabilities_json(3, r#","start":1"#),
+        ] {
+            assert_eq!(
+                context.decode_response(&raw),
+                Err(CapabilityDiscoveryError::MalformedMessage),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            context.decode_response(&minimal_capabilities_json(3, r#","start":false"#)),
+            context.response(capabilities_at(3, false))
+        );
+    }
+
+    #[test]
+    fn one_one_and_one_two_capability_documents_never_carry_start() {
+        for minor in [1, 2] {
+            let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, minor)).unwrap();
+            for tail in [r#","start":false"#, r#","start":true"#] {
+                assert_eq!(
+                    context.decode_response(&minimal_capabilities_json(minor, tail)),
+                    Err(CapabilityDiscoveryError::MalformedMessage),
+                    "a 1.{minor} document must not carry start"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_three_inspect_carries_the_receipt_outcome_of_a_finished_task() {
+        let context = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let binding = lifecycle_binding();
+        for (state, outcome, wire_state, wire_outcome) in [
+            (
+                TaskLifecycleState::Exited,
+                TaskExecutionOutcome::Completed,
+                "exited",
+                "completed",
+            ),
+            (
+                TaskLifecycleState::Exited,
+                TaskExecutionOutcome::Unknown,
+                "exited",
+                "unknown",
+            ),
+            (
+                TaskLifecycleState::Stopped,
+                TaskExecutionOutcome::Failed,
+                "stopped",
+                "failed",
+            ),
+        ] {
+            let response = context
+                .inspected_with_outcome(binding, state, outcome)
+                .unwrap();
+            let expected = format!(
+                r#"{{"response":"inspected","protocol":{{"major":1,"minor":3}},{BOUND_BINDING},"state":"{wire_state}","outcome":"{wire_outcome}"}}"#
+            );
+            assert_eq!(serde_json::to_string(&response).unwrap(), expected);
+            assert_eq!(context.decode_response(&expected).unwrap(), response);
+            assert_ne!(response, context.inspected(binding, state));
+        }
+    }
+
+    #[test]
+    fn inspect_outcome_is_refused_before_one_three_and_for_unfinished_states() {
+        let one_three = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let one_two = TaskLifecycleContext::new(ProtocolVersion::new(1, 2)).unwrap();
+        let binding = lifecycle_binding();
+        let outcome = TaskExecutionOutcome::Completed;
+
+        assert_eq!(
+            one_two.inspected_with_outcome(binding, TaskLifecycleState::Stopped, outcome),
+            Err(TaskLifecycleError::UnsupportedByProtocol)
+        );
+        for state in [
+            TaskLifecycleState::Created,
+            TaskLifecycleState::Ready,
+            TaskLifecycleState::Running,
+            TaskLifecycleState::Paused,
+            TaskLifecycleState::Revoked,
+            TaskLifecycleState::Sealed,
+        ] {
+            assert_eq!(
+                one_three.inspected_with_outcome(binding, state, outcome),
+                Err(TaskLifecycleError::UnsupportedByProtocol),
+                "{state:?}"
+            );
+        }
+
+        let forged = TaskLifecycleResponse::Inspected {
+            protocol: ProtocolVersion::new(1, 2),
+            binding,
+            state: TaskLifecycleState::Stopped,
+            outcome: Some(outcome),
+        };
+        assert!(serde_json::to_string(&forged).is_err());
+        let running = TaskLifecycleResponse::Inspected {
+            protocol: ProtocolVersion::new(1, 3),
+            binding,
+            state: TaskLifecycleState::Running,
+            outcome: Some(outcome),
+        };
+        assert!(serde_json::to_string(&running).is_err());
+
+        for (context, raw) in [
+            (
+                one_two,
+                format!(
+                    r#"{{"response":"inspected","protocol":{{"major":1,"minor":2}},{BOUND_BINDING},"state":"stopped","outcome":"failed"}}"#
+                ),
+            ),
+            (
+                one_three,
+                format!(
+                    r#"{{"response":"inspected","protocol":{{"major":1,"minor":3}},{BOUND_BINDING},"state":"running","outcome":"failed"}}"#
+                ),
+            ),
+            (
+                one_three,
+                format!(
+                    r#"{{"response":"inspected","protocol":{{"major":1,"minor":3}},{BOUND_BINDING},"state":"exited","outcome":null}}"#
+                ),
+            ),
+            (
+                one_three,
+                format!(
+                    r#"{{"response":"inspected","protocol":{{"major":1,"minor":3}},{BOUND_BINDING},"state":"exited","outcome":"possibly_completed"}}"#
+                ),
+            ),
+            (
+                one_three,
+                format!(
+                    r#"{{"response":"accepted","protocol":{{"major":1,"minor":3}},"operation_id":11,{BOUND_BINDING},"state":"exited","outcome":"completed"}}"#
+                ),
+            ),
+        ] {
+            assert_eq!(
+                context.decode_response(&raw),
+                Err(TaskLifecycleError::MalformedMessage),
+                "{raw}"
+            );
+        }
     }
 }
