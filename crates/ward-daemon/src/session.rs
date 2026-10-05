@@ -845,7 +845,7 @@ impl Session {
             })
             .collect();
         let mut egress = Egress::start(&run_dir, &self.manifest.network, routes)?;
-        egress.watch_marker(pause::marker_path(&self.state, &self.session_str));
+        egress.watch_marker(pause::marker_path(&self.state, &self.session_str))?;
         egress.watch_revocations(crate::revoke::dir_path(&self.state, &self.session_str));
         observers.set_egress(egress);
         observers.set_hooks(Hooks::start_with(
@@ -3503,6 +3503,7 @@ mod tests {
         let err = session
             .record_termination(&pause::Termination {
                 ended: 1,
+                method: ward_events::PauseMethod::Sigstop,
                 remaining: Some(pause::Frozen {
                     method: ward_events::PauseMethod::Sigstop,
                     pids: vec![999_999],
@@ -3554,6 +3555,7 @@ mod tests {
                 );
                 pause::Termination {
                     ended: 1,
+                    method: ward_events::PauseMethod::Sigstop,
                     remaining: Some(pause::Frozen {
                         method: ward_events::PauseMethod::Sigstop,
                         pids: vec![999_999],
@@ -3593,6 +3595,7 @@ mod tests {
         let err = session
             .record_termination(&pause::Termination {
                 ended: 2,
+                method: ward_events::PauseMethod::Sigstop,
                 remaining: Some(pause::Frozen {
                     method: ward_events::PauseMethod::Sigstop,
                     pids: Vec::new(),

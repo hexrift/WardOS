@@ -140,9 +140,28 @@ sandbox running, unobserved: a log-only closure presented as a stop. Now:
   it. A client's retry observes the reconciled state; `ward pause --status` reads
   `unconfirmed` while an intent has no outcome.
 
+* **Per-component acknowledgement (#145 item 3).** A pause is confirmed by every
+  component that must hold, not by process quiescence alone. After the freeze settles,
+  the daemon collects a bounded acknowledgement from the egress proxy (each egress
+  registers under `sessions/<id>/proxies/` and rewrites its state as the marker flips
+  it; the daemon waits up to `acks::ACK_TIMEOUT` for every live registration to read
+  `paused`), from the approvals (hold applied, decision clocks standing) and from
+  credential mediation (no grant still exercisable), in that order. `SessionPaused` is
+  recorded only when the freeze and every component confirmed; otherwise
+  `SessionPauseUnsettled`, its `reason` naming the first unconfirmed component and its
+  `pending` the freeze's own count — the shipped variant gains no field (postcard
+  identifies fields positionally), the component travels in the text. `resume` releases
+  in the reverse order, confirming each step before the next and thawing last, and
+  takes a release back rather than leave the session half-resumed. `stop` collects the
+  same acknowledgements over the hold it keeps for the termination before
+  `WorkloadsTerminated` is appended, refusing the stop (held, named) when one is
+  missing. Restart reconciliation re-collects them when it finishes an interrupted
+  pause. `ward pause` prints the unconfirmed component, `ward pause --status --json`
+  carries it, and the trust bar's agent segment names it on hover.
+
 Still open under #145: the persisted `Pausing`/`Stopping`/`Incomplete` lifecycle as an
 explicit state machine (the stop marker, the intent file and the in-memory hold are its
-precursors, not that state machine), and per-component acknowledgement from the proxy. The
+precursors, not that state machine). The
 fork barrier is confirmed only when every known process is frozen and a stable
 rescan closes the membership set within `pause::FREEZE_SETTLE`. A failed late cgroup
 migration invalidates that barrier and falls back to `SIGSTOP`; a timeout remains a

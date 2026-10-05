@@ -159,6 +159,12 @@ enum Command {
         /// died mid-way and no daemon has reconciled the session since).
         #[arg(long, conflicts_with = "all")]
         status: bool,
+        /// With `--status`: one JSON object, `{status, unconfirmed}`, where
+        /// `unconfirmed` names what the current hold could not confirm (#145
+        /// item 3: `egress proxy (no acknowledgement within 2s)`, `2 process(es)
+        /// not confirmed stopped`) or is `null`.
+        #[arg(long, requires = "status")]
+        json: bool,
         /// Pause every live session, not just one (#141 item 5: "Pause all
         /// sessions" is a distinct, explicit action from pausing the selected
         /// one). Prints one result line per session.
@@ -653,12 +659,14 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             session,
             reason,
             status,
+            json,
             all,
         } => cmd_pause(
             &dir.unwrap_or_else(cwd),
             session.as_deref(),
             reason.as_deref(),
             status,
+            json,
             all,
         ),
         Command::Resume { dir, session } => {
@@ -1748,19 +1756,24 @@ fn cmd_run(dir: &Path, argv: &[String]) -> ward_daemon::Result<ExitCode> {
 }
 
 /// `ward pause --status`'s word for `session` when one is pinned, else for
-/// `dir`'s current session: `paused` (the marker exists), `running` (a
-/// session but no marker) or `none` (no session at all). Needs no daemon.
+/// `dir`'s current session: `paused` (the marker exists), `unconfirmed` (an
+/// intent has no outcome yet), `running` (a session but no marker) or `none`
+/// (no session at all) — and, for a session that has one, what its current
+/// hold could not confirm ([`ward_daemon::acks::unconfirmed_detail`], read
+/// from the session's own log, #145 item 3): the component that did not
+/// acknowledge it, or the processes not confirmed stopped; `None` for a
+/// confirmed hold, a released one, or no session. Needs no daemon.
 ///
 /// A pinned `--session` reads that session's own marker, through
 /// [`SessionMeta::load`] — never `dir`'s current session — so a no-argument
 /// toggle pinned to one session is never told about a different session's
 /// state (#141 finding 3: `WARDOS_SESSION` must pin the status decision
 /// exactly the way it already pins pause and resume themselves).
-fn pause_status_word(
+fn pause_status(
     dir: &Path,
     state: &Path,
     session: Option<&str>,
-) -> ward_daemon::Result<&'static str> {
+) -> ward_daemon::Result<(&'static str, Option<String>)> {
     let meta = match session {
         Some(id) => match SessionMeta::load(state, id) {
             Ok(meta) => Some(meta),
@@ -1773,12 +1786,46 @@ fn pause_status_word(
         },
         None => SessionMeta::current(dir, state)?,
     };
-    Ok(match meta {
-        Some(meta) if ward_daemon::pause::intent_path(state, &meta.id).exists() => "unconfirmed",
-        Some(meta) if ward_daemon::pause::marker_path(state, &meta.id).exists() => "paused",
-        Some(_) => "running",
-        None => "none",
-    })
+    let Some(meta) = meta else {
+        return Ok(("none", None));
+    };
+    let word = if ward_daemon::pause::intent_path(state, &meta.id).exists() {
+        "unconfirmed"
+    } else if ward_daemon::pause::marker_path(state, &meta.id).exists() {
+        "paused"
+    } else {
+        "running"
+    };
+    let log = ward_daemon::session::session_dir(state, &meta.id).join("events.log");
+    let unconfirmed = match ward_daemon::acks::unconfirmed_detail(&log) {
+        Ok(detail) => detail,
+        Err(_) if !log.exists() => None,
+        Err(e) => return Err(e),
+    };
+    Ok((word, unconfirmed))
+}
+
+/// The line `ward pause` prints under its row when the daemon could not confirm
+/// the pause (#145 items 3-4): the freeze's pending processes, the component
+/// that did not acknowledge the hold, or both — never the same clean success a
+/// confirmed pause gets. The marker and the held approvals stand either way.
+fn pause_uncertainty_lines(unsettled: Option<u32>, unconfirmed: Option<&str>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(pending) = unsettled {
+        lines.push(format!(
+            "paused, but {pending} process{} had not confirmed stopped within {}s — the \
+             marker is held and approvals stay frozen regardless",
+            if pending == 1 { "" } else { "es" },
+            ward_daemon::pause::FREEZE_SETTLE.as_secs(),
+        ));
+    }
+    if let Some(component) = unconfirmed {
+        lines.push(format!(
+            "paused, but unconfirmed: {component} — the marker is held and approvals stay \
+             frozen regardless"
+        ));
+    }
+    lines
 }
 
 /// `ward pause`: one request to the daemon, which does the whole operation;
@@ -1826,11 +1873,20 @@ fn cmd_pause(
     session: Option<&str>,
     reason: Option<&str>,
     status: bool,
+    json: bool,
     all: bool,
 ) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     if status {
-        println!("{}", pause_status_word(dir, &state, session)?);
+        let (word, unconfirmed) = pause_status(dir, &state, session)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "status": word, "unconfirmed": unconfirmed })
+            );
+        } else {
+            println!("{word}");
+        }
         return Ok(ExitCode::SUCCESS);
     }
     if all {
@@ -1847,18 +1903,14 @@ fn cmd_pause(
                         None => println!("  {} · paused", result.session),
                     }
                     // #145 items 3-4: `--all` reports each session's own
-                    // pause independently, so an unsettled freeze on one
-                    // session must not read as a clean success for that
-                    // session just because its line printed alongside others
-                    // that did settle.
-                    if let Some(pending) = outcome.unsettled {
-                        println!(
-                            "    paused, but {pending} process{} had not confirmed stopped \
-                             within {}s — the marker is held and approvals stay frozen \
-                             regardless",
-                            if pending == 1 { "" } else { "es" },
-                            ward_daemon::pause::FREEZE_SETTLE.as_secs(),
-                        );
+                    // pause independently, so an unsettled freeze or an
+                    // unconfirmed component on one session must not read as a
+                    // clean success for that session just because its line
+                    // printed alongside others that did confirm.
+                    for line in
+                        pause_uncertainty_lines(outcome.unsettled, outcome.unconfirmed.as_deref())
+                    {
+                        println!("    {line}");
                     }
                 }
                 Err(e) => {
@@ -1882,17 +1934,12 @@ fn cmd_pause(
     if let Some(row) = render::observer_row(&outcome.record) {
         println!("{row}");
     }
-    // #145 items 3-4: never let an unconfirmed freeze read as the same clean
-    // success as a confirmed one. The marker and held approvals stand either way
-    // (the safest achievable state) — what's uncertain is only whether every
-    // sandboxed process has actually stopped yet.
-    if let Some(pending) = outcome.unsettled {
-        println!(
-            "  paused, but {pending} process{} had not confirmed stopped within {}s \
-             — the marker is held and approvals stay frozen regardless",
-            if pending == 1 { "" } else { "es" },
-            ward_daemon::pause::FREEZE_SETTLE.as_secs(),
-        );
+    // #145 items 3-4: never let an unconfirmed freeze, or a component that did
+    // not acknowledge the hold (item 3), read as the same clean success as a
+    // confirmed pause. The marker and held approvals stand either way (the
+    // safest achievable state).
+    for line in pause_uncertainty_lines(outcome.unsettled, outcome.unconfirmed.as_deref()) {
+        println!("  {line}");
     }
     println!(
         "  `ward resume` continues; `ward stop` keeps the workspace; `ward stop --restore-entry` restores the entry state"
@@ -2140,9 +2187,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
         Cli, Command, SessionCmd, SnapshotCmd, WatchMode, approvals_all_line, desktop_command,
-        observer_degraded_warning, on_path_in, pause_status_word, pending_all_line, pending_text,
-        resolved_session_line, resolved_session_line_for, stop_in, stopped_line, unreachable_line,
-        verb_program,
+        observer_degraded_warning, on_path_in, pause_status, pause_uncertainty_lines,
+        pending_all_line, pending_text, resolved_session_line, resolved_session_line_for, stop_in,
+        stopped_line, unreachable_line, verb_program,
     };
     use clap::Parser as _;
     use std::time::Duration;
@@ -2744,7 +2791,7 @@ mod tests {
     }
 
     /// A session record at `state/sessions/<id>/session.json`, minimal enough
-    /// for `SessionMeta::load` and `pause_status_word` — the same shape
+    /// for `SessionMeta::load` and `pause_status` — the same shape
     /// `ward-daemon`'s own client tests build (`spawn_pool_session`).
     fn write_session(state: &std::path::Path, id: &str, project: &std::path::Path, started: u64) {
         let dir = ward_daemon::session::session_dir(state, id);
@@ -2792,25 +2839,142 @@ mod tests {
         std::fs::write(&current, "sess_a").unwrap();
 
         assert_eq!(
-            pause_status_word(project.path(), state.path(), None).unwrap(),
+            pause_status(project.path(), state.path(), None).unwrap().0,
             "paused",
             "no --session: the project's current session, sess_a"
         );
         assert_eq!(
-            pause_status_word(project.path(), state.path(), Some("sess_b")).unwrap(),
+            pause_status(project.path(), state.path(), Some("sess_b"))
+                .unwrap()
+                .0,
             "running",
             "--session sess_b: sess_b's own state, not sess_a's just because \
              sess_a is the project's current session"
         );
         assert_eq!(
-            pause_status_word(project.path(), state.path(), Some("sess_a")).unwrap(),
+            pause_status(project.path(), state.path(), Some("sess_a"))
+                .unwrap()
+                .0,
             "paused",
             "--session sess_a: the same session, reached the pinned way"
         );
         assert_eq!(
-            pause_status_word(project.path(), state.path(), Some("sess_missing")).unwrap(),
+            pause_status(project.path(), state.path(), Some("sess_missing"))
+                .unwrap()
+                .0,
             "none",
             "a pinned id naming no session is `none`, not an error"
+        );
+    }
+
+    /// #145 item 3: `--status --json` carries what the session's log says its
+    /// current hold could not confirm — the component an unsettled pause names,
+    /// or the processes — and `null` once the hold is confirmed or released; a
+    /// session with no log yet is simply its word.
+    #[test]
+    fn pause_status_json_names_what_the_hold_could_not_confirm() {
+        use ward_daemon::control::Sink as _;
+        let state = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let worktree = project.path().canonicalize().unwrap();
+        write_session(state.path(), "sess_a", &worktree, 1);
+        assert_eq!(
+            pause_status(project.path(), state.path(), Some("sess_a")).unwrap(),
+            ("running", None),
+            "no log yet"
+        );
+        let log_path = ward_daemon::session::session_dir(state.path(), "sess_a").join("events.log");
+        let mut log = ward_daemon::control::LocalLog::create(
+            &log_path,
+            ward_events::SessionId::from_u128(1),
+            ward_events::Blake3Hash::from_bytes([3; 32]),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        let proxy = ward_daemon::acks::Acknowledgement {
+            component: ward_daemon::acks::Component::Proxy,
+            outcome: ward_daemon::acks::Outcome::TimedOut {
+                after: ward_daemon::acks::ACK_TIMEOUT,
+            },
+        };
+        log.append(
+            ward_events::Origin::Wardd,
+            ward_events::WardEvent::SessionPauseUnsettled {
+                method: ward_events::PauseMethod::Sigstop,
+                reason: ward_events::ShortText::new(&ward_daemon::acks::unconfirmed_reason(
+                    "looks wrong",
+                    &proxy,
+                )),
+                pending: 0,
+            },
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        ward_daemon::pause::write_marker(state.path(), "sess_a", "looks wrong").unwrap();
+        let (word, unconfirmed) =
+            pause_status(project.path(), state.path(), Some("sess_a")).unwrap();
+        assert_eq!(word, "paused");
+        assert_eq!(
+            unconfirmed.as_deref(),
+            Some("egress proxy (no acknowledgement within 2s)")
+        );
+        assert_eq!(
+            serde_json::json!({ "status": word, "unconfirmed": unconfirmed }).to_string(),
+            r#"{"status":"paused","unconfirmed":"egress proxy (no acknowledgement within 2s)"}"#
+        );
+        log.append(
+            ward_events::Origin::Wardd,
+            ward_events::WardEvent::SessionResumed {
+                paused_for: std::time::Duration::from_secs(1),
+            },
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        ward_daemon::pause::clear_marker(state.path(), "sess_a").unwrap();
+        assert_eq!(
+            pause_status(project.path(), state.path(), Some("sess_a")).unwrap(),
+            ("running", None)
+        );
+        assert_eq!(
+            pause_status(project.path(), state.path(), Some("sess_missing")).unwrap(),
+            ("none", None)
+        );
+        let cli = Cli::try_parse_from(["ward", "pause", "--status", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pause {
+                status: true,
+                json: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["ward", "pause", "--json"]).is_err(),
+            "--json belongs to --status"
+        );
+    }
+
+    /// #145 items 3-4: the line under `ward pause`'s row names the freeze's
+    /// pending processes, the component that did not acknowledge, or both —
+    /// and nothing for a confirmed pause.
+    #[test]
+    fn pause_uncertainty_lines_name_the_freeze_and_the_component() {
+        assert!(pause_uncertainty_lines(None, None).is_empty());
+        assert_eq!(
+            pause_uncertainty_lines(Some(1), None),
+            [
+                "paused, but 1 process had not confirmed stopped within 1s — the marker is held \
+              and approvals stay frozen regardless"
+            ]
+        );
+        let both =
+            pause_uncertainty_lines(Some(2), Some("egress proxy (no acknowledgement within 2s)"));
+        assert_eq!(both.len(), 2);
+        assert!(both[0].starts_with("paused, but 2 processes had not confirmed stopped"));
+        assert_eq!(
+            both[1],
+            "paused, but unconfirmed: egress proxy (no acknowledgement within 2s) — the marker \
+             is held and approvals stay frozen regardless"
         );
     }
 
@@ -2844,18 +3008,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            pause_status_word(project.path(), state.path(), Some("sess_a")).unwrap(),
+            pause_status(project.path(), state.path(), Some("sess_a"))
+                .unwrap()
+                .0,
             "unconfirmed",
             "a marker with an unfinished pause behind it is not `paused`"
         );
         assert_eq!(
-            pause_status_word(project.path(), state.path(), Some("sess_b")).unwrap(),
+            pause_status(project.path(), state.path(), Some("sess_b"))
+                .unwrap()
+                .0,
             "unconfirmed",
             "a stop in flight with no marker is not `running`"
         );
         ward_daemon::pause::clear_intent(state.path(), "sess_a").unwrap();
         assert_eq!(
-            pause_status_word(project.path(), state.path(), Some("sess_a")).unwrap(),
+            pause_status(project.path(), state.path(), Some("sess_a"))
+                .unwrap()
+                .0,
             "paused"
         );
     }

@@ -492,6 +492,26 @@ pub fn observer_cells(rec: &EventRecord) -> Option<ObserverCells> {
 
 /// Rows for the host's own interventions (ADR-0019 §3) and for the observer's
 /// admission that its record of a window is incomplete (#137).
+/// The `PAUSE?` row's text: what the hold could not confirm — the component
+/// its reason names when the freeze itself settled (`pending == 0`, #145 item
+/// 3), else the processes not confirmed stopped — and that the marker and the
+/// grants are held regardless.
+fn pause_unsettled_text(method: ward_events::PauseMethod, reason: &str, pending: u32) -> String {
+    match crate::acks::unconfirmed_in(reason) {
+        Some((_, unconfirmed)) if pending == 0 => format!(
+            "{unconfirmed} did not confirm the hold ({}) · marker and grants held regardless · \
+             {reason}",
+            method.as_str()
+        ),
+        _ => format!(
+            "{pending} process{} not confirmed stopped ({}) · marker and grants held regardless \
+             · {reason}",
+            if pending == 1 { "" } else { "es" },
+            method.as_str()
+        ),
+    }
+}
+
 fn intervention_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)> {
     Some(match event {
         WardEvent::SessionPaused { method, reason } => (
@@ -510,13 +530,7 @@ fn intervention_cells(event: &WardEvent) -> Option<(&'static str, Tone, String)>
         } => (
             "PAUSE?",
             Tone::Warn,
-            format!(
-                "{pending} process{} not confirmed stopped ({}) · marker and grants held \
-                 regardless · {}",
-                if *pending == 1 { "" } else { "es" },
-                method.as_str(),
-                reason.as_str()
-            ),
+            pause_unsettled_text(*method, reason.as_str(), *pending),
         ),
         WardEvent::WorkloadsTerminated {
             ended,

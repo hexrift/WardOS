@@ -189,6 +189,15 @@ pub enum Response {
         /// `None` on a clean, confirmed pause (today's only outcome for the cgroup
         /// freezer, and the common case for the signal path).
         unsettled: Option<u32>,
+        /// The component that did not confirm the hold (#145 item 3), as
+        /// `crate::acks::Acknowledgement::text` names it — `egress proxy (no
+        /// acknowledgement within 2s)` — when one did not; `None` when every
+        /// component acknowledged. Absent on the wire from a daemon that predates
+        /// component acknowledgement, which a client must read as "not confirmed
+        /// by components", never as confirmed: it is paired with `unsettled`, so
+        /// such a daemon's answer still carries its own freeze outcome.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unconfirmed: Option<String>,
     },
     /// Nothing to return.
     Ok,

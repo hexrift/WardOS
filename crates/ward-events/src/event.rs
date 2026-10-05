@@ -1083,15 +1083,19 @@ pub enum WardEvent {
         /// `SessionPaused` having been read to make sense of it.
         method: PauseMethod,
         /// Why, in the user's words (`ward pause --reason`), sanitised — the same
-        /// text `SessionPaused` would have carried.
+        /// text `SessionPaused` would have carried. When a component of the hold
+        /// did not acknowledge it (#145 item 3: the egress proxy, the approvals or
+        /// credential mediation), the daemon appends ` - unconfirmed: <component>
+        /// (<why>)` to it (`ward-daemon::acks::unconfirmed_reason`), so the record
+        /// names what is uncertain without a field this shipped variant cannot gain.
         reason: ShortText,
         /// Number of the session's sandboxed processes that had not confirmed stopped
         /// (or exited) when the settle bound expired. Never the pid list itself: this is
         /// a durable log record, and which pids they were is meaningful only in the
         /// moment a human or `ward resume` might act on it, not worth keeping forever.
-        /// Always nonzero: a recount of zero pending is a settled freeze, reported as
-        /// `SessionPaused` instead (`pause::settle_outcome` normalizes `Some(0)` to
-        /// `None` for exactly this reason).
+        /// A recount of zero pending is a settled freeze (`pause::settle_outcome`
+        /// normalizes `Some(0)` to `None`), so this is zero only when the freeze
+        /// settled and a component named in `reason` is what did not confirm.
         pending: u32,
     },
 
