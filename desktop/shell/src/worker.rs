@@ -57,7 +57,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ward_daemon::client;
+use ward_daemon::client::{self, WatchEnd, WatchUpdate};
 use ward_shell_core::{DigestGate, Module, SegmentName};
 
 use crate::{
@@ -303,7 +303,15 @@ fn serve_session(socket: &Path, settle: Duration, shared: &Shared) -> ward_daemo
     let subscriber = client::connect(socket)?;
     let mut last_force = Instant::now();
     let poll_tick = Duration::from_millis(TICK_MS).min(DIGEST_DEBOUNCE);
-    client::watch_records_ticking(subscriber, from_seq, poll_tick, |rec| {
+    let end = client::watch_records_ticking(subscriber, from_seq, poll_tick, |watched| {
+        let rec = match watched {
+            WatchUpdate::Record(rec) => Some(*rec),
+            WatchUpdate::Tick => None,
+            WatchUpdate::CaughtUp => {
+                snapshot.model.mark_connected();
+                None
+            }
+        };
         let at = Instant::now();
         let force =
             rec.is_none() && at.duration_since(last_force) >= Duration::from_millis(TICK_MS);
@@ -320,7 +328,10 @@ fn serve_session(socket: &Path, settle: Duration, shared: &Shared) -> ward_daemo
         }
         shared.publish(compute_all(&snapshot, now_unix_ms()));
     })?;
-    snapshot.model.seal();
+    match end {
+        WatchEnd::Sealed { .. } => snapshot.model.seal(),
+        WatchEnd::Closed { .. } | WatchEnd::CaughtUp { .. } => snapshot.model.mark_disconnected(),
+    }
     shared.publish(compute_all(&snapshot, now_unix_ms()));
     Ok(())
 }
@@ -993,5 +1004,15 @@ mod tests {
         assert_eq!(agent.class, ["none"], "no agent record arrived: none");
         let (_id, _rx, whole_bar) = shared.register(None).unwrap();
         assert!(whole_bar.text.contains("WARD"), "{}", whole_bar.text);
+        assert!(
+            whole_bar.text.contains("UNKNOWN") && !whole_bar.text.contains("SEALED"),
+            "a live subscription the daemon closed without a seal is unknown, never sealed: {}",
+            whole_bar.text
+        );
+        assert!(
+            whole_bar.class.iter().any(|c| c == "unknown"),
+            "{:?}",
+            whole_bar.class
+        );
     }
 }
