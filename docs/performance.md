@@ -94,15 +94,20 @@ process, with no daemon and no `ward` CLI subprocess in the timed path itself:
   fixture (`benchmarks/fixtures/snapshot-digest/`), cold (first run) and warm (median of
   N after discarded warm-ups), mirroring the cold/warm split `docs/experiments.md`'s E-02
   uses. Always measurable; no sandbox involved.
+* **`observer_event_propagation`** — a still-running sandboxed command creates one file
+  per sample and blocks until that observation has reached a subscriber; each sample is
+  the inotify timestamp the watcher stamps on `EventRecord::ts_wall` to the moment a real
+  daemon `Subscribe` stream (`daemon::serve` in-process, `client::watch_records`) hands
+  the record over. The production path end to end — watcher, bounded queue, session live
+  drain, the daemon's single writer, the subscriber — with no benchmark-only timestamp,
+  against "Observer event propagation" (§2). The one metric here that runs a daemon.
 
-`sandbox_start` and `verifier_spawn` need a working bubblewrap and user namespace; where
+`sandbox_start`, `verifier_spawn` and `observer_event_propagation` need a working bubblewrap and user namespace; where
 that is unavailable (this repository's own nested dev sandbox, some hardened hosts) they
 report `status: "unsupported"` with a reason instead of failing the run or being
 silently dropped. Every `docs/performance.md` §2 budget this tool does not implement at
 all — everything needing Hyprland/Waybar (#84) or the reference rig (#99): launcher,
-workspace, terminal and bar latency, observer event propagation (producer-to-subscriber,
-not just row-rendering — deferred pending a cheap way to add a live subscriber),
-project warm resume, the Btrfs entry-snapshot stall, idle CPU/RAM, boot/login/resume and
+workspace, terminal and bar latency, project warm resume, the Btrfs entry-snapshot stall, idle CPU/RAM, boot/login/resume and
 install — appears in the report as `status: "not_implemented"` with a reason, never
 omitted.
 
