@@ -91,9 +91,13 @@ The node protocol version and the WardOS release version are independent:
 - `WARD_NODE_PROTOCOL` changes in the pull request that implements the new or retired
   minor, together with this document (the check above enforces that pairing). It
   never changes as a side effect of a release PR.
-- `ward-node` is not yet released as an independently versioned artifact, and the
-  release manifest ([release-manifest.md](release-manifest.md)) does not record the
-  protocol window; the window of a release is the one in its source commit.
+- `ward-node` ships in every release as its own tarball,
+  `ward-node-<version>-<arch>-linux.tar.gz`
+  ([node-release-readiness.md](node-release-readiness.md) §2), under the WardOS
+  version; a node version of its own is still open
+  ([#275](https://github.com/hexrift/WardOS/issues/275)). Neither the tarball nor the
+  release manifest ([release-manifest.md](release-manifest.md)) records the protocol
+  window; the window of a release is the one in its source commit.
 
 ## 7. What CI checks
 

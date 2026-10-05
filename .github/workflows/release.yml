@@ -1,7 +1,9 @@
 # Release: build the Linux binaries for x86_64 and aarch64, each natively on a runner
-# of that architecture (no cross toolchain), package them with the installer, and
-# attach both tarballs and their checksums to one GitHub release. Runs on a v* tag
-# push, or by hand with a version (then the workflow creates the tag on the chosen ref).
+# of that architecture (no cross toolchain), package them as two trains per
+# architecture -- the runtime tarball with the installer, and the node tarball
+# (issue #275) -- and attach every tarball and its checksum to one GitHub release.
+# Runs on a v* tag push, or by hand with a version (then the workflow creates the
+# tag on the chosen ref).
 name: release
 
 on:
@@ -61,7 +63,7 @@ jobs:
         run: bash scripts/release/check-version.sh "$TAG"
 
   # One job per architecture, on a runner of that architecture: the binaries are built
-  # and smoke-tested natively, and the tarball name carries `uname -m` of the machine
+  # and smoke-tested natively, and the tarball names carry `uname -m` of the machine
   # they run on (install.sh and the image's release stage pick the tarball by it).
   build:
     name: ${{ matrix.arch }}-unknown-linux-gnu
@@ -92,33 +94,35 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = "$ARCH"
       - name: Build
-        run: cargo build --release --locked -p ward-cli -p ward-daemon -p ward-agent -p ward-shell -p wardos-theme
+        run: cargo build --release --locked -p ward-cli -p ward-daemon -p ward-agent -p ward-shell -p wardos-theme -p ward-node -p ward-node-client
       - name: Package
+        # Two tarballs with their .sha256 sidecars (scripts/release/package.sh, covered
+        # by package.test.sh): wardos-<version>-<arch>-linux with the five binaries the
+        # image's release stage expects, install.sh, README.md, LICENSE and docs/; and
+        # ward-node-<version>-<arch>-linux with ward-node, ward-node-adapter, LICENSE
+        # and docs/. A build missing a binary fails here, not in the smoke step.
         run: |
           set -euo pipefail
-          name="wardos-${VERSION}-${ARCH}-linux"
-          mkdir -p "dist/${name}"
-          # The image's release stage expects these five (image/Containerfile); tarballs
-          # before v0.2 carried only the first three.
-          cp target/release/ward target/release/wardd target/release/ward-agent \
-             target/release/ward-shell target/release/wardos-theme-render "dist/${name}/"
-          cp install.sh README.md LICENSE "dist/${name}/"
-          cp -r docs "dist/${name}/docs"
-          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          bash scripts/release/package.sh "$VERSION" "$ARCH" target/release dist
           ls -la dist
       - name: Smoke the packaged binaries
         run: |
           set -euo pipefail
           dir="dist/wardos-${VERSION}-${ARCH}-linux"
-          # The compiled binary must report the version this release is labelled with.
-          # A tarball whose `ward` was built from other source is rejected here, before
-          # the artifact is uploaded (upload-artifact runs after this step).
+          node="dist/ward-node-${VERSION}-${ARCH}-linux"
+          # The compiled binaries must report the version this release is labelled
+          # with. A tarball whose `ward` (or `ward-node`) was built from other source is
+          # rejected here, before the artifact is uploaded (upload-artifact runs after
+          # this step).
           bash scripts/release/check-binary-version.sh "$VERSION" "${dir}/ward"
+          bash scripts/release/check-binary-version.sh "$VERSION" "${node}/ward-node"
+          bash scripts/release/check-binary-version.sh "$VERSION" "${node}/ward-node-adapter"
           "${dir}/wardd" --help >/dev/null
           "${dir}/ward-agent" --help >/dev/null
           "${dir}/ward-shell" --help >/dev/null
           "${dir}/wardos-theme-render" --help >/dev/null
+          "${node}/ward-node" --help >/dev/null
+          "${node}/ward-node-adapter" --help >/dev/null
       - uses: actions/upload-artifact@v7
         with:
           name: wardos-${{ matrix.arch }}
@@ -131,7 +135,8 @@ jobs:
   # One job creates the release and attaches every tarball, so the two builds never
   # race on `gh release create`. It runs as long as the version resolved and nothing
   # was cancelled: an aarch64 build that fails must not lose the x86_64 release (the
-  # red matrix job says what is missing), but a missing x86_64 tarball is fatal.
+  # red matrix job says what is missing), but a missing x86_64 set is fatal, and so
+  # is an architecture that arrived with one train but not the other.
   release:
     name: release
     needs: [version, build]
@@ -157,7 +162,11 @@ jobs:
         run: |
           set -euo pipefail
           ls -la dist
-          test -f "dist/wardos-${VERSION}-x86_64-linux.tar.gz"
+          # Both trains, each with a verified sidecar, for x86_64 and for every other
+          # architecture that uploaded anything (scripts/release/check-release-set.sh,
+          # covered by check-release-set.test.sh). A misnamed or missing node tarball
+          # fails the release here, before anything is created or uploaded.
+          bash scripts/release/check-release-set.sh dist "$VERSION" x86_64
           arch=x86_64
           if [[ -f "dist/wardos-${VERSION}-aarch64-linux.tar.gz" ]]; then arch=both; fi
           echo "disk_arch=$arch" >> "$GITHUB_OUTPUT"

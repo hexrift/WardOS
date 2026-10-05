@@ -101,8 +101,9 @@ If the release carries `ward-node` changes, the release PR also records the six 
 of [`docs/node-release-readiness.md`](docs/node-release-readiness.md) §4: the protocol
 window marker agrees with the code, the acceptance table is green on the release commit,
 the status line of `docs/node-integration.md` §1 names what ships, the limitations list
-is current, the documents are in the tarball, and the node binaries build `--locked`
-from the tag.
+is current, the documents are in both tarballs, and the node binaries build `--locked`
+on the release PR's head (the release workflow then packages them as the node tarball,
+`ward-node-<version>-<arch>-linux.tar.gz`, beside the runtime tarball).
 
 Choose the release number from the set of changes being released:
 

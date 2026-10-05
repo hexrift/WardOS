@@ -29,10 +29,12 @@ or attest anything; it only assembles and validates fields already available onc
 release's artifacts exist.
 
 Every input is validated before any output is produced. An artifact whose name
-doesn't carry this manifest's own version, a tarball with no checksum sidecar (or a
-sidecar with no matching tarball), or a sidecar whose recorded digest doesn't match
-the artifact's actual bytes are all refused with a specific, actionable message —
-never silently dropped from the manifest or silently trusted. See
+doesn't carry this manifest's own version or one of the two release trains
+(`wardos-<version>-<arch>-linux.tar.gz`, the runtime, and
+`ward-node-<version>-<arch>-linux.tar.gz`, the node; issue #275), a tarball with no
+checksum sidecar (or a sidecar with no matching tarball), or a sidecar whose recorded
+digest doesn't match the artifact's actual bytes are all refused with a specific,
+actionable message — never silently dropped from the manifest or silently trusted. See
 [`generate-manifest.test.sh`](../scripts/release/generate-manifest.test.sh) for the
 full set of fixtures this covers.
 
@@ -47,7 +49,15 @@ full set of fixtures this covers.
   "generated_at": "<UTC ISO-8601 timestamp>",
   "artifacts": [
     {
+      "name": "ward-node-1.2.3-x86_64-linux.tar.gz",
+      "component": "ward-node",
+      "architecture": "x86_64",
+      "digest": "sha256:<hex>",
+      "size_bytes": 1234567
+    },
+    {
       "name": "wardos-1.2.3-x86_64-linux.tar.gz",
+      "component": "wardos",
       "architecture": "x86_64",
       "digest": "sha256:<hex>",
       "size_bytes": 12345678
@@ -71,7 +81,10 @@ full set of fixtures this covers.
 ```
 
 `artifacts` is sorted by `name` so that two runs over identical inputs produce
-byte-identical manifests, independent of filesystem/glob ordering.
+byte-identical manifests, independent of filesystem/glob ordering. `component` is the
+release train the artifact belongs to, taken from its name: `wardos` for the runtime
+tarball, `ward-node` for the node tarball
+([node-release-readiness.md](node-release-readiness.md) §2).
 
 ## What this is not
 

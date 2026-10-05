@@ -37,7 +37,7 @@ use ward_node_protocol::{
 };
 
 #[derive(Parser)]
-#[command(name = "ward-node", subcommand_negates_reqs = true)]
+#[command(name = "ward-node", version, subcommand_negates_reqs = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

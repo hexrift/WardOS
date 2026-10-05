@@ -20,9 +20,12 @@ ward doctor
 ```
 
 The tarball also carries `ward-shell` and `wardos-theme-render` (the desktop's
-binaries, only useful with the desktop of §6) and a copy of `install.sh`. The checksum
-proves the tarball is the one CI attached to the release; releases are not yet signed
-or provenance-verified. The planned trust policy is recorded in
+binaries, only useful with the desktop of §6) and a copy of `install.sh`. `ward-node`
+and `ward-node-adapter` are not in it: the node is a service of the host, released
+beside it as `ward-node-<version>-<arch>-linux.tar.gz` and installed by its operator
+([`node-integration-guide.md`](node-integration-guide.md) §1), not by `install.sh`.
+The checksum proves the tarball is the one CI attached to the release; releases are not
+yet signed or provenance-verified. The planned trust policy is recorded in
 [`ADR-0028`](decisions/ADR-0028-release-provenance-and-trusted-updates.md); until its
 workflow and verifier land, this install path remains checksum-only.
 

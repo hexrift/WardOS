@@ -30,7 +30,7 @@ which the workflow pins to the same version) on an x86_64 GitHub runner.
 | **ward-bench** (job `benchmark`, measures, never gates) | `ward benchmark --json`, the CI-measurable subset of [performance.md](performance.md) §5, uploaded as an artifact for 90 days. | Nothing specific to the node: its metrics are the session path's (`sandbox_start`, `verifier_spawn`, `snapshot_*`, `observer_event_propagation`, `pause_acknowledgement`). `sandbox_start` and `snapshot_capture_*` measure the same `ward-launch` spawn and `ward-snapshot` capture the node uses, so a regression there is a regression for `start`; no threshold fails the job (#150). |
 | **TamperWard gate** (`.github/workflows/tamperward.yml`) | The diff-time protected-surface check over the pull request's commit range, and `tamperward verify`, which re-runs the merge gate in a visible and a pristine copy. | A pull request that deletes, skips or weakens a node test, rewrites a fixture or edits CI is blocked until a human signs off out of band; the gate's own result cannot be manufactured by the change under test. |
 | **image** (`.github/workflows/image.yml`, on pull requests that touch `crates/**`) | Builds the bootc image, natively for x86_64 and aarch64, compiling `ward-node` from the checkout (`image/Containerfile`). | `ward-node` builds `--locked` for both architectures the image ships for. It is not started inside the image build. |
-| **release scripts** (job `release-scripts`) | `scripts/release/run.sh`: shellcheck and the bash regressions of every release helper. | The tag, version and asset binding of §2 behaves as documented. |
+| **release scripts** (job `release-scripts`) | `scripts/release/run.sh`: shellcheck and the bash regressions of every release helper. | The tag, version and asset binding of §2 behaves as documented, including the layout of the node tarball (`package.test.sh`) and the refusal to publish without it (`check-release-set.test.sh`). |
 
 The same `scripts/verify/tamperward.sh` runs locally; a green run there is a green run
 in CI (CONTRIBUTING.md). What CI adds is the proof that isolation was required, the
@@ -40,28 +40,50 @@ named verdicts and the protected-surface gate.
 
 `.github/workflows/release.yml` runs on a `v*` tag or by dispatch with a version. It
 refuses a tag that does not equal the workspace version of the source commit
-(`scripts/release/check-version.sh`), builds natively per architecture, smokes the
-binaries (`check-binary-version.sh` and `--help`), and attaches
-`wardos-<version>-<arch>-linux.tar.gz` with its `.sha256` to one GitHub release bound
-to that commit (`check-tag-commit.sh`, `check-assets.sh` on a retry). The tarball
-carries `ward`, `wardd`, `ward-agent`, `ward-shell`, `wardos-theme-render`,
-`install.sh`, `README.md`, `LICENSE` and a copy of `docs/`.
+(`scripts/release/check-version.sh`), builds natively per architecture with the
+toolchain of `rust-toolchain.toml` and `--locked`, packages two trains per architecture
+(`scripts/release/package.sh`), smokes every packaged binary (`check-binary-version.sh`
+and `--help`), refuses to publish unless both trains and their checksums are present for
+every architecture that built (`check-release-set.sh`), and attaches everything to one
+GitHub release bound to that commit (`check-tag-commit.sh`, `check-assets.sh` on a
+retry):
+
+| Asset | Carries |
+| --- | --- |
+| `wardos-<version>-<arch>-linux.tar.gz` and `.sha256` | the runtime: `ward`, `wardd`, `ward-agent`, `ward-shell`, `wardos-theme-render`, `install.sh`, `README.md`, `LICENSE` and a copy of `docs/` |
+| `ward-node-<version>-<arch>-linux.tar.gz` and `.sha256` | the node: `ward-node`, `ward-node-adapter`, `LICENSE` and a copy of `docs/` |
+
+`<version>` is the workspace version without the `v`; `<arch>` is the runner's
+`uname -m`, `x86_64` or `aarch64`. Each `.sha256` is `sha256sum`'s line for its
+tarball, checked with `sha256sum -c` next to it.
 
 For the node this means:
 
-- **`ward-node` is not in the release tarball**, and neither is `ward-node-adapter`.
-  `ward-node` ships in checkout-built images (`image/Containerfile`, #306); both are
-  built from source for a deployment ([node-integration-guide.md](node-integration-guide.md)
-  §1). Independently versioned node artifacts are
+- **`ward-node` and `ward-node-adapter` are release artifacts**, in the node tarball,
+  for both architectures. Each prints the release version (`ward-node --version`,
+  `ward-node-adapter --version`), which the release checks before uploading, as it does
+  for `ward`. The two trains share the workspace version at this revision; a node
+  version of its own, moving independently of the runtime's, is the remaining part of
   [#275](https://github.com/hexrift/WardOS/issues/275).
-- **The node documents ship in the tarball**, as part of `docs/`, at the revision of the
-  release commit.
+- **The node is not part of `install.sh`**, which installs the session layer for one
+  user. Installing the node tarball is the operator step of
+  [node-integration-guide.md](node-integration-guide.md) §1.
+- **The images do not take the node from the release yet.** `image/Containerfile` builds
+  `ward-node` from the checkout (#306); its `release` stage copies the runtime tarball
+  only, so an image built from a release has no node until that stage learns the node
+  tarball (#275).
+- **The node documents ship in both tarballs**, as part of `docs/`, at the revision of
+  the release commit.
 - **The protocol window of a release is the one in its source commit**
   (compatibility.md §6). The release manifest
-  ([release-manifest.md](release-manifest.md)) does not record it.
+  ([release-manifest.md](release-manifest.md)) records the node tarball as its own
+  component, not the window.
 - **The release run does not re-run the acceptance suite.** The evidence for a release
   commit is the `verify` run on that commit (every push to `main` runs it), not the
   release workflow.
+- **Checksum only.** A `.sha256` proves the bytes are the ones CI attached, not which
+  workflow or commit built them; that is ADR-0028 and #148, for the node as for the
+  runtime.
 
 ## 3. What CI does not prove
 
@@ -70,8 +92,9 @@ For the node this means:
   bubblewrap version and user-namespace settings differ. The `desktop-compositor` job
   runs on Fedora 44 for the desktop; nothing comparable exists for the node.
 - **aarch64 execution.** The acceptance suite and the workspace tests run on x86_64
-  only. The image build compiles `ward-node` for aarch64; the release build smokes only
-  the five tarball binaries, which do not include the node.
+  only. The image build and the release build compile `ward-node` for aarch64; the
+  release smokes `--version` and `--help` of the packaged node binaries on an aarch64
+  runner, nothing more.
 - **Remote transport, enrolment, rotation.** There is none to test
   ([node-security-limitations.md](node-security-limitations.md) §3.1, #262).
 - **Network grants.** The suite proves a network manifest is refused and an offline
@@ -84,7 +107,9 @@ For the node this means:
 - **Delegated cgroups.** The runner has none; the node uses none. The signal-only
   freeze is what is tested.
 - **The release artifact itself.** The acceptance suite runs against binaries built by
-  `cargo test` from the same commit, not against the tarball or the image.
+  `cargo test` from the same commit, not against the tarballs or the image. Of the
+  packaged `ward-node` and `ward-node-adapter` the release checks the version they
+  report and that `--help` runs.
 - **TamperWard verdicts.** The suite says what the node did; certification is the
   external control plane's (ADR-0029).
 
@@ -107,10 +132,11 @@ workflow.
 4. **The limitations.** node-security-limitations.md §3 matches what the release ships:
    a limitation closed since the last release is removed, a new one is added, and each
    "no issue yet" still has none or now names its issue.
-5. **The documents ship.** `docs/` is copied into the tarball by the release workflow;
-   the node documents the tarball carries are therefore the ones on the release commit.
-   Nothing to do unless a document was moved.
-6. **Build from the tag.** `cargo build --release --locked -p ward-node -p ward-node-client`
-   succeeds on the tagged commit on the architectures you deploy to; `ward-node`'s
-   `--help` and `ward-node-adapter`'s `--help` print the flags of node-integration.md
-   §2.1 and §11.4.
+5. **The documents ship.** `docs/` is copied into both tarballs by the release
+   workflow; the node documents they carry are therefore the ones on the release
+   commit. Nothing to do unless a document was moved.
+6. **The node builds `--locked`.** `cargo build --release --locked -p ward-node -p ward-node-client`
+   succeeds on the release PR's head (the release workflow repeats it per architecture
+   and refuses to publish without both binaries); `ward-node`'s `--help` and
+   `ward-node-adapter`'s `--help` print the flags of node-integration.md §2.1 and
+   §11.4, and `--version` of each prints the version the tag will carry.

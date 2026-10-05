@@ -44,6 +44,15 @@ add_artifact() {
   (cd "$dist" && sha256sum "$name" >"$name.sha256")
 }
 
+# add_node_artifact DIST ARCH -> the node train's tarball+sidecar pair for
+# $version/$ARCH (issue #275).
+add_node_artifact() {
+  local dist="$1" arch="$2"
+  local name="ward-node-${version}-${arch}-linux.tar.gz"
+  printf '%s' "node-payload-$arch" >"$dist/$name"
+  (cd "$dist" && sha256sum "$name" >"$name.sha256")
+}
+
 ### Happy path ################################################################
 
 c="$(fresh_case valid)"
@@ -57,6 +66,8 @@ echo "$out" | jq -e . >/dev/null || fail "valid case: output is not valid JSON"
 [[ "$(jq -r '.artifacts | length' <<<"$out")" == "2" ]] || fail "valid case: expected 2 artifacts"
 [[ "$(jq -r '.artifacts[0].name' <<<"$out")" == "wardos-1.2.3-aarch64-linux.tar.gz" ]] ||
   fail "valid case: artifacts are not sorted by name"
+[[ "$(jq -r '.artifacts[0].component' <<<"$out")" == "wardos" ]] ||
+  fail "valid case: the runtime tarball's component is not wardos"
 [[ "$(jq -r '.artifacts[] | select(.architecture == "x86_64") | .digest' <<<"$out")" \
   == "sha256:$(sha256sum "$c/dist/wardos-1.2.3-x86_64-linux.tar.gz" | awk '{print $1}')" ]] ||
   fail "valid case: x86_64 digest does not match the artifact's actual bytes"
@@ -83,6 +94,32 @@ out="$(bash "$sut" "$tag" "$commit" "$c/dist" "quay.io/hexrift/wardos:$tag")"
 [[ "$(jq -r '.image.bootc_reference' <<<"$out")" == "quay.io/hexrift/wardos:$tag" ]] ||
   fail "image-ref case: bootc_reference not carried through"
 echo "ok   an explicit image reference is recorded"
+
+# The node train (issue #275): ward-node-<version>-<arch>-linux.tar.gz is an
+# artifact of the same release, recorded under its own component next to the
+# runtime tarball's, with the same digest and architecture validation.
+c="$(fresh_case node-train)"
+add_artifact "$c/dist" x86_64
+add_node_artifact "$c/dist" x86_64
+out="$(bash "$sut" "$tag" "$commit" "$c/dist")"
+[[ "$(jq -r '.artifacts | length' <<<"$out")" == "2" ]] || fail "node-train case: expected 2 artifacts"
+node_entry="$(jq -c '.artifacts[] | select(.name == "ward-node-1.2.3-x86_64-linux.tar.gz")' <<<"$out")"
+[[ -n "$node_entry" ]] || fail "node-train case: the node tarball is not in the manifest"
+[[ "$(jq -r .component <<<"$node_entry")" == "ward-node" ]] || fail "node-train case: wrong component for the node tarball"
+[[ "$(jq -r .architecture <<<"$node_entry")" == "x86_64" ]] || fail "node-train case: wrong architecture for the node tarball"
+[[ "$(jq -r .digest <<<"$node_entry")" \
+  == "sha256:$(sha256sum "$c/dist/ward-node-1.2.3-x86_64-linux.tar.gz" | awk '{print $1}')" ]] ||
+  fail "node-train case: the node tarball's digest does not match its bytes"
+[[ "$(jq -r '.artifacts[] | select(.name == "wardos-1.2.3-x86_64-linux.tar.gz") | .component' <<<"$out")" == "wardos" ]] ||
+  fail "node-train case: the runtime tarball's component is not wardos"
+echo "ok   the node tarball is recorded as its own component"
+
+# A node tarball that no longer matches its sidecar is refused like any other.
+c="$(fresh_case node-digest-mismatch)"
+add_artifact "$c/dist" x86_64
+add_node_artifact "$c/dist" x86_64
+printf 'TAMPERED-NODE\n' >"$c/dist/ward-node-${version}-x86_64-linux.tar.gz"
+expect_status 1 "a node tarball that no longer matches its own sidecar is refused" bash "$sut" "$tag" "$commit" "$c/dist"
 
 ### Rejections #################################################################
 
