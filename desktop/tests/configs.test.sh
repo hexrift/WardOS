@@ -12,8 +12,9 @@
 #   - bash configs pass `bash -n`, the profile.d script passes shellcheck;
 #   - systemd units carry the keys they need (`systemd-analyze verify` needs a running
 #     manager and a bus, so the check is structural);
-#   - the waybar bar lists the six trust segments of design-language §6 in order and
-#     its stylesheet knows every state class the ward-shell JSON supplies.
+#   - the waybar bar lists the seven trust segments of design-language §6 in order,
+#     including the daemon connection-state segment (#138 item 5), and its stylesheet
+#     knows every state class the ward-shell JSON supplies.
 # shellcheck source=desktop/tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 setup_env
@@ -161,7 +162,7 @@ grep -q 'wardos/theme/current/swayosd.css' "$root/systemd/user/swayosd.service" 
 python3 - "$root/config/waybar/config.jsonc" <<'PY' || fail "waybar config is not the trust bar"
 import json, sys
 c = json.load(open(sys.argv[1]))
-want = ["custom/ward-mark", "custom/ward-project", "custom/ward-agent", "custom/ward-network", "custom/ward-grants", "custom/ward-tamperward", "custom/ward-verify"]
+want = ["custom/ward-mark", "custom/ward-project", "custom/ward-agent", "custom/ward-network", "custom/ward-grants", "custom/ward-tamperward", "custom/ward-verify", "custom/ward-daemon"]
 assert c["modules-left"] == want, c["modules-left"]
 # Network keeps the read-only authority panel; grants opens the focused revoke picker (#317).
 assert c["custom/ward-network"]["on-click"] == "foot --app-id ward-authority -e sh -c 'ward-shell authority-panel; read -r _'", c["custom/ward-network"]["on-click"]
@@ -182,7 +183,7 @@ assert c["custom/ward-update"]["interval"] >= 3600
 for m in ("cpu", "memory", "battery", "network", "pulseaudio", "bluetooth"):
     assert c[m].get("interval", 5) >= 5, m
 PY
-for cls in working waiting blocked verifying finished verified restricted denied; do
+for cls in working waiting blocked verifying finished verified restricted denied unknown; do
   grep -q "\.$cls\b" "$root/config/waybar/style.css" || fail "waybar/style.css has no .$cls rule"
 done
 grep -Eq 'gradient\(|box-shadow:[^;]*[0-9]' "$root/config/waybar/style.css" && fail "waybar/style.css: no gradients, no shadows (§3, §5)"
