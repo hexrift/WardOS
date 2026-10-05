@@ -88,7 +88,7 @@ jobs:
           done < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' image/coprs.txt)
           mapfile -t pkgs < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' desktop/capture/packages.txt)
           retry 3 5 dnf -y --setopt=install_weak_deps=False install "${pkgs[@]}"
-          Hyprland --version | sed -n 1p
+          rpm -q hyprland aquamarine waybar fuzzel mako foot grim
       # The tree placed by the script the Containerfile runs, the checkout's binaries in
       # /usr/bin as the image has them, and the unprivileged user the session runs as.
       - name: Place the desktop and the binaries
