@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# wardos-hint — the empty-workspace hint (docs/desktop.md §Commands, #99).
+#
+# Usage: wardos-hint [--force] <workspace>   the hint for that workspace (1|code, 2|agent,
+#                                            3|web) when nothing is open on it and it has
+#                                            not been shown this session; --force shows it
+#                                            regardless
+#        wardos-hint --watch                 follow Hyprland's event socket and hint on
+#                                            every workspace change (wardos-hint.service)
+#
+# The first boot on the reference laptop (#99) clicked `code`, `agent` and `web` in the
+# bar and landed on empty workspaces with nothing to say what starts there. Nothing
+# auto-starts on them by design (an agent starts when asked), so the hint says how: one
+# notification through the desktop's own path (wardos_notify → mako), once per workspace
+# per login (a marker under XDG_RUNTIME_DIR, which is this login's and gone at logout),
+# never for a workspace that already has a window, never for the free workspaces 4–9.
+# --watch reads `workspacev2>>ID,NAME` lines from the compositor's socket2 with socat;
+# a short settle (WARDOS_HINT_SETTLE, 0.3 s) lets a window that is opening on the new
+# workspace (a browser the rules send to 3) map before the window count is read.
+set -euo pipefail
+# shellcheck source=desktop/lib/wardos.sh disable=SC1091
+source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev/null ||
+  source /usr/lib/wardos/wardos.sh
+wardos_help "$@"
+
+# workspace_id WORD: the id of a named workspace (looknfeel.conf's defaultName) or a number.
+workspace_id() {
+  case "$1" in
+    1 | code) echo 1 ;;
+    2 | agent) echo 2 ;;
+    3 | web) echo 3 ;;
+    [0-9] | [1-9][0-9]) echo "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+# hint_for ID: title and body, tab-separated; nothing for a free workspace.
+hint_for() {
+  case "$1" in
+    1) printf '%s\t%s\n' "Workspace 1 · code" \
+      "Nothing is open here yet. Super + N opens the editor, Super + Return a terminal; Super + Space lists everything." ;;
+    2) printf '%s\t%s\n' "Workspace 2 · agent" \
+      "No agent is running yet. Super + Space → Start Claude, or ward claude in a terminal (Super + Return). The observer (Super + O) lands here." ;;
+    3) printf '%s\t%s\n' "Workspace 3 · web" \
+      "Nothing is open here yet. Super + B opens the browser; web apps (Super + Space → Apps) open here." ;;
+  esac
+}
+
+# windows_on ID: how many windows the workspace holds; one hyprctl does not list has none.
+windows_on() {
+  hyprctl workspaces -j 2>/dev/null |
+    jq -r --argjson id "$1" '[.[] | select(.id == $id) | .windows] | first // 0' 2>/dev/null ||
+    echo 0
+}
+
+marker_dir="${XDG_RUNTIME_DIR:-$(wardos_state_dir)}/wardos"
+
+# show ID [force]: the hint, when due.
+show() {
+  local id=$1 force=${2:-0} line title body marker
+  line=$(hint_for "$id")
+  [[ -n "$line" ]] || return 0
+  marker="$marker_dir/hint-shown-$id"
+  if [[ $force != 1 ]]; then
+    [[ -e "$marker" ]] && return 0
+    [[ "$(windows_on "$id")" == 0 ]] || return 0
+  fi
+  mkdir -p "$marker_dir"
+  : >"$marker"
+  title=${line%%$'\t'*}
+  body=${line#*$'\t'}
+  wardos_notify "$title" "$body" -t 10000
+}
+
+watch() {
+  [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] ||
+    wardos_die "no Hyprland instance to follow (HYPRLAND_INSTANCE_SIGNATURE is unset)"
+  local sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock"
+  local line id
+  socat -u "UNIX-CONNECT:$sock" - | while IFS= read -r line; do
+    [[ $line == 'workspacev2>>'* ]] || continue
+    id=${line#'workspacev2>>'}
+    id=${id%%,*}
+    [[ $id =~ ^[0-9]+$ ]] || continue
+    sleep "${WARDOS_HINT_SETTLE:-0.3}"
+    show "$id"
+  done
+}
+
+force=0
+case "${1:-}" in
+  --watch)
+    watch
+    exit 0
+    ;;
+  --force)
+    force=1
+    shift
+    ;;
+esac
+[[ -n "${1:-}" ]] || wardos_die "which workspace? 1|code, 2|agent, 3|web, or --watch (--help)"
+id=$(workspace_id "$1") || wardos_die "no workspace '$1' (1|code, 2|agent, 3|web, or a number)"
+show "$id" "$force"

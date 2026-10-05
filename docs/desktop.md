@@ -26,7 +26,8 @@ desktop/
   themes/       <id>.toml token files (+ optional <id>/backgrounds/) → /usr/share/wardos/themes
   theme/        Rust crate `wardos-theme`: renders a theme into every component's format
   webapps/      default web apps (name, url, icon)     tuis/  default terminal apps
-  systemd/      user units (battery monitor, approval listener, swayosd)
+  systemd/      user units (battery monitor, approval listener, bar worker, the
+                empty-workspace hint, swayosd)
   flatpaks.txt  default Flathub applications, one id per line with its purpose
   tests/        run.sh (shellcheck + every *.test.sh with a mocked PATH)
   capture/      the README capture: capture.sh, ci-run.sh, scenes.tsv, assemble.py,
@@ -122,6 +123,7 @@ use them); `ward` is the front door for people.
 | `wardos-update [what]` | `bootc upgrade` (stage-only; ADR-0028 §5's states and the anti-rollback floor first, "Update states" below; `--allow-rollback`, `--require-provenance`) + `flatpak update` + `wardos-refresh`; `--status` the states alone; `--check` for the bar indicator |
 | `wardos-refresh [component]` | re-copy a component's default config into `~/.config`, keeping a backup |
 | `wardos-notify <title> [body]` | notification with the WardOS defaults; `--done` for "finished" toasts |
+| `wardos-hint [--force] <workspace>` / `wardos-hint --watch` | the empty-workspace hint (#99, §Discoverability): for `1\|code`, `2\|agent` or `3\|web` with no window on it, one notification saying what starts there and how, once per workspace per login (a marker under `$XDG_RUNTIME_DIR/wardos/`); nothing for a workspace with a window or for 4–9; `--force` shows it anyway. `--watch` follows Hyprland's event socket (`socat`, `workspacev2>>ID,NAME`) and is the long-running listener behind `wardos-hint.service`; `hint.test.sh` |
 | `wardos-approve` | shows a pending approval from `wardd` as its three blocks (destination · requested by agent · Ward will allow; `design-language.md` §10) and answers it (`y`/`s`/`n`); `--watch` multiplexes every live session's approvals (#141), titling each notification with its agent and project, and relays the answer to the session it was asked from; a still-showing notification is replaced with the outcome the moment its approval becomes terminal elsewhere, and its live workers are bounded (`WARDOS_APPROVE_MAX_NOTIFIERS`, #146 items 2-3) |
 | `wardos-approve-inbox` | the persistent approval inbox (#146 items 2-3): every approval `ward session approvals --all` knows across every live session, pending first, fuzzel-dmenu style, each pending row ending with the decision time the daemon reports (`42 s left, then denied`, or `held while paused · …` while its session is paused, #146 item 4); a pending choice opens `wardos-approve <id>` pinned to its own session in a terminal that stays open on the outcome (the daemon's own confirmation, or its refusal: answered elsewhere, timed out, unreachable), a decided one shows a read-only summary, and a live session whose approvals could not be listed is an `unreachable` row naming the error, never a pending one — reachable even when a notification was missed, dismissed, or never shown at all; a listing that fails outright is a critical notification, not a silent exit |
 | `wardos-pause [pause\|resume\|menu\|pause-all\|--status]` | pause the agent session (`WARDOS_SESSION`'s if set, an immutable pinned id — else `WARDOS_PROJECT`'s) as one host operation (ADR-0019 §3: processes frozen, network closed, credential grants suspended, approvals held, recorded) through `ward pause`, with the one notification; paused, the exits: Resume / Stop & preserve workspace / Stop & restore entry state / Inspect activity; `pause-all` (#141 item 5) is the distinct, explicit "pause every live session" scope, one result line each; `--status` prints `paused`, `unconfirmed` (a pause or stop began and its outcome is not recorded yet — the daemon is still at it, or died mid-way and none has reconciled the session since), `running` or `none`; a pause a component did not acknowledge (#145 item 3: `ward pause` prints `paused, but unconfirmed: egress proxy (…)`) gets the same critical `AGENTS PAUSING` notification an unsettled freeze gets, naming the component; a resume that releases the user's pause while a snapshot capture still holds the session (#145 item 6) notifies `Agents still held for capture`, never `Agents resumed` |
@@ -130,7 +132,7 @@ use them); `ward` is the front door for people.
 | `wardos-screensaver` | terminal text effects on idle, any key exits |
 | `wardos-share <file>` | serve a file on the LAN with a QR code (python http.server + qrencode) |
 | `wardos-calibrate [--force] [step…]` | first-boot system setup, CALIBRATE ([ADR-0026](decisions/ADR-0026-first-run-calibrate.md)): `locale` (`localectl set-locale`), `keyboard` (Hyprland `kb_layout` live + persisted, and `localectl set-x11-keymap`), `timezone` (region → city, `timedatectl set-timezone`), `password` (one terminal running `passwd`, off the default path); no arguments runs the guided flow with a review that changes any choice. Offered every login until it **completes**: the marker (`~/.config/wardos/calibrate-done`) is written only when the applies succeed or you choose *Skip the rest*; a cancelled review or a failed apply leaves it unset, so an unconfigured machine is re-offered next login rather than recorded as done. A step with a value applies it non-interactively. Keyboard-first, offline, polkit not `sudo` |
-| `wardos-first-run` | first login: copy configs (once, guarded by `~/.config/wardos/first-run-done` — never re-copied, so a resumed login can't clobber the user's config backups), the default theme, `ward doctor`, the default apps, show the keys; then the resumable stages `wardos-calibrate` and `wardos-welcome`, offered each login until each records its own completion |
+| `wardos-first-run` | first login: copy configs (once, guarded by `~/.config/wardos/first-run-done` — never re-copied, so a resumed login can't clobber the user's config backups), the default theme, `ward doctor`, the default apps, show the keys, then one pointer (#99: `Super + Space`, `Super + Shift + Escape` / the bar's POWER cell, the trust bar — never the walkthrough's "Welcome to WardOS" greeting); then the resumable stages `wardos-calibrate` and `wardos-welcome`, offered each login until each records its own completion |
 | `wardos-greetd-session` | greetd's session selector ([ADR-0027](decisions/ADR-0027-first-boot-provisioning.md)): `/var/lib/wardos/provisioned` absent → the provisioning UI under cage; present → the normal `gtkgreet` greeter (byte-for-byte the provisioned-machine login) |
 | `wardos-provision-ui` | first-boot provisioning UI (CALIBRATE provisioning form): unprivileged foot-hosted TUI under cage (xdg-shell, not fuzzel) — keyboard first (re-established as the live layout before password entry), then language, timezone, name, username, masked password — that asks the broker to apply them and create the first user. No privileged operation itself |
 | `wardos-provisiond` | the root provisioning broker (socket-activated, one instance per connection): validated verbs `LOCALE`/`KEYMAP`/`TIMEZONE`/`ACCOUNT`/`STATUS`; refuses once provisioned; the password is fed to `chpasswd` on stdin, never logged; `ACCOUNT` is the transactional commit that writes the marker |
@@ -360,7 +362,7 @@ group so `wardos-keys` can title them:
 | `Super + M` / `Super + G` / `Super + D` / `Super + T` / `Super + /` | music / messages / containers / activity / passwords |
 | `Print` / `Shift + Print` / `Ctrl + Print` | screenshot region / window / output |
 | `Alt + Print` / `Super + Print` | screen record toggle / colour picker |
-| `Super + Escape` / `Super + Shift + Escape` | lock / power menu |
+| `Super + Escape` / `Super + Shift + Escape` | lock / power menu (`wardos-power menu`: Lock · Suspend · Relaunch · Restart · Shutdown — also the bar's POWER cell and SYSTEM ▸ Power in the command centre, §Discoverability) |
 | `Super + Shift + P` | pause the agents (`wardos-pause`); paused, the exits menu |
 | `Super + Alt + S` | session switcher (#141): every live session, keyboard-first (`wardos-session-switch`) |
 | `Super + Alt + A` | approval inbox (`wardos-approve-inbox`, #146 items 2-3) |
@@ -378,6 +380,62 @@ Volume and brightness keys are `bindel` (repeat, work when locked), media keys `
 `desktop/tests/configs.test.sh` checks that every key in this table has a bind, that no
 two binds share a chord, and that every `exec` is a `wardos-*` command, a defined
 `$variable` or one of a short allowlist (`swayosd-client`, `playerctl`, `cliphist`, …).
+
+## Discoverability
+
+The first boot on the reference laptop (#99, E-09) could not find a way to shut down,
+clicked `code`, `agent` and `web` in the bar and landed on empty workspaces with nothing
+to say what starts there, and found tool dialogs left floating on the wrong workspace.
+Each has one answer, and the first-run pointer names them:
+
+**A visible way out.** The bar's right group ends in a `POWER` cell (`custom/ward-power`,
+after the clock, the one cell without a right border): a click opens `wardos-power menu`,
+the same five choices `Super + Shift + Escape` opens, with `wardos-power`'s semantics
+unchanged (no confirmation — the menu is the confirmation, and every action is undone by
+logging in again). Its tooltip names the key and the command centre's SYSTEM ▸ Power. The
+first-run pointer and the walkthrough's closing card name both. `Relaunch` is "leave
+Hyprland"; with autologin it comes straight back, so whether it should read `Log out` is
+part of the autologin decision #99 leaves to the owner.
+
+**Workspace labels are workspaces.** The three named workspaces (`looknfeel.conf`:
+`defaultName:code`, `agent`, `web`) were rendered by their word alone, and three lowercase
+words in the centre of a bar whose other cells are clickable actions read as three apps to
+launch — which is what the first boot did. The bar now renders them as `1 code`, `2 agent`,
+`3 web` and a free workspace as its number (`hyprland/workspaces` `format` `{id} {icon}`,
+with `format-icons` mapping each name to itself and `default` to nothing): the number is
+the `Super + 1/2/3` key, the word says what the place is for, and the Hyprland names stay
+what they were, so `hyprctl` and the window rules are unchanged. The labels stay
+clickable (they switch workspaces), which is what a numbered tab suggests.
+
+**The empty-workspace hint.** Nothing auto-starts on a workspace by design (an agent
+starts when asked), so `wardos-hint` says how. `wardos-hint.service` runs `wardos-hint
+--watch` for the session (started on `autostart.conf`'s `systemctl --user start` line like
+the other units, after `import-environment` has handed `HYPRLAND_INSTANCE_SIGNATURE` to the
+user manager); it follows the compositor's `socket2` with `socat` and, on a `workspacev2`
+event for 1, 2 or 3, waits a short settle (`WARDOS_HINT_SETTLE`, 0.3 s, so a browser the
+rules send to 3 has mapped), reads the window count from `hyprctl workspaces -j`, and when
+it is zero sends one notification through the desktop's own path (`wardos_notify` → mako,
+10 s, calm words): `Workspace 2 · agent — No agent is running yet. Super + Space → Start
+Claude, or ward claude in a terminal (Super + Return). The observer (Super + O) lands
+here.`; `1 · code` names the editor (`Super + N`) and the terminal; `3 · web` the browser
+(`Super + B`) and web apps. Once per workspace per login: the marker is under
+`$XDG_RUNTIME_DIR/wardos/`, which is this login's and gone at logout, so the hint is a
+first-visit card, not a nag. No hint for 4–9, none for a workspace with a window, and no
+new surface or daemon beyond the one listener. The bar's workspace buttons keep Waybar's
+own `activate` click; the hint reacts to the resulting workspace change, so a click, a
+key, a scroll and a swipe all get it.
+
+**Tool dialogs open where they were asked for.** `windows.conf`'s utilities section
+(`configs.test.sh` enforces it): the audio mixer (`pavucontrol`), the network and
+Bluetooth editors, the portal pickers and the terminals `wardos-menu` and
+`wardos-calibrate` open for an install, an update, a setup step, About or `passwd`
+(`wardos-launch run <app-id>`, classes `wardos-install|remove|update|setup|about|passwd`)
+are floating, sized (800×560, or 1000×700 like the terminal apps) and centred, on the
+current workspace; every `float on` match also places its window (`center on` or `move`),
+and no dialog match carries a `workspace` effect that would send it elsewhere. A dialog
+left open when the user moves on stays on its workspace — a window belongs to one — and
+is closed there with `Super + Q`; the numbered labels and the hint say which workspace is
+which.
 
 ## Themes
 
@@ -643,4 +701,5 @@ Then some (WardOS only):
 | Package names and the whole image checked by CI | `image/packages.txt`, image build job | ✔ `image/check-packages.sh` ("image packages"), `image.yml` ("image build") |
 | Claude Code, Codex and TamperWard in the image (ADR-0017) | `image/agents/package.json` + lockfile, `npm ci` at build time, `/usr/bin/{claude,codex,tamperward}` | ✔ `image/agents/`, Containerfile agents step, "What the image holds" prints the three versions; `ward doctor` rows `agents`, `node`, `keys` (`ward-daemon` `doctor::tests::{agents_lists_versions_and_names_what_is_missing_with_its_package,node_is_checked_against_the_agents_floor,keys_reports_where_a_key_is_and_never_its_value}`) |
 | Host firewall, nothing inbound | firewalld enabled, default zone `wardos` (`image/rootfs/etc/firewalld/zones/wardos.xml`) | ✔ `image/rootfs/usr/lib/systemd/system-preset/90-wardos.preset`, Containerfile; `ward doctor` row `firewall` (`doctor::tests::firewall_wants_firewalld_running_with_a_closed_default_zone`) |
+| A way out, workspace labels and an empty-workspace hint the first boot can find (#99, §Discoverability) | the bar's `POWER` cell (`wardos-power menu`, `Super + Shift + Escape`, SYSTEM ▸ Power), numbered workspace labels (`1 code` · `2 agent` · `3 web`), `wardos-hint` + `wardos-hint.service` (one notification per empty named workspace per login), the first-run pointer and the walkthrough's closing card, tool dialogs floating and centred where they were asked for | ✔ `hint.test.sh`; `configs.test.sh` (the power cell and its click, the label format, the unit and its autostart line, every floating dialog placed and none sent to another workspace); `first-run.test.sh` (the pointer, once, after the keys viewer); `welcome.test.sh`. Hardware confirmation on the T480s still open |
 | Timed image updates, rollback kept | `bootc-fetch-apply-updates.timer` (stage only; the next boot applies), `bootc rollback` | ✔ preset + drop-in `bootc-fetch-apply-updates.service.d/wardos.conf`; "What the image holds" checks `is-enabled`; `wardos-update` stays the manual path |

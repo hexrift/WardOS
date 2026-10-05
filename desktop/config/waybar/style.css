@@ -44,7 +44,8 @@ window#waybar {
 #battery,
 #cpu,
 #memory,
-#clock {
+#clock,
+#custom-ward-power {
   padding: 0 8px;
   border-right: 1px solid @separator;
   border-bottom: 2px solid transparent;
@@ -132,6 +133,12 @@ window#waybar {
 #custom-ward-update.available { color: @accent; }
 #clock {
   color: @text;
+}
+/* The power cell closes the bar (#99): the one visible way to lock, suspend or shut
+ * down, a muted word like the rest of the system group, and as the last cell the one
+ * without a right border. */
+#custom-ward-power {
+  color: @text_muted;
   border-right: none;
 }
 /* A battery that needs attention is a 2 px marker under the cell, not a colour on
