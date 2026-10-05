@@ -90,12 +90,24 @@ verifies it offline against the pinned issuer and the exact identity derived fro
 manifest's own tag, then the artifact digests, ending in one of this ADR's states with a
 distinct exit code per failure cause ([`docs/release-manifest.md`](../release-manifest.md));
 the crate's tests hold the script's pinned literals equal to the crate's constants.
-Still open: a SLSA provenance attestation for the tarballs and the OCI digest (point 1),
-signing the tarballs and the image themselves (point 3 for them), wiring the verifier
-and the two decisions into `install.sh`, `desktop/bin/wardos-update` and the image's
-release stage as the state machine of point 5, shipping the verifier and the Sigstore
-trusted root on the image ("Trust roots and bootstrap" below), and the boot-chain work
-of point 6. This ADR's own status stays Proposed until enough of the verification
+Point 5 is implemented on the install path: `install.sh` fetches that verifier at the
+release tag it installs, runs it beside the downloaded manifest, bundle and tarball, and
+reports the states `downloaded` → `digest-checked` → `provenance-verified`, with
+`provenance-missing` (a release without a manifest or bundle) and `verifier-unavailable`
+(no cosign, no verifier, no trusted root) as loud checksum-only states it never calls
+verified — `--require-provenance` makes them refusals — and the verifier's failure
+causes as refusals under distinct exit codes ([`docs/install.md`](../install.md) §1;
+`scripts/release/install.test.sh` covers this table's untouched, one-byte-changed,
+other-repository, missing-bundle and stale-trusted-root rows for it). The anti-rollback
+floor is not wired there: `install.sh` records no installed version to compare against,
+so the crate's decision has nothing to read yet. Still open: a SLSA provenance
+attestation for the tarballs and the OCI digest (point 1), signing the tarballs and the
+image themselves (point 3 for them), the rest of point 5's state machine — `staged`
+onwards, the anti-rollback floor, and `desktop/bin/wardos-update` and the image's
+release stage, which do not run the verifier — shipping the verifier and the Sigstore
+trusted root on the image and a first-trust step for the downloaded installer ("Trust
+roots and bootstrap" below; today `install.sh` and the verifier it fetches arrive
+through the same repository channel), and the boot-chain work of point 6. This ADR's own status stays Proposed until enough of the verification
 contract below is real, wired together, and tested end-to-end; the signing step first
 runs on the first `v*` tag released after it landed.
 

@@ -30,7 +30,7 @@ which the workflow pins to the same version) on an x86_64 GitHub runner.
 | **ward-bench** (job `benchmark`, measures, never gates) | `ward benchmark --json`, the CI-measurable subset of [performance.md](performance.md) §5, uploaded as an artifact for 90 days. | Nothing specific to the node: its metrics are the session path's (`sandbox_start`, `verifier_spawn`, `snapshot_*`, `observer_event_propagation`, `pause_acknowledgement`). `sandbox_start` and `snapshot_capture_*` measure the same `ward-launch` spawn and `ward-snapshot` capture the node uses, so a regression there is a regression for `start`; no threshold fails the job (#150). |
 | **TamperWard gate** (`.github/workflows/tamperward.yml`) | The diff-time protected-surface check over the pull request's commit range, and `tamperward verify`, which re-runs the merge gate in a visible and a pristine copy. | A pull request that deletes, skips or weakens a node test, rewrites a fixture or edits CI is blocked until a human signs off out of band; the gate's own result cannot be manufactured by the change under test. |
 | **image** (`.github/workflows/image.yml`, on pull requests that touch `crates/**`) | Builds the bootc image, natively for x86_64 and aarch64, compiling `ward-node` and `ward-node-adapter` from the checkout (`image/Containerfile`'s builder stage; the release stage, which takes them from the node tarball, needs a published release and is not run on pull requests). | `ward-node` and `ward-node-adapter` build `--locked` for both architectures the image ships for and are in the image's `/usr/bin` (the Containerfile asserts both, and the job runs `ward-node --help`). Neither is started as a service inside the image build. |
-| **release scripts** (job `release-scripts`) | `scripts/release/run.sh`: shellcheck and the bash regressions of every release helper. | The tag, version and asset binding of §2 behaves as documented, including the layout of the node tarball (`package.test.sh`), the refusal to publish without it (`check-release-set.test.sh`), the manifest's protocol window, read from compatibility.md's marker and refused when the marker is absent or malformed (`generate-manifest.test.sh`), the offline manifest verifier's verdicts and exit codes against a fake `cosign` — valid, wrong identity, wrong issuer, altered bytes, missing bundle, incomplete set, no cosign (`verify-manifest.test.sh`) — and the rule that the signature bundle is uploaded on a retry but never byte-compared (`check-assets.test.sh`, `download-published.test.sh`). |
+| **release scripts** (job `release-scripts`) | `scripts/release/run.sh`: shellcheck and the bash regressions of every release helper. | The tag, version and asset binding of §2 behaves as documented, including the layout of the node tarball (`package.test.sh`), the refusal to publish without it (`check-release-set.test.sh`), the manifest's protocol window, read from compatibility.md's marker and refused when the marker is absent or malformed (`generate-manifest.test.sh`), the offline manifest verifier's verdicts and exit codes against a fake `cosign` — valid, wrong identity, wrong issuer, altered bytes, missing bundle, incomplete set, no cosign (`verify-manifest.test.sh`) — `install.sh`'s states against a fixture release served by a fake `curl`: verified, checksum-only without cosign or a manifest, refused on a wrong identity or an altered tarball (`install.test.sh`) — and the rule that the signature bundle is uploaded on a retry but never byte-compared (`check-assets.test.sh`, `download-published.test.sh`). |
 
 The same `scripts/verify/tamperward.sh` runs locally; a green run there is a green run
 in CI (CONTRIBUTING.md). What CI adds is the proof that isolation was required, the
@@ -100,9 +100,10 @@ For the node this means:
   tag of which repository, recorded that tarball's digest — `verify-manifest.sh`
   checks the signature against the pinned identity and then the tarballs beside the
   manifest against its digests (release-manifest.md). The node tarball is trusted
-  exactly as far as its digest in the signed manifest: it is not signed itself, and
-  nothing on the install path verifies it yet (§3); that is the rest of ADR-0028 and
-  #148, for the node as for the runtime.
+  exactly as far as its digest in the signed manifest: it is not signed itself, and its
+  install path — an operator's, not `install.sh`'s — runs the verifier only by hand
+  (§3); `install.sh` runs it for the runtime tarball ([install.md](install.md) §1). The
+  rest is ADR-0028 and #148.
 
 ## 3. What CI does not prove
 
@@ -132,10 +133,16 @@ For the node this means:
 - **TamperWard verdicts.** The suite says what the node did; certification is the
   external control plane's (ADR-0029).
 - **Verification on the install path.** `verify-manifest.sh` runs in the release job on
-  its own fresh signature and by an operator by hand; `install.sh`, the image's release
-  stage and `wardos-update` do not run it, and the tarballs carry no signature of their
-  own. The signing step has run on no published release yet (v0.4.1 is the latest); the
-  first `v*` tag after it landed exercises it for real, and §4 says what to check then.
+  its own fresh signature, by an operator by hand, and inside `install.sh`, which fetches
+  it at the release tag and reports ADR-0028 §5's states — `downloaded`,
+  `digest-checked`, `provenance-verified`, or `provenance-missing` and
+  `verifier-unavailable` for a checksum-only install it never calls verified, refusals
+  under the verifier's own exit codes ([install.md](install.md) §1). That covers the
+  runtime tarball only: the node tarball is an operator install, the image's release
+  stage and `wardos-update` do not run the verifier, and the tarballs carry no signature
+  of their own. The signing step has run on no published release yet (v0.4.1 is the
+  latest), so `install.sh` has installed nothing as `provenance-verified` either; the
+  first `v*` tag after it landed exercises both for real, and §4 says what to check then.
 
 ## 4. Before tagging a release with node changes
 
