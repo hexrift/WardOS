@@ -136,6 +136,11 @@ Revisit when the shell gains a GUI toolkit with its own native dependencies and 
 when another product needs `ward-events`/`ward-proxy` as versioned crates; the
 extracted piece would be called `ward`, with WardOS remaining the distribution.
 
+An external control plane is not built here (ADR-0029); it reaches `ward-node` only
+through the versioned node protocol, whose window is independent of the WardOS release
+version ([compatibility.md](compatibility.md)). A WardOS release therefore does not
+force a control-plane release unless the protocol window changes.
+
 ## Deviations from the brief and why
 
 | Change | Reason |

@@ -648,6 +648,119 @@ mod tests {
         }
     }
 
+    /// Send `hello` for `peer` and, in the same write, a well-formed 1.2 `create`, as a
+    /// client that ignores the handshake answer would. Returns the handshake response
+    /// and whatever the node wrote after it.
+    fn skewed_hello_then_create(
+        service: &NodeService,
+        peer: SupportedProtocolRange,
+    ) -> (HandshakeResponse, String) {
+        let worker_service = service.clone();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || worker_service.serve_connection(server));
+
+        let hello = HandshakeRequest::Hello { protocol: peer };
+        let create = lifecycle_context().create(OperationId::new(1).unwrap(), lifecycle_binding());
+        let lines = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&hello).unwrap(),
+            serde_json::to_string(&create).unwrap()
+        );
+        client.write_all(lines.as_bytes()).unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        let mut rest = String::new();
+        reader.read_line(&mut rest).unwrap();
+        worker.join().unwrap().unwrap();
+        (serde_json::from_str(response.trim()).unwrap(), rest)
+    }
+
+    #[test]
+    fn protocol_skew_outside_the_served_window_is_rejected_fail_closed() {
+        let window = WARD_NODE_PROTOCOL;
+        let (major, min, max) = (window.major(), window.min_minor(), window.max_minor());
+        let range = |major, lo, hi| SupportedProtocolRange::new(major, lo, hi).unwrap();
+        for (peer, reason) in [
+            // A newer control plane that only speaks minors this node does not serve yet.
+            (
+                range(major, max + 1, max + 1),
+                ProtocolRejectionReason::NoCommonMinor,
+            ),
+            (
+                range(major, max + 1, u16::MAX),
+                ProtocolRejectionReason::NoCommonMinor,
+            ),
+            // The node's own minors under another major, above and below.
+            (
+                range(major + 1, min, max),
+                ProtocolRejectionReason::MajorVersionMismatch,
+            ),
+            (
+                range(major - 1, min, max),
+                ProtocolRejectionReason::MajorVersionMismatch,
+            ),
+        ] {
+            let service = NodeService::new(capabilities()).unwrap();
+            let (response, rest) = skewed_hello_then_create(&service, peer);
+            assert_eq!(
+                response,
+                HandshakeResponse::Rejected {
+                    reason,
+                    supported: WARD_NODE_PROTOCOL,
+                },
+                "peer {peer:?}"
+            );
+            assert_eq!(rest, "", "nothing is served after a rejection: {peer:?}");
+            assert!(service.tasks.lock().unwrap().is_empty(), "peer {peer:?}");
+        }
+    }
+
+    #[test]
+    fn a_peer_offering_only_retired_minors_is_rejected_fail_closed() {
+        // A node whose window starts at 1.2 has no overlap with a 1.0-1.1 peer: it
+        // rejects rather than degrading to a minor it does not serve.
+        let mut service = NodeService::new(capabilities()).unwrap();
+        service.supported =
+            SupportedProtocolRange::new(1, 2, WARD_NODE_PROTOCOL.max_minor()).unwrap();
+        let (response, rest) =
+            skewed_hello_then_create(&service, SupportedProtocolRange::new(1, 0, 1).unwrap());
+        assert_eq!(
+            response,
+            HandshakeResponse::Rejected {
+                reason: ProtocolRejectionReason::NoCommonMinor,
+                supported: service.supported,
+            }
+        );
+        assert_eq!(rest, "");
+        assert!(service.tasks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_newer_peer_that_still_offers_the_nodes_max_minor_negotiates_down_to_it() {
+        let max = WARD_NODE_PROTOCOL.max_minor();
+        let service = NodeService::new(capabilities()).unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || service.serve_connection(server));
+
+        let hello = HandshakeRequest::Hello {
+            protocol: SupportedProtocolRange::new(1, max, max + 5).unwrap(),
+        };
+        writeln!(client, "{}", serde_json::to_string(&hello).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<HandshakeResponse>(line(&mut client).trim()).unwrap(),
+            HandshakeResponse::Accepted {
+                protocol: ProtocolVersion::new(1, max),
+            }
+        );
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(NodeServiceError::UnexpectedEof)
+        ));
+    }
+
     #[test]
     fn malformed_or_oversized_first_request_fails_closed() {
         for payload in [
