@@ -297,6 +297,9 @@ mod tests {
 
     fn write_store(dir: &Path, text: &str, mode: u32) -> std::path::PathBuf {
         let path = dir.join("trusted-issuers");
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
         std::fs::write(&path, text).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         path
