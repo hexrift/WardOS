@@ -35,7 +35,7 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | Flag | Required | Meaning |
 | --- | --- | --- |
 | `--socket` | yes | Unix socket to serve. Its parent directory must exist and have no group or other permission bits (0700 or stricter). The socket is created mode 0600. An existing path is never removed: delete a stale socket before restarting. |
-| `--state-dir` | yes | Node-owned state, created mode 0700 if absent and refused if group- or world-accessible. Holds `node-id`, `admission-versions.json`, `revocations.json` and the snapshot store `cas/`. |
+| `--state-dir` | yes | Node-owned state, created mode 0700 if absent and refused if group- or world-accessible. Holds `node-id`, `admission-versions.json`, `revocations.json`, `retired-attempts.json` and the snapshot store `cas/`. |
 | `--node-id` | yes | The node's audience id (`node_` + 26-character ULID). Pinned in `<state-dir>/node-id` at first start; a later start with another id is refused. Envelopes must name exactly this id. |
 | `--trusted-issuers` | no | Trust store (§2.2). Without it no issuer is trusted and every `admit` is refused `authority_denied`. |
 | `--task-root` | no | Directory under which the node allocates workspaces, created mode 0700 and refused if group- or world-accessible or not a real directory. With it the node executes (`start`, `pause`, `resume`, `stop`, `revoke`, `seal`); the node refuses to start if bubblewrap is unusable. Without it, all six are `unsupported_operation`. |
@@ -116,10 +116,21 @@ from it, and two different facts for one lease make it unusable. A `revoke` reco
 task's lease with `revoked_at_unix_ms` at the node clock and reason `operator`, rewriting
 the whole file from the node's in-memory facts, so an edit made while the node runs is
 lost at the next `revoke`. Edit the file only while the node is stopped; a malformed
-file, or one over 8 MiB, stops the node. The node never removes an entry.
-`admission-versions.json` and `node-id` are node-owned: deleting the versions file would
-let old envelopes be replayed, and deleting a revocation the node recorded would make
-that lease usable again.
+file, or one over 8 MiB (8 388 608 bytes), stops the node.
+
+The node never removes an entry, and it never writes a state file larger than the 8 MiB
+it accepts at start. A `revoke` whose record would make `revocations.json` exceed 8 MiB
+(written compactly, about 83 000 records) is refused `resource_unavailable` with nothing
+changed: the revocation is not recorded, no older one is dropped, and the workload keeps
+running. To make room, stop the node and remove entries you no longer need (only for
+leases that can never be presented again, for example expired ones), or stop or revoke
+the task by other means. The same bound applies to every state file the node writes; a
+refused write is `resource_unavailable` from the verb that needed it.
+
+`admission-versions.json`, `retired-attempts.json` and `node-id` are node-owned:
+deleting the versions file would let old envelopes be replayed, deleting a retired attempt
+would let a replaced attempt be registered again (§6.1), and deleting a revocation the
+node recorded would make that lease usable again.
 
 ## 3. Transport framing
 
@@ -291,15 +302,21 @@ answers (from `ready` it spawns nothing):
 {"response":"inspected","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"state":"running"}
 ```
 
-An `exited` or `stopped` task also carries its receipt outcome (§9). A `paused`,
-`revoked` or `sealed` task never does:
+An `exited`, `stopped`, `revoked` or `sealed` task also carries its receipt outcome (§9).
+A `created`, `ready`, `running` or `paused` task never does, and neither does any 1.1 or
+1.2 response:
 
 ```json
 {"response":"inspected","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"state":"exited","outcome":"completed"}
 {"response":"inspected","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"state":"stopped","outcome":"failed"}
-{"response":"inspected","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"state":"revoked"}
-{"response":"inspected","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"state":"sealed"}
+{"response":"inspected","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"state":"revoked","outcome":"failed"}
+{"response":"inspected","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"state":"sealed","outcome":"failed"}
+{"response":"inspected","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"state":"paused"}
 ```
+
+`outcome` on a `revoked` or `sealed` task is new in this revision of 1.3: an earlier
+1.3 node never sent it there, and a strict 1.3 decoder of that revision refuses it.
+Treat `outcome` as optional on `exited`, `stopped`, `revoked` and `sealed`.
 
 A refusal echoes the request's `operation_id`, or `null` for `inspect` and `stream`:
 
@@ -328,6 +345,21 @@ refused, and after the replacement the old binding is no longer known:
 {"response":"rejected","protocol":{"major":1,"minor":3},"operation_id":null,"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"reason":"attempt_mismatch"}
 ```
 
+A replaced attempt is retired for good. Before the replacement takes effect the node
+records the old attempt id durably in `<state-dir>/retired-attempts.json`; from then on a
+`create` naming that attempt is refused `stale_operation`, whatever the task's current
+attempt is doing, after a node restart and after the task is evicted, so the old attempt
+can never be registered, admitted or run again:
+
+```json
+{"request":"create","protocol":{"major":1,"minor":3},"operation_id":10,"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"}}
+{"response":"rejected","protocol":{"major":1,"minor":3},"operation_id":10,"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"reason":"stale_operation"}
+```
+
+The node retires at most 256 attempts per task and 65 536 in all. It never forgets one:
+when recording the old attempt would exceed either bound, or the write fails, the new
+attempt is refused `resource_unavailable` and the current attempt stays as it was.
+
 ### 6.2 State machine
 
 | From | Event | To | Receipt outcome |
@@ -343,8 +375,8 @@ refused, and after the replacement the old binding is no longer known:
 | `running`, `paused` | workload ends on its own or at its budget | `exited` | `completed`, `failed` or `unknown` |
 | `running`, `paused` | `stop` | `stopped` | `failed`, or `unknown` if the reap is unconfirmed |
 | `running`, `paused` | `revoke` | `revoked` | `failed`; what the reaper observed if the workload had already ended on its own; `unknown` if the reap is unconfirmed |
-| `exited`, `stopped`, `revoked` | `seal` | `sealed` | unchanged (kept, no longer reported) |
-| `exited`, `stopped`, `revoked`, `sealed` | `create` under a new attempt id | `created` (the new attempt) | the old attempt's receipt is discarded |
+| `exited`, `stopped`, `revoked` | `seal` | `sealed` | unchanged (kept and still reported) |
+| `exited`, `stopped`, `revoked`, `sealed` | `create` under a new attempt id | `created` (the new attempt) | the old attempt's receipt is discarded; the old attempt id is retired |
 
 `exited`, `stopped` and `revoked` end an attempt: the only transitions out of them are
 `seal` and a `create` for a new attempt. `sealed` is terminal; only a new attempt
@@ -353,30 +385,56 @@ nothing changed (replays aside, §6.3). A paused workload is still watched by it
 and its budget keeps running, so it can end in `exited` while paused (killed at its
 budget).
 
+A `stop` or `revoke` of a `paused` task continues the task's whole tree before the kill.
+From that moment the task reads `running`, because its processes are running again while
+they are killed, and it stays `running` until the reaper records how it ended. If the
+reap is not confirmed in time, a `stop` is answered `resource_unavailable` (§8.2) and the
+task keeps reading `running` with the kill still pending: `pause` and `resume` are then
+refused `invalid_state`, while `inspect`, a replay of the `stop` and a `revoke` are
+served. (A `revoke` always ends in `revoked`, §8.2.)
+
 ### 6.3 Idempotency and replay
 
-Operation ids are recorded per attempt and per verb. A replay is the same request again,
-for example after a lost response.
+A replay is the same request again, for example after a lost response. The node keeps,
+for each attempt and each verb, every `operation_id` that took effect on that attempt, for
+as long as the attempt is registered: one each for `create`, `admit`, `start`, `stop`,
+`revoke` and `seal`, and every `pause` and every `resume`. An attempt takes at most 128
+pauses (and so at most 128 resumes); a further `pause` is refused `resource_unavailable`
+with nothing changed, so no id is ever forgotten while its attempt is registered. `stop`
+and `revoke` are never held back by that bound. An id is tied to its verb: the same id
+under another verb is a new operation of that verb.
+
+One rule covers all eight mutating verbs. When a request's `operation_id` already took
+effect for its verb on this attempt:
+
+- if it is the latest operation of that verb on the attempt, the answer is `accepted` with
+  the task's current state, however far the task has moved on since (for example
+  `sealed`, or `running` again after a `pause` was resumed). Nothing acts again.
+- if a later operation of the same verb has taken effect since (only `pause` and `resume`
+  can take effect more than once per attempt), the answer is `stale_operation` and nothing
+  acts.
+
+Only an operation that took effect is recorded. A refused request records nothing and
+may be retried, with the same `operation_id` or another.
 
 | Verb | Replay that is accepted | Anything else |
 | --- | --- | --- |
-| `create` | Same binding and the `operation_id` of the `create` that registered it: `accepted` with the current state. | Another `operation_id`: `invalid_state`. Same task and attempt, another lease: `lease_mismatch`. Same task, another attempt: a new attempt if the current one is `exited`, `stopped`, `revoked` or `sealed` (§6.1), otherwise `attempt_mismatch`. |
-| `admit` | Same `operation_id`, byte-identical `envelope_json` and identical `proof` as the admit that succeeded: `accepted` with the current state (which may be past `ready`). | On a task that is not `created`: `invalid_state`. A refused admit records nothing and may be retried with any `operation_id`. |
-| `start` | The `operation_id` of the `start` that took effect (including an ambiguous one): `accepted` with the current state. | On a task that is not `ready`: `invalid_state`. A refused start records nothing. |
-| `stop` | The `operation_id` of the `stop` that took effect, while the task is `stopped`: `accepted`, `stopped`. Once the task is sealed the replay is `invalid_state`. | On a task that is not `ready`, `running` or `paused`, including one stopped by another operation: `invalid_state`. |
-| `pause` | The `operation_id` of the last `pause` that took effect: `accepted` with the current state (which may be `running` again after a `resume`). | On a task that is not `running`, or whose `stop` is pending: `invalid_state`. A refused pause records nothing and may be retried with the same `operation_id`. |
-| `resume` | The `operation_id` of the last `resume` that took effect: `accepted` with the current state. | On a task that is not `paused`: `invalid_state`. A refused resume records nothing and may be retried with the same `operation_id`. |
-| `revoke` | The `operation_id` of the `revoke` that took effect: `accepted` with the current state (`revoked`, or `sealed` once sealed). | On a task that is not `ready`, `running` or `paused`: `invalid_state`. A refused revoke records nothing. |
+| `create` | Same binding and the `operation_id` of the `create` that registered it: `accepted` with the current state. | Another `operation_id`: `invalid_state`. Same task and attempt, another lease: `lease_mismatch`. Same task, a retired attempt (§6.1): `stale_operation`. Same task, another attempt: a new attempt if the current one is `exited`, `stopped`, `revoked` or `sealed` (§6.1), otherwise `attempt_mismatch`. |
+| `admit` | Same `operation_id`, byte-identical `envelope_json` and identical `proof` as the admit that succeeded: `accepted` with the current state. | On a task that is not `created`: `invalid_state`. |
+| `start` | The `operation_id` of the `start` that took effect (including an ambiguous one): `accepted` with the current state. | On a task that is not `ready`: `invalid_state`. |
+| `stop` | The `operation_id` of the `stop` that took effect: `accepted` with the current state (`stopped`, or `sealed` once sealed). | On a task that is not `ready`, `running` or `paused`, including one stopped by another operation: `invalid_state`. |
+| `pause` | The `operation_id` of the latest `pause` that took effect: `accepted` with the current state. An earlier one: `stale_operation`. | On a task that is not `running`, or whose kill is pending: `invalid_state`. On an attempt that already took 128 pauses: `resource_unavailable`. |
+| `resume` | The `operation_id` of the latest `resume` that took effect: `accepted` with the current state. An earlier one: `stale_operation`. | On a task that is not `paused`: `invalid_state`. |
+| `revoke` | The `operation_id` of the `revoke` that took effect: `accepted` with the current state (`revoked`, or `sealed` once sealed). | On a task that is not `ready`, `running` or `paused`: `invalid_state`. |
 | `seal` | The `operation_id` of the `seal` that took effect: `accepted`, `sealed`. | On a task that is not `exited`, `stopped` or `revoked`, including one sealed by another operation: `invalid_state`. |
 
 Replay a `stop` that timed out with the same `operation_id`: a second stop with a new id
 while the first is pending also stops the task, but is then answered `invalid_state`
 because the first id is recorded as the stopping operation.
 
-The node remembers only the most recent `pause` and the most recent `resume` per
-attempt. Replaying a `pause` after a later `pause` has taken effect and been resumed is
-not recognised as a replay: it pauses the task again. Use a fresh `operation_id` for
-every `pause` and `resume`, and replay only the latest one.
+The record belongs to the attempt. Once a new attempt replaces it, every request naming
+the old attempt is refused (`stale_operation` for `create`, `attempt_mismatch` for the
+other verbs, `task_not_found` after a restart or an eviction); none of them acts.
 
 ## 7. The admission envelope
 
@@ -628,29 +686,31 @@ from the store, the attempt's workspace already existing (`<task-root>/<task>/<a
 or the sandbox failing to spawn → `resource_unavailable` with the task still `ready`.
 
 `stop`: checks 1–2; replay; `ready` → `stopped`; `running` or `paused` → kill
-(continuing a paused tree first), wait up to 10 seconds for the reap, then `stopped`, or
-`resource_unavailable` if still running, or `invalid_state` if the workload exited first;
-any other state → `invalid_state`. The answer is written after the wait, whatever it
-took (§3).
+(continuing a paused tree first, after which the task reads `running`, §6.2), wait up to
+10 seconds for the reap, then `stopped`, or `resource_unavailable` if still running (the
+task reads `running` and the kill stays pending), or `invalid_state` if the workload
+exited first; any other state → `invalid_state`. The answer is written after the wait,
+whatever it took (§3).
 
-`pause`: checks 1–2; replay; not `running`, or a `stop` of it is pending →
-`invalid_state`; then the node sends `SIGSTOP` to every process of the workload's tree
-(rooted at the sandbox's outer `bwrap`, children first) and waits up to 1 second until
-each is stopped, ended or held in vfork wait on a stopped child, freezing anything forked
-meanwhile. Confirmed → `paused`. Not confirmed in time, or the workload ended → the node
+`pause`: checks 1–2; replay; not `running`, or a kill of it is pending →
+`invalid_state`; 128 pauses already taken by the attempt → `resource_unavailable`; then
+the node sends `SIGSTOP` to every process of the workload's tree (rooted at the sandbox's
+outer `bwrap`, children first) and waits up to 1 second until each is stopped, ended or
+held in vfork wait on a stopped child, freezing anything forked meanwhile. Confirmed → `paused`. Not confirmed in time, or the workload ended → the node
 sends `SIGCONT` to everything it stopped and answers `resource_unavailable`, with the task
 still `running`. The freeze is by signal only; no cgroup freezer is used.
 
-`resume`: checks 1–2; replay; not `paused` → `invalid_state`; then `SIGCONT` to the tree,
-parents first, and up to 1 second for no process of it to be left stopped. Confirmed (or
-the workload already gone) → `running`; otherwise `resource_unavailable` with the task
-still `paused`.
+`resume`: checks 1–2; replay; not `paused`, or a kill of it is pending → `invalid_state`;
+then `SIGCONT` to the tree, parents first, and up to 1 second for no process of it to be
+left stopped. Confirmed (or the workload already gone) → `running`; otherwise
+`resource_unavailable` with the task still `paused`.
 
 `revoke`: checks 1–2; replay; not `ready`, `running` or `paused` → `invalid_state`; then
 the revocation of the binding's lease is written to `revocations.json` (§2.5) unless one
-already in effect is recorded, and a failed write → `resource_unavailable` with nothing
-changed. Only then: `ready` → `revoked`; `running` or `paused` → kill (continuing a paused
-tree first), wait up to 10 seconds for the reap, then `revoked`. Unlike `stop`, `revoke`
+already in effect is recorded, and a failed write, or a store that would exceed 8 MiB →
+`resource_unavailable` with nothing changed. Only then: `ready` → `revoked`; `running` or
+`paused` → kill (continuing a paused tree first, after which the task reads `running`),
+wait up to 10 seconds for the reap, then `revoked`. Unlike `stop`, `revoke`
 is answered `revoked` even if the reap is not confirmed in time (the receipt is then
 `unknown` and the node keeps killing) and even if the workload ends on its own before the
 kill lands (the receipt then records what the reaper observed): the authority is gone
@@ -659,9 +719,11 @@ either way.
 `seal`: checks 1–2; replay; not `exited`, `stopped` or `revoked` → `invalid_state`;
 otherwise `sealed`. Nothing is written to disk and the workspace is not removed.
 
-`create`: checks 2 and the replay rule of §6.3, with a new attempt replacing a finished
-one (§6.1). A new task when the node already holds 1 024 tasks evicts the task sealed
-longest ago; with no sealed task to evict it is refused `resource_unavailable`.
+`create`: a retired attempt (§6.1) → `stale_operation`; then check 2 and the replay rule
+of §6.3, with a new attempt replacing a finished one (§6.1) once the replaced attempt id is
+durably retired (`resource_unavailable` with nothing changed if it cannot be). A new task
+when the node already holds 1 024 tasks evicts the task sealed longest ago; with no sealed
+task to evict it is refused `resource_unavailable`.
 
 ### 8.3 Rejection reasons
 
@@ -672,20 +734,20 @@ longest ago; with no sealed task to evict it is refused `resource_unavailable`.
 | `lease_mismatch` | The task is registered, or the envelope is bound, under another lease id, or the envelope's lease `id` is not the binding's lease. |
 | `lease_expired` | The envelope or a lease is past its expiry at the node clock. |
 | `lease_revoked` | A durable revocation, from `revocations.json` or recorded by `revoke`, covers the lease or an ancestor. |
-| `stale_operation` | The request is stale. From `admit`: the envelope `version` is not greater than the last version the node durably accepted for the task (an old or replayed envelope, also after a restart). The protocol also reserves it for a mutating request whose `operation_id` was superseded by a later operation on the task; `ward-node` does not return it for that today. |
+| `stale_operation` | The request is stale and nothing was done. From `admit`: the envelope `version` is not greater than the last version the node durably accepted for the task (an old or replayed envelope, also after a restart). From `pause` or `resume`: the `operation_id` took effect earlier and a later operation of the same verb has superseded it (§6.3). From `create`: the attempt was replaced by a later attempt of the task and is retired (§6.1). |
 | `invalid_state` | The task is not in a state that allows the verb, or another operation already did it. |
 | `authority_denied` | Untrusted key, bad signature, malformed envelope, a root lease `issuer` that is not the principal bound to the signing key, wrong audience, not yet valid, or authority that does not cover the task or agent. |
-| `resource_unavailable` | Registry full with no sealed task to evict, snapshot missing, workspace exists, spawn failed, a state write failed (admission version or revocation), stop not confirmed in time, or a pause or resume not confirmed. |
+| `resource_unavailable` | Registry full with no sealed task to evict, snapshot missing, workspace exists, spawn failed, a state write failed or would exceed its bound (admission version, revocation or retired attempt), stop not confirmed in time, a pause or resume not confirmed, or an attempt's 128 pauses used up. |
 | `unsupported_operation` | The verb is not implemented (`stream`), or not enabled on this node or connection (no `--task-root`, or protocol 1.2). |
 
 ## 9. Receipts
 
 The node records one receipt per attempt (binding, session and outcome) when the attempt
-ends (`exited`, `stopped` or `revoked`) and keeps it in memory. The wire reports the
-outcome only on `inspect` of an `exited` or `stopped` task: a `revoked` task's receipt is
-recorded but not reported, and `seal` keeps the receipt but `inspect` of a `sealed` task
-no longer carries it. Read the outcome before you seal. A receipt is lost on restart, when
-a new attempt replaces its attempt, and when its sealed task is evicted.
+ends (`exited`, `stopped` or `revoked`) and keeps it in memory. At 1.3, `inspect` of an
+`exited`, `stopped`, `revoked` or `sealed` task reports the outcome; `seal` keeps the
+receipt, so a sealed task reports the outcome its attempt ended with. A 1.1 or 1.2
+connection never sees an outcome. A receipt is lost on restart, when a new attempt
+replaces its attempt, and when its sealed task is evicted: read the outcome before then.
 
 | Outcome | When |
 | --- | --- |
@@ -708,7 +770,8 @@ returned.
 - **Slow `start`, `stop` and `revoke`.** A slow verb is answered, not cut off: a `start`
   whose spawn is not confirmed within 30 seconds is answered `accepted` with `exited`
   (ambiguous, below); a `stop` whose reap is not confirmed within 10 seconds is answered
-  `resource_unavailable` (replay it with the same `operation_id`); a `revoke` whose reap
+  `resource_unavailable` (replay it with the same `operation_id`; a task that was
+  `paused` reads `running` meanwhile and refuses `pause` and `resume`, §6.2); a `revoke` whose reap
   is not confirmed within 10 seconds is still answered `accepted` with `revoked`, with an
   `unknown` receipt, while the node keeps killing. Keep the connection open and reading
   until the answer arrives (§3).
@@ -723,8 +786,9 @@ returned.
   paused, and the reaper keeps watching it: a paused task whose budget runs out is killed
   and becomes `exited` with `failed`. Pausing never extends a budget.
 - **Revoke is durability-first.** `revoke` writes the revocation of the binding's lease
-  to `revocations.json` before anything else changes; if that write fails the answer is
-  `resource_unavailable`, nothing changed and the workload keeps running. Once written it
+  to `revocations.json` before anything else changes; if that write fails, or the store
+  would exceed 8 MiB (§2.5), the answer is `resource_unavailable`, nothing changed and the
+  workload keeps running. Once written it
   holds across restarts: no later `admit` or `start` under that lease, or under any lease
   delegated from it, is accepted (`lease_revoked`). Its scope is the named task only: a
   lease is bound to one task, so other tasks, their leases and the lease's ancestors are
@@ -741,10 +805,12 @@ returned.
   id, `admit` a new envelope bound to it with a higher `version`, and `start` it; its
   workspace is `<task-root>/<task>/<new-attempt>/`. The new attempt replaces the old one
   in the registry: the old binding then reads `attempt_mismatch` and its state and
-  receipt can no longer be inspected, so read the outcome first. While the current
-  attempt is `created`, `ready`, `running` or `paused`, the `create` is refused
-  `attempt_mismatch`; stop or revoke it first. Never reuse an attempt id: once replaced,
-  the node no longer knows it.
+  receipt can no longer be inspected, so read the outcome first. The old attempt id is
+  retired durably: a late or replayed `create` for it is refused `stale_operation`, also
+  after a restart or an eviction (§6.1). While the current attempt is `created`, `ready`,
+  `running` or `paused`, the `create` is refused `attempt_mismatch`; stop or revoke it
+  first. A task takes at most 256 replacements; after that a new attempt is refused
+  `resource_unavailable`. Never reuse an attempt id.
 - **Stop or revoke racing exit.** Exactly one terminal state wins. If the workload exited
   on its own before a `stop` took effect, the task is `exited` with its real outcome and
   the `stop` is answered `invalid_state`; inspect to read it. A `revoke` served while the
@@ -755,7 +821,9 @@ returned.
   Treat an attempt that was `running` or `paused` and is now `task_not_found` as outcome
   unknown. Its workspace survives, so the attempt cannot be started again; the admission
   version survives, so the old envelope is refused `stale_operation`; revocations
-  recorded by `revoke` survive.
+  recorded by `revoke` and retired attempt ids survive. Operation ids do not: the
+  registry is gone, so after a restart a replay is answered as a new request of a
+  forgotten task (`task_not_found`, or for `create` a new registration).
 - **Versions.** Keep a durable, strictly increasing version per task in the control
   plane. It is per task, not per attempt: a new attempt's envelope needs a version higher
   than every one accepted for the task before, across attempts, evictions and restarts.
