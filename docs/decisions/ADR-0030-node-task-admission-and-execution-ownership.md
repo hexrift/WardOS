@@ -163,8 +163,14 @@ TDD slices without guessing at semantics inside a feature PR.
    restart ambiguous attempts recovered `Exited`/`Unknown` with survivors killed and
    never re-run, `Ready` tasks `Created` again, and ended tasks, receipts and replays
    preserved.
+7. Per-attempt evidence logs (§3): the node, as the single writer, keeps one hash-chained
+   `ward-events` log per admitted attempt beside its workspace under the task root, with a
+   record of admission, launch, every pause and resume, the end with its receipt outcome,
+   recovery after a restart and seal. Each record is durable before its verb is answered,
+   a restarted node reconciles the log before it serves, and sealing the task seals the
+   log.
 
-Steps 1–6 are written down as the external contract in
+Steps 1–7 are written down as the external contract in
 [node-integration.md](../node-integration.md).
 
 Cross-system acceptance — isolation, interruption, no duplicate effect — is #332 slice 9.
