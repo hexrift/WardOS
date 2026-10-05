@@ -352,10 +352,13 @@ authority lease itself.
 
 After negotiation, the local node serves one request per connection. Protocol
 1.1 supports read-only capability discovery; 1.2 supports discovery or a task
-lifecycle request. Capability responses retain the same node facts while naming
-the exact negotiated version. Protocol 1.0 has no discovery endpoint.
+lifecycle request; 1.3 adds the `admit` verb and the `exited` state. Capability
+responses retain the same node facts while naming the exact negotiated version, and
+a 1.3 document advertises nothing new. Protocol 1.0 has no discovery endpoint. A 1.2
+connection refuses `admit` exactly like an unknown request and never carries
+`exited`.
 
-### 3.11 Node admission and execution ownership (decided, not yet implemented)
+### 3.11 Node admission and execution ownership (decided; protocol types only)
 
 [ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md) settles
 how the node will execute. Protocol 1.3 adds an `admit` verb carrying one signed,
@@ -363,8 +366,15 @@ audience-bound, versioned admission envelope (binding, agent, node, session, lea
 lineage, workload, mandatory budget). The workspace is allocated by the node under its
 configured task root. The node owns spawn, reaping, budget enforcement and per-attempt
 evidence. `start` and `stop` ship together. Natural exit is a distinct `Exited` state
-with a real receipt, and an ambiguous launch is `Unknown` and never retried. None of this
-is implemented yet; #324 tracks the slices.
+with a real receipt, and an ambiguous launch is `Unknown` and never retried.
+
+The protocol 1.3 types exist in `ward-node-protocol`: `TaskAdmissionEnvelope`, the
+`admit` request and the `Exited` state. `admit` carries the envelope as the exact JSON
+bytes the issuer signed (at most 32 KiB) beside a detached proof (issuer key id and a
+64-byte Ed25519 signature, both hex); the envelope is decoded strictly only after the
+proof is checked. Admission itself is not implemented: `ward-node` answers `admit` with
+`unsupported_operation` and changes nothing, and no signature is verified yet. #324
+tracks the remaining slices.
 
 ---
 

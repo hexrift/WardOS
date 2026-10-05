@@ -11,9 +11,11 @@
 //!   binding belong to `start`.
 //! * `inspect` reports the state the registry actually holds for that binding.
 //!
-//! Every other verb (`start`, `pause`, `resume`, `stop`, `revoke`, `seal`, `stream`) is
-//! answered with an explicit [`TaskLifecycleRejectionReason::UnsupportedOperation`] and
-//! never changes a task's state. The node does not accept a transition it cannot carry
+//! Every other verb (`admit`, `start`, `pause`, `resume`, `stop`, `revoke`, `seal`,
+//! `stream`) is answered with an explicit
+//! [`TaskLifecycleRejectionReason::UnsupportedOperation`] and never changes a task's
+//! state. `admit` (protocol 1.3) stays refused until the node verifies the issuer proof
+//! and the durable version and revocation stores exist (ADR-0030). The node does not accept a transition it cannot carry
 //! out, and it never reports one as applied.
 //!
 //! The registry is in memory and bounded by its capacity: a node restart forgets every
@@ -82,6 +84,7 @@ impl TaskRegistry {
     ///
     /// The request must already have been decoded through `context` (which proves it
     /// names the negotiated protocol).
+    #[allow(clippy::needless_pass_by_value)]
     pub fn handle(
         &mut self,
         context: TaskLifecycleContext,
@@ -94,7 +97,12 @@ impl TaskRegistry {
                 ..
             } => self.create(context, operation_id, binding),
             TaskLifecycleRequest::Inspect { binding, .. } => self.inspect(context, binding),
-            TaskLifecycleRequest::Start {
+            TaskLifecycleRequest::Admit {
+                operation_id,
+                binding,
+                ..
+            }
+            | TaskLifecycleRequest::Start {
                 operation_id,
                 binding,
                 ..
@@ -330,7 +338,7 @@ mod tests {
             (ctx.stream(task, 0), None),
         ] {
             assert_eq!(
-                registry.handle(ctx, request),
+                registry.handle(ctx, request.clone()),
                 ctx.rejected(operation_id, task, Reason::UnsupportedOperation),
                 "{request:?} must be refused, not reported as applied"
             );
@@ -339,6 +347,33 @@ mod tests {
                 ctx.inspected(task, TaskLifecycleState::Created)
             );
         }
+    }
+
+    #[test]
+    fn admit_is_refused_as_unsupported_and_never_changes_state() {
+        let ctx = TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let mut registry = TaskRegistry::default();
+        let task = binding(1, 2, 3);
+        let unknown = binding(4, 5, 6);
+
+        assert_eq!(
+            registry.handle(ctx, crate::test_support::admit(ctx, op(9), unknown)),
+            ctx.rejected(Some(op(9)), unknown, Reason::UnsupportedOperation)
+        );
+        assert!(registry.is_empty());
+
+        registry.handle(ctx, ctx.create(op(10), task));
+        for operation in [op(11), op(10)] {
+            assert_eq!(
+                registry.handle(ctx, crate::test_support::admit(ctx, operation, task)),
+                ctx.rejected(Some(operation), task, Reason::UnsupportedOperation)
+            );
+            assert_eq!(
+                registry.handle(ctx, ctx.inspect(task)),
+                ctx.inspected(task, TaskLifecycleState::Created)
+            );
+        }
+        assert_eq!(registry.len(), 1);
     }
 
     #[test]
