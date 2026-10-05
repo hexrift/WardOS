@@ -8328,11 +8328,16 @@ mod tests {
             served.try_lock().is_err(),
             "the pause holds the daemon's mutex meanwhile"
         );
-        assert_eq!(
+        // The lane publishes `pausing` as soon as the transition is admitted;
+        // the intent the on-disk derivation reads is written a moment later in
+        // the same operation, so wait for it rather than assume both at once.
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                pause::lifecycle_on_disk(dir.path(), "sess_9")
+                    .is_ok_and(|on_disk| on_disk.state == Lifecycle::Pausing)
+            }),
+            "{:?}",
             pause::lifecycle_on_disk(dir.path(), "sess_9")
-                .unwrap()
-                .state,
-            Lifecycle::Pausing
         );
         release.send(()).unwrap();
         assert!(matches!(pausing.join().unwrap().0, Response::Paused { .. }));
