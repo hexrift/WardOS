@@ -1,0 +1,18 @@
+[package]
+name = "ward-launch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WardOS: bubblewrap launch primitive shared by ward-daemon and ward-node"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# `ci::isolation_ready` gates the bwrap-backed unit tests exactly as before the move.
+ward-sandbox = { path = "../ward-sandbox", version = "0.18.0" }
+
+[lints]
+workspace = true

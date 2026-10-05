@@ -41,6 +41,7 @@ wardos/
 │   ├── ward-snapshot/             # CAS, manifest, capture (btrfs / frozen-copy), materialise
 │   ├── ward-proxy/                # egress proxy: allowlist, private-range deny, injection
 │   ├── ward-sandbox/              # OCI spec generation, crun driver, cgroup/netns plumbing
+│   ├── ward-launch/               # bubblewrap launch primitive shared by ward-daemon and ward-node
 │   ├── ward-shell-core/           # Ward Shell view model (trust bar, feed, launcher, settings), no toolkit
 │   └── ward-bench/                # `ward benchmark`
 │
@@ -98,6 +99,7 @@ responsibility lives now:
 | `ward-policy` | `policy`, `capability`, `merge`, `default`, `ids` | as planned (CODEOWNERS) |
 | `ward-snapshot` | `cas`, `manifest`, `capture`, `materialize`, `meta`, `ignore`, `backend` | as planned |
 | `ward-sandbox` | OCI spec generation and the typed seccomp profile | as planned |
+| `ward-launch` | the bubblewrap launch primitive (`Launch`, `RunningLaunch`, `Outcome`), re-exported unchanged as `ward_daemon::sandbox` | split out of `ward-daemon` so `ward-node` can launch without depending on it (ADR-0030 §3) |
 | `ward-proxy` | `proxy`, `policy`, `addr`, `hosts`, `http`, `resolve`, `gateway`, `secret`, `observer` | as planned; `gateway` is the credential injection of `ward-credentials` |
 | `ward-agent` | `cli`, `landlock`, `seccomp`, `privs`, `supervise`, `relay`, `hook` | as planned; `hook` is the hook adapter |
 | `ward-daemon` | `session`, `control`, `daemon`, `sandbox`, `egress`, `gateway`, `hooks`, `verify`, `selftest`, `watch`, `agents`, `render`, `describe`, `snapshot`, `ids` | `gateway` → `ward-credentials`; `verify` → `ward-verifier`; `render` → `ward-observer` |
