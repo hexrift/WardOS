@@ -5,9 +5,9 @@
 #                  [--tag NAME] [--version V] [--dev-seed-user NAME] [--dry-run]
 #                  [-- extra podman build args]
 #
-# Defaults: --source release (the published tarball of --release, default the newest
-# tag reachable from HEAD, else the Containerfile default; checksum fetched from the
-# release and verified in the build);
+# Defaults: --source release (the published tarballs of --release, default the newest
+# tag reachable from HEAD, else the Containerfile default; the runtime and the node
+# tarball's checksums fetched from the release and verified in the build);
 # --source checkout compiles this working tree instead. --arch builds for another
 # architecture (podman --platform, and the release tarball and checksum of that
 # architecture; aarch64 tarballs exist from v0.3), the default being this machine's.
@@ -100,7 +100,11 @@ case "$arch" in
   *) echo "build.sh: --arch must be x86_64 or aarch64 (got '$arch')" >&2; exit 2 ;;
 esac
 sha_arg="WARDOS_SHA256"
-if [[ "$arch" == aarch64 ]]; then sha_arg="WARDOS_SHA256_AARCH64"; fi
+node_sha_arg="WARDOS_NODE_SHA256"
+if [[ "$arch" == aarch64 ]]; then
+  sha_arg="WARDOS_SHA256_AARCH64"
+  node_sha_arg="WARDOS_NODE_SHA256_AARCH64"
+fi
 
 # --format docker: the Containerfile's SHELL (pipefail) is honoured; the OCI format
 # ignores it, and bootc is happy with either.
@@ -141,6 +145,21 @@ case "$source" in
     cmd+=(--build-arg "WARDOS_SOURCE=release"
       --build-arg "WARDOS_RELEASE=${release}"
       --build-arg "${sha_arg}=${sha}")
+    # The node tarball's checksum, the same way (issue #275). Releases up to v0.4.1 carry
+    # no node tarball; the Containerfile's release stage refuses to build an image without
+    # it (an image carries the node whichever stage it comes from), so a build of such a
+    # release stops there, at once, with that reason. The reason is said here too, and
+    # the decision stays the Containerfile's: a dry run (the "image lint" job's, against
+    # the Containerfile default) still shows the command, and a hand-run `podman build`
+    # meets the same refusal.
+    node_asset="ward-node-${release#v}-${arch}-linux.tar.gz.sha256"
+    node_sha=$(curl -fsSL "https://github.com/hexrift/WardOS/releases/download/${release}/${node_asset}" | awk '{print $1}') || true
+    if [[ "$node_sha" =~ ^[0-9a-f]{64}$ ]]; then
+      cmd+=(--build-arg "${node_sha_arg}=${node_sha}")
+    else
+      echo "build.sh: could not fetch the node checksum for release ${release} (${node_asset})" >&2
+      echo "build.sh: releases up to v0.4.1 carry no node tarball; the release stage will refuse to build an image without the node: use a later release or --source checkout" >&2
+    fi
     ;;
   checkout)
     cmd+=(--build-arg "WARDOS_SOURCE=builder")

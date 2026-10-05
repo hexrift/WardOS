@@ -368,18 +368,27 @@ The host stage copies the binaries from one of two stages, chosen with
 
 | Source | What happens | Use |
 | --- | --- | --- |
-| `release` (default) | downloads `wardos-<ver>-<arch>-linux.tar.gz` for `WARDOS_RELEASE` from the GitHub release (`<arch>` from the platform being built: `TARGETARCH` amd64 → `x86_64`, arm64 → `aarch64`) and refuses to continue unless its SHA-256 matches `WARDOS_SHA256` (x86_64) or `WARDOS_SHA256_AARCH64` (`build.sh` fetches the published checksum for `--arch`) | every image that leaves your machine: reproducible from a known, tested release |
+| `release` (default) | downloads `wardos-<ver>-<arch>-linux.tar.gz` and `ward-node-<ver>-<arch>-linux.tar.gz` for `WARDOS_RELEASE` from the GitHub release (`<arch>` from the platform being built: `TARGETARCH` amd64 → `x86_64`, arm64 → `aarch64`) and refuses to continue unless their SHA-256s match `WARDOS_SHA256` and `WARDOS_NODE_SHA256` (x86_64) or `WARDOS_SHA256_AARCH64` and `WARDOS_NODE_SHA256_AARCH64` (`build.sh` fetches the published checksums for `--arch`) | every image that leaves your machine: reproducible from a known, tested release |
 | `builder` (`--source checkout`) | compiles this working tree with `docker.io/library/rust:1.94.1` (the channel of `rust-toolchain.toml`; bump both together), `--locked` | development images of unreleased changes; the "image build" CI job |
 
-Five binaries: `ward`, `wardd`, `ward-agent` (required; the build fails without them),
-`ward-shell` and `wardos-theme-render` (the shell's surfaces and the theme renderer).
-The builder stage compiles all five (`desktop/shell`, `desktop/theme` are workspace
-crates); the release stage copies the last two when the tarball has them, which
-release tarballs from **v0.2** do (`release.yml` packages five from now on)
-and earlier releases do not: an image built from one has the desktop's packages and
-configuration but no shell surfaces, and `ls -l /usr/bin/ward*` in the build log says
-which arrived. The Rust image is Debian-based; its glibc is older than Fedora 44's, so
-the binaries run on the host without a rebuild.
+Seven binaries: `ward`, `wardd`, `ward-agent`, `ward-node` and `ward-node-adapter`
+(required; the build fails without them), `ward-shell` and `wardos-theme-render` (the
+shell's surfaces and the theme renderer). The builder stage compiles all seven
+(`crates/ward-node`, `crates/ward-node-client`, `desktop/shell` and `desktop/theme` are
+workspace crates). The release stage takes the first three from the runtime tarball,
+copies the last two when that tarball has them, which release tarballs from **v0.2** do
+(`release.yml` packages five from then on) and earlier releases do not (an image built
+from one has the desktop's packages and configuration but no shell surfaces), and takes
+the node's two from the release's node tarball, `ward-node-<ver>-<arch>-linux.tar.gz`
+(`scripts/release/package.sh`, issue #275), checked against `WARDOS_NODE_SHA256` or
+`WARDOS_NODE_SHA256_AARCH64` the way the runtime tarball is checked. There is no
+optional node: a release without a node tarball (every release up to **v0.4.1**) cannot
+feed a release-source image, the stage says so and stops, and such a release is built
+with `--source checkout`; `build.sh` fetches the node checksum beside the runtime's and
+warns when the release has none. Whichever stage the binaries come from, the host stage
+asserts the five required ones are in `/usr/bin`, and `ls -l /usr/bin/ward*` in the
+build log says which arrived. The Rust image is Debian-based; its glibc is older than
+Fedora 44's, so the binaries run on the host without a rebuild.
 
 The tools and the image therefore have separate cadences: `vX.Y.Z` tags release the
 tools; images carry the release they embed in `org.wardos.version` plus the build's
@@ -605,11 +614,12 @@ every dispatch), every name in `packages.txt` is noarch or built for aarch64 (th
 `image build (aarch64)` job is the proof, on every merge), and bootc-image-builder is
 published for arm64. Nothing in the desktop tree is architecture-specific. The
 Containerfile's release stage reads `TARGETARCH` (which docker and podman set from
-`--platform`) to fetch the tarball of the platform being built and checks it against
-`WARDOS_SHA256_AARCH64`; the builder stage compiles for that platform by itself.
+`--platform`) to fetch the tarballs of the platform being built and checks them against
+`WARDOS_SHA256_AARCH64` and `WARDOS_NODE_SHA256_AARCH64`; the builder stage compiles
+for that platform by itself.
 
 Locally, `build.sh --arch aarch64` passes `--platform linux/arm64` and the aarch64
-checksum. On an arm64 host (an Asahi or Fedora-on-Mac box, a Graviton VM) that is a
+checksums. On an arm64 host (an Asahi or Fedora-on-Mac box, a Graviton VM) that is a
 native build; on an x86_64 host podman runs the Rust build and `dnf` under
 `qemu-user-static`, which works and takes hours, so prefer the published image or CI.
 `disk.sh --arch aarch64` passes `--target-arch arm64` to bootc-image-builder: a no-op on
