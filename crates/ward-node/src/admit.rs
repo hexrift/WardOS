@@ -195,6 +195,37 @@ impl NodeAdmission {
         })
     }
 
+    /// Recheck, at the node clock, that an admitted envelope and its authority are still
+    /// usable: the envelope and lease unexpired and no durable revocation covering the
+    /// lease or its lineage. `start` calls this before anything is materialised or spawned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskLifecycleRejectionReason::LeaseExpired`],
+    /// [`TaskLifecycleRejectionReason::LeaseRevoked`], or
+    /// [`TaskLifecycleRejectionReason::AuthorityDenied`] for a clock before issuance.
+    pub fn revalidate(
+        &self,
+        verified: &VerifiedAdmission,
+    ) -> Result<(), TaskLifecycleRejectionReason> {
+        let now = self.clock.now_unix_ms();
+        let envelope = verified.envelope();
+        if now < envelope.issued_at_unix_ms() {
+            return Err(Reason::AuthorityDenied);
+        }
+        if now >= envelope.expires_at_unix_ms() {
+            return Err(Reason::LeaseExpired);
+        }
+        verified
+            .authority()
+            .revalidate(&AuthorityRevocations::new(), now)
+            .map_err(|_| Reason::LeaseExpired)?;
+        verified
+            .authority()
+            .revalidate(self.state.revocations(), now)
+            .map_err(|_| Reason::LeaseRevoked)
+    }
+
     /// Durably record a verified admission's version before the task changes state.
     ///
     /// # Errors

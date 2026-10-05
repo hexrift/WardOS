@@ -82,6 +82,9 @@ pub struct Outcome {
     pub duration: Duration,
     /// The launch was killed because it outran its budget.
     pub timed_out: bool,
+    /// The launch was killed and reaped because the caller asked it to stop
+    /// ([`RunningLaunch::wait_stoppable`]).
+    pub stopped: bool,
 }
 
 /// Whether the sandbox actually works on this host.
@@ -218,6 +221,7 @@ pub struct Launch {
     budget: Option<Duration>,
     capture_bytes: Option<usize>,
     keep_prefix: Option<String>,
+    clear_env: bool,
 }
 
 /// A spawned sandbox whose child is owned until it is waited or dropped.
@@ -252,8 +256,29 @@ impl RunningLaunch {
     /// # Errors
     ///
     /// Returns an error if waiting for the child fails.
-    pub fn wait_observed(mut self, on_tick: &mut dyn FnMut()) -> Result<Outcome> {
-        let (status, timed_out) = wait_within(&mut self.child, self.deadline, on_tick)?;
+    pub fn wait_observed(self, on_tick: &mut dyn FnMut()) -> Result<Outcome> {
+        self.wait_for_end(on_tick, &|| false)
+    }
+
+    /// Wait like [`wait`](Self::wait), but kill and reap the child as soon as `stop`
+    /// returns true; `stop` is polled about every [`WAIT_POLL`]. The outcome reports
+    /// `stopped` only when the kill ended the child: a child that had already exited
+    /// on its own reports its own exit, so a stop racing a natural exit never claims
+    /// to have ended it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if waiting for the child fails.
+    pub fn wait_stoppable(self, stop: &dyn Fn() -> bool) -> Result<Outcome> {
+        self.wait_for_end(&mut || {}, stop)
+    }
+
+    fn wait_for_end(
+        mut self,
+        on_tick: &mut dyn FnMut(),
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Outcome> {
+        let (status, end) = wait_until(&mut self.child, self.deadline, on_tick, stop)?;
         self.reaped = true;
         let collect = |handle: Option<std::thread::JoinHandle<StreamCapture>>| {
             handle
@@ -273,7 +298,8 @@ impl RunningLaunch {
             truncated: out.truncated || err.truncated,
             kept_lines,
             duration: self.start.elapsed(),
-            timed_out,
+            timed_out: end == WaitEnd::TimedOut,
+            stopped: end == WaitEnd::Stopped,
         })
     }
 }
@@ -305,6 +331,7 @@ impl Launch {
             budget: None,
             capture_bytes: None,
             keep_prefix: None,
+            clear_env: false,
         }
     }
 
@@ -365,6 +392,14 @@ impl Launch {
         self
     }
 
+    /// Start the sandbox from an empty environment: none of the launching
+    /// process's variables reach it, only those set explicitly.
+    #[must_use]
+    pub const fn clear_env(mut self) -> Self {
+        self.clear_env = true;
+        self
+    }
+
     /// Inherit or capture stdio.
     #[must_use]
     pub fn stdio(mut self, stdio: StdioMode) -> Self {
@@ -403,6 +438,9 @@ impl Launch {
             a.extend(xs.iter().map(|x| (*x).to_string()));
         }
         let mut a: Vec<String> = Vec::new();
+        if self.clear_env {
+            push(&mut a, &["--clearenv"]);
+        }
         // Read-only system directories the toolchain needs; host home is never bound.
         // TLS trust roots are read-only system data the agent needs for HTTPS via CONNECT.
         for dir in SYSTEM_RO {
@@ -745,39 +783,78 @@ fn push_kept_line(line: &[u8], prefix: &str, out: &mut Vec<String>, kept_bytes: 
 /// offered to the caller at.
 pub const WAIT_POLL: Duration = Duration::from_millis(20);
 
-/// Wait for `child`, killing it once `deadline` passes, and call `on_tick` between
-/// waits so the caller can make progress (draining observers, #137) while the child
-/// still runs. Returns the exit status (`None` when killed) and whether the budget
-/// was exceeded.
+/// Wait for `child`, killing it once `deadline` passes or as soon as `stop` returns
+/// true, and call `on_tick` between waits so the caller can make progress (draining
+/// observers, #137) while the child still runs. Returns the exit status (`None` when
+/// killed at the budget) and how the wait ended. A stop that lands after the child
+/// already exited on its own reports that exit, never a stop.
 ///
 /// The wait polls even with no deadline, where it used to block in `wait(2)`: a
 /// blocking wait cannot offer the caller a turn, and an interactive agent session
 /// is exactly the case where the whole run would otherwise pass with nothing on the
 /// log. `on_tick` never runs after the child has been reaped.
-fn wait_within(
+fn wait_until(
     child: &mut std::process::Child,
     deadline: Option<Instant>,
     on_tick: &mut dyn FnMut(),
-) -> Result<(Option<std::process::ExitStatus>, bool)> {
+    stop: &dyn Fn() -> bool,
+) -> Result<(Option<std::process::ExitStatus>, WaitEnd)> {
     let wait_err = |e: std::io::Error| Error::Sandbox(format!("waiting for bwrap: {e}"));
     loop {
         if let Some(status) = child.try_wait().map_err(wait_err)? {
-            return Ok((Some(status), false));
+            return Ok((Some(status), WaitEnd::Exited));
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             let _ = child.kill();
             let _ = child.wait();
-            return Ok((None, true));
+            return Ok((None, WaitEnd::TimedOut));
+        }
+        if stop() {
+            let _ = child.kill();
+            let status = child.wait().map_err(wait_err)?;
+            let end = if status.code().is_some() {
+                WaitEnd::Exited
+            } else {
+                WaitEnd::Stopped
+            };
+            return Ok((Some(status), end));
         }
         std::thread::sleep(WAIT_POLL);
         on_tick();
     }
 }
 
+/// How [`wait_until`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitEnd {
+    /// The child exited on its own.
+    Exited,
+    /// The child outran its budget and was killed.
+    TimedOut,
+    /// The caller asked the child to stop, and the kill ended it.
+    Stopped,
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn clear_env_unsets_the_host_environment_before_any_sandbox_variable() {
+        let inherited = Launch::new("/tmp", vec!["true".into()]).env("FOO", "bar");
+        assert!(
+            !inherited
+                .args(Path::new("/tmp"))
+                .contains(&"--clearenv".to_string())
+        );
+        let cleared = inherited.clear_env();
+        let a = cleared.args(Path::new("/tmp"));
+        let clear = a.iter().position(|x| x == "--clearenv").unwrap();
+        let first_set = a.iter().position(|x| x == "--setenv").unwrap();
+        assert!(clear < first_set, "{a:?}");
+        assert!(a.join(" ").contains("--setenv FOO bar"));
+    }
 
     #[test]
     fn args_isolate_net_and_bind_egress_and_shim() {
@@ -920,6 +997,74 @@ mod tests {
         let pid = running.id();
         drop(running);
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn a_stop_request_kills_and_reaps_a_running_child_promptly() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let started = Instant::now();
+        let (status, end) = wait_until(&mut child, None, &mut || {}, &|| true).unwrap();
+        assert_eq!(end, WaitEnd::Stopped);
+        assert_eq!(status.and_then(|status| status.code()), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn a_stop_request_after_a_natural_exit_reports_the_exit() {
+        let mut child = Command::new("sh").args(["-c", "exit 4"]).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let (status, end) = wait_until(&mut child, None, &mut || {}, &|| true).unwrap();
+        assert_eq!(end, WaitEnd::Exited);
+        assert_eq!(status.and_then(|status| status.code()), Some(4));
+    }
+
+    #[test]
+    fn a_stop_that_is_never_requested_leaves_the_budget_in_charge() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let (status, end) = wait_until(&mut child, Some(deadline), &mut || {}, &|| false).unwrap();
+        assert_eq!(end, WaitEnd::TimedOut);
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn wait_stoppable_kills_a_sandbox_on_request_and_keeps_a_natural_exit() {
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        let running = Launch::new("/tmp", vec!["sleep".into(), "30".into()])
+            .budget(Duration::from_secs(30))
+            .spawn()
+            .unwrap();
+        let pid = running.id();
+        let requested = std::sync::atomic::AtomicBool::new(false);
+        let started = Instant::now();
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(200));
+                requested.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            running
+                .wait_stoppable(&|| requested.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap()
+        });
+        assert!(outcome.stopped);
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.code, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+
+        let exited = Launch::new("/tmp", vec!["sh".into(), "-c".into(), "exit 3".into()])
+            .budget(Duration::from_secs(30))
+            .spawn()
+            .unwrap()
+            .wait_stoppable(&|| false)
+            .unwrap();
+        assert!(!exited.stopped);
+        assert!(!exited.timed_out);
+        assert_eq!(exited.code, Some(3));
     }
 
     #[test]

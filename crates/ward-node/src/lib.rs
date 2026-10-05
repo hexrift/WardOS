@@ -12,19 +12,26 @@
 //!   issuers, its node id, its clock and its durable state, and moves the task
 //!   `Created → Ready` (see [`admit`]); it then advertises `admit` in 1.3 capability
 //!   discovery. Without admission, `admit` is refused as unsupported.
+//! * at protocol 1.3, a service built with [`NodeService::with_execution`] also starts
+//!   and stops admitted tasks in an offline sandbox over a node-allocated workspace, reaps
+//!   them on a node-owned thread and records `exited` with a receipt (see [`task`] and
+//!   [`execution`]). It advertises `start` and `stop` together in 1.3 capability
+//!   discovery; any other 1.3 node advertises neither. 1.1 and 1.2 documents are unchanged.
 //!
-//! No task is executed yet: `start` and `stop` stay unsupported, and remote transport is
-//! deliberately absent.
+//! `pause`, `resume`, `revoke` and `seal` stay unsupported, and remote transport is
+//! deliberately absent. Serving a lifecycle request never waits on a running workload.
 
 #![forbid(unsafe_code)]
 
 pub mod admission;
 pub mod admit;
+pub mod execution;
 pub mod issuer;
 pub mod state;
 pub mod task;
 #[cfg(test)]
 mod test_support;
+pub mod workspace;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -41,6 +48,7 @@ use ward_node_protocol::{
 };
 
 use crate::admit::NodeAdmission;
+use crate::execution::NodeExecution;
 use crate::task::{MAX_NODE_TASKS, TaskRegistry};
 
 /// Maximum bytes in one node-protocol JSON request, excluding the terminating newline.
@@ -96,6 +104,7 @@ pub struct NodeService {
     capabilities: NodeCapabilities,
     supported: SupportedProtocolRange,
     admits: bool,
+    executes: bool,
     tasks: Arc<Mutex<TaskRegistry>>,
 }
 
@@ -113,6 +122,7 @@ impl NodeService {
             capabilities,
             supported: WARD_NODE_PROTOCOL,
             admits: false,
+            executes: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::default())),
         })
     }
@@ -133,9 +143,37 @@ impl NodeService {
             capabilities,
             supported: WARD_NODE_PROTOCOL,
             admits: true,
+            executes: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_admission(
                 MAX_NODE_TASKS,
                 admission,
+            ))),
+        })
+    }
+
+    /// Create a service that admits signed envelopes through `admission` and starts and
+    /// stops admitted tasks through `execution` (protocol 1.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidCapabilities` if the capability document is not valid for
+    /// capability discovery in this build.
+    pub fn with_execution(
+        capabilities: NodeCapabilities,
+        admission: NodeAdmission,
+        execution: NodeExecution,
+    ) -> Result<Self, NodeServiceError> {
+        CapabilityDiscoveryContext::new(capabilities.protocol())
+            .map_err(|_| NodeServiceError::InvalidCapabilities)?;
+        Ok(Self {
+            capabilities,
+            supported: WARD_NODE_PROTOCOL,
+            admits: true,
+            executes: true,
+            tasks: Arc::new(Mutex::new(TaskRegistry::with_execution(
+                MAX_NODE_TASKS,
+                admission,
+                execution,
             ))),
         })
     }
@@ -211,6 +249,21 @@ impl NodeService {
         context
             .decode_request(request_line)
             .map_err(|_| NodeServiceError::MalformedCapabilityRequest)?;
+        let configured = self.capabilities.lifecycle();
+        let lifecycle = if supports_task_admission(protocol) {
+            LifecycleCapabilities {
+                admit: self.admits,
+                start: self.executes,
+                stop: self.executes,
+                ..configured
+            }
+        } else {
+            LifecycleCapabilities {
+                admit: false,
+                start: false,
+                ..configured
+            }
+        };
         let capabilities = NodeCapabilities::new(
             protocol,
             self.capabilities.architecture(),
@@ -220,10 +273,7 @@ impl NodeService {
             self.capabilities.credentials(),
             self.capabilities.snapshots(),
             self.capabilities.verifier(),
-            LifecycleCapabilities {
-                admit: self.admits && supports_task_admission(protocol),
-                ..self.capabilities.lifecycle()
-            },
+            lifecycle,
         )
         .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         let response = context
@@ -244,11 +294,8 @@ impl NodeService {
         let request = context
             .decode_request(request_line)
             .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
-        let response = self
-            .tasks
-            .lock()
-            .map_err(|_| NodeServiceError::TaskRegistryUnavailable)?
-            .handle(context, request);
+        let response = TaskRegistry::serve(&self.tasks, context, request)
+            .map_err(|_| NodeServiceError::TaskRegistryUnavailable)?;
         write_json_line(stream, &response, deadline)
     }
 }
@@ -434,6 +481,7 @@ mod tests {
                 stop: true,
                 revoke: true,
                 admit: false,
+                start: false,
             },
         )
         .unwrap()
@@ -963,7 +1011,15 @@ mod tests {
             capabilities: observed,
         } = response;
         assert_eq!(observed.protocol(), ProtocolVersion::new(1, 3));
-        assert_eq!(observed.lifecycle(), service.capabilities.lifecycle());
+        assert_eq!(
+            observed.lifecycle(),
+            LifecycleCapabilities {
+                stop: false,
+                start: false,
+                ..service.capabilities.lifecycle()
+            },
+            "a 1.3 node without execution advertises neither start nor stop"
+        );
         assert_eq!(observed.isolation(), service.capabilities.isolation());
         worker.join().unwrap().unwrap();
         assert!(service.tasks.lock().unwrap().is_empty());
@@ -1179,6 +1235,134 @@ mod tests {
         }
         admitting.join();
         plain.join();
+    }
+
+    struct Executing {
+        _dir: tempfile::TempDir,
+        service: NodeService,
+        launcher: crate::test_support::FakeLauncher,
+        snapshot: ward_events::SnapshotId,
+    }
+
+    fn executing_service() -> Executing {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let clock = crate::test_support::FixedClock::at(crate::test_support::NOW);
+        let admission = crate::test_support::node_admission(&state, &clock);
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("hello.txt"), b"hello").unwrap();
+        let snapshots = crate::workspace::open_snapshot_store(&state).unwrap();
+        let snapshot = crate::workspace::import_snapshot(&snapshots, &project).unwrap();
+        let launcher = crate::test_support::FakeLauncher::new();
+        let execution = NodeExecution::new(
+            crate::workspace::TaskRoot::open(&dir.path().join("tasks")).unwrap(),
+            snapshots,
+            Arc::new(launcher.clone()),
+        );
+        let service = NodeService::with_execution(capabilities(), admission, execution).unwrap();
+        Executing {
+            _dir: dir,
+            service,
+            launcher,
+            snapshot,
+        }
+    }
+
+    #[test]
+    fn capability_discovery_advertises_start_and_stop_together_only_with_execution() {
+        let state = tempfile::tempdir().unwrap();
+        let executing = executing_service();
+        let executing_node = LocalNode::serve(executing.service.clone(), 3);
+        let admitting = LocalNode::serve(admitting_service(&state.path().join("state")), 1);
+        let plain = LocalNode::serve(NodeService::new(capabilities()).unwrap(), 2);
+
+        for minor in [1, 2] {
+            let protocol = SupportedProtocolRange::new(1, minor, minor).unwrap();
+            let request = serde_json::to_string(
+                &CapabilityDiscoveryContext::new(ProtocolVersion::new(1, minor))
+                    .unwrap()
+                    .request(),
+            )
+            .unwrap();
+            assert_eq!(
+                executing_node.request(protocol, &request),
+                plain.request(protocol, &request),
+                "1.{minor} documents are unchanged by execution"
+            );
+        }
+
+        let one_three = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let request = serde_json::to_string(&one_three.request()).unwrap();
+        for (node, executes) in [(&executing_node, true), (&admitting, false)] {
+            let raw = node.request(WARD_NODE_PROTOCOL, &request);
+            let ward_node_protocol::CapabilityDiscoveryResponse::Capabilities {
+                capabilities: observed,
+            } = one_three.decode_response(&raw).unwrap();
+            let lifecycle = observed.lifecycle();
+            assert_eq!(lifecycle.start, executes, "{raw}");
+            assert_eq!(lifecycle.stop, executes, "{raw}");
+            assert!(lifecycle.admit, "{raw}");
+            assert_eq!(lifecycle.pause, capabilities().lifecycle().pause);
+            assert_eq!(lifecycle.revoke, capabilities().lifecycle().revoke);
+        }
+        executing_node.join();
+        admitting.join();
+        plain.join();
+    }
+
+    #[test]
+    fn one_three_start_and_stop_over_the_local_socket() {
+        let executing = executing_service();
+        let node = LocalNode::serve(executing.service.clone(), 7);
+        let ctx = admission_context();
+        let binding = lifecycle_binding();
+        let mut input = crate::test_support::envelope_input(binding);
+        input.workload = ward_node_protocol::TaskWorkload::new(
+            input.workload.argv().clone(),
+            input.workload.capability_manifest().clone(),
+            executing.snapshot,
+            60_000,
+        )
+        .unwrap();
+        let envelope = ward_node_protocol::TaskAdmissionEnvelope::new(input).unwrap();
+        let start = OperationId::new(3).unwrap();
+        let stop = OperationId::new(4).unwrap();
+
+        node.lifecycle(&ctx.create(OperationId::new(1).unwrap(), binding));
+        node.lifecycle(&crate::test_support::signed_admit(
+            ctx,
+            OperationId::new(2).unwrap(),
+            binding,
+            &envelope,
+        ));
+        assert_eq!(
+            node.lifecycle(&ctx.start(start, binding)),
+            ctx.accepted(start, binding, TaskLifecycleState::Running)
+        );
+        assert_eq!(
+            node.lifecycle(&ctx.inspect(binding)),
+            ctx.inspected(binding, TaskLifecycleState::Running)
+        );
+        assert_eq!(
+            node.lifecycle(&ctx.stop(stop, binding)),
+            ctx.accepted(stop, binding, TaskLifecycleState::Stopped)
+        );
+        assert_eq!(
+            node.lifecycle(&ctx.inspect(binding)),
+            ctx.inspected_with_outcome(
+                binding,
+                TaskLifecycleState::Stopped,
+                ward_node_protocol::TaskExecutionOutcome::Failed
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            node.lifecycle(&ctx.stop(stop, binding)),
+            ctx.accepted(stop, binding, TaskLifecycleState::Stopped)
+        );
+        assert_eq!(executing.launcher.stopped(), 1);
+        node.join();
     }
 
     #[test]

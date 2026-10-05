@@ -1,20 +1,30 @@
 //! Local Ward node service executable.
 //!
-//! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]`
-//! serves the local node protocol. `--node-id` is this node's audience identity; the
-//! state directory pins it at first start and holds the durable admission version and
-//! revocation stores. Without `--trusted-issuers` no issuer is trusted and every `admit`
-//! is refused. `ward-node issuer-key-id <hex-public-key>` prints the key id an issuer
-//! proof must name for that Ed25519 public key.
+//! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
+//! [--task-root <dir>]` serves the local node protocol. `--node-id` is this node's
+//! audience identity; the state directory pins it at first start and holds the durable
+//! admission version and revocation stores and the node's snapshot store (`cas`). Without
+//! `--trusted-issuers` no issuer is trusted and every `admit` is refused. With
+//! `--task-root` (created mode 0700, refused if group- or world-accessible) the node starts
+//! and stops admitted tasks in a bubblewrap sandbox over workspaces it allocates there; it
+//! refuses to run when the sandbox is unavailable.
+//!
+//! `ward-node snapshot import --state-dir <dir> <project-dir>` captures a local directory
+//! into the node's snapshot store and prints its id, the id an admission envelope names.
+//! `ward-node issuer-key-id <hex-public-key>` prints the key id an issuer proof must name
+//! for that Ed25519 public key.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use ward_events::NodeId;
 use ward_node::admit::{NodeAdmission, SystemClock};
+use ward_node::execution::{NodeExecution, SandboxLauncher};
 use ward_node::issuer::{IssuerKeyParseError, IssuerPublicKey, TrustedIssuers};
-use ward_node::state::NodeState;
+use ward_node::state::{NodeState, open_private_dir};
+use ward_node::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
 use ward_node::{NodeService, serve_local};
 use ward_node_protocol::{
     CredentialCapabilities, ExecutionBackendCapabilities, IsolationCapabilities,
@@ -41,6 +51,10 @@ struct Cli {
     /// Without it no issuer is trusted and every `admit` is refused.
     #[arg(long)]
     trusted_issuers: Option<PathBuf>,
+    /// Private task root (created mode 0700) under which the node allocates each attempt's
+    /// workspace. With it the node starts and stops admitted tasks; without it, it does not.
+    #[arg(long)]
+    task_root: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -50,13 +64,44 @@ enum Command {
         /// The 32-byte Ed25519 public key as 64 hex characters.
         public_key: String,
     },
+    /// Manage the node's content-addressed snapshot store.
+    Snapshot {
+        /// The snapshot operation.
+        #[command(subcommand)]
+        command: SnapshotCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCommand {
+    /// Capture a local directory into the node's snapshot store and print its id.
+    Import {
+        /// Private node state directory (created mode 0700) holding the store.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// The project directory to capture.
+        project_dir: PathBuf,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    if let Some(Command::IssuerKeyId { public_key }) = cli.command {
-        println!("{}", issuer_key_id(&public_key)?);
-        return Ok(());
+    match cli.command {
+        Some(Command::IssuerKeyId { public_key }) => {
+            println!("{}", issuer_key_id(&public_key)?);
+            return Ok(());
+        }
+        Some(Command::Snapshot {
+            command:
+                SnapshotCommand::Import {
+                    state_dir,
+                    project_dir,
+                },
+        }) => {
+            println!("{}", import(&state_dir, &project_dir)?);
+            return Ok(());
+        }
+        None => {}
     }
     let (Some(socket), Some(state_dir), Some(node_id)) = (cli.socket, cli.state_dir, cli.node_id)
     else {
@@ -67,11 +112,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => TrustedIssuers::load(&path)?,
         None => TrustedIssuers::empty(),
     };
+    let task_root = cli
+        .task_root
+        .map(|dir| {
+            TaskRoot::open(&dir)
+                .map_err(|error| io::Error::other(format!("task root {}: {error}", dir.display())))
+        })
+        .transpose()?;
+    if task_root.is_some() && !SandboxLauncher::available() {
+        return Err(io::Error::other(
+            "task root configured but the bubblewrap sandbox is unavailable on this host",
+        )
+        .into());
+    }
     let state = NodeState::open(&state_dir, node_id)?;
     let admission = NodeAdmission::new(issuers, state, Box::new(SystemClock));
-    let service = NodeService::with_admission(conservative_host_capabilities()?, admission)?;
+    let capabilities = conservative_host_capabilities()?;
+    let service = match task_root {
+        Some(task_root) => NodeService::with_execution(
+            capabilities,
+            admission,
+            NodeExecution::new(
+                task_root,
+                open_snapshot_store(&state_dir)?,
+                Arc::new(SandboxLauncher),
+            ),
+        )?,
+        None => NodeService::with_admission(capabilities, admission)?,
+    };
     serve_local(&socket, &service)?;
     Ok(())
+}
+
+fn import(state_dir: &Path, project_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    open_private_dir(state_dir)?;
+    let snapshots = open_snapshot_store(state_dir)?;
+    Ok(import_snapshot(&snapshots, project_dir)?.to_string())
 }
 
 fn issuer_key_id(public_key: &str) -> Result<String, IssuerKeyParseError> {
@@ -187,5 +263,33 @@ mod tests {
 
         let cli = Cli::try_parse_from(["ward-node", "issuer-key-id", "00"]).expect("helper");
         assert!(matches!(cli.command, Some(Command::IssuerKeyId { .. })));
+    }
+
+    #[test]
+    fn task_root_is_optional_and_snapshot_import_needs_a_state_dir() {
+        let node = NodeId::from_u128(4).to_string();
+        let serve = [
+            "ward-node",
+            "--socket",
+            "s",
+            "--state-dir",
+            "d",
+            "--node-id",
+            &node,
+        ];
+        assert_eq!(Cli::try_parse_from(serve).expect("serve").task_root, None);
+        let cli = Cli::try_parse_from(serve.iter().copied().chain(["--task-root", "t"]))
+            .expect("serve with a task root");
+        assert_eq!(cli.task_root, Some(PathBuf::from("t")));
+
+        let cli = Cli::try_parse_from(["ward-node", "snapshot", "import", "--state-dir", "d", "p"])
+            .expect("import");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Snapshot {
+                command: SnapshotCommand::Import { ref state_dir, ref project_dir },
+            }) if state_dir == Path::new("d") && project_dir == Path::new("p")
+        ));
+        assert!(Cli::try_parse_from(["ward-node", "snapshot", "import", "p"]).is_err());
     }
 }

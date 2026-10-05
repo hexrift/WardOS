@@ -333,10 +333,10 @@ decodes the report against the expected binding and session; malformed data,
 unknown fields, and a mismatched identity are refused. The report contains no
 workload output or credential material.
 
-This is a contract only. The current `ward-node` task registry supports `create`,
-`inspect` and `admit`; it does not yet execute tasks or emit receipts. A future
-node implementation must bind admission, durable evidence, and recovery before a
-receipt can be treated as an authoritative execution result.
+`ward-node` records a receipt for every attempt it starts or stops (§3.11) and reports
+its outcome through 1.3 `inspect`. The receipt is held in memory only: durable
+evidence and recovery must still be bound before a receipt can be treated as an
+authoritative execution result.
 
 ### 3.9 Trusted task-authority check
 
@@ -345,7 +345,8 @@ trusted `AuthorityLease`, its validated lineage, and locally known monotonic
 revocations. Inactive, mismatched, or revoked authority fails closed. This is a
 pure prerequisite check, not a way to promote inbound lease bytes into trust: only
 `admit` promotes a lease, after verifying a trusted issuer's signature over the
-envelope that carried it (§3.11), and the node still does not run `start`.
+envelope that carried it (§3.11), and `start` rechecks that authority at the node
+clock before anything runs.
 Execution-attempt identity remains bound by node-owned task state, not by the
 authority lease itself.
 
@@ -353,14 +354,16 @@ authority lease itself.
 
 After negotiation, the local node serves one request per connection. Protocol
 1.1 supports read-only capability discovery; 1.2 supports discovery or a task
-lifecycle request; 1.3 adds the `admit` verb and the `exited` state. Capability
-responses retain the same node facts while naming the exact negotiated version. A 1.3
-document adds `"admit":true` to `lifecycle` only when the node admits signed envelopes;
-1.1 and 1.2 documents never carry it and are byte-for-byte unchanged. Protocol 1.0 has
+lifecycle request; 1.3 adds the `admit` verb, the `exited` state and the receipt
+outcome on `inspect`. Capability responses retain the same node facts while naming the
+exact negotiated version. A 1.3 document adds `"admit":true` to `lifecycle` only when the
+node admits signed envelopes, and advertises `stop` and `"start":true` together only
+when it executes (a 1.3 document with one but not the other is invalid); 1.1 and 1.2
+documents never carry `admit` or `start` and are byte-for-byte unchanged. Protocol 1.0 has
 no discovery endpoint. A 1.2 connection refuses `admit` exactly like an unknown request
 and never carries `exited`.
 
-### 3.11 Node admission and execution ownership (decided; admission implemented)
+### 3.11 Node admission and execution ownership (decided; admission, start, stop and exit implemented)
 
 [ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md) settles
 how the node will execute. Protocol 1.3 adds an `admit` verb carrying one signed,
@@ -402,8 +405,53 @@ Each failure is a typed refusal (`task_not_found`, `attempt_mismatch`,
 `lease_mismatch`, `invalid_state`, `authority_denied`, `lease_expired`,
 `stale_operation`, `lease_revoked`) with no state change. On success the version is
 recorded durably and the task becomes `ready`, holding its admitted envelope; replaying
-the same operation returns the same result. Nothing executes yet: `start` and `stop`
-stay unsupported, and #324 tracks the remaining slices.
+the same operation returns the same result.
+
+The node executes admitted tasks when given a task root (ADR-0030 §3–§6):
+
+```text
+ward-node snapshot import --state-dir <dir> <project-dir>     # prints blake3:<hex>
+ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
+  --trusted-issuers <file> --task-root <dir>
+```
+
+`snapshot import` captures a local directory into the node's content-addressed store
+(`<state-dir>/cas`) and prints the id an envelope names; it is an operator command over
+local files, not a socket verb. The task root is created mode 0700 and refused if group-
+or world-accessible, and the node refuses to serve with a task root when bubblewrap is
+unusable. Only then does a 1.3 capability document advertise `start` and `stop`.
+
+`start` needs a `ready` task; it rechecks that the envelope and lease are unexpired and
+unrevoked (`lease_expired`, `lease_revoked`), allocates `<task-root>/<task>/<attempt>/`
+(mode 0700, created once per attempt) and materialises the envelope's snapshot into it
+(`resource_unavailable` with nothing spawned if the store lacks it). No path comes from a
+request. The envelope's argv runs through `ward-launch` in an offline sandbox (no egress
+socket, loopback only) from an empty environment (`--clearenv`: none of the node's own
+variables reach the workload), with the workspace as the only writable host path and the
+envelope's budget enforced; the capability manifest is not interpreted yet, so network
+grants are not honoured. The node answers `running` only after a confirmed spawn with
+the host pid recorded. A clean spawn failure changes nothing; an ambiguous launch is
+`exited` with an `unknown` receipt and is never re-run.
+
+A node-owned reaper thread per attempt waits on the workload and records `exited` with a
+receipt: `completed` for exit 0 within budget, `failed` for a non-zero exit, a signal or a
+kill at the budget, `unknown` for a lost child. `stop` kills and reaps the workload before
+answering `stopped` (a `ready` task stops without spawning); its receipt is `failed`, or
+`unknown` if the reap cannot be confirmed. A stop racing a natural exit ends in exactly one
+terminal state: `exited` if the workload had already exited (the stop is
+`invalid_state`), otherwise `stopped`. A stop not confirmed within its timeout is
+`resource_unavailable` and can be replayed. Replaying the `start` or `stop` that took
+effect returns the task's current state. 1.3 `inspect` of an `exited` or `stopped` task
+adds `"outcome"`; a 1.2 connection reads an exited task as `stopped`. Serving never waits
+on a running workload.
+
+The registry is in memory: after a node restart a previously running attempt is unknown
+to the node, though its workspace still blocks a second start of the same attempt.
+Durable recovery is #332 slice 7. Dropping the registry stops and reaps every running
+workload, and a node that dies outright takes its sandboxes with it through bubblewrap's
+`--die-with-parent`, except in the brief window before a just-spawned sandbox has armed
+it. Per-attempt evidence logs, network grants, `pause`/`resume`, `revoke` and `seal` are
+later #324 slices.
 
 ---
 

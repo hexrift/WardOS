@@ -223,3 +223,161 @@ fn admission_envelope(binding: TaskBinding) -> TaskAdmissionEnvelope {
     })
     .unwrap()
 }
+
+/// What the next [`FakeLauncher`] launch does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeSpawn {
+    /// Spawn a fake workload.
+    Spawn,
+    /// Refuse cleanly: nothing spawned.
+    Refuse,
+    /// Fail ambiguously: something may have started.
+    Ambiguous,
+}
+
+/// How a fake workload answers a stop request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FakeStop {
+    /// The kill ends it.
+    Honour,
+    /// It had already exited on its own before the kill landed.
+    ExitedFirst(crate::execution::WorkloadExit),
+    /// It cannot be confirmed reaped: keep waiting.
+    Ignore,
+}
+
+#[derive(Debug)]
+struct FakeState {
+    spawn: FakeSpawn,
+    on_stop: FakeStop,
+    exit: Option<crate::execution::WorkloadExit>,
+    launches: Vec<crate::execution::LaunchRequest>,
+    waiting: usize,
+    stopped: usize,
+    reaped: usize,
+}
+
+/// A deterministic launcher: workloads end only when the test says so, or on stop.
+#[derive(Clone, Debug)]
+pub struct FakeLauncher(Arc<(std::sync::Mutex<FakeState>, std::sync::Condvar)>);
+
+/// The host pid every fake workload reports.
+pub const FAKE_PID: u32 = 4242;
+
+impl FakeLauncher {
+    pub fn new() -> Self {
+        Self(Arc::new((
+            std::sync::Mutex::new(FakeState {
+                spawn: FakeSpawn::Spawn,
+                on_stop: FakeStop::Honour,
+                exit: None,
+                launches: Vec::new(),
+                waiting: 0,
+                stopped: 0,
+                reaped: 0,
+            }),
+            std::sync::Condvar::new(),
+        )))
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
+        self.0.0.lock().unwrap()
+    }
+
+    pub fn set_spawn(&self, spawn: FakeSpawn) {
+        self.state().spawn = spawn;
+    }
+
+    pub fn set_on_stop(&self, on_stop: FakeStop) {
+        self.state().on_stop = on_stop;
+        self.0.1.notify_all();
+    }
+
+    /// Let the running fake workload end on its own with `exit`.
+    pub fn exit(&self, exit: crate::execution::WorkloadExit) {
+        self.state().exit = Some(exit);
+        self.0.1.notify_all();
+    }
+
+    pub fn launches(&self) -> Vec<crate::execution::LaunchRequest> {
+        self.state().launches.clone()
+    }
+
+    /// Workloads currently being waited on by a reaper.
+    pub fn waiting(&self) -> usize {
+        self.state().waiting
+    }
+
+    /// Workloads a stop request ended.
+    pub fn stopped(&self) -> usize {
+        self.state().stopped
+    }
+
+    /// Workloads whose wait has returned.
+    pub fn reaped(&self) -> usize {
+        self.state().reaped
+    }
+}
+
+impl crate::execution::TaskLauncher for FakeLauncher {
+    fn launch(
+        &self,
+        request: &crate::execution::LaunchRequest,
+    ) -> Result<Box<dyn crate::execution::RunningWorkload>, crate::execution::SpawnError> {
+        let mut state = self.state();
+        state.launches.push(request.clone());
+        match state.spawn {
+            FakeSpawn::Spawn => Ok(Box::new(FakeWorkload(self.clone()))),
+            FakeSpawn::Refuse => Err(crate::execution::SpawnError::Refused),
+            FakeSpawn::Ambiguous => Err(crate::execution::SpawnError::Ambiguous),
+        }
+    }
+}
+
+struct FakeWorkload(FakeLauncher);
+
+impl crate::execution::RunningWorkload for FakeWorkload {
+    fn pid(&self) -> u32 {
+        FAKE_PID
+    }
+
+    fn wait(
+        self: Box<Self>,
+        stop: &crate::execution::StopSignal,
+    ) -> crate::execution::WorkloadExit {
+        let (lock, ready) = &*self.0.0;
+        let mut state = lock.lock().unwrap();
+        state.waiting += 1;
+        let exit = loop {
+            if let Some(exit) = state.exit.take() {
+                break exit;
+            }
+            if stop.is_requested() {
+                match state.on_stop {
+                    FakeStop::Honour => {
+                        state.stopped += 1;
+                        break crate::execution::WorkloadExit::Stopped;
+                    }
+                    FakeStop::ExitedFirst(exit) => break exit,
+                    FakeStop::Ignore => {}
+                }
+            }
+            state = ready
+                .wait_timeout(state, std::time::Duration::from_millis(5))
+                .unwrap()
+                .0;
+        };
+        state.waiting -= 1;
+        state.reaped += 1;
+        exit
+    }
+}
+
+/// Poll until `done` holds, failing after a generous bound.
+pub fn eventually(mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "condition never held");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
