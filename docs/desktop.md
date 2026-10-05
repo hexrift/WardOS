@@ -119,7 +119,7 @@ use them); `ward` is the front door for people.
 | `wardos-install <what>` | `app <flatpak-id>`, `package <rpm>` (bootc layering, says so), `webapp`, `tui`, `theme`, `font`, `dev <lang>` (mise), `service <name>` |
 | `wardos-remove <what>` | the inverse of every install |
 | `wardos-setup <what>` | `wifi` (nmtui), `bluetooth` (bluetui or bluetoothctl), `audio` (pulsemixer), `power` (power profile), `monitors`, `input`, `keys`, `fingerprint` (fprintd), `fido2` (pam-u2f), `printers`, `dns`, `timezone`, `config <component>` |
-| `wardos-update [what]` | `bootc upgrade` + `flatpak update` + `wardos-refresh`; `--check` for the bar indicator |
+| `wardos-update [what]` | `bootc upgrade` (stage-only; ADR-0028 §5's states and the anti-rollback floor first, "Update states" below; `--allow-rollback`, `--require-provenance`) + `flatpak update` + `wardos-refresh`; `--status` the states alone; `--check` for the bar indicator |
 | `wardos-refresh [component]` | re-copy a component's default config into `~/.config`, keeping a backup |
 | `wardos-notify <title> [body]` | notification with the WardOS defaults; `--done` for "finished" toasts |
 | `wardos-approve` | shows a pending approval from `wardd` as its three blocks (destination · requested by agent · Ward will allow; `design-language.md` §10) and answers it (`y`/`s`/`n`); `--watch` multiplexes every live session's approvals (#141), titling each notification with its agent and project, and relays the answer to the session it was asked from; a still-showing notification is replaced with the outcome the moment its approval becomes terminal elsewhere, and its live workers are bounded (`WARDOS_APPROVE_MAX_NOTIFIERS`, #146 items 2-3) |
@@ -145,7 +145,8 @@ the class `wardos-tui-<name>` (the window rules tile the first on the web worksp
 float the second at 1000×700); `or-focus` matches the class case-insensitively;
 `wardos-setup` opens its TUI in a terminal window when it is not already in one (the
 bar clicks call it directly); `wardos-update --check` prints one Waybar JSON line
-(`text`, `tooltip`, `class` `available` or empty); `wardos-screensaver` returns at once
+(`text`, `tooltip`, `class` `available`, `unavailable` when bootc could not ask — the
+tooltip says why — or empty); `wardos-screensaver` returns at once
 when `wardos-toggle screensaver` has switched it off (hypridle calls it at 2.5 min);
 `wardos-approve --watch` is the long-running listener behind `wardos-approve.service`;
 `ward-shell worker` is the long-running shared bar projection behind
@@ -194,6 +195,35 @@ tailscale` only enables an installed `tailscaled` because Tailscale is not in Fe
 `rustup-init` (the host has no compiler, ADR-0001; the verifier binds this one, and
 `ward doctor` names the command until it has run; repeating it only sets the default
 channel), and `package` says that a layered RPM belongs in `image/packages.txt`.
+
+### Update states
+
+`wardos-update --status`, and `wardos-update system` before it stages anything, print
+ADR-0028 §5's states one per line, each its own fact (#148 item 5):
+
+| Line | Shows |
+| --- | --- |
+| `booted` | the running deployment as `reference@digest`, its WardOS version and `ward --version`. The version is the image's `org.wardos.version` label (`image/Containerfile`), read from the registry with `skopeo inspect` by digest; when skopeo cannot answer, bootc's own `version` field — the Fedora base image's label today — said as `(bootc version; <why>)` |
+| `staged` | the deployment the next boot runs (digest, version), or `none` |
+| `available` | the newest image bootc finds for the configured reference (`bootc upgrade --check`, then the `cachedUpdate` of `bootc status --json`): digest and version; `up to date`; or why it could not ask — `network-unavailable: …; retry when the machine is online`, `registry-auth-failed: …`, `bootc-error: …` |
+| `verified` | how far the candidate got: `digest-resolved` (bootc resolved the digest; the layers are downloaded and digest-checked at staging), or `downloaded, digest-checked` once staged — then `provenance-missing`, since no signed manifest covers the image yet ([`release-manifest.md`](release-manifest.md)) |
+| `manifest` | the release manifest of the candidate's version, fetched from that release and verified with [`scripts/release/verify-manifest.sh`](../scripts/release/verify-manifest.sh) (a copy beside the checkout, `/usr/lib/wardos/verify-manifest.sh`, `$WARDOS_VERIFY_MANIFEST`, else the repository's at the tag): `provenance-verified`, `verification-failed (<cause>)`, `provenance-missing`, `verifier-unavailable (<cause>)`, `network-unavailable`, or `not looked up` (the version is unknown, or not a release tag — a build between releases is `v0.4.1-15-g…`). Evidence about that release's tarballs, never about the image; the line says so |
+| `rollback` | the deployment `bootc rollback` would boot (digest, version), or `none` |
+| `anti-rollback` | `allowed`, `refused: candidate X is lower than booted Y; pass --allow-rollback to stage it anyway`, `allowed by --allow-rollback`, or `not evaluated` (a version unknown, or not a version). The shell mirrors `check_anti_rollback` of [`crates/ward-release-verify`](../crates/ward-release-verify) over its version grammar (`[vV]?X.Y.Z(-pre)?(+build)?`, SemVer precedence); the crate is the reference. Both sides come from one source — two labels, else two bootc fields, said as `(bootc versions)` — never one of each |
+| `compatibility` | the node protocol window the release serves: from the verified manifest (`node_protocol_window`, with `rollback_supported`), else from [`compatibility.md`](compatibility.md)'s marker when this host has the document, else `unknown` |
+
+`system` stages only (`sudo bootc upgrade`; the booted deployment is unchanged until a
+reboot you choose) and prints the compatibility and rollback lines before it does. It
+refuses, with its own exit code and no `sudo bootc upgrade`: a lower version (5, unless
+`--allow-rollback`), a release manifest that fails verification (6), and a missing
+manifest or an unavailable verifier under `--require-provenance` (6; without the flag
+both are said and the image is staged checksum-only, as `install.sh` does); a network
+(3), registry (4) or bootc (1) failure stops it before a candidate is known. Without an
+argument the toast carries the same outcome: `✓ Update` with the staged version and the
+rollback, or a critical notice with the failure state. A failure is never "no update".
+`update-states.test.sh` holds every row and refusal against mocked `bootc`, `skopeo`
+and `curl` and the fake `cosign` of `scripts/release/verify-manifest.test.sh`, with the
+real verifier.
 
 ## Menu
 
@@ -584,7 +614,7 @@ command, key and test exist on `main`.
 | Plymouth boot splash | WardOS Plymouth theme | ✔ `image/rootfs/usr/share/plymouth/themes/wardos/` (WARD on the ground, 2 px progress, passphrase prompt), selected in the `Containerfile` and in the initramfs (the image build proves it); its look at boot is E-09's |
 | Login screen into Hyprland | greetd greeter (graphical, Ward Dark) → uwsm | ✔ `image/rootfs/etc/greetd/` (`config.toml`, `wardos-greeter.css`, the `greeter` sysusers), `image/rootfs/usr/libexec/wardos-session` (uwsm + fallback), enabled in the `Containerfile`; `greeter.test.sh`. A real login screen, not autologin (ADR-0024); the user is created by first-boot provisioning (ADR-0027), not baked into the disk |
 | Full-disk encryption at install | `image/disk.sh` (Anaconda kickstart on the ISO, on by default; bootc-image-builder has no LUKS) | ✔ `image/disk.sh --type iso` encrypts unless `--no-luks` (ADR-0017), `install.test.sh`; passphrase prompt unverified until E-09 |
-| omarchy-update, migrations | `wardos-update` (bootc upgrade, flatpak, refresh) | ✔ `wardos-update [system\|flatpaks\|themes\|configs\|--check]`, `wardos-refresh <component>\|--all`; `update.test.sh`, `refresh.test.sh`; image side: `bootc upgrade`, `image/boot/README.md` |
+| omarchy-update, migrations | `wardos-update` (bootc upgrade, flatpak, refresh) | ✔ `wardos-update [system\|flatpaks\|themes\|configs\|--status\|--check] [--allow-rollback] [--require-provenance]` (ADR-0028 §5's states one per line, the anti-rollback floor, failures as states; "Update states"), `wardos-refresh <component>\|--all`; `update.test.sh`, `update-states.test.sh`, `refresh.test.sh`; image side: `bootc upgrade`, `image/boot/README.md` |
 | Snapshots and rollback (Limine + snapper) | bootc deployments, `bootc rollback` | ✔ every upgrade keeps the previous deployment; `bootc rollback` (`image/boot/README.md`) |
 | Install on an existing Arch | `desktop/install.sh` on an existing Fedora | ✔ `desktop/install.sh` (dnf or rpm-ostree, `--dry-run`), `install.test.sh` |
 | Share a file over LAN | `wardos-share` | ✔ `wardos-share [--port N] <file>` (python3 http.server, qrencode); `share.test.sh` |

@@ -1,14 +1,49 @@
 #!/usr/bin/env bash
 # wardos-update — bring the machine up to date (docs/desktop.md §Commands).
 #
-# Usage: wardos-update              system, flatpaks and themes, then a done toast
-#        wardos-update system       `sudo bootc upgrade` (the next boot runs the new image)
-#        wardos-update flatpaks     `flatpak update -y`
-#        wardos-update themes       `git pull` every installed theme, re-render the current one
-#        wardos-update configs      `wardos-refresh --all` (backups kept; only on request,
-#                                   since it replaces the user's copies)
-#        wardos-update --check      one Waybar JSON line for the bar: text "update" and
-#                                   class "available" when `bootc upgrade --check` reports one
+# Usage: wardos-update [options]        system, flatpaks and themes, then a toast with the outcome
+#        wardos-update system [options] the states below, then `sudo bootc upgrade`: the newest
+#                                       image is staged and the next boot you choose runs it
+#        wardos-update --status          the states below, one line each; changes nothing
+#        wardos-update flatpaks          `flatpak update -y`
+#        wardos-update themes            `git pull` every installed theme, re-render the current one
+#        wardos-update configs           `wardos-refresh --all` (backups kept; only on request,
+#                                       since it replaces the user's copies)
+#        wardos-update --check           one Waybar JSON line for the bar: text "update" and
+#                                       class "available" when `bootc upgrade --check` reports
+#                                       one; text "update?" and class "unavailable" when it
+#                                       could not ask, the tooltip saying why
+#
+# Options: --allow-rollback      stage a candidate whose version is lower than the booted one;
+#                                the anti-rollback floor (ADR-0028 §5) refuses it otherwise
+#          --require-provenance  refuse to stage when the release manifest is missing or its
+#                                verifier cannot run; by default both are said and staging goes on
+#
+# The states (ADR-0028 §5), one line each in `--status` and before `system` stages anything:
+#   booted         the running deployment: reference@digest, its WardOS version (the image's
+#                  org.wardos.version label, read with skopeo; bootc's own version field, the
+#                  base image's, when skopeo cannot) and `ward --version`
+#   staged         the deployment the next boot runs, or none
+#   available      what bootc reports as the newest image for the configured reference (digest,
+#                  version), `up to date`, or why it could not ask: `network-unavailable`,
+#                  `registry-auth-failed`, `bootc-error`
+#   verified       how far the candidate got: digest-resolved, then downloaded and digest-checked
+#                  by bootc (it pulls by digest); provenance-missing, since no signed manifest
+#                  covers the image yet (docs/release-manifest.md)
+#   manifest       the release manifest of the candidate's version, fetched from the release and
+#                  verified with scripts/release/verify-manifest.sh — evidence about that
+#                  release's tarballs, not about the image: provenance-verified,
+#                  verification-failed (<cause>), provenance-missing, verifier-unavailable
+#                  (<cause>), network-unavailable, or not looked up (not a release tag)
+#   rollback       the deployment `bootc rollback` would boot, or none
+#   anti-rollback  allowed, refused (a lower version; --allow-rollback), or not evaluated
+#   compatibility  the node protocol window the candidate serves (from the verified release
+#                  manifest, else docs/compatibility.md) and whether the release supports rollback
+# A failure is one of these states and a non-zero exit, never "no update".
+#
+# Exit codes of `system`: 0 staged or up to date; 1 bootc-error; 2 usage; 3 network-unavailable;
+# 4 registry-auth-failed; 5 a lower version refused; 6 verification-failed, or provenance
+# required and missing.
 #
 # Root is asked for with sudo, so the bar and the menu run this in a terminal window.
 set -euo pipefail
@@ -18,25 +53,573 @@ source "${WARDOS_LIB:-$(dirname "$(readlink -f "$0")")/../lib/wardos.sh}" 2>/dev
 wardos_help "$@"
 
 json_string() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n'; }
+row() { printf '%-14s %s\n' "$1" "$2"; }
 
-check() {
-  local report text="" class=""
-  if wardos_has bootc; then
-    report=$(bootc upgrade --check 2>&1 | head -n1) || true
-    if [[ $report == *"Update available"* ]]; then
-      text=update
-      class=available
-    fi
-  else
-    report="bootc is not installed"
-  fi
-  printf '{"text": "%s", "tooltip": "%s", "class": "%s"}\n' "$text" "$(json_string "$report")" "$class"
+allow_rollback=0
+require_provenance=0
+args=()
+for a in "$@"; do
+  case $a in
+    --allow-rollback) allow_rollback=1 ;;
+    --require-provenance) require_provenance=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+
+here=$(dirname "$(readlink -f "$0")")
+repo="https://github.com/hexrift/WardOS"
+work=""
+workdir() {
+  [[ -n $work ]] || {
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+  }
 }
 
+# classify_failure MSG: the state a failed registry or bootc call is, and what to do about it.
+classify_failure() {
+  local msg=$1
+  case $msg in
+    *"no such host"* | *"dial tcp"* | *"connection refused"* | *"etwork is unreachable"* | *"timed out"* | \
+      *"imeout"* | *"TLS handshake"* | *"Could not resolve"* | *"emporary failure"* | *"pinging container registry"*)
+      printf 'network-unavailable: %s; retry when the machine is online\n' "$msg" ;;
+    *nauthorized* | *"authentication required"* | *"access denied"* | *" denied"* | *" 401"* | *" 403"*)
+      printf 'registry-auth-failed: %s; log in to the registry (skopeo login) or check the image is public\n' "$msg" ;;
+    *) printf 'bootc-error: %s\n' "$msg" ;;
+  esac
+}
+# state_exit STATE-LINE: the exit code a failure state carries (see the usage block).
+state_exit() {
+  case $1 in
+    network-unavailable:*) return 3 ;;
+    registry-auth-failed:*) return 4 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------------------
+# bootc's deployments. `bootc status --json` has the same shape under booted, staged and
+# rollback, plus the booted deployment's cachedUpdate (what `bootc upgrade --check` found);
+# python3 picks them apart (jq is not part of the image's promise, python3 is).
+declare -A dep=()
+BOOTC_ERROR=""
+read_bootc_status() {
+  local json out
+  dep=()
+  workdir
+  json=$(bootc status --json 2>"$work/bootc.err") || {
+    BOOTC_ERROR=$(head -n1 "$work/bootc.err")
+    [[ -n $BOOTC_ERROR ]] || BOOTC_ERROR="bootc status exited non-zero"
+    return 1
+  }
+  out=$(python3 - "$json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    status = json.loads(sys.argv[1]).get("status") or {}
+except Exception:
+    sys.exit(1)
+def emit(name, image):
+    image = image or {}
+    print("%s_ref\t%s" % (name, ((image.get("image") or {}).get("image")) or ""))
+    print("%s_digest\t%s" % (name, image.get("imageDigest") or ""))
+    print("%s_version\t%s" % (name, image.get("version") or ""))
+booted = status.get("booted") or {}
+emit("booted", booted.get("image"))
+emit("staged", (status.get("staged") or {}).get("image"))
+emit("rollback", (status.get("rollback") or {}).get("image"))
+emit("cached", booted.get("cachedUpdate"))
+PY
+  ) || {
+    BOOTC_ERROR="unreadable bootc status"
+    return 1
+  }
+  local k v
+  while IFS=$'\t' read -r k v; do dep[$k]=$v; done <<<"$out"
+  [[ -n ${dep[booted_digest]:-} ]] || {
+    BOOTC_ERROR="unreadable bootc status: no booted deployment"
+    return 1
+  }
+}
+
+# The WardOS version of an image is its org.wardos.version label (image/Containerfile),
+# which only the registry can answer for an image that is not booted: `skopeo inspect` by
+# digest, once per digest. bootc's own `version` field is the base image's label today, so
+# it is the fallback, and the two are never mixed in one comparison.
+declare -A label_cache=()
+LABEL="" LABEL_NOTE="" VERSION=""
+# image_label REF DIGEST: sets LABEL (empty when the image carries none); returns 1, with
+# LABEL_NOTE saying why, when the registry could not be asked.
+image_label() {
+  local ref=$1 digest=$2 repo_ref out
+  LABEL=""
+  if [[ -n ${label_cache[$digest]+x} ]]; then
+    LABEL=${label_cache[$digest]}
+    return 0
+  fi
+  wardos_has skopeo || {
+    LABEL_NOTE="skopeo not installed"
+    return 1
+  }
+  repo_ref=${ref%%@*}
+  [[ ${repo_ref##*/} == *:* ]] && repo_ref=${repo_ref%:*}
+  workdir
+  out=$(skopeo inspect --no-tags "docker://$repo_ref@$digest" 2>"$work/skopeo.err") || {
+    LABEL_NOTE=$(head -n1 "$work/skopeo.err")
+    [[ -n $LABEL_NOTE ]] || LABEL_NOTE="skopeo inspect failed"
+    return 1
+  }
+  LABEL=$(python3 -c 'import json, sys
+print((json.loads(sys.stdin.read()).get("Labels") or {}).get("org.wardos.version") or "")' <<<"$out" 2>/dev/null) || LABEL=""
+  label_cache[$digest]=$LABEL
+}
+
+# version_of NAME: sets VERSION, the WardOS version to show for a deployment (its label,
+# else bootc's field).
+version_of() {
+  if image_label "${dep[${1}_ref]}" "${dep[${1}_digest]}" && [[ -n $LABEL ]]; then
+    VERSION=$LABEL
+  else
+    VERSION=${dep[${1}_version]:-unknown}
+  fi
+}
+
+# anti_rollback CANDIDATE COMMITTED: the shell mirror of ward-release-verify's
+# check_anti_rollback (crates/ward-release-verify/src/rollback.rs, the Rust reference) over
+# its version grammar (version.rs): [vV]?<major>.<minor>.<patch>(-<pre>)?(+<build>)?, SemVer
+# 2.0.0 precedence, build metadata ignored. Prints lower, equal or higher, or
+# invalid-candidate / invalid-committed with the reason.
+anti_rollback() {
+  python3 - "$1" "$2" <<'PY'
+import re, sys
+
+def parse(original):
+    s = original[1:] if original[:1] in ("v", "V") else original
+    if not s:
+        raise ValueError("version string '%s' is empty" % original)
+    s, plus, build = s.partition("+")
+    core, dash, pre = s.partition("-")
+    parts = core.split(".")
+    if len(parts) != 3:
+        raise ValueError("version '%s' does not have the form <major>.<minor>.<patch>: bad component '%s'" % (original, core))
+    nums = []
+    for p in parts:
+        if not re.fullmatch(r"[0-9]+", p):
+            raise ValueError("version '%s' does not have the form <major>.<minor>.<patch>: bad component '%s'" % (original, p))
+        nums.append(int(p))
+    def identifiers(field):
+        out = []
+        for part in field.split("."):
+            if not re.fullmatch(r"[0-9A-Za-z-]+", part or ""):
+                raise ValueError("version '%s' has an invalid pre-release/build identifier '%s'" % (original, part))
+            out.append((0, int(part), "") if re.fullmatch(r"[0-9]+", part) else (1, 0, part))
+        return out
+    pre_ids = identifiers(pre) if dash else []
+    if plus:
+        identifiers(build)
+    return nums, pre_ids
+
+try:
+    cand = parse(sys.argv[1])
+except ValueError as e:
+    print("invalid-candidate: candidate version '%s' is not a valid version: %s" % (sys.argv[1], e))
+    sys.exit(0)
+try:
+    committed = parse(sys.argv[2])
+except ValueError as e:
+    print("invalid-committed: committed version '%s' is not a valid version: %s" % (sys.argv[2], e))
+    sys.exit(0)
+
+def compare(a, b):
+    if a[0] != b[0]:
+        return -1 if a[0] < b[0] else 1
+    if not a[1] and not b[1]:
+        return 0
+    if not a[1]:
+        return 1
+    if not b[1]:
+        return -1
+    return -1 if a[1] < b[1] else (1 if a[1] > b[1] else 0)
+
+print({-1: "lower", 0: "equal", 1: "higher"}[compare(cand, committed)])
+PY
+}
+
+# ---------------------------------------------------------------------------------------
+# The release manifest of a version: fetched from the release's assets and verified with
+# scripts/release/verify-manifest.sh (a copy beside this checkout, one installed under
+# /usr/lib/wardos, $WARDOS_VERIFY_MANIFEST, or the repository's at the release tag).
+# fetch URL DEST: 200 copied, 404 absent (returns 1), otherwise the failure (returns 2).
+FETCH_ERROR=""
+fetch() {
+  local code
+  workdir
+  code=$(curl -sSL -o "$2" -w '%{http_code}' "$1" 2>"$work/curl.err") || {
+    FETCH_ERROR=$(classify_failure "$(head -n1 "$work/curl.err")")
+    [[ $FETCH_ERROR == network-unavailable:* ]] || FETCH_ERROR="network-unavailable: ${FETCH_ERROR#bootc-error: }; retry when the machine is online"
+    return 2
+  }
+  case $code in
+    200) return 0 ;;
+    404) return 1 ;;
+    *)
+      FETCH_ERROR="release-fetch-failed: HTTP $code for $1; retry, or check $repo/releases"
+      return 2
+      ;;
+  esac
+}
+find_verifier() {
+  local tag=$1 c
+  for c in "${WARDOS_VERIFY_MANIFEST:-}" /usr/lib/wardos/verify-manifest.sh "$here/../../scripts/release/verify-manifest.sh"; do
+    [[ -n $c && -f $c ]] && {
+      printf '%s\n' "$c"
+      return 0
+    }
+  done
+  if fetch "https://raw.githubusercontent.com/hexrift/WardOS/$tag/scripts/release/verify-manifest.sh" "$work/verify-manifest.sh"; then
+    printf '%s\n' "$work/verify-manifest.sh"
+    return 0
+  fi
+  return 1
+}
+# release_manifest VERSION: sets MANIFEST_STATE (verified|failed|missing|unavailable|network|
+# skipped), MANIFEST_LINE, and MANIFEST_FILE when verified.
+MANIFEST_STATE="" MANIFEST_LINE="" MANIFEST_FILE=""
+release_manifest() {
+  local v=$1 tag name base verifier out rc cause
+  MANIFEST_FILE=""
+  if [[ ! $v =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ || $v =~ -[0-9]+-g[0-9a-f]+$ ]]; then
+    MANIFEST_STATE=skipped
+    MANIFEST_LINE="not looked up: $v is not a release tag"
+    return 0
+  fi
+  tag="v${v#v}"
+  name="wardos-${tag#v}-manifest.json"
+  base="$repo/releases/download/$tag"
+  workdir
+  mkdir -p "$work/release"
+  rc=0
+  fetch "$base/$name" "$work/release/$name" || rc=$?
+  if ((rc == 1)); then
+    MANIFEST_STATE=missing
+    MANIFEST_LINE="$tag: provenance-missing (release $tag publishes no manifest)"
+    return 0
+  elif ((rc)); then
+    MANIFEST_STATE=network
+    MANIFEST_LINE="$FETCH_ERROR"
+    return 0
+  fi
+  fetch "$base/$name.sha256" "$work/release/$name.sha256" || rm -f "$work/release/$name.sha256"
+  rc=0
+  fetch "$base/$name.sigstore.json" "$work/release/$name.sigstore.json" || rc=$?
+  if ((rc == 1)); then
+    MANIFEST_STATE=missing
+    MANIFEST_LINE="$tag: provenance-missing (release $tag has a manifest but no Sigstore bundle)"
+    return 0
+  elif ((rc)); then
+    MANIFEST_STATE=network
+    MANIFEST_LINE="$FETCH_ERROR"
+    return 0
+  fi
+  if ! verifier=$(find_verifier "$tag"); then
+    MANIFEST_STATE=unavailable
+    MANIFEST_LINE="$tag: verifier-unavailable (verifier-not-found: scripts/release/verify-manifest.sh is not on this host and could not be fetched at $tag)"
+    return 0
+  fi
+  rc=0
+  out=$(cd "$work/release" && bash "$verifier" "$name" "$name.sigstore.json" --tag "$tag" 2>&1) || rc=$?
+  cause=$(sed -n 's/.*cause=\([a-z0-9-]*\).*/\1/p' <<<"$out" | tail -n1)
+  case $rc in
+    0)
+      MANIFEST_STATE=verified
+      MANIFEST_FILE="$work/release/$name"
+      MANIFEST_LINE="$tag: provenance-verified (evidence about release $tag's tarballs, not about the image)"
+      ;;
+    3 | 11)
+      MANIFEST_STATE=unavailable
+      MANIFEST_LINE="$tag: verifier-unavailable (${cause:-verifier exited $rc})"
+      ;;
+    4)
+      MANIFEST_STATE=missing
+      MANIFEST_LINE="$tag: provenance-missing (${cause:-no bundle})"
+      ;;
+    *)
+      MANIFEST_STATE=failed
+      MANIFEST_LINE="$tag: verification-failed (${cause:-verifier exited $rc}); do not stage from this release: $(tail -n1 <<<"$out")"
+      ;;
+  esac
+}
+
+# compatibility_line: the node protocol window from the verified manifest, else from
+# docs/compatibility.md's marker when this host has the document.
+compatibility_line() {
+  local doc out
+  if [[ -n $MANIFEST_FILE ]]; then
+    out=$(python3 - "$MANIFEST_FILE" <<'PY' 2>/dev/null
+import json, sys
+m = json.load(open(sys.argv[1]))
+w = m.get("node_protocol_window") or {}
+c = m.get("compatibility") or {}
+print("node protocol window %s.%s-%s.%s (release manifest %s); rollback supported: %s" % (
+    w.get("major"), w.get("min_minor"), w.get("major"), w.get("max_minor"), m.get("tag"),
+    str(c.get("rollback_supported")).lower()))
+PY
+    ) && {
+      printf '%s\n' "$out"
+      return 0
+    }
+  fi
+  for doc in "${WARDOS_COMPATIBILITY_DOC:-}" "$here/../../docs/compatibility.md" /usr/share/wardos/docs/compatibility.md; do
+    [[ -n $doc && -f $doc ]] || continue
+    out=$(tr '\n' ' ' <"$doc" | grep -o -E '<!--[[:space:]]*protocol-window:[^>]*-->' | head -n1 | sed -E 's/.*protocol-window:[[:space:]]*([0-9.]+-[0-9.]+).*/\1/')
+    [[ -n $out ]] && {
+      printf 'node protocol window %s (docs/compatibility.md)\n' "$out"
+      return 0
+    }
+  done
+  printf 'unknown (no verified release manifest, and docs/compatibility.md is not on this host)\n'
+}
+
+# ---------------------------------------------------------------------------------------
+# gather: every state into the ST_* variables; FAIL_LINE/FAIL_CODE when a failure stops
+# the machine before a candidate is known. print_status prints them.
+ST_BOOTED="" ST_STAGED="" ST_AVAILABLE="" ST_VERIFIED="" ST_MANIFEST="" ST_ROLLBACK="" ST_FLOOR="" ST_COMPAT=""
+FAIL_LINE="" FAIL_CODE=0 FLOOR_STATE="" CAND_DIGEST="" CAND_VERSION=""
+gather() {
+  local wardv="" report first="" cand booted_v cand_v source="" verdict
+  FAIL_LINE=""
+  FAIL_CODE=0
+  if ! read_bootc_status; then
+    ST_BOOTED="bootc-error: $BOOTC_ERROR"
+    FAIL_LINE=$ST_BOOTED
+    FAIL_CODE=1
+    return 0
+  fi
+  if wardos_has ward; then
+    wardv=$(ward --version 2>/dev/null | head -n1)
+    wardv=" · ward ${wardv#ward }"
+  fi
+  version_of booted
+  booted_v=$VERSION
+  if [[ -z ${label_cache[${dep[booted_digest]}]:-} ]]; then
+    ST_BOOTED="${dep[booted_ref]}@${dep[booted_digest]}  $booted_v (bootc version; ${LABEL_NOTE:-the image carries no org.wardos.version label})$wardv"
+  else
+    ST_BOOTED="${dep[booted_ref]}@${dep[booted_digest]}  $booted_v$wardv"
+  fi
+  if [[ -n ${dep[staged_digest]} ]]; then
+    version_of staged
+    ST_STAGED="${dep[staged_digest]}  $VERSION"
+  else
+    ST_STAGED="none"
+  fi
+  if [[ -n ${dep[rollback_digest]} ]]; then
+    version_of rollback
+    ST_ROLLBACK="available: ${dep[rollback_digest]}  $VERSION"
+  else
+    ST_ROLLBACK="none (no previous deployment to roll back to)"
+  fi
+
+  # The candidate: what bootc finds for the configured reference, else what is staged.
+  workdir
+  if report=$(bootc upgrade --check 2>&1); then
+    first=$(head -n1 <<<"$report")
+    if ! read_bootc_status; then
+      ST_AVAILABLE="bootc-error: $BOOTC_ERROR"
+      FAIL_LINE=$ST_AVAILABLE
+      FAIL_CODE=1
+      cand=""
+    elif [[ -n ${dep[cached_digest]:-} ]]; then
+      cand=cached
+      version_of cached
+      ST_AVAILABLE="${dep[cached_digest]}  $VERSION  (bootc: $first)"
+    elif [[ $first == *"No changes"* || -z $first ]]; then
+      cand=""
+      ST_AVAILABLE="up to date (bootc: ${first:-no changes})"
+    else
+      cand=""
+      ST_AVAILABLE="bootc-error: no candidate reported (bootc: $first)"
+      FAIL_LINE=$ST_AVAILABLE
+      FAIL_CODE=1
+    fi
+  else
+    first=$(head -n1 <<<"$report")
+    ST_AVAILABLE=$(classify_failure "${first:-bootc upgrade --check exited non-zero}")
+    FAIL_LINE=$ST_AVAILABLE
+    state_exit "$ST_AVAILABLE" || FAIL_CODE=$?
+    cand=""
+  fi
+  [[ -n $cand || -z ${dep[staged_digest]:-} ]] || cand=staged
+  if [[ -z $cand ]]; then
+    ST_VERIFIED="nothing to verify: no candidate"
+    ST_MANIFEST="not looked up: no candidate"
+    ST_FLOOR="not evaluated: no candidate"
+    FLOOR_STATE=none
+    MANIFEST_STATE=skipped
+    MANIFEST_FILE=""
+    CAND_DIGEST=""
+    ST_COMPAT=$(compatibility_line)
+    return 0
+  fi
+  CAND_DIGEST=${dep[${cand}_digest]}
+  if [[ $cand == staged ]]; then
+    ST_VERIFIED="downloaded, digest-checked (bootc); provenance-missing: the image is not covered by the release manifest (no image signature yet, ADR-0028 §6)"
+  else
+    ST_VERIFIED="digest-resolved (bootc), downloaded and digest-checked at staging; provenance-missing: the image is not covered by the release manifest (no image signature yet, ADR-0028 §6)"
+  fi
+
+  # The anti-rollback floor, over the two WardOS labels, else over bootc's two version
+  # fields; never one of each.
+  if image_label "${dep[${cand}_ref]}" "$CAND_DIGEST"; then cand_v=$LABEL; else cand_v=""; fi
+  booted_v=${label_cache[${dep[booted_digest]}]:-}
+  if [[ -n $cand_v && -n $booted_v ]]; then
+    source=""
+  else
+    cand_v=${dep[${cand}_version]}
+    booted_v=${dep[booted_version]}
+    source=" (bootc versions)"
+  fi
+  CAND_VERSION=$cand_v
+  if [[ -z $cand_v ]]; then
+    FLOOR_STATE=unknown
+    ST_FLOOR="not evaluated: the candidate's version is unknown (${LABEL_NOTE:-no version label})"
+  elif [[ -z $booted_v ]]; then
+    FLOOR_STATE=unknown
+    ST_FLOOR="not evaluated: the booted deployment's version is unknown (${LABEL_NOTE:-no version label})"
+  else
+    verdict=$(anti_rollback "$cand_v" "$booted_v")
+    case $verdict in
+      lower)
+        if ((allow_rollback)); then
+          FLOOR_STATE=overridden
+          ST_FLOOR="allowed by --allow-rollback: candidate $cand_v is lower than booted $booted_v$source"
+        else
+          FLOOR_STATE=refused
+          ST_FLOOR="refused: candidate $cand_v is lower than booted $booted_v; pass --allow-rollback to stage it anyway$source"
+        fi
+        ;;
+      equal | higher)
+        FLOOR_STATE=allowed
+        ST_FLOOR="allowed: candidate $cand_v is not lower than booted $booted_v$source"
+        ;;
+      *)
+        FLOOR_STATE=unknown
+        ST_FLOOR="not evaluated: ${verdict#*: }"
+        ;;
+    esac
+  fi
+
+  # The release manifest of the candidate's WardOS version, when that version is known.
+  if [[ -n $source ]]; then
+    MANIFEST_STATE=skipped
+    MANIFEST_FILE=""
+    if [[ $LABEL_NOTE == *"no such host"* || $LABEL_NOTE == *"dial tcp"* || $LABEL_NOTE == *"pinging container registry"* ]]; then
+      MANIFEST_STATE=network
+      ST_MANIFEST=$(classify_failure "$LABEL_NOTE")
+    else
+      ST_MANIFEST="not looked up: the candidate's WardOS version is unknown (${LABEL_NOTE:-no org.wardos.version label})"
+    fi
+  else
+    release_manifest "$cand_v"
+    ST_MANIFEST=$MANIFEST_LINE
+  fi
+  ST_COMPAT=$(compatibility_line)
+}
+
+print_status() {
+  row booted "$ST_BOOTED"
+  [[ -n $ST_STAGED ]] || return 0
+  row staged "$ST_STAGED"
+  row available "$ST_AVAILABLE"
+  row verified "$ST_VERIFIED"
+  row manifest "$ST_MANIFEST"
+  row rollback "$ST_ROLLBACK"
+  row anti-rollback "$ST_FLOOR"
+  row compatibility "$ST_COMPAT"
+}
+
+status() {
+  wardos_has bootc || {
+    row booted "not a bootc host (bootc is not installed)"
+    return 0
+  }
+  gather
+  print_status
+}
+
+check() {
+  local report first text="" class="" tooltip
+  if wardos_has bootc; then
+    if report=$(bootc upgrade --check 2>&1); then
+      first=$(head -n1 <<<"$report")
+      tooltip=$first
+      if [[ $first == *"Update available"* ]]; then
+        text=update
+        class=available
+      fi
+    else
+      first=$(head -n1 <<<"$report")
+      tooltip=$(classify_failure "${first:-bootc upgrade --check exited non-zero}")
+      text="update?"
+      class=unavailable
+    fi
+  else
+    tooltip="bootc is not installed"
+  fi
+  printf '{"text": "%s", "tooltip": "%s", "class": "%s"}\n' "$text" "$(json_string "$tooltip")" "$class"
+}
+
+SUMMARY="" FAILURE=""
 system() {
   wardos_has bootc || wardos_die "bootc is not installed: not a WardOS image host"
   echo "== System image (bootc upgrade, root)"
-  sudo bootc upgrade
+  gather
+  print_status
+  if ((FAIL_CODE)); then
+    FAILURE=$FAIL_LINE
+    return "$FAIL_CODE"
+  fi
+  if [[ -z $CAND_DIGEST ]]; then
+    SUMMARY="Up to date: the booted image is the newest for its reference"
+    echo "$SUMMARY"
+    return 0
+  fi
+  if [[ $FLOOR_STATE == refused ]]; then
+    FAILURE="downgrade refused: $ST_FLOOR"
+    echo "wardos-update: $FAILURE" >&2
+    return 5
+  fi
+  case $MANIFEST_STATE in
+    failed)
+      FAILURE="verification-failed: $ST_MANIFEST"
+      echo "wardos-update: $FAILURE" >&2
+      return 6
+      ;;
+    missing | unavailable | network)
+      if ((require_provenance)); then
+        FAILURE="$ST_MANIFEST; refusing to stage (--require-provenance)"
+        echo "wardos-update: $FAILURE" >&2
+        return 6
+      fi
+      echo "wardos-update: $ST_MANIFEST; staging checksum-only (bootc's digest), said here and nowhere verified" >&2
+      ;;
+  esac
+  echo "Staging $CAND_DIGEST${CAND_VERSION:+ ($CAND_VERSION)}: stage only; the booted deployment is not changed until a reboot you choose."
+  echo "Before that reboot: $ST_COMPAT; rollback $ST_ROLLBACK."
+  if ! sudo bootc upgrade; then
+    FAILURE="bootc-error: bootc upgrade failed; see its output above"
+    echo "wardos-update: $FAILURE" >&2
+    return 1
+  fi
+  if read_bootc_status && [[ -n ${dep[staged_digest]} ]]; then
+    version_of staged
+    ST_STAGED="${dep[staged_digest]}  $VERSION"
+    row staged "$ST_STAGED"
+    SUMMARY="Staged $VERSION (${dep[staged_digest]}); the new image runs after a reboot you choose. Rollback: $ST_ROLLBACK. Image provenance: missing (not covered by the release manifest); release manifest: ${ST_MANIFEST}"
+  else
+    SUMMARY="bootc upgrade finished with nothing staged (the newest image may already be booted or staged); the booted deployment runs until a reboot you choose"
+  fi
+  echo "$SUMMARY"
+  return 0
 }
 
 flatpaks() {
@@ -58,15 +641,22 @@ themes() {
 
 case "${1:-all}" in
   --check) check ;;
+  --status) status ;;
   system) system ;;
   flatpaks | flatpak) flatpaks ;;
   themes) themes ;;
   configs) wardos-refresh --all ;;
   all)
-    system
+    rc=0
+    system || rc=$?
     flatpaks
     themes
-    wardos-notify --done "Update" "The new image runs after a reboot"
+    if ((rc == 0)); then
+      wardos-notify --done "Update" "$SUMMARY"
+    else
+      wardos-notify -u critical "Update" "$FAILURE"
+      exit "$rc"
+    fi
     ;;
-  *) wardos_die "system, flatpaks, themes, configs or --check? (--help)" ;;
+  *) wardos_die "system, flatpaks, themes, configs, --status or --check? (--help)" ;;
 esac
