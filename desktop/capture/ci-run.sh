@@ -61,6 +61,10 @@ retry 3 5 dnf -y --setopt=install_weak_deps=False install "${pkgs[@]}"
 retry 3 5 dnf -y -q --setopt=install_weak_deps=False install egl-utils ||
   echo "ci-run.sh: egl-utils not installed; the failure output goes without eglinfo" >&2
 rpm -q hyprland aquamarine hyprlock waybar fuzzel mako foot grim mesa-dri-drivers seatd | tee "$out/versions.txt"
+# Hyprland 0.56 warns at every login that hyprland-guiutils (hyprland-qtutils before it)
+# is not installed; whether the enabled repositories carry it decides if the image can.
+guiutils=$(dnf -q repoquery hyprland-guiutils hyprland-qtutils 2>/dev/null | tr '\n' ' ' || true)
+echo "hyprland-guiutils in the repositories: ${guiutils:-none (nor hyprland-qtutils)}" | tee -a "$out/versions.txt"
 
 "$root/image/install-desktop.sh" "$root/desktop" /
 install -m 0755 "$bins"/ward "$bins"/wardd "$bins"/ward-shell "$bins"/wardos-theme-render /usr/bin/

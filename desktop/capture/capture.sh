@@ -107,6 +107,23 @@ clients_seen() { hypr_json clients -r '[.[] | .class] | join(" ")' 2>/dev/null |
 # shellcheck disable=SC2016  # $ns is jq's
 layer_up() { hypr_json layers -e --arg ns "$1" '[.. | objects | .namespace? // empty] | index($ns) != null' >/dev/null; }
 layer_gone() { ! layer_up "$1"; }
+# layer_addresses NS: the addresses of NS's layer surfaces, sorted; a client that
+# re-creates its surface (Waybar on SIGUSR2) gets new ones.
+# shellcheck disable=SC2016  # $ns is jq's
+layer_addresses() { hypr_json layers -r --arg ns "$1" '[.. | objects | select(.namespace? == $ns) | .address] | sort | join(" ")' 2>/dev/null || true; }
+# layer_recreated NS OLD: NS is on screen on other surfaces than OLD (layer_addresses
+# before the change).
+layer_recreated() {
+  local now
+  now=$(layer_addresses "$1")
+  [[ -n $now && $now != "$2" ]]
+}
+# pid_gone PID: the process is no longer there (swaybg is replaced, not reloaded).
+pid_gone() { [[ -n $1 ]] && ! kill -0 "$1" 2>/dev/null; }
+# dismiss: Hyprland's own notifications (the overlay toasts top-right: on 0.56, that
+# hyprland-guiutils is not installed and that the .conf format goes in 0.57) are not the
+# desktop and a user clicks them away; no shot has one.
+dismiss() { hyprctl dismissnotify >/dev/null 2>&1 || true; }
 # shellcheck disable=SC2016  # $c is jq's
 clients() { hypr_json clients --arg c "$1" '[.[] | select(.class == $c and .mapped)] | length'; }
 client_up() {
@@ -253,12 +270,21 @@ scene_observer() {
 scene_menu() { menu_open wardos-menu; }
 leave_menu() { menu_close; }
 
+# The switch is done when every component has taken the render, not when the toast is
+# up (run 7 shot the toast over a bar and a wallpaper still in Ward Dark): swaybg is
+# replaced (its pid goes), Waybar re-creates its surface on SIGUSR2 (new layer
+# addresses), then a second for the re-render. The shot's dominant colour must not be
+# the Ward Dark ground (expect[tokyo], checked by assemble.py).
 scene_tokyo() {
+  local swaybg_was bar_was
+  swaybg_was=$(pgrep -n -u "$UID" -x swaybg || true)
+  bar_was=$(layer_addresses waybar)
   hypr_run wardos-theme set tokyo-night
   wait_for "the Tokyo Night render" "$limit" theme_is tokyo-night
   wait_for "wardos-theme to finish" "$limit" idle wardos-theme
-  wait_for "the bar" "$limit" layer_up waybar
+  wait_for "swaybg to be replaced" "$limit" pid_gone "$swaybg_was"
   wait_for "the wallpaper" "$limit" layer_up wallpaper
+  wait_for "the bar to re-create its surface" "$limit" layer_recreated waybar "$bar_was"
   wait_for "the theme toast" "$limit" layer_up notifications
   sleep 1
   wait_for "the live trust bar" "$limit" bar_live
@@ -431,6 +457,11 @@ cd "$HOME"
 say "setting up $(id -un) as a first login leaves it"
 wardos-refresh --all >"$logs/refresh.log"
 wardos-theme render ward-dark
+# What each scene's shot must not be dominated by, for assemble.py check: the Tokyo Night
+# scene must have left the Ward Dark ground behind.
+ward_dark_ground=$(sed -n 's/^WARDOS_GROUND=//p' "$HOME/.config/wardos/theme/current/colors.env" | tr -d '"' | head -n 1)
+declare -A expect=()
+[[ -z $ward_dark_ground ]] || expect[tokyo]="--not-dominant $ward_dark_ground"
 for marker in first-run-done calibrate-done welcome-done; do
   date -u +%Y-%m-%dT%H:%M:%SZ >"$HOME/.config/wardos/$marker"
 done
@@ -481,6 +512,7 @@ hypr_pid=$!
 pids+=("$hypr_pid")
 wait_for "Hyprland's socket" "$limit" hypr_ready || die "Hyprland did not come up"
 say "$(hyprctl version | sed -n 1p), instance $HYPRLAND_INSTANCE_SIGNATURE on $WAYLAND_DISPLAY"
+dismiss
 # There is no systemd here, so the exec-once systemctl line only logs its failure and the
 # units it would start do not run: the bar's segments subscribe to the daemon themselves,
 # as they do whenever wardos-shell-worker.service is down (desktop/systemd/user), and no
@@ -515,13 +547,15 @@ while IFS=$'\t' read -r -u 3 id ms need what; do
   n=$((n + 1))
   png=$(printf '%s/%02d-%s.png' "$frames" "$n" "$id")
   say "scene $n, $id: $what"
+  read -ra checks <<<"${expect[$id]:-}"
   set +e
   (
     set -e
     "scene_$id"
     sleep "$settle"
+    dismiss
     grim -o "$output" "$png"
-    python3 "$here/assemble.py" check "$png"
+    python3 "$here/assemble.py" check "$png" "${checks[@]}"
   )
   rc=$?
   set -e

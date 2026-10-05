@@ -146,7 +146,8 @@ trace_filter="grep -v '\\[TRACE\\]'"
 for want in 'exec-once = " cmd " >>" logs "/" name ".log 2>&1; echo \"exited $?\" >>" logs "/" name ".log"' \
   'if (cmd == "waybar") cmd = "waybar -l debug"' 'if (name == "hypridle") { print "exec-once = true # hypridle' \
   'assemble.py" check "$png"' 'assemble.py" describe "$logs/not-on-screen-$id.png"' 'ps -o pid,ppid,stat,etime,cmd -u' \
-  "$trace_filter" 'layers [$(layers_seen)]'; do
+  "$trace_filter" 'layers [$(layers_seen)]' 'hyprctl dismissnotify' 'expect[tokyo]="--not-dominant $ward_dark_ground"' \
+  'layer_recreated waybar "$bar_was"' 'pid_gone "$swaybg_was"'; do
   grep -qF -- "$want" "$script" || fail "capture.sh does not have: $want"
 done
 for pkg in wl-clipboard cliphist dbus-daemon dbus-tools; do
@@ -237,6 +238,10 @@ EOF
 line=$(python3 "$cap/assemble.py" check "$frames/01-${ids[0]}.png") || fail "assemble.py check refused a real-looking shot"
 [[ $line == *"1920x1080, 2 colours, dominant #0e0f11 ("* ]] || fail "assemble.py check describes the shot: $line"
 if python3 "$cap/assemble.py" check "$TMP/flat.png" 2>/dev/null; then fail "assemble.py check must refuse a flat frame"; fi
+if python3 "$cap/assemble.py" check "$frames/01-${ids[0]}.png" --not-dominant '#0E0F11' >/dev/null 2>&1; then
+  fail "assemble.py check --not-dominant must refuse a shot still dominated by that colour"
+fi
+python3 "$cap/assemble.py" check "$frames/01-${ids[0]}.png" --not-dominant '#16161e' >/dev/null || fail "assemble.py check --not-dominant passes a shot dominated by another colour"
 line=$(python3 "$cap/assemble.py" describe "$TMP/flat.png") || fail "assemble.py describe never fails"
 [[ $line == *"one flat colour, dominant #000000 (100%)"* ]] || fail "assemble.py describe names the flat colour: $line"
 python3 "$cap/assemble.py" gif "$table" "$frames" "$TMP/out.gif" >/dev/null

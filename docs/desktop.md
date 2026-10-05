@@ -486,8 +486,15 @@ get "no such service" answers rather than no bus. Then it walks
 through `hyprctl dispatch exec` (the welcome steps, `wardos-launch run`, `wardos-menu`,
 `wardos-theme`, `wardos-power`), waited for in `hyprctl layers` and `hyprctl clients`
 rather than slept on, shot with `grim`, and closed again (a menu is cancelled the way
-Escape would). `assemble.py` makes the GIF from the shots with each scene's
-milliseconds, 1280x720 and 128 colours. Every shot is described in
+Escape would). Before every shot Hyprland's own notifications are dismissed
+(`hyprctl dismissnotify`): on 0.56 two overlay toasts appear at login, that
+`hyprland-guiutils` is not installed (the repositories' answer is in the job's
+`versions.txt`) and that the `.conf` config format goes in 0.57 (the Lua migration, left
+for then); a user clicks them away and they are not the desktop. The Tokyo Night scene
+waits for the switch itself, not the toast: swaybg replaced, Waybar's surface re-created
+on `SIGUSR2`, then a second for the re-render, and its shot must not be dominated by the
+Ward Dark ground (`assemble.py check --not-dominant`). `assemble.py` makes the GIF from
+the shots with each scene's milliseconds, 1280x720 and 128 colours. Every shot is described in
 the job log (size, how many colours, the dominant one), and a required scene that does
 not come up fails the job with a shot of what was on screen instead, every client's log,
 `hyprctl` monitors, layers and clients, the processes, Hyprland's log without its trace
