@@ -202,6 +202,22 @@ pub fn observations(
 /// is written, so this lag is not a window anything inside can use.
 const MARKER_POLL: Duration = Duration::from_millis(50);
 
+/// What the egress tells the holder of a launch's provider leases (#267,
+/// `credentials::keeper`): which grant's route it withdrew on a revoke marker,
+/// and that the proxy closed for a pause. Called on the egress's watcher
+/// threads, after the proxy has acted and its acknowledgement is written, so
+/// an implementation must only record what is to be done and return — the
+/// provider calls happen on its own thread.
+pub trait CredentialWatch: Send + Sync {
+    /// The route of grant `grant_id` was withdrawn (`ward session revoke`).
+    /// May be called again for the same id while its marker stands.
+    fn withdrawn(&self, grant_id: u64);
+    /// The session paused: credential injection is suspended. Calls
+    /// `withdraw_route` for each grant whose route must be withdrawn for good
+    /// (a provider lease is revoked, not held across the pause).
+    fn paused(&self, withdraw_route: &dyn Fn(u64));
+}
+
 /// A running session proxy bound to a Unix socket.
 pub struct Egress {
     handle: Arc<Handle>,
@@ -276,6 +292,17 @@ impl Egress {
     /// cannot register would be invisible to that confirmation, so it does not
     /// start.
     pub fn watch_marker(&mut self, marker: PathBuf) -> Result<()> {
+        self.watch_marker_with(marker, None)
+    }
+
+    /// [`watch_marker`](Self::watch_marker), also telling `credentials` when
+    /// the proxy pauses (#267), so a launch's provider leases are withdrawn
+    /// and revoked rather than held across the pause.
+    pub fn watch_marker_with(
+        &mut self,
+        marker: PathBuf,
+        credentials: Option<Arc<dyn CredentialWatch>>,
+    ) -> Result<()> {
         let handle = Arc::clone(&self.handle);
         let paused = marker.exists();
         handle.set_paused(paused);
@@ -294,6 +321,11 @@ impl Egress {
                 if paused != handle.paused() {
                     handle.set_paused(paused);
                     let _ = acknowledge.set(paused);
+                    if paused && let Some(watch) = &credentials {
+                        watch.paused(&|id| {
+                            let _ = handle.revoke_credential(id);
+                        });
+                    }
                 }
             }
         });
@@ -322,6 +354,17 @@ impl Egress {
     /// other launch's egress may own it, or none ever will, which is for the
     /// daemon's own bound to give up on, not this loop.
     pub fn watch_revocations(&mut self, dir: PathBuf) {
+        self.watch_revocations_with(dir, None);
+    }
+
+    /// [`watch_revocations`](Self::watch_revocations), also telling
+    /// `credentials` which grant's route was withdrawn (#267), once its
+    /// acknowledgement is written, so its provider lease is revoked too.
+    pub fn watch_revocations_with(
+        &mut self,
+        dir: PathBuf,
+        credentials: Option<Arc<dyn CredentialWatch>>,
+    ) {
         let handle = Arc::clone(&self.handle);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
@@ -348,6 +391,9 @@ impl Egress {
                         crate::revoke::in_flight_text(in_flight)
                     };
                     let _ = std::fs::write(entry.path(), outcome);
+                    if let Some(watch) = &credentials {
+                        watch.withdrawn(id);
+                    }
                 }
             }
         });

@@ -68,7 +68,7 @@ pub mod secret;
 
 pub use addr::AddrClass;
 pub use error::Error;
-pub use gateway::{GatewayRoute, ScopeDenial};
+pub use gateway::{GatewayRoute, LeaseDeadline, ScopeDenial};
 pub use http::{Header, Host, Method, ParseError, Parsed, Request, Target};
 pub use observer::{Decision, NullObserver, Observer};
 pub use policy::{Denial, Pinned, Policy};

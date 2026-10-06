@@ -23,6 +23,7 @@ pub mod attempt;
 pub mod baseline;
 pub mod client;
 pub mod control;
+pub mod credentials;
 pub mod daemon;
 pub mod describe;
 pub mod doctor;

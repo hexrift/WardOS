@@ -204,6 +204,40 @@ pub enum Request {
     /// existing client is unaffected; a daemon that predates this rejects
     /// the request, which a client reads as "no progress", not a failure.
     ReportProgress,
+    /// What happened to a provider-backed credential's lease (#267), from
+    /// the launch that holds it (`credentials::keeper`): renewed, renewal
+    /// refused, revoked at the provider or not, and whether the grant is now
+    /// retired. The daemon keeps the text in the grant's (history) line —
+    /// never a secret: the keeper builds it from names and states only.
+    /// Answered [`Response::Ok`]; a daemon that predates it rejects it, and
+    /// the launch carries on (the provider outcome is then not recorded).
+    LeaseNote(LeaseNote),
+}
+
+/// A provider-backed credential's lease outcome (#267), for the grant `id`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseNote {
+    /// The grant id the daemon minted for the credential.
+    pub id: u64,
+    /// `provider bao: revoked at the provider (grant revoked)`.
+    pub text: String,
+    /// Retire the grant into the history in this state, when it is still
+    /// live and not already being revoked by `ward session revoke`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire: Option<LeaseRetire>,
+    /// A renewal's new expiry, milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<u64>,
+}
+
+/// The terminal state a [`LeaseNote`] retires a grant in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LeaseRetire {
+    /// Withdrawn: revoked, suspended by a pause, or its launch ended.
+    Revoked,
+    /// The lease ran out.
+    Expired,
 }
 
 /// [`Request::Capabilities`] feature: `Request::Stop` terminates the session's
@@ -952,7 +986,8 @@ pub fn handle_with(
         | Request::HoldForCapture { .. }
         | Request::ReleaseCapture { .. }
         | Request::Lifecycle
-        | Request::ReportProgress => (
+        | Request::ReportProgress
+        | Request::LeaseNote(_) => (
             Response::Error("not served on this connection".into()),
             false,
         ),
