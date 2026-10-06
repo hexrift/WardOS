@@ -28,7 +28,13 @@
 # proves that the client, through the adapter's --connect-tls, reads the same capability
 # document as over the socket and runs an attempt to a verifying sealed log, that the
 # node's key pinned the operator's way is accepted and another refused, and that a client
-# from another CA is refused and reported. A fake upstream on loopback over plain HTTP is
+# from another CA is refused and reported.
+# The capacity and resources cases (node-integration.md §5, §7.5, §8.2; #260) start a
+# ninth node, the shipped build, with --max-running 1 and without --cgroup-root, and prove
+# that a start refused capacity_exhausted is waited out by sending the same start again
+# (or, once the client's wait is spent, left ready for a replay that sends it), and that a
+# resources grant is refused by the client and by the node itself without --cgroup-root. A
+# fake upstream on loopback over plain HTTP is
 # something the shipped ward-node refuses by design (its proxy never connects to loopback
 # and speaks only TLS upstream), so the credentials and hold nodes alone are ward-node
 # built with the `test-loopback` feature, exactly as ward-node's own
@@ -1612,6 +1618,176 @@ if [[ -z "$problems" ]]; then
   pass mutual_tls_transport "a node started with --listen-tls serves the client over TLS 1.3 with client certificates: the capability document is the socket's byte for byte, a run completes and seals a verifying log, the operator's openssl-computed pin of the node's key is accepted and any other refused by name, and a client certified by another CA is refused and reported in the node's log"
 else
   fail mutual_tls_transport "$problems"
+fi
+
+# ---- capacity and resource limits (node-integration.md §5, §7.5, §8.2; #260) ----------------
+# A shipped node bounding what runs at once to one attempt, and enforcing no resource limit:
+# it was started without --cgroup-root, which needs a delegated cgroup v2 directory this
+# runner does not have (node-acceptance.md §2.4 runs that case where one is delegated).
+
+cap_snapshot="$("$WARD_NODE_BIN" snapshot import --state-dir "$work/cap-state" "$work/project")"
+cap_pid="$(start_node "$work/cap.sock" "$work/cap-state" "$work/cap-tasks" --max-running 1)"
+background+=("$cap_pid")
+cap_common=(--socket "$work/cap.sock" --adapter "$WARD_NODE_ADAPTER_BIN")
+cap_run=("${cap_common[@]}" --key "$work/cp/issuer.pem" --principal acceptance-issuer --node "$node_id"
+  --state-dir "$work/cp" --snapshot "$cap_snapshot" --task-root "$work/cap-tasks" --timeout-ms 90000)
+node "$client" capabilities "${cap_common[@]}" >"$work/cap-capabilities.json"
+
+# cap_running <n>: wait until the capacity node reports n attempts running; 60 s at most.
+cap_running() {
+  for _ in $(seq 1 600); do
+    if node "$client" capabilities "${cap_common[@]}" >"$work/cap-now.json" 2>/dev/null \
+      && [[ "$(field "$work/cap-now.json" 'o.scheduling.running')" == "$1" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# sign_record <caller-task> <caller-attempt> <manifest-json>: the run record `run` writes
+# before its first send, for the capacity node, built and signed with the client library
+# alone and without asking the node: for a grant the client refuses to sign for this node,
+# so that the node's own refusal of the same signed grant can be shown.
+sign_record() {
+  # shellcheck disable=SC2016  # JavaScript, not shell: its ${…} are template literals
+  node --input-type=module -e '
+    import { join } from "node:path";
+    import { VersionStore, buildEnvelope, deriveId, loadIssuerKey, rootLease, saveRunRecord, signEnvelope } from "./examples/node-control-plane/ward-node.mjs";
+    const [dir, node, snapshot, tasks, callerTask, callerAttempt, manifestJson] = process.argv.slice(1);
+    const task = deriveId("task", callerTask);
+    const binding = { task, attempt: deriveId("exec", callerAttempt), lease: deriveId("lease", callerAttempt) };
+    const agent = deriveId("agent", "control-plane");
+    const now = Date.now();
+    const version = new VersionStore(join(dir, "admission-versions.json")).next(task);
+    const envelope = buildEnvelope({
+      binding, agent, node, session: deriveId("sess", callerAttempt),
+      lease: rootLease({
+        id: binding.lease, delegationId: deriveId("deleg", callerAttempt), issuer: deriveId("prn", "acceptance-issuer"), subject: agent, task,
+        grants: [{ capability: "workload.run", resource: `task:${task}`, delegable: false }],
+        issuedAtUnixMs: now - 60000, expiresAtUnixMs: now + 960000,
+      }),
+      workload: { argv: ["sh", "-c", "echo never"], manifest: JSON.parse(manifestJson), snapshot, wallClockBudgetMs: 60000 },
+      issuedAtUnixMs: now - 60000, expiresAtUnixMs: now + 900000, version,
+    });
+    const signed = signEnvelope(loadIssuerKey(join(dir, "issuer.pem")), envelope);
+    saveRunRecord(join(dir, "runs"), {
+      binding, caller: { task: callerTask, attempt: callerAttempt, lease: callerAttempt }, version,
+      envelope_json: signed.envelope_json, proof: signed.proof, operation_ids: { start_at: 1 }, task_root: tasks,
+    });
+  ' -- "$work/cp" "$node_id" "$cap_snapshot" "$work/cap-tasks" "$@"
+}
+
+# ---- case 27: a start refused capacity_exhausted is waited out with the same start ---------
+
+problems=""
+check 27 "$work/cap-capabilities.json" 'o.scheduling.max_running' '1' "the node reports its running bound"
+check 27 "$work/cap-capabilities.json" 'o.scheduling.running' '0' "nothing runs yet"
+# The first attempt holds the node's one slot until the host drops `release` in its workspace.
+task27a="$(node "$client" derive-id task acc-task-27a)"
+attempt27a="$(node "$client" derive-id exec acc-attempt-27a)"
+status27a=0
+node "$client" run "${cap_run[@]}" --task acc-task-27a --attempt acc-attempt-27a --budget-ms 120000 \
+  -- sh -c 'while [ ! -e release ]; do sleep 0.1; done' >"$work/run27a.json" 2>>"$work/client.log" &
+hold_pid=$!
+background+=("$hold_pid")
+cap_running 1 || problems+="the holding attempt never ran; "
+# A run that may wait one second gives up, its attempt admitted, ready and not started.
+status=0
+node "$client" run "${cap_run[@]}" --task acc-task-27b --attempt acc-attempt-27b --budget-ms 60000 --capacity-wait-secs 1 \
+  -- sh -c 'echo replayed > out.txt' >"$work/run27b.json" 2>"$work/run27b.err" || status=$?
+[[ "$status" == "1" ]] || problems+="give-up exit status $status, expected 1; "
+check 27 "$work/run27b.json" 'o.refused' '{"verb":"start","reason":"capacity_exhausted"}' "the start is refused"
+check 27 "$work/run27b.json" 'o.certain' 'true' "a refusal is certain"
+check 27 "$work/run27b.json" 'o.finalState' '"ready"' "the attempt is left ready"
+check 27 "$work/run27b.json" 'o.operations.map(x => x.verb).join()' '"create,admit,start"' "nothing past the refused start"
+check 27 "$work/run27b.json" 'o.capacity_waits.length > 0' 'true' "it waited"
+check 27 "$work/run27b.json" 'o.capacity_waits.every(w => w.operation_id === 3 && w.scheduling.max_running === 1 && w.scheduling.running === 1)' 'true' "every wait is for start 3 with the node full"
+attempt27b="$(node "$client" derive-id exec acc-attempt-27b)"
+grep -q "stayed at capacity for 1 s .*replay --attempt $attempt27b sends the same start again" "$work/run27b.err" \
+  || problems+="the give-up is not explained: $(cat "$work/run27b.err"); "
+node "$client" inspect --socket "$work/cap.sock" --adapter "$WARD_NODE_ADAPTER_BIN" --task "$(field "$work/run27b.json" 'o.binding.task' | tr -d '"')" \
+  --attempt "$attempt27b" --lease "$(field "$work/run27b.json" 'o.binding.lease' | tr -d '"')" >"$work/inspect27b.json" 2>>"$work/client.log" \
+  || problems+="inspect failed; "
+check 27 "$work/inspect27b.json" 'o.state' '"ready"' "the node holds the attempt ready"
+# A run that may wait a minute is refused at first, then started once the holder ends.
+status27c=0
+node "$client" run "${cap_run[@]}" --task acc-task-27c --attempt acc-attempt-27c --budget-ms 60000 --capacity-wait-secs 60 \
+  -- sh -c 'echo waited > out.txt' >"$work/run27c.json" 2>"$work/run27c.err" &
+waiter_pid=$!
+background+=("$waiter_pid")
+for _ in $(seq 1 600); do
+  grep -q 'sending the same start again' "$work/run27c.err" 2>/dev/null && break
+  sleep 0.1
+done
+grep -q 'refused capacity_exhausted: the node runs 1 of 1 attempts; sending the same start again' "$work/run27c.err" \
+  || problems+="the waiting run did not report a wait with the node's running count: $(cat "$work/run27c.err"); "
+touch "$work/cap-tasks/$task27a/$attempt27a/release"
+wait "$hold_pid" || status27a=$?
+wait "$waiter_pid" || status27c=$?
+[[ "$status27a" == "0" ]] || problems+="holder exit status $status27a; "
+check 27 "$work/run27a.json" 'o.outcome' '"completed"' "the holder completes"
+[[ "$status27c" == "0" ]] || problems+="waiting run exit status $status27c: $(cat "$work/run27c.err"); "
+check 27 "$work/run27c.json" 'o.outcome' '"completed"' "the waiting run completes"
+check 27 "$work/run27c.json" 'o.version' '1' "one version, allocated once"
+check 27 "$work/run27c.json" 'o.capacity_waits.length > 0' 'true' "it waited"
+check 27 "$work/run27c.json" 'o.capacity_waits.every(w => w.operation_id === 3)' 'true' "every wait was for the same start"
+check 27 "$work/run27c.json" 'o.operations.map(x => [x.verb, x.operation_id].join(":")).join()' '"create:1,admit:2,start:3,seal:6"' "the same operation ids, start 3 accepted"
+check 27 "$work/cp/admission-versions.json" "o.versions[\"$(node "$client" derive-id task acc-task-27c)\"]" '1' "no version past the first"
+task27c="$(field "$work/run27c.json" 'o.binding.task' | tr -d '"')"
+verify_log_at "$work/cap-state" "$work/cap-tasks" "$task27c" "$(field "$work/run27c.json" 'o.evidenceLog' | tr -d '"')" \
+  || problems+="the waiting run's evidence log does not verify; "
+# The run that gave up is still admitted: a replay sends the same start, now accepted.
+status=0
+node "$client" replay "${cap_common[@]}" --state-dir "$work/cp" --attempt "$attempt27b" >"$work/replay27b.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "0" ]] || problems+="replay exit status $status; "
+check 27 "$work/replay27b.json" 'o.replayed' 'true' "replayed"
+check 27 "$work/replay27b.json" 'o.outcome' '"completed"' "the replayed start runs"
+check 27 "$work/replay27b.json" 'o.operations.map(x => [x.verb, x.operation_id].join(":")).join()' '"create:1,admit:2,start:3,seal:6"' "the same operation ids"
+task27b="$(field "$work/run27b.json" 'o.binding.task' | tr -d '"')"
+[[ "$(cat "$work/cap-tasks/$task27b/$attempt27b/out.txt" 2>/dev/null)" == "replayed" ]] || problems+="the replayed attempt did not run; "
+if [[ -z "$problems" ]]; then
+  pass capacity_exhausted_start_is_waited_out_with_the_same_start "on a node started with --max-running 1 and holding one attempt, run --capacity-wait-secs 1 is refused start capacity_exhausted, waits with the node's scheduling (1 of 1 running) and gives up with the attempt ready, saying a replay sends the same start; run --capacity-wait-secs 60 waits until the holder ends and completes under operation ids 1, 2, 3 and 6 and version 1 with a verifying sealed log; and the replay of the run that gave up sends the same start, now accepted"
+else
+  fail capacity_exhausted_start_is_waited_out_with_the_same_start "$problems"
+fi
+
+# ---- case 28: without --cgroup-root a resources grant is refused, by the client and the node -
+
+problems=""
+check 28 "$work/cap-capabilities.json" 'o.resources' 'undefined' "a node without --cgroup-root reports no resources section"
+status=0
+node "$client" run "${cap_run[@]}" --task acc-task-28 --attempt acc-attempt-28a --budget-ms 60000 --memory-bytes 268435456 --pids 64 \
+  -- sh -c 'echo never' >"$work/run28a.json" 2>"$work/run28a.err" || status=$?
+[[ "$status" == "2" ]] || problems+="client refusal exit status $status, expected 2; "
+grep -q 'does not advertise resources (a node started with --cgroup-root does).*unsupported_grant' "$work/run28a.err" \
+  || problems+="the client's refusal does not name --cgroup-root and unsupported_grant: $(cat "$work/run28a.err"); "
+[[ ! -s "$work/run28a.json" ]] || problems+="the refused grant printed an outcome; "
+[[ ! -e "$work/cp/runs/$(node "$client" derive-id exec acc-attempt-28a).json" ]] || problems+="the refused grant was recorded as a run; "
+check 28 "$work/cp/admission-versions.json" "o.versions[\"$(node "$client" derive-id task acc-task-28)\"]" 'undefined' "no version allocated"
+# The node refuses it too: the same grant, signed without asking the node, then replayed to it.
+sign_record acc-task-28 acc-attempt-28b '{"network":"offline","resources":{"memory_bytes":268435456,"pids":64}}' \
+  || problems+="the grant could not be signed; "
+status=0
+node "$client" replay "${cap_common[@]}" --state-dir "$work/cp" --attempt "$(node "$client" derive-id exec acc-attempt-28b)" \
+  >"$work/run28b.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "1" ]] || problems+="node refusal exit status $status, expected 1; "
+check 28 "$work/run28b.json" 'o.refused' '{"verb":"admit","reason":"unsupported_grant"}' "the node without --cgroup-root refuses the grant"
+check 28 "$work/run28b.json" 'o.resources' '{"memory_bytes":268435456,"pids":64}' "the signed grant is listed"
+check 28 "$work/run28b.json" 'o.operations.map(x => x.verb).join()' '"create,admit"' "nothing sent after the refusal"
+[[ ! -e "$work/cap-tasks/$(node "$client" derive-id task acc-task-28)" ]] || problems+="a refused grant materialised a task directory; "
+# A limit outside the grammar or above the pid ceiling never reaches a node.
+for entry in '0:is an integer >= 1' '65537:65536 every node refuses as unsupported_grant'; do
+  status=0
+  node "$client" run "${cap_run[@]}" --task acc-task-28 --attempt acc-attempt-28c --budget-ms 60000 --pids "${entry%%:*}" \
+    -- sh -c 'echo never' >"$work/run28c.json" 2>"$work/run28c.err" || status=$?
+  [[ "$status" == "2" ]] || problems+="--pids ${entry%%:*}: exit status $status, expected 2; "
+  grep -q "${entry#*:}" "$work/run28c.err" || problems+="--pids ${entry%%:*}: the refusal does not say why: $(cat "$work/run28c.err"); "
+done
+if [[ -z "$problems" ]]; then
+  pass resources_grant_is_refused_without_cgroup_root "a node started without --cgroup-root reports no resources section; run --memory-bytes --pids reads that and refuses the grant (unsupported_grant) before a version is allocated or anything is signed or recorded, the node itself refuses the same grant signed without asking it unsupported_grant at admit with nothing materialised, and a pid limit of 0 or above 65536 is refused by the client before signing"
+else
+  fail resources_grant_is_refused_without_cgroup_root "$problems"
 fi
 
 echo
