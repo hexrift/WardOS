@@ -384,9 +384,14 @@ export function isolationFloor(minimum: IsolationLevel): IsolationFloor;
  */
 export function offersIsolation(capabilities: unknown, level: IsolationLevel): boolean;
 /**
+ * Whether the node runs an attempt on the weakest backend above its floor
+ * (`isolation.stronger_placement`, ADR-0039 §5).
+ */
+export function placesStronger(capabilities: unknown): boolean;
+/**
  * The capability document, refused (naming the flag and `unsupported_grant`) unless it
- * offers a backend at the floor's level: any other node refuses the manifest at `admit`, so
- * it is refused before signing.
+ * offers a backend at the floor's level or, placing stronger, one above it: any other node
+ * refuses the manifest at `admit`, so it is refused before signing.
  */
 export function requireIsolation<C>(capabilities: C, floor: IsolationFloor): C;
 /**
