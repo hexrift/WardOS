@@ -26,6 +26,13 @@ export const ACTION_KINDS: ReadonlyArray<ActionKind>;
  */
 export const ACTION_CEILINGS: Readonly<{ maxPending: 8; maxTotal: 64; waitSecs: 3600 }>;
 
+/**
+ * What the `credentials` grammar bounds (§7.5, ADR-0034 §1): 1 to 4 grants, service names
+ * of at most 32 bytes, a `ttl_secs` of at most 2^32 - 1. Outside these the grant is refused
+ * before signing.
+ */
+export const CREDENTIAL_LIMITS: Readonly<{ grants: 4; serviceBytes: 32; ttlSecs: 4294967295 }>;
+
 /** The decisions a control plane may answer; `expired` and `cancelled` are the node's. */
 export const ANSWER_DECISIONS: ReadonlyArray<AnswerDecision>;
 
@@ -119,7 +126,30 @@ export interface ActionsGrant {
   wait_secs: number;
 }
 
-export type Manifest = ({ network: "offline" } | { network: { custom: string[] } }) & { output?: OutputGrant; actions?: ActionsGrant };
+/**
+ * One grant of the `credentials` list of §7.5 (ADR-0034 §1): the operator's `service`
+ * (`[a-z][a-z0-9-]{0,31}`), injected by the node's proxy into requests for `host` only (a
+ * lowercase DNS name, no wildcard, no address literal, covered by the manifest's own
+ * `network.custom`), under a lease of at most `ttl_secs` (≥ 1). Never a provider, header or
+ * secret. Honoured only by a node started with `--network-allowlist` and `--credentials`
+ * whose operator configured the service for that host and a ceiling of at least `ttl_secs`;
+ * refused `unsupported_grant` otherwise.
+ */
+export interface CredentialGrant {
+  service: string;
+  host: string;
+  ttl_secs: number;
+}
+
+/**
+ * A manifest of §7.5. `credentials` (1–4 grants, no service twice) needs
+ * `network.custom` covering every grant's host, so an offline manifest carries none.
+ */
+export type Manifest = ({ network: "offline" } | { network: { custom: string[] } }) & {
+  output?: OutputGrant;
+  actions?: ActionsGrant;
+  credentials?: CredentialGrant[];
+};
 
 export interface ManifestBytes {
   /** BLAKE3-256 of `bytes`, 64 lowercase hex digits. */
@@ -212,6 +242,23 @@ export function outputGrant(input: { stdioBytes: number; files: string[]; filesB
 export function actionsGrantOf(envelopeJson: string): ActionsGrant | null;
 /** The §7.5 grant from the control plane's words, refused outside ADR-0031's grammar or above the ceilings. */
 export function actionsGrant(input: { kinds: ActionKind[]; maxPending: number; maxTotal: number; waitSecs: number }): ActionsGrant;
+/** The `credentials` grant a signed envelope's manifest carries, read from its exact bytes, or `null`. */
+export function credentialsGrantOf(envelopeJson: string): CredentialGrant[] | null;
+/**
+ * The §7.5 grant from the control plane's words, refused outside ADR-0034's grammar; the
+ * manifest that carries it is refused unless its `network.custom` covers every host.
+ */
+export function credentialsGrant(grants: Array<{ service: string; host: string; ttlSecs: number }>): CredentialGrant[];
+/**
+ * Whether a capability document (§5) offers the credential broker: both
+ * `credentials.proxy_injection` and `credentials.scoped_http_gateway` are `true`.
+ */
+export function brokersCredentials(capabilities: unknown): boolean;
+/**
+ * The capability document, refused (an `Error` naming `unsupported_grant`) unless it
+ * offers the credential broker. Call it before signing a `credentials` grant for that node.
+ */
+export function requireCredentialBroker<C>(capabilities: C): C;
 
 export class Issuer {
   private constructor(privateKey: unknown);

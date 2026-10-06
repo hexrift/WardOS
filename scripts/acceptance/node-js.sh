@@ -6,7 +6,19 @@
 # node itself. A second node without either flag proves the refusal of an output grant and
 # of an actions grant. The action-channel cases run a Python agent in the sandbox that asks
 # through /run/ward/actions.sock and proceeds only on an approval, and read the sealed
-# evidence log's action records back byte for byte. One verdict line per case on stdout,
+# evidence log's action records back byte for byte. The brokered-credentials cases
+# (node-integration.md §6.8, ADR-0034) start a third node with --network-allowlist and
+# --credentials against a fake OpenBao and a fake upstream on 127.0.0.1
+# (examples/node-control-plane/fixtures/fake-credential-services.mjs), prove the upstream
+# sees the leased credential the proxy injected while the workload's output, the sealed
+# log, the node's state and the task root never hold it, that the lease is revoked at the
+# provider when the attempt ends or is cancelled, and read the log's credential records back;
+# a fourth node with --network-allowlist and without --credentials proves the refusal. A
+# fake upstream on loopback over plain HTTP is something the shipped ward-node refuses by
+# design (its proxy never connects to loopback and speaks only TLS upstream), so the
+# credentials node alone is ward-node built with the `test-loopback` feature, exactly as
+# ward-node's own tests/node_credentials_cli.rs runs it; every other node runs
+# WARD_NODE_BIN, which this script builds without it. One verdict line per case on stdout,
 #   node-js acceptance <case>: PASS|FAIL -- <what it proves>
 # then a summary; everything else goes to stderr. Exit status: 0 when every case passed
 # (or isolation is unavailable and not required, which prints SKIPPED), 1 otherwise.
@@ -15,8 +27,11 @@
 #   scripts/acceptance/node-js.sh --probe   print whether isolation is available and exit
 #
 # Environment: WARD_NODE_BIN and WARD_NODE_ADAPTER_BIN name the binaries (default: build
-# them with cargo into ${CARGO_TARGET_DIR:-target}/debug); WARD_REQUIRE_ISOLATION=1 makes
-# a host without a working bubblewrap fail instead of skipping, as the Rust suites do.
+# them with cargo into ${CARGO_TARGET_DIR:-target}/debug); WARD_NODE_LOOPBACK_BIN names the
+# test-loopback build of ward-node for the credentials node (default: build it with cargo
+# into ${CARGO_TARGET_DIR:-target}/node-js-test-loopback, a target directory of its own,
+# so the shipped build is never overwritten); WARD_REQUIRE_ISOLATION=1 makes a host
+# without a working bubblewrap fail instead of skipping, as the Rust suites do.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -73,6 +88,13 @@ if [[ -z "${WARD_NODE_BIN:-}" || -z "${WARD_NODE_ADAPTER_BIN:-}" ]]; then
 fi
 [[ -x "$WARD_NODE_BIN" ]] || die "ward-node binary is not executable: $WARD_NODE_BIN"
 [[ -x "$WARD_NODE_ADAPTER_BIN" ]] || die "ward-node-adapter binary is not executable: $WARD_NODE_ADAPTER_BIN"
+if [[ -z "${WARD_NODE_LOOPBACK_BIN:-}" ]]; then
+  loopback_target="${CARGO_TARGET_DIR:-target}/node-js-test-loopback"
+  echo "node-js: building ward-node with the test-loopback feature for the credentials node" >&2
+  cargo build -p ward-node --features test-loopback --target-dir "$loopback_target" >&2
+  WARD_NODE_LOOPBACK_BIN="$loopback_target/debug/ward-node"
+fi
+[[ -x "$WARD_NODE_LOOPBACK_BIN" ]] || die "the test-loopback ward-node binary is not executable: $WARD_NODE_LOOPBACK_BIN"
 
 work="$(mktemp -d)"
 chmod 700 "$work"
@@ -114,19 +136,25 @@ text_digest() {
   node --input-type=module -e 'import { blake3Hex } from "./examples/node-control-plane/blake3.mjs"; process.stdout.write(blake3Hex(Buffer.from(process.argv[1], "utf8")));' -- "$1"
 }
 
-# action_records <log> <out>: the evidence log's records as one JSON line, read from the raw
+# log_records <log> <out>: the evidence log's records as one JSON line, read from the raw
 # bytes: every frame (`WE`, version 1, kind 1, u32 length, the postcard record) is walked,
 # each record's event named by its variant, and the three action records decoded field by
 # field (ward-events' NodeActionRequested, NodeActionAnswered, NodeActionRefused; ADR-0031
-# §4). A record that does not decode exactly up to its own hash fails the read.
-action_records() {
+# §4), the credential records (CredentialGranted, CredentialRevoked: ADR-0034 §6; and the
+# service and subject of CredentialDenied) and the host, port and decision of
+# NetworkRequested. A record of these but the last two that does not decode exactly up to
+# its own hash fails the read.
+log_records() {
   # shellcheck disable=SC2016  # JavaScript, not shell: its ${…} are template literals
   node --input-type=module -e '
     import { readFileSync, writeFileSync } from "node:fs";
-    const NAMES = { 40: "NodeAttemptAdmitted", 41: "NodeAttemptLaunched", 42: "NodeAttemptIntervened", 43: "NodeAttemptEnded", 44: "NodeAttemptRecovered", 45: "NodeAttemptSealed", 46: "NodeAttemptOutputCollected", 47: "NodeAttemptResourceUsage", 48: "NodeActionRequested", 49: "NodeActionAnswered", 50: "NodeActionRefused" };
+    const NAMES = { 7: "NetworkRequested", 8: "NetworkDenied", 12: "CredentialGranted", 13: "CredentialDenied", 14: "CredentialRevoked", 40: "NodeAttemptAdmitted", 41: "NodeAttemptLaunched", 42: "NodeAttemptIntervened", 43: "NodeAttemptEnded", 44: "NodeAttemptRecovered", 45: "NodeAttemptSealed", 46: "NodeAttemptOutputCollected", 47: "NodeAttemptResourceUsage", 48: "NodeActionRequested", 49: "NodeActionAnswered", 50: "NodeActionRefused" };
     const KINDS = ["approval", "decision"];
     const DECISIONS = ["approved", "denied", "expired", "cancelled"];
     const REFUSALS = ["oversized", "malformed", "control_request", "kind_not_granted", "duplicate_id", "too_many_pending", "too_many_requests"];
+    const VERDICTS = ["Allow", "Ask", "Deny"];
+    const DELIVERIES = ["ProxyInjected", "MintedToken"];
+    const REVOKE_REASONS = ["SessionEnded", "PolicyChanged", "UserRevoked", "Expired", "TamperDetected"];
     const bytes = readFileSync(process.argv[1]);
     const records = [];
     let at = 0;
@@ -144,6 +172,16 @@ action_records() {
         }
       };
       const hash = () => payload.subarray(p, (p += 32)).toString("hex");
+      const text = () => {
+        const length = varint();
+        return payload.toString("utf8", p, (p += length));
+      };
+      const bounded = () => {
+        const value = text();
+        p += 1;
+        if (payload[p++] === 1) p += 32;
+        return value;
+      };
       const seq = varint();
       varint(); varint();
       if (payload[p++] === 1) { varint(); varint(); }
@@ -154,7 +192,14 @@ action_records() {
       if (variant === 48) Object.assign(record, { action: varint(), kind: KINDS[varint()], summary_bytes: varint(), summary: hash(), detail_bytes: varint(), detail: hash() });
       if (variant === 49) Object.assign(record, { action: varint(), decision: DECISIONS[varint()], operation: payload[p++] === 1 ? varint() : null, note_bytes: varint(), note: payload[p++] === 1 ? hash() : null });
       if (variant === 50) Object.assign(record, { reason: REFUSALS[varint()], bytes: varint() });
-      if (variant >= 48 && variant <= 50 && p + 32 !== payload.length) throw new Error(`record ${seq} does not decode as ${record.event}`);
+      if (variant === 7) Object.assign(record, { host: text(), port: varint(), decision: VERDICTS[varint()] });
+      if (variant === 12 || variant === 13) {
+        Object.assign(record, { service: text(), subject: bounded() });
+        record.permissions = Array.from({ length: varint() }, () => bounded());
+      }
+      if (variant === 12) Object.assign(record, { expires_secs: varint(), expires_nanos: varint(), delivery: DELIVERIES[varint()] });
+      if (variant === 14) Object.assign(record, { service: text(), reason: REVOKE_REASONS[varint()] });
+      if ([12, 14, 48, 49, 50].includes(variant) && p + 32 !== payload.length) throw new Error(`record ${seq} does not decode as ${record.event}`);
       records.push(record);
     }
     writeFileSync(process.argv[2], JSON.stringify(records));
@@ -183,9 +228,14 @@ log_holds_digest() {
 
 # start_node <socket> <state-dir> <task-root> [flags…]: start a node, wait for its socket, print its pid.
 start_node() {
-  local socket=$1 state=$2 tasks=$3 pid
-  shift 3
-  "$WARD_NODE_BIN" --socket "$socket" --state-dir "$state" --node-id "$node_id" \
+  start_node_bin "$WARD_NODE_BIN" "$@"
+}
+
+# start_node_bin <binary> <socket> <state-dir> <task-root> [flags…]: start_node with that binary.
+start_node_bin() {
+  local bin=$1 socket=$2 state=$3 tasks=$4 pid
+  shift 4
+  "$bin" --socket "$socket" --state-dir "$state" --node-id "$node_id" \
     --trusted-issuers "$work/trusted-issuers" --task-root "$tasks" "$@" >>"$work/node.log" 2>&1 &
   pid=$!
   for _ in $(seq 1 100); do
@@ -290,7 +340,7 @@ check() {
 }
 
 audit_json() {
-  "$WARD_NODE_BIN" audit --state-dir "$work/state" --task-root "$work/tasks" --json "$1"
+  "$WARD_NODE_BIN" audit --state-dir "${audit_state:-$work/state}" --task-root "${audit_tasks:-$work/tasks}" --json "$1"
 }
 
 verify_log() {
@@ -306,6 +356,11 @@ verify_log() {
   if [[ -n "$ward" ]]; then
     "$ward" replay --verify "$log" >/dev/null 2>&1 || return 1
   fi
+}
+
+# verify_log_at <state-dir> <task-root> <task> <log>: verify_log for another node's task.
+verify_log_at() {
+  audit_state=$1 audit_tasks=$2 verify_log "$3" "$4"
 }
 
 # ---- case 1: a workload that exits 0 completes and seals a verifying log ------------------
@@ -615,7 +670,7 @@ grep -q 'request 1 (approval, id deploy-9): deploy to staging' "$work/client.log
 grep -q 'request 1 answered approved (operation 263)' "$work/client.log" || problems+="the answer was not printed; "
 [[ ! -e "$work/tasks/$task9/$attempt9.actions/actions.sock" ]] || problems+="the channel socket outlived the attempt; "
 log9="$(field "$work/run9.json" 'o.evidenceLog' | tr -d '"')"
-if action_records "$log9" "$work/records9.json"; then
+if log_records "$log9" "$work/records9.json"; then
   requested_ok 9 "$work/records9.json" 1
   answered_before_end 9 "$work/records9.json" 1 approved 263 "approved by acceptance"
 else
@@ -644,7 +699,7 @@ attempt10="$(field "$work/run10.json" 'o.binding.attempt' | tr -d '"')"
 check 10 "$work/tasks/$task10/$attempt10/replies.json" 'o' '[{"id":"deploy-10","decision":"denied","note":"denied by acceptance"}]' "the workload received the denial"
 [[ ! -e "$work/tasks/$task10/$attempt10/proceeded" ]] || problems+="the workload proceeded on a denial; "
 log10="$(field "$work/run10.json" 'o.evidenceLog' | tr -d '"')"
-if action_records "$log10" "$work/records10.json"; then
+if log_records "$log10" "$work/records10.json"; then
   requested_ok 10 "$work/records10.json" 1
   answered_before_end 10 "$work/records10.json" 1 denied 263 "denied by acceptance"
 else
@@ -671,7 +726,7 @@ task11="$(field "$work/run11.json" 'o.binding.task' | tr -d '"')"
 attempt11="$(field "$work/run11.json" 'o.binding.attempt' | tr -d '"')"
 check 11 "$work/tasks/$task11/$attempt11/replies.json" 'o' '[{"id":"deploy-11","decision":"expired"}]' "the workload received expired"
 log11="$(field "$work/run11.json" 'o.evidenceLog' | tr -d '"')"
-if action_records "$log11" "$work/records11.json"; then
+if log_records "$log11" "$work/records11.json"; then
   requested_ok 11 "$work/records11.json" 1
   answered_before_end 11 "$work/records11.json" 1 expired null ""
 else
@@ -724,7 +779,7 @@ done
 pgrep -f "$marker12" >/dev/null 2>&1 && problems+="a workload process outlived the cancellation; "
 task12="$(field "$work/run12.json" 'o.binding.task' | tr -d '"')"
 log12="$(field "$work/run12.json" 'o.evidenceLog' | tr -d '"')"
-if action_records "$log12" "$work/records12.json"; then
+if log_records "$log12" "$work/records12.json"; then
   requested_ok 12 "$work/records12.json" 1
   answered_before_end 12 "$work/records12.json" 1 cancelled null ""
 else
@@ -788,7 +843,7 @@ check 13 "$work/tasks/$task13/$attempt13/replies.json" 'o.map(r => r.decision).j
 [[ -f "$work/tasks/$task13/$attempt13/proceeded" ]] || problems+="the workload did not proceed; "
 check 13 "$work/cp/runs/$attempt13.json" 'o.answers.map(a => [a.request, a.decision, a.operation_id])' '[[1,"approved",263],[2,"approved",264]]' "the run record"
 log13="$(field "$work/run13.json" 'o.evidenceLog' | tr -d '"')"
-if action_records "$log13" "$work/records13.json"; then
+if log_records "$log13" "$work/records13.json"; then
   check 13 "$work/records13.json" 'o.filter(r => r.event === "NodeActionAnswered").map(r => [r.action, r.decision, r.operation])' '[[1,"approved",263],[2,"approved",264]]' "exactly the two applied answers, nothing for the replay or the refusals"
   answered_before_end 13 "$work/records13.json" 1 approved 263 "from a second process"
 else
@@ -839,6 +894,281 @@ if [[ -z "$problems" ]]; then
   pass actions_grant_is_refused_without_the_flag_or_outside_the_grammar "a node started without --action-channel reports no actions section and refuses an actions grant unsupported_grant at admit with nothing materialised, which the client reports refused and exits 1, and answers actions unsupported_operation; a grant above the ceilings or with an unknown kind is refused by the client before signing or recording"
 else
   fail actions_grant_is_refused_without_the_flag_or_outside_the_grammar "$problems"
+fi
+
+# ---- brokered credentials (node-integration.md §6.8, ADR-0034) -----------------------------
+
+# The secret bytes of this run: the leased token the fake provider issues (`<leased>-<n>`
+# for the n-th lease) and the node's own provider token. Neither may reach anything but
+# the provider and the upstream.
+leased="hvs.node-js-acceptance-$$-$(date +%s%N)"
+bao_token="node-js-provider-token-$$-$(date +%s%N)"
+mkdir -p "$work/fake"
+node examples/node-control-plane/fixtures/fake-credential-services.mjs --dir "$work/fake" --token "$bao_token" --leased "$leased" \
+  2>>"$work/client.log" &
+fake_pid=$!
+background+=("$fake_pid")
+for _ in $(seq 1 100); do
+  [[ -s "$work/fake/ready.json" ]] && break
+  kill -0 "$fake_pid" 2>/dev/null || die "the fake provider and upstream exited before listening"
+  sleep 0.1
+done
+[[ -s "$work/fake/ready.json" ]] || die "the fake provider and upstream did not listen within 10 s"
+bao_port="$(field "$work/fake/ready.json" 'o.provider')"
+upstream_port="$(field "$work/fake/ready.json" 'o.upstream')"
+
+printf '%s\n' "$bao_token" >"$work/bao.token"
+chmod 600 "$work/bao.token"
+# As ward-node's tests/node_credentials_cli.rs configures it: an OpenBao token role whose
+# leases are injected as `Bearer <token>` into requests for /artifacts/v1/… sent to the
+# fake upstream; `plain_upstream` exists only in the test-loopback build.
+cat >"$work/credentials.toml" <<TOML
+[provider.bao]
+kind = "openbao"
+address = "http://127.0.0.1:$bao_port"
+token_file = "$work/bao.token"
+insecure_loopback = true
+timeout_ms = 2000
+max_ttl_secs = 600
+
+[service.artifacts]
+provider = "bao"
+engine = "token"
+role = "ward-artifacts"
+permissions = ["artifacts-read"]
+max_ttl_secs = 600
+upstream = "localhost:$upstream_port"
+value_prefix = "Bearer "
+paths = ["/v1"]
+plain_upstream = true
+TOML
+chmod 600 "$work/credentials.toml"
+
+# The workload: one request for the `artifacts` route through the proxy socket, carrying a
+# placeholder the proxy must replace; it prints the answer and its whole environment, keeps
+# the answer in answer.txt, and with `hold` then waits to be ended.
+cat >"$work/project/fetch.py" <<'FETCH'
+import os
+import socket
+import sys
+import time
+
+peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+peer.settimeout(20)
+peer.connect(os.environ["WARD_PROXY_SOCKET"])
+peer.sendall(b"GET /artifacts/v1/data HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer placeholder\r\nConnection: close\r\n\r\n")
+answer = b""
+while True:
+    chunk = peer.recv(4096)
+    if not chunk:
+        break
+    answer += chunk
+sys.stdout.write(answer.decode("utf-8", "replace") + "\n")
+sys.stdout.write(repr(dict(os.environ)) + "\n")
+sys.stdout.flush()
+with open("answer.txt", "wb") as out:
+    out.write(answer)
+if sys.argv[1:] == ["hold"]:
+    while True:
+        time.sleep(0.05)
+sys.exit(0 if answer.startswith(b"HTTP/1.1 200") else 3)
+FETCH
+cred_snapshot="$("$WARD_NODE_BIN" snapshot import --state-dir "$work/cred-state" "$work/project")"
+cred_pid="$(start_node_bin "$WARD_NODE_LOOPBACK_BIN" "$work/cred.sock" "$work/cred-state" "$work/cred-tasks" \
+  --network-allowlist --credentials "$work/credentials.toml" --output-return)"
+background+=("$cred_pid")
+cred_common=(--socket "$work/cred.sock" --adapter "$WARD_NODE_ADAPTER_BIN")
+cred_run=("${cred_common[@]}" --key "$work/cp/issuer.pem" --principal acceptance-issuer --node "$node_id"
+  --state-dir "$work/cp" --snapshot "$cred_snapshot" --task-root "$work/cred-tasks" --timeout-ms 90000)
+node "$client" capabilities "${cred_common[@]}" >"$work/cred-capabilities.json"
+
+# fake <expression>: one value from what the fake provider and upstream saw.
+fake() {
+  field "$work/fake/state.json" "$1"
+}
+
+# wait_fake <expression> <expected-json>: poll what the fakes saw until the expression has
+# the expected value; 60 s at most.
+wait_fake() {
+  for _ in $(seq 1 600); do
+    [[ "$(fake "$1" 2>/dev/null)" == "$2" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# secret_free <path>…: none of the paths (files or trees) holds the leased token or the
+# provider token, byte for byte.
+secret_free() {
+  ! grep -r -a -q -F -e "$leased" -e "$bao_token" -- "$@" 2>/dev/null
+}
+
+# credential_records_ok <case> <records> <reason>: the grant is recorded issued for
+# localhost with the service's permission and the lease's lifetime, injected by the proxy,
+# before the launch; the injected request after it; the route withdrawn (reason) after
+# that and before the end; nothing denied.
+credential_records_ok() {
+  check "$1" "$2" 'o.filter(r => r.event === "CredentialGranted").map(r => [r.service, /^issued localhost lease b3:[0-9a-f]{32}$/.test(r.subject), r.permissions, r.delivery])' \
+    '[["artifacts",true,["artifacts-read"],"ProxyInjected"]]' "the grant recorded once, with a lease id and no secret"
+  check "$1" "$2" 'o.filter(r => r.event === "CredentialRevoked").map(r => [r.service, r.reason])' "[[\"artifacts\",\"$3\"]]" "the revocation recorded once"
+  check "$1" "$2" 'o.filter(r => r.event === "CredentialDenied").length' '0' "nothing denied"
+  check "$1" "$2" '(i => i("CredentialGranted") < i("NodeAttemptLaunched") && i("NodeAttemptLaunched") < o.findIndex(r => r.event === "NetworkRequested" && r.host === "localhost" && r.decision === "Allow") && o.findIndex(r => r.event === "NetworkRequested" && r.host === "localhost") < i("CredentialRevoked") && i("CredentialRevoked") < i("NodeAttemptEnded"))(e => o.findIndex(r => r.event === e))' \
+    'true' "granted before the launch, used after it, revoked before the end"
+}
+
+# ---- case 15: the proxy injects a lease the workload never sees, revoked at the end -------
+
+problems=""
+check 15 "$work/cred-capabilities.json" 'o.credentials' '{"proxy_injection":true,"scoped_http_gateway":true}' "the credentials node advertises the broker"
+check 15 "$work/cred-capabilities.json" 'o.network.proxy_allowlist' 'true' "and the allowlist"
+status=0
+node "$client" run "${cred_run[@]}" --task acc-task-15 --attempt acc-attempt-15a --budget-ms 120000 \
+  --credential artifacts=localhost:60 --stdio-bytes 65536 -- python3 fetch.py >"$work/run15.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "0" ]] || problems+="exit status $status; "
+check 15 "$work/run15.json" 'o.outcome' '"completed"' "outcome"
+check 15 "$work/run15.json" 'o.exitStatus' '0' "the workload got a 200"
+check 15 "$work/run15.json" 'o.credentials' '[{"service":"artifacts","host":"localhost","ttl_secs":60}]' "the outcome lists the grant"
+task15="$(field "$work/run15.json" 'o.binding.task' | tr -d '"')"
+attempt15="$(field "$work/run15.json" 'o.binding.attempt' | tr -d '"')"
+check 15 "$work/cp/runs/$attempt15.json" 'Buffer.from(JSON.parse(o.envelope_json).workload.capability_manifest.bytes, "hex").toString()' \
+  '"{\"network\":{\"custom\":[\"localhost\"]},\"output\":{\"stdio_bytes\":65536,\"files\":[],\"files_bytes\":0},\"credentials\":[{\"service\":\"artifacts\",\"host\":\"localhost\",\"ttl_secs\":60}]}"' "the signed manifest: the grant last, its host the allowlist"
+check 15 "$work/fake/state.json" 'o.heads.length' '1' "one request reached the upstream"
+check 15 "$work/fake/state.json" 'o.heads[0]?.split("\n")[0]' '"GET /v1/data HTTP/1.1"' "the route's prefix stripped"
+check 15 "$work/fake/state.json" "o.heads[0]?.split(\"\\n\").filter(h => h.startsWith(\"authorization: \"))" "[\"authorization: Bearer $leased-1\"]" "the upstream saw the leased token, injected"
+check 15 "$work/fake/state.json" 'o.heads[0]?.includes("placeholder")' 'false' "the workload's own header replaced"
+check 15 "$work/fake/state.json" 'o.issued.map(b => [b.ttl, b.policies, b.meta?.ward_service, b.meta?.ward_audience, b.meta?.ward_session])' \
+  "[[\"60s\",[\"artifacts-read\"],\"artifacts\",\"localhost\",\"$attempt15\"]]" "one lease, bound to the attempt, the service and the host, for the grant's 60 s"
+check 15 "$work/fake/state.json" 'o.revoked' '["node-js-accessor-1"]' "the lease revoked at the provider"
+check 15 "$work/run15.json" 'Buffer.from(o.output.stdout.content_base64, "base64").toString().startsWith("HTTP/1.1 200")' 'true' "the workload printed the upstream's answer"
+check 15 "$work/run15.json" 'Buffer.from(o.output.stdout.content_base64, "base64").toString().includes("WARD_PROXY_SOCKET")' 'true' "and its environment"
+check 15 "$work/run15.json" "[o.output.stdout, o.output.stderr].some(s => Buffer.from(s.content_base64, \"base64\").includes(\"$leased\"))" 'false' "the workload's output holds no leased byte"
+[[ ! -e "$work/cred-tasks/$task15/$attempt15.credentials/leases.json" ]] || problems+="the lease handles outlived the attempt; "
+log15="$(field "$work/run15.json" 'o.evidenceLog' | tr -d '"')"
+[[ "$log15" == "$work/cred-tasks/$task15/$attempt15.evidence/events.log" ]] || problems+="evidence log path $log15; "
+secret_free "$log15" || problems+="the sealed log holds a secret; "
+secret_free "$work/cred-tasks" "$work/cred-state" || problems+="the task root or the node's state holds a secret; "
+secret_free "$work/run15.json" "$work/client.log" "$work/cp" || problems+="the client's outcome, log or state holds a secret; "
+! grep -r -a -q -F "node-js-accessor-" "$work/cred-tasks" "$work/cred-state" 2>/dev/null || problems+="a revocation handle outlived its lease; "
+if log_records "$log15" "$work/records15.json"; then
+  credential_records_ok 15 "$work/records15.json" SessionEnded
+  check 15 "$work/records15.json" 'o.filter(r => r.event === "CredentialGranted").map(r => r.expires_secs)' '[60]' "the lease's lifetime"
+else
+  problems+="the evidence log's records do not decode; "
+fi
+verify_log_at "$work/cred-state" "$work/cred-tasks" "$task15" "$log15" || problems+="the evidence log does not verify; "
+if [[ -z "$problems" ]]; then
+  pass credentials_injected_by_the_proxy_never_seen_and_revoked "run --credential artifacts=localhost:60 on a node started with --network-allowlist and --credentials (it advertises the broker) signs the grant with network.custom [localhost] and lists it in the outcome; the node leases one token from the fake OpenBao bound to the attempt, the service and the host for 60 s, its proxy replaces the workload's own Authorization header with the leased token on the request to the fake upstream, the lease is revoked at the provider when the attempt ends and its handle file is gone; the workload's returned stdout, stderr and environment, the sealed log, the task root, the node's state and the client's outcome, log and state hold neither the leased token nor the provider token; the log records CredentialGranted (issued localhost lease b3:…, ProxyInjected) before the launch and CredentialRevoked SessionEnded before the end, and verifies"
+else
+  fail credentials_injected_by_the_proxy_never_seen_and_revoked "$problems"
+fi
+
+# ---- case 16: a replay of the credentials run leases nothing --------------------------------
+
+problems=""
+status=0
+node "$client" replay "${cred_common[@]}" --state-dir "$work/cp" --attempt "$attempt15" >"$work/replay15.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "0" ]] || problems+="exit status $status; "
+check 16 "$work/replay15.json" 'o.replayed' 'true' "replayed"
+check 16 "$work/replay15.json" 'o.outcome' '"completed"' "outcome"
+check 16 "$work/replay15.json" 'o.operations.map(x => x.verb).join()' '"create,admit,seal"' "no start on replay"
+check 16 "$work/replay15.json" 'o.credentials' '[{"service":"artifacts","host":"localhost","ttl_secs":60}]' "the recorded grant listed"
+check 16 "$work/replay15.json" 'o.evidenceHead' "$(field "$work/run15.json" 'o.evidenceHead')" "same evidence head"
+check 16 "$work/fake/state.json" '[o.issued.length, o.heads.length, o.revoked.length]' '[1,1,1]' "no new lease, request or revocation"
+if [[ -z "$problems" ]]; then
+  pass credentials_replay_leases_nothing "replaying the credentials run from its record answers create, admit and seal sealed with no start, lists the signed grant, keeps the evidence head, and asks the provider for nothing and sends the upstream nothing"
+else
+  fail credentials_replay_leases_nothing "$problems"
+fi
+
+# ---- case 17: cancelling the attempt revokes the lease at the provider ----------------------
+
+problems=""
+attempt17="$(node "$client" derive-id exec acc-attempt-17a)"
+node "$client" run "${cred_run[@]}" --task acc-task-17 --attempt acc-attempt-17a --budget-ms 600000 \
+  --credential artifacts=localhost -- python3 fetch.py hold >"$work/run17.json" 2>>"$work/client.log" &
+run17_pid=$!
+background+=("$run17_pid")
+if wait_fake 'o.heads.length' '2'; then
+  [[ "$(fake 'o.revoked.length')" == "1" ]] || problems+="the lease was revoked while the attempt ran; "
+  task17="$(node "$client" derive-id task acc-task-17)"
+  [[ -e "$work/cred-tasks/$task17/$attempt17.credentials/leases.json" ]] || problems+="no handle is kept while the lease lives; "
+else
+  problems+="the workload's request never reached the upstream; "
+fi
+kill -TERM "$run17_pid" 2>/dev/null || true
+status=0
+wait "$run17_pid" || status=$?
+[[ "$status" == "1" ]] || problems+="exit status $status, expected 1; "
+check 17 "$work/run17.json" 'o.cancelled' 'true' "cancelled"
+check 17 "$work/run17.json" 'o.operations.map(x => x.verb).join()' '"create,admit,start,revoke,seal"' "revoke, then seal"
+check 17 "$work/run17.json" 'o.credentials' '[{"service":"artifacts","host":"localhost","ttl_secs":600}]' "the TTL defaults to the budget"
+check 17 "$work/fake/state.json" 'o.issued.map(b => b.ttl)' '["60s","600s"]' "the second lease for 600 s"
+check 17 "$work/fake/state.json" 'o.heads[1]?.split("\n").filter(h => h.startsWith("authorization: "))' "[\"authorization: Bearer $leased-2\"]" "the second lease injected"
+check 17 "$work/fake/state.json" 'o.revoked' '["node-js-accessor-1","node-js-accessor-2"]' "the lease revoked at the provider"
+task17="$(field "$work/run17.json" 'o.binding.task' | tr -d '"')"
+[[ ! -e "$work/cred-tasks/$task17/$attempt17.credentials/leases.json" ]] || problems+="the lease handles outlived the cancellation; "
+log17="$(field "$work/run17.json" 'o.evidenceLog' | tr -d '"')"
+if log_records "$log17" "$work/records17.json"; then
+  credential_records_ok 17 "$work/records17.json" UserRevoked
+else
+  problems+="the evidence log's records do not decode; "
+fi
+secret_free "$work/cred-tasks" "$work/cred-state" "$work/run17.json" "$work/client.log" || problems+="a secret leaked; "
+verify_log_at "$work/cred-state" "$work/cred-tasks" "$task17" "$log17" || problems+="the evidence log does not verify; "
+if [[ -z "$problems" ]]; then
+  pass credentials_cancel_revokes_the_lease "while the workload holds after its injected request, its lease handle is kept beside the workspace and nothing is revoked; cancelling the run (SIGTERM: revoke, then seal) revokes the lease at the provider and removes the handle, the log records CredentialRevoked UserRevoked before the end, a --credential without a TTL is leased for the budget, and no secret leaks"
+else
+  fail credentials_cancel_revokes_the_lease "$problems"
+fi
+
+# ---- case 18: a node without --credentials, or a grant the node does not honour, is refused -
+
+problems=""
+allow_pid="$(start_node "$work/allow.sock" "$work/allow-state" "$work/allow-tasks" --network-allowlist)"
+background+=("$allow_pid")
+allow_common=(--socket "$work/allow.sock" --adapter "$WARD_NODE_ADAPTER_BIN")
+node "$client" capabilities "${allow_common[@]}" >"$work/allow-capabilities.json"
+check 18 "$work/allow-capabilities.json" 'o.credentials' '{"proxy_injection":false,"scoped_http_gateway":false}' "a node without the flag does not advertise the broker"
+check 18 "$work/allow-capabilities.json" 'o.network.proxy_allowlist' 'true' "though it enforces an allowlist"
+# The client reads the document first and refuses the grant before signing or recording.
+allow_snapshot="$("$WARD_NODE_BIN" snapshot import --state-dir "$work/allow-state" "$work/project")"
+status=0
+node "$client" run "${allow_common[@]}" --key "$work/cp/issuer.pem" --principal acceptance-issuer --node "$node_id" \
+  --state-dir "$work/cp" --snapshot "$allow_snapshot" --task-root "$work/allow-tasks" --timeout-ms 90000 \
+  --task acc-task-18 --attempt acc-attempt-18a --budget-ms 60000 --credential artifacts=localhost:60 \
+  -- python3 fetch.py >"$work/run18a.json" 2>"$work/run18a.err" || status=$?
+[[ "$status" == "2" ]] || problems+="client refusal exit status $status, expected 2; "
+grep -q 'credentials.proxy_injection.*unsupported_grant' "$work/run18a.err" || problems+="the client's refusal does not name the flag and unsupported_grant: $(cat "$work/run18a.err"); "
+[[ ! -s "$work/run18a.json" ]] || problems+="the refused grant printed an outcome; "
+[[ ! -e "$work/cp/runs/$(node "$client" derive-id exec acc-attempt-18a).json" ]] || problems+="the refused grant was recorded as a run; "
+check 18 "$work/cp/admission-versions.json" "o.versions[\"$(node "$client" derive-id task acc-task-18)\"]" 'undefined' "no version allocated"
+# The node refuses it too: the signed credentials run of case 15, replayed to this node.
+status=0
+node "$client" replay "${allow_common[@]}" --state-dir "$work/cp" --attempt "$attempt15" >"$work/run18b.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "1" ]] || problems+="node refusal exit status $status, expected 1; "
+check 18 "$work/run18b.json" 'o.refused' '{"verb":"admit","reason":"unsupported_grant"}' "the node without the flag refuses the grant"
+check 18 "$work/run18b.json" 'o.operations.map(x => x.verb).join()' '"create,admit"' "nothing sent after the refusal"
+[[ ! -e "$work/allow-tasks/$task15" ]] || problems+="a refused grant materialised a task directory; "
+# On the credentials node, a TTL above the service's ceiling and a service the operator did
+# not configure are the node's to refuse; neither asks the provider for anything.
+for entry in b:artifacts=localhost:601 c:unconfigured=localhost:60; do
+  status=0
+  node "$client" run "${cred_run[@]}" --task "acc-task-18${entry%%:*}" --attempt "acc-attempt-18${entry%%:*}" --budget-ms 60000 \
+    --credential "${entry#*:}" -- python3 fetch.py >"$work/run18${entry%%:*}.json" 2>>"$work/client.log" || status=$?
+  [[ "$status" == "1" ]] || problems+="${entry#*:}: exit status $status, expected 1; "
+  check 18 "$work/run18${entry%%:*}.json" 'o.refused' '{"verb":"admit","reason":"unsupported_grant"}' "${entry#*:} refused by the node"
+done
+check 18 "$work/fake/state.json" 'o.issued.length' '2' "the refused grants asked the provider for nothing"
+# A grant outside the grammar never reaches a node.
+status=0
+node "$client" run "${cred_run[@]}" --task acc-task-18d --attempt acc-attempt-18d --budget-ms 60000 \
+  --credential artifacts=127.0.0.1:60 -- python3 fetch.py >"$work/run18d.json" 2>"$work/run18d.err" || status=$?
+[[ "$status" == "2" ]] || problems+="address literal exit status $status, expected 2; "
+grep -q 'not a lowercase DNS name' "$work/run18d.err" || problems+="the client's refusal does not name the host rule: $(cat "$work/run18d.err"); "
+if [[ -z "$problems" ]]; then
+  pass credentials_grant_is_refused_without_the_flag_or_outside_the_grammar "a node started with --network-allowlist and without --credentials advertises credentials.proxy_injection and scoped_http_gateway false; run --credential reads that and refuses the grant (unsupported_grant) before a version is allocated or anything is signed or recorded, and the node itself refuses the signed grant unsupported_grant at admit with nothing materialised; the credentials node refuses a TTL above the service's ceiling and an unconfigured service unsupported_grant without asking the provider; an address literal is refused by the client before signing"
+else
+  fail credentials_grant_is_refused_without_the_flag_or_outside_the_grammar "$problems"
 fi
 
 echo
