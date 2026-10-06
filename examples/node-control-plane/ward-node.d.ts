@@ -33,6 +33,12 @@ export const ACTION_CEILINGS: Readonly<{ maxPending: 8; maxTotal: 64; waitSecs: 
  */
 export const CREDENTIAL_LIMITS: Readonly<{ grants: 4; serviceBytes: 32; ttlSecs: 4294967295 }>;
 
+/**
+ * What the `hold` grammar bounds (§6.9, §7.5, ADR-0035): at most 8 held capabilities. A
+ * hold past it is refused before signing.
+ */
+export const HOLD_LIMITS: Readonly<{ holds: 8 }>;
+
 /** The decisions a control plane may answer; `expired` and `cancelled` are the node's. */
 export const ANSWER_DECISIONS: ReadonlyArray<AnswerDecision>;
 
@@ -142,13 +148,31 @@ export interface CredentialGrant {
 }
 
 /**
+ * The `hold` of §7.5 (ADR-0035): capabilities of the same manifest the node holds until the
+ * control plane approves the request it opens for each on first use. Each list, when
+ * present, is non-empty; together 1–8 entries, none twice.
+ */
+export interface HoldGrant {
+  /** Patterns of the manifest's `network.custom`, exactly as written there. */
+  hosts?: string[];
+  /** Services of the manifest's `credentials`. */
+  services?: string[];
+}
+
+/** A held capability, as a listing's `hold` names it. */
+export type HeldCapability = { host: string } | { service: string };
+
+/**
  * A manifest of §7.5. `credentials` (1–4 grants, no service twice) needs
  * `network.custom` covering every grant's host, so an offline manifest carries none.
+ * `hold` names only what the manifest grants and needs an `actions` grant naming
+ * `approval`.
  */
 export type Manifest = ({ network: "offline" } | { network: { custom: string[] } }) & {
   output?: OutputGrant;
   actions?: ActionsGrant;
   credentials?: CredentialGrant[];
+  hold?: HoldGrant;
 };
 
 export interface ManifestBytes {
@@ -259,6 +283,22 @@ export function brokersCredentials(capabilities: unknown): boolean;
  * offers the credential broker. Call it before signing a `credentials` grant for that node.
  */
 export function requireCredentialBroker<C>(capabilities: C): C;
+/** The `hold` a signed envelope's manifest carries, read from its exact bytes, or `null`. */
+export function holdGrantOf(envelopeJson: string): HoldGrant | null;
+/** The §7.5 hold from the control plane's words, refused outside ADR-0035's grammar. */
+export function holdGrant(input?: { hosts?: string[]; services?: string[] }): HoldGrant;
+/**
+ * The capabilities a hold names, in the order the node numbers its requests (hosts, then
+ * services), with the id (`hold:N`) and summary the node opens each request with.
+ */
+export function heldCapabilities(hold: HoldGrant): Array<{ id: string; capability: HeldCapability; summary: string }>;
+/** Whether a capability document (§5) offers approval holds: `actions.hold` is `true`. */
+export function offersApprovalHold(capabilities: unknown): boolean;
+/**
+ * The capability document, refused (an `Error` naming `unsupported_grant`) unless it
+ * offers approval holds. Call it before signing a manifest with a `hold` for that node.
+ */
+export function requireApprovalHold<C>(capabilities: C): C;
 
 export class Issuer {
   private constructor(privateKey: unknown);
@@ -430,6 +470,8 @@ export interface PendingAction {
   detail: string;
   /** Milliseconds before the node answers it `expired` (frozen while paused). */
   expires_in_ms: number;
+  /** Present on a request the node opened for a held capability (§6.9): what approving it releases. */
+  hold?: HeldCapability;
 }
 
 export interface ActionsListing {
@@ -439,10 +481,11 @@ export interface ActionsListing {
 }
 
 /**
- * Hold an `actions` answer to §6.7 (and, given the grant, to it): bounds, ids, kinds,
- * order and count. A listing outside them is refused, not acted on.
+ * Hold an `actions` answer to §6.7 and §6.9 (and, given the grant and hold, to them):
+ * bounds, ids, kinds, order, count and each node-opened request's held capability. A
+ * listing outside them is refused, not acted on.
  */
-export function decodeActions(listing: ActionsListing, grant?: ActionsGrant | null): ActionsListing;
+export function decodeActions(listing: ActionsListing, grant?: ActionsGrant | null, hold?: HoldGrant | null): ActionsListing;
 
 export type AnswerResult =
   | { result: "answered"; request: number; decision: AnswerDecision; operation_id: number }
@@ -458,6 +501,8 @@ export interface LoopAnswer {
   request: number;
   id: string;
   kind: ActionKind;
+  /** The held capability, for a request the node opened for one. */
+  hold?: HeldCapability;
   summary: string;
   decision: AnswerDecision;
   note?: string;
@@ -479,6 +524,8 @@ export interface AnswerLoopOptions {
   operationIds?: { start_at: number };
   /** The grant listings are held to; default the run record's. */
   grant?: ActionsGrant | null;
+  /** The hold listings are held to; default the run record's (none with an explicit `grant`). */
+  hold?: HoldGrant | null;
   onRequest?: (request: PendingAction) => void;
   onAnswer?: (answer: LoopAnswer) => void;
 }

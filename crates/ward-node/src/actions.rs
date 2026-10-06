@@ -36,7 +36,17 @@
 //!
 //! Replies are written without blocking: a workload that does not read its socket loses
 //! the reply (the connection is shut down), never the node's progress. The channel grants
-//! nothing: an approval is a statement the node records and relays.
+//! nothing by itself: an approval of a workload's request is a statement the node records
+//! and relays.
+//!
+//! A channel started with a manifest's `hold` ([`AttemptActions::start_held`], #415,
+//! ADR-0035) also holds the capabilities it names: [`AttemptActions::hold`] is what the
+//! attempt's egress proxy asks about every request it would let through. The first request
+//! touching a held capability opens one `approval` request for it, the node's own, under
+//! [`ward_node_protocol::hold_request_id`] and listed with the capability; the capability
+//! is refused until that request is answered `approved`, recorded, and any other answer
+//! keeps it refused for the attempt. The node's requests count against neither the
+//! workload's `max_pending` nor its `max_total`, and their ids are reserved.
 //!
 //! A Unix socket path is at most 108 bytes and a task root may be deep, so the listener is
 //! bound through a held descriptor of the directory (`/proc/self/fd/<n>/actions.sock`)
@@ -57,9 +67,10 @@ use thiserror::Error;
 use ward_events::{Blake3Hash, NodeActionDecision, NodeActionKind, NodeActionRefusal, WardEvent};
 use ward_node_protocol::{
     ActionDecision, ActionError, ActionGrant, ActionId, ActionKind, ActionNote,
-    ActionRejectionReason, ActionReply, ActionRequest, MAX_ACTION_LINE_BYTES, OperationId,
-    PendingAction, TaskBinding,
+    ActionRejectionReason, ActionReply, ActionRequest, HeldCapability, HoldGrant,
+    MAX_ACTION_LINE_BYTES, OperationId, PendingAction, TaskBinding, hold_request_id,
 };
+use ward_proxy::{Held, Hold, Host, Target};
 
 use crate::evidence::private_dir;
 
@@ -184,9 +195,30 @@ fn answered_event(
 #[derive(Debug)]
 struct Pending {
     request: ActionRequest,
-    conn: u64,
+    /// The workload's connection it was asked on; `None` for a request the node opened for
+    /// a held capability.
+    conn: Option<u64>,
     deadline: Instant,
     recorded: bool,
+    hold: Option<HeldCapability>,
+}
+
+/// One held capability and the request the node opened for it, once it has.
+#[derive(Debug)]
+struct HoldSlot {
+    held: HeldCapability,
+    action: Option<u32>,
+}
+
+impl HoldSlot {
+    fn covers(&self, host: Option<&str>, service: Option<&str>) -> bool {
+        match &self.held {
+            HeldCapability::Host(pattern) => {
+                host.is_some_and(|host| ward_proxy::hosts::matches(pattern, host))
+            }
+            HeldCapability::Service(name) => service == Some(name.as_str()),
+        }
+    }
 }
 
 type AnswerKey = (u32, ActionDecision, Option<ActionNote>);
@@ -205,6 +237,7 @@ struct State {
     refusals: u32,
     paused_since: Option<Instant>,
     closed: bool,
+    holds: Vec<HoldSlot>,
 }
 
 #[derive(Debug)]
@@ -231,7 +264,12 @@ impl Shared {
         if state.ids.contains(request.id()) {
             return Err(Some(NodeActionRefusal::DuplicateId));
         }
-        if u32::try_from(state.pending.len()).unwrap_or(u32::MAX) >= self.grant.max_pending() {
+        let waiting = state
+            .pending
+            .values()
+            .filter(|pending| pending.conn.is_some())
+            .count();
+        if u32::try_from(waiting).unwrap_or(u32::MAX) >= self.grant.max_pending() {
             return Err(Some(NodeActionRefusal::TooManyPending));
         }
         if state.sent >= self.grant.max_total() {
@@ -248,12 +286,87 @@ impl Shared {
             action,
             Pending {
                 request,
-                conn,
+                conn: Some(conn),
                 deadline,
                 recorded: false,
+                hold: None,
             },
         );
         Ok(())
+    }
+
+    /// What the attempt's proxy is told about a request for `host` (on the credential route
+    /// of `service`, if any): every held capability it touches is opened on first use, and
+    /// it passes only once each of them was approved, recorded.
+    fn held(&self, host: Option<&str>, service: Option<&str>, now: Instant) -> Option<Held> {
+        let mut state = self.lock();
+        let covering: Vec<usize> = state
+            .holds
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.covers(host, service))
+            .map(|(index, _)| index)
+            .collect();
+        let refusals: Vec<Held> = covering
+            .into_iter()
+            .filter_map(|index| self.hold_state(&mut state, index, now))
+            .collect();
+        refusals.into_iter().next()
+    }
+
+    /// The refusal the held capability at `index` earns now, opening its request first if
+    /// nothing has; `None` once it was approved.
+    fn hold_state(&self, state: &mut State, index: usize, now: Instant) -> Option<Held> {
+        let opened = match state.holds[index].action {
+            Some(action) => Some(action),
+            None if state.closed => None,
+            None => self.open(state, index, now),
+        };
+        let Some(action) = opened else {
+            return Some(Held {
+                reason: "hold:cancelled".to_owned(),
+                body: "approval cancelled",
+            });
+        };
+        let (state_name, body) = match state.answered.get(&action) {
+            Some(ActionDecision::Approved) => return None,
+            Some(ActionDecision::Denied) => ("denied", "approval denied"),
+            Some(ActionDecision::Expired) => ("expired", "approval expired"),
+            Some(ActionDecision::Cancelled) => ("cancelled", "approval cancelled"),
+            None => ("held", "held for approval"),
+        };
+        Some(Held {
+            reason: format!("hold:{state_name}:{action}"),
+            body,
+        })
+    }
+
+    /// Open the approval request for the held capability at `index`, queued for the record.
+    fn open(&self, state: &mut State, index: usize, now: Instant) -> Option<u32> {
+        let held = state.holds[index].held.clone();
+        let request = ActionRequest::new(
+            hold_request_id(index),
+            ActionKind::Approval,
+            held.summary(),
+            held.detail(),
+        )
+        .ok()?;
+        state.next_action += 1;
+        let action = state.next_action;
+        let started = state.paused_since.unwrap_or(now);
+        state.queue.push(requested_event(action, &request));
+        state.pending.insert(
+            action,
+            Pending {
+                request,
+                conn: None,
+                deadline: started + Duration::from_secs(u64::from(self.grant.wait_secs())),
+                recorded: false,
+                hold: Some(held),
+            },
+        );
+        state.holds[index].action = Some(action);
+        Some(action)
     }
 
     fn refuse(&self, reason: NodeActionRefusal, bytes: usize) {
@@ -277,7 +390,7 @@ impl Shared {
         let withdrawn: Vec<u32> = state
             .pending
             .iter()
-            .filter(|(_, pending)| pending.conn == conn)
+            .filter(|(_, pending)| pending.conn == Some(conn))
             .map(|(action, _)| *action)
             .collect();
         for action in withdrawn {
@@ -373,7 +486,10 @@ impl Shared {
 /// Write the reply to `pending`'s request on its connection without blocking; a reply that
 /// does not fit whole shuts the connection down, so the workload never reads half of one.
 fn reply(state: &mut State, pending: &Pending, decision: ActionDecision, note: Option<ActionNote>) {
-    let Some(stream) = state.connections.get(&pending.conn) else {
+    let Some(conn) = pending.conn else {
+        return;
+    };
+    let Some(stream) = state.connections.get(&conn) else {
         return;
     };
     let reply = ActionReply::new(pending.request.id().clone(), decision, note);
@@ -388,7 +504,7 @@ fn reply(state: &mut State, pending: &Pending, decision: ActionDecision, note: O
     );
     if sent.ok() != Some(line.len()) {
         let _ = stream.shutdown(std::net::Shutdown::Both);
-        state.connections.remove(&pending.conn);
+        state.connections.remove(&conn);
     }
 }
 
@@ -418,6 +534,20 @@ impl AttemptActions {
     /// Returns [`ActionChannelError`] when the directory cannot be prepared or the socket
     /// cannot be bound; nothing is left listening then.
     pub fn start(dir: &Path, grant: ActionGrant) -> Result<Self, ActionChannelError> {
+        Self::start_held(dir, grant, None)
+    }
+
+    /// [`Self::start`], also holding the capabilities of `hold` (#415, ADR-0035): their
+    /// request ids are the node's, and [`Self::hold`] is what the attempt's proxy asks.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`].
+    pub fn start_held(
+        dir: &Path,
+        grant: ActionGrant,
+        holding: Option<&HoldGrant>,
+    ) -> Result<Self, ActionChannelError> {
         private_dir(dir).map_err(|error| match error {
             crate::evidence::EvidenceError::Io(error) => ActionChannelError::Io(error),
             _ => ActionChannelError::InsecurePath,
@@ -430,8 +560,19 @@ impl AttemptActions {
         let socket = dir.join(ACTION_SOCKET_FILE);
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&bind)?;
+        let holds: Vec<HoldSlot> = holding
+            .map(HoldGrant::held)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|held| HoldSlot { held, action: None })
+            .collect();
+        let state = State {
+            ids: (0..holds.len()).map(hold_request_id).collect(),
+            holds,
+            ..State::default()
+        };
         let shared = Arc::new(Shared {
-            state: Mutex::new(State::default()),
+            state: Mutex::new(state),
             grant,
             listener: listener.try_clone()?,
             socket,
@@ -457,6 +598,17 @@ impl AttemptActions {
     #[must_use]
     pub fn grant(&self) -> &ActionGrant {
         &self.shared.grant
+    }
+
+    /// The hold the attempt's egress proxy asks about every request it would let through
+    /// ([`ward_proxy::Hold`]): a request touching a held capability opens its approval
+    /// request on first use and is refused until that request is answered `approved`,
+    /// recorded; one the hold does not name passes.
+    #[must_use]
+    pub fn hold(&self) -> Arc<dyn Hold> {
+        Arc::new(ActionHold {
+            shared: Arc::clone(&self.shared),
+        })
     }
 
     /// Whether the registry has something to do: records queued, or a recorded request
@@ -497,12 +649,16 @@ impl AttemptActions {
             .filter(|(_, pending)| pending.recorded)
             .filter_map(|(action, pending)| {
                 let left = pending.deadline.saturating_duration_since(clock);
-                PendingAction::new(
+                let listed = PendingAction::new(
                     *action,
                     pending.request.clone(),
                     u64::try_from(left.as_millis()).unwrap_or(u64::MAX),
                 )
-                .ok()
+                .ok()?;
+                Some(match &pending.hold {
+                    Some(held) => listed.with_hold(held.clone()),
+                    None => listed,
+                })
             })
             .collect()
     }
@@ -653,6 +809,23 @@ impl Drop for AttemptActions {
         {
             let _ = accept.join();
         }
+    }
+}
+
+/// What an attempt's egress proxy asks about the requests it would let through.
+#[derive(Debug)]
+struct ActionHold {
+    shared: Arc<Shared>,
+}
+
+impl Hold for ActionHold {
+    fn held(&self, target: &Target, route: Option<&str>) -> Option<Held> {
+        let host = match &target.host {
+            Host::Name(name) => Some(name.as_str()),
+            Host::Ip(_) => None,
+        };
+        let service = route.and_then(|prefix| prefix.strip_prefix('/'));
+        self.shared.held(host, service, Instant::now())
     }
 }
 
@@ -1386,5 +1559,410 @@ mod tests {
         let (mut stream, _reader) = fixture.connect();
         writeln!(stream, "{}", line("later")).unwrap();
         assert_eq!(fixture.listed(1)[0].id().as_str(), "later");
+    }
+
+    fn hold_grant(hosts: &[&str], services: &[&str]) -> HoldGrant {
+        HoldGrant::new(
+            hosts.iter().map(|host| (*host).to_owned()).collect(),
+            services
+                .iter()
+                .map(|service| (*service).to_owned())
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn holding(grant: ActionGrant, hold: &HoldGrant) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let actions =
+            AttemptActions::start_held(&dir.path().join("a.actions"), grant, Some(hold)).unwrap();
+        Fixture {
+            _dir: dir,
+            actions,
+            records: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn target(host: &str) -> Target {
+        Target {
+            host: Host::Name(host.to_owned()),
+            port: 443,
+        }
+    }
+
+    /// What the attempt's proxy is told about a request for `host` (on `route`, if any).
+    fn asked(hold: &dyn Hold, host: &str, route: Option<&str>) -> Option<(String, &'static str)> {
+        hold.held(&target(host), route)
+            .map(|held| (held.reason, held.body))
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // compared with what the hold answers
+    fn held(action: u32) -> Option<(String, &'static str)> {
+        Some((format!("hold:held:{action}"), "held for approval"))
+    }
+
+    fn answer(fixture: &Fixture, operation: u64, action: u32, decision: ActionDecision) {
+        assert_eq!(
+            fixture.actions.answer(
+                Instant::now(),
+                op(operation),
+                action,
+                decision,
+                None,
+                &mut fixture.recorder()
+            ),
+            Ok(decision)
+        );
+    }
+
+    #[test]
+    fn a_held_capability_opens_one_request_on_first_use_recorded_before_it_is_listed() {
+        let fixture = holding(
+            grant(1, 1, 30),
+            &hold_grant(&["deploy.example.com", "*.wild.example"], &["artifacts"]),
+        );
+        let hold = fixture.actions.hold();
+        assert_eq!(asked(hold.as_ref(), "other.example", None), None);
+        assert_eq!(
+            asked(hold.as_ref(), "artifacts.example", Some("/other")),
+            None
+        );
+        assert!(
+            fixture
+                .actions
+                .list(Instant::now(), &mut fixture.recorder())
+                .is_empty()
+        );
+        assert!(fixture.records().is_empty(), "nothing held, nothing opened");
+
+        assert_eq!(asked(hold.as_ref(), "deploy.example.com", None), held(1));
+        assert!(fixture.records().is_empty(), "queued, not yet recorded");
+        let listed = fixture.listed(1);
+        assert_eq!(listed[0].action(), 1);
+        assert_eq!(listed[0].id().as_str(), "hold:1");
+        assert_eq!(listed[0].kind(), ActionKind::Approval);
+        assert_eq!(listed[0].summary(), "network deploy.example.com");
+        assert_eq!(
+            listed[0].hold(),
+            Some(&HeldCapability::Host("deploy.example.com".to_owned()))
+        );
+        assert!(matches!(
+            fixture.records()[0],
+            WardEvent::NodeActionRequested {
+                action: 1,
+                kind: NodeActionKind::Approval,
+                ..
+            }
+        ));
+        let WardEvent::NodeActionRequested { summary, .. } = fixture.records()[0] else {
+            unreachable!()
+        };
+        assert_eq!(summary, Blake3Hash::hash(b"network deploy.example.com"));
+
+        // The same capability again, in any case, opens nothing more.
+        assert_eq!(asked(hold.as_ref(), "deploy.example.com", None), held(1));
+        assert_eq!(asked(hold.as_ref(), "DEPLOY.example.com", None), held(1));
+        assert_eq!(fixture.listed(1).len(), 1);
+        assert_eq!(fixture.records().len(), 1);
+
+        assert_eq!(asked(hold.as_ref(), "x.wild.example", None), held(2));
+        assert_eq!(asked(hold.as_ref(), "wild.example", None), None);
+        assert_eq!(
+            asked(hold.as_ref(), "127.0.0.1", Some("/artifacts")),
+            held(3)
+        );
+        let listed = fixture.listed(3);
+        assert_eq!(listed[2].id().as_str(), "hold:3");
+        assert_eq!(listed[2].summary(), "credential artifacts");
+        assert_eq!(
+            listed[2].hold(),
+            Some(&HeldCapability::Service("artifacts".to_owned()))
+        );
+        let ip = Target {
+            host: Host::Ip(std::net::IpAddr::from([10, 0, 0, 1])),
+            port: 443,
+        };
+        assert!(hold.held(&ip, None).is_none());
+    }
+
+    #[test]
+    fn an_approval_releases_only_the_capability_its_request_was_opened_for_once_recorded() {
+        let fixture = holding(
+            grant(2, 4, 30),
+            &hold_grant(&["deploy.example.com", "artifacts.example"], &["artifacts"]),
+        );
+        let hold = fixture.actions.hold();
+        assert_eq!(asked(hold.as_ref(), "deploy.example.com", None), held(1));
+        assert_eq!(asked(hold.as_ref(), "artifacts.example", None), held(2));
+        fixture.listed(2);
+
+        // The workload's own approval request, worded like the node's, releases nothing.
+        let (mut stream, mut reader) = fixture.connect();
+        writeln!(
+            stream,
+            r#"{{"id":"mine","kind":"approval","summary":"network deploy.example.com","detail":""}}"#
+        )
+        .unwrap();
+        let listed = fixture.listed(3);
+        assert_eq!(listed[2].hold(), None);
+        answer(&fixture, 10, 3, ActionDecision::Approved);
+        assert_eq!(reply(&mut reader).decision(), ActionDecision::Approved);
+        assert_eq!(asked(hold.as_ref(), "deploy.example.com", None), held(1));
+
+        // An answer that cannot be recorded releases nothing.
+        assert_eq!(
+            fixture.actions.answer(
+                Instant::now(),
+                op(11),
+                2,
+                ActionDecision::Approved,
+                None,
+                &mut |_| false
+            ),
+            Err(ActionRejectionReason::ResourceUnavailable)
+        );
+        assert_eq!(asked(hold.as_ref(), "artifacts.example", None), held(2));
+
+        // Approving request 2 releases its host only, and the route to it is still held
+        // by its service.
+        answer(&fixture, 12, 2, ActionDecision::Approved);
+        assert_eq!(asked(hold.as_ref(), "artifacts.example", None), None);
+        assert_eq!(asked(hold.as_ref(), "deploy.example.com", None), held(1));
+        assert_eq!(
+            asked(hold.as_ref(), "artifacts.example", Some("/artifacts")),
+            held(4)
+        );
+        assert_eq!(
+            fixture
+                .listed(2)
+                .iter()
+                .map(PendingAction::action)
+                .collect::<Vec<_>>(),
+            [1, 4]
+        );
+
+        // A replay applies nothing new; the same operation id for another request is stale
+        // and releases nothing.
+        answer(&fixture, 12, 2, ActionDecision::Approved);
+        assert_eq!(
+            fixture.actions.answer(
+                Instant::now(),
+                op(12),
+                1,
+                ActionDecision::Approved,
+                None,
+                &mut fixture.recorder()
+            ),
+            Err(ActionRejectionReason::StaleOperation)
+        );
+        assert_eq!(asked(hold.as_ref(), "deploy.example.com", None), held(1));
+        assert_eq!(
+            fixture.actions.answer(
+                Instant::now(),
+                op(13),
+                9,
+                ActionDecision::Approved,
+                None,
+                &mut fixture.recorder()
+            ),
+            Err(ActionRejectionReason::UnknownRequest)
+        );
+        assert_eq!(asked(hold.as_ref(), "deploy.example.com", None), held(1));
+        let approvals = fixture
+            .records()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    WardEvent::NodeActionAnswered {
+                        decision: NodeActionDecision::Approved,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(approvals, 2);
+    }
+
+    #[test]
+    fn a_denied_expired_or_cancelled_hold_stays_refused_by_name() {
+        let fixture = holding(
+            grant(1, 1, 30),
+            &hold_grant(&["a.example", "b.example", "c.example", "d.example"], &[]),
+        );
+        let hold = fixture.actions.hold();
+        for host in ["a.example", "b.example"] {
+            assert!(asked(hold.as_ref(), host, None).is_some());
+        }
+        fixture.listed(2);
+
+        answer(&fixture, 1, 1, ActionDecision::Denied);
+        let denied = Some(("hold:denied:1".to_owned(), "approval denied"));
+        assert_eq!(asked(hold.as_ref(), "a.example", None), denied);
+        assert_eq!(asked(hold.as_ref(), "a.example", None), denied);
+
+        let expired = Instant::now() + Duration::from_secs(31);
+        fixture.actions.tend(expired, &mut fixture.recorder());
+        assert_eq!(
+            asked(hold.as_ref(), "b.example", None),
+            Some(("hold:expired:2".to_owned(), "approval expired"))
+        );
+        assert!(
+            fixture
+                .actions
+                .list(expired, &mut fixture.recorder())
+                .is_empty()
+        );
+
+        assert_eq!(asked(hold.as_ref(), "c.example", None), held(3));
+        fixture.listed(1);
+        fixture.actions.finish(&mut fixture.recorder());
+        assert_eq!(
+            asked(hold.as_ref(), "a.example", None),
+            denied,
+            "a denial stays a denial"
+        );
+        assert_eq!(
+            asked(hold.as_ref(), "d.example", None),
+            Some(("hold:cancelled".to_owned(), "approval cancelled")),
+            "a closed channel opens nothing"
+        );
+        let answered: Vec<(u32, NodeActionDecision)> = fixture
+            .records()
+            .iter()
+            .filter_map(|event| match event {
+                WardEvent::NodeActionAnswered {
+                    action, decision, ..
+                } => Some((*action, *decision)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            answered,
+            vec![
+                (1, NodeActionDecision::Denied),
+                (2, NodeActionDecision::Expired),
+                (3, NodeActionDecision::Cancelled),
+            ]
+        );
+        assert_eq!(
+            asked(hold.as_ref(), "c.example", None),
+            Some(("hold:cancelled:3".to_owned(), "approval cancelled"))
+        );
+        assert_eq!(
+            fixture.actions.answer(
+                Instant::now(),
+                op(5),
+                3,
+                ActionDecision::Approved,
+                None,
+                &mut fixture.recorder()
+            ),
+            Err(ActionRejectionReason::AlreadyAnswered)
+        );
+        assert_eq!(
+            asked(hold.as_ref(), "c.example", None),
+            Some(("hold:cancelled:3".to_owned(), "approval cancelled"))
+        );
+    }
+
+    #[test]
+    fn a_hold_whose_request_cannot_be_recorded_is_cancelled_and_never_listed() {
+        let fixture = holding(grant(1, 1, 30), &hold_grant(&["a.example"], &[]));
+        let hold = fixture.actions.hold();
+        assert_eq!(asked(hold.as_ref(), "a.example", None), held(1));
+        assert!(
+            fixture
+                .actions
+                .list(Instant::now(), &mut |_| false)
+                .is_empty()
+        );
+        assert_eq!(
+            asked(hold.as_ref(), "a.example", None),
+            Some(("hold:cancelled:1".to_owned(), "approval cancelled"))
+        );
+    }
+
+    #[test]
+    fn a_pause_keeps_a_hold_held_and_stops_its_clock() {
+        let fixture = holding(grant(1, 1, 30), &hold_grant(&["a.example"], &[]));
+        let hold = fixture.actions.hold();
+        assert_eq!(asked(hold.as_ref(), "a.example", None), held(1));
+        fixture.listed(1);
+        let now = Instant::now();
+        fixture.actions.set_paused(true, now);
+        let later = now + Duration::from_secs(120);
+        fixture.actions.tend(later, &mut fixture.recorder());
+        assert_eq!(
+            fixture.actions.list(later, &mut fixture.recorder()).len(),
+            1
+        );
+        assert_eq!(asked(hold.as_ref(), "a.example", None), held(1));
+        fixture.actions.set_paused(false, later);
+        answer(&fixture, 1, 1, ActionDecision::Approved);
+        assert_eq!(asked(hold.as_ref(), "a.example", None), None);
+    }
+
+    #[test]
+    fn the_node_reserves_its_hold_ids_and_holds_take_none_of_the_workloads_slots() {
+        let fixture = holding(
+            grant(1, 1, 30),
+            &hold_grant(&["a.example", "b.example"], &[]),
+        );
+        let hold = fixture.actions.hold();
+        let (mut stream, mut reader) = fixture.connect();
+        writeln!(stream, "{}", line("hold:2")).unwrap();
+        assert!(
+            closed(&mut reader),
+            "a workload request under a hold id gets nothing"
+        );
+        fixture.recorded(|event| {
+            matches!(
+                event,
+                WardEvent::NodeActionRefused {
+                    reason: NodeActionRefusal::DuplicateId,
+                    ..
+                }
+            )
+        });
+        assert_eq!(asked(hold.as_ref(), "a.example", None), held(1));
+        assert_eq!(asked(hold.as_ref(), "b.example", None), held(2));
+        let (mut stream, _reader) = fixture.connect();
+        writeln!(stream, "{}", line("mine")).unwrap();
+        let listed = fixture.listed(3);
+        assert_eq!(listed[2].id().as_str(), "mine");
+        assert_eq!(listed[2].action(), 3);
+    }
+
+    #[test]
+    fn a_request_touching_two_held_capabilities_opens_both_at_once() {
+        let fixture = holding(
+            grant(1, 1, 30),
+            &hold_grant(&["artifacts.example"], &["artifacts"]),
+        );
+        let hold = fixture.actions.hold();
+        assert_eq!(
+            asked(hold.as_ref(), "artifacts.example", Some("/artifacts")),
+            held(1)
+        );
+        let listed = fixture.listed(2);
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.id().as_str())
+                .collect::<Vec<_>>(),
+            ["hold:1", "hold:2"]
+        );
+        answer(&fixture, 1, 1, ActionDecision::Approved);
+        assert_eq!(
+            asked(hold.as_ref(), "artifacts.example", Some("/artifacts")),
+            held(2)
+        );
+        assert_eq!(asked(hold.as_ref(), "artifacts.example", None), None);
+        answer(&fixture, 2, 2, ActionDecision::Approved);
+        assert_eq!(
+            asked(hold.as_ref(), "artifacts.example", Some("/artifacts")),
+            None
+        );
     }
 }

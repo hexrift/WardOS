@@ -508,6 +508,11 @@ impl TaskRegistry {
                     .as_ref()
                     .is_some_and(NodeExecution::honours_action_channel),
             )
+            .with_approval_hold(
+                execution
+                    .as_ref()
+                    .is_some_and(NodeExecution::honours_approval_hold),
+            )
             .with_credentials(
                 execution
                     .as_ref()
@@ -1259,22 +1264,7 @@ impl TaskRegistry {
             Some(resources) => request.with_resources(*resources),
             None => request,
         };
-        let actions = match manifest.actions() {
-            Some(grant) => {
-                let started = actions_dir_beside(request.workspace())
-                    .and_then(|dir| AttemptActions::start(&dir, grant.clone()).ok());
-                let Some(actions) = started else {
-                    discard(request.workspace());
-                    return Err(Reason::ResourceUnavailable);
-                };
-                Some(Arc::new(actions))
-            }
-            None => None,
-        };
-        let request = match &actions {
-            Some(actions) => request.with_action_socket(actions.socket().to_path_buf()),
-            None => request,
-        };
+        let (request, actions) = with_actions(request, manifest)?;
         let credentials = match manifest.credentials() {
             Some(grants) => {
                 let issued = execution
@@ -1953,6 +1943,30 @@ impl Reaper {
             self.reaped.set();
         }
     }
+}
+
+/// `request` with the action channel `manifest` grants, started beside its workspace and
+/// holding what the manifest's `hold` names, and the channel; unchanged without a grant.
+/// A channel that cannot start discards the workspace.
+fn with_actions(
+    request: LaunchRequest,
+    manifest: &ward_node_protocol::CapabilityManifest,
+) -> Result<(LaunchRequest, Option<Arc<AttemptActions>>), Reason> {
+    let Some(grant) = manifest.actions() else {
+        return Ok((request, None));
+    };
+    let Some(actions) = actions_dir_beside(request.workspace())
+        .and_then(|dir| AttemptActions::start_held(&dir, grant.clone(), manifest.hold()).ok())
+    else {
+        discard(request.workspace());
+        return Err(Reason::ResourceUnavailable);
+    };
+    let request = request.with_action_socket(actions.socket().to_path_buf());
+    let request = match manifest.hold() {
+        Some(_) => request.with_hold(actions.hold()),
+        None => request,
+    };
+    Ok((request, Some(Arc::new(actions))))
 }
 
 /// Collect and durably store what `request`'s output grant asks for, on the reaper's
@@ -3724,12 +3738,38 @@ mod tests {
                 )
             }
 
+            fn with_approval_hold() -> Self {
+                Self::build_holding(
+                    tempfile::tempdir().unwrap(),
+                    MAX_NODE_TASKS,
+                    Duration::from_secs(10),
+                    (true, false),
+                    true,
+                )
+            }
+
             fn build(
                 dir: tempfile::TempDir,
                 capacity: usize,
                 stop_timeout: Duration,
                 network_allowlist: bool,
                 output_return: bool,
+            ) -> Self {
+                Self::build_holding(
+                    dir,
+                    capacity,
+                    stop_timeout,
+                    (network_allowlist, output_return),
+                    false,
+                )
+            }
+
+            fn build_holding(
+                dir: tempfile::TempDir,
+                capacity: usize,
+                stop_timeout: Duration,
+                (network_allowlist, output_return): (bool, bool),
+                approval_hold: bool,
             ) -> Self {
                 let state = dir.path().join("state");
                 let clock = FixedClock::at(NOW);
@@ -3748,7 +3788,9 @@ mod tests {
                 )
                 .with_stop_timeout(stop_timeout)
                 .with_network_allowlist(network_allowlist)
-                .with_output_return(output_return);
+                .with_output_return(output_return)
+                .with_action_channel(approval_hold)
+                .with_approval_hold(approval_hold);
                 let tasks = Arc::new(Mutex::new(
                     TaskRegistry::with_execution(capacity, admission, execution).unwrap(),
                 ));
@@ -4393,6 +4435,85 @@ mod tests {
             for record in node.evidence_log().records() {
                 assert_eq!(record.origin, ward_events::Origin::Node);
             }
+        }
+
+        #[test]
+        fn a_held_host_is_refused_by_the_attempts_proxy_until_its_approval_is_recorded() {
+            let node = Node::with_approval_hold();
+            let binding = lifecycle_binding();
+            node.ready_with(&node.envelope_with(crate::test_support::hold_manifest(
+                &["github.com", "*.crates.io"],
+                &["github.com"],
+                300,
+            )));
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().accepted(op(30), binding, State::Running)
+            );
+            let egress = node.launcher.egress().expect("a held launch has a proxy");
+            assert!(ask_proxy(&egress, "github.com:443").starts_with("HTTP/1.1 403"));
+            let listed =
+                || match TaskRegistry::actions(&node.tasks, ctx(), ctx().actions(binding).unwrap())
+                    .unwrap()
+                {
+                    ward_node_protocol::TaskActionsResponse::Actions { pending, .. } => pending,
+                    other => panic!("{other:?}"),
+                };
+            eventually(|| listed().len() == 1);
+            let pending = listed();
+            assert_eq!(pending[0].id().as_str(), "hold:1");
+            assert_eq!(
+                pending[0].hold(),
+                Some(&ward_node_protocol::HeldCapability::Host(
+                    "github.com".to_owned()
+                ))
+            );
+            let held_verdict = |event: &WardEvent| {
+                matches!(
+                    event,
+                    WardEvent::NetworkDenied {
+                        reason: ward_events::DenyReason::PolicyDeny { rule },
+                        ..
+                    } if rule.as_str() == "hold:held:1"
+                )
+            };
+            eventually(|| node.evidence().iter().any(held_verdict));
+            assert_eq!(
+                TaskRegistry::actions(
+                    &node.tasks,
+                    ctx(),
+                    ctx()
+                        .answer(
+                            op(40),
+                            binding,
+                            1,
+                            ward_node_protocol::ActionDecision::Approved,
+                            None
+                        )
+                        .unwrap()
+                )
+                .unwrap(),
+                ctx().answered(
+                    op(40),
+                    binding,
+                    1,
+                    ward_node_protocol::ActionDecision::Approved
+                )
+            );
+            assert!(listed().is_empty());
+            let _ = ask_proxy(&egress, "github.com:443");
+            eventually(|| network_records(&node.evidence()) == 2);
+            let events = node.evidence();
+            let verdicts: Vec<&WardEvent> = events
+                .iter()
+                .filter(|event| network_records(std::slice::from_ref(event)) == 1)
+                .collect();
+            assert!(held_verdict(verdicts[0]));
+            assert!(!held_verdict(verdicts[1]), "{:?}", verdicts[1]);
+            assert_eq!(
+                node.serve(ctx().stop(op(60), binding)),
+                ctx().accepted(op(60), binding, State::Stopped)
+            );
         }
 
         #[test]

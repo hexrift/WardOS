@@ -156,7 +156,7 @@ impl CredentialGrants {
 }
 
 /// `[a-z][a-z0-9-]{0,31}`: the service also names the attempt's proxy route.
-fn is_service(service: &str) -> bool {
+pub(crate) fn is_service(service: &str) -> bool {
     let bytes = service.as_bytes();
     (1..=MAX_CREDENTIAL_SERVICE_BYTES).contains(&bytes.len())
         && bytes[0].is_ascii_lowercase()

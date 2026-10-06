@@ -40,6 +40,7 @@ use ward_policy::NetworkCapability;
 
 use crate::error::Error;
 use crate::gateway::{GatewayRoute, Upstream};
+use crate::hold::{Held, Hold};
 use crate::http::{self, ChunkTracker, Framing, Method, Parsed, Request};
 use crate::observer::{Decision, Observer};
 use crate::policy::{Pinned, Policy};
@@ -74,6 +75,7 @@ pub struct Config {
     idle_timeout: Duration,
     allow_loopback: bool,
     gateways: Vec<GatewayRoute>,
+    hold: Option<Arc<dyn Hold>>,
 }
 
 impl Config {
@@ -91,7 +93,16 @@ impl Config {
             idle_timeout: Duration::from_secs(300),
             allow_loopback: false,
             gateways: Vec::new(),
+            hold: None,
         }
+    }
+
+    /// Ask `hold` about every request the policy and its route would allow, before it is
+    /// resolved, connected to or has a credential injected ([`crate::hold`]).
+    #[must_use]
+    pub fn hold(mut self, hold: Arc<dyn Hold>) -> Self {
+        self.hold = Some(hold);
+        self
     }
 
     /// Add a gateway route (repeatable). Routes are tried in the order added;
@@ -185,6 +196,7 @@ impl fmt::Debug for Config {
             .field("idle_timeout", &self.idle_timeout)
             .field("allow_loopback", &self.allow_loopback)
             .field("gateways", &self.gateways)
+            .field("hold", &self.hold.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -195,6 +207,7 @@ struct Shared {
     resolver: Arc<dyn Resolver>,
     observer: Arc<dyn Observer>,
     gateways: Vec<GatewayRoute>,
+    hold: Option<Arc<dyn Hold>>,
     max_connections: usize,
     request_timeout: Duration,
     connect_timeout: Duration,
@@ -332,6 +345,7 @@ impl Proxy {
             resolver: config.resolver,
             observer,
             gateways: config.gateways,
+            hold: config.hold,
             max_connections: config.max_connections,
             request_timeout: config.request_timeout,
             connect_timeout: config.connect_timeout,
@@ -781,6 +795,17 @@ fn gateway_refusal(
     None
 }
 
+/// Why the proxy's [`Hold`] (#415) refuses a request, if it has one and does: asked only
+/// about what the matched route or the policy's host stage would let through, and before
+/// anything is resolved, connected to or injected.
+fn hold_refusal(gateway: Option<&GatewayRoute>, req: &Request, shared: &Shared) -> Option<Held> {
+    let hold = shared.hold.as_ref()?;
+    if gateway.is_none() && shared.policy.check_host(&req.target).is_err() {
+        return None;
+    }
+    hold.held(&req.target, gateway.map(GatewayRoute::prefix))
+}
+
 /// Serve exactly one request on `client`.
 ///
 /// `pending` is this connection's outstanding verdict: every return below either
@@ -826,6 +851,10 @@ fn serve<C: Conn>(mut client: C, shared: &Arc<Shared>, mut pending: Pending) {
     {
         pending.report(req, Decision::Deny, &reason);
         return respond(&mut client, 403, "Forbidden", body);
+    }
+    if let Some(held) = hold_refusal(gateway, req, shared) {
+        pending.report(req, Decision::Deny, &held.reason);
+        return respond(&mut client, 403, "Forbidden", held.body);
     }
     let resolver = shared.resolver.as_ref();
     let pinned = match gateway.map_or_else(

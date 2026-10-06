@@ -49,8 +49,8 @@ use ward_events::{
 };
 use ward_node_protocol::{HostAllowlist, TaskBinding};
 use ward_proxy::{
-    Config, Decision, GatewayRoute, Handle, Host, NetworkCapability, Observer, Proxy, Request,
-    Resolver, SystemResolver,
+    Config, Decision, GatewayRoute, Handle, Hold, Host, NetworkCapability, Observer, Proxy,
+    Request, Resolver, SystemResolver,
 };
 
 use crate::evidence::private_dir;
@@ -165,6 +165,11 @@ impl NetworkDecision {
 }
 
 fn deny_reason(reason: &str) -> DenyReason {
+    if reason.starts_with("hold:")
+        && let Ok(rule) = RuleRef::new(reason)
+    {
+        return DenyReason::PolicyDeny { rule };
+    }
     let reason = reason.to_ascii_lowercase();
     if reason.contains("offline") {
         DenyReason::Offline
@@ -358,6 +363,23 @@ impl AttemptEgress {
         routes: Vec<GatewayRoute>,
         resolver: Arc<dyn Resolver>,
     ) -> Result<Self, EgressError> {
+        Self::start_held(dir, allowlist, routes, None, resolver)
+    }
+
+    /// [`Self::start_routed`], also asking `hold` (#415, ADR-0035) about every request the
+    /// allowlist or a route would let through, before it is resolved, connected to or has
+    /// a credential injected.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start_routed`].
+    pub fn start_held(
+        dir: &Path,
+        allowlist: &HostAllowlist,
+        routes: Vec<GatewayRoute>,
+        holding: Option<Arc<dyn Hold>>,
+        resolver: Arc<dyn Resolver>,
+    ) -> Result<Self, EgressError> {
         let outside = routes.iter().any(|route| match &route.target().host {
             Host::Name(name) => !allowlist.covers(name),
             Host::Ip(_) => true,
@@ -383,6 +405,10 @@ impl AttemptEgress {
                 .listen_unix(bind),
             Config::gateway,
         );
+        let config = match holding {
+            Some(holding) => config.hold(holding),
+            None => config,
+        };
         let handle = Proxy::spawn(config, observer)?;
         Ok(Self {
             handle,
@@ -828,7 +854,118 @@ mod tests {
     }
 
     #[test]
+    fn a_held_route_and_host_are_refused_by_name_and_recorded_until_approved() {
+        let (port, upstream) = fake_upstream();
+        let root = tempfile::tempdir().unwrap();
+        let resolver = StaticResolver::new()
+            .with("artifacts.example", [IpAddr::from([127, 0, 0, 1])])
+            .with("free.example", [IpAddr::from([9, 9, 9, 9])]);
+        let allowed = HostAllowlist::new(vec![
+            "artifacts.example".to_owned(),
+            "free.example".to_owned(),
+        ])
+        .unwrap();
+        let actions = crate::actions::AttemptActions::start_held(
+            &root.path().join("c.actions"),
+            ward_node_protocol::ActionGrant::new(
+                vec![ward_node_protocol::ActionKind::Approval],
+                1,
+                1,
+                30,
+            )
+            .unwrap(),
+            Some(
+                &ward_node_protocol::HoldGrant::new(
+                    vec!["artifacts.example".to_owned()],
+                    Vec::new(),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let egress = AttemptEgress::start_held(
+            &root.path().join("c.egress"),
+            &allowed,
+            vec![credential_route(port)],
+            Some(actions.hold()),
+            Arc::new(resolver),
+        )
+        .unwrap();
+        let request = "GET /artifacts/v1/x HTTP/1.1\r\nHost: anything\r\n\r\n";
+
+        let held = send(&egress, request);
+        assert!(held.starts_with("HTTP/1.1 403"), "{held}");
+        assert!(held.ends_with("held for approval\n"), "{held}");
+        assert!(upstream.lock().unwrap().is_empty());
+        let refused = ask(&egress, "artifacts.example:443");
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        assert_eq!(
+            drained_events(&egress),
+            vec![
+                WardEvent::NetworkDenied {
+                    dst: DeniedDst::Host {
+                        host: HostName::new("artifacts.example").unwrap(),
+                        port,
+                    },
+                    reason: DenyReason::PolicyDeny {
+                        rule: RuleRef::new("hold:held:1").unwrap()
+                    },
+                },
+                WardEvent::NetworkDenied {
+                    dst: DeniedDst::Host {
+                        host: HostName::new("artifacts.example").unwrap(),
+                        port: 443,
+                    },
+                    reason: DenyReason::PolicyDeny {
+                        rule: RuleRef::new("hold:held:1").unwrap()
+                    },
+                },
+            ]
+        );
+        // A host the hold does not name is the policy's alone.
+        let free = ask(&egress, "free.example:443");
+        assert!(!free.contains("approval"), "{free}");
+
+        let mut records = Vec::new();
+        let listed = actions.list(Instant::now(), &mut |event| {
+            records.push(event);
+            true
+        });
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            actions.answer(
+                Instant::now(),
+                ward_node_protocol::OperationId::new(4).unwrap(),
+                1,
+                ward_node_protocol::ActionDecision::Approved,
+                None,
+                &mut |event| {
+                    records.push(event);
+                    true
+                },
+            ),
+            Ok(ward_node_protocol::ActionDecision::Approved)
+        );
+        let routed = send(&egress, request);
+        assert!(routed.starts_with("HTTP/1.1 200"), "{routed}");
+        let seen = upstream.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer leased-value")
+        );
+    }
+
+    #[test]
     fn deny_reasons_map_to_the_event_catalogue() {
+        assert_eq!(
+            deny_reason("hold:denied:3"),
+            DenyReason::PolicyDeny {
+                rule: RuleRef::new("hold:denied:3").unwrap()
+            }
+        );
+        assert_eq!(deny_reason("hold: spaced"), DenyReason::NotAllowlisted);
         assert_eq!(
             deny_reason("session network mode is offline"),
             DenyReason::Offline

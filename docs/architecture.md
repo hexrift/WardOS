@@ -570,6 +570,9 @@ threads that share no parser with the protocol socket) on which the workload ask
 `approval` and `decision` requests that the control plane lists with `actions` and
 answers with `answer`, every request recorded before it is visible and every answer
 before it is relayed, a control-protocol line answered with nothing;
+a `hold`, on a node started with `--approval-hold` as well, has the attempt's egress proxy
+refuse each held host or credential service `403` by name until the control plane's
+approval of the request the node opened for it on first use is recorded (ADR-0035);
 any grant the node cannot enforce is refused `unsupported_grant` at `admit`, so every
 workload that starts runs under exactly what its manifest says (node-integration.md
 §7.5, §9). The node answers `running` only after a confirmed spawn with

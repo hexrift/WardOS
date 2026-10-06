@@ -249,6 +249,34 @@ pub fn credentials_manifest(grants: &[(&str, &str, u32)]) -> CapabilityManifestB
     .unwrap()
 }
 
+/// A manifest allowing `hosts`, granting an approval channel (one request pending, one in
+/// all, `wait_secs` each) and holding the hosts `held` until approved (#415).
+pub fn hold_manifest(hosts: &[&str], held: &[&str], wait_secs: u32) -> CapabilityManifestBytes {
+    CapabilityManifestBytes::encode(
+        &CapabilityManifest::new(NetworkGrant::Custom(
+            HostAllowlist::new(hosts.iter().map(|host| (*host).to_owned()).collect()).unwrap(),
+        ))
+        .with_actions(
+            ward_node_protocol::ActionGrant::new(
+                vec![ward_node_protocol::ActionKind::Approval],
+                1,
+                1,
+                wait_secs,
+            )
+            .unwrap(),
+        )
+        .with_hold(
+            ward_node_protocol::HoldGrant::new(
+                held.iter().map(|host| (*host).to_owned()).collect(),
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
 /// Replace the manifest of `input`'s workload, keeping everything else.
 pub fn with_manifest(input: &mut TaskAdmissionEnvelopeInput, manifest: CapabilityManifestBytes) {
     input.workload = TaskWorkload::new(
@@ -564,10 +592,11 @@ impl crate::execution::TaskLauncher for FakeLauncher {
                 let egress = request.allowlist().map(|allowlist| {
                     let dir = crate::egress::egress_dir_beside(request.workspace()).unwrap();
                     Arc::new(
-                        crate::egress::AttemptEgress::start_routed(
+                        crate::egress::AttemptEgress::start_held(
                             &dir,
                             allowlist,
                             request.credential_routes().to_vec(),
+                            request.hold(),
                             Arc::new(ward_proxy::SystemResolver),
                         )
                         .unwrap(),

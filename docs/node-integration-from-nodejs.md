@@ -26,7 +26,10 @@ back the receipt, the bounded output the manifest declared (§7.1 below) and, on
 evidence log, and answering on its own side the approvals and decisions the workload asks
 for through the action channel (§7.2 below). Where an action needs a service's credential,
 the control plane grants it by name and the node leases and injects it, so the workload
-reaches only that service's host and never holds the secret (§7.3 below). What the node
+reaches only that service's host and never holds the secret (§7.3 below). Where an action
+must not reach a host or use a credential before a human says yes, the control plane holds
+that capability in the manifest and the node refuses it until the control plane approves
+the request the node opens for it (§7.4 below). What the node
 cannot do yet for such a control plane is §11 below; read it before deciding which actions
 go through the node.
 
@@ -79,7 +82,10 @@ $ node examples/node-control-plane/control-plane.mjs capabilities --socket /run/
 For brokered credentials (§7.3 below) start it with `--network-allowlist` and
 `--credentials <file>`; its document then reads
 `"network":{"offline":true,"proxy_allowlist":true}` and
-`"credentials":{"proxy_injection":true,"scoped_http_gateway":true}`.
+`"credentials":{"proxy_injection":true,"scoped_http_gateway":true}`. For approval holds
+(§7.4 below) start it with `--network-allowlist`, `--action-channel` and
+`--approval-hold`; its `actions` section then ends `…,"max_wait_secs":3600,"hold":true}`
+(the adapter prints the document's keys in sorted order, so read it as an object).
 
 ## 2. Key custody
 
@@ -539,11 +545,13 @@ workload exits, it is cancelled, its budget runs out) every pending request is a
 **What an approval is.** A recorded statement, relayed. The workload proceeds because it
 chose to wait for the answer, and must treat everything but `approved` (`denied`,
 `expired`, `cancelled`, an end of file without a reply) as "do not proceed". The node
-enforces nothing on it: an approval widens no capability, credential or network, and is
-not signed per answer; it is authorised by the exact binding on the node's socket
-(node-security-limitations.md §3.2). Governance that must hold whatever the workload does
-stays where it is today: in the control plane's policy, before `admit`, in the grants and
-the manifest it signs.
+enforces nothing on an approval the workload asked for: it widens no capability,
+credential or network, and is not signed per answer; it is authorised by the exact binding
+on the node's socket (node-security-limitations.md §3.2). What the node does enforce is a
+hold (§7.4 below): an approval of a request the node opened itself for a held host or
+credential. Governance that must hold whatever the workload does stays where it is today:
+in the control plane's policy, before `admit`, in the grants, the hold and the manifest it
+signs.
 
 ### 7.3 Brokered credentials
 
@@ -628,6 +636,69 @@ records from the sealed log's raw bytes, and finds neither the leased token nor 
 provider token in the log, the workload's output, the task root, the node's state or
 anything the client wrote.
 
+### 7.4 Approval holds
+
+A node started with `--network-allowlist`, `--action-channel` and `--approval-hold` holds
+the hosts and credential services a manifest's `hold` names until the control plane
+approves them (node-integration.md §6.9,
+[ADR-0035](decisions/ADR-0035-node-approval-hold.md)). It is the per-session approval hold
+for what the node enforces: the question is the node's, not the agent's claim, deny is the
+default, and the record precedes the release.
+
+**The hold** is part of the signed manifest, last, after `credentials`:
+
+```json
+{"network":{"custom":["deploy.example.com","artifacts.example.com"]},"actions":{"kinds":["approval"],"max_pending":1,"max_total":4,"wait_secs":300},"credentials":[{"service":"artifacts","host":"artifacts.example.com","ttl_secs":600}],"hold":{"hosts":["deploy.example.com"],"services":["artifacts"]}}
+```
+
+`hosts` are patterns of the manifest's own `network.custom`, exactly as written there;
+`services` services of its own `credentials`; each list non-empty when present, at least
+one present, nothing twice, at most 8 in all (`HOLD_LIMITS`), and the manifest must grant
+`actions` naming `approval`. `holdGrant({hosts, services})` builds it, `manifest` refuses a
+hold outside that grammar or naming what the manifest does not grant before anything is
+signed, and `holdGrantOf(envelope_json)` reads it back. `offersApprovalHold(capabilities)`
+says whether a node honours holds (`actions.hold` is `true`), and
+`requireApprovalHold(capabilities)` refuses, naming `unsupported_grant`, before a version is
+allocated; any other node refuses the manifest `unsupported_grant` itself.
+
+**What happens.** The first request the attempt's proxy sees for a held capability — a
+request to a host a held pattern covers, a credential route to it included, or on a held
+service's route — opens one `approval` request on the channel and is refused `403` with
+the body `held for approval`. The listing shows it with its `hold` (§7.2 above): id
+`hold:<n>` (the capability's place, hosts first, then services), summary
+`network <pattern>` or `credential <service>`, and `"hold":{"host":…}` or
+`"hold":{"service":…}`. `heldCapabilities(hold)` gives the ids and summaries to expect, and
+`decodeActions(listing, grant, hold)` (which `answerLoop` and the command line apply with
+the run record's grant and hold) refuses a listing whose node-opened requests do not match
+them. Answering it `approved` releases that capability for the rest of the attempt; `denied`,
+an expiry or the attempt's end keep it refused (`approval denied`, `approval expired`,
+`approval cancelled`). The node's requests take numbers past the workload's (up to 72 in
+all), and `answerOperationId` gives their answers operation ids of the run's scheme like
+any other. The workload sees only `403`s until the release: it should retry at its own pace
+and treat a named refusal as final.
+
+**The command line.** `control-plane.mjs run --hold host=<pattern>` or
+`--hold service=<name>`, repeatable, with `--actions approval` and the `--credential` flags
+whose hosts and services it holds, signs the hold; the policy flags answer the node-opened
+requests like the workload's, and each is printed as opened by the node for its hold:
+
+```text
+$ node control-plane.mjs run … --actions approval --credential artifacts=localhost:60 --hold service=artifacts --approve-all -- python3 held.py
+control-plane: request 1 (approval, id hold:1, opened by the node for its hold on artifacts): credential artifacts
+control-plane: request 1 answered approved (operation 263)
+{"outcome":"completed",…,"actions":[{"request":1,"id":"hold:1","kind":"approval","hold":{"service":"artifacts"},"summary":"credential artifacts","decision":"approved",…}],"hold":{"services":["artifacts"]}}
+```
+
+It reads the node's capability document first and exits 2, naming `unsupported_grant`, on a
+node without `--approval-hold`; a hold outside the grammar or its manifest exits 2 before
+the node is asked.
+
+**What the evidence log says.** The node's request is `NodeActionRequested` and its answer
+`NodeActionAnswered`, as for any request; each refusal is a `NetworkDenied` for the
+destination with the reason `PolicyDeny` and the rule `hold:<state>:<n>`. The acceptance
+decodes all three from the sealed log's bytes and checks the request's summary digest
+against `blake3Hex("credential artifacts")`.
+
 ## 8. Cancel
 
 Cancellation is `revoke`, never `stop` (§11.2): the lease is durably revoked first, then
@@ -691,8 +762,8 @@ before replacing an attempt, because a new attempt discards the old receipt (§9
 ## 10. The proof
 
 ```bash
-cd examples/node-control-plane && node --test       # 76 cases, no node, no sandbox
-scripts/acceptance/node-js.sh                        # 18 cases against real nodes; skips loudly without bubblewrap
+cd examples/node-control-plane && node --test       # 86 cases, no node, no sandbox
+scripts/acceptance/node-js.sh                        # 22 cases against real nodes; skips loudly without bubblewrap
 WARD_REQUIRE_ISOLATION=1 scripts/acceptance/node-js.sh   # fail instead of skipping, as CI does
 ```
 
@@ -713,7 +784,11 @@ held to `ward-node-protocol`'s (the same accepted and refused services, hosts an
 its hosts held to the manifest's `network.custom`, its place last in the signed bytes, the
 capability document's two flags read before signing, and `run --credential` refused on a
 node that does not broker before a version is allocated, signed and listed in the outcome
-on one that does, and replayed. The acceptance starts a real node with the client's generated
+on one that does, and replayed, and approval holds: the `hold`'s grammar held to
+`ward-node-protocol`'s (the same signed bytes for the same hold), its hosts and services
+held to the manifest's, a listing's node-opened requests held to the hold, `actions.hold`
+read before signing, and `run --hold` with `--approve-all` and `--deny-all` and its refusals.
+The acceptance starts a real node with the client's generated
 key in its trust store, `--output-return` and `--action-channel` and proves `completes_and_seals`,
 `fails_with_exit_status`, `cancel_is_revoke_then_seal`, `replay_acts_on_nothing`,
 `version_is_held_strictly_increasing`,
@@ -749,12 +824,20 @@ the sealed log, the task root, the node's state or the client's files; the log's
 and the provider's revocation on cancel) and, against a node with `--network-allowlist` and
 without `--credentials`, `credentials_grant_is_refused_without_the_flag_or_outside_the_grammar`
 (the client's refusal before signing, the node's own `unsupported_grant` for the same signed
-grant, and the credentials node's for a TTL above the ceiling and an unconfigured service),
+grant, and the credentials node's for a TTL above the ceiling and an unconfigured service);
+and, against a node started with `--network-allowlist`, `--credentials`, `--action-channel`
+and `--approval-hold` and a Python workload that retries the held route until it is answered
+with anything but `held for approval`, `hold_approval_releases_the_held_credential` (the
+node's request `hold:1` approved by `--approve-all`, the next request reaching the fake
+upstream with the lease injected; the request recorded before the approval, the approval
+before the released request, and the hold's refusal under its rule), `hold_denial_keeps_it_refused` (`approval denied`, exit 3, nothing
+upstream), `hold_expiry_keeps_it_refused` (`approval expired` after a 2 s wait) and,
+against a node without `--approval-hold`, `hold_is_refused_without_the_flag_or_outside_its_manifest`,
 verifying every evidence log with `ward-node audit --task-root` (and `ward replay --verify`
 when a `ward` binary is at hand). The shipped `ward-node` never connects to a loopback
-address and speaks only TLS upstream, so the credentials node, alone, is `ward-node` built
-with its `test-loopback` feature, as ward-node's own `tests/node_credentials_cli.rs` runs
-it; the script builds it into a target directory of its own (or takes
+address and speaks only TLS upstream, so the credentials and hold nodes, alone, are
+`ward-node` built with its `test-loopback` feature, as ward-node's own
+`tests/node_credentials_cli.rs` and `tests/node_hold_cli.rs` run it; the script builds it into a target directory of its own (or takes
 `WARD_NODE_LOOPBACK_BIN`), and every other node runs `WARD_NODE_BIN`, which it builds without
 the feature. It runs
 as part of `scripts/acceptance/node.sh` in CI, so the table in the verify job's summary
@@ -781,18 +864,20 @@ plane deciding what to put through the node today:
   §11.5), and no tool results, model calls or credentials reach the workload through the
   channel, so an agent loop that needs them stays on the control plane; the node runs the
   bounded actions it delegates.
-- **Approvals.** The node has no approval step of its own; governance is the control
-  plane's (ai-institution's action policy and approval resolution) and happens before
-  `admit`. An approval given through the action channel (§7.2 above) is a recorded
-  statement the workload acts on, not a hold the node enforces, and it is not signed per
-  answer (node-security-limitations.md §3.2). The grants the envelope carries record the decision; the node checks their
-  shape and lineage, not their meaning.
+- **Approvals beyond a hold on a host or a credential.** Governance is the control plane's
+  (ai-institution's action policy and approval resolution) and happens before `admit`. The
+  node enforces an approval only as a hold (§7.4 above) on a host or a brokered
+  credential the manifest names; an approval a workload asks for through the action channel
+  (§7.2 above) is a recorded statement it acts on, nothing gates a file it writes or a
+  command it runs, a release lasts for the rest of the attempt, and no answer is signed per
+  answer (node-security-limitations.md §3.2). The grants the envelope carries record the
+  decision; the node checks their shape and lineage, not their meaning.
 - **Credentials beyond a proxy-injected header.** A credential reaches a workload's traffic
   only as a header the attempt's proxy injects into plain HTTP/1.1 requests for
   `/<service>/…` on `WARD_PROXY_SOCKET` (§7.3 above); nothing is injected into a `CONNECT`
   tunnel, there is no in-sandbox relay for a tool that only speaks `HTTP_PROXY` (§9), the
-  capability document does not list the services a node offers (the operator says), and a
-  credential is not held for an approval (#267).
+  capability document does not list the services a node offers (the operator says) (#267);
+  a credential is held for an approval only by a hold (§7.4 above).
 - **Remote transport.** The adapter runs on the node's host (#262); a control plane
   elsewhere brings its own channel to that host and ships pre-signed bytes over it.
 
@@ -816,6 +901,9 @@ Operator side:
       services, their hosts and ceilings recorded in the institution's configuration;
       `credentials.proxy_injection` and `scoped_http_gateway` read `true` from the
       client's user.
+- [ ] Where a host or credential must wait for a human: the node started with
+      `--approval-hold` as well (with `--action-channel` and `--network-allowlist`);
+      `actions.hold` reads `true` from the client's user.
 
 ai-institution side, as an `InstitutionWorkerExecutionPort` (or an action execution port)
 behind an adapter:
@@ -850,6 +938,14 @@ behind an adapter:
       a `403` from the route or a `CredentialDenied` record read as the credential being
       unavailable, never answered with another credential; `CredentialRevoked` in the
       sealed log as the end of the lease.
+- [ ] Where an irreversible step reaches a host or uses a credential: that host or service
+      in the manifest's `hold` (§7.4 above), with an `actions` grant naming `approval`,
+      signed only after `requireApprovalHold` accepted the node's capability document; the
+      node-opened requests (`hold` in the listing, ids `hold:<n>`) routed to the
+      institution's approval resolution through `answerLoop` with the run record's grant and
+      hold, each answer recorded before it is sent and replayed, never re-decided; the
+      workload written to retry a `403 held for approval` and to stop on `approval denied`,
+      `approval expired` or `approval cancelled`.
 - [ ] The signed bytes, proof, ids and version persisted before the first send; replay on
       restart with the same adapter conversation (§9); no second attempt until the first is
       ended.
