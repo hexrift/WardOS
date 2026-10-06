@@ -17,6 +17,22 @@ on the same host, as the node's uid or as a uid the node is told to serve
 (node-integration.md §11.1); the control plane proper
 may be elsewhere, but whatever it uses to reach the node runs here.
 
+### Docker Desktop on macOS
+
+Docker Desktop on macOS is not currently a qualified deployment for `ward-node`.
+On an Apple Silicon host with Docker Desktop's Linux engine 27.4.0, the node's
+Bubblewrap preflight failed inside an ordinary Ubuntu 24.04 container while mounting
+the task's private `/proc` (`Operation not permitted`). Bubblewrap could create user
+and PID namespaces without that mount, but that does not meet the node's isolation
+contract. Do not work around this by omitting the private proc mount or by granting
+privileged container access; the node must refuse to run when its sandbox cannot be
+created.
+
+The result is reproducible with
+[`node-docker-preflight.sh`](../scripts/acceptance/node-docker-preflight.sh). Until
+that probe and the node's workload isolation acceptance pass on the target Docker
+Desktop configuration, use a supported Linux host or the WardOS image instead.
+
 ## 1. Operator: install the node
 
 Every release attaches a node tarball per architecture with its checksum,
