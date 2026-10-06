@@ -142,7 +142,8 @@ their state, receipt and applied operation ids (#332 slice 7).
   revocation and version store, and by `ward-proxy` for an attempt with a network
   allowlist; it does not grow by `ward-daemon`'s session machinery.
 - What is not enforced at this revision is stated, not implied: no remote transport or
-  mTLS, egress only through a per-attempt proxy socket on a node that enabled it (no
+  mTLS (since added as an operator-enabled listener by
+  [ADR-0038](ADR-0038-node-mutual-tls-transport.md)), egress only through a per-attempt proxy socket on a node that enabled it (no
   in-sandbox relay, no credential), result return only as a declared, bounded result on a
   node that enabled it (step 13: stream heads and exact workspace files, digests in the
   evidence log, no workspace export and nothing streamed), a callback channel only as the

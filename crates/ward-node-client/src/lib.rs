@@ -2,7 +2,8 @@
 //! external control planes that drive a local `ward-node` (node-integration.md).
 //!
 //! * [`UnixTransport`] speaks the Unix-socket JSON-lines framing of §3, one connection per
-//!   request, with the line bounds and the fail-closed reading of EOF.
+//!   request, with the line bounds and the fail-closed reading of EOF; [`TlsTransport`]
+//!   speaks the same over TCP with mutual TLS to a node serving `--listen-tls` (ADR-0038).
 //! * [`Client`] negotiates protocol 1.3 or later (§4), reads capabilities (§5) and sends
 //!   the typed lifecycle verbs (§6), the read-only `result` request (§6.6) and the action
 //!   channel's `actions` listing and `answer` (§6.7), checking every answer against its
@@ -16,8 +17,8 @@
 //!   inspect-and-replay (§10), and otherwise fails closed with an unknown outcome.
 //!
 //! The `ward-node-adapter` binary of this crate exposes the same over stdin/stdout for
-//! control planes in other languages. Nothing here depends on `ward-daemon`; the only
-//! transport is the local socket (remote transport and key bootstrap are #262).
+//! control planes in other languages. Nothing here depends on `ward-daemon`. Enrolment and
+//! key bootstrap are the rest of #262: certificates and the issuer key are the operator's.
 
 #![forbid(unsafe_code)]
 
@@ -25,6 +26,7 @@ mod client;
 mod driver;
 mod envelope;
 mod issuer;
+mod tls;
 mod transport;
 
 pub use client::{
@@ -37,4 +39,5 @@ pub use driver::{
 };
 pub use envelope::{EnvelopeError, EnvelopeInput, WorkloadInput, offline_manifest};
 pub use issuer::{IssuerKey, IssuerKeyError, SEED_LEN, SignedEnvelope};
+pub use tls::{TlsSettings, TlsSetupError, TlsTransport};
 pub use transport::{Exchange, MAX_LINE_BYTES, Timeouts, Transport, TransportError, UnixTransport};

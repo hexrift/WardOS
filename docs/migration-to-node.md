@@ -137,7 +137,7 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
 | Stage | What moves to the node | Exit criterion | Delivered by |
 | --- | --- | --- | --- |
 | 0 (today) | Governed tool and verification runs: an argv over a snapshot, offline, with a budget, beside per-session development on the same host | A real node is driven over its socket through `ward-node-client` and `ward-node-adapter`; the acceptance suite proves bounded execution, isolation, interruption, authorization failure, replay safety and recovery (node-acceptance.md) | #332 slices 5 to 10 (done: #354, #356, #358, #359, #361, #362, #363, #366, #367, #368, #371, #373, #374) |
-| 1 | Task driving by an external control plane, as a uid of its own on the node's host, through the adapter | A control plane outside WardOS runs attempts end to end from its own identity without sharing the node's uid, reads receipts and verifies evidence logs, following the integration guide alone | The client-uid allowlist (#378, done) and node-integration-guide.md (#374, done); the control plane's side is outside WardOS. Remote transport, enrolment and key bootstrap remain [#262](https://github.com/hexrift/WardOS/issues/262) |
+| 1 | Task driving by an external control plane, as a uid of its own on the node's host, through the adapter | A control plane outside WardOS runs attempts end to end from its own identity without sharing the node's uid, reads receipts and verifies evidence logs, following the integration guide alone | The client-uid allowlist (#378, done) and node-integration-guide.md (#374, done); the control plane's side is outside WardOS. A control plane on another host reaches the node over mutual TLS (`--listen-tls`, ADR-0038, done); enrolment, attestation, revocation and key bootstrap remain [#262](https://github.com/hexrift/WardOS/issues/262) |
 | 2 | Producer tasks: workloads that fetch a dependency, call a provider or hand a result back | A manifest with `network.custom` is honoured through a node-owned egress proxy with the session proxy's rules; an attempt's output or workspace reaches the control plane in a bounded form the protocol carries; `network.proxy_allowlist` and `snapshots.read` or an output capability read `true` | Both halves by #332: the network half (`--network-allowlist`, node-integration.md §9; done) and the result half (`--output-return`, the manifest's `output` grant, `result` and the `output` capability section, node-integration.md §6.6; done). A workspace export as a snapshot (`snapshots.read`) has no issue yet (node-security-limitations.md §3.2) |
 | 3 | A hosted agent runtime: the conversation loop inside the sandbox, with approvals and credentials as node capabilities | A workload can ask the control plane a question and get an answer through a channel relayed by the node; a credential reaches a workload only brokered, scoped and revocable, with `credentials.proxy_injection` or `scoped_http_gateway` `true`; approvals are a node-mediated hold rather than a per-session daemon hold | The channel by [#404](https://github.com/hexrift/WardOS/issues/404) (`--action-channel`, the manifest's `actions` grant, `actions` and `answer`, node-integration.md §6.7, ADR-0031; done); [#267](https://github.com/hexrift/WardOS/issues/267) for credentials (first node slice done, ADR-0034); [#415](https://github.com/hexrift/WardOS/issues/415) for approvals as an enforced node capability (`--approval-hold`, the manifest's `hold`, node-integration.md §6.9, ADR-0035; done) |
 | 4 | Local sessions themselves: the desktop reads attempt evidence and drives node tasks, `ward up` is a thin client of a local node, per-session `wardd` is retired | `ward up`, `ward pause`, `ward resume`, `ward stop`, `ward verify`, `ward watch` and the desktop behave as they do today against a local node with no remote control plane; the single evidence writer of a session is the node; no command falls back to an in-process writer | [#258](https://github.com/hexrift/WardOS/issues/258)'s open slices ("Multi-session ownership and restart recovery", "Preserve current local CLI behaviour through the node boundary"); ADR-0029's migration map rows for the CLI, the per-session writer and the desktop; [#260](https://github.com/hexrift/WardOS/issues/260) for the scheduler several sessions need. The local-and-remote CLI issue (#272) was closed as superseded by #332 |
@@ -162,9 +162,12 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
 - **What changes.** The operator creates a second system user for the adapter, a group
   for the socket, and starts the node with `--client-group` and `--client-uid`
   (node-integration-guide.md §3). The control plane keeps its issuer key off the node's
-  host and pre-signs envelopes for the adapter (node-integration.md §11.4). Whatever
-  carries the control plane's commands to the host is the control plane's own and
-  unauthenticated by the node until #262.
+  host and pre-signs envelopes for the adapter (node-integration.md §11.4). A control
+  plane on another host instead reaches a node started with `--listen-tls` over mutual
+  TLS with a client certificate from the operator's client CA, through the same adapter's
+  `--connect-tls` (node-integration-guide.md §3.1, ADR-0038); without it, whatever carries
+  the control plane's commands to the host is the control plane's own and unauthenticated
+  by the node.
 - **What stays compatible.** Everything of stage 0. The protocol window and the upgrade
   order of [compatibility.md](compatibility.md) govern the node and the control plane.
 - **What breaks.** Nothing on the per-session side. On the node side, a listed uid can
@@ -172,7 +175,8 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
   that read logs as the node's uid at stage 0 has to read them another way or run as the
   node's uid.
 - **Rollback.** Remove the two flags and the group; the socket is 0600 again and only the
-  node's uid is served. Nothing durable depends on the flags.
+  node's uid is served. Remove `--listen-tls` and its files and nothing listens on TCP.
+  Nothing durable depends on either.
 
 ### 3.3 Stage 2: network grants and result return
 

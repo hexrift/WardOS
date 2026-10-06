@@ -334,8 +334,11 @@ minute on a developer machine; each case prints its own time.
 
 ## 4. What it does not prove
 
-- **No remote transport.** The only transport is the local Unix socket; nothing here
-  exercises mTLS, key bootstrap or a control plane on another host (#262).
+- **No remote transport here.** This suite drives the local Unix socket only. The
+  mutual-TLS listener of ADR-0038 is proven by `ward-node`'s `tests/node_mtls_cli.rs`,
+  `ward-node-client`'s `tests/tls_transport.rs` and `node-js.sh`'s `mutual_tls_transport`;
+  enrolment, attestation and revocation of transport identities have nothing to test yet
+  (#262).
 - **No loopback relay, and credentials outside this suite.** The network cases prove the
   proxy's verdicts, its recording and its lifecycle through the Unix socket the sandbox is
   handed; they do not prove a workload tool that only speaks `HTTP_PROXY` can use it (only

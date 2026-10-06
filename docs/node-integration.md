@@ -14,8 +14,10 @@ and agent adapters hosted on admitted workloads of
 [ADR-0036](decisions/ADR-0036-node-hosted-agent-adapters.md), #279, additive within 1.3
 too, with the operator's `ward-agent` shim and its loopback relay in their attempts of
 [ADR-0037](decisions/ADR-0037-node-agent-shim-and-relay.md), #424, an operator flag that
-changes nothing on the wire), and the client and process adapter that drive it
-(§11). The cross-system acceptance suite that proves it against a real node (ADR-0030
+changes nothing on the wire), the same protocol over TCP with mutual TLS of
+[ADR-0038](decisions/ADR-0038-node-mutual-tls-transport.md), the remote-transport slice of
+#262, an operator-enabled second listener that changes nothing in the protocol (§3), and
+the client and process adapter that drive it (§11). The cross-system acceptance suite that proves it against a real node (ADR-0030
 step 10, #332 slice 9) is [node-acceptance.md](node-acceptance.md). Three companion
 documents (ADR-0030 step 11, #332 slice 10): the walk from an empty host to a verified
 attempt is [node-integration-guide.md](node-integration-guide.md); what the node does
@@ -42,7 +44,8 @@ admission example is a working test vector (§7.4).
 - The control plane is external and not part of WardOS. It only issues bounded,
   expiring authority: an admission envelope signed by an issuer key the node's operator
   configured ([ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md)).
-  Reaching the socket proves nothing; a signature by a trusted key is required.
+  Reaching the socket, or completing a TLS handshake with a certificate the node accepts
+  (§3), proves nothing; a signature by a trusted key is required.
 - The node reads the capability manifest and honours only what it can enforce: `offline`
   always, a `network.custom` host allowlist only on a node its operator started with
   `--network-allowlist`, which then runs the workload behind a node-owned egress proxy
@@ -85,7 +88,9 @@ admission example is a working test vector (§7.4).
   a typed client, an issuer signer and a fail-closed attempt driver for Rust control
   planes) and its `ward-node-adapter` binary (the same over stdin/stdout for control
   planes in other languages), §11. Both run on the node's host, as the node's uid or as
-  a uid the node's operator listed with `--client-uid` (§2.1, §11.1).
+  a uid the node's operator listed with `--client-uid` (§2.1, §11.1), or anywhere that
+  reaches a node started with `--listen-tls`, with a client certificate from the
+  operator's client CA (§2.1, §3, ADR-0038).
 - Not implemented yet: a loopback relay and `HTTP_PROXY` environment inside the sandbox
   of a workload naming no adapter (the proxy is reached through its Unix socket, §9; a
   hosted adapter on a node with `--agent-shim` has both, §6.10), credentials delivered any other way
@@ -95,9 +100,10 @@ admission example is a working test vector (§7.4).
   the node opens for a held capability is enforced, §6.9), a hook's `PermissionRequest`
   bridged onto the action channel (the hold is the approval, §6.10), an event stream
   (`stream`), a workspace export as a snapshot (`snapshots.read` and
-  `snapshots.diff` stay `false`; `result` returns declared files only, §6.6), and any
-  remote transport or mTLS. The only transport is a
-  local Unix socket; remote transport and key bootstrap are #262. The full list, with what each gap means for a control plane, is
+  `snapshots.diff` stay `false`; `result` returns declared files only, §6.6), and
+  enrolment, attestation, certificate revocation or a durable record of TLS handshakes
+  (the transport is a local Unix socket and, on a node started with `--listen-tls`, TCP
+  with mutual TLS whose certificates the operator provisions, §3; the rest is #262). The full list, with what each gap means for a control plane, is
   [node-security-limitations.md](node-security-limitations.md) §3.
 - The per-session runtime (`ward up`, one `wardd` per session) is a separate mode on the
   same host, with its own state, sockets and uid; how the two compare, coexist and
@@ -112,7 +118,8 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
   [--trusted-issuers <file>] [--task-root <dir>] [--network-allowlist [--credentials <file>]] \
   [--output-return] [--action-channel [--approval-hold]] [--cgroup-root <dir>] \
   [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]] \
-  [--agent-adapter <id>… [--agent-shim <file>]] [--client-uid <uid>]… [--client-group <group>]
+  [--agent-adapter <id>… [--agent-shim <file>]] [--client-uid <uid>]… [--client-group <group>] \
+  [--listen-tls <ip:port> --tls-cert <file> --tls-key <file> --tls-client-ca <file> [--tls-client-pin <pin>]…]
 ```
 
 | Flag | Required | Meaning |
@@ -134,10 +141,17 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | `--agent-shim` | no | The operator's `ward-agent` shim (the node tarball's, the runtime tarball's or the image's `ward-agent`: `/usr/local/bin/ward-agent` as node-integration-guide.md §1 installs it, `/usr/bin/ward-agent` on the image), verified at start: an absolute path to a regular file, not a symlink, executable, owned by root or the node's user and writable by no one else, that names `--relay` in its `--help` and once runs `/bin/true` hardened over the task root (so a kernel without Landlock stops the node). Every attempt of a hosted adapter then runs under it, bound read-only at `/run/ward/ward-agent`: Landlock, seccomp and no capabilities inside the sandbox, the adapter's command hooks reaching its hook socket, and, behind an egress proxy, the shim's relay on `127.0.0.1:3128` forwarding to the attempt's proxy with `HTTP_PROXY`/`HTTPS_PROXY` naming it and the adapter's provider base URL on it for a provider the manifest grants a credential for (§6.10). Nothing in the capability document changes. Needs `--agent-adapter`. Without it no shim is bound and no relay runs. |
 | `--client-uid` | no | A uid (decimal) or user name the node serves on its socket besides its own uid; repeatable, resolved once at start (an unknown name or a uid listed twice refuses to start). The node reads every connection's peer credentials before it reads a byte and closes a connection from any other uid without a response (§3). Root is not exempt. Being served grants no authority: `admit` still needs a trusted signature (§8.1). |
 | `--client-group` | no | A gid or group name to share the socket with: the socket is created mode 0660 owned by it, and its parent directory must be owned by it with mode 0750 or stricter. Needs at least one `--client-uid`; a member of the group that is not a listed uid can connect but is closed unread. Without it the socket is 0600 and only the node's uid (or root) can connect, whatever `--client-uid` says. The state directory and task root stay 0700 either way: a listed client can speak to the node, not read its state. |
+| `--listen-tls` | no | Also serve the protocol on this TCP address (`<ip>:<port>`; port `0` picks a free one) over TLS 1.3 with a mandatory client certificate ([ADR-0038](decisions/ADR-0038-node-mutual-tls-transport.md), §3). At start the node writes `ward-node: serving the node protocol over mutual TLS on <ip>:<port>` to stderr. The socket is served as before. A certificate the node accepts takes the place of `--client-uid` for this listener, never of an issuer signature. Needs `--tls-cert`, `--tls-key` and `--tls-client-ca`; an address already in use stops the node. |
+| `--tls-cert` | with `--listen-tls` | The node's certificate chain in PEM, leaf first, as the operator's PKI issued it for the names its clients expect (`subjectAltName`); the node user's own regular file, not a symlink, writable by no one else, at most 64 KiB. |
+| `--tls-key` | with `--listen-tls` | The private key of `--tls-cert`'s leaf, PEM (PKCS#8, SEC1 or PKCS#1); the node user's own regular file, not a symlink, with no group or other permission bits (0600 or 0400), at most 64 KiB. A key that is not the certificate's stops the node. |
+| `--tls-client-ca` | with `--listen-tls` | The CA certificates, PEM, a client's certificate must chain to, for client authentication; the node user's own regular file, not a symlink, writable by no one else, at most 64 KiB, with at least one usable certificate. |
+| `--tls-client-pin` | no | Serve only these client keys: `sha256:` and the 64 lowercase hex digits of the SHA-256 of the client certificate's DER `SubjectPublicKeyInfo` (`openssl x509 -in client.pem -pubkey -noout \| openssl pkey -pubin -outform der \| sha256sum`); repeatable, a malformed or repeated pin stops the node. A pin outlives the renewal of a certificate for the same key. Without it every key the client CA certified is served. Needs `--listen-tls`. |
 
 The node refuses to start on any unsafe or malformed input: a trust store, state file or
-task record it cannot parse, wrong permissions, a pinned id mismatch. It serves until
-killed.
+task record it cannot parse, wrong permissions, a pinned id mismatch, a TLS file that is
+unsafe, empty or inconsistent. It serves until killed. Every file, the TLS files included,
+is read once at start: changing one, rotating a certificate or a client CA included, is a
+restart (§6.4).
 
 The same binary has three operator subcommands over local files; none speaks to the
 socket, and each runs as the node's uid:
@@ -313,7 +327,9 @@ and hashes are lowercase hex. The exit status is the text form's.
 ## 3. Transport framing
 
 - Unix stream socket, newline-delimited JSON: each message is one UTF-8 JSON object
-  followed by `\n` (a preceding `\r` is tolerated). Responses are one line each.
+  followed by `\n` (a preceding `\r` is tolerated). Responses are one line each. On a
+  node started with `--listen-tls` the identical framing runs inside a TLS session over
+  TCP (below); everything in this section holds there byte for byte.
 - **One request per connection.** A connection carries exactly: the handshake line, its
   response, then at most one request line and its response. The node then closes it.
   Open a new connection per request. Both lines may be written at once.
@@ -342,6 +358,25 @@ and hashes are lowercase hex. The exit status is the text form's.
   if it had already written) and nothing else, indistinguishable on the wire from the
   fail-closed closes below. The node reports the refusal on stderr with the uid, at most
   once per uid per 10 seconds, with the count of refusals it did not report.
+- **Mutual TLS** ([ADR-0038](decisions/ADR-0038-node-mutual-tls-transport.md)). On the
+  `--listen-tls` address the node speaks TLS 1.3 only (no 1.2, no early data, no session
+  resumption) and requires the application protocol `ward-node` (ALPN) and a client
+  certificate that chains to `--tls-client-ca` for client authentication, is within its
+  validity window give or take 60 seconds of clock skew and, with `--tls-client-pin`,
+  carries a pinned key. The client checks the node's certificate against the server CA
+  it was given, for the name it expects (and, if it pins one, the node's key), with the
+  same skew. One connection still carries one request; the handshake must complete within
+  10 seconds of accept and then the request deadline applies. A refused handshake (no
+  certificate, another CA, expired or not yet valid, not pinned, no `ward-node` ALPN, TLS
+  1.2, a plaintext client, too slow) ends with a TLS alert or a close and no protocol byte,
+  and the node reports it on stderr with the peer's address and the reason, at most once
+  per address per 10 seconds with the count it did not report; a served session is
+  reported as `served a TLS client sha256:<pin> from <address>`, at most once per client
+  key per 10 seconds. Handshakes run on their own threads, at most 32 TCP connections at
+  once (one more is closed at accept), and only an authenticated session waits for the
+  one-at-a-time lock the socket's connections share, so a TCP peer that never completes a
+  handshake delays nobody. After the answer, or after a fail-closed close, the node ends
+  the session with `close_notify`; a client reads that as EOF exactly as on the socket.
 - **Fail closed:** anything malformed (invalid JSON, an unknown or missing field, an
   unknown verb, a request whose `protocol` differs from the negotiated version, a value
   out of bounds) gets no response line: the node closes the connection. Only well-formed
@@ -1845,6 +1880,14 @@ WardOS ships one implementation of this contract for the control-plane side, in 
   `request` timeout (until the verb's answer; default 90 seconds, §3). EOF before the
   handshake answer is `ClosedWithoutResponse`; EOF after it is "no response", which the
   client reports for the verb as "unknown whether it took effect" (§10).
+- `TlsTransport`: the same over TCP with mutual TLS to a node started with `--listen-tls`
+  (§3, ADR-0038), from `TlsSettings`: the node's address, the name its certificate must
+  carry, the server CA, this client's certificate and key (mode `0600` or `0400`) and,
+  optionally, the node's pinned key. The TLS handshake counts against the `connect`
+  timeout. A node whose certificate is not from the server CA, not for the name or not the
+  pinned key, and a node that refuses this client's certificate, are
+  `TransportError::Tls` with the reason; nothing is sent to a node that is not
+  authenticated.
 - `Client`: negotiates once, offering 1.3 up to the highest minor this revision
   implements (today 1.3–1.3), and refuses with a typed error a node that offers nothing
   in that window (`HandshakeRejected`) or accepts a version below 1.3 (`ProtocolTooOld`).
@@ -1883,6 +1926,12 @@ their operation ids from the run's scheme and are recorded before they are sent;
 is the worked example for [node-integration-from-nodejs.md](node-integration-from-nodejs.md).
 
 ### 11.1 Operator requirements for a client host
+
+Over mutual TLS (§3) the client runs wherever it reaches the node's `--listen-tls`
+address, as any user that can read its own key; the rest of this section is the socket's
+case. A remote client cannot read the node's evidence logs (`task_root` in a `run` is then
+left out) and cannot run `ward-node snapshot import`: the snapshot is imported on the
+node's host, and the id travels to the control plane.
 
 The client runs where the node runs, under the node's own Unix identity or under a uid
 the operator listed with `--client-uid`. Without `--client-group` the socket is mode
@@ -1971,6 +2020,11 @@ and the node's `--task-root`.
 
 `ward-node-adapter --socket <path> [--timeout-ms 90000] [--connect-timeout-ms 10000]`
 reads one JSON command per line on stdin and writes one JSON event per line on stdout.
+For a node started with `--listen-tls`, `--connect-tls <host:port> --tls-cert <file>
+--tls-key <file> --tls-server-ca <file> --tls-server-name <name> [--tls-server-pin
+sha256:<hex>]` takes the place of `--socket` (the two are exclusive) and every command
+travels over mutual TLS (§3, §11); TLS files that cannot be used are an `error` event and
+exit status 1 before any command is read.
 Every output line carries `"schema":1`; stderr is diagnostics only. Commands:
 
 | Command | Answer |

@@ -227,12 +227,13 @@ impl PeerRefusal {
     }
 }
 
-/// Per-uid rate limit on refusal reports.
+/// A per-key rate limit on reports: at most one per key per interval, the next one
+/// carrying the count of those it did not report, over a bounded number of keys.
 #[derive(Debug)]
-pub struct RefusalLog {
+pub struct ReportLimit<K> {
     interval: Duration,
     capacity: usize,
-    entries: BTreeMap<Option<u32>, Reported>,
+    entries: BTreeMap<K, Reported>,
 }
 
 #[derive(Debug)]
@@ -241,8 +242,9 @@ struct Reported {
     suppressed: u64,
 }
 
-impl RefusalLog {
-    /// One report per uid per `interval`, tracking at most `capacity` uids.
+impl<K: Ord + Clone> ReportLimit<K> {
+    /// One report per key per `interval`, tracking at most `capacity` keys; past it, the
+    /// key reported longest ago is forgotten and its next event is reported like a first.
     #[must_use]
     pub fn new(interval: Duration, capacity: usize) -> Self {
         Self {
@@ -252,10 +254,9 @@ impl RefusalLog {
         }
     }
 
-    /// Record a refusal of `peer` at `now`: `Some(n)` when it is to be reported, with
-    /// the `n` refusals of the same peer that went unreported since its last report.
-    pub fn record(&mut self, peer: Option<Uid>, now: Instant) -> Option<u64> {
-        let key = peer.map(Uid::as_raw);
+    /// Record an event for `key` at `now`: `Some(n)` when it is to be reported, with the
+    /// `n` events of the same key that went unreported since its last report.
+    pub fn record(&mut self, key: K, now: Instant) -> Option<u64> {
         if let Some(entry) = self.entries.get_mut(&key) {
             if now.saturating_duration_since(entry.at) < self.interval {
                 entry.suppressed = entry.suppressed.saturating_add(1);
@@ -271,7 +272,7 @@ impl RefusalLog {
                 .entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.at)
-                .map(|(key, _)| *key);
+                .map(|(key, _)| key.clone());
             if let Some(oldest) = oldest {
                 self.entries.remove(&oldest);
             }
@@ -286,10 +287,34 @@ impl RefusalLog {
         Some(0)
     }
 
-    /// How many uids are tracked right now.
+    /// How many keys are tracked right now.
     #[must_use]
     pub fn tracked(&self) -> usize {
         self.entries.len()
+    }
+}
+
+/// Per-uid rate limit on refusal reports.
+#[derive(Debug)]
+pub struct RefusalLog(ReportLimit<Option<u32>>);
+
+impl RefusalLog {
+    /// One report per uid per `interval`, tracking at most `capacity` uids.
+    #[must_use]
+    pub fn new(interval: Duration, capacity: usize) -> Self {
+        Self(ReportLimit::new(interval, capacity))
+    }
+
+    /// Record a refusal of `peer` at `now`: `Some(n)` when it is to be reported, with
+    /// the `n` refusals of the same peer that went unreported since its last report.
+    pub fn record(&mut self, peer: Option<Uid>, now: Instant) -> Option<u64> {
+        self.0.record(peer.map(Uid::as_raw), now)
+    }
+
+    /// How many uids are tracked right now.
+    #[must_use]
+    pub fn tracked(&self) -> usize {
+        self.0.tracked()
     }
 }
 

@@ -83,8 +83,14 @@
 //! other peer is closed with nothing sent. The socket itself is private (0600) unless the
 //! operator shares it with a group (0660), see [`SocketAccess`].
 //!
-//! `stream` stays unsupported, and remote transport is deliberately absent. Serving a
-//! lifecycle request never waits on a running workload.
+//! An operator may also serve the same protocol over TCP with mutual TLS ([`tls`],
+//! `--listen-tls`, ADR-0038): TLS 1.3 only, a client certificate chained to the operator's
+//! client CA (and optionally pinned) in place of the peer-credential gate, never in place
+//! of an issuer signature. Handshakes run on threads of their own; requests from either
+//! listener are still served one at a time.
+//!
+//! `stream` stays unsupported. Serving a lifecycle request never waits on a running
+//! workload.
 
 #![forbid(unsafe_code)]
 
@@ -108,13 +114,14 @@ pub mod state;
 pub mod task;
 #[cfg(test)]
 mod test_support;
+pub mod tls;
 pub mod workspace;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use nix::unistd::{Gid, Uid};
@@ -132,6 +139,7 @@ use crate::execution::NodeExecution;
 use crate::peer::{ClientGroup, ClientUids, PeerGate};
 use crate::records::TaskRecordError;
 use crate::task::{MAX_NODE_TASKS, TaskRegistry};
+use crate::tls::TlsListener;
 
 /// Maximum bytes in one node-protocol JSON request, excluding the terminating newline.
 pub const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024;
@@ -345,22 +353,21 @@ impl NodeService {
         self.serve_connection_with_lifetime(stream, REQUEST_TIMEOUT)
     }
 
-    fn serve_connection_with_lifetime(
+    fn serve_connection_with_lifetime<S: Connection>(
         &self,
-        mut stream: UnixStream,
+        stream: S,
         request_timeout: Duration,
     ) -> Result<(), NodeServiceError> {
         let deadline = deadline_after(request_timeout)?;
 
-        let reader_stream = stream.try_clone()?;
-        let mut reader = BufReader::new(reader_stream);
+        let mut reader = BufReader::new(stream);
 
         let handshake_line = read_request_line(&mut reader, deadline)?;
         let handshake = serde_json::from_str::<HandshakeRequest>(&handshake_line)
             .map_err(|_| NodeServiceError::MalformedHandshake)?;
         let HandshakeRequest::Hello { protocol: peer } = handshake;
         let response = negotiate(self.supported, peer);
-        write_json_line(&mut stream, &response, deadline)?;
+        write_json_line(reader.get_mut(), &response, deadline)?;
 
         let HandshakeResponse::Accepted { protocol } = response else {
             return Ok(());
@@ -374,17 +381,17 @@ impl NodeService {
         if serde_json::from_str::<serde_json::Value>(&request_line)
             .is_ok_and(|value| value["request"] == "capabilities")
         {
-            return self.serve_capabilities(&mut stream, protocol, &request_line);
+            return self.serve_capabilities(reader.get_mut(), protocol, &request_line);
         }
         if supports_task_lifecycle(protocol) {
-            return self.serve_lifecycle(&mut stream, protocol, &request_line);
+            return self.serve_lifecycle(reader.get_mut(), protocol, &request_line);
         }
         Err(NodeServiceError::MalformedCapabilityRequest)
     }
 
     fn serve_capabilities(
         &self,
-        stream: &mut UnixStream,
+        stream: &mut impl Connection,
         protocol: ward_node_protocol::ProtocolVersion,
         request_line: &str,
     ) -> Result<(), NodeServiceError> {
@@ -475,7 +482,7 @@ impl NodeService {
 
     fn serve_lifecycle(
         &self,
-        stream: &mut UnixStream,
+        stream: &mut impl Connection,
         protocol: ward_node_protocol::ProtocolVersion,
         request_line: &str,
     ) -> Result<(), NodeServiceError> {
@@ -509,10 +516,6 @@ impl NodeService {
     }
 }
 
-/// Bind a local ward-node socket and serve connections for `service` indefinitely.
-///
-/// Connections are handled sequentially in this initial endpoint. That deliberately caps
-/// active protocol handlers at one instead of allocating an unbounded thread per client.
 /// Who may reach the node's socket and who is served on it.
 ///
 /// Without a client group the socket is created mode 0600 in a directory that must be
@@ -521,8 +524,7 @@ impl NodeService {
 /// group with mode 0750 or stricter, so the group's members can connect too. Either way
 /// every connection is then gated by its peer credentials ([`peer::PeerGate`]): the
 /// node's own uid and the listed client uids are served, any other peer is closed with
-/// nothing sent. This is a local bootstrap boundary, not the remote authenticated
-/// transport tracked by #262.
+/// nothing sent. This is the local boundary; the remote one is [`tls`].
 #[derive(Debug)]
 pub struct SocketAccess {
     group: Option<Gid>,
@@ -552,6 +554,9 @@ impl SocketAccess {
 /// A connection the gate refuses is closed before any of it is read and the refusal is
 /// reported on stderr, rate-limited per uid; nothing about it reaches the peer.
 ///
+/// Connections are handled sequentially. That deliberately caps active protocol handlers
+/// at one instead of allocating an unbounded thread per client.
+///
 /// # Errors
 ///
 /// Returns if the listener cannot be created/configured. Existing socket paths are never
@@ -559,14 +564,45 @@ impl SocketAccess {
 pub fn serve_local(
     socket: &Path,
     service: &NodeService,
+    access: SocketAccess,
+) -> Result<(), NodeServiceError> {
+    serve_node(socket, service, access, None)
+}
+
+/// [`serve_local`], and with `remote` also the same protocol over mutual TLS on its
+/// listener ([`tls::TlsListener`]), forever.
+///
+/// TLS handshakes run on threads of their own, at most [`tls::MAX_TLS_CONNECTIONS`] at
+/// once, so a slow or hostile TCP peer never holds the socket. A request from either
+/// listener is served only while no other one is, exactly as the socket alone serves
+/// them: one at a time.
+///
+/// # Errors
+///
+/// Returns if the socket cannot be created/configured or the TLS thread cannot be
+/// started. Existing socket paths are never removed automatically.
+pub fn serve_node(
+    socket: &Path,
+    service: &NodeService,
     mut access: SocketAccess,
+    remote: Option<TlsListener>,
 ) -> Result<(), NodeServiceError> {
     let listener = bind_local(socket, access.group)?;
+    let serving = Arc::new(Mutex::new(()));
+    if let Some(remote) = remote {
+        let addr = remote.local_addr()?;
+        tls::spawn(remote, service.clone(), Arc::clone(&serving))?;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "ward-node: serving the node protocol over mutual TLS on {addr}"
+        );
+    }
 
     for connection in listener.incoming() {
         let stream = connection?;
         match access.gate.admit(&stream, Instant::now()) {
             Ok(()) => {
+                let _one_at_a_time = one_at_a_time(&serving);
                 let _ = service.serve_connection(stream);
             }
             Err(refusal) => {
@@ -579,6 +615,47 @@ pub fn serve_local(
     }
 
     Ok(())
+}
+
+/// The lock that keeps protocol handlers to one at a time across listeners. A handler
+/// that panicked held no registry state of its own, so a poisoned lock is still a lock.
+pub(crate) fn one_at_a_time(serving: &Mutex<()>) -> MutexGuard<'_, ()> {
+    serving.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A byte stream the node serves the protocol on: the Unix socket, or a TLS session over
+/// TCP. Its read and write bounds are what the request and answer deadlines set.
+pub(crate) trait Connection: Read + Write {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl Connection for UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_write_timeout(self, timeout)
+    }
+}
+
+impl<C: Connection + ?Sized> Connection for &mut C {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        (**self).set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        (**self).set_write_timeout(timeout)
+    }
+}
+
+impl NodeService {
+    /// Serve exactly one protocol connection on `stream`, as [`Self::serve_connection`]
+    /// does on the socket.
+    pub(crate) fn serve_stream(&self, stream: impl Connection) -> Result<(), NodeServiceError> {
+        self.serve_connection_with_lifetime(stream, REQUEST_TIMEOUT)
+    }
 }
 
 fn bind_local(socket: &Path, group: Option<Gid>) -> Result<UnixListener, NodeServiceError> {
@@ -611,8 +688,8 @@ fn bind_local(socket: &Path, group: Option<Gid>) -> Result<UnixListener, NodeSer
     Ok(listener)
 }
 
-fn read_request_line(
-    reader: &mut BufReader<UnixStream>,
+fn read_request_line<S: Connection>(
+    reader: &mut BufReader<S>,
     deadline: Instant,
 ) -> Result<String, NodeServiceError> {
     let mut bytes = Vec::new();
@@ -667,20 +744,21 @@ fn read_request_line(
 }
 
 fn write_json_line(
-    writer: &mut UnixStream,
+    writer: &mut impl Connection,
     value: &impl serde::Serialize,
     deadline: Instant,
 ) -> Result<(), NodeServiceError> {
     let remaining = remaining_until(deadline)?;
     writer.set_write_timeout(Some(remaining))?;
-    serde_json::to_writer(&mut *writer, value).map_err(|_| NodeServiceError::Serialization)?;
-    writer.write_all(b"\n").map_err(map_timeout)?;
+    let mut line = serde_json::to_vec(value).map_err(|_| NodeServiceError::Serialization)?;
+    line.push(b'\n');
+    writer.write_all(&line).map_err(map_timeout)?;
     writer.flush().map_err(map_timeout)?;
     Ok(())
 }
 
 fn write_answer(
-    writer: &mut UnixStream,
+    writer: &mut impl Connection,
     value: &impl serde::Serialize,
 ) -> Result<(), NodeServiceError> {
     write_json_line(writer, value, deadline_after(ANSWER_TIMEOUT)?)
