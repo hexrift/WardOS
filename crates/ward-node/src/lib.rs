@@ -51,7 +51,10 @@
 //!   `ward-agent` shim ([`execution::NodeExecution::with_agent_shim`], `--agent-shim`,
 //!   ADR-0037) runs those attempts under it ([`shim`]): command hooks that reach the hook
 //!   socket and, behind an egress proxy, a loopback relay to it, with the provider's base
-//!   URL on the relay only for a provider the manifest grants a credential for.
+//!   URL on the relay only for a provider the manifest grants a credential for. Such a node
+//!   runs every other attempt behind an egress proxy under the shim as well, so a plain
+//!   workload's stock HTTP clients reach its allowlist and credential routes through the
+//!   relay (#267).
 //!
 //! * at protocol 1.3, a service whose execution runs attempts in cgroups
 //!   ([`cgroup`], `--cgroup-root`) honours a manifest's `resources` limits, records what

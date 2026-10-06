@@ -70,6 +70,11 @@ paths and read-only unless `write` was granted (credential-broker.md §4, route 
 proxy refuses to start if a route forwards to a host its allowlist does not cover. Nothing
 about the credential enters the sandbox: no variable, file or socket is added; a `CONNECT`
 tunnel is never injected into; a request to any other host carries nothing the proxy added.
+On a node with the operator's `ward-agent` shim the same route is reachable by a stock HTTP
+client as `http://127.0.0.1:3128/<service>/…` through the shim's loopback relay
+([ADR-0037](ADR-0037-node-agent-shim-and-relay.md) §7, #267): a Git workload clones the
+gateway URL `http://127.0.0.1:3128/<service>/<repo>.git` and the route sets
+`Authorization: Bearer <lease>`; the relay decides nothing.
 
 ### 4. The lease is bounded by the attempt and revoked when it ends
 
@@ -186,4 +191,7 @@ route allowlist (`egress`), `admit` (`admit`) and the capability document (`lib`
 in-process fake OpenBao and a fake upstream: the upstream sees the injected value while the
 workload, the log, the state and the answers never do; the end of the attempt, `revoke` and
 a restart after a kill revoke at the provider; a sealed provider fails closed with a
-recorded denial and a `403`; a node without the file advertises and admits nothing.
+recorded denial and a `403`; a node without the file advertises and admits nothing. The
+end-to-end acceptance with a stock client is `tests/node_git_capability_cli.rs`
+(ADR-0037 §7): `git` clones and pushes with a leased token through the relay, the token is
+revoked when the attempt ends, and the next attempt of the task cannot clone.

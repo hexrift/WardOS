@@ -3,7 +3,7 @@
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
 //! [--task-root <dir>] [--network-allowlist [--credentials <file>]] [--output-return]
 //! [--action-channel [--approval-hold]] [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
-//! [--agent-adapter <id>… [--agent-shim <file>]] [--client-uid <uid>]… [--client-group <group>]
+//! [--agent-adapter <id>…] [--agent-shim <file>] [--client-uid <uid>]… [--client-group <group>]
 //! [--listen-tls <addr> --tls-cert <file> --tls-key <file> --tls-client-ca <file> [--tls-client-pin <pin>]… [--tls-client-revoked <file>]]`
 //! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
@@ -49,11 +49,14 @@
 //! the shared adapter contract: its command line, environment and settings files on top of
 //! exactly the sandbox, proxy and credentials its manifest grants, its hook lines recorded
 //! as agent-origin claims; the node advertises `adapters`, and without the flag such a
-//! workload is refused `unsupported_grant`. With `--agent-shim` as well, the operator's
-//! `ward-agent` shim, verified at start, runs every hosted adapter's attempt: its command
-//! hooks reach the hook socket and, behind an egress proxy, its loopback relay forwards to
-//! the attempt's proxy, the adapter's provider base URL pointing at it only for a provider
-//! the manifest grants a credential for. The socket is served to the node's own
+//! workload is refused `unsupported_grant`. With `--agent-shim` (it needs `--agent-adapter`
+//! or `--network-allowlist`), the operator's `ward-agent` shim, verified at start, runs every
+//! hosted adapter's attempt and every attempt behind an egress proxy: a hosted adapter's
+//! command hooks reach the hook socket and, behind an egress proxy, its loopback relay
+//! forwards to the attempt's proxy with the proxy variables naming it, so a stock HTTP client
+//! such as `git` reaches the allowlist and the credential routes; a hosted adapter's
+//! provider base URL points at the relay only for a provider the manifest grants a
+//! credential for. The socket is served to the node's own
 //! uid and to each `--client-uid` (a uid or user name); every other peer is closed without
 //! a response. With `--client-group` the socket is created mode 0660 owned by that group,
 //! in a directory owned by it with mode 0750 or stricter, so a client of another uid can
@@ -82,7 +85,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use nix::sys::signal::SigSet;
 use ward_events::{ExecutionAttemptId, NodeId, TaskId};
 use ward_node::admit::{NodeAdmission, SystemClock};
@@ -114,6 +117,7 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (test-loopback)");
 
 #[derive(Parser)]
 #[command(name = "ward-node", version = VERSION, subcommand_negates_reqs = true)]
+#[command(group(ArgGroup::new("shim_runs").multiple(true).args(["agent_adapter", "network_allowlist"])))]
 #[allow(clippy::struct_excessive_bools)] // one flag per operator-enabled capability
 struct Cli {
     #[command(subcommand)]
@@ -222,13 +226,14 @@ struct Cli {
     agent_adapter: Vec<HostedAdapter>,
     /// The operator's `ward-agent` shim (an absolute path to a regular file, executable,
     /// owned by root or the node's user and writable by no one else), verified at start.
-    /// Every hosted adapter's attempt runs under it, bound read-only at
-    /// `/run/ward/ward-agent`: the adapter's command hooks run it against the hook socket,
-    /// and behind an egress proxy its relay on 127.0.0.1:3128 forwards to the attempt's
-    /// proxy, the proxy variables name it and the adapter's provider base URL points at it
-    /// for a provider the manifest grants a credential for. Needs `--agent-adapter`.
-    /// Without it no shim is bound and no relay runs.
-    #[arg(long = "agent-shim", value_name = "FILE", requires = "agent_adapter")]
+    /// Every hosted adapter's attempt and every attempt behind an egress proxy runs under
+    /// it, bound read-only at `/run/ward/ward-agent`: a hosted adapter's command hooks run
+    /// it against the hook socket, and behind an egress proxy its relay on 127.0.0.1:3128
+    /// forwards to the attempt's proxy and the proxy variables name it, with a hosted
+    /// adapter's provider base URL pointing at it for a provider the manifest grants a
+    /// credential for. Needs `--agent-adapter` or `--network-allowlist`. Without it no
+    /// shim is bound and no relay runs.
+    #[arg(long = "agent-shim", value_name = "FILE", requires = "shim_runs")]
     agent_shim: Option<PathBuf>,
     /// A uid, or user name, served on the socket besides the node's own; repeatable. Any
     /// other peer is closed without a response. Being served grants no authority: `admit`
@@ -685,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_shim_is_the_operators_file_and_needs_a_hosted_adapter() {
+    fn an_agent_shim_is_the_operators_file_and_needs_a_hosted_adapter_or_an_allowlist() {
         let node = NodeId::from_u128(4).to_string();
         let serve = [
             "ward-node",
@@ -716,9 +721,23 @@ mod tests {
                 .agent_shim,
             None
         );
+        assert_eq!(
+            parse(&[
+                "--network-allowlist",
+                "--agent-shim",
+                "/usr/libexec/ward-agent"
+            ])
+            .expect("a shim for the relay of a plain workload")
+            .agent_shim,
+            Some(PathBuf::from("/usr/libexec/ward-agent"))
+        );
+        let refused = parse(&["--agent-shim", "/usr/libexec/ward-agent"])
+            .err()
+            .expect("a shim with nothing to run")
+            .to_string();
         assert!(
-            parse(&["--agent-shim", "/usr/libexec/ward-agent"]).is_err(),
-            "a shim needs --agent-adapter"
+            refused.contains("--agent-adapter") && refused.contains("--network-allowlist"),
+            "{refused}"
         );
     }
 

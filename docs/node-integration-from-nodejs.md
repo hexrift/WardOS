@@ -650,9 +650,10 @@ value, replacing any header of that name the workload sent, within the service's
 read-only unless the operator granted writes, and streams the answer back. Nothing else
 changes in the sandbox: no variable, file or socket carries the credential, a `CONNECT`
 tunnel is never injected into, and a request to any other host carries nothing the proxy
-added. A tool that only speaks `HTTP_PROXY` cannot use the route unless it runs as a hosted
-agent adapter on a node with a `ward-agent` shim, whose relay and base URL reach it (§7.5
-below).
+added. A tool that only speaks `HTTP_PROXY` reaches the route only on a node with a
+`ward-agent` shim, whose relay runs in every attempt behind a proxy there: `git` clones
+`http://127.0.0.1:3128/<service>/<repo>.git` (credential-broker.md §8.1), and a hosted
+agent adapter also gets its base URL (§7.5 below).
 
 **The lease and its end.** The node leases at `start`, before the spawn, bound to the
 attempt (the provider's session is the attempt id), the service and the host, for at most
@@ -1085,8 +1086,8 @@ plane deciding what to put through the node today:
 - **Credentials beyond a proxy-injected header.** A credential reaches a workload's traffic
   only as a header the attempt's proxy injects into plain HTTP/1.1 requests for
   `/<service>/…` on `WARD_PROXY_SOCKET` (§7.3 above); nothing is injected into a `CONNECT`
-  tunnel, there is no in-sandbox relay for a tool that only speaks `HTTP_PROXY` outside a
-  hosted adapter on a node with a shim (§7.5 above), the
+  tunnel, there is no in-sandbox relay for a tool that only speaks `HTTP_PROXY` on a node
+  without a shim (§7.3, §7.5 above), the
   capability document does not list the services a node offers (the operator says) (#267);
   a credential is held for an approval only by a hold (§7.4 above).
 - **A real agent runtime on a node without a shim.** A hosted adapter (§7.5 above) gets

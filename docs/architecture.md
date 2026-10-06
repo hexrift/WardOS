@@ -582,7 +582,9 @@ argv through `ward-agent-adapter`'s shared launch builder, with the adapter's en
 read-only settings files and, for Claude Code, a hook socket whose lines are recorded as
 agent-origin claims, and nothing beyond what the manifest grants; on a node started with
 `--agent-shim` it runs under the operator's `ward-agent` shim, whose loopback relay
-forwards to the attempt's proxy and whose hook client its command hooks run (ADR-0037);
+forwards to the attempt's proxy and whose hook client its command hooks run (ADR-0037),
+as does every other attempt behind an egress proxy there, so stock HTTP clients such as
+`git` reach the allowlist and the credential routes (ADR-0037 §7);
 any grant the node cannot enforce is refused `unsupported_grant` at `admit`, so every
 workload that starts runs under exactly what its manifest says (node-integration.md
 §7.5, §9). The node answers `running` only after a confirmed spawn with
