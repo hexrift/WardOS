@@ -96,7 +96,10 @@ fn fake_node(
             recorded.lock().unwrap().push(line.trim().to_owned());
             let reply = answer(index, line.trim());
             if !reply.is_empty() {
-                writeln!(writer, "{reply}").unwrap();
+                match writeln!(writer, "{reply}") {
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                    written => written.unwrap(),
+                }
             }
         }
     });
