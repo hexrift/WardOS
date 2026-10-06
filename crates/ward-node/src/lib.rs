@@ -2372,6 +2372,15 @@ mod tests {
         assert!(!discovered(&admitting, 3).0.contains("output"));
     }
 
+    /// The reaper stores an attempt's output before it records the attempt's end, and a
+    /// result is answered only once the end is recorded.
+    fn until_the_attempt_has_ended(service: &NodeService, result_line: &str) {
+        crate::test_support::eventually(|| {
+            let (raw, _) = exchange(service, WARD_NODE_PROTOCOL, result_line, REQUEST_TIMEOUT);
+            !raw.contains(r#""reason":"invalid_state""#)
+        });
+    }
+
     #[test]
     fn a_result_request_over_the_local_socket_returns_the_stored_output_or_a_typed_refusal() {
         let returning = executing_service_returning_output();
@@ -2441,12 +2450,7 @@ mod tests {
         returning
             .launcher
             .exit(crate::execution::WorkloadExit::Exited { code: Some(0) });
-        crate::test_support::eventually(|| {
-            crate::output::AttemptOutputStore::new(&returning.root, binding)
-                .read()
-                .unwrap()
-                .is_some()
-        });
+        until_the_attempt_has_ended(&returning.service, &result_line);
         let raw = node.request(WARD_NODE_PROTOCOL, &result_line);
         assert!(
             raw.starts_with(r#"{"response":"result","protocol":{"major":1,"minor":3},"binding":"#),
