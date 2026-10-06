@@ -133,6 +133,10 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                replay, and a different one for a recorded request is refused here. An answer the
                node refuses (already_answered, invalid_state, …) prints it and exits 1.
 
+Every command that speaks to the node takes --socket <path>, or for a node serving
+--listen-tls (ADR-0038) --connect-tls <host:port> --tls-cert <pem> --tls-key <pem>
+--tls-server-ca <pem> --tls-server-name <name> [--tls-server-pin sha256:<hex>] in its place.
+
 An id option takes a WardOS id of the right prefix as is, and derives one from anything
 else with deriveId (docs/node-integration-from-nodejs.md §3). Output streams and, without
 --out-dir, returned file contents are printed as content_base64, the exact bytes.
@@ -140,6 +144,12 @@ else with deriveId (docs/node-integration-from-nodejs.md §3). Output streams an
 
 const OPTIONS = {
   socket: { type: "string" },
+  "connect-tls": { type: "string" },
+  "tls-cert": { type: "string" },
+  "tls-key": { type: "string" },
+  "tls-server-ca": { type: "string" },
+  "tls-server-name": { type: "string" },
+  "tls-server-pin": { type: "string" },
   key: { type: "string" },
   principal: { type: "string" },
   node: { type: "string" },
@@ -214,8 +224,25 @@ function trace(values) {
   return values.trace ? (line) => process.stderr.write(`${line}\n`) : null;
 }
 
+const TLS_OPTIONS = { "tls-cert": "cert", "tls-key": "key", "tls-server-ca": "serverCa", "tls-server-name": "serverName" };
+
+/** The node the adapter speaks to: --socket, or --connect-tls and its files. */
+function nodeOf(values) {
+  if (values["connect-tls"] === undefined) {
+    for (const flag of [...Object.keys(TLS_OPTIONS), "tls-server-pin"]) {
+      if (values[flag] !== undefined) throw new UsageError(`--${flag} needs --connect-tls`);
+    }
+    return { socket: need(values, "socket") };
+  }
+  if (values.socket !== undefined) throw new UsageError("--socket and --connect-tls are exclusive");
+  const tls = { address: need(values, "connect-tls") };
+  for (const [flag, field] of Object.entries(TLS_OPTIONS)) tls[field] = need(values, flag);
+  if (values["tls-server-pin"] !== undefined) tls.serverPin = values["tls-server-pin"];
+  return { tls };
+}
+
 function adapterOf(values) {
-  const options = { command: [values.adapter ?? "ward-node-adapter"], socket: need(values, "socket"), trace: trace(values) };
+  const options = { command: [values.adapter ?? "ward-node-adapter"], ...nodeOf(values), trace: trace(values) };
   if (values["timeout-ms"] !== undefined) options.timeoutMs = integer(values, "timeout-ms");
   return new Adapter(options);
 }

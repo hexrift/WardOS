@@ -1119,12 +1119,48 @@ export function recordAnswer(dir, attempt, { request, id, kind, decision, note, 
 // The adapter conversation (§11.4)
 // ---------------------------------------------------------------------------------------
 
+const SPKI_PIN = /^sha256:[0-9a-f]{64}$/;
+const TLS_FIELDS = [
+  ["address", "--connect-tls"],
+  ["cert", "--tls-cert"],
+  ["key", "--tls-key"],
+  ["serverCa", "--tls-server-ca"],
+  ["serverName", "--tls-server-name"],
+];
+
+/**
+ * The adapter's flags for the node it speaks to: `--socket <path>` for the node's Unix
+ * socket, or, for a node serving `--listen-tls` (§3, ADR-0038), `--connect-tls` with this
+ * client's certificate and key, the server CA, the name the node's certificate must carry
+ * and optionally the node's pinned key (`sha256:` and 64 lowercase hex digits). Never both.
+ */
+export function adapterNodeArgs({ socket, tls }) {
+  if (socket !== undefined && tls !== undefined) refuse("the adapter takes the node's socket or its TLS settings, not both");
+  if (tls === undefined) {
+    if (typeof socket !== "string" || socket.length === 0) refuse("the adapter needs the node's socket path or its TLS settings");
+    return ["--socket", socket];
+  }
+  if (tls === null || typeof tls !== "object") refuse("the TLS settings are an object");
+  const args = [];
+  for (const [field, flag] of TLS_FIELDS) {
+    const value = tls[field];
+    if (typeof value !== "string" || value.length === 0) refuse(`the TLS settings need ${field} (${flag})`);
+    args.push(flag, value);
+  }
+  if (tls.serverPin !== undefined) {
+    if (typeof tls.serverPin !== "string" || !SPKI_PIN.test(tls.serverPin)) refuse("serverPin is sha256: and 64 lowercase hex digits");
+    args.push("--tls-server-pin", tls.serverPin);
+  }
+  return args;
+}
+
 /**
  * One `ward-node-adapter` process: JSON commands in, JSON events out, one per line. The
- * adapter is spawned the way any external tool is, with `--socket` on its command line;
- * `command` is the executable and any leading arguments (default `["ward-node-adapter"]`).
- * Cancellation is a signal: `cancel()` sends SIGTERM, which the adapter answers by
- * revoking and sealing the running attempt and writing its `done` (§11.4).
+ * adapter is spawned the way any external tool is, with `--socket` (or `--connect-tls` and
+ * its files, see `adapterNodeArgs`) on its command line; `command` is the executable and
+ * any leading arguments (default `["ward-node-adapter"]`). Cancellation is a signal:
+ * `cancel()` sends SIGTERM, which the adapter answers by revoking and sealing the running
+ * attempt and writing its `done` (§11.4).
  */
 export class Adapter {
   #child;
@@ -1133,10 +1169,9 @@ export class Adapter {
   #exit = null;
   #trace;
 
-  constructor({ command = ["ward-node-adapter"], socket, timeoutMs, connectTimeoutMs, env = process.env, trace = null }) {
-    if (typeof socket !== "string" || socket.length === 0) refuse("the adapter needs the node's socket path");
+  constructor({ command = ["ward-node-adapter"], socket, tls, timeoutMs, connectTimeoutMs, env = process.env, trace = null }) {
     const [executable, ...leading] = command;
-    const args = [...leading, "--socket", socket];
+    const args = [...leading, ...adapterNodeArgs({ socket, tls })];
     if (timeoutMs !== undefined) args.push("--timeout-ms", String(timeoutMs));
     if (connectTimeoutMs !== undefined) args.push("--connect-timeout-ms", String(connectTimeoutMs));
     this.#trace = trace;

@@ -578,11 +578,32 @@ export interface AttemptReport {
   output?: WireOutput | null;
 }
 
+/** A node serving `--listen-tls` (ADR-0038), as the adapter's `--connect-tls` and TLS flags. */
+export interface AdapterTls {
+  /** The node's `--listen-tls` address, `<host>:<port>` (`--connect-tls`). */
+  address: string;
+  /** This client's certificate chain, leaf first, in PEM (`--tls-cert`). */
+  cert: string;
+  /** This client's private key in PEM, mode 0600 or 0400 (`--tls-key`). */
+  key: string;
+  /** The CA certificates the node's certificate must chain to (`--tls-server-ca`). */
+  serverCa: string;
+  /** The DNS name or IP address the node's certificate must be valid for (`--tls-server-name`). */
+  serverName: string;
+  /** The node's pinned key, `sha256:` and 64 lowercase hex digits (`--tls-server-pin`). */
+  serverPin?: string;
+}
+
+/** The adapter's flags for its node: `--socket`, or `--connect-tls` and the TLS flags; never both. */
+export function adapterNodeArgs(node: { socket?: string; tls?: AdapterTls }): string[];
+
 export interface AdapterOptions {
   /** The executable and any leading arguments; default `["ward-node-adapter"]`. */
   command?: string[];
-  /** The node's Unix socket, passed as `--socket`. */
-  socket: string;
+  /** The node's Unix socket, passed as `--socket`; give this or `tls`. */
+  socket?: string;
+  /** A node serving `--listen-tls`, reached over mutual TLS; give this or `socket`. */
+  tls?: AdapterTls;
   timeoutMs?: number;
   connectTimeoutMs?: number;
   env?: NodeJS.ProcessEnv;
