@@ -104,6 +104,7 @@ pub mod admit;
 pub mod audit;
 pub mod capsule;
 pub mod cgroup;
+pub mod container;
 pub mod credentials;
 pub mod egress;
 pub mod evidence;
@@ -838,6 +839,7 @@ mod tests {
                     user_namespace: true,
                 },
                 backends: ExecutionBackendCapabilities::default(),
+                stronger_placement: false,
             },
             NetworkCapabilities {
                 offline: true,
@@ -2127,6 +2129,7 @@ mod tests {
                     user_namespace: true,
                 },
                 backends: ExecutionBackendCapabilities::default(),
+                stronger_placement: false,
             }
         );
         assert_eq!(

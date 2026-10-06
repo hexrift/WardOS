@@ -3,7 +3,8 @@
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
 //! [--task-root <dir>] [--network-allowlist [--credentials <file>]] [--output-return]
 //! [--action-channel [--approval-hold]] [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
-//! [--agent-adapter <id>…] [--agent-shim <file>] [--client-uid <uid>]… [--client-group <group>]
+//! [--agent-adapter <id>…] [--agent-shim <file>] [--container-runtime <file> [--place-stronger]]
+//! [--client-uid <uid>]… [--client-group <group>]
 //! [--listen-tls <addr> --tls-cert <file> --tls-key <file> --tls-client-ca <file> [--tls-client-pin <pin>]… [--tls-client-revoked <file>]]`
 //! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
@@ -56,7 +57,14 @@
 //! forwards to the attempt's proxy with the proxy variables naming it, so a stock HTTP client
 //! such as `git` reaches the allowlist and the credential routes; a hosted adapter's
 //! provider base URL points at the relay only for a provider the manifest grants a
-//! credential for. The socket is served to the node's own
+//! credential for. With `--container-runtime` (it needs `--task-root`), the operator's
+//! `runc`, verified at start, runs every attempt placed at isolation level `container` in
+//! an OCI container of its own built from the same launch as the bubblewrap sandbox (no
+//! capability, `no_new_privs`, a seccomp filter, its own user namespace mapping only the
+//! node's user); the node advertises `isolation.backends.container` and a manifest whose
+//! floor is `container` runs there. With `--place-stronger` as well, an attempt runs on the
+//! weakest backend above its floor, so one naming no floor runs in a container, and the
+//! node advertises `isolation.stronger_placement`. The socket is served to the node's own
 //! uid and to each `--client-uid` (a uid or user name); every other peer is closed without
 //! a response. With `--client-group` the socket is created mode 0660 owned by that group,
 //! in a directory owned by it with mode 0750 or stricter, so a client of another uid can
@@ -89,8 +97,9 @@ use clap::{ArgGroup, Parser, Subcommand};
 use nix::sys::signal::SigSet;
 use ward_events::{ExecutionAttemptId, NodeId, TaskId};
 use ward_node::admit::{NodeAdmission, SystemClock};
-use ward_node::capsule::CapsuleBackend;
+use ward_node::capsule::{CapsuleBackend, StrongerPlacement};
 use ward_node::cgroup::{CgroupLauncher, CgroupRoot, ResourceEnforcement};
+use ward_node::container::{ContainerRuntime, RuncLauncher};
 use ward_node::credentials::NodeCredentials;
 use ward_node::execution::{NodeExecution, SandboxLauncher};
 use ward_node::issuer::{IssuerKeyParseError, IssuerPublicKey, TrustedIssuers};
@@ -236,6 +245,25 @@ struct Cli {
     /// shim is bound and no relay runs.
     #[arg(long = "agent-shim", value_name = "FILE", requires = "shim_runs")]
     agent_shim: Option<PathBuf>,
+    /// The operator's OCI runtime, `runc` (an absolute path to a regular file, executable,
+    /// owned by root or the node's user and writable by no one else, whose `--version`
+    /// names runc), verified at start by running one container. The node then also runs
+    /// attempts at isolation level `container`, each in an OCI container of its own built
+    /// from the same launch as the bubblewrap sandbox, and advertises
+    /// `isolation.backends.container`. Needs `--task-root` and `/usr/bin/setpriv`. Without
+    /// it a manifest whose floor is `container` is refused `unsupported_grant`.
+    #[arg(
+        long = "container-runtime",
+        value_name = "FILE",
+        requires = "task_root"
+    )]
+    container_runtime: Option<PathBuf>,
+    /// Run an attempt on the weakest backend above its manifest's floor, when the node has
+    /// one, instead of at exactly its floor: with `--container-runtime`, an attempt whose
+    /// manifest names no floor runs in a container. Advertised as
+    /// `isolation.stronger_placement`. Needs `--container-runtime`.
+    #[arg(long, requires = "container_runtime")]
+    place_stronger: bool,
     /// A uid, or user name, served on the socket besides the node's own; repeatable. Any
     /// other peer is closed without a response. Being served grants no authority: `admit`
     /// still needs a trusted signature.
@@ -373,6 +401,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             AgentShim::verify(path, root.dir()).map_err(|error| io::Error::other(error.to_string()))
         })
         .transpose()?;
+    let container_runtime = verified_runtime(cli.container_runtime.as_deref(), task_root.as_ref())?;
     let cgroups = cli
         .cgroup_root
         .as_deref()
@@ -406,10 +435,12 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             let enforcement = cgroups
                 .as_ref()
                 .map(|root| ResourceEnforcement::new(root.enforces(), capabilities.capacity()));
+            let execution =
+                NodeExecution::new(task_root, open_snapshot_store(&state_dir)?, backend);
             NodeService::with_execution(
                 capabilities,
                 admission,
-                NodeExecution::new(task_root, open_snapshot_store(&state_dir)?, backend)
+                placing(execution, container_runtime, cli.place_stronger)
                     .with_network_allowlist(cli.network_allowlist)
                     .with_output_return(cli.output_return)
                     .with_action_channel(cli.action_channel)
@@ -426,6 +457,40 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let access = SocketAccess::new(client_group, clients);
     serve_node(&socket, &service, access, bind_tls(remote, hangup)?)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The operator's container runtime at `path`, verified over the task root, if both are
+/// given.
+fn verified_runtime(
+    path: Option<&Path>,
+    task_root: Option<&TaskRoot>,
+) -> io::Result<Option<Arc<ContainerRuntime>>> {
+    path.zip(task_root)
+        .map(|(path, root)| {
+            ContainerRuntime::verify(path, root.dir())
+                .map(Arc::new)
+                .map_err(|error| io::Error::other(error.to_string()))
+        })
+        .transpose()
+}
+
+/// `execution` also running attempts in containers of `runtime`, if there is one, placing
+/// stronger than an attempt's floor when the operator said `--place-stronger`.
+fn placing(
+    execution: NodeExecution,
+    runtime: Option<Arc<ContainerRuntime>>,
+    place_stronger: bool,
+) -> NodeExecution {
+    let Some(runtime) = runtime else {
+        return execution;
+    };
+    execution
+        .with_backend(Arc::new(RuncLauncher::new(runtime)))
+        .with_stronger_placement(if place_stronger {
+            StrongerPlacement::Allowed
+        } else {
+            StrongerPlacement::Refused
+        })
 }
 
 /// Bind the TLS listener, if any, and reload its configuration on every `SIGHUP`.
@@ -561,6 +626,7 @@ fn conservative_host_capabilities() -> Result<NodeCapabilities, Box<dyn std::err
         IsolationCapabilities {
             namespaces: NamespaceCapabilities::default(),
             backends: ExecutionBackendCapabilities::default(),
+            stronger_placement: false,
         },
         NetworkCapabilities::default(),
         CredentialCapabilities::default(),
@@ -740,6 +806,43 @@ mod tests {
             refused.contains("--agent-adapter") && refused.contains("--network-allowlist"),
             "{refused}"
         );
+    }
+
+    #[test]
+    fn a_container_runtime_needs_a_task_root_and_stronger_placement_needs_the_runtime() {
+        let node = NodeId::from_u128(4).to_string();
+        let serve = [
+            "ward-node",
+            "--socket",
+            "s",
+            "--state-dir",
+            "d",
+            "--node-id",
+            &node,
+        ];
+        let parse = |extra: &[&str]| Cli::try_parse_from(serve.iter().chain(extra));
+        let cli = parse(&[
+            "--task-root",
+            "t",
+            "--container-runtime",
+            "/usr/bin/runc",
+            "--place-stronger",
+        ])
+        .expect("a runtime placing stronger");
+        assert_eq!(cli.container_runtime, Some(PathBuf::from("/usr/bin/runc")));
+        assert!(cli.place_stronger);
+        let exact = parse(&["--task-root", "t", "--container-runtime", "/usr/bin/runc"])
+            .expect("a runtime placing at the floor");
+        assert!(!exact.place_stronger);
+        let plain = parse(&["--task-root", "t"]).expect("no runtime");
+        assert_eq!(plain.container_runtime, None);
+        assert!(!plain.place_stronger);
+        for refused in [
+            &["--container-runtime", "/usr/bin/runc"][..],
+            &["--task-root", "t", "--place-stronger"][..],
+        ] {
+            assert!(parse(refused).is_err(), "{refused:?}");
+        }
     }
 
     #[test]

@@ -454,6 +454,7 @@ struct FakeState {
     stopped: usize,
     reaped: usize,
     survivors: Vec<crate::execution::WorkloadProcess>,
+    survivors_beside: Vec<std::path::PathBuf>,
     blocked_on_launch: Option<std::path::PathBuf>,
     egress: Option<Arc<crate::egress::AttemptEgress>>,
     stdio: (Vec<u8>, Vec<u8>),
@@ -489,6 +490,7 @@ impl FakeLauncher {
                 stopped: 0,
                 reaped: 0,
                 survivors: Vec::new(),
+                survivors_beside: Vec::new(),
                 blocked_on_launch: None,
                 egress: None,
                 stdio: (Vec::new(), Vec::new()),
@@ -564,6 +566,12 @@ impl FakeLauncher {
         self.state().survivors.clone()
     }
 
+    /// Workspaces beside which a [`DescribedLauncher`] over this launcher was asked to
+    /// clean up after a restart.
+    pub fn survivors_beside(&self) -> Vec<std::path::PathBuf> {
+        self.state().survivors_beside.clone()
+    }
+
     /// While spawning the next workload, also create the directory `path`.
     pub fn block_on_launch(&self, path: std::path::PathBuf) {
         self.state().blocked_on_launch = Some(path);
@@ -631,6 +639,40 @@ impl crate::execution::TaskLauncher for FakeLauncher {
 
     fn end_survivor(&self, process: &crate::execution::WorkloadProcess) {
         self.state().survivors.push(process.clone());
+    }
+}
+
+/// A fake backend that describes itself as its descriptor and launches through its fake
+/// launcher: a second backend beside the [`FakeLauncher`] a node runs on.
+#[derive(Clone)]
+pub struct DescribedLauncher(
+    pub FakeLauncher,
+    pub crate::capsule::CapsuleBackendDescriptor,
+);
+
+impl crate::capsule::CapsuleBackend for DescribedLauncher {
+    fn descriptor(&self) -> crate::capsule::CapsuleBackendDescriptor {
+        self.1
+    }
+}
+
+impl crate::execution::TaskLauncher for DescribedLauncher {
+    fn launch(
+        &self,
+        request: &crate::execution::LaunchRequest,
+    ) -> Result<Box<dyn crate::execution::RunningWorkload>, crate::execution::SpawnError> {
+        self.0.launch(request)
+    }
+
+    fn end_survivor(&self, process: &crate::execution::WorkloadProcess) {
+        self.0.end_survivor(process);
+    }
+
+    fn end_survivor_beside(&self, workspace: &std::path::Path) {
+        self.0
+            .state()
+            .survivors_beside
+            .push(workspace.to_path_buf());
     }
 }
 

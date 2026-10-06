@@ -217,7 +217,7 @@ use crate::actions::{AttemptActions, actions_dir_beside};
 use crate::adapters::{AttemptAdapter, adapter_dir, adapter_dir_beside, workload_launch};
 use crate::admission::TrustedTaskAdmission;
 use crate::admit::{NodeAdmission, VerifiedAdmission};
-use crate::capsule::CapsuleRecord;
+use crate::capsule::{CapsuleOperation, CapsuleRecord};
 use crate::credentials::{
     AttemptCredentials, NodeCredentials, Renewal, Revoked, credentials_dir, credentials_dir_beside,
 };
@@ -294,6 +294,8 @@ struct Attempt {
     actions: Option<Arc<AttemptActions>>,
     credentials: Option<Arc<AttemptCredentials>>,
     adapter: Option<Arc<AttemptAdapter>>,
+    /// Whether the attempt's backend serves `pause` and `resume`.
+    pausable: bool,
 }
 
 /// How many egress verdicts an attempt has recorded, and how many it could not.
@@ -545,12 +547,13 @@ impl TaskRegistry {
                     .cloned(),
             );
         let unconfigured = NodeCredentials::default();
-        let survivors: Arc<dyn TaskLauncher> = execution
-            .as_ref()
-            .map_or_else(|| Arc::new(SandboxLauncher), NodeExecution::launcher);
         let mut tasks = HashMap::new();
         let mut seals = 0;
         for record in store.load(capacity)? {
+            let survivors: Arc<dyn TaskLauncher> = match &execution {
+                Some(execution) => execution.survivors(record.capsule.as_ref()),
+                None => Arc::new(SandboxLauncher),
+            };
             let (task, changed) = NodeTask::recovered(record, survivors.as_ref());
             if changed {
                 store.write(&task.record())?;
@@ -1130,6 +1133,9 @@ impl TaskRegistry {
         if task.state != State::Running {
             return Err(Reason::InvalidState);
         }
+        if !task.pausable() {
+            return Err(Reason::UnsupportedOperation);
+        }
         if task.paused_by.len() >= MAX_ATTEMPT_PAUSES {
             return Err(Reason::ResourceUnavailable);
         }
@@ -1272,6 +1278,10 @@ impl TaskRegistry {
         let capsule = execution
             .placement()
             .place(manifest.minimum_isolation())
+            .filter(|capsule| manifest.resources().is_none() || capsule.honours_resources())
+            .ok_or(Reason::UnsupportedGrant)?;
+        let launcher = execution
+            .launcher_for(capsule)
             .ok_or(Reason::UnsupportedGrant)?;
         if let Some(limits) = execution.scheduling() {
             limits.admit(self.executing(), execution.task_root().dir())?;
@@ -1332,13 +1342,14 @@ impl TaskRegistry {
         };
         Ok(Prepared::Launch(
             Box::new(request),
-            execution.launcher(),
+            launcher,
             execution.spawn_timeout(),
             Box::new(Started {
                 actions,
                 credentials,
                 adapter,
                 capsule: CapsuleRecord::from(capsule),
+                pausable: capsule.serves(CapsuleOperation::Pause),
             }),
         ))
     }
@@ -1361,6 +1372,7 @@ impl TaskRegistry {
             credentials,
             adapter,
             capsule,
+            pausable,
         }: Started,
     ) -> Result<TaskLifecycleState, Reason> {
         let journal = Journal(self.store.as_ref());
@@ -1454,6 +1466,7 @@ impl TaskRegistry {
             actions,
             credentials,
             adapter,
+            pausable,
         });
         Ok(task.record_spawn(journal, evidence, operation_id, pid))
     }
@@ -1902,6 +1915,7 @@ struct Started {
     credentials: Option<Arc<AttemptCredentials>>,
     adapter: Option<Arc<AttemptAdapter>>,
     capsule: CapsuleRecord,
+    pausable: bool,
 }
 
 /// What the reaper observed once the workload ended, beside how it ended: the proxy's last
@@ -2222,6 +2236,13 @@ impl NodeTask {
         if let Some(process) = &record.process {
             survivors.end_survivor(process);
         }
+        if let (
+            RecordedState::Launching | RecordedState::Running | RecordedState::Paused,
+            Some(workspace),
+        ) = (record.state, &record.workspace)
+        {
+            survivors.end_survivor_beside(workspace);
+        }
         let mut task = Self {
             binding: record.binding,
             state: TaskLifecycleState::Created,
@@ -2541,6 +2562,14 @@ impl NodeTask {
         {
             actions.set_paused(paused, Instant::now());
         }
+    }
+
+    /// Whether this task's live workload runs on a backend that serves `pause` and
+    /// `resume`.
+    fn pausable(&self) -> bool {
+        self.attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.pausable)
     }
 
     /// The freezer of this task's live workload, unless its kill is pending.
@@ -3833,14 +3862,14 @@ mod tests {
             TaskLifecycleState as State, TaskReceiptContext, WorkloadArgv,
         };
 
-        use crate::capsule::{CapsuleBackendDescriptor, CapsuleRecord};
+        use crate::capsule::{CapsuleBackendDescriptor, CapsuleRecord, StrongerPlacement};
         use crate::execution::{NodeExecution, WorkloadExit};
         use crate::task::{
             MAX_ATTEMPT_NETWORK_RECORDS, MAX_ATTEMPT_PAUSES, MAX_NODE_TASKS, TaskRegistry,
         };
         use crate::test_support::{
-            FAKE_PID, FakeFreeze, FakeLauncher, FakeSpawn, FakeStop, FixedClock, NOW,
-            envelope_input, eventually, fake_process, fill_revocations, isolation_manifest,
+            DescribedLauncher, FAKE_PID, FakeFreeze, FakeLauncher, FakeSpawn, FakeStop, FixedClock,
+            NOW, envelope_input, eventually, fake_process, fill_revocations, isolation_manifest,
             lifecycle_binding, network_manifest, node_admission, output_manifest, signed_admit,
         };
         use crate::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
@@ -3850,6 +3879,7 @@ mod tests {
             root: PathBuf,
             clock: FixedClock,
             launcher: FakeLauncher,
+            container: FakeLauncher,
             tasks: Arc<Mutex<TaskRegistry>>,
             snapshot: SnapshotId,
         }
@@ -3925,12 +3955,39 @@ mod tests {
                 )
             }
 
+            /// A node that also runs attempts on a fake backend described as `container`,
+            /// placing as `stronger` says.
+            fn with_container(
+                container: CapsuleBackendDescriptor,
+                stronger: StrongerPlacement,
+            ) -> Self {
+                Self::build_placing(
+                    tempfile::tempdir().unwrap(),
+                    MAX_NODE_TASKS,
+                    Duration::from_secs(10),
+                    (false, false),
+                    false,
+                    Some((container, stronger)),
+                )
+            }
+
             fn build_holding(
+                dir: tempfile::TempDir,
+                capacity: usize,
+                stop_timeout: Duration,
+                flags: (bool, bool),
+                approval_hold: bool,
+            ) -> Self {
+                Self::build_placing(dir, capacity, stop_timeout, flags, approval_hold, None)
+            }
+
+            fn build_placing(
                 dir: tempfile::TempDir,
                 capacity: usize,
                 stop_timeout: Duration,
                 (network_allowlist, output_return): (bool, bool),
                 approval_hold: bool,
+                placing: Option<(CapsuleBackendDescriptor, StrongerPlacement)>,
             ) -> Self {
                 let state = dir.path().join("state");
                 let clock = FixedClock::at(NOW);
@@ -3952,6 +4009,13 @@ mod tests {
                 .with_output_return(output_return)
                 .with_action_channel(approval_hold)
                 .with_approval_hold(approval_hold);
+                let container = FakeLauncher::new();
+                let execution = match placing {
+                    Some((descriptor, stronger)) => execution
+                        .with_backend(Arc::new(DescribedLauncher(container.clone(), descriptor)))
+                        .with_stronger_placement(stronger),
+                    None => execution,
+                };
                 let tasks = Arc::new(Mutex::new(
                     TaskRegistry::with_execution(capacity, admission, execution).unwrap(),
                 ));
@@ -3960,6 +4024,7 @@ mod tests {
                     root,
                     clock,
                     launcher,
+                    container,
                     tasks,
                     snapshot,
                 }
@@ -6335,6 +6400,100 @@ mod tests {
 
             node.ready();
             assert_eq!(node.evidence(), vec![node.admitted_event(20, 1)]);
+        }
+
+        #[test]
+        fn a_container_floor_runs_on_the_container_backend_which_pauses_only_if_it_serves_it() {
+            for (runc, pauses) in [
+                (CapsuleBackendDescriptor::RUNC, true),
+                (CapsuleBackendDescriptor::RUNC_ROOTLESS, false),
+            ] {
+                let node = Node::with_container(runc, StrongerPlacement::Refused);
+                let binding = lifecycle_binding();
+                node.ready_with(&node.envelope_with(isolation_manifest(IsolationLevel::Container)));
+                assert_eq!(
+                    node.serve(ctx().start(op(30), binding)),
+                    ctx().accepted(op(30), binding, State::Running)
+                );
+                assert!(node.launcher.launches().is_empty());
+                assert_eq!(node.container.launches().len(), 1);
+                assert_eq!(
+                    node.tasks.lock().unwrap().capsule(binding),
+                    Some(CapsuleRecord::from(runc))
+                );
+                eventually(|| node.container.waiting() == 1);
+                if pauses {
+                    assert_eq!(
+                        node.serve(ctx().pause(op(40), binding)),
+                        ctx().accepted(op(40), binding, State::Paused)
+                    );
+                    assert_eq!(
+                        node.serve(ctx().resume(op(41), binding)),
+                        ctx().accepted(op(41), binding, State::Running)
+                    );
+                } else {
+                    assert_eq!(
+                        node.serve(ctx().pause(op(40), binding)),
+                        ctx().rejected(Some(op(40)), binding, Reason::UnsupportedOperation),
+                        "a backend that does not serve pause is never asked to"
+                    );
+                    assert_eq!(node.state(), State::Running);
+                }
+                node.container.exit(WorkloadExit::Exited { code: Some(0) });
+                node.wait_for(State::Exited);
+                node.assert_finished(State::Exited, Outcome::Completed);
+            }
+        }
+
+        #[test]
+        fn an_unmarked_attempt_runs_stronger_only_under_the_operators_policy() {
+            for (stronger, on_container) in [
+                (StrongerPlacement::Refused, false),
+                (StrongerPlacement::Allowed, true),
+            ] {
+                let node = Node::with_container(CapsuleBackendDescriptor::RUNC, stronger);
+                node.running();
+                assert_eq!(node.container.launches().len(), usize::from(on_container));
+                assert_eq!(node.launcher.launches().len(), usize::from(!on_container));
+                let ran = if on_container {
+                    CapsuleBackendDescriptor::RUNC
+                } else {
+                    CapsuleBackendDescriptor::BUBBLEWRAP
+                };
+                assert_eq!(
+                    node.tasks.lock().unwrap().capsule(lifecycle_binding()),
+                    Some(CapsuleRecord::from(ran)),
+                    "{stronger:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_restarted_node_ends_a_survivor_through_the_backend_its_record_names() {
+            let node =
+                Node::with_container(CapsuleBackendDescriptor::RUNC, StrongerPlacement::Refused);
+            let binding = lifecycle_binding();
+            node.ready_with(&node.envelope_with(isolation_manifest(IsolationLevel::Container)));
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().accepted(op(30), binding, State::Running)
+            );
+            let Node {
+                _dir: dir, tasks, ..
+            } = node;
+            drop(tasks);
+            let node = Node::build_placing(
+                dir,
+                MAX_NODE_TASKS,
+                Duration::from_secs(10),
+                (false, false),
+                false,
+                Some((CapsuleBackendDescriptor::RUNC, StrongerPlacement::Refused)),
+            );
+            node.assert_finished(State::Exited, Outcome::Unknown);
+            assert_eq!(node.container.survivors(), vec![fake_process()]);
+            assert_eq!(node.container.survivors_beside(), vec![node.workspace()]);
+            assert!(node.launcher.survivors().is_empty());
         }
 
         #[test]
