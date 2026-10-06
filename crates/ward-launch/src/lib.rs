@@ -1080,6 +1080,67 @@ mod tests {
     }
 
     #[test]
+    fn args_remask_only_present_sensitive_proc_paths_after_mounting_private_proc() {
+        let proc_root = tempfile::tempdir().unwrap();
+        for path in ["acpi", "asound", "scsi"] {
+            std::fs::create_dir(proc_root.path().join(path)).unwrap();
+        }
+        for path in [
+            "kcore",
+            "keys",
+            "latency_stats",
+            "sched_debug",
+            "timer_list",
+            "timer_stats",
+        ] {
+            std::fs::File::create(proc_root.path().join(path)).unwrap();
+        }
+
+        let args = Launch::new("/tmp", vec!["true".into()])
+            .args_with_proc_root(Path::new("/tmp"), proc_root.path());
+        let proc_mount = args.iter().position(|arg| arg == "--proc").unwrap();
+        for path in ["/proc/acpi", "/proc/asound", "/proc/scsi"] {
+            let mask = args
+                .windows(4)
+                .position(|window| window == ["--tmpfs", path, "--remount-ro", path])
+                .unwrap();
+            assert!(proc_mount < mask);
+        }
+        for path in [
+            "/proc/kcore",
+            "/proc/keys",
+            "/proc/latency_stats",
+            "/proc/sched_debug",
+            "/proc/timer_list",
+            "/proc/timer_stats",
+        ] {
+            assert!(args.windows(3).any(|window| window == ["--ro-bind", "/dev/null", path]));
+        }
+    }
+
+    #[test]
+    fn args_do_not_add_proc_masks_for_paths_absent_from_the_kernel() {
+        let proc_root = tempfile::tempdir().unwrap();
+
+        let args = Launch::new("/tmp", vec!["true".into()])
+            .args_with_proc_root(Path::new("/tmp"), proc_root.path());
+
+        for path in [
+            "/proc/acpi",
+            "/proc/asound",
+            "/proc/scsi",
+            "/proc/kcore",
+            "/proc/keys",
+            "/proc/latency_stats",
+            "/proc/sched_debug",
+            "/proc/timer_list",
+            "/proc/timer_stats",
+        ] {
+            assert!(!args.iter().any(|arg| arg == path), "unexpected {path}");
+        }
+    }
+
+    #[test]
     fn args_bind_an_action_socket_only_when_asked() {
         let plain = Launch::new("/tmp", vec!["true".into()]);
         assert!(
