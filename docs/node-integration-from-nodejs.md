@@ -615,7 +615,9 @@ value, replacing any header of that name the workload sent, within the service's
 read-only unless the operator granted writes, and streams the answer back. Nothing else
 changes in the sandbox: no variable, file or socket carries the credential, a `CONNECT`
 tunnel is never injected into, and a request to any other host carries nothing the proxy
-added. A tool that only speaks `HTTP_PROXY` cannot use the route (§11 below).
+added. A tool that only speaks `HTTP_PROXY` cannot use the route unless it runs as a hosted
+agent adapter on a node with a `ward-agent` shim, whose relay and base URL reach it (§7.5
+below).
 
 **The lease and its end.** The node leases at `start`, before the spawn, bound to the
 attempt (the provider's session is the attempt id), the service and the host, for at most
@@ -728,8 +730,15 @@ for Claude Code, a hook socket at `/run/ward/hooks.sock` whose lines are answere
 and recorded as agent-origin claims; everything else is the manifest's, exactly as for any
 workload. The provider is metadata: a runtime reaches its model API only through a
 `credentials` grant (§7.3 above) for a service the operator configured, named after the
-provider by convention, on `WARD_PROXY_SOCKET`. The sealed log holds the binding
-(`{"agent_adapter":{…}}`, origin `agent`) right after the launch record.
+provider by convention, on `WARD_PROXY_SOCKET`. On a node whose operator named a
+`ward-agent` shim (`--agent-shim`, node-integration.md §6.10, ADR-0037) the runtime runs
+under it: Claude Code's command hooks reach the hook socket, and behind the attempt's proxy
+the shim relays `127.0.0.1:3128` to it, with `HTTPS_PROXY` naming the relay and the
+provider's base URL (`ANTHROPIC_BASE_URL=http://127.0.0.1:3128/anthropic`,
+`OPENAI_BASE_URL=http://127.0.0.1:3128/openai/v1`) and a placeholder key set only when the
+manifest grants the service named after the provider. Nothing the client sends changes. The
+sealed log holds the binding (`{"agent_adapter":{…}}`, origin `agent`) right after the
+launch record.
 
 **The command line.** `control-plane.mjs run --agent-adapter <id> -- <argv>` (`--adapter`
 stays the `ward-node-adapter` binary) reads the node's capability document first and exits
@@ -935,15 +944,17 @@ plane deciding what to put through the node today:
 - **Credentials beyond a proxy-injected header.** A credential reaches a workload's traffic
   only as a header the attempt's proxy injects into plain HTTP/1.1 requests for
   `/<service>/…` on `WARD_PROXY_SOCKET` (§7.3 above); nothing is injected into a `CONNECT`
-  tunnel, there is no in-sandbox relay for a tool that only speaks `HTTP_PROXY` (§9), the
+  tunnel, there is no in-sandbox relay for a tool that only speaks `HTTP_PROXY` outside a
+  hosted adapter on a node with a shim (§7.5 above), the
   capability document does not list the services a node offers (the operator says) (#267);
   a credential is held for an approval only by a hold (§7.4 above).
-- **A real agent runtime on the node.** A hosted adapter (§7.5 above) gets its
-  configuration and, for Claude Code, a hook socket, but no `ward-agent` shim (Claude
-  Code's command hooks find nothing to run) and no loopback relay (a runtime that needs an
-  HTTP base URL cannot use the proxy socket's route); its hook answers are `allow` and its
-  approvals are not bridged onto the action channel (#279). Run an agent loop on the node
-  today only if it speaks the hook lines and the proxy socket itself.
+- **A real agent runtime on a node without a shim.** A hosted adapter (§7.5 above) gets
+  its command hooks and an HTTP base URL for its model only on a node whose operator named
+  a `ward-agent` shim (`--agent-shim`, ADR-0037), which the capability document does not
+  show; elsewhere Claude Code's command hooks find nothing to run and a runtime that needs
+  a base URL has none. Hook answers are `allow` everywhere and a `PermissionRequest` is not
+  bridged onto the action channel: hold the hosts and credentials that matter (§7.4 above)
+  (#279, #424).
 - **Remote transport.** The adapter runs on the node's host (#262); a control plane
   elsewhere brings its own channel to that host and ships pre-signed bytes over it.
 
@@ -973,7 +984,14 @@ Operator side:
 - [ ] Where an agent runtime runs on the node: the node started with `--agent-adapter`
       for each runtime the institution routes there (`claude-code`, `codex`, `process`);
       `adapters.hosted` lists them from the client's user; the model provider's service
-      (`anthropic`, `openai`) configured in `--credentials` with its upstream and header.
+      (`anthropic`, `openai`) configured in `--credentials` with its upstream, header,
+      the API path in `paths` and `write` among its `permissions` (a model API is a
+      `POST`).
+- [ ] Where a real Claude Code or Codex runs there: the node started with
+      `--agent-shim <file>` naming the release's `ward-agent` (from the runtime tarball or
+      the image, owned by root or the node user, writable by no one else) and
+      `--network-allowlist`; the node refuses to start with a shim it cannot verify, and the
+      operator records that it relays, since the capability document does not say.
 
 ai-institution side, as an `InstitutionWorkerExecutionPort` (or an action execution port)
 behind an adapter:
@@ -1020,8 +1038,9 @@ behind an adapter:
       `workload.adapter` (§7.5 above), signed only after `requireAgentAdapter` accepted the
       node's capability document, under the same manifest whichever runtime it is; its
       model reached through a `credentials` grant, never a key in the argv, snapshot or
-      environment; the sealed log's `agent_adapter` binding and hook claims read as the
-      agent's account, never as authority.
+      environment, the base URL (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`) set by a node with
+      a shim only for the provider the manifest grants; the sealed log's `agent_adapter`
+      binding and hook claims read as the agent's account, never as authority.
 - [ ] The signed bytes, proof, ids and version persisted before the first send; replay on
       restart with the same adapter conversation (§9); no second attempt until the first is
       ended.

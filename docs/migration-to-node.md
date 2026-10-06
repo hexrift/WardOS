@@ -24,7 +24,7 @@ neither reads or converts the other's.
 | What runs | One `wardd serve` per session, spawned detached by `ward up`, owning the session's hash chain and control socket ([ADR-0015](decisions/ADR-0015-single-writer-daemon.md)); the bubblewrap sandbox, the egress proxy and the hook listener in the `ward` process that launched them (ADR-0013); the trusted verifier on `ward verify` | One `ward-node` process for the host, serving a Unix socket on protocol 1.0 to 1.3 ([compatibility.md](compatibility.md)); one bubblewrap sandbox per admitted attempt, spawned and reaped by the node through `ward-launch` ([ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md) §3) |
 | Unit of work | A session: a project worktree, an agent, a policy, from `ward up` to `ward stop` | A task attempt: an argv over an imported snapshot with a wall-clock budget, from `admit` to `seal` |
 | Who owns authority | The local user, through policy: `.ward/policy.yaml` merged with the user and system policy into a capability manifest that only narrows (security-model.md G7) | An external control plane, through an issuer key the node's operator put in the trust store; the node admits only a signed, audience-bound, versioned envelope and verifies it before anything is materialised (ADR-0030 §2) |
-| Network | The session proxy: the manifest's host allowlist, private ranges denied, credentials injected, a loopback relay for `HTTP_PROXY` clients | Offline by default; with `--network-allowlist` a `network.custom` manifest runs behind a per-attempt proxy with the session proxy's rules, reached through its Unix socket, with no relay, and credentials only on the routes of `--credentials` services (node-integration.md §6.8, §9); any other grant is refused `unsupported_grant` at `admit` (§7.5) |
+| Network | The session proxy: the manifest's host allowlist, private ranges denied, credentials injected, a loopback relay for `HTTP_PROXY` clients | Offline by default; with `--network-allowlist` a `network.custom` manifest runs behind a per-attempt proxy with the session proxy's rules, reached through its Unix socket, with no relay except for a hosted agent adapter under the operator's `ward-agent` shim (`--agent-shim`), and credentials only on the routes of `--credentials` services (node-integration.md §6.8, §9); any other grant is refused `unsupported_grant` at `admit` (§7.5) |
 | Credentials | The vault (`ward vault`) and proxy injection; brokered credentials the policy marks `ask` are approved per session | With `--credentials`, leases from the operator's providers for the services a signed manifest grants, injected by the attempt's proxy and revoked when it ends (node-integration.md §6.8); nothing else reaches a workload (node-security-limitations.md §3.2) |
 | Approvals | Held by the daemon, answered by the user or the desktop (`agent-integration.md` §4.1) | With `--action-channel` a workload asks the control plane through its attempt's channel and receives a recorded answer (node-integration.md §6.7); with `--approval-hold` as well, a manifest's `hold` makes the node refuse a held host or credential until the control plane approves the request the node opened for it (§6.9); nothing else is held (node-security-limitations.md §3.2) |
 | Intervention | `ward pause`, `ward resume`, `ward stop`, `ward stop --restore-entry` ([ADR-0019](decisions/ADR-0019-authority-freshness-intervention.md) §3) | `pause`, `resume`, `stop`, `revoke` over the socket, each confirmed before it is answered (node-integration.md §6) |
@@ -252,9 +252,11 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
   [ADR-0036](decisions/ADR-0036-node-hosted-agent-adapters.md)): a node started with
   `--agent-adapter` runs Claude Code, Codex or the generic process adapter through the
   shared adapter contract under exactly the authority its manifest grants, records the
-  binding and the hook lines as agent-origin claims, and advertises `adapters`; the
-  `ward-agent` shim and a loopback relay inside node attempts are what a real runtime still
-  needs (node-integration.md §6.10).
+  binding and the hook lines as agent-origin claims, and advertises `adapters`; with the
+  operator's `ward-agent` shim (`--agent-shim`,
+  [ADR-0037](decisions/ADR-0037-node-agent-shim-and-relay.md)) a real runtime's command
+  hooks run and its model route is reached through the shim's loopback relay, as in a
+  session (node-integration.md §6.10).
 - **What stays compatible.** Stage 2 envelopes and every attempt log. The per-session
   mode, which keeps its own approvals and vault until stage 4; its credential providers are
   the same code, moved behaviour-preserving into `ward-credentials`.

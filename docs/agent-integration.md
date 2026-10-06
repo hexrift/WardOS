@@ -519,9 +519,12 @@ test build has no shim in the sandbox — and the Codex fake checks the environm
 
 ### 10.8 Not yet
 
-* On `ward-node` (§10.9) a real Claude Code finds no `ward-agent` shim for its command
-  hooks and no loopback relay for its provider route; hook approvals are not bridged onto
-  the node's action channel.
+* On `ward-node` (§10.9) a real Claude Code has its command hooks and its provider route
+  only on a node whose operator named a `ward-agent` shim (`--agent-shim`); no CI run
+  drives a real runtime against a model there either.
+* In a session, the shim's Landlock ruleset reads neither `/opt` nor the shim itself, so
+  on a kernel that enforces it a command hook cannot execute `/run/ward/ward-agent hook`;
+  the node's read-only set (ADR-0037 §2) is the fix to carry over.
 * Capability requests, cooperative cancellation and structured task results have
   contract shapes and no host path (`coverage` reports them as unserved for an adapter
   that claims them).
@@ -543,8 +546,9 @@ capability document (`"adapters":{"contract":"1.0","hosted":[…]}`) and refuses
 | --- | --- |
 | Launch | `ward_agent_adapter::catalogue::launch(id, argv)`, the builder sessions take their first-party launches from: `argv[0]` is the program, the adapter adds its fixed arguments, its environment and its settings files (bound read-only under `/home/agent`), nothing else |
 | Authority | The manifest's, exactly as for a plain workload: the workspace, no network but the attempt's proxy and its allowlist, leased credentials, holds, the action channel, cgroup limits, an empty environment |
-| Provider | Metadata. The node reads no model key from its environment and sets no base URL; a runtime reaches its model API only through a manifest `credentials` grant for a service the operator configured (named after the provider by convention), at `/<service>/…` on `WARD_PROXY_SOCKET` |
-| Hooks | For an adapter with semantic events (Claude Code), a hook socket at `/run/ward/hooks.sock` (`WARD_SOCKET`) speaking §10.1's lines: each is answered `allow` and recorded as an `AgentClaim` with origin `agent`, at most 256 per attempt. A hookless adapter gets no socket |
+| Provider | The node reads no model key from its environment; a runtime reaches its model API only through a manifest `credentials` grant for a service the operator configured (named after the provider by convention), at `/<service>/…` on `WARD_PROXY_SOCKET` and, on a node with a shim, on its relay |
+| Shim and relay | On a node started with `--agent-shim <file>` ([ADR-0037](decisions/ADR-0037-node-agent-shim-and-relay.md)), the operator's `ward-agent`, verified at start, bound read-only at `/run/ward/ward-agent` and run ahead of the adapter as in a session (Landlock, seccomp, no capabilities). Behind an egress proxy it relays `127.0.0.1:3128` to the attempt's proxy, `HTTP_PROXY`/`HTTPS_PROXY` name it, and the provider's base URL (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`) and placeholder key (`ward-gateway`) point at it only when the manifest grants the service named after the provider |
+| Hooks | For an adapter with semantic events (Claude Code), a hook socket at `/run/ward/hooks.sock` (`WARD_SOCKET`) speaking §10.1's lines, reached by Claude Code's own `ward-agent hook` on a node with a shim: each is answered `allow` and recorded as an `AgentClaim` with origin `agent`, at most 256 per attempt; a `PermissionRequest` included, never bridged onto the action channel (the hold of node-integration.md §6.9 is the approval). A hookless adapter gets no socket |
 | Binding | §10.4's `agent_adapter` claim, right after the node's `NodeAttemptLaunched` |
 
 `crates/ward-node/tests/node_adapter_conformance.rs` is §10.7's suite against the real
@@ -558,3 +562,16 @@ the manifest grants, and the semantic events each document declares; a forged ap
 answered `allow` on Claude Code's hook socket or sent by Codex to a socket it does not
 have, is refused by the proxy and recorded the same; an adapter the node does not host is
 refused before the version is consumed.
+
+`crates/ward-node/tests/node_agent_relay_cli.rs` runs the real node with the real shim and a
+runtime that behaves like Claude Code: it reads its base URL from its environment, speaks
+HTTP to it, and runs each hook its seeded settings wire as a shell command with Claude
+Code's hook input. The model round trip reaches the fake upstream with the node's leased
+credential injected by the proxy and never visible to the runtime; its five hooks run the
+bound shim and are recorded as agent claims; the relay refuses an unlisted host by
+`CONNECT` and by absolute URI; without a grant for its provider (Claude Code under no
+`credentials`, Codex under an `anthropic`-only grant) a runtime gets no base URL and its
+route is `400`; a held credential is refused through the relay until the control plane
+approves the node's request; the workload cannot write, rename, remove, `chmod` or create
+beside the shim; nothing of the node's environment reaches the sandbox; and the node
+refuses to start with a shim it cannot verify.

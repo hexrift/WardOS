@@ -129,7 +129,8 @@ For the node this means:
   refuses the rest, is recorded, and pauses and stops with the attempt
   (node-acceptance.md §2.2). It does not prove a transfer with a real upstream (the
   allowed case accepts the proxy's `200` and `502` alike, and needs only name resolution
-  on the runner), an in-sandbox relay for `HTTP_PROXY` clients, or a credential from a
+  on the runner), an in-sandbox relay for `HTTP_PROXY` clients outside a hosted adapter,
+  or a credential from a
   real provider over TLS (#267): brokered credentials are proven by `node-js.sh` and
   `ward-node`'s `tests/node_credentials_cli.rs` against a fake OpenBao and a plain-HTTP
   fake upstream on loopback, with the `test-loopback` build of `ward-node`.
@@ -162,9 +163,13 @@ For the node this means:
   are proven by `ward-node`'s `tests/node_adapter_conformance.rs` (under the merge gate:
   one signed manifest through Claude Code, Codex and the generic adapter on a real node,
   identical refusals and enforcement records, a forged approval refused, unhosted adapters
-  refused) and the three agent-adapter cases of `node-js.sh`, all with fake runtimes. No
-  real Claude Code or Codex runs against a model: the node binds no `ward-agent` shim and
-  has no loopback relay, and CI has no model key.
+  refused), `tests/node_agent_relay_cli.rs` (under the merge gate: the real node with the
+  real `ward-agent` shim, a runtime that behaves like Claude Code completing a model round
+  trip through the shim's relay with the lease injected by the node's broker, its hooks
+  run by the shim and recorded as claims, no base URL or route without a grant, a held
+  credential refused until approved, the shim read-only) and the three agent-adapter cases
+  of `node-js.sh`, all with fake runtimes. No real Claude Code or Codex runs against a
+  model: CI has no model key, and no `node-js.sh` case runs the shipped node with a shim.
 - **Clock skew.** Envelopes are signed at the node's own clock.
 - **Adversarial escape.** The isolation case checks what the sandbox denies an ordinary
   workload; it is not an exploit suite (node-acceptance.md §4).

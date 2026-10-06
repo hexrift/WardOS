@@ -1,6 +1,8 @@
 # ADR-0036 — Agent adapters on ward-node: the workload names one, the manifest stays the authority
 
-Status: **Proposed; second slice of [#279](https://github.com/hexrift/WardOS/issues/279).**
+Status: **Proposed; second slice of [#279](https://github.com/hexrift/WardOS/issues/279);
+§4's base URL and the deferred shim and relay amended by
+[ADR-0037](ADR-0037-node-agent-shim-and-relay.md).**
 It applies [ADR-0033](ADR-0033-agent-adapter-contract.md)'s contract to `ward-node`
 (its §8 first item) without changing the contract, the node protocol's minor or the
 event catalogue.
@@ -76,7 +78,8 @@ as for any workload, whichever adapter runs.
 
 An adapter's provider (`anthropic` for Claude Code, `openai` for Codex) is metadata on the
 node: the node never reads a model key from its own environment and sets no base URL or
-placeholder. A runtime reaches its model API only through a manifest `credentials` grant
+placeholder (amended by ADR-0037 §4: on a node with a `ward-agent` shim, the base URL on the
+attempt's relay and a placeholder, only for a provider the manifest grants). A runtime reaches its model API only through a manifest `credentials` grant
 for a service the operator configured (ADR-0034) — by convention named after the
 provider, `[service.anthropic]` with `upstream = "api.anthropic.com:443"` and
 `header = "x-api-key"` — at `/<service>/…` on `WARD_PROXY_SOCKET`, with the lease injected
@@ -203,9 +206,10 @@ shared launch builder, and records the catalogue already has.
 ## What remains
 
 * Bind the `ward-agent` shim into node attempts for Claude Code's command hooks and an
-  in-sandbox loopback relay, so a real runtime reaches its provider route.
+  in-sandbox loopback relay, so a real runtime reaches its provider route. Done by
+  ADR-0037 (`--agent-shim`).
 * Bridge a hook's `PermissionRequest` onto the action channel, or say why the hold is
-  enough.
+  enough. ADR-0037 §5 says why the hold is enough.
 * `ward-node-client` (Rust) and `ward-node-adapter` building an envelope with an adapter
   (both carry one a control plane signed, byte for byte, today).
 * A real-runtime conformance run in CI, as ADR-0033 §8.

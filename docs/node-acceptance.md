@@ -338,8 +338,9 @@ minute on a developer machine; each case prints its own time.
   exercises mTLS, key bootstrap or a control plane on another host (#262).
 - **No loopback relay, and credentials outside this suite.** The network cases prove the
   proxy's verdicts, its recording and its lifecycle through the Unix socket the sandbox is
-  handed; they do not prove a workload tool that only speaks `HTTP_PROXY` can use it (the
-  node path has no in-sandbox relay yet, node-integration.md §9). Brokered credentials
+  handed; they do not prove a workload tool that only speaks `HTTP_PROXY` can use it (only
+  a hosted adapter on a node with `--agent-shim` has an in-sandbox relay, proven by
+  `ward-node`'s own `tests/node_agent_relay_cli.rs`, node-integration.md §6.10). Brokered credentials
   (node-integration.md §6.8) are proven against a real node by `ward-node`'s own
   `tests/node_credentials_cli.rs` and, driven through `ward-node-adapter`, by the four
   credentials cases of `node-js.sh`, both against a fake OpenBao and a plain-HTTP fake
@@ -353,9 +354,12 @@ minute on a developer machine; each case prints its own time.
 - **Hosted agent adapters outside this suite.** A workload naming an agent adapter
   (node-integration.md §6.10, ADR-0036) is proven by `ward-node`'s own
   `tests/node_adapter_conformance.rs` (the same signed manifest through Claude Code, Codex
-  and the generic adapter, with identical refusals and enforcement records) and by the
-  three agent-adapter cases of `node-js.sh`, with fake runtimes; never with a real runtime
-  against a real model.
+  and the generic adapter, with identical refusals and enforcement records),
+  `tests/node_agent_relay_cli.rs` (the operator's `ward-agent` shim and its relay,
+  ADR-0037: a model round trip with the lease injected by the node's broker, command hooks
+  recorded as claims, no base URL without a grant, a held credential refused until
+  approved) and by the three agent-adapter cases of `node-js.sh`, with fake runtimes;
+  never with a real runtime against a real model.
 - **No workspace export, no streamed output.** The result return cases prove the bounded
   result of §2.3 (declared files, stream heads); what a workload wrote beyond the files it
   declared is still read on the host as the node's uid, which a remote control plane
