@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Regressions for node-js.sh's gates, none of which needs a sandbox: a Node.js below 22
 # is refused with the version named; a host whose bubblewrap cannot sandbox is skipped
-# loudly, or fails when WARD_REQUIRE_ISOLATION=1; `--probe` reports either way; and a
-# binary that is not there is named before anything is started.
+# loudly, or fails when WARD_REQUIRE_ISOLATION=1; `--probe` reports either way; a
+# binary that is not there is named before anything is started; and a test-loopback
+# ward-node given as WARD_NODE_BIN, or a shipped one given as WARD_NODE_LOOPBACK_BIN, is
+# refused by what its --version says before anything is started.
 set -euo pipefail
 
 sut="$(cd "$(dirname "$0")" && pwd)/node-js.sh"
@@ -66,5 +68,31 @@ expect 1 "a missing ward-node binary is named before anything starts" \
   env PATH="$work/sandbox" WARD_NODE_BIN="$work/absent/ward-node" WARD_NODE_ADAPTER_BIN="$work/absent/ward-node-adapter" bash "$sut"
 grep -q "ward-node binary is not executable: $work/absent/ward-node" "$work/last" \
   || fail "the missing binary is not named: $(cat "$work/last")"
+
+# fake_node <path> <version>: a ward-node whose --version prints `ward-node <version>`.
+fake_node() {
+  mkdir -p "$(dirname "$1")"
+  printf '#!/bin/sh\necho "ward-node %s"\n' "$2" >"$1"
+  chmod +x "$1"
+}
+fake_node "$work/shipped/ward-node" "0.1.0"
+fake_node "$work/loopback/ward-node" "0.1.0 (test-loopback)"
+fake_node "$work/shipped/ward-node-adapter" "0.1.0"
+
+expect 1 "a test-loopback ward-node as WARD_NODE_BIN is refused before anything starts" \
+  env PATH="$work/sandbox" WARD_NODE_BIN="$work/loopback/ward-node" \
+  WARD_NODE_ADAPTER_BIN="$work/shipped/ward-node-adapter" \
+  WARD_NODE_LOOPBACK_BIN="$work/loopback/ward-node" bash "$sut"
+grep -q "WARD_NODE_BIN is a test-loopback build of ward-node ($work/loopback/ward-node)" "$work/last" \
+  || fail "the test-loopback build is not refused by name: $(cat "$work/last")"
+grep -q 'node-js acceptance' "$work/last" && fail "a case ran against the test-loopback build: $(cat "$work/last")"
+
+expect 1 "a shipped ward-node as WARD_NODE_LOOPBACK_BIN is refused before anything starts" \
+  env PATH="$work/sandbox" WARD_NODE_BIN="$work/shipped/ward-node" \
+  WARD_NODE_ADAPTER_BIN="$work/shipped/ward-node-adapter" \
+  WARD_NODE_LOOPBACK_BIN="$work/shipped/ward-node" bash "$sut"
+grep -q "WARD_NODE_LOOPBACK_BIN is not a test-loopback build of ward-node ($work/shipped/ward-node)" "$work/last" \
+  || fail "the shipped build is not refused as the loopback node: $(cat "$work/last")"
+grep -q 'node-js acceptance' "$work/last" && fail "a case ran against the wrong build: $(cat "$work/last")"
 
 echo "node-js.test.sh: PASS"

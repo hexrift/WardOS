@@ -838,8 +838,11 @@ when a `ward` binary is at hand). The shipped `ward-node` never connects to a lo
 address and speaks only TLS upstream, so the credentials and hold nodes, alone, are
 `ward-node` built with its `test-loopback` feature, as ward-node's own
 `tests/node_credentials_cli.rs` and `tests/node_hold_cli.rs` run it; the script builds it into a target directory of its own (or takes
-`WARD_NODE_LOOPBACK_BIN`), and every other node runs `WARD_NODE_BIN`, which it builds without
-the feature. It runs
+`WARD_NODE_LOOPBACK_BIN`), and every other node runs the shipped build, `WARD_NODE_BIN`,
+which it builds without the feature into a target directory of its own as well, never
+reusing the `test-loopback` build a `cargo test` leaves in `target/debug`. A build with the
+feature says so in its `--version`, and the script refuses a `WARD_NODE_BIN` that does (and
+a `WARD_NODE_LOOPBACK_BIN` that does not) before any node starts. It runs
 as part of `scripts/acceptance/node.sh` in CI, so the table in the verify job's summary
 ends with its verdicts; it passes as root and as an unprivileged user, which is how a
 control plane's user runs it.

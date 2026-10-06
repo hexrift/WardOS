@@ -57,7 +57,8 @@
 //! <exec_…>] [--task-root <dir>] [--json]` answers, from the task's durable record, who
 //! delegated what authority to the task and when, and with `--task-root` cross-checks the
 //! attempt's evidence log; it exits non-zero when the record cannot be read or the
-//! evidence disagrees with it.
+//! evidence disagrees with it. `ward-node --version` prints the version, followed by
+//! `(test-loopback)` in a build with that feature, which no shipped `ward-node` has.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -82,8 +83,14 @@ use ward_node_protocol::{
     NodeCapabilities, NodeCapacity, ProtocolVersion, SnapshotCapabilities, VerifierCapabilities,
 };
 
+/// What `--version` prints after the name: a `test-loopback` build says it is one.
+#[cfg(not(feature = "test-loopback"))]
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(feature = "test-loopback")]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (test-loopback)");
+
 #[derive(Parser)]
-#[command(name = "ward-node", version, subcommand_negates_reqs = true)]
+#[command(name = "ward-node", version = VERSION, subcommand_negates_reqs = true)]
 #[allow(clippy::struct_excessive_bools)] // one flag per operator-enabled capability
 struct Cli {
     #[command(subcommand)]
@@ -444,6 +451,17 @@ mod tests {
     #[test]
     fn meminfo_parser_source_reports_nonzero_host_memory() {
         assert!(total_memory_bytes().expect("Linux MemTotal") > 0);
+    }
+
+    #[test]
+    fn version_names_a_test_loopback_build() {
+        let version = <Cli as clap::CommandFactory>::command().render_version();
+        let expected = if cfg!(feature = "test-loopback") {
+            format!("ward-node {} (test-loopback)\n", env!("CARGO_PKG_VERSION"))
+        } else {
+            format!("ward-node {}\n", env!("CARGO_PKG_VERSION"))
+        };
+        assert_eq!(version, expected);
     }
 
     #[test]

@@ -24,7 +24,9 @@
 # and speaks only TLS upstream), so the credentials and hold nodes alone are ward-node
 # built with the `test-loopback` feature, exactly as ward-node's own
 # tests/node_credentials_cli.rs and tests/node_hold_cli.rs run it; every other node runs
-# WARD_NODE_BIN, which this script builds without it. One verdict line per case on stdout,
+# WARD_NODE_BIN, the shipped build, without it. A WARD_NODE_BIN whose --version names the
+# feature is refused before anything starts, as is a WARD_NODE_LOOPBACK_BIN whose
+# --version does not. One verdict line per case on stdout,
 #   node-js acceptance <case>: PASS|FAIL -- <what it proves>
 # then a summary; everything else goes to stderr. Exit status: 0 when every case passed
 # (or isolation is unavailable and not required, which prints SKIPPED), 1 otherwise.
@@ -33,7 +35,9 @@
 #   scripts/acceptance/node-js.sh --probe   print whether isolation is available and exit
 #
 # Environment: WARD_NODE_BIN and WARD_NODE_ADAPTER_BIN name the binaries (default: build
-# them with cargo into ${CARGO_TARGET_DIR:-target}/debug); WARD_NODE_LOOPBACK_BIN names the
+# them with cargo into ${CARGO_TARGET_DIR:-target}/node-shipped, a target directory no
+# feature build shares, so a `cargo test` that left a test-loopback ward-node in
+# ${CARGO_TARGET_DIR:-target}/debug is never picked up); WARD_NODE_LOOPBACK_BIN names the
 # test-loopback build of ward-node for the credentials node (default: build it with cargo
 # into ${CARGO_TARGET_DIR:-target}/node-js-test-loopback, a target directory of its own,
 # so the shipped build is never overwritten); WARD_REQUIRE_ISOLATION=1 makes a host
@@ -83,17 +87,26 @@ if ! isolation_ready; then
   exit 0
 fi
 
+# loopback_build <ward-node>: whether that binary is a test-loopback build, which its
+# --version names.
+loopback_build() {
+  local version
+  version="$("$1" --version 2>/dev/null)" || die "ward-node binary does not answer --version: $1"
+  [[ "$version" == *"(test-loopback)"* ]]
+}
+
 if [[ -z "${WARD_NODE_BIN:-}" || -z "${WARD_NODE_ADAPTER_BIN:-}" ]]; then
-  target="${CARGO_TARGET_DIR:-target}"
-  if [[ ! -x "$target/debug/ward-node" || ! -x "$target/debug/ward-node-adapter" ]]; then
-    echo "node-js: building ward-node and ward-node-adapter" >&2
-    cargo build -p ward-node -p ward-node-client >&2
-  fi
-  WARD_NODE_BIN="${WARD_NODE_BIN:-$target/debug/ward-node}"
-  WARD_NODE_ADAPTER_BIN="${WARD_NODE_ADAPTER_BIN:-$target/debug/ward-node-adapter}"
+  shipped_target="${CARGO_TARGET_DIR:-target}/node-shipped"
+  echo "node-js: building the shipped ward-node and ward-node-adapter" >&2
+  cargo build -p ward-node -p ward-node-client --target-dir "$shipped_target" >&2
+  WARD_NODE_BIN="${WARD_NODE_BIN:-$shipped_target/debug/ward-node}"
+  WARD_NODE_ADAPTER_BIN="${WARD_NODE_ADAPTER_BIN:-$shipped_target/debug/ward-node-adapter}"
 fi
 [[ -x "$WARD_NODE_BIN" ]] || die "ward-node binary is not executable: $WARD_NODE_BIN"
 [[ -x "$WARD_NODE_ADAPTER_BIN" ]] || die "ward-node-adapter binary is not executable: $WARD_NODE_ADAPTER_BIN"
+if loopback_build "$WARD_NODE_BIN"; then
+  die "WARD_NODE_BIN is a test-loopback build of ward-node ($WARD_NODE_BIN); the cases it runs prove the shipped build and need one built without that feature"
+fi
 if [[ -z "${WARD_NODE_LOOPBACK_BIN:-}" ]]; then
   loopback_target="${CARGO_TARGET_DIR:-target}/node-js-test-loopback"
   echo "node-js: building ward-node with the test-loopback feature for the credentials node" >&2
@@ -101,6 +114,8 @@ if [[ -z "${WARD_NODE_LOOPBACK_BIN:-}" ]]; then
   WARD_NODE_LOOPBACK_BIN="$loopback_target/debug/ward-node"
 fi
 [[ -x "$WARD_NODE_LOOPBACK_BIN" ]] || die "the test-loopback ward-node binary is not executable: $WARD_NODE_LOOPBACK_BIN"
+loopback_build "$WARD_NODE_LOOPBACK_BIN" \
+  || die "WARD_NODE_LOOPBACK_BIN is not a test-loopback build of ward-node ($WARD_NODE_LOOPBACK_BIN); the credentials and hold nodes need one"
 
 work="$(mktemp -d)"
 chmod 700 "$work"

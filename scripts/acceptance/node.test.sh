@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Regressions for node.sh's rendering: a log in which every case passed renders a PASS
 # table and exits 0; a skipped case is shown with its reason and fails nothing; a failed
-# case, a failed suite and a log with no case at all each exit 1 and name the failure.
+# case, a failed suite and a log with no case at all each exit 1 and name the failure. A
+# test-loopback ward-node given as WARD_NODE_BIN is refused before any case runs.
 set -euo pipefail
 
 sut="$(cd "$(dirname "$0")" && pwd)/node.sh"
@@ -88,5 +89,18 @@ grep -q '^acceptance: PASS$' "$work/last" || fail "no PASS verdict: $(cat "$work
 
 printf 'error: could not compile\n' >"$work/broken.log"
 expect 1 "a build failure exits 1" "$work/broken.log"
+
+# A `cargo` that only records it was called: the refusal must come before any build or case.
+mkdir -p "$work/bin"
+printf '#!/bin/sh\ntouch "%s/cargo-ran"\nexit 1\n' "$work" >"$work/bin/cargo"
+printf '#!/bin/sh\necho "ward-node 0.1.0 (test-loopback)"\n' >"$work/bin/ward-node"
+chmod +x "$work/bin/cargo" "$work/bin/ward-node"
+got=0
+out=$(env PATH="$work/bin:$PATH" WARD_NODE_BIN="$work/bin/ward-node" bash "$sut" 2>&1) || got=$?
+[[ "$got" == 1 ]] || fail "a test-loopback WARD_NODE_BIN: expected exit 1, got $got: $out"
+[[ "$out" == *"WARD_NODE_BIN is a test-loopback build of ward-node ($work/bin/ward-node)"* ]] \
+  || fail "the test-loopback build is not refused by name: $out"
+[[ ! -e "$work/cargo-ran" ]] || fail "cargo ran before the test-loopback build was refused: $out"
+echo "ok   a test-loopback ward-node as WARD_NODE_BIN is refused before any case runs"
 
 echo "node.test.sh: PASS"
