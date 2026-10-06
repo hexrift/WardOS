@@ -1405,3 +1405,83 @@ fn a_runc_attempt_dies_with_its_node() {
         "the restarted node deletes the container its predecessor left"
     );
 }
+
+/// The operator's `ward-agent` shim of this build (`WARD_AGENT_BIN`, or beside the test's
+/// target directory, which `cargo test --workspace` builds).
+fn shim() -> Option<PathBuf> {
+    let path = std::env::var_os("WARD_AGENT_BIN").map_or_else(
+        || {
+            let exe = std::env::current_exe().unwrap();
+            exe.parent().unwrap().parent().unwrap().join("ward-agent")
+        },
+        PathBuf::from,
+    );
+    path.is_file().then_some(path)
+}
+
+/// Under the operator's shim (`--agent-shim`) an attempt behind a proxy runs the shim
+/// first on both backends, with its relay and the variables naming it, and the same
+/// report; bubblewrap then has the seccomp filter and `no_new_privs` a container always
+/// has.
+#[test]
+fn under_the_shim_both_backends_run_the_same_attempt() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    if !container()
+        || !ward_sandbox::ci::isolation_ready(
+            shim().is_some(),
+            "the ward-agent shim of this build (cargo build -p ward-agent, or WARD_AGENT_BIN)",
+        )
+    {
+        eprintln!("skipping: bubblewrap, python3, a runnable runc or the shim unavailable");
+        return;
+    }
+    let bench = Bench::new();
+    let shim = shim().unwrap();
+    let node = Node::spawn(
+        bench.path(),
+        &[
+            "--container-runtime",
+            RUNC,
+            "--agent-shim",
+            shim.to_str().unwrap(),
+        ],
+    );
+    let targets = Targets::new();
+    let sandboxed = probe(&node, 701, bench.snapshot, MANIFEST, &targets, bench.port);
+    let contained = probe(
+        &node,
+        702,
+        bench.snapshot,
+        CONTAINER_MANIFEST,
+        &targets,
+        bench.port,
+    );
+    assert_eq!(sandboxed.outcome, completed(task_binding(701)));
+    assert_eq!(contained.outcome, completed(task_binding(702)));
+    assert_eq!(contained.report, sandboxed.report);
+    let steps: Vec<&str> = contained
+        .report
+        .lines()
+        .filter_map(|line| line.strip_prefix("PROBE "))
+        .collect();
+    assert_eq!(steps, STEPS, "{}", contained.report);
+    for name in ["HTTPS_PROXY", "NO_PROXY"] {
+        assert!(
+            environment(&contained.report)
+                .iter()
+                .any(|seen| seen == name),
+            "{name}: {}",
+            contained.report
+        );
+    }
+    assert_eq!(contained.evidence, sandboxed.evidence);
+    assert_eq!(contained.result, sandboxed.result);
+    assert_hardened(&contained.status);
+    for line in ["NoNewPrivs:\t1", "Seccomp:\t2"] {
+        assert!(
+            sandboxed.status.lines().any(|seen| seen == line),
+            "the shim applies {line:?} in bubblewrap: {}",
+            sandboxed.status
+        );
+    }
+}
