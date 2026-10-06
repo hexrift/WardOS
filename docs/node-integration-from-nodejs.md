@@ -7,7 +7,8 @@ that wants `ward-node` to run its bounded workloads. It says what to install, wh
 keep where, how to derive the ids and the version, how to build and sign the envelope with
 `node:crypto`, how to spawn `ward-node-adapter` and speak its JSON lines, how to read the
 outcome, how to ask for and read back a bounded result, how to grant the action channel
-and answer the workload's requests while it runs, how to cancel and how to recover after
+and answer the workload's requests while it runs, how to grant a workload a credential the
+node brokers without the secret ever reaching it, how to cancel and how to recover after
 a restart on either side. Every rule
 here is the contract's, [node-integration.md](node-integration.md), cited by section;
 nothing here adds to it. The reference implementation of everything below is
@@ -23,9 +24,11 @@ keeps its agent loop and its authority on its own side, and hands the node one b
 offline action at a time — an `argv` over a snapshot with a wall-clock budget — reading
 back the receipt, the bounded output the manifest declared (§7.1 below) and, on the host, the
 evidence log, and answering on its own side the approvals and decisions the workload asks
-for through the action channel (§7.2 below). What the node cannot do yet for
-such a control plane is §11 below; read it before deciding which actions go through the
-node.
+for through the action channel (§7.2 below). Where an action needs a service's credential,
+the control plane grants it by name and the node leases and injects it, so the workload
+reaches only that service's host and never holds the secret (§7.3 below). What the node
+cannot do yet for such a control plane is §11 below; read it before deciding which actions
+go through the node.
 
 ## 1. Prerequisites
 
@@ -58,7 +61,8 @@ to §4, with what the Node.js side adds:
 6. **A snapshot.** The workload runs over a project snapshot the node already holds:
    `ward-node snapshot import --state-dir <dir> <project>` as the node's user prints the
    64-hex id the envelope's `workload.snapshot` carries (§2.4, guide §4). Everything the
-   workload needs is in the snapshot: the workload is offline.
+   workload needs is in the snapshot: the workload is offline, unless its manifest grants
+   a brokered credential and with it the credential's host (§7.3 below).
 
 Check the host from the control plane's user before anything else:
 
@@ -72,6 +76,10 @@ $ node examples/node-control-plane/control-plane.mjs capabilities --socket /run/
 `"output":{"stdio":true,"files":true}`. For the action channel (§7.2 below) start it with
 `--action-channel`; its document then carries
 `"actions":{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600}`.
+For brokered credentials (§7.3 below) start it with `--network-allowlist` and
+`--credentials <file>`; its document then reads
+`"network":{"offline":true,"proxy_allowlist":true}` and
+`"credentials":{"proxy_injection":true,"scoped_http_gateway":true}`.
 
 ## 2. Key custody
 
@@ -222,7 +230,8 @@ or lower-case id, a lease that is not the binding's lease or task or whose subje
 `agent`, an empty or oversized `argv`, a NUL, unsorted or duplicate grants, a budget below
 1, a snapshot that is not 64 lowercase hex digits, `expires_at <= issued_at`, a version
 below 1, a manifest outside §7.5's grammar or with an `output` or `actions` grant above
-the node's ceilings (§7.1 and §7.2 below), or an envelope over 32 KiB. It writes the keys
+the node's ceilings (§7.1 and §7.2 below) or a `credentials` grant for a host its own
+`network.custom` does not cover (§7.3 below), or an envelope over 32 KiB. It writes the keys
 in the order the §7.4 vector has them; `serialiseEnvelope` is `JSON.stringify`, compact,
 which is also what the node's own encoder produces.
 
@@ -536,6 +545,89 @@ not signed per answer; it is authorised by the exact binding on the node's socke
 stays where it is today: in the control plane's policy, before `admit`, in the grants and
 the manifest it signs.
 
+### 7.3 Brokered credentials
+
+A node started with `--network-allowlist` and `--credentials <file>` leases, for an
+attempt whose manifest grants it, a credential from a provider its operator configured,
+and the attempt's egress proxy injects it into the workload's requests for that service
+(node-integration.md §6.8, [ADR-0034](decisions/ADR-0034-node-brokered-credentials.md)).
+The control plane names a service, a host and a lifetime, never a provider, a header or a
+secret: those are the operator's, and the secret never reaches the sandbox, the evidence
+log or any answer the control plane reads.
+
+**The grant** is part of the signed manifest, last, after `network` (and `output` and
+`actions`):
+
+```json
+{"network":{"custom":["artifacts.example.com"]},"credentials":[{"service":"artifacts","host":"artifacts.example.com","ttl_secs":600}]}
+```
+
+1 to 4 grants, no service twice. `service` is `[a-z][a-z0-9-]{0,31}`, the name of a service
+the node's operator configured; `host` a lowercase DNS name, without a wildcard and not an
+address literal, that one of the manifest's own `network.custom` patterns covers
+(`*.example.com` covers `a.example.com`, never `example.com`), so an offline manifest grants
+no credential; `ttl_secs` an integer of at least 1 (and at most 2^32 − 1, `CREDENTIAL_LIMITS`),
+the longest the lease may live; nothing else. `workload.manifest` takes the object and
+`credentialsGrant([{service, host, ttlSecs}])` builds the list; both refuse anything outside
+that grammar before anything is signed, and `manifest` refuses a host its `network.custom`
+does not cover. `credentialsGrantOf(envelope_json)` reads the grant back from the signed
+bytes.
+
+**The node's offer.** The capability document says whether a node brokers at all, not
+which services: `credentials.proxy_injection` and `credentials.scoped_http_gateway` are both
+`true` exactly on a node started with `--network-allowlist` and `--credentials` (§5). Any
+other node refuses the grant `unsupported_grant` at `admit`, so the client reads the
+document first: `brokersCredentials(capabilities)` says whether, and
+`requireCredentialBroker(capabilities)` refuses, naming `unsupported_grant`, before a
+version is allocated or anything is signed. Which services a node offers, for which host
+and up to which `ttl_secs`, the operator tells the control plane; a grant for a service the
+file does not configure, for a host other than that service's upstream or above its
+`max_ttl_secs` is refused `unsupported_grant` by the node itself: the outcome is `refused`
+and certain, nothing ran, no provider was asked and no version was consumed (§7.5).
+
+**The command line.** `control-plane.mjs run --credential <service>=<host>[:<ttl-secs>]`,
+repeatable, puts the grant in the manifest with a `network.custom` of exactly the granted
+hosts; without a TTL the lease may live as long as the budget, rounded up to whole seconds.
+It reads the node's capability document before anything else and exits 2, naming
+`unsupported_grant`, on a node that does not broker credentials; the outcome lists the
+grants in `credentials`, and `replay` lists them from the run record and resends the same
+bytes (an attempt that ended is not started again, so nothing is leased again):
+
+```text
+$ node control-plane.mjs run … --credential artifacts=artifacts.example.com:600 -- python3 fetch.py
+{"outcome":"completed",…,"credentials":[{"service":"artifacts","host":"artifacts.example.com","ttl_secs":600}]}
+```
+
+**What the workload does.** It sends an ordinary HTTP/1.1 request to the attempt's proxy
+socket (`WARD_PROXY_SOCKET`) for `/<service>/…`. The proxy strips `/<service>`, forwards the
+request to the service's upstream over TLS with the configured header set to the leased
+value, replacing any header of that name the workload sent, within the service's paths and
+read-only unless the operator granted writes, and streams the answer back. Nothing else
+changes in the sandbox: no variable, file or socket carries the credential, a `CONNECT`
+tunnel is never injected into, and a request to any other host carries nothing the proxy
+added. A tool that only speaks `HTTP_PROXY` cannot use the route (§11 below).
+
+**The lease and its end.** The node leases at `start`, before the spawn, bound to the
+attempt (the provider's session is the attempt id), the service and the host, for at most
+the shortest of the grant's `ttl_secs`, the service's and the provider's ceilings and the
+attempt's budget. When the attempt ends — its exit, its budget, `stop`, or a cancel
+(`revoke`, §8 below) — every route is withdrawn and every lease revoked at its provider
+before the end is recorded; a node restarted after it died revokes what it left before it
+serves. A provider that cannot serve fails closed: the attempt still runs, its request is
+answered `403` (`credential lease expired`), and the log names the provider's state. There
+is no fallback to another credential; the workload's exit status carries the rest.
+
+**What the evidence log says.** Every grant is recorded `CredentialGranted` (the subject
+`issued <host> lease b3:<32 hex>`, the lease's permissions and lifetime, delivery
+`ProxyInjected`) before `NodeAttemptLaunched`, each injected request a `NetworkRequested`
+verdict, and the route's end `CredentialRevoked` (`UserRevoked` after a cancel,
+`SessionEnded` otherwise) before `NodeAttemptEnded`; `CredentialDenied` names the rule
+`credential-provider:<provider>:<state>` when no lease could be issued. Never the leased
+value, its digest or the provider's revocation handle. The acceptance decodes these
+records from the sealed log's raw bytes, and finds neither the leased token nor the
+provider token in the log, the workload's output, the task root, the node's state or
+anything the client wrote.
+
 ## 8. Cancel
 
 Cancellation is `revoke`, never `stop` (§11.2): the lease is durably revoked first, then
@@ -599,8 +691,8 @@ before replacing an attempt, because a new attempt discards the old receipt (§9
 ## 10. The proof
 
 ```bash
-cd examples/node-control-plane && node --test       # 67 cases, no node, no sandbox
-scripts/acceptance/node-js.sh                        # 14 cases against a real node; skips loudly without bubblewrap
+cd examples/node-control-plane && node --test       # 76 cases, no node, no sandbox
+scripts/acceptance/node-js.sh                        # 18 cases against real nodes; skips loudly without bubblewrap
 WARD_REQUIRE_ISOLATION=1 scripts/acceptance/node-js.sh   # fail instead of skipping, as CI does
 ```
 
@@ -616,7 +708,12 @@ adapter scripted with requests (each answered once by the policy, persisted befo
 sent, the loop stopping at the attempt's end), a restarted loop replaying the recorded
 answer under the same operation id without asking again, each refusal handled by what it
 means, and `run --approve-all`, `--deny-all` and `--ask` and the standalone `actions` and
-`answer` commands end to end. The acceptance starts a real node with the client's generated
+`answer` commands end to end, and brokered credentials: the `credentials` grant's grammar
+held to `ward-node-protocol`'s (the same accepted and refused services, hosts and TTLs),
+its hosts held to the manifest's `network.custom`, its place last in the signed bytes, the
+capability document's two flags read before signing, and `run --credential` refused on a
+node that does not broker before a version is allocated, signed and listed in the outcome
+on one that does, and replayed. The acceptance starts a real node with the client's generated
 key in its trust store, `--output-return` and `--action-channel` and proves `completes_and_seals`,
 `fails_with_exit_status`, `cancel_is_revoke_then_seal`, `replay_acts_on_nothing`,
 `version_is_held_strictly_increasing`,
@@ -638,9 +735,28 @@ while the request is listed answers it `cancelled` before the end),
 `actions_answered_from_a_second_process` (the standalone `actions` and `answer`: a replay
 answered again, `stale_operation`, `already_answered` and `unknown_request` from the real
 node, exactly two answers in the log) and, against the node without the flag,
-`actions_grant_is_refused_without_the_flag_or_outside_the_grammar`, verifying every
-evidence log with `ward-node audit --task-root` (and `ward replay --verify` when a `ward`
-binary is at hand). It runs
+`actions_grant_is_refused_without_the_flag_or_outside_the_grammar`; and, against a node
+started with `--network-allowlist` and `--credentials`, a fake OpenBao and a fake upstream on
+127.0.0.1 (`fixtures/fake-credential-services.mjs`) and a Python workload that sends one
+request with a placeholder `Authorization` header through `WARD_PROXY_SOCKET`,
+`credentials_injected_by_the_proxy_never_seen_and_revoked` (the upstream receives the leased
+token in place of the placeholder; the lease is bound to the attempt, the service and the
+host for the grant's TTL and revoked at the provider when the attempt ends; neither the
+leased token nor the provider token is in the workload's returned output and environment,
+the sealed log, the task root, the node's state or the client's files; the log's
+`CredentialGranted` and `CredentialRevoked` records decoded from its bytes),
+`credentials_replay_leases_nothing`, `credentials_cancel_revokes_the_lease` (`UserRevoked`
+and the provider's revocation on cancel) and, against a node with `--network-allowlist` and
+without `--credentials`, `credentials_grant_is_refused_without_the_flag_or_outside_the_grammar`
+(the client's refusal before signing, the node's own `unsupported_grant` for the same signed
+grant, and the credentials node's for a TTL above the ceiling and an unconfigured service),
+verifying every evidence log with `ward-node audit --task-root` (and `ward replay --verify`
+when a `ward` binary is at hand). The shipped `ward-node` never connects to a loopback
+address and speaks only TLS upstream, so the credentials node, alone, is `ward-node` built
+with its `test-loopback` feature, as ward-node's own `tests/node_credentials_cli.rs` runs
+it; the script builds it into a target directory of its own (or takes
+`WARD_NODE_LOOPBACK_BIN`), and every other node runs `WARD_NODE_BIN`, which it builds without
+the feature. It runs
 as part of `scripts/acceptance/node.sh` in CI, so the table in the verify job's summary
 ends with its verdicts; it passes as root and as an unprivileged user, which is how a
 control plane's user runs it.
@@ -671,8 +787,12 @@ plane deciding what to put through the node today:
   statement the workload acts on, not a hold the node enforces, and it is not signed per
   answer (node-security-limitations.md §3.2). The grants the envelope carries record the decision; the node checks their
   shape and lineage, not their meaning.
-- **Credentials.** Nothing is injected into the sandbox (#267); the only egress is an
-  HTTP(S) proxy over a Unix socket on a node started with `--network-allowlist` (§9).
+- **Credentials beyond a proxy-injected header.** A credential reaches a workload's traffic
+  only as a header the attempt's proxy injects into plain HTTP/1.1 requests for
+  `/<service>/…` on `WARD_PROXY_SOCKET` (§7.3 above); nothing is injected into a `CONNECT`
+  tunnel, there is no in-sandbox relay for a tool that only speaks `HTTP_PROXY` (§9), the
+  capability document does not list the services a node offers (the operator says), and a
+  credential is not held for an approval (#267).
 - **Remote transport.** The adapter runs on the node's host (#262); a control plane
   elsewhere brings its own channel to that host and ships pre-signed bytes over it.
 
@@ -689,6 +809,13 @@ Operator side:
       trust-store line installed, `ward-node issuer-key-id` agreeing with the client.
 - [ ] Snapshots imported for every project a workload may run over; the id stored with the
       work item.
+- [ ] Where a workload needs a service's credential: the node started with
+      `--network-allowlist` and `--credentials <file>` (the node user's own file, writable
+      by no one else, its provider token in a 0600 file), each service configured with its
+      upstream, paths, permissions and `max_ttl_secs` (node-integration.md §6.8); the
+      services, their hosts and ceilings recorded in the institution's configuration;
+      `credentials.proxy_injection` and `scoped_http_gateway` read `true` from the
+      client's user.
 
 ai-institution side, as an `InstitutionWorkerExecutionPort` (or an action execution port)
 behind an adapter:
@@ -715,6 +842,14 @@ behind an adapter:
       its operation id of the attempt's scheme before it is sent and replayed, never
       re-decided, after a restart; the workload proceeding only on `approved`, and the
       answer understood as a recorded statement, not a hold the node enforces.
+- [ ] Where an action needs a credential: the `credentials` grant in its manifest (§7.3
+      above), naming the configured service, its host (also in `network.custom`) and a TTL
+      within the operator's ceiling, signed only after `requireCredentialBroker` accepted the
+      node's capability document; never a secret in an envelope, argv, snapshot or
+      environment; the workload's requests sent to `/<service>/…` on `WARD_PROXY_SOCKET`;
+      a `403` from the route or a `CredentialDenied` record read as the credential being
+      unavailable, never answered with another credential; `CredentialRevoked` in the
+      sealed log as the end of the lease.
 - [ ] The signed bytes, proof, ids and version persisted before the first send; replay on
       restart with the same adapter conversation (§9); no second attempt until the first is
       ended.

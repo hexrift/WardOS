@@ -17,11 +17,14 @@ import { parseArgs } from "node:util";
 
 import {
   Adapter,
+  CREDENTIAL_LIMITS,
   VersionStore,
   actionsGrant,
   actionsGrantOf,
   answerOperationId,
   buildEnvelope,
+  credentialsGrant,
+  credentialsGrantOf,
   decodeActions,
   deriveId,
   isId,
@@ -33,6 +36,7 @@ import {
   outputGrant,
   outputGrantOf,
   recordAnswer,
+  requireCredentialBroker,
   rootLease,
   saveRunRecord,
   signEnvelope,
@@ -56,7 +60,7 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                [--stdio-bytes <n>] [--files <path>[,<path>...]]... [--files-bytes <n>] [--out-dir <dir>]
                [--actions <kind>[,<kind>]] [--actions-max-pending <n>] [--actions-max-total <n>]
                [--actions-wait-secs <n>] [--approve-all | --deny-all | --ask] [--note <text>]
-               [--actions-poll-ms <n>]
+               [--actions-poll-ms <n>] [--credential <service>=<host>[:<ttl-secs>]]...
                [--cancel-after <ms>] [--adapter <bin>] [--timeout-ms <n>] [--trace] -- <argv>...
                Admit, start, watch and seal one attempt; print its outcome as one JSON line.
                SIGINT or SIGTERM cancels it (revoke, then seal). Any of --stdio-bytes, --files
@@ -75,10 +79,21 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                answer is printed on stderr and listed in the outcome's actions; answers are
                recorded in the run record before they are sent, so a replay never answers
                twice. Without a policy nobody here answers (see actions and answer).
+               --credential grants a credential the node leases from the operator's
+               configured service (1 to 4, no service twice): its proxy injects it into the
+               workload's requests for /<service>/... on WARD_PROXY_SOCKET, sent to the
+               service's upstream at <host>, and revokes the lease when the attempt ends;
+               the workload never sees it. The lease lives at most <ttl-secs> (default: the
+               budget, rounded up to whole seconds). The manifest's network.custom is then
+               exactly the granted hosts. The node's capability document is read first: a
+               node not started with --network-allowlist and --credentials is refused here
+               (unsupported_grant) before anything is signed. The outcome lists the grants
+               in credentials.
   replay       --socket <path> --state-dir <dir> --attempt <exec_…> [--out-dir <dir>] [--adapter <bin>] [--trace]
                [--approve-all | --deny-all | --ask] [--note <text>]
                Resend a recorded run with the same bytes and operation ids; nothing acts twice.
-               A policy answers its action channel as run's does, replaying recorded answers.
+               A policy answers its action channel as run's does, replaying recorded answers;
+               a recorded credentials grant is listed in the outcome as run's is.
   inspect      --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…>
   result       --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…> [--out-dir <dir>]
                Read an ended attempt's stored result again (its run must have carried the grant).
@@ -126,6 +141,7 @@ const OPTIONS = {
   "actions-max-total": { type: "string" },
   "actions-wait-secs": { type: "string" },
   "actions-poll-ms": { type: "string" },
+  credential: { type: "string", multiple: true },
   "approve-all": { type: "boolean" },
   "deny-all": { type: "boolean" },
   ask: { type: "boolean" },
@@ -185,12 +201,33 @@ function grantsOf(values, task) {
   });
 }
 
+const CREDENTIAL_FLAG = /^([^=]+)=([^:]+)(?::([0-9]+))?$/;
+
+/**
+ * The credentials grant the --credential flags ask for, or `null` without one: each
+ * `<service>=<host>[:<ttl-secs>]`, the TTL defaulting to the budget in whole seconds.
+ */
+function credentialsOf(values, budgetMs) {
+  if (values.credential === undefined) return null;
+  const fallback = Math.min(Math.max(1, Math.ceil(budgetMs / 1000)), CREDENTIAL_LIMITS.ttlSecs);
+  return credentialsGrant(
+    values.credential.map((entry) => {
+      const parsed = CREDENTIAL_FLAG.exec(entry);
+      if (parsed === null) throw new UsageError("--credential takes <service>=<host>[:<ttl-secs>]");
+      return { service: parsed[1], host: parsed[2], ttlSecs: parsed[3] === undefined ? fallback : Number(parsed[3]) };
+    }),
+  );
+}
+
 /**
  * The manifest the flags ask for: offline, with an output grant when any output flag is
- * given and an actions grant when --actions is.
+ * given and an actions grant when --actions is; with --credential, the credentials grant
+ * and a network.custom of exactly its hosts.
  */
-function manifestOf(values) {
+function manifestOf(values, budgetMs) {
   const object = { network: "offline" };
+  const credentials = credentialsOf(values, budgetMs);
+  if (credentials !== null) object.network = { custom: [...new Set(credentials.map((grant) => grant.host))] };
   if (values["stdio-bytes"] !== undefined || values.files !== undefined || values["files-bytes"] !== undefined) {
     object.output = outputGrant({
       stdioBytes: integer(values, "stdio-bytes", 0),
@@ -210,6 +247,7 @@ function manifestOf(values) {
       waitSecs: integer(values, "actions-wait-secs", 300),
     });
   }
+  if (credentials !== null) object.credentials = credentials;
   return Object.keys(object).length === 1 ? undefined : object;
 }
 
@@ -417,6 +455,16 @@ function deriveCommand(positionals) {
   return 0;
 }
 
+/** Refuse a credentials grant unless the node's capability document offers the broker. */
+async function requireBroker(values) {
+  const adapter = adapterOf(values);
+  try {
+    requireCredentialBroker(await adapter.capabilities());
+  } finally {
+    await adapter.close();
+  }
+}
+
 async function capabilities(values) {
   const adapter = adapterOf(values);
   try {
@@ -443,9 +491,11 @@ async function run(values, argv) {
   const session = idOf("sess", values.session ?? callerAttempt);
   const budgetMs = integer(values, "budget-ms");
   const validForMs = integer(values, "valid-for-ms", 15 * 60_000);
-  // The grants and the policy are checked before a version is allocated or anything is signed.
-  const workloadManifest = manifestOf(values);
+  // The grants, the policy and the node's offer of a credential broker are checked before
+  // a version is allocated or anything is signed.
+  const workloadManifest = manifestOf(values, budgetMs);
   const answering = policyOf(values, workloadManifest?.actions !== undefined);
+  if (workloadManifest?.credentials !== undefined) await requireBroker(values);
   const now = Date.now();
   const binding = { task, attempt, lease };
   const versions = new VersionStore(join(stateDir, "admission-versions.json"));
@@ -492,6 +542,7 @@ async function run(values, argv) {
   );
   const outcome = { ...outcomeOf(report, { grant: outputGrantOf(signed.envelope_json) }), version, operations: report.operations };
   if (workloadManifest?.actions !== undefined) outcome.actions = answers;
+  if (workloadManifest?.credentials !== undefined) outcome.credentials = workloadManifest.credentials;
   emit({ ...outcome, output: renderOutput(outcome.output, values["out-dir"]) });
   return withLoop(exitStatusOf(outcome), outcome, loopError);
 }
@@ -515,6 +566,8 @@ async function replay(values) {
     replayed: true,
   };
   if (granted) outcome.actions = answers;
+  const credentials = credentialsGrantOf(record.envelope_json);
+  if (credentials !== null) outcome.credentials = credentials;
   emit({ ...outcome, output: renderOutput(outcome.output, values["out-dir"]) });
   return withLoop(exitStatusOf(outcome), outcome, loopError);
 }

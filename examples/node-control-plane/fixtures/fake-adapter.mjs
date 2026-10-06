@@ -6,6 +6,8 @@
 // with an `output` grant gets a canned result (§6.6) in `done` and through `result`;
 // FAKE_ADAPTER_CORRUPT_DIGEST=1 serves the first returned file with a digest that is not
 // its content's, and FAKE_ADAPTER_RESULT_REJECT=<reason> refuses `result` with it.
+// FAKE_ADAPTER_CREDENTIALS=1 advertises the allowlist and the credential broker (§5), as a
+// node started with --network-allowlist and --credentials does.
 //
 // FAKE_ADAPTER_ACTIONS names a JSON file that scripts the attempt's action channel (§6.7)
 // and holds the node's side of it, so that several adapter processes in turn (a run and an
@@ -38,6 +40,7 @@ const hold = process.env.FAKE_ADAPTER_HOLD === "1";
 const corruptDigest = process.env.FAKE_ADAPTER_CORRUPT_DIGEST === "1";
 const resultReject = process.env.FAKE_ADAPTER_RESULT_REJECT;
 const channelFile = process.env.FAKE_ADAPTER_ACTIONS;
+const brokering = process.env.FAKE_ADAPTER_CREDENTIALS === "1";
 const socketFlag = process.argv.indexOf("--socket");
 const socket = socketFlag >= 0 ? process.argv[socketFlag + 1] : null;
 
@@ -50,8 +53,8 @@ const CAPABILITIES = {
   architecture: "x86_64",
   capacity: { logical_cpus: 2, memory_bytes: 4294967296 },
   isolation: { namespaces: { sandbox: true, user_namespace: true }, backends: { container: false, microvm: false, vm: false } },
-  network: { offline: true, proxy_allowlist: false },
-  credentials: { proxy_injection: false, scoped_http_gateway: false },
+  network: { offline: true, proxy_allowlist: brokering },
+  credentials: { proxy_injection: brokering, scoped_http_gateway: brokering },
   snapshots: { content_addressed: true, diff: false, read: false },
   verifier: { isolated: false },
   lifecycle: { pause: true, stop: true, revoke: true, admit: true, start: true },

@@ -52,16 +52,26 @@ After the table, `node.sh` runs [`scripts/acceptance/node-js.sh`](../scripts/acc
 the acceptance of the Node.js reference control plane
 ([node-integration-from-nodejs.md](node-integration-from-nodejs.md) §10) against a second
 real node started with `--output-return` and `--action-channel` (and a third without
-either), under the same isolation requirement; its fourteen verdicts (five of the
-attempt's lifecycle; three of result return: declared content with digests the host
+either, a fourth with `--network-allowlist` and `--credentials` and a fifth with
+`--network-allowlist` alone), under the same isolation requirement; its eighteen verdicts
+(five of the attempt's lifecycle; three of result return: declared content with digests the host
 agrees with, truncation past the budgets, and the refusal of a grant by a node without
 the flag; six of the action channel, with a workload in the sandbox that proceeds only on
 an approval: `--approve-all` lets it proceed, `--deny-all` stops it, an unanswered request
 expires, cancelling the run answers a pending request `cancelled`, a second process
 answers idempotently and meets each refusal, and a node without the flag or a grant
-outside the grammar is refused, each checked against the sealed log's action records)
-follow the table and a failure of either fails the run. The cases below are the Rust
-suite's.
+outside the grammar is refused, each checked against the sealed log's action records;
+four of brokered credentials, against a fake OpenBao and a fake upstream on 127.0.0.1: the
+upstream receives the token the proxy injected while the workload's output, the sealed log,
+the task root and the node's state never hold it and the lease is revoked at the provider
+at the attempt's end, a replay leases nothing, a cancel revokes the lease, and a node
+without `--credentials` and the client before it refuse the grant, each checked against
+the sealed log's credential records) follow the table and a failure of either fails the
+run. The credentials node is `ward-node` built with its `test-loopback` feature (the
+shipped build never connects to a loopback upstream or speaks plain HTTP to one), which
+`node-js.sh` builds into a target directory of its own or takes from
+`WARD_NODE_LOOPBACK_BIN`; every other node it starts runs `WARD_NODE_BIN`, which it builds
+without the feature. The cases below are the Rust suite's.
 
 The cases also run, in parallel with the rest of the workspace, under the merge gate
 (`scripts/verify/tamperward.sh`, which CI runs with `WARD_REQUIRE_ISOLATION=1` and a
@@ -293,8 +303,10 @@ minute on a developer machine; each case prints its own time.
   handed; they do not prove a workload tool that only speaks `HTTP_PROXY` can use it (the
   node path has no in-sandbox relay yet, node-integration.md §9). Brokered credentials
   (node-integration.md §6.8) are proven against a real node by `ward-node`'s own
-  `tests/node_credentials_cli.rs`, not yet by a case here driven through
-  `ward-node-client` (#267).
+  `tests/node_credentials_cli.rs` and, driven through `ward-node-adapter`, by the four
+  credentials cases of `node-js.sh`, both against a fake OpenBao and a plain-HTTP fake
+  upstream on loopback with the `test-loopback` build; not by a case of the Rust suite
+  here, and never against a real provider or a TLS upstream (#267).
 - **No workspace export, no streamed output.** The result return cases prove the bounded
   result of §2.3 (declared files, stream heads); what a workload wrote beyond the files it
   declared is still read on the host as the node's uid, which a remote control plane

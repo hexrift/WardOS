@@ -2,9 +2,9 @@
 // dependencies). It is the control-plane side of docs/node-integration.md as a Node.js or
 // TypeScript control plane would write it: ids (§7.2), the issuer key and its proof
 // (§2.3, §7.4), the admission envelope (§7), the per-task version (§7.3, §10), and the
-// JSON-lines conversation with `ward-node-adapter` (§11.4), result return (§6.6) and the
-// action channel (§6.7). The walk through it for an adapter author is
-// docs/node-integration-from-nodejs.md.
+// JSON-lines conversation with `ward-node-adapter` (§11.4), result return (§6.6), the
+// action channel (§6.7) and brokered credentials (§6.8). The walk through it for an
+// adapter author is docs/node-integration-from-nodejs.md.
 //
 // Everything here fails closed: an id, hex value, grant or bound outside the contract is
 // refused before anything is signed or sent, an `unknown` outcome is never certain, and
@@ -23,6 +23,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { isIP } from "node:net";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -57,6 +58,13 @@ export const ACTION_KINDS = Object.freeze(["approval", "decision"]);
  */
 export const ACTION_CEILINGS = Object.freeze({ maxPending: 8, maxTotal: 64, waitSecs: 3600 });
 
+/**
+ * What the `credentials` grammar bounds (§7.5, ADR-0034 §1): 1 to 4 grants, service names
+ * of at most 32 bytes, a `ttl_secs` the node decodes (a u32). Outside these the node fails
+ * to decode the envelope, so the client refuses the grant before signing.
+ */
+export const CREDENTIAL_LIMITS = Object.freeze({ grants: 4, serviceBytes: 32, ttlSecs: 4_294_967_295 });
+
 /** The decisions a control plane may answer; `expired` and `cancelled` are the node's. */
 export const ANSWER_DECISIONS = Object.freeze(["approved", "denied"]);
 
@@ -66,6 +74,8 @@ const HEX_32 = /^[0-9a-f]{64}$/;
 const CAPABILITY = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const RESOURCE = /^[\x21-\x7e]{1,256}$/;
 const HOST_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+const CREDENTIAL_SERVICE = /^[a-z][a-z0-9-]{0,31}$/;
+const MANIFEST_FIELDS = Object.freeze(["network", "output", "actions", "credentials"]);
 const OUTPUT_PATH_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const OUTPUT_SKIPS = Object.freeze(["missing", "not_a_regular_file", "too_large"]);
@@ -191,6 +201,11 @@ export function randomId(prefix) {
 // Capability manifest (§7.5)
 // ---------------------------------------------------------------------------------------
 
+/** A lowercase DNS name: 1–253 bytes of labels of 1–63 `a-z 0-9 -`, no `-` at either end. */
+function isDnsName(name) {
+  return name.length <= 253 && name.split(".").every((label) => HOST_LABEL.test(label));
+}
+
 function checkNetwork(network) {
   if (network === "offline") return network;
   if (network === null || typeof network !== "object" || Object.keys(network).join() !== "custom") {
@@ -202,8 +217,7 @@ function checkNetwork(network) {
   for (const host of hosts) {
     if (typeof host !== "string") refuse("a manifest host is a string");
     const name = host.startsWith("*.") ? host.slice(2) : host;
-    const labels = name.split(".");
-    if (name.length > 253 || labels.some((label) => !HOST_LABEL.test(label))) {
+    if (!isDnsName(name)) {
       refuse(`manifest host ${JSON.stringify(host)} is not a lowercase DNS name or *.name pattern`);
     }
   }
@@ -299,24 +313,112 @@ export function actionsGrant({ kinds, maxPending, maxTotal, waitSecs }) {
   return checkActionsGrant({ kinds, max_pending: maxPending, max_total: maxTotal, wait_secs: waitSecs });
 }
 
+function checkCredentialGrant(grant) {
+  if (grant === null || typeof grant !== "object" || Array.isArray(grant)) refuse("a credential grant is one object {service, host, ttl_secs}");
+  if (Object.keys(grant).sort().join() !== "host,service,ttl_secs") {
+    refuse("a credential grant has exactly the fields service, host, ttl_secs: never a provider, header or secret");
+  }
+  const { service, host, ttl_secs: ttlSecs } = grant;
+  if (typeof service !== "string" || !CREDENTIAL_SERVICE.test(service)) {
+    refuse(`credential service ${JSON.stringify(service)} is not [a-z][a-z0-9-]{0,31}`);
+  }
+  if (typeof host !== "string" || !isDnsName(host) || isIP(host) !== 0) {
+    refuse(`credential host ${JSON.stringify(host)} is not a lowercase DNS name (no wildcard, no address literal)`);
+  }
+  if (!Number.isSafeInteger(ttlSecs) || ttlSecs < 1 || ttlSecs > CREDENTIAL_LIMITS.ttlSecs) {
+    refuse(`credential grant \`ttl_secs\` is an integer from 1 to ${CREDENTIAL_LIMITS.ttlSecs}, got ${JSON.stringify(ttlSecs)}`);
+  }
+  return { service, host, ttl_secs: ttlSecs };
+}
+
+/** Whether a `network.custom` pattern covers `host`: a name itself, `*.name` any deeper name, never the name. */
+function covers(network, host) {
+  if (network === "offline") return false;
+  return network.custom.some((pattern) =>
+    pattern.startsWith("*.") ? host.endsWith(pattern.slice(1)) && host.length > pattern.length - 1 : pattern === host,
+  );
+}
+
+/**
+ * The `credentials` grant of ADR-0034 §1 in wire spelling, refused outside the grammar and,
+ * given the manifest's checked `network`, for a host its `network.custom` does not cover.
+ */
+function checkCredentialsGrant(credentials, network) {
+  if (!Array.isArray(credentials) || credentials.length < 1 || credentials.length > CREDENTIAL_LIMITS.grants) {
+    refuse(`manifest \`credentials\` lists 1 to ${CREDENTIAL_LIMITS.grants} grants`);
+  }
+  const grants = credentials.map(checkCredentialGrant);
+  grants.forEach((grant, index) => {
+    if (grants.slice(0, index).some((earlier) => earlier.service === grant.service)) {
+      refuse(`manifest \`credentials\` names the service \`${grant.service}\` twice`);
+    }
+  });
+  if (network !== undefined) {
+    for (const { host } of grants) {
+      if (!covers(network, host)) {
+        refuse(`credential host ${JSON.stringify(host)} is not covered by the manifest's network.custom: a credential is granted only for a host the attempt may reach`);
+      }
+    }
+  }
+  return grants;
+}
+
+/**
+ * The §7.5 `credentials` grant in wire spelling from the control plane's words: for each
+ * entry, the operator's `service`, injected by the node's proxy into requests for `host`
+ * only, under a lease of at most `ttlSecs`. Refused outside ADR-0034's grammar; the
+ * manifest that carries it is refused unless its `network.custom` covers every host.
+ */
+export function credentialsGrant(grants) {
+  const wire = Array.isArray(grants)
+    ? grants.map((grant) => (grant === null || typeof grant !== "object" ? grant : { service: grant.service, host: grant.host, ttl_secs: grant.ttlSecs }))
+    : grants;
+  return checkCredentialsGrant(wire);
+}
+
+/**
+ * Whether the node's capability document (§5) offers the credential broker: both
+ * `credentials.proxy_injection` and `credentials.scoped_http_gateway` are `true`, which a
+ * node started with `--network-allowlist` and `--credentials` reports.
+ */
+export function brokersCredentials(capabilities) {
+  const credentials = capabilities?.credentials;
+  return credentials?.proxy_injection === true && credentials?.scoped_http_gateway === true;
+}
+
+/**
+ * The capability document, refused unless it offers the credential broker: any other node
+ * refuses a `credentials` grant `unsupported_grant`, so the client refuses it before signing.
+ */
+export function requireCredentialBroker(capabilities) {
+  if (!brokersCredentials(capabilities)) {
+    refuse(
+      "the node does not advertise credentials.proxy_injection and credentials.scoped_http_gateway " +
+        "(a node started with --network-allowlist and --credentials does) and refuses a credentials grant as unsupported_grant",
+    );
+  }
+  return capabilities;
+}
+
 /** The manifest in canonical key order, refusing anything outside the §7.5 grammar. */
 function checkManifest(object) {
   if (object === null || typeof object !== "object" || Array.isArray(object)) refuse("a manifest is one JSON object");
   const keys = Object.keys(object);
-  if (!keys.includes("network") || keys.some((key) => key !== "network" && key !== "output" && key !== "actions")) {
-    refuse("a manifest has the field `network` and optionally `output` and `actions`, nothing else");
+  if (!keys.includes("network") || keys.some((key) => !MANIFEST_FIELDS.includes(key))) {
+    refuse("a manifest has the field `network` and optionally `output`, `actions` and `credentials`, nothing else");
   }
   const canonical = { network: checkNetwork(object.network) };
   if (keys.includes("output")) canonical.output = checkOutputGrant(object.output);
   if (keys.includes("actions")) canonical.actions = checkActionsGrant(object.actions);
+  if (keys.includes("credentials")) canonical.credentials = checkCredentialsGrant(object.credentials, canonical.network);
   return canonical;
 }
 
 /**
  * The manifest as the envelope carries it: hex bytes as sent and their BLAKE3-256 (§7.3).
- * The bytes are compact JSON with `network` first, then `output` and `actions` when
- * granted, whatever order the caller wrote the fields in, so one grant has one signed
- * spelling.
+ * The bytes are compact JSON with `network` first, then `output`, `actions` and
+ * `credentials` when granted, whatever order the caller wrote the fields in, so one grant
+ * has one signed spelling.
  */
 export function manifest(object = OFFLINE_MANIFEST) {
   const bytes = Buffer.from(JSON.stringify(checkManifest(object)), "utf8");
@@ -339,6 +441,14 @@ export function outputGrantOf(envelopeJson) {
  */
 export function actionsGrantOf(envelopeJson) {
   return manifestOf(envelopeJson).actions ?? null;
+}
+
+/**
+ * The `credentials` grant a signed envelope's manifest carries (wire spelling), or `null`
+ * without one: the services a run of it is leased, in the order granted.
+ */
+export function credentialsGrantOf(envelopeJson) {
+  return manifestOf(envelopeJson).credentials ?? null;
 }
 
 /** The checked manifest of a serialised envelope, read from its exact bytes. */
