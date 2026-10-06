@@ -17,21 +17,29 @@ on the same host, as the node's uid or as a uid the node is told to serve
 (node-integration.md §11.1); the control plane proper
 may be elsewhere, but whatever it uses to reach the node runs here.
 
-### Docker Desktop on macOS
+### Docker Engine containers
 
-Docker Desktop on macOS is not currently a qualified deployment for `ward-node`.
-On an Apple Silicon host with Docker Desktop's Linux engine 27.4.0, the node's
-Bubblewrap preflight failed inside an ordinary Ubuntu 24.04 container while mounting
-the task's private `/proc` (`Operation not permitted`). Bubblewrap could create user
-and PID namespaces without that mount, but that does not meet the node's isolation
-contract. Do not work around this by omitting the private proc mount or by granting
-privileged container access; the node must refuse to run when its sandbox cannot be
-created.
+Docker Engine containers are not currently a qualified deployment for `ward-node`.
+On macOS, Docker Desktop supplies a Linux Engine in a managed VM; a headless Docker
+Engine is available on Linux, but the Linux Engine/container path still needs its own
+acceptance. The `docker` CLI alone does not run Linux containers natively on macOS.
 
-The result is reproducible with
-[`node-docker-preflight.sh`](../scripts/acceptance/node-docker-preflight.sh). Until
-that probe and the node's workload isolation acceptance pass on the target Docker
-Desktop configuration, use a supported Linux host or the WardOS image instead.
+On Apple Silicon with Docker Desktop's Linux Engine 27.4.0, the default container
+`/proc` masks prevent Bubblewrap from mounting a private `/proc`. A focused follow-up
+confirmed that removing those outer masks and reapplying the sensitive paths inside
+Bubblewrap lets the private proc mount work. However, that run used the Engine's
+reported unconfined seccomp default. Explicitly selecting Docker's built-in seccomp
+profile causes `unshare --user` to fail with `Operation not permitted`, so Bubblewrap
+cannot create the namespaces the node requires. The proc-path change alone does not
+qualify Docker, and no supported configuration that preserves the default seccomp
+boundary has been demonstrated.
+
+Do not work around this by omitting the private proc mount, using `seccomp=unconfined`,
+or granting privileged container access; the node must refuse to run when its sandbox
+cannot be created. The failure is reproducible with
+[`node-docker-preflight.sh`](../scripts/acceptance/node-docker-preflight.sh). Until the
+proc and namespace acceptance passes with a supported Engine security profile, use a
+supported Linux host or the WardOS image instead.
 
 ## 1. Operator: install the node
 
