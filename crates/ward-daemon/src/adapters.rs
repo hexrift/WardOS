@@ -11,22 +11,19 @@
 //! runtime needs, and the provider whose gateway it talks to; a missing hook lowers the
 //! first and nothing else.
 
-use ward_agent_adapter::catalogue;
+use ward_agent_adapter::catalogue::{self, MODEL_FLAGS};
+pub use ward_agent_adapter::requested_model;
 use ward_agent_adapter::{
-    AdapterBinding, CapabilityDocument, EnvVar, LaunchSpec, ProviderId, RuntimeMetadata,
-    SettingsFile, TaskResult,
+    AdapterBinding, CapabilityDocument, LaunchSpec, ProviderId, RuntimeMetadata, TaskResult,
 };
 
-use crate::agents::{self, AgentProfile};
+use crate::agents;
 use crate::error::{Error, Result};
 use crate::gateway::GatewaySpec;
 use crate::session::RunReport;
 
 /// The first-party adapter names, as `ward <name>` spells them.
 pub const FIRST_PARTY: [&str; 2] = ["claude", "codex"];
-
-/// Flags with which Claude Code and Codex take a model on their command line.
-const MODEL_FLAGS: &[&str] = &["--model", "-m"];
 
 /// One adapter: its capability document and its launch.
 #[derive(Clone, Debug)]
@@ -40,12 +37,11 @@ impl Adapter {
     /// A first-party adapter by its `ward` name (`claude`, `codex`).
     #[must_use]
     pub fn first_party(name: &str) -> Option<Self> {
-        let document = match name {
-            "claude" => catalogue::claude_code(),
-            "codex" => catalogue::codex(),
+        let (document, launch) = match name {
+            "claude" => (catalogue::claude_code(), catalogue::claude_code_launch()),
+            "codex" => (catalogue::codex(), catalogue::codex_launch()),
             _ => return None,
         };
-        let launch = launch_spec(&agents::profile(name)?).ok()?;
         Some(Self {
             document,
             launch,
@@ -131,61 +127,10 @@ impl Adapter {
     }
 }
 
-/// The launch spec of a first-party profile.
-fn launch_spec(
-    profile: &AgentProfile,
-) -> std::result::Result<LaunchSpec, ward_agent_adapter::LaunchSpecError> {
-    let env = profile
-        .env
-        .iter()
-        .map(|(name, value)| EnvVar {
-            name: (*name).to_owned(),
-            value: (*value).to_owned(),
-        })
-        .collect();
-    let settings = profile
-        .settings
-        .iter()
-        .map(|s| SettingsFile {
-            path: s.path.to_owned(),
-            content: (s.content)(),
-        })
-        .collect();
-    let provider = profile
-        .gateway
-        .as_ref()
-        .and_then(|g| ProviderId::new(g.service).ok());
-    LaunchSpec::new(profile.binary, Vec::new(), env, settings, provider)
-}
-
 /// The host's gateway for `provider`.
 #[must_use]
 pub fn gateway_spec(provider: &ProviderId) -> Option<GatewaySpec> {
     agents::gateway(provider.as_str())
-}
-
-/// The model a command line requests with one of `flags` (`--model x`, `--model=x`),
-/// the last one winning as it does for the runtimes; `None` when it names none.
-#[must_use]
-pub fn requested_model(args: &[String], flags: &[&str]) -> Option<String> {
-    let mut model = None;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--" {
-            break;
-        }
-        for flag in flags {
-            if arg == flag {
-                model = iter.next().cloned();
-            } else if let Some(value) = arg
-                .strip_prefix(flag)
-                .and_then(|rest| rest.strip_prefix('='))
-            {
-                model = Some(value.to_owned());
-            }
-        }
-    }
-    model.filter(|m| !m.is_empty())
 }
 
 /// The task result of a finished launch: the host's outcome from the exit status.
@@ -231,6 +176,20 @@ mod tests {
                 .map(|v| (v.name.as_str(), v.value.as_str()))
                 .collect();
             assert_eq!(env, profile.env);
+            let seeded: Vec<(String, String)> = spec
+                .settings()
+                .iter()
+                .map(|s| (s.path.clone(), s.content.clone()))
+                .collect();
+            let profiled: Vec<(String, String)> = profile
+                .settings
+                .iter()
+                .map(|s| (s.path.to_owned(), (s.content)()))
+                .collect();
+            assert_eq!(
+                seeded, profiled,
+                "{name}: the shared launch is the session's"
+            );
             assert_eq!(
                 adapter.gateway().map(|g| g.service),
                 profile.gateway.map(|g| g.service)
