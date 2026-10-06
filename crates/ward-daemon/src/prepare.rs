@@ -1355,14 +1355,23 @@ fn copy_inputs(req: &Request<'_>, stage: &Path) -> Result<()> {
 
 /// The install's launch: the verifier's own sandbox and toolchain view — same mounts,
 /// same `PATH`, `/work` being the stage — plus the host network, the proxy variables
-/// the host has set and the configured registry.
+/// the host has set and the configured registry. Nothing else from the host
+/// process's environment reaches it (#409): the environment is cleared, and only
+/// those, the toolchain's variables and the session's non-secret forwarded set are
+/// set.
 fn install_launch(recipe: &Recipe, stage: &Path, argv: Vec<String>) -> Launch {
     let toolchains = Toolchains::detect();
     let mut launch = Launch::new(stage, argv)
+        .clear_env()
         .host_network()
         .stdio(StdioMode::Capture)
         .capture_bytes(256 * 1024)
         .budget(BUDGET);
+    for name in crate::session::FORWARDED_ENV {
+        if let Ok(value) = std::env::var(name) {
+            launch = launch.env(*name, value);
+        }
+    }
     for (k, v) in toolchains.env() {
         launch = launch.env(k, v);
     }
@@ -1396,6 +1405,50 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    /// Every variable a launch sets with `--setenv`, by name.
+    fn setenv_names(args: &[String]) -> Vec<String> {
+        args.windows(2)
+            .filter(|w| w[0] == "--setenv")
+            .map(|w| w[1].clone())
+            .collect()
+    }
+
+    /// #409: the install runs with the host network over package code, so it
+    /// inherits nothing from the host process beyond what it declares: the
+    /// toolchain's variables, the proxy variables, the registry setting and the
+    /// session's non-secret forwarded set.
+    #[test]
+    fn the_installer_inherits_no_host_environment() {
+        let stage = tempfile::tempdir().unwrap();
+        let recipe = Recipe {
+            ecosystem: Ecosystem::NodeNpm,
+            inputs: Vec::new(),
+            settings: Settings::default(),
+        };
+        let launch = install_launch(&recipe, stage.path(), vec!["true".into()]);
+        let args = launch.args(stage.path());
+        assert!(args.iter().any(|a| a == "--clearenv"), "{args:?}");
+        // The toolchain's own variables point inside the sandbox; `TERM=xterm` is
+        // the launch primitive's own constant. Neither is a host value.
+        let toolchain: Vec<String> = Toolchains::detect()
+            .env()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let allowed: Vec<&str> = ["HOME", "PATH", "TERM", Ecosystem::NodeNpm.registry_env()]
+            .into_iter()
+            .chain(PROXY_ENV)
+            .chain(crate::session::FORWARDED_ENV.iter().copied())
+            .chain(toolchain.iter().map(String::as_str))
+            .collect();
+        for name in setenv_names(&args) {
+            assert!(
+                allowed.contains(&name.as_str()),
+                "{name} reached the installer"
+            );
+        }
+    }
 
     fn write(dir: &Path, rel: &str, content: &str) {
         let path = dir.join(rel);

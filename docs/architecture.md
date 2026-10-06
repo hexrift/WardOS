@@ -396,6 +396,11 @@ A fresh, disposable environment per verification (ADR-0004). Not a long-lived se
   written by the verifier directly to anything the agent can read.
 * Network: **none** by default. Optional allowlist only when the verification manifest
   requests it and policy permits.
+* Environment: **none** inherited from the host process. The command runs code the
+  agent may have written, so the launch clears the environment (bubblewrap's own
+  included) and sets only the toolchain's variables, the prepared environment's, and
+  the non-secret `LANG`, `LC_ALL`, `USER` and `SHELL`; `ward prepare`'s install adds only
+  the proxy variables and the registry setting (#409).
 
 ### 3.5 TamperWard control plane
 
