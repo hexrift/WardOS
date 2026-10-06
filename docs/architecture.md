@@ -289,7 +289,11 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 > is confirmed, `SessionPauseUnsettled` otherwise, and only when the log does not
 > already carry it, re-collecting the component acknowledgements (a hold the log
 > records as confirmed whose components the restarted daemon cannot confirm gets the one
-> `SessionPauseUnsettled` that says so). A marker with no intent is a hold that completed before the
+> `SessionPauseUnsettled` that says so); a resume is finished as the resume would have
+> finished it, from what `/proc` shows (every release confirmed again, the tree thawed,
+> `SessionResumed` appended only when the log still says held, so the session reads
+> `running` with its workload running, or stays the user's hold when a release is not
+> confirmed). A marker with no intent is a hold that completed before the
 > previous process died: the daemon adopts it the same way, as a hold for the stop when
 > the stop marker exists, so `ward resume` and `ward stop` work on it where a restarted
 > daemon used to answer `not paused`. An intent it cannot read, or a stop it cannot
