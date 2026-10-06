@@ -2408,20 +2408,27 @@ dependencies = [
 name = "ward-cli"
 version = "0.18.1"
 dependencies = [
+ "blake3",
  "clap",
  "crossterm",
+ "getrandom 0.3.4",
  "libc",
  "ratatui",
  "rustix",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
+ "ward-authority",
  "ward-bench",
  "ward-daemon",
  "ward-events",
+ "ward-node-client",
+ "ward-node-protocol",
  "ward-policy",
  "ward-sandbox",
  "ward-shell-core",
+ "ward-snapshot",
 ]
 
 [[package]]

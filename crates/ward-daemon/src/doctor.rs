@@ -34,7 +34,8 @@ pub struct Check {
 }
 
 impl Check {
-    fn new(name: &'static str, status: Status, detail: impl Into<String>) -> Self {
+    /// A check named `name` with its outcome and what was found.
+    pub fn new(name: &'static str, status: Status, detail: impl Into<String>) -> Self {
         Self {
             name,
             status,

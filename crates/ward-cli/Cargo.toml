@@ -17,6 +17,13 @@ ward-bench = { path = "../ward-bench", version = "0.18.0" }
 ward-events = { path = "../ward-events", version = "0.18.0" }
 ward-policy = { path = "../ward-policy", version = "0.18.0" }
 ward-shell-core = { path = "../ward-shell-core", version = "0.18.0" }
+ward-snapshot = { path = "../ward-snapshot", version = "0.18.0" }
+ward-authority = { path = "../ward-authority", version = "0.18.0" }
+ward-node-protocol = { path = "../ward-node-protocol", version = "0.18.0" }
+ward-node-client = { path = "../ward-node-client", version = "0.1.0" }
+blake3 = { workspace = true }
+getrandom = "0.3"
+thiserror = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
