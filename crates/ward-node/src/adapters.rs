@@ -30,6 +30,11 @@
 //! refuses. The node's own approval is the hold (ADR-0035). Each attempt also records one
 //! `agent_adapter` binding ([`AttemptAdapter::binding_event`]) right after its launch
 //! record, with origin `agent`: metadata, never identity or authority.
+//!
+//! On a node with the operator's `ward-agent` shim ([`crate::shim`], ADR-0037) the attempt
+//! runs under it, so a command hook such as Claude Code's `ward-agent hook` reaches the
+//! socket; a hook's `PermissionRequest` is answered and recorded like any other line, never
+//! bridged onto the action channel, since the approval the node enforces is the hold.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -45,7 +50,7 @@ use nix::sys::socket::{Shutdown as SocketShutdown, shutdown};
 use thiserror::Error;
 use ward_agent_adapter::catalogue::{self, AdapterLaunch, AdapterLaunchError};
 use ward_agent_adapter::{
-    ApprovalAnswer, ApprovalDecision, BindingClaim, SemanticEvent, SemanticEventLine,
+    ApprovalAnswer, ApprovalDecision, BindingClaim, ProviderId, SemanticEvent, SemanticEventLine,
 };
 use ward_events::{ClaimKind, ObserverSource, PayloadText, WardEvent};
 use ward_node_protocol::{AdapterCapabilities, TaskBinding, TaskWorkload};
@@ -237,6 +242,13 @@ impl AttemptAdapter {
             .iter()
             .map(|var| (var.name.clone(), var.value.clone()))
             .collect()
+    }
+
+    /// The adapter's provider, if it names one: metadata the node points a base URL at only
+    /// for a provider the manifest grants a credential for ([`crate::shim::relay_env`]).
+    #[must_use]
+    pub fn provider(&self) -> Option<&str> {
+        self.launch.spec().provider().map(ProviderId::as_str)
     }
 
     /// The settings files: each host file and the sandbox path it is bound at, read-only.

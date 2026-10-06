@@ -1286,6 +1286,10 @@ impl TaskRegistry {
             None => request,
         };
         let (request, adapter) = with_adapter(request, workload)?;
+        let request = match execution.agent_shim() {
+            Some(shim) => request.with_agent_shim(shim),
+            None => request,
+        };
         let (request, actions) = with_actions(request, manifest)?;
         let credentials = match manifest.credentials() {
             Some(grants) => {

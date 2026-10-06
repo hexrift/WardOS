@@ -47,7 +47,11 @@
 //!   the same sandbox, proxy, credentials and holds as any workload, the adapter's command
 //!   line, environment and settings, its hook lines recorded as agent-origin claims, and
 //!   its binding recorded as metadata; it advertises `adapters`. Any other node refuses
-//!   such a workload `unsupported_grant` at `admit`.
+//!   such a workload `unsupported_grant` at `admit`. One that also has the operator's
+//!   `ward-agent` shim ([`execution::NodeExecution::with_agent_shim`], `--agent-shim`,
+//!   ADR-0037) runs those attempts under it ([`shim`]): command hooks that reach the hook
+//!   socket and, behind an egress proxy, a loopback relay to it, with the provider's base
+//!   URL on the relay only for a provider the manifest grants a credential for.
 //!
 //! * at protocol 1.3, a service whose execution runs attempts in cgroups
 //!   ([`cgroup`], `--cgroup-root`) honours a manifest's `resources` limits, records what
@@ -99,6 +103,7 @@ pub mod output;
 pub mod peer;
 pub mod records;
 pub mod scheduling;
+pub mod shim;
 pub mod state;
 pub mod task;
 #[cfg(test)]
@@ -2367,6 +2372,15 @@ mod tests {
         assert!(!discovered(&admitting, 3).0.contains("output"));
     }
 
+    /// The reaper stores an attempt's output before it records the attempt's end, and a
+    /// result is answered only once the end is recorded.
+    fn until_the_attempt_has_ended(service: &NodeService, result_line: &str) {
+        crate::test_support::eventually(|| {
+            let (raw, _) = exchange(service, WARD_NODE_PROTOCOL, result_line, REQUEST_TIMEOUT);
+            !raw.contains(r#""reason":"invalid_state""#)
+        });
+    }
+
     #[test]
     fn a_result_request_over_the_local_socket_returns_the_stored_output_or_a_typed_refusal() {
         let returning = executing_service_returning_output();
@@ -2436,12 +2450,7 @@ mod tests {
         returning
             .launcher
             .exit(crate::execution::WorkloadExit::Exited { code: Some(0) });
-        crate::test_support::eventually(|| {
-            crate::output::AttemptOutputStore::new(&returning.root, binding)
-                .read()
-                .unwrap()
-                .is_some()
-        });
+        until_the_attempt_has_ended(&returning.service, &result_line);
         let raw = node.request(WARD_NODE_PROTOCOL, &result_line);
         assert!(
             raw.starts_with(r#"{"response":"result","protocol":{"major":1,"minor":3},"binding":"#),

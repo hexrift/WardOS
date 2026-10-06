@@ -3,7 +3,7 @@
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
 //! [--task-root <dir>] [--network-allowlist [--credentials <file>]] [--output-return]
 //! [--action-channel [--approval-hold]] [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
-//! [--agent-adapter <id>]… [--client-uid <uid>]… [--client-group <group>]`
+//! [--agent-adapter <id>… [--agent-shim <file>]] [--client-uid <uid>]… [--client-group <group>]`
 //! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
 //! admission version, revocation and retired-attempt stores, one record per registered task
@@ -48,7 +48,11 @@
 //! the shared adapter contract: its command line, environment and settings files on top of
 //! exactly the sandbox, proxy and credentials its manifest grants, its hook lines recorded
 //! as agent-origin claims; the node advertises `adapters`, and without the flag such a
-//! workload is refused `unsupported_grant`. The socket is served to the node's own
+//! workload is refused `unsupported_grant`. With `--agent-shim` as well, the operator's
+//! `ward-agent` shim, verified at start, runs every hosted adapter's attempt: its command
+//! hooks reach the hook socket and, behind an egress proxy, its loopback relay forwards to
+//! the attempt's proxy, the adapter's provider base URL pointing at it only for a provider
+//! the manifest grants a credential for. The socket is served to the node's own
 //! uid and to each `--client-uid` (a uid or user name); every other peer is closed without
 //! a response. With `--client-group` the socket is created mode 0660 owned by that group,
 //! in a directory owned by it with mode 0750 or stricter, so a client of another uid can
@@ -79,6 +83,7 @@ use ward_node::execution::{NodeExecution, SandboxLauncher, TaskLauncher};
 use ward_node::issuer::{IssuerKeyParseError, IssuerPublicKey, TrustedIssuers};
 use ward_node::peer::{ClientGroup, ClientUids};
 use ward_node::scheduling::SchedulingLimits;
+use ward_node::shim::AgentShim;
 use ward_node::state::{NodeState, open_private_dir};
 use ward_node::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
 use ward_node::{NodeService, SocketAccess, serve_local};
@@ -203,6 +208,16 @@ struct Cli {
         value_parser = parse_adapter
     )]
     agent_adapter: Vec<HostedAdapter>,
+    /// The operator's `ward-agent` shim (an absolute path to a regular file, executable,
+    /// owned by root or the node's user and writable by no one else), verified at start.
+    /// Every hosted adapter's attempt runs under it, bound read-only at
+    /// `/run/ward/ward-agent`: the adapter's command hooks run it against the hook socket,
+    /// and behind an egress proxy its relay on 127.0.0.1:3128 forwards to the attempt's
+    /// proxy, the proxy variables name it and the adapter's provider base URL points at it
+    /// for a provider the manifest grants a credential for. Needs `--agent-adapter`.
+    /// Without it no shim is bound and no relay runs.
+    #[arg(long = "agent-shim", value_name = "FILE", requires = "agent_adapter")]
+    agent_shim: Option<PathBuf>,
     /// A uid, or user name, served on the socket besides the node's own; repeatable. Any
     /// other peer is closed without a response. Being served grants no authority: `admit`
     /// still needs a trusted signature.
@@ -294,6 +309,14 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         )
         .into());
     }
+    let agent_shim = cli
+        .agent_shim
+        .as_deref()
+        .zip(task_root.as_ref())
+        .map(|(path, root)| {
+            AgentShim::verify(path, root.dir()).map_err(|error| io::Error::other(error.to_string()))
+        })
+        .transpose()?;
     let cgroups = cli
         .cgroup_root
         .as_deref()
@@ -338,7 +361,8 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     .with_credentials(credentials)
                     .with_resource_enforcement(enforcement)
                     .with_scheduling(scheduling)
-                    .with_agent_adapters(AdapterCapabilities::hosting(cli.agent_adapter)),
+                    .with_agent_adapters(AdapterCapabilities::hosting(cli.agent_adapter))
+                    .with_agent_shim(agent_shim),
             )?
         }
         None => NodeService::with_admission(capabilities, admission)?,
@@ -568,6 +592,44 @@ mod tests {
                 "a hold needs the action channel and the allowlist: {without:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_agent_shim_is_the_operators_file_and_needs_a_hosted_adapter() {
+        let node = NodeId::from_u128(4).to_string();
+        let serve = [
+            "ward-node",
+            "--socket",
+            "s",
+            "--state-dir",
+            "d",
+            "--node-id",
+            &node,
+            "--task-root",
+            "t",
+        ];
+        let parse = |extra: &[&str]| Cli::try_parse_from(serve.iter().chain(extra));
+        let cli = parse(&[
+            "--agent-adapter",
+            "claude-code",
+            "--agent-shim",
+            "/usr/libexec/ward-agent",
+        ])
+        .expect("a shim for a hosted adapter");
+        assert_eq!(
+            cli.agent_shim,
+            Some(PathBuf::from("/usr/libexec/ward-agent"))
+        );
+        assert_eq!(
+            parse(&["--agent-adapter", "codex"])
+                .expect("no shim")
+                .agent_shim,
+            None
+        );
+        assert!(
+            parse(&["--agent-shim", "/usr/libexec/ward-agent"]).is_err(),
+            "a shim needs --agent-adapter"
+        );
     }
 
     #[test]

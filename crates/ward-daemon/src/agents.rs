@@ -1,5 +1,7 @@
 //! Launch profiles for supported coding agents (`docs/agent-integration.md`).
 
+use ward_agent_adapter::catalogue::{ANTHROPIC as ANTHROPIC_ENDPOINT, OPENAI as OPENAI_ENDPOINT};
+
 use crate::gateway::GatewaySpec;
 use crate::sandbox::AGENT_SHIM;
 
@@ -47,32 +49,32 @@ pub fn claude_settings() -> String {
 
 /// Anthropic's Messages API behind `/anthropic` on the relay.
 const ANTHROPIC: GatewaySpec = GatewaySpec {
-    service: "anthropic",
+    service: ANTHROPIC_ENDPOINT.provider,
     prefix: "/anthropic",
     upstream: ("api.anthropic.com", 443),
     header: "x-api-key",
     value_prefix: "",
     basic_user: None,
     strip: &["x-api-key", "authorization"],
-    key_env: "ANTHROPIC_API_KEY",
-    base_url_env: "ANTHROPIC_BASE_URL",
-    base_path: "",
-    placeholder_env: "ANTHROPIC_API_KEY",
+    key_env: ANTHROPIC_ENDPOINT.key_env,
+    base_url_env: ANTHROPIC_ENDPOINT.base_url_env,
+    base_path: ANTHROPIC_ENDPOINT.base_path,
+    placeholder_env: ANTHROPIC_ENDPOINT.key_env,
 };
 
 /// OpenAI's API behind `/openai` on the relay; Codex expects the base URL to end in `/v1`.
 const OPENAI: GatewaySpec = GatewaySpec {
-    service: "openai",
+    service: OPENAI_ENDPOINT.provider,
     prefix: "/openai",
     upstream: ("api.openai.com", 443),
     header: "authorization",
     value_prefix: "Bearer ",
     basic_user: None,
     strip: &["authorization", "openai-organization", "openai-project"],
-    key_env: "OPENAI_API_KEY",
-    base_url_env: "OPENAI_BASE_URL",
-    base_path: "/v1",
-    placeholder_env: "OPENAI_API_KEY",
+    key_env: OPENAI_ENDPOINT.key_env,
+    base_url_env: OPENAI_ENDPOINT.base_url_env,
+    base_path: OPENAI_ENDPOINT.base_path,
+    placeholder_env: OPENAI_ENDPOINT.key_env,
 };
 
 /// The providers the host has a model-API gateway for.

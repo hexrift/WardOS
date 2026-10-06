@@ -48,6 +48,49 @@ pub const HOOK_COMMAND: &str = "/run/ward/ward-agent hook";
 /// Flags with which Claude Code and Codex take a model on their command line.
 pub const MODEL_FLAGS: &[&str] = &["--model", "-m"];
 
+/// The placeholder key a first-party runtime is given beside its provider's base URL; the
+/// host's proxy replaces it with the credential on the way out.
+pub const PLACEHOLDER_KEY: &str = "ward-gateway";
+
+/// How a first-party runtime is pointed at its provider's gateway route: the variable it
+/// reads its base URL from, the path it expects after the route's prefix, and the variable
+/// it reads its key from. Configuration, never a credential.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderEndpoint {
+    /// The provider, as the launch spec names it.
+    pub provider: &'static str,
+    /// Variable holding the base URL.
+    pub base_url_env: &'static str,
+    /// Path appended to the route in that base URL (`/v1` for Codex).
+    pub base_path: &'static str,
+    /// Variable holding the key, which only ever holds [`PLACEHOLDER_KEY`].
+    pub key_env: &'static str,
+}
+
+/// Anthropic's Messages API, as Claude Code reaches it.
+pub const ANTHROPIC: ProviderEndpoint = ProviderEndpoint {
+    provider: "anthropic",
+    base_url_env: "ANTHROPIC_BASE_URL",
+    base_path: "",
+    key_env: "ANTHROPIC_API_KEY",
+};
+
+/// `OpenAI`'s API, as Codex reaches it.
+pub const OPENAI: ProviderEndpoint = ProviderEndpoint {
+    provider: "openai",
+    base_url_env: "OPENAI_BASE_URL",
+    base_path: "/v1",
+    key_env: "OPENAI_API_KEY",
+};
+
+/// The endpoint of `provider`, for the providers the first-party adapters name.
+#[must_use]
+pub fn provider_endpoint(provider: &str) -> Option<ProviderEndpoint> {
+    [ANTHROPIC, OPENAI]
+        .into_iter()
+        .find(|endpoint| endpoint.provider == provider)
+}
+
 /// Claude Code's configuration directory inside the sandbox.
 const CLAUDE_CONFIG_DIR: &str = "/home/agent/.claude";
 
@@ -153,7 +196,7 @@ pub fn claude_code_launch() -> LaunchSpec {
         env,
         workdir: crate::launch::WORKSPACE.to_owned(),
         settings,
-        provider: Some(ProviderId("anthropic".to_owned())),
+        provider: Some(ProviderId(ANTHROPIC.provider.to_owned())),
     }
 }
 
@@ -170,7 +213,7 @@ pub fn codex_launch() -> LaunchSpec {
         }],
         workdir: crate::launch::WORKSPACE.to_owned(),
         settings: Vec::new(),
-        provider: Some(ProviderId("openai".to_owned())),
+        provider: Some(ProviderId(OPENAI.provider.to_owned())),
     }
 }
 
@@ -434,6 +477,22 @@ mod tests {
                 value: "/home/agent/.codex".into()
             }]
         );
+    }
+
+    #[test]
+    fn every_first_party_provider_has_an_endpoint_outside_the_reserved_variables() {
+        for spec in [claude_code_launch(), codex_launch()] {
+            let provider = spec.provider().unwrap().as_str();
+            let endpoint = provider_endpoint(provider).unwrap();
+            assert_eq!(endpoint.provider, provider);
+            for name in [endpoint.base_url_env, endpoint.key_env] {
+                assert!(!crate::launch::is_reserved_env(name), "{name}");
+                assert!(spec.env().iter().all(|var| var.name != name), "{name}");
+            }
+        }
+        assert_eq!(provider_endpoint("anthropic"), Some(ANTHROPIC));
+        assert_eq!(provider_endpoint("openai").unwrap().base_path, "/v1");
+        assert_eq!(provider_endpoint("gemini"), None);
     }
 
     #[test]

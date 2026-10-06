@@ -576,7 +576,9 @@ approval of the request the node opened for it on first use is recorded (ADR-003
 a workload naming an agent adapter the node hosts (`--agent-adapter`, ADR-0036) runs its
 argv through `ward-agent-adapter`'s shared launch builder, with the adapter's environment,
 read-only settings files and, for Claude Code, a hook socket whose lines are recorded as
-agent-origin claims, and nothing beyond what the manifest grants;
+agent-origin claims, and nothing beyond what the manifest grants; on a node started with
+`--agent-shim` it runs under the operator's `ward-agent` shim, whose loopback relay
+forwards to the attempt's proxy and whose hook client its command hooks run (ADR-0037);
 any grant the node cannot enforce is refused `unsupported_grant` at `admit`, so every
 workload that starts runs under exactly what its manifest says (node-integration.md
 §7.5, §9). The node answers `running` only after a confirmed spawn with
