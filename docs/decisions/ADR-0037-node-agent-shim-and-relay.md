@@ -1,7 +1,8 @@
 # ADR-0037 — A real agent runtime on ward-node: the operator's `ward-agent` shim and a loopback relay in hosted-adapter attempts
 
 Status: **Proposed; third slice of [#279](https://github.com/hexrift/WardOS/issues/279),
-implemented under [#424](https://github.com/hexrift/WardOS/issues/424).** It amends
+implemented under [#424](https://github.com/hexrift/WardOS/issues/424); amended for plain
+workloads under [#267](https://github.com/hexrift/WardOS/issues/267) (§7).** It amends
 [ADR-0036](ADR-0036-node-hosted-agent-adapters.md) §4 ("sets no base URL or placeholder")
 and settles two items of its "What remains"; it changes neither the adapter contract, the
 node protocol nor the event catalogue.
@@ -24,7 +25,8 @@ each needs an operator input, its own security argument and its own acceptance.
 
 ### 1. The shim is the operator's, named and verified
 
-`ward-node --agent-shim <file>` (it needs `--agent-adapter`) names the shim. At start the
+`ward-node --agent-shim <file>` (it needs `--agent-adapter`, or since §7
+`--network-allowlist`) names the shim. At start the
 node refuses to serve unless the path is absolute and names a regular file (not a symlink),
 executable, owned by root or the node's user and writable by no one else, that answers
 `--help` with its `--relay` flag and that once runs `/bin/true` hardened over the task root
@@ -46,7 +48,8 @@ set, then the adapter's program with only the variables the node names. Claude C
 recorded as agent-origin claims exactly as ADR-0036 §5 says. The workload cannot replace
 the shim: the bind is read-only, and under the ruleset nothing in `/run/ward` can be
 created, renamed or removed. A workload that names no adapter, and every attempt on a node
-without the flag, runs exactly as before.
+without the flag, runs exactly as before (amended by §7: a workload naming no adapter that
+has an egress proxy runs under the shim for its relay).
 
 ### 3. The relay is the shim's, on loopback, in front of the attempt's proxy
 
@@ -97,6 +100,82 @@ hook claims and the proxy's verdicts already say what ran and what passed. A con
 learns whether a node relays from its operator, or from the attempt's outcome (§What
 remains).
 
+### 7. Amendment (#267): the relay for a plain workload behind an egress proxy
+
+**Context.** A workload naming no adapter reaches its proxy only through
+`WARD_PROXY_SOCKET`, a Unix socket that `git`, `curl`, package managers and every other
+stock HTTP client cannot dial, so a brokered credential (ADR-0034) was usable only by a
+workload that speaks HTTP over a Unix socket itself. ADR-0034's acceptance — a task
+receives a short-lived Git, cloud or database capability, uses it, has it revoked and fails
+on a later attempt — needs the stock client.
+
+**Decision.** On a node started with `--agent-shim`, every attempt with an egress proxy
+runs under the shim, whether or not it names an adapter, exactly as §2 and §3 run a hosted
+adapter's: the shim bound read-only at `/run/ward/ward-agent`, its Landlock ruleset,
+seccomp filter, `no_new_privs` and empty capability set, its relay of `127.0.0.1:3128` to
+`/run/ward/proxy.sock`, and `HTTP_PROXY`, `HTTPS_PROXY` (both cases) and `NO_PROXY`
+(`localhost,127.0.0.1`) naming it. A plain workload gets no base URL and no placeholder:
+§4 is the adapter's provider's alone. `--agent-shim` therefore needs `--agent-adapter` or
+`--network-allowlist`; with neither the shim would have nothing to run and the node still
+refuses to start. Unchanged: an offline attempt naming no adapter (nothing to relay, no
+hooks) and every attempt on a node without the flag, byte for byte.
+
+**How a stock client uses a credential.** A credential route is a path prefix on the proxy
+(ADR-0034 §3), so through the relay it is the URL `http://127.0.0.1:3128/<service>/…`. A
+Git workload clones `http://127.0.0.1:3128/<service>/<repo>.git`: `NO_PROXY` sends that
+straight to the relay as an origin-form request, the proxy matches the route, strips the
+prefix, sets the service's configured header to its value prefix and the leased value
+(for Git over smart HTTP, `authorization` with `Bearer `), and forwards it over TLS to the
+service's upstream within the service's paths, read-only unless the service grants
+`write` (a push, `POST …/git-receive-pack`, needs it). The workload never holds a
+credential: no variable, no `.git-credentials`, no `http.extraHeader`, no credential
+helper; the remote URL it keeps in `.git/config` names the relay and nothing else. Any
+other host goes through `HTTP_PROXY` to the allowlist as before, a `CONNECT` tunnel never
+injected into.
+
+**Alternatives.**
+
+* *A node-owned relay without the shim.* The node cannot listen inside the attempt's
+  namespace from the host (§Alternatives), so it would need a program of its own in every
+  sandbox: a second, unhardened copy of the shim's relay. Rejected.
+* *A shim mode that relays without hardening.* A new `ward-agent` flag and a relay outside
+  the Landlock domain and seccomp filter the relay now runs under, for a weaker sandbox
+  than a hosted adapter gets. Rejected.
+* *Every attempt under the shim, offline ones included.* An offline plain workload has
+  nothing for the shim to do; hardening it is a separate decision with its own
+  compatibility cost. Deferred, as §Alternatives deferred it.
+* *A per-attempt opt-in in the manifest.* The envelope would name what the node runs in
+  its sandbox, which §1 keeps the operator's. Rejected; the operator's flag decides.
+
+**Security consequences.** No new authority: the relay is the same pipe to the socket the
+workload already has, every allow, refuse, inject and hold decision is still the proxy's
+and recorded as before, a credential is still injected only on its route to its configured
+upstream, and nothing about a credential enters the sandbox. A plain workload behind a
+proxy on such a node gains the shim's confinement (writable only under `/work`, `/env`,
+`/tmp` and `/home/agent`; seccomp; no capabilities). One loopback port per relayed attempt,
+inside its namespace.
+
+**Compatibility.** Operator-enabled and additive for control planes; a node without
+`--agent-shim` is unchanged. On a node with it, a plain workload behind a proxy now runs
+under Landlock and seccomp: one that writes outside the four writable trees, or makes a
+call the baseline filter refuses, fails where it ran before. `ward-node`'s own code changes
+(no new crate, no protocol or catalogue change), so the next release raises the node
+version (CONTRIBUTING.md, #275).
+
+**Validation.** `ward-node` unit tests (a plain launch behind a proxy under the shim with
+the relay and the proxy variables and no base URL, an offline plain launch unchanged, the
+flag's parsing) and `crates/ward-node/tests/node_git_capability_cli.rs`, against the real
+`ward-node` and `ward-agent` binaries, a fake OpenBao and a `git http-backend` server that
+serves only a live leased token: the stock `git` clones and pushes through the relay with
+the lease injected; the token is in no byte of the sandbox's workspace and environment, the
+evidence log, the state or any node answer; the lease is revoked at the provider when the
+attempt ends; the next attempt of the task, whose fresh grant the provider refuses, fails
+to clone with the proxy's `403 credential lease expired`, and the revoked token is refused
+upstream; a sealed provider fails the clone closed the same way with
+`credential-provider:bao:sealed` recorded; a host outside the allowlist is refused `403`
+through the relay; a node without the shim and an offline attempt on a node with one run
+without relay, proxy variables or seccomp.
+
 ## Alternatives
 
 * **The shim beside the node binary, as `wardd` finds it.** A file that happens to sit next
@@ -110,7 +189,8 @@ remains).
 * **A base URL for every attempt with a proxy.** A URL to a route the manifest does not
   grant is a promise the node cannot keep. Rejected (§4).
 * **Every attempt under the shim.** It would change plain workloads (Landlock, seccomp,
-  dropped capabilities) without anything asking for it. Deferred.
+  dropped capabilities) without anything asking for it. Deferred; §7 takes it for the
+  attempts with an egress proxy, which need the relay.
 * **Bridge `PermissionRequest`.** See §5.
 
 ## Advantages
@@ -184,3 +264,5 @@ and `ward-agent-adapter`), so the next release must raise the node version (CONT
 * Say in the capability document that hosted adapters run under a shim with a relay.
 * A real-runtime conformance run in CI (ADR-0033 §8).
 * A `node-js.sh` case of the shipped node with a shim.
+* A relay for plain workloads. Done by §7 (#267) for attempts with an egress proxy on a
+  node with the shim; an offline plain workload still runs without the shim.
