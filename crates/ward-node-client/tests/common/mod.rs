@@ -117,16 +117,27 @@ pub fn seed_file(dir: &Path) -> PathBuf {
     path
 }
 
+/// The shipped `ward-node`, never one built with `test-loopback`: `WARD_NODE_BIN` when
+/// set, otherwise a build into `<target>/node-shipped`, a target directory no feature
+/// build writes. A workspace test run leaves a `test-loopback` build in
+/// `<target>/<profile>`, so that one is never taken.
 pub fn ward_node_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("WARD_NODE_BIN") {
-        return PathBuf::from(path);
-    }
+    static SHIPPED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    SHIPPED
+        .get_or_init(|| {
+            let binary = std::env::var_os("WARD_NODE_BIN")
+                .map_or_else(build_shipped_ward_node, PathBuf::from);
+            assert_shipped(&binary);
+            binary
+        })
+        .clone()
+}
+
+fn build_shipped_ward_node() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let profile_dir = exe.parent().unwrap().parent().unwrap();
-    let candidate = profile_dir.join("ward-node");
-    if candidate.is_file() {
-        return candidate;
-    }
+    let profile = profile_dir.file_name().unwrap();
+    let target = profile_dir.parent().unwrap().join("node-shipped");
     let mut build = Command::new(env!("CARGO"));
     build
         .args([
@@ -137,18 +148,26 @@ pub fn ward_node_binary() -> PathBuf {
             "ward-node",
             "--target-dir",
         ])
-        .arg(profile_dir.parent().unwrap());
-    if profile_dir
-        .file_name()
-        .is_some_and(|name| name == "release")
-    {
+        .arg(&target);
+    if profile == "release" {
         build.arg("--release");
     }
     assert!(
         build.status().unwrap().success(),
-        "building ward-node failed"
+        "building the shipped ward-node failed"
     );
-    candidate
+    target.join(profile).join("ward-node")
+}
+
+fn assert_shipped(binary: &Path) {
+    let version = Command::new(binary).arg("--version").output().unwrap();
+    let version = String::from_utf8_lossy(&version.stdout);
+    assert!(
+        !version.contains("(test-loopback)"),
+        "{} is a test-loopback build of ward-node ({}); the acceptance proves the shipped build",
+        binary.display(),
+        version.trim()
+    );
 }
 
 pub fn imported(dir: &Path) -> SnapshotId {
