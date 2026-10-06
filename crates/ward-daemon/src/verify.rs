@@ -403,24 +403,21 @@ pub fn execute(v: &Verification) -> Result<Outcome> {
     execute_with(v, None)
 }
 
-/// [`execute`], mounting a prepared dependency environment (#147 item 3) read-only
-/// beside the candidate when the session found one whose key matches the
-/// candidate's own inputs ([`crate::prepare::lookup`]): `node_modules` at
-/// `/work/node_modules`, a Python target directory under `/run/verifier/deps` named by
-/// `PYTHONPATH`, its `bin` first on `PATH`. The sandbox is otherwise the same — every
-/// namespace unshared, no egress — so a missing or stale environment means the command
-/// runs without its dependencies and fails on its own terms, never that anything is
-/// fetched.
-pub fn execute_with(
-    v: &Verification,
+/// The verifier's launch over `scratch`: `command` under `/bin/sh -c`, every
+/// namespace unshared, no egress, the toolchain and any prepared environment
+/// mounted read-only. The command is code the agent may have written, so the
+/// launch inherits nothing from the host process (#409): a cleared environment,
+/// the toolchain's `HOME` and `PATH`, the prepared environment's variables, and
+/// the session's non-secret forwarded set.
+fn verifier_launch(
+    scratch: &Path,
+    command: &str,
+    budget: Duration,
     dependencies: Option<&crate::prepare::Prepared>,
-) -> Result<Outcome> {
-    let argv = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        v.config.verify.command.clone(),
-    ];
-    let mut launch = Launch::new(&v.scratch, argv)
+) -> Launch {
+    let argv = vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()];
+    let mut launch = Launch::new(scratch, argv)
+        .clear_env()
         .stdio(StdioMode::Capture)
         // Bound peak capture memory: each stream keeps a head and tail within half
         // the document budget (so the combined document stays near MAX_OUTPUT_BYTES)
@@ -428,7 +425,12 @@ pub fn execute_with(
         // `test result:` lines from the whole stream so counts survive truncation.
         .capture_bytes(MAX_OUTPUT_BYTES / 2)
         .keep_lines("test result:")
-        .budget(Duration::from_secs(v.config.verify.budget_secs));
+        .budget(budget);
+    for name in crate::session::FORWARDED_ENV {
+        if let Ok(value) = std::env::var(name) {
+            launch = launch.env(*name, value);
+        }
+    }
     let toolchains = Toolchains::detect();
     let mut env = toolchains.env();
     if let Some(deps) = dependencies {
@@ -441,7 +443,28 @@ pub fn execute_with(
     if let Some(deps) = dependencies {
         launch = deps.mount(launch);
     }
-    let out = launch.run()?;
+    launch
+}
+
+/// [`execute`], mounting a prepared dependency environment (#147 item 3) read-only
+/// beside the candidate when the session found one whose key matches the
+/// candidate's own inputs ([`crate::prepare::lookup`]): `node_modules` at
+/// `/work/node_modules`, a Python target directory under `/run/verifier/deps` named by
+/// `PYTHONPATH`, its `bin` first on `PATH`. The sandbox is otherwise the same — every
+/// namespace unshared, no egress — so a missing or stale environment means the command
+/// runs without its dependencies and fails on its own terms, never that anything is
+/// fetched.
+pub fn execute_with(
+    v: &Verification,
+    dependencies: Option<&crate::prepare::Prepared>,
+) -> Result<Outcome> {
+    let out = verifier_launch(
+        &v.scratch,
+        &v.config.verify.command,
+        Duration::from_secs(v.config.verify.budget_secs),
+        dependencies,
+    )
+    .run()?;
     let combined = format!("{}{}", out.stdout, out.stderr);
     let combined_over = combined.len() > MAX_OUTPUT_BYTES;
     let mut output = cap(combined);
@@ -710,6 +733,43 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    /// Every variable a launch sets with `--setenv`, by name.
+    fn setenv_names(args: &[String]) -> Vec<String> {
+        args.windows(2)
+            .filter(|w| w[0] == "--setenv")
+            .map(|w| w[1].clone())
+            .collect()
+    }
+
+    /// #409: the verifier runs code the agent wrote, so it inherits nothing from
+    /// the host process: a cleared environment, and only the toolchain's
+    /// variables and the session's non-secret forwarded set.
+    #[test]
+    fn the_verifier_inherits_no_host_environment() {
+        let scratch = tempfile::tempdir().unwrap();
+        let launch = verifier_launch(scratch.path(), "true", Duration::from_secs(5), None);
+        let args = launch.args(scratch.path());
+        assert!(args.iter().any(|a| a == "--clearenv"), "{args:?}");
+        // The toolchain's own variables point inside the sandbox; `TERM=xterm` is
+        // the launch primitive's own constant. Neither is a host value.
+        let toolchain: Vec<String> = Toolchains::detect()
+            .env()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let allowed: Vec<&str> = ["HOME", "PATH", "TERM"]
+            .into_iter()
+            .chain(crate::session::FORWARDED_ENV.iter().copied())
+            .chain(toolchain.iter().map(String::as_str))
+            .collect();
+        for name in setenv_names(&args) {
+            assert!(
+                allowed.contains(&name.as_str()),
+                "{name} reached the verifier"
+            );
+        }
+    }
 
     #[test]
     fn config_needs_a_command_and_reads_protected_tests() {
