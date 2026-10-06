@@ -20,7 +20,10 @@
 //! node never runs a workload under less, or more, than its manifest asked for. A
 //! `credentials` grant adds the routes that inject its leases to that proxy
 //! ([`LaunchRequest::with_credential_routes`], [`crate::credentials`]); nothing about it
-//! enters the sandbox.
+//! enters the sandbox. A workload naming a hosted agent adapter ([`crate::adapters`],
+//! ADR-0036) runs the adapter's command line with its environment and read-only settings
+//! files, and its hook socket when it has hooks ([`LaunchRequest::with_adapter`]); none of
+//! it changes the workspace, the network namespace, the proxy or anything above.
 //!
 //! `pause` and `resume` act on the running workload through its [`WorkloadFreezer`], which
 //! the reaper hands back with the spawned pid. The sandbox freezer first pauses the
@@ -54,11 +57,14 @@ use serde::{Deserialize, Serialize};
 use ward_events::NodeResourceUsage;
 use ward_launch::freeze::{FrozenTree, TreeRoot, freeze_tree, kill_tree, thaw_tree};
 use ward_launch::{ACTION_SOCKET, Launch, PROXY_SOCKET, RunningLaunch};
-use ward_node_protocol::{HostAllowlist, MAX_OUTPUT_STDIO_BYTES, OutputGrant, ResourceGrant};
+use ward_node_protocol::{
+    AdapterCapabilities, HostAllowlist, MAX_OUTPUT_STDIO_BYTES, OutputGrant, ResourceGrant,
+};
 use ward_proxy::{GatewayRoute, Hold, SystemResolver};
 use ward_snapshot::SnapshotStore;
 
 use crate::actions::ACTION_SOCKET_ENV;
+use crate::adapters::AttemptAdapter;
 use crate::cgroup::ResourceEnforcement;
 use crate::credentials::NodeCredentials;
 use crate::egress::{AttemptEgress, PROXY_SOCKET_ENV, egress_dir_beside};
@@ -98,6 +104,19 @@ pub struct LaunchRequest {
     action_socket: Option<PathBuf>,
     credential_routes: Vec<GatewayRoute>,
     hold: Option<Arc<dyn Hold>>,
+    adapter: Option<AdapterParts>,
+}
+
+/// What a hosted agent adapter adds to a launch: its environment, its settings files (each
+/// host file and the sandbox path it is bound at, read-only) and its hook socket.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdapterParts {
+    /// The adapter's non-secret environment.
+    pub env: Vec<(String, String)>,
+    /// Host file and sandbox path of each settings file.
+    pub seeds: Vec<(PathBuf, String)>,
+    /// Host path of the hook socket, for an adapter with hooks.
+    pub hooks: Option<PathBuf>,
 }
 
 impl LaunchRequest {
@@ -114,7 +133,28 @@ impl LaunchRequest {
             action_socket: None,
             credential_routes: Vec::new(),
             hold: None,
+            adapter: None,
         }
+    }
+
+    /// The same launch run as the hosted agent adapter `adapter` (ADR-0036): its command
+    /// line in place of the argv, its environment, its settings files bound read-only and
+    /// its hook socket bound at [`ward_launch::HOOK_SOCKET`], named by `WARD_SOCKET`.
+    #[must_use]
+    pub fn with_adapter(mut self, adapter: &AttemptAdapter) -> Self {
+        adapter.argv().clone_into(&mut self.argv);
+        self.adapter = Some(AdapterParts {
+            env: adapter.env(),
+            seeds: adapter.seeds().to_vec(),
+            hooks: adapter.hook_socket().map(Path::to_path_buf),
+        });
+        self
+    }
+
+    /// What a hosted adapter adds to the launch; `None` for a plain workload.
+    #[must_use]
+    pub const fn adapter(&self) -> Option<&AdapterParts> {
+        self.adapter.as_ref()
     }
 
     /// The same launch behind an egress proxy allowing exactly `allowlist`.
@@ -475,8 +515,27 @@ fn sandbox_launch(request: &LaunchRequest, proxy_socket: Option<&Path>) -> Launc
         Some(socket) => launch.actions(socket).env(ACTION_SOCKET_ENV, ACTION_SOCKET),
         None => launch,
     };
+    let launch = match request.adapter() {
+        Some(adapter) => with_adapter(launch, adapter),
+        None => launch,
+    };
     match proxy_socket {
         Some(socket) => launch.egress(socket).env(PROXY_SOCKET_ENV, PROXY_SOCKET),
+        None => launch,
+    }
+}
+
+fn with_adapter(launch: Launch, adapter: &AdapterParts) -> Launch {
+    let launch = adapter
+        .env
+        .iter()
+        .fold(launch, |launch, (name, value)| launch.env(name, value));
+    let launch = adapter
+        .seeds
+        .iter()
+        .fold(launch, |launch, (file, path)| launch.seed(file, path));
+    match &adapter.hooks {
+        Some(socket) => launch.hooks(socket),
         None => launch,
     }
 }
@@ -609,6 +668,7 @@ pub struct NodeExecution {
     action_channel: bool,
     approval_hold: bool,
     credentials: Option<Arc<NodeCredentials>>,
+    agent_adapters: Option<AdapterCapabilities>,
 }
 
 impl std::fmt::Debug for NodeExecution {
@@ -625,6 +685,7 @@ impl std::fmt::Debug for NodeExecution {
             .field("action_channel", &self.action_channel)
             .field("approval_hold", &self.approval_hold)
             .field("credentials", &self.credentials)
+            .field("agent_adapters", &self.agent_adapters)
             .finish_non_exhaustive()
     }
 }
@@ -651,7 +712,23 @@ impl NodeExecution {
             action_channel: false,
             approval_hold: false,
             credentials: None,
+            agent_adapters: None,
         }
+    }
+
+    /// Host the agent adapters `adapters` names on admitted workloads that name one
+    /// ([`crate::adapters`], ADR-0036). `None`, the default, refuses every workload naming
+    /// an adapter `unsupported_grant` at `admit` and advertises no `adapters` section.
+    #[must_use]
+    pub const fn with_agent_adapters(mut self, adapters: Option<AdapterCapabilities>) -> Self {
+        self.agent_adapters = adapters;
+        self
+    }
+
+    /// The agent adapters this node hosts, if any.
+    #[must_use]
+    pub const fn agent_adapters(&self) -> Option<AdapterCapabilities> {
+        self.agent_adapters
     }
 
     /// Bound how many attempts execute at once and the host headroom `start` keeps
@@ -881,6 +958,80 @@ mod tests {
         let joined = args.join(" ");
         assert!(!joined.contains(PROXY_SOCKET), "{joined}");
         assert!(!joined.contains(PROXY_SOCKET_ENV), "{joined}");
+    }
+
+    /// `args` without one occurrence of each of `parts`, each a contiguous run.
+    fn without(mut args: Vec<String>, parts: &[Vec<String>]) -> Vec<String> {
+        for part in parts {
+            let at = args
+                .windows(part.len())
+                .position(|window| window == part.as_slice())
+                .unwrap_or_else(|| panic!("{part:?} not in {args:?}"));
+            args.drain(at..at + part.len());
+        }
+        args
+    }
+
+    #[test]
+    fn an_adapter_adds_its_environment_settings_and_hook_socket_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let command: Vec<String> = vec!["/opt/claude".into(), "-p".into(), "fix it".into()];
+        let claude = AttemptAdapter::start(
+            &dir.path().join("exec.adapter"),
+            ward_agent_adapter::catalogue::launch("claude-code", &command).unwrap(),
+        )
+        .unwrap();
+        let request = LaunchRequest::new(PathBuf::from("/tmp"), command, Duration::from_secs(1))
+            .with_allowlist(HostAllowlist::new(vec!["localhost".to_owned()]).unwrap());
+        let proxy = Some(Path::new("/host/x.egress/proxy.sock"));
+        let plain = sandbox_launch(&request, proxy).args(Path::new("/tmp"));
+        let hosted = request.clone().with_adapter(&claude);
+        assert_eq!(
+            hosted.argv(),
+            request.argv(),
+            "Claude Code adds no fixed argument"
+        );
+        let args = sandbox_launch(&hosted, proxy).args(Path::new("/tmp"));
+        let s = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let socket = claude.hook_socket().unwrap().display().to_string();
+        let mut added: Vec<Vec<String>> = claude
+            .env()
+            .iter()
+            .map(|(name, value)| s(&["--setenv", name, value]))
+            .collect();
+        added.extend(
+            claude
+                .seeds()
+                .iter()
+                .map(|(file, path)| s(&["--ro-bind", &file.display().to_string(), path])),
+        );
+        added.push(s(&[
+            "--bind",
+            &socket,
+            "/run/ward/hooks.sock",
+            "--setenv",
+            "WARD_SOCKET",
+            "/run/ward/hooks.sock",
+        ]));
+        assert_eq!(without(args, &added), plain, "nothing else changes");
+
+        let codex = AttemptAdapter::start(
+            &dir.path().join("other.adapter"),
+            ward_agent_adapter::catalogue::launch("codex", &s(&["codex"])).unwrap(),
+        )
+        .unwrap();
+        let plain =
+            LaunchRequest::new(PathBuf::from("/tmp"), s(&["codex"]), Duration::from_secs(1));
+        let args =
+            sandbox_launch(&plain.clone().with_adapter(&codex), None).args(Path::new("/tmp"));
+        assert_eq!(
+            without(
+                args,
+                &[s(&["--setenv", "CODEX_HOME", "/home/agent/.codex"])]
+            ),
+            sandbox_launch(&plain, None).args(Path::new("/tmp")),
+            "a hookless adapter binds no hook socket"
+        );
     }
 
     #[test]

@@ -39,6 +39,12 @@ export const CREDENTIAL_LIMITS: Readonly<{ grants: 4; serviceBytes: 32; ttlSecs:
  */
 export const HOLD_LIMITS: Readonly<{ holds: 8 }>;
 
+/**
+ * The agent adapters a node can host on a workload (§7.3, ADR-0036); which of them a node
+ * hosts is its capability document's `adapters.hosted`.
+ */
+export const AGENT_ADAPTERS: ReadonlyArray<"claude-code" | "codex" | "process">;
+
 /** The decisions a control plane may answer; `expired` and `cancelled` are the node's. */
 export const ANSWER_DECISIONS: ReadonlyArray<AnswerDecision>;
 
@@ -239,6 +245,8 @@ export interface EnvelopeInput {
     /** The line `ward-node snapshot import` printed (§2.4). */
     snapshot: string;
     wallClockBudgetMs: number;
+    /** The agent adapter the argv runs as (§6.10, §7.3): an id, signed as `{"id": …}` last in the workload; default none. */
+    adapter?: string | null;
   };
   issuedAtUnixMs: number;
   expiresAtUnixMs: number;
@@ -299,6 +307,20 @@ export function offersApprovalHold(capabilities: unknown): boolean;
  * offers approval holds. Call it before signing a manifest with a `hold` for that node.
  */
 export function requireApprovalHold<C>(capabilities: C): C;
+/**
+ * The workload's `adapter` in wire spelling, `{id}`, refused (an `Error`) for an id outside
+ * the grammar or an `argv[0]` the adapter cannot launch.
+ */
+export function workloadAdapter(id: string, argv: string[]): { id: string };
+/** Whether a capability document (§5) hosts the agent adapter: `adapters.hosted` lists it. */
+export function hostsAgentAdapter(capabilities: unknown, id: string): boolean;
+/**
+ * The capability document, refused (an `Error` naming `unsupported_grant`) unless it hosts
+ * the agent adapter. Call it before signing a workload naming it for that node.
+ */
+export function requireAgentAdapter<C>(capabilities: C, id: string): C;
+/** The agent adapter a signed envelope's workload names, or `null` for a plain workload. */
+export function agentAdapterOf(envelopeJson: string): string | null;
 
 export class Issuer {
   private constructor(privateKey: unknown);

@@ -46,6 +46,7 @@ neither reads or converts the other's.
 | The seal at `ward stop` | `seal` | Both write `HEAD` and make the log read-only. The node also accepts `seal` from `exited` and `revoked` |
 | Session log | Attempt evidence log | Same `ward-events` format (§4.1). The session log carries the agent's claims, kernel, proxy and verifier facts and the user's decisions; the attempt log carries the seven node records about admission, launch, intervention, output collection, end, recovery and seal, the proxy's verdicts as `NetworkRequested`/`NetworkDenied` with origin `node` when the attempt has egress, and never workload output itself (a returned result is recorded by its counts and digests) |
 | Policy manifest (`.ward/policy.yaml` merged into a capability manifest) | Capability manifest in the envelope | The envelope's manifest uses `ward-policy`'s spelling for `network`; `offline` is honoured everywhere and `custom` on a node with `--network-allowlist`. Filesystem, exec, credential and step-through policy have no envelope field yet |
+| `ward claude`, `ward codex`, `ward agent` (agent adapters, ADR-0033) | `workload.adapter` on a node started with `--agent-adapter` (ADR-0036) | Both launch through `ward-agent-adapter`'s one builder, so Claude Code and Codex get the same configuration and settings either way, under the session's or the manifest's authority. A session binds the `ward-agent` shim (hook client, relay) and a provider gateway with a placeholder key; a node binds neither yet: its hook socket hears a runtime that writes the contract's lines itself, and a model API is reached only through a manifest `credentials` grant on the proxy socket (node-integration.md §6.10). Both record the binding and hook lines as agent-origin claims |
 | Entry snapshot (session CAS) | Imported snapshot (node CAS) | Both are `ward-snapshot` content-addressed stores with 64-hex ids; the stores are separate (`~/.local/state/ward/cas` and `<state-dir>/cas`) |
 | `ward replay --verify` | `ward replay --verify` | The same command verifies both logs (§4.1) |
 | `ward doctor` | `ward doctor` | One command. Its `ward-node` line is the only place the per-session tooling knows about a node (§2.2) |
@@ -246,7 +247,14 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
   preserved for what the node enforces. The capability document's `actions` section carries
   `hold` only on such a node. Stage 3 is complete with this; what remains is the rest of
   #267 for the node (delivery B, the services advertised) and holds on anything but a host
-  or a credential (node-security-limitations.md §3.2).
+  or a credential (node-security-limitations.md §3.2). The hosted agent runtime itself is
+  named by the workload ([#279](https://github.com/hexrift/WardOS/issues/279),
+  [ADR-0036](decisions/ADR-0036-node-hosted-agent-adapters.md)): a node started with
+  `--agent-adapter` runs Claude Code, Codex or the generic process adapter through the
+  shared adapter contract under exactly the authority its manifest grants, records the
+  binding and the hook lines as agent-origin claims, and advertises `adapters`; the
+  `ward-agent` shim and a loopback relay inside node attempts are what a real runtime still
+  needs (node-integration.md §6.10).
 - **What stays compatible.** Stage 2 envelopes and every attempt log. The per-session
   mode, which keeps its own approvals and vault until stage 4; its credential providers are
   the same code, moved behaviour-preserving into `ward-credentials`.

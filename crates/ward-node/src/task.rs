@@ -98,6 +98,13 @@
 //!   refused `invalid_state` once the attempt has ended, except for a replay of an answer
 //!   it applied. A restarted node answers `cancelled` every request a recovered attempt's
 //!   log shows unanswered ([`crate::evidence`]).
+//! * A `start` whose admitted workload names an agent adapter the node hosts
+//!   ([`crate::adapters`], ADR-0036) prepares the adapter beside the workspace before the
+//!   spawn (one that cannot be prepared refuses `start` `resource_unavailable` with the
+//!   workspace removed) and launches the adapter's command line; the binding is recorded
+//!   right after the launch record, as part of it, the reaper has the registry record what
+//!   the hook socket queued between waits, and the end of the attempt closes the socket and
+//!   records the rest, and one marker for what could not be, before the end record.
 //!
 //! The reaper waits on the workload promptly and, when it ends, moves the task
 //! `Running → Exited` (or `Paused → Exited`) under the registry lock with a
@@ -204,6 +211,7 @@ use ward_node_protocol::{
 };
 
 use crate::actions::{AttemptActions, actions_dir_beside};
+use crate::adapters::{AttemptAdapter, adapter_dir, adapter_dir_beside, workload_launch};
 use crate::admission::TrustedTaskAdmission;
 use crate::admit::{NodeAdmission, VerifiedAdmission};
 use crate::credentials::{
@@ -280,6 +288,7 @@ struct Attempt {
     network: NetworkTally,
     actions: Option<Arc<AttemptActions>>,
     credentials: Option<Arc<AttemptCredentials>>,
+    adapter: Option<Arc<AttemptAdapter>>,
 }
 
 /// How many egress verdicts an attempt has recorded, and how many it could not.
@@ -415,6 +424,15 @@ impl Evidence<'_> {
         })
     }
 
+    /// Append a hosted adapter's claim, with origin `agent`.
+    fn append_claim(self, binding: TaskBinding, event: WardEvent) -> Result<(), Reason> {
+        self.0.map_or(Ok(()), |root| {
+            AttemptEvidence::new(root.dir(), binding)
+                .append_claim(event)
+                .map_err(|_| Reason::ResourceUnavailable)
+        })
+    }
+
     /// Record that `output` was collected for `binding`; a result the log will not bind
     /// is removed from the store so it is never served.
     fn record_output(self, binding: TaskBinding, output: &AttemptOutput) {
@@ -513,6 +531,7 @@ impl TaskRegistry {
                     .as_ref()
                     .is_some_and(NodeExecution::honours_approval_hold),
             )
+            .with_agent_adapters(execution.as_ref().and_then(NodeExecution::agent_adapters))
             .with_credentials(
                 execution
                     .as_ref()
@@ -548,6 +567,8 @@ impl TaskRegistry {
                         source,
                     })?;
                 reconcile_output(execution.task_root(), task.binding);
+                let _ =
+                    std::fs::remove_dir_all(adapter_dir(execution.task_root().dir(), task.binding));
             }
             if let Some(sealed) = task.sealed {
                 seals = seals.max(sealed.order.saturating_add(1));
@@ -1264,6 +1285,7 @@ impl TaskRegistry {
             Some(resources) => request.with_resources(*resources),
             None => request,
         };
+        let (request, adapter) = with_adapter(request, workload)?;
         let (request, actions) = with_actions(request, manifest)?;
         let credentials = match manifest.credentials() {
             Some(grants) => {
@@ -1294,6 +1316,7 @@ impl TaskRegistry {
             Box::new(Started {
                 actions,
                 credentials,
+                adapter,
             }),
         ))
     }
@@ -1314,6 +1337,7 @@ impl TaskRegistry {
         Started {
             actions,
             credentials,
+            adapter,
         }: Started,
     ) -> Result<TaskLifecycleState, Reason> {
         let journal = Journal(self.store.as_ref());
@@ -1339,6 +1363,7 @@ impl TaskRegistry {
         let launcher = Arc::clone(launcher);
         let tended = actions.clone();
         let leased = credentials.clone();
+        let hosted = adapter.clone();
         let thread = std::thread::Builder::new()
             .name("ward-node-reaper".to_owned())
             .spawn(move || {
@@ -1358,7 +1383,13 @@ impl TaskRegistry {
                     reaper.reaped.set();
                     return;
                 }
-                reaper.watch(workload, &request, tended.as_deref(), leased.as_deref());
+                reaper.watch(
+                    workload,
+                    &request,
+                    tended.as_deref(),
+                    leased.as_deref(),
+                    hosted.as_deref(),
+                );
             });
 
         let spawned = match thread {
@@ -1398,6 +1429,7 @@ impl TaskRegistry {
             network: NetworkTally::default(),
             actions,
             credentials,
+            adapter,
         });
         Ok(task.record_spawn(journal, evidence, operation_id, pid))
     }
@@ -1536,6 +1568,7 @@ impl TaskRegistry {
             .is_some_and(|attempt| attempt.revoke_requested_by == Some(operation_id));
         if live(task.state) && requested {
             task.finish_actions(evidence);
+            task.finish_adapter(evidence);
             task.finish_credentials(evidence, RevokeReason::UserRevoked);
             return match task.commit(
                 journal,
@@ -1569,6 +1602,24 @@ impl TaskRegistry {
         actions.tend(Instant::now(), &mut |event| {
             evidence.append(binding, event).is_ok()
         });
+    }
+
+    /// Record what the hook socket of the live attempt `reaped` belongs to has queued.
+    fn record_claims(&self, binding: TaskBinding, reaped: &Arc<Reaped>) {
+        let evidence = Evidence::of(self.execution.as_ref());
+        let Some(adapter) = self
+            .tasks
+            .get(&binding.task())
+            .filter(|task| task.binding == binding && live(task.state))
+            .and_then(|task| task.attempt.as_ref())
+            .filter(|attempt| Arc::ptr_eq(&attempt.reaped, reaped))
+            .and_then(|attempt| attempt.adapter.clone())
+        else {
+            return;
+        };
+        if let Some(hooks) = adapter.hooks() {
+            hooks.flush(&mut |event| evidence.append_claim(binding, event).is_ok());
+        }
     }
 
     /// Serve one `actions` or `answer` request against the shared registry (see the module
@@ -1739,6 +1790,7 @@ impl TaskRegistry {
             return;
         };
         task.finish_actions(evidence);
+        task.finish_adapter(evidence);
         if let Some(last) = last {
             task.record_network(evidence, reaped, last);
         }
@@ -1819,10 +1871,12 @@ enum Prepared {
 }
 
 /// What a `start` prepared beside the launch: the attempt's action channel and its leased
-/// credentials, if its manifest grants them.
+/// credentials, if its manifest grants them, and its hosted adapter, if its workload names
+/// one.
 struct Started {
     actions: Option<Arc<AttemptActions>>,
     credentials: Option<Arc<AttemptCredentials>>,
+    adapter: Option<Arc<AttemptAdapter>>,
 }
 
 /// What the reaper observed once the workload ended, beside how it ended: the proxy's last
@@ -1876,21 +1930,39 @@ impl Reaper {
         }
     }
 
+    /// Have the registry record what the attempt's hook socket queued; nothing queued
+    /// costs no registry lock.
+    fn claims(&self, adapter: Option<&AttemptAdapter>) {
+        if !adapter
+            .and_then(AttemptAdapter::hooks)
+            .is_some_and(crate::adapters::AttemptHooks::due)
+        {
+            return;
+        }
+        if let Some(registry) = self.registry.upgrade()
+            && let Ok(registry) = registry.lock()
+        {
+            registry.record_claims(self.binding, &self.reaped);
+        }
+    }
+
     /// Wait for the spawned `workload` of `request` to end, tending its egress verdicts,
-    /// action channel and leases meanwhile; then revoke its leases, quiesce its proxy,
-    /// collect its output and record how it ended.
+    /// action channel, leases and adapter claims meanwhile; then revoke its leases, quiesce
+    /// its proxy, collect its output and record how it ended.
     fn watch(
         self,
         workload: Box<dyn RunningWorkload>,
         request: &LaunchRequest,
         actions: Option<&AttemptActions>,
         credentials: Option<&AttemptCredentials>,
+        adapter: Option<&AttemptAdapter>,
     ) {
         let egress = workload.egress();
         let WorkloadEnd { exit, stdio, usage } = workload.wait(&self.stop, &mut || {
             self.drain(egress.as_deref());
             self.tend(actions);
             self.renew(credentials);
+            self.claims(adapter);
         });
         let revoked = credentials.map(AttemptCredentials::revoke);
         let last = egress.as_deref().map(|egress| {
@@ -1943,6 +2015,28 @@ impl Reaper {
             self.reaped.set();
         }
     }
+}
+
+/// `request` run as the agent adapter `workload` names, prepared beside its workspace, and
+/// the adapter; unchanged for a workload naming none. An adapter that cannot be prepared
+/// discards the workspace.
+fn with_adapter(
+    request: LaunchRequest,
+    workload: &ward_node_protocol::TaskWorkload,
+) -> Result<(LaunchRequest, Option<Arc<AttemptAdapter>>), Reason> {
+    let Some(launch) = workload_launch(workload) else {
+        return Ok((request, None));
+    };
+    let Some(adapter) = launch
+        .ok()
+        .zip(adapter_dir_beside(request.workspace()))
+        .and_then(|(launch, dir)| AttemptAdapter::start(&dir, launch).ok())
+    else {
+        discard(request.workspace());
+        return Err(Reason::ResourceUnavailable);
+    };
+    let request = request.with_adapter(&adapter);
+    Ok((request, Some(Arc::new(adapter))))
 }
 
 /// `request` with the action channel `manifest` grants, started beside its workspace and
@@ -2219,6 +2313,7 @@ impl NodeTask {
                             },
                         )
                         .is_ok()
+                    && self.record_binding(evidence)
                 {
                     return self.state;
                 } else {
@@ -2231,6 +2326,7 @@ impl NodeTask {
             attempt.stop.request();
         }
         self.finish_actions(evidence);
+        self.finish_adapter(evidence);
         self.finish_credentials(evidence, RevokeReason::SessionEnded);
         self.finish(TaskLifecycleState::Exited, TaskExecutionOutcome::Unknown);
         if rewrite {
@@ -2327,6 +2423,36 @@ impl NodeTask {
             .and_then(|attempt| attempt.actions.as_ref())
         {
             actions.finish(&mut |event| evidence.append(binding, event).is_ok());
+        }
+    }
+
+    /// Append the attempt's adapter binding right after its launch record; true without
+    /// an adapter.
+    fn record_binding(&self, evidence: Evidence<'_>) -> bool {
+        self.attempt
+            .as_ref()
+            .and_then(|attempt| attempt.adapter.as_ref())
+            .is_none_or(|adapter| {
+                evidence
+                    .append_claim(self.binding, adapter.binding_event())
+                    .is_ok()
+            })
+    }
+
+    /// The attempt has ended: close its hook socket, record what it queued, and the one
+    /// marker for the claims that could not be.
+    fn finish_adapter(&self, evidence: Evidence<'_>) {
+        let binding = self.binding;
+        if let Some(adapter) = self
+            .attempt
+            .as_ref()
+            .and_then(|attempt| attempt.adapter.as_ref())
+        {
+            let dropped =
+                adapter.finish(&mut |event| evidence.append_claim(binding, event).is_ok());
+            if dropped > 0 {
+                let _ = evidence.append(binding, crate::adapters::overflow_marker(dropped));
+            }
         }
     }
 

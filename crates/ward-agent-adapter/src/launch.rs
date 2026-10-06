@@ -37,7 +37,7 @@ const RESERVED_PREFIX: &str = "WARD_";
 /// it is metadata in evidence and never a credential or an authority by itself.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
-pub struct ProviderId(String);
+pub struct ProviderId(pub(crate) String);
 
 impl ProviderId {
     /// Maximum bytes in a provider identifier.
@@ -112,12 +112,12 @@ pub struct SettingsFile {
 /// What an adapter asks of a launch (contract 1.0).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LaunchSpec {
-    program: String,
-    args: Vec<String>,
-    env: Vec<EnvVar>,
-    workdir: String,
-    settings: Vec<SettingsFile>,
-    provider: Option<ProviderId>,
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<EnvVar>,
+    pub(crate) workdir: String,
+    pub(crate) settings: Vec<SettingsFile>,
+    pub(crate) provider: Option<ProviderId>,
 }
 
 impl LaunchSpec {
@@ -217,6 +217,31 @@ impl LaunchSpec {
             .chain(extra.iter().cloned())
             .collect()
     }
+}
+
+/// The model a command line requests with one of `flags` (`--model x`, `--model=x`), the
+/// last one winning as it does for the runtimes; `None` when it names none, after a `--`,
+/// or when `flags` is empty (an adapter that does not know its program's flags).
+#[must_use]
+pub fn requested_model(args: &[String], flags: &[&str]) -> Option<String> {
+    let mut model = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        for flag in flags {
+            if arg == flag {
+                model = iter.next().cloned();
+            } else if let Some(value) = arg
+                .strip_prefix(flag)
+                .and_then(|rest| rest.strip_prefix('='))
+            {
+                model = Some(value.to_owned());
+            }
+        }
+    }
+    model.filter(|m| !m.is_empty())
 }
 
 fn validate_program(program: &str) -> Result<(), LaunchSpecError> {
@@ -506,6 +531,29 @@ mod tests {
             spec(vec![], vec![file("/home/agent/a"), file("/home/agent/a")]),
             Err(LaunchSpecError::DuplicateSettings("/home/agent/a".into()))
         );
+    }
+
+    #[test]
+    fn requested_model_reads_the_last_flag_before_a_double_dash() {
+        let s = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let flags = &["--model", "-m"];
+        assert_eq!(
+            requested_model(&s(&["--model", "a"]), flags).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            requested_model(&s(&["--model=b"]), flags).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            requested_model(&s(&["-m", "c", "--model", "d"]), flags).as_deref(),
+            Some("d")
+        );
+        assert_eq!(requested_model(&s(&["--", "--model", "f"]), flags), None);
+        assert_eq!(requested_model(&s(&["--model"]), flags), None);
+        assert_eq!(requested_model(&s(&["--model="]), flags), None);
+        assert_eq!(requested_model(&s(&["--models", "g"]), flags), None);
+        assert_eq!(requested_model(&s(&["--model", "h"]), &[]), None);
     }
 
     #[test]

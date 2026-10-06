@@ -32,7 +32,9 @@
 //!     node that enforces a network allowlist and whose operator configured every service
 //!     it names, for that service's host and within its ceiling
 //!     ([`NodeAdmission::with_credentials`]), and a `hold` only on a node that holds
-//!     capabilities until approved ([`NodeAdmission::with_approval_hold`]); any other
+//!     capabilities until approved ([`NodeAdmission::with_approval_hold`]), and a workload
+//!     naming an agent adapter only on a node that hosts it and can build its launch from
+//!     the argv ([`NodeAdmission::with_agent_adapters`], ADR-0036); any other
 //!     grant is refused
 //!     `unsupported_grant`, after authority is proven and before the version is committed,
 //!     so a refused grant consumes nothing.
@@ -52,8 +54,8 @@ use ward_authority::{
 };
 use ward_events::{LeaseId, NodeId};
 use ward_node_protocol::{
-    AdmissionEnvelopeJson, CapabilityManifest, IssuerProof, NetworkGrant, TaskAdmissionEnvelope,
-    TaskBinding, TaskLifecycleRejectionReason,
+    AdapterCapabilities, AdmissionEnvelopeJson, CapabilityManifest, IssuerProof, NetworkGrant,
+    TaskAdmissionEnvelope, TaskBinding, TaskLifecycleRejectionReason,
 };
 
 use crate::admission::{TaskAdmissionIdentity, TaskAuthorityError, TrustedTaskAdmission};
@@ -133,6 +135,7 @@ pub struct NodeAdmission {
     action_channel: bool,
     approval_hold: bool,
     credentials: Option<Arc<NodeCredentials>>,
+    agent_adapters: Option<AdapterCapabilities>,
 }
 
 impl std::fmt::Debug for NodeAdmission {
@@ -147,6 +150,7 @@ impl std::fmt::Debug for NodeAdmission {
             .field("action_channel", &self.action_channel)
             .field("approval_hold", &self.approval_hold)
             .field("credentials", &self.credentials)
+            .field("agent_adapters", &self.agent_adapters)
             .finish_non_exhaustive()
     }
 }
@@ -165,7 +169,17 @@ impl NodeAdmission {
             action_channel: false,
             approval_hold: false,
             credentials: None,
+            agent_adapters: None,
         }
+    }
+
+    /// Which agent adapters a workload may name (check 10, ADR-0036). The task registry
+    /// sets this from its execution, so what `admit` accepts is exactly what `start`
+    /// launches and the capability document advertises.
+    #[must_use]
+    pub const fn with_agent_adapters(mut self, adapters: Option<AdapterCapabilities>) -> Self {
+        self.agent_adapters = adapters;
+        self
     }
 
     /// Whether a `{"network":{"custom":[…]}}` manifest is honoured (check 10). The task
@@ -374,6 +388,9 @@ impl NodeAdmission {
             }
         }
         if manifest.hold().is_some() && !self.approval_hold {
+            return Err(Reason::UnsupportedGrant);
+        }
+        if !crate::adapters::honours(self.agent_adapters, envelope.workload()) {
             return Err(Reason::UnsupportedGrant);
         }
 

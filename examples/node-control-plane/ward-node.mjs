@@ -72,6 +72,13 @@ export const CREDENTIAL_LIMITS = Object.freeze({ grants: 4, serviceBytes: 32, tt
  */
 export const HOLD_LIMITS = Object.freeze({ holds: 8 });
 
+/**
+ * The agent adapters a node can host on a workload (node-integration.md §7.3, ADR-0036):
+ * Claude Code, the Codex CLI and the generic process adapter. Which of them a node hosts
+ * is its capability document's `adapters.hosted`.
+ */
+export const AGENT_ADAPTERS = Object.freeze(["claude-code", "codex", "process"]);
+
 /** The decisions a control plane may answer; `expired` and `cancelled` are the node's. */
 export const ANSWER_DECISIONS = Object.freeze(["approved", "denied"]);
 
@@ -82,6 +89,7 @@ const CAPABILITY = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const RESOURCE = /^[\x21-\x7e]{1,256}$/;
 const HOST_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const CREDENTIAL_SERVICE = /^[a-z][a-z0-9-]{0,31}$/;
+const ADAPTER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const MANIFEST_FIELDS = Object.freeze(["network", "output", "actions", "credentials", "hold"]);
 const OUTPUT_PATH_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -762,6 +770,62 @@ export function rootLease({ id, delegationId, issuer, subject, task, grants, iss
   );
 }
 
+/**
+ * The adapter a workload names, in wire spelling (`{"id": …}`), refused outside the §7.3
+ * grammar: an id of 1 to 64 bytes of lowercase letters, digits, `.`, `_` and `-`, starting
+ * with a letter or digit, and an `argv[0]` the adapter can launch (a name on the sandbox
+ * PATH or an absolute path, never a relative path with a `/`).
+ */
+export function workloadAdapter(id, argv) {
+  if (typeof id !== "string" || !ADAPTER_ID.test(id)) {
+    refuse("an agent adapter id is 1 to 64 bytes of a-z 0-9 . _ -, starting with a letter or digit (claude-code, codex, process)");
+  }
+  const program = Array.isArray(argv) ? argv[0] : undefined;
+  if (typeof program !== "string" || (program.includes("/") && !program.startsWith("/"))) {
+    refuse("a workload naming an agent adapter runs argv[0] as a name on the sandbox PATH or an absolute path");
+  }
+  return { id };
+}
+
+/**
+ * Whether the node's capability document (§5) hosts the agent adapter `id`: its `adapters`
+ * section lists it, which a node started with `--agent-adapter <id>` reports.
+ */
+export function hostsAgentAdapter(capabilities, id) {
+  const hosted = capabilities?.adapters?.hosted;
+  return Array.isArray(hosted) && hosted.includes(id);
+}
+
+/**
+ * The capability document, refused unless it hosts the agent adapter `id`: any other node
+ * refuses a workload naming it `unsupported_grant`, so the client refuses it before signing.
+ */
+export function requireAgentAdapter(capabilities, id) {
+  if (!hostsAgentAdapter(capabilities, id)) {
+    refuse(
+      `the node does not list ${id} in adapters.hosted (a node started with --agent-adapter ${id} does) ` +
+        "and refuses a workload naming it as unsupported_grant",
+    );
+  }
+  return capabilities;
+}
+
+/**
+ * The agent adapter a signed envelope's workload names, or `null` for a plain workload:
+ * what a run of it was launched as.
+ */
+export function agentAdapterOf(envelopeJson) {
+  if (typeof envelopeJson !== "string") refuse("envelope_json is the serialised envelope");
+  let envelope;
+  try {
+    envelope = JSON.parse(envelopeJson);
+  } catch {
+    refuse("envelope_json is not JSON");
+  }
+  const adapter = envelope?.workload?.adapter;
+  return adapter === undefined ? null : workloadAdapter(adapter?.id, envelope.workload.argv).id;
+}
+
 function checkArgv(argv) {
   if (!Array.isArray(argv) || argv.length < 1 || argv.length > MAX_ARGV_ENTRIES) {
     refuse(`argv is 1 to ${MAX_ARGV_ENTRIES} strings`);
@@ -783,8 +847,10 @@ function checkArgv(argv) {
  * Build the envelope of §7.1, with the keys in the order the §7.4 vector has them, from:
  * binding {task, attempt, lease}, agent, node, session, lease (a `rootLease` or a
  * delegated lease in wire form), lineage (nearest parent first, default none), workload
- * {argv, manifest (object, default offline), snapshot, wallClockBudgetMs}, issuedAtUnixMs,
- * expiresAtUnixMs and version. Every bound of §7.3 is checked here, before signing.
+ * {argv, manifest (object, default offline), snapshot, wallClockBudgetMs, adapter (an agent
+ * adapter id, default none)}, issuedAtUnixMs, expiresAtUnixMs and version. Every bound of
+ * §7.3 is checked here, before signing; `adapter` is spelled last in the workload, and not
+ * at all without one.
  */
 export function buildEnvelope(input) {
   const { binding, agent, node, session, lease, lineage = [], workload, issuedAtUnixMs, expiresAtUnixMs, version } = input;
@@ -810,6 +876,7 @@ export function buildEnvelope(input) {
   if (!Number.isSafeInteger(workload.wallClockBudgetMs) || workload.wallClockBudgetMs < 1) {
     refuse("wallClockBudgetMs, the budget, is an integer >= 1");
   }
+  const adapter = workload.adapter === undefined || workload.adapter === null ? null : workloadAdapter(workload.adapter, argv);
   checkTime(issuedAtUnixMs, "issuedAtUnixMs");
   checkTime(expiresAtUnixMs, "expiresAtUnixMs");
   if (expiresAtUnixMs <= issuedAtUnixMs) refuse("expiresAtUnixMs must be after issuedAtUnixMs");
@@ -825,6 +892,7 @@ export function buildEnvelope(input) {
       capability_manifest: capabilityManifest,
       snapshot: workload.snapshot,
       wall_clock_budget_ms: workload.wallClockBudgetMs,
+      ...(adapter === null ? {} : { adapter }),
     },
     issued_at_unix_ms: issuedAtUnixMs,
     expires_at_unix_ms: expiresAtUnixMs,

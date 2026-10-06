@@ -7,7 +7,8 @@
 //! four modules: [`contract`] (version, hook coverage, semantic events and the
 //! capability-discovery document), [`launch`] (what an adapter may ask of a launch),
 //! [`wire`] (the hook-socket lines, approvals, capability requests, cancellation, task
-//! result and the evidence binding) and [`catalogue`] (the documents `WardOS` ships).
+//! result and the evidence binding) and [`catalogue`] (the documents and launches `WardOS`
+//! ships).
 
 #![forbid(unsafe_code)]
 
@@ -18,11 +19,14 @@ pub mod wire;
 
 use std::fmt::{Display, Formatter};
 
+pub use catalogue::{AdapterLaunch, AdapterLaunchError};
 pub use contract::{
     CapabilityDocument, CapabilityDocumentError, ContractVersion, ContractVersionError, Coverage,
     HookSupport, SERVED_FEATURES, SemanticEvent, SemanticEvents, SemanticEventsError,
 };
-pub use launch::{EnvVar, LaunchSpec, LaunchSpecError, ProviderId, ProviderIdError, SettingsFile};
+pub use launch::{
+    EnvVar, LaunchSpec, LaunchSpecError, ProviderId, ProviderIdError, SettingsFile, requested_model,
+};
 pub use wire::{
     AdapterBinding, AdapterBindingError, ApprovalAnswer, ApprovalDecision, BindingClaim,
     CancelReason, CancelRequest, CapabilityRequest, CapabilityRequestError, RequestedCapability,

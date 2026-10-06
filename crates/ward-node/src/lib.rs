@@ -41,6 +41,13 @@
 //!   refuses each capability a manifest's `hold` names in the attempt's egress proxy until
 //!   the control plane approves the request the node opens for it on first use, and
 //!   advertises `actions.hold`.
+//! * at protocol 1.3, a service whose execution hosts agent adapters
+//!   ([`execution::NodeExecution::with_agent_adapters`], `--agent-adapter`, ADR-0036) runs
+//!   a workload naming one of them through the shared adapter contract ([`adapters`]):
+//!   the same sandbox, proxy, credentials and holds as any workload, the adapter's command
+//!   line, environment and settings, its hook lines recorded as agent-origin claims, and
+//!   its binding recorded as metadata; it advertises `adapters`. Any other node refuses
+//!   such a workload `unsupported_grant` at `admit`.
 //!
 //! * at protocol 1.3, a service whose execution runs attempts in cgroups
 //!   ([`cgroup`], `--cgroup-root`) honours a manifest's `resources` limits, records what
@@ -78,6 +85,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod adapters;
 pub mod admission;
 pub mod admit;
 pub mod audit;
@@ -107,10 +115,11 @@ use std::time::{Duration, Instant};
 use nix::unistd::{Gid, Uid};
 use thiserror::Error;
 use ward_node_protocol::{
-    ActionCapabilities, CapabilityDiscoveryContext, CredentialCapabilities, HandshakeRequest,
-    HandshakeResponse, LifecycleCapabilities, NamespaceCapabilities, NodeCapabilities,
-    OutputCapabilities, SupportedProtocolRange, TaskLifecycleContext, TaskResultRequest,
-    WARD_NODE_PROTOCOL, negotiate, supports_task_admission, supports_task_lifecycle,
+    ActionCapabilities, AdapterCapabilities, CapabilityDiscoveryContext, CredentialCapabilities,
+    HandshakeRequest, HandshakeResponse, LifecycleCapabilities, NamespaceCapabilities,
+    NodeCapabilities, OutputCapabilities, SupportedProtocolRange, TaskLifecycleContext,
+    TaskResultRequest, WARD_NODE_PROTOCOL, negotiate, supports_task_admission,
+    supports_task_lifecycle,
 };
 
 use crate::admit::NodeAdmission;
@@ -205,6 +214,7 @@ pub struct NodeService {
     action_channel: bool,
     approval_hold: bool,
     credentials: bool,
+    agent_adapters: Option<AdapterCapabilities>,
     tasks: Arc<Mutex<TaskRegistry>>,
 }
 
@@ -228,6 +238,7 @@ impl NodeService {
             action_channel: false,
             approval_hold: false,
             credentials: false,
+            agent_adapters: None,
             tasks: Arc::new(Mutex::new(TaskRegistry::default())),
         })
     }
@@ -256,6 +267,7 @@ impl NodeService {
             action_channel: false,
             approval_hold: false,
             credentials: false,
+            agent_adapters: None,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_admission(
                 MAX_NODE_TASKS,
                 admission,
@@ -284,6 +296,7 @@ impl NodeService {
         let action_channel = execution.honours_action_channel();
         let approval_hold = execution.honours_approval_hold();
         let credentials = execution.honours_credentials();
+        let agent_adapters = execution.agent_adapters();
         Ok(Self {
             capabilities,
             supported: WARD_NODE_PROTOCOL,
@@ -294,6 +307,7 @@ impl NodeService {
             action_channel,
             approval_hold,
             credentials,
+            agent_adapters,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_execution(
                 MAX_NODE_TASKS,
                 admission,
@@ -383,6 +397,7 @@ impl NodeService {
         let mut resources = None;
         let mut scheduling = None;
         let mut actions = ActionCapabilities::NONE;
+        let mut adapters = None;
         let lifecycle = if supports_task_admission(protocol) {
             isolation.namespaces = NamespaceCapabilities {
                 sandbox: self.executes,
@@ -406,6 +421,9 @@ impl NodeService {
                     .map_err(|_| NodeServiceError::TaskRegistryUnavailable)?;
                 resources = tasks.resource_capabilities();
                 scheduling = tasks.scheduling();
+            }
+            if self.executes {
+                adapters = self.agent_adapters;
             }
             if self.executes && self.action_channel {
                 actions = ActionCapabilities {
@@ -442,6 +460,7 @@ impl NodeService {
         .and_then(|capabilities| capabilities.with_resources(resources))
         .and_then(|capabilities| capabilities.with_scheduling(scheduling))
         .and_then(|capabilities| capabilities.with_actions(actions))
+        .and_then(|capabilities| capabilities.with_adapters(adapters))
         .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         let response = context
             .response(capabilities)

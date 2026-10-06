@@ -3,7 +3,7 @@
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
 //! [--task-root <dir>] [--network-allowlist [--credentials <file>]] [--output-return]
 //! [--action-channel [--approval-hold]] [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
-//! [--client-uid <uid>]… [--client-group <group>]`
+//! [--agent-adapter <id>]… [--client-uid <uid>]… [--client-group <group>]`
 //! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
 //! admission version, revocation and retired-attempt stores, one record per registered task
@@ -43,7 +43,12 @@
 //! is recorded in its task record and evidence log; without it such a manifest is refused
 //! `unsupported_grant`. With `--max-running` as well, at most that many attempts execute at
 //! once and a `start` past it, or below `--memory-floor` or `--disk-floor`, is refused
-//! `capacity_exhausted` with the task still `ready`. The socket is served to the node's own
+//! `capacity_exhausted` with the task still `ready`. With `--agent-adapter` (`claude-code`,
+//! `codex` or `process`, repeatable) as well, a workload naming that adapter runs through
+//! the shared adapter contract: its command line, environment and settings files on top of
+//! exactly the sandbox, proxy and credentials its manifest grants, its hook lines recorded
+//! as agent-origin claims; the node advertises `adapters`, and without the flag such a
+//! workload is refused `unsupported_grant`. The socket is served to the node's own
 //! uid and to each `--client-uid` (a uid or user name); every other peer is closed without
 //! a response. With `--client-group` the socket is created mode 0660 owned by that group,
 //! in a directory owned by it with mode 0750 or stricter, so a client of another uid can
@@ -78,9 +83,10 @@ use ward_node::state::{NodeState, open_private_dir};
 use ward_node::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
 use ward_node::{NodeService, SocketAccess, serve_local};
 use ward_node_protocol::{
-    CredentialCapabilities, ExecutionBackendCapabilities, IsolationCapabilities,
-    LifecycleCapabilities, NamespaceCapabilities, NetworkCapabilities, NodeArchitecture,
-    NodeCapabilities, NodeCapacity, ProtocolVersion, SnapshotCapabilities, VerifierCapabilities,
+    AdapterCapabilities, CredentialCapabilities, ExecutionBackendCapabilities, HostedAdapter,
+    IsolationCapabilities, LifecycleCapabilities, NamespaceCapabilities, NetworkCapabilities,
+    NodeArchitecture, NodeCapabilities, NodeCapacity, ProtocolVersion, SnapshotCapabilities,
+    VerifierCapabilities,
 };
 
 /// What `--version` prints after the name: a `test-loopback` build says it is one.
@@ -184,6 +190,19 @@ struct Cli {
     /// than this many bytes available. Needs `--max-running`.
     #[arg(long, value_name = "BYTES", requires = "max_running")]
     disk_floor: Option<u64>,
+    /// Host this agent adapter (`claude-code`, `codex` or `process`; repeatable) on
+    /// workloads that name it: the node launches the workload's argv through the adapter
+    /// contract, adding the adapter's environment and settings files and, for an adapter
+    /// with hooks, a hook socket whose lines are recorded as agent-origin claims, never
+    /// anything its manifest does not grant; advertise `adapters`. Needs `--task-root`.
+    /// Without it every workload naming an adapter is refused `unsupported_grant`.
+    #[arg(
+        long = "agent-adapter",
+        value_name = "ID",
+        requires = "task_root",
+        value_parser = parse_adapter
+    )]
+    agent_adapter: Vec<HostedAdapter>,
     /// A uid, or user name, served on the socket besides the node's own; repeatable. Any
     /// other peer is closed without a response. Being served grants no authority: `admit`
     /// still needs a trusted signature.
@@ -318,13 +337,21 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     .with_approval_hold(cli.approval_hold)
                     .with_credentials(credentials)
                     .with_resource_enforcement(enforcement)
-                    .with_scheduling(scheduling),
+                    .with_scheduling(scheduling)
+                    .with_agent_adapters(AdapterCapabilities::hosting(cli.agent_adapter)),
             )?
         }
         None => NodeService::with_admission(capabilities, admission)?,
     };
     serve_local(&socket, &service, SocketAccess::new(client_group, clients))?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn parse_adapter(id: &str) -> Result<HostedAdapter, String> {
+    HostedAdapter::from_id(id).ok_or_else(|| {
+        let known: Vec<&str> = HostedAdapter::ALL.iter().map(|a| a.id()).collect();
+        format!("no such adapter `{id}` (known: {})", known.join(", "))
+    })
 }
 
 fn run(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -541,6 +568,57 @@ mod tests {
                 "a hold needs the action channel and the allowlist: {without:?}"
             );
         }
+    }
+
+    #[test]
+    fn agent_adapters_are_named_by_id_and_need_a_task_root() {
+        let node = NodeId::from_u128(4).to_string();
+        let serve = [
+            "ward-node",
+            "--socket",
+            "s",
+            "--state-dir",
+            "d",
+            "--node-id",
+            &node,
+        ];
+        let parse = |extra: &[&str]| Cli::try_parse_from(serve.iter().chain(extra));
+        let cli = parse(&[
+            "--task-root",
+            "t",
+            "--agent-adapter",
+            "codex",
+            "--agent-adapter",
+            "claude-code",
+        ])
+        .expect("adapters with a task root");
+        assert_eq!(
+            cli.agent_adapter,
+            [HostedAdapter::Codex, HostedAdapter::ClaudeCode]
+        );
+        assert_eq!(
+            AdapterCapabilities::hosting(cli.agent_adapter)
+                .expect("two hosted")
+                .hosted(),
+            [HostedAdapter::ClaudeCode, HostedAdapter::Codex]
+        );
+        assert!(
+            parse(&["--agent-adapter", "codex"]).is_err(),
+            "needs --task-root"
+        );
+        let unknown = parse(&["--task-root", "t", "--agent-adapter", "gemini-cli"])
+            .err()
+            .expect("an unknown adapter is refused");
+        assert!(
+            unknown.to_string().contains("claude-code, codex, process"),
+            "{unknown}"
+        );
+        assert!(
+            parse(&["--task-root", "t"])
+                .expect("no adapter")
+                .agent_adapter
+                .is_empty()
+        );
     }
 
     #[test]

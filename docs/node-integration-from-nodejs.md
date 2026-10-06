@@ -8,8 +8,8 @@ keep where, how to derive the ids and the version, how to build and sign the env
 `node:crypto`, how to spawn `ward-node-adapter` and speak its JSON lines, how to read the
 outcome, how to ask for and read back a bounded result, how to grant the action channel
 and answer the workload's requests while it runs, how to grant a workload a credential the
-node brokers without the secret ever reaching it, how to cancel and how to recover after
-a restart on either side. Every rule
+node brokers without the secret ever reaching it, how to run the workload as an agent
+adapter the node hosts, how to cancel and how to recover after a restart on either side. Every rule
 here is the contract's, [node-integration.md](node-integration.md), cited by section;
 nothing here adds to it. The reference implementation of everything below is
 [`examples/node-control-plane`](../examples/node-control-plane/README.md): a
@@ -29,7 +29,9 @@ the control plane grants it by name and the node leases and injects it, so the w
 reaches only that service's host and never holds the secret (§7.3 below). Where an action
 must not reach a host or use a credential before a human says yes, the control plane holds
 that capability in the manifest and the node refuses it until the control plane approves
-the request the node opens for it (§7.4 below). What the node
+the request the node opens for it (§7.4 below). Where the action is an agent runtime —
+Claude Code, Codex or any program — the workload names its adapter and the node launches
+it through the adapter contract under the same manifest (§7.5 below). What the node
 cannot do yet for such a control plane is §11 below; read it before deciding which actions
 go through the node.
 
@@ -699,6 +701,48 @@ destination with the reason `PolicyDeny` and the rule `hold:<state>:<n>`. The ac
 decodes all three from the sealed log's bytes and checks the request's summary digest
 against `blake3Hex("credential artifacts")`.
 
+### 7.5 Agent adapters
+
+A node started with `--agent-adapter <id>` hosts that agent adapter on workloads that name
+it (node-integration.md §6.10, §7.3,
+[ADR-0036](decisions/ADR-0036-node-hosted-agent-adapters.md)): `claude-code`, `codex` or
+`process`. The adapter is named in the workload, beside the argv, not in the manifest, so
+the same manifest bytes serve every adapter:
+
+```json
+"workload":{"argv":["claude","-p","fix the build"],"capability_manifest":{…},"snapshot":"…","wall_clock_budget_ms":600000,"adapter":{"id":"claude-code"}}
+```
+
+`buildEnvelope` takes it as `workload.adapter` (an id) and spells it last in the workload,
+and not at all without one; `workloadAdapter(id, argv)` refuses an id outside the grammar
+(1–64 bytes of `a-z 0-9 . _ -`) or an `argv[0]` the adapter cannot launch (a relative path
+with a `/`) before anything is signed, and `agentAdapterOf(envelope_json)` reads it back.
+`hostsAgentAdapter(capabilities, id)` says whether a node lists it in `adapters.hosted`, and
+`requireAgentAdapter(capabilities, id)` refuses, naming `unsupported_grant`, before a version
+is allocated; any other node refuses the envelope `unsupported_grant` itself. `AGENT_ADAPTERS`
+lists the ids a node can host.
+
+**What the node does with it.** It launches `argv[0]` with the adapter's environment and
+settings files (Claude Code's `CLAUDE_CONFIG_DIR` and settings, Codex's `CODEX_HOME`) and,
+for Claude Code, a hook socket at `/run/ward/hooks.sock` whose lines are answered `allow`
+and recorded as agent-origin claims; everything else is the manifest's, exactly as for any
+workload. The provider is metadata: a runtime reaches its model API only through a
+`credentials` grant (§7.3 above) for a service the operator configured, named after the
+provider by convention, on `WARD_PROXY_SOCKET`. The sealed log holds the binding
+(`{"agent_adapter":{…}}`, origin `agent`) right after the launch record.
+
+**The command line.** `control-plane.mjs run --agent-adapter <id> -- <argv>` (`--adapter`
+stays the `ward-node-adapter` binary) reads the node's capability document first and exits
+2, naming `unsupported_grant`, on a node that does not host the adapter; an id or a program
+outside the grammar exits 2 before the node is asked. The outcome names it:
+
+```text
+$ node control-plane.mjs run … --agent-adapter codex -- codex exec "fix the build"
+{"outcome":"completed",…,"agent_adapter":"codex"}
+```
+
+`replay` names the recorded adapter the same way.
+
 ## 8. Cancel
 
 Cancellation is `revoke`, never `stop` (§11.2): the lease is durably revoked first, then
@@ -762,8 +806,8 @@ before replacing an attempt, because a new attempt discards the old receipt (§9
 ## 10. The proof
 
 ```bash
-cd examples/node-control-plane && node --test       # 86 cases, no node, no sandbox
-scripts/acceptance/node-js.sh                        # 22 cases against real nodes; skips loudly without bubblewrap
+cd examples/node-control-plane && node --test       # 93 cases, no node, no sandbox
+scripts/acceptance/node-js.sh                        # 25 cases against real nodes; skips loudly without bubblewrap
 WARD_REQUIRE_ISOLATION=1 scripts/acceptance/node-js.sh   # fail instead of skipping, as CI does
 ```
 
@@ -787,7 +831,11 @@ node that does not broker before a version is allocated, signed and listed in th
 on one that does, and replayed, and approval holds: the `hold`'s grammar held to
 `ward-node-protocol`'s (the same signed bytes for the same hold), its hosts and services
 held to the manifest's, a listing's node-opened requests held to the hold, `actions.hold`
-read before signing, and `run --hold` with `--approve-all` and `--deny-all` and its refusals.
+read before signing, and `run --hold` with `--approve-all` and `--deny-all` and its refusals,
+and agent adapters: the workload's `adapter` spelled last and absent without one, the
+manifest the same bytes with or without it, the id and program grammar, `adapters.hosted`
+read before signing, and `run --agent-adapter` signed, named in the outcome, replayed and
+refused on a node that does not host it.
 The acceptance starts a real node with the client's generated
 key in its trust store, `--output-return` and `--action-channel` and proves `completes_and_seals`,
 `fails_with_exit_status`, `cancel_is_revoke_then_seal`, `replay_acts_on_nothing`,
@@ -832,7 +880,16 @@ node's request `hold:1` approved by `--approve-all`, the next request reaching t
 upstream with the lease injected; the request recorded before the approval, the approval
 before the released request, and the hold's refusal under its rule), `hold_denial_keeps_it_refused` (`approval denied`, exit 3, nothing
 upstream), `hold_expiry_keeps_it_refused` (`approval expired` after a 2 s wait) and,
-against a node without `--approval-hold`, `hold_is_refused_without_the_flag_or_outside_its_manifest`,
+against a node without `--approval-hold`, `hold_is_refused_without_the_flag_or_outside_its_manifest`;
+and, against a node started with `--agent-adapter claude-code` and `--agent-adapter codex`
+(the shipped build) whose own environment holds model keys, with a Claude Code fake that
+writes its hook lines to `$WARD_SOCKET` and a Codex fake that checks its home,
+`agent_adapters_run_one_manifest` (both complete under byte-identical signed manifests,
+none of the node's keys in either sandbox, one `agent_adapter` binding in each sealed log),
+`claude_code_hooks_are_claims` (every hook line answered `allow` and recorded as a claim,
+none in Codex's log, the adapter's directory gone with the attempt) and
+`agent_adapter_refused_where_not_hosted` (the client's refusal of `process` before signing,
+and the plain node's own `unsupported_grant` for the signed Codex run),
 verifying every evidence log with `ward-node audit --task-root` (and `ward replay --verify`
 when a `ward` binary is at hand). The shipped `ward-node` never connects to a loopback
 address and speaks only TLS upstream, so the credentials and hold nodes, alone, are
@@ -881,6 +938,12 @@ plane deciding what to put through the node today:
   tunnel, there is no in-sandbox relay for a tool that only speaks `HTTP_PROXY` (§9), the
   capability document does not list the services a node offers (the operator says) (#267);
   a credential is held for an approval only by a hold (§7.4 above).
+- **A real agent runtime on the node.** A hosted adapter (§7.5 above) gets its
+  configuration and, for Claude Code, a hook socket, but no `ward-agent` shim (Claude
+  Code's command hooks find nothing to run) and no loopback relay (a runtime that needs an
+  HTTP base URL cannot use the proxy socket's route); its hook answers are `allow` and its
+  approvals are not bridged onto the action channel (#279). Run an agent loop on the node
+  today only if it speaks the hook lines and the proxy socket itself.
 - **Remote transport.** The adapter runs on the node's host (#262); a control plane
   elsewhere brings its own channel to that host and ships pre-signed bytes over it.
 
@@ -907,6 +970,10 @@ Operator side:
 - [ ] Where a host or credential must wait for a human: the node started with
       `--approval-hold` as well (with `--action-channel` and `--network-allowlist`);
       `actions.hold` reads `true` from the client's user.
+- [ ] Where an agent runtime runs on the node: the node started with `--agent-adapter`
+      for each runtime the institution routes there (`claude-code`, `codex`, `process`);
+      `adapters.hosted` lists them from the client's user; the model provider's service
+      (`anthropic`, `openai`) configured in `--credentials` with its upstream and header.
 
 ai-institution side, as an `InstitutionWorkerExecutionPort` (or an action execution port)
 behind an adapter:
@@ -949,6 +1016,12 @@ behind an adapter:
       hold, each answer recorded before it is sent and replayed, never re-decided; the
       workload written to retry a `403 held for approval` and to stop on `approval denied`,
       `approval expired` or `approval cancelled`.
+- [ ] Where a work item runs an agent runtime: the runtime named in the envelope's
+      `workload.adapter` (§7.5 above), signed only after `requireAgentAdapter` accepted the
+      node's capability document, under the same manifest whichever runtime it is; its
+      model reached through a `credentials` grant, never a key in the argv, snapshot or
+      environment; the sealed log's `agent_adapter` binding and hook claims read as the
+      agent's account, never as authority.
 - [ ] The signed bytes, proof, ids and version persisted before the first send; replay on
       restart with the same adapter conversation (§9); no second attempt until the first is
       ended.
