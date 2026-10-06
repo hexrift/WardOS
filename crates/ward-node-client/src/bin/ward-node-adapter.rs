@@ -2,12 +2,13 @@
 //! languages (node-integration.md §11).
 //!
 //! `ward-node-adapter (--socket <path> | --connect-tls <host:port> --tls-cert <file>
-//! --tls-key <file> --tls-server-ca <file> --tls-server-name <name> [--tls-server-pin <pin>])
-//! [--timeout-ms <ms>] [--connect-timeout-ms <ms>]` reads one JSON command per line on stdin
-//! and writes one JSON event per line on stdout, each carrying `"schema":1`; stderr is
-//! diagnostics only. With `--connect-tls` every command reaches a node serving
-//! `--listen-tls` over mutual TLS (ADR-0038) instead of its socket; TLS files that cannot
-//! be used are an `error` before any command is read. Commands:
+//! --tls-key <file> --tls-server-ca <file> --tls-server-name <name> [--tls-server-pin <pin>]
+//! [--tls-server-revoked <file>]) [--timeout-ms <ms>] [--connect-timeout-ms <ms>]` reads one
+//! JSON command per line on stdin and writes one JSON event per line on stdout, each
+//! carrying `"schema":1`; stderr is diagnostics only. With `--connect-tls` every command
+//! reaches a node serving `--listen-tls` over mutual TLS (ADR-0038) instead of its socket,
+//! and a node whose key `--tls-server-revoked` lists is refused at the handshake; TLS files
+//! that cannot be used are an `error` before any command is read. Commands:
 //!
 //! * `{"cmd":"capabilities"}` → `capabilities`;
 //! * `{"cmd":"run", ...}` with a pre-signed envelope (`envelope_json` and `proof`, sent
@@ -48,8 +49,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use ward_node_client::{
     ActionsListed, AnswerApplied, Applied, AttemptRequest, CancelToken, Client, Driver,
-    EnvelopeInput, Inspection, IssuerKey, OperationIds, Resulted, RunConfig, SignedEnvelope,
-    Timeouts, TlsSettings, TlsTransport, Transport, UnixTransport,
+    EnvelopeInput, Inspection, IssuerKey, OperationIds, Resulted, RevokedNodeKeys, RunConfig,
+    SignedEnvelope, Timeouts, TlsSettings, TlsTransport, Transport, UnixTransport,
 };
 use ward_node_protocol::{
     ActionDecision, ActionNote, AdmissionEnvelopeJson, IssuerProof, OperationId, TaskBinding,
@@ -90,6 +91,11 @@ struct Cli {
     /// certificate's DER `SubjectPublicKeyInfo`.
     #[arg(long, value_name = "PIN", requires = "connect_tls")]
     tls_server_pin: Option<String>,
+    /// Node keys refused even when their certificate chains to the server CA and is
+    /// pinned: one pin per line, as `--tls-server-pin` spells it, with blank lines and `#`
+    /// comments; a regular file writable by no one else.
+    #[arg(long, value_name = "FILE", requires = "connect_tls")]
+    tls_server_revoked: Option<PathBuf>,
     /// Bound on a verb's answer; `start`, `stop` and `revoke` need more than 60 000.
     #[arg(long, default_value_t = 90_000)]
     timeout_ms: u64,
@@ -194,7 +200,13 @@ fn main() -> ExitCode {
                 client_key: cli.tls_key.unwrap_or_default(),
                 server_pin: cli.tls_server_pin,
             };
-            match TlsTransport::new(&settings, timeouts) {
+            let revoked = cli
+                .tls_server_revoked
+                .as_deref()
+                .map_or_else(|| Ok(RevokedNodeKeys::default()), RevokedNodeKeys::load);
+            match revoked
+                .and_then(|revoked| TlsTransport::with_revoked(&settings, &revoked, timeouts))
+            {
                 Ok(transport) => serve(transport, cancel, running),
                 Err(error) => {
                     let message = format!("TLS: {error}");
