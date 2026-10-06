@@ -6,7 +6,7 @@ Status: **Proposed; the remote-transport slice of
 or mTLS") and the transport of node-integration.md §3; it changes neither the protocol
 grammar, the capability document, the admission envelope nor the event catalogue. §8
 (client-key revocation and reload without a restart) was decided in a later slice of
-#262.
+#262, and §9's revocation of node keys on the client in another.
 
 ## Context
 
@@ -165,9 +165,27 @@ framing, bounds and EOF semantics; it refuses a node whose certificate does not 
 server CA, is not valid for the expected name or is not the pinned key, and a TLS failure is
 `TransportError::Tls`. The client's key file must be mode 0600 or 0400, like the issuer seed.
 `ward-node-adapter --connect-tls <host:port> --tls-cert … --tls-key … --tls-server-ca …
---tls-server-name … [--tls-server-pin …]` uses it in place of `--socket`, and the Node.js
-reference client passes those flags through (`new Adapter({tls: …})`, `--connect-tls` on its
-CLI), so the protocol code stays in one place.
+--tls-server-name … [--tls-server-pin …] [--tls-server-revoked …]` uses it in place of
+`--socket`, and the Node.js reference client passes those flags through (`new
+Adapter({tls: …})`, `--connect-tls` on its CLI), so the protocol code stays in one place.
+
+**Revoked node keys.** A node key that leaked still chains to the server CA, and a pin
+names the key a client expects, not the keys it must never accept again. The client
+therefore takes a revocation list of node keys (`RevokedNodeKeys`, given to
+`TlsTransport::with_revoked`; `--tls-server-revoked <file>` on the adapter;
+`tls.serverRevoked` in the Node.js client), spelled and read exactly as the node's
+`--tls-client-revoked` (§3): one pin per line, blank lines and `#` comments, a regular file
+writable by no one else, at most 64 KiB, a malformed line refused with its number before
+anything is sent. After the chain is validated, a node whose key is on the list is refused
+at the handshake, before the pin is compared and so even when it is the pinned key, as
+`TransportError::Tls` with `invalid peer certificate: the node's key sha256:<hex> is
+revoked`. Every certificate for that key is refused, renewals included. The list is read
+when the transport is built, so a new list takes effect at the next adapter process. The
+parser is a copy of the node's rather than a shared one: the only crate both depend on is
+`ward-node-protocol`, which holds the protocol's types and not a transport's files, and the
+client never depends on `ward-node` (architecture.md); a unit test of the client reads a
+corpus of lists with both parsers and requires the same keys or the same error.
+`TlsSettings` keeps its fields, so existing callers are unchanged.
 
 ## Alternatives
 
@@ -209,12 +227,16 @@ CLI), so the protocol code stays in one place.
 * The issuer signature stays the only source of authority; the transport adds who-may-speak.
 * A stolen client key is refused at its next handshake, and the node's certificate or the
   client CA is rotated, without a restart: no attempt in flight is lost to it.
+* A node whose key leaked is refused by every client given its key in a revocation list,
+  even where that key is pinned, and the node is reached again once its operator rotates
+  it to a fresh key.
 
 ## Disadvantages
 
 * The operator runs a PKI (or at least two CAs) and provisions files per node.
-* Revocation is a key list the operator distributes to each node and signals; there is no
-  CRL, no OCSP and no propagation across nodes. Changing the pins, or the trust store,
+* Revocation is a key list the operator distributes to each node and signals, and a list of
+  node keys each client host is given; there is no CRL, no OCSP and no propagation across
+  nodes or clients. Changing the pins, or the trust store,
   still needs a restart.
 * Handshakes are reported on stderr, not recorded durably.
 * Two more crates in the node's closure as direct dependencies (`rustls` and `rustls-webpki`,
@@ -249,6 +271,12 @@ CLI), so the protocol code stays in one place.
   certificate is from another CA, for another name or not the pinned key is refused; a whole
   attempt runs, seals and replays over TLS without running twice, and a superseded `pause`
   replays `stale_operation`; the adapter speaks over `--connect-tls`.
+* `crates/ward-node-client/tests/tls_node_revocation.rs` proves §9's node-key revocation
+  against the real node: a node whose key the client's list names is refused even when it
+  is pinned and chains to the server CA, a list that does not name it changes nothing, a
+  node rotated to a fresh key from the same CA and reloaded with `SIGHUP` is reached again
+  by the same client with the same list, the adapter refuses the revoked node with
+  `--tls-server-revoked` and an unusable list before anything is sent.
 
 ## Performance consequences
 
@@ -269,7 +297,8 @@ must raise the node version (CONTRIBUTING.md, #275).
   line-numbered errors, the reload report, the skew arithmetic, the bound on connections
   in progress, the refusal reasons, the flags' parsing and requirements.
 * `ward-node-client` unit tests: the client's file checks, pin parsing, skew, the TLS error
-  inside an I/O error.
+  inside an I/O error, the node-key revocation list's parsing, its line-numbered errors,
+  its file rules and its agreement with the node's parser.
 * The two end-to-end suites of Security consequences, against the real binaries, with every
   certificate generated at test time (rcgen); none is committed.
 * `scripts/acceptance/node-js.sh` case `mutual_tls_transport`: the Node.js reference client
@@ -282,10 +311,10 @@ must raise the node version (CONTRIBUTING.md, #275).
   plane, instead of operator-provisioned files.
 * Attestation: nothing about the node's software or hardware is attested; the certificate
   says which key, not what runs behind it.
-* Revocation beyond §8's key list: certificate revocation lists or short-lived
-  certificates for clients and nodes, a revocation list for node keys in
-  `ward-node-client` (it pins one node key today), propagation of a revoked key to every
-  node, and remote revocation propagation of leases with acknowledgement.
+* Revocation beyond the key lists of §8 and §9: certificate revocation lists or
+  short-lived certificates for clients and nodes, propagation of a revoked key to every
+  node and every client (each list is the operator's file, per host), and remote
+  revocation propagation of leases with acknowledgement.
 * Reloading the pins (a file in place of the flags) and the trust store without a
   restart.
 * A durable node audit record of every handshake, enrolment, renewal, revocation and

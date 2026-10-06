@@ -293,13 +293,19 @@ openssl x509 -in client.pem -pubkey -noout | openssl pkey -pubin -outform der | 
 ```
 
 On the control plane, install the client's certificate and key (mode 0600, the worker's
-user) and the **node** CA, and check from there:
+user), the **node** CA and a list of revoked node keys, empty for now and writable by no
+one but its owner, and check from there:
 
 ```text
+$ printf '# node keys this client refuses, one sha256:<hex> per line\n' > revoked-nodes
 $ echo '{"cmd":"capabilities"}' | ward-node-adapter --connect-tls node-7.exec.internal:7443 \
-    --tls-cert client.pem --tls-key client-key.pem --tls-server-ca node-ca.pem --tls-server-name node-7.exec.internal
+    --tls-cert client.pem --tls-key client-key.pem --tls-server-ca node-ca.pem --tls-server-name node-7.exec.internal \
+    --tls-server-revoked revoked-nodes
 {"schema":1,"event":"capabilities","protocol":{"major":1,"minor":3},"capabilities":{…}}
 ```
+
+Every adapter process reads the list when it starts, so a revoked node key needs no
+restart of anything on the control plane: the next adapter refuses it.
 
 The node's journal says what happened at the edge: `serving the node protocol over mutual
 TLS on 10.0.4.7:7443` at start, `served a TLS client sha256:<pin> from <address>` and
@@ -337,6 +343,20 @@ keeps the old pair, and the next `SIGHUP` after the key is in place succeeds.
 - *Node certificate:* issue a new one (same or new key), replace `node.pem` and
   `node-key.pem`, reload, and check that the journal reports the new `server key`. Clients
   that pin the node's key need the new pin first if the key changed.
+- *A compromised node key:* whoever holds it can pose as the node to every client that
+  trusts the node CA, pins or not. First generate a fresh key on the node and have the CA
+  certify it (never reuse the old key). Then, on **every** client host, append the old
+  key's pin (the `server key sha256:<pin>` the node's journal reported, or the one
+  `openssl` computes from `node.pem`) to `revoked-nodes`; from the next adapter process on,
+  a handshake with that key is refused before anything is sent, as an `error` event
+  `TLS: … invalid peer certificate: the node's key sha256:<pin> is revoked`, even where
+  the key is pinned, and every certificate for it, renewals included. Then install the new
+  certificate and key on the node and reload; the journal reports `server key
+  sha256:<new pin> (changed)`. Clients that pin the node move their pin to the new key.
+  Between the revocation and the reload the clients refuse the real node too, which is the
+  safe side: an attempt in flight keeps running on the node, and its `run` ends `unknown`
+  if an answer is lost (§7). Keep the old pin in the list for as long as any certificate
+  for it is unexpired.
 - *Client certificates:* issue the new one before the old expires; nothing changes on the
   node unless it pins keys. Pins are flags, so adding or removing one is still a restart
   (§8; an attempt running at that moment ends `exited`/`unknown`, so drain first): add
@@ -349,6 +369,9 @@ keeps the old pair, and the next `SIGHUP` after the key is in place succeeds.
 `crates/ward-node/tests/node_mtls_revocation_cli.rs` exercises these procedures against
 the real node: a revocation and its removal, a broken list and a half-rotated certificate
 kept out, and a rotated node key and client CA, each by `SIGHUP` without a restart.
+`crates/ward-node-client/tests/tls_node_revocation.rs` exercises the compromised node key:
+the client refuses the revoked key, pinned or not, through the library and the adapter, and
+reaches the node again once it is rotated to a fresh key and reloaded.
 
 ## 4. Operator: import a snapshot
 
@@ -513,6 +536,13 @@ replays as `create`, `admit` and `seal`, each answered `sealed`, with no `start`
 why the signed bytes and the id scheme are persisted before the first send (§5). The
 acceptance case `replay_after_a_client_restart_runs_nothing_twice` is exactly this path
 (node-acceptance.md §2).
+
+**Your side is gone for a while** (node-integration.md §6.4). The node carries on without
+you and never on more than you signed: a running attempt ends at its budget, an
+unanswered action-channel request expires and a held capability stays refused, and an
+admission whose envelope expired meanwhile is refused at `start`. Nothing you did not send
+happens, and nothing waits for you either: issue envelopes and budgets you are prepared
+to let run out unattended.
 
 **Reading the outcome before it is gone.** A new attempt replaces the old one's receipt
 and an evicted sealed task reads `task_not_found` (§9, §10); read `inspect` or the

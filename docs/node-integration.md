@@ -381,7 +381,8 @@ and hashes are lowercase hex. The exit status is the text form's.
   `--tls-client-revoked` list and, with `--tls-client-pin`, carries a pinned key. The
   client checks the node's certificate against the server CA
   it was given, for the name it expects (and, if it pins one, the node's key), with the
-  same skew. One connection still carries one request; the handshake must complete within
+  same skew, and refuses a node whose key is on its own list of revoked node keys
+  (§11, `--tls-server-revoked` on the adapter) even when that key is pinned. One connection still carries one request; the handshake must complete within
   10 seconds of accept and then the request deadline applies. A refused handshake (no
   certificate, another CA, expired or not yet valid, revoked, not pinned, no `ward-node`
   ALPN, TLS 1.2, a plaintext client, too slow) ends with a TLS alert or a close and no protocol byte,
@@ -755,6 +756,25 @@ loads: an evicted task's record is removed before the task that needed its room 
 recorded. Each recovered attempt's evidence log is also brought in line with its recovered
 state before the node serves (§6.5); a log that does not verify stops the node from
 starting.
+
+**Without the control plane (partition behaviour).** Losing the control plane never
+widens what the node does: nothing the node does on its own grants authority, and silence
+is never an answer. An attempt nobody watches keeps exactly the authority it was admitted
+with and ends at its budget, killed by the node (`exited`, `failed`, cause
+`BudgetExceeded`); the envelope's validity does not bound a running workload, the budget
+does (§7.3). An action-channel request nobody answers is answered `expired` after its wait
+(§6.7), and a held capability stays refused until then and after (`approval expired`,
+§6.9); nothing is released. An admission whose envelope expires while nobody is connected
+is refused at `start` (`lease_expired`) with nothing materialised, and an envelope signed
+before the partition is refused at `admit` once it has expired. A node restarted meanwhile
+recovers as above: a `ready` task reads `created` and its expired envelope is not admitted
+again, an attempt that may have been executing reads `exited`/`unknown` and never runs
+again. What a lost control plane cannot do is revoke or stop an attempt early (the node's
+operator still can, §2.5); budgets and expiry still bound everything. `crates/ward-node/tests/node_partition_cli.rs` proves the budget
+and the expiry with nothing connected, before and after a restart;
+`tests/node_hold_cli.rs` (`an_unanswered_hold_expires_and_stays_refused`), the acceptance
+case `action_channel_unanswered_request_expires_after_its_wait` and
+`tests/node_recovery_cli.rs` prove the rest.
 
 ### 6.5 Evidence logs
 
@@ -1923,9 +1943,14 @@ WardOS ships one implementation of this contract for the control-plane side, in 
 - `TlsTransport`: the same over TCP with mutual TLS to a node started with `--listen-tls`
   (§3, ADR-0038), from `TlsSettings`: the node's address, the name its certificate must
   carry, the server CA, this client's certificate and key (mode `0600` or `0400`) and,
-  optionally, the node's pinned key. The TLS handshake counts against the `connect`
-  timeout. A node whose certificate is not from the server CA, not for the name or not the
-  pinned key, and a node that refuses this client's certificate, are
+  optionally, the node's pinned key; `TlsTransport::with_revoked` also takes
+  `RevokedNodeKeys`, node keys refused even when they chain to the server CA and are
+  pinned, read from a list spelled as the node's `--tls-client-revoked` (one
+  `sha256:<hex>` per line, blank lines and `#` comments; a regular file writable by no one
+  else, at most 64 KiB; a malformed line is `TlsSetupError::Revocation` with its number).
+  The TLS handshake counts against the `connect` timeout. A node whose certificate is not
+  from the server CA, not for the name, revoked (`the node's key sha256:<hex> is revoked`)
+  or not the pinned key, and a node that refuses this client's certificate, are
   `TransportError::Tls` with the reason; nothing is sent to a node that is not
   authenticated.
 - `Client`: negotiates once, offering 1.3 up to the highest minor this revision
@@ -2062,9 +2087,10 @@ and the node's `--task-root`.
 reads one JSON command per line on stdin and writes one JSON event per line on stdout.
 For a node started with `--listen-tls`, `--connect-tls <host:port> --tls-cert <file>
 --tls-key <file> --tls-server-ca <file> --tls-server-name <name> [--tls-server-pin
-sha256:<hex>]` takes the place of `--socket` (the two are exclusive) and every command
-travels over mutual TLS (§3, §11); TLS files that cannot be used are an `error` event and
-exit status 1 before any command is read.
+sha256:<hex>] [--tls-server-revoked <file>]` takes the place of `--socket` (the two are
+exclusive) and every command travels over mutual TLS (§3, §11), refusing a node whose key
+the `--tls-server-revoked` list names; TLS files that cannot be used, a malformed list
+included, are an `error` event and exit status 1 before any command is read.
 Every output line carries `"schema":1`; stderr is diagnostics only. Commands:
 
 | Command | Answer |

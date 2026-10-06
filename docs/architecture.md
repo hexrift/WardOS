@@ -703,7 +703,8 @@ The control-plane side of the contract ships as `ward-node-client` (#332 slice 8
 node-integration.md §11), which depends on `ward-node-protocol`, `ward-events` and
 `ward-authority` but never on `ward-daemon` or `ward-node`: a Unix-socket transport with
 the §3 bounds and timeouts and the same over TCP with mutual TLS for a node started with
-`--listen-tls` ([ADR-0038](decisions/ADR-0038-node-mutual-tls-transport.md)), a client that negotiates 1.3 or later and checks every answer
+`--listen-tls` ([ADR-0038](decisions/ADR-0038-node-mutual-tls-transport.md)), refusing a node
+whose key is on the client's own revocation list, a client that negotiates 1.3 or later and checks every answer
 against its request, an issuer key read only from a private seed file that signs an
 envelope's exact bytes, a bounded envelope input, and a driver that runs one attempt
 `create → admit → start → inspect… → seal` with caller-supplied, replayable operation
