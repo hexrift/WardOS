@@ -3,9 +3,9 @@
 //! A node started with `--agent-shim <file>` ([`crate::execution::NodeExecution::with_agent_shim`])
 //! runs every attempt of a hosted adapter ([`crate::adapters`]) under that shim, bound
 //! read-only at [`ward_launch::AGENT_SHIM`] and run ahead of the adapter's command line. The
-//! shim applies its Landlock ruleset (read-only on [`READ_ONLY`], the shim itself included,
-//! so the adapter's command hooks can run it as `ward-agent hook` against the attempt's hook
-//! socket), its seccomp filter and `no_new_privs`; for an attempt with an egress proxy it
+//! shim applies its Landlock ruleset (read-only on [`ward_launch::SHIM_READ_ONLY`], the shim
+//! itself included, so the adapter's command hooks can run it as `ward-agent hook` against the
+//! attempt's hook socket), its seccomp filter and `no_new_privs`; for an attempt with an egress proxy it
 //! then starts its relay, a TCP listener on [`ward_launch::RELAY_ADDR`] inside the attempt's
 //! network namespace that forwards every connection to the attempt's proxy socket. The
 //! relay is a pipe: whatever passes it is decided by the proxy behind the socket the
@@ -32,14 +32,8 @@ use std::process::{Command, Stdio};
 use nix::unistd::geteuid;
 use thiserror::Error;
 use ward_agent_adapter::catalogue::{self, PLACEHOLDER_KEY};
-use ward_launch::{AGENT_SHIM, RELAY_ADDR};
+use ward_launch::RELAY_ADDR;
 use ward_proxy::GatewayRoute;
-
-/// What the shim's Landlock ruleset leaves readable and executable: the system directories
-/// the sandbox binds and the shim, so a command hook can run it.
-pub const READ_ONLY: [&str; 9] = [
-    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/etc", "/proc", AGENT_SHIM,
-];
 
 /// The proxy variables that name the relay.
 pub const PROXY_ENV: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"];
@@ -165,15 +159,6 @@ impl AgentShim {
     pub fn path(&self) -> &Path {
         &self.path
     }
-
-    /// The shim's flags ahead of the command line: its read-only set, [`READ_ONLY`].
-    #[must_use]
-    pub fn flags() -> Vec<String> {
-        READ_ONLY
-            .iter()
-            .flat_map(|dir| ["--ro".to_owned(), (*dir).to_owned()])
-            .collect()
-    }
 }
 
 fn quiet(command: &mut Command) -> &mut Command {
@@ -283,19 +268,6 @@ mod tests {
                 "{provider:?}"
             );
         }
-    }
-
-    #[test]
-    fn the_shim_reads_and_runs_the_system_and_itself_and_nothing_else() {
-        let shim = AgentShim::assumed(PathBuf::from("/usr/libexec/ward-agent"));
-        let flags = AgentShim::flags();
-        assert_eq!(flags.len(), 2 * READ_ONLY.len());
-        assert!(flags.chunks(2).all(|pair| pair[0] == "--ro"));
-        assert!(flags.contains(&AGENT_SHIM.to_owned()));
-        for writable in ["/work", "/tmp", "/home", "/run", "/run/ward"] {
-            assert!(!flags.contains(&writable.to_owned()), "{writable}");
-        }
-        assert_eq!(shim.path(), Path::new("/usr/libexec/ward-agent"));
     }
 
     #[test]

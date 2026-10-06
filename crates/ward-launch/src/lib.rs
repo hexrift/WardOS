@@ -143,6 +143,13 @@ pub const PROXY_SOCKET: &str = "/run/ward/proxy.sock";
 pub const ACTION_SOCKET: &str = "/run/ward/actions.sock";
 /// Mount point of the `ward-agent` shim inside the sandbox.
 pub const AGENT_SHIM: &str = "/run/ward/ward-agent";
+/// What the shim's Landlock ruleset leaves readable and executable in every launch that
+/// binds it, a session's and a node's alike: the system directories the sandbox binds
+/// (`/opt` carries vendor runtimes such as Claude Code) and the shim, so a command hook
+/// can run it (ADR-0037 §2).
+pub const SHIM_READ_ONLY: [&str; 9] = [
+    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/etc", "/proc", AGENT_SHIM,
+];
 /// Mount point of the worktree itself inside the sandbox — an ordinary
 /// read-write `--bind`, so (unlike `SYSTEM_RO`) it is never at the same
 /// path on the host. `ward ready`'s `runtime` row (`ward_daemon::readiness`)
@@ -421,7 +428,8 @@ impl Launch {
         self
     }
 
-    /// Run through the `ward-agent` shim at this host path (Landlock, seccomp, relay).
+    /// Run through the `ward-agent` shim at this host path (Landlock, read-only on
+    /// [`SHIM_READ_ONLY`]; seccomp; relay).
     #[must_use]
     pub fn shim(mut self, path: impl Into<PathBuf>) -> Self {
         self.shim = Some(path.into());
@@ -621,6 +629,9 @@ impl Launch {
         push(&mut a, &["--"]);
         if self.shim.is_some() {
             push(&mut a, &[AGENT_SHIM]);
+            for dir in SHIM_READ_ONLY {
+                push(&mut a, &["--ro", dir]);
+            }
             a.extend(self.shim_flags.iter().cloned());
             // The shim only forwards whitelisted env to the agent; name ours explicitly.
             for (k, _) in &self.env {
@@ -1101,7 +1112,9 @@ mod tests {
             "shim must be told to pass FOO through"
         );
         assert!(a.ends_with(
-            "-- /run/ward/ward-agent --env FOO --relay 127.0.0.1:3128=/run/ward/proxy.sock -- true"
+            "-- /run/ward/ward-agent --ro /usr --ro /bin --ro /sbin --ro /lib --ro /lib64 \
+             --ro /opt --ro /etc --ro /proc --ro /run/ward/ward-agent \
+             --env FOO --relay 127.0.0.1:3128=/run/ward/proxy.sock -- true"
         ));
         assert!(!a.contains("/root"), "host home must never be bound");
         assert!(
@@ -1389,6 +1402,41 @@ mod tests {
             "summary kept from the full stream: {:?}",
             out.kept_lines
         );
+    }
+
+    #[test]
+    fn the_bound_shim_reads_and_runs_the_system_and_itself_and_nothing_else() {
+        assert!(SHIM_READ_ONLY.contains(&AGENT_SHIM));
+        for writable in [
+            "/work",
+            "/env",
+            "/tmp",
+            "/home",
+            "/run",
+            "/run/ward",
+            "/dev",
+        ] {
+            assert!(!SHIM_READ_ONLY.contains(&writable), "{writable}");
+        }
+        let a = Launch::new("/tmp", vec!["true".into()])
+            .shim("/host/ward-agent")
+            .shim_flags(vec!["--allow-no-landlock".into()])
+            .args(Path::new("/tmp"));
+        let run = a.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(a[run + 1], AGENT_SHIM);
+        let read_only: Vec<String> = SHIM_READ_ONLY
+            .iter()
+            .flat_map(|dir| ["--ro".to_owned(), (*dir).to_owned()])
+            .collect();
+        assert_eq!(a[run + 2..run + 2 + read_only.len()], read_only);
+        assert_eq!(a[run + 2 + read_only.len()], "--allow-no-landlock");
+        assert_eq!(
+            a.iter().filter(|arg| *arg == "--ro").count(),
+            SHIM_READ_ONLY.len()
+        );
+
+        let direct = Launch::new("/tmp", vec!["true".into()]).args(Path::new("/tmp"));
+        assert!(!direct.iter().any(|arg| arg == "--ro"));
     }
 
     #[test]

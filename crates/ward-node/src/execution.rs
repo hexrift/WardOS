@@ -574,7 +574,7 @@ fn with_adapter(
     let Some(shim) = &adapter.shim else {
         return launch;
     };
-    let launch = launch.shim_flags(AgentShim::flags()).shim(shim.path());
+    let launch = launch.shim(shim.path());
     if !relayed {
         return launch;
     }
@@ -1136,10 +1136,11 @@ mod tests {
         );
         let run = args.iter().position(|arg| arg == "--").unwrap();
         assert_eq!(args[run + 1], "/run/ward/ward-agent");
-        assert_eq!(
-            args[run + 2..run + 2 + 2 * crate::shim::READ_ONLY.len()],
-            AgentShim::flags()
-        );
+        let read_only: Vec<String> = ward_launch::SHIM_READ_ONLY
+            .iter()
+            .flat_map(|dir| ["--ro".to_owned(), (*dir).to_owned()])
+            .collect();
+        assert_eq!(args[run + 2..run + 2 + read_only.len()], read_only);
         assert!(
             joined.ends_with("--relay 127.0.0.1:3128=/run/ward/proxy.sock -- /work/claude -p x"),
             "{joined}"

@@ -166,20 +166,18 @@ and `ward-agent-adapter`), so the next release must raise the node version (CONT
 * `ward-agent-adapter`: every first-party provider has an endpoint outside the reserved
   variables.
 * `ward-node` unit tests: the shim's refusals before it runs (relative, missing, a symlink,
-  a directory, group- or other-writable, not executable, not a shim), its read-only set,
-  the base URL only for the route of the adapter's provider, the launch under the shim with
+  a directory, group- or other-writable, not executable, not a shim), the base URL only for the route of the adapter's provider, the launch under the shim with
   the relay only behind a proxy and a plain workload unchanged, and the flag's parsing.
 * `crates/ward-node/tests/node_agent_relay_cli.rs` against the real `ward-node` and
   `ward-agent` binaries, as in Security consequences, and the node's refusal to start with a
   shim it cannot verify.
 * `ward-daemon`: the gateway tests, unchanged, over the shared provider endpoints.
+* `ward-launch` unit tests: the read-only set, `ward_launch::SHIM_READ_ONLY`, passed to every
+  shim a launch binds, a session's as well as a node's (#426).
 
 ## What remains
 
 * Ship the shim in the node tarball (it would join the node train's inputs, #275).
 * Say in the capability document that hosted adapters run under a shim with a relay.
 * A real-runtime conformance run in CI (ADR-0033 §8).
-* The session's own ruleset reads neither `/opt` nor the shim, so a session's command hook
-  cannot execute `/run/ward/ward-agent hook` under an enforced ruleset; the node's read-only
-  set (§2) is the fix to carry over.
 * A `node-js.sh` case of the shipped node with a shim.

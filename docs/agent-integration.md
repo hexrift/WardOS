@@ -16,7 +16,10 @@ ward claude [dir] [-- <claude args>]
    agent's own hosts (§3) so the agent can reach its model API and nothing else.
 3. Build the sandbox: worktree rw at `/work`, `/env` rw, tmpfs `$HOME`, **no host
    home**, netns whose only egress is the proxy, `ward-agent` as PID 1 (Landlock,
-   seccomp, `NoNewPrivs`).
+   seccomp, `NoNewPrivs`). Its Landlock ruleset reads and executes only `/usr`, `/bin`,
+   `/sbin`, `/lib`, `/lib64`, `/opt`, `/etc`, `/proc` and the shim itself
+   (`/run/ward/ward-agent`, so a command hook can run it): the set a node's hosted
+   adapters run under (ADR-0037 §2), one definition for both.
 4. Provision a **sandbox-private** agent config dir (`CLAUDE_CONFIG_DIR=/home/agent/.claude`)
    containing only: hook wiring (§4), a settings file that disables non-essential
    traffic, and a *short-lived* credential or a gateway pointer (§3). The user's real
@@ -332,7 +335,9 @@ silently weakening. The model-API key stays on the host: `ward claude` configure
 the upstream receives the real key). Other host credentials enter the sandbox only via
 an explicit, printed `--pass-env NAME`. Hook adapters (§4) are wired: the daemon
 seeds the settings file, answers `/run/ward/hooks.sock`, and records claims; verified
-end to end in `crates/ward-daemon/tests/e2e.rs` under a `step_through` policy. Live
+end to end in `crates/ward-daemon/tests/e2e.rs` under a `step_through` policy, and in
+`crates/ward-daemon/tests/session_shim_landlock.rs` with the seeded hook command run
+through the bound shim under its enforced ruleset, beside a readable `/opt`. Live
 run (E-07, `experiments.md` §5): Claude Code 2.1.263 started headless inside the
 sandbox from the read-only `/opt` bind, reached `api.anthropic.com` only through the
 gateway (the API's `401` for a deliberately invalid host key proves the path), and its
@@ -522,9 +527,6 @@ test build has no shim in the sandbox — and the Codex fake checks the environm
 * On `ward-node` (§10.9) a real Claude Code has its command hooks and its provider route
   only on a node whose operator named a `ward-agent` shim (`--agent-shim`); no CI run
   drives a real runtime against a model there either.
-* In a session, the shim's Landlock ruleset reads neither `/opt` nor the shim itself, so
-  on a kernel that enforces it a command hook cannot execute `/run/ward/ward-agent hook`;
-  the node's read-only set (ADR-0037 §2) is the fix to carry over.
 * Capability requests, cooperative cancellation and structured task results have
   contract shapes and no host path (`coverage` reports them as unserved for an adapter
   that claims them).

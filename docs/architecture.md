@@ -817,7 +817,7 @@ runtime spec, plus WardOS-specific inner hardening.
 | IPC/UTS/cgroup namespaces | Isolation of SysV IPC, hostname (`ward-<session>`), and cgroup view. |
 | cgroups v2 | Per-session scope under `ward.slice`: CPU weight, memory cap, pids cap, freezer for snapshots, `cgroup.kill` for teardown. |
 | seccomp | Two layers: OCI runtime profile (deny `mount` family, `ptrace` of foreign, `bpf`, `keyctl`, `add_key`, `kexec`, `reboot`, module syscalls, `userfaultfd`, io_uring by default) then a tighter `ward-agent` final filter with user-notification on `connect` for observation **[experiment E-05]**. |
-| Landlock | Applied by `ward-agent` before exec: rw only under `/work`, `/env`, `/tmp`, `$HOME` (sandbox home); ro elsewhere; no access to control socket dir except the socket. Belt-and-braces over the mount namespace. |
+| Landlock | Applied by `ward-agent` before exec: rw only under `/work`, `/env`, `/tmp`, `$HOME` (sandbox home); ro only under `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/opt`, `/etc`, `/proc` and the shim itself (`ward_launch::SHIM_READ_ONLY`); no access to control socket dir except the socket. Belt-and-braces over the mount namespace. |
 | Capabilities | Bounding set empty except when a project explicitly needs `CAP_NET_BIND_SERVICE` (never granted by default). `NoNewPrivs` set. |
 | Devices | None except `/dev/null,zero,random,urandom,tty,pts`. `/dev/fuse` only if nested containers enabled. No GPU by default. |
 
