@@ -2,8 +2,9 @@
 
 Status: **Proposed; implemented under #404 (stage 3 of [migration-to-node.md](../migration-to-node.md)
 §3.4, #332).** Approvals as an enforced node capability and brokered credentials (#267) are
-not part of this decision; what the channel does not do yet is a row of
-[node-security-limitations.md](../node-security-limitations.md) §3.
+not part of this decision; they are [ADR-0035](ADR-0035-node-approval-hold.md) and
+[ADR-0034](ADR-0034-node-brokered-credentials.md). What the channel does not do yet is a
+row of [node-security-limitations.md](../node-security-limitations.md) §3.
 
 [ADR-0030](ADR-0030-node-task-admission-and-execution-ownership.md) gives `ward-node`
 ownership of what it admits: spawn, budget, reaping and the attempt's evidence log. Its

@@ -52,8 +52,10 @@ After the table, `node.sh` runs [`scripts/acceptance/node-js.sh`](../scripts/acc
 the acceptance of the Node.js reference control plane
 ([node-integration-from-nodejs.md](node-integration-from-nodejs.md) §10) against a second
 real node started with `--output-return` and `--action-channel` (and a third without
-either, a fourth with `--network-allowlist` and `--credentials` and a fifth with
-`--network-allowlist` alone), under the same isolation requirement; its eighteen verdicts
+either, a fourth with `--network-allowlist` and `--credentials`, a fifth with
+`--network-allowlist` alone, a sixth with `--network-allowlist`, `--credentials`,
+`--action-channel` and `--approval-hold`, and a seventh with all of those but
+`--approval-hold`), under the same isolation requirement; its twenty-two verdicts
 (five of the attempt's lifecycle; three of result return: declared content with digests the host
 agrees with, truncation past the budgets, and the refusal of a grant by a node without
 the flag; six of the action channel, with a workload in the sandbox that proceeds only on
@@ -66,8 +68,14 @@ upstream receives the token the proxy injected while the workload's output, the 
 the task root and the node's state never hold it and the lease is revoked at the provider
 at the attempt's end, a replay leases nothing, a cancel revokes the lease, and a node
 without `--credentials` and the client before it refuse the grant, each checked against
-the sealed log's credential records) follow the table and a failure of either fails the
-run. The credentials node is `ward-node` built with its `test-loopback` feature (the
+the sealed log's credential records; four of approval holds, against the same fakes with a
+workload that retries a held credential route: `--approve-all` approves the request the
+node opened and the next request reaches the upstream with the lease injected, `--deny-all`
+and an unanswered request keep the route refused by name with nothing sent upstream, and a
+node without `--approval-hold` and the client before it refuse the hold, each checked
+against the sealed log's action and network records) follow the table and a failure of
+either fails the run. The credentials and hold nodes are `ward-node` built with its
+`test-loopback` feature (the
 shipped build never connects to a loopback upstream or speaks plain HTTP to one), which
 `node-js.sh` builds into a target directory of its own or takes from
 `WARD_NODE_LOOPBACK_BIN`; every other node it starts runs `WARD_NODE_BIN`, which it builds
@@ -306,17 +314,23 @@ minute on a developer machine; each case prints its own time.
   `tests/node_credentials_cli.rs` and, driven through `ward-node-adapter`, by the four
   credentials cases of `node-js.sh`, both against a fake OpenBao and a plain-HTTP fake
   upstream on loopback with the `test-loopback` build; not by a case of the Rust suite
-  here, and never against a real provider or a TLS upstream (#267).
+  here, and never against a real provider or a TLS upstream (#267). Approval holds
+  (node-integration.md §6.9) likewise: by `ward-node`'s own `tests/node_hold_cli.rs`
+  (approve, deny, expiry, stop, pause, a node restart, forged, replayed and misdirected
+  answers) and by the four hold cases of `node-js.sh`, against the same fakes; a held host
+  is proven released only on a credential route to it, since the shipped proxy never
+  connects to a loopback upstream.
 - **No workspace export, no streamed output.** The result return cases prove the bounded
   result of §2.3 (declared files, stream heads); what a workload wrote beyond the files it
   declared is still read on the host as the node's uid, which a remote control plane
   cannot do, and nothing is carried while the attempt runs.
-- **Approvals are not enforced.** The action channel cases (§2.5) prove that a workload
-  that asks holds on the answer, and that the node records, relays, expires and cancels
-  as the contract says; nothing proves, or could, that a workload which never asks is
-  stopped, because the node enforces nothing on an approval at this revision. The hostile
-  case sends four kinds of lines, not a fuzzer's corpus; the channel's parser is
-  unit-tested for the rest.
+- **Approvals are enforced only as holds, outside this suite.** The action channel cases
+  (§2.5) prove that a workload that asks holds on the answer, and that the node records,
+  relays, expires and cancels as the contract says; nothing proves, or could, that a
+  workload which never asks is stopped, because the node enforces nothing on an approval a
+  workload asks for itself. What the node enforces, a hold on a host or a credential, is
+  proven by the tests named in the bullet above. The hostile case sends four kinds of
+  lines, not a fuzzer's corpus; the channel's parser is unit-tested for the rest.
 - **No escape attempt beyond the probes.** The isolation case is a contract check of what
   the sandbox denies to an ordinary workload, not an adversarial escape suite; the
   kernel-level boundary tests of [experiments.md](experiments.md) E-01 and the
