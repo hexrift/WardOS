@@ -169,6 +169,39 @@ const SYSTEM_RO: &[&str] = &[
     "/etc/ssl",
     "/etc/ca-certificates",
 ];
+const PROC_MASKED_DIRECTORIES: [&str; 3] = ["acpi", "asound", "scsi"];
+const PROC_MASKED_FILES: [&str; 6] = [
+    "kcore",
+    "keys",
+    "latency_stats",
+    "sched_debug",
+    "timer_list",
+    "timer_stats",
+];
+
+fn append_proc_masks(args: &mut Vec<String>, proc_root: &Path) {
+    for path in PROC_MASKED_DIRECTORIES {
+        if proc_root.join(path).is_dir() {
+            let destination = format!("/proc/{path}");
+            args.extend([
+                "--tmpfs".into(),
+                destination.clone(),
+                "--remount-ro".into(),
+                destination,
+            ]);
+        }
+    }
+    for path in PROC_MASKED_FILES {
+        if proc_root.join(path).exists() {
+            args.extend([
+                "--ro-bind".into(),
+                "/dev/null".into(),
+                format!("/proc/{path}"),
+            ]);
+        }
+    }
+}
+
 /// Whether `path` is guaranteed to exist, read-only, at this same path inside
 /// every sandbox `Launch::args` builds — one of the fixed `SYSTEM_RO`
 /// `--ro-bind`s, always added when the host has the directory. Never true for a
@@ -538,6 +571,10 @@ impl Launch {
 
     /// The `bwrap` argument vector (without the program name). Pure, for tests.
     pub fn args(&self, worktree: &Path) -> Vec<String> {
+        self.args_with_proc_root(worktree, Path::new("/proc"))
+    }
+
+    fn args_with_proc_root(&self, worktree: &Path, proc_root: &Path) -> Vec<String> {
         fn push(a: &mut Vec<String>, xs: &[&str]) {
             a.extend(xs.iter().map(|x| (*x).to_string()));
         }
@@ -558,6 +595,7 @@ impl Launch {
                 "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/home",
             ],
         );
+        append_proc_masks(&mut a, proc_root);
         push(&mut a, &["--tmpfs", "/run"]);
         // The shim's read-write set is /work, /env, /tmp and $HOME; every one must exist
         // (it fails closed otherwise), so create the sandbox-private ones here.
@@ -1114,7 +1152,10 @@ mod tests {
             "/proc/timer_list",
             "/proc/timer_stats",
         ] {
-            assert!(args.windows(3).any(|window| window == ["--ro-bind", "/dev/null", path]));
+            assert!(
+                args.windows(3)
+                    .any(|window| window == ["--ro-bind", "/dev/null", path])
+            );
         }
     }
 
