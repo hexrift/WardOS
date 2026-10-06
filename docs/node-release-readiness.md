@@ -131,8 +131,11 @@ For the node this means:
   only. The image build and the release build compile `ward-node` for aarch64; the
   release smokes `--version` and `--help` of the packaged node binaries on an aarch64
   runner, nothing more.
-- **Remote transport, enrolment, rotation.** There is none to test
-  ([node-security-limitations.md](node-security-limitations.md) §3.1, #262).
+- **Enrolment, attestation, revocation, reload.** There is none to test
+  ([node-security-limitations.md](node-security-limitations.md) §3.1, #262). The
+  mutual-TLS transport (ADR-0038) and its restart-based rotation are proven by the
+  `ward-node` and `ward-node-client` suites under the merge gate and by `node-js.sh`'s
+  `mutual_tls_transport`.
 - **Network grants beyond the proxy's verdicts.** The suite proves a network manifest is
   refused on a node without `--network-allowlist`, that an offline workload has no route
   off the host, and that an allowlisted attempt's proxy allows exactly the listed hosts,

@@ -1,9 +1,13 @@
 //! `ward-node-adapter`: the node client as a process, for control planes in other
 //! languages (node-integration.md §11).
 //!
-//! `ward-node-adapter --socket <path> [--timeout-ms <ms>] [--connect-timeout-ms <ms>]`
-//! reads one JSON command per line on stdin and writes one JSON event per line on stdout,
-//! each carrying `"schema":1`; stderr is diagnostics only. Commands:
+//! `ward-node-adapter (--socket <path> | --connect-tls <host:port> --tls-cert <file>
+//! --tls-key <file> --tls-server-ca <file> --tls-server-name <name> [--tls-server-pin <pin>])
+//! [--timeout-ms <ms>] [--connect-timeout-ms <ms>]` reads one JSON command per line on stdin
+//! and writes one JSON event per line on stdout, each carrying `"schema":1`; stderr is
+//! diagnostics only. With `--connect-tls` every command reaches a node serving
+//! `--listen-tls` over mutual TLS (ADR-0038) instead of its socket; TLS files that cannot
+//! be used are an `error` before any command is read. Commands:
 //!
 //! * `{"cmd":"capabilities"}` → `capabilities`;
 //! * `{"cmd":"run", ...}` with a pre-signed envelope (`envelope_json` and `proof`, sent
@@ -45,7 +49,7 @@ use serde_json::{Value, json};
 use ward_node_client::{
     ActionsListed, AnswerApplied, Applied, AttemptRequest, CancelToken, Client, Driver,
     EnvelopeInput, Inspection, IssuerKey, OperationIds, Resulted, RunConfig, SignedEnvelope,
-    Timeouts, UnixTransport,
+    Timeouts, TlsSettings, TlsTransport, Transport, UnixTransport,
 };
 use ward_node_protocol::{
     ActionDecision, ActionNote, AdmissionEnvelopeJson, IssuerProof, OperationId, TaskBinding,
@@ -56,10 +60,36 @@ const MAX_COMMAND_BYTES: usize = 256 * 1024;
 
 #[derive(Parser)]
 #[command(name = "ward-node-adapter", version)]
+#[command(group(clap::ArgGroup::new("node").required(true).args(["socket", "connect_tls"])))]
 struct Cli {
     /// The node's Unix socket.
     #[arg(long)]
-    socket: PathBuf,
+    socket: Option<PathBuf>,
+    /// Reach the node over mutual TLS at this `<host>:<port>` (its `--listen-tls`) instead
+    /// of a socket. Needs `--tls-cert`, `--tls-key`, `--tls-server-ca` and
+    /// `--tls-server-name`.
+    #[arg(
+        long,
+        value_name = "HOST:PORT",
+        requires_all = ["tls_cert", "tls_key", "tls_server_ca", "tls_server_name"]
+    )]
+    connect_tls: Option<String>,
+    /// This client's certificate chain, leaf first, in PEM.
+    #[arg(long, value_name = "FILE", requires = "connect_tls")]
+    tls_cert: Option<PathBuf>,
+    /// This client's private key in PEM, mode 0600 or 0400.
+    #[arg(long, value_name = "FILE", requires = "connect_tls")]
+    tls_key: Option<PathBuf>,
+    /// The CA certificates, in PEM, the node's certificate must chain to.
+    #[arg(long, value_name = "FILE", requires = "connect_tls")]
+    tls_server_ca: Option<PathBuf>,
+    /// The DNS name or IP address the node's certificate must be valid for.
+    #[arg(long, value_name = "NAME", requires = "connect_tls")]
+    tls_server_name: Option<String>,
+    /// The node's key: `sha256:` and the 64 lowercase hex digits of the SHA-256 of its
+    /// certificate's DER `SubjectPublicKeyInfo`.
+    #[arg(long, value_name = "PIN", requires = "connect_tls")]
+    tls_server_pin: Option<String>,
     /// Bound on a verb's answer; `start`, `stop` and `revoke` need more than 60 000.
     #[arg(long, default_value_t = 90_000)]
     timeout_ms: u64,
@@ -149,14 +179,42 @@ fn main() -> ExitCode {
         eprintln!("ward-node-adapter: cannot watch for termination: {error}");
         return ExitCode::from(1);
     }
+    let timeouts = Timeouts {
+        connect: Duration::from_millis(cli.connect_timeout_ms),
+        request: Duration::from_millis(cli.timeout_ms),
+    };
+    match (cli.socket, cli.connect_tls) {
+        (Some(socket), None) => serve(UnixTransport::new(socket, timeouts), cancel, running),
+        (None, Some(address)) => {
+            let settings = TlsSettings {
+                address,
+                server_name: cli.tls_server_name.unwrap_or_default(),
+                server_ca: cli.tls_server_ca.unwrap_or_default(),
+                client_cert: cli.tls_cert.unwrap_or_default(),
+                client_key: cli.tls_key.unwrap_or_default(),
+                server_pin: cli.tls_server_pin,
+            };
+            match TlsTransport::new(&settings, timeouts) {
+                Ok(transport) => serve(transport, cancel, running),
+                Err(error) => {
+                    let message = format!("TLS: {error}");
+                    eprintln!("ward-node-adapter: {message}");
+                    emit(json!({"event": "error", "error": message}));
+                    ExitCode::from(1)
+                }
+            }
+        }
+        _ => ExitCode::from(2),
+    }
+}
+
+fn serve<T: Transport + Clone>(
+    transport: T,
+    cancel: CancelToken,
+    running: Arc<AtomicBool>,
+) -> ExitCode {
     let mut adapter = Adapter {
-        transport: UnixTransport::new(
-            cli.socket,
-            Timeouts {
-                connect: Duration::from_millis(cli.connect_timeout_ms),
-                request: Duration::from_millis(cli.timeout_ms),
-            },
-        ),
+        transport,
         cancel,
         running,
         failed: false,
@@ -229,14 +287,14 @@ fn emit(mut event: Value) -> bool {
     writeln!(stdout, "{event}").is_ok() && stdout.flush().is_ok()
 }
 
-struct Adapter {
-    transport: UnixTransport,
+struct Adapter<T> {
+    transport: T,
     cancel: CancelToken,
     running: Arc<AtomicBool>,
     failed: bool,
 }
 
-impl Adapter {
+impl<T: Transport + Clone> Adapter<T> {
     fn error(&mut self, message: &str) {
         self.failed = true;
         eprintln!("ward-node-adapter: {message}");
@@ -265,7 +323,7 @@ impl Adapter {
         }
     }
 
-    fn client(&self) -> Result<Client<UnixTransport>, String> {
+    fn client(&self) -> Result<Client<T>, String> {
         Client::connect(self.transport.clone()).map_err(|error| error.to_string())
     }
 
@@ -383,7 +441,7 @@ impl Adapter {
     }
 }
 
-impl Adapter {
+impl<T: Transport + Clone> Adapter<T> {
     fn result(&self, line: &str) -> Result<(), String> {
         let command = parse::<ResultCommand>(line)?;
         let client = self.client()?;
@@ -405,7 +463,7 @@ impl Adapter {
     }
 }
 
-impl Adapter {
+impl<T: Transport + Clone> Adapter<T> {
     fn actions(&self, line: &str) -> Result<(), String> {
         let command = parse::<ActionsCommand>(line)?;
         let client = self.client()?;

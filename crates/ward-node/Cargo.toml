@@ -27,6 +27,7 @@ blake3 = { workspace = true }
 clap = { workspace = true }
 nix = { version = "0.30", features = ["fs", "signal", "socket", "user"] }
 ring = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -39,9 +40,12 @@ ward-launch = { path = "../ward-launch", version = "0.18.0" }
 ward-node-protocol = { path = "../ward-node-protocol", version = "0.18.0" }
 ward-proxy = { path = "../ward-proxy", version = "0.18.0" }
 ward-snapshot = { path = "../ward-snapshot", version = "0.18.0" }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 postcard = { workspace = true }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Self-dependency so the crate's own tests see the `test-loopback` feature.
 ward-node = { path = ".", version = "0.1.0", features = ["test-loopback"] }
 tempfile = { workspace = true }

@@ -696,7 +696,8 @@ evicting a sealed task leaves its sealed log in place for the operator.
 The control-plane side of the contract ships as `ward-node-client` (#332 slice 8;
 node-integration.md §11), which depends on `ward-node-protocol`, `ward-events` and
 `ward-authority` but never on `ward-daemon` or `ward-node`: a Unix-socket transport with
-the §3 bounds and timeouts, a client that negotiates 1.3 or later and checks every answer
+the §3 bounds and timeouts and the same over TCP with mutual TLS for a node started with
+`--listen-tls` ([ADR-0038](decisions/ADR-0038-node-mutual-tls-transport.md)), a client that negotiates 1.3 or later and checks every answer
 against its request, an issuer key read only from a private seed file that signs an
 envelope's exact bytes, a bounded envelope input, and a driver that runs one attempt
 `create → admit → start → inspect… → seal` with caller-supplied, replayable operation
@@ -705,8 +706,9 @@ once by inspect-and-replay and otherwise reports `unknown`. The `ward-node-adapt
 binary speaks the same over stdin/stdout JSON lines for control planes in other
 languages, transports pre-signed envelopes byte for byte so key custody stays outside
 WardOS, and turns `SIGTERM` into revoke-and-seal. Both run on the node's host as the
-node's uid, or as a uid the operator lists for the socket (node-integration.md §2.1);
-remote transport is #262. What the node does not enforce at this revision,
+node's uid, or as a uid the operator lists for the socket (node-integration.md §2.1),
+or anywhere with a client certificate the node's operator trusts; enrolment and the rest
+of the remote trust bootstrap are #262. What the node does not enforce at this revision,
 gap by gap, is [node-security-limitations.md](node-security-limitations.md); the walk
 from an empty host to a verified attempt is
 [node-integration-guide.md](node-integration-guide.md). How this node mode relates to

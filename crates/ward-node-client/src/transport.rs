@@ -1,4 +1,6 @@
-//! The Unix-socket, newline-delimited JSON transport of node-integration.md §3.
+//! The newline-delimited JSON transport of node-integration.md §3, over the node's Unix
+//! socket ([`UnixTransport`]) or over TCP with mutual TLS to a node serving `--listen-tls`
+//! ([`TlsTransport`], ADR-0038).
 //!
 //! One connection carries exactly one handshake line and at most one request line, each
 //! answered by one line; both request lines are written at once and the node closes the
@@ -17,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use thiserror::Error;
+
+use crate::tls::{TlsStream, describe, rustls_error};
 
 /// Maximum bytes of one request or response line, excluding the newline (§3).
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -82,6 +86,10 @@ pub enum TransportError {
     /// An answer line is not UTF-8.
     #[error("a response line is not UTF-8")]
     ResponseNotUtf8,
+    /// The TLS session with the node failed: its certificate was not the expected one, or
+    /// it refused this client's.
+    #[error("the TLS session with the node failed: {0}")]
+    Tls(String),
 }
 
 /// One connection per request to a node: handshake, then at most one request.
@@ -148,46 +156,77 @@ impl UnixTransport {
     }
 
     fn connect(&self, lines: &[&str]) -> Result<BufReader<UnixStream>, TransportError> {
-        if lines.iter().any(|line| line.len() > MAX_LINE_BYTES) {
-            return Err(TransportError::RequestTooLarge);
-        }
+        let payload = payload(lines)?;
         let mut stream = UnixStream::connect(&self.socket).map_err(TransportError::Connect)?;
         stream
             .set_write_timeout(Some(self.timeouts.connect))
             .map_err(TransportError::Io)?;
-        let mut payload = Vec::with_capacity(lines.iter().map(|line| line.len() + 1).sum());
-        for line in lines {
-            payload.extend_from_slice(line.as_bytes());
-            payload.push(b'\n');
-        }
-        stream
-            .write_all(&payload)
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => {
-                    TransportError::ClosedWithoutResponse
-                }
-                _ => io_error(error),
-            })?;
+        send(&mut stream, &payload)?;
         Ok(BufReader::new(stream))
     }
 }
 
-fn io_error(error: std::io::Error) -> TransportError {
+/// Both request lines as one write, each newline-terminated, within the line bound.
+pub(crate) fn payload(lines: &[&str]) -> Result<Vec<u8>, TransportError> {
+    if lines.iter().any(|line| line.len() > MAX_LINE_BYTES) {
+        return Err(TransportError::RequestTooLarge);
+    }
+    let mut payload = Vec::with_capacity(lines.iter().map(|line| line.len() + 1).sum());
+    for line in lines {
+        payload.extend_from_slice(line.as_bytes());
+        payload.push(b'\n');
+    }
+    Ok(payload)
+}
+
+pub(crate) fn send(stream: &mut impl Write, payload: &[u8]) -> Result<(), TransportError> {
+    stream
+        .write_all(payload)
+        .and_then(|()| stream.flush())
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => {
+                TransportError::ClosedWithoutResponse
+            }
+            _ => io_error(error),
+        })
+}
+
+pub(crate) fn io_error(error: std::io::Error) -> TransportError {
+    if let Some(tls) = rustls_error(&error) {
+        return TransportError::Tls(describe(tls));
+    }
     match error.kind() {
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => TransportError::TimedOut,
         _ => TransportError::Io(error),
     }
 }
 
-fn read_line(
-    reader: &mut BufReader<UnixStream>,
+/// A connected stream whose reads the transport bounds.
+pub(crate) trait Wire: Read {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl Wire for UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_read_timeout(self, timeout)
+    }
+}
+
+impl Wire for TlsStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+}
+
+pub(crate) fn read_line(
+    reader: &mut BufReader<impl Wire>,
     timeout: Duration,
 ) -> Result<Option<String>, TransportError> {
     read_bounded_line(reader, timeout, MAX_LINE_BYTES)
 }
 
-fn read_bounded_line(
-    reader: &mut BufReader<UnixStream>,
+pub(crate) fn read_bounded_line(
+    reader: &mut BufReader<impl Wire>,
     timeout: Duration,
     bound: usize,
 ) -> Result<Option<String>, TransportError> {
@@ -200,7 +239,14 @@ fn read_bounded_line(
         u64::try_from(bound.saturating_add(1)).map_err(|_| TransportError::ResponseTooLong)?;
     let read = match reader.by_ref().take(limit).read_until(b'\n', &mut buffer) {
         Ok(read) => read,
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => 0,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+            ) && rustls_error(&error).is_none() =>
+        {
+            0
+        }
         Err(error) => return Err(io_error(error)),
     };
     if read == 0 {

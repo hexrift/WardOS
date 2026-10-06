@@ -3,7 +3,8 @@
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
 //! [--task-root <dir>] [--network-allowlist [--credentials <file>]] [--output-return]
 //! [--action-channel [--approval-hold]] [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
-//! [--agent-adapter <id>… [--agent-shim <file>]] [--client-uid <uid>]… [--client-group <group>]`
+//! [--agent-adapter <id>… [--agent-shim <file>]] [--client-uid <uid>]… [--client-group <group>]
+//! [--listen-tls <addr> --tls-cert <file> --tls-key <file> --tls-client-ca <file> [--tls-client-pin <pin>]…]`
 //! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
 //! admission version, revocation and retired-attempt stores, one record per registered task
@@ -57,6 +58,11 @@
 //! a response. With `--client-group` the socket is created mode 0660 owned by that group,
 //! in a directory owned by it with mode 0750 or stricter, so a client of another uid can
 //! connect at all; without it the socket is mode 0600 in a 0700 directory as before.
+//! With `--listen-tls` the node also serves the same protocol on that TCP address over TLS
+//! 1.3 with a mandatory client certificate (ADR-0038): its own certificate and key
+//! (`--tls-cert`, `--tls-key`), the CA its clients' certificates must chain to
+//! (`--tls-client-ca`) and, optionally, the client keys it serves (`--tls-client-pin`); the
+//! certificate takes the place of the peer-credential check, not of an issuer signature.
 //!
 //! `ward-node snapshot import --state-dir <dir> <project-dir>` captures a local directory
 //! into the node's snapshot store and prints its id as 64 lowercase hex characters with no
@@ -70,6 +76,7 @@
 //! `(test-loopback)` in a build with that feature, which no shipped `ward-node` has.
 
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -85,8 +92,9 @@ use ward_node::peer::{ClientGroup, ClientUids};
 use ward_node::scheduling::SchedulingLimits;
 use ward_node::shim::AgentShim;
 use ward_node::state::{NodeState, open_private_dir};
+use ward_node::tls::{ClientPins, NodeTls, TlsFiles, TlsListener};
 use ward_node::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
-use ward_node::{NodeService, SocketAccess, serve_local};
+use ward_node::{NodeService, SocketAccess, serve_node};
 use ward_node_protocol::{
     AdapterCapabilities, CredentialCapabilities, ExecutionBackendCapabilities, HostedAdapter,
     IsolationCapabilities, LifecycleCapabilities, NamespaceCapabilities, NetworkCapabilities,
@@ -228,6 +236,34 @@ struct Cli {
     /// stricter. Needs at least one `--client-uid`. Without it the socket is mode 0600.
     #[arg(long, value_name = "GROUP", requires = "client_uid")]
     client_group: Option<String>,
+    /// Also serve the protocol on this TCP address (`<ip>:<port>`) over TLS 1.3 with a
+    /// mandatory client certificate chained to `--tls-client-ca`. The certificate takes
+    /// the place of the socket's peer-credential check; `admit` still needs a trusted
+    /// signature. Needs `--tls-cert`, `--tls-key` and `--tls-client-ca`.
+    #[arg(
+        long,
+        value_name = "ADDR",
+        requires_all = ["tls_cert", "tls_key", "tls_client_ca"]
+    )]
+    listen_tls: Option<SocketAddr>,
+    /// The node's certificate chain, leaf first, in PEM: the node user's own regular file,
+    /// writable by no one else. Needs `--listen-tls`.
+    #[arg(long, value_name = "FILE", requires = "listen_tls")]
+    tls_cert: Option<PathBuf>,
+    /// The node's private key in PEM, matching `--tls-cert`: the node user's own regular
+    /// file with no group or other permission bits. Needs `--listen-tls`.
+    #[arg(long, value_name = "FILE", requires = "listen_tls")]
+    tls_key: Option<PathBuf>,
+    /// The CA certificates, in PEM, a client's certificate must chain to (for client
+    /// authentication): the node user's own regular file, writable by no one else. Needs
+    /// `--listen-tls`.
+    #[arg(long, value_name = "FILE", requires = "listen_tls")]
+    tls_client_ca: Option<PathBuf>,
+    /// Serve only the client keys pinned here (`sha256:` and the 64 lowercase hex digits
+    /// of the SHA-256 of the certificate's DER `SubjectPublicKeyInfo`); repeatable. Without
+    /// it every key the client CA certified is served. Needs `--listen-tls`.
+    #[arg(long, value_name = "PIN", requires = "listen_tls")]
+    tls_client_pin: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -281,6 +317,10 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Some(command) = cli.command.take() {
         return run(command);
     }
+    let remote = cli
+        .listen_tls
+        .map(|addr| load_tls(&cli, addr))
+        .transpose()?;
     let (Some(socket), Some(state_dir), Some(node_id)) = (cli.socket, cli.state_dir, cli.node_id)
     else {
         return Err(io::Error::other("--socket, --state-dir and --node-id are required").into());
@@ -367,8 +407,41 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         None => NodeService::with_admission(capabilities, admission)?,
     };
-    serve_local(&socket, &service, SocketAccess::new(client_group, clients))?;
+    let access = SocketAccess::new(client_group, clients);
+    serve_node(&socket, &service, access, bind_tls(remote)?)?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn bind_tls(remote: Option<(NodeTls, SocketAddr)>) -> io::Result<Option<TlsListener>> {
+    remote
+        .map(|(tls, addr)| {
+            tls.bind(addr)
+                .map_err(|error| io::Error::other(format!("TLS listener {addr}: {error}")))
+        })
+        .transpose()
+}
+
+fn load_tls(cli: &Cli, addr: SocketAddr) -> io::Result<(NodeTls, SocketAddr)> {
+    let (Some(cert), Some(key), Some(client_ca)) =
+        (&cli.tls_cert, &cli.tls_key, &cli.tls_client_ca)
+    else {
+        return Err(io::Error::other(
+            "--listen-tls needs --tls-cert, --tls-key and --tls-client-ca",
+        ));
+    };
+    let tls = ClientPins::parse(&cli.tls_client_pin)
+        .and_then(|pins| {
+            NodeTls::load(
+                TlsFiles {
+                    cert,
+                    key,
+                    client_ca,
+                },
+                pins,
+            )
+        })
+        .map_err(|error| io::Error::other(format!("TLS: {error}")))?;
+    Ok((tls, addr))
 }
 
 fn parse_adapter(id: &str) -> Result<HostedAdapter, String> {
@@ -860,6 +933,57 @@ mod tests {
         let cli = Cli::try_parse_from(serve.iter().copied().chain(["--client-uid", "0"]))
             .expect("a client uid alone");
         assert_eq!(cli.client_group, None);
+    }
+
+    #[test]
+    fn a_tls_listener_needs_its_three_files_and_the_files_and_pins_need_the_listener() {
+        let node = NodeId::from_u128(4).to_string();
+        let serve = [
+            "ward-node",
+            "--socket",
+            "s",
+            "--state-dir",
+            "d",
+            "--node-id",
+            &node,
+        ];
+        let parse = |extra: &[&str]| Cli::try_parse_from(serve.iter().chain(extra));
+        let cli = parse(&[]).expect("serve");
+        assert_eq!(cli.listen_tls, None);
+        assert!(cli.tls_client_pin.is_empty());
+        let full = [
+            "--listen-tls",
+            "0.0.0.0:7443",
+            "--tls-cert",
+            "c.pem",
+            "--tls-key",
+            "k.pem",
+            "--tls-client-ca",
+            "ca.pem",
+        ];
+        let cli = parse(&full).expect("serve over TLS");
+        assert_eq!(cli.listen_tls, "0.0.0.0:7443".parse().ok());
+        assert_eq!(cli.tls_cert, Some(PathBuf::from("c.pem")));
+        assert_eq!(cli.tls_key, Some(PathBuf::from("k.pem")));
+        assert_eq!(cli.tls_client_ca, Some(PathBuf::from("ca.pem")));
+        let pinned: Vec<&str> = full
+            .iter()
+            .copied()
+            .chain(["--tls-client-pin", "a", "--tls-client-pin", "b"])
+            .collect();
+        assert_eq!(
+            parse(&pinned).expect("serve with pins").tls_client_pin,
+            ["a", "b"]
+        );
+        for without in [0, 2, 4, 6] {
+            let mut partial = full.to_vec();
+            partial.drain(without..without + 2);
+            assert!(parse(&partial).is_err(), "{partial:?}");
+        }
+        assert!(parse(&["--tls-client-pin", "a"]).is_err());
+        let mut named = full;
+        named[1] = "localhost:7443";
+        assert!(parse(&named).is_err(), "the address is an IP and a port");
     }
 
     #[test]

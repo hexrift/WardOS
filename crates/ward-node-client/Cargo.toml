@@ -17,16 +17,19 @@ path = "src/bin/ward-node-adapter.rs"
 
 [dependencies]
 clap = { workspace = true }
-nix = { version = "0.30", features = ["signal"] }
+nix = { version = "0.30", features = ["fs", "signal"] }
 ring = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 ward-authority = { path = "../ward-authority", version = "0.18.0" }
 ward-events = { path = "../ward-events", version = "0.18.0" }
 ward-node-protocol = { path = "../ward-node-protocol", version = "0.18.0" }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
+rcgen = "0.14"
 tempfile = { workspace = true }
 ward-launch = { path = "../ward-launch", version = "0.18.0" }
 ward-node = { path = "../ward-node", version = "0.1.0" }
