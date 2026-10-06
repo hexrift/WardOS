@@ -642,6 +642,8 @@ export interface AdapterTls {
   serverName: string;
   /** The node's pinned key, `sha256:` and 64 lowercase hex digits (`--tls-server-pin`). */
   serverPin?: string;
+  /** A file of node keys refused even when pinned, one `sha256:<hex>` per line (`--tls-server-revoked`). */
+  serverRevoked?: string;
 }
 
 /** The adapter's flags for its node: `--socket`, or `--connect-tls` and the TLS flags; never both. */

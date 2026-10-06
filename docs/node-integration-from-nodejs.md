@@ -935,7 +935,7 @@ before replacing an attempt, because a new attempt discards the old receipt (§9
 ## 10. The proof
 
 ```bash
-cd examples/node-control-plane && node --test       # 118 cases, no node, no sandbox
+cd examples/node-control-plane && node --test       # 120 cases, no node, no sandbox
 scripts/acceptance/node-js.sh                        # 28 cases against real nodes; skips loudly without bubblewrap
 WARD_REQUIRE_ISOLATION=1 scripts/acceptance/node-js.sh   # fail instead of skipping, as CI does
 ```

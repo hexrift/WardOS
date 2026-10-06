@@ -161,7 +161,9 @@ const USAGE = `usage: control-plane.mjs <command> [options]
 
 Every command that speaks to the node takes --socket <path>, or for a node serving
 --listen-tls (ADR-0038) --connect-tls <host:port> --tls-cert <pem> --tls-key <pem>
---tls-server-ca <pem> --tls-server-name <name> [--tls-server-pin sha256:<hex>] in its place.
+--tls-server-ca <pem> --tls-server-name <name> [--tls-server-pin sha256:<hex>]
+[--tls-server-revoked <file>] in its place; the adapter refuses a node whose key that
+file lists (one sha256:<hex> per line, # comments), even when it is the pinned one.
 
 An id option takes a WardOS id of the right prefix as is, and derives one from anything
 else with deriveId (docs/node-integration-from-nodejs.md §3). Output streams and, without
@@ -176,6 +178,7 @@ const OPTIONS = {
   "tls-server-ca": { type: "string" },
   "tls-server-name": { type: "string" },
   "tls-server-pin": { type: "string" },
+  "tls-server-revoked": { type: "string" },
   key: { type: "string" },
   principal: { type: "string" },
   node: { type: "string" },
@@ -259,7 +262,7 @@ const TLS_OPTIONS = { "tls-cert": "cert", "tls-key": "key", "tls-server-ca": "se
 /** The node the adapter speaks to: --socket, or --connect-tls and its files. */
 function nodeOf(values) {
   if (values["connect-tls"] === undefined) {
-    for (const flag of [...Object.keys(TLS_OPTIONS), "tls-server-pin"]) {
+    for (const flag of [...Object.keys(TLS_OPTIONS), "tls-server-pin", "tls-server-revoked"]) {
       if (values[flag] !== undefined) throw new UsageError(`--${flag} needs --connect-tls`);
     }
     return { socket: need(values, "socket") };
@@ -268,6 +271,7 @@ function nodeOf(values) {
   const tls = { address: need(values, "connect-tls") };
   for (const [flag, field] of Object.entries(TLS_OPTIONS)) tls[field] = need(values, flag);
   if (values["tls-server-pin"] !== undefined) tls.serverPin = values["tls-server-pin"];
+  if (values["tls-server-revoked"] !== undefined) tls.serverRevoked = values["tls-server-revoked"];
   return { tls };
 }
 

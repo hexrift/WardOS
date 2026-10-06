@@ -1251,8 +1251,10 @@ const TLS_FIELDS = [
 /**
  * The adapter's flags for the node it speaks to: `--socket <path>` for the node's Unix
  * socket, or, for a node serving `--listen-tls` (§3, ADR-0038), `--connect-tls` with this
- * client's certificate and key, the server CA, the name the node's certificate must carry
- * and optionally the node's pinned key (`sha256:` and 64 lowercase hex digits). Never both.
+ * client's certificate and key, the server CA, the name the node's certificate must carry,
+ * optionally the node's pinned key (`sha256:` and 64 lowercase hex digits) and optionally a
+ * file of revoked node keys the adapter refuses even when pinned (`--tls-server-revoked`).
+ * Never both.
  */
 export function adapterNodeArgs({ socket, tls }) {
   if (socket !== undefined && tls !== undefined) refuse("the adapter takes the node's socket or its TLS settings, not both");
@@ -1270,6 +1272,10 @@ export function adapterNodeArgs({ socket, tls }) {
   if (tls.serverPin !== undefined) {
     if (typeof tls.serverPin !== "string" || !SPKI_PIN.test(tls.serverPin)) refuse("serverPin is sha256: and 64 lowercase hex digits");
     args.push("--tls-server-pin", tls.serverPin);
+  }
+  if (tls.serverRevoked !== undefined) {
+    if (typeof tls.serverRevoked !== "string" || tls.serverRevoked.length === 0) refuse("serverRevoked is the path of a list of revoked node keys");
+    args.push("--tls-server-revoked", tls.serverRevoked);
   }
   return args;
 }
