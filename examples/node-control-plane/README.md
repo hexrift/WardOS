@@ -45,7 +45,10 @@ and network records in them are decoded from the raw bytes and checked against w
 client used (22 cases). The credentials and hold nodes are `ward-node` built with its
 `test-loopback` feature, since the shipped build never connects to a loopback upstream or
 speaks plain HTTP to one; the script builds it into a target directory of its own, or takes
-`WARD_NODE_LOOPBACK_BIN`.
+`WARD_NODE_LOOPBACK_BIN`. Every other node is the shipped build, `WARD_NODE_BIN`, built
+without the feature into another target directory of its own; a build with the feature
+says so in its `--version`, and the script refuses it as `WARD_NODE_BIN` before any node
+starts.
 
 The signing key is a PKCS#8 PEM file (mode 0600) that never leaves the control plane's
 process; the node sees signatures only. Everything the client builds is checked against

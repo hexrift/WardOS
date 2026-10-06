@@ -18,7 +18,8 @@ path = "src/main.rs"
 [features]
 # Lets a node's credentials file name a plain-HTTP upstream (`plain_upstream`), and
 # turns on ward-proxy's loopback test mode with it, so the tests can run a fake
-# upstream on 127.0.0.1. Never enabled in a shipped `ward-node`.
+# upstream on 127.0.0.1. Never enabled in a shipped `ward-node`; a build with it says so
+# in its `--version`.
 test-loopback = ["ward-proxy/test-loopback"]
 
 [dependencies]

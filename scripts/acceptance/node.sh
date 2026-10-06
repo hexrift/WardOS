@@ -18,6 +18,12 @@
 # real node under the same isolation requirement and adds its verdict lines. Exit status:
 # 0 when every case of both passed, 1 otherwise.
 #
+# Both run the shipped ward-node, built without the `test-loopback` feature: WARD_NODE_BIN
+# when set, otherwise a build into ${CARGO_TARGET_DIR:-target}/node-shipped, a target
+# directory no feature build shares, since a `cargo test` of ward-node or of the workspace
+# leaves a test-loopback ward-node in ${CARGO_TARGET_DIR:-target}/debug. A WARD_NODE_BIN
+# whose --version names the feature is refused before anything runs.
+#
 #   scripts/acceptance/node.sh            run the suite and print the table
 #   scripts/acceptance/node.sh --render F render the table from a saved cargo test log F
 #                                         (the Node.js acceptance is not run)
@@ -84,6 +90,19 @@ if [[ "${1:-}" == "--render" ]]; then
   render "$2"
   exit $?
 fi
+
+if [[ -z "${WARD_NODE_BIN:-}" ]]; then
+  shipped_target="${CARGO_TARGET_DIR:-target}/node-shipped"
+  echo "node: building the shipped ward-node" >&2
+  cargo build -p ward-node --target-dir "$shipped_target" >&2
+  WARD_NODE_BIN="$shipped_target/debug/ward-node"
+fi
+[[ -x "$WARD_NODE_BIN" ]] || { echo "node: ward-node binary is not executable: $WARD_NODE_BIN" >&2; exit 1; }
+if [[ "$("$WARD_NODE_BIN" --version)" == *"(test-loopback)"* ]]; then
+  echo "node: WARD_NODE_BIN is a test-loopback build of ward-node ($WARD_NODE_BIN); the acceptance proves the shipped build and needs one built without that feature" >&2
+  exit 1
+fi
+export WARD_NODE_BIN
 
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT

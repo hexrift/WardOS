@@ -78,8 +78,9 @@ either fails the run. The credentials and hold nodes are `ward-node` built with 
 `test-loopback` feature (the
 shipped build never connects to a loopback upstream or speaks plain HTTP to one), which
 `node-js.sh` builds into a target directory of its own or takes from
-`WARD_NODE_LOOPBACK_BIN`; every other node it starts runs `WARD_NODE_BIN`, which it builds
-without the feature. The cases below are the Rust suite's.
+`WARD_NODE_LOOPBACK_BIN`; every other node it starts, and every node of the Rust suite
+when `node.sh` runs it, is the shipped build, `WARD_NODE_BIN`, built without the feature
+(§3). The cases below are the Rust suite's.
 
 The cases also run, in parallel with the rest of the workspace, under the merge gate
 (`scripts/verify/tamperward.sh`, which CI runs with `WARD_REQUIRE_ISOLATION=1` and a
@@ -270,6 +271,28 @@ is 0 only when every case passed and at least one ran. A run as an unprivileged 
 part of the slice's verification: build first, then run the test binary from a directory
 that user can read, with `WARD_REQUIRE_ISOLATION=1`, `HOME` and `TMPDIR` pointing at a
 writable directory.
+
+Which `ward-node` each case runs:
+
+| Cases | Build | Where it comes from |
+| --- | --- | --- |
+| The Rust suite's (§2), run by `node.sh` | shipped, without `test-loopback` | `WARD_NODE_BIN`, or built by `node.sh` into `${CARGO_TARGET_DIR:-target}/node-shipped` and passed on to the suite and to `node-js.sh` as `WARD_NODE_BIN` |
+| `node-js.sh`'s lifecycle, result return and action channel cases, its node with `--network-allowlist` and without `--credentials`, and every `snapshot import`, `issuer-key-id` and `audit` | shipped, without `test-loopback` | `WARD_NODE_BIN`, or built into the same `node-shipped` directory |
+| `node-js.sh`'s credentials node, hold node and node without `--approval-hold` | `test-loopback` | `WARD_NODE_LOOPBACK_BIN`, or built into `${CARGO_TARGET_DIR:-target}/node-js-test-loopback` |
+
+Neither runner takes `ward-node` from `${CARGO_TARGET_DIR:-target}/debug`: a `cargo test`
+of `ward-node` or of the workspace (the merge gate runs it with `--all-features`) leaves the
+`test-loopback` build there, since `ward-node`'s own tests enable the feature. A
+`test-loopback` build says so in its `--version` (`ward-node 0.1.0 (test-loopback)`; the
+shipped build prints `ward-node 0.1.0`), and both runners refuse a `WARD_NODE_BIN` that
+does, as `node-js.sh` refuses a `WARD_NODE_LOOPBACK_BIN` that does not, before anything is
+started. Run on its own, `cargo test -p ward-node-client --test acceptance` uses
+`WARD_NODE_BIN` when it is set and otherwise the `ward-node` beside its test binaries,
+which is the `test-loopback` build after such a `cargo test`; set `WARD_NODE_BIN` to a
+shipped build, or use `node.sh`, for a run that proves the shipped build. The merge gate's
+own run of the cases (§1) takes the `test-loopback` build this way, since
+`cargo test --workspace --all-features` builds `ward-node` with every feature; the shipped
+build is proven by `node.sh`'s run, which CI makes after it.
 
 ### 3.1 What the host needs
 
