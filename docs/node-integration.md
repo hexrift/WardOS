@@ -12,9 +12,10 @@ additive within 1.3 too, and approvals as a hold the node enforces of
 [ADR-0035](decisions/ADR-0035-node-approval-hold.md), #415, additive within 1.3 as well,
 and agent adapters hosted on admitted workloads of
 [ADR-0036](decisions/ADR-0036-node-hosted-agent-adapters.md), #279, additive within 1.3
-too, with the operator's `ward-agent` shim and its loopback relay in their attempts of
-[ADR-0037](decisions/ADR-0037-node-agent-shim-and-relay.md), #424, an operator flag that
-changes nothing on the wire), the same protocol over TCP with mutual TLS of
+too, with the operator's `ward-agent` shim and its loopback relay in their attempts, and
+in every attempt behind an egress proxy, of
+[ADR-0037](decisions/ADR-0037-node-agent-shim-and-relay.md), #424 and #267, an operator
+flag that changes nothing on the wire), the same protocol over TCP with mutual TLS of
 [ADR-0038](decisions/ADR-0038-node-mutual-tls-transport.md), the remote-transport slice of
 #262, an operator-enabled second listener that changes nothing in the protocol (§3), and
 the client and process adapter that drive it (§11). The cross-system acceptance suite that proves it against a real node (ADR-0030
@@ -78,7 +79,9 @@ admission example is a working test vector (§7.4).
   `--agent-shim <file>`, the adapter runs under the operator's `ward-agent` shim, so its
   command hooks work, and behind an egress proxy the shim's loopback relay forwards to the
   attempt's proxy, the provider's base URL pointing at it for a provider the manifest
-  grants a credential for (§6.10).
+  grants a credential for (§6.10). Such a node runs every other attempt behind an egress
+  proxy under the shim and its relay too, so a plain workload's stock HTTP clients (`git`,
+  `curl`) reach its allowlist and its credential routes (§6.8).
 - How much the node runs at once is the operator's choice: a node started with
   `--max-running` executes at most that many attempts at once and refuses a `start` past
   it, or below a memory or disk headroom floor, `capacity_exhausted` with the task still
@@ -92,8 +95,9 @@ admission example is a working test vector (§7.4).
   reaches a node started with `--listen-tls`, with a client certificate from the
   operator's client CA (§2.1, §3, ADR-0038).
 - Not implemented yet: a loopback relay and `HTTP_PROXY` environment inside the sandbox
-  of a workload naming no adapter (the proxy is reached through its Unix socket, §9; a
-  hosted adapter on a node with `--agent-shim` has both, §6.10), credentials delivered any other way
+  of an attempt on a node without `--agent-shim` (the proxy is reached through its Unix
+  socket, §9; on a node with the shim every attempt behind a proxy has both, §6.8, §6.10),
+  credentials delivered any other way
   than by proxy injection, or for anything but HTTP to one configured host (#267), a hold
   on anything but an allowlisted host or a brokered credential (an approval the workload
   asks for itself through the action channel is a recorded statement it acts on, §6.7; one
@@ -119,7 +123,7 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
   [--trusted-issuers <file>] [--task-root <dir>] [--network-allowlist [--credentials <file>]] \
   [--output-return] [--action-channel [--approval-hold]] [--cgroup-root <dir>] \
   [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]] \
-  [--agent-adapter <id>… [--agent-shim <file>]] [--client-uid <uid>]… [--client-group <group>] \
+  [--agent-adapter <id>…] [--agent-shim <file>] [--client-uid <uid>]… [--client-group <group>] \
   [--listen-tls <ip:port> --tls-cert <file> --tls-key <file> --tls-client-ca <file> [--tls-client-pin <pin>]… [--tls-client-revoked <file>]]
 ```
 
@@ -139,7 +143,7 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | `--max-running` | no | At most this many attempts (1 to 1 024) execute at once: from the spawn until the reaper has reaped the workload, paused attempts and attempts whose kill is pending included. A `start` past it is refused `capacity_exhausted` with the task still `ready` and nothing materialised (§8.2); the node reports the bound, the running count and its headroom in `scheduling` (§5). Needs `--task-root`. Without it the node bounds nothing, as before. |
 | `--memory-floor`, `--disk-floor` | no | Refuse a `start` `capacity_exhausted` while the host's available memory (`MemAvailable`) or the space available on the task root's filesystem is below this many bytes. A floor the node cannot measure refuses the `start` `resource_unavailable`. Need `--max-running`. |
 | `--agent-adapter` | no | Host this agent adapter (`claude-code`, `codex` or `process`; repeatable) on workloads that name it (§6.10, §7.3): the node launches the workload's argv through `ward-agent-adapter`'s contract, adding the adapter's environment and settings files and, for one with hooks, a hook socket whose lines are recorded as agent-origin claims, under exactly the authority the manifest grants; the capability document carries `adapters` (§5). An unknown id stops the node. Needs `--task-root`. Without it every workload naming an adapter is refused `unsupported_grant`. |
-| `--agent-shim` | no | The operator's `ward-agent` shim (the node tarball's, the runtime tarball's or the image's `ward-agent`: `/usr/local/bin/ward-agent` as node-integration-guide.md §1 installs it, `/usr/bin/ward-agent` on the image), verified at start: an absolute path to a regular file, not a symlink, executable, owned by root or the node's user and writable by no one else, that names `--relay` in its `--help` and once runs `/bin/true` hardened over the task root (so a kernel without Landlock stops the node). Every attempt of a hosted adapter then runs under it, bound read-only at `/run/ward/ward-agent`: Landlock, seccomp and no capabilities inside the sandbox, the adapter's command hooks reaching its hook socket, and, behind an egress proxy, the shim's relay on `127.0.0.1:3128` forwarding to the attempt's proxy with `HTTP_PROXY`/`HTTPS_PROXY` naming it and the adapter's provider base URL on it for a provider the manifest grants a credential for (§6.10). Nothing in the capability document changes. Needs `--agent-adapter`. Without it no shim is bound and no relay runs. |
+| `--agent-shim` | no | The operator's `ward-agent` shim (the node tarball's, the runtime tarball's or the image's `ward-agent`: `/usr/local/bin/ward-agent` as node-integration-guide.md §1 installs it, `/usr/bin/ward-agent` on the image), verified at start: an absolute path to a regular file, not a symlink, executable, owned by root or the node's user and writable by no one else, that names `--relay` in its `--help` and once runs `/bin/true` hardened over the task root (so a kernel without Landlock stops the node). Every attempt of a hosted adapter, and every attempt with an egress proxy, then runs under it, bound read-only at `/run/ward/ward-agent`: Landlock, seccomp and no capabilities inside the sandbox, a hosted adapter's command hooks reaching its hook socket, and, behind an egress proxy, the shim's relay on `127.0.0.1:3128` forwarding to the attempt's proxy with `HTTP_PROXY`/`HTTPS_PROXY` naming it (§6.8) and a hosted adapter's provider base URL on it for a provider the manifest grants a credential for (§6.10). An offline attempt naming no adapter runs without it. Nothing in the capability document changes. Needs `--agent-adapter` or `--network-allowlist`. Without it no shim is bound and no relay runs. |
 | `--client-uid` | no | A uid (decimal) or user name the node serves on its socket besides its own uid; repeatable, resolved once at start (an unknown name or a uid listed twice refuses to start). The node reads every connection's peer credentials before it reads a byte and closes a connection from any other uid without a response (§3). Root is not exempt. Being served grants no authority: `admit` still needs a trusted signature (§8.1). |
 | `--client-group` | no | A gid or group name to share the socket with: the socket is created mode 0660 owned by it, and its parent directory must be owned by it with mode 0750 or stricter. Needs at least one `--client-uid`; a member of the group that is not a listed uid can connect but is closed unread. Without it the socket is 0600 and only the node's uid (or root) can connect, whatever `--client-uid` says. The state directory and task root stay 0700 either way: a listed client can speak to the node, not read its state. |
 | `--listen-tls` | no | Also serve the protocol on this TCP address (`<ip>:<port>`; port `0` picks a free one) over TLS 1.3 with a mandatory client certificate ([ADR-0038](decisions/ADR-0038-node-mutual-tls-transport.md), §3). At start the node writes `ward-node: serving the node protocol over mutual TLS on <ip>:<port>` to stderr. The socket is served as before. A certificate the node accepts takes the place of `--client-uid` for this listener, never of an issuer signature. With it, `SIGHUP` reloads the TLS files without a restart (below). Needs `--tls-cert`, `--tls-key` and `--tls-client-ca`; an address already in use stops the node. |
@@ -1073,6 +1077,24 @@ GET /artifacts/v1/repos/acme/latest HTTP/1.1
 Host: artifacts.example.com
 ```
 
+On a node started with `--agent-shim` (§2.1, ADR-0037 §7) the attempt also runs under the
+shim's loopback relay, with `HTTP_PROXY`, `HTTPS_PROXY` (both cases) set to
+`http://127.0.0.1:3128` and `NO_PROXY` to `localhost,127.0.0.1`, so a stock client reaches
+the same route as the URL `http://127.0.0.1:3128/<service>/…`, workload naming an adapter
+or not. A Git workload clones the gateway URL:
+
+```text
+git clone http://127.0.0.1:3128/git/acme/widgets.git
+git push origin HEAD:main            # needs `write` among the service's permissions
+```
+
+and the route sets the service's header, for Git over smart HTTP `authorization` with
+`value_prefix = "Bearer "`, on every request of the clone, fetch or push. The workload holds
+no credential: no variable, `.git-credentials`, `http.extraHeader` or helper, and the remote
+it keeps in `.git/config` names only the relay (credential-broker.md §8.1 is the
+operator's recipe). Any other host goes through `HTTP_PROXY` to the allowlist, an
+unlisted one refused `403` there.
+
 The proxy strips `/<service>`, forwards the request over TLS to the service's `upstream`
 with the configured header set to `value_prefix` and the leased value (replacing any
 header of that name the workload sent), within the service's `paths` and read-only unless
@@ -1206,7 +1228,8 @@ the manifest's, so it is the same for every adapter.
 
 **The shim and the relay.** On a node started with `--agent-shim` (§2.1,
 [ADR-0037](decisions/ADR-0037-node-agent-shim-and-relay.md)) every attempt of a hosted
-adapter runs under the operator's `ward-agent` shim, bound read-only at
+adapter, and every attempt behind an egress proxy whether it names an adapter or not (§6.8),
+runs under the operator's `ward-agent` shim, bound read-only at
 `/run/ward/ward-agent`, which hardens the sandbox (Landlock read-write on `/work`, `/env`,
 `/tmp` and `/home/agent`, read-only on the system directories and itself; seccomp; no
 capabilities; only the variables the node names) before it runs the adapter's command
@@ -1225,8 +1248,9 @@ socket, and the node sets:
 The relay is a pipe to the socket the workload already has: every request through it is
 the proxy's to allow, refuse, inject or hold, and is recorded as one (§6.5, §9). Without a
 grant for its provider the runtime gets no base URL, and a request for `/<provider>/…` is
-the proxy's `400` (`proxy requires an absolute http:// URI`). A workload naming no
-adapter, and every attempt on a node without the flag, runs without shim and relay.
+the proxy's `400` (`proxy requires an absolute http:// URI`). A workload naming no adapter
+gets the proxy variables and the relay, never a base URL or a placeholder; an offline one,
+and every attempt on a node without the flag, runs without shim and relay.
 
 **Hooks.** For an adapter whose capability document declares semantic events (Claude
 Code), the node listens on `<task-root>/<task>/<attempt>.adapter/hooks.sock`, binds it at
@@ -1774,8 +1798,8 @@ evidence log as `NetworkRequested` or `NetworkDenied` (§6.5). `pause` makes the
 answer every new connection `503 paused by ward` and hold established relays until
 `resume`; `stop`, `revoke`, the budget kill and the attempt's own exit shut it down and
 unlink the socket; a node restart ends it with the node. A workload reaches the proxy
-through the socket `WARD_PROXY_SOCKET` names; only a hosted adapter's attempt on a node
-with `--agent-shim` also has a loopback relay to it and `HTTP_PROXY` naming that (§6.10). A `credentials` grant, on a node started with `--credentials`,
+through the socket `WARD_PROXY_SOCKET` names; on a node with `--agent-shim` every attempt
+behind a proxy also has a loopback relay to it and `HTTP_PROXY` naming that (§6.8, §6.10). A `credentials` grant, on a node started with `--credentials`,
 adds the attempt's credential routes to that proxy (§6.8); nothing else injects a
 credential, and nothing about one is bound into the sandbox. A `hold`, on a node started
 with `--approval-hold`, has the proxy ask the attempt's action channel about every request
@@ -2111,8 +2135,8 @@ bad flags. A command line is at most 256 KiB.
 
 - Egress is HTTP(S) through the attempt's proxy socket only, and only on a node started
   with `--network-allowlist` (§7.5, §9): there is no loopback relay or `HTTP_PROXY` in
-  the sandbox except for a hosted adapter on a node with `--agent-shim` (§6.10), and
-  patterns are host-level. On any other node a manifest with
+  the sandbox except on a node with `--agent-shim` (§6.8, §6.10), and patterns are
+  host-level. On any other node a manifest with
   `network.custom` is refused `unsupported_grant`.
 - A credential reaches a workload only as a header the attempt's proxy injects on the
   route of a service the node's operator configured, on a node started with

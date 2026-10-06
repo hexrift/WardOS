@@ -350,11 +350,15 @@ minute on a developer machine; each case prints its own time.
   (#262).
 - **No loopback relay, and credentials outside this suite.** The network cases prove the
   proxy's verdicts, its recording and its lifecycle through the Unix socket the sandbox is
-  handed; they do not prove a workload tool that only speaks `HTTP_PROXY` can use it (only
-  a hosted adapter on a node with `--agent-shim` has an in-sandbox relay, proven by
-  `ward-node`'s own `tests/node_agent_relay_cli.rs`, node-integration.md §6.10). Brokered credentials
+  handed; they do not prove a workload tool that only speaks `HTTP_PROXY` can use it (the
+  suite's node runs without `--agent-shim`; on a node with it every attempt behind a proxy
+  has an in-sandbox relay, proven by `ward-node`'s own `tests/node_agent_relay_cli.rs` for
+  hosted adapters and `tests/node_git_capability_cli.rs` for a plain workload's stock
+  `git`, node-integration.md §6.8, §6.10). Brokered credentials
   (node-integration.md §6.8) are proven against a real node by `ward-node`'s own
-  `tests/node_credentials_cli.rs` and, driven through `ward-node-adapter`, by the four
+  `tests/node_credentials_cli.rs` and `tests/node_git_capability_cli.rs` (a leased token
+  used by `git` through the relay, revoked at the attempt's end, and no clone for the
+  task's next attempt), and, driven through `ward-node-adapter`, by the four
   credentials cases of `node-js.sh`, both against a fake OpenBao and a plain-HTTP fake
   upstream on loopback with the `test-loopback` build; not by a case of the Rust suite
   here, and never against a real provider or a TLS upstream (#267). Approval holds

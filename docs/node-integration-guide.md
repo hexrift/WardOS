@@ -42,10 +42,11 @@ install -m 0755 "ward-node-${version}-${arch}-linux"/{ward-node,ward-node-adapte
 ward-node --version                                            # "ward-node <node version>"
 ```
 
-**The shim.** `ward-agent` lands beside `ward-node`. A node that hosts agent adapters
-(`--agent-adapter`) runs every hosted attempt under it when started with
-`--agent-shim /usr/local/bin/ward-agent` (on the image, `--agent-shim /usr/bin/ward-agent`;
-node-integration.md §2.1 and §6.10,
+**The shim.** `ward-agent` lands beside `ward-node`. A node started with
+`--agent-shim /usr/local/bin/ward-agent` (on the image, `--agent-shim /usr/bin/ward-agent`)
+runs every hosted adapter's attempt (`--agent-adapter`) and every attempt behind an egress
+proxy (`--network-allowlist`) under it, so command hooks work and stock HTTP clients reach
+the proxy through its loopback relay (node-integration.md §2.1, §6.8 and §6.10,
 [ADR-0037](decisions/ADR-0037-node-agent-shim-and-relay.md)). The node never looks for a
 shim on its own, so without the flag none is bound. It verifies the file when it starts
 and refuses to start unless the path is absolute and names a regular file (not a symlink),
