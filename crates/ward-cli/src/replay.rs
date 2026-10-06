@@ -593,6 +593,32 @@ fn summary(event: &WardEvent) -> String {
                 value(usage.pids_max_events),
             )
         }
+        WardEvent::NodeActionRequested {
+            action,
+            kind,
+            summary_bytes,
+            summary,
+            detail_bytes,
+            detail,
+        } => format!(
+            "action {action} requested · {} · summary {summary_bytes} B {summary} · detail {detail_bytes} B {detail}",
+            kind.as_str()
+        ),
+        WardEvent::NodeActionAnswered {
+            action,
+            decision,
+            operation,
+            note_bytes,
+            note,
+        } => format!(
+            "action {action} {}{}{}",
+            decision.as_str(),
+            operation.map_or_else(|| " · by the node".to_owned(), |op| format!(" · op {op}")),
+            note.map_or_else(String::new, |note| format!(" · note {note_bytes} B {note}"))
+        ),
+        WardEvent::NodeActionRefused { reason, bytes } => {
+            format!("action line refused · {} · {bytes} B", reason.as_str())
+        }
         WardEvent::NetworkRequested { .. }
         | WardEvent::NetworkDenied { .. }
         | WardEvent::CapabilityRequested { .. }
@@ -1018,5 +1044,75 @@ mod tests {
             summary(&WardEvent::NodeAttemptResourceUsage { usage }),
             "usage · cpu 1234567 us (limit 500 millicpu) · memory peak 52428800 B (limit 67108864 B) · pids peak - (limit -) · oom kills 1 · pid-limit hits 0"
         );
+    }
+
+    #[test]
+    fn node_action_records_summarise_with_sizes_and_digests_only() {
+        use ward_events::{NodeActionDecision, NodeActionKind, NodeActionRefusal};
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.log");
+        let mut chain = Chain::genesis(SessionId::from_u128(8), Blake3Hash::hash(b"binding"));
+        let mut w = LogWriter::create(&log, chain.head(), FsyncPolicy::Never).unwrap();
+        let summary = Blake3Hash::hash(b"deploy");
+        let detail = Blake3Hash::hash(b"");
+        let note = Blake3Hash::hash(b"ok");
+        for event in [
+            WardEvent::NodeActionRequested {
+                action: 1,
+                kind: NodeActionKind::Approval,
+                summary_bytes: 6,
+                summary,
+                detail_bytes: 0,
+                detail,
+            },
+            WardEvent::NodeActionAnswered {
+                action: 1,
+                decision: NodeActionDecision::Approved,
+                operation: Some(9),
+                note_bytes: 2,
+                note: Some(note),
+            },
+            WardEvent::NodeActionAnswered {
+                action: 2,
+                decision: NodeActionDecision::Expired,
+                operation: None,
+                note_bytes: 0,
+                note: None,
+            },
+            WardEvent::NodeActionRefused {
+                reason: NodeActionRefusal::ControlRequest,
+                bytes: 70,
+            },
+        ] {
+            let r = chain
+                .append(Origin::Node, event, Timestamp::default())
+                .unwrap();
+            w.append(&r).unwrap();
+        }
+        w.seal().unwrap();
+        let opts = Options {
+            verify: false,
+            json: true,
+        };
+        let rows: Vec<serde_json::Value> = replay(&log, opts)
+            .unwrap()
+            .output
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let summaries: Vec<&str> = rows
+            .iter()
+            .map(|r| r["summary"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            summaries[0],
+            format!("action 1 requested · approval · summary 6 B {summary} · detail 0 B {detail}")
+        );
+        assert_eq!(
+            summaries[1],
+            format!("action 1 approved · op 9 · note 2 B {note}")
+        );
+        assert_eq!(summaries[2], "action 2 expired · by the node");
+        assert_eq!(summaries[3], "action line refused · control_request · 70 B");
     }
 }

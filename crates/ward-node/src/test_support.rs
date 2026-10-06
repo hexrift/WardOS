@@ -166,6 +166,27 @@ pub fn output_manifest(
     .unwrap()
 }
 
+/// An offline manifest also granting an action channel for `approval` and `decision`
+/// requests under the given bounds.
+pub fn actions_manifest(
+    max_pending: u32,
+    max_total: u32,
+    wait_secs: u32,
+) -> CapabilityManifestBytes {
+    CapabilityManifestBytes::encode(
+        &CapabilityManifest::new(NetworkGrant::Offline).with_actions(
+            ward_node_protocol::ActionGrant::new(
+                ward_node_protocol::ActionKind::ALL.to_vec(),
+                max_pending,
+                max_total,
+                wait_secs,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap()
+}
+
 /// Replace the manifest of `input`'s workload, keeping everything else.
 pub fn with_manifest(input: &mut TaskAdmissionEnvelopeInput, manifest: CapabilityManifestBytes) {
     input.workload = TaskWorkload::new(

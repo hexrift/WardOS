@@ -1,8 +1,8 @@
 //! Local Ward node service executable.
 //!
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
-//! [--task-root <dir>] [--network-allowlist] [--output-return] [--cgroup-root <dir>]
-//! [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
+//! [--task-root <dir>] [--network-allowlist] [--output-return] [--action-channel]
+//! [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
 //! [--client-uid <uid>]… [--client-group <group>]`
 //! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
@@ -20,13 +20,18 @@
 //! honoured: the node keeps the head of the workload's stdout and stderr, collects the
 //! declared workspace files once the attempt has ended, stores the bounded result beside
 //! the workspace and returns it through `result`, advertising `output`; without it such a
-//! manifest is refused `unsupported_grant`. With `--cgroup-root` as well, every attempt
-//! runs in a cgroup of its own under that delegated cgroup v2 directory, a manifest's
-//! `resources` limits are enforced there and what each attempt used is recorded in its task
-//! record and evidence log; without it such a manifest is refused `unsupported_grant`. With
-//! `--max-running` as well, at most that many attempts execute at once and a `start` past
-//! it, or below `--memory-floor` or `--disk-floor`, is refused `capacity_exhausted` with the
-//! task still `ready`. The socket is served to the node's own
+//! manifest is refused `unsupported_grant`. With `--action-channel` as well, a manifest's
+//! `actions` grant is honoured: the attempt gets its own action channel, a socket bound
+//! into the sandbox at `/run/ward/actions.sock` and named by `WARD_ACTION_SOCKET`, on which
+//! the workload asks and the node records, relays and answers; the control plane reads the
+//! pending requests with `actions` and answers them with `answer`, and the node advertises
+//! `actions`; without it such a manifest is refused `unsupported_grant`. With `--cgroup-root`
+//! as well, every attempt runs in a cgroup of its own under that delegated cgroup v2
+//! directory, a manifest's `resources` limits are enforced there and what each attempt used
+//! is recorded in its task record and evidence log; without it such a manifest is refused
+//! `unsupported_grant`. With `--max-running` as well, at most that many attempts execute at
+//! once and a `start` past it, or below `--memory-floor` or `--disk-floor`, is refused
+//! `capacity_exhausted` with the task still `ready`. The socket is served to the node's own
 //! uid and to each `--client-uid` (a uid or user name); every other peer is closed without
 //! a response. With `--client-group` the socket is created mode 0660 owned by that group,
 //! in a directory owned by it with mode 0750 or stricter, so a client of another uid can
@@ -104,6 +109,15 @@ struct Cli {
     /// `unsupported_grant`.
     #[arg(long, requires = "task_root")]
     output_return: bool,
+    /// Honour a manifest's `actions` grant: give the attempt its own action channel (a
+    /// socket bound into the sandbox, beside the workspace on the host), relay each bounded
+    /// request to the control plane (`actions`), record it and every answer (`answer`), the
+    /// node's `expired` and `cancelled` included, in the attempt's evidence log, and
+    /// advertise `actions`. An approval is a recorded statement, not a capability the node
+    /// enforces. Needs `--task-root`. Without it every manifest with `actions` is refused
+    /// `unsupported_grant`.
+    #[arg(long, requires = "task_root")]
+    action_channel: bool,
     /// A cgroup v2 directory delegated to the node (writable by its uid, with no process of
     /// its own): every attempt runs in a cgroup of its own under it, its manifest's
     /// `resources` limits are enforced there (`cpu.max`, `memory.max` with no swap,
@@ -278,6 +292,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 NodeExecution::new(task_root, open_snapshot_store(&state_dir)?, launcher)
                     .with_network_allowlist(cli.network_allowlist)
                     .with_output_return(cli.output_return)
+                    .with_action_channel(cli.action_channel)
                     .with_resource_enforcement(enforcement)
                     .with_scheduling(scheduling),
             )?
@@ -479,6 +494,19 @@ mod tests {
         );
         let cli = Cli::try_parse_from(serve).expect("serve");
         assert!(!cli.output_return);
+        assert!(!cli.action_channel);
+        let cli = Cli::try_parse_from(serve.iter().copied().chain([
+            "--task-root",
+            "t",
+            "--action-channel",
+        ]))
+        .expect("serve offering the action channel");
+        assert!(cli.action_channel);
+        assert!(!cli.output_return && !cli.network_allowlist);
+        assert!(
+            Cli::try_parse_from(serve.iter().copied().chain(["--action-channel"])).is_err(),
+            "the action channel needs a task root"
+        );
 
         let cli = Cli::try_parse_from(["ward-node", "snapshot", "import", "--state-dir", "d", "p"])
             .expect("import");

@@ -145,7 +145,10 @@ their state, receipt and applied operation ids (#332 slice 7).
   mTLS, egress only through a per-attempt proxy socket on a node that enabled it (no
   in-sandbox relay, no credential), result return only as a declared, bounded result on a
   node that enabled it (step 13: stream heads and exact workspace files, digests in the
-  evidence log, no workspace export and nothing streamed), no callback channel, a receipt the protocol
+  evidence log, no workspace export and nothing streamed), a callback channel only as the
+  per-attempt action channel of [ADR-0031](ADR-0031-node-action-channel.md) on a node that
+  enabled it (questions out, recorded answers in, an approval a statement rather than an
+  enforced capability), a receipt the protocol
   does not bind to the evidence head, a manually bootstrapped trust store, same-uid
   co-location of client and node unless the operator lists the client uids the socket
   serves (a peer-credential check, the first local slice of #262), and no resource limit
@@ -297,6 +300,11 @@ the control plane. All of it is additive within 1.3, for the same reason as step
 the rest of #260: disk and I/O limits, reservations and CPU oversubscription policy, a
 node-side queue with priority and fairness, a separate bound for verifier workloads, and
 a delegated cgroup in CI.
+
+The action channel that stage 3 of the migration path needs (#404) is a decision of its
+own, [ADR-0031](ADR-0031-node-action-channel.md): additive within 1.3 like steps 12 and
+13, opt-in with `--action-channel`, granted per attempt by the manifest's `actions`, and
+recorded by the node as this ADR's §3 requires of every evidence record.
 
 Steps 1–9, 12 and 13 are written down as the external contract in
 [node-integration.md](../node-integration.md); step 10 is its acceptance,

@@ -3,9 +3,10 @@
 # real node, with isolation required rather than skipped, and prints one verdict line per
 # case and a summary table. The cases are the #[test]s of
 # crates/ward-node-client/tests/acceptance.rs and, for the network allowlist, result
-# return and capacity, crates/ward-node-client/tests/acceptance_network.rs,
-# crates/ward-node-client/tests/acceptance_output.rs and
-# crates/ward-node-client/tests/acceptance_capacity.rs; each writes its verdict as
+# return, capacity and the action channel, crates/ward-node-client/tests/acceptance_network.rs,
+# crates/ward-node-client/tests/acceptance_output.rs,
+# crates/ward-node-client/tests/acceptance_capacity.rs and
+# crates/ward-node-client/tests/acceptance_actions.rs; each writes its verdict as
 #   acceptance <case>: PASS in <ms> ms -- <criterion>
 # A case whose host prerequisite is optional and absent (the capacity suite's delegated
 # cgroup) writes instead
@@ -89,7 +90,7 @@ trap 'rm -f "$log"' EXIT
 
 export WARD_REQUIRE_ISOLATION=1
 set +e
-cargo test -p ward-node-client --test acceptance --test acceptance_network --test acceptance_output --test acceptance_capacity -- --test-threads=1 --nocapture 2>&1 | tee "$log" >&2
+cargo test -p ward-node-client --test acceptance --test acceptance_network --test acceptance_output --test acceptance_capacity --test acceptance_actions -- --test-threads=1 --nocapture 2>&1 | tee "$log" >&2
 set -e
 
 status=0

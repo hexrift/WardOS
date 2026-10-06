@@ -15,7 +15,15 @@
 //! * `{"cmd":"revoke","operation_id":N,"binding":{...}}` → `verb`;
 //! * `{"cmd":"inspect","binding":{...}}` → `inspected` or `rejected`;
 //! * `{"cmd":"result","binding":{...}}` → `result` (the state and the bounded output) or
-//!   `rejected`.
+//!   `rejected`;
+//! * `{"cmd":"actions","binding":{...}}` → `actions` (the state and the pending
+//!   action-channel requests) or `rejected`;
+//! * `{"cmd":"answer","binding":{...},"request":N,"decision":"approved"|"denied",
+//!   "operation_id":N[,"note":"..."]}` → `answered` or `rejected`.
+//!
+//! A `run` blocks this adapter until the attempt is sealed, so a control plane that runs an
+//! attempt whose workload asks through its action channel answers from a second adapter
+//! process (or its own client) while the first one runs.
 //!
 //! A `SIGTERM` or `SIGINT` during a `run` cancels it: the attempt is revoked and sealed,
 //! `done` is written, and the adapter exits without reading further commands; while idle,
@@ -35,10 +43,13 @@ use nix::sys::signal::{SigSet, Signal};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ward_node_client::{
-    Applied, AttemptRequest, CancelToken, Client, Driver, EnvelopeInput, Inspection, IssuerKey,
-    OperationIds, Resulted, RunConfig, SignedEnvelope, Timeouts, UnixTransport,
+    ActionsListed, AnswerApplied, Applied, AttemptRequest, CancelToken, Client, Driver,
+    EnvelopeInput, Inspection, IssuerKey, OperationIds, Resulted, RunConfig, SignedEnvelope,
+    Timeouts, UnixTransport,
 };
-use ward_node_protocol::{AdmissionEnvelopeJson, IssuerProof, OperationId, TaskBinding};
+use ward_node_protocol::{
+    ActionDecision, ActionNote, AdmissionEnvelopeJson, IssuerProof, OperationId, TaskBinding,
+};
 
 const SCHEMA: u64 = 1;
 const MAX_COMMAND_BYTES: usize = 256 * 1024;
@@ -108,6 +119,26 @@ struct ResultCommand {
     #[serde(rename = "cmd")]
     _cmd: String,
     binding: TaskBinding,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionsCommand {
+    #[serde(rename = "cmd")]
+    _cmd: String,
+    binding: TaskBinding,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnswerCommand {
+    #[serde(rename = "cmd")]
+    _cmd: String,
+    binding: TaskBinding,
+    request: u32,
+    decision: ActionDecision,
+    operation_id: OperationId,
+    note: Option<ActionNote>,
 }
 
 fn main() -> ExitCode {
@@ -223,8 +254,10 @@ impl Adapter {
             "revoke" => self.revoke(line),
             "inspect" => self.inspect(line),
             "result" => self.result(line),
+            "actions" => self.actions(line),
+            "answer" => self.answer(line),
             other => Err(format!(
-                "unknown command `{other}`; the commands are capabilities, run, revoke, inspect and result"
+                "unknown command `{other}`; the commands are capabilities, run, revoke, inspect, result, actions and answer"
             )),
         };
         if let Err(message) = result {
@@ -365,6 +398,60 @@ impl Adapter {
                 "event": "rejected",
                 "verb": "result",
                 "operation_id": Value::Null,
+                "reason": reason,
+            }),
+        });
+        Ok(())
+    }
+}
+
+impl Adapter {
+    fn actions(&self, line: &str) -> Result<(), String> {
+        let command = parse::<ActionsCommand>(line)?;
+        let client = self.client()?;
+        let listed = client
+            .actions(command.binding)
+            .map_err(|error| error.to_string())?;
+        emit(match listed {
+            ActionsListed::Actions { state, pending } => {
+                json!({"event": "actions", "state": state, "pending": pending})
+            }
+            ActionsListed::Rejected { reason } => json!({
+                "event": "rejected",
+                "verb": "actions",
+                "operation_id": Value::Null,
+                "reason": reason,
+            }),
+        });
+        Ok(())
+    }
+
+    fn answer(&self, line: &str) -> Result<(), String> {
+        let command = parse::<AnswerCommand>(line)?;
+        if !command.decision.answerable() {
+            return Err("an answer's decision is approved or denied".to_owned());
+        }
+        let client = self.client()?;
+        let applied = client
+            .answer(
+                command.binding,
+                command.operation_id,
+                command.request,
+                command.decision,
+                command.note,
+            )
+            .map_err(|error| error.to_string())?;
+        emit(match applied {
+            AnswerApplied::Answered { action, decision } => json!({
+                "event": "answered",
+                "operation_id": command.operation_id,
+                "request": action,
+                "decision": decision,
+            }),
+            AnswerApplied::Rejected { reason } => json!({
+                "event": "rejected",
+                "verb": "answer",
+                "operation_id": command.operation_id,
                 "reason": reason,
             }),
         });

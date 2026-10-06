@@ -50,10 +50,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use ward_events::NodeResourceUsage;
 use ward_launch::freeze::{FrozenTree, TreeRoot, freeze_tree, kill_tree, thaw_tree};
-use ward_launch::{Launch, PROXY_SOCKET, RunningLaunch};
+use ward_launch::{ACTION_SOCKET, Launch, PROXY_SOCKET, RunningLaunch};
 use ward_node_protocol::{HostAllowlist, MAX_OUTPUT_STDIO_BYTES, OutputGrant, ResourceGrant};
 use ward_snapshot::SnapshotStore;
 
+use crate::actions::ACTION_SOCKET_ENV;
 use crate::cgroup::ResourceEnforcement;
 use crate::egress::{AttemptEgress, PROXY_SOCKET_ENV, egress_dir_beside};
 use crate::output::{CapturedStdio, CapturedStream};
@@ -89,6 +90,7 @@ pub struct LaunchRequest {
     allowlist: Option<HostAllowlist>,
     output: Option<OutputGrant>,
     resources: Option<ResourceGrant>,
+    action_socket: Option<PathBuf>,
 }
 
 impl LaunchRequest {
@@ -102,6 +104,7 @@ impl LaunchRequest {
             allowlist: None,
             output: None,
             resources: None,
+            action_socket: None,
         }
     }
 
@@ -132,6 +135,22 @@ impl LaunchRequest {
     #[must_use]
     pub const fn resources(&self) -> Option<&ResourceGrant> {
         self.resources.as_ref()
+    }
+
+    /// The same launch with the attempt's action channel socket, a host path, bound into
+    /// the sandbox at [`ward_launch::ACTION_SOCKET`] and named in
+    /// [`crate::actions::ACTION_SOCKET_ENV`].
+    #[must_use]
+    pub fn with_action_socket(mut self, socket: PathBuf) -> Self {
+        self.action_socket = Some(socket);
+        self
+    }
+
+    /// The host path of the attempt's action channel socket; `None` without an `actions`
+    /// grant.
+    #[must_use]
+    pub fn action_socket(&self) -> Option<&Path> {
+        self.action_socket.as_deref()
     }
 
     /// The output grant the admitted manifest carried; `None` when nothing is returned.
@@ -407,6 +426,10 @@ fn sandbox_launch(request: &LaunchRequest, proxy_socket: Option<&Path>) -> Launc
         ),
         None => launch,
     };
+    let launch = match request.action_socket() {
+        Some(socket) => launch.actions(socket).env(ACTION_SOCKET_ENV, ACTION_SOCKET),
+        None => launch,
+    };
     match proxy_socket {
         Some(socket) => launch.egress(socket).env(PROXY_SOCKET_ENV, PROXY_SOCKET),
         None => launch,
@@ -537,6 +560,7 @@ pub struct NodeExecution {
     output_return: bool,
     scheduling: Option<SchedulingLimits>,
     resources: Option<ResourceEnforcement>,
+    action_channel: bool,
 }
 
 impl std::fmt::Debug for NodeExecution {
@@ -550,6 +574,7 @@ impl std::fmt::Debug for NodeExecution {
             .field("output_return", &self.output_return)
             .field("scheduling", &self.scheduling)
             .field("resources", &self.resources)
+            .field("action_channel", &self.action_channel)
             .finish_non_exhaustive()
     }
 }
@@ -573,6 +598,7 @@ impl NodeExecution {
             output_return: false,
             scheduling: None,
             resources: None,
+            action_channel: false,
         }
     }
 
@@ -650,6 +676,23 @@ impl NodeExecution {
     #[must_use]
     pub const fn honours_output_return(&self) -> bool {
         self.output_return
+    }
+
+    /// Whether this node honours a manifest's `actions` grant, giving each such attempt
+    /// its own action channel ([`crate::actions`]) that the control plane reads with
+    /// `actions` and answers with `answer`. Off, every manifest with `actions` is refused
+    /// `unsupported_grant` at `admit`, both requests are `unsupported_operation` and the
+    /// node advertises no `actions` section.
+    #[must_use]
+    pub const fn with_action_channel(mut self, enabled: bool) -> Self {
+        self.action_channel = enabled;
+        self
+    }
+
+    /// Whether this node honours a manifest's `actions` grant.
+    #[must_use]
+    pub const fn honours_action_channel(&self) -> bool {
+        self.action_channel
     }
 
     /// The task root workspaces are allocated under.

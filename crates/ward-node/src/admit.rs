@@ -22,10 +22,13 @@
 //!     the registry from its execution), and an `output` grant only on a node that returns
 //!     output ([`NodeAdmission::with_output_return`]) and only within its ceilings
 //!     ([`ward_node_protocol::MAX_OUTPUT_STDIO_BYTES`],
-//!     [`ward_node_protocol::MAX_OUTPUT_FILES_BYTES`]), and a `resources` grant only on a
+//!     [`ward_node_protocol::MAX_OUTPUT_FILES_BYTES`]), a `resources` grant only on a
 //!     node that runs attempts in cgroups, only for limits it has a controller for and
-//!     within the host's ceilings ([`NodeAdmission::with_resource_enforcement`]); any other
-//!     grant is refused
+//!     within the host's ceilings ([`NodeAdmission::with_resource_enforcement`]), and an
+//!     `actions` grant only on a node that offers the action channel
+//!     ([`NodeAdmission::with_action_channel`]) and only within its ceilings
+//!     ([`ward_node_protocol::MAX_ACTION_PENDING`], [`ward_node_protocol::MAX_ACTION_TOTAL`],
+//!     [`ward_node_protocol::MAX_ACTION_WAIT_SECS`]); any other grant is refused
 //!     `unsupported_grant`, after authority is proven and before the version is committed,
 //!     so a refused grant consumes nothing.
 //!
@@ -119,6 +122,7 @@ pub struct NodeAdmission {
     network_allowlist: bool,
     output_return: bool,
     resources: Option<ResourceEnforcement>,
+    action_channel: bool,
 }
 
 impl std::fmt::Debug for NodeAdmission {
@@ -130,6 +134,7 @@ impl std::fmt::Debug for NodeAdmission {
             .field("network_allowlist", &self.network_allowlist)
             .field("output_return", &self.output_return)
             .field("resources", &self.resources)
+            .field("action_channel", &self.action_channel)
             .finish_non_exhaustive()
     }
 }
@@ -145,6 +150,7 @@ impl NodeAdmission {
             network_allowlist: false,
             output_return: false,
             resources: None,
+            action_channel: false,
         }
     }
 
@@ -189,6 +195,21 @@ impl NodeAdmission {
     ) -> Self {
         self.resources = resources;
         self
+    }
+
+    /// Whether a manifest's `actions` grant is honoured, within the ceilings (check 10).
+    /// The task registry sets this from its execution, so what `admit` accepts is exactly
+    /// what `start` gives a channel.
+    #[must_use]
+    pub const fn with_action_channel(mut self, enabled: bool) -> Self {
+        self.action_channel = enabled;
+        self
+    }
+
+    /// Whether a manifest's `actions` grant is honoured.
+    #[must_use]
+    pub const fn honours_action_channel(&self) -> bool {
+        self.action_channel
     }
 
     /// This node's identity: the only audience it admits.
@@ -281,7 +302,12 @@ impl NodeAdmission {
             .revalidate(self.state.revocations(), now)
             .map_err(|_| Reason::LeaseRevoked)?;
         let manifest = envelope.workload().capability_manifest().manifest();
-        check_grants(manifest, self.network_allowlist, self.output_return)?;
+        check_grants(
+            manifest,
+            self.network_allowlist,
+            self.output_return,
+            self.action_channel,
+        )?;
         if let Some(grant) = manifest.resources()
             && !self
                 .resources
@@ -439,6 +465,7 @@ const fn check_grants(
     manifest: &CapabilityManifest,
     network_allowlist: bool,
     output_return: bool,
+    action_channel: bool,
 ) -> Result<(), Reason> {
     match manifest.network() {
         NetworkGrant::Offline => {}
@@ -446,8 +473,13 @@ const fn check_grants(
         NetworkGrant::Custom(_) => return Err(Reason::UnsupportedGrant),
     }
     match manifest.output() {
+        None => {}
+        Some(output) if output_return && output.within_ceilings() => {}
+        Some(_) => return Err(Reason::UnsupportedGrant),
+    }
+    match manifest.actions() {
         None => Ok(()),
-        Some(output) if output_return && output.within_ceilings() => Ok(()),
+        Some(actions) if action_channel && actions.within_ceilings() => Ok(()),
         Some(_) => Err(Reason::UnsupportedGrant),
     }
 }
@@ -651,5 +683,53 @@ mod tests {
         let offline = TaskAdmissionEnvelope::new(envelope_input(lifecycle_binding())).unwrap();
         assert!(verify_signed(&plain, &offline, &issuer_keypair()).is_ok());
         assert!(verify_signed(&returning, &offline, &issuer_keypair()).is_ok());
+    }
+
+    #[test]
+    fn an_actions_grant_is_honoured_only_when_enabled_and_within_the_ceilings() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = node_admission(&dir.path().join("state"), &FixedClock::at(NOW));
+        let channel = node_admission(&dir.path().join("channel"), &FixedClock::at(NOW))
+            .with_action_channel(true);
+        assert!(!plain.honours_action_channel());
+        assert!(channel.honours_action_channel());
+        let with = |manifest| {
+            let mut input = envelope_input(lifecycle_binding());
+            crate::test_support::with_manifest(&mut input, manifest);
+            TaskAdmissionEnvelope::new(input).unwrap()
+        };
+        let modest = with(crate::test_support::actions_manifest(2, 4, 30));
+        assert_eq!(
+            verify_signed(&plain, &modest, &issuer_keypair()).unwrap_err(),
+            Reason::UnsupportedGrant
+        );
+        assert!(verify_signed(&channel, &modest, &issuer_keypair()).is_ok());
+        let ceilings = with(crate::test_support::actions_manifest(
+            ward_node_protocol::MAX_ACTION_PENDING,
+            ward_node_protocol::MAX_ACTION_TOTAL,
+            ward_node_protocol::MAX_ACTION_WAIT_SECS,
+        ));
+        assert!(verify_signed(&channel, &ceilings, &issuer_keypair()).is_ok());
+        for over in [
+            crate::test_support::actions_manifest(
+                ward_node_protocol::MAX_ACTION_PENDING + 1,
+                99,
+                1,
+            ),
+            crate::test_support::actions_manifest(1, ward_node_protocol::MAX_ACTION_TOTAL + 1, 1),
+            crate::test_support::actions_manifest(
+                1,
+                1,
+                ward_node_protocol::MAX_ACTION_WAIT_SECS + 1,
+            ),
+        ] {
+            assert_eq!(
+                verify_signed(&channel, &with(over), &issuer_keypair()).unwrap_err(),
+                Reason::UnsupportedGrant
+            );
+        }
+        let offline = TaskAdmissionEnvelope::new(envelope_input(lifecycle_binding())).unwrap();
+        assert!(verify_signed(&plain, &offline, &issuer_keypair()).is_ok());
+        assert!(verify_signed(&channel, &offline, &issuer_keypair()).is_ok());
     }
 }

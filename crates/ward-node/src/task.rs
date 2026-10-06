@@ -84,6 +84,20 @@
 //!   ended, and `resource_unavailable` when no stored result exists: the manifest asked
 //!   for none, the workload never ran or was lost, the node restarted before the output
 //!   was collected, or the collection could not be recorded in the evidence log.
+//! * `actions` and `answer` (protocol 1.3, with execution that offers the action channel,
+//!   [`crate::execution::NodeExecution::with_action_channel`]) read and answer the requests
+//!   a workload admitted with an `actions` grant asks through its channel
+//!   ([`crate::actions`]). `start` opens the channel before the spawn (a channel that
+//!   cannot be opened refuses `start` `resource_unavailable` with the workspace removed),
+//!   the reaper has the registry record what the channel queued and expire what ran out
+//!   between waits, `pause` and `resume` stop and restart the wait clocks, and the end of
+//!   the attempt (exit, budget, `stop`, `revoke`, an unconfirmed revoke, an ambiguous
+//!   launch) answers every pending request `cancelled` before the end record and closes
+//!   the channel. `actions` lists the recorded pending requests of the attempt, empty
+//!   unless it runs or is paused; `answer` records the answer, then relays it, and is
+//!   refused `invalid_state` once the attempt has ended, except for a replay of an answer
+//!   it applied. A restarted node answers `cancelled` every request a recovered attempt's
+//!   log shows unanswered ([`crate::evidence`]).
 //!
 //! The reaper waits on the workload promptly and, when it ends, moves the task
 //! `Running → Exited` (or `Paused → Exited`) under the registry lock with a
@@ -181,13 +195,15 @@ use ward_events::{
     ProcessRef, TaskId, WardEvent,
 };
 use ward_node_protocol::{
-    AdmissionEnvelopeJson, AttemptOutput, IssuerProof, NetworkGrant, OperationId,
-    ResourceCapabilities, SchedulingCapabilities, TaskAdmissionEnvelope, TaskBinding,
+    ActionDecision, ActionNote, ActionRejectionReason, AdmissionEnvelopeJson, AttemptOutput,
+    IssuerProof, NetworkGrant, OperationId, ResourceCapabilities, SchedulingCapabilities,
+    TaskActionsRequest, TaskActionsResponse, TaskAdmissionEnvelope, TaskBinding,
     TaskExecutionOutcome, TaskExecutionReceipt, TaskLifecycleContext, TaskLifecycleRejectionReason,
     TaskLifecycleRequest, TaskLifecycleResponse, TaskLifecycleState, TaskReceiptContext,
     TaskResultResponse, supports_task_admission,
 };
 
+use crate::actions::{AttemptActions, actions_dir_beside};
 use crate::admission::TrustedTaskAdmission;
 use crate::admit::{NodeAdmission, VerifiedAdmission};
 use crate::egress::{AttemptEgress, DEFAULT_QUIESCE, Drained, overflow_marker};
@@ -259,6 +275,7 @@ struct Attempt {
     revoke_requested_by: Option<OperationId>,
     reaped: Arc<Reaped>,
     network: NetworkTally,
+    actions: Option<Arc<AttemptActions>>,
 }
 
 /// How many egress verdicts an attempt has recorded, and how many it could not.
@@ -481,6 +498,11 @@ impl TaskRegistry {
                 execution
                     .as_ref()
                     .and_then(NodeExecution::resource_enforcement),
+            )
+            .with_action_channel(
+                execution
+                    .as_ref()
+                    .is_some_and(NodeExecution::honours_action_channel),
             );
         let survivors: Arc<dyn TaskLauncher> = execution
             .as_ref()
@@ -1070,6 +1092,7 @@ impl TaskRegistry {
             let _ = freezer.thaw();
             return Err(reason);
         }
+        task.pause_actions(true);
         Ok(task.state)
     }
 
@@ -1100,6 +1123,7 @@ impl TaskRegistry {
             let _ = freezer.freeze();
             return Err(reason);
         }
+        task.pause_actions(false);
         Ok(task.state)
     }
 
@@ -1142,8 +1166,16 @@ impl TaskRegistry {
     ) -> TaskLifecycleResponse {
         match self.prepare_start(context, operation_id, binding) {
             Ok(Prepared::Replay(state)) => context.accepted(operation_id, binding, state),
-            Ok(Prepared::Launch(request, launcher, timeout)) => {
-                match self.launch(registry, operation_id, binding, request, &launcher, timeout) {
+            Ok(Prepared::Launch(request, launcher, timeout, actions)) => {
+                match self.launch(
+                    registry,
+                    operation_id,
+                    binding,
+                    *request,
+                    &launcher,
+                    timeout,
+                    actions,
+                ) {
                     Ok(state) => context.accepted(operation_id, binding, state),
                     Err(reason) => context.rejected(Some(operation_id), binding, reason),
                 }
@@ -1211,10 +1243,27 @@ impl TaskRegistry {
             Some(resources) => request.with_resources(*resources),
             None => request,
         };
+        let actions = match manifest.actions() {
+            Some(grant) => {
+                let started = actions_dir_beside(request.workspace())
+                    .and_then(|dir| AttemptActions::start(&dir, grant.clone()).ok());
+                let Some(actions) = started else {
+                    discard(request.workspace());
+                    return Err(Reason::ResourceUnavailable);
+                };
+                Some(Arc::new(actions))
+            }
+            None => None,
+        };
+        let request = match &actions {
+            Some(actions) => request.with_action_socket(actions.socket().to_path_buf()),
+            None => request,
+        };
         Ok(Prepared::Launch(
-            request,
+            Box::new(request),
             execution.launcher(),
             execution.spawn_timeout(),
+            actions,
         ))
     }
 
@@ -1222,6 +1271,7 @@ impl TaskRegistry {
     /// `running` record cannot be written is killed and recorded `exited` with an `unknown`
     /// receipt, as is a clean refusal whose launch intent cannot be withdrawn: the durable
     /// intent already makes the attempt ambiguous.
+    #[allow(clippy::too_many_arguments)]
     fn launch(
         &mut self,
         registry: &SharedRegistry,
@@ -1230,6 +1280,7 @@ impl TaskRegistry {
         request: LaunchRequest,
         launcher: &Arc<dyn TaskLauncher>,
         spawn_timeout: Duration,
+        actions: Option<Arc<AttemptActions>>,
     ) -> Result<TaskLifecycleState, Reason> {
         let journal = Journal(self.store.as_ref());
         let evidence = Evidence::of(self.execution.as_ref());
@@ -1252,6 +1303,7 @@ impl TaskRegistry {
             reaped: Arc::clone(&done),
         };
         let launcher = Arc::clone(launcher);
+        let tended = actions.clone();
         let thread = std::thread::Builder::new()
             .name("ward-node-reaper".to_owned())
             .spawn(move || {
@@ -1274,6 +1326,7 @@ impl TaskRegistry {
                 let egress = workload.egress();
                 let WorkloadEnd { exit, stdio, usage } = workload.wait(&reaper.stop, &mut || {
                     reaper.drain(egress.as_deref());
+                    reaper.tend(tended.as_deref());
                 });
                 let last = egress.as_deref().map(|egress| {
                     egress.quiesce(DEFAULT_QUIESCE);
@@ -1318,6 +1371,7 @@ impl TaskRegistry {
             revoke_requested_by: None,
             reaped: done,
             network: NetworkTally::default(),
+            actions,
         });
         Ok(task.record_spawn(journal, evidence, operation_id, pid))
     }
@@ -1455,6 +1509,7 @@ impl TaskRegistry {
             .as_ref()
             .is_some_and(|attempt| attempt.revoke_requested_by == Some(operation_id));
         if live(task.state) && requested {
+            task.finish_actions(evidence);
             return match task.commit(
                 journal,
                 |task| evidence.append(task.binding, task.ended_event(NodeAttemptEnd::Unconfirmed)),
@@ -1468,6 +1523,147 @@ impl TaskRegistry {
             };
         }
         context.rejected(Some(operation_id), binding, Reason::InvalidState)
+    }
+
+    /// Record what the action channel of the live attempt `reaped` belongs to has queued,
+    /// and answer `expired` what ran out.
+    fn tend_actions(&mut self, binding: TaskBinding, reaped: &Arc<Reaped>) {
+        let evidence = Evidence::of(self.execution.as_ref());
+        let Some(actions) = self
+            .tasks
+            .get(&binding.task())
+            .filter(|task| task.binding == binding && live(task.state))
+            .and_then(|task| task.attempt.as_ref())
+            .filter(|attempt| Arc::ptr_eq(&attempt.reaped, reaped))
+            .and_then(|attempt| attempt.actions.clone())
+        else {
+            return;
+        };
+        actions.tend(Instant::now(), &mut |event| {
+            evidence.append(binding, event).is_ok()
+        });
+    }
+
+    /// Serve one `actions` or `answer` request against the shared registry (see the module
+    /// docs).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskRegistryUnavailable`] if the registry lock is poisoned.
+    pub fn actions(
+        registry: &SharedRegistry,
+        context: TaskLifecycleContext,
+        request: TaskActionsRequest,
+    ) -> Result<TaskActionsResponse, TaskRegistryUnavailable> {
+        let registry = registry.lock().map_err(|_| TaskRegistryUnavailable)?;
+        Ok(match request {
+            TaskActionsRequest::Actions { binding, .. } => registry.list_actions(context, binding),
+            TaskActionsRequest::Answer {
+                operation_id,
+                binding,
+                action,
+                decision,
+                note,
+                ..
+            } => registry.answer_action(context, operation_id, binding, action, decision, note),
+        })
+    }
+
+    /// The task `binding` names, for an action-channel request on a node that offers the
+    /// channel at 1.3.
+    fn action_task(
+        &self,
+        context: TaskLifecycleContext,
+        binding: TaskBinding,
+    ) -> Result<&NodeTask, ActionRejectionReason> {
+        let offered = self
+            .execution
+            .as_ref()
+            .is_some_and(NodeExecution::honours_action_channel);
+        if !offered || self.admission.is_none() || !supports_task_admission(context.protocol()) {
+            return Err(ActionRejectionReason::UnsupportedOperation);
+        }
+        let task = self
+            .tasks
+            .get(&binding.task())
+            .ok_or(ActionRejectionReason::TaskNotFound)?;
+        task.matches(binding).map_err(|reason| match reason {
+            Reason::LeaseMismatch => ActionRejectionReason::LeaseMismatch,
+            _ => ActionRejectionReason::AttemptMismatch,
+        })?;
+        Ok(task)
+    }
+
+    fn list_actions(
+        &self,
+        context: TaskLifecycleContext,
+        binding: TaskBinding,
+    ) -> TaskActionsResponse {
+        let refuse = |reason| context.actions_rejected(None, binding, reason);
+        let task = match self.action_task(context, binding) {
+            Ok(task) => task,
+            Err(reason) => return refuse(reason),
+        };
+        let evidence = Evidence::of(self.execution.as_ref());
+        let pending = match task
+            .attempt
+            .as_ref()
+            .and_then(|attempt| attempt.actions.as_ref())
+        {
+            Some(actions) if live(task.state) => actions.list(Instant::now(), &mut |event| {
+                evidence.append(binding, event).is_ok()
+            }),
+            _ => Vec::new(),
+        };
+        context
+            .actions_listed(binding, visible(context, task.state), pending)
+            .unwrap_or_else(|_| refuse(ActionRejectionReason::ResourceUnavailable))
+    }
+
+    fn answer_action(
+        &self,
+        context: TaskLifecycleContext,
+        operation_id: OperationId,
+        binding: TaskBinding,
+        action: u32,
+        decision: ActionDecision,
+        note: Option<ActionNote>,
+    ) -> TaskActionsResponse {
+        let refuse = |reason| context.actions_rejected(Some(operation_id), binding, reason);
+        let task = match self.action_task(context, binding) {
+            Ok(task) => task,
+            Err(reason) => return refuse(reason),
+        };
+        let actions = task
+            .attempt
+            .as_ref()
+            .and_then(|attempt| attempt.actions.as_ref());
+        if let Some(replayed) = actions
+            .and_then(|actions| actions.replay(operation_id, action, decision, note.as_ref()))
+        {
+            return match replayed {
+                Ok(decision) => context.answered(operation_id, binding, action, decision),
+                Err(reason) => refuse(reason),
+            };
+        }
+        if !live(task.state) {
+            return refuse(ActionRejectionReason::InvalidState);
+        }
+        let Some(actions) = actions else {
+            return refuse(ActionRejectionReason::UnknownRequest);
+        };
+        let evidence = Evidence::of(self.execution.as_ref());
+        match actions.answer(
+            Instant::now(),
+            operation_id,
+            action,
+            decision,
+            note,
+            &mut |event| evidence.append(binding, event).is_ok(),
+        ) {
+            Ok(decision) => context.answered(operation_id, binding, action, decision),
+            Err(reason) => refuse(reason),
+        }
     }
 
     /// Record the egress verdicts `drained` of the live attempt `reaped` belongs to, as its
@@ -1512,6 +1708,7 @@ impl TaskRegistry {
             }
             return;
         };
+        task.finish_actions(evidence);
         if let Some(last) = last {
             task.record_network(evidence, reaped, last);
         }
@@ -1560,7 +1757,12 @@ impl Drop for TaskRegistry {
 /// A `start` that passed every check, ready to launch, or the replay of the one that did.
 enum Prepared {
     Replay(TaskLifecycleState),
-    Launch(LaunchRequest, Arc<dyn TaskLauncher>, Duration),
+    Launch(
+        Box<LaunchRequest>,
+        Arc<dyn TaskLauncher>,
+        Duration,
+        Option<Arc<AttemptActions>>,
+    ),
 }
 
 /// What an attempt's reaper thread needs to record how the attempt ended.
@@ -1586,6 +1788,22 @@ impl Reaper {
             && let Ok(mut registry) = registry.lock()
         {
             registry.record_network(self.binding, &self.reaped, drained);
+        }
+    }
+
+    /// Have the registry record what the attempt's action channel queued and expire what
+    /// ran out; nothing to do costs no registry lock.
+    fn tend(&self, actions: Option<&AttemptActions>) {
+        let Some(actions) = actions else {
+            return;
+        };
+        if !actions.due(Instant::now()) {
+            return;
+        }
+        if let Some(registry) = self.registry.upgrade()
+            && let Ok(mut registry) = registry.lock()
+        {
+            registry.tend_actions(self.binding, &self.reaped);
         }
     }
 
@@ -1872,6 +2090,7 @@ impl NodeTask {
         if let Some(attempt) = &self.attempt {
             attempt.stop.request();
         }
+        self.finish_actions(evidence);
         self.finish(TaskLifecycleState::Exited, TaskExecutionOutcome::Unknown);
         if rewrite {
             let _ = journal.write(&self.record());
@@ -1954,6 +2173,30 @@ impl NodeTask {
             .is_err()
         {
             attempt.network.dropped = dropped;
+        }
+    }
+
+    /// The attempt has ended: answer its pending action-channel requests `cancelled`,
+    /// recorded before the end, and close the channel.
+    fn finish_actions(&self, evidence: Evidence<'_>) {
+        let binding = self.binding;
+        if let Some(actions) = self
+            .attempt
+            .as_ref()
+            .and_then(|attempt| attempt.actions.as_ref())
+        {
+            actions.finish(&mut |event| evidence.append(binding, event).is_ok());
+        }
+    }
+
+    /// Stop or restart the action channel's wait clocks with a confirmed pause or resume.
+    fn pause_actions(&self, paused: bool) {
+        if let Some(actions) = self
+            .attempt
+            .as_ref()
+            .and_then(|attempt| attempt.actions.as_ref())
+        {
+            actions.set_paused(paused, Instant::now());
         }
     }
 

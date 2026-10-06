@@ -2,9 +2,11 @@
 
 Status: living document. It describes the `ward-node` protocol 1.3 contract as
 implemented today (ADR-0030 steps 1–9, 12 and 13: the network allowlist and bounded
-result return, both additive within 1.3; and the first single-node slice of #260:
+result return, both additive within 1.3; the first single-node slice of #260:
 cgroup resource limits and accounting, and a bound on attempts executing at once, also
-additive within 1.3), and the client and process adapter that drive it
+additive within 1.3; and the action channel of
+[ADR-0031](decisions/ADR-0031-node-action-channel.md), #404, additive within 1.3 as well),
+and the client and process adapter that drive it
 (§11). The cross-system acceptance suite that proves it against a real node (ADR-0030
 step 10, #332 slice 9) is [node-acceptance.md](node-acceptance.md). Three companion
 documents (ADR-0030 step 11, #332 slice 10): the walk from an empty host to a verified
@@ -39,11 +41,13 @@ admission example is a working test vector (§7.4).
   allowing exactly those hosts (§7.5, §9), and an `output` grant only on a node started
   with `--output-return`, which then keeps the head of the workload's stdout and stderr,
   collects the declared workspace files once the attempt has ended and returns the bounded
-  result through `result` (§6.6, §7.5), and a `resources` grant (CPU, memory and pid
+  result through `result` (§6.6, §7.5), a `resources` grant (CPU, memory and pid
   limits) only on a node started with `--cgroup-root`, which then runs every attempt in a
   cgroup of its own, enforces the limits there and records what each attempt used
-  (§6.5, §7.5, §9); any other grant is refused `unsupported_grant` at `admit`, never run
-  with less silently.
+  (§6.5, §7.5, §9), and an `actions` grant only on a node started with
+  `--action-channel`, which then gives the attempt a socket in the sandbox through which
+  the workload asks and the control plane answers, every exchange recorded (§6.7, §7.5);
+  any other grant is refused `unsupported_grant` at `admit`, never run with less silently.
 - How much the node runs at once is the operator's choice: a node started with
   `--max-running` executes at most that many attempts at once and refuses a `start` past
   it, or below a memory or disk headroom floor, `capacity_exhausted` with the task still
@@ -55,8 +59,9 @@ admission example is a working test vector (§7.4).
   planes in other languages), §11. Both run on the node's host, as the node's uid or as
   a uid the node's operator listed with `--client-uid` (§2.1, §11.1).
 - Not implemented yet: a loopback relay and `HTTP_PROXY` environment inside the sandbox
-  (the proxy is reached through its Unix socket, §9), credential injection (#267), an
-  event stream (`stream`), a workspace export as a snapshot (`snapshots.read` and
+  (the proxy is reached through its Unix socket, §9), credential injection (#267),
+  approvals the node enforces (an approval through the action channel is a recorded
+  statement the workload acts on, §6.7), an event stream (`stream`), a workspace export as a snapshot (`snapshots.read` and
   `snapshots.diff` stay `false`; `result` returns declared files only, §6.6), and any
   remote transport or mTLS. The only transport is a
   local Unix socket; remote transport and key bootstrap are #262. The full list, with what each gap means for a control plane, is
@@ -72,7 +77,8 @@ admission example is a working test vector (§7.4).
 ```text
 ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
   [--trusted-issuers <file>] [--task-root <dir>] [--network-allowlist] [--output-return] \
-  [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]] \
+  [--action-channel] [--cgroup-root <dir>] \
+  [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]] \
   [--client-uid <uid>]… [--client-group <group>]
 ```
 
@@ -85,6 +91,7 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | `--task-root` | no | Directory under which the node allocates workspaces and keeps each admitted attempt's evidence log (§6.5), created mode 0700 and refused if group- or world-accessible or not a real directory. With it the node executes (`start`, `pause`, `resume`, `stop`, `revoke`, `seal`); the node refuses to start if bubblewrap is unusable. Without it, all six are `unsupported_operation` and no evidence log is kept. |
 | `--network-allowlist` | no | Honour a manifest's `network.custom` host allowlist (§7.5): the attempt runs behind a node-owned egress proxy allowing exactly those hosts, with IP literals, private ranges and the metadata endpoint always refused (§9), and the node reports `network.proxy_allowlist` `true` (§5). Needs `--task-root`. Without it every `network.custom` manifest is refused `unsupported_grant`. |
 | `--output-return` | no | Honour a manifest's `output` grant (§7.5): the node keeps the first `stdio_bytes` of the workload's stdout and stderr, collects the declared workspace files once the attempt has ended (relative paths only, nothing followed outside the workspace, bounded), stores the result in `<task-root>/<task>/<attempt>.output/` (§6.6) and returns it through `result`; the capability document then carries `output` with `stdio` and `files` `true` (§5). Needs `--task-root`. Without it every manifest with `output` is refused `unsupported_grant` and `result` is `unsupported_operation`. |
+| `--action-channel` | no | Honour a manifest's `actions` grant (§7.5): the attempt gets its own action channel, a socket in `<task-root>/<task>/<attempt>.actions/` bound into the sandbox at `/run/ward/actions.sock` and named by `WARD_ACTION_SOCKET`, on which the workload asks bounded questions; the node records every request and answer in the attempt's evidence log, relays them to the control plane (`actions`) and the control plane's answers back (`answer`), and the capability document carries `actions` (§5, §6.7). An approval is a recorded statement, not a capability the node enforces. Needs `--task-root`. Without it every manifest with `actions` is refused `unsupported_grant` and both requests are `unsupported_operation`. |
 | `--cgroup-root` | no | A cgroup v2 directory delegated to the node: writable by the node's uid and holding no process of its own (for systemd, a unit with `Delegate=yes` whose main process sits in a sub-cgroup, `DelegateSubgroup=`). The node refuses to start if it is not on a cgroup v2 filesystem, if one of the `cpu`, `memory` and `pids` controllers it offers cannot be enabled in its `cgroup.subtree_control`, or if no cgroup can be created under it. Every attempt then runs in a cgroup of its own, `<dir>/<attempt>`, created before the spawn and removed once the workload is reaped; a manifest's `resources` limits are written there (§7.5, §9); what the attempt used is read from the kernel's counters and recorded (§6.5); and the node reports `resources` with the controllers it enabled (§5). At start the node also kills and removes every attempt cgroup (`exec_…`) a previous run left under it. Needs `--task-root`. Without it every manifest with `resources` is refused `unsupported_grant` and nothing is measured. |
 | `--max-running` | no | At most this many attempts (1 to 1 024) execute at once: from the spawn until the reaper has reaped the workload, paused attempts and attempts whose kill is pending included. A `start` past it is refused `capacity_exhausted` with the task still `ready` and nothing materialised (§8.2); the node reports the bound, the running count and its headroom in `scheduling` (§5). Needs `--task-root`. Without it the node bounds nothing, as before. |
 | `--memory-floor`, `--disk-floor` | no | Refuse a `start` `capacity_exhausted` while the host's available memory (`MemAvailable`) or the space available on the task root's filesystem is below this many bytes. A floor the node cannot measure refuses the `start` `resource_unavailable`. Need `--max-running`. |
@@ -364,10 +371,12 @@ well, `network.proxy_allowlist` reads `true`):
 | `scheduling` | Present, as `"scheduling":{"max_running":…,"running":…,"memory_floor_bytes":…,"memory_available_bytes":…,"disk_floor_bytes":…,"disk_available_bytes":…}` after `resources` (or where `resources` would be), exactly when `lifecycle.start` is and the node was started with `--max-running`. Read when the document is served: `running` counts the attempts executing now (spawned and not yet reaped), the `*_available_bytes` are the host's `MemAvailable` and the task root filesystem's available space (`0` if they cannot be read), and a floor of `0` means none. A `start` is refused `capacity_exhausted` while `running` is at `max_running` or an available amount is below its floor (§8.2). New in this revision of 1.3, with the same caveat as `output`. |
 | `output.stdio`, `output.files` | Present, as `"output":{"stdio":true,"files":true}` after `verifier`, exactly when `lifecycle.start` is and the node was started with `--output-return` (§2.1): a manifest's `output` grant (§7.5) is then honoured and `result` returns an ended attempt's bounded stdout, stderr and declared files (§6.6). Otherwise the section is absent, which means both `false`, and such a manifest is refused `unsupported_grant` at `admit`. The section is new in this revision of 1.3: a strict decoder of an earlier 1.3 revision refuses a document that carries it, so start a node with `--output-return` only once every control plane that reads it is at this revision; a node without the flag emits exactly the earlier document. |
 
+| `actions.approval`, `actions.decision`, `actions.max_pending`, `actions.max_total`, `actions.max_wait_secs` | Present, as `"actions":{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600}` after `verifier` (and after `output`, `resources` and `scheduling` when those are present), exactly when `lifecycle.start` is and the node was started with `--action-channel` (§2.1): a manifest's `actions` grant (§7.5) is then honoured within those ceilings, and `actions` and `answer` are served (§6.7). Otherwise the section is absent, which means no channel, and such a manifest is refused `unsupported_grant` at `admit`. Like `output`, the section is new in this revision of 1.3: a strict decoder of an earlier revision refuses a document that carries it, so start a node with `--action-channel` only once every control plane that reads it is at this revision; a node without the flag emits exactly the earlier document. |
+
 Everything else (`isolation.backends`, `credentials`, `snapshots.diff`,
 `snapshots.read`, `verifier`) is `false`: the node offers none of it yet. 1.1 and 1.2
 documents keep their earlier content: they never carry `admit`, `start`, `output`,
-`resources` or `scheduling`,
+`resources`, `scheduling` or `actions`,
 report `stop`, `pause` and `revoke` as `false`, and report the execution flags
 above as `false`, because a 1.1 or 1.2 connection cannot run anything.
 
@@ -660,6 +669,7 @@ evidence log per attempt it admits:
 <task-root>/<task>/<attempt>.evidence/events.log    the log (mode 0600; 0400 once sealed)
 <task-root>/<task>/<attempt>.evidence/HEAD          the sealed head, written by seal (0400)
 <task-root>/<task>/<attempt>.output/result.json     the stored result of an output grant (§6.6; mode 0600)
+<task-root>/<task>/<attempt>.actions/actions.sock   the action channel's socket while the attempt runs (§6.7)
 ```
 
 The directories (mode 0700, like `<task-root>/<task>/`) sit beside the attempt's
@@ -683,12 +693,16 @@ task, attempt and lease ids as 16 big-endian bytes each. Records, in order:
 | `ObservationsDropped` | Verdicts of the attempt's proxy could not be recorded: past the 512 bound, refused by the log's own bound, or still undecided when the attempt ended. One marker, before `NodeAttemptEnded`. | `source` `network`, the count and the bound. |
 | `NodeAttemptResourceUsage` | The attempt ran on a node started with `--cgroup-root` (§2.1), its workload ended and was reaped, and the node read its cgroup's counters. One record, before `NodeAttemptOutputCollected` (if any) and `NodeAttemptEnded`; not written for an attempt whose end was recorded before its reap (a `revoke` whose reap was not confirmed) or that never spawned. | The limits enforced (`cpu_millis_limit`, `memory_limit_bytes`, `pids_limit`, absent when not asked for) and what the tree used: `cpu_usage_usec` (`cpu.stat`), `memory_peak_bytes` (`memory.peak`), `pids_peak` (`pids.peak`), `memory_oom_kills` (`memory.events` `oom_kill`) and `pids_max_events` (forks refused at the limit, `pids.events` `max`); a counter the host's kernel or controllers do not provide is absent. |
 | `NodeAttemptOutputCollected` | The attempt was admitted with an `output` grant on a node started with `--output-return` (§6.6, §7.5), its workload ended and was reaped, and the node collected the output and stored it. One record, right before `NodeAttemptEnded`; never written for a workload the node lost track of. | For stdout and for stderr, the bytes returned and the bytes dropped past them; for every declared file, in declaration order, its workspace path, size, `BLAKE3-256` digest and status (`returned`, `digest_only`, `missing`, `not_a_regular_file`, `too_large`). Never the bytes. `result` returns exactly what this record digests. |
+| `NodeActionRequested` | The workload asked through the attempt's action channel (§6.7: an `actions` grant on a node started with `--action-channel`) and the node accepted the request. Appended before the control plane can list or answer it. | The node's request number (from 1), the kind (`approval`, `decision`), and the size and `BLAKE3-256` digest of the summary and of the detail. Never the text. |
+| `NodeActionAnswered` | A request was answered: by `answer` (appended before the workload is told), or by the node: `expired` once its wait ran out, `cancelled` when the attempt ended, the workload's connection closed, the channel closed, or a restarted node recovered the attempt. Every pending request is answered before `NodeAttemptEnded` or `NodeAttemptRecovered`. | The request number, the decision (`approved`, `denied`, `expired`, `cancelled`), the `answer`'s operation id (none for the node's own answers), and the size and digest of the note. Never the note. |
+| `NodeActionRefused` | The node refused a line on the channel and closed that connection without a reply (§6.7): oversized, malformed, a node-protocol or control-protocol request, a kind not granted, a repeated id, too many pending or in all. At most 16 per attempt: the 16th closes the channel. | The reason and how many bytes of the line the node read. |
 | `NodeAttemptEnded` | The attempt ended: natural exit, budget kill, a lost child, an ambiguous launch, a `stop` or `revoke` (from `ready`, or with its kill reaped, or a revoke whose reap was not confirmed). | The state (`exited`, `stopped`, `revoked`), the receipt outcome, the cause (exit code, budget, killed, lost, ambiguous, not started, unconfirmed) and the `stop` or `revoke` operation id. |
 | `NodeAttemptRecovered` | The state the node holds differs from the state the log last shows: after a restart, before the node serves, and before sealing. | The state and outcome the node holds. |
 | `NodeAttemptSealed` | `seal` took effect; the log is then sealed. | The `seal` operation id. |
 
 Every record is metadata; workload output is never logged (an output record carries
-counts, sizes and digests, never a byte of the output). A record is fsynced before the
+counts, sizes and digests, never a byte of the output), and neither is anything a workload
+or a control plane said through the action channel (§6.7: sizes and digests only). A record is fsynced before the
 node answers its verb. If it cannot be appended, the verb is refused
 `resource_unavailable` and nothing changes: the task record written for it is restored,
 and a `pause` or `resume` undoes its freeze or thaw first. One exception is `admit`: its
@@ -710,7 +724,9 @@ cuts it off. Any other damage (a flipped byte, a foreign or reordered record, a 
 that does not match) refuses every further append with `resource_unavailable` and stops a
 restarted node from starting. The log is bounded at 256 KiB; records that do not end an
 attempt are refused `resource_unavailable` once it would pass 240 KiB, so the records that
-end, recover and seal it always fit.
+end, recover and seal it always fit; the node's own `expired` and `cancelled` answers to
+action-channel requests (§6.7) may use that reserve too, since they are bounded by the
+grant and must never be lost.
 
 To verify a log, as an operator or a control plane with access to the host:
 
@@ -792,6 +808,121 @@ the socket a control plane binds what it received to the sealed log by the diges
 `NodeAttemptOutputCollected`: recompute `BLAKE3-256` over each returned file's content and
 over the stream heads' lengths and compare them with the record, read as §6.5 says. The
 shipped client reads the result after `seal` and puts it in the report (§11.3).
+
+### 6.7 Action channel
+
+A node started with `--action-channel` (§2.1) honours a manifest's `actions` grant (§7.5)
+by giving the attempt its own channel ([ADR-0031](decisions/ADR-0031-node-action-channel.md)):
+at `start`, before the spawn, the node listens on
+`<task-root>/<task>/<attempt>.actions/actions.sock` (the directory mode 0700, beside the
+workspace, never inside it), binds that socket into the sandbox at
+`/run/ward/actions.sock` and sets `WARD_ACTION_SOCKET=/run/ward/actions.sock` (§9). The
+socket is removed when the attempt ends. The channel is a question-and-answer path, not a
+route: the network namespace is unchanged.
+
+**What the workload sends and receives.** One JSON request per line, on a connection it
+opens to the socket:
+
+```json
+{"id":"deploy-1","kind":"approval","summary":"deploy to staging","detail":"plan: rotate 3 services"}
+```
+
+| Field | Values |
+| --- | --- |
+| `id` | 1–64 bytes of `A-Z a-z 0-9 . _ : -`, unique within the attempt. The workload's correlation key. |
+| `kind` | `approval` (permission to do what the summary says) or `decision` (a yes-or-no choice made for the workload), and only a kind the grant names. |
+| `summary` | 1–512 bytes of UTF-8 text: what the control plane is asked. |
+| `detail` | 0–16 KiB (16 384 bytes) of UTF-8 text: the context it needs. |
+
+Every field is required and no other is allowed; a line is at most 128 KiB. The answer
+comes back on the same connection, one line per request:
+
+```json
+{"id":"deploy-1","decision":"approved","note":"go ahead"}
+```
+
+`decision` is `approved` or `denied` from the control plane, `expired` from the node once
+the grant's `wait_secs` ran out with no answer, or `cancelled` from the node when the
+attempt ended (`stop`, `revoke`, the budget kill, the workload's own exit), the channel
+closed, or a restarted node recovered the attempt; `note` is the control plane's, at most
+512 bytes, absent without one. A workload must proceed only on `approved` and treat
+everything else, an end-of-file without a reply included, as a refusal. Several requests
+may wait on one connection, up to `max_pending`; closing the connection withdraws its
+waiting requests (answered `cancelled`).
+
+**What gets nothing.** The node answers only well-formed, granted requests. A line longer
+than 128 KiB or whose summary or detail is past its bound (`oversized`), a line that is not
+one request object of the grammar (`malformed`), one that parses as a node-protocol or
+control-protocol request — any object with a `request`, `req` or `response` member, so a
+lifecycle request and a `hello` (`control_request`) — a kind the grant does not name
+(`kind_not_granted`), a repeated id (`duplicate_id`), and a request past `max_pending`
+(`too_many_pending`) or `max_total` (`too_many_requests`) are answered with zero bytes:
+the node records `NodeActionRefused` (§6.5) and closes that connection. The 16th refusal
+closes the channel for the rest of the attempt (its waiting requests are answered
+`cancelled`); at most 8 connections are served at once and a further one is closed unread.
+Nothing a workload sends reaches the node's protocol socket or changes what the node
+enforces.
+
+**Ordering and records.** The node records before it shows or tells (§6.5): a request is
+listed and answerable only once its `NodeActionRequested` is appended, and an answer is
+appended before the workload is told. A request whose record cannot be appended is
+answered `cancelled` and never listed; an `answer` whose record cannot be appended is
+refused `resource_unavailable` and the request stays pending. Records carry sizes and
+`BLAKE3-256` digests, never a summary, detail or note: a control plane binds what it saw
+to the sealed log by hashing the UTF-8 bytes of what `actions` returned.
+
+**Pause, stop, revoke, the budget and a restart.** While the attempt is paused its requests
+stay pending and their wait clocks stop, so a pause never makes one expire; the control
+plane may still list and answer, and the reply is read once the workload runs again. When
+the attempt ends every pending request is answered `cancelled`, recorded before
+`NodeAttemptEnded`. A node restart recovers every attempt that may have been running as
+`exited` (§6.4); before it serves, it answers `cancelled` every request the attempt's log
+shows unanswered, before `NodeAttemptRecovered`.
+
+**`actions`** is read-only and has no `operation_id`: the attempt's state and its pending
+requests, oldest first, each with the node's request number (`action`, what `answer`
+names), the workload's `id`, the kind, the summary and detail, and the milliseconds left
+before it expires (frozen while paused). It is served for every state; only a `running`
+or `paused` attempt has pending requests. Its answer is read within 1 MiB, not the 64 KiB
+line bound.
+
+```json
+{"request":"actions","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"}}
+{"response":"actions","protocol":{"major":1,"minor":3},"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"state":"running","pending":[{"action":1,"id":"deploy-1","kind":"approval","summary":"deploy to staging","detail":"plan: rotate 3 services","expires_in_ms":298512}]}
+```
+
+**`answer`** is mutating and carries an `operation_id`; `decision` is `approved` or
+`denied` (a control plane may not answer `expired` or `cancelled`), `note` is optional:
+
+```json
+{"request":"answer","protocol":{"major":1,"minor":3},"operation_id":10,"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"action":1,"decision":"approved","note":"go ahead"}
+{"response":"answered","protocol":{"major":1,"minor":3},"operation_id":10,"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"action":1,"decision":"approved"}
+```
+
+Both are refused with a `rejected` response spelled like a lifecycle refusal (§6.1), with
+`operation_id` `null` for `actions`:
+
+| Reason | When |
+| --- | --- |
+| `unsupported_operation` | The node was not started with `--action-channel`. Below 1.3 both requests are unknown and the connection closes without an answer. |
+| `task_not_found`, `attempt_mismatch`, `lease_mismatch` | As for every verb (§8.3). |
+| `invalid_state` | `answer` to an attempt that is not `running` or `paused`. |
+| `unknown_request` | `answer` names a request number the attempt never recorded. |
+| `already_answered` | `answer` to a request already answered: by an earlier `answer`, or `expired` or `cancelled` by the node. |
+| `stale_operation` | `answer` reuses an operation id that applied a different answer. |
+| `resource_unavailable` | The answer could not be appended to the evidence log; nothing changed and the request is still pending. |
+
+Replaying an `answer` with the same operation id and the same request, decision and note
+is answered `answered` again and appends nothing, also once the attempt has ended. The
+applied answer ids live in the node process: after a node restart the attempt has ended
+and a replay is `invalid_state`; the log is the durable record of what was answered.
+
+**Authority, and what an approval is.** An `answer` is authorised like every verb: by the
+exact binding, on a socket the node serves only to its own uid and its listed client uids
+(§2.1, §3). It is not signed per request (#262). The channel grants nothing: an approval is
+a statement the node records and relays, which the workload acts on because it chose to
+wait for it; the node enforces nothing on it at this revision (no capability, credential
+or network is widened; node-security-limitations.md §3).
 
 ## 7. The admission envelope
 
@@ -1021,18 +1152,23 @@ grammar, and anything that is not one object fail envelope decoding (`authority_
 | `resources.cpu_millis` | Integer ≥ 1: CPU time per second of wall clock, in thousandths of one CPU (`cpu.max`; `1000` is one full CPU). The node honours at most 1 000 per logical CPU it reports in `capacity`. |
 | `resources.memory_bytes` | Integer ≥ 1: memory the tree may use, tmpfs writes included (`memory.max`), with no swap where the kernel accounts swap (`memory.swap.max` `0`); a tree that passes it is killed whole (`memory.oom.group`). The node honours at most the `capacity.memory_bytes` it reports. |
 | `resources.pids` | Integer ≥ 1: processes and threads that may exist in the tree at once, bubblewrap's own included (`pids.max`); a fork past it fails. The node honours at most 65 536. |
+| `actions` | Optional (new in this revision of 1.3, like `output`). `{"kinds": [kinds], "max_pending": P, "max_total": T, "wait_secs": W}`, all four required: give the attempt an action channel for the listed kinds, with at most `P` requests waiting at once, `T` in the attempt's lifetime, each answered `expired` after `W` seconds (§6.7). |
+| `actions.kinds` | 1–2 of `approval` and `decision`, no repeats. Any other kind fails envelope decoding. |
+| `actions.max_pending`, `actions.max_total`, `actions.wait_secs` | Integers ≥ 1, with `max_pending` ≤ `max_total`. The node honours at most 8 pending, 64 in all and 3600 seconds (its capability document says so, §5), and refuses a larger grant `unsupported_grant`. |
 | `output.files` | 0–64 paths, no repeats, each 1–255 bytes of `a-z A-Z 0-9 . _ - /`, relative to the workspace root, with no empty, `.` or `..` component, no leading or trailing `/` and no `//`. Exact paths only: no globs, no directories. A path outside the grammar (`../x`, `/etc/passwd`, a space) fails envelope decoding. |
 
 The node honours a decoded grant only if its capability document (§5) says it can
 enforce it: `offline` always, `custom` only when `network.proxy_allowlist` is `true`,
 which a node started with `--network-allowlist` reports (§2.1), and `output` only when
 `output.stdio` and `output.files` are `true`, which a node started with
-`--output-return` reports, and only within the ceilings above, and `resources` only when
+`--output-return` reports, and only within the ceilings above, `resources` only when
 every limit it names has its flag `true` in the document's `resources` section, which a
-node started with `--cgroup-root` reports, and only within the ceilings above; the
+node started with `--cgroup-root` reports, and only within the ceilings above, and
+`actions` only when the document carries an `actions` section offering every listed kind,
+which a node started with `--action-channel` reports, and only within its ceilings; the
 workload then runs behind the attempt's own egress proxy allowing exactly the listed
-patterns (§9), its output is kept and returned as §6.6 says, and its process tree is
-held to the limits as §9 says. A
+patterns (§9), its output is kept and returned as §6.6 says, its process tree is held to
+the limits as §9 says, and its channel is served as §6.7 says. A
 manifest that asks for a grant the node does not honour is refused `unsupported_grant`
 (§8.1 step 16): the node refuses what it cannot enforce
 rather than run the workload with less than its manifest says. The refusal comes after
@@ -1072,13 +1208,22 @@ a limit of `0`, a `null` limit and an unknown limit (`"disk_bytes"`) fail decodi
 (`authority_denied`).
 
 ```json
+{"network":"offline","actions":{"kinds":["approval"],"max_pending":2,"max_total":8,"wait_secs":300}}
+```
+
+Decodes; honoured on a node started with `--action-channel`, refused `unsupported_grant`
+on any other, as is `{"max_pending":9,…}` on every node.
+
+```json
 {"network":"development"}
 ```
 
 `ward-policy`'s presets are not in the grammar: the envelope fails decoding
 (`authority_denied`), as do `{}`, `{"network":{"custom":[]}}`,
-`{"network":"offline","output":{"stdio_bytes":1,"files":["../x"],"files_bytes":1}}` and
-any manifest with a field other than `network`, `output` and `resources`.
+`{"network":"offline","output":{"stdio_bytes":1,"files":["../x"],"files_bytes":1}}`,
+`{"network":"offline","actions":{"kinds":["credential"],"max_pending":1,"max_total":1,"wait_secs":1}}`,
+an `actions` grant with no kind, a zero bound or `max_pending` above `max_total`, and any
+manifest with a field other than `network`, `output`, `resources` and `actions`.
 
 ## 8. Verification order and rejection reasons
 
@@ -1177,10 +1322,10 @@ task to evict it is refused `resource_unavailable`.
 | `stale_operation` | The request is stale and nothing was done. From `admit`: the envelope `version` is not greater than the last version the node durably accepted for the task (an old or replayed envelope, also after a restart). From `pause` or `resume`: the `operation_id` took effect earlier and a later operation of the same verb has superseded it (§6.3). From `create`: the attempt was replaced by a later attempt of the task and is retired (§6.1). |
 | `invalid_state` | The task is not in a state that allows the verb, or another operation already did it. From `result`: the attempt has not ended yet (§6.6). |
 | `authority_denied` | Untrusted key, bad signature, malformed envelope (a capability manifest outside the grammar of §7.5 included), a root lease `issuer` that is not the principal bound to the signing key, wrong audience, not yet valid, or authority that does not cover the task or agent. |
-| `unsupported_grant` | From `admit` only: the envelope's capability manifest decodes but asks for a grant this node cannot honour (§7.5): a `network.custom` allowlist on a node without `--network-allowlist`, an `output` grant on a node without `--output-return` or above its ceilings (§6.6), or a `resources` grant on a node without `--cgroup-root`, naming a limit whose controller the node has not enabled, or above its ceilings. The task stays `created` and no version is consumed; re-admit under the same version with a manifest the node honours. Protocol 1.3 and later. |
+| `unsupported_grant` | From `admit` only: the envelope's capability manifest decodes but asks for a grant this node cannot honour (§7.5): a `network.custom` allowlist on a node without `--network-allowlist`, an `output` grant on a node without `--output-return` or above its ceilings (§6.6), a `resources` grant on a node without `--cgroup-root`, naming a limit whose controller the node has not enabled, or above its ceilings, or an `actions` grant on a node without `--action-channel` or above its ceilings (§6.7). The task stays `created` and no version is consumed; re-admit under the same version with a manifest the node honours. Protocol 1.3 and later. |
 | `capacity_exhausted` | From `start` only, on a node started with `--max-running` (§2.1): the node already executes as many attempts as its bound, or the host's available memory or the task root's available disk is below the configured floor. Nothing changed: the task stays `ready`, nothing is materialised or recorded; send the same `start` again once an attempt has ended (§6.1). New in this revision of 1.3: a strict decoder of an earlier revision does not know the string, which is why only a node started with `--max-running` sends it. |
 | `resource_unavailable` | Registry full with no sealed task to evict, snapshot missing, workspace exists, spawn failed, a state write failed or would exceed its bound (admission version, revocation, retired attempt or task record), an evidence record could not be appended (§6.5), stop not confirmed in time, a pause or resume not confirmed, or an attempt's 128 pauses used up. From `result`: no stored result exists for the ended attempt (§6.6). |
-| `unsupported_operation` | The verb is not implemented (`stream`), or not enabled on this node or connection (no `--task-root`, or protocol 1.2; `result` without `--output-return`). |
+| `unsupported_operation` | The verb is not implemented (`stream`), or not enabled on this node or connection (no `--task-root`, or protocol 1.2; `result` without `--output-return`; `actions` and `answer` without `--action-channel`). |
 
 ## 9. Receipts
 
@@ -1248,6 +1393,13 @@ answer every new connection `503 paused by ward` and hold established relays unt
 unlink the socket; a node restart ends it with the node. There is no loopback relay and
 no `HTTP_PROXY` inside the sandbox yet: a workload reaches the proxy through the socket
 `WARD_PROXY_SOCKET` names. No credential is injected (#267).
+
+An `actions` manifest, on a node started with `--action-channel` (§2.1), binds one more
+socket: the attempt's action channel, from `<task-root>/<task>/<attempt>.actions/`
+(mode 0700, beside the workspace) at `/run/ward/actions.sock`, and sets
+`WARD_ACTION_SOCKET=/run/ward/actions.sock`. It is not a network path: the node reads
+only the bounded request lines of §6.7 on it and answers only those, and nothing on it
+reaches the node's protocol socket.
 
 ## 10. Failure semantics an adapter must handle
 
@@ -1360,9 +1512,10 @@ WardOS ships one implementation of this contract for the control-plane side, in 
   in that window (`HandshakeRejected`) or accepts a version below 1.3 (`ProtocolTooOld`).
   Every later connection must be accepted at exactly the negotiated version. It reads the
   capability document (§5) and sends `create`, `admit`, `start`, `pause`, `resume`,
-  `stop`, `revoke`, `seal`, `inspect` (§6) and `result` (§6.6, read within the 16 MiB
-  result bound rather than the 64 KiB line bound), decoding each answer strictly and
-  refusing one that names another binding or operation id than the request.
+  `stop`, `revoke`, `seal`, `inspect` (§6), `result` (§6.6, read within the 16 MiB
+  result bound rather than the 64 KiB line bound), and `actions` (read within 1 MiB) and
+  `answer` (§6.7), decoding each answer strictly and refusing one that names another
+  binding, operation id or request number than the request.
 - `IssuerKey`: the control plane's Ed25519 issuer key, loaded from a 32-byte seed file
   that must be a regular file of mode `0600` or `0400` (any other mode is refused), or
   from seed bytes. It prints its public key and key id (§2.3) and the trust-store line
@@ -1486,6 +1639,8 @@ Every output line carries `"schema":1`; stderr is diagnostics only. Commands:
 | `{"cmd":"revoke","operation_id":N,"binding":{…}}` | `{"event":"verb","verb":"revoke","operation_id":N,"result":"accepted","state":…}` or `…,"result":"rejected","reason":…}`. |
 | `{"cmd":"inspect","binding":{…}}` | `{"event":"inspected","state":…,"outcome":…}` or `{"event":"rejected","verb":"inspect","operation_id":null,"reason":…}`. |
 | `{"cmd":"result","binding":{…}}` | `{"event":"result","state":…,"output":{…}}` (the §6.6 output) or `{"event":"rejected","verb":"result","operation_id":null,"reason":…}`. |
+| `{"cmd":"actions","binding":{…}}` | `{"event":"actions","state":…,"pending":[…]}` (the §6.7 listing) or `{"event":"rejected","verb":"actions","operation_id":null,"reason":…}`. |
+| `{"cmd":"answer","binding":{…},"request":N,"decision":"approved","operation_id":M}` | `{"event":"answered","operation_id":M,"request":N,"decision":…}` or `{"event":"rejected","verb":"answer","operation_id":M,"reason":…}` (§6.7). `decision` is `approved` or `denied`; an optional `"note"` is relayed to the workload. |
 | anything else | `{"event":"error","error":"…"}`. |
 
 `run` takes the attempt in one of two forms, never a mixture:
@@ -1533,7 +1688,9 @@ restart; a caller that pre-signed already holds them.
 
 `SIGTERM` or `SIGINT` during a `run` cancels it: the attempt is revoked and sealed, the
 `done` is written, and the adapter exits without reading further commands; while idle it
-exits at once. The exit status is 0 when every command was well formed and answered (an
+exits at once. A `run` holds its adapter until the attempt is sealed, so a control plane
+whose workload asks through the action channel lists and answers from a second adapter
+process (or its own client) while the first runs. The exit status is 0 when every command was well formed and answered (an
 attempt that failed, was refused or ended `unknown` is still a clean answer: read `done`),
 1 when an `error` event was written (a malformed command, an unreachable node for
 `capabilities`, `revoke` or `inspect`, or a `run` refused before anything was sent), 2 for
@@ -1552,13 +1709,16 @@ bad flags. A command line is at most 256 KiB.
   workload wrote beyond the declared files stays under `<task-root>/<task>/<attempt>/`,
   readable only on the host as the node's uid (`snapshots.read` and `snapshots.diff` are
   `false`).
-- There is no event stream (`stream`) and no callback channel into the sandbox; progress
-  is what `inspect` reports.
+- There is no event stream (`stream`); progress is what `inspect` reports. The action
+  channel (§6.7) carries bounded questions out and answers in, on a node started with
+  `--action-channel`, but an approval through it is a recorded statement, not something
+  the node enforces, and no credential reaches the workload through it (#267).
 
 The honest integration shape today is therefore running governed tool actions and
 verification runs, an `argv` over a snapshot with a budget, through the node, reading the
 receipt, the bounded result and the evidence log, and not hosting a whole agent runtime
-whose conversation loop needs streamed output, credentials or callbacks from inside the
-sandbox. Each of these gaps,
+whose conversation loop needs streamed output or credentials inside the sandbox; a loop
+that needs approvals can ask through the action channel and must itself hold to the
+answer. Each of these gaps,
 with its impact, the mitigation available today and the issue that closes it, is a row
 of [node-security-limitations.md](node-security-limitations.md) §3.

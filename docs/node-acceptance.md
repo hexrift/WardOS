@@ -13,14 +13,17 @@ replay path by the `ward-node-adapter` process. Nothing is mocked: the sandbox i
 bubblewrap, the workloads are real processes, the evidence logs are the node's own files.
 
 The suite is [`crates/ward-node-client/tests/acceptance.rs`](../crates/ward-node-client/tests/acceptance.rs)
-and, for the network allowlist (§2.2), result return (§2.3) and capacity (§2.4),
+and, for the network allowlist (§2.2), result return (§2.3), capacity (§2.4) and the
+action channel (§2.5),
 [`crates/ward-node-client/tests/acceptance_network.rs`](../crates/ward-node-client/tests/acceptance_network.rs),
-[`crates/ward-node-client/tests/acceptance_output.rs`](../crates/ward-node-client/tests/acceptance_output.rs)
-and [`crates/ward-node-client/tests/acceptance_capacity.rs`](../crates/ward-node-client/tests/acceptance_capacity.rs):
+[`crates/ward-node-client/tests/acceptance_output.rs`](../crates/ward-node-client/tests/acceptance_output.rs),
+[`crates/ward-node-client/tests/acceptance_capacity.rs`](../crates/ward-node-client/tests/acceptance_capacity.rs)
+and [`crates/ward-node-client/tests/acceptance_actions.rs`](../crates/ward-node-client/tests/acceptance_actions.rs):
 one `#[test]` per case, named exactly as in the tables below. The pass criterion of each
 case is written in the test file's `CASES` table and repeated here word for word; the
 tests `every_acceptance_case_is_documented`, `every_network_acceptance_case_is_documented`,
-`every_output_acceptance_case_is_documented` and `every_capacity_acceptance_case_is_documented`
+`every_output_acceptance_case_is_documented`, `every_capacity_acceptance_case_is_documented`
+and `every_action_acceptance_case_is_documented`
 fail when the two drift apart. A case that passes prints one verdict line:
 
 ```text
@@ -36,7 +39,7 @@ acceptance <case>: SKIP -- <reason>
 ```
 
 [`scripts/acceptance/node.sh`](../scripts/acceptance/node.sh) runs exactly these cases,
-from all four files, with isolation required (`WARD_REQUIRE_ISOLATION=1`, so a host without a working
+from all five files, with isolation required (`WARD_REQUIRE_ISOLATION=1`, so a host without a working
 bubblewrap fails instead of skipping), one case at a time so the verdict lines stay
 whole, and prints the verdicts (with the rest of the `cargo test` output, on stderr) and
 a summary table (on stdout, so it can be captured alone):
@@ -76,7 +79,9 @@ Together they cover the epic's completion gate: bounded execution (case 1), reco
 isolation (case 2) and interruption (cases 3 to 5) as the cross-system properties the
 slice is named for. The network allowlist cases of §2.2 extend isolation and interruption
 to an attempt with egress; the result return cases of §2.3 prove the bounded result a
-control plane receives against the files on the host.
+control plane receives against the files on the host; the action channel cases of §2.5
+prove the question-and-answer path from a workload to the control plane, its records and
+its refusals.
 
 ### 2.1 How each case reads its result
 
@@ -198,6 +203,35 @@ workload forking 32 sleeps under `pids` 8, memory by `dd` with a 256 MiB buffer 
 `memory_bytes` 32 MiB, CPU by a two-second busy loop under `cpu_millis` 100. CI's runner
 delegates no cgroup to the tests, so on CI this case is a `SKIP` row (§4).
 
+### 2.5 The action channel cases
+
+The cases of `acceptance_actions.rs` start the node with `--action-channel`
+(node-integration.md §2.1) and admit manifests carrying an `actions` grant (§7.5). The
+workload is a small Python agent from the imported snapshot that connects to the socket
+`WARD_ACTION_SOCKET` names (`/run/ward/actions.sock`), asks for approval, writes the reply
+it received into the workspace and exits 0 only on `approved` (non-zero on `denied`,
+`expired`, `cancelled` or no reply); the hostile case first sends four hostile lines, each
+on its own connection, and records how many bytes came back. The control plane lists
+pending requests with `actions` and answers with `answer` (§6.7) through the shipped
+client; the test compares what the workload received with what was answered and with the
+`NodeActionRequested`, `NodeActionAnswered` and `NodeActionRefused` records of the log.
+
+| Case | Pass criterion |
+| --- | --- |
+| `action_channel_approval_lets_the_workload_proceed_and_a_denial_stops_it` | a workload admitted with an actions grant on a node started with --action-channel finds WARD_ACTION_SOCKET=/run/ward/actions.sock, asks for approval and waits; the control plane lists the request with its id, kind, summary and detail and approves it, the workload receives approved with the note and exits 0, and a second attempt that is denied receives denied and exits non-zero without proceeding; each sealed log records NodeActionRequested with the summary and detail digests and NodeActionAnswered with the answer's operation id before NodeAttemptEnded, never the text; the socket lives in a 0700 directory beside the workspace and is gone once the attempt ends |
+| `action_channel_unanswered_request_expires_after_its_wait` | a request nobody answers is answered expired by the node once the grant's wait_secs ran out, the workload fails closed with a non-zero exit, the log records NodeActionAnswered expired with no operation id, and a late answer once the attempt has ended is refused invalid_state |
+| `action_channel_stop_and_revoke_cancel_a_pending_request` | a stop and a revoke while a request is pending each end the attempt (stopped, revoked) with no workload left, answer the request cancelled and record NodeActionAnswered cancelled before NodeAttemptEnded; a later answer is refused invalid_state and the listing is empty |
+| `action_channel_pause_keeps_a_request_pending_until_answered_after_resume` | a pause while a request is pending keeps it pending past its wait (the listing reads paused with the request in it, nothing is answered expired), and an approval given after resume is delivered: the workload proceeds and exits 0, and the log shows the pause and resume around the request and its answer |
+| `action_channel_hostile_lines_get_nothing_and_are_recorded` | an oversized line, a malformed line, a node lifecycle request and a hello sent on the channel, each on its own connection, are each answered with zero bytes and a closed connection and recorded as NodeActionRefused oversized, malformed, control_request and control_request; nothing of them reaches the control plane's listing, and a well-formed request afterwards is still listed and approved |
+| `action_channel_replayed_answer_is_idempotent_and_a_second_answer_is_refused` | replaying an answer with the same operation id and the same decision is answered answered again and appends nothing, a different answer to the same request is refused already_answered, the same operation id with another decision is refused stale_operation, an unknown request number is refused unknown_request, and the log holds exactly one NodeActionAnswered for the request |
+| `action_channel_pending_request_is_cancelled_when_a_restarted_node_recovers_the_attempt` | after SIGKILL of the node while a request is pending and a restart with the flag, the attempt is exited with an unknown receipt, its log records NodeActionAnswered cancelled for the request before NodeAttemptRecovered and still verifies, the listing is empty and the attempt seals |
+| `action_channel_is_advertised_and_honoured_only_when_enabled` | a node started without --action-channel carries no actions section in its 1.3 capability document, refuses an actions grant unsupported_grant with nothing materialised and answers actions and answer unsupported_operation; the same node started with it reports actions with approval and decision and its ceilings, and refuses a grant above them unsupported_grant |
+
+The pause case holds the pause for six seconds against a five-second wait: the time the
+listing says the request has left is the same before and after, and nothing is answered
+`expired`; that sleep is the passage of time the case is about, not a synchronisation.
+Every other wait in these cases polls a condition (the listing, `inspect`) with a bound.
+
 ## 3. Running it
 
 ```text
@@ -256,6 +290,12 @@ minute on a developer machine; each case prints its own time.
   result of §2.3 (declared files, stream heads); what a workload wrote beyond the files it
   declared is still read on the host as the node's uid, which a remote control plane
   cannot do, and nothing is carried while the attempt runs.
+- **Approvals are not enforced.** The action channel cases (§2.5) prove that a workload
+  that asks holds on the answer, and that the node records, relays, expires and cancels
+  as the contract says; nothing proves, or could, that a workload which never asks is
+  stopped, because the node enforces nothing on an approval at this revision. The hostile
+  case sends four kinds of lines, not a fuzzer's corpus; the channel's parser is
+  unit-tested for the rest.
 - **No escape attempt beyond the probes.** The isolation case is a contract check of what
   the sandbox denies to an ordinary workload, not an adversarial escape suite; the
   kernel-level boundary tests of [experiments.md](experiments.md) E-01 and the
