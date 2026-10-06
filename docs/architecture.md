@@ -370,7 +370,9 @@ PID 1 inside the agent sandbox. Responsibilities:
 * expose the control socket to the agent and its tools as `$WARD_SOCKET`;
 * provide helper binaries: `ward-git-credential` (git credential helper), `ward-request`
   (capability request), agent hook adapters (e.g. Claude Code `PreToolUse`/`PostToolUse`
-  hooks that emit semantic events and honour step-through approvals).
+  hooks that emit semantic events and honour step-through approvals). Which hooks an
+  agent has is its adapter's capability document (ADR-0033, `agent-integration.md`
+  §10); every adapter launches through the same path under the same enforcement.
 
 `ward-agent` runs *inside* Zone 3 and is therefore **untrusted after start**. Nothing in
 Zone 0 relies on it for enforcement. It exists for correctness and UX, not security. All

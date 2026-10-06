@@ -17,6 +17,7 @@
 )]
 
 pub mod acks;
+pub mod adapters;
 pub mod agents;
 pub mod approvals;
 pub mod attempt;

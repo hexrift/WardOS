@@ -443,7 +443,9 @@ impl Launch {
     }
 
     /// Start the sandbox from an empty environment: none of the launching
-    /// process's variables reach it, only those set explicitly.
+    /// process's variables reach it, only those set explicitly — neither the
+    /// sandboxed program's environment nor that of bubblewrap's own init, which
+    /// every process inside could otherwise read at `/proc/1/environ`.
     #[must_use]
     pub const fn clear_env(mut self) -> Self {
         self.clear_env = true;
@@ -709,8 +711,20 @@ impl Launch {
                     .arg(bwrap);
                 cmd
             }
+            None if self.clear_env => Command::new(
+                find_on_path("bwrap")
+                    .ok_or_else(|| Error::Sandbox("bubblewrap (bwrap) is not installed".into()))?,
+            ),
             None => Command::new("bwrap"),
         };
+        if self.clear_env {
+            // `--clearenv` empties the sandboxed program's environment, not
+            // bubblewrap's own: its init, PID 1 inside the sandbox, keeps the
+            // environment bwrap was started with, readable by every process in the
+            // sandbox at /proc/1/environ. Start bwrap (or the cgroup shell that
+            // becomes it, found by absolute path) with none at all.
+            cmd.env_clear();
+        }
         cmd.args(self.args(&worktree));
         let admitted = admit()?;
         let start = Instant::now();
@@ -1173,6 +1187,30 @@ mod tests {
             .find("--ro-bind /root/.cargo/bin /run/verifier/cargo/bin")
             .unwrap();
         assert!(tmpfs < bind);
+    }
+
+    /// `--clearenv` empties the sandboxed program's environment, not bubblewrap's own:
+    /// its init process, PID 1 inside the sandbox, keeps whatever environment bwrap was
+    /// started with, and every process in the sandbox can read it from
+    /// `/proc/1/environ`. A cleared launch must leave nothing there either (#279).
+    #[test]
+    fn clear_env_leaves_nothing_in_the_sandbox_init_either() {
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        let names = "tr '\\0' '\\n' < /proc/1/environ | cut -d= -f1 | sort | tr '\\n' ' '";
+        let probe = || Launch::new("/tmp", vec!["sh".into(), "-c".into(), names.into()]);
+        // The probe can see an inherited environment: this test process has `PATH`.
+        let inherited = probe().run().unwrap();
+        assert_eq!(inherited.code, Some(0), "{}", inherited.stderr);
+        assert!(inherited.stdout.contains("PATH"), "{:?}", inherited.stdout);
+        let cleared = probe().clear_env().env("FOO", "bar").run().unwrap();
+        assert_eq!(cleared.code, Some(0), "{}", cleared.stderr);
+        assert_eq!(
+            cleared.stdout.trim(),
+            "",
+            "PID 1 holds the host's environment"
+        );
     }
 
     #[test]

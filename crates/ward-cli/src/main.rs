@@ -47,6 +47,35 @@ struct Cli {
     command: Command,
 }
 
+/// `ward agent`: the generic process adapter (ADR-0033).
+#[derive(clap::Args)]
+struct AgentArgs {
+    /// Project directory (default: current).
+    #[arg(long)]
+    dir: Option<PathBuf>,
+    /// Product name recorded with the launch as metadata (default: the
+    /// program's file name). Never identity or authority.
+    #[arg(long)]
+    product: Option<String>,
+    /// Product version recorded with the launch as metadata.
+    #[arg(long = "product-version")]
+    product_version: Option<String>,
+    /// The model-API gateway the agent talks to (`anthropic`, `openai`): the
+    /// key stays on the host and the proxy injects it, as for `ward claude`.
+    #[arg(long)]
+    provider: Option<String>,
+    /// Host environment variables to pass through (explicit, visible opt-in).
+    #[arg(long = "pass-env")]
+    pass_env: Vec<String>,
+    /// Grant a brokered credential the policy marks `ask` (e.g. `github`).
+    #[arg(long = "grant")]
+    grant: Vec<String>,
+    /// The agent program (a name on the sandbox `PATH`, or an absolute path)
+    /// and its arguments.
+    #[arg(trailing_var_arg = true, required = true)]
+    argv: Vec<String>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Make a directory a WardOS project: `.ward/policy.yaml`, the verifier config,
@@ -122,6 +151,18 @@ enum Command {
         /// Extra arguments for the agent.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+    },
+    /// Launch any agent program inside the session sandbox through the generic
+    /// process adapter: the same sandbox, network allowlist and credential rules as
+    /// `ward claude` and `ward codex`, and no hooks, so the observer sees its exec,
+    /// file and network activity but no tool intent (`ward adapters`).
+    Agent(AgentArgs),
+    /// Print the capability-discovery document of every agent adapter (contract
+    /// 1.0): hook coverage, semantic events, and the features the host serves.
+    Adapters {
+        /// One JSON array of `{command, document, coverage}`.
+        #[arg(long)]
+        json: bool,
     },
     /// End the current session: every sandboxed process of it is ended and
     /// confirmed gone, then its log is sealed (running or paused). Refused, with
@@ -690,6 +731,11 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             grant,
             args,
         } => cmd_agent(&dir.unwrap_or_else(cwd), "codex", &args, &pass_env, &grant),
+        Command::Agent(args) => cmd_generic(args),
+        Command::Adapters { json } => {
+            print!("{}", adapters_text(json));
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Stop {
             dir,
             session,
@@ -1822,6 +1868,106 @@ fn cmd_agent(
     pass_env: &[String],
     grants: &[String],
 ) -> ward_daemon::Result<ExitCode> {
+    let adapter = ward_daemon::adapters::Adapter::first_party(agent)
+        .ok_or_else(|| ward_daemon::Error::Project(format!("unknown agent `{agent}`")))?;
+    cmd_adapter(dir, &adapter, args, pass_env, grants)
+}
+
+/// `ward agent`: any program through the generic process adapter.
+fn cmd_generic(args: AgentArgs) -> ward_daemon::Result<ExitCode> {
+    let adapter = ward_daemon::adapters::Adapter::process(
+        &args.argv[0],
+        args.product.as_deref(),
+        args.product_version.as_deref(),
+        args.provider.as_deref(),
+    )?;
+    cmd_adapter(
+        &args.dir.unwrap_or_else(cwd),
+        &adapter,
+        &args.argv[1..],
+        &args.pass_env,
+        &args.grant,
+    )
+}
+
+/// The `ward` command that launches each shipped adapter.
+fn adapter_command(id: &str) -> &'static str {
+    match id {
+        "claude-code" => "ward claude",
+        "codex" => "ward codex",
+        _ => "ward agent -- <program>",
+    }
+}
+
+/// `ward adapters`: every capability document, as text or one JSON array.
+fn adapters_text(json: bool) -> String {
+    use std::fmt::Write as _;
+    let documents = ward_daemon::adapters::catalogue();
+    if json {
+        let values: Vec<serde_json::Value> = documents
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "command": adapter_command(d.adapter().id().as_str()),
+                    "document": d,
+                    "coverage": d.coverage(),
+                })
+            })
+            .collect();
+        return format!("{}\n", serde_json::Value::Array(values));
+    }
+    let mut out = String::new();
+    for d in &documents {
+        let runtime = d.adapter().runtime();
+        let events: Vec<&str> = d.events().as_slice().iter().map(|e| e.as_str()).collect();
+        let coverage = d.coverage();
+        let unserved: Vec<String> = coverage
+            .unserved
+            .as_slice()
+            .iter()
+            .map(|f| format!("{f:?}"))
+            .collect();
+        let _ = write!(
+            out,
+            "{}  {}{}  ({})\n  hooks {}  events {}\n{}",
+            d.adapter().id().as_str(),
+            runtime.product(),
+            runtime
+                .version()
+                .map(|v| format!(" {v}"))
+                .unwrap_or_default(),
+            adapter_command(d.adapter().id().as_str()),
+            d.hooks().as_str(),
+            if events.is_empty() {
+                "none (host observations only)".to_owned()
+            } else {
+                events.join(" ")
+            },
+            if unserved.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "  claimed but not served by this host: {}\n",
+                    unserved.join(", ")
+                )
+            },
+        );
+    }
+    out.push_str(
+        "Every adapter runs under the same sandbox, network allowlist and credential rules; \
+         hooks add semantic visibility only.\n",
+    );
+    out
+}
+
+/// Launch `adapter` in the project's current session (or a throwaway one).
+fn cmd_adapter(
+    dir: &Path,
+    adapter: &ward_daemon::adapters::Adapter,
+    args: &[String],
+    pass_env: &[String],
+    grants: &[String],
+) -> ward_daemon::Result<ExitCode> {
     let state = ward_daemon::session::state_root();
     let (mut session, throwaway) = match Session::open_current(dir, &state)? {
         Some(session) => (session, false),
@@ -1834,7 +1980,7 @@ fn cmd_agent(
         );
     }
     let log = session.log_path();
-    let (command, opts) = session.agent_launch(agent, args, pass_env, grants)?;
+    let (command, opts) = session.adapter_launch(adapter, args, pass_env, grants)?;
     for g in opts.gateways.iter().filter(|g| g.service != "github") {
         eprintln!(
             "ward: {} credential stays on the host; the proxy injects it",
@@ -2546,8 +2692,8 @@ fn cwd() -> PathBuf {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
-        Cli, Command, SessionCmd, SnapshotCmd, WatchMode, approvals_all_line, desktop_command,
-        observer_degraded_warning, on_path_in, pause_status, pause_status_json,
+        Cli, Command, SessionCmd, SnapshotCmd, WatchMode, adapters_text, approvals_all_line,
+        desktop_command, observer_degraded_warning, on_path_in, pause_status, pause_status_json,
         pause_uncertainty_lines, pending_all_line, pending_text, resolved_session_line,
         resolved_session_line_for, resume_note, stop_in, stopped_line, unreachable_line,
         verb_program,
@@ -2567,6 +2713,86 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
         }
+    }
+
+    #[test]
+    fn agent_takes_any_program_with_its_arguments_after_the_options() {
+        let cli = Cli::try_parse_from([
+            "ward",
+            "agent",
+            "--product",
+            "OpenCode",
+            "--provider",
+            "anthropic",
+            "--grant",
+            "github",
+            "opencode",
+            "run",
+            "--model",
+            "x",
+        ])
+        .unwrap();
+        let Command::Agent(super::AgentArgs {
+            product,
+            provider,
+            grant,
+            argv,
+            dir,
+            ..
+        }) = cli.command
+        else {
+            unreachable!("not agent")
+        };
+        assert_eq!(product.as_deref(), Some("OpenCode"));
+        assert_eq!(provider.as_deref(), Some("anthropic"));
+        assert_eq!(grant, ["github"]);
+        assert_eq!(argv, ["opencode", "run", "--model", "x"]);
+        assert!(dir.is_none());
+        assert!(
+            Cli::try_parse_from(["ward", "agent"]).is_err(),
+            "a program is required"
+        );
+    }
+
+    #[test]
+    fn adapters_lists_every_document_and_says_what_hooks_are_for() {
+        let text = adapters_text(false);
+        assert!(
+            text.contains("claude-code  Claude Code 2.1.263  (ward claude)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("hooks full  events SessionStart PreToolUse PostToolUse"),
+            "{text}"
+        );
+        assert!(
+            text.contains("codex  OpenAI Codex CLI 0.153.4  (ward codex)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("process  <program>  (ward agent -- <program>)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("hooks none  events none (host observations only)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("hooks add semantic visibility only"),
+            "{text}"
+        );
+
+        let json: serde_json::Value = serde_json::from_str(&adapters_text(true)).unwrap();
+        let ids: Vec<&str> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["document"]["adapter"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["claude-code", "codex", "process"]);
+        assert_eq!(json[0]["command"], "ward claude");
+        assert_eq!(json[0]["document"]["contract"], "1.0");
+        assert_eq!(json[1]["coverage"]["hooks"], "none");
     }
 
     #[test]
