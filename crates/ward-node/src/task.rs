@@ -39,8 +39,8 @@
 //!   `Ready` task to [`TaskLifecycleState::Running`] (ADR-0030 §3). It rechecks at the
 //!   node clock that the admitted envelope and lease are unexpired and unrevoked, places the
 //!   attempt on the Capsule backend its manifest's isolation floor allows
-//!   ([`crate::capsule`], ADR-0039; none is `unsupported_grant`, which `admit` already
-//!   refused), allocates and materialises the attempt's workspace ([`crate::workspace`]),
+//!   ([`crate::capsule`], ADR-0039; none, or one that does not enforce the manifest's
+//!   `resources` limits, is `unsupported_grant`, which `admit` already refused), allocates and materialises the attempt's workspace ([`crate::workspace`]),
 //!   and spawns the envelope's argv through that backend on a node-owned reaper thread. The
 //!   backend and its level are written into the launch intent and kept in the task's
 //!   record ([`TaskRegistry::capsule`]). `Running` is reported only once the launcher
@@ -60,7 +60,10 @@
 //!   [`TaskLifecycleState::Paused`] only once the attempt's
 //!   [`crate::execution::WorkloadFreezer`] confirmed its whole process tree stopped. A freeze
 //!   that cannot be confirmed is continued back and refused
-//!   [`TaskLifecycleRejectionReason::ResourceUnavailable`] with the task still `Running`.
+//!   [`TaskLifecycleRejectionReason::ResourceUnavailable`] with the task still `Running`;
+//!   an attempt on a backend whose descriptor does not serve `pause` (a rootless `runc`
+//!   container) is refused [`TaskLifecycleRejectionReason::UnsupportedOperation`] without
+//!   asking it.
 //!   `resume` moves a `Paused` task back to `Running` once the thaw is confirmed, and is
 //!   refused `resource_unavailable` with the task still `Paused` otherwise. The reaper keeps
 //!   watching a paused workload and the budget clock keeps running: a paused workload can
