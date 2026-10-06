@@ -8,7 +8,10 @@
 //! `SubjectPublicKeyInfo`), and with `--tls-client-revoked <file>` refuses the client keys
 //! that file lists, one pin per line. Every file is read at start, owned by the node's
 //! user, never a symlink, the key readable by no one else and the rest writable by no one
-//! else; any unsafe, unreadable or inconsistent input stops the node.
+//! else; any unsafe, unreadable or inconsistent input stops the node. On `SIGHUP`
+//! ([`reload_on_hangup`]) every file is read and checked again, and the new configuration
+//! replaces the old one for every handshake from then on only when all of it is usable;
+//! otherwise the node keeps serving the old one. Either outcome is reported on stderr.
 //!
 //! A client is served only when its certificate chains to the client CA for client
 //! authentication, is within its validity window give or take [`CLOCK_SKEW`], carries a
@@ -20,9 +23,10 @@
 //!
 //! Each accepted TCP connection gets a thread of its own for the handshake, at most
 //! [`MAX_TLS_CONNECTIONS`] at once, bounded by [`HANDSHAKE_TIMEOUT`]; the request is then
-//! served under the same one-at-a-time lock as the socket's. Refused handshakes are
-//! reported on stderr at most once per peer address per [`REPORT_INTERVAL`], served ones
-//! at most once per client key, each with the count it did not report.
+//! served under the same one-at-a-time lock as the socket's, unless a reload revoked the
+//! client's key while it waited for that lock. Refused handshakes are reported on stderr
+//! at most once per peer address per [`REPORT_INTERVAL`], served ones at most once per
+//! client key, each with the count it did not report.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -30,9 +34,10 @@ use std::io::{self, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
+use nix::sys::signal::{SigSet, Signal};
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
@@ -289,9 +294,10 @@ pub struct TlsSources {
 }
 
 /// A loaded, consistent server configuration, ready to bind.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct NodeTls {
-    config: Arc<ServerConfig>,
+    sources: TlsSources,
+    loaded: Arc<Loaded>,
 }
 
 impl NodeTls {
@@ -301,7 +307,40 @@ impl NodeTls {
     ///
     /// Returns [`TlsConfigError`] for an unsafe, unreadable, empty or malformed file, a
     /// key that does not match the certificate, or a configuration rustls refuses.
-    pub fn load(sources: &TlsSources) -> Result<Self, TlsConfigError> {
+    pub fn load(sources: TlsSources) -> Result<Self, TlsConfigError> {
+        let loaded = Arc::new(Loaded::assemble(&sources)?);
+        Ok(Self { sources, loaded })
+    }
+
+    /// Bind the TCP listener at `addr`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bind failure.
+    pub fn bind(self, addr: SocketAddr) -> io::Result<TlsListener> {
+        Ok(TlsListener {
+            listener: TcpListener::bind(addr)?,
+            current: Arc::new(Current {
+                sources: self.sources,
+                loaded: RwLock::new(self.loaded),
+            }),
+        })
+    }
+}
+
+/// One server configuration and what a reload compares.
+#[derive(Debug)]
+struct Loaded {
+    config: Arc<ServerConfig>,
+    revoked: Arc<RevokedKeys>,
+    server_key: SpkiPin,
+    server_chain: Vec<CertificateDer<'static>>,
+    client_ca: Vec<CertificateDer<'static>>,
+    pins: usize,
+}
+
+impl Loaded {
+    fn assemble(sources: &TlsSources) -> Result<Self, TlsConfigError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let chain = certificates(&sources.cert, 0o022)?;
         let key_bytes = read(&sources.key, 0o077)?;
@@ -323,24 +362,32 @@ impl NodeTls {
                 cert: sources.cert.clone(),
                 key: sources.key.clone(),
             })?;
+        let server_key =
+            SpkiPin::of_certificate(&chain[0]).map_err(|error| TlsConfigError::Pem {
+                path: sources.cert.clone(),
+                reason: format!("holds a leaf certificate that is not X.509 ({error})"),
+            })?;
 
+        let client_ca = certificates(&sources.client_ca, 0o022)?;
         let mut roots = RootCertStore::empty();
-        for ca in certificates(&sources.client_ca, 0o022)? {
+        for ca in client_ca.iter().cloned() {
             roots.add(ca).map_err(|error| TlsConfigError::Pem {
                 path: sources.client_ca.clone(),
                 reason: format!("holds a certificate that is not a usable CA ({error})"),
             })?;
         }
-        let revoked = sources
-            .client_revoked
-            .as_deref()
-            .map(RevokedKeys::load)
-            .transpose()?
-            .unwrap_or_default();
+        let revoked = Arc::new(
+            sources
+                .client_revoked
+                .as_deref()
+                .map(RevokedKeys::load)
+                .transpose()?
+                .unwrap_or_default(),
+        );
         let verifier = ClientVerifier::new(
             roots,
             sources.client_pins.clone(),
-            Arc::new(revoked),
+            Arc::clone(&revoked),
             Arc::clone(&provider),
         )?;
 
@@ -348,7 +395,7 @@ impl NodeTls {
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|error| TlsConfigError::Tls(error.to_string()))?
             .with_client_cert_verifier(Arc::new(verifier))
-            .with_single_cert(chain, key)
+            .with_single_cert(chain.clone(), key)
             .map_err(|error| TlsConfigError::Tls(error.to_string()))?;
         config.alpn_protocols = vec![ALPN.to_vec()];
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
@@ -356,20 +403,163 @@ impl NodeTls {
         config.max_early_data_size = 0;
         Ok(Self {
             config: Arc::new(config),
+            revoked,
+            server_key,
+            server_chain: chain,
+            client_ca,
+            pins: sources.client_pins.0.len(),
         })
     }
+}
 
-    /// Bind the TCP listener at `addr`.
+/// The sources of a listener's configuration and the configuration new handshakes use.
+#[derive(Debug)]
+struct Current {
+    sources: TlsSources,
+    loaded: RwLock<Arc<Loaded>>,
+}
+
+impl Current {
+    fn get(&self) -> Arc<Loaded> {
+        Arc::clone(&self.loaded.read().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// Reloads a listener's configuration from the sources it was loaded from.
+#[derive(Debug, Clone)]
+pub struct TlsReloader(Arc<Current>);
+
+impl TlsReloader {
+    /// Read and check every source again and, only when all of them are usable, make the
+    /// result the configuration of every handshake from now on. Sessions already
+    /// authenticated keep going, except that one whose client key is now revoked is
+    /// closed unserved when its request comes up.
     ///
     /// # Errors
     ///
-    /// Returns the bind failure.
-    pub fn bind(self, addr: SocketAddr) -> io::Result<TlsListener> {
-        Ok(TlsListener {
-            listener: TcpListener::bind(addr)?,
-            config: self.config,
-        })
+    /// Returns what [`NodeTls::load`] returns; the configuration in use is unchanged.
+    pub fn reload(&self) -> Result<Reloaded, TlsConfigError> {
+        let new = Arc::new(Loaded::assemble(&self.0.sources)?);
+        let mut current = self
+            .0
+            .loaded
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let reloaded = Reloaded::between(&current, &new);
+        *current = new;
+        Ok(reloaded)
     }
+
+    fn report(&self) -> String {
+        match self.reload() {
+            Ok(reloaded) => format!("ward-node: reloaded the TLS configuration: {reloaded}"),
+            Err(error) => format!(
+                "ward-node: reloading the TLS configuration failed; still serving the previous one: {error}"
+            ),
+        }
+    }
+}
+
+/// What a reload changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reloaded {
+    server_key: SpkiPin,
+    server: ServerChange,
+    client_ca: usize,
+    client_ca_changed: bool,
+    pins: usize,
+    revoked: usize,
+    revoked_added: usize,
+    revoked_removed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerChange {
+    Unchanged,
+    Certificate,
+    Key,
+}
+
+impl Reloaded {
+    fn between(old: &Loaded, new: &Loaded) -> Self {
+        let server = if old.server_key != new.server_key {
+            ServerChange::Key
+        } else if old.server_chain != new.server_chain {
+            ServerChange::Certificate
+        } else {
+            ServerChange::Unchanged
+        };
+        Self {
+            server_key: new.server_key,
+            server,
+            client_ca: new.client_ca.len(),
+            client_ca_changed: old.client_ca != new.client_ca,
+            pins: new.pins,
+            revoked: new.revoked.len(),
+            revoked_added: new.revoked.0.difference(&old.revoked.0).count(),
+            revoked_removed: old.revoked.0.difference(&new.revoked.0).count(),
+        }
+    }
+}
+
+impl fmt::Display for Reloaded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let changed = |changed: bool| if changed { "changed" } else { "unchanged" };
+        let server = match self.server {
+            ServerChange::Unchanged => "unchanged",
+            ServerChange::Certificate => "unchanged, new certificate",
+            ServerChange::Key => "changed",
+        };
+        write!(
+            formatter,
+            "server key {} ({server}), client CA certificates {} ({}), pinned client keys {}, \
+             revoked client keys {} (+{}, -{})",
+            self.server_key,
+            self.client_ca,
+            changed(self.client_ca_changed),
+            self.pins,
+            self.revoked,
+            self.revoked_added,
+            self.revoked_removed
+        )
+    }
+}
+
+/// Block `SIGHUP` on the calling thread, and so on every thread it starts afterwards, so
+/// that only [`reload_on_hangup`] takes it; call it before any thread starts.
+/// `std::process::Command` clears the mask in a child.
+///
+/// # Errors
+///
+/// Returns the failure to change the signal mask.
+pub fn block_hangup() -> io::Result<SigSet> {
+    let mut hangup = SigSet::empty();
+    hangup.add(Signal::SIGHUP);
+    hangup.thread_block()?;
+    Ok(hangup)
+}
+
+/// On a thread of its own, forever: reload with `reloader` on every `SIGHUP` that
+/// [`block_hangup`] blocked, and report the outcome on stderr.
+///
+/// # Errors
+///
+/// Returns the failure to start the thread.
+pub fn reload_on_hangup(reloader: TlsReloader, hangup: SigSet) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("ward-node-tls-reload".to_owned())
+        .spawn(move || {
+            loop {
+                if let Err(error) = hangup.wait() {
+                    report(&format!(
+                        "ward-node: waiting for SIGHUP failed ({error}); the TLS configuration is no longer reloaded"
+                    ));
+                    return;
+                }
+                report(&reloader.report());
+            }
+        })
+        .map(drop)
 }
 
 fn read(path: &Path, forbidden_mode: u32) -> Result<Vec<u8>, TlsConfigError> {
@@ -532,10 +722,16 @@ impl ClientCertVerifier for ClientVerifier {
 #[derive(Debug)]
 pub struct TlsListener {
     listener: TcpListener,
-    config: Arc<ServerConfig>,
+    current: Arc<Current>,
 }
 
 impl TlsListener {
+    /// The handle that reloads this listener's configuration.
+    #[must_use]
+    pub fn reloader(&self) -> TlsReloader {
+        TlsReloader(Arc::clone(&self.current))
+    }
+
     /// The address the listener is bound to.
     ///
     /// # Errors
@@ -566,6 +762,7 @@ enum Refusal {
     Tls(rustls::Error),
     NoProtocol,
     NoCertificate,
+    RevokedSince(SpkiPin),
 }
 
 impl fmt::Display for Refusal {
@@ -590,6 +787,10 @@ impl fmt::Display for Refusal {
                 "the client did not negotiate the ward-node application protocol (ALPN)",
             ),
             Self::NoCertificate => formatter.write_str("the client presented no certificate"),
+            Self::RevokedSince(client) => write!(
+                formatter,
+                "the client key {client} was revoked by --tls-client-revoked after its handshake"
+            ),
         }
     }
 }
@@ -707,7 +908,8 @@ fn accept(listener: &TlsListener, service: &NodeService, serving: &Arc<Mutex<()>
             report_refusal(&reports, peer, &Refusal::Busy);
             continue;
         };
-        let config = Arc::clone(&listener.config);
+        let config = Arc::clone(&listener.current.get().config);
+        let current = Arc::clone(&listener.current);
         let service = service.clone();
         let serving = Arc::clone(serving);
         let connection_reports = Arc::clone(&reports);
@@ -718,7 +920,9 @@ fn accept(listener: &TlsListener, service: &NodeService, serving: &Arc<Mutex<()>
                 match handshake(tcp, config) {
                     Ok((stream, client)) => {
                         report_served(&connection_reports, peer, client);
-                        serve(stream, &service, &serving);
+                        if let Err(refusal) = serve(stream, client, &service, &serving, &current) {
+                            report_refusal(&connection_reports, peer, &refusal);
+                        }
                     }
                     Err(refusal) => report_refusal(&connection_reports, peer, &refusal),
                 }
@@ -787,13 +991,24 @@ fn io_refusal(error: &io::Error) -> Refusal {
     }
 }
 
-/// Serve one request under the one-at-a-time lock, then end the session cleanly so the
-/// client reads a close, not a truncation, whether or not it was answered.
-fn serve(mut stream: TlsStream, service: &NodeService, serving: &Mutex<()>) {
-    {
+/// Serve one request under the one-at-a-time lock unless a reload revoked the client's
+/// key since its handshake, then end the session cleanly so the client reads a close, not
+/// a truncation, whether or not it was answered.
+fn serve(
+    mut stream: TlsStream,
+    client: SpkiPin,
+    service: &NodeService,
+    serving: &Mutex<()>,
+    current: &Current,
+) -> Result<(), Refusal> {
+    let revoked = {
         let _one_at_a_time = one_at_a_time(serving);
-        let _ = service.serve_stream(&mut stream);
-    }
+        let revoked = current.get().revoked.revokes(client);
+        if !revoked {
+            let _ = service.serve_stream(&mut stream);
+        }
+        revoked
+    };
     stream.conn.send_close_notify();
     let _ = stream.sock.set_write_timeout(Some(ANSWER_TIMEOUT));
     while stream.conn.wants_write() {
@@ -802,6 +1017,10 @@ fn serve(mut stream: TlsStream, service: &NodeService, serving: &Mutex<()>) {
         }
     }
     let _ = stream.sock.shutdown(Shutdown::Both);
+    if revoked {
+        return Err(Refusal::RevokedSince(client));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -943,6 +1162,45 @@ mod tests {
         );
         assert_eq!(since_last(0), "");
         assert_eq!(since_last(3), " (3 more since the last report)");
+    }
+
+    #[test]
+    fn a_reload_says_what_it_changed() {
+        let pin = SpkiPin::of_spki(b"node");
+        let mut reloaded = Reloaded {
+            server_key: pin,
+            server: ServerChange::Unchanged,
+            client_ca: 2,
+            client_ca_changed: false,
+            pins: 1,
+            revoked: 3,
+            revoked_added: 2,
+            revoked_removed: 1,
+        };
+        assert_eq!(
+            reloaded.to_string(),
+            format!(
+                "server key {pin} (unchanged), client CA certificates 2 (unchanged), \
+                 pinned client keys 1, revoked client keys 3 (+2, -1)"
+            )
+        );
+        reloaded.server = ServerChange::Certificate;
+        reloaded.client_ca_changed = true;
+        let line = reloaded.to_string();
+        assert!(line.contains("(unchanged, new certificate)"), "{line}");
+        assert!(
+            line.contains("client CA certificates 2 (changed)"),
+            "{line}"
+        );
+        reloaded.server = ServerChange::Key;
+        assert!(
+            reloaded
+                .to_string()
+                .starts_with(&format!("server key {pin} (changed)"))
+        );
+        let late = Refusal::RevokedSince(pin).to_string();
+        assert!(late.contains(&pin.to_string()), "{late}");
+        assert!(late.contains("after its handshake"), "{late}");
     }
 
     #[test]

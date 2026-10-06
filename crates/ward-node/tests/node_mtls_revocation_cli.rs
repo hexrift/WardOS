@@ -1,8 +1,12 @@
-//! End-to-end client-key revocation for `ward-node --listen-tls` (#262, ADR-0038 §8).
+//! End-to-end client-key revocation and reload without restart for `ward-node
+//! --listen-tls` (#262, ADR-0038 §8).
 //!
 //! `--tls-client-revoked <file>` lists client keys the node refuses even when their
-//! certificate chains to the client CA and is pinned. Every certificate and key is
-//! generated here; none is committed.
+//! certificate chains to the client CA and is pinned. On `SIGHUP` the node reads its
+//! certificate, key, client CA and revocation list again, swaps them in only when all of
+//! them are usable, and otherwise keeps serving what it had; either way it says so on
+//! stderr. The process, and with it the task registry, stays up throughout. Every
+//! certificate and key is generated here; none is committed.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -16,6 +20,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, PublicKeyData, SanType,
@@ -23,15 +29,21 @@ use rcgen::{
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
-use ward_events::{NodeId, PrincipalId};
+use ward_events::{ExecutionAttemptId, LeaseId, NodeId, PrincipalId, TaskId};
+use ward_node::tls::SpkiPin;
 use ward_node_protocol::{
-    CapabilityDiscoveryContext, HandshakeRequest, ProtocolVersion, WARD_NODE_PROTOCOL,
+    CapabilityDiscoveryContext, HandshakeRequest, OperationId, ProtocolVersion, TaskBinding,
+    TaskLifecycleContext, TaskLifecycleRequest, TaskLifecycleResponse, TaskLifecycleState,
+    WARD_NODE_PROTOCOL,
 };
 
 const NODE: NodeId = NodeId::from_u128(4);
 const ISSUER: PrincipalId = PrincipalId::from_u128(2);
 const SERVER_NAME: &str = "node-4.ward.test";
 const STARTUP: Duration = Duration::from_secs(20);
+const RELOADED: &str = "ward-node: reloaded the TLS configuration: ";
+const RELOAD_FAILED: &str =
+    "ward-node: reloading the TLS configuration failed; still serving the previous one: ";
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -136,6 +148,7 @@ fn trust_store(dir: &Path) -> PathBuf {
 
 struct Node {
     child: Child,
+    socket: PathBuf,
     addr: SocketAddr,
     stderr: Receiver<String>,
 }
@@ -204,6 +217,7 @@ impl Node {
         }
         Self {
             child,
+            socket,
             addr,
             stderr,
         }
@@ -239,6 +253,40 @@ impl Node {
             }
         }
     }
+
+    /// Send `SIGHUP` and return what the node says about the reload: the rest of its
+    /// line after the success or failure prefix, and whether it succeeded.
+    fn hangup(&mut self) -> (bool, String) {
+        kill(
+            Pid::from_raw(i32::try_from(self.child.id()).unwrap()),
+            Signal::SIGHUP,
+        )
+        .unwrap();
+        let line = self.reported("the TLS configuration");
+        assert!(
+            self.child.try_wait().unwrap().is_none(),
+            "ward-node exited on SIGHUP"
+        );
+        if let Some(rest) = line.strip_prefix(RELOADED) {
+            return (true, rest.to_owned());
+        }
+        if let Some(rest) = line.strip_prefix(RELOAD_FAILED) {
+            return (false, rest.to_owned());
+        }
+        panic!("unexpected reload report {line:?}")
+    }
+
+    fn reloads(&mut self) -> String {
+        let (reloaded, line) = self.hangup();
+        assert!(reloaded, "the reload failed: {line}");
+        line
+    }
+
+    fn keeps_the_previous_configuration(&mut self) -> String {
+        let (reloaded, line) = self.hangup();
+        assert!(!reloaded, "the reload succeeded: {line}");
+        line
+    }
 }
 
 impl Drop for Node {
@@ -257,9 +305,21 @@ fn hello() -> String {
     .unwrap()
 }
 
+fn context() -> TaskLifecycleContext {
+    TaskLifecycleContext::new(ProtocolVersion::new(1, 3)).unwrap()
+}
+
 fn discovery() -> String {
     let ctx = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
     serde_json::to_string(&ctx.request()).unwrap()
+}
+
+fn binding() -> TaskBinding {
+    TaskBinding::new(
+        TaskId::from_u128(7),
+        ExecutionAttemptId::from_u128(8),
+        LeaseId::from_u128(9),
+    )
 }
 
 // ---- TLS clients ----------------------------------------------------------------------
@@ -268,6 +328,12 @@ struct TlsClient {
     roots: RootCertStore,
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
+}
+
+/// What one exchange got: every line before the close, and the key the node presented.
+struct Exchanged {
+    lines: Vec<String>,
+    server_key: Option<SpkiPin>,
 }
 
 impl TlsClient {
@@ -293,7 +359,7 @@ impl TlsClient {
         Arc::new(config)
     }
 
-    fn exchange(&self, addr: SocketAddr, lines: &[String]) -> Vec<String> {
+    fn exchange(&self, addr: SocketAddr, lines: &[String]) -> Exchanged {
         let tcp = TcpStream::connect(addr).unwrap();
         tcp.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         tcp.set_write_timeout(Some(Duration::from_secs(30)))
@@ -313,20 +379,37 @@ impl TlsClient {
         if stream.write_all(payload.as_bytes()).is_ok() && stream.flush().is_ok() {
             let _ = stream.read_to_end(&mut received);
         }
-        String::from_utf8_lossy(&received)
-            .lines()
-            .map(str::to_owned)
-            .collect()
+        Exchanged {
+            lines: String::from_utf8_lossy(&received)
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+            server_key: stream
+                .conn
+                .peer_certificates()
+                .and_then(<[CertificateDer<'_>]>::first)
+                .map(|leaf| SpkiPin::of_certificate(leaf).unwrap()),
+        }
     }
 
-    fn served(&self, node: &Node, request: &str) {
-        let lines = self.exchange(node.addr, &[hello(), request.to_owned()]);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].contains("accepted"), "{lines:?}");
+    fn served(&self, node: &Node, request: &str) -> Exchanged {
+        let exchanged = self.exchange(node.addr, &[hello(), request.to_owned()]);
+        assert_eq!(exchanged.lines.len(), 2, "{:?}", exchanged.lines);
+        assert!(
+            exchanged.lines[0].contains("accepted"),
+            "{:?}",
+            exchanged.lines
+        );
+        exchanged
+    }
+
+    fn lifecycle(&self, node: &Node, request: &TaskLifecycleRequest) -> TaskLifecycleResponse {
+        let exchanged = self.served(node, &serde_json::to_string(request).unwrap());
+        context().decode_response(&exchanged.lines[1]).unwrap()
     }
 
     fn refused(&self, node: &Node) {
-        let lines = self.exchange(node.addr, &[hello(), discovery()]);
+        let lines = self.exchange(node.addr, &[hello(), discovery()]).lines;
         assert!(
             lines.is_empty(),
             "a refused TLS client was answered: {lines:?}"
@@ -433,6 +516,174 @@ fn a_revoked_client_key_is_refused_even_when_pinned_and_another_key_from_the_sam
     let line = node.reported("refused a TLS connection from 127.0.0.1");
     assert!(line.contains("revoked"), "{line}");
     assert!(line.contains(&revoked_leaf.pin()), "{line}");
+}
+
+#[test]
+fn revoking_a_key_on_sighup_refuses_it_at_its_next_handshake_and_the_registry_survives() {
+    let setup = setup();
+    let (revoked, revoked_leaf) = setup.client();
+    let (kept, _) = setup.client();
+    let mut node = setup.node(&[]);
+    let ctx = context();
+    let op = OperationId::new(1).unwrap();
+    assert_eq!(
+        revoked.lifecycle(&node, &ctx.create(op, binding())),
+        ctx.accepted(op, binding(), TaskLifecycleState::Created)
+    );
+
+    setup.revoke(&[&revoked_leaf]);
+    let line = node.reloads();
+    assert!(line.contains("revoked client keys 1 (+1, -0)"), "{line}");
+    assert!(line.contains("(unchanged)"), "{line}");
+
+    revoked.refused(&node);
+    let line = node.reported("refused a TLS connection from 127.0.0.1");
+    assert!(line.contains("revoked"), "{line}");
+    assert!(line.contains(&revoked_leaf.pin()), "{line}");
+    assert_eq!(
+        kept.lifecycle(&node, &ctx.inspect(binding())),
+        ctx.inspected(binding(), TaskLifecycleState::Created),
+        "the registry outlives the reload"
+    );
+
+    setup.revoke(&[]);
+    let line = node.reloads();
+    assert!(line.contains("revoked client keys 0 (+0, -1)"), "{line}");
+    revoked.served(&node, &discovery());
+}
+
+#[test]
+fn a_session_authenticated_before_a_revocation_is_not_served_after_it() {
+    let setup = setup();
+    let (revoked, revoked_leaf) = setup.client();
+    let (kept, _) = setup.client();
+    let mut node = setup.node(&[]);
+
+    let mut holder = UnixStream::connect(&node.socket).unwrap();
+    holder
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    writeln!(holder, "{}", hello()).unwrap();
+    let mut accepted = String::new();
+    BufReader::new(holder.try_clone().unwrap())
+        .read_line(&mut accepted)
+        .unwrap();
+    assert!(accepted.contains("accepted"), "{accepted}");
+
+    let addr = node.addr;
+    let waiting = std::thread::spawn(move || revoked.exchange(addr, &[hello(), discovery()]).lines);
+    node.reported(&format!("served a TLS client {}", revoked_leaf.pin()));
+    setup.revoke(&[&revoked_leaf]);
+    node.reloads();
+    drop(holder);
+
+    let lines = waiting.join().unwrap();
+    assert!(
+        lines.is_empty(),
+        "a revoked session was answered: {lines:?}"
+    );
+    let line = node.reported("refused a TLS connection from 127.0.0.1");
+    assert!(line.contains("revoked"), "{line}");
+    assert!(line.contains(&revoked_leaf.pin()), "{line}");
+    kept.served(&node, &discovery());
+}
+
+// ---- reload ---------------------------------------------------------------------------
+
+#[test]
+fn an_unusable_reload_keeps_the_whole_previous_configuration_and_says_why() {
+    let setup = setup();
+    let (client, client_leaf) = setup.client();
+    let mut node = setup.node(&[]);
+    client.served(&node, &discovery());
+
+    write_mode(
+        &setup.revoked,
+        &format!("{}\nsha256:00\n", client_leaf.pin()),
+        0o644,
+    );
+    let line = node.keeps_the_previous_configuration();
+    assert!(
+        line.contains(&setup.revoked.display().to_string()),
+        "{line}"
+    );
+    assert!(line.contains("line 2"), "{line}");
+    client.served(&node, &discovery());
+
+    write_mode(&setup.revoked, &client_leaf.pin(), 0o666);
+    let line = node.keeps_the_previous_configuration();
+    assert!(line.contains("too open"), "{line}");
+    client.served(&node, &discovery());
+
+    std::fs::remove_file(&setup.revoked).unwrap();
+    let line = node.keeps_the_previous_configuration();
+    assert!(line.contains("no such file"), "{line}");
+    client.served(&node, &discovery());
+
+    setup.revoke(&[&client_leaf]);
+    let rotated = server_leaf(&setup.server_ca);
+    write_mode(&setup.path("node-cert.pem"), &rotated.cert_pem, 0o644);
+    let line = node.keeps_the_previous_configuration();
+    assert!(line.contains("does not match"), "{line}");
+    let exchanged = client.served(&node, &discovery());
+    assert_eq!(
+        exchanged.server_key.unwrap().to_string(),
+        setup.server.pin(),
+        "neither the half-rotated server key nor the revocation beside it was taken"
+    );
+
+    setup.write_server(&rotated);
+    let line = node.reloads();
+    assert!(line.contains(&rotated.pin()), "{line}");
+    assert!(line.contains("revoked client keys 1 (+1, -0)"), "{line}");
+    client.refused(&node);
+}
+
+#[test]
+fn a_rotated_server_key_and_client_ca_are_served_after_sighup_without_a_restart() {
+    let setup = setup();
+    let (old_client, _) = setup.client();
+    let mut node = setup.node(&[]);
+    let ctx = context();
+    let op = OperationId::new(1).unwrap();
+    old_client.lifecycle(&node, &ctx.create(op, binding()));
+    assert_eq!(
+        old_client
+            .served(&node, &discovery())
+            .server_key
+            .unwrap()
+            .to_string(),
+        setup.server.pin()
+    );
+
+    let server_ca = ca("ward test server CA, rotated");
+    let server = server_leaf(&server_ca);
+    let client_ca = ca("ward test client CA, rotated");
+    setup.write_server(&server);
+    write_mode(&setup.client_ca_path(), &client_ca.pem(), 0o644);
+    let line = node.reloads();
+    assert!(
+        line.starts_with(&format!("server key {} (changed)", server.pin())),
+        "{line}"
+    );
+    assert!(
+        line.contains("client CA certificates 1 (changed)"),
+        "{line}"
+    );
+
+    let new_client = TlsClient::new(&server_ca, &client_leaf(&client_ca));
+    let exchanged = new_client.served(&node, &discovery());
+    assert_eq!(
+        exchanged.server_key.unwrap().to_string(),
+        server.pin(),
+        "the client sees the rotated server key"
+    );
+    assert_eq!(
+        new_client.lifecycle(&node, &ctx.inspect(binding())),
+        ctx.inspected(binding(), TaskLifecycleState::Created),
+        "the registry outlives the rotation"
+    );
+    old_client.refused(&node);
 }
 
 // ---- configuration --------------------------------------------------------------------

@@ -83,6 +83,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use nix::sys::signal::SigSet;
 use ward_events::{ExecutionAttemptId, NodeId, TaskId};
 use ward_node::admit::{NodeAdmission, SystemClock};
 use ward_node::cgroup::{CgroupLauncher, CgroupRoot, ResourceEnforcement};
@@ -93,7 +94,9 @@ use ward_node::peer::{ClientGroup, ClientUids};
 use ward_node::scheduling::SchedulingLimits;
 use ward_node::shim::AgentShim;
 use ward_node::state::{NodeState, open_private_dir};
-use ward_node::tls::{ClientPins, NodeTls, TlsListener, TlsSources};
+use ward_node::tls::{
+    ClientPins, NodeTls, TlsListener, TlsSources, block_hangup, reload_on_hangup,
+};
 use ward_node::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
 use ward_node::{NodeService, SocketAccess, serve_node};
 use ward_node_protocol::{
@@ -323,6 +326,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Some(command) = cli.command.take() {
         return run(command);
     }
+    let hangup = cli.listen_tls.map(|_| block_hangup()).transpose()?;
     let remote = cli
         .listen_tls
         .map(|addr| load_tls(&cli, addr))
@@ -414,17 +418,25 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         None => NodeService::with_admission(capabilities, admission)?,
     };
     let access = SocketAccess::new(client_group, clients);
-    serve_node(&socket, &service, access, bind_tls(remote)?)?;
+    serve_node(&socket, &service, access, bind_tls(remote, hangup)?)?;
     Ok(ExitCode::SUCCESS)
 }
 
-fn bind_tls(remote: Option<(NodeTls, SocketAddr)>) -> io::Result<Option<TlsListener>> {
-    remote
-        .map(|(tls, addr)| {
-            tls.bind(addr)
-                .map_err(|error| io::Error::other(format!("TLS listener {addr}: {error}")))
-        })
-        .transpose()
+/// Bind the TLS listener, if any, and reload its configuration on every `SIGHUP`.
+fn bind_tls(
+    remote: Option<(NodeTls, SocketAddr)>,
+    hangup: Option<SigSet>,
+) -> io::Result<Option<TlsListener>> {
+    let Some((tls, addr)) = remote else {
+        return Ok(None);
+    };
+    let listener = tls
+        .bind(addr)
+        .map_err(|error| io::Error::other(format!("TLS listener {addr}: {error}")))?;
+    if let Some(hangup) = hangup {
+        reload_on_hangup(listener.reloader(), hangup)?;
+    }
+    Ok(Some(listener))
 }
 
 fn load_tls(cli: &Cli, addr: SocketAddr) -> io::Result<(NodeTls, SocketAddr)> {
@@ -437,7 +449,7 @@ fn load_tls(cli: &Cli, addr: SocketAddr) -> io::Result<(NodeTls, SocketAddr)> {
     };
     let tls = ClientPins::parse(&cli.tls_client_pin)
         .and_then(|client_pins| {
-            NodeTls::load(&TlsSources {
+            NodeTls::load(TlsSources {
                 cert: cert.clone(),
                 key: key.clone(),
                 client_ca: client_ca.clone(),
