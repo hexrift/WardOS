@@ -4,7 +4,7 @@
 //! [--task-root <dir>] [--network-allowlist [--credentials <file>]] [--output-return]
 //! [--action-channel [--approval-hold]] [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
 //! [--agent-adapter <id>… [--agent-shim <file>]] [--client-uid <uid>]… [--client-group <group>]
-//! [--listen-tls <addr> --tls-cert <file> --tls-key <file> --tls-client-ca <file> [--tls-client-pin <pin>]…]`
+//! [--listen-tls <addr> --tls-cert <file> --tls-key <file> --tls-client-ca <file> [--tls-client-pin <pin>]… [--tls-client-revoked <file>]]`
 //! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
 //! admission version, revocation and retired-attempt stores, one record per registered task
@@ -61,8 +61,9 @@
 //! With `--listen-tls` the node also serves the same protocol on that TCP address over TLS
 //! 1.3 with a mandatory client certificate (ADR-0038): its own certificate and key
 //! (`--tls-cert`, `--tls-key`), the CA its clients' certificates must chain to
-//! (`--tls-client-ca`) and, optionally, the client keys it serves (`--tls-client-pin`); the
-//! certificate takes the place of the peer-credential check, not of an issuer signature.
+//! (`--tls-client-ca`) and, optionally, the client keys it serves (`--tls-client-pin`) and
+//! those it refuses all the same (`--tls-client-revoked`); the certificate takes the place
+//! of the peer-credential check, not of an issuer signature.
 //!
 //! `ward-node snapshot import --state-dir <dir> <project-dir>` captures a local directory
 //! into the node's snapshot store and prints its id as 64 lowercase hex characters with no
@@ -82,6 +83,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use nix::sys::signal::SigSet;
 use ward_events::{ExecutionAttemptId, NodeId, TaskId};
 use ward_node::admit::{NodeAdmission, SystemClock};
 use ward_node::cgroup::{CgroupLauncher, CgroupRoot, ResourceEnforcement};
@@ -92,7 +94,9 @@ use ward_node::peer::{ClientGroup, ClientUids};
 use ward_node::scheduling::SchedulingLimits;
 use ward_node::shim::AgentShim;
 use ward_node::state::{NodeState, open_private_dir};
-use ward_node::tls::{ClientPins, NodeTls, TlsFiles, TlsListener};
+use ward_node::tls::{
+    ClientPins, NodeTls, TlsListener, TlsSources, block_hangup, reload_on_hangup,
+};
 use ward_node::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
 use ward_node::{NodeService, SocketAccess, serve_node};
 use ward_node_protocol::{
@@ -264,6 +268,11 @@ struct Cli {
     /// it every key the client CA certified is served. Needs `--listen-tls`.
     #[arg(long, value_name = "PIN", requires = "listen_tls")]
     tls_client_pin: Vec<String>,
+    /// Refuse the client keys listed in this file, even when pinned: one pin per line as
+    /// `--tls-client-pin` spells it, `#` starting a comment; the node user's own regular
+    /// file, writable by no one else. Needs `--listen-tls`.
+    #[arg(long, value_name = "FILE", requires = "listen_tls")]
+    tls_client_revoked: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -317,6 +326,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Some(command) = cli.command.take() {
         return run(command);
     }
+    let hangup = cli.listen_tls.map(|_| block_hangup()).transpose()?;
     let remote = cli
         .listen_tls
         .map(|addr| load_tls(&cli, addr))
@@ -408,17 +418,25 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         None => NodeService::with_admission(capabilities, admission)?,
     };
     let access = SocketAccess::new(client_group, clients);
-    serve_node(&socket, &service, access, bind_tls(remote)?)?;
+    serve_node(&socket, &service, access, bind_tls(remote, hangup)?)?;
     Ok(ExitCode::SUCCESS)
 }
 
-fn bind_tls(remote: Option<(NodeTls, SocketAddr)>) -> io::Result<Option<TlsListener>> {
-    remote
-        .map(|(tls, addr)| {
-            tls.bind(addr)
-                .map_err(|error| io::Error::other(format!("TLS listener {addr}: {error}")))
-        })
-        .transpose()
+/// Bind the TLS listener, if any, and reload its configuration on every `SIGHUP`.
+fn bind_tls(
+    remote: Option<(NodeTls, SocketAddr)>,
+    hangup: Option<SigSet>,
+) -> io::Result<Option<TlsListener>> {
+    let Some((tls, addr)) = remote else {
+        return Ok(None);
+    };
+    let listener = tls
+        .bind(addr)
+        .map_err(|error| io::Error::other(format!("TLS listener {addr}: {error}")))?;
+    if let Some(hangup) = hangup {
+        reload_on_hangup(listener.reloader(), hangup)?;
+    }
+    Ok(Some(listener))
 }
 
 fn load_tls(cli: &Cli, addr: SocketAddr) -> io::Result<(NodeTls, SocketAddr)> {
@@ -430,15 +448,14 @@ fn load_tls(cli: &Cli, addr: SocketAddr) -> io::Result<(NodeTls, SocketAddr)> {
         ));
     };
     let tls = ClientPins::parse(&cli.tls_client_pin)
-        .and_then(|pins| {
-            NodeTls::load(
-                TlsFiles {
-                    cert,
-                    key,
-                    client_ca,
-                },
-                pins,
-            )
+        .and_then(|client_pins| {
+            NodeTls::load(TlsSources {
+                cert: cert.clone(),
+                key: key.clone(),
+                client_ca: client_ca.clone(),
+                client_pins,
+                client_revoked: cli.tls_client_revoked.clone(),
+            })
         })
         .map_err(|error| io::Error::other(format!("TLS: {error}")))?;
     Ok((tls, addr))
@@ -981,6 +998,19 @@ mod tests {
             assert!(parse(&partial).is_err(), "{partial:?}");
         }
         assert!(parse(&["--tls-client-pin", "a"]).is_err());
+        assert_eq!(cli.tls_client_revoked, None);
+        let revoked: Vec<&str> = full
+            .iter()
+            .copied()
+            .chain(["--tls-client-revoked", "revoked"])
+            .collect();
+        assert_eq!(
+            parse(&revoked)
+                .expect("serve with a revocation list")
+                .tls_client_revoked,
+            Some(PathBuf::from("revoked"))
+        );
+        assert!(parse(&["--tls-client-revoked", "revoked"]).is_err());
         let mut named = full;
         named[1] = "localhost:7443";
         assert!(parse(&named).is_err(), "the address is an IP and a port");

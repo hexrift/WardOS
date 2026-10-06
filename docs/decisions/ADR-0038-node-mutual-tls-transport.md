@@ -4,7 +4,9 @@ Status: **Proposed; the remote-transport slice of
 [#262](https://github.com/hexrift/WardOS/issues/262).** It amends
 [ADR-0030](ADR-0030-node-task-admission-and-execution-ownership.md) ("no remote transport
 or mTLS") and the transport of node-integration.md §3; it changes neither the protocol
-grammar, the capability document, the admission envelope nor the event catalogue.
+grammar, the capability document, the admission envelope nor the event catalogue. §8
+(client-key revocation and reload without a restart) was decided in a later slice of
+#262.
 
 ## Context
 
@@ -44,11 +46,12 @@ and is closed the same way.
 
 `--tls-cert` is the node's certificate chain (leaf first) and `--tls-key` its private key,
 both PEM, provisioned by the operator from whatever PKI the deployment uses (ADR-0029: WardOS
-does not become its own PKI). At start the node reads every TLS file once, refusing to serve
+does not become its own PKI). At start the node reads every TLS file, refusing to serve
 unless each is the node user's own regular file, not a symlink, at most 64 KiB, the key
 with no group or other permission bits and the certificates and CA writable by no one else
 (the rule of the credentials file, ADR-0034), the key parses and is the certificate's key,
-and the CA file holds at least one usable certificate. Nothing in the envelope, the
+and the CA file holds at least one usable certificate; a reload (§8) applies the same
+checks and keeps the previous configuration when any fails. Nothing in the envelope, the
 workspace or the protocol names a certificate or a key. The node's server identity proves
 to a control plane which node it reached; the envelope's audience id (ADR-0030 §2) still
 decides what that node admits.
@@ -66,6 +69,15 @@ its own key, and nothing a node holds lets it impersonate another node or a clie
 
 The CA alone was preferred over a pin list alone because rotation and expiry are the CA's
 job and a pin list alone has neither; pins exist for a CA shared beyond the control plane.
+
+`--tls-client-revoked <file>` names a revocation list: one pin per line, spelled as
+`--tls-client-pin` spells it, with blank lines and `#` comments. After the chain is
+validated, a key on the list is refused even when it is pinned, and the refusal is
+reported like any other (`the client key sha256:<hex> is revoked by
+--tls-client-revoked`). The list is held to the rule of the certificates (the node user's
+own regular file, not a symlink, writable by no one else, at most 64 KiB); a line that is
+not a pin, blank or a comment stops the node at start, naming the line. A key listed twice
+is revoked once.
 
 ### 4. What a TLS identity authorises
 
@@ -100,23 +112,50 @@ before.
 
 At start the node writes `ward-node: serving the node protocol over mutual TLS on
 <addr>` to stderr. Every refused connection is reported on stderr with the peer's address and
-the reason (no certificate, unknown issuer, expired, not valid yet, not pinned, no `ward-node`
-protocol, TLS version, handshake timeout, too many connections), at most once per address per
-10 seconds, with the count of the refusals it did not report; every served session is
+the reason (no certificate, unknown issuer, expired, not valid yet, revoked, not pinned, no
+`ward-node` protocol, TLS version, handshake timeout, too many connections), at most once per
+address per 10 seconds, with the count of the refusals it did not report; every served session is
 reported as `served a TLS client sha256:<pin> from <address>`, at most once per client key
-per 10 seconds, with the same count. Under a service manager stderr is the journal. This is
+per 10 seconds, with the same count. Every reload (§8) is reported once, as `reloaded the
+TLS configuration: server key sha256:<pin> (changed|unchanged), client CA certificates <n>
+(changed|unchanged), pinned client keys <n>, revoked client keys <n> (+<added>,
+-<removed>)` or as `reloading the TLS configuration failed; still serving the previous
+one: <reason>`. Under a service manager stderr is the journal. This is
 not a durable, hash-chained node record: handshakes are not task events, the event
 catalogue has no kind for them, and adding one is the audit slice of #262 (§What remains).
 
-### 8. Rotation is a restart
+### 8. Revocation and rotation without a restart: `SIGHUP`
 
-The files are read once. Rotating the node's certificate, the client CA or the pins is
-replacing the files and restarting the node, which recovers every task from its records
-(node-integration.md §6.4); an attempt in flight ends `exited`/`unknown` as for any restart.
-Reloading without a restart is deferred (§What remains). Removing a compromised client is
-removing its pin or issuing from a new client CA and restarting; until certificate
-revocation lists or short-lived certificates exist (§What remains), a compromised client
-certificate that is neither pinned out nor rotated away stays valid until it expires.
+On a node started with `--listen-tls`, `SIGHUP` reloads the TLS configuration: the node
+reads and checks the certificate, the key, the client CA and the revocation list again,
+with the pins it was started with (they are flags, so changing them is still a restart),
+and assembles a new configuration. Only when all of it is usable does it replace the old
+one, in one swap, for every handshake from then on; on any failure (a malformed or unsafe
+file, a key that does not match a half-rotated certificate, a missing revocation list) the
+node keeps serving exactly the previous configuration and says why. Either outcome is
+reported on stderr (§7). The process keeps running, so the task registry, running
+attempts and the Unix socket are untouched. The node blocks `SIGHUP` before it starts any
+thread and takes it on a thread of its own, so a signal never interrupts a handshake or a
+verb; the processes it starts get the default signal mask back. Only the node's uid and
+root can send it, the same principals that can replace its files. Without `--listen-tls`,
+`SIGHUP` keeps its default effect and ends the node.
+
+Established sessions are not interrupted. A session carries one request, bounded by the
+request and answer deadlines (node-integration.md §3), so the exposure is one request
+already in progress. The one exception is revocation: a session whose handshake completed
+before a reload but whose request is still waiting for the one-at-a-time lock is checked
+again against the revocation list when it gets the lock, and a revoked key is closed
+unserved and reported (`was revoked by --tls-client-revoked after its handshake`).
+Closing a session in the middle of its verb was rejected: it would turn an answered,
+recorded transition into an `unknown` for the control plane without taking back anything
+the verb already did.
+
+Removing a compromised client is therefore adding its pin to the revocation list and
+sending `SIGHUP`; the next handshake with that key is refused. Rotating the node's
+certificate or the client CA is replacing the files and sending `SIGHUP`. Revocation is by
+key, not by certificate: every certificate for a revoked key is refused, renewals
+included. Certificate revocation lists, OCSP and short-lived certificates remain
+(§What remains).
 
 ### 9. Clients
 
@@ -146,8 +185,20 @@ CLI), so the protocol code stays in one place.
   contract, kept as a deployment choice.
 * **Accept TLS 1.2.** Every supported client speaks 1.3; offering 1.2 adds downgrade surface
   for nothing. Rejected.
-* **Hot reload on `SIGHUP`.** Small, but it needs a reload path for the trust store too to be
-  coherent, and a restart is already safe. Deferred.
+* **Rotation and revocation by restart only.** Safe, but a restart ends every attempt in
+  flight (`exited`/`unknown`), so removing a stolen client key cost the node's running
+  work. Replaced by §8.
+* **Watching the files (inotify) instead of a signal.** A rotation writes several files;
+  a watcher would reload between the certificate and its key and report a failure the
+  operator did not cause. `SIGHUP` is the operator's own commit point, and the
+  convention of service managers (`ExecReload=`). Rejected.
+* **A reload verb on the protocol.** A client's key would then reconfigure who may be a
+  client; the TLS identities are the operator's. Rejected.
+* **X.509 CRLs instead of a key list.** They revoke a certificate, need the client CA to
+  sign and publish them, and leave a renewed certificate for a stolen key valid; the
+  node already names clients by key. Deferred as an addition (§What remains).
+* **Closing every established session on reload.** It cuts verbs off mid-way and buys
+  nothing the next handshake does not already give (§8). Rejected.
 
 ## Advantages
 
@@ -156,11 +207,15 @@ CLI), so the protocol code stays in one place.
 * Nothing in the protocol, the capability document or the envelope changes: every client,
   test vector and acceptance case of the socket holds over TLS.
 * The issuer signature stays the only source of authority; the transport adds who-may-speak.
+* A stolen client key is refused at its next handshake, and the node's certificate or the
+  client CA is rotated, without a restart: no attempt in flight is lost to it.
 
 ## Disadvantages
 
 * The operator runs a PKI (or at least two CAs) and provisions files per node.
-* Rotation and client removal need a restart; there is no revocation list.
+* Revocation is a key list the operator distributes to each node and signals; there is no
+  CRL, no OCSP and no propagation across nodes. Changing the pins, or the trust store,
+  still needs a restart.
 * Handshakes are reported on stderr, not recorded durably.
 * Two more crates in the node's closure as direct dependencies (`rustls` and `rustls-webpki`,
   both already in the lock file and the node's closure through `ward-proxy`).
@@ -180,6 +235,16 @@ CLI), so the protocol code stays in one place.
   signature and a replayed `admit` acts once; a stalled TCP peer does not hold the socket;
   unsafe or inconsistent files stop the node before it binds; a rotated client CA takes
   effect on restart with the task registry intact.
+* `crates/ward-node/tests/node_mtls_revocation_cli.rs` runs the real node and proves
+  §3's revocation list and §8's reload: a revoked key is refused even when pinned while
+  another key from the same CA is served; revoking a key and sending `SIGHUP` refuses it
+  at its next handshake without a restart, the task registry intact, and removing it
+  serves it again; a session authenticated before the revocation is closed unserved when
+  its request comes up; a malformed, unsafe or missing revocation list and a certificate
+  without its key on `SIGHUP` keep the whole previous configuration (the revocation beside
+  them is not applied) and are reported; a rotated server key and client CA are served
+  after `SIGHUP`, the client seeing the new key; a malformed, unsafe, symlinked,
+  oversized or non-UTF-8 list stops the node at start.
 * `crates/ward-node-client/tests/tls_transport.rs` proves the client side: a node whose
   certificate is from another CA, for another name or not the pinned key is refused; a whole
   attempt runs, seals and replays over TLS without running twice, and a superseded `pause`
@@ -200,8 +265,9 @@ must raise the node version (CONTRIBUTING.md, #275).
 
 ## How it is validated
 
-* `ward-node` unit tests: pin parsing and duplicates, the skew arithmetic, the bound on
-  connections in progress, the refusal reasons, the flags' parsing and requirements.
+* `ward-node` unit tests: pin parsing and duplicates, revocation-list parsing and its
+  line-numbered errors, the reload report, the skew arithmetic, the bound on connections
+  in progress, the refusal reasons, the flags' parsing and requirements.
 * `ward-node-client` unit tests: the client's file checks, pin parsing, skew, the TLS error
   inside an I/O error.
 * The two end-to-end suites of Security consequences, against the real binaries, with every
@@ -216,9 +282,12 @@ must raise the node version (CONTRIBUTING.md, #275).
   plane, instead of operator-provisioned files.
 * Attestation: nothing about the node's software or hardware is attested; the certificate
   says which key, not what runs behind it.
-* Revocation: certificate revocation lists or short-lived certificates for clients and
-  nodes, and remote revocation propagation of leases with acknowledgement.
-* Reload without restart (certificates, CA, pins and the trust store together).
+* Revocation beyond §8's key list: certificate revocation lists or short-lived
+  certificates for clients and nodes, a revocation list for node keys in
+  `ward-node-client` (it pins one node key today), propagation of a revoked key to every
+  node, and remote revocation propagation of leases with acknowledgement.
+* Reloading the pins (a file in place of the flags) and the trust store without a
+  restart.
 * A durable node audit record of every handshake, enrolment, renewal, revocation and
   trust-root change.
 * Per-answer signing of the node's answers, so a record of an answer proves which node

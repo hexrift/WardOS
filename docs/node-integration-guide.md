@@ -262,16 +262,23 @@ install -d -m 0700 -o ward-node -g ward-node /etc/ward-node/tls
 install -m 0644 -o ward-node -g ward-node node.pem      /etc/ward-node/tls/node.pem
 install -m 0600 -o ward-node -g ward-node node-key.pem  /etc/ward-node/tls/node-key.pem
 install -m 0644 -o ward-node -g ward-node client-ca.pem /etc/ward-node/tls/client-ca.pem
+printf '# client keys this node refuses, one sha256:<hex> per line\n' > revoked-clients
+install -m 0644 -o ward-node -g ward-node revoked-clients /etc/ward-node/tls/revoked-clients
 ```
 
-Add the listener to the unit's `ExecStart=`:
+Add the listener to the unit's `ExecStart=`, and let `systemctl reload` reach the node:
 
 ```ini
   --listen-tls 10.0.4.7:7443 \
   --tls-cert /etc/ward-node/tls/node.pem \
   --tls-key /etc/ward-node/tls/node-key.pem \
-  --tls-client-ca /etc/ward-node/tls/client-ca.pem
+  --tls-client-ca /etc/ward-node/tls/client-ca.pem \
+  --tls-client-revoked /etc/ward-node/tls/revoked-clients
+ExecReload=/bin/kill -HUP $MAINPID
 ```
+
+The revocation list starts empty; it is there so that revoking a key later needs no
+restart.
 
 Listen on the address the control plane reaches and open the port to the control plane's
 network only: authentication is the certificate, but nothing is gained by letting anyone
@@ -299,23 +306,48 @@ TLS on 10.0.4.7:7443` at start, `served a TLS client sha256:<pin> from <address>
 address per 10 seconds, with a count of the ones in between). These lines are the only
 record of handshakes; keep the journal.
 
-**Rotation.** Every TLS file is read once at start, so each rotation is a restart, which
-the node survives with every task (node-integration.md §6.4; an attempt running at that
-moment ends `exited`/`unknown`, so drain first, as for the trust store):
+**Reload, rotation and revocation.** On `SIGHUP` (`systemctl reload ward-node`) the node
+reads the certificate, key, client CA and revocation list again and checks them as at
+start. Only when all of them are usable does it switch to them, for every handshake from
+then on; otherwise it keeps serving the previous configuration whole. Either way it says
+so in the journal, and checking that line is part of every procedure below:
 
+```text
+ward-node: reloaded the TLS configuration: server key sha256:<pin> (changed), client CA certificates 1 (unchanged), pinned client keys 0, revoked client keys 1 (+1, -0)
+ward-node: reloading the TLS configuration failed; still serving the previous one: <file>, line 2: malformed revoked key "sha256:00" (…)
+```
+
+The process stays up, so tasks, running attempts and the socket are untouched. Sessions
+already in progress finish their one request; a session whose key you just revoked and
+whose request has not started yet is closed unanswered. Write each file in full before
+signalling (write a temporary file in the same directory and `mv` it into place; keep the
+owner and modes of the install step), because the node reads whatever is there when the
+signal arrives; if it catches a certificate without its key, it refuses the reload and
+keeps the old pair, and the next `SIGHUP` after the key is in place succeeds.
+
+- *A compromised client key:* append its pin (the value the journal reported for it in
+  `served a TLS client sha256:<pin>`, or the one `openssl` computes from its certificate)
+  to `revoked-clients` and reload. The journal shows `revoked client keys <n> (+1, -0)`;
+  the next handshake with that key is refused, as `refused a TLS connection from
+  <address>: invalid peer certificate: the client key sha256:<pin> is revoked by
+  --tls-client-revoked`, even if the key is pinned. Every certificate for that key is
+  refused, renewals included. A revoked key still could not admit anything: that needs
+  the issuer key (§2). Remove the line and reload to serve the key again.
 - *Node certificate:* issue a new one (same or new key), replace `node.pem` and
-  `node-key.pem`, restart. Clients that pin the node's key need the new pin first if the
-  key changed.
+  `node-key.pem`, reload, and check that the journal reports the new `server key`. Clients
+  that pin the node's key need the new pin first if the key changed.
 - *Client certificates:* issue the new one before the old expires; nothing changes on the
-  node unless it pins keys, in which case add the new pin, restart, switch the client,
-  remove the old pin, restart.
-- *Client CA:* put both CAs in `client-ca.pem` (the file holds several), restart, move the
-  clients to the new CA, remove the old CA, restart. A client of a CA no longer in the file
-  is refused at the next handshake after the restart.
-- *A compromised client key:* remove its pin, or rotate the client CA away from it, and
-  restart; there is no revocation list, so without either the certificate is valid until
-  it expires. Issue client certificates with short lifetimes for that reason. A stolen
-  client key still cannot admit anything: that needs the issuer key (§2).
+  node unless it pins keys. Pins are flags, so adding or removing one is still a restart
+  (§8; an attempt running at that moment ends `exited`/`unknown`, so drain first): add
+  the new pin, restart, switch the client, remove the old pin, restart. Revoking the old
+  key instead of unpinning it needs no restart.
+- *Client CA:* put both CAs in `client-ca.pem` (the file holds several), reload, move the
+  clients to the new CA, remove the old CA, reload. A client of a CA no longer in the file
+  is refused at its next handshake after the reload.
+
+`crates/ward-node/tests/node_mtls_revocation_cli.rs` exercises these procedures against
+the real node: a revocation and its removal, a broken list and a half-rotated certificate
+kept out, and a rotated node key and client CA, each by `SIGHUP` without a restart.
 
 ## 4. Operator: import a snapshot
 
