@@ -31,6 +31,12 @@
 //!   stderr and declared workspace files, as the reaper collected and stored them
 //!   ([`output`]), and advertises `output` in 1.3 capability discovery. Any other node
 //!   refuses the grant `unsupported_grant` at `admit` and `result` as unsupported.
+//! * at protocol 1.3, a service whose execution offers the action channel
+//!   ([`execution::NodeExecution::with_action_channel`]) gives an attempt admitted with an
+//!   `actions` grant its own channel into the sandbox ([`actions`]), serves the read-only
+//!   `actions` listing of its pending requests and the mutating `answer`, and advertises
+//!   `actions` in 1.3 capability discovery. Any other node refuses the grant
+//!   `unsupported_grant` at `admit` and both requests as unsupported.
 //!
 //! * at protocol 1.3, a service whose execution runs attempts in cgroups
 //!   ([`cgroup`], `--cgroup-root`) honours a manifest's `resources` limits, records what
@@ -67,6 +73,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod actions;
 pub mod admission;
 pub mod admit;
 pub mod audit;
@@ -95,9 +102,9 @@ use std::time::{Duration, Instant};
 use nix::unistd::{Gid, Uid};
 use thiserror::Error;
 use ward_node_protocol::{
-    CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse, LifecycleCapabilities,
-    NamespaceCapabilities, NodeCapabilities, OutputCapabilities, SupportedProtocolRange,
-    TaskLifecycleContext, TaskResultRequest, WARD_NODE_PROTOCOL, negotiate,
+    ActionCapabilities, CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse,
+    LifecycleCapabilities, NamespaceCapabilities, NodeCapabilities, OutputCapabilities,
+    SupportedProtocolRange, TaskLifecycleContext, TaskResultRequest, WARD_NODE_PROTOCOL, negotiate,
     supports_task_admission, supports_task_lifecycle,
 };
 
@@ -190,6 +197,7 @@ pub struct NodeService {
     executes: bool,
     network_allowlist: bool,
     output_return: bool,
+    action_channel: bool,
     tasks: Arc<Mutex<TaskRegistry>>,
 }
 
@@ -210,6 +218,7 @@ impl NodeService {
             executes: false,
             network_allowlist: false,
             output_return: false,
+            action_channel: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::default())),
         })
     }
@@ -235,6 +244,7 @@ impl NodeService {
             executes: false,
             network_allowlist: false,
             output_return: false,
+            action_channel: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_admission(
                 MAX_NODE_TASKS,
                 admission,
@@ -260,6 +270,7 @@ impl NodeService {
             .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         let network_allowlist = execution.honours_network_allowlist();
         let output_return = execution.honours_output_return();
+        let action_channel = execution.honours_action_channel();
         Ok(Self {
             capabilities,
             supported: WARD_NODE_PROTOCOL,
@@ -267,6 +278,7 @@ impl NodeService {
             executes: true,
             network_allowlist,
             output_return,
+            action_channel,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_execution(
                 MAX_NODE_TASKS,
                 admission,
@@ -354,6 +366,7 @@ impl NodeService {
         let mut output = OutputCapabilities::NONE;
         let mut resources = None;
         let mut scheduling = None;
+        let mut actions = ActionCapabilities::NONE;
         let lifecycle = if supports_task_admission(protocol) {
             isolation.namespaces = NamespaceCapabilities {
                 sandbox: self.executes,
@@ -373,6 +386,9 @@ impl NodeService {
                     .map_err(|_| NodeServiceError::TaskRegistryUnavailable)?;
                 resources = tasks.resource_capabilities();
                 scheduling = tasks.scheduling();
+            }
+            if self.executes && self.action_channel {
+                actions = ActionCapabilities::CEILINGS;
             }
             LifecycleCapabilities {
                 admit: self.admits,
@@ -402,6 +418,7 @@ impl NodeService {
         .and_then(|capabilities| capabilities.with_output(output))
         .and_then(|capabilities| capabilities.with_resources(resources))
         .and_then(|capabilities| capabilities.with_scheduling(scheduling))
+        .and_then(|capabilities| capabilities.with_actions(actions))
         .map_err(|_| NodeServiceError::InvalidCapabilities)?;
         let response = context
             .response(capabilities)
@@ -417,9 +434,18 @@ impl NodeService {
     ) -> Result<(), NodeServiceError> {
         let context = TaskLifecycleContext::new(protocol)
             .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
-        if serde_json::from_str::<serde_json::Value>(request_line)
-            .is_ok_and(|value| value["request"] == "result")
-        {
+        let named = serde_json::from_str::<serde_json::Value>(request_line)
+            .ok()
+            .and_then(|value| value["request"].as_str().map(str::to_owned));
+        if matches!(named.as_deref(), Some("actions" | "answer")) {
+            let request = context
+                .decode_actions_request(request_line)
+                .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
+            let response = TaskRegistry::actions(&self.tasks, context, request)
+                .map_err(|_| NodeServiceError::TaskRegistryUnavailable)?;
+            return write_answer(stream, &response);
+        }
+        if named.as_deref() == Some("result") {
             let TaskResultRequest::Result { binding, .. } = context
                 .decode_result_request(request_line)
                 .map_err(|_| NodeServiceError::MalformedLifecycleRequest)?;
@@ -1627,7 +1653,17 @@ mod tests {
     }
 
     fn executing_service_with(configured: NodeCapabilities, stop_timeout: Duration) -> Executing {
-        executing_service_built(configured, stop_timeout, false, false)
+        executing_service_built(configured, stop_timeout, false, false, false)
+    }
+
+    fn executing_service_with_actions() -> Executing {
+        executing_service_built(
+            capabilities(),
+            crate::execution::DEFAULT_STOP_TIMEOUT,
+            false,
+            false,
+            true,
+        )
     }
 
     fn executing_service_enforcing_a_network_allowlist() -> Executing {
@@ -1635,6 +1671,7 @@ mod tests {
             capabilities(),
             crate::execution::DEFAULT_STOP_TIMEOUT,
             true,
+            false,
             false,
         )
     }
@@ -1645,6 +1682,7 @@ mod tests {
             crate::execution::DEFAULT_STOP_TIMEOUT,
             false,
             true,
+            false,
         )
     }
 
@@ -1653,6 +1691,7 @@ mod tests {
         stop_timeout: Duration,
         network_allowlist: bool,
         output_return: bool,
+        action_channel: bool,
     ) -> Executing {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
@@ -1671,7 +1710,8 @@ mod tests {
         )
         .with_stop_timeout(stop_timeout)
         .with_network_allowlist(network_allowlist)
-        .with_output_return(output_return);
+        .with_output_return(output_return)
+        .with_action_channel(action_channel);
         let service = NodeService::with_execution(configured, admission, execution).unwrap();
         Executing {
             root: dir.path().join("tasks"),
@@ -2430,5 +2470,527 @@ mod tests {
             assert_eq!((served.scheduling(), served.resources()), (None, None));
         }
         let _ = (&loaded.root, &loaded.launcher, loaded.snapshot);
+    }
+
+    #[test]
+    fn actions_are_advertised_only_by_an_executing_node_with_the_channel_at_one_three() {
+        let channel = executing_service_with_actions();
+        let executing = executing_service();
+        let (raw, observed) = discovered(&channel.service, 3);
+        assert_eq!(
+            observed.actions(),
+            ward_node_protocol::ActionCapabilities::CEILINGS
+        );
+        assert!(
+            raw.contains(r#""actions":{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600}"#),
+            "{raw}"
+        );
+        let (raw, observed) = discovered(&executing.service, 3);
+        assert_eq!(
+            observed.actions(),
+            ward_node_protocol::ActionCapabilities::NONE
+        );
+        assert!(!raw.contains("actions"), "{raw}");
+        for minor in [1, 2] {
+            assert_eq!(
+                discovered(&channel.service, minor).0,
+                discovered(&executing.service, minor).0,
+                "1.{minor}"
+            );
+        }
+        let state = tempfile::tempdir().unwrap();
+        assert!(
+            !discovered(&admitting_service(&state.path().join("state")), 3)
+                .0
+                .contains("actions")
+        );
+    }
+
+    fn actions_admit(
+        executing: &Executing,
+        binding: TaskBinding,
+        manifest: ward_node_protocol::CapabilityManifestBytes,
+    ) -> TaskLifecycleRequest {
+        let mut input = crate::test_support::envelope_input(binding);
+        input.workload = ward_node_protocol::TaskWorkload::new(
+            input.workload.argv().clone(),
+            manifest,
+            executing.snapshot,
+            60_000,
+        )
+        .unwrap();
+        crate::test_support::signed_admit(
+            admission_context(),
+            OperationId::new(2).unwrap(),
+            binding,
+            &ward_node_protocol::TaskAdmissionEnvelope::new(input).unwrap(),
+        )
+    }
+
+    fn actions_manifest(max_pending: u32) -> ward_node_protocol::CapabilityManifestBytes {
+        crate::test_support::actions_manifest(max_pending, 8, 600)
+    }
+
+    /// Send `request` (a lifecycle or actions request) on its own connection at 1.3.
+    fn served(service: &NodeService, request: &impl serde::Serialize) -> String {
+        let (raw, served) = exchange(
+            service,
+            WARD_NODE_PROTOCOL,
+            &serde_json::to_string(request).unwrap(),
+            REQUEST_TIMEOUT,
+        );
+        served.unwrap();
+        raw
+    }
+
+    fn actions_of(
+        service: &NodeService,
+        binding: TaskBinding,
+    ) -> ward_node_protocol::TaskActionsResponse {
+        let context = admission_context();
+        context
+            .decode_actions_response(&served(service, &context.actions(binding).unwrap()))
+            .unwrap()
+    }
+
+    fn pending_of(
+        service: &NodeService,
+        binding: TaskBinding,
+        count: usize,
+    ) -> Vec<ward_node_protocol::PendingAction> {
+        let mut found = Vec::new();
+        crate::test_support::eventually(|| {
+            found = match actions_of(service, binding) {
+                ward_node_protocol::TaskActionsResponse::Actions { pending, .. } => pending,
+                other => panic!("{other:?}"),
+            };
+            found.len() == count
+        });
+        found
+    }
+
+    fn answer(
+        service: &NodeService,
+        operation: u64,
+        binding: TaskBinding,
+        action: u32,
+        decision: ward_node_protocol::ActionDecision,
+    ) -> ward_node_protocol::TaskActionsResponse {
+        let context = admission_context();
+        let request = context
+            .answer(
+                OperationId::new(operation).unwrap(),
+                binding,
+                action,
+                decision,
+                None,
+            )
+            .unwrap();
+        context
+            .decode_actions_response(&served(service, &request))
+            .unwrap()
+    }
+
+    fn started_with_actions(
+        executing: &Executing,
+        binding: TaskBinding,
+        max_pending: u32,
+    ) -> (UnixStream, BufReader<UnixStream>) {
+        let context = admission_context();
+        let accepted = |raw: String| context.decode_response(&raw).unwrap();
+        assert!(matches!(
+            accepted(served(
+                &executing.service,
+                &context.create(OperationId::new(1).unwrap(), binding)
+            )),
+            TaskLifecycleResponse::Accepted { .. }
+        ));
+        assert_eq!(
+            accepted(served(
+                &executing.service,
+                &actions_admit(executing, binding, actions_manifest(max_pending))
+            )),
+            context.accepted(
+                OperationId::new(2).unwrap(),
+                binding,
+                TaskLifecycleState::Ready
+            )
+        );
+        assert_eq!(
+            accepted(served(
+                &executing.service,
+                &context.start(OperationId::new(3).unwrap(), binding)
+            )),
+            context.accepted(
+                OperationId::new(3).unwrap(),
+                binding,
+                TaskLifecycleState::Running
+            )
+        );
+        let launch = executing.launcher.launches().pop().unwrap();
+        let socket = launch
+            .action_socket()
+            .expect("the launch binds the channel")
+            .to_path_buf();
+        assert_eq!(
+            socket,
+            crate::actions::actions_dir(&executing.root, binding)
+                .join(crate::actions::ACTION_SOCKET_FILE)
+        );
+        let stream = UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        (stream, reader)
+    }
+
+    fn channel_reply(reader: &mut BufReader<UnixStream>) -> ward_node_protocol::ActionReply {
+        let mut text = String::new();
+        reader.read_line(&mut text).unwrap();
+        ward_node_protocol::ActionReply::decode(text.trim_end()).unwrap()
+    }
+
+    fn action_records(executing: &Executing, binding: TaskBinding) -> Vec<ward_events::WardEvent> {
+        crate::evidence::verify(
+            &crate::evidence::evidence_dir(&executing.root, binding),
+            binding,
+        )
+        .unwrap()
+        .records()
+        .iter()
+        .map(|record| record.event.clone())
+        .filter(|event| {
+            matches!(
+                event,
+                ward_events::WardEvent::NodeActionRequested { .. }
+                    | ward_events::WardEvent::NodeActionAnswered { .. }
+                    | ward_events::WardEvent::NodeActionRefused { .. }
+                    | ward_events::WardEvent::NodeAttemptEnded { .. }
+                    | ward_events::WardEvent::NodeAttemptIntervened { .. }
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_workload_request_is_listed_answered_relayed_and_recorded_over_the_local_socket() {
+        use ward_events::{NodeActionDecision, WardEvent};
+        use ward_node_protocol::{ActionDecision, ActionRejectionReason, TaskActionsResponse};
+        let executing = executing_service_with_actions();
+        let binding = TaskBinding::new(
+            TaskId::from_u128(7),
+            ExecutionAttemptId::from_u128(8),
+            LeaseId::from_u128(9),
+        );
+        let context = admission_context();
+        assert!(matches!(
+            actions_of(&executing.service, binding),
+            TaskActionsResponse::Rejected {
+                operation_id: None,
+                reason: ActionRejectionReason::TaskNotFound,
+                ..
+            }
+        ));
+        let (mut workload, mut replies) = started_with_actions(&executing, binding, 2);
+        writeln!(
+            workload,
+            r#"{{"id":"deploy-1","kind":"approval","summary":"deploy to staging","detail":"3 services"}}"#
+        )
+        .unwrap();
+        let pending = pending_of(&executing.service, binding, 1);
+        assert_eq!(pending[0].action(), 1);
+        assert_eq!(pending[0].id().as_str(), "deploy-1");
+        assert_eq!(pending[0].summary(), "deploy to staging");
+        assert_eq!(pending[0].detail(), "3 services");
+        match actions_of(&executing.service, binding) {
+            TaskActionsResponse::Actions { state, .. } => {
+                assert_eq!(state, TaskLifecycleState::Running);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        assert_eq!(
+            answer(&executing.service, 10, binding, 1, ActionDecision::Approved),
+            context.answered(
+                OperationId::new(10).unwrap(),
+                binding,
+                1,
+                ActionDecision::Approved
+            )
+        );
+        let reply = channel_reply(&mut replies);
+        assert_eq!(reply.id().as_str(), "deploy-1");
+        assert_eq!(reply.decision(), ActionDecision::Approved);
+        assert_eq!(
+            answer(&executing.service, 10, binding, 1, ActionDecision::Approved),
+            context.answered(
+                OperationId::new(10).unwrap(),
+                binding,
+                1,
+                ActionDecision::Approved
+            ),
+            "a replay is idempotent"
+        );
+        assert_eq!(
+            answer(&executing.service, 11, binding, 1, ActionDecision::Denied),
+            context.actions_rejected(
+                Some(OperationId::new(11).unwrap()),
+                binding,
+                ActionRejectionReason::AlreadyAnswered
+            )
+        );
+        assert_eq!(
+            answer(&executing.service, 12, binding, 9, ActionDecision::Denied),
+            context.actions_rejected(
+                Some(OperationId::new(12).unwrap()),
+                binding,
+                ActionRejectionReason::UnknownRequest
+            )
+        );
+        assert_eq!(
+            answer(&executing.service, 10, binding, 1, ActionDecision::Denied),
+            context.actions_rejected(
+                Some(OperationId::new(10).unwrap()),
+                binding,
+                ActionRejectionReason::StaleOperation
+            )
+        );
+        let wrong = TaskBinding::new(
+            binding.task(),
+            ExecutionAttemptId::from_u128(99),
+            binding.lease(),
+        );
+        assert_eq!(
+            answer(&executing.service, 13, wrong, 1, ActionDecision::Denied),
+            context.actions_rejected(
+                Some(OperationId::new(13).unwrap()),
+                wrong,
+                ActionRejectionReason::AttemptMismatch
+            )
+        );
+
+        // A pause keeps a second request pending; an answer after resume is delivered.
+        writeln!(
+            workload,
+            r#"{{"id":"pick","kind":"decision","summary":"use the cache?","detail":""}}"#
+        )
+        .unwrap();
+        assert_eq!(pending_of(&executing.service, binding, 1)[0].action(), 2);
+        assert!(matches!(
+            context
+                .decode_response(&served(
+                    &executing.service,
+                    &context.pause(OperationId::new(4).unwrap(), binding)
+                ))
+                .unwrap(),
+            TaskLifecycleResponse::Accepted {
+                state: TaskLifecycleState::Paused,
+                ..
+            }
+        ));
+        match actions_of(&executing.service, binding) {
+            TaskActionsResponse::Actions { state, pending, .. } => {
+                assert_eq!(state, TaskLifecycleState::Paused);
+                assert_eq!(pending.len(), 1, "paused, still pending");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            context
+                .decode_response(&served(
+                    &executing.service,
+                    &context.resume(OperationId::new(5).unwrap(), binding)
+                ))
+                .unwrap(),
+            TaskLifecycleResponse::Accepted {
+                state: TaskLifecycleState::Running,
+                ..
+            }
+        ));
+        assert_eq!(
+            answer(&executing.service, 14, binding, 2, ActionDecision::Denied),
+            context.answered(
+                OperationId::new(14).unwrap(),
+                binding,
+                2,
+                ActionDecision::Denied
+            )
+        );
+        assert_eq!(
+            channel_reply(&mut replies).decision(),
+            ActionDecision::Denied
+        );
+
+        // A stop while a request is pending answers it cancelled and records it before the end.
+        writeln!(
+            workload,
+            r#"{{"id":"third","kind":"approval","summary":"one more","detail":""}}"#
+        )
+        .unwrap();
+        pending_of(&executing.service, binding, 1);
+        assert!(matches!(
+            context
+                .decode_response(&served(
+                    &executing.service,
+                    &context.stop(OperationId::new(6).unwrap(), binding)
+                ))
+                .unwrap(),
+            TaskLifecycleResponse::Accepted {
+                state: TaskLifecycleState::Stopped,
+                ..
+            }
+        ));
+        assert_eq!(
+            channel_reply(&mut replies).decision(),
+            ActionDecision::Cancelled
+        );
+        assert_eq!(
+            answer(&executing.service, 15, binding, 3, ActionDecision::Approved),
+            context.actions_rejected(
+                Some(OperationId::new(15).unwrap()),
+                binding,
+                ActionRejectionReason::InvalidState
+            )
+        );
+        assert_eq!(
+            answer(&executing.service, 14, binding, 2, ActionDecision::Denied),
+            context.answered(
+                OperationId::new(14).unwrap(),
+                binding,
+                2,
+                ActionDecision::Denied
+            ),
+            "a replay is answered after the attempt ended too"
+        );
+        match actions_of(&executing.service, binding) {
+            TaskActionsResponse::Actions { state, pending, .. } => {
+                assert_eq!(state, TaskLifecycleState::Stopped);
+                assert!(pending.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        let records = action_records(&executing, binding);
+        let decisions: Vec<(u32, NodeActionDecision, Option<u64>)> = records
+            .iter()
+            .filter_map(|event| match event {
+                WardEvent::NodeActionAnswered {
+                    action,
+                    decision,
+                    operation,
+                    ..
+                } => Some((*action, *decision, *operation)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            decisions,
+            [
+                (1, NodeActionDecision::Approved, Some(10)),
+                (2, NodeActionDecision::Denied, Some(14)),
+                (3, NodeActionDecision::Cancelled, None),
+            ]
+        );
+        assert!(matches!(
+            records.last(),
+            Some(WardEvent::NodeAttemptEnded { .. })
+        ));
+        assert!(matches!(
+            records[0],
+            WardEvent::NodeActionRequested { action: 1, .. }
+        ));
+        let raw = std::fs::read(
+            crate::evidence::evidence_dir(&executing.root, binding)
+                .join(crate::evidence::EVIDENCE_LOG),
+        )
+        .unwrap();
+        for text in [&b"deploy to staging"[..], b"3 services", b"use the cache?"] {
+            assert!(
+                !raw.windows(text.len()).any(|window| window == text),
+                "the log never carries the text"
+            );
+        }
+        assert!(
+            !crate::actions::actions_dir(&executing.root, binding)
+                .join(crate::actions::ACTION_SOCKET_FILE)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_node_without_the_channel_refuses_the_grant_and_the_requests() {
+        use ward_node_protocol::{ActionRejectionReason, TaskActionsResponse};
+        let executing = executing_service();
+        let binding = TaskBinding::new(
+            TaskId::from_u128(7),
+            ExecutionAttemptId::from_u128(8),
+            LeaseId::from_u128(9),
+        );
+        let context = admission_context();
+        assert!(matches!(
+            context
+                .decode_response(&served(
+                    &executing.service,
+                    &context.create(OperationId::new(1).unwrap(), binding)
+                ))
+                .unwrap(),
+            TaskLifecycleResponse::Accepted { .. }
+        ));
+        assert_eq!(
+            context
+                .decode_response(&served(
+                    &executing.service,
+                    &actions_admit(&executing, binding, actions_manifest(1))
+                ))
+                .unwrap(),
+            context.rejected(
+                Some(OperationId::new(2).unwrap()),
+                binding,
+                TaskLifecycleRejectionReason::UnsupportedGrant
+            )
+        );
+        assert!(matches!(
+            actions_of(&executing.service, binding),
+            TaskActionsResponse::Rejected {
+                reason: ActionRejectionReason::UnsupportedOperation,
+                ..
+            }
+        ));
+        assert!(matches!(
+            answer(
+                &executing.service,
+                3,
+                binding,
+                1,
+                ward_node_protocol::ActionDecision::Approved
+            ),
+            TaskActionsResponse::Rejected {
+                reason: ActionRejectionReason::UnsupportedOperation,
+                ..
+            }
+        ));
+        // At 1.2 the requests are unknown: the connection closes with no answer.
+        let one_two = SupportedProtocolRange::new(1, 2, 2).unwrap();
+        let early = serde_json::to_string(&context.actions(binding).unwrap())
+            .unwrap()
+            .replace(r#""minor":3"#, r#""minor":2"#);
+        let (raw, served) = exchange(&executing.service, one_two, &early, REQUEST_TIMEOUT);
+        assert_eq!(raw, "");
+        assert!(matches!(
+            served,
+            Err(NodeServiceError::MalformedLifecycleRequest)
+        ));
+        let (raw, served) = exchange(
+            &executing.service,
+            WARD_NODE_PROTOCOL,
+            r#"{"request":"answer","protocol":{"major":1,"minor":3}}"#,
+            REQUEST_TIMEOUT,
+        );
+        assert_eq!(raw, "");
+        assert!(matches!(
+            served,
+            Err(NodeServiceError::MalformedLifecycleRequest)
+        ));
     }
 }

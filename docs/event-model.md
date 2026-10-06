@@ -177,6 +177,20 @@ pub enum WardEvent {
     //                     pids_limit: Option<u64>, cpu_usage_usec: Option<u64>,
     //                     memory_peak_bytes: Option<u64>, pids_peak: Option<u64>,
     //                     memory_oom_kills: Option<u64>, pids_max_events: Option<u64> }
+    // appended after NodeAttemptResourceUsage (#404, the action channel; ADR-0031,
+    // node-integration.md §6.7): a workload's request through its attempt's channel, its
+    // answer (by the control plane's `answer`, or the node's expired / cancelled) and a
+    // refused line. Recorded before the control plane sees a request and before the
+    // workload is told an answer; sizes and BLAKE3 digests only, never the text.
+    NodeActionRequested { action: u32, kind: NodeActionKind,         // Approval | Decision
+                          summary_bytes: u64, summary: Blake3Hash,
+                          detail_bytes: u64, detail: Blake3Hash },
+    NodeActionAnswered { action: u32, decision: NodeActionDecision,  // Approved | Denied
+                         operation: Option<u64>,                     // | Expired | Cancelled
+                         note_bytes: u64, note: Option<Blake3Hash> },
+    NodeActionRefused { reason: NodeActionRefusal, bytes: u64 },
+    // NodeActionRefusal: Oversized | Malformed | ControlRequest | KindNotGranted
+    //                    | DuplicateId | TooManyPending | TooManyRequests
 }
 ```
 

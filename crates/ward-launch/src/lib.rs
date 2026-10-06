@@ -139,6 +139,8 @@ pub fn available() -> bool {
 
 /// Mount point of the egress socket inside the sandbox.
 pub const PROXY_SOCKET: &str = "/run/ward/proxy.sock";
+/// Mount point of a node attempt's action channel socket inside the sandbox (#404).
+pub const ACTION_SOCKET: &str = "/run/ward/actions.sock";
 /// Mount point of the `ward-agent` shim inside the sandbox.
 pub const AGENT_SHIM: &str = "/run/ward/ward-agent";
 /// Mount point of the worktree itself inside the sandbox — an ordinary
@@ -220,6 +222,7 @@ pub struct Launch {
     env: Vec<(String, String)>,
     proxy_socket: Option<PathBuf>,
     hook_socket: Option<PathBuf>,
+    action_socket: Option<PathBuf>,
     seeds: Vec<(PathBuf, String)>,
     ro_binds: Vec<(PathBuf, String)>,
     tmpfs: Vec<String>,
@@ -357,6 +360,7 @@ impl Launch {
             env: Vec::new(),
             proxy_socket: None,
             hook_socket: None,
+            action_socket: None,
             seeds: Vec::new(),
             ro_binds: Vec::new(),
             tmpfs: Vec::new(),
@@ -377,6 +381,14 @@ impl Launch {
     #[must_use]
     pub fn egress(mut self, socket: impl Into<PathBuf>) -> Self {
         self.proxy_socket = Some(socket.into());
+        self
+    }
+
+    /// Bind a node attempt's action channel socket into the sandbox at
+    /// [`ACTION_SOCKET`] (#404). The caller names it in the environment.
+    #[must_use]
+    pub fn actions(mut self, socket: impl Into<PathBuf>) -> Self {
+        self.action_socket = Some(socket.into());
         self
     }
 
@@ -584,6 +596,9 @@ impl Launch {
         push(&mut a, &["--die-with-parent", "--new-session"]);
         if let Some(sock) = &self.proxy_socket {
             push(&mut a, &["--bind", &sock.to_string_lossy(), PROXY_SOCKET]);
+        }
+        if let Some(sock) = &self.action_socket {
+            push(&mut a, &["--bind", &sock.to_string_lossy(), ACTION_SOCKET]);
         }
         if let Some(sock) = &self.hook_socket {
             push(&mut a, &["--bind", &sock.to_string_lossy(), HOOK_SOCKET]);
@@ -1037,6 +1052,23 @@ mod tests {
         let first_set = a.iter().position(|x| x == "--setenv").unwrap();
         assert!(clear < first_set, "{a:?}");
         assert!(a.join(" ").contains("--setenv FOO bar"));
+    }
+
+    #[test]
+    fn args_bind_an_action_socket_only_when_asked() {
+        let plain = Launch::new("/tmp", vec!["true".into()]);
+        assert!(
+            !plain
+                .args(Path::new("/tmp"))
+                .join(" ")
+                .contains(ACTION_SOCKET)
+        );
+        let a = Launch::new("/tmp", vec!["true".into()])
+            .actions("/host/attempt.actions/actions.sock")
+            .args(Path::new("/tmp"))
+            .join(" ");
+        assert!(a.contains("--bind /host/attempt.actions/actions.sock /run/ward/actions.sock"));
+        assert!(a.contains("--unshare-net"));
     }
 
     #[test]

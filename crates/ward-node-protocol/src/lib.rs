@@ -11,7 +11,10 @@
 //! Additive within 1.3 as well (#260): the manifest's optional `resources` grant (cgroup
 //! limits on the attempt's process tree), the capability document's `resources` and
 //! `scheduling` sections, and the `capacity_exhausted` refusal of a `start` on a node at
-//! the capacity its operator configured.
+//! the capacity its operator configured. And additive within 1.3 ([`actions`], #404): the
+//! manifest's optional `actions` grant, the capability document's `actions` section, the
+//! workload's request and reply lines on its per-attempt action channel, and the
+//! `actions` listing and `answer` requests a control plane reads and answers them with.
 //! Issuer verification and execution are the node's (`ward-node`); transport
 //! authentication belongs to #262. A 1.3 capability document may advertise `admit`, and `start` and
 //! `stop` only together. Incompatible peers fail closed rather than falling back to the
@@ -19,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+mod actions;
 mod admission;
 mod output;
 mod receipt;
@@ -26,6 +30,13 @@ mod resources;
 #[cfg(test)]
 mod test_fixtures;
 
+pub use actions::{
+    ActionCapabilities, ActionDecision, ActionError, ActionGrant, ActionId, ActionKind, ActionNote,
+    ActionRejectionReason, ActionReply, ActionRequest, MAX_ACTION_DETAIL_BYTES,
+    MAX_ACTION_ID_BYTES, MAX_ACTION_LINE_BYTES, MAX_ACTION_NOTE_BYTES, MAX_ACTION_PENDING,
+    MAX_ACTION_SUMMARY_BYTES, MAX_ACTION_TOTAL, MAX_ACTION_WAIT_SECS, MAX_ACTIONS_RESPONSE_BYTES,
+    PendingAction, TaskActionsRequest, TaskActionsResponse,
+};
 pub use admission::{
     AdmissionEnvelopeJson, AdmissionVersion, CapabilityManifest, CapabilityManifestBytes,
     HostAllowlist, IssuerProof, IssuerSignature, MAX_ADMISSION_ENVELOPE_BYTES,
@@ -464,6 +475,7 @@ pub struct NodeCapabilities {
     output: OutputCapabilities,
     resources: Option<ResourceCapabilities>,
     scheduling: Option<SchedulingCapabilities>,
+    actions: ActionCapabilities,
 }
 
 impl NodeCapabilities {
@@ -510,6 +522,7 @@ impl NodeCapabilities {
             output: OutputCapabilities::NONE,
             resources: None,
             scheduling: None,
+            actions: ActionCapabilities::NONE,
         })
     }
 
@@ -567,6 +580,25 @@ impl NodeCapabilities {
             return Err(NodeCapabilitiesError::ProtocolDoesNotSupportResources);
         }
         self.scheduling = scheduling;
+        Ok(self)
+    }
+
+    /// The same document advertising `actions`: the action channel the node offers and
+    /// its ceilings. Protocol 1.3 and later only; a document for an earlier version may
+    /// only say it offers none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeCapabilitiesError::ProtocolDoesNotSupportActions`] when `actions`
+    /// offers a kind under a protocol version before 1.3.
+    pub const fn with_actions(
+        mut self,
+        actions: ActionCapabilities,
+    ) -> Result<Self, NodeCapabilitiesError> {
+        if actions.any() && !supports_task_admission(self.protocol) {
+            return Err(NodeCapabilitiesError::ProtocolDoesNotSupportActions);
+        }
+        self.actions = actions;
         Ok(self)
     }
 
@@ -643,6 +675,12 @@ impl NodeCapabilities {
     pub const fn scheduling(self) -> Option<SchedulingCapabilities> {
         self.scheduling
     }
+
+    /// The action channel the node offers (`actions`, `answer`).
+    #[must_use]
+    pub const fn actions(self) -> ActionCapabilities {
+        self.actions
+    }
 }
 
 /// Invalid capability document.
@@ -661,6 +699,8 @@ pub enum NodeCapabilitiesError {
     ProtocolDoesNotSupportOutput,
     /// `resources` or `scheduling` was advertised under a protocol version before 1.3.
     ProtocolDoesNotSupportResources,
+    /// `actions` was advertised under a protocol version that predates the action channel.
+    ProtocolDoesNotSupportActions,
 }
 
 impl Display for NodeCapabilitiesError {
@@ -683,6 +723,9 @@ impl Display for NodeCapabilitiesError {
             }
             Self::ProtocolDoesNotSupportResources => {
                 formatter.write_str("protocol version does not support resource limits")
+            }
+            Self::ProtocolDoesNotSupportActions => {
+                formatter.write_str("protocol version does not support the action channel")
             }
         }
     }
@@ -746,6 +789,12 @@ struct NodeCapabilitiesWire {
         deserialize_with = "deserialize_present_scheduling"
     )]
     scheduling: Option<SchedulingCapabilities>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_action_capabilities"
+    )]
+    actions: Option<ActionCapabilities>,
     lifecycle: LifecycleCapabilitiesWire,
 }
 
@@ -767,6 +816,15 @@ where
     SchedulingCapabilities::deserialize(deserializer).map(Some)
 }
 
+fn deserialize_present_action_capabilities<'de, D>(
+    deserializer: D,
+) -> Result<Option<ActionCapabilities>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    ActionCapabilities::deserialize(deserializer).map(Some)
+}
+
 fn deserialize_present_output_capabilities<'de, D>(
     deserializer: D,
 ) -> Result<Option<OutputCapabilities>, D::Error>
@@ -783,6 +841,11 @@ impl NodeCapabilitiesWire {
         let output = match (supports_task_admission(self.protocol), self.output) {
             (true, Some(output)) => output,
             (_, None) => OutputCapabilities::default(),
+            (false, Some(_)) => return None,
+        };
+        let actions = match (supports_task_admission(self.protocol), self.actions) {
+            (true, Some(actions)) => actions,
+            (_, None) => ActionCapabilities::default(),
             (false, Some(_)) => return None,
         };
         NodeCapabilities::new(
@@ -808,6 +871,8 @@ impl NodeCapabilitiesWire {
         .with_resources(self.resources)
         .ok()?
         .with_scheduling(self.scheduling)
+        .ok()?
+        .with_actions(actions)
         .ok()
     }
 }
@@ -838,6 +903,7 @@ impl Serialize for NodeCapabilities {
             output: self.output.any().then_some(self.output),
             resources: self.resources,
             scheduling: self.scheduling,
+            actions: self.actions.any().then_some(self.actions),
             lifecycle: LifecycleCapabilitiesWire {
                 pause: self.lifecycle.pause,
                 stop: self.lifecycle.stop,
@@ -3556,5 +3622,78 @@ mod tests {
             "{json}"
         );
         assert_eq!(context.decode_response(&json).unwrap(), rejected);
+    }
+
+    #[test]
+    fn a_capability_document_carries_actions_only_when_a_channel_is_offered_at_one_three() {
+        let one_three = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let minimal = capabilities_at(3, false);
+        assert_eq!(minimal.actions(), ActionCapabilities::NONE);
+        let plain = serde_json::to_string(&one_three.response(minimal).unwrap()).unwrap();
+        assert!(!plain.contains("actions"), "{plain}");
+        assert_eq!(
+            serde_json::to_string(
+                &one_three
+                    .response(minimal.with_actions(ActionCapabilities::NONE).unwrap())
+                    .unwrap()
+            )
+            .unwrap(),
+            plain,
+            "no channel, nothing advertised"
+        );
+        let offering = minimal
+            .with_output(OutputCapabilities {
+                stdio: true,
+                files: true,
+            })
+            .unwrap()
+            .with_actions(ActionCapabilities::CEILINGS)
+            .unwrap();
+        let json = serde_json::to_string(&one_three.response(offering).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            plain.replace(
+                r#""verifier":{"isolated":false}"#,
+                r#""verifier":{"isolated":false},"output":{"stdio":true,"files":true},"actions":{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600}"#
+            )
+        );
+        match one_three.decode_response(&json).unwrap() {
+            CapabilityDiscoveryResponse::Capabilities { capabilities } => {
+                assert_eq!(capabilities, offering);
+                assert_eq!(capabilities.actions(), ActionCapabilities::CEILINGS);
+            }
+        }
+        for minor in [1, 2] {
+            let early = capabilities_at(minor, false);
+            assert_eq!(
+                early.with_actions(ActionCapabilities::CEILINGS),
+                Err(NodeCapabilitiesError::ProtocolDoesNotSupportActions)
+            );
+            assert_eq!(early.with_actions(ActionCapabilities::NONE), Ok(early));
+            let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, minor)).unwrap();
+            let early_json = plain
+                .replace(r#""minor":3"#, &format!(r#""minor":{minor}"#))
+                .replace(
+                    r#""verifier":{"isolated":false}"#,
+                    r#""verifier":{"isolated":false},"actions":{"approval":true,"decision":false,"max_pending":1,"max_total":1,"max_wait_secs":1}"#,
+                );
+            assert_eq!(
+                context.decode_response(&early_json),
+                Err(CapabilityDiscoveryError::MalformedMessage),
+                "a 1.{minor} document never carries actions"
+            );
+        }
+        assert_eq!(
+            one_three.decode_response(&json.replace(
+                r#""max_wait_secs":3600"#,
+                r#""max_wait_secs":3600,"credential":true"#
+            )),
+            Err(CapabilityDiscoveryError::MalformedMessage)
+        );
+        assert!(
+            !NodeCapabilitiesError::ProtocolDoesNotSupportActions
+                .to_string()
+                .is_empty()
+        );
     }
 }

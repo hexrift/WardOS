@@ -760,6 +760,89 @@ pub struct NodeResourceUsage {
     pub pids_max_events: Option<u64>,
 }
 
+/// What a workload asked through its attempt's action channel (#404).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeActionKind {
+    /// Permission to do what the request's summary says.
+    Approval,
+    /// A yes-or-no choice made for the workload.
+    Decision,
+}
+
+impl NodeActionKind {
+    /// Stable lowercase name, as the node protocol spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::Decision => "decision",
+        }
+    }
+}
+
+/// How an action-channel request ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeActionDecision {
+    /// The control plane approved it.
+    Approved,
+    /// The control plane denied it.
+    Denied,
+    /// Nobody answered within the grant's wait; the node answered.
+    Expired,
+    /// The attempt ended, the node restarted, the channel closed or the workload withdrew
+    /// the request; the node answered.
+    Cancelled,
+}
+
+impl NodeActionDecision {
+    /// Stable lowercase name, as the node protocol spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Why the node refused a line on an attempt's action channel and closed its connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NodeActionRefusal {
+    /// The line, or its summary or detail, was longer than its bound.
+    Oversized,
+    /// The line was not one request of the channel's grammar.
+    Malformed,
+    /// The line was a node-protocol or control-protocol request (a lifecycle request, a
+    /// `hello`): answered with nothing.
+    ControlRequest,
+    /// The request's kind is not in the attempt's grant.
+    KindNotGranted,
+    /// The request reused an id the attempt already used.
+    DuplicateId,
+    /// As many requests as the grant allows were already waiting.
+    TooManyPending,
+    /// The attempt already sent as many requests as the grant allows.
+    TooManyRequests,
+}
+
+impl NodeActionRefusal {
+    /// Stable lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Oversized => "oversized",
+            Self::Malformed => "malformed",
+            Self::ControlRequest => "control_request",
+            Self::KindNotGranted => "kind_not_granted",
+            Self::DuplicateId => "duplicate_id",
+            Self::TooManyPending => "too_many_pending",
+            Self::TooManyRequests => "too_many_requests",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // The catalogue
 // ---------------------------------------------------------------------------------------
@@ -1416,6 +1499,47 @@ pub enum WardEvent {
         /// The limits and the measurements.
         usage: NodeResourceUsage,
     },
+    /// The workload asked through the attempt's action channel (#404, ADR-0031) and the
+    /// node accepted the request: its number, kind, and the size and `BLAKE3-256` digest
+    /// of its summary and detail. Written before the control plane can see the request.
+    /// Never the text itself.
+    NodeActionRequested {
+        /// The node's request number within the attempt, from 1.
+        action: u32,
+        /// What was asked.
+        kind: NodeActionKind,
+        /// Bytes of the summary.
+        summary_bytes: u64,
+        /// `BLAKE3-256` of the summary's UTF-8 bytes.
+        summary: Blake3Hash,
+        /// Bytes of the detail.
+        detail_bytes: u64,
+        /// `BLAKE3-256` of the detail's UTF-8 bytes.
+        detail: Blake3Hash,
+    },
+    /// An action-channel request was answered: by the control plane's `answer` (with its
+    /// operation id; recorded before the workload is told), or by the node (`expired`,
+    /// `cancelled`). Never the note itself.
+    NodeActionAnswered {
+        /// The request number.
+        action: u32,
+        /// The decision.
+        decision: NodeActionDecision,
+        /// The `answer` operation id; `None` when the node answered.
+        operation: Option<u64>,
+        /// Bytes of the control plane's note; `0` without one.
+        note_bytes: u64,
+        /// `BLAKE3-256` of the note, when there is one.
+        note: Option<Blake3Hash>,
+    },
+    /// The node refused a line on the attempt's action channel, answered it with nothing
+    /// and closed that connection.
+    NodeActionRefused {
+        /// Why.
+        reason: NodeActionRefusal,
+        /// Bytes of the refused line the node read (at most one past the line bound).
+        bytes: u64,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -1473,11 +1597,14 @@ pub enum EventKind {
     NodeAttemptSealed = 45,
     NodeAttemptOutputCollected = 46,
     NodeAttemptResourceUsage = 47,
+    NodeActionRequested = 48,
+    NodeActionAnswered = 49,
+    NodeActionRefused = 50,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 48] = [
+    pub const ALL: [EventKind; 51] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -1526,6 +1653,9 @@ impl EventKind {
         EventKind::NodeAttemptSealed,
         EventKind::NodeAttemptOutputCollected,
         EventKind::NodeAttemptResourceUsage,
+        EventKind::NodeActionRequested,
+        EventKind::NodeActionAnswered,
+        EventKind::NodeActionRefused,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
@@ -1586,6 +1716,9 @@ impl EventKind {
             EventKind::NodeAttemptSealed => "node_attempt_sealed",
             EventKind::NodeAttemptOutputCollected => "node_attempt_output_collected",
             EventKind::NodeAttemptResourceUsage => "node_attempt_resource_usage",
+            EventKind::NodeActionRequested => "node_action_requested",
+            EventKind::NodeActionAnswered => "node_action_answered",
+            EventKind::NodeActionRefused => "node_action_refused",
         }
     }
 
@@ -1629,6 +1762,9 @@ impl EventKind {
                 | EventKind::NodeAttemptSealed
                 | EventKind::NodeAttemptOutputCollected
                 | EventKind::NodeAttemptResourceUsage
+                | EventKind::NodeActionRequested
+                | EventKind::NodeActionAnswered
+                | EventKind::NodeActionRefused
         )
     }
 }
@@ -1824,6 +1960,9 @@ impl WardEvent {
             WardEvent::NodeAttemptSealed { .. } => EventKind::NodeAttemptSealed,
             WardEvent::NodeAttemptOutputCollected { .. } => EventKind::NodeAttemptOutputCollected,
             WardEvent::NodeAttemptResourceUsage { .. } => EventKind::NodeAttemptResourceUsage,
+            WardEvent::NodeActionRequested { .. } => EventKind::NodeActionRequested,
+            WardEvent::NodeActionAnswered { .. } => EventKind::NodeActionAnswered,
+            WardEvent::NodeActionRefused { .. } => EventKind::NodeActionRefused,
         }
     }
 
@@ -1855,9 +1994,9 @@ mod tests {
             assert_eq!(k.bit(), 1u64 << i, "{k}");
         }
         assert_eq!(EventKindSet::ALL.iter().count(), EventKind::ALL.len());
-        // The catalogue is currently 46 kinds wide, well inside the `u64` backing's
+        // The catalogue is currently 51 kinds wide, well inside the `u64` backing's
         // 64-bit capacity -- so, unlike when the backing type was exactly saturated
-        // at `u32`, there IS a first unused bit right now (bit 46), and a value that
+        // at `u32`, there IS a first unused bit right now (bit 51), and a value that
         // sets it must be rejected as an unknown kind rather than silently accepted.
         // This is the same "no room past the known kinds to smuggle a bit through"
         // property `kind_bits_are_dense...`'s name promises, just checked against

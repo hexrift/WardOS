@@ -4,8 +4,9 @@
 //! * [`UnixTransport`] speaks the Unix-socket JSON-lines framing of §3, one connection per
 //!   request, with the line bounds and the fail-closed reading of EOF.
 //! * [`Client`] negotiates protocol 1.3 or later (§4), reads capabilities (§5) and sends
-//!   the typed lifecycle verbs (§6) and the read-only `result` request (§6.6), checking
-//!   every answer against its request.
+//!   the typed lifecycle verbs (§6), the read-only `result` request (§6.6) and the action
+//!   channel's `actions` listing and `answer` (§6.7), checking every answer against its
+//!   request.
 //! * [`IssuerKey`] holds the control plane's Ed25519 issuer key and signs an envelope's
 //!   exact bytes (§7.4); [`EnvelopeInput`] bounds the institution-owned inputs (§7.3)
 //!   before anything is signed.
@@ -27,7 +28,8 @@ mod issuer;
 mod transport;
 
 pub use client::{
-    Applied, Client, ClientError, Inspection, PROTOCOL_WINDOW, Resulted, Verb, protocol_window,
+    ActionsListed, AnswerApplied, Applied, Client, ClientError, Inspection, PROTOCOL_WINDOW,
+    Resulted, Verb, protocol_window,
 };
 pub use driver::{
     AppliedOperation, AttemptEvent, AttemptOutcome, AttemptReport, AttemptRequest, CancelToken,

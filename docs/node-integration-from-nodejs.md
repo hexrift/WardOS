@@ -503,13 +503,21 @@ plane deciding what to put through the node today:
   readable only as the node's uid. Design workloads to leave their verdict in a small
   declared file (a JSON report) and their exit status, and read anything larger on the
   host out of band.
-- **In-sandbox callbacks.** There is no channel from the workload to the control plane:
-  no `stream`, no socket into the sandbox (§6.1, §11.5). An agent loop that needs tool
-  results, model calls or approvals from outside the sandbox stays on the control plane;
-  the node runs the bounded actions it delegates.
+- **In-sandbox callbacks.** A node started with `--action-channel` gives an attempt a
+  channel from the workload to the control plane (node-integration.md §6.7, ADR-0031):
+  bounded `approval` and `decision` requests the control plane reads with `actions` and
+  answers with `answer`. The JS reference client does not speak it yet: its manifest
+  builder refuses an `actions` field before anything is signed (it knows `network` and
+  `output` only), and it has no `actions` or `answer` call. A Node.js control plane that
+  needs the channel today builds and signs the manifest bytes itself (§5) and sends the
+  `ward-node-adapter` process's `actions` and `answer` commands (node-integration.md
+  §11.4) from a second adapter while the first one runs the attempt. There is no `stream` either (§6.1, §11.5), so an
+  agent loop that needs tool results or model calls from outside the sandbox stays on the
+  control plane; the node runs the bounded actions it delegates.
 - **Approvals.** The node has no approval step of its own; governance is the control
   plane's (ai-institution's action policy and approval resolution) and happens before
-  `admit`. The grants the envelope carries record the decision; the node checks their
+  `admit`. An approval given through the action channel is a recorded statement the
+  workload acts on, not a hold the node enforces (node-security-limitations.md §3.2). The grants the envelope carries record the decision; the node checks their
   shape and lineage, not their meaning.
 - **Credentials.** Nothing is injected into the sandbox (#267); the only egress is an
   HTTP(S) proxy over a Unix socket on a node started with `--network-allowlist` (§9).

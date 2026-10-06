@@ -17,6 +17,7 @@ use ward_events::event::{
     PolicySubject, ProcessRef, RevokeReason, Scope, SignatureBytes, SnapshotRole, StepStatus,
     TamperWardSig, VerifyRequester, VerifySummary, WardEvent,
 };
+use ward_events::event::{NodeActionDecision, NodeActionKind, NodeActionRefusal};
 use ward_events::event::{
     NodeAttemptEnd, NodeAttemptOutcome, NodeAttemptState, NodeIntervention, NodeOutputFile,
     NodeOutputFileStatus, NodeOutputStream,
@@ -889,6 +890,34 @@ fn full_catalogue() -> Vec<(Origin, WardEvent)> {
             },
         ),
         (
+            Origin::Node,
+            WardEvent::NodeActionRequested {
+                action: 1,
+                kind: NodeActionKind::Approval,
+                summary_bytes: 17,
+                summary: Blake3Hash::hash(b"deploy to staging"),
+                detail_bytes: 0,
+                detail: Blake3Hash::hash(b""),
+            },
+        ),
+        (
+            Origin::Node,
+            WardEvent::NodeActionAnswered {
+                action: 1,
+                decision: NodeActionDecision::Approved,
+                operation: Some(51),
+                note_bytes: 2,
+                note: Some(Blake3Hash::hash(b"ok")),
+            },
+        ),
+        (
+            Origin::Node,
+            WardEvent::NodeActionRefused {
+                reason: NodeActionRefusal::ControlRequest,
+                bytes: 73,
+            },
+        ),
+        (
             Origin::User,
             WardEvent::SessionEnded {
                 reason: EndReason::UserStop,
@@ -1283,6 +1312,9 @@ fn node_attempt_kinds_are_critical_node_facts_appended_at_the_end() {
             EventKind::NodeAttemptResourceUsage,
             "node_attempt_resource_usage",
         ),
+        (EventKind::NodeActionRequested, "node_action_requested"),
+        (EventKind::NodeActionAnswered, "node_action_answered"),
+        (EventKind::NodeActionRefused, "node_action_refused"),
     ];
     for (offset, (kind, name)) in kinds.into_iter().enumerate() {
         assert_eq!(kind.bit(), 1u64 << (40 + offset), "{name}");
@@ -1290,7 +1322,7 @@ fn node_attempt_kinds_are_critical_node_facts_appended_at_the_end() {
         assert!(kind.is_critical(), "{name}");
         assert!(!Filter::quiet().kinds.contains(kind), "{name}");
     }
-    assert_eq!(EventKind::ALL.len(), 48);
+    assert_eq!(EventKind::ALL.len(), 51);
     assert_eq!(Origin::Node.tag(), 8);
     assert_eq!(Origin::from_tag(8), Some(Origin::Node));
     assert_eq!(Origin::Node.label(), "node");

@@ -1,6 +1,6 @@
 //! A typed client over the node protocol: handshake (node-integration.md §4), capability
-//! discovery (§5), the lifecycle verbs (§6) and the read-only `result` request (§6.6), one
-//! connection per request.
+//! discovery (§5), the lifecycle verbs (§6), the read-only `result` request (§6.6) and the
+//! action channel's `actions` listing and `answer` (§6.7), one connection per request.
 //!
 //! The client offers the window [`PROTOCOL_WINDOW`]: from the first version with signed
 //! admission (1.3) up to the highest version this revision of `ward-node-protocol`
@@ -15,12 +15,13 @@ use std::fmt::{Display, Formatter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ward_node_protocol::{
-    AttemptOutput, CapabilityDiscoveryContext, CapabilityDiscoveryResponse, HandshakeRequest,
-    HandshakeResponse, MAX_RESULT_RESPONSE_BYTES, NodeCapabilities, OperationId,
+    ActionDecision, ActionNote, ActionRejectionReason, AttemptOutput, CapabilityDiscoveryContext,
+    CapabilityDiscoveryResponse, HandshakeRequest, HandshakeResponse, MAX_ACTIONS_RESPONSE_BYTES,
+    MAX_RESULT_RESPONSE_BYTES, NodeCapabilities, OperationId, PendingAction,
     ProtocolRejectionReason, ProtocolVersion, SupportedProtocolRange, TASK_ADMISSION_PROTOCOL,
-    TaskBinding, TaskExecutionOutcome, TaskLifecycleContext, TaskLifecycleRejectionReason,
-    TaskLifecycleRequest, TaskLifecycleResponse, TaskLifecycleState, TaskResultResponse,
-    WARD_NODE_PROTOCOL, supports_task_admission,
+    TaskActionsResponse, TaskBinding, TaskExecutionOutcome, TaskLifecycleContext,
+    TaskLifecycleRejectionReason, TaskLifecycleRequest, TaskLifecycleResponse, TaskLifecycleState,
+    TaskResultResponse, WARD_NODE_PROTOCOL, supports_task_admission,
 };
 
 use crate::issuer::SignedEnvelope;
@@ -68,6 +69,10 @@ pub enum Verb {
     Inspect,
     /// `result` (§6.6).
     Result,
+    /// `actions` (§6.7).
+    Actions,
+    /// `answer` (§6.7).
+    Answer,
 }
 
 impl Verb {
@@ -86,6 +91,8 @@ impl Verb {
             Self::Seal => "seal",
             Self::Inspect => "inspect",
             Self::Result => "result",
+            Self::Actions => "actions",
+            Self::Answer => "answer",
         }
     }
 }
@@ -146,6 +153,42 @@ pub enum Resulted {
     Rejected {
         /// The typed refusal (§8.3).
         reason: TaskLifecycleRejectionReason,
+    },
+}
+
+/// The node's answer to `actions` (§6.7).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionsListed {
+    /// The attempt's pending requests, oldest first, with its state.
+    Actions {
+        /// The task's state.
+        state: TaskLifecycleState,
+        /// The requests waiting for an answer.
+        pending: Vec<PendingAction>,
+    },
+    /// The node refused the request.
+    Rejected {
+        /// The typed refusal (§6.7).
+        reason: ActionRejectionReason,
+    },
+}
+
+/// The node's answer to `answer` (§6.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerApplied {
+    /// The answer was recorded and relayed, or had been (a replay of the same answer).
+    Answered {
+        /// The request answered.
+        action: u32,
+        /// The decision recorded.
+        decision: ActionDecision,
+    },
+    /// The node refused the answer and changed nothing.
+    Rejected {
+        /// The typed refusal (§6.7).
+        reason: ActionRejectionReason,
     },
 }
 
@@ -500,6 +543,89 @@ impl<T: Transport> Client<T> {
             }) if answered == binding => Ok(Resulted::Rejected { reason }),
             Ok(_) => Err(ClientError::ResponseMismatch { verb: Verb::Result }),
             Err(_) => Err(ClientError::MalformedResponse { verb: Verb::Result }),
+        }
+    }
+
+    /// `actions`: the pending action-channel requests of the attempt `binding` names
+    /// (§6.7), read within `MAX_ACTIONS_RESPONSE_BYTES` rather than the lifecycle line
+    /// bound, since each may carry a 16 KiB detail.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ClientError`] when the node cannot be reached or answers outside the
+    /// protocol; a typed refusal is `Ok(ActionsListed::Rejected)`.
+    pub fn actions(&self, binding: TaskBinding) -> Result<ActionsListed, ClientError> {
+        let verb = Verb::Actions;
+        let request = self
+            .lifecycle
+            .actions(binding)
+            .map_err(|_| ClientError::Encoding)?;
+        let request = serde_json::to_string(&request).map_err(|_| ClientError::Encoding)?;
+        let response = self.send_bounded(verb, &request, MAX_ACTIONS_RESPONSE_BYTES)?;
+        match self.lifecycle.decode_actions_response(&response) {
+            Ok(TaskActionsResponse::Actions {
+                binding: answered,
+                state,
+                pending,
+                ..
+            }) if answered == binding => Ok(ActionsListed::Actions { state, pending }),
+            Ok(TaskActionsResponse::Rejected {
+                operation_id: None,
+                binding: answered,
+                reason,
+                ..
+            }) if answered == binding => Ok(ActionsListed::Rejected { reason }),
+            Ok(_) => Err(ClientError::ResponseMismatch { verb }),
+            Err(_) => Err(ClientError::MalformedResponse { verb }),
+        }
+    }
+
+    /// `answer`: answer the pending request `action` of the attempt `binding` names with
+    /// `decision` (`approved` or `denied`) and an optional `note` relayed to the workload,
+    /// under `operation` (§6.7). Replaying the same answer with the same `operation` is
+    /// answered as before.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Encoding`] for request 0 or a decision a control plane may
+    /// not give (`expired`, `cancelled`), and a [`ClientError`] when the node cannot be
+    /// reached or answers outside the protocol; a typed refusal is
+    /// `Ok(AnswerApplied::Rejected)`.
+    pub fn answer(
+        &self,
+        binding: TaskBinding,
+        operation: OperationId,
+        action: u32,
+        decision: ActionDecision,
+        note: Option<ActionNote>,
+    ) -> Result<AnswerApplied, ClientError> {
+        let verb = Verb::Answer;
+        let request = self
+            .lifecycle
+            .answer(operation, binding, action, decision, note)
+            .map_err(|_| ClientError::Encoding)?;
+        let request = serde_json::to_string(&request).map_err(|_| ClientError::Encoding)?;
+        let response = self.send(verb, &request)?;
+        match self.lifecycle.decode_actions_response(&response) {
+            Ok(TaskActionsResponse::Answered {
+                operation_id,
+                binding: answered,
+                action: answered_action,
+                decision,
+                ..
+            }) if operation_id == operation && answered == binding && answered_action == action => {
+                Ok(AnswerApplied::Answered { action, decision })
+            }
+            Ok(TaskActionsResponse::Rejected {
+                operation_id: Some(operation_id),
+                binding: answered,
+                reason,
+                ..
+            }) if operation_id == operation && answered == binding => {
+                Ok(AnswerApplied::Rejected { reason })
+            }
+            Ok(_) => Err(ClientError::ResponseMismatch { verb }),
+            Err(_) => Err(ClientError::MalformedResponse { verb }),
         }
     }
 

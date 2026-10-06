@@ -556,6 +556,13 @@ workspace files once the workload has ended and been reaped (no symlink followed
 nothing read outside the workspace, bounded at 1 MiB per stream and 8 MiB of files),
 store the result in `<task-root>/<task>/<attempt>.output/` and record it with every
 digest before the end record, for the read-only `result` request to return;
+an `actions` grant, on a node started with `--action-channel`, gives the attempt its own
+action channel (ADR-0031: a Unix socket under `<task-root>/<task>/<attempt>.actions/`,
+bound at `/run/ward/actions.sock` and named by `WARD_ACTION_SOCKET`, served by node
+threads that share no parser with the protocol socket) on which the workload asks bounded
+`approval` and `decision` requests that the control plane lists with `actions` and
+answers with `answer`, every request recorded before it is visible and every answer
+before it is relayed, a control-protocol line answered with nothing;
 any grant the node cannot enforce is refused `unsupported_grant` at `admit`, so every
 workload that starts runs under exactly what its manifest says (node-integration.md
 §7.5, §9). The node answers `running` only after a confirmed spawn with
@@ -663,7 +670,9 @@ restarted node cuts a torn final frame, records `NodeAttemptRecovered` wherever 
 shows another state than the one recovered, and seals the log of a sealed task, before it
 serves; a log that does not verify stops it. Logs are bounded at 256 KiB with room kept
 for the closing records, never hold workload output itself (digests and counts of a
-returned result at most), and are never deleted by the node:
+returned result at most) nor the text of an action-channel request or answer (its
+`NodeActionRequested`, `NodeActionAnswered` and `NodeActionRefused` records carry sizes
+and digests), and are never deleted by the node:
 evicting a sealed task leaves its sealed log in place for the operator.
 
 The control-plane side of the contract ships as `ward-node-client` (#332 slice 8;

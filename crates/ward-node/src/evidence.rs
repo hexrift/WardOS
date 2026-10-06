@@ -23,6 +23,8 @@
 //!   the `stop` or `revoke` operation that ended it;
 //! * `NodeAttemptRecovered` when the state the node holds differs from the state the log
 //!   shows: after a restart, before the node serves, and before sealing;
+//! * `NodeActionRequested`, `NodeActionAnswered` and `NodeActionRefused` for the attempt's
+//!   action channel ([`crate::actions`]): sizes and digests, never the text;
 //! * `NodeAttemptSealed`, after which the log is sealed (`HEAD` written, files read-only).
 //!
 //! A log is at most [`MAX_EVIDENCE_LOG_BYTES`]. Records that do not end an attempt are
@@ -41,8 +43,8 @@ use thiserror::Error;
 use ward_events::log::{head_file_path, parse_head};
 use ward_events::{
     Blake3Hash, Chain, ChainError, ChainHead, EventRecord, FsyncPolicy, LogError, LogReader,
-    LogWriter, NodeAttemptOutcome, NodeAttemptState, NodeIntervention, Origin, SessionId,
-    Timestamp, WardEvent, encode_record,
+    LogWriter, NodeActionDecision, NodeAttemptOutcome, NodeAttemptState, NodeIntervention, Origin,
+    SessionId, Timestamp, WardEvent, encode_record,
 };
 use ward_node_protocol::{TaskBinding, TaskExecutionOutcome, TaskLifecycleState};
 
@@ -171,6 +173,21 @@ impl VerifiedEvidence {
         })
     }
 
+    /// The action-channel requests the log records as asked and never answered, oldest
+    /// first.
+    #[must_use]
+    pub fn unanswered_actions(&self) -> Vec<u32> {
+        let mut open = Vec::new();
+        for record in &self.records {
+            match &record.event {
+                WardEvent::NodeActionRequested { action, .. } => open.push(*action),
+                WardEvent::NodeActionAnswered { action, .. } => open.retain(|open| open != action),
+                _ => {}
+            }
+        }
+        open
+    }
+
     fn last_sealed_by(&self, operation: u64) -> bool {
         self.records.last().is_some_and(|record| {
             matches!(record.event, WardEvent::NodeAttemptSealed { operation: by } if by == operation)
@@ -297,9 +314,11 @@ impl AttemptEvidence {
     }
 
     /// Bring the log in line with the state a restarted node holds the attempt in, before
-    /// the node serves: cut off a torn final frame, record `NodeAttemptRecovered` if the log
-    /// shows another state or outcome, and seal it if the attempt is sealed. An attempt that
-    /// was never admitted and has no log is left without one.
+    /// the node serves: cut off a torn final frame, answer `cancelled` every action-channel
+    /// request the log shows unanswered (a restarted node holds no attempt running, so none
+    /// can be answered any more), record `NodeAttemptRecovered` if the log shows another
+    /// state or outcome, and seal it if the attempt is sealed. An attempt that was never
+    /// admitted and has no log is left without one.
     pub(crate) fn recover(
         &self,
         state: NodeAttemptState,
@@ -313,6 +332,7 @@ impl AttemptEvidence {
             }
             other => other?,
         };
+        let current = self.cancel_unanswered(current)?;
         let held = current.as_ref().and_then(VerifiedEvidence::state);
         if let (NodeAttemptState::Sealed, Some(operation)) = (state, sealed_by) {
             let ended = held
@@ -331,6 +351,31 @@ impl AttemptEvidence {
             current.as_ref(),
             WardEvent::NodeAttemptRecovered { state, outcome },
         )
+    }
+
+    fn cancel_unanswered(
+        &self,
+        mut current: Option<VerifiedEvidence>,
+    ) -> Result<Option<VerifiedEvidence>, EvidenceError> {
+        let unanswered = current
+            .as_ref()
+            .filter(|log| !log.is_sealed())
+            .map(VerifiedEvidence::unanswered_actions)
+            .unwrap_or_default();
+        for action in unanswered {
+            self.write(
+                current.as_ref(),
+                WardEvent::NodeActionAnswered {
+                    action,
+                    decision: NodeActionDecision::Cancelled,
+                    operation: None,
+                    note_bytes: 0,
+                    note: None,
+                },
+            )?;
+            current = self.open()?;
+        }
+        Ok(current)
     }
 
     fn open(&self) -> Result<Option<VerifiedEvidence>, EvidenceError> {
@@ -418,12 +463,19 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), EvidenceError> {
     Ok(())
 }
 
+/// Whether `event` may use the reserve kept for ending an attempt: the end, recovery and
+/// seal records, and the node's own answers to action-channel requests (`expired`,
+/// `cancelled`), which are bounded by the grant's `max_total` and must never be lost.
 const fn closes(event: &WardEvent) -> bool {
     matches!(
         event,
         WardEvent::NodeAttemptEnded { .. }
             | WardEvent::NodeAttemptRecovered { .. }
             | WardEvent::NodeAttemptSealed { .. }
+            | WardEvent::NodeActionAnswered {
+                operation: None,
+                ..
+            }
     )
 }
 
@@ -796,5 +848,82 @@ mod tests {
             }
         );
         assert_eq!(log.records().len(), 2);
+    }
+
+    #[test]
+    fn recovery_answers_every_unanswered_action_request_cancelled_before_the_recovered_state() {
+        let (_dir, root) = private_root();
+        let evidence = AttemptEvidence::new(&root, binding());
+        let requested = |action| WardEvent::NodeActionRequested {
+            action,
+            kind: ward_events::NodeActionKind::Approval,
+            summary_bytes: 1,
+            summary: Blake3Hash::hash(b"s"),
+            detail_bytes: 0,
+            detail: Blake3Hash::hash(b""),
+        };
+        evidence
+            .append(WardEvent::NodeAttemptLaunched {
+                operation: 3,
+                host_pid: 1,
+            })
+            .unwrap();
+        evidence.append(requested(1)).unwrap();
+        evidence.append(requested(2)).unwrap();
+        evidence
+            .append(WardEvent::NodeActionAnswered {
+                action: 1,
+                decision: NodeActionDecision::Approved,
+                operation: Some(9),
+                note_bytes: 0,
+                note: None,
+            })
+            .unwrap();
+        evidence.append(requested(3)).unwrap();
+        let dir = evidence_dir(&root, binding());
+        assert_eq!(
+            verify(&dir, binding()).unwrap().unanswered_actions(),
+            [2, 3]
+        );
+        evidence
+            .recover(
+                NodeAttemptState::Exited,
+                Some(NodeAttemptOutcome::Unknown),
+                None,
+            )
+            .unwrap();
+        let log = verify(&dir, binding()).unwrap();
+        assert!(log.unanswered_actions().is_empty());
+        let tail: Vec<&WardEvent> = log.records()[5..]
+            .iter()
+            .map(|record| &record.event)
+            .collect();
+        let cancelled = |action| WardEvent::NodeActionAnswered {
+            action,
+            decision: NodeActionDecision::Cancelled,
+            operation: None,
+            note_bytes: 0,
+            note: None,
+        };
+        assert_eq!(
+            tail,
+            [
+                &cancelled(2),
+                &cancelled(3),
+                &WardEvent::NodeAttemptRecovered {
+                    state: NodeAttemptState::Exited,
+                    outcome: Some(NodeAttemptOutcome::Unknown),
+                },
+            ]
+        );
+        // A second recovery has nothing left to answer.
+        evidence
+            .recover(
+                NodeAttemptState::Exited,
+                Some(NodeAttemptOutcome::Unknown),
+                None,
+            )
+            .unwrap();
+        assert_eq!(verify(&dir, binding()).unwrap().records().len(), 8);
     }
 }
