@@ -877,6 +877,38 @@ attempt holding the slot ends and completes under operation ids 1, 2, 3 and 6 an
 1, the replay of the first that is then started, and the refusal of a resources grant by
 the client and by the node itself.
 
+### 7.7 Isolation floors
+
+A node runs every attempt on a Capsule backend at an isolation level (`sandbox` <
+`container` < `microvm` < `vm`, each guaranteeing everything the ones before it do;
+[ADR-0039](decisions/ADR-0039-capsule-backends-and-isolation-levels.md) says what each
+does and does not cover). A manifest may require a minimum (node-integration.md §7.5):
+
+```json
+{"network":"offline","isolation":{"minimum":"microvm"}}
+```
+
+**The floor** is signed last in the manifest, after `hold`. `minimum` is `container`,
+`microvm` or `vm` and is the only field; without the field the floor is `sandbox`, which
+has no other spelling. `isolationFloor(level)` builds it and `workload.manifest` takes it;
+both refuse `sandbox`, an unknown level and anything else outside the grammar before
+anything is signed. `isolationFloorOf(envelope_json)` reads it back from the signed bytes.
+
+**The node's offer** is its capability document's existing `isolation` section:
+`namespaces.sandbox` for `sandbox` and `backends.<level>` for the others (§5). The node
+places an attempt on a backend at exactly its floor, never weaker, and refuses a floor it
+has no backend for `unsupported_grant` at `admit`; at this revision every node offers
+only `sandbox`. `offersIsolation(capabilities, level)` says whether, and
+`requireIsolation(capabilities, floor)` refuses, naming the flag and `unsupported_grant`,
+before a version is allocated or anything is signed.
+
+**The command line.** `control-plane.mjs run --isolation <level>` puts the floor in the
+manifest, reads the capability document first and exits 2, naming `unsupported_grant`, on
+a node without a backend at that level; the outcome lists the floor in `isolation`, and
+`replay` lists the recorded one. The node writes the backend and level that ran an
+attempt into its task record (`"capsule":{"backend":"bubblewrap","isolation":"sandbox"}`,
+node-integration.md §6.4); the evidence log does not name it yet.
+
 ## 8. Cancel
 
 Cancellation is `revoke`, never `stop` (§11.2): the lease is durably revoked first, then
@@ -977,7 +1009,10 @@ document's `resources` flags and `capacity` read before signing, `run --cpu-mill
 `capacity_exhausted` sent again as the same run with the same operation ids until it is
 accepted, given up once the wait is spent, revoked and sealed when cancelled while waiting (and
 never sent again when that revoke is refused),
-and never waited out by `replay`.
+and never waited out by `replay`, and isolation floors: the floor's grammar held to
+`ward-node-protocol`'s (`sandbox` and unknown levels refused, the §7.5 example signed byte
+for byte, last), the capability document's `isolation` flag for exactly that level read
+before signing, and `run --isolation` signed, listed, replayed and refused.
 The acceptance starts a real node with the client's generated
 key in its trust store, `--output-return` and `--action-channel` and proves `completes_and_seals`,
 `fails_with_exit_status`, `cancel_is_revoke_then_seal`, `replay_acts_on_nothing`,
@@ -1111,6 +1146,10 @@ plane deciding what to put through the node today:
   propagated by the operator. There is no enrolment, attestation or certificate
   revocation list, and the node reports handshakes on stderr, not in a durable record
   (#262, ADR-0038).
+- **A boundary stronger than the sandbox.** Every node offers only the `sandbox` level
+  (§7.7 above): a manifest that requires `container`, `microvm` or `vm` is refused, never
+  run weaker, and the backend that ran an attempt is in the node's task record, not in the
+  sealed evidence log (#263, ADR-0039).
 - **A queue on the node.** A node at its bound on what runs at once refuses a `start`
   `capacity_exhausted` and keeps nothing queued (§7.6 above): the client waits for a
   bounded time with the same start, and the control plane's own queue holds the rest.
