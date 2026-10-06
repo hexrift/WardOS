@@ -15,8 +15,13 @@
 #
 # A release carries two trains per architecture, each a tarball with its sidecar:
 #
-#   wardos-<version>-<arch>-linux.tar.gz           the runtime (package.sh)
-#   ward-node-<node-version>-<arch>-linux.tar.gz   the node
+#   wardos-<version>-<arch>-linux.tar.gz           the runtime (package.sh): ward,
+#                                                  wardd, ward-agent, ward-shell and
+#                                                  wardos-theme-render
+#   ward-node-<node-version>-<arch>-linux.tar.gz   the node: ward-node,
+#                                                  ward-node-adapter and ward-agent,
+#                                                  the shim a node names with
+#                                                  --agent-shim (issue #427)
 #
 # For every architecture that has any asset at all, both tarballs and both
 # sidecars must be present; a build job that packaged one train and lost the
@@ -26,7 +31,12 @@
 # the release version rather than the node's, or a leftover from another release
 # is refused, never silently attached), every sidecar must name
 # its own tarball and verify against its bytes, and every required architecture
-# must be present.
+# must be present. Every tarball must also carry its train's binaries, each an
+# executable regular file directly under the tarball's top directory
+# (<name>/<binary>, as package.sh writes it): a node tarball without the shim
+# would leave an operator who installs only the node nothing to name with
+# --agent-shim, and one whose shim unpacks as a symlink or without its execute
+# bit would be refused by the node at start.
 #
 # Exit codes:
 #   0   the set is complete; what it holds is printed per architecture.
@@ -45,10 +55,40 @@ semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[
 [[ "$version" =~ $semver_re ]] || { echo "check-release-set: not a SemVer version: '$version'" >&2; exit 1; }
 [[ "$node_version" =~ $semver_re ]] || { echo "check-release-set: not a SemVer node version: '$node_version'" >&2; exit 1; }
 
-# Each train is named by its own version (issue #275).
+# Each train is named by its own version (issue #275) and carries its own binaries.
 trains=(wardos ward-node)
 declare -A train_version=([wardos]="$version" [ward-node]="$node_version")
+declare -A train_binaries=(
+  [wardos]="ward wardd ward-agent ward-shell wardos-theme-render"
+  [ward-node]="ward-node ward-node-adapter ward-agent"
+)
 suffix="-linux.tar.gz"
+
+# missing_binaries TARBALL TOP BINARY... -> prints one line per binary that is not an
+# executable regular file at TOP/BINARY in TARBALL (or one line if TARBALL is not a
+# readable gzip tarball); prints nothing when all are there.
+missing_binaries() {
+  python3 - "$@" <<'PY'
+import sys
+import tarfile
+
+path, top, binaries = sys.argv[1], sys.argv[2], sys.argv[3:]
+try:
+    with tarfile.open(path, "r:gz") as archive:
+        members = {member.name: member for member in archive.getmembers()}
+except (OSError, tarfile.TarError) as error:
+    print(f"is not a readable gzip tarball ({error})")
+    sys.exit(0)
+for binary in binaries:
+    member = members.get(f"{top}/{binary}")
+    if member is None:
+        print(f"has no {top}/{binary}")
+    elif not member.isreg():
+        print(f"carries {top}/{binary} as something other than a regular file")
+    elif not member.mode & 0o100:
+        print(f"carries {top}/{binary} without its execute bit")
+PY
+}
 
 [[ -d "$dist_dir" ]] || { echo "check-release-set: no such directory: '$dist_dir'" >&2; exit 1; }
 
@@ -86,6 +126,16 @@ for path in "${tarballs[@]}"; do
     continue
   fi
   arches["$arch"]=1
+  # Fails closed: a tarball that cannot be inspected at all (no python3, a crash) is
+  # a problem, never a silent pass.
+  read -r -a binaries <<<"${train_binaries[$train]}"
+  if ! report="$(missing_binaries "$path" "${name%.tar.gz}" "${binaries[@]}")"; then
+    problem "'$name' could not be inspected for its binaries"
+    continue
+  fi
+  while IFS= read -r missing; do
+    [[ -n "$missing" ]] && problem "'$name' $missing"
+  done <<<"$report"
 done
 
 for path in "${sidecars[@]}"; do

@@ -379,7 +379,8 @@ workspace crates). The release stage takes the first three from the runtime tarb
 copies the last two when that tarball has them, which release tarballs from **v0.2** do
 (`release.yml` packages five from then on) and earlier releases do not (an image built
 from one has the desktop's packages and configuration but no shell surfaces), and takes
-the node's two from the release's node tarball, `ward-node-<node ver>-<arch>-linux.tar.gz`
+the node's two from the release's node tarball (which also carries `ward-agent`, the
+same build as the runtime tarball's, for an operator who installs the node alone), `ward-node-<node ver>-<arch>-linux.tar.gz`
 (`scripts/release/package.sh`, issue #275; the node version is the release manifest's
 `components["ward-node"].version`, passed as `WARDOS_NODE_VERSION`), checked against
 `WARDOS_NODE_SHA256` or `WARDOS_NODE_SHA256_AARCH64` the way the runtime tarball is

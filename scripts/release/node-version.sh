@@ -4,18 +4,23 @@
 # Usage: node-version.sh [--root <dir>] [--since <previous-release-ref>]
 #
 # The node train -- `ward-node` and `ward-node-client` (`ward-node-adapter`), the
-# two crates the node tarball ships -- is versioned on its own, apart from the
-# workspace version the runtime and the image carry. This script is the single
-# reader of that version. Without `--since` it prints the node version after
+# two crates whose binaries the node tarball ships under the node version -- is
+# versioned on its own, apart from the workspace version the runtime and the image
+# carry. The tarball also ships the operator's `ward-agent` shim (issue #427), which
+# keeps the workspace version because the runtime tarball ships it too: it does not
+# carry the node version, but it is part of what the node is built from. This
+# script is the single reader of the node version. Without `--since` it prints it after
 # proving it is consistent: both crates carry the same literal SemVer `version`
 # (not `version.workspace = true`), and every path dependency on either names it.
 #
 # With `--since <ref>` it also holds the version to the previous release: the node
 # version must differ from the one at <ref> exactly when the node's inputs differ,
-# and then be higher. The inputs are what the node binaries are built from:
+# and then be higher. The inputs are what the node tarball's binaries are built from:
 #
-#   - every workspace crate in the dependency closure of the two node crates,
-#     without its tests/ and benches/ (Cargo.lock names the closure);
+#   - every workspace crate in the dependency closure of the two node crates and
+#     of `ward-agent`, without its tests/ and benches/ (Cargo.lock names the
+#     closure), so a change to the shim the node tarball ships raises the node
+#     version as a change to the node does;
 #   - every locked third-party package in that closure (name, version, source,
 #     checksum), so a bumped dependency of the node counts and one only another
 #     crate uses does not;
@@ -32,8 +37,9 @@
 # Exit codes:
 #   0  consistent (and, with --since, moved exactly with the node); the version is
 #      printed on stdout.
-#   1  usage, a missing or malformed manifest, an unknown ref, or a version that is
-#      not SemVer or inherits the workspace version.
+#   1  usage, a missing or malformed manifest (a workspace without a node crate or
+#      without `ward-agent` included), an unknown ref, or a version that is not
+#      SemVer or inherits the workspace version.
 #   2  the node crates disagree, or a path requirement on one names another version.
 #   3  the node's inputs changed since <ref> and the node version did not.
 #   4  the node version changed since <ref> and nothing the node is built from did.
@@ -67,6 +73,10 @@ root = Path(sys.argv[1])
 since = sys.argv[2]
 
 NODE_TRAIN = ("ward-node", "ward-node-client")
+# The crates whose binaries the node tarball ships (scripts/release/package.sh): the
+# train, and the `ward-agent` shim a node names with --agent-shim (issue #427), which
+# carries the workspace version. Their dependency closure is the node's input.
+NODE_TARBALL = NODE_TRAIN + ("ward-agent",)
 SEMVER = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?"
@@ -128,9 +138,9 @@ for member in members:
         refuse(1, f"{member}/Cargo.toml has no package.name")
     manifests[name] = (member, data)
 
-for crate in NODE_TRAIN:
+for crate in NODE_TARBALL:
     if crate not in manifests:
-        refuse(1, f"the workspace has no '{crate}' crate; the node train is {', '.join(NODE_TRAIN)}")
+        refuse(1, f"the workspace has no '{crate}' crate; the node tarball ships {', '.join(NODE_TARBALL)}")
 
 versions: dict[str, str] = {}
 for crate in NODE_TRAIN:
@@ -220,7 +230,8 @@ if not isinstance(previous_version, str) or not SEMVER.match(previous_version):
 
 
 def lock_closure(lock: dict) -> tuple[set[str], set[tuple]]:
-    """The workspace crates and the locked third-party packages the node train pulls in."""
+    """The workspace crates and the locked third-party packages the node tarball's
+    crates pull in."""
     packages = lock.get("package", [])
     by_name: dict[str, list[dict]] = {}
     for package in packages:
@@ -234,7 +245,7 @@ def lock_closure(lock: dict) -> tuple[set[str], set[tuple]]:
         return candidates[0] if len(candidates) == 1 else None
 
     seen: set[tuple[str, str]] = set()
-    stack = [p for crate in NODE_TRAIN for p in by_name.get(crate, [])]
+    stack = [p for crate in NODE_TARBALL for p in by_name.get(crate, [])]
     crates: set[str] = set()
     third_party: set[tuple] = set()
     while stack:

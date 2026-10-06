@@ -116,8 +116,9 @@ reads `not_configured`.
 ### 2.3 Installing both
 
 The runtime tarball installs `ward`, `wardd` and `ward-agent` for a user
-([install.md](install.md) §1); the node tarball installs `ward-node` and
-`ward-node-adapter` for the host's operator (node-integration-guide.md §1). `install.sh`
+([install.md](install.md) §1); the node tarball installs `ward-node`,
+`ward-node-adapter` and the node's own `ward-agent` shim for the host's operator
+(node-integration-guide.md §1). `install.sh`
 never installs the node. Take both tarballs from the same release so that `ward replay`
 knows every record kind the node writes (§4.1), and record the release beside the
 deployment. On the WardOS image both are at `/usr/bin`, whether the image was built from

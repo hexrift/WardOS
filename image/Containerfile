@@ -27,8 +27,9 @@ ARG WARDOS_RELEASE=v0.4.1
 # build.sh fetches the one for --arch).
 ARG WARDOS_SHA256=8ed12f1dbf0b5cd4f5bb009773b5315ba658f51080ff646220d305a8b1f17930
 ARG WARDOS_SHA256_AARCH64=eceb8ef33a20a3bb34c02efc18578ea8217cd9ca32fef937c0e6c8bb0beecbfd
-# The same for the node tarball, ward-node-<node version>-<arch>-linux (ward-node and
-# ward-node-adapter; scripts/release/package.sh, issue #275). The node train has a
+# The same for the node tarball, ward-node-<node version>-<arch>-linux (ward-node,
+# ward-node-adapter and ward-agent; scripts/release/package.sh, issues #275 and #427;
+# the stage below takes ward-agent from the runtime tarball, the same build). The node train has a
 # version of its own, so the release manifest says which node tarball a release
 # carries: WARDOS_NODE_VERSION is that version and the checksums are its tarballs'.
 # Empty on purpose: releases up to v0.4.1 carry no node tarball, and the release stage

@@ -116,7 +116,11 @@ version, which the name carries. `components` names both trains' versions once: 
 top-level `version` is the release's (the runtime's, the image's and the tag's), and
 `components["ward-node"].version` is the node train's own
 ([compatibility.md](compatibility.md) §6; issue #275), which may stay the same across
-releases that change nothing the node is built from. `image/build.sh` reads the node
+releases that change nothing the node is built from. The manifest binds tarballs, not
+the files in them: the node tarball's digest covers `ward-node`, `ward-node-adapter` and
+the `ward-agent` shim it carries (#427) alike, and `check-release-set.sh` has refused,
+before the manifest is generated, any tarball missing a binary of its train.
+`image/build.sh` reads the node
 tarball a release carries from here.
 
 `node_protocol_window` is the `ward-node` protocol window the release serves

@@ -22,7 +22,8 @@ ward doctor
 The tarball also carries `ward-shell` and `wardos-theme-render` (the desktop's
 binaries, only useful with the desktop of §6) and a copy of `install.sh`. `ward-node`
 and `ward-node-adapter` are not in it: the node is a service of the host, released
-beside it as `ward-node-<node version>-<arch>-linux.tar.gz` under the node train's own
+beside it as `ward-node-<node version>-<arch>-linux.tar.gz` (with its own copy of
+`ward-agent`, the shim the node runs agent adapters under) under the node train's own
 version ([`compatibility.md`](compatibility.md) §6) and installed by its operator
 ([`node-integration-guide.md`](node-integration-guide.md) §1), not by `install.sh`.
 The checksum proves the tarball is the one CI attached to the release, not who built

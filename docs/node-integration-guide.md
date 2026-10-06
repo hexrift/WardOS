@@ -27,38 +27,60 @@ is the node train's own version, not the release's: the release manifest
 it stays the same across releases that change nothing the node is built from
 ([compatibility.md](compatibility.md) §6). `<arch>` is what
 `uname -m` prints on the host, `x86_64` or `aarch64`. It carries `ward-node`,
-`ward-node-adapter`, `LICENSE` and the documents, built from the release commit with
+`ward-node-adapter`, `ward-agent` (the shim a node runs hosted agent adapters under,
+below), `LICENSE` and the documents, built from the release commit with
 the pinned toolchain and `--locked`. Download both files from the
 [release](https://github.com/hexrift/WardOS/releases) you deploy, check the tarball
-before unpacking it, and install the two binaries:
+before unpacking it, and install the three binaries:
 
 ```bash
 arch="$(uname -m)"
 version="$(jq -r '.components["ward-node"].version' wardos-0.19.0-manifest.json)"  # the release you deploy
 sha256sum -c "ward-node-${version}-${arch}-linux.tar.gz.sha256"   # "OK", or stop here
 tar -xzf "ward-node-${version}-${arch}-linux.tar.gz"
-install -m 0755 "ward-node-${version}-${arch}-linux"/{ward-node,ward-node-adapter} /usr/local/bin/
+install -m 0755 "ward-node-${version}-${arch}-linux"/{ward-node,ward-node-adapter,ward-agent} /usr/local/bin/
 ward-node --version                                            # "ward-node <node version>"
 ```
+
+**The shim.** `ward-agent` lands beside `ward-node`. A node that hosts agent adapters
+(`--agent-adapter`) runs every hosted attempt under it when started with
+`--agent-shim /usr/local/bin/ward-agent` (on the image, `--agent-shim /usr/bin/ward-agent`;
+node-integration.md §2.1 and §6.10,
+[ADR-0037](decisions/ADR-0037-node-agent-shim-and-relay.md)). The node never looks for a
+shim on its own, so without the flag none is bound. It verifies the file when it starts
+and refuses to start unless the path is absolute and names a regular file (not a symlink),
+the file is executable by its owner, owned by root or by the node's user and writable by
+neither group nor others, its `--help` names `--relay`, and one run of `/bin/true`
+hardened over the task root succeeds (a kernel without Landlock stops the node here). The
+`install` above, run as root, gives the file exactly that shape: `root:root`, mode 0755.
+Name the installed copy, not the one in the unpacked tarball: `tar` run as root keeps the
+archive's owner, the release builder's uid, which the node refuses.
+The node checks the file and not the directory it is in, so keep it in a directory only
+root can write, as `/usr/local/bin` and `/usr/bin` are; a shim in a directory the node's
+user or anyone else can write could be swapped after the check. `ward-agent --version`
+prints the release version, not the node version: it is the same build as the runtime
+tarball's, and a change to it raises the node version all the same
+([compatibility.md](compatibility.md) §6).
 
 The checksum proves the tarball is the one CI attached to the release; releases are not
 signed or provenance-verified yet (node-security-limitations.md §3.3, ADR-0028).
 Releases cut before this revision carry no node tarball. `install.sh`, the runtime's
 installer, does not install the node: it is a per-user install of the session layer,
-and the node is a service of the host. On a WardOS host the two binaries are already in
-the image, at `/usr/bin/ward-node` and `/usr/bin/ward-node-adapter`, whether the image
+and the node is a service of the host. On a WardOS host the three binaries are already in
+the image, at `/usr/bin/ward-node`, `/usr/bin/ward-node-adapter` and `/usr/bin/ward-agent`,
+whether the image
 was built from a release (`image/Containerfile`'s release stage installs the node
 tarball, checksum-checked) or from a checkout (the images CI publishes;
 [node-release-readiness.md](node-release-readiness.md) §2): skip the install above,
 and point the unit of §3 at `/usr/bin/ward-node`.
 
-Without a release for the commit you deploy, build the same two binaries from it with
+Without a release for the commit you deploy, build the same three binaries from it with
 the pinned toolchain (`rust-toolchain.toml`), as the release does:
 
 ```bash
 git clone https://github.com/hexrift/WardOS && cd WardOS && git checkout <commit>   # the commit you deploy
-cargo build --release --locked -p ward-node -p ward-node-client
-install -m 0755 target/release/ward-node target/release/ward-node-adapter /usr/local/bin/
+cargo build --release --locked -p ward-node -p ward-node-client -p ward-agent
+install -m 0755 target/release/ward-node target/release/ward-node-adapter target/release/ward-agent /usr/local/bin/
 ```
 
 Either way, record what you installed, the release or the commit; the protocol window a

@@ -21,12 +21,38 @@ fresh_case() {
   printf '%s' "$dir"
 }
 
-# add_asset DIST NAME [BYTES] -> a tarball NAME.tar.gz with its matching sidecar.
+# The binaries each train's tarball carries under its top directory (package.sh).
+runtime_binaries=(ward wardd ward-agent ward-shell wardos-theme-render)
+node_binaries=(ward-node ward-node-adapter ward-agent)
+
+# add_asset DIST NAME [BINARY...] -> a tarball NAME.tar.gz, laid out as package.sh
+# writes it (NAME/<binary>, executable, plus LICENSE), with its matching sidecar.
+# Without BINARY arguments it carries its train's binaries.
 add_asset() {
-  local dist="$1" name="$2" bytes="${3:-payload-$2}"
-  printf '%s' "$bytes" >"$dist/$name.tar.gz"
+  local dist="$1" name="$2" stage bin
+  shift 2
+  local binaries=("$@")
+  if [[ ${#binaries[@]} -eq 0 ]]; then
+    case "$name" in
+      wardos-*) binaries=("${runtime_binaries[@]}") ;;
+      *) binaries=("${node_binaries[@]}") ;;
+    esac
+  fi
+  stage="$(mktemp -d "$work/stage.XXXXXX")"
+  mkdir -p "$stage/$name"
+  for bin in "${binaries[@]}"; do
+    printf '#!/bin/sh\necho %s\n' "$bin" >"$stage/$name/$bin"
+    chmod 0755 "$stage/$name/$bin"
+  done
+  printf 'license\n' >"$stage/$name/LICENSE"
+  tar -C "$stage" -czf "$dist/$name.tar.gz" "$name"
+  rm -rf "$stage"
   (cd "$dist" && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
 }
+
+# reseal DIST NAME -> rewrite NAME.tar.gz.sha256 for the tarball's current bytes, so a
+# case exercises the contents check rather than the digest check.
+reseal() { (cd "$1" && sha256sum "$2.tar.gz" >"$2.tar.gz.sha256"); }
 
 # add_arch DIST ARCH -> both trains for one architecture.
 add_arch() {
@@ -123,6 +149,64 @@ c="$(fresh_case sidecar-names-other-file)"
 add_arch "$c/dist" x86_64
 cp "$c/dist/wardos-${version}-x86_64-linux.tar.gz.sha256" "$c/dist/ward-node-${node_version}-x86_64-linux.tar.gz.sha256"
 expect_status 1 "a sidecar that names another tarball is refused" bash "$sut" "$c/dist" "$version" "$node_version" x86_64
+
+### Contents ####################################################################
+
+# The node tarball carries the ward-agent shim a node names with --agent-shim
+# (issue #427, ADR-0037): a node release an operator could install without the shim
+# is not published.
+c="$(fresh_case node-without-shim)"
+add_asset "$c/dist" "wardos-${version}-x86_64-linux"
+add_asset "$c/dist" "ward-node-${node_version}-x86_64-linux" ward-node ward-node-adapter
+expect_status 1 "a node tarball without ward-agent is refused" bash "$sut" "$c/dist" "$version" "$node_version" x86_64
+err="$(bash "$sut" "$c/dist" "$version" "$node_version" x86_64 2>&1 >/dev/null || true)"
+grep -q "ward-node-${node_version}-x86_64-linux.tar.gz.*ward-agent" <<<"$err" ||
+  fail "node-without-shim: the refusal does not name the tarball and the missing ward-agent"
+echo "ok   the refusal names the tarball and the missing binary"
+
+c="$(fresh_case node-without-node)"
+add_asset "$c/dist" "wardos-${version}-x86_64-linux"
+add_asset "$c/dist" "ward-node-${node_version}-x86_64-linux" ward-node-adapter ward-agent
+expect_status 1 "a node tarball without ward-node is refused" bash "$sut" "$c/dist" "$version" "$node_version" x86_64
+
+c="$(fresh_case runtime-without-agent)"
+add_asset "$c/dist" "wardos-${version}-x86_64-linux" ward wardd ward-shell wardos-theme-render
+add_asset "$c/dist" "ward-node-${node_version}-x86_64-linux"
+expect_status 1 "a runtime tarball without ward-agent is refused" bash "$sut" "$c/dist" "$version" "$node_version" x86_64
+
+# Present is not enough: the shim must unpack as an executable regular file, the
+# shape the node's start-up check (AgentShim::verify) accepts.
+c="$(fresh_case shim-not-executable)"
+add_arch "$c/dist" x86_64
+name="ward-node-${node_version}-x86_64-linux"
+mkdir -p "$c/re" && tar -C "$c/re" -xzf "$c/dist/$name.tar.gz"
+chmod 0644 "$c/re/$name/ward-agent"
+tar -C "$c/re" -czf "$c/dist/$name.tar.gz" "$name"
+reseal "$c/dist" "$name"
+expect_status 1 "a node tarball whose ward-agent is not executable is refused" bash "$sut" "$c/dist" "$version" "$node_version" x86_64
+
+c="$(fresh_case shim-symlink)"
+add_arch "$c/dist" x86_64
+mkdir -p "$c/re" && tar -C "$c/re" -xzf "$c/dist/$name.tar.gz"
+rm "$c/re/$name/ward-agent"
+ln -s ward-node "$c/re/$name/ward-agent"
+tar -C "$c/re" -czf "$c/dist/$name.tar.gz" "$name"
+reseal "$c/dist" "$name"
+expect_status 1 "a node tarball whose ward-agent is a symlink is refused" bash "$sut" "$c/dist" "$version" "$node_version" x86_64
+
+c="$(fresh_case shim-elsewhere)"
+add_asset "$c/dist" "wardos-${version}-x86_64-linux"
+mkdir -p "$c/re/$name/bin"
+for bin in "${node_binaries[@]}"; do printf 'x' >"$c/re/$name/bin/$bin"; chmod 0755 "$c/re/$name/bin/$bin"; done
+tar -C "$c/re" -czf "$c/dist/$name.tar.gz" "$name"
+reseal "$c/dist" "$name"
+expect_status 1 "binaries outside the tarball's top directory do not count" bash "$sut" "$c/dist" "$version" "$node_version" x86_64
+
+c="$(fresh_case not-a-tarball)"
+add_arch "$c/dist" x86_64
+printf 'not a tarball' >"$c/dist/$name.tar.gz"
+reseal "$c/dist" "$name"
+expect_status 1 "a node asset that is not a gzip tarball is refused even with a matching sidecar" bash "$sut" "$c/dist" "$version" "$node_version" x86_64
 
 ### Guardrails ##################################################################
 
