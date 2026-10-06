@@ -44,21 +44,19 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::Read as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 use ward_policy::{CredentialRule, CredentialScope, Policy, ServiceId};
-use zeroize::Zeroizing;
 
-use super::http::{self, Endpoint};
+use super::provider::{open_private, segment_ok};
 use super::vault::{Engine, VaultProvider, WRITE};
-use super::{CredentialProvider, DegradedState, LeaseRequest, LeaseScope, LeasedSecret};
+use super::{CredentialProvider, DegradedState, LeaseRequest, LeaseScope};
 use super::{ProviderError, bound_ttl};
+
+pub use super::provider::{EngineKind, ProviderConfig, ProviderKind};
 
 /// The file name under the state root.
 pub const FILE: &str = "credentials.toml";
@@ -82,58 +80,6 @@ pub struct ConfigError(pub String);
 
 fn invalid(text: impl Into<String>) -> ConfigError {
     ConfigError(text.into())
-}
-
-/// Which HTTP API a provider speaks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
-    /// HashiCorp Vault.
-    Vault,
-    /// OpenBao (the same API).
-    Openbao,
-}
-
-/// One provider.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderConfig {
-    /// Which API.
-    pub kind: ProviderKind,
-    /// `https://host[:port]`.
-    pub address: String,
-    /// The broker's provider token, 0600.
-    pub token_file: PathBuf,
-    /// A PEM bundle to trust instead of the host store.
-    #[serde(default)]
-    pub ca_bundle: Option<PathBuf>,
-    /// The bound on every call.
-    #[serde(default = "default_timeout_ms")]
-    pub timeout_ms: u64,
-    /// The longest lease it may issue.
-    #[serde(default = "default_max_ttl")]
-    pub max_ttl_secs: u64,
-    /// Plain HTTP to a loopback IP literal, for tests only.
-    #[serde(default)]
-    pub insecure_loopback: bool,
-}
-
-const fn default_timeout_ms() -> u64 {
-    2000
-}
-
-const fn default_max_ttl() -> u64 {
-    3600
-}
-
-/// Which engine a service reads from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EngineKind {
-    /// KV v2.
-    Kv,
-    /// A token role.
-    Token,
 }
 
 /// The rule the host grants a service with.
@@ -242,38 +188,15 @@ impl ServiceConfig {
 
     /// The engine as the provider sees it.
     fn engine_of(&self) -> Result<Engine, ConfigError> {
-        let field = |v: &Option<String>, name: &str| {
-            v.clone()
-                .filter(|s| segment_ok(s))
-                .ok_or_else(|| invalid(format!("engine needs a valid `{name}`")))
-        };
-        Ok(match self.engine {
-            EngineKind::Kv => Engine::Kv {
-                mount: field(&self.mount, "mount")?,
-                path: field(&self.path, "path")?,
-                field: field(&self.field, "field")?,
-            },
-            EngineKind::Token => Engine::Token {
-                role: field(&self.role, "role")?,
-            },
-        })
+        super::provider::engine(
+            self.engine,
+            self.role.as_deref(),
+            self.mount.as_deref(),
+            self.path.as_deref(),
+            self.field.as_deref(),
+        )
+        .map_err(invalid)
     }
-}
-
-/// `a/b.c-d_e`: no empty segment, no `..`, nothing to escape.
-fn segment_ok(s: &str) -> bool {
-    !s.is_empty()
-        && s.split('/')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_'))
-}
-
-/// `[a-z0-9-]{1,32}`: a provider name also appears in rule references.
-fn provider_name_ok(s: &str) -> bool {
-    (1..=32).contains(&s.len())
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 #[derive(Deserialize)]
@@ -320,22 +243,7 @@ impl Registry {
 
     fn validate(&self) -> Result<(), ConfigError> {
         for (name, p) in &self.providers {
-            if !provider_name_ok(name) {
-                return Err(invalid(format!(
-                    "provider name {name:?} is not [a-z0-9-]{{1,32}}"
-                )));
-            }
-            http::check_address(
-                &p.address,
-                p.insecure_loopback,
-                Duration::from_millis(p.timeout_ms),
-            )
-            .map_err(|e| invalid(format!("provider {name}: {e}")))?;
-            if p.max_ttl_secs == 0 {
-                return Err(invalid(format!(
-                    "provider {name}: max_ttl_secs must be > 0"
-                )));
-            }
+            p.check(name).map_err(invalid)?;
         }
         let defaults = ward_policy::default_manifest().credentials;
         let mut prefixes: BTreeSet<&str> = RESERVED_PREFIXES.into_iter().collect();
@@ -450,17 +358,12 @@ impl Registry {
     /// bundle) and its token read from the private token file. A failure is
     /// the provider's degraded state, so it fails closed like an outage.
     pub fn provider(&self, name: &str, engine: Engine) -> Result<VaultProvider, ProviderError> {
-        let p = self.providers.get(name).ok_or_else(|| {
-            ProviderError::degraded(DegradedState::Misconfigured, format!("no provider {name}"))
-        })?;
-        let endpoint = Endpoint::parse(
-            &p.address,
-            p.ca_bundle.as_deref(),
-            p.insecure_loopback,
-            Duration::from_millis(p.timeout_ms).min(http::MAX_TIMEOUT),
-        )?;
-        let token = read_token(&p.token_file)?;
-        Ok(VaultProvider::new(name, endpoint, token, engine))
+        self.providers
+            .get(name)
+            .ok_or_else(|| {
+                ProviderError::degraded(DegradedState::Misconfigured, format!("no provider {name}"))
+            })?
+            .connect(name, engine)
     }
 
     /// Whether provider `name` can serve now: its configuration, its token
@@ -524,67 +427,6 @@ impl Registry {
         };
         Ok((Arc::new(provider), request))
     }
-}
-
-/// Open `path` without following a symlink and read it, refusing anything
-/// but a regular file owned by this user with none of `forbidden_mode` bits
-/// set. `Ok(None)` when it does not exist.
-fn open_private(path: &Path, forbidden_mode: u32) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits() | nix::fcntl::OFlag::O_NONBLOCK.bits())
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(format!(
-                "{}: cannot open ({}; a symlink is refused)",
-                path.display(),
-                e.kind()
-            ));
-        }
-    };
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("{}: {}", path.display(), e.kind()))?;
-    if !meta.is_file() {
-        return Err(format!("{}: not a regular file", path.display()));
-    }
-    if meta.uid() != nix::unistd::getuid().as_raw() {
-        return Err(format!("{}: not owned by this user", path.display()));
-    }
-    if meta.mode() & forbidden_mode != 0 {
-        return Err(format!(
-            "{}: mode {:o} is too open",
-            path.display(),
-            meta.mode() & 0o777
-        ));
-    }
-    let mut out = Zeroizing::new(Vec::new());
-    let mut file: File = file;
-    file.read_to_end(&mut out)
-        .map_err(|e| format!("{}: {}", path.display(), e.kind()))?;
-    Ok(Some(out))
-}
-
-/// The broker's provider token: a regular file of this user's with no group
-/// or other access, its first line trimmed.
-fn read_token(path: &Path) -> Result<LeasedSecret, ProviderError> {
-    let misconfigured = |m: String| ProviderError::degraded(DegradedState::Misconfigured, m);
-    let bytes = open_private(path, 0o077)
-        .map_err(misconfigured)?
-        .ok_or_else(|| misconfigured(format!("{}: token file missing", path.display())))?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| misconfigured(format!("{}: token is not text", path.display())))?;
-    let token = text.lines().next().unwrap_or_default().trim();
-    if token.is_empty() {
-        return Err(misconfigured(format!(
-            "{}: token file is empty",
-            path.display()
-        )));
-    }
-    Ok(LeasedSecret::new(token.as_bytes().to_vec()))
 }
 
 #[cfg(test)]

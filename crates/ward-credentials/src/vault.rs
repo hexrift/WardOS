@@ -12,7 +12,7 @@
 //!   maximum itself; the broker's rules hold its answers to them as well.
 //!
 //! The broker authenticates with its own token (`X-Vault-Token`, read from a
-//! 0600 file by [`super::config`]). Every call is bounded by the endpoint's
+//! 0600 file by [`super::provider`]). Every call is bounded by the endpoint's
 //! timeout ([`super::http`]). Error details name the step and the status,
 //! never a body or a token.
 
