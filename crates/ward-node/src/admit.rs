@@ -28,13 +28,17 @@
 //!     `actions` grant only on a node that offers the action channel
 //!     ([`NodeAdmission::with_action_channel`]) and only within its ceilings
 //!     ([`ward_node_protocol::MAX_ACTION_PENDING`], [`ward_node_protocol::MAX_ACTION_TOTAL`],
-//!     [`ward_node_protocol::MAX_ACTION_WAIT_SECS`]); any other grant is refused
+//!     [`ward_node_protocol::MAX_ACTION_WAIT_SECS`]), and a `credentials` grant only on a
+//!     node that enforces a network allowlist and whose operator configured every service
+//!     it names, for that service's host and within its ceiling
+//!     ([`NodeAdmission::with_credentials`]); any other grant is refused
 //!     `unsupported_grant`, after authority is proven and before the version is committed,
 //!     so a refused grant consumes nothing.
 //!
 //! Each failure is a typed [`TaskLifecycleRejectionReason`]. Task-registry checks
 //! (existence, exact binding, `Created` state) come first, in [`crate::task`].
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ward_authority::revocation::{
@@ -52,6 +56,7 @@ use ward_node_protocol::{
 
 use crate::admission::{TaskAdmissionIdentity, TaskAuthorityError, TrustedTaskAdmission};
 use crate::cgroup::ResourceEnforcement;
+use crate::credentials::NodeCredentials;
 use crate::issuer::TrustedIssuers;
 use crate::state::{NodeState, NodeStateError};
 
@@ -123,6 +128,7 @@ pub struct NodeAdmission {
     output_return: bool,
     resources: Option<ResourceEnforcement>,
     action_channel: bool,
+    credentials: Option<Arc<NodeCredentials>>,
 }
 
 impl std::fmt::Debug for NodeAdmission {
@@ -135,6 +141,7 @@ impl std::fmt::Debug for NodeAdmission {
             .field("output_return", &self.output_return)
             .field("resources", &self.resources)
             .field("action_channel", &self.action_channel)
+            .field("credentials", &self.credentials)
             .finish_non_exhaustive()
     }
 }
@@ -151,6 +158,7 @@ impl NodeAdmission {
             output_return: false,
             resources: None,
             action_channel: false,
+            credentials: None,
         }
     }
 
@@ -210,6 +218,23 @@ impl NodeAdmission {
     #[must_use]
     pub const fn honours_action_channel(&self) -> bool {
         self.action_channel
+    }
+
+    /// Which `credentials` grants are honoured (check 10): only on a node whose operator
+    /// configured services ([`NodeCredentials`]) and that enforces a network allowlist,
+    /// only for a configured service, its host and within its ceiling. The task registry
+    /// sets this from its execution, so what `admit` accepts is exactly what `start`
+    /// leases.
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: Option<Arc<NodeCredentials>>) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
+    /// Whether a manifest's `credentials` grant can be honoured at all.
+    #[must_use]
+    pub const fn honours_credentials(&self) -> bool {
+        self.network_allowlist && self.credentials.is_some()
     }
 
     /// This node's identity: the only audience it admits.
@@ -314,6 +339,18 @@ impl NodeAdmission {
                 .is_some_and(|enforcement| enforcement.honours(grant))
         {
             return Err(Reason::UnsupportedGrant);
+        }
+        if let Some(grants) = manifest.credentials() {
+            let honoured = self.network_allowlist
+                && self.credentials.as_ref().is_some_and(|credentials| {
+                    grants
+                        .grants()
+                        .iter()
+                        .all(|grant| credentials.honours(grant))
+                });
+            if !honoured {
+                return Err(Reason::UnsupportedGrant);
+            }
         }
 
         Ok(VerifiedAdmission {
@@ -731,5 +768,55 @@ mod tests {
         let offline = TaskAdmissionEnvelope::new(envelope_input(lifecycle_binding())).unwrap();
         assert!(verify_signed(&plain, &offline, &issuer_keypair()).is_ok());
         assert!(verify_signed(&channel, &offline, &issuer_keypair()).is_ok());
+    }
+
+    #[test]
+    fn a_credentials_grant_is_honoured_only_for_a_configured_service_within_its_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = Some(std::sync::Arc::new(
+            crate::credentials::NodeCredentials::parse(crate::test_support::CREDENTIALS).unwrap(),
+        ));
+        let allowlisting = node_admission(&dir.path().join("plain"), &FixedClock::at(NOW))
+            .with_network_allowlist(true);
+        let brokering = node_admission(&dir.path().join("brokering"), &FixedClock::at(NOW))
+            .with_network_allowlist(true)
+            .with_credentials(configured.clone());
+        let offline_brokering = node_admission(&dir.path().join("offline"), &FixedClock::at(NOW))
+            .with_credentials(configured);
+        assert!(!allowlisting.honours_credentials());
+        assert!(brokering.honours_credentials());
+        let with = |grants: &[(&str, &str, u32)]| {
+            let mut input = envelope_input(lifecycle_binding());
+            crate::test_support::with_manifest(
+                &mut input,
+                crate::test_support::credentials_manifest(grants),
+            );
+            TaskAdmissionEnvelope::new(input).unwrap()
+        };
+        let modest = with(&[
+            ("artifacts", "artifacts.example.com", 900),
+            ("registry", "registry.example.com", 60),
+        ]);
+        assert!(verify_signed(&brokering, &modest, &issuer_keypair()).is_ok());
+        for node in [&allowlisting, &offline_brokering] {
+            assert_eq!(
+                verify_signed(node, &modest, &issuer_keypair()).unwrap_err(),
+                Reason::UnsupportedGrant
+            );
+        }
+        for refused in [
+            with(&[("artifacts", "artifacts.example.com", 901)]),
+            with(&[("registry", "registry.example.com", 61)]),
+            with(&[("unknown", "artifacts.example.com", 60)]),
+            with(&[("artifacts", "registry.example.com", 60)]),
+        ] {
+            assert_eq!(
+                verify_signed(&brokering, &refused, &issuer_keypair()).unwrap_err(),
+                Reason::UnsupportedGrant
+            );
+        }
+        let offline = TaskAdmissionEnvelope::new(envelope_input(lifecycle_binding())).unwrap();
+        assert!(verify_signed(&allowlisting, &offline, &issuer_keypair()).is_ok());
+        assert!(verify_signed(&brokering, &offline, &issuer_keypair()).is_ok());
     }
 }

@@ -192,7 +192,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use ward_events::{
     Blake3Hash, NodeAttemptEnd, NodeAttemptOutcome, NodeIntervention, NodeResourceUsage, Pid,
-    ProcessRef, TaskId, WardEvent,
+    ProcessRef, RevokeReason, TaskId, WardEvent,
 };
 use ward_node_protocol::{
     ActionDecision, ActionNote, ActionRejectionReason, AdmissionEnvelopeJson, AttemptOutput,
@@ -206,11 +206,14 @@ use ward_node_protocol::{
 use crate::actions::{AttemptActions, actions_dir_beside};
 use crate::admission::TrustedTaskAdmission;
 use crate::admit::{NodeAdmission, VerifiedAdmission};
+use crate::credentials::{
+    AttemptCredentials, NodeCredentials, Renewal, Revoked, credentials_dir, credentials_dir_beside,
+};
 use crate::egress::{AttemptEgress, DEFAULT_QUIESCE, Drained, overflow_marker};
 use crate::evidence::{AttemptEvidence, attempt_outcome, attempt_state};
 use crate::execution::{
-    LaunchRequest, NodeExecution, SandboxLauncher, SpawnError, StopSignal, TaskLauncher,
-    WorkloadEnd, WorkloadExit, WorkloadFreezer, WorkloadProcess,
+    LaunchRequest, NodeExecution, RunningWorkload, SandboxLauncher, SpawnError, StopSignal,
+    TaskLauncher, WorkloadEnd, WorkloadExit, WorkloadFreezer, WorkloadProcess,
 };
 use crate::output::{AttemptOutputStore, CapturedStdio, collect, collected_event};
 use crate::records::{
@@ -276,6 +279,7 @@ struct Attempt {
     reaped: Arc<Reaped>,
     network: NetworkTally,
     actions: Option<Arc<AttemptActions>>,
+    credentials: Option<Arc<AttemptCredentials>>,
 }
 
 /// How many egress verdicts an attempt has recorded, and how many it could not.
@@ -503,7 +507,14 @@ impl TaskRegistry {
                 execution
                     .as_ref()
                     .is_some_and(NodeExecution::honours_action_channel),
+            )
+            .with_credentials(
+                execution
+                    .as_ref()
+                    .and_then(NodeExecution::credentials)
+                    .cloned(),
             );
+        let unconfigured = NodeCredentials::default();
         let survivors: Arc<dyn TaskLauncher> = execution
             .as_ref()
             .map_or_else(|| Arc::new(SandboxLauncher), NodeExecution::launcher);
@@ -515,8 +526,13 @@ impl TaskRegistry {
                 store.write(&task.record())?;
             }
             if let Some(execution) = &execution {
+                let revoked = execution
+                    .credentials()
+                    .map_or(&unconfigured, AsRef::as_ref)
+                    .recover(&credentials_dir(execution.task_root().dir(), task.binding));
                 AttemptEvidence::new(execution.task_root().dir(), task.binding)
-                    .recover(
+                    .recover_after(
+                        revoked,
                         attempt_state(task.state),
                         task.receipt
                             .map(|receipt| attempt_outcome(receipt.outcome())),
@@ -1166,7 +1182,7 @@ impl TaskRegistry {
     ) -> TaskLifecycleResponse {
         match self.prepare_start(context, operation_id, binding) {
             Ok(Prepared::Replay(state)) => context.accepted(operation_id, binding, state),
-            Ok(Prepared::Launch(request, launcher, timeout, actions)) => {
+            Ok(Prepared::Launch(request, launcher, timeout, started)) => {
                 match self.launch(
                     registry,
                     operation_id,
@@ -1174,7 +1190,7 @@ impl TaskRegistry {
                     *request,
                     &launcher,
                     timeout,
-                    actions,
+                    *started,
                 ) {
                     Ok(state) => context.accepted(operation_id, binding, state),
                     Err(reason) => context.rejected(Some(operation_id), binding, reason),
@@ -1259,11 +1275,36 @@ impl TaskRegistry {
             Some(actions) => request.with_action_socket(actions.socket().to_path_buf()),
             None => request,
         };
+        let credentials = match manifest.credentials() {
+            Some(grants) => {
+                let issued = execution
+                    .credentials()
+                    .zip(credentials_dir_beside(request.workspace()))
+                    .and_then(|(credentials, dir)| {
+                        credentials
+                            .issue(&dir, binding, grants, request.budget())
+                            .ok()
+                    });
+                let Some(issued) = issued else {
+                    discard(request.workspace());
+                    return Err(Reason::ResourceUnavailable);
+                };
+                Some(Arc::new(issued))
+            }
+            None => None,
+        };
+        let request = match &credentials {
+            Some(credentials) => request.with_credential_routes(credentials.routes()),
+            None => request,
+        };
         Ok(Prepared::Launch(
             Box::new(request),
             execution.launcher(),
             execution.spawn_timeout(),
-            actions,
+            Box::new(Started {
+                actions,
+                credentials,
+            }),
         ))
     }
 
@@ -1280,7 +1321,10 @@ impl TaskRegistry {
         request: LaunchRequest,
         launcher: &Arc<dyn TaskLauncher>,
         spawn_timeout: Duration,
-        actions: Option<Arc<AttemptActions>>,
+        Started {
+            actions,
+            credentials,
+        }: Started,
     ) -> Result<TaskLifecycleState, Reason> {
         let journal = Journal(self.store.as_ref());
         let evidence = Evidence::of(self.execution.as_ref());
@@ -1304,6 +1348,7 @@ impl TaskRegistry {
         };
         let launcher = Arc::clone(launcher);
         let tended = actions.clone();
+        let leased = credentials.clone();
         let thread = std::thread::Builder::new()
             .name("ward-node-reaper".to_owned())
             .spawn(move || {
@@ -1323,17 +1368,7 @@ impl TaskRegistry {
                     reaper.reaped.set();
                     return;
                 }
-                let egress = workload.egress();
-                let WorkloadEnd { exit, stdio, usage } = workload.wait(&reaper.stop, &mut || {
-                    reaper.drain(egress.as_deref());
-                    reaper.tend(tended.as_deref());
-                });
-                let last = egress.as_deref().map(|egress| {
-                    egress.quiesce(DEFAULT_QUIESCE);
-                    egress.drain()
-                });
-                let output = collect_output(&request, exit, stdio);
-                reaper.record(exit, last, output.as_ref(), usage);
+                reaper.watch(workload, &request, tended.as_deref(), leased.as_deref());
             });
 
         let spawned = match thread {
@@ -1372,6 +1407,7 @@ impl TaskRegistry {
             reaped: done,
             network: NetworkTally::default(),
             actions,
+            credentials,
         });
         Ok(task.record_spawn(journal, evidence, operation_id, pid))
     }
@@ -1510,6 +1546,7 @@ impl TaskRegistry {
             .is_some_and(|attempt| attempt.revoke_requested_by == Some(operation_id));
         if live(task.state) && requested {
             task.finish_actions(evidence);
+            task.finish_credentials(evidence, RevokeReason::UserRevoked);
             return match task.commit(
                 journal,
                 |task| evidence.append(task.binding, task.ended_event(NodeAttemptEnd::Unconfirmed)),
@@ -1692,9 +1729,12 @@ impl TaskRegistry {
         binding: TaskBinding,
         reaped: &Arc<Reaped>,
         exit: WorkloadExit,
-        last: Option<Drained>,
-        output: Option<&AttemptOutput>,
-        usage: Option<NodeResourceUsage>,
+        Ended {
+            last,
+            output,
+            usage,
+            revoked,
+        }: Ended<'_>,
     ) {
         let journal = Journal(self.store.as_ref());
         let evidence = Evidence::of(self.execution.as_ref());
@@ -1726,7 +1766,30 @@ impl TaskRegistry {
         }
         if task.finish_attempt(exit, reaped) {
             let _ = journal.write(&task.record());
+            task.record_revoked(evidence, revoked.as_deref().unwrap_or_default());
             let _ = evidence.append(binding, task.ended_event(attempt_end(exit)));
+        }
+    }
+
+    /// Record the renewals the reaper of the live attempt `reaped` belongs to obtained, each
+    /// put into effect only once its record is appended.
+    fn record_renewals(
+        &self,
+        binding: TaskBinding,
+        reaped: &Arc<Reaped>,
+        renewals: Vec<Renewal<'_>>,
+    ) {
+        let evidence = Evidence::of(self.execution.as_ref());
+        let current = self
+            .tasks
+            .get(&binding.task())
+            .filter(|task| task.binding == binding && live(task.state))
+            .and_then(|task| task.attempt.as_ref())
+            .is_some_and(|attempt| Arc::ptr_eq(&attempt.reaped, reaped));
+        for renewal in renewals {
+            if current && evidence.append(binding, renewal.event().clone()).is_ok() {
+                renewal.apply();
+            }
         }
     }
 }
@@ -1761,8 +1824,24 @@ enum Prepared {
         Box<LaunchRequest>,
         Arc<dyn TaskLauncher>,
         Duration,
-        Option<Arc<AttemptActions>>,
+        Box<Started>,
     ),
+}
+
+/// What a `start` prepared beside the launch: the attempt's action channel and its leased
+/// credentials, if its manifest grants them.
+struct Started {
+    actions: Option<Arc<AttemptActions>>,
+    credentials: Option<Arc<AttemptCredentials>>,
+}
+
+/// What the reaper observed once the workload ended, beside how it ended: the proxy's last
+/// verdicts, the collected output, what the tree used and the leases it revoked.
+struct Ended<'a> {
+    last: Option<Drained>,
+    output: Option<&'a AttemptOutput>,
+    usage: Option<NodeResourceUsage>,
+    revoked: Option<Vec<Revoked>>,
 }
 
 /// What an attempt's reaper thread needs to record how the attempt ended.
@@ -1807,16 +1886,62 @@ impl Reaper {
         }
     }
 
-    fn record(
+    /// Wait for the spawned `workload` of `request` to end, tending its egress verdicts,
+    /// action channel and leases meanwhile; then revoke its leases, quiesce its proxy,
+    /// collect its output and record how it ended.
+    fn watch(
         self,
-        exit: WorkloadExit,
-        last: Option<Drained>,
-        output: Option<&AttemptOutput>,
-        usage: Option<NodeResourceUsage>,
+        workload: Box<dyn RunningWorkload>,
+        request: &LaunchRequest,
+        actions: Option<&AttemptActions>,
+        credentials: Option<&AttemptCredentials>,
     ) {
+        let egress = workload.egress();
+        let WorkloadEnd { exit, stdio, usage } = workload.wait(&self.stop, &mut || {
+            self.drain(egress.as_deref());
+            self.tend(actions);
+            self.renew(credentials);
+        });
+        let revoked = credentials.map(AttemptCredentials::revoke);
+        let last = egress.as_deref().map(|egress| {
+            egress.quiesce(DEFAULT_QUIESCE);
+            egress.drain()
+        });
+        let output = collect_output(request, exit, stdio);
+        self.record(
+            exit,
+            Ended {
+                last,
+                output: output.as_ref(),
+                usage,
+                revoked,
+            },
+        );
+    }
+
+    /// Renew the attempt's leases that are due at the provider, outside the registry lock,
+    /// then have the registry record each before it takes effect; nothing due costs no
+    /// lock.
+    fn renew(&self, credentials: Option<&AttemptCredentials>) {
+        let Some(credentials) = credentials else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        if !credentials.due(now) {
+            return;
+        }
+        let renewals = credentials.renew(now);
+        if let Some(registry) = self.registry.upgrade()
+            && let Ok(registry) = registry.lock()
+        {
+            registry.record_renewals(self.binding, &self.reaped, renewals);
+        }
+    }
+
+    fn record(self, exit: WorkloadExit, ended: Ended<'_>) {
         if let Some(registry) = self.registry.upgrade() {
             if let Ok(mut registry) = registry.lock() {
-                registry.record_exit(self.binding, &self.reaped, exit, last, output, usage);
+                registry.record_exit(self.binding, &self.reaped, exit, ended);
                 // Under the lock that recorded the end, so whoever sees the attempt ended
                 // also sees its slot free (`executing`, `--max-running`).
                 self.reaped.set();
@@ -2070,15 +2195,16 @@ impl NodeTask {
                 self.state = TaskLifecycleState::Running;
                 if journal.write(&self.record()).is_err() {
                     false
-                } else if evidence
-                    .append(
-                        self.binding,
-                        WardEvent::NodeAttemptLaunched {
-                            operation: operation_id.get(),
-                            host_pid,
-                        },
-                    )
-                    .is_ok()
+                } else if self.record_issued(evidence)
+                    && evidence
+                        .append(
+                            self.binding,
+                            WardEvent::NodeAttemptLaunched {
+                                operation: operation_id.get(),
+                                host_pid,
+                            },
+                        )
+                        .is_ok()
                 {
                     return self.state;
                 } else {
@@ -2091,6 +2217,7 @@ impl NodeTask {
             attempt.stop.request();
         }
         self.finish_actions(evidence);
+        self.finish_credentials(evidence, RevokeReason::SessionEnded);
         self.finish(TaskLifecycleState::Exited, TaskExecutionOutcome::Unknown);
         if rewrite {
             let _ = journal.write(&self.record());
@@ -2186,6 +2313,48 @@ impl NodeTask {
             .and_then(|attempt| attempt.actions.as_ref())
         {
             actions.finish(&mut |event| evidence.append(binding, event).is_ok());
+        }
+    }
+
+    fn credentials(&self) -> Option<&Arc<AttemptCredentials>> {
+        self.attempt
+            .as_ref()
+            .and_then(|attempt| attempt.credentials.as_ref())
+    }
+
+    /// Append what the attempt's credentials issued and denied, before the launch record;
+    /// false if a record could not be appended.
+    fn record_issued(&self, evidence: Evidence<'_>) -> bool {
+        self.credentials().is_none_or(|credentials| {
+            credentials
+                .take_records()
+                .into_iter()
+                .all(|event| evidence.append(self.binding, event).is_ok())
+        })
+    }
+
+    /// The attempt has ended without its reaper: withdraw and revoke its leases, recorded
+    /// for `reason` before the end.
+    fn finish_credentials(&self, evidence: Evidence<'_>, reason: RevokeReason) {
+        if let Some(credentials) = self.credentials() {
+            for event in credentials.finish(reason) {
+                let _ = evidence.append(self.binding, event);
+            }
+        }
+    }
+
+    /// Record the leases the reaper revoked once the workload ended, for the reason the
+    /// attempt ended with, before the end.
+    fn record_revoked(&self, evidence: Evidence<'_>, revoked: &[Revoked]) {
+        let reason = if self.state == TaskLifecycleState::Revoked {
+            RevokeReason::UserRevoked
+        } else {
+            RevokeReason::SessionEnded
+        };
+        if let Some(credentials) = self.credentials() {
+            for event in credentials.records_of(revoked, reason) {
+                let _ = evidence.append(self.binding, event);
+            }
         }
     }
 

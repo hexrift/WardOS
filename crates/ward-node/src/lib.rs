@@ -78,6 +78,7 @@ pub mod admission;
 pub mod admit;
 pub mod audit;
 pub mod cgroup;
+pub mod credentials;
 pub mod egress;
 pub mod evidence;
 pub mod execution;
@@ -102,10 +103,10 @@ use std::time::{Duration, Instant};
 use nix::unistd::{Gid, Uid};
 use thiserror::Error;
 use ward_node_protocol::{
-    ActionCapabilities, CapabilityDiscoveryContext, HandshakeRequest, HandshakeResponse,
-    LifecycleCapabilities, NamespaceCapabilities, NodeCapabilities, OutputCapabilities,
-    SupportedProtocolRange, TaskLifecycleContext, TaskResultRequest, WARD_NODE_PROTOCOL, negotiate,
-    supports_task_admission, supports_task_lifecycle,
+    ActionCapabilities, CapabilityDiscoveryContext, CredentialCapabilities, HandshakeRequest,
+    HandshakeResponse, LifecycleCapabilities, NamespaceCapabilities, NodeCapabilities,
+    OutputCapabilities, SupportedProtocolRange, TaskLifecycleContext, TaskResultRequest,
+    WARD_NODE_PROTOCOL, negotiate, supports_task_admission, supports_task_lifecycle,
 };
 
 use crate::admit::NodeAdmission;
@@ -198,6 +199,7 @@ pub struct NodeService {
     network_allowlist: bool,
     output_return: bool,
     action_channel: bool,
+    credentials: bool,
     tasks: Arc<Mutex<TaskRegistry>>,
 }
 
@@ -219,6 +221,7 @@ impl NodeService {
             network_allowlist: false,
             output_return: false,
             action_channel: false,
+            credentials: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::default())),
         })
     }
@@ -245,6 +248,7 @@ impl NodeService {
             network_allowlist: false,
             output_return: false,
             action_channel: false,
+            credentials: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_admission(
                 MAX_NODE_TASKS,
                 admission,
@@ -271,6 +275,7 @@ impl NodeService {
         let network_allowlist = execution.honours_network_allowlist();
         let output_return = execution.honours_output_return();
         let action_channel = execution.honours_action_channel();
+        let credentials = execution.honours_credentials();
         Ok(Self {
             capabilities,
             supported: WARD_NODE_PROTOCOL,
@@ -279,6 +284,7 @@ impl NodeService {
             network_allowlist,
             output_return,
             action_channel,
+            credentials,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_execution(
                 MAX_NODE_TASKS,
                 admission,
@@ -362,6 +368,7 @@ impl NodeService {
         let configured = self.capabilities;
         let mut isolation = configured.isolation();
         let mut network = configured.network();
+        let mut credentials = configured.credentials();
         let mut snapshots = configured.snapshots();
         let mut output = OutputCapabilities::NONE;
         let mut resources = None;
@@ -374,6 +381,10 @@ impl NodeService {
             };
             network.offline = self.executes;
             network.proxy_allowlist = self.executes && self.network_allowlist;
+            credentials = CredentialCapabilities {
+                proxy_injection: self.executes && self.credentials,
+                scoped_http_gateway: self.executes && self.credentials,
+            };
             snapshots.content_addressed = self.executes;
             output = OutputCapabilities {
                 stdio: self.executes && self.output_return,
@@ -410,7 +421,7 @@ impl NodeService {
             configured.capacity(),
             isolation,
             network,
-            configured.credentials(),
+            credentials,
             snapshots,
             configured.verifier(),
             lifecycle,
@@ -1686,12 +1697,38 @@ mod tests {
         )
     }
 
+    fn executing_service_brokering(network_allowlist: bool) -> Executing {
+        executing_service_configured(
+            capabilities(),
+            crate::execution::DEFAULT_STOP_TIMEOUT,
+            (network_allowlist, false, false),
+            Some(Arc::new(
+                crate::credentials::NodeCredentials::parse(crate::test_support::CREDENTIALS)
+                    .unwrap(),
+            )),
+        )
+    }
+
     fn executing_service_built(
         configured: NodeCapabilities,
         stop_timeout: Duration,
         network_allowlist: bool,
         output_return: bool,
         action_channel: bool,
+    ) -> Executing {
+        executing_service_configured(
+            configured,
+            stop_timeout,
+            (network_allowlist, output_return, action_channel),
+            None,
+        )
+    }
+
+    fn executing_service_configured(
+        configured: NodeCapabilities,
+        stop_timeout: Duration,
+        (network_allowlist, output_return, action_channel): (bool, bool, bool),
+        credentials: Option<Arc<crate::credentials::NodeCredentials>>,
     ) -> Executing {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
@@ -1711,7 +1748,8 @@ mod tests {
         .with_stop_timeout(stop_timeout)
         .with_network_allowlist(network_allowlist)
         .with_output_return(output_return)
-        .with_action_channel(action_channel);
+        .with_action_channel(action_channel)
+        .with_credentials(credentials);
         let service = NodeService::with_execution(configured, admission, execution).unwrap();
         Executing {
             root: dir.path().join("tasks"),
@@ -2049,7 +2087,11 @@ mod tests {
             observed.isolation().backends,
             capabilities().isolation().backends
         );
-        assert_eq!(observed.credentials(), capabilities().credentials());
+        assert_eq!(observed.credentials(), CredentialCapabilities::default());
+        assert_eq!(
+            discovered(&admitting, 1).1.credentials(),
+            capabilities().credentials()
+        );
         assert_eq!(observed.verifier(), capabilities().verifier());
         assert_eq!(
             discovered(&admitting, 1).1.isolation(),
@@ -2470,6 +2512,46 @@ mod tests {
             assert_eq!((served.scheduling(), served.resources()), (None, None));
         }
         let _ = (&loaded.root, &loaded.launcher, loaded.snapshot);
+    }
+
+    #[test]
+    fn credentials_are_advertised_only_by_a_node_brokering_them_behind_its_allowlist_at_one_three()
+    {
+        let brokering = executing_service_brokering(true);
+        let unenforced = executing_service_brokering(false);
+        let allowlisting = executing_service_enforcing_a_network_allowlist();
+        let (raw, observed) = discovered(&brokering.service, 3);
+        assert_eq!(
+            observed.credentials(),
+            ward_node_protocol::CredentialCapabilities {
+                proxy_injection: true,
+                scoped_http_gateway: true,
+            }
+        );
+        assert!(
+            raw.contains(r#""credentials":{"proxy_injection":true,"scoped_http_gateway":true}"#),
+            "{raw}"
+        );
+        for other in [&unenforced, &allowlisting] {
+            let (raw, observed) = discovered(&other.service, 3);
+            assert_eq!(
+                observed.credentials(),
+                ward_node_protocol::CredentialCapabilities::default()
+            );
+            assert!(
+                raw.contains(
+                    r#""credentials":{"proxy_injection":false,"scoped_http_gateway":false}"#
+                ),
+                "{raw}"
+            );
+        }
+        for minor in [1, 2] {
+            assert_eq!(
+                discovered(&brokering.service, minor).0,
+                discovered(&allowlisting.service, minor).0,
+                "1.{minor}"
+            );
+        }
     }
 
     #[test]

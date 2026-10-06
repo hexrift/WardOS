@@ -17,7 +17,10 @@
 //! built [`NodeExecution::with_network_allowlist`], binds the attempt's own egress proxy
 //! ([`crate::egress`]) at [`ward_launch::PROXY_SOCKET`], named in
 //! [`crate::egress::PROXY_SOCKET_ENV`], with a policy of exactly the manifest's hosts; the
-//! node never runs a workload under less, or more, than its manifest asked for.
+//! node never runs a workload under less, or more, than its manifest asked for. A
+//! `credentials` grant adds the routes that inject its leases to that proxy
+//! ([`LaunchRequest::with_credential_routes`], [`crate::credentials`]); nothing about it
+//! enters the sandbox.
 //!
 //! `pause` and `resume` act on the running workload through its [`WorkloadFreezer`], which
 //! the reaper hands back with the spawned pid. The sandbox freezer first pauses the
@@ -52,10 +55,12 @@ use ward_events::NodeResourceUsage;
 use ward_launch::freeze::{FrozenTree, TreeRoot, freeze_tree, kill_tree, thaw_tree};
 use ward_launch::{ACTION_SOCKET, Launch, PROXY_SOCKET, RunningLaunch};
 use ward_node_protocol::{HostAllowlist, MAX_OUTPUT_STDIO_BYTES, OutputGrant, ResourceGrant};
+use ward_proxy::{GatewayRoute, SystemResolver};
 use ward_snapshot::SnapshotStore;
 
 use crate::actions::ACTION_SOCKET_ENV;
 use crate::cgroup::ResourceEnforcement;
+use crate::credentials::NodeCredentials;
 use crate::egress::{AttemptEgress, PROXY_SOCKET_ENV, egress_dir_beside};
 use crate::output::{CapturedStdio, CapturedStream};
 use crate::scheduling::SchedulingLimits;
@@ -82,7 +87,7 @@ const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 pub const OUTPUT_CAPTURE_BYTES: usize = 64 * 1024;
 
 /// One workload launch, built only from node-owned state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct LaunchRequest {
     workspace: PathBuf,
     argv: Vec<String>,
@@ -91,6 +96,7 @@ pub struct LaunchRequest {
     output: Option<OutputGrant>,
     resources: Option<ResourceGrant>,
     action_socket: Option<PathBuf>,
+    credential_routes: Vec<GatewayRoute>,
 }
 
 impl LaunchRequest {
@@ -105,6 +111,7 @@ impl LaunchRequest {
             output: None,
             resources: None,
             action_socket: None,
+            credential_routes: Vec::new(),
         }
     }
 
@@ -151,6 +158,21 @@ impl LaunchRequest {
     #[must_use]
     pub fn action_socket(&self) -> Option<&Path> {
         self.action_socket.as_deref()
+    }
+
+    /// The same launch with the routes that inject the attempt's leased credentials
+    /// ([`crate::credentials`]), served by its egress proxy.
+    #[must_use]
+    pub fn with_credential_routes(mut self, routes: Vec<GatewayRoute>) -> Self {
+        self.credential_routes = routes;
+        self
+    }
+
+    /// The credential routes the attempt's egress proxy serves; empty without a
+    /// `credentials` grant.
+    #[must_use]
+    pub fn credential_routes(&self) -> &[GatewayRoute] {
+        &self.credential_routes
     }
 
     /// The output grant the admitted manifest carried; `None` when nothing is returned.
@@ -378,9 +400,14 @@ impl SandboxLauncher {
             .allowlist()
             .map(|allowlist| {
                 let dir = egress_dir_beside(request.workspace()).ok_or(SpawnError::Refused)?;
-                AttemptEgress::start(&dir, allowlist)
-                    .map(Arc::new)
-                    .map_err(|_| SpawnError::Refused)
+                AttemptEgress::start_routed(
+                    &dir,
+                    allowlist,
+                    request.credential_routes().to_vec(),
+                    Arc::new(SystemResolver),
+                )
+                .map(Arc::new)
+                .map_err(|_| SpawnError::Refused)
             })
             .transpose()?;
         let launch = sandbox_launch(request, egress.as_deref().map(AttemptEgress::socket));
@@ -561,6 +588,7 @@ pub struct NodeExecution {
     scheduling: Option<SchedulingLimits>,
     resources: Option<ResourceEnforcement>,
     action_channel: bool,
+    credentials: Option<Arc<NodeCredentials>>,
 }
 
 impl std::fmt::Debug for NodeExecution {
@@ -575,6 +603,7 @@ impl std::fmt::Debug for NodeExecution {
             .field("scheduling", &self.scheduling)
             .field("resources", &self.resources)
             .field("action_channel", &self.action_channel)
+            .field("credentials", &self.credentials)
             .finish_non_exhaustive()
     }
 }
@@ -599,6 +628,7 @@ impl NodeExecution {
             scheduling: None,
             resources: None,
             action_channel: false,
+            credentials: None,
         }
     }
 
@@ -693,6 +723,28 @@ impl NodeExecution {
     #[must_use]
     pub const fn honours_action_channel(&self) -> bool {
         self.action_channel
+    }
+
+    /// Broker the services `credentials` configures to attempts whose manifest grants them
+    /// ([`crate::credentials`], ADR-0034), on a node that also enforces a network
+    /// allowlist. `None`, the default, refuses every `credentials` grant `unsupported_grant`
+    /// and the node advertises `credentials` as `false`.
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: Option<Arc<NodeCredentials>>) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
+    /// The services this node brokers, if it honours `credentials` grants at all.
+    #[must_use]
+    pub fn credentials(&self) -> Option<&Arc<NodeCredentials>> {
+        self.credentials.as_ref().filter(|_| self.network_allowlist)
+    }
+
+    /// Whether this node honours a manifest's `credentials` grant.
+    #[must_use]
+    pub fn honours_credentials(&self) -> bool {
+        self.credentials().is_some()
     }
 
     /// The task root workspaces are allocated under.

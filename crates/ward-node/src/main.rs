@@ -1,8 +1,8 @@
 //! Local Ward node service executable.
 //!
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
-//! [--task-root <dir>] [--network-allowlist] [--output-return] [--action-channel]
-//! [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
+//! [--task-root <dir>] [--network-allowlist [--credentials <file>]] [--output-return]
+//! [--action-channel] [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
 //! [--client-uid <uid>]… [--client-group <group>]`
 //! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
@@ -25,7 +25,13 @@
 //! into the sandbox at `/run/ward/actions.sock` and named by `WARD_ACTION_SOCKET`, on which
 //! the workload asks and the node records, relays and answers; the control plane reads the
 //! pending requests with `actions` and answers them with `answer`, and the node advertises
-//! `actions`; without it such a manifest is refused `unsupported_grant`. With `--cgroup-root`
+//! `actions`; without it such a manifest is refused `unsupported_grant`. With `--credentials`
+//! as well (it needs `--network-allowlist`), the operator's credentials file names the
+//! providers and services the node brokers: a manifest's `credentials` grant for a
+//! configured service gets a short-lived lease, bounded by the attempt, that the attempt's
+//! egress proxy injects into requests for that service's host only, never into the
+//! sandbox, and that is revoked at its provider when the attempt ends; the node advertises
+//! `credentials`, and without the flag such a manifest is refused `unsupported_grant`. With `--cgroup-root`
 //! as well, every attempt runs in a cgroup of its own under that delegated cgroup v2
 //! directory, a manifest's `resources` limits are enforced there and what each attempt used
 //! is recorded in its task record and evidence log; without it such a manifest is refused
@@ -56,6 +62,7 @@ use clap::{Parser, Subcommand};
 use ward_events::{ExecutionAttemptId, NodeId, TaskId};
 use ward_node::admit::{NodeAdmission, SystemClock};
 use ward_node::cgroup::{CgroupLauncher, CgroupRoot, ResourceEnforcement};
+use ward_node::credentials::NodeCredentials;
 use ward_node::execution::{NodeExecution, SandboxLauncher, TaskLauncher};
 use ward_node::issuer::{IssuerKeyParseError, IssuerPublicKey, TrustedIssuers};
 use ward_node::peer::{ClientGroup, ClientUids};
@@ -118,6 +125,16 @@ struct Cli {
     /// `unsupported_grant`.
     #[arg(long, requires = "task_root")]
     action_channel: bool,
+    /// Broker credentials to admitted workloads: a TOML file of the operator's (the node
+    /// user's own, writable by no one else) naming credential providers and the services
+    /// they back. A manifest's `credentials` grant for a configured service gets a
+    /// short-lived lease, bounded by the attempt, that the attempt's egress proxy injects
+    /// into requests for the service's host only; the secret never enters the sandbox, and
+    /// every lease is revoked at its provider when the attempt ends. Advertise
+    /// `credentials`. Needs `--network-allowlist`. Without it every manifest with
+    /// `credentials` is refused `unsupported_grant`.
+    #[arg(long, value_name = "FILE", requires = "network_allowlist")]
+    credentials: Option<PathBuf>,
     /// A cgroup v2 directory delegated to the node (writable by its uid, with no process of
     /// its own): every attempt runs in a cgroup of its own under it, its manifest's
     /// `resources` limits are enforced there (`cpu.max`, `memory.max` with no swap,
@@ -203,32 +220,9 @@ enum SnapshotCommand {
 }
 
 fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-    match cli.command {
-        Some(Command::IssuerKeyId { public_key }) => {
-            println!("{}", issuer_key_id(&public_key)?);
-            return Ok(ExitCode::SUCCESS);
-        }
-        Some(Command::Snapshot {
-            command:
-                SnapshotCommand::Import {
-                    state_dir,
-                    project_dir,
-                },
-        }) => {
-            println!("{}", import(&state_dir, &project_dir)?);
-            return Ok(ExitCode::SUCCESS);
-        }
-        Some(Command::Audit {
-            state_dir,
-            task_root,
-            attempt,
-            json,
-            task,
-        }) => {
-            return audit(&state_dir, task, attempt, task_root.as_deref(), json);
-        }
-        None => {}
+    let mut cli = Cli::parse();
+    if let Some(command) = cli.command.take() {
+        return run(command);
     }
     let (Some(socket), Some(state_dir), Some(node_id)) = (cli.socket, cli.state_dir, cli.node_id)
     else {
@@ -274,6 +268,11 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             .ok_or_else(|| io::Error::other("--max-running must be between 1 and 1024"))
         })
         .transpose()?;
+    let credentials = cli
+        .credentials
+        .as_deref()
+        .map(|path| NodeCredentials::load(path).map(Arc::new))
+        .transpose()?;
     let state = NodeState::open(&state_dir, node_id)?;
     let admission = NodeAdmission::new(issuers, state, Box::new(SystemClock));
     let capabilities = conservative_host_capabilities()?;
@@ -293,6 +292,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     .with_network_allowlist(cli.network_allowlist)
                     .with_output_return(cli.output_return)
                     .with_action_channel(cli.action_channel)
+                    .with_credentials(credentials)
                     .with_resource_enforcement(enforcement)
                     .with_scheduling(scheduling),
             )?
@@ -301,6 +301,32 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     };
     serve_local(&socket, &service, SocketAccess::new(client_group, clients))?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn run(command: Command) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    match command {
+        Command::IssuerKeyId { public_key } => {
+            println!("{}", issuer_key_id(&public_key)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Snapshot {
+            command:
+                SnapshotCommand::Import {
+                    state_dir,
+                    project_dir,
+                },
+        } => {
+            println!("{}", import(&state_dir, &project_dir)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Audit {
+            state_dir,
+            task_root,
+            attempt,
+            json,
+            task,
+        } => audit(&state_dir, task, attempt, task_root.as_deref(), json),
+    }
 }
 
 fn audit(
@@ -506,6 +532,25 @@ mod tests {
         assert!(
             Cli::try_parse_from(serve.iter().copied().chain(["--action-channel"])).is_err(),
             "the action channel needs a task root"
+        );
+        let cli = Cli::try_parse_from(serve.iter().copied().chain([
+            "--task-root",
+            "t",
+            "--network-allowlist",
+            "--credentials",
+            "c.toml",
+        ]))
+        .expect("serve brokering credentials");
+        assert_eq!(cli.credentials, Some(PathBuf::from("c.toml")));
+        assert!(
+            Cli::try_parse_from(serve.iter().copied().chain([
+                "--task-root",
+                "t",
+                "--credentials",
+                "c.toml",
+            ]))
+            .is_err(),
+            "brokering credentials needs the network allowlist"
         );
 
         let cli = Cli::try_parse_from(["ward-node", "snapshot", "import", "--state-dir", "d", "p"])

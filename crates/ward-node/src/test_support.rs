@@ -187,6 +187,68 @@ pub fn actions_manifest(
     .unwrap()
 }
 
+/// A node credentials file configuring the services `artifacts` (a token role, at most 900
+/// seconds) and `registry` (a KV secret, at most 60 seconds) from one provider that is
+/// never reached.
+pub const CREDENTIALS: &str = r#"
+[provider.bao]
+kind = "openbao"
+address = "http://127.0.0.1:9"
+token_file = "/nonexistent/bao.token"
+insecure_loopback = true
+timeout_ms = 200
+max_ttl_secs = 3600
+
+[service.artifacts]
+provider = "bao"
+engine = "token"
+role = "ward-artifacts"
+permissions = ["artifacts-read"]
+max_ttl_secs = 900
+upstream = "artifacts.example.com:443"
+value_prefix = "Bearer "
+
+[service.registry]
+provider = "bao"
+engine = "kv"
+mount = "secret"
+path = "ci/registry"
+field = "token"
+max_ttl_secs = 60
+upstream = "registry.example.com:443"
+"#;
+
+/// A manifest allowing exactly the hosts of `grants` and granting each `(service, host,
+/// ttl_secs)` as a credential.
+pub fn credentials_manifest(grants: &[(&str, &str, u32)]) -> CapabilityManifestBytes {
+    let mut hosts: Vec<String> = grants
+        .iter()
+        .map(|(_, host, _)| (*host).to_owned())
+        .collect();
+    hosts.dedup();
+    CapabilityManifestBytes::encode(
+        &CapabilityManifest::new(NetworkGrant::Custom(HostAllowlist::new(hosts).unwrap()))
+            .with_credentials(
+                ward_node_protocol::CredentialGrants::new(
+                    grants
+                        .iter()
+                        .map(|(service, host, ttl)| {
+                            ward_node_protocol::CredentialGrant::new(
+                                (*service).to_owned(),
+                                (*host).to_owned(),
+                                *ttl,
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 /// Replace the manifest of `input`'s workload, keeping everything else.
 pub fn with_manifest(input: &mut TaskAdmissionEnvelopeInput, manifest: CapabilityManifestBytes) {
     input.workload = TaskWorkload::new(
@@ -501,7 +563,15 @@ impl crate::execution::TaskLauncher for FakeLauncher {
             FakeSpawn::Spawn => {
                 let egress = request.allowlist().map(|allowlist| {
                     let dir = crate::egress::egress_dir_beside(request.workspace()).unwrap();
-                    Arc::new(crate::egress::AttemptEgress::start(&dir, allowlist).unwrap())
+                    Arc::new(
+                        crate::egress::AttemptEgress::start_routed(
+                            &dir,
+                            allowlist,
+                            request.credential_routes().to_vec(),
+                            Arc::new(ward_proxy::SystemResolver),
+                        )
+                        .unwrap(),
+                    )
                 });
                 state.egress.clone_from(&egress);
                 Ok(Box::new(FakeWorkload(

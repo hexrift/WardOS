@@ -288,10 +288,13 @@ minute on a developer machine; each case prints its own time.
 
 - **No remote transport.** The only transport is the local Unix socket; nothing here
   exercises mTLS, key bootstrap or a control plane on another host (#262).
-- **No loopback relay and no credential.** The network cases prove the proxy's verdicts,
-  its recording and its lifecycle through the Unix socket the sandbox is handed; they do
-  not prove a workload tool that only speaks `HTTP_PROXY` can use it (the node path has no
-  in-sandbox relay yet, node-integration.md §9), and no credential is injected (#267).
+- **No loopback relay, and credentials outside this suite.** The network cases prove the
+  proxy's verdicts, its recording and its lifecycle through the Unix socket the sandbox is
+  handed; they do not prove a workload tool that only speaks `HTTP_PROXY` can use it (the
+  node path has no in-sandbox relay yet, node-integration.md §9). Brokered credentials
+  (node-integration.md §6.8) are proven against a real node by `ward-node`'s own
+  `tests/node_credentials_cli.rs`, not yet by a case here driven through
+  `ward-node-client` (#267).
 - **No workspace export, no streamed output.** The result return cases prove the bounded
   result of §2.3 (declared files, stream heads); what a workload wrote beyond the files it
   declared is still read on the host as the node's uid, which a remote control plane

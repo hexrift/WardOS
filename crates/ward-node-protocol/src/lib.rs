@@ -15,6 +15,10 @@
 //! manifest's optional `actions` grant, the capability document's `actions` section, the
 //! workload's request and reply lines on its per-attempt action channel, and the
 //! `actions` listing and `answer` requests a control plane reads and answers them with.
+//! And additive within 1.3 ([`credentials`], #267): the manifest's optional `credentials`
+//! grant, naming a service the node's operator configured and the allowlisted host its
+//! proxy injects that service's short-lived credential into; a node offers it through the
+//! capability document's existing `credentials` flags.
 //! Issuer verification and execution are the node's (`ward-node`); transport
 //! authentication belongs to #262. A 1.3 capability document may advertise `admit`, and `start` and
 //! `stop` only together. Incompatible peers fail closed rather than falling back to the
@@ -24,6 +28,7 @@
 
 mod actions;
 mod admission;
+mod credentials;
 mod output;
 mod receipt;
 mod resources;
@@ -42,6 +47,10 @@ pub use admission::{
     HostAllowlist, IssuerProof, IssuerSignature, MAX_ADMISSION_ENVELOPE_BYTES,
     MAX_ADMISSION_LINEAGE, NetworkGrant, TaskAdmissionAuthority, TaskAdmissionEnvelope,
     TaskAdmissionEnvelopeInput, TaskAdmissionError, TaskWorkload, WorkloadArgv,
+};
+pub use credentials::{
+    CredentialError, CredentialGrant, CredentialGrants, MAX_CREDENTIAL_GRANTS,
+    MAX_CREDENTIAL_SERVICE_BYTES,
 };
 pub use output::{
     AttemptOutput, MAX_OUTPUT_FILE_BYTES, MAX_OUTPUT_FILES, MAX_OUTPUT_FILES_BYTES,

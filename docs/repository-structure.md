@@ -100,8 +100,8 @@ wardos/
 
 ## As built (Phase 1–5)
 
-The workspace today has ten crates; the planned `ward-observer`, `ward-credentials`,
-`ward-verifier` and `ward-bench` crates have not been split out yet because their
+The workspace today has these crates; the planned `ward-observer` and `ward-verifier`
+crates have not been split out yet because their
 current code is small enough to live where it is used (`ward-shell-core` now holds the
 shared view models `ward-observer` was planned for). Where each planned
 responsibility lives now:
@@ -114,6 +114,7 @@ responsibility lives now:
 | `ward-sandbox` | OCI spec generation and the typed seccomp profile | as planned |
 | `ward-launch` | the bubblewrap launch primitive (`Launch`, `RunningLaunch`, `Outcome`), re-exported unchanged as `ward_daemon::sandbox` | split out of `ward-daemon` so `ward-node` can launch without depending on it (ADR-0030 §3) |
 | `ward-proxy` | `proxy`, `policy`, `addr`, `hosts`, `http`, `resolve`, `gateway`, `secret`, `observer` | as planned; `gateway` is the credential injection of `ward-credentials` |
+| `ward-credentials` | the credential-provider interface and lease rules, `http`, `vault`, `provider` | split out of `ward-daemon`, re-exported unchanged as `ward_daemon::credentials`, so `ward-node` brokers credentials with the same rules (ADR-0034) |
 | `ward-agent` | `cli`, `landlock`, `seccomp`, `privs`, `supervise`, `relay`, `hook` | as planned; `hook` is the hook adapter |
 | `ward-daemon` | `session`, `control`, `daemon`, `sandbox`, `egress`, `gateway`, `hooks`, `verify`, `selftest`, `watch`, `agents`, `render`, `describe`, `snapshot`, `ids` | `gateway` → `ward-credentials`; `verify` → `ward-verifier`; `render` → `ward-observer` |
 | `ward-cli` | `main`, `replay`, `tui` | as planned; `replay` → `ward-observer`; `tui` draws the models of `ward-shell-core` |

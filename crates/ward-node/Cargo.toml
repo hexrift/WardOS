@@ -15,6 +15,12 @@ path = "src/lib.rs"
 name = "ward-node"
 path = "src/main.rs"
 
+[features]
+# Lets a node's credentials file name a plain-HTTP upstream (`plain_upstream`), and
+# turns on ward-proxy's loopback test mode with it, so the tests can run a fake
+# upstream on 127.0.0.1. Never enabled in a shipped `ward-node`.
+test-loopback = ["ward-proxy/test-loopback"]
+
 [dependencies]
 blake3 = { workspace = true }
 clap = { workspace = true }
@@ -23,7 +29,9 @@ ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+toml = { workspace = true }
 ward-authority = { path = "../ward-authority", version = "0.18.0" }
+ward-credentials = { path = "../ward-credentials", version = "0.18.0" }
 ward-events = { path = "../ward-events", version = "0.18.0" }
 ward-launch = { path = "../ward-launch", version = "0.18.0" }
 ward-node-protocol = { path = "../ward-node-protocol", version = "0.18.0" }
@@ -32,6 +40,8 @@ ward-snapshot = { path = "../ward-snapshot", version = "0.18.0" }
 
 [dev-dependencies]
 postcard = { workspace = true }
+# Self-dependency so the crate's own tests see the `test-loopback` feature.
+ward-node = { path = ".", version = "0.1.0", features = ["test-loopback"] }
 tempfile = { workspace = true }
 # `ci::isolation_ready` gates the bwrap-backed tests, as in ward-launch.
 ward-sandbox = { path = "../ward-sandbox", version = "0.18.0" }

@@ -313,14 +313,28 @@ impl AttemptEvidence {
         Ok(())
     }
 
+    /// [`Self::recover_after`] with nothing done on the attempt's behalf.
+    #[cfg(test)]
+    pub(crate) fn recover(
+        &self,
+        state: NodeAttemptState,
+        outcome: Option<NodeAttemptOutcome>,
+        sealed_by: Option<u64>,
+    ) -> Result<(), EvidenceError> {
+        self.recover_after(Vec::new(), state, outcome, sealed_by)
+    }
+
     /// Bring the log in line with the state a restarted node holds the attempt in, before
     /// the node serves: cut off a torn final frame, answer `cancelled` every action-channel
     /// request the log shows unanswered (a restarted node holds no attempt running, so none
-    /// can be answered any more), record `NodeAttemptRecovered` if the log shows another
-    /// state or outcome, and seal it if the attempt is sealed. An attempt that was never
-    /// admitted and has no log is left without one.
-    pub(crate) fn recover(
+    /// can be answered any more), append `records` (what the restarted node did on the
+    /// attempt's behalf: the revocation of the leases a dead node left), record
+    /// `NodeAttemptRecovered` if the log shows another state or outcome, and seal it if the
+    /// attempt is sealed. An attempt that was never admitted and has no log is left without
+    /// one.
+    pub(crate) fn recover_after(
         &self,
+        records: Vec<WardEvent>,
         state: NodeAttemptState,
         outcome: Option<NodeAttemptOutcome>,
         sealed_by: Option<u64>,
@@ -332,7 +346,13 @@ impl AttemptEvidence {
             }
             other => other?,
         };
-        let current = self.cancel_unanswered(current)?;
+        let mut current = self.cancel_unanswered(current)?;
+        if current.as_ref().is_some_and(|log| !log.is_sealed()) {
+            for record in records {
+                self.write(current.as_ref(), record)?;
+                current = self.open()?;
+            }
+        }
         let held = current.as_ref().and_then(VerifiedEvidence::state);
         if let (NodeAttemptState::Sealed, Some(operation)) = (state, sealed_by) {
             let ended = held
@@ -464,8 +484,9 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), EvidenceError> {
 }
 
 /// Whether `event` may use the reserve kept for ending an attempt: the end, recovery and
-/// seal records, and the node's own answers to action-channel requests (`expired`,
-/// `cancelled`), which are bounded by the grant's `max_total` and must never be lost.
+/// seal records, the node's own answers to action-channel requests (`expired`,
+/// `cancelled`), which are bounded by the grant's `max_total`, and the records of leases
+/// denied or revoked, bounded by the grant's count; none of them may be lost.
 const fn closes(event: &WardEvent) -> bool {
     matches!(
         event,
@@ -476,6 +497,8 @@ const fn closes(event: &WardEvent) -> bool {
                 operation: None,
                 ..
             }
+            | WardEvent::CredentialRevoked { .. }
+            | WardEvent::CredentialDenied { .. }
     )
 }
 
@@ -848,6 +871,36 @@ mod tests {
             }
         );
         assert_eq!(log.records().len(), 2);
+    }
+
+    #[test]
+    fn recovery_records_what_the_restarted_node_revoked_before_the_recovered_state() {
+        let (_dir, root) = private_root();
+        let evidence = AttemptEvidence::new(&root, binding());
+        evidence
+            .append(WardEvent::NodeAttemptLaunched {
+                operation: 3,
+                host_pid: 1,
+            })
+            .unwrap();
+        let revoked = WardEvent::CredentialRevoked {
+            service: ward_events::ServiceId::new("artifacts").unwrap(),
+            reason: ward_events::RevokeReason::SessionEnded,
+        };
+        evidence
+            .recover_after(
+                vec![revoked.clone()],
+                NodeAttemptState::Exited,
+                Some(NodeAttemptOutcome::Unknown),
+                None,
+            )
+            .unwrap();
+        let log = verify(&evidence_dir(&root, binding()), binding()).unwrap();
+        let events: Vec<&WardEvent> = log.records().iter().map(|record| &record.event).collect();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1], &revoked);
+        assert!(matches!(events[2], WardEvent::NodeAttemptRecovered { .. }));
+        assert!(closes(&revoked));
     }
 
     #[test]
