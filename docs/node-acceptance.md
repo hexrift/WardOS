@@ -293,13 +293,11 @@ of `ward-node` or of the workspace (the merge gate runs it with `--all-features`
 `test-loopback` build says so in its `--version` (`ward-node 0.1.0 (test-loopback)`; the
 shipped build prints `ward-node 0.1.0`), and both runners refuse a `WARD_NODE_BIN` that
 does, as `node-js.sh` refuses a `WARD_NODE_LOOPBACK_BIN` that does not, before anything is
-started. Run on its own, `cargo test -p ward-node-client --test acceptance` uses
-`WARD_NODE_BIN` when it is set and otherwise the `ward-node` beside its test binaries,
-which is the `test-loopback` build after such a `cargo test`; set `WARD_NODE_BIN` to a
-shipped build, or use `node.sh`, for a run that proves the shipped build. The merge gate's
-own run of the cases (§1) takes the `test-loopback` build this way, since
-`cargo test --workspace --all-features` builds `ward-node` with every feature; the shipped
-build is proven by `node.sh`'s run, which CI makes after it.
+started. The Rust suite's own helper does the same: run on its own, or under the merge
+gate (§1), `cargo test -p ward-node-client` uses `WARD_NODE_BIN` when it is set and
+otherwise builds the shipped `ward-node` into the same `node-shipped` directory, never the
+`ward-node` beside its test binaries, and it refuses a `test-loopback` build either way
+(#422). Every run of the cases therefore proves the shipped build.
 
 ### 3.1 What the host needs
 
