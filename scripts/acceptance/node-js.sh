@@ -13,11 +13,17 @@
 # sees the leased credential the proxy injected while the workload's output, the sealed
 # log, the node's state and the task root never hold it, that the lease is revoked at the
 # provider when the attempt ends or is cancelled, and read the log's credential records back;
-# a fourth node with --network-allowlist and without --credentials proves the refusal. A
-# fake upstream on loopback over plain HTTP is something the shipped ward-node refuses by
-# design (its proxy never connects to loopback and speaks only TLS upstream), so the
-# credentials node alone is ward-node built with the `test-loopback` feature, exactly as
-# ward-node's own tests/node_credentials_cli.rs runs it; every other node runs
+# a fourth node with --network-allowlist and without --credentials proves the refusal. The
+# approval-hold cases (node-integration.md §6.9, ADR-0035) start a fifth node with
+# --action-channel and --approval-hold as well, prove that a held credential route is
+# refused 403 by name until the request the node opened for it is approved (and then
+# reaches the fake upstream with the lease injected), stays refused when it is denied or
+# expires, and read the log's request, answer and refusal back; a sixth node without
+# --approval-hold proves the refusal. A fake upstream on loopback over plain HTTP is
+# something the shipped ward-node refuses by design (its proxy never connects to loopback
+# and speaks only TLS upstream), so the credentials and hold nodes alone are ward-node
+# built with the `test-loopback` feature, exactly as ward-node's own
+# tests/node_credentials_cli.rs and tests/node_hold_cli.rs run it; every other node runs
 # WARD_NODE_BIN, which this script builds without it. One verdict line per case on stdout,
 #   node-js acceptance <case>: PASS|FAIL -- <what it proves>
 # then a summary; everything else goes to stderr. Exit status: 0 when every case passed
@@ -141,9 +147,10 @@ text_digest() {
 # each record's event named by its variant, and the three action records decoded field by
 # field (ward-events' NodeActionRequested, NodeActionAnswered, NodeActionRefused; ADR-0031
 # §4), the credential records (CredentialGranted, CredentialRevoked: ADR-0034 §6; and the
-# service and subject of CredentialDenied) and the host, port and decision of
-# NetworkRequested. A record of these but the last two that does not decode exactly up to
-# its own hash fails the read.
+# service and subject of CredentialDenied), the host, port and decision of
+# NetworkRequested and the host, port, reason and rule of a NetworkDenied for a named host.
+# A record of these but the last three that does not decode exactly up to its own hash
+# fails the read.
 log_records() {
   # shellcheck disable=SC2016  # JavaScript, not shell: its ${…} are template literals
   node --input-type=module -e '
@@ -155,6 +162,7 @@ log_records() {
     const VERDICTS = ["Allow", "Ask", "Deny"];
     const DELIVERIES = ["ProxyInjected", "MintedToken"];
     const REVOKE_REASONS = ["SessionEnded", "PolicyChanged", "UserRevoked", "Expired", "TamperDetected"];
+    const DENY_REASONS = ["PrivateRange", "NotAllowlisted", "NonProxyEgress", "Offline", "PolicyDeny", "UserDenied", "Timeout", "Expired", "Revoked", "RateLimited", "Unknown"];
     const bytes = readFileSync(process.argv[1]);
     const records = [];
     let at = 0;
@@ -193,6 +201,10 @@ log_records() {
       if (variant === 49) Object.assign(record, { action: varint(), decision: DECISIONS[varint()], operation: payload[p++] === 1 ? varint() : null, note_bytes: varint(), note: payload[p++] === 1 ? hash() : null });
       if (variant === 50) Object.assign(record, { reason: REFUSALS[varint()], bytes: varint() });
       if (variant === 7) Object.assign(record, { host: text(), port: varint(), decision: VERDICTS[varint()] });
+      if (variant === 8 && varint() === 0) {
+        Object.assign(record, { host: text(), port: varint(), reason: DENY_REASONS[varint()] });
+        if (record.reason === "PolicyDeny") record.rule = text();
+      }
       if (variant === 12 || variant === 13) {
         Object.assign(record, { service: text(), subject: bounded() });
         record.permissions = Array.from({ length: varint() }, () => bounded());
@@ -1169,6 +1181,188 @@ if [[ -z "$problems" ]]; then
   pass credentials_grant_is_refused_without_the_flag_or_outside_the_grammar "a node started with --network-allowlist and without --credentials advertises credentials.proxy_injection and scoped_http_gateway false; run --credential reads that and refuses the grant (unsupported_grant) before a version is allocated or anything is signed or recorded, and the node itself refuses the signed grant unsupported_grant at admit with nothing materialised; the credentials node refuses a TTL above the service's ceiling and an unconfigured service unsupported_grant without asking the provider; an address literal is refused by the client before signing"
 else
   fail credentials_grant_is_refused_without_the_flag_or_outside_the_grammar "$problems"
+fi
+
+# ---- approval holds (node-integration.md §6.9, ADR-0035) ------------------------------------
+
+# The held workload: requests for the `artifacts` route until one is answered with anything
+# but `held for approval`, keeping every distinct answer body in seen.txt; exit 0 once the
+# route answered 200, and 3, 4 and 5 for a refusal named denied, expired and cancelled.
+cat >"$work/project/held.py" <<'HELD'
+import os
+import socket
+import sys
+import time
+
+
+def get():
+    peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    peer.settimeout(20)
+    peer.connect(os.environ["WARD_PROXY_SOCKET"])
+    peer.sendall(b"GET /artifacts/v1/data HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    answer = b""
+    while True:
+        chunk = peer.recv(4096)
+        if not chunk:
+            break
+        answer += chunk
+    return answer
+
+
+seen = []
+while True:
+    answer = get()
+    body = answer.split(b"\r\n\r\n", 1)[-1].strip()
+    if not seen or seen[-1] != body:
+        seen.append(body)
+        with open("seen.txt", "wb") as out:
+            out.write(b"\n".join(seen))
+    if body != b"held for approval":
+        break
+    time.sleep(0.1)
+if answer.startswith(b"HTTP/1.1 200"):
+    sys.exit(0)
+sys.exit({b"approval denied": 3, b"approval expired": 4, b"approval cancelled": 5}.get(body, 6))
+HELD
+hold_snapshot="$("$WARD_NODE_BIN" snapshot import --state-dir "$work/hold-state" "$work/project")"
+hold_pid="$(start_node_bin "$WARD_NODE_LOOPBACK_BIN" "$work/hold.sock" "$work/hold-state" "$work/hold-tasks" \
+  --network-allowlist --credentials "$work/credentials.toml" --action-channel --approval-hold)"
+background+=("$hold_pid")
+hold_common=(--socket "$work/hold.sock" --adapter "$WARD_NODE_ADAPTER_BIN")
+hold_run=("${hold_common[@]}" --key "$work/cp/issuer.pem" --principal acceptance-issuer --node "$node_id"
+  --state-dir "$work/cp" --snapshot "$hold_snapshot" --task-root "$work/hold-tasks" --timeout-ms 90000
+  --budget-ms 120000 --actions approval --actions-poll-ms 50 --credential artifacts=localhost:60 --hold service=artifacts)
+node "$client" capabilities "${hold_common[@]}" >"$work/hold-capabilities.json"
+
+# held_run <case> <out> <args…>: one held run on the hold node; its binding, log and records
+# in held_task, held_attempt, held_log and $work/records<case>.json, and the upstream's
+# request count before it in heads_before.
+held_run() {
+  local case=$1 out=$2
+  shift 2
+  heads_before="$(fake 'o.heads.length')"
+  status=0
+  node "$client" run "${hold_run[@]}" --task "acc-task-$case" --attempt "acc-attempt-${case}a" "$@" \
+    -- python3 held.py >"$out" 2>>"$work/client.log" || status=$?
+  held_task="$(field "$out" 'o.binding.task' | tr -d '"')"
+  held_attempt="$(field "$out" 'o.binding.attempt' | tr -d '"')"
+  held_log="$work/hold-tasks/$held_task/$held_attempt.evidence/events.log"
+  log_records "$held_log" "$work/records$case.json" 2>/dev/null || problems+="the evidence log's records do not decode; "
+}
+
+# held_records_ok <case> <decision> <operation>: the node opened request 1 for the hold,
+# asking `credential artifacts` (digest-checked), refused the workload by the hold's rule,
+# and recorded the one answer, all before the end.
+held_records_ok() {
+  check "$1" "$work/records$1.json" 'o.filter(r => r.event === "NodeActionRequested").map(r => [r.action, r.kind, r.summary_bytes, r.detail_bytes > 0])' \
+    '[[1,"approval",20,true]]' "the node opened one approval request"
+  check "$1" "$work/records$1.json" 'o.find(r => r.event === "NodeActionRequested").summary' "\"$(text_digest "credential artifacts")\"" "its summary digest"
+  check "$1" "$work/records$1.json" 'o.filter(r => r.event === "NodeActionAnswered").map(r => [r.action, r.decision, r.operation])' "[[1,\"$2\",$3]]" "the one answer recorded"
+  check "$1" "$work/records$1.json" '(i => i("NodeActionRequested") < i("NodeActionAnswered") && i("NodeActionAnswered") < i("NodeAttemptEnded") && o.findIndex(r => r.event === "NetworkDenied" && r.rule === "hold:held:1") > i("NodeAttemptLaunched"))(e => o.findIndex(r => r.event === e))' \
+    'true' "requested before answered before the end, the held refusal recorded"
+}
+
+# ---- case 19: approving the node's request releases the held credential --------------------
+
+problems=""
+check 19 "$work/hold-capabilities.json" 'o.actions' '{"approval":true,"decision":true,"hold":true,"max_pending":8,"max_total":64,"max_wait_secs":3600}' "the hold node advertises actions.hold"
+held_run 19 "$work/run19.json" --actions-wait-secs 60 --approve-all
+[[ "$status" == "0" ]] || problems+="exit status $status; "
+check 19 "$work/run19.json" 'o.outcome' '"completed"' "outcome"
+check 19 "$work/run19.json" 'o.hold' '{"services":["artifacts"]}' "the outcome lists the hold"
+check 19 "$work/run19.json" 'o.actions.map(a => [a.request, a.id, a.hold, a.decision, a.operation_id, a.result])' \
+  '[[1,"hold:1",{"service":"artifacts"},"approved",263,"answered"]]' "the node-opened request answered approved by the policy"
+check 19 "$work/cp/runs/$held_attempt.json" 'Buffer.from(JSON.parse(o.envelope_json).workload.capability_manifest.bytes, "hex").toString("utf8")' \
+  '"{\"network\":{\"custom\":[\"localhost\"]},\"actions\":{\"kinds\":[\"approval\"],\"max_pending\":2,\"max_total\":8,\"wait_secs\":60},\"credentials\":[{\"service\":\"artifacts\",\"host\":\"localhost\",\"ttl_secs\":60}],\"hold\":{\"services\":[\"artifacts\"]}}"' "the signed manifest: the hold last"
+[[ "$(cat "$work/hold-tasks/$held_task/$held_attempt/seen.txt" 2>/dev/null)" == $'held for approval\n{"artifact":"built"}' ]] \
+  || problems+="the workload did not see the hold and then the upstream: $(cat "$work/hold-tasks/$held_task/$held_attempt/seen.txt" 2>/dev/null); "
+check 19 "$work/fake/state.json" "o.heads.length - $heads_before" '1' "exactly the released request reached the upstream"
+check 19 "$work/fake/state.json" "/^authorization: Bearer $leased-[0-9]+\$/m.test(o.heads.at(-1))" 'true' "with the leased credential injected"
+held_records_ok 19 approved 263
+check 19 "$work/records19.json" '(i => i("NodeActionAnswered") < o.findIndex(r => r.event === "NetworkRequested" && r.host === "localhost" && r.decision === "Allow"))(e => o.findIndex(r => r.event === e))' \
+  'true' "the approval recorded before the released request"
+secret_free "$work/hold-tasks" "$work/hold-state" "$work/run19.json" || problems+="a secret leaked; "
+verify_log_at "$work/hold-state" "$work/hold-tasks" "$held_task" "$held_log" || problems+="the evidence log does not verify; "
+if [[ -z "$problems" ]]; then
+  pass hold_approval_releases_the_held_credential "on a node started with --network-allowlist, --credentials, --action-channel and --approval-hold (it advertises actions.hold), run --hold service=artifacts --approve-all signs the hold last in the manifest; the workload's first request for the route opens one approval request (hold:1, credential artifacts) and is refused 403 held for approval with nothing sent upstream, the policy approves it, and the next request reaches the fake upstream with the leased token injected; the log records the request before the approval with its operation id and the approval before the released request, records the hold's refusal by its rule, holds no secret, and verifies"
+else
+  fail hold_approval_releases_the_held_credential "$problems"
+fi
+
+# ---- case 20: a denial keeps it refused with a named 403 ------------------------------------
+
+problems=""
+held_run 20 "$work/run20.json" --actions-wait-secs 60 --deny-all
+[[ "$status" == "1" ]] || problems+="exit status $status, expected 1; "
+check 20 "$work/run20.json" 'o.outcome' '"failed"' "outcome"
+check 20 "$work/run20.json" 'o.exitStatus' '3' "the workload saw the denial"
+check 20 "$work/run20.json" 'o.actions.map(a => [a.id, a.decision])' '[["hold:1","denied"]]' "denied by the policy"
+[[ "$(cat "$work/hold-tasks/$held_task/$held_attempt/seen.txt" 2>/dev/null)" == $'held for approval\napproval denied' ]] \
+  || problems+="the workload did not see the hold and then the denial: $(cat "$work/hold-tasks/$held_task/$held_attempt/seen.txt" 2>/dev/null); "
+check 20 "$work/fake/state.json" "o.heads.length - $heads_before" '0' "nothing reached the upstream"
+held_records_ok 20 denied 263
+check 20 "$work/records20.json" 'o.some(r => r.event === "NetworkDenied" && r.rule === "hold:denied:1")' 'true' "the denial's refusal recorded by name"
+verify_log_at "$work/hold-state" "$work/hold-tasks" "$held_task" "$held_log" || problems+="the evidence log does not verify; "
+if [[ -z "$problems" ]]; then
+  pass hold_denial_keeps_it_refused "run --hold --deny-all denies the node's request; the workload's next request for the held route is refused 403 approval denied, so it exits 3 without anything reaching the upstream; the log records the denial with its operation id and the refusal under the rule hold:denied:1, and verifies"
+else
+  fail hold_denial_keeps_it_refused "$problems"
+fi
+
+# ---- case 21: a request nobody answers expires, and the hold stays refused ------------------
+
+problems=""
+held_run 21 "$work/run21.json" --actions-wait-secs 2
+[[ "$status" == "1" ]] || problems+="exit status $status, expected 1; "
+check 21 "$work/run21.json" 'o.exitStatus' '4' "the workload saw the expiry"
+[[ "$(cat "$work/hold-tasks/$held_task/$held_attempt/seen.txt" 2>/dev/null)" == $'held for approval\napproval expired' ]] \
+  || problems+="the workload did not see the hold and then the expiry: $(cat "$work/hold-tasks/$held_task/$held_attempt/seen.txt" 2>/dev/null); "
+check 21 "$work/fake/state.json" "o.heads.length - $heads_before" '0' "nothing reached the upstream"
+held_records_ok 21 expired null
+check 21 "$work/records21.json" 'o.some(r => r.event === "NetworkDenied" && r.rule === "hold:expired:1")' 'true' "the expiry's refusal recorded by name"
+verify_log_at "$work/hold-state" "$work/hold-tasks" "$held_task" "$held_log" || problems+="the evidence log does not verify; "
+if [[ -z "$problems" ]]; then
+  pass hold_expiry_keeps_it_refused "a hold nobody answers is answered expired by the node once the grant's 2 s wait ran out; the workload's next request is refused 403 approval expired and it exits 4 with nothing sent upstream; the log records the expiry with no operation id and the refusal under hold:expired:1, and verifies"
+else
+  fail hold_expiry_keeps_it_refused "$problems"
+fi
+
+# ---- case 22: a node without --approval-hold, or a hold outside its manifest, is refused ---
+
+problems=""
+nohold_pid="$(start_node_bin "$WARD_NODE_LOOPBACK_BIN" "$work/nohold.sock" "$work/nohold-state" "$work/nohold-tasks" \
+  --network-allowlist --credentials "$work/credentials.toml" --action-channel)"
+background+=("$nohold_pid")
+nohold_common=(--socket "$work/nohold.sock" --adapter "$WARD_NODE_ADAPTER_BIN")
+node "$client" capabilities "${nohold_common[@]}" >"$work/nohold-capabilities.json"
+check 22 "$work/nohold-capabilities.json" 'o.actions' '{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600}' "a node without the flag carries no hold"
+nohold_snapshot="$("$WARD_NODE_BIN" snapshot import --state-dir "$work/nohold-state" "$work/project")"
+status=0
+node "$client" run "${nohold_common[@]}" --key "$work/cp/issuer.pem" --principal acceptance-issuer --node "$node_id" \
+  --state-dir "$work/cp" --snapshot "$nohold_snapshot" --task-root "$work/nohold-tasks" --timeout-ms 90000 \
+  --task acc-task-22 --attempt acc-attempt-22a --budget-ms 60000 --actions approval --credential artifacts=localhost:60 \
+  --hold service=artifacts -- python3 held.py >"$work/run22a.json" 2>"$work/run22a.err" || status=$?
+[[ "$status" == "2" ]] || problems+="client refusal exit status $status, expected 2; "
+grep -q 'actions.hold.*unsupported_grant' "$work/run22a.err" || problems+="the client's refusal does not name the flag: $(cat "$work/run22a.err"); "
+[[ ! -e "$work/cp/runs/$(node "$client" derive-id exec acc-attempt-22a).json" ]] || problems+="the refused hold was recorded as a run; "
+# The node refuses it too: case 19's signed run, replayed to this node.
+status=0
+node "$client" replay "${nohold_common[@]}" --state-dir "$work/cp" --attempt "$(node "$client" derive-id exec acc-attempt-19a)" >"$work/run22b.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "1" ]] || problems+="node refusal exit status $status, expected 1; "
+check 22 "$work/run22b.json" 'o.refused' '{"verb":"admit","reason":"unsupported_grant"}' "the node without the flag refuses the hold"
+# A hold on a service the manifest does not grant, or without an approval channel, never reaches a node.
+for flags in "--hold service=registry" "--hold host=other.example"; do
+  status=0
+  # shellcheck disable=SC2086  # the flag pair splits on purpose
+  node "$client" run "${hold_run[@]}" --task acc-task-22c --attempt acc-attempt-22c $flags --actions-wait-secs 60 \
+    -- python3 held.py >"$work/run22c.json" 2>"$work/run22c.err" || status=$?
+  [[ "$status" == "2" ]] || problems+="$flags: exit status $status, expected 2; "
+  grep -q -e 'credentials' -e 'network.custom' "$work/run22c.err" || problems+="$flags: the refusal does not name the rule: $(cat "$work/run22c.err"); "
+done
+if [[ -z "$problems" ]]; then
+  pass hold_is_refused_without_the_flag_or_outside_its_manifest "a node started with --action-channel, --network-allowlist and --credentials but without --approval-hold advertises actions without hold; run --hold reads that and refuses before anything is signed or recorded, the node itself refuses the signed hold unsupported_grant at admit, and a hold on a service or host the manifest does not grant is refused by the client before signing"
+else
+  fail hold_is_refused_without_the_flag_or_outside_its_manifest "$problems"
 fi
 
 echo

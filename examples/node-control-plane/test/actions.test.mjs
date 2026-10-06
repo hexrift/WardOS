@@ -192,9 +192,11 @@ test("answers take operation ids from the run record's scheme: one per request n
   assert.equal(ids.first_answer, 1 + 6 + 256);
   assert.equal(answerOperationId(ids, 1), 263);
   assert.equal(answerOperationId(ids, 64), 326);
+  // Past the workload's 64, the 8 requests a hold may open (§6.9).
+  assert.equal(answerOperationId(ids, 72), 334);
   assert.equal(answerOperationId(operationIds(20), 1), 282);
   assert.equal(answerOperationId({ start_at: 20 }, 2), 283, "a recorded scheme of start_at alone");
-  for (const request of [0, -1, 65, 1.5, "1"]) assert.throws(() => answerOperationId(ids, request), /request/);
+  for (const request of [0, -1, 73, 1.5, "1"]) assert.throws(() => answerOperationId(ids, request), /request/);
 });
 
 test("recordAnswer persists one answer per request durably and returns the recorded one on a second call", () => {

@@ -27,6 +27,9 @@ import {
   credentialsGrantOf,
   decodeActions,
   deriveId,
+  holdGrant,
+  holdGrantOf,
+  manifest,
   isId,
   loadIssuerKey,
   loadOrCreateIssuerKey,
@@ -36,6 +39,7 @@ import {
   outputGrant,
   outputGrantOf,
   recordAnswer,
+  requireApprovalHold,
   requireCredentialBroker,
   rootLease,
   saveRunRecord,
@@ -61,6 +65,7 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                [--actions <kind>[,<kind>]] [--actions-max-pending <n>] [--actions-max-total <n>]
                [--actions-wait-secs <n>] [--approve-all | --deny-all | --ask] [--note <text>]
                [--actions-poll-ms <n>] [--credential <service>=<host>[:<ttl-secs>]]...
+               [--hold host=<pattern> | --hold service=<name>]...
                [--cancel-after <ms>] [--adapter <bin>] [--timeout-ms <n>] [--trace] -- <argv>...
                Admit, start, watch and seal one attempt; print its outcome as one JSON line.
                SIGINT or SIGTERM cancels it (revoke, then seal). Any of --stdio-bytes, --files
@@ -89,11 +94,20 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                node not started with --network-allowlist and --credentials is refused here
                (unsupported_grant) before anything is signed. The outcome lists the grants
                in credentials.
+               --hold holds a capability the manifest grants until the control plane
+               approves it (1 to 8): host=<pattern> one of the network.custom hosts (the
+               --credential hosts), service=<name> one of the --credential services. It
+               needs --actions naming approval: the node opens one approval request for each
+               on the workload's first use of it, listed with its hold, and its proxy
+               refuses that capability with a named 403 until the request is approved; a
+               policy answers those requests like any other. A node not started with
+               --approval-hold is refused here before anything is signed. The outcome lists
+               the hold in hold.
   replay       --socket <path> --state-dir <dir> --attempt <exec_…> [--out-dir <dir>] [--adapter <bin>] [--trace]
                [--approve-all | --deny-all | --ask] [--note <text>]
                Resend a recorded run with the same bytes and operation ids; nothing acts twice.
                A policy answers its action channel as run's does, replaying recorded answers;
-               a recorded credentials grant is listed in the outcome as run's is.
+               a recorded credentials grant and hold are listed in the outcome as run's are.
   inspect      --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…>
   result       --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…> [--out-dir <dir>]
                Read an ended attempt's stored result again (its run must have carried the grant).
@@ -142,6 +156,7 @@ const OPTIONS = {
   "actions-wait-secs": { type: "string" },
   "actions-poll-ms": { type: "string" },
   credential: { type: "string", multiple: true },
+  hold: { type: "string", multiple: true },
   "approve-all": { type: "boolean" },
   "deny-all": { type: "boolean" },
   ask: { type: "boolean" },
@@ -222,7 +237,8 @@ function credentialsOf(values, budgetMs) {
 /**
  * The manifest the flags ask for: offline, with an output grant when any output flag is
  * given and an actions grant when --actions is; with --credential, the credentials grant
- * and a network.custom of exactly its hosts.
+ * and a network.custom of exactly its hosts; with --hold, the hold, which needs --actions
+ * naming approval and may name only those hosts and services.
  */
 function manifestOf(values, budgetMs) {
   const object = { network: "offline" };
@@ -248,7 +264,31 @@ function manifestOf(values, budgetMs) {
     });
   }
   if (credentials !== null) object.credentials = credentials;
+  const hold = holdOf(values);
+  if (hold !== null) {
+    if (object.actions === undefined || !object.actions.kinds.includes("approval")) {
+      throw new UsageError("--hold needs --actions naming approval: the node asks for each held capability through the action channel");
+    }
+    object.hold = hold;
+    // Held to the rest of the manifest here, before the node is asked anything.
+    manifest(object);
+  }
   return Object.keys(object).length === 1 ? undefined : object;
+}
+
+const HOLD_FLAG = /^(host|service)=(.+)$/;
+
+/** The hold the --hold flags ask for, or `null` without one: each `host=<pattern>` or `service=<name>`. */
+function holdOf(values) {
+  if (values.hold === undefined) return null;
+  const hosts = [];
+  const services = [];
+  for (const entry of values.hold) {
+    const parsed = HOLD_FLAG.exec(entry);
+    if (parsed === null) throw new UsageError("--hold takes host=<pattern> or service=<name>");
+    (parsed[1] === "host" ? hosts : services).push(parsed[2]);
+  }
+  return holdGrant({ hosts, services });
 }
 
 const POLICIES = ["approve-all", "deny-all", "ask"];
@@ -326,7 +366,8 @@ function policyOf(values, granted) {
 }
 
 function printRequest(request) {
-  const lines = [`control-plane: request ${request.action} (${request.kind}, id ${request.id}): ${request.summary}`];
+  const opened = request.hold === undefined ? "" : `, opened by the node for its hold on ${request.hold.host ?? request.hold.service}`;
+  const lines = [`control-plane: request ${request.action} (${request.kind}, id ${request.id}${opened}): ${request.summary}`];
   if (request.detail !== "") lines.push(...request.detail.split("\n").map((line) => `control-plane:   ${line}`));
   lines.push(`control-plane:   expires in ${Math.ceil(request.expires_in_ms / 1000)} s unless answered`);
   process.stderr.write(`${lines.join("\n")}\n`);
@@ -455,11 +496,19 @@ function deriveCommand(positionals) {
   return 0;
 }
 
-/** Refuse a credentials grant unless the node's capability document offers the broker. */
-async function requireBroker(values) {
+/**
+ * Refuse a credentials grant unless the node's capability document offers the broker, and
+ * a hold unless it offers approval holds; the document is read once, and only when needed.
+ */
+async function requireOffers(values, workloadManifest) {
+  const brokered = workloadManifest?.credentials !== undefined;
+  const held = workloadManifest?.hold !== undefined;
+  if (!brokered && !held) return;
   const adapter = adapterOf(values);
   try {
-    requireCredentialBroker(await adapter.capabilities());
+    const capabilities = await adapter.capabilities();
+    if (brokered) requireCredentialBroker(capabilities);
+    if (held) requireApprovalHold(capabilities);
   } finally {
     await adapter.close();
   }
@@ -491,11 +540,11 @@ async function run(values, argv) {
   const session = idOf("sess", values.session ?? callerAttempt);
   const budgetMs = integer(values, "budget-ms");
   const validForMs = integer(values, "valid-for-ms", 15 * 60_000);
-  // The grants, the policy and the node's offer of a credential broker are checked before
-  // a version is allocated or anything is signed.
+  // The grants, the policy and the node's offer of a credential broker and of approval
+  // holds are checked before a version is allocated or anything is signed.
   const workloadManifest = manifestOf(values, budgetMs);
   const answering = policyOf(values, workloadManifest?.actions !== undefined);
-  if (workloadManifest?.credentials !== undefined) await requireBroker(values);
+  await requireOffers(values, workloadManifest);
   const now = Date.now();
   const binding = { task, attempt, lease };
   const versions = new VersionStore(join(stateDir, "admission-versions.json"));
@@ -543,6 +592,7 @@ async function run(values, argv) {
   const outcome = { ...outcomeOf(report, { grant: outputGrantOf(signed.envelope_json) }), version, operations: report.operations };
   if (workloadManifest?.actions !== undefined) outcome.actions = answers;
   if (workloadManifest?.credentials !== undefined) outcome.credentials = workloadManifest.credentials;
+  if (workloadManifest?.hold !== undefined) outcome.hold = workloadManifest.hold;
   emit({ ...outcome, output: renderOutput(outcome.output, values["out-dir"]) });
   return withLoop(exitStatusOf(outcome), outcome, loopError);
 }
@@ -568,6 +618,8 @@ async function replay(values) {
   if (granted) outcome.actions = answers;
   const credentials = credentialsGrantOf(record.envelope_json);
   if (credentials !== null) outcome.credentials = credentials;
+  const hold = holdGrantOf(record.envelope_json);
+  if (hold !== null) outcome.hold = hold;
   emit({ ...outcome, output: renderOutput(outcome.output, values["out-dir"]) });
   return withLoop(exitStatusOf(outcome), outcome, loopError);
 }
@@ -624,7 +676,7 @@ async function actionsCommand(values) {
     return 1;
   }
   // A recorded run's listing is also held to the grant it was admitted under.
-  emit(record === null ? listed : decodeActions(listed, actionsGrantOf(record.envelope_json)));
+  emit(record === null ? listed : decodeActions(listed, actionsGrantOf(record.envelope_json), holdGrantOf(record.envelope_json)));
   return 0;
 }
 

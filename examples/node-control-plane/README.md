@@ -8,12 +8,12 @@ through it is [`docs/node-integration-from-nodejs.md`](../../docs/node-integrati
 
 | File | What it is |
 | --- | --- |
-| `ward-node.mjs` | The library: ids (§7.2) and their derivation from caller ids, the issuer key and proof (§2.3, §7.4), the envelope (§7), the durable per-task version (§10), run records for replay, the `ward-node-adapter` conversation (§11.4), the receipt-to-outcome mapping (§9, §11.3), result return: the manifest's `output` grant within the node's ceilings (§7.5), the returned output decoded with every digest recomputed and held to its grant, and returned files written under one directory (§6.6), and the action channel: the manifest's `actions` grant within ADR-0031's grammar and the node's ceilings (§7.5), `actions` and `answer` with every listing and answer held to the contract, and `answerLoop`, which answers a running attempt's requests by a policy from a second adapter, recording each answer with its operation id in the run record before sending it (§6.7), and brokered credentials: the manifest's `credentials` grant within ADR-0034's grammar, its hosts covered by the manifest's own `network.custom`, signed last, and the capability document's `credentials` flags read before a grant is signed (§6.8). |
+| `ward-node.mjs` | The library: ids (§7.2) and their derivation from caller ids, the issuer key and proof (§2.3, §7.4), the envelope (§7), the durable per-task version (§10), run records for replay, the `ward-node-adapter` conversation (§11.4), the receipt-to-outcome mapping (§9, §11.3), result return: the manifest's `output` grant within the node's ceilings (§7.5), the returned output decoded with every digest recomputed and held to its grant, and returned files written under one directory (§6.6), and the action channel: the manifest's `actions` grant within ADR-0031's grammar and the node's ceilings (§7.5), `actions` and `answer` with every listing and answer held to the contract, and `answerLoop`, which answers a running attempt's requests by a policy from a second adapter, recording each answer with its operation id in the run record before sending it (§6.7), and brokered credentials: the manifest's `credentials` grant within ADR-0034's grammar, its hosts covered by the manifest's own `network.custom`, and the capability document's `credentials` flags read before a grant is signed (§6.8), and approval holds: the manifest's `hold` within ADR-0035's grammar, naming only hosts and services the same manifest grants, signed last, `actions.hold` read before it is signed, and the node-opened requests of a listing held to it (§6.9). |
 | `ward-node.d.ts` | Hand-written TypeScript declarations for it. |
 | `blake3.mjs` | BLAKE3-256 in plain JavaScript, for key ids and manifest hashes; held to the reference vectors. |
-| `control-plane.mjs` | The command line: `keygen`, `derive-id`, `capabilities`, `run` (with `--stdio-bytes`, `--files`, `--files-bytes` for an output grant and `--out-dir` for the returned files; `--actions` with `--actions-max-pending`, `--actions-max-total`, `--actions-wait-secs` for an actions grant and `--approve-all`, `--deny-all` or `--ask` to answer it; `--credential <service>=<host>[:<ttl-secs>]` for a credentials grant, refused before signing on a node that does not broker credentials and listed in the outcome), `replay`, `inspect`, `result`, `revoke`, `actions`, `answer`. |
+| `control-plane.mjs` | The command line: `keygen`, `derive-id`, `capabilities`, `run` (with `--stdio-bytes`, `--files`, `--files-bytes` for an output grant and `--out-dir` for the returned files; `--actions` with `--actions-max-pending`, `--actions-max-total`, `--actions-wait-secs` for an actions grant and `--approve-all`, `--deny-all` or `--ask` to answer it; `--credential <service>=<host>[:<ttl-secs>]` for a credentials grant, refused before signing on a node that does not broker credentials and listed in the outcome; `--hold host=<pattern>` or `--hold service=<name>` for a hold, refused before signing on a node without `--approval-hold`, its node-opened requests answered by the policy and listed in the outcome), `replay`, `inspect`, `result`, `revoke`, `actions`, `answer`. |
 | `fixtures/` | `fake-adapter.mjs`, a scripted stand-in for `ward-node-adapter` for the unit suite; `fake-credential-services.mjs`, a fake OpenBao and a fake upstream on 127.0.0.1 for the acceptance's credentials cases. |
-| `test/` | `node --test` cases (76) that need no node and no sandbox: the §7.4 vector byte for byte, ids, the version counter across a restart, the JSON-lines framing against `fixtures/fake-adapter.mjs`, the output grant's grammar and ceilings, result decoding and digest verification, writing returned files without escaping their directory, the actions grant's grammar and ceilings, the answer loop against a scripted channel (answers persisted before sending, replayed after a restart under the same id, each refusal, the end of the attempt), the command line's `--approve-all`, `--deny-all`, `--ask`, `actions` and `answer`, and the credentials grant's grammar and allowlist coverage, the broker flags read before signing, and `run --credential` and its replay. |
+| `test/` | `node --test` cases (86) that need no node and no sandbox: the §7.4 vector byte for byte, ids, the version counter across a restart, the JSON-lines framing against `fixtures/fake-adapter.mjs`, the output grant's grammar and ceilings, result decoding and digest verification, writing returned files without escaping their directory, the actions grant's grammar and ceilings, the answer loop against a scripted channel (answers persisted before sending, replayed after a restart under the same id, each refusal, the end of the attempt), the command line's `--approve-all`, `--deny-all`, `--ask`, `actions` and `answer`, and the credentials grant's grammar and allowlist coverage, the broker flags read before signing, and `run --credential` and its replay, and the hold's grammar and its manifest, its signed bytes, listings held to it, `actions.hold` read before signing, and `run --hold` with each policy and its refusals. |
 
 ```bash
 cd examples/node-control-plane && node --test          # the unit suite
@@ -35,17 +35,24 @@ without the flag refuses the grant, and, on a node started with `--network-allow
 receives the leased token the node's proxy injected while the workload's output, the
 sealed log, the task root and the node's state never hold it, that the lease is revoked at
 the provider when the attempt ends or is cancelled, that a replay leases nothing, and that a
-node without `--credentials` (and the client before it) refuses the grant; its evidence logs
-are verified with the node's own audit, and the action and credential records in them are
-decoded from the raw bytes and checked against what the client used (18 cases). The
-credentials node is `ward-node` built with its `test-loopback` feature, since the shipped
-build never connects to a loopback upstream or speaks plain HTTP to one; the script builds
-it into a target directory of its own, or takes `WARD_NODE_LOOPBACK_BIN`.
+node without `--credentials` (and the client before it) refuses the grant, and, on a node
+started with `--action-channel` and `--approval-hold` as well, that a held credential route
+is refused by name until the client's policy approves the request the node opened for it
+(and then reaches the upstream with the lease injected), stays refused on a denial or an
+expiry, and that a node without `--approval-hold` (and the client before it) refuses the
+hold; its evidence logs are verified with the node's own audit, and the action, credential
+and network records in them are decoded from the raw bytes and checked against what the
+client used (22 cases). The credentials and hold nodes are `ward-node` built with its
+`test-loopback` feature, since the shipped build never connects to a loopback upstream or
+speaks plain HTTP to one; the script builds it into a target directory of its own, or takes
+`WARD_NODE_LOOPBACK_BIN`.
 
 The signing key is a PKCS#8 PEM file (mode 0600) that never leaves the control plane's
 process; the node sees signatures only. Everything the client builds is checked against
 the contract's bounds before it is signed, and neither an `unknown` outcome nor a
 granted output that did not come back is ever success. An approval through the action
 channel is a statement the node records and relays to a workload that chose to wait for
-it, not a hold the node enforces. A credentials grant names a service, never a secret: the
-node leases the credential and its proxy injects it, so the workload never holds it.
+it; what the node enforces is a hold, on a held host or credential, released only by an
+approval of the request the node itself opened. A credentials grant names a service, never
+a secret: the node leases the credential and its proxy injects it, so the workload never
+holds it.

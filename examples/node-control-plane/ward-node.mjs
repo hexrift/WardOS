@@ -3,8 +3,8 @@
 // TypeScript control plane would write it: ids (§7.2), the issuer key and its proof
 // (§2.3, §7.4), the admission envelope (§7), the per-task version (§7.3, §10), and the
 // JSON-lines conversation with `ward-node-adapter` (§11.4), result return (§6.6), the
-// action channel (§6.7) and brokered credentials (§6.8). The walk through it for an
-// adapter author is docs/node-integration-from-nodejs.md.
+// action channel (§6.7), brokered credentials (§6.8) and approval holds (§6.9). The walk
+// through it for an adapter author is docs/node-integration-from-nodejs.md.
 //
 // Everything here fails closed: an id, hex value, grant or bound outside the contract is
 // refused before anything is signed or sent, an `unknown` outcome is never certain, and
@@ -65,6 +65,13 @@ export const ACTION_CEILINGS = Object.freeze({ maxPending: 8, maxTotal: 64, wait
  */
 export const CREDENTIAL_LIMITS = Object.freeze({ grants: 4, serviceBytes: 32, ttlSecs: 4_294_967_295 });
 
+/**
+ * What the `hold` grammar bounds (§6.9, §7.5, ADR-0035): at most 8 held capabilities, each
+ * a `network.custom` pattern or a `credentials` service of the same manifest. Outside these
+ * the node fails to decode the envelope, so the client refuses the hold before signing.
+ */
+export const HOLD_LIMITS = Object.freeze({ holds: 8 });
+
 /** The decisions a control plane may answer; `expired` and `cancelled` are the node's. */
 export const ANSWER_DECISIONS = Object.freeze(["approved", "denied"]);
 
@@ -75,7 +82,7 @@ const CAPABILITY = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const RESOURCE = /^[\x21-\x7e]{1,256}$/;
 const HOST_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const CREDENTIAL_SERVICE = /^[a-z][a-z0-9-]{0,31}$/;
-const MANIFEST_FIELDS = Object.freeze(["network", "output", "actions", "credentials"]);
+const MANIFEST_FIELDS = Object.freeze(["network", "output", "actions", "credentials", "hold"]);
 const OUTPUT_PATH_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const OUTPUT_SKIPS = Object.freeze(["missing", "not_a_regular_file", "too_large"]);
@@ -87,6 +94,7 @@ const MAX_ACTION_SUMMARY_BYTES = 512;
 const MAX_ACTION_DETAIL_BYTES = 16384;
 const MAX_ACTION_NOTE_BYTES = 512;
 const MAX_ACTION_NUMBER = 4_294_967_295;
+const HOLD_REQUEST_ID = /^hold:([1-9][0-9]*)$/;
 // The reasons `actions` and `answer` are refused with (§6.7); anything else is not this contract.
 const ACTIONS_REFUSALS = Object.freeze(["task_not_found", "attempt_mismatch", "lease_mismatch", "unsupported_operation", "resource_unavailable"]);
 const ANSWER_REFUSALS = Object.freeze([
@@ -98,7 +106,7 @@ const ANSWER_REFUSALS = Object.freeze([
 ]);
 // Operation ids past the scheme's six verbs: `pause` and `resume` count up from start + 6,
 // at most 128 of each per attempt (§6.3), so answers start at start + 6 + 256, one per
-// request number (at most 64, the ceiling of `max_total`).
+// request number (at most 72: the ceiling of `max_total` and the requests a hold opens).
 const INTERVENTION_IDS = 256;
 const MAX_ENVELOPE_BYTES = 32768;
 const MAX_ARGV_ENTRY_BYTES = 4096;
@@ -206,6 +214,11 @@ function isDnsName(name) {
   return name.length <= 253 && name.split(".").every((label) => HOST_LABEL.test(label));
 }
 
+/** A `network.custom` pattern: a lowercase DNS name, or `*.` and one. */
+function isHostPattern(pattern) {
+  return typeof pattern === "string" && isDnsName(pattern.startsWith("*.") ? pattern.slice(2) : pattern);
+}
+
 function checkNetwork(network) {
   if (network === "offline") return network;
   if (network === null || typeof network !== "object" || Object.keys(network).join() !== "custom") {
@@ -216,8 +229,7 @@ function checkNetwork(network) {
   if (new Set(hosts).size !== hosts.length) refuse("manifest `network.custom` repeats a host");
   for (const host of hosts) {
     if (typeof host !== "string") refuse("a manifest host is a string");
-    const name = host.startsWith("*.") ? host.slice(2) : host;
-    if (!isDnsName(name)) {
+    if (!isHostPattern(host)) {
       refuse(`manifest host ${JSON.stringify(host)} is not a lowercase DNS name or *.name pattern`);
     }
   }
@@ -400,25 +412,118 @@ export function requireCredentialBroker(capabilities) {
   return capabilities;
 }
 
+/**
+ * The `hold` of ADR-0035 in wire spelling (`hosts` first, then `services`, each only when
+ * non-empty), refused outside the grammar and, given the rest of the checked manifest
+ * (`canonical`), for a host that is not one of its `network.custom` patterns, a service
+ * that is not one of its `credentials`, or a manifest whose `actions` grant does not name
+ * `approval` (the node asks through it).
+ */
+function checkHold(hold, canonical) {
+  if (hold === null || typeof hold !== "object" || Array.isArray(hold)) refuse("manifest `hold` is one object {hosts?, services?}");
+  const keys = Object.keys(hold);
+  if (keys.length === 0 || keys.some((key) => key !== "hosts" && key !== "services")) {
+    refuse("manifest `hold` has the fields hosts and services, at least one, nothing else");
+  }
+  const list = (name, valid, what) => {
+    if (!keys.includes(name)) return [];
+    const entries = hold[name];
+    if (!Array.isArray(entries) || entries.length === 0) refuse(`hold \`${name}\` is a non-empty list`);
+    for (const entry of entries) if (!valid(entry)) refuse(`held ${what} ${JSON.stringify(entry)} is not ${what === "host" ? "a lowercase DNS name or *.name pattern" : "[a-z][a-z0-9-]{0,31}"}`);
+    if (new Set(entries).size !== entries.length) refuse(`hold \`${name}\` repeats a ${what}`);
+    return [...entries];
+  };
+  const hosts = list("hosts", isHostPattern, "host");
+  const services = list("services", (service) => typeof service === "string" && CREDENTIAL_SERVICE.test(service), "service");
+  if (hosts.length + services.length > HOLD_LIMITS.holds) refuse(`a hold names at most ${HOLD_LIMITS.holds} capabilities`);
+  if (canonical !== undefined) {
+    const custom = canonical.network === "offline" ? [] : canonical.network.custom;
+    for (const host of hosts) {
+      if (!custom.includes(host)) refuse(`held host ${JSON.stringify(host)} is not one of the manifest's network.custom patterns: a hold names a capability the manifest grants`);
+    }
+    for (const service of services) {
+      if (!(canonical.credentials ?? []).some((grant) => grant.service === service)) {
+        refuse(`held service ${JSON.stringify(service)} is not one of the manifest's credentials: a hold names a capability the manifest grants`);
+      }
+    }
+    if (!canonical.actions?.kinds.includes("approval")) {
+      refuse("a hold needs an actions grant naming approval: the node asks for each held capability through the action channel");
+    }
+  }
+  return { ...(hosts.length > 0 ? { hosts } : {}), ...(services.length > 0 ? { services } : {}) };
+}
+
+/**
+ * The §7.5 `hold` in wire spelling from the control plane's words: the `hosts` (patterns
+ * of the manifest's `network.custom`) and `services` (of its `credentials`) the node holds
+ * until the control plane approves the request it opens for each on first use (ADR-0035).
+ * Refused outside the grammar; the manifest that carries it is refused unless it grants
+ * every one and an `actions` grant naming `approval`.
+ */
+export function holdGrant({ hosts = [], services = [] } = {}) {
+  const wire = {};
+  if (!Array.isArray(hosts) || hosts.length > 0) wire.hosts = hosts;
+  if (!Array.isArray(services) || services.length > 0) wire.services = services;
+  return checkHold(wire);
+}
+
+/**
+ * The capabilities a checked `hold` names, in the order the node numbers its requests:
+ * hosts first, then services, each `{host}` or `{service}` as the listing's `hold` field
+ * spells it, with the id the node opens its request under (`hold:1`, `hold:2`, …) and the
+ * summary it asks with.
+ */
+export function heldCapabilities(hold) {
+  const checked = checkHold(hold);
+  return [
+    ...(checked.hosts ?? []).map((host) => ({ capability: { host }, summary: `network ${host}` })),
+    ...(checked.services ?? []).map((service) => ({ capability: { service }, summary: `credential ${service}` })),
+  ].map((entry, index) => ({ id: `hold:${index + 1}`, ...entry }));
+}
+
+/**
+ * Whether the node's capability document (§5) offers approval holds: its `actions` section
+ * carries `hold: true`, which a node started with --network-allowlist, --action-channel and
+ * --approval-hold reports.
+ */
+export function offersApprovalHold(capabilities) {
+  return capabilities?.actions?.hold === true;
+}
+
+/**
+ * The capability document, refused unless it offers approval holds: any other node refuses
+ * a manifest with a `hold` `unsupported_grant`, so the client refuses it before signing.
+ */
+export function requireApprovalHold(capabilities) {
+  if (!offersApprovalHold(capabilities)) {
+    refuse(
+      "the node does not advertise actions.hold (a node started with --network-allowlist, --action-channel and " +
+        "--approval-hold does) and refuses a manifest with a hold as unsupported_grant",
+    );
+  }
+  return capabilities;
+}
+
 /** The manifest in canonical key order, refusing anything outside the §7.5 grammar. */
 function checkManifest(object) {
   if (object === null || typeof object !== "object" || Array.isArray(object)) refuse("a manifest is one JSON object");
   const keys = Object.keys(object);
   if (!keys.includes("network") || keys.some((key) => !MANIFEST_FIELDS.includes(key))) {
-    refuse("a manifest has the field `network` and optionally `output`, `actions` and `credentials`, nothing else");
+    refuse("a manifest has the field `network` and optionally `output`, `actions`, `credentials` and `hold`, nothing else");
   }
   const canonical = { network: checkNetwork(object.network) };
   if (keys.includes("output")) canonical.output = checkOutputGrant(object.output);
   if (keys.includes("actions")) canonical.actions = checkActionsGrant(object.actions);
   if (keys.includes("credentials")) canonical.credentials = checkCredentialsGrant(object.credentials, canonical.network);
+  if (keys.includes("hold")) canonical.hold = checkHold(object.hold, canonical);
   return canonical;
 }
 
 /**
  * The manifest as the envelope carries it: hex bytes as sent and their BLAKE3-256 (§7.3).
- * The bytes are compact JSON with `network` first, then `output`, `actions` and
- * `credentials` when granted, whatever order the caller wrote the fields in, so one grant
- * has one signed spelling.
+ * The bytes are compact JSON with `network` first, then `output`, `actions`, `credentials`
+ * and `hold` when granted, whatever order the caller wrote the fields in, so one grant has
+ * one signed spelling.
  */
 export function manifest(object = OFFLINE_MANIFEST) {
   const bytes = Buffer.from(JSON.stringify(checkManifest(object)), "utf8");
@@ -449,6 +554,14 @@ export function actionsGrantOf(envelopeJson) {
  */
 export function credentialsGrantOf(envelopeJson) {
   return manifestOf(envelopeJson).credentials ?? null;
+}
+
+/**
+ * The `hold` a signed envelope's manifest carries (wire spelling), or `null` without one:
+ * the capabilities the node holds for a run of it, and what its listings are held to.
+ */
+export function holdGrantOf(envelopeJson) {
+  return manifestOf(envelopeJson).hold ?? null;
 }
 
 /** The checked manifest of a serialised envelope, read from its exact bytes. */
@@ -858,15 +971,17 @@ export function operationIds(startAt = 1) {
 }
 
 /**
- * The operation id of the answer to the node's request number `request` (1 to 64) under a
- * scheme (`operationIds(N)` or a run record's `{start_at: N}`): one id per request, so a
- * replay of an answer is the same operation and the node applies it at most once (§6.7).
+ * The operation id of the answer to the node's request number `request` (1 to 72: the
+ * workload's 64 at most and the 8 a hold may open) under a scheme (`operationIds(N)` or a
+ * run record's `{start_at: N}`): one id per request, so a replay of an answer is the same
+ * operation and the node applies it at most once (§6.7).
  */
 export function answerOperationId(ids, request) {
   const startAt = ids?.start_at;
   if (!Number.isSafeInteger(startAt) || startAt < 1) refuse("an operation-id scheme has start_at, an integer >= 1");
-  if (!Number.isSafeInteger(request) || request < 1 || request > ACTION_CEILINGS.maxTotal) {
-    refuse(`a request number is an integer from 1 to ${ACTION_CEILINGS.maxTotal}, got ${JSON.stringify(request)}`);
+  const last = ACTION_CEILINGS.maxTotal + HOLD_LIMITS.holds;
+  if (!Number.isSafeInteger(request) || request < 1 || request > last) {
+    refuse(`a request number is an integer from 1 to ${last}, got ${JSON.stringify(request)}`);
   }
   return operationIds(startAt).first_answer + request - 1;
 }
@@ -1125,7 +1240,9 @@ export class Adapter {
    * `actions` every `pollMs` (default 250), and for each pending request not yet answered
    * ask `policy(request, {signal})` once, which returns `"approved"`, `"denied"`,
    * `{decision, note}`, or `null` to leave the request to someone else (it then expires).
-   * Run it on a second adapter while the first one's `run` blocks (§11.4).
+   * A request the node opened for a held capability (§6.9) carries `hold` ({host} or
+   * {service}); approving it is what lets the workload's proxy traffic for that capability
+   * through. Run it on a second adapter while the first one's `run` blocks (§11.4).
    *
    * With `runDir` (the directory of `saveRunRecord`) the answers take their operation ids
    * from the record's scheme (`answerOperationId`) and each is written to the record
@@ -1138,23 +1255,26 @@ export class Adapter {
    * answer; `already_answered` (expired, cancelled or answered elsewhere), `stale_operation`,
    * `unknown_request` and `invalid_state` are final for the request. Before the attempt
    * exists (`task_not_found`, `attempt_mismatch` until the run's `create`) the loop waits;
-   * a listing outside the contract or the record's grant, or a node that cannot serve the
+   * a listing outside the contract or the record's grant and hold (or `grant` and `hold`
+   * when given), or a node that cannot serve the
    * channel, is refused. Resolves with {state, answers} once a listing reads an ended state
    * (`exited`, `stopped`, `revoked`, `sealed`), or with state `null` when `signal` aborts;
    * `answers` holds every answer sent and how the node took it, also reported to
    * `onAnswer`, and each request is reported to `onRequest` when first seen.
    */
-  async answerLoop(binding, policy, { pollMs = 250, signal, runDir, operationIds: ids, grant, onRequest, onAnswer } = {}) {
+  async answerLoop(binding, policy, { pollMs = 250, signal, runDir, operationIds: ids, grant, hold, onRequest, onAnswer } = {}) {
     checkBinding(binding);
     if (typeof policy !== "function") refuse("the answer policy is a function");
     if (!Number.isSafeInteger(pollMs) || pollMs < 1) refuse("pollMs is an integer >= 1");
     let scheme = ids;
     let held = grant ?? null;
+    let holding = hold ?? null;
     if (runDir !== undefined) {
       const record = loadRunRecord(runDir, binding.attempt);
       if (["task", "attempt", "lease"].some((key) => record.binding?.[key] !== binding[key])) refuse("the run record is not this binding's");
       scheme = record.operation_ids;
       if (grant === undefined) held = actionsGrantOf(record.envelope_json);
+      if (hold === undefined) holding = holdGrantOf(record.envelope_json);
     } else if (scheme === undefined) {
       refuse("the answer loop needs runDir or operationIds: its answers take their operation ids from a scheme");
     }
@@ -1177,7 +1297,7 @@ export class Adapter {
         continue;
       }
       exists = true;
-      const listing = decodeActions(listed, held);
+      const listing = decodeActions(listed, held, holding);
       if (ENDED_STATES.includes(listing.state)) return { state: listing.state, answers };
       for (const request of listing.pending) {
         if (signal?.aborted) break;
@@ -1211,6 +1331,7 @@ export class Adapter {
           request: request.action,
           id: request.id,
           kind: request.kind,
+          ...(request.hold === undefined ? {} : { hold: request.hold }),
           summary: request.summary,
           decision: entry.decision,
           ...(entry.note === undefined ? {} : { note: entry.note }),
@@ -1298,35 +1419,47 @@ function textBytes(value, what, min, max) {
 
 /**
  * Decode an `actions` answer (§6.7): {state, pending}, each pending request {action, id,
- * kind, summary, detail, expires_in_ms} within the channel's bounds, oldest first (strictly
- * increasing `action`), ids unique, at most 8, and none unless the attempt is `running` or
+ * kind, summary, detail, expires_in_ms} within the channel's bounds, and a request the node
+ * opened for a held capability (§6.9) also with `hold` ({host} or {service}), its id
+ * `hold:N`, its kind `approval`; oldest first (strictly increasing `action`), ids unique, at
+ * most 8 of the workload's and 8 of the node's, and none unless the attempt is `running` or
  * `paused`. With the `grant` the attempt was admitted under (`actionsGrantOf`), also held to
- * it: only granted kinds, at most `max_pending`, numbers up to `max_total`, and no wait
- * longer than `wait_secs`. A listing outside these is refused, not acted on.
+ * it: only granted kinds, at most `max_pending` of the workload's, numbers up to
+ * `max_total` and the holds, and no wait longer than `wait_secs`; and to its `hold`
+ * (`holdGrantOf`; with a `grant` and no `hold` the manifest had none): each node-opened
+ * request names exactly the capability its id numbers and asks with its summary. A
+ * listing outside these is refused, not acted on.
  */
-export function decodeActions(listing, grant = null) {
+export function decodeActions(listing, grant = null, hold = null) {
   if (listing === null || typeof listing !== "object" || Array.isArray(listing)) refuse("a listing is {state, pending}");
   if (!LIFECYCLE_STATES.includes(listing.state)) refuse(`a listing's state ${JSON.stringify(listing.state)} is not a lifecycle state`);
   if (!Array.isArray(listing.pending)) refuse("a listing's pending is a list");
   const held = grant === null || grant === undefined ? null : checkActionsGrant(grant);
+  const holds = hold === null || hold === undefined ? null : heldCapabilities(hold);
+  const opened = listing.pending.filter((entry) => entry !== null && typeof entry === "object" && "hold" in entry).length;
   const limit = held ? held.max_pending : ACTION_CEILINGS.maxPending;
-  if (listing.pending.length > limit) {
-    refuse(`a listing holds at most ${limit} pending requests (${held ? "the grant's max_pending" : "the node's ceiling"}), got ${listing.pending.length}`);
+  if (listing.pending.length - opened > limit) {
+    refuse(`a listing holds at most ${limit} pending requests of the workload's (${held ? "the grant's max_pending" : "the node's ceiling"}), got ${listing.pending.length - opened}`);
   }
+  const holdLimit = holds ? holds.length : held ? 0 : HOLD_LIMITS.holds;
+  if (opened > holdLimit) refuse(`a listing holds at most ${holdLimit} requests the node opened for a hold, got ${opened}`);
   if (listing.pending.length > 0 && !LIVE_STATES.includes(listing.state)) {
     refuse(`only a running or paused attempt has pending requests; this one is ${listing.state}`);
   }
   const ids = new Set();
   let previous = 0;
   const pending = listing.pending.map((entry) => {
-    if (entry === null || typeof entry !== "object" || Object.keys(entry).sort().join() !== "action,detail,expires_in_ms,id,kind,summary") {
-      refuse("a pending request is {action, id, kind, summary, detail, expires_in_ms}");
+    const keys = entry === null || typeof entry !== "object" ? "" : Object.keys(entry).sort().join();
+    if (keys !== "action,detail,expires_in_ms,id,kind,summary" && keys !== "action,detail,expires_in_ms,hold,id,kind,summary") {
+      refuse("a pending request is {action, id, kind, summary, detail, expires_in_ms} and, when the node opened it for a hold, hold");
     }
     const { action } = entry;
     if (!Number.isSafeInteger(action) || action < 1 || action > MAX_ACTION_NUMBER) refuse(`a pending request's action is an integer from 1 to ${MAX_ACTION_NUMBER}`);
     if (action <= previous) refuse("pending requests are listed oldest first, by strictly increasing action");
     previous = action;
-    if (held && action > held.max_total) refuse(`request ${action} is above the grant's max_total ${held.max_total}`);
+    if (held && action > held.max_total + holdLimit) {
+      refuse(`request ${action} is above the grant's max_total ${held.max_total} and the requests a hold opens`);
+    }
     if (typeof entry.id !== "string" || !ACTION_ID.test(entry.id)) refuse(`request ${action}'s id ${JSON.stringify(entry.id)} is not 1-64 bytes of A-Z a-z 0-9 . _ : -`);
     if (ids.has(entry.id)) refuse(`the listing repeats the id ${entry.id}`);
     ids.add(entry.id);
@@ -1336,9 +1469,33 @@ export function decodeActions(listing, grant = null) {
     textBytes(entry.detail, `request ${action}'s detail`, 0, MAX_ACTION_DETAIL_BYTES);
     if (!Number.isSafeInteger(entry.expires_in_ms) || entry.expires_in_ms < 0) refuse(`request ${action}'s expires_in_ms is an integer >= 0`);
     if (held && entry.expires_in_ms > held.wait_secs * 1000) refuse(`request ${action} expires in ${entry.expires_in_ms} ms, longer than the grant's wait_secs ${held.wait_secs}`);
-    return { action, id: entry.id, kind: entry.kind, summary: entry.summary, detail: entry.detail, expires_in_ms: entry.expires_in_ms };
+    const decoded = { action, id: entry.id, kind: entry.kind, summary: entry.summary, detail: entry.detail, expires_in_ms: entry.expires_in_ms };
+    const number = HOLD_REQUEST_ID.exec(entry.id);
+    if (!("hold" in entry)) {
+      if (holds && number !== null && Number(number[1]) <= holds.length) refuse(`request ${action} is under the node's id ${entry.id} but names no held capability`);
+      return decoded;
+    }
+    decoded.hold = checkHeldCapability(entry.hold, action);
+    if (number === null || entry.kind !== "approval") refuse(`request ${action} names a held capability, so the node opened it: its id is hold:N and its kind approval`);
+    if (holds) {
+      const expected = holds[Number(number[1]) - 1];
+      if (expected === undefined || JSON.stringify(expected.capability) !== JSON.stringify(decoded.hold) || expected.summary !== entry.summary) {
+        refuse(`request ${action} (${entry.id}) is not the request the node opens for the hold's capability ${number[1]}`);
+      }
+    }
+    return decoded;
   });
   return { state: listing.state, pending };
+}
+
+/** A listing's `hold`: {host: pattern} or {service: name}, nothing else. */
+function checkHeldCapability(capability, action) {
+  const keys = capability === null || typeof capability !== "object" || Array.isArray(capability) ? [] : Object.keys(capability);
+  if (keys.length === 1 && keys[0] === "host" && isHostPattern(capability.host)) return { host: capability.host };
+  if (keys.length === 1 && keys[0] === "service" && typeof capability.service === "string" && CREDENTIAL_SERVICE.test(capability.service)) {
+    return { service: capability.service };
+  }
+  return refuse(`request ${action}'s hold is {host: pattern} or {service: name}, got ${JSON.stringify(capability)}`);
 }
 
 // ---------------------------------------------------------------------------------------
