@@ -55,8 +55,10 @@ real node started with `--output-return` and `--action-channel` (and a third wit
 either, a fourth with `--network-allowlist` and `--credentials`, a fifth with
 `--network-allowlist` alone, a sixth with `--network-allowlist`, `--credentials`,
 `--action-channel` and `--approval-hold`, a seventh with all of those but
-`--approval-hold`, and an eighth with `--agent-adapter claude-code` and
-`--agent-adapter codex`), under the same isolation requirement; its twenty-five verdicts
+`--approval-hold`, an eighth with `--agent-adapter claude-code` and
+`--agent-adapter codex`, a ninth with `--listen-tls` and certificates made at run time,
+and a tenth with `--max-running 1` and without `--cgroup-root`), under the same isolation
+requirement; its twenty-eight verdicts
 (five of the attempt's lifecycle; three of result return: declared content with digests the host
 agrees with, truncation past the budgets, and the refusal of a grant by a node without
 the flag; six of the action channel, with a workload in the sandbox that proceeds only on
@@ -80,7 +82,15 @@ its home, on the shipped build whose environment holds model keys: both run unde
 byte-identical signed manifests with none of the node's keys in either sandbox and one
 `agent_adapter` binding in each sealed log, Claude Code's hook lines are answered `allow`
 and recorded as claims while Codex has no hook socket, and an adapter the node does not
-host is refused by the client and by a node without `--agent-adapter`) follow the table
+host is refused by the client and by a node without `--agent-adapter`; one of the mutual-TLS
+transport: the client over `--connect-tls` reads the socket's capability document and runs
+an attempt to a verifying sealed log, the node's key pinned the operator's way is accepted
+and another refused, and a client of another CA is refused and reported; two of capacity and
+resource limits, on the shipped build started with `--max-running 1` and without
+`--cgroup-root`: while one attempt holds the slot a start refused `capacity_exhausted` is
+waited out by the client with the same start under the same operation ids and version (and,
+once its wait is spent, left `ready` for a replay that sends it), and a `resources` grant is
+refused by the client and, signed without asking the node, by the node itself) follow the table
 and a failure of either fails the run. The credentials and hold nodes are `ward-node` built with its
 `test-loopback` feature (the
 shipped build never connects to a loopback upstream or speaks plain HTTP to one), which
@@ -284,7 +294,7 @@ Which `ward-node` each case runs:
 | Cases | Build | Where it comes from |
 | --- | --- | --- |
 | The Rust suite's (§2), run by `node.sh` | shipped, without `test-loopback` | `WARD_NODE_BIN`, or built by `node.sh` into `${CARGO_TARGET_DIR:-target}/node-shipped` and passed on to the suite and to `node-js.sh` as `WARD_NODE_BIN` |
-| `node-js.sh`'s lifecycle, result return and action channel cases, its node with `--network-allowlist` and without `--credentials`, and every `snapshot import`, `issuer-key-id` and `audit` | shipped, without `test-loopback` | `WARD_NODE_BIN`, or built into the same `node-shipped` directory |
+| `node-js.sh`'s lifecycle, result return, action channel, capacity and resources cases, its node with `--network-allowlist` and without `--credentials`, and every `snapshot import`, `issuer-key-id` and `audit` | shipped, without `test-loopback` | `WARD_NODE_BIN`, or built into the same `node-shipped` directory |
 | `node-js.sh`'s credentials node, hold node and node without `--approval-hold` | `test-loopback` | `WARD_NODE_LOOPBACK_BIN`, or built into `${CARGO_TARGET_DIR:-target}/node-js-test-loopback` |
 
 Neither runner takes `ward-node` from `${CARGO_TARGET_DIR:-target}/debug`: a `cargo test`

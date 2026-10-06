@@ -3,7 +3,8 @@
 // TypeScript control plane would write it: ids (§7.2), the issuer key and its proof
 // (§2.3, §7.4), the admission envelope (§7), the per-task version (§7.3, §10), and the
 // JSON-lines conversation with `ward-node-adapter` (§11.4), result return (§6.6), the
-// action channel (§6.7), brokered credentials (§6.8) and approval holds (§6.9). The walk
+// action channel (§6.7), brokered credentials (§6.8), approval holds (§6.9), resource
+// limits (§7.5, §9) and waiting out a node at capacity (§8.2). The walk
 // through it for an adapter author is docs/node-integration-from-nodejs.md.
 //
 // Everything here fails closed: an id, hex value, grant or bound outside the contract is
@@ -46,6 +47,22 @@ export const ID_PREFIXES = Object.freeze(["task", "exec", "lease", "agent", "nod
  * is refused `unsupported_grant` by every node, so the client refuses it before signing.
  */
 export const OUTPUT_CEILINGS = Object.freeze({ stdioBytes: 1_048_576, filesBytes: 8_388_608, files: 64, pathBytes: 255 });
+
+/**
+ * What a node started with `--cgroup-root` honours of a `resources` grant (§7.5): at most
+ * 65 536 `pids` on every node, and at most `cpuMillisPerCpu` `cpu_millis` per logical CPU
+ * and the host's memory, both as the capability document's `capacity` reports them. A
+ * grant above the pid ceiling is refused `unsupported_grant` by every node, so the client
+ * refuses it before signing; the other two are held to the node's document.
+ */
+export const RESOURCE_CEILINGS = Object.freeze({ pids: 65_536, cpuMillisPerCpu: 1000 });
+
+/**
+ * How `Adapter.run` paces a capacity wait (§8.2) unless told otherwise: the first wait
+ * after a `start` refused `capacity_exhausted` is `firstDelayMs`, each next one twice the
+ * last, at most `maxDelayMs`, all within the run's `capacityWaitMs`.
+ */
+export const CAPACITY_WAIT = Object.freeze({ firstDelayMs: 250, maxDelayMs: 5000 });
 
 /** The kinds of request a workload may send on the action channel (§6.7, ADR-0031). */
 export const ACTION_KINDS = Object.freeze(["approval", "decision"]);
@@ -90,7 +107,9 @@ const RESOURCE = /^[\x21-\x7e]{1,256}$/;
 const HOST_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const CREDENTIAL_SERVICE = /^[a-z][a-z0-9-]{0,31}$/;
 const ADAPTER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
-const MANIFEST_FIELDS = Object.freeze(["network", "output", "actions", "credentials", "hold"]);
+const MANIFEST_FIELDS = Object.freeze(["network", "output", "resources", "actions", "credentials", "hold"]);
+// The limits of a `resources` grant, in the order the node's encoder writes them.
+const RESOURCE_LIMITS = Object.freeze(["cpu_millis", "memory_bytes", "pids"]);
 const OUTPUT_PATH_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const OUTPUT_SKIPS = Object.freeze(["missing", "not_a_regular_file", "too_large"]);
@@ -291,6 +310,98 @@ function checkOutputGrant(output) {
  */
 export function outputGrant({ stdioBytes, files, filesBytes }) {
   return checkOutputGrant({ stdio_bytes: stdioBytes, files, files_bytes: filesBytes });
+}
+
+/**
+ * The `resources` grant of §7.5 in wire spelling (`cpu_millis`, `memory_bytes`, `pids`, in
+ * that order, each only when given), refused outside ward-node-protocol's grammar: one
+ * object naming at least one limit and nothing else, each an integer >= 1 (and one that
+ * JSON carries exactly here), `pids` within the ceiling every node holds.
+ */
+function checkResourcesGrant(resources) {
+  if (resources === null || typeof resources !== "object" || Array.isArray(resources)) refuse("manifest `resources` is one object");
+  const keys = Object.keys(resources);
+  if (keys.length === 0 || keys.some((key) => !RESOURCE_LIMITS.includes(key))) {
+    refuse("manifest `resources` names at least one of cpu_millis, memory_bytes, pids and nothing else (no limits is no resources field)");
+  }
+  const grant = {};
+  for (const name of RESOURCE_LIMITS) {
+    if (!keys.includes(name)) continue;
+    const value = resources[name];
+    if (!Number.isSafeInteger(value) || value < 1) refuse(`resources grant \`${name}\` is an integer >= 1, got ${JSON.stringify(value)}`);
+    grant[name] = value;
+  }
+  if (grant.pids > RESOURCE_CEILINGS.pids) {
+    refuse(`resources grant \`pids\` ${grant.pids} is above the ${RESOURCE_CEILINGS.pids} every node refuses as unsupported_grant`);
+  }
+  return grant;
+}
+
+/**
+ * The §7.5 `resources` grant in wire spelling from the control plane's words: the CPU time
+ * per second of wall clock in thousandths of one CPU (`cpuMillis`), the memory the
+ * attempt's process tree may use, with no swap (`memoryBytes`), and the processes and
+ * threads that may exist in it at once (`pids`); each optional, at least one given. An
+ * omitted limit is not bounded by the grant. Refused outside the grammar or above the pid
+ * ceiling; the node's own ceilings are `requireResourceEnforcement`'s to check.
+ */
+export function resourcesGrant({ cpuMillis, memoryBytes, pids } = {}) {
+  const wire = {};
+  if (cpuMillis !== undefined) wire.cpu_millis = cpuMillis;
+  if (memoryBytes !== undefined) wire.memory_bytes = memoryBytes;
+  if (pids !== undefined) wire.pids = pids;
+  return checkResourcesGrant(wire);
+}
+
+/**
+ * Why the node's capability document (§5) does not enforce `grant`, or `null` when it
+ * does: it reports a `resources` section (a node started with `--cgroup-root` does) with
+ * `true` for every limit the grant names, and the grant is within the ceilings of its
+ * `capacity`.
+ */
+function resourceRefusal(capabilities, grant) {
+  const section = capabilities?.resources;
+  if (section === null || typeof section !== "object") {
+    return "the node does not advertise resources (a node started with --cgroup-root does)";
+  }
+  const flags = { cpu_millis: "cpu", memory_bytes: "memory", pids: "pids" };
+  for (const name of Object.keys(grant)) {
+    if (section[flags[name]] !== true) return `the node does not advertise resources.${flags[name]} true, so it cannot enforce \`${name}\``;
+  }
+  const cpus = capabilities?.capacity?.logical_cpus;
+  const memory = capabilities?.capacity?.memory_bytes;
+  if (!Number.isSafeInteger(cpus) || cpus < 1 || !Number.isSafeInteger(memory) || memory < 1) {
+    return "the node's capacity does not say how many logical CPUs and how much memory it has, so no limit is within its ceilings";
+  }
+  const cpuCeiling = cpus * RESOURCE_CEILINGS.cpuMillisPerCpu;
+  if (grant.cpu_millis > cpuCeiling) {
+    return `cpu_millis ${grant.cpu_millis} is above the ${cpuCeiling} the node honours (${RESOURCE_CEILINGS.cpuMillisPerCpu} per CPU, ${cpus} logical CPUs)`;
+  }
+  if (grant.memory_bytes > memory) return `memory_bytes ${grant.memory_bytes} is above the ${memory} bytes the node reports in capacity`;
+  return null;
+}
+
+/**
+ * Whether the node's capability document (§5) enforces the `resources` grant `grant`:
+ * every limit it names has its flag `true` in the document's `resources` section and is
+ * within the ceilings of its `capacity`. A grant outside the grammar is never enforced.
+ */
+export function enforcesResources(capabilities, grant) {
+  try {
+    return resourceRefusal(capabilities, checkResourcesGrant(grant)) === null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The capability document, refused unless it enforces `grant`: any other node refuses the
+ * manifest `unsupported_grant` at `admit`, so the client refuses it before signing.
+ */
+export function requireResourceEnforcement(capabilities, grant) {
+  const why = resourceRefusal(capabilities, checkResourcesGrant(grant));
+  if (why !== null) refuse(`${why}, and refuses this resources grant as unsupported_grant`);
+  return capabilities;
 }
 
 function checkActionBound(value, name, ceiling) {
@@ -517,10 +628,11 @@ function checkManifest(object) {
   if (object === null || typeof object !== "object" || Array.isArray(object)) refuse("a manifest is one JSON object");
   const keys = Object.keys(object);
   if (!keys.includes("network") || keys.some((key) => !MANIFEST_FIELDS.includes(key))) {
-    refuse("a manifest has the field `network` and optionally `output`, `actions`, `credentials` and `hold`, nothing else");
+    refuse("a manifest has the field `network` and optionally `output`, `resources`, `actions`, `credentials` and `hold`, nothing else");
   }
   const canonical = { network: checkNetwork(object.network) };
   if (keys.includes("output")) canonical.output = checkOutputGrant(object.output);
+  if (keys.includes("resources")) canonical.resources = checkResourcesGrant(object.resources);
   if (keys.includes("actions")) canonical.actions = checkActionsGrant(object.actions);
   if (keys.includes("credentials")) canonical.credentials = checkCredentialsGrant(object.credentials, canonical.network);
   if (keys.includes("hold")) canonical.hold = checkHold(object.hold, canonical);
@@ -529,8 +641,8 @@ function checkManifest(object) {
 
 /**
  * The manifest as the envelope carries it: hex bytes as sent and their BLAKE3-256 (§7.3).
- * The bytes are compact JSON with `network` first, then `output`, `actions`, `credentials`
- * and `hold` when granted, whatever order the caller wrote the fields in, so one grant has
+ * The bytes are compact JSON with `network` first, then `output`, `resources`, `actions`,
+ * `credentials` and `hold` when granted, whatever order the caller wrote the fields in, so one grant has
  * one signed spelling.
  */
 export function manifest(object = OFFLINE_MANIFEST) {
@@ -546,6 +658,14 @@ export function manifest(object = OFFLINE_MANIFEST) {
  */
 export function outputGrantOf(envelopeJson) {
   return manifestOf(envelopeJson).output ?? null;
+}
+
+/**
+ * The `resources` grant a signed envelope's manifest carries (wire spelling), or `null`
+ * without one: the limits a run of it was admitted under.
+ */
+export function resourcesGrantOf(envelopeJson) {
+  return manifestOf(envelopeJson).resources ?? null;
 }
 
 /**
@@ -1155,6 +1275,16 @@ export function adapterNodeArgs({ socket, tls }) {
 }
 
 /**
+ * Whether an attempt report (§11.3) is a `start` the node refused `capacity_exhausted`
+ * (§8.2): the task is still `ready` and its admission valid, so the same `start` (the same
+ * run, with the same operation ids) may be sent again once the node has room.
+ */
+export function capacityExhausted(report) {
+  const refused = report?.outcome?.refused;
+  return refused?.verb === "start" && refused?.reason === "capacity_exhausted";
+}
+
+/**
  * One `ward-node-adapter` process: JSON commands in, JSON events out, one per line. The
  * adapter is spawned the way any external tool is, with `--socket` (or `--connect-tls` and
  * its files, see `adapterNodeArgs`) on its command line; `command` is the executable and
@@ -1168,6 +1298,9 @@ export class Adapter {
   #waiters = [];
   #exit = null;
   #trace;
+  #waiting = false;
+  #cancelRequested = false;
+  #wake = null;
 
   constructor({ command = ["ward-node-adapter"], socket, tls, timeoutMs, connectTimeoutMs, env = process.env, trace = null }) {
     const [executable, ...leading] = command;
@@ -1276,25 +1409,112 @@ export class Adapter {
 
   /**
    * Drive one attempt with a pre-signed envelope: `create`, `admit`, `start`, poll, read the
-   * receipt, `seal`. Resolves with every event and the `done` report once the adapter
-   * writes it; `onEvent` sees each event as it arrives. Replaying with the same `signed`
-   * and `operationIds` after a restart acts on nothing (§6.3).
+   * receipt, `seal`. Resolves with every event, the `done` report once the adapter writes
+   * it, and `capacityWaits`; `onEvent` sees each event as it arrives. Replaying with the
+   * same `signed` and `operationIds` after a restart acts on nothing (§6.3).
+   *
+   * With `capacityWaitMs` (default 0: none), a `start` the node refuses `capacity_exhausted`
+   * (§8.2, `capacityExhausted`) is not the end: the task is still `ready`, so the same `run`
+   * command (the same signed bytes, proof and operation ids, hence the same `start`) is sent
+   * again after `capacityDelayMs` (default `CAPACITY_WAIT.firstDelayMs`), each wait twice
+   * the last up to `capacityMaxDelayMs`, until the node starts it or `capacityWaitMs` is
+   * spent; nothing is re-signed and no version is allocated. Before each wait the node's
+   * `scheduling` (§5) is read, and the wait {retry, operation_id, delay_ms, scheduling} is
+   * listed in `capacityWaits` and passed to `onCapacityWait`. Once the wait is spent the
+   * last report, the refusal, is the result. A `cancel()` while waiting revokes the ready
+   * attempt under the scheme's `revoke` id and sends the run once more, which replays
+   * `create` and `admit`, sends no `start` and seals it; that report is the result, with
+   * `cancelled` true and every operation of both runs and the revoke in `operations`.
    */
-  async run(signed, { operationIds: ids, taskRoot, pollMs, maxPollMs, graceMs, onEvent } = {}) {
+  async run(signed, options = {}) {
+    const { operationIds: ids, taskRoot, pollMs, maxPollMs, graceMs, onEvent, onCapacityWait } = options;
+    const {
+      capacityWaitMs = 0,
+      capacityDelayMs = CAPACITY_WAIT.firstDelayMs,
+      capacityMaxDelayMs = CAPACITY_WAIT.maxDelayMs,
+    } = options;
+    if (!Number.isSafeInteger(capacityWaitMs) || capacityWaitMs < 0) refuse("capacityWaitMs is an integer >= 0");
+    for (const [name, value] of [["capacityDelayMs", capacityDelayMs], ["capacityMaxDelayMs", capacityMaxDelayMs]]) {
+      if (!Number.isSafeInteger(value) || value < 1) refuse(`${name}, a capacity wait's delay, is an integer >= 1`);
+    }
     const command = { cmd: "run", envelope_json: signed.envelope_json, proof: signed.proof };
     if (ids !== undefined) command.operation_ids = { start_at: ids.start_at ?? ids };
     if (pollMs !== undefined) command.poll_ms = pollMs;
     if (maxPollMs !== undefined) command.max_poll_ms = maxPollMs;
     if (graceMs !== undefined) command.grace_ms = graceMs;
     if (taskRoot !== undefined) command.task_root = taskRoot;
-    this.send(command);
+    const deadline = Date.now() + capacityWaitMs;
     const events = [];
+    const capacityWaits = [];
+    let delay = capacityDelayMs;
+    this.#cancelRequested = false;
+    for (;;) {
+      const report = await this.#runOnce(command, events, onEvent);
+      const remaining = deadline - Date.now();
+      if (!capacityExhausted(report) || this.#cancelRequested || remaining <= 0) return { events, report, capacityWaits };
+      // Idle between runs: a cancel now revokes through this adapter instead of signalling it.
+      this.#waiting = true;
+      try {
+        const capabilities = await this.capabilities();
+        const start = report.operations?.find((operation) => operation.verb === "start");
+        const wait = {
+          retry: capacityWaits.length + 1,
+          operation_id: start?.operation_id ?? null,
+          delay_ms: Math.min(delay, remaining),
+          scheduling: capabilities?.scheduling ?? null,
+        };
+        capacityWaits.push(wait);
+        if (onCapacityWait) onCapacityWait(wait);
+        await this.#idle(wait.delay_ms);
+        if (this.#cancelRequested) {
+          return { events, report: await this.#cancelReady(report, command, events, onEvent), capacityWaits };
+        }
+      } finally {
+        this.#waiting = false;
+      }
+      delay = Math.min(delay * 2, capacityMaxDelayMs);
+    }
+  }
+
+  /** Send one `run` command and collect its events to `done`. */
+  async #runOnce(command, events, onEvent) {
+    this.send(command);
     for (;;) {
       const event = await this.next();
       events.push(event);
       if (onEvent) onEvent(event);
-      if (event.event === "done") return { events, report: event.report };
+      if (event.event === "done") return event.report;
     }
+  }
+
+  /** Wait `ms`, or less when `cancel()` is called meanwhile (or was already). */
+  #idle(ms) {
+    if (this.#cancelRequested) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(done, ms);
+      function done() {
+        clearTimeout(timer);
+        resolve();
+      }
+      this.#wake = done;
+    }).finally(() => {
+      this.#wake = null;
+    });
+  }
+
+  /**
+   * End an attempt left `ready` by a capacity refusal when its run is cancelled: `revoke`
+   * under the scheme's id, so nothing starts it later, then the same run once more, which
+   * finds it revoked, sends no `start`, reads the receipt and seals. A refused revoke is
+   * reported as it is, and the run is not sent again: it could start the attempt.
+   */
+  async #cancelReady(refused, command, events, onEvent) {
+    const revokeId = operationIds(command.operation_ids?.start_at ?? 1).revoke;
+    const revoked = await this.revoke(refused.binding, revokeId);
+    const revoke = { verb: "revoke", operation_id: revokeId, state: revoked.state ?? null, reason: revoked.reason ?? null };
+    if (revoked.result !== "accepted") return { ...refused, cancelled: true, operations: [...(refused.operations ?? []), revoke] };
+    const sealed = await this.#runOnce(command, events, onEvent);
+    return { ...sealed, cancelled: true, operations: [...(refused.operations ?? []), revoke, ...(sealed.operations ?? [])] };
   }
 
   /**
@@ -1452,8 +1672,17 @@ export class Adapter {
     return { state: null, answers };
   }
 
-  /** Cancel the attempt this adapter is running: the adapter revokes, seals and writes `done`. */
+  /**
+   * Cancel the attempt this adapter is running: the adapter revokes, seals and writes
+   * `done`. While `run` waits out a capacity refusal the adapter is idle and is not
+   * signalled (an idle adapter exits at once); `run` revokes and seals the ready attempt.
+   */
   cancel() {
+    this.#cancelRequested = true;
+    if (this.#waiting) {
+      if (this.#wake) this.#wake();
+      return;
+    }
     if (this.#exit === null) this.#child.kill("SIGTERM");
   }
 

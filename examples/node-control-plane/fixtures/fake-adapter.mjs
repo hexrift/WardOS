@@ -11,7 +11,18 @@
 // advertises the action channel with `hold` (§5, §6.9), as one started with
 // --action-channel and --approval-hold as well does. FAKE_ADAPTER_AGENT_ADAPTERS=<id>,…
 // advertises those agent adapters in `adapters` (§5), as a node started with
-// --agent-adapter for each does.
+// --agent-adapter for each does. FAKE_ADAPTER_RESOURCES=<flag>,… advertises a `resources`
+// section with those of `cpu`, `memory` and `pids` true (§5), as a node started with
+// --cgroup-root that enabled those controllers does.
+//
+// FAKE_ADAPTER_CAPACITY names a JSON file that scripts a node started with --max-running
+// (§2.1, §8.2), shared by every adapter process: {refuse: N, max_running, running}. The
+// first N `run`s across all processes are refused `capacity_exhausted` at `start`, after
+// `create` and `admit`, with the task left `ready` (the file counts them in `refused`);
+// `capabilities` reports a `scheduling` section with `running` at `max_running` while a
+// refusal is still to come, and 0 after. A `run` of an attempt this process revoked
+// replays `create` and `admit` as `revoked`, sends no `start`, and seals.
+// FAKE_ADAPTER_REVOKE_REJECT=<reason> refuses every `revoke` command with it.
 //
 // FAKE_ADAPTER_ACTIONS names a JSON file that scripts the attempt's action channel (§6.7)
 // and holds the node's side of it, so that several adapter processes in turn (a run and an
@@ -47,6 +58,9 @@ const channelFile = process.env.FAKE_ADAPTER_ACTIONS;
 const brokering = process.env.FAKE_ADAPTER_CREDENTIALS === "1";
 const holding = process.env.FAKE_ADAPTER_APPROVAL_HOLD === "1";
 const agentAdapters = (process.env.FAKE_ADAPTER_AGENT_ADAPTERS ?? "").split(",").filter(Boolean);
+const resourceFlags = (process.env.FAKE_ADAPTER_RESOURCES ?? "").split(",").filter(Boolean);
+const capacityFile = process.env.FAKE_ADAPTER_CAPACITY;
+const revokeReject = process.env.FAKE_ADAPTER_REVOKE_REJECT;
 const socketFlag = process.argv.indexOf("--socket");
 const socket = socketFlag >= 0 ? process.argv[socketFlag + 1] : null;
 
@@ -64,12 +78,47 @@ const CAPABILITIES = {
   snapshots: { content_addressed: true, diff: false, read: false },
   verifier: { isolated: false },
   lifecycle: { pause: true, stop: true, revoke: true, admit: true, start: true },
+  ...(resourceFlags.length > 0
+    ? { resources: { cpu: resourceFlags.includes("cpu"), memory: resourceFlags.includes("memory"), pids: resourceFlags.includes("pids") } }
+    : {}),
   ...(holding ? { actions: { approval: true, decision: true, max_pending: 8, max_total: 64, max_wait_secs: 3600, hold: true } } : {}),
   ...(agentAdapters.length > 0 ? { adapters: { contract: "1.0", hosted: agentAdapters } } : {}),
 };
 
 let failed = false;
 let running = null;
+const revoked = new Set();
+
+function readCapacity() {
+  const capacity = JSON.parse(readFileSync(capacityFile, "utf8"));
+  capacity.refused ??= 0;
+  return capacity;
+}
+
+/** The `scheduling` section a node started with --max-running reports (§5). */
+function scheduling() {
+  const capacity = readCapacity();
+  const full = capacity.refused < capacity.refuse;
+  return {
+    max_running: capacity.max_running,
+    running: full ? capacity.running : 0,
+    memory_floor_bytes: 0,
+    memory_available_bytes: 2147483648,
+    disk_floor_bytes: 0,
+    disk_available_bytes: 8589934592,
+  };
+}
+
+/** Whether this `start` is refused capacity_exhausted, counting the refusal in the shared file. */
+function refuseForCapacity() {
+  if (!capacityFile) return false;
+  const capacity = readCapacity();
+  if (capacity.refused >= capacity.refuse) return false;
+  capacity.refused += 1;
+  writeFileSync(`${capacityFile}.${process.pid}`, JSON.stringify(capacity));
+  renameSync(`${capacityFile}.${process.pid}`, capacityFile);
+  return true;
+}
 
 /** The canned §6.6 result for a grant: both streams printed once, every declared file but `missing.txt` returned. */
 function cannedOutput(grant) {
@@ -256,12 +305,21 @@ lines.on("line", (line) => {
   }
   switch (command.cmd) {
     case "capabilities":
-      emit({ event: "capabilities", protocol: { major: 1, minor: 3 }, capabilities: { ...CAPABILITIES, socket } });
+      emit({
+        event: "capabilities",
+        protocol: { major: 1, minor: 3 },
+        capabilities: { ...CAPABILITIES, ...(capacityFile ? { scheduling: scheduling() } : {}), socket },
+      });
       return;
     case "inspect":
       emit({ event: "inspected", state: "sealed", outcome: "completed" });
       return;
     case "revoke":
+      if (revokeReject) {
+        emit({ event: "verb", verb: "revoke", operation_id: command.operation_id, result: "rejected", reason: revokeReject });
+        return;
+      }
+      revoked.add(command.binding?.attempt);
       emit({ event: "verb", verb: "revoke", operation_id: command.operation_id, result: "accepted", state: "revoked" });
       return;
     case "actions":
@@ -296,11 +354,41 @@ lines.on("line", (line) => {
       const binding = envelope.binding;
       const evidence = command.task_root ? `${command.task_root}/${binding.task}/${binding.attempt}.evidence/events.log` : null;
       const operations = [];
-      for (const [verb, state] of [["create", "created"], ["admit", "ready"]]) {
+      const ended = revoked.has(binding.attempt);
+      for (const [verb, state] of [["create", ended ? "revoked" : "created"], ["admit", ended ? "revoked" : "ready"]]) {
         operations.push({ verb, operation_id: ids[verb], state, reason: null });
         emit({ event: "state", verb, operation_id: ids[verb], state });
       }
       emit({ event: "admitted", envelope_json: command.envelope_json, proof: command.proof });
+      if (ended) {
+        finish(binding, ids, "revoked", "failed", false, operations, evidence);
+        return;
+      }
+      if (refuseForCapacity()) {
+        operations.push({ verb: "start", operation_id: ids.start, state: null, reason: "capacity_exhausted" });
+        emit({ event: "rejected", verb: "start", operation_id: ids.start, reason: "capacity_exhausted" });
+        if (evidence) emit({ event: "evidence", path: evidence });
+        emit({
+          event: "done",
+          report: {
+            binding,
+            final_state: "ready",
+            outcome: { refused: { verb: "start", reason: "capacity_exhausted" } },
+            outcome_certain: true,
+            receipt: null,
+            cause: null,
+            sealed: false,
+            cancelled: false,
+            deadline_exceeded: false,
+            evidence_log: evidence,
+            evidence_head: null,
+            operations,
+            transport_error: null,
+            output: null,
+          },
+        });
+        return;
+      }
       operations.push({ verb: "start", operation_id: ids.start, state: "running", reason: null });
       emit({ event: "state", verb: "start", operation_id: ids.start, state: "running" });
       if (hold) {

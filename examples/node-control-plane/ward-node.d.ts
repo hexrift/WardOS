@@ -17,6 +17,20 @@ export const ID_PREFIXES: ReadonlyArray<IdPrefix>;
  */
 export const OUTPUT_CEILINGS: Readonly<{ stdioBytes: 1048576; filesBytes: 8388608; files: 64; pathBytes: 255 }>;
 
+/**
+ * What a node started with `--cgroup-root` honours of a `resources` grant (§7.5): at most
+ * 65 536 `pids` on every node (refused before signing above it), and at most
+ * `cpuMillisPerCpu` `cpu_millis` per logical CPU and the host's memory, both as the
+ * capability document's `capacity` reports them.
+ */
+export const RESOURCE_CEILINGS: Readonly<{ pids: 65536; cpuMillisPerCpu: 1000 }>;
+
+/**
+ * How `Adapter.run` paces a capacity wait (§8.2) unless told otherwise: 250 ms after the
+ * first `capacity_exhausted`, each next wait twice the last, at most 5 s.
+ */
+export const CAPACITY_WAIT: Readonly<{ firstDelayMs: 250; maxDelayMs: 5000 }>;
+
 /** The kinds of request a workload may send on the action channel (§6.7, ADR-0031). */
 export const ACTION_KINDS: ReadonlyArray<ActionKind>;
 
@@ -125,6 +139,22 @@ export interface OutputGrant {
 }
 
 /**
+ * The `resources` grant of §7.5 in wire spelling: the limits the node enforces on the
+ * attempt's whole process tree through its cgroup (§9). Each optional, at least one
+ * present, each an integer ≥ 1: `cpu_millis` is CPU time per second of wall clock in
+ * thousandths of one CPU (`cpu.max`), `memory_bytes` the memory the tree may use, tmpfs
+ * included, with no swap (`memory.max`), `pids` the processes and threads that may exist in
+ * it at once (`pids.max`, at most 65 536). Honoured only by a node started with
+ * `--cgroup-root` that reports each named limit `true` in `resources` and within its
+ * `capacity`; refused `unsupported_grant` otherwise.
+ */
+export interface ResourcesGrant {
+  cpu_millis?: number;
+  memory_bytes?: number;
+  pids?: number;
+}
+
+/**
  * The `actions` grant of §7.5 in wire spelling (ADR-0031 §2): the `kinds` the workload may
  * send (1–2, no repeats), at most `max_pending` waiting at once and `max_total` in the
  * attempt's lifetime (`max_pending` ≤ `max_total`), each answered `expired` after
@@ -176,6 +206,7 @@ export type HeldCapability = { host: string } | { service: string };
  */
 export type Manifest = ({ network: "offline" } | { network: { custom: string[] } }) & {
   output?: OutputGrant;
+  resources?: ResourcesGrant;
   actions?: ActionsGrant;
   credentials?: CredentialGrant[];
   hold?: HoldGrant;
@@ -270,6 +301,25 @@ export function manifest(object?: Manifest): ManifestBytes;
 export function outputGrantOf(envelopeJson: string): OutputGrant | null;
 /** The §7.5 grant from the control plane's words, refused outside the grammar or above the ceilings. */
 export function outputGrant(input: { stdioBytes: number; files: string[]; filesBytes: number }): OutputGrant;
+/** The `resources` grant of a signed envelope's manifest, or `null` without one. */
+export function resourcesGrantOf(envelopeJson: string): ResourcesGrant | null;
+/**
+ * The §7.5 `resources` grant from the control plane's words; an omitted limit is absent.
+ * Refused outside the grammar (no limit, a limit < 1 or not a safe integer) or above the
+ * pid ceiling.
+ */
+export function resourcesGrant(input?: { cpuMillis?: number; memoryBytes?: number; pids?: number }): ResourcesGrant;
+/**
+ * Whether the node's capability document (§5) enforces `grant`: its `resources` section has
+ * every named limit `true`, and the grant is within its `capacity` (1000 `cpu_millis` per
+ * logical CPU, at most its `memory_bytes`).
+ */
+export function enforcesResources(capabilities: unknown, grant: ResourcesGrant): boolean;
+/**
+ * The capability document, refused (naming why and `unsupported_grant`) unless it enforces
+ * `grant`: any other node refuses the manifest at `admit`, so it is refused before signing.
+ */
+export function requireResourceEnforcement<C>(capabilities: C, grant: ResourcesGrant): C;
 /** The `actions` grant a signed envelope's manifest carries, read from its exact bytes, or `null`. */
 export function actionsGrantOf(envelopeJson: string): ActionsGrant | null;
 /** The §7.5 grant from the control plane's words, refused outside ADR-0031's grammar or above the ceilings. */
@@ -611,6 +661,30 @@ export interface AdapterOptions {
   trace?: ((line: string) => void) | null;
 }
 
+/**
+ * The `scheduling` section of a capability document (§5), read when it is served: present
+ * on a node started with `--max-running`. A floor of 0 means none.
+ */
+export interface Scheduling {
+  max_running: number;
+  running: number;
+  memory_floor_bytes: number;
+  memory_available_bytes: number;
+  disk_floor_bytes: number;
+  disk_available_bytes: number;
+}
+
+/** One wait of a run whose `start` the node refused `capacity_exhausted` (§8.2). */
+export interface CapacityWait {
+  /** 1 for the first wait, then 2, …: the number of the `run` sent again after it. */
+  retry: number;
+  /** The refused `start`'s operation id, the one sent again. */
+  operation_id: number | null;
+  delay_ms: number;
+  /** The node's `scheduling` read before the wait; `null` when it reports none. */
+  scheduling: Scheduling | null;
+}
+
 export interface RunOptions {
   operationIds?: OperationIds | number;
   taskRoot?: string;
@@ -618,7 +692,24 @@ export interface RunOptions {
   maxPollMs?: number;
   graceMs?: number;
   onEvent?: (event: AdapterEvent) => void;
+  /**
+   * How long a `start` refused `capacity_exhausted` is waited out, sending the same run
+   * again (same bytes, proof and operation ids); default 0, none.
+   */
+  capacityWaitMs?: number;
+  /** The first wait; default `CAPACITY_WAIT.firstDelayMs`. Each next one is twice the last. */
+  capacityDelayMs?: number;
+  /** The longest wait; default `CAPACITY_WAIT.maxDelayMs`. */
+  capacityMaxDelayMs?: number;
+  /** Each wait as it begins. */
+  onCapacityWait?: (wait: CapacityWait) => void;
 }
+
+/**
+ * Whether a report is a `start` the node refused `capacity_exhausted` (§8.2): the task is
+ * still `ready`, and the same run may be sent again once the node has room.
+ */
+export function capacityExhausted(report: AttemptReport): boolean;
 
 export class Adapter {
   constructor(options: AdapterOptions);
@@ -648,8 +739,17 @@ export class Adapter {
    * answer is replayed under its id instead of asking the policy again.
    */
   answerLoop(binding: Binding, policy: AnswerPolicy, options?: AnswerLoopOptions): Promise<{ state: LifecycleState | null; answers: LoopAnswer[] }>;
-  run(signed: Pick<SignedEnvelope, "envelope_json" | "proof">, options?: RunOptions): Promise<{ events: AdapterEvent[]; report: AttemptReport }>;
-  /** SIGTERM to the adapter: it revokes and seals the running attempt and writes `done`. */
+  /**
+   * Drive one attempt to `done`. With `capacityWaitMs`, a `start` refused
+   * `capacity_exhausted` is sent again (the same run) with backoff until it is accepted or
+   * the wait is spent, every wait listed in `capacityWaits`; never re-signed.
+   */
+  run(signed: Pick<SignedEnvelope, "envelope_json" | "proof">, options?: RunOptions): Promise<{ events: AdapterEvent[]; report: AttemptReport; capacityWaits: CapacityWait[] }>;
+  /**
+   * SIGTERM to the adapter: it revokes and seals the running attempt and writes `done`.
+   * While `run` waits out a capacity refusal, `run` revokes and seals the ready attempt
+   * itself instead.
+   */
   cancel(): void;
   close(): Promise<number>;
 }
