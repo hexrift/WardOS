@@ -154,6 +154,9 @@ pub enum SnapshotRole {
 }
 
 impl SnapshotRole {
+    /// Every role, in declaration order.
+    pub const ALL: [Self; 4] = [Self::Entry, Self::Candidate, Self::Accepted, Self::Final];
+
     /// Stable lowercase token, used in metadata filenames.
     pub fn as_str(self) -> &'static str {
         match self {

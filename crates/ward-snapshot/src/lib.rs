@@ -44,6 +44,7 @@ mod ignore;
 mod manifest;
 mod materialize;
 mod meta;
+mod transfer;
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
